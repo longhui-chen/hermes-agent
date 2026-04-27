@@ -19,6 +19,13 @@
 name: Deploy to devboard
 
 on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.github/**'
+      - 'website/**'
   workflow_dispatch:
     inputs:
       ref:
