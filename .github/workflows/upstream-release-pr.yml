@@ -1,0 +1,69 @@
+name: Open PR on upstream release
+
+on:
+  schedule:
+    - cron: '30 18 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  open-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get latest upstream release tag
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Check existing open sync PR
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          COUNT=$(gh pr list --base main --head upstream --state open --json number --jq 'length')
+          echo "exists=$COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Compare main vs upstream
+        id: diff
+        run: |
+          git fetch origin upstream:upstream
+          BEHIND=$(git rev-list --count main..upstream)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+
+      - name: Open PR
+        if: steps.check.outputs.exists == '0' && steps.diff.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_TAG: ${{ steps.rel.outputs.tag }}
+          BEHIND: ${{ steps.diff.outputs.behind }}
+        run: |
+          cat > /tmp/pr_body.md <<EOF
+          Automated PR from upstream sync.
+
+          - Latest upstream release: \`${UPSTREAM_TAG}\`
+          - Commits behind upstream: ${BEHIND}
+
+          ## Review checklist before merging
+          - [ ] \`hermes_cli/main.py\` — \`OFFICIAL_REPO_URLS\` / \`OFFICIAL_REPO_URL\` still point to \`zettlab/hermes-agent\`
+          - [ ] \`scripts/install.sh\` — \`REPO_URL_SSH\` / \`REPO_URL_HTTPS\` still point to \`zettlab/hermes-agent\`
+          - [ ] \`.github/workflows/\` — only zettlab workflows present (no upstream tests/nix/docker/site reintroduced)
+          - [ ] Tests still pass on a deploy target
+          EOF
+          gh pr create \
+            --base main \
+            --head upstream \
+            --title "chore(sync): merge upstream ${UPSTREAM_TAG}" \
+            --body-file /tmp/pr_body.md
