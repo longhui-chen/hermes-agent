@@ -28,14 +28,6 @@ jobs:
           TAG=$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Check existing open sync PR
-        id: check
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          COUNT=$(gh pr list --base main --head upstream --state open --json number --jq 'length')
-          echo "exists=$COUNT" >> "$GITHUB_OUTPUT"
-
       - name: Compare main vs upstream
         id: diff
         run: |
@@ -43,27 +35,23 @@ jobs:
           BEHIND=$(git rev-list --count main..upstream)
           echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
 
-      - name: Open PR
-        if: steps.check.outputs.exists == '0' && steps.diff.outputs.behind != '0'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          UPSTREAM_TAG: ${{ steps.rel.outputs.tag }}
-          BEHIND: ${{ steps.diff.outputs.behind }}
-        run: |
-          cat > /tmp/pr_body.md <<EOF
-          Automated PR from upstream sync.
+      - name: Open or update sync PR
+        if: steps.diff.outputs.behind != '0'
+        uses: repo-sync/pull-request@v2
+        with:
+          source_branch: upstream
+          destination_branch: main
+          pr_title: "chore(sync): merge upstream ${{ steps.rel.outputs.tag }}"
+          pr_label: "upstream-sync"
+          pr_body: |
+            Automated PR from upstream sync.
 
-          - Latest upstream release: \`${UPSTREAM_TAG}\`
-          - Commits behind upstream: ${BEHIND}
+            - Latest upstream release: `${{ steps.rel.outputs.tag }}`
+            - Commits behind upstream: ${{ steps.diff.outputs.behind }}
 
-          ## Review checklist before merging
-          - [ ] \`hermes_cli/main.py\` — \`OFFICIAL_REPO_URLS\` / \`OFFICIAL_REPO_URL\` still point to \`zettlab/hermes-agent\`
-          - [ ] \`scripts/install.sh\` — \`REPO_URL_SSH\` / \`REPO_URL_HTTPS\` still point to \`zettlab/hermes-agent\`
-          - [ ] \`.github/workflows/\` — only zettlab workflows present (no upstream tests/nix/docker/site reintroduced)
-          - [ ] Tests still pass on a deploy target
-          EOF
-          gh pr create \
-            --base main \
-            --head upstream \
-            --title "chore(sync): merge upstream ${UPSTREAM_TAG}" \
-            --body-file /tmp/pr_body.md
+            ## Review checklist before merging
+            - [ ] `hermes_cli/main.py` — `OFFICIAL_REPO_URLS` / `OFFICIAL_REPO_URL` still point to `zettlab/hermes-agent`
+            - [ ] `scripts/install.sh` — `REPO_URL_SSH` / `REPO_URL_HTTPS` still point to `zettlab/hermes-agent`
+            - [ ] `.github/workflows/` — only zettlab workflows present (no upstream tests/nix/docker/site reintroduced)
+            - [ ] Tests still pass on a deploy target
+          github_token: ${{ secrets.GITHUB_TOKEN }}
