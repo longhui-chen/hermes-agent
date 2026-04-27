@@ -1,0 +1,90 @@
+# Sync hermes source to the dev board, run uv sync, restart hermes-gateway,
+# health-check, write .version.
+#
+# Required GitHub Secrets:
+#   DEVBOARD_HOST, DEVBOARD_PORT, DEVBOARD_USER, DEVBOARD_DEPLOY_KEY
+#
+# Notes:
+# - The board must be provisioned first (see scripts/provisioning/ in the
+#   zettlab-product-dev monorepo): /usr/local/bin/zettlab-deploy dispatcher,
+#   /etc/systemd/system/hermes-gateway.service, and a working venv at
+#   /opt/zettlab/hermes/venv (one-off `uv venv` + `uv sync` from the board).
+# - The deploy key's public half must be in the board's authorized_keys
+#   with command="/usr/local/bin/zettlab-deploy".
+# - rsync goes through the dispatcher's `rsync --server` whitelist; the
+#   destination must stay under /opt/zettlab/.
+# - `--no-owner --no-group` keeps the board's root:root ownership intact;
+#   the dispatcher also `chown -R root:root` defensively.
+
+name: Deploy to devboard
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to deploy (default: current branch)"
+        required: false
+        default: ""
+
+concurrency:
+  group: deploy-devboard
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Load deploy key into ssh-agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DEVBOARD_DEPLOY_KEY }}
+
+      - name: Add devboard host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p ${{ secrets.DEVBOARD_PORT }} \
+            ${{ secrets.DEVBOARD_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Rsync source tree
+        run: |
+          rsync -avz --delete \
+            --no-owner --no-group \
+            -e "ssh -p ${{ secrets.DEVBOARD_PORT }}" \
+            --exclude=venv/ \
+            --exclude=__pycache__/ \
+            --exclude=.git/ \
+            --exclude=.env \
+            --exclude=hermes-data/ \
+            --exclude=.pytest_cache/ \
+            --exclude=node_modules/ \
+            ./ \
+            ${{ secrets.DEVBOARD_USER }}@${{ secrets.DEVBOARD_HOST }}:/opt/zettlab/hermes/
+
+      - name: Trigger deploy on board (uv sync + restart hermes-gateway)
+        run: |
+          ssh -p ${{ secrets.DEVBOARD_PORT }} \
+            ${{ secrets.DEVBOARD_USER }}@${{ secrets.DEVBOARD_HOST }} \
+            hermes-deploy
+
+      - name: Write version file
+        run: |
+          {
+            echo "git_sha=${{ github.sha }}"
+            echo "deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "workflow_run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } | ssh -p ${{ secrets.DEVBOARD_PORT }} \
+              ${{ secrets.DEVBOARD_USER }}@${{ secrets.DEVBOARD_HOST }} \
+              "write-version hermes"
+
+      - name: Show post-deploy status
+        if: always()
+        run: |
+          ssh -p ${{ secrets.DEVBOARD_PORT }} \
+            ${{ secrets.DEVBOARD_USER }}@${{ secrets.DEVBOARD_HOST }} \
+            status || true
