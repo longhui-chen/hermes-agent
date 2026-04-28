@@ -100,12 +100,12 @@ jobs:
         if: always()
         uses: actions/github-script@v7
         env:
-          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_DEPLOY_WEBHOOK_URL: ${{ secrets.FEISHU_DEPLOY_WEBHOOK_URL }}
           DEPLOY_STATUS: ${{ job.status }}
         with:
           script: |
-            if (!process.env.FEISHU_WEBHOOK_URL) {
-              core.warning('FEISHU_WEBHOOK_URL not set; skipping deploy notification');
+            if (!process.env.FEISHU_DEPLOY_WEBHOOK_URL) {
+              core.warning('FEISHU_DEPLOY_WEBHOOK_URL not set; skipping deploy notification');
               return;
             }
             const status = process.env.DEPLOY_STATUS;
@@ -126,7 +126,7 @@ jobs:
               [{ tag: 'text', text: `Actor: ${context.actor}` }],
               [{ tag: 'a', text: 'View workflow run', href: runUrl }],
             ];
-            await fetch(process.env.FEISHU_WEBHOOK_URL, {
+            await fetch(process.env.FEISHU_DEPLOY_WEBHOOK_URL, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
