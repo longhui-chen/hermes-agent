@@ -1,0 +1,256 @@
+# Tar hermes source, push to every GCP VM tagged zettlab-role=cloudnas, and
+# run the zettlab-cloudnas-deploy dispatcher (extract over /opt/zettlab/hermes/,
+# uv sync, restart hermes-gateway, health-check on :8642).
+#
+# Manual trigger only.
+#
+# Required GitHub Secrets:
+#   GCP_SA_KEY              service-account JSON, with at minimum:
+#                             roles/compute.osAdminLogin
+#                             roles/iap.tunnelResourceAccessor
+#                             roles/compute.viewer
+#   FEISHU_WEBHOOK_URL      (optional) Feishu webhook for the run summary
+#
+# Onboarding new hosts:
+#   See zettlab-product-dev/scripts/cloudnas/onboard.sh. Once a VM has the
+#   right labels, this workflow picks it up automatically.
+
+name: Deploy to cloud NAS fleet
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to deploy (default: current branch)"
+        required: false
+        default: ""
+      env:
+        description: "Env filter (prod | staging | all)"
+        required: false
+        default: "prod"
+      targets:
+        description: "Override: comma-separated instance names (empty = all matching env)"
+        required: false
+        default: ""
+      dry_run:
+        description: "Only list discovered targets, do not deploy"
+        type: boolean
+        default: false
+
+env:
+  GCP_PROJECT: zettlab-1
+
+concurrency:
+  group: deploy-cloudnas-fleet
+  cancel-in-progress: false
+
+jobs:
+  discover:
+    name: Discover targets
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+      count:  ${{ steps.list.outputs.count }}
+    steps:
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT }}
+
+      - name: Discover by GCP labels
+        id: list
+        env:
+          ENV_INPUT: ${{ inputs.env }}
+          NAMES_INPUT: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+          FILTER="labels.zettlab-role=cloudnas"
+          if [ -n "$ENV_INPUT" ] && [ "$ENV_INPUT" != "all" ]; then
+            FILTER+=" AND labels.zettlab-env=$ENV_INPUT"
+          fi
+          echo "filter: $FILTER"
+
+          gcloud compute instances list \
+            --project="${GCP_PROJECT}" \
+            --filter="$FILTER" \
+            --format="json" > all.json
+
+          if [ -n "$NAMES_INPUT" ]; then
+            jq --arg csv "$NAMES_INPUT" '
+              ($csv | split(",") | map(gsub("^\\s+|\\s+$"; ""))) as $names
+              | map(select(.name as $n | $names | index($n)))
+            ' all.json > filtered.json
+          else
+            cp all.json filtered.json
+          fi
+
+          jq '{include: map({
+            name: .name,
+            zone: (.zone | split("/") | .[-1]),
+            arch: (.labels["zettlab-arch"] // "amd64"),
+            env:  (.labels["zettlab-env"]  // "unknown"),
+            iap:  ((.labels["zettlab-iap"] // "true") != "false")
+          })}' filtered.json > matrix.json
+
+          echo "Discovered targets:"
+          jq -r '.include[] | "  - \(.name)  zone=\(.zone)  arch=\(.arch)  env=\(.env)  iap=\(.iap)"' matrix.json
+          COUNT=$(jq '.include | length' matrix.json)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          {
+            echo "matrix<<EOF"
+            jq -c . matrix.json
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::warning::No matching cloud NAS hosts (filter: $FILTER)"
+          fi
+
+  deploy:
+    name: Deploy → ${{ matrix.name }}
+    needs: discover
+    if: ${{ !inputs.dry_run && needs.discover.outputs.count != '0' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover.outputs.matrix) }}
+    concurrency:
+      group: deploy-cloudnas-${{ matrix.name }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Archive hermes source (clean tree from git ref)
+        run: |
+          # `git archive` only emits tracked files for ${{ inputs.ref || github.sha }} —
+          # gitignored files, .git/, build artifacts, and any working-tree
+          # cruft are excluded by definition.
+          git archive --format=tar.gz -o /tmp/hermes-src.tgz HEAD
+          ls -lh /tmp/hermes-src.tgz
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT }}
+
+      - name: Resolve IAP flag
+        id: iap
+        run: |
+          if [ "${{ matrix.iap }}" = "true" ]; then
+            echo "flag=--tunnel-through-iap" >> "$GITHUB_OUTPUT"
+          else
+            echo "flag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: SCP tarball to ${{ matrix.name }}
+        run: |
+          gcloud compute scp \
+            --project="${{ env.GCP_PROJECT }}" \
+            --zone="${{ matrix.zone }}" \
+            ${{ steps.iap.outputs.flag }} \
+            --quiet \
+            /tmp/hermes-src.tgz \
+            "${{ matrix.name }}:/tmp/hermes-src.tgz"
+
+      - name: Run dispatcher
+        run: |
+          gcloud compute ssh \
+            --project="${{ env.GCP_PROJECT }}" \
+            --zone="${{ matrix.zone }}" \
+            ${{ steps.iap.outputs.flag }} \
+            --quiet \
+            "${{ matrix.name }}" \
+            --command="sudo /usr/local/bin/zettlab-cloudnas-deploy hermes /tmp/hermes-src.tgz"
+
+      - name: Write version
+        run: |
+          {
+            echo "git_sha=${{ github.sha }}"
+            echo "deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "workflow_run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } | gcloud compute ssh \
+              --project="${{ env.GCP_PROJECT }}" \
+              --zone="${{ matrix.zone }}" \
+              ${{ steps.iap.outputs.flag }} \
+              --quiet \
+              "${{ matrix.name }}" \
+              --command="sudo /usr/local/bin/zettlab-cloudnas-deploy write-version hermes"
+
+      - name: Show post-deploy status
+        if: always()
+        run: |
+          gcloud compute ssh \
+            --project="${{ env.GCP_PROJECT }}" \
+            --zone="${{ matrix.zone }}" \
+            ${{ steps.iap.outputs.flag }} \
+            --quiet \
+            "${{ matrix.name }}" \
+            --command="sudo /usr/local/bin/zettlab-cloudnas-deploy status" || true
+
+  notify:
+    name: Notify Feishu
+    needs: [discover, deploy]
+    if: always()
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          DISCOVER_RESULT: ${{ needs.discover.result }}
+          TARGET_COUNT: ${{ needs.discover.outputs.count }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          ENV_FILTER: ${{ inputs.env }}
+          TARGETS_OVERRIDE: ${{ inputs.targets }}
+        with:
+          script: |
+            if (!process.env.FEISHU_WEBHOOK_URL) {
+              core.warning('FEISHU_WEBHOOK_URL not set; skipping');
+              return;
+            }
+            const dryRun = process.env.DRY_RUN === 'true';
+            const status = dryRun
+              ? `dry-run (count=${process.env.TARGET_COUNT})`
+              : (process.env.DEPLOY_RESULT === 'skipped'
+                  ? `discover-only: ${process.env.DISCOVER_RESULT}`
+                  : process.env.DEPLOY_RESULT);
+            const repo = `${context.repo.owner}/${context.repo.repo}`;
+            const sha  = context.sha.substring(0, 7);
+            const branch = context.ref.replace('refs/heads/', '');
+            const runUrl = `${context.serverUrl}/${repo}/actions/runs/${context.runId}`;
+            const commitUrl = `${context.serverUrl}/${repo}/commit/${context.sha}`;
+            const title = `[${context.repo.repo}] cloud NAS deploy ${status}`;
+            const content = [
+              [{ tag: 'text', text: `Status: ${status}` }],
+              [{ tag: 'text', text: `Targets: ${process.env.TARGET_COUNT} (env=${process.env.ENV_FILTER}, override=${process.env.TARGETS_OVERRIDE || '(none)'})` }],
+              [{ tag: 'text', text: `Branch: ${branch}` }],
+              [
+                { tag: 'text', text: 'Commit: ' },
+                { tag: 'a', text: sha, href: commitUrl },
+              ],
+              [{ tag: 'text', text: `Actor: ${context.actor}` }],
+              [{ tag: 'a', text: 'View workflow run', href: runUrl }],
+            ];
+            await fetch(process.env.FEISHU_WEBHOOK_URL, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                msg_type: 'post',
+                content: { post: { zh_cn: { title, content } } },
+              }),
+            });
