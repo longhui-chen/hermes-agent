@@ -14,16 +14,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout main
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_PR_TOKEN }}
 
       - name: Get latest upstream release tag
         id: rel
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
         run: |
           TAG=$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
@@ -54,4 +54,4 @@ jobs:
             - [ ] `scripts/install.sh` — `REPO_URL_SSH` / `REPO_URL_HTTPS` still point to `zettlab/hermes-agent`
             - [ ] `.github/workflows/` — only zettlab workflows present (no upstream tests/nix/docker/site reintroduced)
             - [ ] Tests still pass on a deploy target
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          github_token: ${{ secrets.RELEASE_PR_TOKEN }}
