@@ -9,7 +9,7 @@
 #                             roles/compute.osAdminLogin
 #                             roles/iap.tunnelResourceAccessor
 #                             roles/compute.viewer
-#   FEISHU_WEBHOOK_URL      (optional) Feishu webhook for the run summary
+#   FEISHU_DEPLOY_WEBHOOK_URL      (optional) Feishu webhook for the run summary
 #
 # Onboarding new hosts:
 #   See zettlab-product-dev/scripts/cloudnas/onboard.sh. Once a VM has the
@@ -210,7 +210,7 @@ jobs:
     steps:
       - uses: actions/github-script@v7
         env:
-          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_DEPLOY_WEBHOOK_URL: ${{ secrets.FEISHU_DEPLOY_WEBHOOK_URL }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
           DISCOVER_RESULT: ${{ needs.discover.result }}
           TARGET_COUNT: ${{ needs.discover.outputs.count }}
@@ -219,8 +219,8 @@ jobs:
           TARGETS_OVERRIDE: ${{ inputs.targets }}
         with:
           script: |
-            if (!process.env.FEISHU_WEBHOOK_URL) {
-              core.warning('FEISHU_WEBHOOK_URL not set; skipping');
+            if (!process.env.FEISHU_DEPLOY_WEBHOOK_URL) {
+              core.warning('FEISHU_DEPLOY_WEBHOOK_URL not set; skipping');
               return;
             }
             const dryRun = process.env.DRY_RUN === 'true';
@@ -246,7 +246,7 @@ jobs:
               [{ tag: 'text', text: `Actor: ${context.actor}` }],
               [{ tag: 'a', text: 'View workflow run', href: runUrl }],
             ];
-            await fetch(process.env.FEISHU_WEBHOOK_URL, {
+            await fetch(process.env.FEISHU_DEPLOY_WEBHOOK_URL, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
