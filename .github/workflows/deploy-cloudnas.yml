@@ -102,11 +102,10 @@ jobs:
           jq -r '.include[] | "  - \(.name)  zone=\(.zone)  arch=\(.arch)  env=\(.env)  iap=\(.iap)"' matrix.json
           COUNT=$(jq '.include | length' matrix.json)
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
-          {
-            echo "matrix<<EOF"
-            jq -c . matrix.json
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          # Use single-line `KEY=VALUE` form (jq -c emits one compact line);
+          # multi-line heredoc to $GITHUB_OUTPUT triggers GitHub's secret
+          # redaction heuristic and the matrix output gets dropped.
+          echo "matrix=$(jq -c . matrix.json)" >> "$GITHUB_OUTPUT"
 
           if [ "$COUNT" -eq 0 ]; then
             echo "::warning::No matching cloud NAS hosts (filter: $FILTER)"
