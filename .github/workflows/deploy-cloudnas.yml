@@ -25,9 +25,9 @@ on:
         required: false
         default: ""
       env:
-        description: "Env filter (prod | staging | all)"
+        description: "Env filter (staging | all). prod is reserved; no real prod hosts exist yet."
         required: false
-        default: "prod"
+        default: "staging"
       targets:
         description: "Override: comma-separated instance names (empty = all matching env)"
         required: false
