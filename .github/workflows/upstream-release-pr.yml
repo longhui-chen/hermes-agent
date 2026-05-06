@@ -20,6 +20,10 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.RELEASE_PR_TOKEN }}
 
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git || true
+
       - name: Get latest upstream release tag
         id: rel
         env:
@@ -27,29 +31,56 @@ jobs:
         run: |
           TAG=$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "branch=sync/upstream-${TAG}" >> "$GITHUB_OUTPUT"
 
-      - name: Compare main vs upstream
+      - name: Fetch tag and resolve release commit
+        id: sha
+        run: |
+          git fetch upstream "refs/tags/${{ steps.rel.outputs.tag }}:refs/tags/${{ steps.rel.outputs.tag }}"
+          SHA=$(git rev-parse "refs/tags/${{ steps.rel.outputs.tag }}^{commit}")
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure sync branch exists (frozen at release tag)
+        run: |
+          BRANCH="${{ steps.rel.outputs.branch }}"
+          SHA="${{ steps.sha.outputs.sha }}"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "Branch $BRANCH already exists; leaving as-is (may contain manual conflict resolutions)."
+          else
+            echo "Creating branch $BRANCH at release commit $SHA"
+            git push origin "${SHA}:refs/heads/${BRANCH}"
+          fi
+
+      - name: Compute commits ahead of main
         id: diff
         run: |
-          git fetch origin upstream:upstream
-          BEHIND=$(git rev-list --count main..upstream)
+          git fetch origin "${{ steps.rel.outputs.branch }}:${{ steps.rel.outputs.branch }}"
+          BEHIND=$(git rev-list --count "main..${{ steps.rel.outputs.branch }}")
           echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
 
       - name: Open or update sync PR
         if: steps.diff.outputs.behind != '0'
         uses: repo-sync/pull-request@v2
         with:
-          source_branch: upstream
+          source_branch: ${{ steps.rel.outputs.branch }}
           destination_branch: main
           pr_title: "chore(sync): merge upstream ${{ steps.rel.outputs.tag }}"
           pr_label: "upstream-sync"
           pr_body: |
             Automated PR from upstream sync.
 
-            - Latest upstream release: `${{ steps.rel.outputs.tag }}`
-            - Commits behind upstream: ${{ steps.diff.outputs.behind }}
+            - Upstream release: `${{ steps.rel.outputs.tag }}`
+            - Source branch (frozen at release commit): `${{ steps.rel.outputs.branch }}`
+            - Release commit SHA: `${{ steps.sha.outputs.sha }}`
+            - Commits ahead of main: ${{ steps.diff.outputs.behind }}
+
+            ## Conflict resolution
+
+            If conflicts arise, commit fixes directly to `${{ steps.rel.outputs.branch }}`.
+            This branch is frozen at the upstream release commit and is **not** force-pushed by the daily upstream mirror, so manual fixes will persist.
 
             ## Review checklist before merging
+
             - [ ] `hermes_cli/main.py` — `OFFICIAL_REPO_URLS` / `OFFICIAL_REPO_URL` still point to `zettlab/hermes-agent`
             - [ ] `scripts/install.sh` — `REPO_URL_SSH` / `REPO_URL_HTTPS` still point to `zettlab/hermes-agent`
             - [ ] `.github/workflows/` — only zettlab workflows present (no upstream tests/nix/docker/site reintroduced)
