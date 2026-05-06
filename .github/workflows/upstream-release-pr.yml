@@ -9,6 +9,10 @@ permissions:
   contents: write
   pull-requests: write
 
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
 jobs:
   open-pr:
     runs-on: ubuntu-latest
@@ -85,10 +89,15 @@ jobs:
             - Release commit SHA: `${{ steps.sha.outputs.sha }}`
             - Commits ahead of main: ${{ steps.diff.outputs.behind }}
 
+            ## Branch maintenance
+
+            This workflow also force-updates `origin/upstream` to the latest release commit on each run (idempotent — skipped if already there). `origin/upstream` is therefore a stable pointer to the latest upstream release between runs.
+
+            The PR head `${{ steps.rel.outputs.branch }}` is created once from the release commit and is **not** moved by automation, so manual conflict-resolution commits pushed to it will persist.
+
             ## Conflict resolution
 
             If conflicts arise, commit fixes directly to `${{ steps.rel.outputs.branch }}`.
-            This branch is frozen at the upstream release commit and is **not** force-pushed by the daily upstream mirror, so manual fixes will persist.
 
             ## Review checklist before merging
 
