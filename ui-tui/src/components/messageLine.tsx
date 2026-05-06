@@ -5,6 +5,7 @@ import { LONG_MSG } from '../config/limits.js'
 import { sectionMode } from '../domain/details.js'
 import { userDisplay } from '../domain/messages.js'
 import { ROLE } from '../domain/roles.js'
+import { transcriptBodyWidth, transcriptGutterWidth } from '../lib/inputMetrics.js'
 import {
   boundedHistoryRenderText,
   boundedLiveRenderText,
@@ -80,13 +81,13 @@ export const MessageLine = memo(function MessageLine({
     const preview = compactPreview(stripped, maxChars) || '(empty tool result)'
 
     return (
-      <Box alignSelf="flex-start" borderColor={t.color.dim} borderStyle="round" marginLeft={3} paddingX={1}>
+      <Box alignSelf="flex-start" borderColor={t.color.muted} borderStyle="round" marginLeft={3} paddingX={1}>
         {hasAnsi(msg.text) ? (
           <Text wrap="truncate-end">
             <Ansi>{msg.text}</Ansi>
           </Text>
         ) : (
-          <Text color={t.color.dim} wrap="truncate-end">
+          <Text color={t.color.muted} wrap="truncate-end">
             {preview}
           </Text>
         )}
@@ -95,13 +96,14 @@ export const MessageLine = memo(function MessageLine({
   }
 
   const { body, glyph, prefix } = ROLE[msg.role](t)
+  const gutterWidth = transcriptGutterWidth(msg.role, t.brand.prompt)
 
   const showDetails =
     (toolsMode !== 'hidden' && Boolean(msg.tools?.length)) || (thinkingMode !== 'hidden' && Boolean(thinking))
 
   const content = (() => {
     if (msg.kind === 'slash') {
-      return <Text color={t.color.dim}>{msg.text}</Text>
+      return <Text color={t.color.muted}>{msg.text}</Text>
     }
 
     if (msg.role !== 'user' && hasAnsi(msg.text)) {
@@ -125,7 +127,7 @@ export const MessageLine = memo(function MessageLine({
       return (
         <Text color={body}>
           {head}
-          <Text color={t.color.dim} dimColor>
+          <Text color={t.color.muted} dimColor>
             [long message]
           </Text>
           {rest.join('')}
@@ -163,13 +165,13 @@ export const MessageLine = memo(function MessageLine({
       )}
 
       <Box>
-        <NoSelect flexShrink={0} fromLeftEdge width={3}>
+        <NoSelect flexShrink={0} fromLeftEdge width={gutterWidth}>
           <Text bold={msg.role === 'user'} color={prefix}>
             {glyph}{' '}
           </Text>
         </NoSelect>
 
-        <Box width={Math.max(20, cols - 5)}>{content}</Box>
+        <Box width={transcriptBodyWidth(cols, msg.role, t.brand.prompt)}>{content}</Box>
       </Box>
     </Box>
   )
