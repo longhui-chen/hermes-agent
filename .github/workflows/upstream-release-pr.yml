@@ -40,6 +40,17 @@ jobs:
           SHA=$(git rev-parse "refs/tags/${{ steps.rel.outputs.tag }}^{commit}")
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
+      - name: Update origin/upstream pointer to latest release commit
+        run: |
+          SHA="${{ steps.sha.outputs.sha }}"
+          CURRENT=$(git ls-remote origin refs/heads/upstream | awk '{print $1}')
+          if [ "$CURRENT" = "$SHA" ]; then
+            echo "origin/upstream already at $SHA; no-op"
+          else
+            echo "Updating origin/upstream: ${CURRENT:-<absent>} -> $SHA"
+            git push --force origin "${SHA}:refs/heads/upstream"
+          fi
+
       - name: Ensure sync branch exists (frozen at release tag)
         run: |
           BRANCH="${{ steps.rel.outputs.branch }}"
