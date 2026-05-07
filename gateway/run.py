@@ -1211,7 +1211,7 @@ class GatewayRunner:
             return
 
         connected = self.config.get_connected_platforms()
-        messaging_platforms = [p for p in connected if p not in {Platform.LOCAL, Platform.API_SERVER, Platform.WEBHOOK}]
+        messaging_platforms = [p for p in connected if p not in {Platform.LOCAL, Platform.API_SERVER, Platform.ZET_AGENT, Platform.WEBHOOK}]
         if not messaging_platforms:
             return
 
@@ -4370,6 +4370,13 @@ class GatewayRunner:
                 logger.warning("API Server: aiohttp not installed")
                 return None
             return APIServerAdapter(config)
+
+        elif platform == Platform.ZET_AGENT:
+            from gateway.platforms.zet_agent import ZetAgentAdapter, check_zet_agent_requirements
+            if not check_zet_agent_requirements():
+                logger.warning("Zet Agent: aiohttp not installed")
+                return None
+            return ZetAgentAdapter(config)
 
         elif platform == Platform.WEBHOOK:
             from gateway.platforms.webhook import WebhookAdapter, check_webhook_requirements
