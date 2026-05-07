@@ -22,7 +22,12 @@ jobs:
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ secrets.RELEASE_PR_TOKEN }}
+          # GITHUB_TOKEN (not the RELEASE_PR_TOKEN PAT) so that subsequent
+          # git pushes can update workflow files under .github/workflows/
+          # without tripping the "PAT lacks `workflow` scope" rejection.
+          # PR creation below still uses RELEASE_PR_TOKEN so that the
+          # opened PR triggers downstream CI workflows.
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Add upstream remote
         run: |
@@ -31,7 +36,7 @@ jobs:
       - name: Get latest upstream release tag
         id: rel
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG=$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
