@@ -2291,7 +2291,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
     # Allowed fields for update — prevents clients injecting arbitrary keys
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled", "timezone"}
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
 
@@ -2312,6 +2312,36 @@ class APIServerAdapter(BasePlatformAdapter):
                 {"error": "Invalid job ID format"}, status=400,
             )
         return job_id, None
+
+    @staticmethod
+    def _validate_timezone_field(value) -> Optional["web.Response"]:
+        """Validate an IANA timezone string from a job request body.
+
+        Returns a 400 response on bad input, or None when value is OK
+        (None, empty string, or a recognised zone). Done at the API layer
+        so clients get a clear 400 instead of the catch-all 500 from the
+        underlying ``_cron_create`` / ``_cron_update`` ValueError.
+        """
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return web.json_response(
+                {"error": "timezone must be a string"}, status=400,
+            )
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # type: ignore[no-redef]
+        try:
+            ZoneInfo(text)
+        except (ZoneInfoNotFoundError, ValueError):
+            return web.json_response(
+                {"error": f"Invalid IANA timezone: {text!r}"}, status=400,
+            )
+        return None
 
     async def _handle_list_jobs(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs — list all cron jobs."""
@@ -2344,6 +2374,7 @@ class APIServerAdapter(BasePlatformAdapter):
             deliver = body.get("deliver", "local")
             skills = body.get("skills")
             repeat = body.get("repeat")
+            timezone = body.get("timezone")
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -2359,6 +2390,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
                 return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
+            tz_err = self._validate_timezone_field(timezone)
+            if tz_err:
+                return tz_err
 
             kwargs = {
                 "prompt": prompt,
@@ -2370,6 +2404,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
+            if timezone is not None:
+                kwargs["timezone"] = timezone
 
             job = _cron_create(**kwargs)
             return web.json_response({"job": job})
@@ -2421,6 +2457,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(
                     {"error": f"Prompt must be ≤ {self._MAX_PROMPT_LENGTH} characters"}, status=400,
                 )
+            if "timezone" in sanitized:
+                tz_err = self._validate_timezone_field(sanitized["timezone"])
+                if tz_err:
+                    return tz_err
             job = _cron_update(job_id, sanitized)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)

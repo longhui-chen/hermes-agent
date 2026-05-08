@@ -232,6 +232,41 @@ class TestCreateJob:
                 data = await resp.json()
                 assert "schedule" in data["error"].lower() or "Schedule" in data["error"]
 
+    @pytest.mark.asyncio
+    async def test_create_job_with_timezone_passthrough(self, adapter):
+        """POST /api/jobs forwards timezone kwarg into _cron_create."""
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "6 23 * * *",
+                    "timezone": "Asia/Shanghai",
+                })
+                assert resp.status == 200
+                call_kwargs = mock_create.call_args[1]
+                assert call_kwargs["timezone"] == "Asia/Shanghai"
+
+    @pytest.mark.asyncio
+    async def test_create_job_invalid_timezone_returns_400(self, adapter):
+        """Bogus IANA tz must surface as a 400 — not a generic 500."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "6 23 * * *",
+                    "timezone": "Mars/Olympus_Mons",
+                })
+                assert resp.status == 400
+                data = await resp.json()
+                assert "timezone" in data["error"].lower()
+
 
 # ---------------------------------------------------------------------------
 # 8-10. test_get_job
@@ -352,6 +387,38 @@ class TestUpdateJob:
                 assert resp.status == 400
                 data = await resp.json()
                 assert "No valid fields" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_update_job_timezone_passes_through(self, adapter):
+        """PATCH lets timezone through the whitelist into _cron_update."""
+        app = _create_app(adapter)
+        mock_update = MagicMock(return_value={**SAMPLE_JOB, "timezone": "Asia/Shanghai"})
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_update", mock_update
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"timezone": "Asia/Shanghai"},
+                )
+                assert resp.status == 200
+                sanitized = mock_update.call_args[0][1]
+                assert sanitized["timezone"] == "Asia/Shanghai"
+
+    @pytest.mark.asyncio
+    async def test_update_job_invalid_timezone_returns_400(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"timezone": "Mars/Olympus_Mons"},
+                )
+                assert resp.status == 400
+                data = await resp.json()
+                assert "timezone" in data["error"].lower()
 
 
 # ---------------------------------------------------------------------------
