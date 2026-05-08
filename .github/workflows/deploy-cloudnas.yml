@@ -86,16 +86,17 @@ jobs:
         with:
           project_id: ${{ env.GCP_PROJECT }}
 
-      - name: Inspect + purge OS Login profile for deploy SA
-        # Hit the REST API directly:
-        #   - `gcloud compute os-login ssh-keys list` showed empty profile yet
-        #     `gcloud compute scp` still failed with "profile size exceeds 32
-        #     KiB" → bloat is in fields the gcloud subcommand does not surface
-        #     (likely sshPublicKeys with no fingerprint, posixAccounts, or
-        #     historical entries from a different API version).
-        #   - Dump full loginProfile, log byte size + record counts so we can
-        #     see exactly what is filling the cap, then delete every entry by
-        #     its `name` resource path (works regardless of fingerprint).
+      - name: Purge OS Login SSH keys for deploy SA
+        # Why REST instead of `gcloud compute os-login ssh-keys list/remove`:
+        #   - the gcloud subcommand reported "No OS Login SSH keys present"
+        #     while the REST API showed 50 keys filling 44 KiB → gcloud
+        #     surfaces a stale or filtered view we can't trust.
+        # Why DELETE on the email-based path (not the `name` field returned by
+        # GET, which is keyed by SA UID `users/{numeric-uid}/sshPublicKeys/...`):
+        #   - the OS Login API rejects a DELETE on the UID path with 403:
+        #     "End user credentials must match the user specified in the
+        #     request" — for an SA, the credential principal is the *email*,
+        #     so the path component must be the email too.
         run: |
           set -euo pipefail
           TOKEN="$(gcloud auth print-access-token)"
@@ -107,30 +108,22 @@ jobs:
             > profile.json
           echo "profile bytes: $(wc -c < profile.json)"
           echo "sshPublicKeys count: $(jq '.sshPublicKeys // {} | length' profile.json)"
-          echo "posixAccounts count: $(jq '.posixAccounts // [] | length' profile.json)"
-          echo "securityKeys count:  $(jq '.securityKeys  // [] | length' profile.json)"
-          echo "--- profile (keys/posix only, no payload) ---"
-          jq '{
-            sshKeys: (.sshPublicKeys // {} | to_entries | map({fp: .key, expires: .value.expirationTimeUsec, name: .value.name})),
-            posix: (.posixAccounts // [] | map({username, accountId, primary})),
-            securityKeyCount: (.securityKeys // [] | length)
-          }' profile.json
 
-          # Delete every SSH public key by REST resource name.
-          mapfile -t names < <(jq -r '.sshPublicKeys // {} | to_entries[] | .value.name' profile.json)
-          if [ "${#names[@]}" -eq 0 ]; then
-            echo "No sshPublicKeys to delete via REST."
+          mapfile -t fps < <(jq -r '.sshPublicKeys // {} | keys[]' profile.json)
+          if [ "${#fps[@]}" -eq 0 ]; then
+            echo "Nothing to purge."
           else
-            for n in "${names[@]}"; do
-              [ -z "$n" ] && continue
-              echo "DELETE $n"
-              curl -fsS -X DELETE \
+            for fp in "${fps[@]}"; do
+              [ -z "$fp" ] && continue
+              status=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
                 -H "Authorization: Bearer $TOKEN" \
-                "https://oslogin.googleapis.com/v1/${n}" || echo "  (delete failed, continuing)"
+                "https://oslogin.googleapis.com/v1/users/${SA_EMAIL}/sshPublicKeys/${fp}")
+              if [ "$status" != "200" ]; then
+                echo "DELETE ${fp:0:12}… status=$status"
+              fi
             done
           fi
 
-          # Re-fetch to confirm post-purge size.
           curl -fsS -H "Authorization: Bearer $TOKEN" \
             "https://oslogin.googleapis.com/v1/users/${SA_EMAIL}/loginProfile" \
             > profile-after.json
@@ -231,42 +224,90 @@ jobs:
             echo "flag=" >> "$GITHUB_OUTPUT"
           fi
 
+      # On a fresh runner the first scp/ssh transparently calls OS Login's
+      # importSshPublicKey to register the runner's ephemeral key. When the
+      # whole matrix fans out at once, those imports race and the API returns
+      # "Multiple concurrent mutations were attempted. Please retry the
+      # request." gcloud does not retry on its own, so wrap each call with a
+      # backoff loop that retries only on that exact conflict.
       - name: SCP tarball to ${{ matrix.name }}
         run: |
-          gcloud compute scp \
-            --project="${{ env.GCP_PROJECT }}" \
-            --zone="${{ matrix.zone }}" \
-            ${{ steps.iap.outputs.flag }} \
-            --ssh-key-expire-after=10m \
-            --quiet \
-            /tmp/hermes-src.tgz \
-            "${{ matrix.name }}:/tmp/hermes-src.tgz"
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            err=$(mktemp)
+            if gcloud compute scp \
+                --project="${{ env.GCP_PROJECT }}" \
+                --zone="${{ matrix.zone }}" \
+                ${{ steps.iap.outputs.flag }} \
+                --ssh-key-expire-after=10m \
+                --quiet \
+                /tmp/hermes-src.tgz \
+                "${{ matrix.name }}:/tmp/hermes-src.tgz" 2> >(tee "$err" >&2); then
+              exit 0
+            fi
+            if ! grep -q "Multiple concurrent mutations" "$err"; then
+              exit 1
+            fi
+            sleep_s=$((attempt * 3 + RANDOM % 4))
+            echo "concurrent-mutation race on attempt $attempt; sleeping ${sleep_s}s"
+            sleep "$sleep_s"
+          done
+          echo "scp gave up after 5 attempts" >&2
+          exit 1
 
       - name: Run dispatcher
         run: |
-          gcloud compute ssh \
-            --project="${{ env.GCP_PROJECT }}" \
-            --zone="${{ matrix.zone }}" \
-            ${{ steps.iap.outputs.flag }} \
-            --ssh-key-expire-after=10m \
-            --quiet \
-            "${{ matrix.name }}" \
-            --command="sudo /usr/local/bin/zettlab-cloudnas-deploy hermes /tmp/hermes-src.tgz"
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            err=$(mktemp)
+            if gcloud compute ssh \
+                --project="${{ env.GCP_PROJECT }}" \
+                --zone="${{ matrix.zone }}" \
+                ${{ steps.iap.outputs.flag }} \
+                --ssh-key-expire-after=10m \
+                --quiet \
+                "${{ matrix.name }}" \
+                --command="sudo /usr/local/bin/zettlab-cloudnas-deploy hermes /tmp/hermes-src.tgz" 2> >(tee "$err" >&2); then
+              exit 0
+            fi
+            if ! grep -q "Multiple concurrent mutations" "$err"; then
+              exit 1
+            fi
+            sleep_s=$((attempt * 3 + RANDOM % 4))
+            echo "concurrent-mutation race on attempt $attempt; sleeping ${sleep_s}s"
+            sleep "$sleep_s"
+          done
+          echo "dispatcher ssh gave up after 5 attempts" >&2
+          exit 1
 
       - name: Write version
         run: |
-          {
-            echo "git_sha=${{ github.sha }}"
-            echo "deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "workflow_run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          } | gcloud compute ssh \
-              --project="${{ env.GCP_PROJECT }}" \
-              --zone="${{ matrix.zone }}" \
-              ${{ steps.iap.outputs.flag }} \
-              --ssh-key-expire-after=10m \
-              --quiet \
-              "${{ matrix.name }}" \
-              --command="sudo /usr/local/bin/zettlab-cloudnas-deploy write-version hermes"
+          set -euo pipefail
+          payload=$(printf 'git_sha=%s\ndeployed_at=%s\nworkflow_run=%s\n' \
+            "${{ github.sha }}" \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}")
+          for attempt in 1 2 3 4 5; do
+            err=$(mktemp)
+            if echo "$payload" | gcloud compute ssh \
+                --project="${{ env.GCP_PROJECT }}" \
+                --zone="${{ matrix.zone }}" \
+                ${{ steps.iap.outputs.flag }} \
+                --ssh-key-expire-after=10m \
+                --quiet \
+                "${{ matrix.name }}" \
+                --command="sudo /usr/local/bin/zettlab-cloudnas-deploy write-version hermes" 2> >(tee "$err" >&2); then
+              exit 0
+            fi
+            if ! grep -q "Multiple concurrent mutations" "$err"; then
+              exit 1
+            fi
+            sleep_s=$((attempt * 3 + RANDOM % 4))
+            echo "concurrent-mutation race on attempt $attempt; sleeping ${sleep_s}s"
+            sleep "$sleep_s"
+          done
+          echo "write-version ssh gave up after 5 attempts" >&2
+          exit 1
 
       - name: Show post-deploy status
         if: always()
