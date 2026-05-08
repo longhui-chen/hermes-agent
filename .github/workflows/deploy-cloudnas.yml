@@ -1,6 +1,10 @@
 # Tar hermes source, push to every GCP VM tagged zettlab-role=cloudnas, and
-# run the zettlab-cloudnas-deploy dispatcher (extract over /opt/zettlab/hermes/,
-# uv sync, restart hermes-gateway, health-check on :8642).
+# run the zettlab-cloudnas-deploy dispatcher: extract over /opt/zettlab/hermes/
+# (preserving venv/.env/hermes-data/.version), `uv sync --locked`, restart the
+# `zettlab-local-server` systemd unit, then health-check local-server. There
+# is no standalone hermes-gateway daemon — local-server's agent registry
+# lazy-respawns one `hermes -p <agent_id> gateway run` child per agent on the
+# first chat / cron call after restart.
 #
 # Triggers:
 #   - push to main (paths-ignore filters out doc/website/nix/tests and the
