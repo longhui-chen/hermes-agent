@@ -237,8 +237,17 @@ class ZetAgentAdapter(APIServerAdapter):
 
     def _maybe_update_title(self, session_id: Optional[str], user_message: str) -> Optional[str]:
         """Cache and return a new title when the session sees its first
-        non-empty user message. Returns None if no update needed."""
+        non-empty user message. Returns None if no update needed.
+
+        Zettlab system markers (e.g. [ZETTLAB:BOOTSTRAP_KICKOFF],
+        [ZETTLAB:SKIP_TRIGGER], [ZETTLAB:RESUME_TRIGGER]) are skipped
+        so they don't pollute the conversation.title SSE event. These
+        markers are local-server-issued synthetic user messages used by
+        the bootstrap interview flow; see Phase 11 design doc.
+        """
         if not session_id or not user_message:
+            return None
+        if user_message.startswith("[ZETTLAB:"):
             return None
         candidate = self._truncate_title(user_message)
         if not candidate:
