@@ -2,7 +2,10 @@
 # run the zettlab-cloudnas-deploy dispatcher (extract over /opt/zettlab/hermes/,
 # uv sync, restart hermes-gateway, health-check on :8642).
 #
-# Manual trigger only.
+# Triggers:
+#   - push to main (paths-ignore filters out doc/website/nix/tests and the
+#     sibling deploy workflow). Auto-deploys to env=staging.
+#   - workflow_dispatch (manual override with ref / env / targets / dry_run).
 #
 # Required GitHub Secrets:
 #   GCP_SA_KEY              service-account JSON, with at minimum:
@@ -14,10 +17,30 @@
 # Onboarding new hosts:
 #   See zettlab-product-dev/scripts/cloudnas/onboard.sh. Once a VM has the
 #   right labels, this workflow picks it up automatically.
+#
+# Note on OS Login profile size:
+#   Each GH Actions runner generates a fresh SSH keypair and gcloud pushes it
+#   into the SA's OS Login profile on first scp/ssh. Profile is hard-capped at
+#   32 KiB; without housekeeping, ~50–60 stale keys later every deploy fails
+#   with FAILED_PRECONDITION. Two-layer mitigation:
+#     1. discover job purges all SA OS Login keys before fan-out (one-shot).
+#     2. scp/ssh use --ssh-key-expire-after=10m so newly-pushed keys auto-GC.
 
 name: Deploy to cloud NAS fleet
 
 on:
+  push:
+    branches: [main]
+    # Blacklist (mirrors deploy-devboard.yml) — hermes layout shifts every
+    # upstream sync, so a whitelist would silently rot.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'website/**'
+      - 'nix/**'
+      - 'tests/**'
+      - '.github/workflows/deploy-devboard.yml'
+      - '.github/workflows/upstream-release-pr.yml'
   workflow_dispatch:
     inputs:
       ref:
@@ -63,10 +86,28 @@ jobs:
         with:
           project_id: ${{ env.GCP_PROJECT }}
 
+      - name: Purge stale OS Login SSH keys for deploy SA
+        # 32 KiB profile cap fills up after ~50 runs (one ephemeral runner key
+        # per matrix job, never expires). Wipe before fan-out so deploy jobs
+        # always have headroom; --ssh-key-expire-after below keeps it that way.
+        run: |
+          set -euo pipefail
+          fps=$(gcloud compute os-login ssh-keys list --format='value(key.fingerprint)' 2>/dev/null || true)
+          if [ -z "$fps" ]; then
+            echo "No OS Login SSH keys present."
+            exit 0
+          fi
+          echo "$fps" | while read -r fp; do
+            [ -z "$fp" ] && continue
+            echo "removing $fp"
+            gcloud compute os-login ssh-keys remove --key="$fp" >/dev/null 2>&1 || true
+          done
+
       - name: Discover by GCP labels
         id: list
         env:
-          ENV_INPUT: ${{ inputs.env }}
+          # Fall back to "staging" when triggered by push (no inputs).
+          ENV_INPUT: ${{ inputs.env || 'staging' }}
           NAMES_INPUT: ${{ inputs.targets }}
         run: |
           set -euo pipefail
@@ -162,6 +203,7 @@ jobs:
             --project="${{ env.GCP_PROJECT }}" \
             --zone="${{ matrix.zone }}" \
             ${{ steps.iap.outputs.flag }} \
+            --ssh-key-expire-after=10m \
             --quiet \
             /tmp/hermes-src.tgz \
             "${{ matrix.name }}:/tmp/hermes-src.tgz"
@@ -172,6 +214,7 @@ jobs:
             --project="${{ env.GCP_PROJECT }}" \
             --zone="${{ matrix.zone }}" \
             ${{ steps.iap.outputs.flag }} \
+            --ssh-key-expire-after=10m \
             --quiet \
             "${{ matrix.name }}" \
             --command="sudo /usr/local/bin/zettlab-cloudnas-deploy hermes /tmp/hermes-src.tgz"
@@ -186,6 +229,7 @@ jobs:
               --project="${{ env.GCP_PROJECT }}" \
               --zone="${{ matrix.zone }}" \
               ${{ steps.iap.outputs.flag }} \
+              --ssh-key-expire-after=10m \
               --quiet \
               "${{ matrix.name }}" \
               --command="sudo /usr/local/bin/zettlab-cloudnas-deploy write-version hermes"
@@ -197,6 +241,7 @@ jobs:
             --project="${{ env.GCP_PROJECT }}" \
             --zone="${{ matrix.zone }}" \
             ${{ steps.iap.outputs.flag }} \
+            --ssh-key-expire-after=10m \
             --quiet \
             "${{ matrix.name }}" \
             --command="sudo /usr/local/bin/zettlab-cloudnas-deploy status" || true
