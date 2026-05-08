@@ -82,34 +82,51 @@ jobs:
 
       - name: Open or update sync PR
         if: steps.diff.outputs.behind != '0'
-        uses: repo-sync/pull-request@v2
-        with:
-          source_branch: ${{ steps.rel.outputs.branch }}
-          destination_branch: main
-          pr_title: "chore(sync): merge upstream ${{ steps.rel.outputs.tag }}"
-          pr_label: "upstream-sync"
-          pr_body: |
-            Automated PR from upstream sync.
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
+          BRANCH: ${{ steps.rel.outputs.branch }}
+          TAG: ${{ steps.rel.outputs.tag }}
+          SHA: ${{ steps.sha.outputs.sha }}
+          BEHIND: ${{ steps.diff.outputs.behind }}
+        run: |
+          set -euo pipefail
 
-            - Upstream release: `${{ steps.rel.outputs.tag }}`
-            - Source branch (frozen at release commit): `${{ steps.rel.outputs.branch }}`
-            - Release commit SHA: `${{ steps.sha.outputs.sha }}`
-            - Commits ahead of main: ${{ steps.diff.outputs.behind }}
+          {
+            echo "Automated PR from upstream sync."
+            echo
+            echo "- Upstream release: \`${TAG}\`"
+            echo "- Source branch (frozen at release commit): \`${BRANCH}\`"
+            echo "- Release commit SHA: \`${SHA}\`"
+            echo "- Commits ahead of main: ${BEHIND}"
+            echo
+            echo "## Branch maintenance"
+            echo
+            echo "This workflow also force-updates \`origin/upstream\` to the latest release commit on each run (idempotent — skipped if already there). \`origin/upstream\` is therefore a stable pointer to the latest upstream release between runs."
+            echo
+            echo "The PR head \`${BRANCH}\` is created once from the release commit and is **not** moved by automation, so manual conflict-resolution commits pushed to it will persist."
+            echo
+            echo "## Conflict resolution"
+            echo
+            echo "If conflicts arise, commit fixes directly to \`${BRANCH}\`."
+            echo
+            echo "## Review checklist before merging"
+            echo
+            echo "- [ ] \`hermes_cli/main.py\` — \`OFFICIAL_REPO_URLS\` / \`OFFICIAL_REPO_URL\` still point to \`zettlab/hermes-agent\`"
+            echo "- [ ] \`scripts/install.sh\` — \`REPO_URL_SSH\` / \`REPO_URL_HTTPS\` still point to \`zettlab/hermes-agent\`"
+            echo "- [ ] \`.github/workflows/\` — only zettlab workflows present (no upstream tests/nix/docker/site reintroduced)"
+            echo "- [ ] Tests still pass on a deploy target"
+          } > /tmp/pr-body.md
 
-            ## Branch maintenance
-
-            This workflow also force-updates `origin/upstream` to the latest release commit on each run (idempotent — skipped if already there). `origin/upstream` is therefore a stable pointer to the latest upstream release between runs.
-
-            The PR head `${{ steps.rel.outputs.branch }}` is created once from the release commit and is **not** moved by automation, so manual conflict-resolution commits pushed to it will persist.
-
-            ## Conflict resolution
-
-            If conflicts arise, commit fixes directly to `${{ steps.rel.outputs.branch }}`.
-
-            ## Review checklist before merging
-
-            - [ ] `hermes_cli/main.py` — `OFFICIAL_REPO_URLS` / `OFFICIAL_REPO_URL` still point to `zettlab/hermes-agent`
-            - [ ] `scripts/install.sh` — `REPO_URL_SSH` / `REPO_URL_HTTPS` still point to `zettlab/hermes-agent`
-            - [ ] `.github/workflows/` — only zettlab workflows present (no upstream tests/nix/docker/site reintroduced)
-            - [ ] Tests still pass on a deploy target
-          github_token: ${{ secrets.RELEASE_PR_TOKEN }}
+          EXISTING=$(gh pr list --head "$BRANCH" --base main --state open --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            echo "PR #$EXISTING already open for $BRANCH; updating body."
+            gh pr edit "$EXISTING" --body-file /tmp/pr-body.md
+          else
+            echo "Creating PR for $BRANCH -> main"
+            gh pr create \
+              --base main \
+              --head "$BRANCH" \
+              --title "chore(sync): merge upstream ${TAG}" \
+              --body-file /tmp/pr-body.md \
+              --label upstream-sync
+          fi
