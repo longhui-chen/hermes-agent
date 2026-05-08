@@ -119,14 +119,15 @@ jobs:
 
           EXISTING=$(gh pr list --head "$BRANCH" --base main --state open --json number --jq '.[0].number // empty')
           if [ -n "$EXISTING" ]; then
-            echo "PR #$EXISTING already open for $BRANCH; updating body."
-            gh pr edit "$EXISTING" --body-file /tmp/pr-body.md
+            echo "PR #$EXISTING already open for $BRANCH; updating body + label."
+            gh pr edit "$EXISTING" --body-file /tmp/pr-body.md --add-label upstream-sync
           else
             echo "Creating PR for $BRANCH -> main"
-            gh pr create \
+            PR_URL=$(gh pr create \
               --base main \
               --head "$BRANCH" \
               --title "chore(sync): merge upstream ${TAG}" \
-              --body-file /tmp/pr-body.md \
-              --label upstream-sync
+              --body-file /tmp/pr-body.md)
+            echo "Created $PR_URL"
+            gh pr edit "$PR_URL" --add-label upstream-sync
           fi
