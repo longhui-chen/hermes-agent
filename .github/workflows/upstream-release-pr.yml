@@ -80,23 +80,6 @@ jobs:
           BEHIND=$(git rev-list --count "main..${{ steps.rel.outputs.branch }}")
           echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
 
-      - name: Debug token effective permissions (TEMP)
-        if: steps.diff.outputs.behind != '0'
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
-        run: |
-          set -euo pipefail
-          echo "::group::token viewer + repo permission"
-          gh api graphql -f query='query { viewer { login } repository(owner:"zettlab",name:"hermes-agent") { viewerPermission nameWithOwner } }' || true
-          echo "::endgroup::"
-          echo "::group::gh auth status"
-          gh auth status 2>&1 || true
-          echo "::endgroup::"
-          echo "::group::token bytes (length only, no value)"
-          printf "GH_TOKEN length: %s\n" "${#GH_TOKEN}"
-          printf "GH_TOKEN prefix: %s\n" "${GH_TOKEN:0:14}"
-          echo "::endgroup::"
-
       - name: Open or update sync PR
         if: steps.diff.outputs.behind != '0'
         env:
