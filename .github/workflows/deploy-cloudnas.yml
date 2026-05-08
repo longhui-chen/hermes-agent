@@ -86,22 +86,56 @@ jobs:
         with:
           project_id: ${{ env.GCP_PROJECT }}
 
-      - name: Purge stale OS Login SSH keys for deploy SA
-        # 32 KiB profile cap fills up after ~50 runs (one ephemeral runner key
-        # per matrix job, never expires). Wipe before fan-out so deploy jobs
-        # always have headroom; --ssh-key-expire-after below keeps it that way.
+      - name: Inspect + purge OS Login profile for deploy SA
+        # Hit the REST API directly:
+        #   - `gcloud compute os-login ssh-keys list` showed empty profile yet
+        #     `gcloud compute scp` still failed with "profile size exceeds 32
+        #     KiB" → bloat is in fields the gcloud subcommand does not surface
+        #     (likely sshPublicKeys with no fingerprint, posixAccounts, or
+        #     historical entries from a different API version).
+        #   - Dump full loginProfile, log byte size + record counts so we can
+        #     see exactly what is filling the cap, then delete every entry by
+        #     its `name` resource path (works regardless of fingerprint).
         run: |
           set -euo pipefail
-          fps=$(gcloud compute os-login ssh-keys list --format='value(key.fingerprint)' 2>/dev/null || true)
-          if [ -z "$fps" ]; then
-            echo "No OS Login SSH keys present."
-            exit 0
+          TOKEN="$(gcloud auth print-access-token)"
+          SA_EMAIL="$(gcloud auth list --filter='status:ACTIVE' --format='value(account)')"
+          echo "SA: $SA_EMAIL"
+
+          curl -fsS -H "Authorization: Bearer $TOKEN" \
+            "https://oslogin.googleapis.com/v1/users/${SA_EMAIL}/loginProfile" \
+            > profile.json
+          echo "profile bytes: $(wc -c < profile.json)"
+          echo "sshPublicKeys count: $(jq '.sshPublicKeys // {} | length' profile.json)"
+          echo "posixAccounts count: $(jq '.posixAccounts // [] | length' profile.json)"
+          echo "securityKeys count:  $(jq '.securityKeys  // [] | length' profile.json)"
+          echo "--- profile (keys/posix only, no payload) ---"
+          jq '{
+            sshKeys: (.sshPublicKeys // {} | to_entries | map({fp: .key, expires: .value.expirationTimeUsec, name: .value.name})),
+            posix: (.posixAccounts // [] | map({username, accountId, primary})),
+            securityKeyCount: (.securityKeys // [] | length)
+          }' profile.json
+
+          # Delete every SSH public key by REST resource name.
+          mapfile -t names < <(jq -r '.sshPublicKeys // {} | to_entries[] | .value.name' profile.json)
+          if [ "${#names[@]}" -eq 0 ]; then
+            echo "No sshPublicKeys to delete via REST."
+          else
+            for n in "${names[@]}"; do
+              [ -z "$n" ] && continue
+              echo "DELETE $n"
+              curl -fsS -X DELETE \
+                -H "Authorization: Bearer $TOKEN" \
+                "https://oslogin.googleapis.com/v1/${n}" || echo "  (delete failed, continuing)"
+            done
           fi
-          echo "$fps" | while read -r fp; do
-            [ -z "$fp" ] && continue
-            echo "removing $fp"
-            gcloud compute os-login ssh-keys remove --key="$fp" >/dev/null 2>&1 || true
-          done
+
+          # Re-fetch to confirm post-purge size.
+          curl -fsS -H "Authorization: Bearer $TOKEN" \
+            "https://oslogin.googleapis.com/v1/users/${SA_EMAIL}/loginProfile" \
+            > profile-after.json
+          echo "post-purge bytes: $(wc -c < profile-after.json)"
+          echo "post-purge sshPublicKeys: $(jq '.sshPublicKeys // {} | length' profile-after.json)"
 
       - name: Discover by GCP labels
         id: list
