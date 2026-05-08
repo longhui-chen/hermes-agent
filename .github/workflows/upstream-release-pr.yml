@@ -80,6 +80,24 @@ jobs:
           BEHIND=$(git rev-list --count "main..${{ steps.rel.outputs.branch }}")
           echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
 
+      - name: Debug — direct REST POST /pulls (TEMP)
+        if: steps.diff.outputs.behind != '0'
+        env:
+          TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
+          BRANCH: ${{ steps.rel.outputs.branch }}
+          TAG: ${{ steps.rel.outputs.tag }}
+        run: |
+          set -euo pipefail
+          echo "::group::curl POST /repos/zettlab/hermes-agent/pulls"
+          curl -sS -X POST \
+            -H "Authorization: Bearer ${TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -w "\nHTTP %{http_code}\n" \
+            https://api.github.com/repos/zettlab/hermes-agent/pulls \
+            -d "{\"title\":\"DEBUG — curl from runner\",\"head\":\"${BRANCH}\",\"base\":\"main\",\"body\":\"debug\",\"draft\":true}" || true
+          echo "::endgroup::"
+
       - name: Open or update sync PR
         if: steps.diff.outputs.behind != '0'
         env:
