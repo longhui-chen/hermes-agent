@@ -91,9 +91,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Build PR body. NOTE: REST API requires explicit \n (literal
-          # newlines), so we keep the body as a single string with \n
-          # escapes via jq.
           BODY=$(cat <<EOF
           Automated PR from upstream sync.
 
