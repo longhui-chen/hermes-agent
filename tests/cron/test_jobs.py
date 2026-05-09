@@ -1,6 +1,7 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
 import json
+import threading
 import pytest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -174,6 +175,54 @@ class TestComputeNextRun:
     def test_unknown_kind_returns_none(self):
         assert compute_next_run({"kind": "unknown"}) is None
 
+    def test_cron_with_tz_name_evaluates_in_that_zone(self, monkeypatch):
+        """The classic bug: '6 23 * * *' should mean 23:06 *in the user's zone*,
+        not 23:06 UTC. With tz_name='Asia/Shanghai' and a hermes default of UTC,
+        the next firing should be the next 23:06 Shanghai = 15:06 UTC."""
+        pytest.importorskip("croniter")
+        # Pin hermes "now" to a UTC moment well before next 23:06 Shanghai
+        # 2026-05-08 06:00:00 UTC = 14:00 Shanghai. Next 23:06 Shanghai is
+        # the same Shanghai day = 15:06 UTC same day.
+        now = datetime(2026, 5, 8, 6, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        schedule = {"kind": "cron", "expr": "6 23 * * *"}
+        result = compute_next_run(schedule, tz_name="Asia/Shanghai")
+        assert result is not None
+
+        next_dt = datetime.fromisoformat(result)
+        assert next_dt.astimezone(timezone.utc) == datetime(
+            2026, 5, 8, 15, 6, 0, tzinfo=timezone.utc
+        )
+
+    def test_cron_without_tz_name_uses_hermes_default(self, monkeypatch):
+        """When no per-job tz is provided, behaviour matches pre-feature: cron
+        runs in whatever timezone _hermes_now() returns."""
+        pytest.importorskip("croniter")
+        now = datetime(2026, 5, 8, 6, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        schedule = {"kind": "cron", "expr": "6 23 * * *"}
+        result = compute_next_run(schedule)
+        # No tz_name → croniter base is hermes-now (UTC here) → next 23:06 UTC.
+        next_dt = datetime.fromisoformat(result)
+        assert next_dt.astimezone(timezone.utc) == datetime(
+            2026, 5, 8, 23, 6, 0, tzinfo=timezone.utc
+        )
+
+    def test_cron_invalid_tz_name_falls_back_safely(self, monkeypatch):
+        """Bad tz at compute time logs and falls back rather than crashing —
+        keeps the scheduler robust against jobs.json that somehow stored a
+        zone the runtime doesn't know (e.g. tzdata mismatch on a NAS image)."""
+        pytest.importorskip("croniter")
+        now = datetime(2026, 5, 8, 6, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        schedule = {"kind": "cron", "expr": "6 23 * * *"}
+        # Should not raise, should return a value (using fallback).
+        result = compute_next_run(schedule, tz_name="Mars/Olympus_Mons")
+        assert result is not None
+
 
 # =========================================================================
 # Job CRUD (with tmp file storage)
@@ -278,6 +327,45 @@ class TestUpdateJob:
     def test_update_nonexistent_returns_none(self, tmp_cron_dir):
         result = update_job("nonexistent_id", {"name": "X"})
         assert result is None
+
+    def test_create_job_persists_timezone(self, tmp_cron_dir):
+        pytest.importorskip("croniter")
+        job = create_job(
+            prompt="Daily greet", schedule="6 23 * * *", timezone="Asia/Shanghai"
+        )
+        assert job["timezone"] == "Asia/Shanghai"
+        fetched = get_job(job["id"])
+        assert fetched["timezone"] == "Asia/Shanghai"
+
+    def test_create_job_invalid_timezone_raises(self, tmp_cron_dir):
+        with pytest.raises(ValueError):
+            create_job(prompt="x", schedule="every 1h", timezone="Mars/Olympus_Mons")
+
+    def test_update_timezone_only_recomputes_next_run(self, tmp_cron_dir, monkeypatch):
+        """User fixes a wrong tz; next_run_at must move even though schedule
+        didn't change. Otherwise the user has to also re-set the schedule
+        which is the surprising/buggy behaviour we just fixed."""
+        pytest.importorskip("croniter")
+        now = datetime(2026, 5, 8, 6, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        # Created without tz — next_run lands at 23:06 UTC.
+        job = create_job(prompt="x", schedule="6 23 * * *")
+        before = datetime.fromisoformat(job["next_run_at"]).astimezone(timezone.utc)
+        assert before == datetime(2026, 5, 8, 23, 6, 0, tzinfo=timezone.utc)
+
+        updated = update_job(job["id"], {"timezone": "Asia/Shanghai"})
+        after = datetime.fromisoformat(updated["next_run_at"]).astimezone(timezone.utc)
+        # 23:06 Shanghai = 15:06 UTC.
+        assert after == datetime(2026, 5, 8, 15, 6, 0, tzinfo=timezone.utc)
+
+    def test_update_clear_timezone_with_empty_string(self, tmp_cron_dir):
+        pytest.importorskip("croniter")
+        job = create_job(
+            prompt="x", schedule="every 1h", timezone="Asia/Shanghai"
+        )
+        updated = update_job(job["id"], {"timezone": ""})
+        assert updated["timezone"] is None
 
 
 class TestPauseResumeJob:
@@ -743,6 +831,100 @@ class TestEnabledToolsets:
         update_job(job["id"], {"enabled_toolsets": ["web", "delegation"]})
         fetched = get_job(job["id"])
         assert fetched["enabled_toolsets"] == ["web", "delegation"]
+
+
+class TestMarkJobRunConcurrency:
+    """Regression tests for concurrent parallel job state writes.
+
+    tick() dispatches multiple jobs to separate threads simultaneously.
+    Without _jobs_file_lock protecting the load→modify→save cycle in
+    mark_job_run(), concurrent writes can clobber each other's updates
+    (last-writer-wins), leaving some jobs with stale last_status / last_run_at.
+    """
+
+    def test_three_concurrent_mark_job_run_no_overwrites(self, tmp_cron_dir):
+        """Run mark_job_run() for 3 jobs in parallel threads; all must land correctly."""
+        # Create 3 distinct recurring jobs
+        job_a = create_job(prompt="Job A", schedule="every 1h")
+        job_b = create_job(prompt="Job B", schedule="every 1h")
+        job_c = create_job(prompt="Job C", schedule="every 1h")
+
+        errors: list = []
+
+        def run_mark(job_id: str, success: bool, error_msg=None):
+            try:
+                mark_job_run(job_id, success=success, error=error_msg)
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        # Fire all three concurrently
+        threads = [
+            threading.Thread(target=run_mark, args=(job_a["id"], True)),
+            threading.Thread(target=run_mark, args=(job_b["id"], False, "timeout")),
+            threading.Thread(target=run_mark, args=(job_c["id"], True)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"Unexpected exceptions in worker threads: {errors}"
+
+        # Verify each job has the correct state — no overwrites
+        a = get_job(job_a["id"])
+        b = get_job(job_b["id"])
+        c = get_job(job_c["id"])
+
+        assert a is not None, "Job A was unexpectedly deleted"
+        assert b is not None, "Job B was unexpectedly deleted"
+        assert c is not None, "Job C was unexpectedly deleted"
+
+        assert a["last_status"] == "ok", f"Job A last_status wrong: {a['last_status']}"
+        assert a["last_run_at"] is not None, "Job A last_run_at not set"
+        assert a["repeat"]["completed"] == 1, f"Job A completed count wrong: {a['repeat']['completed']}"
+
+        assert b["last_status"] == "error", f"Job B last_status wrong: {b['last_status']}"
+        assert b["last_error"] == "timeout", f"Job B last_error wrong: {b['last_error']}"
+        assert b["last_run_at"] is not None, "Job B last_run_at not set"
+        assert b["repeat"]["completed"] == 1, f"Job B completed count wrong: {b['repeat']['completed']}"
+
+        assert c["last_status"] == "ok", f"Job C last_status wrong: {c['last_status']}"
+        assert c["last_run_at"] is not None, "Job C last_run_at not set"
+        assert c["repeat"]["completed"] == 1, f"Job C completed count wrong: {c['repeat']['completed']}"
+
+    def test_repeated_concurrent_runs_accumulate_completed_count(self, tmp_cron_dir):
+        """Stress test: 10 threads each call mark_job_run on a different job once.
+
+        The completed count for every job must be exactly 1 after all threads finish,
+        confirming no thread's write was silently dropped.
+        """
+        n = 10
+        jobs = [create_job(prompt=f"Stress job {i}", schedule="every 1h") for i in range(n)]
+        errors: list = []
+
+        def run_mark(job_id: str):
+            try:
+                mark_job_run(job_id, success=True)
+            except Exception as exc:  # pragma: no cover
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run_mark, args=(j["id"],)) for j in jobs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not errors, f"Unexpected exceptions: {errors}"
+
+        for job in jobs:
+            updated = get_job(job["id"])
+            assert updated is not None, f"Job {job['id']} was deleted"
+            assert updated["last_status"] == "ok", (
+                f"Job {job['id']} has wrong last_status: {updated['last_status']}"
+            )
+            assert updated["repeat"]["completed"] == 1, (
+                f"Job {job['id']} completed count is {updated['repeat']['completed']}, expected 1"
+            )
 
 
 class TestSaveJobOutput:

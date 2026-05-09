@@ -91,43 +91,56 @@ jobs:
         run: |
           set -euo pipefail
 
-          {
-            echo "Automated PR from upstream sync."
-            echo
-            echo "- Upstream release: \`${TAG}\`"
-            echo "- Source branch (frozen at release commit): \`${BRANCH}\`"
-            echo "- Release commit SHA: \`${SHA}\`"
-            echo "- Commits ahead of main: ${BEHIND}"
-            echo
-            echo "## Branch maintenance"
-            echo
-            echo "This workflow also force-updates \`origin/upstream\` to the latest release commit on each run (idempotent — skipped if already there). \`origin/upstream\` is therefore a stable pointer to the latest upstream release between runs."
-            echo
-            echo "The PR head \`${BRANCH}\` is created once from the release commit and is **not** moved by automation, so manual conflict-resolution commits pushed to it will persist."
-            echo
-            echo "## Conflict resolution"
-            echo
-            echo "If conflicts arise, commit fixes directly to \`${BRANCH}\`."
-            echo
-            echo "## Review checklist before merging"
-            echo
-            echo "- [ ] \`hermes_cli/main.py\` — \`OFFICIAL_REPO_URLS\` / \`OFFICIAL_REPO_URL\` still point to \`zettlab/hermes-agent\`"
-            echo "- [ ] \`scripts/install.sh\` — \`REPO_URL_SSH\` / \`REPO_URL_HTTPS\` still point to \`zettlab/hermes-agent\`"
-            echo "- [ ] \`.github/workflows/\` — only zettlab workflows present (no upstream tests/nix/docker/site reintroduced)"
-            echo "- [ ] Tests still pass on a deploy target"
-          } > /tmp/pr-body.md
+          BODY=$(cat <<EOF
+          Automated PR from upstream sync.
 
-          EXISTING=$(gh pr list --head "$BRANCH" --base main --state open --json number --jq '.[0].number // empty')
+          - Upstream release: \`${TAG}\`
+          - Source branch (frozen at release commit): \`${BRANCH}\`
+          - Release commit SHA: \`${SHA}\`
+          - Commits ahead of main: ${BEHIND}
+
+          ## Branch maintenance
+
+          This workflow also force-updates \`origin/upstream\` to the latest release commit on each run (idempotent — skipped if already there). \`origin/upstream\` is therefore a stable pointer to the latest upstream release between runs.
+
+          The PR head \`${BRANCH}\` is created once from the release commit and is **not** moved by automation, so manual conflict-resolution commits pushed to it will persist.
+
+          ## Conflict resolution
+
+          If conflicts arise, commit fixes directly to \`${BRANCH}\`.
+
+          ## Review checklist before merging
+
+          - [ ] \`hermes_cli/main.py\` — \`OFFICIAL_REPO_URLS\` / \`OFFICIAL_REPO_URL\` still point to \`zettlab/hermes-agent\`
+          - [ ] \`scripts/install.sh\` — \`REPO_URL_SSH\` / \`REPO_URL_HTTPS\` still point to \`zettlab/hermes-agent\`
+          - [ ] \`.github/workflows/\` — only zettlab workflows present (no upstream tests/nix/docker/site reintroduced)
+          - [ ] Tests still pass on a deploy target
+          EOF
+          )
+          # YAML | indents body by 10; trim leading 10 spaces from each line.
+          BODY=$(printf '%s\n' "$BODY" | sed 's/^          //')
+
+          # Look up existing open PR via REST list.
+          EXISTING=$(gh api -X GET "repos/zettlab/hermes-agent/pulls" \
+            -f state=open -f head="zettlab:${BRANCH}" -f base=main \
+            --jq '.[0].number // empty')
+
           if [ -n "$EXISTING" ]; then
-            echo "PR #$EXISTING already open for $BRANCH; updating body + label."
-            gh pr edit "$EXISTING" --body-file /tmp/pr-body.md --add-label upstream-sync
+            echo "PR #$EXISTING already open for $BRANCH; updating body via REST PATCH."
+            gh api -X PATCH "repos/zettlab/hermes-agent/pulls/$EXISTING" \
+              -f body="$BODY" >/dev/null
+            PR_NUM="$EXISTING"
           else
-            echo "Creating PR for $BRANCH -> main"
-            PR_URL=$(gh pr create \
-              --base main \
-              --head "$BRANCH" \
-              --title "chore(sync): merge upstream ${TAG}" \
-              --body-file /tmp/pr-body.md)
-            echo "Created $PR_URL"
-            gh pr edit "$PR_URL" --add-label upstream-sync
+            echo "Creating PR for $BRANCH -> main via REST POST."
+            PR_NUM=$(gh api -X POST "repos/zettlab/hermes-agent/pulls" \
+              -f title="chore(sync): merge upstream ${TAG}" \
+              -f head="$BRANCH" \
+              -f base=main \
+              -f body="$BODY" \
+              --jq '.number')
+            echo "Created PR #$PR_NUM"
           fi
+
+          # Add label idempotently via REST.
+          gh api -X POST "repos/zettlab/hermes-agent/issues/$PR_NUM/labels" \
+            -f "labels[]=upstream-sync" >/dev/null || true

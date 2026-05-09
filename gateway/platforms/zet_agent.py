@@ -243,8 +243,17 @@ class ZetAgentAdapter(APIServerAdapter):
 
     def _maybe_update_title(self, session_id: Optional[str], user_message: str) -> Optional[str]:
         """Cache and return a new title when the session sees its first
-        non-empty user message. Returns None if no update needed."""
+        non-empty user message. Returns None if no update needed.
+
+        Zettlab system markers (e.g. [ZETTLAB:BOOTSTRAP_KICKOFF],
+        [ZETTLAB:SKIP_TRIGGER], [ZETTLAB:RESUME_TRIGGER]) are skipped
+        so they don't pollute the conversation.title SSE event. These
+        markers are local-server-issued synthetic user messages used by
+        the bootstrap interview flow; see Phase 11 design doc.
+        """
         if not session_id or not user_message:
+            return None
+        if user_message.startswith("[ZETTLAB:"):
             return None
         candidate = self._truncate_title(user_message)
         if not candidate:
@@ -385,8 +394,17 @@ class ZetAgentAdapter(APIServerAdapter):
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
+        gateway_session_key: Optional[str] = None,
     ) -> Any:
-        """Build the agent via super(), then attach extra callbacks.
+        """Build the agent for the zet_agent platform, then attach extra callbacks.
+
+        Body mirrors ``APIServerAdapter._create_agent`` (api_server.py:740-775)
+        except the toolset key and ``platform=`` argument are bound to
+        ``Platform.ZET_AGENT.value`` instead of the upstream-hardcoded
+        ``"api_server"`` literal. We duplicate the body rather than calling
+        ``super()._create_agent(...)`` so we never have to patch upstream
+        api_server.py — keeping the override surface entirely in this fork
+        file and avoiding merge conflicts on every upstream sync.
 
         Reasoning, clarify, and approval hooks all share the same
         sniffed ``_stream_q``. If sniff fails we degrade silently to
@@ -413,13 +431,44 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception as _e:
                 logger.warning("[zet_agent] set_session_vars failed (cron origin won't auto-populate): %s", _e)
 
-        agent = super()._create_agent(
-            ephemeral_system_prompt=ephemeral_system_prompt,
+        from run_agent import AIAgent
+        from gateway.run import (
+            _resolve_runtime_agent_kwargs,
+            _resolve_gateway_model,
+            _load_gateway_config,
+            GatewayRunner,
+        )
+        from hermes_cli.tools_config import _get_platform_tools
+
+        platform_key = Platform.ZET_AGENT.value
+        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        reasoning_config = GatewayRunner._load_reasoning_config()
+        model = _resolve_gateway_model()
+
+        user_config = _load_gateway_config()
+        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+
+        max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+        fallback_model = GatewayRunner._load_fallback_model()
+
+        agent = AIAgent(
+            model=model,
+            **runtime_kwargs,
+            max_iterations=max_iterations,
+            quiet_mode=True,
+            verbose_logging=False,
+            ephemeral_system_prompt=ephemeral_system_prompt or None,
+            enabled_toolsets=enabled_toolsets,
             session_id=session_id,
+            platform=platform_key,
             stream_delta_callback=stream_delta_callback,
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
+            session_db=self._ensure_session_db(),
+            fallback_model=fallback_model,
+            reasoning_config=reasoning_config,
+            gateway_session_key=gateway_session_key,
         )
 
         stream_q = self._sniff_stream_q(
@@ -494,6 +543,7 @@ class ZetAgentAdapter(APIServerAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         agent_ref=None,
+        gateway_session_key: Optional[str] = None,
     ):
         """Wrap base ``_run_agent`` to (1) push the auto-title before
         kicking off the agent thread and (2) bind the session-scoped env
@@ -536,6 +586,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,
                 agent_ref=agent_ref,
+                gateway_session_key=gateway_session_key,
             )
         finally:
             if old_session_key is None:

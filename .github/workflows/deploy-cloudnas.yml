@@ -1,8 +1,15 @@
 # Tar hermes source, push to every GCP VM tagged zettlab-role=cloudnas, and
-# run the zettlab-cloudnas-deploy dispatcher (extract over /opt/zettlab/hermes/,
-# uv sync, restart hermes-gateway, health-check on :8642).
+# run the zettlab-cloudnas-deploy dispatcher: extract over /opt/zettlab/hermes/
+# (preserving venv/.env/hermes-data/.version), `uv sync --locked`, restart the
+# `zettlab-local-server` systemd unit, then health-check local-server. There
+# is no standalone hermes-gateway daemon — local-server's agent registry
+# lazy-respawns one `hermes -p <agent_id> gateway run` child per agent on the
+# first chat / cron call after restart.
 #
-# Manual trigger only.
+# Triggers:
+#   - push to main (paths-ignore filters out doc/website/nix/tests and the
+#     sibling deploy workflow). Auto-deploys to env=staging.
+#   - workflow_dispatch (manual override with ref / env / targets / dry_run).
 #
 # Required GitHub Secrets:
 #   GCP_SA_KEY              service-account JSON, with at minimum:
@@ -14,10 +21,30 @@
 # Onboarding new hosts:
 #   See zettlab-product-dev/scripts/cloudnas/onboard.sh. Once a VM has the
 #   right labels, this workflow picks it up automatically.
+#
+# Note on OS Login profile size:
+#   Each GH Actions runner generates a fresh SSH keypair and gcloud pushes it
+#   into the SA's OS Login profile on first scp/ssh. Profile is hard-capped at
+#   32 KiB; without housekeeping, ~50–60 stale keys later every deploy fails
+#   with FAILED_PRECONDITION. Two-layer mitigation:
+#     1. discover job purges all SA OS Login keys before fan-out (one-shot).
+#     2. scp/ssh use --ssh-key-expire-after=10m so newly-pushed keys auto-GC.
 
 name: Deploy to cloud NAS fleet
 
 on:
+  push:
+    branches: [main]
+    # Blacklist (mirrors deploy-devboard.yml) — hermes layout shifts every
+    # upstream sync, so a whitelist would silently rot.
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'website/**'
+      - 'nix/**'
+      - 'tests/**'
+      - '.github/workflows/deploy-devboard.yml'
+      - '.github/workflows/upstream-release-pr.yml'
   workflow_dispatch:
     inputs:
       ref:
@@ -63,10 +90,55 @@ jobs:
         with:
           project_id: ${{ env.GCP_PROJECT }}
 
+      - name: Purge OS Login SSH keys for deploy SA
+        # Why REST instead of `gcloud compute os-login ssh-keys list/remove`:
+        #   - the gcloud subcommand reported "No OS Login SSH keys present"
+        #     while the REST API showed 50 keys filling 44 KiB → gcloud
+        #     surfaces a stale or filtered view we can't trust.
+        # Why DELETE on the email-based path (not the `name` field returned by
+        # GET, which is keyed by SA UID `users/{numeric-uid}/sshPublicKeys/...`):
+        #   - the OS Login API rejects a DELETE on the UID path with 403:
+        #     "End user credentials must match the user specified in the
+        #     request" — for an SA, the credential principal is the *email*,
+        #     so the path component must be the email too.
+        run: |
+          set -euo pipefail
+          TOKEN="$(gcloud auth print-access-token)"
+          SA_EMAIL="$(gcloud auth list --filter='status:ACTIVE' --format='value(account)')"
+          echo "SA: $SA_EMAIL"
+
+          curl -fsS -H "Authorization: Bearer $TOKEN" \
+            "https://oslogin.googleapis.com/v1/users/${SA_EMAIL}/loginProfile" \
+            > profile.json
+          echo "profile bytes: $(wc -c < profile.json)"
+          echo "sshPublicKeys count: $(jq '.sshPublicKeys // {} | length' profile.json)"
+
+          mapfile -t fps < <(jq -r '.sshPublicKeys // {} | keys[]' profile.json)
+          if [ "${#fps[@]}" -eq 0 ]; then
+            echo "Nothing to purge."
+          else
+            for fp in "${fps[@]}"; do
+              [ -z "$fp" ] && continue
+              status=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE \
+                -H "Authorization: Bearer $TOKEN" \
+                "https://oslogin.googleapis.com/v1/users/${SA_EMAIL}/sshPublicKeys/${fp}")
+              if [ "$status" != "200" ]; then
+                echo "DELETE ${fp:0:12}… status=$status"
+              fi
+            done
+          fi
+
+          curl -fsS -H "Authorization: Bearer $TOKEN" \
+            "https://oslogin.googleapis.com/v1/users/${SA_EMAIL}/loginProfile" \
+            > profile-after.json
+          echo "post-purge bytes: $(wc -c < profile-after.json)"
+          echo "post-purge sshPublicKeys: $(jq '.sshPublicKeys // {} | length' profile-after.json)"
+
       - name: Discover by GCP labels
         id: list
         env:
-          ENV_INPUT: ${{ inputs.env }}
+          # Fall back to "staging" when triggered by push (no inputs).
+          ENV_INPUT: ${{ inputs.env || 'staging' }}
           NAMES_INPUT: ${{ inputs.targets }}
         run: |
           set -euo pipefail
@@ -156,39 +228,90 @@ jobs:
             echo "flag=" >> "$GITHUB_OUTPUT"
           fi
 
+      # On a fresh runner the first scp/ssh transparently calls OS Login's
+      # importSshPublicKey to register the runner's ephemeral key. When the
+      # whole matrix fans out at once, those imports race and the API returns
+      # "Multiple concurrent mutations were attempted. Please retry the
+      # request." gcloud does not retry on its own, so wrap each call with a
+      # backoff loop that retries only on that exact conflict.
       - name: SCP tarball to ${{ matrix.name }}
         run: |
-          gcloud compute scp \
-            --project="${{ env.GCP_PROJECT }}" \
-            --zone="${{ matrix.zone }}" \
-            ${{ steps.iap.outputs.flag }} \
-            --quiet \
-            /tmp/hermes-src.tgz \
-            "${{ matrix.name }}:/tmp/hermes-src.tgz"
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            err=$(mktemp)
+            if gcloud compute scp \
+                --project="${{ env.GCP_PROJECT }}" \
+                --zone="${{ matrix.zone }}" \
+                ${{ steps.iap.outputs.flag }} \
+                --ssh-key-expire-after=10m \
+                --quiet \
+                /tmp/hermes-src.tgz \
+                "${{ matrix.name }}:/tmp/hermes-src.tgz" 2> >(tee "$err" >&2); then
+              exit 0
+            fi
+            if ! grep -q "Multiple concurrent mutations" "$err"; then
+              exit 1
+            fi
+            sleep_s=$((attempt * 3 + RANDOM % 4))
+            echo "concurrent-mutation race on attempt $attempt; sleeping ${sleep_s}s"
+            sleep "$sleep_s"
+          done
+          echo "scp gave up after 5 attempts" >&2
+          exit 1
 
       - name: Run dispatcher
         run: |
-          gcloud compute ssh \
-            --project="${{ env.GCP_PROJECT }}" \
-            --zone="${{ matrix.zone }}" \
-            ${{ steps.iap.outputs.flag }} \
-            --quiet \
-            "${{ matrix.name }}" \
-            --command="sudo /usr/local/bin/zettlab-cloudnas-deploy hermes /tmp/hermes-src.tgz"
+          set -euo pipefail
+          for attempt in 1 2 3 4 5; do
+            err=$(mktemp)
+            if gcloud compute ssh \
+                --project="${{ env.GCP_PROJECT }}" \
+                --zone="${{ matrix.zone }}" \
+                ${{ steps.iap.outputs.flag }} \
+                --ssh-key-expire-after=10m \
+                --quiet \
+                "${{ matrix.name }}" \
+                --command="sudo /usr/local/bin/zettlab-cloudnas-deploy hermes /tmp/hermes-src.tgz" 2> >(tee "$err" >&2); then
+              exit 0
+            fi
+            if ! grep -q "Multiple concurrent mutations" "$err"; then
+              exit 1
+            fi
+            sleep_s=$((attempt * 3 + RANDOM % 4))
+            echo "concurrent-mutation race on attempt $attempt; sleeping ${sleep_s}s"
+            sleep "$sleep_s"
+          done
+          echo "dispatcher ssh gave up after 5 attempts" >&2
+          exit 1
 
       - name: Write version
         run: |
-          {
-            echo "git_sha=${{ github.sha }}"
-            echo "deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "workflow_run=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          } | gcloud compute ssh \
-              --project="${{ env.GCP_PROJECT }}" \
-              --zone="${{ matrix.zone }}" \
-              ${{ steps.iap.outputs.flag }} \
-              --quiet \
-              "${{ matrix.name }}" \
-              --command="sudo /usr/local/bin/zettlab-cloudnas-deploy write-version hermes"
+          set -euo pipefail
+          payload=$(printf 'git_sha=%s\ndeployed_at=%s\nworkflow_run=%s\n' \
+            "${{ github.sha }}" \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}")
+          for attempt in 1 2 3 4 5; do
+            err=$(mktemp)
+            if echo "$payload" | gcloud compute ssh \
+                --project="${{ env.GCP_PROJECT }}" \
+                --zone="${{ matrix.zone }}" \
+                ${{ steps.iap.outputs.flag }} \
+                --ssh-key-expire-after=10m \
+                --quiet \
+                "${{ matrix.name }}" \
+                --command="sudo /usr/local/bin/zettlab-cloudnas-deploy write-version hermes" 2> >(tee "$err" >&2); then
+              exit 0
+            fi
+            if ! grep -q "Multiple concurrent mutations" "$err"; then
+              exit 1
+            fi
+            sleep_s=$((attempt * 3 + RANDOM % 4))
+            echo "concurrent-mutation race on attempt $attempt; sleeping ${sleep_s}s"
+            sleep "$sleep_s"
+          done
+          echo "write-version ssh gave up after 5 attempts" >&2
+          exit 1
 
       - name: Show post-deploy status
         if: always()
@@ -197,6 +320,7 @@ jobs:
             --project="${{ env.GCP_PROJECT }}" \
             --zone="${{ matrix.zone }}" \
             ${{ steps.iap.outputs.flag }} \
+            --ssh-key-expire-after=10m \
             --quiet \
             "${{ matrix.name }}" \
             --command="sudo /usr/local/bin/zettlab-cloudnas-deploy status" || true

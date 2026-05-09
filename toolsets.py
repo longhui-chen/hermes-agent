@@ -359,6 +359,20 @@ TOOLSETS = {
         "includes": []
     },
 
+    "hermes-zet-agent": {
+        # Zet Agent (APIServerAdapter subclass) extends api_server's
+        # OpenAI-compatible /v1/chat/completions surface with structured
+        # SSE events (reasoning/approval/clarify/title) on the
+        # `event: hermes.tool.progress` channel. Because the platform
+        # layer handles those interactive prompts (via threading.Event
+        # blocking + HTTP respond endpoints), it can safely expose the
+        # full _HERMES_CORE_TOOLS set — including clarify, send_message,
+        # and text_to_speech that hermes-api-server explicitly excludes.
+        "description": "Zet Agent — APIServerAdapter + interactive SSE extension (reasoning/approval/clarify/title)",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
     "hermes-cron": {
         # Mirrors hermes-cli so cron's "default" toolset is the same set of
         # core tools users see interactively — then `hermes tools` filters
@@ -521,13 +535,18 @@ def get_toolset(name: str) -> Optional[Dict[str, Any]]:
         None: If toolset not found
     """
     toolset = TOOLSETS.get(name)
-    if toolset:
-        return toolset
 
     try:
         from tools.registry import registry
     except Exception:
-        return None
+        return toolset if toolset else None
+
+    if toolset:
+        merged_tools = sorted(
+            set(toolset.get("tools", []))
+            | set(registry.get_tool_names_for_toolset(name))
+        )
+        return {**toolset, "tools": merged_tools}
 
     registry_toolset = name
     description = f"Plugin toolset: {name}"
