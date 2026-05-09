@@ -81,6 +81,7 @@ jobs:
           set -euo pipefail
           jq -c --arg t "$TARGETS" '
             .boards
+            | map(select(.enabled != false))
             | if ($t == "" or $t == "all") then .
               else map(select(.name as $n
                               | ($t | split(",") | map(gsub("^\\s+|\\s+$"; "")))
