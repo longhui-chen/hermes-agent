@@ -89,6 +89,7 @@ from gateway.platforms.api_server import (
     AIOHTTP_AVAILABLE,
     APIServerAdapter,
     DEFAULT_HOST,
+    MAX_REQUEST_BYTES,
     _coerce_port,
     _openai_error,
 )
@@ -114,6 +115,35 @@ CLARIFY_RESPONSE_TIMEOUT = 300.0
 # Cap the auto-title at a length the APP can render in a single line
 # without truncation. Beyond that, the APP can elide.
 TITLE_MAX_LEN = 60
+
+
+# Zettlab APP 平台的工作风格补丁。
+#
+# 背景：webui 那边用 hermes 默认 SOUL（含 "admit uncertainty when appropriate"
+# 这种隐式 clarify nudge），所以 agent 在面对模糊指令时会主动调 clarify
+# 工具确认。App 这边 agent SOUL 是从 zettlab-local-server 的 from_template.go
+# 渲染的，模板 identity 字段普遍是任务定向的人物设定（"你是 X 助手……"），
+# 没有 clarify 引导，agent 倾向直接执行。
+#
+# clarify 工具本身两边都 enabled（toolsets.py:362-374 hermes-zet-agent
+# 工具包明确包含 clarify），差距纯粹在 prompt 层面。这里通过 ephemeral
+# system prompt 在 zet_agent 平台层补一段最小 disambiguation 引导，让
+# 结构化变更前先确认意图，但不打扰纯对话/查询流程。
+#
+# 不写进 SOUL.md 是为了保留 per-agent 的灵活性 —— 用户在某个 agent 的
+# 身份定位里如果显式覆盖（比如"快速执行不要确认"），那条 SOUL 仍然
+# 跟在这段 addendum 后面，模型会以更靠后的、更具体的指令为准。
+ZETTLAB_WORKFLOW_ADDENDUM = """\
+## 工作风格
+
+执行以下结构化变更前，先用 clarify 工具向用户确认意图（把关键参数列成 2-4 个选项让用户选）：
+- 创建 / 修改 / 删除定时任务
+- 删除数据、清空记录、批量操作
+- 发送外部消息（邮件、IM 推送）
+
+用户已经明确指定全部关键参数（频率、时间、目标、内容）时直接执行，无需再 clarify。
+信息查询、闲聊、回答问题不要 clarify。
+"""
 
 
 def check_zet_agent_requirements() -> bool:
@@ -410,6 +440,16 @@ class ZetAgentAdapter(APIServerAdapter):
         sniffed ``_stream_q``. If sniff fails we degrade silently to
         upstream behaviour (no extension events, but no crash).
         """
+        # 在 ephemeral_system_prompt 头部接 zettlab 工作风格 addendum。
+        # 上游传进来的 ephemeral 通常是 SOUL.md / IDENTITY.md 的拼接（per-agent
+        # 人格），让 addendum 在前、SOUL 在后是有意的：模型在系统提示里靠后
+        # 的 instruction 优先级更高，per-agent SOUL 真要 override 这条 workflow
+        # 时仍能压过去。
+        ephemeral_system_prompt = (
+            ZETTLAB_WORKFLOW_ADDENDUM
+            + ("\n\n" + ephemeral_system_prompt if ephemeral_system_prompt else "")
+        )
+
         # ZettClaw — 让 cronjob tool 自动设 origin: 把当前 chat session_id 注入
         # contextvars，cronjob_tools._origin_from_env 会读到 platform/chat_id
         # 自动填到 cron job.origin。否则 cron 触发时 OriginStrategy 找不到 chat
@@ -736,6 +776,56 @@ class ZetAgentAdapter(APIServerAdapter):
         })
 
     # ------------------------------------------------------------------
+    # Diagnostic wrapper around base /v1/chat/completions
+    # ------------------------------------------------------------------
+
+    async def _diagnostic_chat_completions(self, request: "web.Request") -> "web.Response":
+        """Pre-read the body so a parse / size failure surfaces the real
+        exception type and a body sample in our logs, instead of bubbling
+        up as the base handler's catch-all 400 "Invalid JSON in request
+        body" — which masks ``RequestEntityTooLarge``, ``UnicodeDecodeError``,
+        and read timeouts indistinguishably.
+
+        ``request.read()`` caches the bytes on the Request object, so the
+        downstream ``await request.json()`` inside the base handler reuses
+        them — we only pay one read.
+        """
+        try:
+            raw = await request.read()
+        except Exception as e:
+            cl = request.headers.get("Content-Length")
+            ct = request.headers.get("Content-Type")
+            logger.error(
+                "[zet_agent] /v1/chat/completions body read failed: %s: %s "
+                "(Content-Length=%s, Content-Type=%s, client_max_size=%s)",
+                type(e).__name__, e, cl, ct, MAX_REQUEST_BYTES,
+            )
+            return web.json_response(
+                _openai_error(
+                    f"Request body could not be read ({type(e).__name__}); "
+                    f"check Content-Length vs server client_max_size={MAX_REQUEST_BYTES}",
+                    code="body_read_failed",
+                ),
+                status=413 if "TooLarge" in type(e).__name__ else 400,
+            )
+        try:
+            json.loads(raw)
+        except json.JSONDecodeError as e:
+            sample = raw[:256]
+            try:
+                sample_repr = sample.decode("utf-8", errors="replace")
+            except Exception:
+                sample_repr = repr(sample)
+            logger.error(
+                "[zet_agent] /v1/chat/completions JSON decode failed at pos %s: %s "
+                "(body bytes=%d, head=%r)",
+                getattr(e, "pos", "?"), e.msg, len(raw), sample_repr,
+            )
+            # Fall through to base handler so the client still gets the
+            # original 400 shape — we just have a real log now.
+        return await self._handle_chat_completions(request)
+
+    # ------------------------------------------------------------------
     # connect — extend base routes with our respond endpoints
     # ------------------------------------------------------------------
 
@@ -787,7 +877,12 @@ class ZetAgentAdapter(APIServerAdapter):
 
         try:
             mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
-            self._app = web.Application(middlewares=mws)
+            # client_max_size=MAX_REQUEST_BYTES mirrors APIServerAdapter.connect
+            # in api_server.py — without it aiohttp falls back to its 1 MiB
+            # default and rejects multimodal payloads (image_url with inlined
+            # base64) before they reach _handle_chat_completions, surfacing
+            # as a misleading 400 "Invalid JSON in request body".
+            self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             self._app["api_server_adapter"] = self
             # Base routes — kept identical to APIServerAdapter.connect
             # so health/models/responses/runs/jobs all work under the
@@ -798,7 +893,7 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_get("/v1/models", self._handle_models)
             if hasattr(self, "_handle_capabilities"):
                 self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
-            self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)
+            self._app.router.add_post("/v1/chat/completions", self._diagnostic_chat_completions)
             self._app.router.add_post("/v1/responses", self._handle_responses)
             self._app.router.add_get("/v1/responses/{response_id}", self._handle_get_response)
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
