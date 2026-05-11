@@ -863,6 +863,121 @@ class ZetAgentAdapter(APIServerAdapter):
         return await self._handle_chat_completions(request)
 
     # ------------------------------------------------------------------
+    # model switch — agent-level runtime swap via local-server
+    # ------------------------------------------------------------------
+
+    async def _handle_model_switch(self, request: "web.Request") -> "web.Response":
+        """POST /v1/model/switch — agent-level model switch without restart.
+
+        Called by zettlab-local-server's PUT /api/v1/agent/agents/:id/model
+        endpoint. Updates the profile's config.yaml model.* slot AND
+        live-swaps all cached AIAgent instances so existing sessions pick
+        up the new model immediately (same mechanism as hermes' /model
+        command, but applied to every session at once).
+
+        Expected body: {"model": "...", "provider": "...", "base_url": "...", "api_key": "..."}
+        """
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+        new_model = body.get("model", "")
+        new_provider = body.get("provider", "")
+        new_base_url = body.get("base_url", "")
+        new_api_key = body.get("api_key", "")
+        if not new_model:
+            return web.json_response({"ok": False, "error": "model is required"}, status=400)
+
+        # 1. Update profile config.yaml so the change persists across
+        #    gateway restarts and new sessions read the right default.
+        try:
+            from gateway.run import _load_gateway_config, _hermes_home
+            from utils import atomic_yaml_write
+            cfg = _load_gateway_config()
+            model_slot = cfg.get("model", {})
+            if isinstance(model_slot, str):
+                model_slot = {"default": model_slot}
+            model_slot["default"] = new_model
+            if new_provider:
+                model_slot["provider"] = new_provider
+            if new_base_url:
+                model_slot["base_url"] = new_base_url
+            if new_api_key:
+                model_slot["api_key"] = new_api_key
+            cfg["model"] = model_slot
+            config_path = _hermes_home / "config.yaml"
+            atomic_yaml_write(config_path, cfg)
+        except Exception as exc:
+            logger.warning("model-switch: config write failed: %s", exc)
+            return web.json_response({"ok": False, "error": f"config write: {exc}"}, status=500)
+
+        # 2. Clear session-level /model overrides — the agent-level switch
+        #    takes precedence; stale per-session overrides would shadow it.
+        gw = getattr(self, "gateway_runner", None)
+        if gw is not None:
+            overrides = getattr(gw, "_session_model_overrides", None)
+            if overrides is not None:
+                overrides.clear()
+
+        # 3. Repin session files — hermes pins {model, base_url} at session
+        #    creation and uses the session value over config.yaml. Without
+        #    updating the files, existing sessions keep calling the old
+        #    model even though config and live agents were swapped.
+        repinned = self._repin_session_files(new_model, new_base_url)
+
+        logger.info(
+            "model-switch: model=%s provider=%s repinned=%d sessions",
+            new_model, new_provider, repinned,
+        )
+        return web.json_response({
+            "ok": True, "model": new_model, "repinned": repinned,
+        })
+
+    def _repin_session_files(self, new_model: str, new_base_url: str) -> int:
+        """Rewrite {model, base_url} in every session_*.json under _hermes_home/sessions/.
+
+        Hermes pins these at session creation. Without updating them,
+        existing sessions override config.yaml and keep using the old model.
+        """
+        import json as _json
+        from gateway.run import _hermes_home
+        sessions_dir = _hermes_home / "sessions"
+        if not sessions_dir.is_dir():
+            return 0
+        patched = 0
+        for f in sessions_dir.iterdir():
+            if not f.name.startswith("session_") or not f.name.endswith(".json"):
+                continue
+            try:
+                raw = f.read_text(encoding="utf-8")
+                doc = _json.loads(raw)
+                if not isinstance(doc, dict) or "model" not in doc:
+                    continue
+                doc["model"] = new_model
+                if "base_url" in doc:
+                    doc["base_url"] = new_base_url
+                # Inject a system-level note into messages so the LLM knows
+                # the model changed when it loads conversation history.
+                msgs = doc.get("messages")
+                if isinstance(msgs, list):
+                    msgs.append({
+                        "role": "system",
+                        "content": (
+                            f"[System: model switched to {new_model}. "
+                            f"Adjust your self-identification accordingly.]"
+                        ),
+                    })
+                    doc["message_count"] = len(msgs)
+                tmp = f.with_suffix(".json.tmp")
+                tmp.write_text(_json.dumps(doc, indent=2, default=str, ensure_ascii=False), encoding="utf-8")
+                tmp.rename(f)
+                patched += 1
+            except Exception as exc:
+                logger.warning("repin-session: %s failed: %s", f.name, exc)
+        return patched
+
+    # ------------------------------------------------------------------
     # connect — extend base routes with our respond endpoints
     # ------------------------------------------------------------------
 
@@ -962,6 +1077,10 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_get(
                 "/v1/sessions/{session_id}/pending",
                 self._handle_pending,
+            )
+            self._app.router.add_post(
+                "/v1/model/switch",
+                self._handle_model_switch,
             )
 
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
