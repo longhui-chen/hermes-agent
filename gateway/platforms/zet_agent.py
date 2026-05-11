@@ -77,6 +77,7 @@ import json
 import logging
 import os
 import threading
+import time
 from typing import Any, Dict, List, Optional
 
 try:
@@ -111,6 +112,29 @@ ZET_AGENT_DEFAULT_PORT = 7900
 # approval flow uses hermes' built-in timeout (``approval.gateway_timeout``,
 # default 300s) so we don't duplicate it here.
 CLARIFY_RESPONSE_TIMEOUT = 300.0
+
+# Default approval gateway timeout in seconds — must mirror the literal
+# default in tools/approval.py:1110. We read this independently so the
+# expires_at_ms we publish to clients matches what the agent thread will
+# actually wait for. Both reads land before the wait starts, so a stable
+# config read returns the same value to both call sites.
+DEFAULT_APPROVAL_TIMEOUT_SECONDS = 300.0
+
+
+def _approval_timeout_seconds() -> float:
+    """Return the approval gateway timeout (seconds) from runtime config.
+
+    Mirrors the read in tools/approval.py inside the gateway wait loop.
+    Falls back to ``DEFAULT_APPROVAL_TIMEOUT_SECONDS`` when the import or
+    parse fails so we never publish a degenerate deadline.
+    """
+    try:
+        from tools.approval import _get_approval_config
+        return float(_get_approval_config().get(
+            "gateway_timeout", DEFAULT_APPROVAL_TIMEOUT_SECONDS,
+        ))
+    except Exception:
+        return DEFAULT_APPROVAL_TIMEOUT_SECONDS
 
 # Cap the auto-title at a length the APP can render in a single line
 # without truncation. Beyond that, the APP can elide.
@@ -327,21 +351,29 @@ class ZetAgentAdapter(APIServerAdapter):
         is what actually blocks the run.
 
         Plan-E rev4 payload: ``{command, description, pattern_key,
-        pattern_keys}`` — no request_id (per-session FIFO; oldest
-        pending wins). expires_at_ms is injected by the local-server
-        adapter so all clients see one timer source.
+        pattern_keys, expires_at_ms}`` — no request_id (per-session
+        FIFO; oldest pending wins). expires_at_ms is stamped here from
+        the same approval config the wait loop in tools/approval.py
+        reads, so the App's countdown matches the agent's actual deadline.
 
         We also cache the payload in ``self._pending_approval`` so a
         reconnecting client can fetch it via the GET /pending endpoint
         and re-render the modal after a ws drop.
         """
         def _notify(approval_data: Dict[str, Any]) -> None:
+            # Stamp the deadline using the same config the wait loop in
+            # tools/approval.py reads. The notify callback fires
+            # immediately before that wait starts, so a stable config
+            # read returns the same value to both sites — clients see
+            # the wall-clock time the agent will actually give up at.
+            expires_at_ms = int((time.time() + _approval_timeout_seconds()) * 1000)
             payload = {
                 "type": "hermes.approval",
                 "command": approval_data.get("command", ""),
                 "description": approval_data.get("description", ""),
                 "pattern_key": approval_data.get("pattern_key", ""),
                 "pattern_keys": list(approval_data.get("pattern_keys", []) or []),
+                "expires_at_ms": expires_at_ms,
             }
             with self._pending_lock:
                 self._pending_approval[session_id] = payload
@@ -373,10 +405,15 @@ class ZetAgentAdapter(APIServerAdapter):
             with self._clarify_state_lock:
                 self._clarify_queues.setdefault(session_id, []).append(entry)
 
+            # Stamp the deadline using the same constant the agent
+            # thread waits on a few lines below. Clients see the wall-
+            # clock time we will actually give up at.
+            expires_at_ms = int((time.time() + CLARIFY_RESPONSE_TIMEOUT) * 1000)
             payload = {
                 "type": "hermes.clarify",
                 "question": question,
                 "choices_offered": list(choices or []),
+                "expires_at_ms": expires_at_ms,
             }
             with self._pending_lock:
                 self._pending_clarify[session_id] = payload

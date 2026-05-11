@@ -38,8 +38,10 @@ Failure modes
 
 import json
 import logging
+import mimetypes
 import os
-from typing import Any, Dict, Optional
+import stat as _stat
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,15 @@ _PATCH_SENTINEL = "__zet_agent_cron_patched__"
 # job_id → most recent saved markdown content. Populated by the
 # save_job_output wrapper, drained by the mark_job_run wrapper.
 _LATEST_OUTPUT: Dict[str, str] = {}
+
+# Tool calls whose successful execution we treat as "produced a file this
+# turn". Keep in sync with zettlab-local-server/internal/chat/handler/
+# produced_files.go (App reuses the same shape for in-chat file cards).
+_PRODUCE_TOOL_NAMES = frozenset({
+    "Write", "Edit", "MultiEdit", "NotebookEdit",
+    "write_file", "edit_file",
+})
+_PATH_KEYS = ("file_path", "notebook_path", "path")
 
 
 def _dbg(msg: str) -> None:
@@ -177,6 +188,70 @@ def install() -> None:
             _dbg("install() patched APIServerAdapter._create_agent OK")
     except ImportError as _ie:
         _dbg(f"install() _create_agent patch SKIP (ImportError): {_ie}")
+
+    # ── _flush_messages_to_session_db patch — fix user-message-drop bug ──
+    #
+    # 上游 _flush_messages_to_session_db 用 len(conversation_history) 当
+    # flush 起点，假设 messages[:N] 跟 conversation_history 一对一对应。
+    # 但 _repair_message_sequence (run_agent.py:3891) 会把 messages 里
+    # 相邻 user 合并成一条，导致 messages 比 conversation_history 短，
+    # flush_from 越过新 turn 的 user message —— assistant 入库但 user 丢失。
+    #
+    # 现象只出现在 SessionDB 里历史包含相邻 user message 的 session（最常
+    # 见于 channel session：一次 turn 被中断 / clarify timeout 后留下两条
+    # 没有 assistant 隔开的 user）。一旦埋下"种子"，所有后续 turn 都被 hit。
+    #
+    # 上游修过 _compress_context 路径（line 11055 显式把 conversation_history
+    # 设为 None），但 _repair_message_sequence 路径没补。这里 wrap 一下，把
+    # conversation_history 切到 _persist_user_message_idx 前（_run_agent 维
+    # 护好的当前-turn user 锚点），让原 flush_from 公式落到 user 位置。
+    try:
+        from run_agent import AIAgent
+
+        if not getattr(AIAgent._flush_messages_to_session_db, _PATCH_SENTINEL, False):
+            _orig_flush = AIAgent._flush_messages_to_session_db
+
+            def _wrapped_flush(self, messages, conversation_history=None):
+                # 修正 _repair_message_sequence 合并相邻 user 导致的 flush 错位。
+                # 边界条件设计：
+                #  - persist_idx = _persist_user_message_idx 是 _run_agent 设的
+                #    "期望 user 位置"（line 10949）；如果没设，跳过 patch。
+                #  - walk messages 末尾向前找真实 user 位置 turn_user_idx；
+                #    无 user（cron 等）→ 跳过。
+                #  - 只有 turn_user_idx < persist_idx 时才修（说明 merge 把 user
+                #    向前推了），其他情况一律走原逻辑，避免误伤。
+                try:
+                    persist_idx = getattr(self, "_persist_user_message_idx", None)
+                    if persist_idx is None or not isinstance(messages, list):
+                        return _orig_flush(self, messages, conversation_history)
+
+                    turn_user_idx = None
+                    for _i in range(len(messages) - 1, -1, -1):
+                        _m = messages[_i]
+                        if isinstance(_m, dict) and _m.get("role") == "user":
+                            turn_user_idx = _i
+                            break
+
+                    if (
+                        turn_user_idx is not None
+                        and turn_user_idx < persist_idx
+                        and isinstance(conversation_history, list)
+                        and turn_user_idx < len(conversation_history)
+                    ):
+                        _dbg(
+                            f"_flush patch: adjust hist_len={len(conversation_history)} "
+                            f"→ {turn_user_idx} (persist_idx={persist_idx}, msgs_len={len(messages)})"
+                        )
+                        conversation_history = conversation_history[:turn_user_idx]
+                except Exception as _e:
+                    _dbg(f"_flush patch: pre-adjust FAILED (falling back): {_e!r}")
+                return _orig_flush(self, messages, conversation_history)
+
+            setattr(_wrapped_flush, _PATCH_SENTINEL, True)
+            AIAgent._flush_messages_to_session_db = _wrapped_flush
+            _dbg("install() patched AIAgent._flush_messages_to_session_db OK")
+    except ImportError as _ie:
+        _dbg(f"install() _flush patch SKIP (ImportError): {_ie}")
 
     logger.info("zet_agent_cron: installed cron persistence hooks on cron.scheduler")
 
@@ -322,6 +397,10 @@ def _build_typed_message_content(
     if delivery_error:
         metadata["delivery_error"] = delivery_error
 
+    attachments = _collect_produced_files(job_id)
+    if attachments:
+        metadata["attachments"] = attachments
+
     body = _extract_response_body(_LATEST_OUTPUT.get(job_id, "")) or (error or "").strip()
 
     parts = [
@@ -334,6 +413,121 @@ def _build_typed_message_content(
         parts.append(body)
 
     return "\n".join(parts)
+
+
+def _collect_produced_files(job_id: str) -> List[Dict[str, Any]]:
+    """Enumerate files written by Write/Edit-class tool calls in this job's
+    most recent cron session. Result is embedded into cron-summary metadata
+    so downstream clients (App, channel bridges) can render attachments
+    without re-deriving them from raw history.
+
+    Why look up the cron session by prefix instead of capturing it at
+    save_job_output time: hermes upstream owns cron/scheduler.py and we
+    avoid editing it to keep merge churn down. The cron session id format
+    `cron_{job_id}_{YYYYMMDD_HHMMSS}` is stable enough to query by.
+
+    Silent degradation: any failure (no SessionDB, no matching session,
+    unreadable path, malformed tool_calls) yields an empty list — the
+    cron summary still ships without an attachments field.
+    """
+    if not job_id:
+        return []
+    try:
+        from hermes_state import SessionDB
+    except ImportError as _ie:
+        _dbg(f"_collect_produced_files: SessionDB ImportError: {_ie}")
+        return []
+
+    db = SessionDB()
+    try:
+        prefix = f"cron_{job_id}_"
+        like = (
+            prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            + "%"
+        )
+        try:
+            with db._lock:
+                cursor = db._conn.execute(
+                    "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' "
+                    "ORDER BY started_at DESC LIMIT 1",
+                    (like,),
+                )
+                row = cursor.fetchone()
+        except Exception as _e:
+            _dbg(f"_collect_produced_files: cron session lookup FAILED: {_e!r}")
+            return []
+        if not row:
+            _dbg(
+                f"_collect_produced_files: no cron session matching prefix={prefix}"
+            )
+            return []
+        sid = row["id"]
+        try:
+            messages = db.get_messages(sid)
+        except Exception as _e:
+            _dbg(f"_collect_produced_files: get_messages FAILED sid={sid}: {_e!r}")
+            return []
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+    seen: set = set()
+    produced: List[Dict[str, Any]] = []
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        tcs = msg.get("tool_calls")
+        if not isinstance(tcs, list):
+            continue
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                continue
+            # Schema in SessionDB.append_message (run_agent.py:4011-4015):
+            # {"name": "...", "arguments": "..."}. Older snapshots may still
+            # carry OpenAI-shaped {"function": {"name", "arguments"}} —
+            # accept both rather than gate on a schema version.
+            name = tc.get("name") or ((tc.get("function") or {}).get("name") or "")
+            if name not in _PRODUCE_TOOL_NAMES:
+                continue
+            args_raw = tc.get("arguments")
+            if args_raw is None:
+                args_raw = (tc.get("function") or {}).get("arguments")
+            if not args_raw:
+                continue
+            if isinstance(args_raw, str):
+                try:
+                    args = json.loads(args_raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+            else:
+                args = args_raw
+            if not isinstance(args, dict):
+                continue
+            path = ""
+            for k in _PATH_KEYS:
+                v = args.get(k)
+                if v:
+                    path = str(v).strip()
+                    break
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if not _stat.S_ISREG(st.st_mode):
+                continue
+            mime, _enc = mimetypes.guess_type(path)
+            produced.append({
+                "path": path,
+                "name": os.path.basename(path),
+                "size": st.st_size,
+                "mime": mime or "application/octet-stream",
+            })
+    return produced
 
 
 def _will_hit_repeat_limit(job: Optional[dict]) -> bool:
