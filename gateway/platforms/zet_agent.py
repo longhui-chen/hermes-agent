@@ -609,20 +609,6 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception:
                 logger.debug("[zet_agent] auto-title hook failed", exc_info=True)
 
-        # Consume pending model-switch note (set by /v1/model/switch).
-        # The main GatewayServer._dispatch_message checks this dict for
-        # Telegram/Discord/etc, but the zet_agent /v1/chat/completions
-        # path bypasses that dispatcher — so we consume it here instead.
-        gw = getattr(self, "gateway_runner", None)
-        if gw is not None and session_id:
-            notes = getattr(gw, "_pending_model_notes", None)
-            if notes:
-                note = notes.pop(session_id, None)
-                if not note and gateway_session_key:
-                    note = notes.pop(gateway_session_key, None)
-                if note and user_message:
-                    user_message = note + "\n\n" + user_message
-
         old_session_key = os.environ.get("HERMES_SESSION_KEY")
         old_exec_ask = os.environ.get("HERMES_EXEC_ASK")
         if session_id:
@@ -889,53 +875,13 @@ class ZetAgentAdapter(APIServerAdapter):
             logger.warning("model-switch: config write failed: %s", exc)
             return web.json_response({"ok": False, "error": f"config write: {exc}"}, status=500)
 
-        # 2. Live-swap all cached agents (mirrors hermes /model command).
-        switched = 0
+        # 2. Clear session-level /model overrides — the agent-level switch
+        #    takes precedence; stale per-session overrides would shadow it.
         gw = getattr(self, "gateway_runner", None)
         if gw is not None:
-            cache_lock = getattr(gw, "_agent_cache_lock", None)
-            cache = getattr(gw, "_agent_cache", None)
-            if cache_lock is not None and cache is not None:
-                with cache_lock:
-                    entries = list(cache.items())
-                for key, entry in entries:
-                    agent = entry[0] if isinstance(entry, tuple) else entry
-                    if agent is not None and hasattr(agent, "switch_model"):
-                        try:
-                            agent.switch_model(
-                                new_model=new_model,
-                                new_provider=new_provider,
-                                api_key=new_api_key,
-                                base_url=new_base_url,
-                            )
-                            switched += 1
-                        except Exception as exc:
-                            logger.warning("model-switch: agent swap failed for %s: %s", key, exc)
-
-            # Clear session-level /model overrides — the agent-level switch
-            # takes precedence; stale per-session overrides would shadow it.
             overrides = getattr(gw, "_session_model_overrides", None)
             if overrides is not None:
                 overrides.clear()
-
-            # Inject a model-switch note for every cached session so the
-            # LLM knows the model changed on the next turn — same mechanism
-            # hermes /model uses (gateway/run.py _pending_model_notes).
-            # Without this, the LLM still has "I'm <old_model>" in its
-            # conversation history and keeps self-identifying as the old
-            # model until the context naturally rolls over.
-            old_model = body.get("old_model", "")
-            if not hasattr(gw, "_pending_model_notes"):
-                gw._pending_model_notes = {}
-            note = (
-                f"[Note: model was just switched"
-                f"{f' from {old_model}' if old_model else ''}"
-                f" to {new_model}"
-                f"{f' via {new_provider}' if new_provider else ''}."
-                f" Adjust your self-identification accordingly.]"
-            )
-            for key in list(cache.keys()) if cache is not None else []:
-                gw._pending_model_notes[key] = note
 
         # 3. Repin session files — hermes pins {model, base_url} at session
         #    creation and uses the session value over config.yaml. Without
@@ -944,12 +890,11 @@ class ZetAgentAdapter(APIServerAdapter):
         repinned = self._repin_session_files(new_model, new_base_url)
 
         logger.info(
-            "model-switch: model=%s provider=%s switched=%d agents repinned=%d sessions",
-            new_model, new_provider, switched, repinned,
+            "model-switch: model=%s provider=%s repinned=%d sessions",
+            new_model, new_provider, repinned,
         )
         return web.json_response({
-            "ok": True, "model": new_model,
-            "switched": switched, "repinned": repinned,
+            "ok": True, "model": new_model, "repinned": repinned,
         })
 
     def _repin_session_files(self, new_model: str, new_base_url: str) -> int:
