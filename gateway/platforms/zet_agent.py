@@ -609,6 +609,20 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception:
                 logger.debug("[zet_agent] auto-title hook failed", exc_info=True)
 
+        # Consume pending model-switch note (set by /v1/model/switch).
+        # The main GatewayServer._dispatch_message checks this dict for
+        # Telegram/Discord/etc, but the zet_agent /v1/chat/completions
+        # path bypasses that dispatcher — so we consume it here instead.
+        gw = getattr(self, "gateway_runner", None)
+        if gw is not None and session_id:
+            notes = getattr(gw, "_pending_model_notes", None)
+            if notes:
+                note = notes.pop(session_id, None)
+                if not note and gateway_session_key:
+                    note = notes.pop(gateway_session_key, None)
+                if note and user_message:
+                    user_message = note + "\n\n" + user_message
+
         old_session_key = os.environ.get("HERMES_SESSION_KEY")
         old_exec_ask = os.environ.get("HERMES_EXEC_ASK")
         if session_id:
