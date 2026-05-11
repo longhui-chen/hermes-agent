@@ -904,6 +904,25 @@ class ZetAgentAdapter(APIServerAdapter):
             if overrides is not None:
                 overrides.clear()
 
+            # Inject a model-switch note for every cached session so the
+            # LLM knows the model changed on the next turn — same mechanism
+            # hermes /model uses (gateway/run.py _pending_model_notes).
+            # Without this, the LLM still has "I'm <old_model>" in its
+            # conversation history and keeps self-identifying as the old
+            # model until the context naturally rolls over.
+            old_model = body.get("old_model", "")
+            if not hasattr(gw, "_pending_model_notes"):
+                gw._pending_model_notes = {}
+            note = (
+                f"[Note: model was just switched"
+                f"{f' from {old_model}' if old_model else ''}"
+                f" to {new_model}"
+                f"{f' via {new_provider}' if new_provider else ''}."
+                f" Adjust your self-identification accordingly.]"
+            )
+            for key in list(cache.keys()) if cache is not None else []:
+                gw._pending_model_notes[key] = note
+
         logger.info("model-switch: model=%s provider=%s switched=%d agents", new_model, new_provider, switched)
         return web.json_response({"ok": True, "model": new_model, "switched": switched})
 
