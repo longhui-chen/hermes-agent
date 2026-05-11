@@ -4543,7 +4543,9 @@ class GatewayRunner:
             if not check_zet_agent_requirements():
                 logger.warning("Zet Agent: aiohttp not installed")
                 return None
-            return ZetAgentAdapter(config)
+            adapter = ZetAgentAdapter(config)
+            adapter.gateway_runner = self
+            return adapter
 
         elif platform == Platform.WEBHOOK:
             from gateway.platforms.webhook import WebhookAdapter, check_webhook_requirements
