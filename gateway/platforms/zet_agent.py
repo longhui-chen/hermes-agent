@@ -937,8 +937,62 @@ class ZetAgentAdapter(APIServerAdapter):
             for key in list(cache.keys()) if cache is not None else []:
                 gw._pending_model_notes[key] = note
 
-        logger.info("model-switch: model=%s provider=%s switched=%d agents", new_model, new_provider, switched)
-        return web.json_response({"ok": True, "model": new_model, "switched": switched})
+        # 3. Repin session files — hermes pins {model, base_url} at session
+        #    creation and uses the session value over config.yaml. Without
+        #    updating the files, existing sessions keep calling the old
+        #    model even though config and live agents were swapped.
+        repinned = self._repin_session_files(new_model, new_base_url)
+
+        logger.info(
+            "model-switch: model=%s provider=%s switched=%d agents repinned=%d sessions",
+            new_model, new_provider, switched, repinned,
+        )
+        return web.json_response({
+            "ok": True, "model": new_model,
+            "switched": switched, "repinned": repinned,
+        })
+
+    def _repin_session_files(self, new_model: str, new_base_url: str) -> int:
+        """Rewrite {model, base_url} in every session_*.json under _hermes_home/sessions/.
+
+        Hermes pins these at session creation. Without updating them,
+        existing sessions override config.yaml and keep using the old model.
+        """
+        import json as _json
+        sessions_dir = _hermes_home / "sessions"
+        if not sessions_dir.is_dir():
+            return 0
+        patched = 0
+        for f in sessions_dir.iterdir():
+            if not f.name.startswith("session_") or not f.name.endswith(".json"):
+                continue
+            try:
+                raw = f.read_text(encoding="utf-8")
+                doc = _json.loads(raw)
+                if not isinstance(doc, dict) or "model" not in doc:
+                    continue
+                doc["model"] = new_model
+                if "base_url" in doc:
+                    doc["base_url"] = new_base_url
+                # Inject a system-level note into messages so the LLM knows
+                # the model changed when it loads conversation history.
+                msgs = doc.get("messages")
+                if isinstance(msgs, list):
+                    msgs.append({
+                        "role": "system",
+                        "content": (
+                            f"[System: model switched to {new_model}. "
+                            f"Adjust your self-identification accordingly.]"
+                        ),
+                    })
+                    doc["message_count"] = len(msgs)
+                tmp = f.with_suffix(".json.tmp")
+                tmp.write_text(_json.dumps(doc, indent=2, default=str, ensure_ascii=False), encoding="utf-8")
+                tmp.rename(f)
+                patched += 1
+            except Exception as exc:
+                logger.warning("repin-session: %s failed: %s", f.name, exc)
+        return patched
 
     # ------------------------------------------------------------------
     # connect — extend base routes with our respond endpoints
