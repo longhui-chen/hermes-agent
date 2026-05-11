@@ -904,6 +904,7 @@ class ZetAgentAdapter(APIServerAdapter):
         existing sessions override config.yaml and keep using the old model.
         """
         import json as _json
+        from gateway.run import _hermes_home
         sessions_dir = _hermes_home / "sessions"
         if not sessions_dir.is_dir():
             return 0
