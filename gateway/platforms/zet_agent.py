@@ -522,6 +522,25 @@ class ZetAgentAdapter(APIServerAdapter):
         reasoning_config = GatewayRunner._load_reasoning_config()
         model = _resolve_gateway_model()
 
+        # ZET-576: apply session-level model override if present.
+        # _resolve_gateway_model reads config.yaml (agent default), but
+        # session overrides live in gateway_runner._session_model_overrides
+        # which this adapter's _create_agent bypasses. Check it here.
+        gw = getattr(self, "gateway_runner", None)
+        override_key = gateway_session_key or session_id
+        if gw is not None and override_key:
+            override = getattr(gw, "_session_model_overrides", {}).get(override_key)
+            if override:
+                model = override.get("model", model)
+                for k in ("provider", "api_key", "base_url", "api_mode"):
+                    v = override.get(k)
+                    if v is not None:
+                        runtime_kwargs[k] = v
+                logger.info(
+                    "session-model-override applied: session=%s model=%s",
+                    override_key, model,
+                )
+
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
 
@@ -934,6 +953,81 @@ class ZetAgentAdapter(APIServerAdapter):
             "ok": True, "model": new_model, "repinned": repinned,
         })
 
+    async def _handle_session_model_switch(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions/{session_id}/model/switch — session-level model override.
+
+        Unlike the agent-level POST /v1/model/switch, this only changes the
+        model for a single session without touching config.yaml or other
+        sessions.  The override is stored in gateway_runner's
+        ``_session_model_overrides`` dict so the next turn in this session
+        picks up the new model.
+
+        Expected body: {"model": "...", "provider"?: "...", "base_url"?: "...", "api_key"?: "..."}
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "")
+        if not session_id:
+            return web.json_response(
+                _openai_error("session_id is required"), status=400,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+        new_model = body.get("model", "")
+        if not new_model:
+            return web.json_response({"ok": False, "error": "model is required"}, status=400)
+
+        new_provider = body.get("provider", "")
+        new_base_url = body.get("base_url", "")
+        new_api_key = body.get("api_key", "")
+
+        # Build the override dict — only include keys that were provided.
+        override: Dict[str, str] = {"model": new_model}
+        if new_provider:
+            override["provider"] = new_provider
+        if new_base_url:
+            override["base_url"] = new_base_url
+        if new_api_key:
+            override["api_key"] = new_api_key
+
+        # Store override in gateway_runner so the next _create_agent call
+        # for this session reads the overridden model.
+        gw = getattr(self, "gateway_runner", None)
+        if gw is not None:
+            overrides = getattr(gw, "_session_model_overrides", None)
+            if overrides is not None:
+                overrides[session_id] = override
+            evict = getattr(gw, "_evict_cached_agent", None)
+            if callable(evict):
+                try:
+                    evict(session_id)
+                except Exception as exc:
+                    logger.warning(
+                        "session-model-switch: evict_cached_agent failed for %s: %s",
+                        session_id, exc,
+                    )
+
+        # Repin only the single session file so the persisted session
+        # reflects the new model on next gateway restart.
+        repinned = self._repin_single_session_file(session_id, new_model, new_base_url)
+
+        logger.info(
+            "session-model-switch: session=%s model=%s provider=%s repinned=%d",
+            session_id, new_model, new_provider, repinned,
+        )
+        return web.json_response({
+            "ok": True,
+            "session_id": session_id,
+            "model": new_model,
+            "repinned": repinned,
+        })
+
     def _repin_session_files(self, new_model: str, new_base_url: str) -> int:
         """Rewrite {model, base_url} in every session_*.json under _hermes_home/sessions/.
 
@@ -976,6 +1070,56 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception as exc:
                 logger.warning("repin-session: %s failed: %s", f.name, exc)
         return patched
+
+    def _repin_single_session_file(self, session_id: str, new_model: str, new_base_url: str) -> int:
+        """Rewrite {model, base_url} in a single session file.
+
+        Like ``_repin_session_files`` but targets only the file for
+        ``session_id``.  Session files are named ``session_<safe_id>.json``
+        where colons in the session_id are replaced with underscores.
+
+        Returns 1 if the file was updated, 0 if it was not found or had
+        no ``model`` key.
+        """
+        import json as _json
+        from gateway.run import _hermes_home
+
+        # hermes uses the raw session_id in filenames (colons preserved);
+        # some older builds encoded colons to underscores — try both.
+        session_file = _hermes_home / "sessions" / f"session_{session_id}.json"
+        if not session_file.is_file():
+            safe_id = session_id.replace(":", "_")
+            session_file = _hermes_home / "sessions" / f"session_{safe_id}.json"
+            if not session_file.is_file():
+                return 0
+        try:
+            raw = session_file.read_text(encoding="utf-8")
+            doc = _json.loads(raw)
+            if not isinstance(doc, dict) or "model" not in doc:
+                return 0
+            doc["model"] = new_model
+            if "base_url" in doc:
+                doc["base_url"] = new_base_url
+            msgs = doc.get("messages")
+            if isinstance(msgs, list):
+                msgs.append({
+                    "role": "system",
+                    "content": (
+                        f"[System: model switched to {new_model} for this session. "
+                        f"Adjust your self-identification accordingly.]"
+                    ),
+                })
+                doc["message_count"] = len(msgs)
+            tmp = session_file.with_suffix(".json.tmp")
+            tmp.write_text(
+                _json.dumps(doc, indent=2, default=str, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            tmp.rename(session_file)
+            return 1
+        except Exception as exc:
+            logger.warning("repin-single-session: %s failed: %s", session_file.name, exc)
+            return 0
 
     # ------------------------------------------------------------------
     # connect — extend base routes with our respond endpoints
@@ -1081,6 +1225,10 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_post(
                 "/v1/model/switch",
                 self._handle_model_switch,
+            )
+            self._app.router.add_post(
+                "/v1/sessions/{session_id}/model/switch",
+                self._handle_session_model_switch,
             )
 
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
