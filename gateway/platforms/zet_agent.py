@@ -886,13 +886,15 @@ class ZetAgentAdapter(APIServerAdapter):
     # ------------------------------------------------------------------
 
     async def _handle_model_switch(self, request: "web.Request") -> "web.Response":
-        """POST /v1/model/switch — agent-level model switch without restart.
+        """POST /v1/model/switch — agent-level default model switch.
 
         Called by zettlab-local-server's PUT /api/v1/agent/agents/:id/model
-        endpoint. Updates the profile's config.yaml model.* slot AND
-        live-swaps all cached AIAgent instances so existing sessions pick
-        up the new model immediately (same mechanism as hermes' /model
-        command, but applied to every session at once).
+        endpoint. Only updates the profile's config.yaml model.* slot.
+
+        Sessions without a session-level override will pick up the new
+        default on their next _create_agent call (reads config.yaml).
+        Sessions WITH an override keep their override — aligning with
+        hermes CLI /model --global behavior.
 
         Expected body: {"model": "...", "provider": "...", "base_url": "...", "api_key": "..."}
         """
@@ -908,8 +910,10 @@ class ZetAgentAdapter(APIServerAdapter):
         if not new_model:
             return web.json_response({"ok": False, "error": "model is required"}, status=400)
 
-        # 1. Update profile config.yaml so the change persists across
-        #    gateway restarts and new sessions read the right default.
+        # Update profile config.yaml so the change persists across gateway
+        # restarts and new sessions / sessions without override read the
+        # right default. Session-level overrides are NOT cleared — they
+        # take precedence per session (same as hermes /model --global).
         try:
             from gateway.run import _load_gateway_config, _hermes_home
             from utils import atomic_yaml_write
@@ -931,26 +935,12 @@ class ZetAgentAdapter(APIServerAdapter):
             logger.warning("model-switch: config write failed: %s", exc)
             return web.json_response({"ok": False, "error": f"config write: {exc}"}, status=500)
 
-        # 2. Clear session-level /model overrides — the agent-level switch
-        #    takes precedence; stale per-session overrides would shadow it.
-        gw = getattr(self, "gateway_runner", None)
-        if gw is not None:
-            overrides = getattr(gw, "_session_model_overrides", None)
-            if overrides is not None:
-                overrides.clear()
-
-        # 3. Repin session files — hermes pins {model, base_url} at session
-        #    creation and uses the session value over config.yaml. Without
-        #    updating the files, existing sessions keep calling the old
-        #    model even though config and live agents were swapped.
-        repinned = self._repin_session_files(new_model, new_base_url)
-
         logger.info(
-            "model-switch: model=%s provider=%s repinned=%d sessions",
-            new_model, new_provider, repinned,
+            "model-switch: model=%s provider=%s (config.yaml only, session overrides preserved)",
+            new_model, new_provider,
         )
         return web.json_response({
-            "ok": True, "model": new_model, "repinned": repinned,
+            "ok": True, "model": new_model,
         })
 
     async def _handle_session_model_switch(self, request: "web.Request") -> "web.Response":
