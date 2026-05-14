@@ -244,6 +244,15 @@ class ZetAgentAdapter(APIServerAdapter):
         self._pending_clarify: Dict[str, Dict[str, Any]] = {}
         self._pending_approval: Dict[str, Dict[str, Any]] = {}
 
+        # Active chat-completions turns keyed by X-Hermes-Session-Id, so
+        # POST /v1/sessions/{sid}/interrupt can find the running agent +
+        # asyncio task and stop them on demand. Upstream api_server.py only
+        # tracks /v1/runs by run_id; chat-completions has no built-in
+        # session-keyed stop, which is what ZET-641 needed.
+        self._session_run_lock = threading.Lock()
+        self._active_session_agents: Dict[str, Any] = {}
+        self._active_session_tasks: Dict[str, Any] = {}
+
         # Per-session sticky data: title plus the set of session_ids
         # for which we've already pushed a title (avoid duplicates).
         self._session_lock = threading.Lock()
@@ -448,6 +457,30 @@ class ZetAgentAdapter(APIServerAdapter):
                 self._clarify_queues.pop(session_id, None)
         with self._pending_lock:
             self._pending_clarify.pop(session_id, None)
+
+    def _register_active_session_turn(self, session_id: Optional[str], agent_ref: list, agent_task: Any) -> None:
+        """Stash the in-flight chat-completions turn so the session
+        interrupt endpoint can reach it. agent_ref is the mutable
+        ``[None] -> [AIAgent]`` list the base handler fills in once the
+        agent is constructed; we keep the list itself (not a snapshot)
+        so the interrupt picks up the agent the moment it appears."""
+        if not session_id:
+            return
+        with self._session_run_lock:
+            self._active_session_agents[session_id] = agent_ref
+            self._active_session_tasks[session_id] = agent_task
+
+    def _clear_active_session_turn(self, session_id: Optional[str], agent_ref: list, agent_task: Any) -> None:
+        """Drop the registration ONLY if it still points at the turn we
+        registered. Guards against late-clearing a fresher turn that
+        the same session has already started."""
+        if not session_id:
+            return
+        with self._session_run_lock:
+            if self._active_session_agents.get(session_id) is agent_ref:
+                self._active_session_agents.pop(session_id, None)
+            if self._active_session_tasks.get(session_id) is agent_task:
+                self._active_session_tasks.pop(session_id, None)
 
     # ------------------------------------------------------------------
     # Agent factory override
@@ -722,6 +755,42 @@ class ZetAgentAdapter(APIServerAdapter):
         return ""
 
     # ------------------------------------------------------------------
+    # SSE writer override — track chat-completions turn by session_id
+    # ------------------------------------------------------------------
+
+    async def _write_sse_chat_completion(
+        self, request, completion_id: str, model: str, created: int,
+        stream_q, agent_task, agent_ref=None, session_id: str = None,
+        gateway_session_key: str = None,
+    ):
+        """Register the active turn under session_id for the lifetime of
+        the SSE response, then delegate to the base writer. The
+        ``/v1/sessions/{sid}/interrupt`` handler looks up the same map
+        to stop the agent + cancel the task.
+
+        We register the caller-provided ``agent_ref`` list (not a copy)
+        so the interrupt sees the AIAgent the moment ``_run_agent``
+        fills it in. ``[None]`` is normalised on the way in so the
+        register helper always has a list to stash.
+        """
+        active_ref = agent_ref if agent_ref is not None else [None]
+        self._register_active_session_turn(session_id, active_ref, agent_task)
+        try:
+            return await super()._write_sse_chat_completion(
+                request,
+                completion_id,
+                model,
+                created,
+                stream_q,
+                agent_task,
+                active_ref,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+            )
+        finally:
+            self._clear_active_session_turn(session_id, active_ref, agent_task)
+
+    # ------------------------------------------------------------------
     # HTTP respond handlers — wake blocked agent threads
     # ------------------------------------------------------------------
 
@@ -830,6 +899,115 @@ class ZetAgentAdapter(APIServerAdapter):
             "approval": ap,
             "clarify": cl,
         })
+
+    async def _handle_session_interrupt(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions/{session_id}/interrupt — stop the active
+        chat-completions turn for ``session_id``.
+
+        Mirrors what ``_handle_stop_run`` does for the /v1/runs API,
+        but keyed by ``X-Hermes-Session-Id`` so local-server's
+        ``chat.cancel`` (session-scoped) has a real interrupt path
+        instead of waiting for the SSE keepalive write to fail
+        (up to 30 s during quiet tool periods — see ZET-641).
+
+        Side effects, in order:
+          1. ``agent.interrupt(reason)`` — flips the agent loop's
+             interrupt flag and signals in-flight tools to abort. This
+             is the only step that actually stops the model + tool
+             work; the disconnect path eventually does the same, just
+             slowly.
+          2. Drop any pending clarify entries for this session (set
+             empty response + signal the event) so a thread blocked
+             in ``ask_user_callback`` doesn't dangle past the
+             interrupt.
+          3. Resolve any pending approval as ``deny`` and tear down
+             the registered process / VM workers so long-running
+             tools (terminal, browser) unblock.
+          4. ``task.cancel()`` — cancel the asyncio task wrapper so
+             ``_write_sse_chat_completion`` exits its delta loop.
+
+        Returns 200 with ``status: "stopping"`` when we hit at least
+        one of agent/task, ``"not_running"`` otherwise (caller can
+        treat both as a no-op success — idempotent).
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "")
+        with self._session_run_lock:
+            agent_ref = self._active_session_agents.get(session_id)
+            task = self._active_session_tasks.get(session_id)
+
+        agent = agent_ref[0] if agent_ref else None
+
+        if agent is not None:
+            try:
+                agent.interrupt("Stop requested via Zettlab")
+            except Exception:
+                logger.debug("[zet_agent] session interrupt: agent.interrupt failed", exc_info=True)
+
+        self._interrupt_pending_interactions(session_id)
+
+        if task is not None and not task.done():
+            try:
+                task.cancel()
+            except Exception:
+                logger.debug("[zet_agent] session interrupt: task.cancel failed", exc_info=True)
+
+        status = "stopping" if (agent is not None or task is not None) else "not_running"
+        return web.json_response({"session_id": session_id, "status": status})
+
+    def _interrupt_pending_interactions(self, session_id: str) -> None:
+        """Best-effort cleanup of agent-thread blockers for ``session_id``.
+
+        Without this, ``agent.interrupt()`` flips the flag but the
+        agent thread may still be parked inside
+        ``ask_user_callback`` / approval wait / terminal tool — none
+        of which check ``_interrupt_requested`` while blocked. We
+        resolve each blocker with a benign value so the thread can
+        wake, see the interrupt flag, and exit the loop.
+
+        Every step is wrapped in try/except: this runs during an
+        already-failed turn, and a secondary failure here would mask
+        the original interrupt status returned to the caller.
+        """
+        # Clarify queue: drain pending entries and signal their events
+        # with empty response so the ask_user callback unblocks.
+        with self._clarify_state_lock:
+            clarify_queue = list(self._clarify_queues.pop(session_id, []) or [])
+        for entry in clarify_queue:
+            try:
+                entry.response = ""
+                entry.event.set()
+            except Exception:
+                pass
+
+        # Approval gate: tell hermes the pending approval was denied
+        # so its run loop bails. tools.approval.resolve_gateway_approval
+        # is the same path /v1/sessions/{sid}/approval/respond uses.
+        try:
+            from tools.approval import resolve_gateway_approval
+            resolve_gateway_approval(session_id, "deny")
+        except Exception:
+            logger.debug("[zet_agent] session interrupt: approval cleanup failed", exc_info=True)
+
+        # Long-running tools registered with the per-session process
+        # registry / terminal VM cache.
+        try:
+            from tools.process_registry import process_registry
+            process_registry.kill_all(task_id=session_id)
+        except Exception:
+            logger.debug("[zet_agent] session interrupt: process registry cleanup failed", exc_info=True)
+        try:
+            from tools.terminal_tool import cleanup_vm
+            cleanup_vm(session_id)
+        except Exception:
+            logger.debug("[zet_agent] session interrupt: terminal cleanup failed", exc_info=True)
+
+        with self._pending_lock:
+            self._pending_clarify.pop(session_id, None)
+            self._pending_approval.pop(session_id, None)
 
     # ------------------------------------------------------------------
     # Diagnostic wrapper around base /v1/chat/completions
@@ -1221,6 +1399,10 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_get(
                 "/v1/sessions/{session_id}/pending",
                 self._handle_pending,
+            )
+            self._app.router.add_post(
+                "/v1/sessions/{session_id}/interrupt",
+                self._handle_session_interrupt,
             )
             self._app.router.add_post(
                 "/v1/model/switch",
