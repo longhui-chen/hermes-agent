@@ -3,6 +3,8 @@
 ZPK_OUTPUT ?= build/zettlab-claws.zpk
 ZPK_SRC_DIR := zpk/lib/hermes-agent
 PYPI_INDEX_URL ?= https://pypi.tuna.tsinghua.edu.cn/simple/
+ZPK_INSTALL_SPEC ?= .[all]
+ZPK_PACK_JOBS ?= 0
 
 ZPK_EXCLUDES := \
 	--exclude=.git \
@@ -13,21 +15,38 @@ ZPK_EXCLUDES := \
 	--exclude=.venv \
 	--exclude=node_modules \
 	--exclude=.pytest_cache \
+	--exclude=.ruff_cache \
+	--exclude=.mypy_cache \
 	--exclude=build \
 	--exclude=dist \
 	--exclude=data \
 	--exclude=logs \
 	--exclude=tmp \
+	--exclude=tests \
+	--exclude=docs \
+	--exclude=examples \
+	--exclude=website \
+	--exclude=web \
+	--exclude=ui-tui \
+	--exclude=nix \
+	--exclude=environments \
+	--exclude=packaging \
+	--exclude='*.egg-info' \
+	--exclude=wandb \
+	--exclude=testlogs \
+	--exclude=venv/.zpk-venv.stamp \
+	--exclude=venv/.zpk-install-spec \
 	--exclude=zpk
 
 zpk-venv:
 	rm -rf venv python-runtime
 	uv venv venv --python 3.11
-	UV_LINK_MODE=copy uv pip install --python venv/bin/python --index-url "$(PYPI_INDEX_URL)" .
+	UV_LINK_MODE=copy uv pip install --python venv/bin/python --index-url "$(PYPI_INDEX_URL)" "$(ZPK_INSTALL_SPEC)"
 	test -x venv/bin/hermes
 	venv/bin/hermes --version
+	venv/bin/python -c 'import faster_whisper, onnxruntime, googleapiclient, mautrix, mistralai, boto3, fastapi; print("all extras ok")'
 
-zpk-stage:
+zpk-stage: zpk-venv
 	test -x venv/bin/hermes
 	rm -rf "$(ZPK_SRC_DIR)"
 	mkdir -p "$(ZPK_SRC_DIR)"
@@ -44,7 +63,7 @@ zpk-stage:
 
 zpk-pack: zpk-stage
 	mkdir -p build
-	python3 ../my-scripts/zpk-pack.py -p . -o "$(ZPK_OUTPUT)"
+	python3 ../my-scripts/zpk-pack.py -p . -o "$(ZPK_OUTPUT)" --jobs "$(ZPK_PACK_JOBS)" --quiet
 
 clean-zpk:
 	rm -rf build zpk/.check-app "$(ZPK_SRC_DIR)"
