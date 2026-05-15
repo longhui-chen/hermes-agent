@@ -6843,6 +6843,28 @@ class AIAgent:
                 self._record_streamed_assistant_text(tail)
         self._current_streamed_assistant_text = ""
 
+    def _discard_current_turn_on_interrupt(self, messages: list) -> None:
+        """ZET-641: roll back the current turn when an interrupt fires
+        before the agent produced any visible output (no streaming text,
+        no committed tool call).
+
+        After this, messages ends at the previous turn's tail — the
+        user's message for this turn is gone, no assistant scaffolding
+        either. The app side mirrors this by retracting the user bubble
+        back into the input box; without server-side rollback, state.db
+        would keep a phantom user row that re-surfaces on next session
+        load (orphan user message, no reply).
+
+        Idempotent: if there is no current-turn user message tracked,
+        does nothing. Also clears the streamed-assistant buffers so a
+        stale fragment doesn't leak into the next turn.
+        """
+        idx = getattr(self, "_persist_user_message_idx", None)
+        if isinstance(idx, int) and 0 <= idx < len(messages) and isinstance(messages[idx], dict) and messages[idx].get("role") == "user":
+            del messages[idx:]
+        self._persist_user_message_idx = None
+        self._current_streamed_assistant_text = ""
+
     def _record_streamed_assistant_text(self, text: str) -> None:
         """Accumulate visible assistant text emitted through stream callbacks."""
         if isinstance(text, str) and text:
@@ -12194,7 +12216,36 @@ class AIAgent:
                         self.thinking_callback("")
                     api_elapsed = time.time() - api_start_time
                     self._vprint(f"{self.log_prefix}⚡ Interrupted during API call.", force=True)
-                    self._persist_session(messages, conversation_history)
+                    # ZET-641: two-mode interrupt behavior. Decision pivot is
+                    # whether the agent had produced any *visible* output
+                    # before the interrupt fired:
+                    #
+                    #   - has visible output (some assistant text streamed):
+                    #     persist a partial "interrupted" assistant message
+                    #     so the user keeps what they already saw.
+                    #
+                    #   - pure-thinking interrupt (no visible text, no
+                    #     committed tool yet): discard the whole turn. The
+                    #     app retracts the user message back into the input
+                    #     box; we mirror that server-side by rolling user_msg
+                    #     out of `messages` so state.db doesn't keep a
+                    #     phantom row. Reasoning is intentionally NOT
+                    #     captured as a separate persistence target — the
+                    #     user's directive is "no separate thinking storage",
+                    #     so we don't accumulate it for fallback writes.
+                    partial_text = (getattr(self, "_current_streamed_assistant_text", "") or "").strip()
+                    if partial_text:
+                        messages.append({
+                            "role": "assistant",
+                            "content": partial_text,
+                            "interrupted": True,
+                        })
+                        self._persist_session(messages, conversation_history)
+                    else:
+                        self._discard_current_turn_on_interrupt(messages)
+                        # Skip _persist_session — the final persist at end
+                        # of run_conversation will see the rolled-back tail
+                        # and write nothing new.
                     interrupted = True
                     final_response = f"Operation interrupted: waiting for model response ({api_elapsed:.1f}s elapsed)."
                     break
@@ -14025,6 +14076,24 @@ class AIAgent:
                         _turn_exit_reason = "empty_response_exhausted"
                         reasoning_text = self._extract_reasoning(assistant_message)
                         self._drop_trailing_empty_response_scaffolding(messages)
+                        # ZET-641 race A: when interrupt fires during a
+                        # thinking-only stream, the inner thread returns a
+                        # mock with content=None + reasoning_content=<...>
+                        # (no InterruptedError reaches the outer wrapper),
+                        # which lands here as "truly empty". Without this
+                        # short-circuit we would append an _empty_terminal_sentinel
+                        # row that _persist_session strips, BUT the user_msg
+                        # still gets flushed to state.db → orphan user row
+                        # on next session load. Mirror the InterruptedError
+                        # path (12189): discard the whole turn and let the
+                        # final persist at end of run_conversation see the
+                        # rolled-back tail.
+                        if self._interrupt_requested:
+                            self._discard_current_turn_on_interrupt(messages)
+                            _turn_exit_reason = "interrupted_thinking_discard"
+                            final_response = ""
+                            interrupted = True
+                            break
                         assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
                         assistant_msg["content"] = "(empty)"
                         # This is a user-facing failure sentinel for the gateway,

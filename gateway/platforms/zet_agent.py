@@ -244,6 +244,15 @@ class ZetAgentAdapter(APIServerAdapter):
         self._pending_clarify: Dict[str, Dict[str, Any]] = {}
         self._pending_approval: Dict[str, Dict[str, Any]] = {}
 
+        # Active chat-completions turns keyed by X-Hermes-Session-Id, so
+        # POST /v1/sessions/{sid}/interrupt can find the running agent +
+        # asyncio task and stop them on demand. Upstream api_server.py only
+        # tracks /v1/runs by run_id; chat-completions has no built-in
+        # session-keyed stop, which is what ZET-641 needed.
+        self._session_run_lock = threading.Lock()
+        self._active_session_agents: Dict[str, Any] = {}
+        self._active_session_tasks: Dict[str, Any] = {}
+
         # Per-session sticky data: title plus the set of session_ids
         # for which we've already pushed a title (avoid duplicates).
         self._session_lock = threading.Lock()
@@ -449,6 +458,30 @@ class ZetAgentAdapter(APIServerAdapter):
         with self._pending_lock:
             self._pending_clarify.pop(session_id, None)
 
+    def _register_active_session_turn(self, session_id: Optional[str], agent_ref: list, agent_task: Any) -> None:
+        """Stash the in-flight chat-completions turn so the session
+        interrupt endpoint can reach it. agent_ref is the mutable
+        ``[None] -> [AIAgent]`` list the base handler fills in once the
+        agent is constructed; we keep the list itself (not a snapshot)
+        so the interrupt picks up the agent the moment it appears."""
+        if not session_id:
+            return
+        with self._session_run_lock:
+            self._active_session_agents[session_id] = agent_ref
+            self._active_session_tasks[session_id] = agent_task
+
+    def _clear_active_session_turn(self, session_id: Optional[str], agent_ref: list, agent_task: Any) -> None:
+        """Drop the registration ONLY if it still points at the turn we
+        registered. Guards against late-clearing a fresher turn that
+        the same session has already started."""
+        if not session_id:
+            return
+        with self._session_run_lock:
+            if self._active_session_agents.get(session_id) is agent_ref:
+                self._active_session_agents.pop(session_id, None)
+            if self._active_session_tasks.get(session_id) is agent_task:
+                self._active_session_tasks.pop(session_id, None)
+
     # ------------------------------------------------------------------
     # Agent factory override
     # ------------------------------------------------------------------
@@ -521,6 +554,25 @@ class ZetAgentAdapter(APIServerAdapter):
         runtime_kwargs = _resolve_runtime_agent_kwargs()
         reasoning_config = GatewayRunner._load_reasoning_config()
         model = _resolve_gateway_model()
+
+        # ZET-576: apply session-level model override if present.
+        # _resolve_gateway_model reads config.yaml (agent default), but
+        # session overrides live in gateway_runner._session_model_overrides
+        # which this adapter's _create_agent bypasses. Check it here.
+        gw = getattr(self, "gateway_runner", None)
+        override_key = gateway_session_key or session_id
+        if gw is not None and override_key:
+            override = getattr(gw, "_session_model_overrides", {}).get(override_key)
+            if override:
+                model = override.get("model", model)
+                for k in ("provider", "api_key", "base_url", "api_mode"):
+                    v = override.get(k)
+                    if v is not None:
+                        runtime_kwargs[k] = v
+                logger.info(
+                    "session-model-override applied: session=%s model=%s",
+                    override_key, model,
+                )
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
@@ -703,6 +755,42 @@ class ZetAgentAdapter(APIServerAdapter):
         return ""
 
     # ------------------------------------------------------------------
+    # SSE writer override — track chat-completions turn by session_id
+    # ------------------------------------------------------------------
+
+    async def _write_sse_chat_completion(
+        self, request, completion_id: str, model: str, created: int,
+        stream_q, agent_task, agent_ref=None, session_id: str = None,
+        gateway_session_key: str = None,
+    ):
+        """Register the active turn under session_id for the lifetime of
+        the SSE response, then delegate to the base writer. The
+        ``/v1/sessions/{sid}/interrupt`` handler looks up the same map
+        to stop the agent + cancel the task.
+
+        We register the caller-provided ``agent_ref`` list (not a copy)
+        so the interrupt sees the AIAgent the moment ``_run_agent``
+        fills it in. ``[None]`` is normalised on the way in so the
+        register helper always has a list to stash.
+        """
+        active_ref = agent_ref if agent_ref is not None else [None]
+        self._register_active_session_turn(session_id, active_ref, agent_task)
+        try:
+            return await super()._write_sse_chat_completion(
+                request,
+                completion_id,
+                model,
+                created,
+                stream_q,
+                agent_task,
+                active_ref,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+            )
+        finally:
+            self._clear_active_session_turn(session_id, active_ref, agent_task)
+
+    # ------------------------------------------------------------------
     # HTTP respond handlers — wake blocked agent threads
     # ------------------------------------------------------------------
 
@@ -811,6 +899,115 @@ class ZetAgentAdapter(APIServerAdapter):
             "approval": ap,
             "clarify": cl,
         })
+
+    async def _handle_session_interrupt(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions/{session_id}/interrupt — stop the active
+        chat-completions turn for ``session_id``.
+
+        Mirrors what ``_handle_stop_run`` does for the /v1/runs API,
+        but keyed by ``X-Hermes-Session-Id`` so local-server's
+        ``chat.cancel`` (session-scoped) has a real interrupt path
+        instead of waiting for the SSE keepalive write to fail
+        (up to 30 s during quiet tool periods — see ZET-641).
+
+        Side effects, in order:
+          1. ``agent.interrupt(reason)`` — flips the agent loop's
+             interrupt flag and signals in-flight tools to abort. This
+             is the only step that actually stops the model + tool
+             work; the disconnect path eventually does the same, just
+             slowly.
+          2. Drop any pending clarify entries for this session (set
+             empty response + signal the event) so a thread blocked
+             in ``ask_user_callback`` doesn't dangle past the
+             interrupt.
+          3. Resolve any pending approval as ``deny`` and tear down
+             the registered process / VM workers so long-running
+             tools (terminal, browser) unblock.
+          4. ``task.cancel()`` — cancel the asyncio task wrapper so
+             ``_write_sse_chat_completion`` exits its delta loop.
+
+        Returns 200 with ``status: "stopping"`` when we hit at least
+        one of agent/task, ``"not_running"`` otherwise (caller can
+        treat both as a no-op success — idempotent).
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "")
+        with self._session_run_lock:
+            agent_ref = self._active_session_agents.get(session_id)
+            task = self._active_session_tasks.get(session_id)
+
+        agent = agent_ref[0] if agent_ref else None
+
+        if agent is not None:
+            try:
+                agent.interrupt("Stop requested via Zettlab")
+            except Exception:
+                logger.debug("[zet_agent] session interrupt: agent.interrupt failed", exc_info=True)
+
+        self._interrupt_pending_interactions(session_id)
+
+        if task is not None and not task.done():
+            try:
+                task.cancel()
+            except Exception:
+                logger.debug("[zet_agent] session interrupt: task.cancel failed", exc_info=True)
+
+        status = "stopping" if (agent is not None or task is not None) else "not_running"
+        return web.json_response({"session_id": session_id, "status": status})
+
+    def _interrupt_pending_interactions(self, session_id: str) -> None:
+        """Best-effort cleanup of agent-thread blockers for ``session_id``.
+
+        Without this, ``agent.interrupt()`` flips the flag but the
+        agent thread may still be parked inside
+        ``ask_user_callback`` / approval wait / terminal tool — none
+        of which check ``_interrupt_requested`` while blocked. We
+        resolve each blocker with a benign value so the thread can
+        wake, see the interrupt flag, and exit the loop.
+
+        Every step is wrapped in try/except: this runs during an
+        already-failed turn, and a secondary failure here would mask
+        the original interrupt status returned to the caller.
+        """
+        # Clarify queue: drain pending entries and signal their events
+        # with empty response so the ask_user callback unblocks.
+        with self._clarify_state_lock:
+            clarify_queue = list(self._clarify_queues.pop(session_id, []) or [])
+        for entry in clarify_queue:
+            try:
+                entry.response = ""
+                entry.event.set()
+            except Exception:
+                pass
+
+        # Approval gate: tell hermes the pending approval was denied
+        # so its run loop bails. tools.approval.resolve_gateway_approval
+        # is the same path /v1/sessions/{sid}/approval/respond uses.
+        try:
+            from tools.approval import resolve_gateway_approval
+            resolve_gateway_approval(session_id, "deny")
+        except Exception:
+            logger.debug("[zet_agent] session interrupt: approval cleanup failed", exc_info=True)
+
+        # Long-running tools registered with the per-session process
+        # registry / terminal VM cache.
+        try:
+            from tools.process_registry import process_registry
+            process_registry.kill_all(task_id=session_id)
+        except Exception:
+            logger.debug("[zet_agent] session interrupt: process registry cleanup failed", exc_info=True)
+        try:
+            from tools.terminal_tool import cleanup_vm
+            cleanup_vm(session_id)
+        except Exception:
+            logger.debug("[zet_agent] session interrupt: terminal cleanup failed", exc_info=True)
+
+        with self._pending_lock:
+            self._pending_clarify.pop(session_id, None)
+            self._pending_approval.pop(session_id, None)
 
     # ------------------------------------------------------------------
     # Diagnostic wrapper around base /v1/chat/completions
@@ -934,6 +1131,81 @@ class ZetAgentAdapter(APIServerAdapter):
             "ok": True, "model": new_model, "repinned": repinned,
         })
 
+    async def _handle_session_model_switch(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions/{session_id}/model/switch — session-level model override.
+
+        Unlike the agent-level POST /v1/model/switch, this only changes the
+        model for a single session without touching config.yaml or other
+        sessions.  The override is stored in gateway_runner's
+        ``_session_model_overrides`` dict so the next turn in this session
+        picks up the new model.
+
+        Expected body: {"model": "...", "provider"?: "...", "base_url"?: "...", "api_key"?: "..."}
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "")
+        if not session_id:
+            return web.json_response(
+                _openai_error("session_id is required"), status=400,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "invalid json"}, status=400)
+
+        new_model = body.get("model", "")
+        if not new_model:
+            return web.json_response({"ok": False, "error": "model is required"}, status=400)
+
+        new_provider = body.get("provider", "")
+        new_base_url = body.get("base_url", "")
+        new_api_key = body.get("api_key", "")
+
+        # Build the override dict — only include keys that were provided.
+        override: Dict[str, str] = {"model": new_model}
+        if new_provider:
+            override["provider"] = new_provider
+        if new_base_url:
+            override["base_url"] = new_base_url
+        if new_api_key:
+            override["api_key"] = new_api_key
+
+        # Store override in gateway_runner so the next _create_agent call
+        # for this session reads the overridden model.
+        gw = getattr(self, "gateway_runner", None)
+        if gw is not None:
+            overrides = getattr(gw, "_session_model_overrides", None)
+            if overrides is not None:
+                overrides[session_id] = override
+            evict = getattr(gw, "_evict_cached_agent", None)
+            if callable(evict):
+                try:
+                    evict(session_id)
+                except Exception as exc:
+                    logger.warning(
+                        "session-model-switch: evict_cached_agent failed for %s: %s",
+                        session_id, exc,
+                    )
+
+        # Repin only the single session file so the persisted session
+        # reflects the new model on next gateway restart.
+        repinned = self._repin_single_session_file(session_id, new_model, new_base_url)
+
+        logger.info(
+            "session-model-switch: session=%s model=%s provider=%s repinned=%d",
+            session_id, new_model, new_provider, repinned,
+        )
+        return web.json_response({
+            "ok": True,
+            "session_id": session_id,
+            "model": new_model,
+            "repinned": repinned,
+        })
+
     def _repin_session_files(self, new_model: str, new_base_url: str) -> int:
         """Rewrite {model, base_url} in every session_*.json under _hermes_home/sessions/.
 
@@ -976,6 +1248,56 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception as exc:
                 logger.warning("repin-session: %s failed: %s", f.name, exc)
         return patched
+
+    def _repin_single_session_file(self, session_id: str, new_model: str, new_base_url: str) -> int:
+        """Rewrite {model, base_url} in a single session file.
+
+        Like ``_repin_session_files`` but targets only the file for
+        ``session_id``.  Session files are named ``session_<safe_id>.json``
+        where colons in the session_id are replaced with underscores.
+
+        Returns 1 if the file was updated, 0 if it was not found or had
+        no ``model`` key.
+        """
+        import json as _json
+        from gateway.run import _hermes_home
+
+        # hermes uses the raw session_id in filenames (colons preserved);
+        # some older builds encoded colons to underscores — try both.
+        session_file = _hermes_home / "sessions" / f"session_{session_id}.json"
+        if not session_file.is_file():
+            safe_id = session_id.replace(":", "_")
+            session_file = _hermes_home / "sessions" / f"session_{safe_id}.json"
+            if not session_file.is_file():
+                return 0
+        try:
+            raw = session_file.read_text(encoding="utf-8")
+            doc = _json.loads(raw)
+            if not isinstance(doc, dict) or "model" not in doc:
+                return 0
+            doc["model"] = new_model
+            if "base_url" in doc:
+                doc["base_url"] = new_base_url
+            msgs = doc.get("messages")
+            if isinstance(msgs, list):
+                msgs.append({
+                    "role": "system",
+                    "content": (
+                        f"[System: model switched to {new_model} for this session. "
+                        f"Adjust your self-identification accordingly.]"
+                    ),
+                })
+                doc["message_count"] = len(msgs)
+            tmp = session_file.with_suffix(".json.tmp")
+            tmp.write_text(
+                _json.dumps(doc, indent=2, default=str, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            tmp.rename(session_file)
+            return 1
+        except Exception as exc:
+            logger.warning("repin-single-session: %s failed: %s", session_file.name, exc)
+            return 0
 
     # ------------------------------------------------------------------
     # connect — extend base routes with our respond endpoints
@@ -1079,8 +1401,16 @@ class ZetAgentAdapter(APIServerAdapter):
                 self._handle_pending,
             )
             self._app.router.add_post(
+                "/v1/sessions/{session_id}/interrupt",
+                self._handle_session_interrupt,
+            )
+            self._app.router.add_post(
                 "/v1/model/switch",
                 self._handle_model_switch,
+            )
+            self._app.router.add_post(
+                "/v1/sessions/{session_id}/model/switch",
+                self._handle_session_model_switch,
             )
 
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
