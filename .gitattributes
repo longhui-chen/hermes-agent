@@ -1,2 +1,6 @@
-# Auto-generated files — collapse diffs and exclude from language stats
+# Auto-generated files: collapse diffs and exclude from language stats
 web/package-lock.json linguist-generated=true
+
+# ZPK lifecycle scripts run on Linux targets and must not contain CRLF.
+zpk/*.sh text eol=lf
+zpk/bin/* text eol=lf

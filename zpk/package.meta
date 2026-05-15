@@ -1,0 +1,9 @@
+{
+  "app_id": "com.zettlab.claws",
+  "version": "0.13.0",
+  "update_note": "Package hermes-agent for Zettlab NAS local-server agent gateway.",
+  "service_name": "hermes-agent",
+  "binary": "bin/hermes",
+  "package_type": "app",
+  "app_type": "system"
+}
