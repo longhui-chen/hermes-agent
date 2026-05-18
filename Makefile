@@ -34,7 +34,7 @@ ZPK_EXCLUDES := \
 	--exclude=web \
 	--exclude=ui-tui \
 	--exclude=nix \
-	--exclude=environments \
+	--exclude=./environments \
 	--exclude=packaging \
 	--exclude='*.egg-info' \
 	--exclude=wandb \
@@ -69,6 +69,7 @@ zpk-venv:
 	@test -x venv/bin/hermes
 	@venv/bin/hermes --version
 	@venv/bin/python -c 'import faster_whisper, onnxruntime, googleapiclient, mautrix, mistralai, boto3, fastapi; print("all extras ok")'
+	@venv/bin/python -c 'import tools.environments.local, tools.process_registry; print("gateway imports ok")'
 
 zpk-stage: zpk-venv
 	@echo "Staging hermes-agent ZPK payload..."
