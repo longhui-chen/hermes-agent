@@ -5,6 +5,11 @@ ZPK_SRC_DIR := zpk/lib/hermes-agent
 PYPI_INDEX_URL ?= https://pypi.tuna.tsinghua.edu.cn/simple/
 ZPK_INSTALL_SPEC ?= .[all]
 ZPK_PACK_JOBS ?= 0
+ZPK_VERBOSE ?= 0
+ZPK_LOG_DIR ?= build
+ZPK_UV_VENV_LOG ?= $(ZPK_LOG_DIR)/zpk-uv-venv.log
+ZPK_UV_INSTALL_LOG ?= $(ZPK_LOG_DIR)/zpk-uv-install.log
+ZPK_UV_FLAGS ?= --no-progress
 
 ZPK_EXCLUDES := \
 	--exclude=.git \
@@ -29,7 +34,7 @@ ZPK_EXCLUDES := \
 	--exclude=web \
 	--exclude=ui-tui \
 	--exclude=nix \
-	--exclude=environments \
+	--exclude=./environments \
 	--exclude=packaging \
 	--exclude='*.egg-info' \
 	--exclude=wandb \
@@ -39,27 +44,49 @@ ZPK_EXCLUDES := \
 	--exclude=zpk
 
 zpk-venv:
-	rm -rf venv python-runtime
-	uv venv venv --python 3.11
-	UV_LINK_MODE=copy uv pip install --python venv/bin/python --index-url "$(PYPI_INDEX_URL)" "$(ZPK_INSTALL_SPEC)"
-	test -x venv/bin/hermes
-	venv/bin/hermes --version
-	venv/bin/python -c 'import faster_whisper, onnxruntime, googleapiclient, mautrix, mistralai, boto3, fastapi; print("all extras ok")'
+	@echo "Preparing hermes-agent ZPK venv..."
+	@rm -rf venv python-runtime
+	@mkdir -p "$(ZPK_LOG_DIR)"
+	@if [ "$(ZPK_VERBOSE)" = "1" ]; then \
+		uv $(ZPK_UV_FLAGS) venv venv --python 3.11; \
+	else \
+		uv $(ZPK_UV_FLAGS) venv venv --python 3.11 >"$(ZPK_UV_VENV_LOG)" 2>&1 || { \
+			echo "uv venv failed; showing last 120 log lines from $(ZPK_UV_VENV_LOG)"; \
+			tail -n 120 "$(ZPK_UV_VENV_LOG)" 2>/dev/null || true; \
+			exit 1; \
+		}; \
+	fi
+	@echo "Installing hermes-agent dependencies ($(ZPK_INSTALL_SPEC))..."
+	@if [ "$(ZPK_VERBOSE)" = "1" ]; then \
+		UV_LINK_MODE=copy uv $(ZPK_UV_FLAGS) pip install --python venv/bin/python --index-url "$(PYPI_INDEX_URL)" "$(ZPK_INSTALL_SPEC)"; \
+	else \
+		UV_LINK_MODE=copy uv $(ZPK_UV_FLAGS) pip install --python venv/bin/python --index-url "$(PYPI_INDEX_URL)" "$(ZPK_INSTALL_SPEC)" >"$(ZPK_UV_INSTALL_LOG)" 2>&1 || { \
+			echo "uv pip install failed; showing last 160 log lines from $(ZPK_UV_INSTALL_LOG)"; \
+			tail -n 160 "$(ZPK_UV_INSTALL_LOG)" 2>/dev/null || true; \
+			exit 1; \
+		}; \
+	fi
+	@test -x venv/bin/hermes
+	@venv/bin/hermes --version
+	@venv/bin/python -c 'import faster_whisper, onnxruntime, googleapiclient, mautrix, mistralai, boto3, fastapi; print("all extras ok")'
+	@venv/bin/python -c 'import tools.environments.local, tools.process_registry; print("gateway imports ok")'
 
 zpk-stage: zpk-venv
-	test -x venv/bin/hermes
-	rm -rf "$(ZPK_SRC_DIR)"
-	mkdir -p "$(ZPK_SRC_DIR)"
-	tar $(ZPK_EXCLUDES) -cf - . | tar -xf - -C "$(ZPK_SRC_DIR)"
-	rm -f "$(ZPK_SRC_DIR)/venv/lib64"
-	python_bin=$$(readlink -f venv/bin/python); \
+	@echo "Staging hermes-agent ZPK payload..."
+	@test -x venv/bin/hermes
+	@rm -rf "$(ZPK_SRC_DIR)"
+	@mkdir -p "$(ZPK_SRC_DIR)"
+	@tar $(ZPK_EXCLUDES) -cf - . | tar -xf - -C "$(ZPK_SRC_DIR)"
+	@rm -f "$(ZPK_SRC_DIR)/venv/lib64"
+	@python_bin=$$(readlink -f venv/bin/python); \
 	rm -f "$(ZPK_SRC_DIR)/venv/bin/python" "$(ZPK_SRC_DIR)/venv/bin/python3" "$(ZPK_SRC_DIR)/venv/bin/python3.11"; \
 	cp "$$python_bin" "$(ZPK_SRC_DIR)/venv/bin/python"; \
 	cp "$$python_bin" "$(ZPK_SRC_DIR)/venv/bin/python3"; \
 	cp "$$python_bin" "$(ZPK_SRC_DIR)/venv/bin/python3.11"
-	chmod 0755 "$(ZPK_SRC_DIR)/venv/bin/python" "$(ZPK_SRC_DIR)/venv/bin/python3" "$(ZPK_SRC_DIR)/venv/bin/python3.11"
-	find "$(ZPK_SRC_DIR)" -type l -delete
-	chmod 0755 zpk/install.sh zpk/update.sh zpk/uninstall.sh zpk/bin/hermes
+	@chmod 0755 "$(ZPK_SRC_DIR)/venv/bin/python" "$(ZPK_SRC_DIR)/venv/bin/python3" "$(ZPK_SRC_DIR)/venv/bin/python3.11"
+	@find "$(ZPK_SRC_DIR)" -type l -delete
+	@chmod 0755 zpk/install.sh zpk/update.sh zpk/uninstall.sh zpk/bin/hermes
+	@echo "Hermes-agent ZPK payload staged at $(ZPK_SRC_DIR)"
 
 zpk-pack: zpk-stage
 	mkdir -p build
