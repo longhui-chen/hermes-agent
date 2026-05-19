@@ -4,7 +4,7 @@ import time
 import pytest
 from pathlib import Path
 
-from hermes_state import SessionDB
+from hermes_state import SCHEMA_VERSION, SessionDB
 
 
 @pytest.fixture()
@@ -135,6 +135,40 @@ class TestSessionLifecycle:
 
         child = db.get_session("child")
         assert child["parent_session_id"] == "parent"
+
+
+# =========================================================================
+# Session overrides
+# =========================================================================
+
+class TestSessionOverrides:
+    def test_session_override_crud(self, db):
+        override = {
+            "model": "glm-5",
+            "provider": "custom",
+            "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+            "api_key": "local-ai-proxy",
+        }
+
+        db.set_session_override("s1", "model", override)
+        assert db.get_session_override("s1", "model") == override
+        assert db.get_all_session_overrides("model") == {"s1": override}
+
+        updated = dict(override, model="glm-5.1")
+        db.set_session_override("s1", "model", updated)
+        db.set_session_override("s2", "model", dict(override, model="deepseek-v4-flash"))
+
+        assert db.get_session_override("s1", "model") == updated
+        assert db.get_all_session_overrides("model") == {
+            "s1": updated,
+            "s2": dict(override, model="deepseek-v4-flash"),
+        }
+
+        db.delete_session_override("s1", "model")
+        assert db.get_session_override("s1", "model") is None
+        assert db.get_all_session_overrides("model") == {
+            "s2": dict(override, model="deepseek-v4-flash"),
+        }
 
 
 # =========================================================================
@@ -1447,7 +1481,7 @@ class TestSchemaInit:
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 11
+        assert version == SCHEMA_VERSION
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
@@ -1744,7 +1778,7 @@ class TestSchemaInit:
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 11
+        assert cursor.fetchone()[0] == SCHEMA_VERSION
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")
@@ -2939,7 +2973,6 @@ class TestFTS5ToolCallMigration:
                 "SELECT version FROM schema_version LIMIT 1"
             ).fetchone()
             version = row["version"] if hasattr(row, "keys") else row[0]
-            assert version == 11
+            assert version == SCHEMA_VERSION
         finally:
             session_db.close()
-
