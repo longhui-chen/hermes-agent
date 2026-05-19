@@ -33,7 +33,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 11
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -3026,4 +3026,3 @@ class SessionDB:
             except Exception:
                 continue
         return result
-
