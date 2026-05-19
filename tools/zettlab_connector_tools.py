@@ -13,6 +13,7 @@ real connector call fails and the model receives that error.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -38,6 +39,42 @@ def _is_connector_tool_name(name: str) -> bool:
 
 def _model_tool_name(canonical_name: str) -> str:
     return _MODEL_TOOL_NAME_RE.sub("_", str(canonical_name).strip())
+
+
+def _normalise_tool_schema(schema: Any) -> Dict[str, Any]:
+    """Return an OpenAI-compatible object schema for a connector tool.
+
+    The connector runtime speaks JSON Schema, but some providers omit
+    optional fields as null. OpenAI-compatible function calling rejects
+    ``required: null``; normalize that at the bridge so canonical connector
+    schemas can pass through without leaking provider quirks into Hermes.
+    """
+    if not isinstance(schema, dict):
+        return {"type": "object", "properties": {}, "additionalProperties": True}
+
+    def clean(value: Any) -> Any:
+        if isinstance(value, dict):
+            out: Dict[str, Any] = {}
+            for key, child in value.items():
+                if key == "required":
+                    if isinstance(child, list):
+                        out[key] = [item for item in child if isinstance(item, str)]
+                    elif child is not None:
+                        out[key] = []
+                    continue
+                out[key] = clean(child)
+            return out
+        if isinstance(value, list):
+            return [clean(item) for item in value]
+        return value
+
+    normalized = clean(copy.deepcopy(schema))
+    if not isinstance(normalized, dict):
+        return {"type": "object", "properties": {}, "additionalProperties": True}
+    normalized.setdefault("type", "object")
+    if normalized.get("type") == "object" and not isinstance(normalized.get("properties"), dict):
+        normalized["properties"] = {}
+    return normalized
 
 
 def _normalise_names(values: Any) -> List[str]:
@@ -224,16 +261,14 @@ def _list_available_connector_schemas(tool_names: Iterable[str]) -> Dict[str, Di
         name = str(item.get("name") or "").strip()
         if name not in wanted:
             continue
-        schema = item.get("inputSchema")
-        if not isinstance(schema, dict):
-            schema = {"type": "object", "properties": {}, "additionalProperties": True}
+        schema = _normalise_tool_schema(item.get("inputSchema"))
         alias = _model_tool_name(name)
         description = str(item.get("description") or f"Call Zettlab connector tool {name}.")
         schemas[name] = {
             "name": alias,
             "description": (
-                f"Model-safe alias for registered connector skill tool `{name}`. "
-                f"{description}"
+                f"Internal model-safe alias for connector tool `{name}`. "
+                f"When naming this tool in user-facing text, use `{name}`. {description}"
             ),
             "parameters": schema,
         }
@@ -245,7 +280,8 @@ def _generic_tool_schema(name: str) -> Dict[str, Any]:
     return {
         "name": _model_tool_name(name),
         "description": (
-            f"Model-safe alias for registered connector skill tool `{name}`. "
+            f"Internal model-safe alias for connector tool `{name}`. "
+            f"When naming this tool in user-facing text, use `{name}`. "
             f"Call the Zettlab {provider} connector runtime with the current "
             "user, agent, and chat authorization context."
         ),
