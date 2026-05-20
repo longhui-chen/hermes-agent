@@ -1126,11 +1126,12 @@ class ZetAgentAdapter(APIServerAdapter):
 
         Unlike the agent-level POST /v1/model/switch, this only changes the
         model for a single session without touching config.yaml or other
-        sessions.  The override is stored in gateway_runner's
-        ``_session_model_overrides`` dict so the next turn in this session
-        picks up the new model.
+        sessions. Local-server owns persistence in
+        ``session_model_overrides.json``; Hermes only applies the runtime
+        override in memory so the next turn in this session picks up the
+        new model.
 
-        Expected body: {"model": "...", "provider"?: "...", "base_url"?: "...", "api_key"?: "..."}
+        Expected body: {"model": "...", "provider"?: "...", "base_url"?: "...", "api_key"?: "...", "api_mode"?: "..."}
         """
         auth_err = self._check_auth(request)
         if auth_err:
@@ -1154,15 +1155,21 @@ class ZetAgentAdapter(APIServerAdapter):
         new_provider = body.get("provider", "")
         new_base_url = body.get("base_url", "")
         new_api_key = body.get("api_key", "")
+        new_api_mode = body.get("api_mode", "")
+        new_context_length = body.get("context_length", None)
 
         # Build the override dict — only include keys that were provided.
-        override: Dict[str, str] = {"model": new_model}
+        override: Dict[str, Any] = {"model": new_model}
         if new_provider:
             override["provider"] = new_provider
         if new_base_url:
             override["base_url"] = new_base_url
         if new_api_key:
             override["api_key"] = new_api_key
+        if new_api_mode:
+            override["api_mode"] = new_api_mode
+        if new_context_length is not None:
+            override["context_length"] = new_context_length
 
         # Store override in gateway_runner so the next _create_agent call
         # for this session reads the overridden model.
@@ -1180,17 +1187,6 @@ class ZetAgentAdapter(APIServerAdapter):
                         "session-model-switch: evict_cached_agent failed for %s: %s",
                         session_id, exc,
                     )
-
-        # Persist override to state.db so it survives gateway restarts.
-        try:
-            session_db = getattr(gw, "_session_db", None) if gw is not None else None
-            if session_db is not None and hasattr(session_db, "set_session_override"):
-                session_db.set_session_override(session_id, "model", override)
-        except Exception as exc:
-            logger.warning(
-                "session-model-switch: state.db persist failed for %s: %s",
-                session_id, exc,
-            )
 
         logger.info(
             "session-model-switch: session=%s model=%s provider=%s",
