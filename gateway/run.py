@@ -1352,6 +1352,26 @@ class GatewayRunner:
             except Exception as exc:
                 logger.debug("state.db auto-maintenance skipped: %s", exc)
 
+        # Restore explicit session-level model overrides from state.db so
+        # they survive gateway restarts.  Restore every stored override,
+        # even when it currently matches config.yaml: the row means the
+        # user pinned this session, so a later agent-level switch must not
+        # move it.
+        if self._session_db is not None:
+            try:
+                stored = self._session_db.get_all_session_overrides("model")
+                if stored:
+                    for sid, ov in stored.items():
+                        if ov.get("model"):
+                            self._session_model_overrides[sid] = ov
+                    if self._session_model_overrides:
+                        logger.info(
+                            "session-model-overrides: restored %d from state.db",
+                            len(self._session_model_overrides),
+                        )
+            except Exception as exc:
+                logger.debug("session-model-overrides restore skipped: %s", exc)
+
         # Opportunistic shadow-repo cleanup — deletes orphan/stale
         # checkpoint repos under ~/.hermes/checkpoints/.  Opt-in via
         # checkpoints.auto_prune, idempotent via .last_prune marker.
