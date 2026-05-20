@@ -578,7 +578,19 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "schedule": {
                 "type": "string",
-                "description": "For create/update: '30m', 'every 2h', '0 9 * * *', or ISO timestamp"
+                "description": (
+                    "For create/update. Pick the format based on user intent:\n"
+                    "  - RECURRING (user said 每天/每周/每隔/每N分钟/repeat/every/daily): "
+                    "use cron expression 'M H * * *' (e.g. '35 14 * * *' for daily at 14:35) "
+                    "or 'every Nm' / 'every Nh' (e.g. 'every 10m' for every 10 minutes).\n"
+                    "  - ONE-SHOT (user said a single specific time, no repetition): "
+                    "use ISO timestamp 'YYYY-MM-DDTHH:MM:SS' or a duration like '30m' / '2h' / '1d' "
+                    "(meaning from now).\n"
+                    "WARNING: A bare duration ('10m') or ISO timestamp fires ONCE and the job is "
+                    "marked completed — do NOT use these formats when the user wants the job to "
+                    "repeat. If unsure (e.g. '每10分钟提醒我喝水一次' — '一次' here means 'each "
+                    "cycle', not 'only once'), default to 'every Nm' so the job keeps firing."
+                ),
             },
             "name": {
                 "type": "string",
@@ -586,11 +598,41 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "repeat": {
                 "type": "integer",
-                "description": "Optional repeat count. Omit for defaults (once for one-shot, forever for recurring)."
+                "description": (
+                    "Optional total execution cap. OMIT this parameter entirely to get the "
+                    "correct default behavior: one-shot schedules run 1 time, recurring schedules "
+                    "(cron / every-N) run FOREVER. "
+                    "Do NOT pass a large sentinel like 999999 to mean 'forever' — that creates "
+                    "a hard cap and the job will eventually stop. "
+                    "Only set this when the user explicitly says a finite count "
+                    "(e.g. '提醒我 3 次' → repeat=3)."
+                ),
             },
             "deliver": {
                 "type": "string",
-                "description": "Omit this parameter to auto-deliver back to the current chat and topic (recommended). Auto-detection preserves thread/topic context. Only set explicitly when the user asks to deliver somewhere OTHER than the current conversation. Values: 'origin' (same as omitting), 'local' (no delivery, save only), 'all' (fan out to every connected home channel), or platform:chat_id:thread_id for a specific destination. Combine with comma: 'origin,all' delivers to the origin plus every other connected channel. Examples: 'telegram:-1001234567890:17585', 'discord:#engineering', 'sms:+15551234567', 'all'. WARNING: 'platform:chat_id' without :thread_id loses topic targeting. 'all' resolves at fire time, so a job created before a channel was wired up will pick it up automatically once connected."
+                "description": (
+                    "ALLOWED VALUES (anything else silently drops messages):\n"
+                    "  - omit / 'origin' — auto-deliver to the current chat (recommended)\n"
+                    "  - 'local' — save output to file only, no delivery\n"
+                    "  - 'all' — fan out to every connected home channel "
+                    "(resolves at fire time; if no channels are wired up the delivery resolves "
+                    "to empty and the cron output goes nowhere — last_delivery_error="
+                    "'no delivery target resolved for deliver=all'. Don't pick 'all' unless "
+                    "the user explicitly asked for cross-channel broadcast.)\n"
+                    "  - '<platform>:<chat_id>[:<thread_id>]' — explicit destination "
+                    "(e.g. 'telegram:-1001234567890:17585', 'discord:#engineering')\n"
+                    "  - comma-separated combinations (e.g. 'origin,all' = origin plus every "
+                    "other connected channel)\n"
+                    "Do NOT invent values like 'everyone', 'broadcast', 'channel' — only the "
+                    "above are recognized.\n"
+                    "If a previous task's last_delivery_error mentions \"unknown platform "
+                    "'zettlab'\", that error is known cosmetic noise — the message DID reach "
+                    "the user via WebSocket. Do NOT 'fix' it by changing deliver to 'all' or "
+                    "any other value; leave deliver as is (omit / 'origin').\n\n"
+                    "Auto-detection preserves thread/topic context — only set explicitly when "
+                    "the user asks for a different destination. WARNING: 'platform:chat_id' "
+                    "without ':thread_id' loses topic targeting."
+                ),
             },
             "skills": {
                 "type": "array",
