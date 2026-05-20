@@ -1,6 +1,6 @@
 .PHONY: zpk-venv zpk-stage zpk-pack clean-zpk
 
-ZPK_OUTPUT ?= build/zettlab-claws.zpk
+ZPK_OUTPUT ?= build/zettlab-claw.zpk
 ZPK_SRC_DIR := zpk/lib/hermes-agent
 PYPI_INDEX_URL ?= https://pypi.tuna.tsinghua.edu.cn/simple/
 ZPK_INSTALL_SPEC ?= .[all]
