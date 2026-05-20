@@ -1859,6 +1859,7 @@ class GatewayRunner:
                 "api_key": override.get("api_key"),
                 "base_url": override.get("base_url"),
                 "api_mode": override.get("api_mode"),
+                "config_context_length": override.get("context_length"),
             }
             if override_runtime.get("api_key"):
                 logger.debug(
@@ -1927,6 +1928,7 @@ class GatewayRunner:
             "base_url": runtime_kwargs.get("base_url"),
             "provider": runtime_kwargs.get("provider"),
             "api_mode": runtime_kwargs.get("api_mode"),
+            "config_context_length": runtime_kwargs.get("config_context_length"),
             "command": runtime_kwargs.get("command"),
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
@@ -1939,6 +1941,7 @@ class GatewayRunner:
                 runtime["provider"],
                 runtime["base_url"],
                 runtime["api_mode"],
+                runtime["config_context_length"],
                 runtime["command"],
                 tuple(runtime["args"]),
             ),
@@ -13891,6 +13894,9 @@ class GatewayRunner:
             val = override.get(key)
             if val is not None:
                 runtime_kwargs[key] = val
+        context_length = override.get("context_length")
+        if context_length is not None:
+            runtime_kwargs["config_context_length"] = context_length
         return model, runtime_kwargs
 
     def _is_intentional_model_switch(self, session_key: str, agent_model: str) -> bool:
