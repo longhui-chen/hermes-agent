@@ -1181,19 +1181,25 @@ class ZetAgentAdapter(APIServerAdapter):
                         session_id, exc,
                     )
 
-        # Repin only the single session file so the persisted session
-        # reflects the new model on next gateway restart.
-        repinned = self._repin_single_session_file(session_id, new_model, new_base_url)
+        # Persist override to state.db so it survives gateway restarts.
+        try:
+            session_db = getattr(gw, "_session_db", None) if gw is not None else None
+            if session_db is not None and hasattr(session_db, "set_session_override"):
+                session_db.set_session_override(session_id, "model", override)
+        except Exception as exc:
+            logger.warning(
+                "session-model-switch: state.db persist failed for %s: %s",
+                session_id, exc,
+            )
 
         logger.info(
-            "session-model-switch: session=%s model=%s provider=%s repinned=%d",
-            session_id, new_model, new_provider, repinned,
+            "session-model-switch: session=%s model=%s provider=%s",
+            session_id, new_model, new_provider,
         )
         return web.json_response({
             "ok": True,
             "session_id": session_id,
             "model": new_model,
-            "repinned": repinned,
         })
 
     def _repin_session_files(self, new_model: str, new_base_url: str) -> int:
