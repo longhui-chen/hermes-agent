@@ -1199,6 +1199,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        config_context_length: int = None,
     ):
         """
         Initialize the AI Agent.
@@ -1247,6 +1248,8 @@ class AIAgent:
             load_soul_identity (bool): If True, still use ~/.hermes/SOUL.md as the primary
                 identity even when skip_context_files=True. Project context files from the cwd
                 remain skipped.
+            config_context_length (int): Per-agent context window override. When provided,
+                it takes precedence over model.context_length in config.yaml.
         """
         _install_safe_stdio()
 
@@ -2198,8 +2201,12 @@ class AIAgent:
                     )
         self._session_init_model_config["max_tokens"] = self.max_tokens
 
-        # Read explicit context_length override from model config
-        if isinstance(_model_cfg, dict):
+        # Read explicit context_length override from constructor or model config.
+        # Gateway session overrides use the constructor path so a single pinned
+        # session can carry a context window without mutating profile config.
+        if config_context_length is not None:
+            _config_context_length = config_context_length
+        elif isinstance(_model_cfg, dict):
             _config_context_length = _model_cfg.get("context_length")
         else:
             _config_context_length = None

@@ -569,6 +569,9 @@ class ZetAgentAdapter(APIServerAdapter):
                     v = override.get(k)
                     if v is not None:
                         runtime_kwargs[k] = v
+                context_length = override.get("context_length")
+                if context_length is not None:
+                    runtime_kwargs["config_context_length"] = context_length
                 logger.info(
                     "session-model-override applied: session=%s model=%s",
                     override_key, model,
@@ -1074,7 +1077,7 @@ class ZetAgentAdapter(APIServerAdapter):
         Sessions WITH an override keep their override — aligning with
         hermes CLI /model --global behavior.
 
-        Expected body: {"model": "...", "provider": "...", "base_url": "...", "api_key": "..."}
+        Expected body: {"model": "...", "provider": "...", "base_url": "...", "api_key": "...", "api_mode"?: "...", "context_length"?: 123}
         """
         try:
             body = await request.json()
@@ -1085,6 +1088,8 @@ class ZetAgentAdapter(APIServerAdapter):
         new_provider = body.get("provider", "")
         new_base_url = body.get("base_url", "")
         new_api_key = body.get("api_key", "")
+        new_api_mode = body.get("api_mode", "")
+        new_context_length = body.get("context_length", None)
         if not new_model:
             return web.json_response({"ok": False, "error": "model is required"}, status=400)
 
@@ -1106,6 +1111,19 @@ class ZetAgentAdapter(APIServerAdapter):
                 model_slot["base_url"] = new_base_url
             if new_api_key:
                 model_slot["api_key"] = new_api_key
+            if "api_mode" in body:
+                if new_api_mode:
+                    model_slot["api_mode"] = new_api_mode
+                else:
+                    model_slot.pop("api_mode", None)
+            if "context_length" in body:
+                parsed_context_length = 0
+                if new_context_length is not None and str(new_context_length).strip() != "":
+                    parsed_context_length = int(new_context_length)
+                if parsed_context_length > 0:
+                    model_slot["context_length"] = parsed_context_length
+                else:
+                    model_slot.pop("context_length", None)
             cfg["model"] = model_slot
             config_path = _hermes_home / "config.yaml"
             atomic_yaml_write(config_path, cfg)
@@ -1126,11 +1144,12 @@ class ZetAgentAdapter(APIServerAdapter):
 
         Unlike the agent-level POST /v1/model/switch, this only changes the
         model for a single session without touching config.yaml or other
-        sessions.  The override is stored in gateway_runner's
-        ``_session_model_overrides`` dict so the next turn in this session
-        picks up the new model.
+        sessions. Local-server owns persistence in
+        ``session_model_overrides.json``; Hermes only applies the runtime
+        override in memory so the next turn in this session picks up the
+        new model.
 
-        Expected body: {"model": "...", "provider"?: "...", "base_url"?: "...", "api_key"?: "..."}
+        Expected body: {"model": "...", "provider"?: "...", "base_url"?: "...", "api_key"?: "...", "api_mode"?: "..."}
         """
         auth_err = self._check_auth(request)
         if auth_err:
@@ -1154,15 +1173,21 @@ class ZetAgentAdapter(APIServerAdapter):
         new_provider = body.get("provider", "")
         new_base_url = body.get("base_url", "")
         new_api_key = body.get("api_key", "")
+        new_api_mode = body.get("api_mode", "")
+        new_context_length = body.get("context_length", None)
 
         # Build the override dict — only include keys that were provided.
-        override: Dict[str, str] = {"model": new_model}
+        override: Dict[str, Any] = {"model": new_model}
         if new_provider:
             override["provider"] = new_provider
         if new_base_url:
             override["base_url"] = new_base_url
         if new_api_key:
             override["api_key"] = new_api_key
+        if new_api_mode:
+            override["api_mode"] = new_api_mode
+        if new_context_length is not None:
+            override["context_length"] = new_context_length
 
         # Store override in gateway_runner so the next _create_agent call
         # for this session reads the overridden model.
@@ -1180,17 +1205,6 @@ class ZetAgentAdapter(APIServerAdapter):
                         "session-model-switch: evict_cached_agent failed for %s: %s",
                         session_id, exc,
                     )
-
-        # Persist override to state.db so it survives gateway restarts.
-        try:
-            session_db = getattr(gw, "_session_db", None) if gw is not None else None
-            if session_db is not None and hasattr(session_db, "set_session_override"):
-                session_db.set_session_override(session_id, "model", override)
-        except Exception as exc:
-            logger.warning(
-                "session-model-switch: state.db persist failed for %s: %s",
-                session_id, exc,
-            )
 
         logger.info(
             "session-model-switch: session=%s model=%s provider=%s",

@@ -138,40 +138,6 @@ class TestSessionLifecycle:
 
 
 # =========================================================================
-# Session overrides
-# =========================================================================
-
-class TestSessionOverrides:
-    def test_session_override_crud(self, db):
-        override = {
-            "model": "glm-5",
-            "provider": "custom",
-            "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
-            "api_key": "local-ai-proxy",
-        }
-
-        db.set_session_override("s1", "model", override)
-        assert db.get_session_override("s1", "model") == override
-        assert db.get_all_session_overrides("model") == {"s1": override}
-
-        updated = dict(override, model="glm-5.1")
-        db.set_session_override("s1", "model", updated)
-        db.set_session_override("s2", "model", dict(override, model="deepseek-v4-flash"))
-
-        assert db.get_session_override("s1", "model") == updated
-        assert db.get_all_session_overrides("model") == {
-            "s1": updated,
-            "s2": dict(override, model="deepseek-v4-flash"),
-        }
-
-        db.delete_session_override("s1", "model")
-        assert db.get_session_override("s1", "model") is None
-        assert db.get_all_session_overrides("model") == {
-            "s2": dict(override, model="deepseek-v4-flash"),
-        }
-
-
-# =========================================================================
 # Message storage
 # =========================================================================
 

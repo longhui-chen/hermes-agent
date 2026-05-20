@@ -248,14 +248,6 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
-
-CREATE TABLE IF NOT EXISTS session_overrides (
-    session_id TEXT NOT NULL,
-    key TEXT NOT NULL,
-    value TEXT NOT NULL,
-    updated_at REAL NOT NULL,
-    PRIMARY KEY (session_id, key)
-);
 """
 
 FTS_SQL = """
@@ -2971,58 +2963,3 @@ class SessionDB:
                 (error[:500], session_id),
             )
         self._execute_write(_do)
-
-    # ── Session overrides ──
-
-    def set_session_override(self, session_id: str, key: str, value_dict: dict) -> None:
-        """UPSERT a session-level override (e.g. model switch)."""
-        import json as _json
-        value_json = _json.dumps(value_dict, ensure_ascii=False)
-        def _do(conn):
-            conn.execute(
-                "INSERT INTO session_overrides (session_id, key, value, updated_at) "
-                "VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(session_id, key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-                (session_id, key, value_json, time.time()),
-            )
-        self._execute_write(_do)
-
-    def get_session_override(self, session_id: str, key: str) -> Optional[Dict[str, Any]]:
-        """Read a single session override. Returns None if not set."""
-        import json as _json
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT value FROM session_overrides WHERE session_id=? AND key=?",
-                (session_id, key),
-            ).fetchone()
-        if row is None:
-            return None
-        try:
-            return _json.loads(row[0])
-        except Exception:
-            return None
-
-    def delete_session_override(self, session_id: str, key: str) -> None:
-        """Remove a session override."""
-        def _do(conn):
-            conn.execute(
-                "DELETE FROM session_overrides WHERE session_id=? AND key=?",
-                (session_id, key),
-            )
-        self._execute_write(_do)
-
-    def get_all_session_overrides(self, key: str) -> Dict[str, Dict[str, Any]]:
-        """Bulk-read all overrides for a given key. Returns {session_id: value_dict}."""
-        import json as _json
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT session_id, value FROM session_overrides WHERE key=?",
-                (key,),
-            ).fetchall()
-        result: Dict[str, Dict[str, Any]] = {}
-        for row in rows:
-            try:
-                result[row[0]] = _json.loads(row[1])
-            except Exception:
-                continue
-        return result
