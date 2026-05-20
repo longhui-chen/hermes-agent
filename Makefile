@@ -1,6 +1,6 @@
 .PHONY: zpk-venv zpk-stage zpk-pack clean-zpk
 
-ZPK_OUTPUT ?= build/zettlab-claws.zpk
+ZPK_OUTPUT ?= build/zettlab-claw.zpk
 ZPK_SRC_DIR := zpk/lib/hermes-agent
 PYPI_INDEX_URL ?= https://pypi.tuna.tsinghua.edu.cn/simple/
 ZPK_INSTALL_SPEC ?= .[all]
@@ -66,10 +66,7 @@ zpk-venv:
 			exit 1; \
 		}; \
 	fi
-	@test -x venv/bin/hermes
-	@venv/bin/hermes --version
-	@venv/bin/python -c 'import faster_whisper, onnxruntime, googleapiclient, mautrix, mistralai, boto3, fastapi; print("all extras ok")'
-	@venv/bin/python -c 'import tools.environments.local, tools.process_registry; print("gateway imports ok")'
+	@venv/bin/python scripts/check_zpk_payload.py
 
 zpk-stage: zpk-venv
 	@echo "Staging hermes-agent ZPK payload..."

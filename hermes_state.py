@@ -2963,4 +2963,3 @@ class SessionDB:
                 (error[:500], session_id),
             )
         self._execute_write(_do)
-

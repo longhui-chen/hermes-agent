@@ -1192,7 +1192,7 @@ class GatewayRunner:
     _restart_detached: bool = False
     _restart_via_service: bool = False
     _stop_task: Optional[asyncio.Task] = None
-    _session_model_overrides: Dict[str, Dict[str, str]] = {}
+    _session_model_overrides: Dict[str, Dict[str, Any]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
 
     def __init__(self, config: Optional[GatewayConfig] = None):
@@ -1277,7 +1277,7 @@ class GatewayRunner:
 
         # Per-session model overrides from /model command.
         # Key: session_key, Value: dict with model/provider/api_key/base_url/api_mode
-        self._session_model_overrides: Dict[str, Dict[str, str]] = {}
+        self._session_model_overrides: Dict[str, Dict[str, Any]] = {}
         # Per-session reasoning effort overrides from /reasoning.
         # Key: session_key, Value: parsed reasoning config dict.
         self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
@@ -1351,6 +1351,23 @@ class GatewayRunner:
                     )
             except Exception as exc:
                 logger.debug("state.db auto-maintenance skipped: %s", exc)
+
+        # Restore explicit session-level model overrides written by the
+        # Zettlab local-server. Local-server owns the control-plane state;
+        # Hermes consumes this profile-local JSON at startup and only keeps
+        # runtime overrides in memory afterwards.
+        try:
+            from gateway.session_model_overrides import load_session_model_overrides
+
+            stored = load_session_model_overrides()
+            if stored:
+                self._session_model_overrides.update(stored)
+                logger.info(
+                    "session-model-overrides: restored %d from profile json",
+                    len(stored),
+                )
+        except Exception as exc:
+            logger.debug("session-model-overrides restore skipped: %s", exc)
 
         # Opportunistic shadow-repo cleanup — deletes orphan/stale
         # checkpoint repos under ~/.hermes/checkpoints/.  Opt-in via
@@ -1842,6 +1859,7 @@ class GatewayRunner:
                 "api_key": override.get("api_key"),
                 "base_url": override.get("base_url"),
                 "api_mode": override.get("api_mode"),
+                "config_context_length": override.get("context_length"),
             }
             if override_runtime.get("api_key"):
                 logger.debug(
@@ -1910,6 +1928,7 @@ class GatewayRunner:
             "base_url": runtime_kwargs.get("base_url"),
             "provider": runtime_kwargs.get("provider"),
             "api_mode": runtime_kwargs.get("api_mode"),
+            "config_context_length": runtime_kwargs.get("config_context_length"),
             "command": runtime_kwargs.get("command"),
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
@@ -1922,6 +1941,7 @@ class GatewayRunner:
                 runtime["provider"],
                 runtime["base_url"],
                 runtime["api_mode"],
+                runtime["config_context_length"],
                 runtime["command"],
                 tuple(runtime["args"]),
             ),
@@ -13874,6 +13894,9 @@ class GatewayRunner:
             val = override.get(key)
             if val is not None:
                 runtime_kwargs[key] = val
+        context_length = override.get("context_length")
+        if context_length is not None:
+            runtime_kwargs["config_context_length"] = context_length
         return model, runtime_kwargs
 
     def _is_intentional_model_switch(self, session_key: str, agent_model: str) -> bool:
