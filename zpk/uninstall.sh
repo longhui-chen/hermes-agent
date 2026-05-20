@@ -3,7 +3,7 @@ set -euo pipefail
 
 APP_ROOT=$(dirname "$(readlink -f "$0")")
 APP_BASE=$(dirname "$APP_ROOT")
-APP_ID="com.zettlab.claws"
+APP_ID="com.zettlab.claw"
 KEEP_DATA=false
 HERMES_LINK="/usr/local/bin/hermes"
 EXPECTED_DATA_TARGET="/zettos/main/data/$APP_ID"
