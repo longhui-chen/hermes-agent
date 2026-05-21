@@ -4,6 +4,18 @@ description: "Use the user's already-authorized Zettlab apps such as GitHub, Lin
 version: 1.0.0
 author: Zettlab
 license: proprietary
+prerequisites:
+  tools:
+    - github.list_repos
+    - github.list_issues
+    - github.list_commits
+    - github.create_issue
+    - linear.list_issues
+    - linear.create_issue
+    - linear.update_issue
+    - notion.search
+    - notion.get_page
+    - notion.create_page
 metadata:
   hermes:
     tags: [connectors, zettlab, github, linear, notion, oauth, authorized-apps]
@@ -19,6 +31,8 @@ metadata:
 Use this skill when the user asks the agent to work with an app they have already authorized in Zettlab Connectors, especially GitHub, Linear, or Notion.
 
 The user's OAuth authorization is managed by Zettlab. Do not ask for personal API keys. Do not read `GITHUB_TOKEN`, `GH_TOKEN`, `LINEAR_API_KEY`, `NOTION_API_KEY`, or provider tokens from environment variables. Do not call GitHub REST, Linear GraphQL, or Notion REST directly with `curl`. Use the connector MCP tools exposed to the agent.
+
+The account-level OAuth connection, Agent connector policy, and Chat session override decide whether each connector tool is available in the current session.
 
 ## Tool Availability Rule
 
