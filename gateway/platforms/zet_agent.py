@@ -94,6 +94,7 @@ from gateway.platforms.api_server import (
     _coerce_port,
     _openai_error,
 )
+from gateway.platforms.base import SendResult
 # ZettClaw cron event hook — monkey-patches cron.scheduler at import time
 # so cron triggers POST a webhook to local-server. zero hermes main-line
 # changes; see zet_agent_cron.py docstring for the full rationale.
@@ -530,7 +531,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 # tokens 不显式 reset — contextvars 是 task-local，task 结束自动清；
                 # 同 task 内多次 _create_agent 后 set 会覆盖前值，符合预期。
                 set_session_vars(
-                    platform="zettlab",
+                    platform="zet_agent",
                     chat_id=session_id,
                     chat_name="",  # 暂留空，APP 这边的 chat title 不通过这条路径来
                     thread_id="",
@@ -1504,3 +1505,17 @@ class ZetAgentAdapter(APIServerAdapter):
             entry.event.set()
 
         await super().disconnect()
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        if metadata and metadata.get("zet_agent_cron_delivery"):
+            # cron 投递实际由 zet_agent_cron monkey-patch 完成（写 SessionDB +
+            # POST ZET_CHAT_APPEND_URL）；这里只给 scheduler 的显式内部调用
+            # 返回 success，避免普通 send_message 被静默吞掉。
+            return SendResult(success=True, message_id=f"zet_agent:{chat_id}")
+        return SendResult(success=False, error="zet_agent has no proactive send path")
