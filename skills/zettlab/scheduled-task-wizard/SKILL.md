@@ -1,6 +1,6 @@
 ---
 name: scheduled-task-wizard
-description: 用自然对话引导用户创建/修改/管理定时任务（Hermes cron），把意图翻译成 cronjob 工具调用，全程不让用户填表单。出货内置，每个 ZettClaw Agent 默认装载。
+description: 用自然对话引导用户创建/修改/管理定时任务（Hermes cron），把意图翻译成 cronjob 工具调用，全程不让用户填表单。⚠️ 调用 cronjob(action=create/update/remove) 前**必须先 skill_view('scheduled-task-wizard') 加载完整 workflow**，里面规定了用户确认卡片 + cron-action-preview JSON 围栏的产出格式；跳过 skill_view 直接调 cronjob 会绕过用户确认环节，APP 端拿不到结构化卡片。出货内置，每个 ZettClaw Agent 默认装载。
 version: 1.0.0
 author: zettlab
 license: proprietary
