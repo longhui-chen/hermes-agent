@@ -61,6 +61,41 @@ _PRODUCE_TOOL_NAMES = frozenset({
 _PATH_KEYS = ("file_path", "notebook_path", "path")
 
 
+def _is_zet_agent_platform(platform: Any) -> bool:
+    return str(platform or "").lower() in {"zet_agent", "zettlab"}
+
+
+def _target_to_deliver_value(target: dict) -> str:
+    value = f"{target.get('platform')}:{target.get('chat_id')}"
+    thread_id = target.get("thread_id")
+    if thread_id is not None:
+        value += f":{thread_id}"
+    return value
+
+
+def _resolve_zet_agent_chat_id(job: dict) -> str:
+    origin = job.get("origin") or {}
+    if isinstance(origin, dict):
+        chat_id = str(origin.get("chat_id", "") or "").strip()
+        platform = origin.get("platform")
+        if chat_id and (not platform or _is_zet_agent_platform(platform)):
+            return chat_id
+    try:
+        import cron.scheduler as _sched
+        for target in _sched._resolve_delivery_targets(job):
+            if _is_zet_agent_platform(target.get("platform")):
+                return str(target.get("chat_id", "") or "").strip()
+    except Exception as _e:
+        _dbg(f"_resolve_zet_agent_chat_id: target resolution FAILED: {_e!r}")
+    return ""
+
+
+def _combine_delivery_errors(existing: Optional[str], added: str) -> str:
+    if existing:
+        return f"{existing}; {added}"
+    return added
+
+
 def _dbg(msg: str) -> None:
     """Best-effort debug log to /tmp/zet_agent_cron.log — useful during
     development since hermes child stdout/stderr land in zerolog inside
@@ -111,35 +146,51 @@ def install() -> None:
 
         will_be_auto_deleted = _will_hit_repeat_limit(job_snapshot)
 
-        result = _orig_mark(job_id, success, error, delivery_error=delivery_error)
-
-        # PRD UX：once+repeat=N 跑满后 hermes 默认把 job 从 jobs.json pop
-        # 掉 → APP 列表空。我们把它"复活"成 enabled=False/state=completed
-        # 状态保留住，APP 列表能继续看到+查看运行历史。Id / created_at /
-        # origin 等元数据来自 snapshot，保证用户在列表里看到的是同一条任
-        # 务记录。
-        if will_be_auto_deleted and job_snapshot is not None:
-            try:
-                _restore_as_completed(job_snapshot, success, error, delivery_error)
-            except Exception as e:
-                _dbg(f"_wrapped_mark restore FAILED: {e!r}")
-                logger.warning(
-                    "zet_agent_cron: restore-as-completed for %s failed: %s",
-                    job_id, e,
-                )
-
+        effective_delivery_error = delivery_error
         try:
-            _try_persist_to_session(job_id, success, error, delivery_error, job_snapshot)
+            persist_error = _try_persist_to_session(
+                job_id, success, error, delivery_error, job_snapshot
+            )
+            if persist_error:
+                effective_delivery_error = _combine_delivery_errors(
+                    effective_delivery_error, persist_error
+                )
         except Exception as e:
             _dbg(f"_wrapped_mark persist FAILED: {e!r}")
             logger.warning(
                 "zet_agent_cron: persist for job %s failed (non-fatal): %s",
                 job_id, e,
             )
+            effective_delivery_error = _combine_delivery_errors(
+                effective_delivery_error,
+                f"zet_agent session persist failed: {e}",
+            )
+
+        try:
+            result = _orig_mark(
+                job_id, success, error, delivery_error=effective_delivery_error
+            )
+
+            # PRD UX：once+repeat=N 跑满后 hermes 默认把 job 从 jobs.json pop
+            # 掉 → APP 列表空。我们把它"复活"成 enabled=False/state=completed
+            # 状态保留住，APP 列表能继续看到+查看运行历史。Id / created_at /
+            # origin 等元数据来自 snapshot，保证用户在列表里看到的是同一条任
+            # 务记录。
+            if will_be_auto_deleted and job_snapshot is not None:
+                try:
+                    _restore_as_completed(
+                        job_snapshot, success, error, effective_delivery_error
+                    )
+                except Exception as e:
+                    _dbg(f"_wrapped_mark restore FAILED: {e!r}")
+                    logger.warning(
+                        "zet_agent_cron: restore-as-completed for %s failed: %s",
+                        job_id, e,
+                    )
+
+            return result
         finally:
             _LATEST_OUTPUT.pop(job_id, None)
-
-        return result
 
     setattr(_wrapped_mark, _PATCH_SENTINEL, True)
     setattr(_wrapped_save, _PATCH_SENTINEL, True)
@@ -147,6 +198,63 @@ def install() -> None:
     _sched.save_job_output = _wrapped_save
     _sched.mark_job_run = _wrapped_mark
     _dbg("install() patched mark_job_run + save_job_output OK")
+
+    # ── scheduler delivery patch — keep Zettlab-specific delivery out of
+    # upstream cron/scheduler.py. App cron output is persisted below in
+    # _wrapped_mark via SessionDB + ZET_CHAT_APPEND_URL; scheduler's generic
+    # live/standalone send path cannot deliver to a HTTP request/response
+    # platform and would otherwise report a false delivery error.
+    try:
+        if not getattr(_sched._resolve_origin, _PATCH_SENTINEL, False):
+            _orig_resolve_origin = _sched._resolve_origin
+
+            def _wrapped_resolve_origin(job):
+                origin = _orig_resolve_origin(job)
+                if (
+                    isinstance(origin, dict)
+                    and str(origin.get("platform", "")).lower() == "zettlab"
+                ):
+                    origin = dict(origin)
+                    origin["platform"] = "zet_agent"
+                return origin
+
+            setattr(_wrapped_resolve_origin, _PATCH_SENTINEL, True)
+            _sched._resolve_origin = _wrapped_resolve_origin
+            _dbg("install() patched scheduler._resolve_origin OK")
+
+        if not getattr(_sched._deliver_result, _PATCH_SENTINEL, False):
+            _orig_deliver_result = _sched._deliver_result
+
+            def _wrapped_deliver_result(job, content, adapters=None, loop=None):
+                try:
+                    targets = _sched._resolve_delivery_targets(job)
+                    zet_targets = [
+                        t for t in targets if _is_zet_agent_platform(t.get("platform"))
+                    ]
+                    if zet_targets:
+                        other_targets = [
+                            t for t in targets
+                            if not _is_zet_agent_platform(t.get("platform"))
+                        ]
+                        if not other_targets:
+                            _dbg(
+                                f"_deliver_result: bypass zet_agent delivery job={job.get('id')}"
+                            )
+                            return None
+                        job = dict(job)
+                        job["origin"] = None
+                        job["deliver"] = ",".join(
+                            _target_to_deliver_value(t) for t in other_targets
+                        )
+                except Exception as _e:
+                    _dbg(f"_deliver_result patch pre-check FAILED: {_e!r}")
+                return _orig_deliver_result(job, content, adapters=adapters, loop=loop)
+
+            setattr(_wrapped_deliver_result, _PATCH_SENTINEL, True)
+            _sched._deliver_result = _wrapped_deliver_result
+            _dbg("install() patched scheduler._deliver_result OK")
+    except Exception as _e:
+        _dbg(f"install() scheduler delivery patch FAILED: {_e!r}")
 
     # ── _create_agent patch — set HERMES_SESSION_* contextvars ────────
     #
@@ -168,7 +276,7 @@ def install() -> None:
                 if session_id:
                     try:
                         set_session_vars(
-                            platform="zettlab",
+                            platform="zet_agent",
                             chat_id=session_id,
                             chat_name="",
                             thread_id="",
@@ -264,7 +372,7 @@ def _try_persist_to_session(
     error: Optional[str],
     delivery_error: Optional[str],
     job_snapshot: Optional[dict],
-) -> None:
+) -> Optional[str]:
     """Append cron summary as an assistant message to the originating chat's
     hermes SessionDB. APP's regular hermes /history call surfaces it.
 
@@ -283,13 +391,12 @@ def _try_persist_to_session(
             job = None
     if not job:
         _dbg(f"_try_persist: job {job_id} unavailable, skip")
-        return
+        return None
 
-    origin = job.get("origin") or {}
-    origin_chat_id = origin.get("chat_id", "").strip()
+    origin_chat_id = _resolve_zet_agent_chat_id(job)
     if not origin_chat_id:
         _dbg(f"_try_persist: job {job_id} no origin.chat_id, skip (deliver={job.get('deliver')!r})")
-        return
+        return None
 
     content = _build_typed_message_content(job, job_id, success, error, delivery_error)
     _dbg(f"_try_persist: appending to session={origin_chat_id} job={job_id} content_len={len(content)}")
@@ -298,7 +405,7 @@ def _try_persist_to_session(
         from hermes_state import SessionDB
     except ImportError as _ie:
         _dbg(f"_try_persist: SessionDB ImportError: {_ie}")
-        return
+        return f"zet_agent session persist unavailable: {_ie}"
 
     db = SessionDB()
     try:
@@ -318,6 +425,7 @@ def _try_persist_to_session(
     # 当前在线的 chat WS 立即收到 message.appended 事件并插条。失败仅 log
     # —— SessionDB 已落盘，APP 下次进 chat 走 /history 兜底。
     _try_notify_chat_append(origin_chat_id, msg_id, content)
+    return None
 
 
 def _try_notify_chat_append(session_id: str, msg_id: int, content: str) -> None:
