@@ -83,7 +83,9 @@
 
 ## 2. 创建确认卡片（落盘前必经）
 
-把 4 类信息提炼成结构化卡片让用户过目：
+把 4 类信息提炼成结构化卡片让用户过目。卡片有**两部分**：
+
+**(a) 人话 markdown 卡片**——webui / 不支持结构化卡的客户端看得到：
 
 ```
 🕐 < 任务名 >
@@ -98,9 +100,34 @@
 [创建] [修改] [取消]
 ```
 
+**(b) 紧跟其后的 `cron-action-preview` JSON 围栏**——APP 端 fence parser 用它渲染可交互卡片：
+
+````
+```cron-action-preview
+{
+  "mode": "create",
+  "name": "<任务名>",
+  "schedule": "<hermes schedule: cron expr / ISO 时间 / every Nm 等>",
+  "cronExpr": "<可选，cron 表达式形态>",
+  "schedule_human": "<人话描述，与卡片"触发"一致>",
+  "prompt": "<提炼后的 prompt 全文>",
+  "deliver": {
+    "mode": "origin" | "new_session" | "specified",
+    "chatName": "<对话名，origin/specified 模式必填>",
+    "sendTo": {
+      "channel": "<feishu / slack / zettlab_app / ...>",
+      "chatName": "<目标对话名>",
+      "chatType": "private" | "group"
+    }
+  },
+  "repeat": { "times": <null|1|N>, "completed": 0 }
+}
+```
+````
+
 落盘动作：
 
-- 用户点 `[创建]` → `cronjob(action=create, ...)` → 一句话确认（含下次执行时间）
+- 用户点 `[创建]` → APP 直接走 `cronjob(action=create, ...)` 落盘 → 一句话确认（含下次执行时间）
 - 用户点 `[修改]` → 在卡片内就地调整任务名 / 触发时间 / Agent 要做的事 / 重复次数（投递目标不在卡片内改，落盘后跟 Agent 说）
 - 用户点 `[取消]` → 不创建，"好的，没问题"
 
@@ -109,6 +136,7 @@
 - 卡片里 `prompt` 字段展示提炼后的版本，不展示用户原话——便于用户 review 提炼是否到位
 - 重复次数不是默认（一次/永远）就显式写出来——"共 4 次" / "持续 7 天" / "本周每天"
 - 投递模式显式标记——避免用户以为发哪都行实际只发到了当前对话
+- **JSON 围栏的字段值必须跟 markdown 卡片一一对应**——APP 端用 JSON，webui 用 markdown，两边数据要一致
 
 ---
 
@@ -120,7 +148,10 @@
    - 用户点了名 + 候选 1 条 → 直接进确认
    - 用户点了名 + 候选多条 → 反问"是每天 8 点那条还是周报？"
    - 用户没点名 → "你想改哪条？我看到你有：[列表]"
-2. **生成对照卡片**——展示当前值 → 修改后：
+2. **生成对照卡片**——分两部分：
+
+   **(a) 人话 markdown 对照卡片**：
+
    ```
    任务：AI 新闻早报
    触发：~~每天 08:00~~ → 每天 09:00
@@ -128,7 +159,27 @@
    发送到：（未改）
    [确认] [取消]
    ```
-3. 用户点 `[确认]` → `cronjob(action=update, ...)`
+
+   **(b) 紧跟其后的 `cron-action-preview` JSON 围栏**（`mode=edit`、必带 `job_id`、`changedFields` 列出变更字段、`previousValues` 给旧值用于 strikethrough diff）：
+
+   ````
+   ```cron-action-preview
+   {
+     "mode": "edit",
+     "job_id": "<目标 job_id>",
+     "name": "AI 新闻早报",
+     "schedule": "0 9 * * *",
+     "schedule_human": "每天 09:00",
+     "prompt": "<未改时也写全量>",
+     "deliver": { "mode": "origin", "chatName": "<对话名>" },
+     "repeat": { "times": null, "completed": 0 },
+     "changedFields": ["schedule"],
+     "previousValues": { "schedule": "每天 08:00" }
+   }
+   ```
+   ````
+
+3. 用户点 `[确认]` → APP 直接走 `cronjob(action=update, job_id=..., ...)` 落盘
 4. 改完一句话确认（含下次执行时间）
 
 任何字段都可改：触发规则 / 任务名 / `prompt` / 投递目标 / 重复次数。
@@ -141,7 +192,68 @@
 |---|---|---|
 | 暂停 | `cronjob(action=pause, job_id=...)` | "好，已暂停。回来再说一声开启。" |
 | 开启 | `cronjob(action=resume, job_id=...)` | "好，已开启。下次 < 时间 > 执行。" |
-| 删除 | 二次确认后 `cronjob(action=remove, job_id=...)` | "确定删除「< 任务名 >」吗？运行历史会一起清掉。" → 确认 → "删了。" |
+| 删除 | 二次确认（见下）后 APP 直接 `cronjob(action=remove, job_id=...)` | "确定删除「< 任务名 >」吗？运行历史会一起清掉。" → 确认 → "删了。" |
 | 立即执行一次 | `cronjob(action=run, job_id=...)` | "好——会在下次调度心跳（最多 60 秒内）执行一遍，结果按你设定的方式投递。" |
 
 定位任务的方式同 §3。
+
+### 删除任务的二次确认卡片
+
+删除走"确认卡片 → 用户点[确认删除] → 落盘"流程，同样分两部分：
+
+**(a) 人话 markdown 卡片**：
+
+```
+确定删除「AI 新闻早报」吗？
+触发：每天 09:00
+运行历史会一起清除。
+[确认删除] [取消]
+```
+
+**(b) `cron-action-preview` JSON 围栏**（`mode=delete`、必带 `job_id`、其它字段填用于显示）：
+
+````
+```cron-action-preview
+{
+  "mode": "delete",
+  "job_id": "<目标 job_id>",
+  "name": "AI 新闻早报",
+  "schedule": "0 9 * * *",
+  "schedule_human": "每天 09:00",
+  "prompt": "<原 prompt 全文>",
+  "deliver": { "mode": "origin", "chatName": "<对话名>" }
+}
+```
+````
+
+用户点 `[确认删除]` → APP 直接走 `cronjob(action=remove, job_id=...)`。
+
+---
+
+## 5. JSON 围栏字段规范（必读）
+
+每张确认卡都必须附带 `cron-action-preview` JSON 围栏，APP 端用它渲染可交互按钮。规范：
+
+| 字段 | 类型 | create | edit | delete | 说明 |
+|---|---|---|---|---|---|
+| `mode` | string | ✅ `"create"` | ✅ `"edit"` | ✅ `"delete"` | 卡片模式 |
+| `job_id` | string | ❌ | ✅ | ✅ | 目标 job ID（先 `cronjob(action=list)` 拿到）|
+| `name` | string | ✅ | ✅ | ✅ | 任务名 |
+| `schedule` | string | ✅ | ✅ | ✅ | hermes 原始 schedule（cron expr / ISO / `every Nm`）|
+| `cronExpr` | string | optional | optional | optional | 等价 cron 表达式（便于 APP 调试）|
+| `schedule_human` | string | ✅ | ✅ | ✅ | 人话描述，与 markdown 卡的"触发"行一致 |
+| `prompt` | string | ✅ | ✅ | ✅ | 提炼后的 prompt 全文 |
+| `deliver.mode` | string | ✅ | ✅ | ✅ | `"origin"` / `"new_session"` / `"specified"` |
+| `deliver.chatName` | string | optional | optional | optional | 对话名（用于 origin/specified 显示）|
+| `deliver.sendTo` | object | optional | optional | ❌ | 仅 specified 模式：`{channel, chatName, chatType}` |
+| `repeat.times` | number\|null | ✅ | ✅ | ❌ | `null`=永远 / `1`=一次 / `N`=N 次 |
+| `repeat.completed` | number | ✅ `0` | ✅ | ❌ | 已完成次数 |
+| `changedFields` | string[] | ❌ | ✅ | ❌ | 变更字段名列表 |
+| `previousValues` | object | ❌ | ✅ | ❌ | `{字段名: 旧值}`，给 APP 渲染 strikethrough diff |
+
+注意事项：
+
+- 围栏内**必须**是合法 JSON——不要用注释、单引号、尾逗号
+- 围栏外的 markdown 卡片是降级渲染兜底，APP 端会用 JSON 重新渲染可交互卡片，不依赖 markdown
+- 卡片每出现一次，**必须**带一个对应的围栏——不要只发 markdown 没有 JSON
+- 落盘后的"一句话确认"用普通文本，不要再发围栏

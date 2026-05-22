@@ -20,6 +20,23 @@
 > 发送到：📍 当前对话：与 ZettClaw 助手的对话
 > [创建] [修改] [取消]
 > ```
+>
+> 紧跟其后的 JSON 围栏（APP 端解析渲染可交互卡片）：
+>
+> ````
+> ```cron-action-preview
+> {
+>   "mode": "create",
+>   "name": "AI 新闻早报",
+>   "schedule": "0 8 * * *",
+>   "cronExpr": "0 8 * * *",
+>   "schedule_human": "每天 08:00",
+>   "prompt": "用 web_search 搜索最近 24 小时内的全球 AI 重要新闻，按重要性排前 5 条，每条一句话总结+链接。用中文输出。如本周期没有值得汇报的新内容，请只回复 [SILENT]。",
+>   "deliver": { "mode": "origin", "chatName": "与 ZettClaw 助手的对话" },
+>   "repeat": { "times": null, "completed": 0 }
+> }
+> ```
+> ````
 
 ---
 

@@ -15,7 +15,7 @@ metadata:
 
 ## References
 
-- `references/workflow.md` — 4 步解析（任务/触发/投递/任务名）、确认卡片格式、修改/暂停/删除/立即跑流程细节
+- `references/workflow.md` — 4 步解析（任务/触发/投递/任务名）、确认卡片格式（含 `cron-action-preview` JSON 围栏规范）、修改/暂停/删除/立即跑流程细节
 - `references/examples.md` — 5 个 end-to-end 对话例子
 
 ## When to Use
