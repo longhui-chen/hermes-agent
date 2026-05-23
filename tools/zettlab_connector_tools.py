@@ -297,9 +297,33 @@ def _generic_tool_schema(name: str) -> Dict[str, Any]:
     }
 
 
+def _normalise_connector_call_args(name: str, args: Dict[str, Any] | None) -> Dict[str, Any]:
+    if not isinstance(args, dict):
+        return {}
+    normalized = dict(args)
+    if name == "custom_connector.call_tool":
+        nested = normalized.get("arguments")
+        if isinstance(nested, dict) and (
+            "connection_id" in nested or "tool_name" in nested
+        ):
+            normalized = dict(nested)
+        tool_args = normalized.get("arguments")
+        if isinstance(tool_args, str):
+            try:
+                decoded = json.loads(tool_args)
+            except json.JSONDecodeError:
+                decoded = None
+            if isinstance(decoded, dict):
+                normalized["arguments"] = decoded
+    return normalized
+
+
 def _call_connector_tool(name: str, args: Dict[str, Any] | None = None, **_: Any) -> str:
     try:
-        response = _json_rpc("tools/call", {"name": name, "arguments": args or {}})
+        response = _json_rpc(
+            "tools/call",
+            {"name": name, "arguments": _normalise_connector_call_args(name, args)},
+        )
     except ConnectorRPCError as exc:
         return tool_error(str(exc), connector_error=exc.payload)
     except Exception as exc:

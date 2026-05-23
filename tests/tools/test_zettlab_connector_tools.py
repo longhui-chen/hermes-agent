@@ -5,6 +5,7 @@ from tools import zettlab_connector_tools
 from tools.zettlab_connector_tools import (
     _call_connector_tool,
     _connector_tools_from_frontmatter,
+    _normalise_connector_call_args,
     _registered_skill_connector_tools,
     _is_zettlab_connector_skill,
     _normalise_tool_schema,
@@ -76,6 +77,22 @@ def test_default_custom_dispatcher_tools_are_registered_without_profile_skill():
 
     assert "custom_connector.list_tools" in tools
     assert "custom_connector.call_tool" in tools
+
+
+def test_custom_dispatcher_call_unwraps_provider_nested_arguments():
+    args = {
+        "arguments": {
+            "connection_id": "api-1",
+            "tool_name": "status_read",
+            "arguments": '{"name":"zed"}',
+        },
+    }
+
+    assert _normalise_connector_call_args("custom_connector.call_tool", args) == {
+        "connection_id": "api-1",
+        "tool_name": "status_read",
+        "arguments": {"name": "zed"},
+    }
 
 
 def test_connector_preset_skills_are_not_bundled_in_runtime_repo():
