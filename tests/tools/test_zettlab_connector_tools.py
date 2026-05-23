@@ -5,6 +5,7 @@ from tools import zettlab_connector_tools
 from tools.zettlab_connector_tools import (
     _call_connector_tool,
     _connector_tools_from_frontmatter,
+    _registered_skill_connector_tools,
     _is_zettlab_connector_skill,
     _normalise_tool_schema,
     ConnectorRPCError,
@@ -68,6 +69,13 @@ def test_connector_tool_metadata_detection_uses_frontmatter_shape():
         "linear.create_issue",
         "linear.update_issue",
     ]
+
+
+def test_default_custom_dispatcher_tools_are_registered_without_profile_skill():
+    tools = _registered_skill_connector_tools()
+
+    assert "custom_connector.list_tools" in tools
+    assert "custom_connector.call_tool" in tools
 
 
 def test_connector_preset_skills_are_not_bundled_in_runtime_repo():

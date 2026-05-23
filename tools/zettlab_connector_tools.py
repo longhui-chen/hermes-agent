@@ -31,6 +31,10 @@ _CONNECTOR_TOOL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*\.[A-Za-z0-9_.-]+$")
 _MODEL_TOOL_NAME_RE = re.compile(r"[^A-Za-z0-9_]")
 _TOOLSET = "zettlab-connectors"
 _REQUEST_TIMEOUT_SECONDS = 120
+_DEFAULT_DISPATCHER_TOOLS = (
+    "custom_connector.list_tools",
+    "custom_connector.call_tool",
+)
 
 
 def _is_connector_tool_name(name: str) -> bool:
@@ -124,6 +128,8 @@ def _connector_tools_from_frontmatter(frontmatter: Dict[str, Any]) -> List[str]:
 
 
 def _registered_skill_connector_tools() -> List[str]:
+    names: List[str] = list(_DEFAULT_DISPATCHER_TOOLS)
+    seen: set[str] = set(names)
     try:
         from agent.skill_utils import get_all_skills_dirs, iter_skill_index_files
         from tools.skills_tool import (
@@ -134,10 +140,8 @@ def _registered_skill_connector_tools() -> List[str]:
         )
     except Exception as exc:
         logger.debug("Zettlab connector tools: cannot inspect skills: %s", exc)
-        return []
+        return names
 
-    names: List[str] = []
-    seen: set[str] = set()
     for skills_dir in get_all_skills_dirs():
         if not skills_dir.exists():
             continue
