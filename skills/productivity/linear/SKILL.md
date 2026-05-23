@@ -1,126 +1,64 @@
 ---
 name: linear
-description: "Linear via Zettlab Connectors first: list, create, and update issues with the user's authorized Linear account."
+description: "Linear direct API helper: inspect, create, and update Linear issues with a LINEAR_API_KEY in non-Zettlab environments."
 version: 1.1.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
 prerequisites:
-  tools: [linear.list_issues, linear.create_issue, linear.update_issue]
+  environment: LINEAR_API_KEY
 metadata:
   hermes:
-    tags: [Linear, Connectors, Project Management, Issues, Productivity]
-    related_skills: [zettlab-linear, authorized-connectors]
-  zettlab:
-    connector_skill: true
-    temporary_location: hermes-agent
-    migration_target: dedicated-connector-skills-repo
-    migration_task: connector-v1-t13
+    tags: [Linear, Project Management, Issues, Productivity]
+    related_skills: []
 ---
 
-# Linear - Issue & Project Management
+# Linear - Direct API Mode
 
-Use this skill when the user asks to inspect, create, or update Linear issues.
+Use this skill when the user explicitly wants to work with Linear through a personal Linear API key or when the environment is not using Zettlab Connectors.
 
-In Zettlab, Linear authorization belongs to Connectors. Use the user's already-authorized Linear account through the connector tools. Do not ask for a personal Linear API key, do not read `LINEAR_API_KEY`, and do not call Linear GraphQL directly unless the user explicitly asks for direct Linear API mode outside the Zettlab connector flow.
+In Zettlab profiles, prefer the official connector preset skill `zettlab-linear` from `zettlab-presets`. That preset uses account-level OAuth, Agent connector policy, and Chat connector overrides. This bundled Hermes skill is only the direct API fallback.
 
-This skill should behave like `zettlab-linear`: account-level OAuth connection, Agent connector policy, and Chat session override decide whether the Linear tools are visible and callable.
+## Authentication
 
-## Required Connector Tools
+The helper reads `LINEAR_API_KEY` from the environment and calls Linear GraphQL with the personal API key header format:
 
-- `linear.list_issues` - list issues visible to the connected Linear account.
-- `linear.create_issue` - create an issue in a Linear team.
-- `linear.update_issue` - update issue title, description, or workflow state.
-
-If a required tool is unavailable, stop and explain the connector state from the tool or skill readiness result. Typical cases:
-
-- `not_connected`: ask the user to connect Linear in Connectors.
-- `denied_by_agent_policy`: ask the user to enable Linear for this Agent.
-- `denied_by_chat_override`: ask the user to enable Linear in this chat's Connectors drawer.
-- `expired` or `revoked`: ask the user to reconnect Linear.
-- `ambiguous_account`: ask which Linear account to use.
-
-Do not report "Linear is not authorized" just because a tool is hidden by Agent policy or chat override. Name the actual blocking layer when the runtime returns it.
-
-## Usage Patterns
-
-### List Issues
-
-Use `linear.list_issues` first for discovery. Keep filters minimal unless the user gives specifics.
-
-```json
-{
-  "team_key": "ENG",
-  "state": "In Progress",
-  "first": 20
-}
+```bash
+export LINEAR_API_KEY=lin_api_...
 ```
 
-Rules:
+Never print the key or copy it into user-visible output. If the key is missing, explain that direct Linear API mode needs `LINEAR_API_KEY`.
 
-- `team_key` is optional. Use it when the user mentions a team key.
-- `state` is optional. Use it when the user asks for a workflow state.
-- `first` defaults to a small page. Use 20 unless the user asks for more.
-- Use `account_alias` only when the user selected a specific connected account or the runtime reports `ambiguous_account`.
+## Helper
 
-### Create Issue
+Use the bundled zero-dependency helper:
 
-Use `linear.create_issue` only when the user has provided enough intent to create an issue.
-
-Required:
-
-- `team_id`
-- `title`
-
-Optional:
-
-- `description`
-
-Example:
-
-```json
-{
-  "team_id": "TEAM_UUID",
-  "title": "Fix connector policy refresh",
-  "description": "Chat drawer count should update after returning from connector authorization."
-}
+```bash
+python3 ~/.hermes/skills/productivity/linear/scripts/linear_api.py <command> [args...]
 ```
 
-If the user only gives a team key, first list issues for that team and use the returned team id if present. If no team id is available, ask a short clarification.
+Common read commands:
 
-### Update Issue
-
-Use `linear.update_issue` when the user asks to change an existing issue.
-
-Required:
-
-- `issue_id`
-
-Optional:
-
-- `title`
-- `description`
-- `state_id`
-
-Example:
-
-```json
-{
-  "issue_id": "ZET-275",
-  "title": "Connectors V1 acceptance",
-  "description": "Updated acceptance checklist",
-  "state_id": "STATE_UUID"
-}
+```bash
+python3 ~/.hermes/skills/productivity/linear/scripts/linear_api.py whoami
+python3 ~/.hermes/skills/productivity/linear/scripts/linear_api.py list-teams
+python3 ~/.hermes/skills/productivity/linear/scripts/linear_api.py list-states --team ENG
+python3 ~/.hermes/skills/productivity/linear/scripts/linear_api.py list-issues --team ENG --status "In Progress" --limit 20
+python3 ~/.hermes/skills/productivity/linear/scripts/linear_api.py get-issue ENG-42
+python3 ~/.hermes/skills/productivity/linear/scripts/linear_api.py search-issues "connector policy"
 ```
 
-For status changes, ask for or discover the target workflow state ID before calling `linear.update_issue`. Only send fields the user actually asked to change.
+Common write commands:
 
-## Direct Linear API Fallback
+```bash
+python3 ~/.hermes/skills/productivity/linear/scripts/linear_api.py create-issue --team ENG --title "Fix connector policy refresh" --description "Chat drawer count should update after authorization."
+python3 ~/.hermes/skills/productivity/linear/scripts/linear_api.py update-issue ENG-42 --title "Updated title"
+python3 ~/.hermes/skills/productivity/linear/scripts/linear_api.py update-status ENG-42 Done
+python3 ~/.hermes/skills/productivity/linear/scripts/linear_api.py add-comment ENG-42 "Validated in staging."
+```
 
-The bundled `scripts/linear_api.py` helper is a non-Zettlab fallback for environments that are not using Connectors. Use it only when the user explicitly asks for direct Linear API mode or provides a personal API key workflow.
-
-When using direct mode, the helper reads `LINEAR_API_KEY` and calls `https://api.linear.app/graphql`. This mode does not use the user's Zettlab connector authorization, Agent policy, or chat connector override.
+Only run write commands when the user clearly asked to create or change something. If the target team, issue, title, or workflow state is ambiguous, ask a short clarification first.
 
 ## Response Style
 
-Summarize the Linear result in user language: issue identifier, title, state, assignee if present, and URL if returned. For write actions, confirm what changed and include the issue URL. Do not expose OAuth tokens, connector IDs, raw authorization headers, or full provider payloads unless the user is debugging and specifically asks for them.
+Summarize Linear results in user language: issue identifier, title, state, assignee if present, and URL when returned. For write actions, confirm the change and include the issue URL if the helper returns one.
