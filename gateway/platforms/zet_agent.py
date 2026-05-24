@@ -695,7 +695,13 @@ class ZetAgentAdapter(APIServerAdapter):
         contention window is short enough in practice.
         """
         stream_q = self._sniff_stream_q(tool_start_callback, stream_delta_callback)
-        if stream_q is not None:
+        # conversation_history 守卫：_session_titles 是进程内 cache，子进程
+        # 重启（lifecycle.OnUpdate / OOM / supervisor 拉起）会清零，老会话
+        # 下一条 user msg 在 cache cold 时会被误判成首句重推 title，让 App
+        # 把会话列表里的首句标题换成当前这条新消息。OpenAI 兼容 API 下
+        # caller 每次都传完整 history，真新会话 history 必为空 —— 只在那
+        # 一刻才允许触发首句去重逻辑。App 侧另有 first-write-wins 兜底。
+        if stream_q is not None and not conversation_history:
             try:
                 title = self._maybe_update_title(session_id, user_message)
                 self._push_title_if_new(stream_q, session_id, title)
