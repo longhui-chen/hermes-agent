@@ -30,6 +30,10 @@ logger = logging.getLogger(__name__)
 _CONNECTOR_TOOL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*\.[A-Za-z0-9_.-]+$")
 _TOOLSET = "zettlab-connectors"
 _REQUEST_TIMEOUT_SECONDS = 120
+_SETUP_CONNECTORS_ACTION = {
+    "type": "setup_connectors",
+    "label": "Reconnect Zettlab device connector runtime",
+}
 _DEFAULT_DISPATCHER_TOOLS = (
     "custom_connector.list_tools",
     "custom_connector.call_tool",
@@ -193,10 +197,22 @@ def _connector_token() -> str:
 def _json_rpc(method: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
     url = _connector_url()
     if not url:
-        raise RuntimeError("zettlab_connector_runtime_url_missing")
+        raise ConnectorRPCError(
+            "zettlab_connector_runtime_url_missing",
+            {
+                "code": "connector_runtime_url_missing",
+                "nextAction": _SETUP_CONNECTORS_ACTION,
+            },
+        )
     token = _connector_token()
     if not token:
-        raise RuntimeError("zettlab_connector_auth_token_missing")
+        raise ConnectorRPCError(
+            "zettlab_connector_auth_token_missing",
+            {
+                "code": "connector_runtime_auth_required",
+                "nextAction": _SETUP_CONNECTORS_ACTION,
+            },
+        )
 
     payload = json.dumps(
         {

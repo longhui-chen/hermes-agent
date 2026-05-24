@@ -208,3 +208,32 @@ def test_connector_tool_call_surfaces_structured_connector_errors(monkeypatch):
         "code": "denied_by_agent_policy",
         "provider": "linear",
     }
+
+
+def test_connector_tool_call_reports_missing_runtime_token_as_setup_action(monkeypatch):
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_URL", "https://api.zettlab.test/mcp/connectors")
+    monkeypatch.delenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", raising=False)
+
+    result = json.loads(_call_connector_tool("custom_connector.list_tools", {}))
+
+    assert result["error"] == "zettlab_connector_auth_token_missing"
+    assert result["connector_error"] == {
+        "code": "connector_runtime_auth_required",
+        "nextAction": {
+            "type": "setup_connectors",
+            "label": "Reconnect Zettlab device connector runtime",
+        },
+    }
+
+
+def test_connector_tool_call_reports_missing_runtime_url_as_setup_action(monkeypatch):
+    monkeypatch.delenv("ZETTLAB_CONNECTORS_URL", raising=False)
+    monkeypatch.delenv("ZETTLAB_CONNECTORS_RPC_URL", raising=False)
+    monkeypatch.delenv("ZETTLAB_CONNECTORS_MCP_URL", raising=False)
+    monkeypatch.setattr(zettlab_connector_tools, "read_raw_config", lambda: {})
+
+    result = json.loads(_call_connector_tool("custom_connector.list_tools", {}))
+
+    assert result["error"] == "zettlab_connector_runtime_url_missing"
+    assert result["connector_error"]["code"] == "connector_runtime_url_missing"
+    assert result["connector_error"]["nextAction"]["type"] == "setup_connectors"
