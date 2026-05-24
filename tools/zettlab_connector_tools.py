@@ -28,7 +28,6 @@ from tools.registry import registry, tool_error, tool_result
 logger = logging.getLogger(__name__)
 
 _CONNECTOR_TOOL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*\.[A-Za-z0-9_.-]+$")
-_MODEL_TOOL_NAME_RE = re.compile(r"[^A-Za-z0-9_]")
 _TOOLSET = "zettlab-connectors"
 _REQUEST_TIMEOUT_SECONDS = 120
 _DEFAULT_DISPATCHER_TOOLS = (
@@ -39,10 +38,6 @@ _DEFAULT_DISPATCHER_TOOLS = (
 
 def _is_connector_tool_name(name: str) -> bool:
     return bool(_CONNECTOR_TOOL_RE.match(str(name).strip()))
-
-
-def _model_tool_name(canonical_name: str) -> str:
-    return _MODEL_TOOL_NAME_RE.sub("_", str(canonical_name).strip())
 
 
 def _normalise_tool_schema(schema: Any) -> Dict[str, Any]:
@@ -266,14 +261,10 @@ def _list_available_connector_schemas(tool_names: Iterable[str]) -> Dict[str, Di
         if name not in wanted:
             continue
         schema = _normalise_tool_schema(item.get("inputSchema"))
-        alias = _model_tool_name(name)
         description = str(item.get("description") or f"Call Zettlab connector tool {name}.")
         schemas[name] = {
-            "name": alias,
-            "description": (
-                f"Internal model-safe alias for connector tool `{name}`. "
-                f"When naming this tool in user-facing text, use `{name}`. {description}"
-            ),
+            "name": name,
+            "description": description,
             "parameters": schema,
         }
     return schemas
@@ -282,10 +273,8 @@ def _list_available_connector_schemas(tool_names: Iterable[str]) -> Dict[str, Di
 def _generic_tool_schema(name: str) -> Dict[str, Any]:
     provider = name.split(".", 1)[0]
     return {
-        "name": _model_tool_name(name),
+        "name": name,
         "description": (
-            f"Internal model-safe alias for connector tool `{name}`. "
-            f"When naming this tool in user-facing text, use `{name}`. "
             f"Call the Zettlab {provider} connector runtime with the current "
             "user, agent, and chat authorization context."
         ),
@@ -338,27 +327,25 @@ def _register_skill_declared_connector_tools() -> List[str]:
     tool_names = _registered_skill_connector_tools()
     hydrated = _list_available_connector_schemas(tool_names)
     registered: List[str] = []
-    aliases_seen: set[str] = set()
+    seen: set[str] = set()
     for tool_name in tool_names:
-        model_name = _model_tool_name(tool_name)
-        if not model_name or model_name in aliases_seen:
+        if not tool_name or tool_name in seen:
             logger.warning(
-                "Zettlab connector tools skipped duplicate model alias %s for %s",
-                model_name,
+                "Zettlab connector tools skipped duplicate tool %s",
                 tool_name,
             )
             continue
-        aliases_seen.add(model_name)
+        seen.add(tool_name)
         schema = hydrated.get(tool_name) or _generic_tool_schema(tool_name)
         registry.register(
-            name=model_name,
+            name=tool_name,
             toolset=_TOOLSET,
             schema=schema,
             handler=lambda args, _name=tool_name, **kw: _call_connector_tool(_name, args, **kw),
             description=schema.get("description", ""),
             max_result_size_chars=20000,
         )
-        registered.append(model_name)
+        registered.append(tool_name)
     if registered:
         logger.info("Zettlab connector tools registered: %s", ", ".join(registered))
     return registered

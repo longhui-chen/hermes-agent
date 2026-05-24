@@ -5,7 +5,10 @@ from tools import zettlab_connector_tools
 from tools.zettlab_connector_tools import (
     _call_connector_tool,
     _connector_tools_from_frontmatter,
+    _generic_tool_schema,
+    _list_available_connector_schemas,
     _normalise_connector_call_args,
+    _register_skill_declared_connector_tools,
     _registered_skill_connector_tools,
     _is_zettlab_connector_skill,
     _normalise_tool_schema,
@@ -70,6 +73,67 @@ def test_connector_tool_metadata_detection_uses_frontmatter_shape():
         "linear.create_issue",
         "linear.update_issue",
     ]
+
+
+def test_connector_tool_schema_keeps_skill_declared_name(monkeypatch):
+    def fake_json_rpc(method, params=None):
+        assert method == "tools/list"
+        return {
+            "result": {
+                "tools": [
+                    {
+                        "name": "linear.list_issues",
+                        "description": "List Linear issues.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {"first": {"type": "integer"}},
+                        },
+                    }
+                ]
+            }
+        }
+
+    monkeypatch.setattr(zettlab_connector_tools, "_json_rpc", fake_json_rpc)
+
+    schemas = _list_available_connector_schemas(["linear.list_issues"])
+
+    assert schemas["linear.list_issues"]["name"] == "linear.list_issues"
+
+
+def test_generic_connector_tool_schema_keeps_skill_declared_name():
+    assert _generic_tool_schema("linear.list_issues")["name"] == "linear.list_issues"
+
+
+def test_register_skill_declared_connector_tools_uses_canonical_names(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        zettlab_connector_tools,
+        "_registered_skill_connector_tools",
+        lambda: ["linear.list_issues"],
+    )
+    monkeypatch.setattr(
+        zettlab_connector_tools,
+        "_list_available_connector_schemas",
+        lambda names: {
+            "linear.list_issues": {
+                "name": "linear.list_issues",
+                "description": "List Linear issues.",
+                "parameters": {"type": "object", "properties": {}},
+            }
+        },
+    )
+    monkeypatch.setattr(
+        zettlab_connector_tools.registry,
+        "register",
+        lambda **kwargs: calls.append(kwargs),
+    )
+
+    registered = _register_skill_declared_connector_tools()
+
+    assert registered == ["linear.list_issues"]
+    assert calls[0]["name"] == "linear.list_issues"
+    assert calls[0]["schema"]["name"] == "linear.list_issues"
 
 
 def test_default_custom_dispatcher_tools_are_registered_without_profile_skill():
