@@ -356,3 +356,118 @@ class TestUnifiedCronjobTool:
         assert updated["success"] is True
         stored = get_job(created["job_id"])
         assert stored["deliver"] == "telegram"
+
+    # =====================================================================
+    # Per-job timezone wiring (ZET-942) — schema exposure, create/update
+    # passthrough, normalization. The hermes-side compute_next_run is
+    # already covered in tests/cron/test_jobs.py; here we lock in the
+    # LLM-facing surface so the tool can no longer regress to "timezone
+    # silently dropped before reaching create_job()".
+    # =====================================================================
+
+    def test_schema_exposes_timezone_parameter(self):
+        """Without the schema entry, the LLM has no way to discover the
+        parameter exists. Lock the contract."""
+        from tools.cronjob_tools import CRONJOB_SCHEMA
+
+        props = CRONJOB_SCHEMA["parameters"]["properties"]
+        assert "timezone" in props
+        assert props["timezone"]["type"] == "string"
+
+    def test_create_with_timezone_persists_to_job(self):
+        from cron.jobs import get_job
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Daily",
+                schedule="30 10 * * *",
+                timezone="Asia/Shanghai",
+            )
+        )
+        assert created["success"] is True
+        stored = get_job(created["job_id"])
+        assert stored["timezone"] == "Asia/Shanghai"
+        # And the next_run_at must carry the +08:00 offset.
+        assert stored["next_run_at"].endswith("+08:00")
+
+    def test_create_without_timezone_leaves_field_none(self):
+        """No timezone arg → the per-job tz stays None and the job falls
+        back to hermes' instance default (the existing pre-fix behaviour
+        we must not regress)."""
+        from cron.jobs import get_job
+
+        created = json.loads(
+            cronjob(action="create", prompt="Daily", schedule="30 10 * * *")
+        )
+        stored = get_job(created["job_id"])
+        assert stored["timezone"] is None
+
+    def test_create_whitespace_timezone_normalized_to_none(self):
+        """A whitespace-only string should be treated as "not supplied", not
+        as a bogus IANA name that throws."""
+        from cron.jobs import get_job
+
+        created = json.loads(
+            cronjob(
+                action="create", prompt="x", schedule="every 1h", timezone="   "
+            )
+        )
+        stored = get_job(created["job_id"])
+        assert stored["timezone"] is None
+
+    def test_update_sets_timezone_and_recomputes_next_run(self):
+        from cron.jobs import get_job
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Daily",
+                schedule="30 10 * * *",
+                timezone="UTC",
+            )
+        )
+        utc_next = get_job(created["job_id"])["next_run_at"]
+        assert utc_next.endswith("+00:00")
+
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                timezone="Asia/Shanghai",
+            )
+        )
+        assert updated["success"] is True
+        assert get_job(created["job_id"])["next_run_at"].endswith("+08:00")
+
+    def test_update_empty_timezone_clears_field(self):
+        """Empty string is the documented "clear the per-job tz override"
+        signal — must reach update_job() and persist as None."""
+        from cron.jobs import get_job
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="x",
+                schedule="every 1h",
+                timezone="Asia/Shanghai",
+            )
+        )
+        updated = json.loads(
+            cronjob(action="update", job_id=created["job_id"], timezone="")
+        )
+        assert updated["success"] is True
+        assert get_job(created["job_id"])["timezone"] is None
+
+    def test_create_invalid_timezone_surfaces_error(self):
+        """A bogus IANA name should fail loudly — the LLM (or App) wrote
+        garbage and we want to flag it, not silently drop the job."""
+        result = cronjob(
+            action="create",
+            prompt="x",
+            schedule="every 1h",
+            timezone="Mars/Olympus_Mons",
+        )
+        payload = json.loads(result)
+        assert payload["success"] is False
+        assert "timezone" in payload["error"].lower() or "invalid" in payload["error"].lower()
