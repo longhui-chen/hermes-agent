@@ -187,17 +187,28 @@ def _connector_url() -> str:
     return os.path.expandvars(raw)
 
 
+def _connector_action_token() -> str:
+    return os.getenv("ZETTLAB_AGENT_ACTION_TOKEN", "").strip()
+
+
 def _connector_token() -> str:
     return os.getenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "").strip()
+
+
+def _connector_auth_headers() -> Dict[str, str]:
+    action_token = _connector_action_token()
+    if action_token:
+        return {"X-Zettlab-Agent-Action-Token": action_token}
+    token = _connector_token()
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    raise RuntimeError("zettlab_connector_auth_token_missing")
 
 
 def _json_rpc(method: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
     url = _connector_url()
     if not url:
         raise RuntimeError("zettlab_connector_runtime_url_missing")
-    token = _connector_token()
-    if not token:
-        raise RuntimeError("zettlab_connector_auth_token_missing")
 
     payload = json.dumps(
         {
@@ -211,10 +222,10 @@ def _json_rpc(method: str, params: Dict[str, Any] | None = None) -> Dict[str, An
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {token}",
         "X-Zettlab-Client": "hermes-agent",
         "X-Zettlab-Tool-Bridge": "skill-tools",
     }
+    headers.update(_connector_auth_headers())
     req = urllib.request.Request(url, data=payload, headers=headers, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT_SECONDS) as resp:
