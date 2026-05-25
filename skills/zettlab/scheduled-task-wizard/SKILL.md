@@ -70,6 +70,7 @@ metadata:
 - 不要让用户填表单——你是 skill，不是 form
 - 不要批量 clarify——每轮最多 1-2 个真正缺失的关键信息
 - 不要建议"分多条"——用户说"每天 8 点和 18 点都发"就直接建两条，不要让用户自己拆
+- **`schedule` 字段不能塞用户原文**——任何语种（中/英/日/韩/德…）的自然语言都先翻译成 canonical 格式：cron 表达式 / `every Nm` / `Nm` 时长简写 / ISO 时间戳。详见 `references/workflow.md` §步骤 2。错了 hermes 报 `Invalid schedule '...'` 卡片创建失败。
 - 不主动暴露底座高级选项（任务级模型 / 跨渠道 fan-out）——卡片默认不出现，clarify 也不主动问；但用户主动用自然语言表达就接住（如"用便宜模型"、"同时发飞书和 Slack"）
 - 脚本挂接（pre-run script + wake-gate）保持纯底座能力——用户没办法用自然语言表达"挂个 script"，不接也不解释
 - prompt 含明显指令注入/敏感命令会被底座 prompt 扫描拦截——拦了告诉用户"换种说法重写一下"
