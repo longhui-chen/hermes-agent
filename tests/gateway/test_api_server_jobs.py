@@ -267,6 +267,121 @@ class TestCreateJob:
                 data = await resp.json()
                 assert "timezone" in data["error"].lower()
 
+    @pytest.mark.asyncio
+    async def test_create_job_with_origin_passthrough(self, adapter):
+        """POST /api/jobs forwards origin dict into _cron_create.
+
+        APP's preview-confirm-POST path needs this — without it, the
+        scheduler has no chat to deliver back to and last_delivery_error
+        ends up "no delivery target resolved for deliver=origin"
+        (ZET-942 follow-up).
+        """
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                origin_body = {
+                    "platform": "zet_agent",
+                    "chat_id": "zettlab:local-dev:main:Abc123",
+                    "chat_name": "",
+                }
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "6 23 * * *",
+                    "origin": origin_body,
+                })
+                assert resp.status == 200
+                call_kwargs = mock_create.call_args[1]
+                assert call_kwargs["origin"] == origin_body
+
+    @pytest.mark.asyncio
+    async def test_create_job_origin_missing_platform_returns_400(self, adapter):
+        """origin must carry platform — caught at API layer, not 500."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "6 23 * * *",
+                    "origin": {"chat_id": "abc"},
+                })
+                assert resp.status == 400
+                data = await resp.json()
+                assert "platform" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_create_job_origin_missing_chat_id_returns_400(self, adapter):
+        """origin must carry chat_id — without it the scheduler can't
+        resolve where to deliver, defeats the whole point of passing origin."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "6 23 * * *",
+                    "origin": {"platform": "zet_agent"},
+                })
+                assert resp.status == 400
+                data = await resp.json()
+                assert "chat_id" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_create_job_origin_non_object_returns_400(self, adapter):
+        """origin field must be a dict — string / number / array reject."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "6 23 * * *",
+                    "origin": "zet_agent:abc",
+                })
+                assert resp.status == 400
+                data = await resp.json()
+                assert "object" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_create_job_origin_oversized_field_returns_400(self, adapter):
+        """Length cap prevents megabyte payloads landing in jobs.json."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "6 23 * * *",
+                    "origin": {
+                        "platform": "zet_agent",
+                        "chat_id": "x" * 10_000,
+                    },
+                })
+                assert resp.status == 400
+                data = await resp.json()
+                assert "chat_id" in data["error"].lower() or "long" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_create_job_no_origin_omitted_from_kwargs(self, adapter):
+        """When origin isn't supplied, don't pass kwarg at all — preserves
+        backward-compat with callers (curl, tests) that never knew about it."""
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "6 23 * * *",
+                })
+                assert resp.status == 200
+                call_kwargs = mock_create.call_args[1]
+                assert "origin" not in call_kwargs
+
 
 # ---------------------------------------------------------------------------
 # 8-10. test_get_job
