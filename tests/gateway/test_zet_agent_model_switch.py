@@ -1,3 +1,4 @@
+import threading
 import types
 
 import pytest
@@ -168,3 +169,60 @@ async def test_session_model_switch_creates_pending_notes_when_missing(monkeypat
 
     assert resp.status == 200
     assert "glm-5" in gw._pending_model_notes[session_id]
+
+
+@pytest.mark.asyncio
+async def test_agent_model_switch_queues_note_for_active_sessions(tmp_path, monkeypatch):
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(zet_agent, "web", _FakeWeb)
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"model": {"default": "old-model"}}), encoding="utf-8"
+    )
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    gw = types.SimpleNamespace(
+        _agent_cache={"sess-a": object(), "sess-b": object()},
+        _agent_cache_lock=threading.Lock(),
+        _running_agents={"sess-c": object()},
+        # sess-b has a session-level override → must be skipped.
+        _session_model_overrides={"sess-b": {"model": "x"}},
+        _pending_model_notes={},
+    )
+    adapter.gateway_runner = gw
+
+    resp = await adapter._handle_model_switch(
+        _FakeRequest(
+            {"model": "glm-5", "provider": "custom", "old_model": "old-model"}
+        )
+    )
+
+    assert resp.status == 200
+    cfg = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+    assert cfg["model"]["default"] == "glm-5"
+
+    # Active sessions without override get the note; the override one is skipped.
+    assert set(gw._pending_model_notes.keys()) == {"sess-a", "sess-c"}
+    note = gw._pending_model_notes["sess-a"]
+    assert "from old-model to glm-5" in note
+    assert "self-identification" in note
+
+
+@pytest.mark.asyncio
+async def test_agent_model_switch_without_gateway_runner_is_ok(tmp_path, monkeypatch):
+    import gateway.run as gateway_run
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(zet_agent, "web", _FakeWeb)
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"model": {"default": "old"}}), encoding="utf-8"
+    )
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    adapter.gateway_runner = None
+
+    resp = await adapter._handle_model_switch(
+        _FakeRequest({"model": "glm-5", "old_model": "old"})
+    )
+    assert resp.status == 200

@@ -1097,6 +1097,7 @@ class ZetAgentAdapter(APIServerAdapter):
         new_api_key = body.get("api_key", "")
         new_api_mode = body.get("api_mode", "")
         new_context_length = body.get("context_length", None)
+        old_model = body.get("old_model", "")
         if not new_model:
             return web.json_response({"ok": False, "error": "model is required"}, status=400)
 
@@ -1138,6 +1139,27 @@ class ZetAgentAdapter(APIServerAdapter):
             logger.warning("model-switch: config write failed: %s", exc)
             return web.json_response({"ok": False, "error": f"config write: {exc}"}, status=500)
 
+        # Notify already-running sessions (no session-level override) that the
+        # default model changed. These sessions reuse their persisted system
+        # prompt, whose `Model:` line still names the old model, so they need an
+        # explicit note to self-identify correctly on the next turn. Sessions
+        # created after this switch rebuild the prompt with the new model and
+        # need no note. Mirrors the gateway /model command path.
+        if old_model and old_model != new_model:
+            note = (
+                f"[Note: model was just switched from {old_model} to {new_model}. "
+                f"Adjust your self-identification accordingly.]"
+            )
+        else:
+            note = (
+                f"[Note: model was just switched to {new_model}. "
+                f"Adjust your self-identification accordingly.]"
+            )
+        try:
+            self._queue_model_note_for_active_sessions(note)
+        except Exception as exc:
+            logger.warning("model-switch: queue note failed: %s", exc)
+
         logger.info(
             "model-switch: model=%s provider=%s (config.yaml only, session overrides preserved)",
             new_model, new_provider,
@@ -1145,6 +1167,48 @@ class ZetAgentAdapter(APIServerAdapter):
         return web.json_response({
             "ok": True, "model": new_model,
         })
+
+    def _queue_model_note_for_active_sessions(self, note: str) -> int:
+        """Queue a one-shot model-switch note for every active session that
+        has no session-level override.
+
+        Active = cached between turns (``_agent_cache``) or mid-turn
+        (``_running_agents``). Sessions with a session-level override are
+        skipped: an agent-level default switch does not affect them. Returns
+        the number of sessions the note was queued for.
+        """
+        gw = getattr(self, "gateway_runner", None)
+        if gw is None:
+            return 0
+        overrides = getattr(gw, "_session_model_overrides", None) or {}
+        notes = getattr(gw, "_pending_model_notes", None)
+        if notes is None:
+            notes = {}
+            try:
+                gw._pending_model_notes = notes
+            except Exception:
+                return 0
+
+        keys = set()
+        cache = getattr(gw, "_agent_cache", None)
+        if cache is not None:
+            lock = getattr(gw, "_agent_cache_lock", None)
+            if lock is not None:
+                with lock:
+                    keys.update(cache.keys())
+            else:
+                keys.update(list(cache.keys()))
+        running = getattr(gw, "_running_agents", None)
+        if running is not None:
+            keys.update(list(running.keys()))
+
+        queued = 0
+        for sk in keys:
+            if sk in overrides:
+                continue
+            notes[sk] = note
+            queued += 1
+        return queued
 
     async def _handle_session_model_switch(self, request: "web.Request") -> "web.Response":
         """POST /v1/sessions/{session_id}/model/switch — session-level model override.
