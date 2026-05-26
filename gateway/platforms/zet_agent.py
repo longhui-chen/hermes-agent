@@ -1212,6 +1212,23 @@ class ZetAgentAdapter(APIServerAdapter):
                         "session-model-switch: evict_cached_agent failed for %s: %s",
                         session_id, exc,
                     )
+            # Queue a one-shot note that GatewayRunner._run_agent prepends to
+            # this session's next user message, so the freshly-rebuilt agent
+            # knows its model changed and self-identifies correctly. Kept out
+            # of stored history to preserve prompt cache (mirrors the gateway
+            # /model command path).
+            notes = getattr(gw, "_pending_model_notes", None)
+            if notes is None:
+                notes = {}
+                try:
+                    gw._pending_model_notes = notes
+                except Exception:
+                    notes = None
+            if notes is not None:
+                notes[session_id] = (
+                    f"[Note: model for this session was just switched to {new_model}. "
+                    f"Adjust your self-identification accordingly.]"
+                )
 
         logger.info(
             "session-model-switch: session=%s model=%s provider=%s",
@@ -1222,99 +1239,6 @@ class ZetAgentAdapter(APIServerAdapter):
             "session_id": session_id,
             "model": new_model,
         })
-
-    def _repin_session_files(self, new_model: str, new_base_url: str) -> int:
-        """Rewrite {model, base_url} in every session_*.json under _hermes_home/sessions/.
-
-        Hermes pins these at session creation. Without updating them,
-        existing sessions override config.yaml and keep using the old model.
-        """
-        import json as _json
-        from gateway.run import _hermes_home
-        sessions_dir = _hermes_home / "sessions"
-        if not sessions_dir.is_dir():
-            return 0
-        patched = 0
-        for f in sessions_dir.iterdir():
-            if not f.name.startswith("session_") or not f.name.endswith(".json"):
-                continue
-            try:
-                raw = f.read_text(encoding="utf-8")
-                doc = _json.loads(raw)
-                if not isinstance(doc, dict) or "model" not in doc:
-                    continue
-                doc["model"] = new_model
-                if "base_url" in doc:
-                    doc["base_url"] = new_base_url
-                # Inject a system-level note into messages so the LLM knows
-                # the model changed when it loads conversation history.
-                msgs = doc.get("messages")
-                if isinstance(msgs, list):
-                    msgs.append({
-                        "role": "system",
-                        "content": (
-                            f"[System: model switched to {new_model}. "
-                            f"Adjust your self-identification accordingly.]"
-                        ),
-                    })
-                    doc["message_count"] = len(msgs)
-                tmp = f.with_suffix(".json.tmp")
-                tmp.write_text(_json.dumps(doc, indent=2, default=str, ensure_ascii=False), encoding="utf-8")
-                tmp.rename(f)
-                patched += 1
-            except Exception as exc:
-                logger.warning("repin-session: %s failed: %s", f.name, exc)
-        return patched
-
-    def _repin_single_session_file(self, session_id: str, new_model: str, new_base_url: str) -> int:
-        """Rewrite {model, base_url} in a single session file.
-
-        Like ``_repin_session_files`` but targets only the file for
-        ``session_id``.  Session files are named ``session_<safe_id>.json``
-        where colons in the session_id are replaced with underscores.
-
-        Returns 1 if the file was updated, 0 if it was not found or had
-        no ``model`` key.
-        """
-        import json as _json
-        from gateway.run import _hermes_home
-
-        # hermes uses the raw session_id in filenames (colons preserved);
-        # some older builds encoded colons to underscores — try both.
-        session_file = _hermes_home / "sessions" / f"session_{session_id}.json"
-        if not session_file.is_file():
-            safe_id = session_id.replace(":", "_")
-            session_file = _hermes_home / "sessions" / f"session_{safe_id}.json"
-            if not session_file.is_file():
-                return 0
-        try:
-            raw = session_file.read_text(encoding="utf-8")
-            doc = _json.loads(raw)
-            if not isinstance(doc, dict) or "model" not in doc:
-                return 0
-            doc["model"] = new_model
-            if "base_url" in doc:
-                doc["base_url"] = new_base_url
-            msgs = doc.get("messages")
-            if isinstance(msgs, list):
-                msgs.append({
-                    "role": "system",
-                    "content": (
-                        f"[System: model switched to {new_model} for this session. "
-                        f"Adjust your self-identification accordingly.]"
-                    ),
-                })
-                doc["message_count"] = len(msgs)
-            tmp = session_file.with_suffix(".json.tmp")
-            tmp.write_text(
-                _json.dumps(doc, indent=2, default=str, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            tmp.rename(session_file)
-            return 1
-        except Exception as exc:
-            logger.warning("repin-single-session: %s failed: %s", session_file.name, exc)
-            return 0
 
     # ------------------------------------------------------------------
     # connect — extend base routes with our respond endpoints

@@ -1,3 +1,5 @@
+import types
+
 import pytest
 import yaml
 
@@ -7,9 +9,10 @@ from gateway.platforms.zet_agent import ZetAgentAdapter
 
 
 class _FakeRequest:
-    def __init__(self, body):
+    def __init__(self, body, match_info=None):
         self._body = body
         self.headers = {"Authorization": "Bearer test-key"}
+        self.match_info = match_info or {}
 
     async def json(self):
         return self._body
@@ -105,3 +108,63 @@ async def test_model_switch_clears_stale_api_mode_and_context_length(tmp_path, m
     assert cfg["model"]["default"] == "glm-5"
     assert "api_mode" not in cfg["model"]
     assert "context_length" not in cfg["model"]
+
+
+@pytest.mark.asyncio
+async def test_session_model_switch_queues_pending_note(monkeypatch):
+    monkeypatch.setattr(zet_agent, "web", _FakeWeb)
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    adapter._check_auth = lambda request: None
+
+    evicted = []
+    gw = types.SimpleNamespace(
+        _session_model_overrides={},
+        _pending_model_notes={},
+        _evict_cached_agent=lambda sid: evicted.append(sid),
+    )
+    adapter.gateway_runner = gw
+
+    session_id = "zettlab:user1:agent-1:42"
+    resp = await adapter._handle_session_model_switch(
+        _FakeRequest(
+            {"model": "deepseek-v4", "provider": "custom"},
+            match_info={"session_id": session_id},
+        )
+    )
+
+    assert resp.status == 200
+    # Runtime override stored so the next turn resolves the new model.
+    assert gw._session_model_overrides[session_id]["model"] == "deepseek-v4"
+    # Cached agent evicted so the next turn rebuilds with the new model.
+    assert evicted == [session_id]
+    # One-shot note queued for this session's next user message.
+    note = gw._pending_model_notes[session_id]
+    assert "deepseek-v4" in note
+    assert "self-identification" in note
+
+
+@pytest.mark.asyncio
+async def test_session_model_switch_creates_pending_notes_when_missing(monkeypatch):
+    monkeypatch.setattr(zet_agent, "web", _FakeWeb)
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    adapter._check_auth = lambda request: None
+
+    # gateway_runner has no pre-existing _pending_model_notes attribute.
+    gw = types.SimpleNamespace(
+        _session_model_overrides={},
+        _evict_cached_agent=lambda sid: None,
+    )
+    adapter.gateway_runner = gw
+
+    session_id = "zettlab:user1:agent-1:7"
+    resp = await adapter._handle_session_model_switch(
+        _FakeRequest(
+            {"model": "glm-5"},
+            match_info={"session_id": session_id},
+        )
+    )
+
+    assert resp.status == 200
+    assert "glm-5" in gw._pending_model_notes[session_id]
