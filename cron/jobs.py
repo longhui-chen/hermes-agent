@@ -204,16 +204,21 @@ def parse_duration(s: str) -> int:
     return value * multipliers[unit]
 
 
-def parse_schedule(schedule: str) -> Dict[str, Any]:
+def parse_schedule(schedule: str, *, tz_name: Optional[str] = None) -> Dict[str, Any]:
     """
     Parse schedule string into structured format.
-    
+
     Returns dict with:
         - kind: "once" | "interval" | "cron"
         - For "once": "run_at" (ISO timestamp)
         - For "interval": "minutes" (int)
         - For "cron": "expr" (cron expression)
-    
+
+    ``tz_name`` is an optional IANA timezone (e.g. ``"Asia/Shanghai"``) used to
+    anchor *naive* ISO timestamps. With ``tz_name`` set, ``"2026-05-25T10:30"``
+    is interpreted as 10:30 wall-clock in that zone instead of the system local
+    zone — without it, the result depends on where hermes happens to run.
+
     Examples:
         "30m"              → once in 30 minutes
         "2h"               → once in 2 hours
@@ -262,8 +267,26 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
             dt = datetime.fromisoformat(schedule.replace('Z', '+00:00'))
             # Make naive timestamps timezone-aware at parse time so the stored
             # value doesn't depend on the system timezone matching at check time.
+            # When the caller supplied a tz_name (per-job timezone), interpret
+            # the naive wall-clock in that zone — otherwise fall back to system
+            # local (preserves pre-tz-aware behaviour).
             if dt.tzinfo is None:
-                dt = dt.astimezone()  # Interpret as local timezone
+                anchor_tz = None
+                if tz_name:
+                    try:
+                        anchor_tz = ZoneInfo(tz_name)
+                    except (ZoneInfoNotFoundError, ValueError):
+                        logger.warning(
+                            "parse_schedule: invalid tz_name %r, falling back "
+                            "to system local; create_job._validate_tz_name "
+                            "should normally catch this earlier",
+                            tz_name,
+                        )
+                        anchor_tz = None
+                if anchor_tz is not None:
+                    dt = dt.replace(tzinfo=anchor_tz)
+                else:
+                    dt = dt.astimezone()  # Interpret as local timezone
             return {
                 "kind": "once",
                 "run_at": dt.isoformat(),
@@ -597,7 +620,10 @@ def create_job(
     Returns:
         The created job dict
     """
-    parsed_schedule = parse_schedule(schedule)
+    # Validate the per-job timezone up-front so parse_schedule can honour it
+    # for naive ISO timestamps (e.g. "2026-05-25T10:30" → 10:30 wall in tz).
+    normalized_tz = _validate_tz_name(timezone)
+    parsed_schedule = parse_schedule(schedule, tz_name=normalized_tz)
 
     # Normalize repeat: treat 0 or negative values as None (infinite)
     if repeat is not None and repeat <= 0:
@@ -627,7 +653,6 @@ def create_job(
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
-    normalized_tz = _validate_tz_name(timezone)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -787,7 +812,9 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             # instead of a pre-parsed dict.  Normalize it the same way
             # create_job() does so downstream code can call .get() safely.
             if isinstance(updated_schedule, str):
-                updated_schedule = parse_schedule(updated_schedule)
+                updated_schedule = parse_schedule(
+                    updated_schedule, tz_name=updated.get("timezone")
+                )
                 updated["schedule"] = updated_schedule
             updated["schedule_display"] = updates.get(
                 "schedule_display",

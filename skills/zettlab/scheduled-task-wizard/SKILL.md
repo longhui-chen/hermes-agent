@@ -1,6 +1,6 @@
 ---
 name: scheduled-task-wizard
-description: 用自然对话引导用户创建/修改/管理定时任务（Hermes cron），把意图翻译成 cronjob 工具调用，全程不让用户填表单。⚠️ 调用 cronjob(action=create/update/remove) 前**必须先 skill_view('scheduled-task-wizard') 加载完整 workflow**，里面规定了用户确认卡片 + cron-action-preview JSON 围栏的产出格式；跳过 skill_view 直接调 cronjob 会绕过用户确认环节，APP 端拿不到结构化卡片。出货内置，每个 ZettClaw Agent 默认装载。
+description: 用自然对话引导用户创建/修改/管理定时任务（Hermes cron），把用户意图翻译成 cronjob 工具调用，不让用户填表单。在 Zettlab APP 交互式创建/修改/删除任务时，优先先 skill_view('scheduled-task-wizard') 加载 workflow，按其中格式输出 cron-action-preview JSON 围栏，让 APP 渲染预览/确认卡片。不要把这个向导当成 cronjob 的硬拦截器：用户已用文字明确确认、当前渠道不支持 APP 卡片、或 APP 按钮确认后的后台落盘路径，可以直接调用 cronjob。无论是否加载 workflow，schedule 都必须是 canonical 格式（cron 表达式 / every Nm / ISO 时间戳 / 时长简写），不能传用户自然语言原文。出货内置，每个 ZettClaw Agent 默认装载。
 version: 1.0.0
 author: zettlab
 license: proprietary
@@ -11,7 +11,7 @@ metadata:
 
 # 定时任务对话向导
 
-把"到点让 Agent 做事"的自然语言翻译成 Hermes cron job——4 类信息齐全才落盘，不齐全就 clarify。所有创建/修改/暂停/删除/立即跑都走对话，绝不让用户填表单。
+把"到点让 Agent 做事"的自然语言翻译成 Hermes cron job——4 类信息齐全才创建，不齐全就 clarify。APP 交互式创建/修改/删除优先给用户确认卡片；已确认或不支持卡片的渠道可以直接调用 cronjob，不要让向导阻塞正常定时任务。
 
 ## References
 
@@ -45,8 +45,8 @@ metadata:
 
 | 用户意图 | 工具调用 | 行为 |
 |---|---|---|
-| 创建 | `cronjob(action=create)` | 提炼 → 必要时 clarify → 卡片确认 → 落盘 |
-| 修改 | `cronjob(action=update)` | 定位 → 对照卡片 → 确认 → 落盘 |
+| 创建 | `cronjob(action=create)` | 提炼 → 必要时 clarify → APP 预览/确认或直接落盘 |
+| 修改 | `cronjob(action=update)` | 定位 → APP 对照确认或直接落盘 |
 | 暂停 | `cronjob(action=pause)` | 定位 → 直接调用 |
 | 开启 | `cronjob(action=resume)` | 定位 → 直接调用 |
 | 删除 | `cronjob(action=remove)` | 定位 → 二次确认 → 调用 |
@@ -70,6 +70,8 @@ metadata:
 - 不要让用户填表单——你是 skill，不是 form
 - 不要批量 clarify——每轮最多 1-2 个真正缺失的关键信息
 - 不要建议"分多条"——用户说"每天 8 点和 18 点都发"就直接建两条，不要让用户自己拆
+- **`schedule` 字段不能塞用户原文**——任何语种（中/英/日/韩/德…）的自然语言都先翻译成 canonical 格式：cron 表达式 / `every Nm` / `Nm` 时长简写 / ISO 时间戳。详见 `references/workflow.md` §步骤 2。错了 hermes 报 `Invalid schedule '...'`，任务创建失败。
+- 不要为了卡片流程阻断已确认的任务——用户明确说"确认/创建/就这样"、当前渠道没有 APP 卡片能力、或系统正在执行 APP 按钮确认后的后台落盘时，直接调 `cronjob`。
 - 不主动暴露底座高级选项（任务级模型 / 跨渠道 fan-out）——卡片默认不出现，clarify 也不主动问；但用户主动用自然语言表达就接住（如"用便宜模型"、"同时发飞书和 Slack"）
 - 脚本挂接（pre-run script + wake-gate）保持纯底座能力——用户没办法用自然语言表达"挂个 script"，不接也不解释
 - prompt 含明显指令注入/敏感命令会被底座 prompt 扫描拦截——拦了告诉用户"换种说法重写一下"

@@ -2397,6 +2397,70 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return job_id, None
 
+    # Bounded so a malicious or malformed origin can't push megabytes into
+    # jobs.json. Chat IDs in zet_agent are typically <80 chars
+    # ("zettlab:local-dev:main:EsGjUc7V-2oA"); 500 leaves headroom for future
+    # formats. User/chat name fields are short labels; 500 is generous.
+    _ORIGIN_PLATFORM_MAX = 200
+    _ORIGIN_TEXT_MAX = 500
+
+    @staticmethod
+    def _validate_origin_field(value) -> Optional["web.Response"]:
+        """Validate a cron job ``origin`` body — the chat session that
+        gets the delivery when ``deliver='origin'`` fires.
+
+        Mirrors the shape ``cronjob_tools._origin_from_env()`` writes in
+        the LLM-tool path: ``{platform, chat_id, chat_name?, thread_id?,
+        user_id?, user_name?}``. APP's preview-confirm-POST path lost
+        this metadata because the handler used to ignore unknown body
+        keys, so jobs landed with ``origin=null`` and the scheduler had
+        nowhere to deliver to (ZET-942 follow-up).
+
+        Returns a 400 web.Response on bad input, None when OK.
+        """
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            return web.json_response(
+                {"error": "origin must be an object"}, status=400,
+            )
+        platform = value.get("platform")
+        chat_id = value.get("chat_id")
+        if not isinstance(platform, str) or not platform.strip():
+            return web.json_response(
+                {"error": "origin.platform is required and must be a non-empty string"},
+                status=400,
+            )
+        if not isinstance(chat_id, str) or not chat_id.strip():
+            return web.json_response(
+                {"error": "origin.chat_id is required and must be a non-empty string"},
+                status=400,
+            )
+        if len(platform) > APIServerAdapter._ORIGIN_PLATFORM_MAX:
+            return web.json_response(
+                {"error": f"origin.platform must be ≤ {APIServerAdapter._ORIGIN_PLATFORM_MAX} characters"},
+                status=400,
+            )
+        if len(chat_id) > APIServerAdapter._ORIGIN_TEXT_MAX:
+            return web.json_response(
+                {"error": f"origin.chat_id must be ≤ {APIServerAdapter._ORIGIN_TEXT_MAX} characters"},
+                status=400,
+            )
+        for k in ("chat_name", "thread_id", "user_id", "user_name"):
+            v = value.get(k)
+            if v is None:
+                continue
+            if not isinstance(v, str):
+                return web.json_response(
+                    {"error": f"origin.{k} must be a string"}, status=400,
+                )
+            if len(v) > APIServerAdapter._ORIGIN_TEXT_MAX:
+                return web.json_response(
+                    {"error": f"origin.{k} must be ≤ {APIServerAdapter._ORIGIN_TEXT_MAX} characters"},
+                    status=400,
+                )
+        return None
+
     @staticmethod
     def _validate_timezone_field(value) -> Optional["web.Response"]:
         """Validate an IANA timezone string from a job request body.
@@ -2459,6 +2523,7 @@ class APIServerAdapter(BasePlatformAdapter):
             skills = body.get("skills")
             repeat = body.get("repeat")
             timezone = body.get("timezone")
+            origin = body.get("origin")
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -2477,6 +2542,9 @@ class APIServerAdapter(BasePlatformAdapter):
             tz_err = self._validate_timezone_field(timezone)
             if tz_err:
                 return tz_err
+            origin_err = self._validate_origin_field(origin)
+            if origin_err:
+                return origin_err
 
             kwargs = {
                 "prompt": prompt,
@@ -2490,6 +2558,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["repeat"] = repeat
             if timezone is not None:
                 kwargs["timezone"] = timezone
+            if origin is not None:
+                kwargs["origin"] = origin
 
             job = _cron_create(**kwargs)
             return web.json_response({"job": job})
