@@ -271,6 +271,96 @@ def _content_has_visible_payload(content: Any) -> bool:
     return False
 
 
+def _short_error_text(value: Any, *, limit: int = 500) -> str:
+    if value is None:
+        return ""
+    try:
+        text = str(value).strip()
+    except Exception:
+        return ""
+    return text[:limit]
+
+
+def _chat_finish_reason_from_result(result: Dict[str, Any]) -> str:
+    completed = bool(result.get("completed", True))
+    is_partial = bool(result.get("partial"))
+    is_failed = bool(result.get("failed"))
+    err_msg = _short_error_text(result.get("error"))
+    if _chat_result_is_truncated(result):
+        return "length"
+    if is_failed or (not completed and err_msg):
+        return "error"
+    return "stop"
+
+
+def _chat_result_is_truncated(result: Dict[str, Any]) -> bool:
+    if bool(result.get("truncated")):
+        return True
+    completed = bool(result.get("completed", True))
+    is_partial = bool(result.get("partial"))
+    is_failed = bool(result.get("failed"))
+    # run_agent marks response-length exhaustion as partial without failed.
+    # Treat that structured state as length instead of matching localized or
+    # provider-specific error strings such as "max tokens exceeded".
+    return is_partial and not completed and not is_failed
+
+
+def _chat_stream_error_payload(result: Dict[str, Any], finish_reason: str) -> Optional[Dict[str, Any]]:
+    completed = bool(result.get("completed", True))
+    is_partial = bool(result.get("partial"))
+    is_failed = bool(result.get("failed"))
+    err_msg = _short_error_text(result.get("error"))
+    if not (is_partial or is_failed or not completed or finish_reason == "error"):
+        return None
+    return {
+        "message": err_msg or "Agent run did not complete.",
+        "code": "output_truncated" if finish_reason == "length" else "agent_error",
+        "completed": completed,
+        "partial": is_partial,
+        "failed": is_failed,
+    }
+
+
+def _tool_completion_payload(
+    tool_call_id: str,
+    function_name: str,
+    function_result: Any,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "tool": function_name,
+        "toolCallId": tool_call_id,
+        "status": "completed",
+        "outcome": "success",
+    }
+    decoded = function_result if isinstance(function_result, dict) else None
+    if decoded is None and isinstance(function_result, str):
+        try:
+            decoded = json.loads(function_result)
+        except json.JSONDecodeError:
+            decoded = None
+    if not isinstance(decoded, dict) or "error" not in decoded:
+        return payload
+
+    error_msg = _short_error_text(decoded.get("error")) or "tool_error"
+    payload["outcome"] = "error"
+    payload["error"] = error_msg
+    if decoded.get("errorCode"):
+        payload["errorCode"] = _short_error_text(decoded.get("errorCode"), limit=120)
+    connector_error = decoded.get("connector_error")
+    if isinstance(connector_error, dict):
+        payload["connector_error"] = connector_error
+        for source_key, wire_key in (
+            ("provider", "provider"),
+            ("status", "statusCode"),
+            ("code", "errorCode"),
+            ("errorCode", "errorCode"),
+        ):
+            value = connector_error.get(source_key)
+            if value is not None and wire_key not in payload:
+                payload[wire_key] = value
+    return payload
+
+
 def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Response":
     """Translate a ``_normalize_multimodal_content`` ValueError into a 400 response."""
     raw = str(exc)
@@ -1161,11 +1251,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
-                _stream_q.put(("__tool_progress__", {
-                    "tool": function_name,
-                    "toolCallId": tool_call_id,
-                    "status": "completed",
-                }))
+                _stream_q.put(("__tool_progress__", _tool_completion_payload(
+                    tool_call_id, function_name, function_result,
+                )))
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -1237,12 +1325,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Decide finish_reason. OpenAI uses "length" for truncation, "stop"
         # for normal completion, and downstream SDKs accept "error" / custom
         # codes. See issue #22496.
-        if is_partial and err_msg and "truncat" in err_msg.lower():
-            finish_reason = "length"
-        elif is_failed or (not completed and err_msg):
-            finish_reason = "error"
-        else:
-            finish_reason = "stop"
+        finish_reason = _chat_finish_reason_from_result(result if isinstance(result, dict) else {})
 
         response_headers = {
             "X-Hermes-Session-Id": result.get("session_id", session_id),
@@ -1366,6 +1449,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__hermes_error__":
+                    event_data = json.dumps(item[1])
+                    await response.write(
+                        f"event: hermes.error\ndata: {event_data}\n\n".encode()
+                    )
                 else:
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
@@ -1404,17 +1492,27 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            result = {}
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
             except Exception as exc:
                 logger.warning("Agent task %s failed, usage data lost: %s", completion_id, exc)
+                result = {
+                    "completed": False,
+                    "failed": True,
+                    "error": str(exc),
+                }
+            finish_reason = _chat_finish_reason_from_result(result if isinstance(result, dict) else {})
+            error_payload = _chat_stream_error_payload(result if isinstance(result, dict) else {}, finish_reason)
+            if error_payload:
+                await _emit(("__hermes_error__", error_payload))
 
             # Finish chunk
             finish_chunk = {
                 "id": completion_id, "object": "chat.completion.chunk",
                 "created": created, "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                 "usage": {
                     "prompt_tokens": usage.get("input_tokens", 0),
                     "completion_tokens": usage.get("output_tokens", 0),
