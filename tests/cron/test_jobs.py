@@ -408,7 +408,7 @@ class TestUpdateJob:
         next_run = datetime.fromisoformat(job["next_run_at"])
         assert next_run.utcoffset() == timedelta(hours=8)
 
-    def test_create_job_invalid_timezone_raises(self, tmp_cron_dir):
+    def test_create_job_invalid_timezone_raises_with_message(self, tmp_cron_dir):
         with pytest.raises(ValueError, match="Invalid timezone"):
             create_job(
                 prompt="X", schedule="every 1h", timezone="Mars/Olympus_Mons"

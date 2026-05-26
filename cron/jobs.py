@@ -276,6 +276,12 @@ def parse_schedule(schedule: str, *, tz_name: Optional[str] = None) -> Dict[str,
                     try:
                         anchor_tz = ZoneInfo(tz_name)
                     except (ZoneInfoNotFoundError, ValueError):
+                        logger.warning(
+                            "parse_schedule: invalid tz_name %r, falling back "
+                            "to system local; create_job._validate_tz_name "
+                            "should normally catch this earlier",
+                            tz_name,
+                        )
                         anchor_tz = None
                 if anchor_tz is not None:
                     dt = dt.replace(tzinfo=anchor_tz)
