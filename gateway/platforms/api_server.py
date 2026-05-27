@@ -271,6 +271,96 @@ def _content_has_visible_payload(content: Any) -> bool:
     return False
 
 
+def _short_error_text(value: Any, *, limit: int = 500) -> str:
+    if value is None:
+        return ""
+    try:
+        text = str(value).strip()
+    except Exception:
+        return ""
+    return text[:limit]
+
+
+def _chat_finish_reason_from_result(result: Dict[str, Any]) -> str:
+    completed = bool(result.get("completed", True))
+    is_partial = bool(result.get("partial"))
+    is_failed = bool(result.get("failed"))
+    err_msg = _short_error_text(result.get("error"))
+    if _chat_result_is_truncated(result):
+        return "length"
+    if is_failed or (not completed and err_msg):
+        return "error"
+    return "stop"
+
+
+def _chat_result_is_truncated(result: Dict[str, Any]) -> bool:
+    if bool(result.get("truncated")):
+        return True
+    completed = bool(result.get("completed", True))
+    is_partial = bool(result.get("partial"))
+    is_failed = bool(result.get("failed"))
+    # run_agent marks response-length exhaustion as partial without failed.
+    # Treat that structured state as length instead of matching localized or
+    # provider-specific error strings such as "max tokens exceeded".
+    return is_partial and not completed and not is_failed
+
+
+def _chat_stream_error_payload(result: Dict[str, Any], finish_reason: str) -> Optional[Dict[str, Any]]:
+    completed = bool(result.get("completed", True))
+    is_partial = bool(result.get("partial"))
+    is_failed = bool(result.get("failed"))
+    err_msg = _short_error_text(result.get("error"))
+    if not (is_partial or is_failed or not completed or finish_reason == "error"):
+        return None
+    return {
+        "message": err_msg or "Agent run did not complete.",
+        "code": "output_truncated" if finish_reason == "length" else "agent_error",
+        "completed": completed,
+        "partial": is_partial,
+        "failed": is_failed,
+    }
+
+
+def _tool_completion_payload(
+    tool_call_id: str,
+    function_name: str,
+    function_result: Any,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "tool": function_name,
+        "toolCallId": tool_call_id,
+        "status": "completed",
+        "outcome": "success",
+    }
+    decoded = function_result if isinstance(function_result, dict) else None
+    if decoded is None and isinstance(function_result, str):
+        try:
+            decoded = json.loads(function_result)
+        except json.JSONDecodeError:
+            decoded = None
+    if not isinstance(decoded, dict) or "error" not in decoded:
+        return payload
+
+    error_msg = _short_error_text(decoded.get("error")) or "tool_error"
+    payload["outcome"] = "error"
+    payload["error"] = error_msg
+    if decoded.get("errorCode"):
+        payload["errorCode"] = _short_error_text(decoded.get("errorCode"), limit=120)
+    connector_error = decoded.get("connector_error")
+    if isinstance(connector_error, dict):
+        payload["connector_error"] = connector_error
+        for source_key, wire_key in (
+            ("provider", "provider"),
+            ("status", "statusCode"),
+            ("code", "errorCode"),
+            ("errorCode", "errorCode"),
+        ):
+            value = connector_error.get(source_key)
+            if value is not None and wire_key not in payload:
+                payload[wire_key] = value
+    return payload
+
+
 def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Response":
     """Translate a ``_normalize_multimodal_content`` ValueError into a 400 response."""
     raw = str(exc)
@@ -1161,11 +1251,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
-                _stream_q.put(("__tool_progress__", {
-                    "tool": function_name,
-                    "toolCallId": tool_call_id,
-                    "status": "completed",
-                }))
+                _stream_q.put(("__tool_progress__", _tool_completion_payload(
+                    tool_call_id, function_name, function_result,
+                )))
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -1237,12 +1325,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Decide finish_reason. OpenAI uses "length" for truncation, "stop"
         # for normal completion, and downstream SDKs accept "error" / custom
         # codes. See issue #22496.
-        if is_partial and err_msg and "truncat" in err_msg.lower():
-            finish_reason = "length"
-        elif is_failed or (not completed and err_msg):
-            finish_reason = "error"
-        else:
-            finish_reason = "stop"
+        finish_reason = _chat_finish_reason_from_result(result if isinstance(result, dict) else {})
 
         response_headers = {
             "X-Hermes-Session-Id": result.get("session_id", session_id),
@@ -1366,6 +1449,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__hermes_error__":
+                    event_data = json.dumps(item[1])
+                    await response.write(
+                        f"event: hermes.error\ndata: {event_data}\n\n".encode()
+                    )
                 else:
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
@@ -1404,17 +1492,27 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Get usage from completed agent
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            result = {}
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
             except Exception as exc:
                 logger.warning("Agent task %s failed, usage data lost: %s", completion_id, exc)
+                result = {
+                    "completed": False,
+                    "failed": True,
+                    "error": str(exc),
+                }
+            finish_reason = _chat_finish_reason_from_result(result if isinstance(result, dict) else {})
+            error_payload = _chat_stream_error_payload(result if isinstance(result, dict) else {}, finish_reason)
+            if error_payload:
+                await _emit(("__hermes_error__", error_payload))
 
             # Finish chunk
             finish_chunk = {
                 "id": completion_id, "object": "chat.completion.chunk",
                 "created": created, "model": model,
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
                 "usage": {
                     "prompt_tokens": usage.get("input_tokens", 0),
                     "completion_tokens": usage.get("output_tokens", 0),
@@ -2397,6 +2495,70 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return job_id, None
 
+    # Bounded so a malicious or malformed origin can't push megabytes into
+    # jobs.json. Chat IDs in zet_agent are typically <80 chars
+    # ("zettlab:local-dev:main:EsGjUc7V-2oA"); 500 leaves headroom for future
+    # formats. User/chat name fields are short labels; 500 is generous.
+    _ORIGIN_PLATFORM_MAX = 200
+    _ORIGIN_TEXT_MAX = 500
+
+    @staticmethod
+    def _validate_origin_field(value) -> Optional["web.Response"]:
+        """Validate a cron job ``origin`` body — the chat session that
+        gets the delivery when ``deliver='origin'`` fires.
+
+        Mirrors the shape ``cronjob_tools._origin_from_env()`` writes in
+        the LLM-tool path: ``{platform, chat_id, chat_name?, thread_id?,
+        user_id?, user_name?}``. APP's preview-confirm-POST path lost
+        this metadata because the handler used to ignore unknown body
+        keys, so jobs landed with ``origin=null`` and the scheduler had
+        nowhere to deliver to (ZET-942 follow-up).
+
+        Returns a 400 web.Response on bad input, None when OK.
+        """
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            return web.json_response(
+                {"error": "origin must be an object"}, status=400,
+            )
+        platform = value.get("platform")
+        chat_id = value.get("chat_id")
+        if not isinstance(platform, str) or not platform.strip():
+            return web.json_response(
+                {"error": "origin.platform is required and must be a non-empty string"},
+                status=400,
+            )
+        if not isinstance(chat_id, str) or not chat_id.strip():
+            return web.json_response(
+                {"error": "origin.chat_id is required and must be a non-empty string"},
+                status=400,
+            )
+        if len(platform) > APIServerAdapter._ORIGIN_PLATFORM_MAX:
+            return web.json_response(
+                {"error": f"origin.platform must be ≤ {APIServerAdapter._ORIGIN_PLATFORM_MAX} characters"},
+                status=400,
+            )
+        if len(chat_id) > APIServerAdapter._ORIGIN_TEXT_MAX:
+            return web.json_response(
+                {"error": f"origin.chat_id must be ≤ {APIServerAdapter._ORIGIN_TEXT_MAX} characters"},
+                status=400,
+            )
+        for k in ("chat_name", "thread_id", "user_id", "user_name"):
+            v = value.get(k)
+            if v is None:
+                continue
+            if not isinstance(v, str):
+                return web.json_response(
+                    {"error": f"origin.{k} must be a string"}, status=400,
+                )
+            if len(v) > APIServerAdapter._ORIGIN_TEXT_MAX:
+                return web.json_response(
+                    {"error": f"origin.{k} must be ≤ {APIServerAdapter._ORIGIN_TEXT_MAX} characters"},
+                    status=400,
+                )
+        return None
+
     @staticmethod
     def _validate_timezone_field(value) -> Optional["web.Response"]:
         """Validate an IANA timezone string from a job request body.
@@ -2459,6 +2621,7 @@ class APIServerAdapter(BasePlatformAdapter):
             skills = body.get("skills")
             repeat = body.get("repeat")
             timezone = body.get("timezone")
+            origin = body.get("origin")
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -2477,6 +2640,9 @@ class APIServerAdapter(BasePlatformAdapter):
             tz_err = self._validate_timezone_field(timezone)
             if tz_err:
                 return tz_err
+            origin_err = self._validate_origin_field(origin)
+            if origin_err:
+                return origin_err
 
             kwargs = {
                 "prompt": prompt,
@@ -2490,6 +2656,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["repeat"] = repeat
             if timezone is not None:
                 kwargs["timezone"] = timezone
+            if origin is not None:
+                kwargs["origin"] = origin
 
             job = _cron_create(**kwargs)
             return web.json_response({"job": job})

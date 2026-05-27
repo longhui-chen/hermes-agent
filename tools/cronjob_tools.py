@@ -304,6 +304,7 @@ def cronjob(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
+    timezone: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -370,6 +371,7 @@ def cronjob(
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
+                timezone=_normalize_optional_job_value(timezone),
             )
             return json.dumps(
                 {
@@ -517,6 +519,10 @@ def cronjob(
                             success=False,
                         )
                 updates["no_agent"] = target_no_agent
+            if timezone is not None:
+                # Empty string clears the per-job tz (falls back to hermes
+                # instance tz); otherwise normalize and let update_job validate.
+                updates["timezone"] = _normalize_optional_job_value(timezone)
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -698,6 +704,20 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "string",
                 "description": "Optional absolute path to run the job from. When set, AGENTS.md / CLAUDE.md / .cursorrules from that directory are injected into the system prompt, and the terminal/file/code_exec tools use it as their working directory — useful for running a job inside a specific project repo. Must be an absolute path that exists. When unset (default), preserves the original behaviour: no project context files, tools use the scheduler's cwd. On update, pass an empty string to clear. Jobs with workdir run sequentially (not parallel) to keep per-job directories isolated."
             },
+            "timezone": {
+                "type": "string",
+                "description": (
+                    "IANA timezone name (e.g. 'Asia/Shanghai', 'America/New_York', 'UTC') "
+                    "the job's wall-clock time is evaluated in. Affects cron expressions "
+                    "(e.g. '30 10 * * *' fires at 10:30 in this zone) and naive one-shot "
+                    "ISO timestamps ('2026-05-25T10:30' is interpreted as this zone's wall time). "
+                    "Omit to inherit the hermes instance default — but when the surrounding "
+                    "platform (Zettlab gateway / app) already injected a timezone in the "
+                    "request, that value is propagated automatically and you should not "
+                    "override it unless the user explicitly named a different zone "
+                    "(e.g. '北京时间', 'UTC 02:30'). On update, pass empty string to clear."
+                ),
+            },
         },
         "required": ["action"]
     }
@@ -753,6 +773,7 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        timezone=args.get("timezone"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,

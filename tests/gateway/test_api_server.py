@@ -841,6 +841,76 @@ class TestChatCompletionsEndpoint:
                 assert " about it..." in body
 
     @pytest.mark.asyncio
+    async def test_stream_agent_failure_emits_hermes_error(self, adapter):
+        mock_result = {
+            "final_response": "",
+            "completed": False,
+            "partial": False,
+            "failed": True,
+            "error": "provider auth failed",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+            assert resp.status == 200
+            body = await resp.text()
+
+        assert "event: hermes.error" in body
+        assert '"message": "provider auth failed"' in body
+        assert '"code": "agent_error"' in body
+        assert '"finish_reason": "error"' in body
+        assert "[DONE]" in body
+
+    @pytest.mark.asyncio
+    async def test_stream_partial_agent_result_uses_length_finish_reason(self, adapter):
+        mock_result = {
+            "final_response": "partial answer",
+            "completed": False,
+            "partial": True,
+            "failed": False,
+            "error": "max tokens exceeded",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("partial answer")
+                return mock_result, {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+            assert resp.status == 200
+            body = await resp.text()
+
+        assert "event: hermes.error" in body
+        assert '"code": "output_truncated"' in body
+        assert '"finish_reason": "length"' in body
+        assert "partial answer" in body
+
+    @pytest.mark.asyncio
     async def test_stream_includes_tool_progress(self, adapter):
         """tool_start_callback fires → progress appears as custom SSE event, not in delta.content."""
         import asyncio
@@ -1020,6 +1090,71 @@ class TestChatCompletionsEndpoint:
             assert len(pairs) == 2, f"expected 2 events (running+completed), got {pairs}"
             assert pairs[0] == ("running", "call_terminal_1"), pairs
             assert pairs[1] == ("completed", "call_terminal_1"), pairs
+
+    @pytest.mark.asyncio
+    async def test_stream_tool_complete_includes_error_outcome(self, adapter):
+        import asyncio
+        import json as _json
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                ts_cb = kwargs.get("tool_start_callback")
+                tc_cb = kwargs.get("tool_complete_callback")
+                if ts_cb:
+                    ts_cb("call_linear_1", "linear_list_issues", {"first": 3})
+                if tc_cb:
+                    tc_cb(
+                        "call_linear_1",
+                        "linear_list_issues",
+                        {"first": 3},
+                        _json.dumps({
+                            "error": "denied_by_agent_policy",
+                            "errorCode": "denied_by_agent_policy",
+                            "connector_error": {
+                                "code": "denied_by_agent_policy",
+                                "provider": "linear",
+                                "status": 403,
+                            },
+                        }),
+                    )
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("The connector call failed.")
+                return (
+                    {"final_response": "The connector call failed.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "list linear issues"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        events = []
+        lines = body.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip() != "event: hermes.tool.progress":
+                continue
+            for follow in lines[i + 1: i + 4]:
+                if follow.startswith("data: "):
+                    events.append(_json.loads(follow[len("data: "):]))
+                    break
+        completed = [event for event in events if event.get("status") == "completed"]
+        assert len(completed) == 1
+        assert completed[0]["outcome"] == "error"
+        assert completed[0]["error"] == "denied_by_agent_policy"
+        assert completed[0]["errorCode"] == "denied_by_agent_policy"
+        assert completed[0]["connector_error"]["provider"] == "linear"
+        assert completed[0]["connector_error"]["status"] == 403
 
     @pytest.mark.asyncio
     async def test_stream_tool_lifecycle_skips_internal_and_orphan_completes(self, adapter):
@@ -2550,13 +2685,13 @@ class TestChatCompletionsAgentIncomplete:
 
     @pytest.mark.asyncio
     async def test_truncation_with_partial_text_uses_length_finish_reason(self, adapter):
-        """Partial text + truncation marker → finish_reason='length', 200 OK,
+        """Partial text + structured partial state → finish_reason='length', 200 OK,
         plus hermes extras + headers."""
         mock_result = {
             "final_response": "Here is part one of the answer",
             "completed": False,
             "partial": True,
-            "error": "Response truncated due to output length limit",
+            "error": "max tokens exceeded",
             "messages": [],
             "api_calls": 1,
         }
