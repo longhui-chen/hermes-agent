@@ -2955,6 +2955,17 @@ class AIAgent:
             except Exception:
                 logger.debug("status_callback error in _emit_warning", exc_info=True)
 
+    def _emit_structured_status(self, event_type: str, payload: Dict[str, Any]) -> None:
+        """Emit a structured gateway status event without changing CLI output."""
+        if not self.status_callback:
+            return
+        if not getattr(self.status_callback, "_hermes_accepts_structured_status", False):
+            return
+        try:
+            self.status_callback(event_type, payload)
+        except Exception:
+            logger.debug("status_callback error in _emit_structured_status", exc_info=True)
+
     # Headers we capture from the dying stream's HTTP response so post-mortem
     # diagnosis can answer "which CF edge / which OpenRouter downstream
     # provider / which request id".  Lowercased; httpx returns CIMultiDict.
@@ -10700,8 +10711,19 @@ class AIAgent:
             f"{approx_tokens:,}" if approx_tokens else "unknown", self.model,
             focus_topic,
         )
+        _old_session_id = self.session_id or ""
         self._emit_status(
             "🗜️ Compacting context — summarizing earlier conversation so I can continue..."
+        )
+        self._emit_structured_status(
+            "context.compaction",
+            {
+                "state": "started",
+                "message": "上下文正在压缩",
+                "old_session_id": _old_session_id,
+                "before_messages": _pre_msg_count,
+                "before_tokens": approx_tokens,
+            },
         )
 
         # Notify external memory provider before compression discards context
@@ -10712,11 +10734,23 @@ class AIAgent:
                 pass
 
         try:
-            compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic)
-        except TypeError:
-            # Plugin context engine with strict signature that doesn't accept
-            # focus_topic — fall back to calling without it.
-            compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
+            try:
+                compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic)
+            except TypeError:
+                # Plugin context engine with strict signature that doesn't accept
+                # focus_topic — fall back to calling without it.
+                compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens)
+        except Exception as _compress_err:
+            self._emit_structured_status(
+                "context.compaction",
+                {
+                    "state": "failed",
+                    "message": "上下文压缩失败",
+                    "old_session_id": _old_session_id,
+                    "error": str(_compress_err),
+                },
+            )
+            raise
 
         summary_error = getattr(self.context_compressor, "_last_summary_error", None)
         if summary_error:
@@ -10860,6 +10894,19 @@ class AIAgent:
             "context compression done: session=%s messages=%d->%d tokens=~%s",
             self.session_id or "none", _pre_msg_count, len(compressed),
             f"{_compressed_est:,}",
+        )
+        self._emit_structured_status(
+            "context.compaction",
+            {
+                "state": "succeeded",
+                "message": "上下文压缩成功",
+                "old_session_id": _old_session_id,
+                "new_session_id": self.session_id or "",
+                "before_messages": _pre_msg_count,
+                "after_messages": len(compressed),
+                "before_tokens": approx_tokens,
+                "after_tokens": _compressed_est,
+            },
         )
         return compressed, new_system_prompt
 
