@@ -3121,7 +3121,12 @@ def _guard_official_docker_root_gateway() -> None:
     sys.exit(1)
 
 
-def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False):
+def run_gateway(
+    verbose: int = 0,
+    quiet: bool = False,
+    replace: bool = False,
+    accept_hooks: bool = False,
+):
     """Run the gateway in foreground.
     
     Args:
@@ -3130,6 +3135,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False):
         replace: If True, kill any existing gateway instance before starting.
                  This prevents systemd restart loops when the old process
                  hasn't fully exited yet.
+        accept_hooks: Auto-approve configured shell hooks for this gateway process.
     """
     _guard_official_docker_root_gateway()
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -3252,7 +3258,13 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False):
 
     success = False
     try:
-        success = asyncio.run(start_gateway(replace=replace, verbosity=verbosity))
+        success = asyncio.run(
+            start_gateway(
+                replace=replace,
+                verbosity=verbosity,
+                accept_hooks=accept_hooks,
+            )
+        )
         _exit_diag("asyncio.run.returned", success=success)
     except KeyboardInterrupt:
         # On Windows-detached runs this shouldn't fire (we absorb SIGINT above),
@@ -5031,7 +5043,13 @@ def _gateway_command_inner(args):
         verbose = getattr(args, 'verbose', 0)
         quiet = getattr(args, 'quiet', False)
         replace = getattr(args, 'replace', False)
-        run_gateway(verbose, quiet=quiet, replace=replace)
+        accept_hooks = getattr(args, 'accept_hooks', False)
+        run_gateway(
+            verbose,
+            quiet=quiet,
+            replace=replace,
+            accept_hooks=accept_hooks,
+        )
         return
 
     if subcmd == "setup":

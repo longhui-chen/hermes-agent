@@ -1,5 +1,6 @@
 import pytest
 import yaml
+import queue
 
 from gateway.config import PlatformConfig
 import gateway.platforms.zet_agent as zet_agent
@@ -105,3 +106,50 @@ async def test_model_switch_clears_stale_api_mode_and_context_length(tmp_path, m
     assert cfg["model"]["default"] == "glm-5"
     assert "api_mode" not in cfg["model"]
     assert "context_length" not in cfg["model"]
+
+
+def test_status_callback_forwards_context_compaction_to_tool_progress_lane():
+    stream_q = queue.Queue()
+    cb = ZetAgentAdapter._make_status_cb(stream_q)
+
+    cb("context.compaction", {
+        "state": "succeeded",
+        "message": "上下文压缩成功",
+        "old_session_id": "old",
+        "new_session_id": "new",
+    })
+
+    tag, payload = stream_q.get_nowait()
+    assert tag == "__tool_progress__"
+    assert payload == {
+        "type": "context.compaction",
+        "state": "succeeded",
+        "message": "上下文压缩成功",
+        "old_session_id": "old",
+        "new_session_id": "new",
+    }
+
+
+def test_status_callback_ignores_unstructured_status():
+    stream_q = queue.Queue()
+    cb = ZetAgentAdapter._make_status_cb(stream_q)
+
+    cb("lifecycle", "Compacting context")
+
+    assert stream_q.empty()
+
+
+def test_status_callback_preserves_existing_callback():
+    stream_q = queue.Queue()
+    seen = []
+    cb = ZetAgentAdapter._make_status_cb(stream_q, lambda kind, payload=None: seen.append((kind, payload)))
+
+    cb("lifecycle", "Compacting context")
+    cb("context.compaction", {"state": "started"})
+
+    assert seen == [("lifecycle", "Compacting context")]
+    assert stream_q.get_nowait() == ("__tool_progress__", {
+        "type": "context.compaction",
+        "state": "started",
+    })
+    assert getattr(cb, "_hermes_accepts_structured_status") is True
