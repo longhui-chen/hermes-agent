@@ -151,6 +151,13 @@ def _approval_timeout_seconds() -> float:
 # without truncation. Beyond that, the APP can elide.
 TITLE_MAX_LEN = 60
 
+# Name of the single MCP server that carries Zettlab connector tools
+# (linear.*, etc). local-server injects this server into each agent's
+# profile config.yaml at spawn (see spawn.go). POST /v1/connectors/reload
+# reconnects ONLY this server so a connector-policy change is picked up
+# without bouncing any other MCP server the agent may have connected.
+ZETTLAB_CONNECTORS_SERVER_NAME = "zettlab_connectors"
+
 
 # Zettlab APP 平台的工作风格补丁。
 #
@@ -1363,6 +1370,152 @@ class ZetAgentAdapter(APIServerAdapter):
         })
 
     # ------------------------------------------------------------------
+    # ZET-900 — skill / connector reload control endpoints
+    # ------------------------------------------------------------------
+
+    async def _handle_skills_reload(self, request: "web.Request") -> "web.Response":
+        """POST /v1/skills/reload — drop the skills prompt cache + rescan.
+
+        Called by zettlab-local-server right after a skillhub install/uninstall
+        lands a bundle in ``<profile>/skills/__skillhub__/...`` (see ZET-900
+        plan §4.1b). The install path is pure Go and never touches this
+        process, so without this nudge the in-process skills index stays stale
+        until the next cold start.
+
+        Behaviour (clear cache + rescan only — no prompt rebuild, no SQLite
+        write):
+          - ``clear_skills_system_prompt_cache(clear_snapshot=True)`` drops the
+            in-process LRU and the on-disk snapshot, so the next *new* session
+            rebuilds its system prompt from the freshly-written skill files.
+          - ``scan_skill_commands()`` refreshes the slash-command table and
+            gives us the current skill count for the response.
+
+        Both are module-level functions (same ones ``/reload-skills`` and the
+        skill-hub CLI call); they are NOT per-AIAgent-instance methods. The
+        gateway is per-session one AIAgent, and a fresh session starts with
+        ``_cached_system_prompt = None`` → it re-reads the cleared cache.
+
+        Auth: ZET_AGENT_KEY Bearer (same as chat).
+
+        Response: ``{"cleared": true, "skills_total": <int>}``.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            from agent.prompt_builder import clear_skills_system_prompt_cache
+            from agent.skill_commands import scan_skill_commands
+        except Exception as exc:
+            logger.exception("[zet_agent] skills-reload: import failed")
+            return web.json_response(
+                _openai_error(
+                    f"skills reload modules unavailable: {exc}",
+                    err_type="server_error",
+                ),
+                status=500,
+            )
+
+        try:
+            clear_skills_system_prompt_cache(clear_snapshot=True)
+            skill_commands = scan_skill_commands()
+            skills_total = len(skill_commands)
+        except Exception as exc:
+            logger.exception("[zet_agent] skills-reload failed")
+            return web.json_response(
+                _openai_error(
+                    f"skills reload failed: {exc}", err_type="server_error",
+                ),
+                status=500,
+            )
+
+        logger.info(
+            "[zet_agent] skills-reload: cleared prompt cache + rescanned "
+            "(%d skill(s))", skills_total,
+        )
+        return web.json_response({
+            "cleared": True,
+            "skills_total": skills_total,
+        })
+
+    async def _handle_connectors_reload(self, request: "web.Request") -> "web.Response":
+        """POST /v1/connectors/reload — reconnect ONLY the zettlab_connectors
+        MCP server and re-pull its tool table.
+
+        Called by zettlab-local-server after installing/uninstalling a
+        connector-skill (ZET-900 plan §4.2). The connector MCP server's
+        ``tools/list`` is policy-gated and dynamic: a tool only appears if the
+        agent's connector policy allows it. The tool table is frozen when the
+        gateway first connects, so a policy change made after start-up is
+        invisible until we explicitly reconnect this server.
+
+        We reconnect ONLY ``zettlab_connectors`` — never a full
+        ``shutdown_mcp_servers()`` — to avoid disturbing any other MCP server
+        the agent has connected (a full shutdown also stops the whole MCP
+        background loop). The single-server reconnect lives in
+        ``tools/mcp_tool.reload_single_mcp_server`` (tear down just that server
+        via its own ``shutdown()`` which self-deregisters its tools, then
+        ``discover_mcp_tools()`` to reconnect the now-missing one).
+
+        Runs the (blocking) reconnect in an executor so the aiohttp event loop
+        is not stalled while the MCP handshake happens on its background loop.
+
+        This only serves *new* sessions — it does not invalidate the current
+        session's cached agent. That matches the skills-reload boundary.
+
+        Auth: ZET_AGENT_KEY Bearer (same as chat).
+
+        Response: ``{"reloaded": true, "tools_total": <int>}`` where
+        ``tools_total`` is the count of ALL registered MCP tools (across every
+        connected server) after the reconnect.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            from tools.mcp_tool import reload_single_mcp_server
+        except Exception as exc:
+            logger.exception("[zet_agent] connectors-reload: import failed")
+            return web.json_response(
+                _openai_error(
+                    f"mcp reload module unavailable: {exc}",
+                    err_type="server_error",
+                ),
+                status=500,
+            )
+
+        import asyncio
+        loop = asyncio.get_running_loop()
+        try:
+            tools = await loop.run_in_executor(
+                None,
+                reload_single_mcp_server,
+                ZETTLAB_CONNECTORS_SERVER_NAME,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[zet_agent] connectors-reload failed for server '%s': %s",
+                ZETTLAB_CONNECTORS_SERVER_NAME, exc,
+            )
+            return web.json_response(
+                _openai_error(
+                    f"connector reload failed: {exc}", err_type="server_error",
+                ),
+                status=500,
+            )
+
+        tools_total = len(tools or [])
+        logger.info(
+            "[zet_agent] connectors-reload: reconnected '%s'; %d MCP tool(s) total",
+            ZETTLAB_CONNECTORS_SERVER_NAME, tools_total,
+        )
+        return web.json_response({
+            "reloaded": True,
+            "tools_total": tools_total,
+        })
+
+    # ------------------------------------------------------------------
     # connect — extend base routes with our respond endpoints
     # ------------------------------------------------------------------
 
@@ -1474,6 +1627,20 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_post(
                 "/v1/sessions/{session_id}/model/switch",
                 self._handle_session_model_switch,
+            )
+
+            # ZET-900 — skill / connector reload control endpoints.
+            # Triggered by zettlab-local-server after a skillhub install /
+            # uninstall lands so the running gateway picks up new skills
+            # (prompt cache) and connector tools (zettlab_connectors MCP)
+            # without a cold restart. Auth: ZET_AGENT_KEY Bearer.
+            self._app.router.add_post(
+                "/v1/skills/reload",
+                self._handle_skills_reload,
+            )
+            self._app.router.add_post(
+                "/v1/connectors/reload",
+                self._handle_connectors_reload,
             )
 
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
