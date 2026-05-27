@@ -274,11 +274,27 @@ def _content_has_visible_payload(content: Any) -> bool:
 def _short_error_text(value: Any, *, limit: int = 500) -> str:
     if value is None:
         return ""
+    if isinstance(value, str):
+        return value.strip()[:limit]
+    if isinstance(value, (list, tuple, set, dict)) and not _has_tool_error_value(value):
+        return ""
     try:
         text = str(value).strip()
     except Exception:
         return ""
     return text[:limit]
+
+
+def _has_tool_error_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        return any(_has_tool_error_value(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_has_tool_error_value(item) for item in value)
+    return bool(value)
 
 
 def _chat_finish_reason_from_result(result: Dict[str, Any]) -> str:
@@ -338,15 +354,25 @@ def _tool_completion_payload(
             decoded = json.loads(function_result)
         except json.JSONDecodeError:
             decoded = None
-    if not isinstance(decoded, dict) or "error" not in decoded:
+    if not isinstance(decoded, dict):
         return payload
 
-    error_msg = _short_error_text(decoded.get("error")) or "tool_error"
+    has_error = _has_tool_error_value(decoded.get("error"))
+    has_error_code = _has_tool_error_value(decoded.get("errorCode"))
+    connector_error = decoded.get("connector_error")
+    has_connector_error = _has_tool_error_value(connector_error)
+    if not (has_error or has_error_code or has_connector_error):
+        return payload
+
+    error_msg = (
+        _short_error_text(decoded.get("error"))
+        or _short_error_text(decoded.get("errorCode"), limit=120)
+        or "tool_error"
+    )
     payload["outcome"] = "error"
     payload["error"] = error_msg
-    if decoded.get("errorCode"):
+    if has_error_code:
         payload["errorCode"] = _short_error_text(decoded.get("errorCode"), limit=120)
-    connector_error = decoded.get("connector_error")
     if isinstance(connector_error, dict):
         payload["connector_error"] = connector_error
         for source_key, wire_key in (

@@ -1157,6 +1157,84 @@ class TestChatCompletionsEndpoint:
         assert completed[0]["connector_error"]["status"] == 403
 
     @pytest.mark.asyncio
+    async def test_stream_tool_complete_treats_empty_error_fields_as_success(self, adapter):
+        import asyncio
+        import json as _json
+
+        empty_error_values = [
+            None,
+            "",
+            "   ",
+            {},
+            [],
+            {"message": ""},
+            {"message": None, "details": []},
+        ]
+
+        for index, error_value in enumerate(empty_error_values):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                async def _mock_run_agent(**kwargs):
+                    cb = kwargs.get("stream_delta_callback")
+                    ts_cb = kwargs.get("tool_start_callback")
+                    tc_cb = kwargs.get("tool_complete_callback")
+                    call_id = f"call_terminal_{index}"
+                    if ts_cb:
+                        ts_cb(call_id, "terminal", {"command": "ls -la"})
+                    if tc_cb:
+                        tc_cb(
+                            call_id,
+                            "terminal",
+                            {"command": "ls -la"},
+                            _json.dumps({
+                                "output": "total 136\n",
+                                "exit_code": 0,
+                                "error": error_value,
+                                "errorCode": "",
+                                "connector_error": {
+                                    "code": "",
+                                    "provider": "",
+                                    "status": None,
+                                },
+                            }),
+                        )
+                    if cb:
+                        await asyncio.sleep(0.05)
+                        cb("done.")
+                    return (
+                        {"final_response": "done.", "messages": [], "api_calls": 1},
+                        {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    )
+
+                with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                    resp = await cli.post(
+                        "/v1/chat/completions",
+                        json={
+                            "model": "test",
+                            "messages": [{"role": "user", "content": "list"}],
+                            "stream": True,
+                        },
+                    )
+                    assert resp.status == 200
+                    body = await resp.text()
+
+            events = []
+            lines = body.splitlines()
+            for line_index, line in enumerate(lines):
+                if line.strip() != "event: hermes.tool.progress":
+                    continue
+                for follow in lines[line_index + 1: line_index + 4]:
+                    if follow.startswith("data: "):
+                        events.append(_json.loads(follow[len("data: "):]))
+                        break
+            completed = [event for event in events if event.get("status") == "completed"]
+            assert len(completed) == 1
+            assert completed[0]["outcome"] == "success", error_value
+            assert "error" not in completed[0]
+            assert "errorCode" not in completed[0]
+            assert "connector_error" not in completed[0]
+
+    @pytest.mark.asyncio
     async def test_stream_tool_lifecycle_skips_internal_and_orphan_completes(self, adapter):
         """Internal tools (``_thinking``-style) and ``completed`` events
         without a prior matching ``running`` must produce no lifecycle
