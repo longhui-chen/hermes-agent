@@ -346,6 +346,37 @@ class ZetAgentAdapter(APIServerAdapter):
         except Exception:
             logger.debug("[zet_agent] title push failed", exc_info=True)
 
+    @staticmethod
+    def _make_status_cb(stream_q: Any, previous: Any = None):
+        """Forward structured AIAgent status events onto the SSE extension lane."""
+        # AIAgent instances are currently created per turn. If a future change
+        # reuses them, unwrap our prior wrapper instead of chaining closures that
+        # still capture an old stream_q.
+        if getattr(previous, "_hermes_zettlab_status_wrapper", False):
+            previous = getattr(previous, "_hermes_previous_status_callback", None)
+
+        def _status(kind: str, payload: Any = None) -> None:
+            is_compaction = kind == "context.compaction" and isinstance(payload, dict)
+            previous_accepts_structured = getattr(previous, "_hermes_accepts_structured_status", False)
+            if previous is not None and (not is_compaction or previous_accepts_structured):
+                try:
+                    previous(kind, payload)
+                except Exception:
+                    logger.debug("[zet_agent] previous status_callback failed", exc_info=True)
+            if not is_compaction:
+                return
+            event = dict(payload)
+            event["type"] = "context.compaction"
+            try:
+                stream_q.put(("__tool_progress__", event))
+            except Exception:
+                logger.debug("[zet_agent] status push failed", exc_info=True)
+
+        setattr(_status, "_hermes_accepts_structured_status", True)
+        setattr(_status, "_hermes_zettlab_status_wrapper", True)
+        setattr(_status, "_hermes_previous_status_callback", previous)
+        return _status
+
     # ------------------------------------------------------------------
     # Approval — register notify callback, resolve via HTTP respond
     # ------------------------------------------------------------------
@@ -637,7 +668,17 @@ class ZetAgentAdapter(APIServerAdapter):
                 exc_info=True,
             )
 
-        # 2. Clarify: late-bind. The AIAgent invokes this only if the
+        # 2. Structured lifecycle status: late-bind so only the sniffed
+        # chat-completions stream receives the App-specific extension event.
+        try:
+            agent.status_callback = self._make_status_cb(
+                stream_q,
+                getattr(agent, "status_callback", None),
+            )
+        except Exception:
+            logger.warning("[zet_agent] failed to attach status_callback", exc_info=True)
+
+        # 3. Clarify: late-bind. The AIAgent invokes this only if the
         # model calls the clarify tool, so the cost of always wiring
         # it is just a closure allocation.
         if session_id:
@@ -646,7 +687,7 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception:
                 logger.warning("[zet_agent] failed to attach clarify_callback", exc_info=True)
 
-        # 3. Approval: register a per-session notify callback.
+        # 4. Approval: register a per-session notify callback.
         # We don't unregister here because chat.completions reuses the
         # same session_id across turns; unregistration happens on
         # platform disconnect (or never, for short-lived processes).
@@ -657,7 +698,7 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception:
                 logger.warning("[zet_agent] failed to register approval notify", exc_info=True)
 
-        # 4. Auto-title is emitted in _run_agent() instead — the
+        # 5. Auto-title is emitted in _run_agent() instead — the
         # user_message arrives there as a kwarg, but at this point in
         # _create_agent it has not been threaded through yet
         # (base _run_agent passes user_message only to run_conversation).
