@@ -749,6 +749,24 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception:
                 logger.debug("[zet_agent] auto-title hook failed", exc_info=True)
 
+        # Consume a pending model-switch note (queued by the model switch
+        # handlers into GatewayRunner._pending_model_notes) and prepend it to
+        # the user message so the model self-identifies correctly after a
+        # switch. The base APIServerAdapter path does NOT consume these — only
+        # the non-API GatewayRunner._run_agent does — so the device
+        # chat.completions path must consume here, otherwise the queued note
+        # never reaches the model. Try gateway_session_key then session_id
+        # since either may carry the key the handler queued under.
+        gw = getattr(self, "gateway_runner", None)
+        _notes = getattr(gw, "_pending_model_notes", None) if gw is not None else None
+        if _notes:
+            for _k in (gateway_session_key, session_id):
+                if _k and _k in _notes:
+                    _note = _notes.pop(_k, None)
+                    if _note:
+                        user_message = f"{_note}\n\n{user_message}"
+                    break
+
         old_session_key = os.environ.get("HERMES_SESSION_KEY")
         old_exec_ask = os.environ.get("HERMES_EXEC_ASK")
         if session_id:

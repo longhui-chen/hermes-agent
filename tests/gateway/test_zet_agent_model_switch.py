@@ -274,3 +274,81 @@ def test_status_callback_preserves_existing_callback():
         "state": "started",
     })
     assert getattr(cb, "_hermes_accepts_structured_status") is True
+
+
+@pytest.mark.asyncio
+async def test_run_agent_prepends_pending_model_note(monkeypatch):
+    from gateway.platforms.api_server import APIServerAdapter
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    gw = types.SimpleNamespace(
+        _pending_model_notes={"sess-1": "[Note: model switched to glm-5]"}
+    )
+    adapter.gateway_runner = gw
+
+    captured = {}
+
+    async def fake_super(self, **kwargs):
+        captured.update(kwargs)
+        return ({}, {})
+
+    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
+
+    await adapter._run_agent(
+        user_message="hello", conversation_history=[], session_id="sess-1"
+    )
+
+    # Note prepended to the user message handed to the agent.
+    assert captured["user_message"].startswith("[Note: model switched to glm-5]")
+    assert captured["user_message"].endswith("hello")
+    # One-shot: consumed (popped) so it isn't re-injected next turn.
+    assert "sess-1" not in gw._pending_model_notes
+
+
+@pytest.mark.asyncio
+async def test_run_agent_consumes_note_by_gateway_session_key(monkeypatch):
+    from gateway.platforms.api_server import APIServerAdapter
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    gw = types.SimpleNamespace(_pending_model_notes={"gw-key-9": "[Note: switched]"})
+    adapter.gateway_runner = gw
+
+    captured = {}
+
+    async def fake_super(self, **kwargs):
+        captured.update(kwargs)
+        return ({}, {})
+
+    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
+
+    await adapter._run_agent(
+        user_message="hi",
+        conversation_history=[],
+        session_id="other",
+        gateway_session_key="gw-key-9",
+    )
+
+    assert captured["user_message"].startswith("[Note: switched]")
+    assert "gw-key-9" not in gw._pending_model_notes
+
+
+@pytest.mark.asyncio
+async def test_run_agent_no_note_leaves_message_unchanged(monkeypatch):
+    from gateway.platforms.api_server import APIServerAdapter
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    adapter.gateway_runner = types.SimpleNamespace(_pending_model_notes={})
+
+    captured = {}
+
+    async def fake_super(self, **kwargs):
+        captured.update(kwargs)
+        return ({}, {})
+
+    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
+
+    await adapter._run_agent(
+        user_message="plain", conversation_history=[], session_id="sess-x"
+    )
+
+    assert captured["user_message"] == "plain"
