@@ -102,6 +102,25 @@ def _combine_delivery_errors(existing: Optional[str], added: str) -> str:
     return added
 
 
+def _user_id_from(session_id: str) -> str:
+    """zettlab:<userID>:<agentID>:<suffix> → userID（取不到返回空串）。"""
+    parts = session_id.split(":", 3)
+    return parts[1] if len(parts) == 4 and parts[0] == "zettlab" else ""
+
+
+def _handoff_session_id(old_id: str) -> Optional[str]:
+    """源对话已删时，基于旧 id 派生一个同 user/agent、新后缀的会话 id。
+
+    仅对标准 ``zettlab:<userID>:<agentID>:<suffix>`` 形状生效；其它形状返回
+    None（无法安全派生 → 退回原行为，让上层记为投递失败）。
+    """
+    import uuid
+    parts = old_id.split(":", 3)
+    if len(parts) != 4 or parts[0] != "zettlab":
+        return None
+    return f"zettlab:{parts[1]}:{parts[2]}:{uuid.uuid4().hex[:12]}"
+
+
 def _fence_safe(text: str) -> str:
     """把 error 串里的 ``` 折成 `` —— 防它破坏外层 fenced block / 让 App parser
     （parseCronRunStatus 的 `[\\s\\S]*?(?:\\n```|$)`）提前截断。两个 backtick
@@ -515,6 +534,30 @@ def _detect_fake_success(job_id: str) -> Optional[str]:
     )
 
 
+# ── Silent-run detection ────────────────────────────────────────────
+# 镜像 cron.scheduler.SILENT_MARKER；本地常量避免在 .pth 早期 import 时拉 scheduler。
+_SILENT_MARKER = "[SILENT]"
+_SILENT_STATUS_RE = re.compile(r"^\*\*Status:\*\*\s*silent\b", re.MULTILINE)
+
+
+def _is_silent_run(job_id: str) -> bool:
+    """本轮 tick 是否为 scheduler 已跳过推送的「静默运行」。
+
+    两种来源（都被 scheduler.tick() 用 SILENT_MARKER 跳过推送）：
+      - no_agent 脚本无输出（窗口外提醒 / wakeAgent=false）→ doc 带 "**Status:** silent (...)"
+      - agent 回复 [SILENT] → 落在 doc 的 ## Response body
+
+    落卡路径必须同样跳过，否则每个窗口外 tick 都会往聊天泄漏一张空卡；
+    per-run .md 仍由 save_job_output 落盘，详情页历史不受影响。
+    """
+    doc = _LATEST_OUTPUT.get(job_id, "")
+    if not doc.strip():
+        return False
+    if _SILENT_STATUS_RE.search(doc):
+        return True
+    return _SILENT_MARKER in _extract_response_body(doc).strip().upper()
+
+
 # ── Persist to hermes SessionDB ─────────────────────────────────────
 
 def _try_persist_to_session(
@@ -528,11 +571,18 @@ def _try_persist_to_session(
     hermes SessionDB. APP's regular hermes /history call surfaces it.
 
     Skips when:
+      - the run was silent (no_agent emitted nothing / agent replied [SILENT]) —
+        scheduler already skipped its push, so we skip the App card to match;
+        per-run md is still on disk
       - job has no origin (deliver=local or job created via REST without
         origin) — cron output md is on disk, user can review there
       - job_snapshot missing AND get_job returns None (job already gone +
         no pre-mark snapshot — extremely rare race)
     """
+    if _is_silent_run(job_id):
+        _dbg(f"_try_persist: job {job_id} silent run, skip card")
+        return None
+
     job = job_snapshot
     if job is None:
         try:
@@ -549,9 +599,6 @@ def _try_persist_to_session(
         _dbg(f"_try_persist: job {job_id} no origin.chat_id, skip (deliver={job.get('deliver')!r})")
         return None
 
-    content = _build_typed_message_content(job, job_id, success, error, delivery_error)
-    _dbg(f"_try_persist: appending to session={origin_chat_id} job={job_id} content_len={len(content)}")
-
     try:
         from hermes_state import SessionDB
     except ImportError as _ie:
@@ -560,12 +607,38 @@ def _try_persist_to_session(
 
     db = SessionDB()
     try:
+        # deliver=origin 但源对话已被 App 删除：直接 append 会撞 messages→sessions
+        # 外键、cron 输出静默丢失。改为新建一个同 user/agent 的承接会话，把本次及
+        # 后续输出投到它，并在 cron-summary 打 origin_recreated 标记让 App 渲染
+        # 本地化提示。再把 job.origin 重指过去，避免下周期反复新建。
+        target_id = origin_chat_id
+        origin_recreated = False
+        if db.get_session(origin_chat_id) is None:
+            new_id = _handoff_session_id(origin_chat_id)
+            if new_id:
+                # source 与正常 App 会话一致（run_agent 用 platform 名），让承接会话
+                # 跟用户手建的对话同档，避免别处按 source 的隐性差异。
+                db.create_session(new_id, source="zet_agent", user_id=_user_id_from(origin_chat_id))
+                target_id = new_id
+                origin_recreated = True
+                _dbg(f"_try_persist: origin {origin_chat_id} gone → handoff session {new_id}")
+                try:
+                    from cron.jobs import update_job
+                    _new_origin = dict(job.get("origin") or {})
+                    _new_origin["chat_id"] = new_id
+                    update_job(job_id, {"origin": _new_origin})
+                except Exception as _ue:
+                    _dbg(f"_try_persist: rewrite job.origin FAILED: {_ue!r}")
+
+        content = _build_typed_message_content(
+            job, job_id, success, error, delivery_error, origin_recreated=origin_recreated
+        )
         msg_id = db.append_message(
-            session_id=origin_chat_id,
+            session_id=target_id,
             role="assistant",
             content=content,
         )
-        _dbg(f"_try_persist: appended msg_id={msg_id} session={origin_chat_id}")
+        _dbg(f"_try_persist: appended msg_id={msg_id} session={target_id} recreated={origin_recreated}")
     finally:
         try:
             db.close()
@@ -575,7 +648,7 @@ def _try_persist_to_session(
     # PRD §6.3 在线实时显示：写完 SessionDB 立刻 POST 给 local-server，让
     # 当前在线的 chat WS 立即收到 message.appended 事件并插条。失败仅 log
     # —— SessionDB 已落盘，APP 下次进 chat 走 /history 兜底。
-    _try_notify_chat_append(origin_chat_id, msg_id, content)
+    _try_notify_chat_append(target_id, msg_id, content)
     return None
 
 
@@ -615,6 +688,7 @@ def _build_typed_message_content(
     success: bool,
     error: Optional[str],
     delivery_error: Optional[str],
+    origin_recreated: bool = False,
 ) -> str:
     """Build markdown content with a typed code fence.
 
@@ -655,8 +729,22 @@ def _build_typed_message_content(
         "last_run_result": "success" if success else "failed",
         "scheduled_at": _now_iso(),
     }
+    # next_run_at 是绝对时刻（带 offset），App 据此把循环任务的展示时间换算到设备
+    # 本地时区——绕开"cron 表达式按哪个时区写的"歧义（旧 job 存 UTC 表达式 +
+    # timezone=None，按字面显示会差 8 小时）。timezone 一并带上：App 用它区分
+    # 字面可信（tz 显式）还是要靠 next_run_at 兜底（tz 缺失）。
+    next_run_at = job.get("next_run_at")
+    if next_run_at:
+        metadata["next_run_at"] = next_run_at
+    job_tz = job.get("timezone")
+    if job_tz:
+        metadata["timezone"] = job_tz
     if delivery_error:
         metadata["delivery_error"] = delivery_error
+    if origin_recreated:
+        # 源对话已删、本会话是系统新建来承接 cron 输出的标记。App 暂不渲染横幅，
+        # 仅作为数据标记保留（便于后续区分/排查这类承接会话）。
+        metadata["origin_recreated"] = True
 
     attachments = _collect_produced_files(job_id)
     if attachments:
