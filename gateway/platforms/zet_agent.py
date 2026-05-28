@@ -78,6 +78,7 @@ import logging
 import os
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 try:
@@ -103,6 +104,15 @@ from gateway.platforms import zet_agent_cron as _zet_agent_cron
 _zet_agent_cron.install()
 
 logger = logging.getLogger(__name__)
+
+# Upper bound on the per-session last-seen-model map so a long-lived process
+# with many sessions cannot grow it (or its on-disk JSON) without bound
+# (Engineering Hard Rule 第 1 条 内存预算). Oldest entries are evicted LRU-style;
+# an evicted session simply re-records its baseline on the next open (worst
+# case: one missed identity note for a session idle past the cap).
+_SEEN_MODELS_CAP = 512
+# Guards lazy per-adapter creation of _seen_models_lock.
+_SEEN_INIT_LOCK = threading.Lock()
 
 # Default port for the Zet Agent platform. Distinct from API_SERVER's
 # 8642 so both platforms can run side-by-side during the migration.
@@ -749,6 +759,38 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception:
                 logger.debug("[zet_agent] auto-title hook failed", exc_info=True)
 
+        # Open-time check: if this session's effective model (override, else
+        # config default) differs from the persisted last-seen value, inject a
+        # one-shot identity note. Covers session- and agent-level switches,
+        # survives restarts; a brand-new session just records its baseline.
+        try:
+            if session_id:
+                _eff_model = self._effective_model(session_id, gateway_session_key)
+                if _eff_model:
+                    with self._seen_lock():
+                        _seen = self._ensure_seen_models()
+                        _prev = _seen.get(session_id)
+                        if _prev != _eff_model:
+                            _seen[session_id] = _eff_model
+                            _seen.move_to_end(session_id)
+                            while len(_seen) > _SEEN_MODELS_CAP:
+                                _seen.popitem(last=False)
+                            self._save_seen_models()
+                        elif session_id in _seen:
+                            # Touch LRU position: an active session keeping the
+                            # same model must not drift to the oldest end and be
+                            # evicted, which would drop its baseline and miss the
+                            # next switch's note.
+                            _seen.move_to_end(session_id)
+                    if _prev and _prev != _eff_model:
+                        _note = (
+                            f"[Note: the model has changed and is now {_eff_model}. "
+                            f"Adjust your self-identification accordingly.]"
+                        )
+                        user_message = f"{_note}\n\n{user_message}"
+        except Exception:
+            logger.debug("[zet_agent] model-identity note hook failed", exc_info=True)
+
         old_session_key = os.environ.get("HERMES_SESSION_KEY")
         old_exec_ask = os.environ.get("HERMES_EXEC_ASK")
         if session_id:
@@ -777,6 +819,58 @@ class ZetAgentAdapter(APIServerAdapter):
                 os.environ.pop("HERMES_EXEC_ASK", None)
             else:
                 os.environ["HERMES_EXEC_ASK"] = old_exec_ask
+
+    def _effective_model(self, session_id: Optional[str], gateway_session_key: Optional[str]) -> str:
+        """Return the model this session will actually use this turn: the
+        session override's model if present, else the agent-level config
+        default. Mirrors the model resolution in ``_create_agent`` so the
+        open-time identity check compares against what the agent really runs.
+        """
+        gw = getattr(self, "gateway_runner", None)
+        key = gateway_session_key or session_id
+        if gw is not None and key:
+            try:
+                override = getattr(gw, "_session_model_overrides", {}).get(key)
+            except Exception:
+                override = None
+            if override and override.get("model"):
+                return override["model"]
+        try:
+            from gateway.run import _resolve_gateway_model
+            return _resolve_gateway_model() or ""
+        except Exception:
+            logger.debug("[zet_agent] _resolve_gateway_model failed", exc_info=True)
+            return ""
+
+    def _seen_lock(self) -> threading.Lock:
+        """Lazily create (once, race-safe) this adapter's seen-models lock."""
+        lk = getattr(self, "_seen_models_lock", None)
+        if lk is None:
+            with _SEEN_INIT_LOCK:
+                lk = getattr(self, "_seen_models_lock", None)
+                if lk is None:
+                    lk = threading.Lock()
+                    self._seen_models_lock = lk
+        return lk
+
+    def _ensure_seen_models(self) -> "OrderedDict[str, str]":
+        """Lazily load (once) the per-session last-seen model map. Call under _seen_lock()."""
+        if not getattr(self, "_seen_loaded", False):
+            try:
+                from gateway.session_seen_models import load_seen_models
+                self._seen_models = OrderedDict(load_seen_models())
+            except Exception:
+                self._seen_models = OrderedDict()
+                logger.debug("[zet_agent] load_seen_models failed", exc_info=True)
+            self._seen_loaded = True
+        return self._seen_models
+
+    def _save_seen_models(self) -> None:
+        try:
+            from gateway.session_seen_models import save_seen_models
+            save_seen_models(getattr(self, "_seen_models", {}))
+        except Exception:
+            logger.debug("[zet_agent] save_seen_models failed", exc_info=True)
 
     @staticmethod
     def _extract_first_user_message(agent: Any) -> str:
@@ -1179,6 +1273,7 @@ class ZetAgentAdapter(APIServerAdapter):
             logger.warning("model-switch: config write failed: %s", exc)
             return web.json_response({"ok": False, "error": f"config write: {exc}"}, status=500)
 
+        # Identity note is handled by _run_agent's open-time compare, not here.
         logger.info(
             "model-switch: model=%s provider=%s (config.yaml only, session overrides preserved)",
             new_model, new_provider,
@@ -1254,6 +1349,9 @@ class ZetAgentAdapter(APIServerAdapter):
                         session_id, exc,
                     )
 
+        # Note injection happens in _run_agent (open-time compare); here we only
+        # persist the override and evict the cached agent so the next turn
+        # rebuilds with the new model.
         logger.info(
             "session-model-switch: session=%s model=%s provider=%s",
             session_id, new_model, new_provider,
@@ -1263,99 +1361,6 @@ class ZetAgentAdapter(APIServerAdapter):
             "session_id": session_id,
             "model": new_model,
         })
-
-    def _repin_session_files(self, new_model: str, new_base_url: str) -> int:
-        """Rewrite {model, base_url} in every session_*.json under _hermes_home/sessions/.
-
-        Hermes pins these at session creation. Without updating them,
-        existing sessions override config.yaml and keep using the old model.
-        """
-        import json as _json
-        from gateway.run import _hermes_home
-        sessions_dir = _hermes_home / "sessions"
-        if not sessions_dir.is_dir():
-            return 0
-        patched = 0
-        for f in sessions_dir.iterdir():
-            if not f.name.startswith("session_") or not f.name.endswith(".json"):
-                continue
-            try:
-                raw = f.read_text(encoding="utf-8")
-                doc = _json.loads(raw)
-                if not isinstance(doc, dict) or "model" not in doc:
-                    continue
-                doc["model"] = new_model
-                if "base_url" in doc:
-                    doc["base_url"] = new_base_url
-                # Inject a system-level note into messages so the LLM knows
-                # the model changed when it loads conversation history.
-                msgs = doc.get("messages")
-                if isinstance(msgs, list):
-                    msgs.append({
-                        "role": "system",
-                        "content": (
-                            f"[System: model switched to {new_model}. "
-                            f"Adjust your self-identification accordingly.]"
-                        ),
-                    })
-                    doc["message_count"] = len(msgs)
-                tmp = f.with_suffix(".json.tmp")
-                tmp.write_text(_json.dumps(doc, indent=2, default=str, ensure_ascii=False), encoding="utf-8")
-                tmp.rename(f)
-                patched += 1
-            except Exception as exc:
-                logger.warning("repin-session: %s failed: %s", f.name, exc)
-        return patched
-
-    def _repin_single_session_file(self, session_id: str, new_model: str, new_base_url: str) -> int:
-        """Rewrite {model, base_url} in a single session file.
-
-        Like ``_repin_session_files`` but targets only the file for
-        ``session_id``.  Session files are named ``session_<safe_id>.json``
-        where colons in the session_id are replaced with underscores.
-
-        Returns 1 if the file was updated, 0 if it was not found or had
-        no ``model`` key.
-        """
-        import json as _json
-        from gateway.run import _hermes_home
-
-        # hermes uses the raw session_id in filenames (colons preserved);
-        # some older builds encoded colons to underscores — try both.
-        session_file = _hermes_home / "sessions" / f"session_{session_id}.json"
-        if not session_file.is_file():
-            safe_id = session_id.replace(":", "_")
-            session_file = _hermes_home / "sessions" / f"session_{safe_id}.json"
-            if not session_file.is_file():
-                return 0
-        try:
-            raw = session_file.read_text(encoding="utf-8")
-            doc = _json.loads(raw)
-            if not isinstance(doc, dict) or "model" not in doc:
-                return 0
-            doc["model"] = new_model
-            if "base_url" in doc:
-                doc["base_url"] = new_base_url
-            msgs = doc.get("messages")
-            if isinstance(msgs, list):
-                msgs.append({
-                    "role": "system",
-                    "content": (
-                        f"[System: model switched to {new_model} for this session. "
-                        f"Adjust your self-identification accordingly.]"
-                    ),
-                })
-                doc["message_count"] = len(msgs)
-            tmp = session_file.with_suffix(".json.tmp")
-            tmp.write_text(
-                _json.dumps(doc, indent=2, default=str, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            tmp.rename(session_file)
-            return 1
-        except Exception as exc:
-            logger.warning("repin-single-session: %s failed: %s", session_file.name, exc)
-            return 0
 
     # ------------------------------------------------------------------
     # connect — extend base routes with our respond endpoints
