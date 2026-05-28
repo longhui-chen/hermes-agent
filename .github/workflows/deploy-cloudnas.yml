@@ -7,9 +7,9 @@
 # first chat / cron call after restart.
 #
 # Triggers:
-#   - push to main (paths-ignore filters out doc/website/nix/tests and the
-#     sibling deploy workflow). Auto-deploys to env=staging.
-#   - workflow_dispatch (manual override with ref / env / targets / dry_run).
+#   - workflow_dispatch only (manual). Pick ref / env / targets / dry_run.
+#     Auto-deploy on push to main was intentionally removed — cloud NAS
+#     deploys are manual-gated.
 #
 # Required GitHub Secrets:
 #   GCP_SA_KEY              service-account JSON, with at minimum:
@@ -33,18 +33,6 @@
 name: Deploy to cloud NAS fleet
 
 on:
-  push:
-    branches: [main]
-    # Blacklist (mirrors deploy-devboard.yml) — hermes layout shifts every
-    # upstream sync, so a whitelist would silently rot.
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'website/**'
-      - 'nix/**'
-      - 'tests/**'
-      - '.github/workflows/deploy-devboard.yml'
-      - '.github/workflows/upstream-release-pr.yml'
   workflow_dispatch:
     inputs:
       ref:
@@ -137,7 +125,8 @@ jobs:
       - name: Discover by GCP labels
         id: list
         env:
-          # Fall back to "staging" when triggered by push (no inputs).
+          # workflow_dispatch already defaults env to "staging"; keep the
+          # fallback as a belt-and-suspenders guard against an empty input.
           ENV_INPUT: ${{ inputs.env || 'staging' }}
           NAMES_INPUT: ${{ inputs.targets }}
         run: |
