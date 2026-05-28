@@ -295,3 +295,21 @@ async def test_run_agent_evicts_oldest_seen_over_cap(monkeypatch):
     # cap=2 → oldest (s1) evicted LRU-style.
     assert len(adapter._seen_models) == 2
     assert set(adapter._seen_models) == {"s2", "s3"}
+
+
+@pytest.mark.asyncio
+async def test_run_agent_active_session_not_evicted(monkeypatch):
+    # An active session that keeps the SAME model must refresh its LRU position
+    # each open, so it isn't wrongly evicted as "oldest" (which would drop its
+    # baseline and miss the next switch's note).
+    monkeypatch.setattr(zet_agent, "_SEEN_MODELS_CAP", 2)
+    adapter = _seen_adapter(monkeypatch, config_model="m1", seen={})
+    # s_active opens, then s_other, then s_active again (same model m1 → elif branch).
+    for sid in ("s_active", "s_other", "s_active"):
+        await _capture_run_agent(monkeypatch, adapter, user_message="hi", session_id=sid)
+    # New session pushes over cap=2 → the truly-oldest (s_other) is evicted,
+    # not s_active (which was touched by its second open).
+    await _capture_run_agent(monkeypatch, adapter, user_message="hi", session_id="s_new")
+    assert "s_active" in adapter._seen_models
+    assert "s_other" not in adapter._seen_models
+    assert set(adapter._seen_models) == {"s_active", "s_new"}

@@ -759,23 +759,14 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception:
                 logger.debug("[zet_agent] auto-title hook failed", exc_info=True)
 
-        # Inject a one-shot model-identity note when this session's effective
-        # model changed since we last saw it. The effective model is the
-        # session override if present, else the agent-level config default —
-        # so this single open-time check covers both session-level and
-        # agent-level switches. The last-seen model is persisted
-        # (session_seen_models.json) so a switch is still announced on the
-        # session's next turn even across a gateway restart, and repeated
-        # switches collapse naturally (only the final effective model matters).
-        # A brand-new session (no prior seen value) gets no note — its system
-        # prompt is already built with the current model — we just record the
-        # baseline so a later switch is detected.
+        # Open-time check: if this session's effective model (override, else
+        # config default) differs from the persisted last-seen value, inject a
+        # one-shot identity note. Covers session- and agent-level switches,
+        # survives restarts; a brand-new session just records its baseline.
         try:
             if session_id:
                 _eff_model = self._effective_model(session_id, gateway_session_key)
                 if _eff_model:
-                    # Lock guards the shared seen-map + its write-back against
-                    # concurrent chat.completions turns; LRU cap bounds growth.
                     with self._seen_lock():
                         _seen = self._ensure_seen_models()
                         _prev = _seen.get(session_id)
@@ -785,6 +776,12 @@ class ZetAgentAdapter(APIServerAdapter):
                             while len(_seen) > _SEEN_MODELS_CAP:
                                 _seen.popitem(last=False)
                             self._save_seen_models()
+                        elif session_id in _seen:
+                            # Touch LRU position: an active session keeping the
+                            # same model must not drift to the oldest end and be
+                            # evicted, which would drop its baseline and miss the
+                            # next switch's note.
+                            _seen.move_to_end(session_id)
                     if _prev and _prev != _eff_model:
                         _note = (
                             f"[Note: the model has changed and is now {_eff_model}. "
@@ -857,11 +854,7 @@ class ZetAgentAdapter(APIServerAdapter):
         return lk
 
     def _ensure_seen_models(self) -> "OrderedDict[str, str]":
-        """Lazily load (once) the persisted per-session last-seen model map.
-
-        Call under ``_seen_lock()``. Backed by an OrderedDict so the open-time
-        check can evict oldest entries (LRU) once it exceeds _SEEN_MODELS_CAP.
-        """
+        """Lazily load (once) the per-session last-seen model map. Call under _seen_lock()."""
         if not getattr(self, "_seen_loaded", False):
             try:
                 from gateway.session_seen_models import load_seen_models
@@ -1280,11 +1273,7 @@ class ZetAgentAdapter(APIServerAdapter):
             logger.warning("model-switch: config write failed: %s", exc)
             return web.json_response({"ok": False, "error": f"config write: {exc}"}, status=500)
 
-        # Note: the model-identity note is no longer pushed here. zet_agent's
-        # _run_agent detects the effective-model change at the session's next
-        # turn (open-time compare against the persisted last-seen model) and
-        # injects the note then — which also covers sessions that aren't
-        # currently active. See _run_agent / session_seen_models.py.
+        # Identity note is handled by _run_agent's open-time compare, not here.
         logger.info(
             "model-switch: model=%s provider=%s (config.yaml only, session overrides preserved)",
             new_model, new_provider,
@@ -1360,12 +1349,9 @@ class ZetAgentAdapter(APIServerAdapter):
                         session_id, exc,
                     )
 
-        # The model-identity note is injected by _run_agent at the session's
-        # next turn (open-time compare against the persisted last-seen model),
-        # not here — so it works uniformly with agent-level switches and
-        # survives gateway restarts. This handler only persists the override
-        # (via local-server's session_model_overrides.json) and evicts the
-        # cached agent so the next turn rebuilds with the new model.
+        # Note injection happens in _run_agent (open-time compare); here we only
+        # persist the override and evict the cached agent so the next turn
+        # rebuilds with the new model.
         logger.info(
             "session-model-switch: session=%s model=%s provider=%s",
             session_id, new_model, new_provider,
