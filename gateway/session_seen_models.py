@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import uuid
 from pathlib import Path
 from typing import Dict
 
@@ -54,14 +55,21 @@ def load_seen_models(path: Path | None = None) -> Dict[str, str]:
 
 
 def save_seen_models(models: Dict[str, str], path: Path | None = None) -> None:
-    """Atomically persist the ``{session_id: model}`` map (tmp write + rename)."""
+    """Atomically persist the ``{session_id: model}`` map (tmp write + rename).
+
+    The tmp file carries a pid+uuid suffix so concurrent writers never share
+    one tmp path (a fixed name would let one writer ``os.replace`` a tmp the
+    other is still writing — a truncated file could become the live one).
+    """
     target = path or seen_path()
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(models, ensure_ascii=False), encoding="utf-8"
-        )
+        tmp.write_text(json.dumps(models, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, target)
     except OSError as exc:
         logger.warning("session-seen-models: write failed for %s: %s", target, exc)
+        try:
+            tmp.unlink()
+        except OSError:
+            pass

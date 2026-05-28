@@ -1,4 +1,5 @@
 import types
+from collections import OrderedDict
 
 import pytest
 import yaml
@@ -224,7 +225,7 @@ def _seen_adapter(monkeypatch, *, config_model, seen, override=None):
     adapter.gateway_runner = types.SimpleNamespace(
         _session_model_overrides=dict(override or {})
     )
-    adapter._seen_models = dict(seen)
+    adapter._seen_models = OrderedDict(seen)
     adapter._seen_loaded = True
     monkeypatch.setattr(adapter, "_save_seen_models", lambda: None)
     return adapter
@@ -282,3 +283,15 @@ async def test_run_agent_effective_model_prefers_override(monkeypatch):
     captured = await _capture_run_agent(monkeypatch, adapter, user_message="hi", session_id="sess-1")
     # Effective model = override (not config default) → note announces it.
     assert captured["user_message"].startswith("[Note: the model has changed and is now override-model")
+
+
+@pytest.mark.asyncio
+async def test_run_agent_evicts_oldest_seen_over_cap(monkeypatch):
+    # Bound the map so it can't grow without limit (Hard Rule 第 1 条).
+    monkeypatch.setattr(zet_agent, "_SEEN_MODELS_CAP", 2)
+    adapter = _seen_adapter(monkeypatch, config_model="m1", seen={})
+    for sid in ("s1", "s2", "s3"):
+        await _capture_run_agent(monkeypatch, adapter, user_message="hi", session_id=sid)
+    # cap=2 → oldest (s1) evicted LRU-style.
+    assert len(adapter._seen_models) == 2
+    assert set(adapter._seen_models) == {"s2", "s3"}

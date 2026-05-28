@@ -78,6 +78,7 @@ import logging
 import os
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 
 try:
@@ -103,6 +104,15 @@ from gateway.platforms import zet_agent_cron as _zet_agent_cron
 _zet_agent_cron.install()
 
 logger = logging.getLogger(__name__)
+
+# Upper bound on the per-session last-seen-model map so a long-lived process
+# with many sessions cannot grow it (or its on-disk JSON) without bound
+# (Engineering Hard Rule 第 1 条 内存预算). Oldest entries are evicted LRU-style;
+# an evicted session simply re-records its baseline on the next open (worst
+# case: one missed identity note for a session idle past the cap).
+_SEEN_MODELS_CAP = 512
+# Guards lazy per-adapter creation of _seen_models_lock.
+_SEEN_INIT_LOCK = threading.Lock()
 
 # Default port for the Zet Agent platform. Distinct from API_SERVER's
 # 8642 so both platforms can run side-by-side during the migration.
@@ -764,17 +774,23 @@ class ZetAgentAdapter(APIServerAdapter):
             if session_id:
                 _eff_model = self._effective_model(session_id, gateway_session_key)
                 if _eff_model:
-                    _seen = self._ensure_seen_models()
-                    _prev = _seen.get(session_id)
+                    # Lock guards the shared seen-map + its write-back against
+                    # concurrent chat.completions turns; LRU cap bounds growth.
+                    with self._seen_lock():
+                        _seen = self._ensure_seen_models()
+                        _prev = _seen.get(session_id)
+                        if _prev != _eff_model:
+                            _seen[session_id] = _eff_model
+                            _seen.move_to_end(session_id)
+                            while len(_seen) > _SEEN_MODELS_CAP:
+                                _seen.popitem(last=False)
+                            self._save_seen_models()
                     if _prev and _prev != _eff_model:
                         _note = (
                             f"[Note: the model has changed and is now {_eff_model}. "
                             f"Adjust your self-identification accordingly.]"
                         )
                         user_message = f"{_note}\n\n{user_message}"
-                    if _prev != _eff_model:
-                        _seen[session_id] = _eff_model
-                        self._save_seen_models()
         except Exception:
             logger.debug("[zet_agent] model-identity note hook failed", exc_info=True)
 
@@ -829,14 +845,29 @@ class ZetAgentAdapter(APIServerAdapter):
             logger.debug("[zet_agent] _resolve_gateway_model failed", exc_info=True)
             return ""
 
-    def _ensure_seen_models(self) -> Dict[str, str]:
-        """Lazily load (once) the persisted per-session last-seen model map."""
+    def _seen_lock(self) -> threading.Lock:
+        """Lazily create (once, race-safe) this adapter's seen-models lock."""
+        lk = getattr(self, "_seen_models_lock", None)
+        if lk is None:
+            with _SEEN_INIT_LOCK:
+                lk = getattr(self, "_seen_models_lock", None)
+                if lk is None:
+                    lk = threading.Lock()
+                    self._seen_models_lock = lk
+        return lk
+
+    def _ensure_seen_models(self) -> "OrderedDict[str, str]":
+        """Lazily load (once) the persisted per-session last-seen model map.
+
+        Call under ``_seen_lock()``. Backed by an OrderedDict so the open-time
+        check can evict oldest entries (LRU) once it exceeds _SEEN_MODELS_CAP.
+        """
         if not getattr(self, "_seen_loaded", False):
             try:
                 from gateway.session_seen_models import load_seen_models
-                self._seen_models = load_seen_models()
+                self._seen_models = OrderedDict(load_seen_models())
             except Exception:
-                self._seen_models = {}
+                self._seen_models = OrderedDict()
                 logger.debug("[zet_agent] load_seen_models failed", exc_info=True)
             self._seen_loaded = True
         return self._seen_models
