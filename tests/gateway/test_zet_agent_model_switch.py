@@ -1,4 +1,3 @@
-import threading
 import types
 
 import pytest
@@ -113,7 +112,7 @@ async def test_model_switch_clears_stale_api_mode_and_context_length(tmp_path, m
 
 
 @pytest.mark.asyncio
-async def test_session_model_switch_queues_pending_note(monkeypatch):
+async def test_session_model_switch_persists_override_no_note(monkeypatch):
     monkeypatch.setattr(zet_agent, "web", _FakeWeb)
 
     adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
@@ -122,7 +121,6 @@ async def test_session_model_switch_queues_pending_note(monkeypatch):
     evicted = []
     gw = types.SimpleNamespace(
         _session_model_overrides={},
-        _pending_model_notes={},
         _evict_cached_agent=lambda sid: evicted.append(sid),
     )
     adapter.gateway_runner = gw
@@ -136,44 +134,16 @@ async def test_session_model_switch_queues_pending_note(monkeypatch):
     )
 
     assert resp.status == 200
-    # Runtime override stored so the next turn resolves the new model.
+    # Override persisted + cached agent evicted. The identity note is no longer
+    # pushed here — it's injected at the session's next turn by _run_agent's
+    # open-time effective-model compare.
     assert gw._session_model_overrides[session_id]["model"] == "deepseek-v4"
-    # Cached agent evicted so the next turn rebuilds with the new model.
     assert evicted == [session_id]
-    # One-shot note queued for this session's next user message.
-    note = gw._pending_model_notes[session_id]
-    assert "deepseek-v4" in note
-    assert "self-identification" in note
+    assert not hasattr(gw, "_pending_model_notes")
 
 
 @pytest.mark.asyncio
-async def test_session_model_switch_creates_pending_notes_when_missing(monkeypatch):
-    monkeypatch.setattr(zet_agent, "web", _FakeWeb)
-
-    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
-    adapter._check_auth = lambda request: None
-
-    # gateway_runner has no pre-existing _pending_model_notes attribute.
-    gw = types.SimpleNamespace(
-        _session_model_overrides={},
-        _evict_cached_agent=lambda sid: None,
-    )
-    adapter.gateway_runner = gw
-
-    session_id = "zettlab:user1:agent-1:7"
-    resp = await adapter._handle_session_model_switch(
-        _FakeRequest(
-            {"model": "glm-5"},
-            match_info={"session_id": session_id},
-        )
-    )
-
-    assert resp.status == 200
-    assert "glm-5" in gw._pending_model_notes[session_id]
-
-
-@pytest.mark.asyncio
-async def test_agent_model_switch_queues_note_for_active_sessions(tmp_path, monkeypatch):
+async def test_agent_model_switch_writes_config_only(tmp_path, monkeypatch):
     import gateway.run as gateway_run
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
@@ -183,50 +153,17 @@ async def test_agent_model_switch_queues_note_for_active_sessions(tmp_path, monk
     )
 
     adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
-    gw = types.SimpleNamespace(
-        _agent_cache={"sess-a": object(), "sess-b": object()},
-        _agent_cache_lock=threading.Lock(),
-        _running_agents={"sess-c": object()},
-        # sess-b has a session-level override → must be skipped.
-        _session_model_overrides={"sess-b": {"model": "x"}},
-        _pending_model_notes={},
-    )
-    adapter.gateway_runner = gw
+    # Agent-level switch only writes config.yaml now; no broadcast, so it
+    # doesn't need gateway_runner at all.
+    adapter.gateway_runner = None
 
     resp = await adapter._handle_model_switch(
-        _FakeRequest(
-            {"model": "glm-5", "provider": "custom", "old_model": "old-model"}
-        )
+        _FakeRequest({"model": "glm-5", "provider": "custom"})
     )
 
     assert resp.status == 200
     cfg = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
     assert cfg["model"]["default"] == "glm-5"
-
-    # Active sessions without override get the note; the override one is skipped.
-    assert set(gw._pending_model_notes.keys()) == {"sess-a", "sess-c"}
-    note = gw._pending_model_notes["sess-a"]
-    assert "from old-model to glm-5" in note
-    assert "self-identification" in note
-
-
-@pytest.mark.asyncio
-async def test_agent_model_switch_without_gateway_runner_is_ok(tmp_path, monkeypatch):
-    import gateway.run as gateway_run
-
-    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
-    monkeypatch.setattr(zet_agent, "web", _FakeWeb)
-    (tmp_path / "config.yaml").write_text(
-        yaml.dump({"model": {"default": "old"}}), encoding="utf-8"
-    )
-
-    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
-    adapter.gateway_runner = None
-
-    resp = await adapter._handle_model_switch(
-        _FakeRequest({"model": "glm-5", "old_model": "old"})
-    )
-    assert resp.status == 200
 
 
 def test_status_callback_forwards_context_compaction_to_tool_progress_lane():
@@ -276,79 +213,72 @@ def test_status_callback_preserves_existing_callback():
     assert getattr(cb, "_hermes_accepts_structured_status") is True
 
 
-@pytest.mark.asyncio
-async def test_run_agent_prepends_pending_model_note(monkeypatch):
-    from gateway.platforms.api_server import APIServerAdapter
+def _seen_adapter(monkeypatch, *, config_model, seen, override=None):
+    """Build a ZetAgentAdapter wired for open-time model-compare tests:
+    a config default model, a pre-seeded seen-map, an optional session
+    override, and a no-op persistence so tests don't touch disk."""
+    import gateway.run as gateway_run
 
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda: config_model)
     adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
-    gw = types.SimpleNamespace(
-        _pending_model_notes={"sess-1": "[Note: model switched to glm-5]"}
+    adapter.gateway_runner = types.SimpleNamespace(
+        _session_model_overrides=dict(override or {})
     )
-    adapter.gateway_runner = gw
+    adapter._seen_models = dict(seen)
+    adapter._seen_loaded = True
+    monkeypatch.setattr(adapter, "_save_seen_models", lambda: None)
+    return adapter
+
+
+async def _capture_run_agent(monkeypatch, adapter, **kwargs):
+    from gateway.platforms.api_server import APIServerAdapter
 
     captured = {}
 
-    async def fake_super(self, **kwargs):
-        captured.update(kwargs)
+    async def fake_super(self, **kw):
+        captured.update(kw)
         return ({}, {})
 
     monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
-
-    await adapter._run_agent(
-        user_message="hello", conversation_history=[], session_id="sess-1"
-    )
-
-    # Note prepended to the user message handed to the agent.
-    assert captured["user_message"].startswith("[Note: model switched to glm-5]")
-    assert captured["user_message"].endswith("hello")
-    # One-shot: consumed (popped) so it isn't re-injected next turn.
-    assert "sess-1" not in gw._pending_model_notes
+    await adapter._run_agent(conversation_history=[], **kwargs)
+    return captured
 
 
 @pytest.mark.asyncio
-async def test_run_agent_consumes_note_by_gateway_session_key(monkeypatch):
-    from gateway.platforms.api_server import APIServerAdapter
-
-    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
-    gw = types.SimpleNamespace(_pending_model_notes={"gw-key-9": "[Note: switched]"})
-    adapter.gateway_runner = gw
-
-    captured = {}
-
-    async def fake_super(self, **kwargs):
-        captured.update(kwargs)
-        return ({}, {})
-
-    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
-
-    await adapter._run_agent(
-        user_message="hi",
-        conversation_history=[],
-        session_id="other",
-        gateway_session_key="gw-key-9",
-    )
-
-    assert captured["user_message"].startswith("[Note: switched]")
-    assert "gw-key-9" not in gw._pending_model_notes
+async def test_run_agent_injects_note_on_effective_model_change(monkeypatch):
+    adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={"sess-1": "deepseek-v4"})
+    captured = await _capture_run_agent(monkeypatch, adapter, user_message="hi", session_id="sess-1")
+    assert captured["user_message"].startswith("[Note: the model has changed and is now glm-5.1")
+    assert captured["user_message"].endswith("hi")
+    # last-seen updated to the new effective model.
+    assert adapter._seen_models["sess-1"] == "glm-5.1"
 
 
 @pytest.mark.asyncio
-async def test_run_agent_no_note_leaves_message_unchanged(monkeypatch):
-    from gateway.platforms.api_server import APIServerAdapter
+async def test_run_agent_no_note_when_model_unchanged(monkeypatch):
+    adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={"sess-1": "glm-5.1"})
+    captured = await _capture_run_agent(monkeypatch, adapter, user_message="hi", session_id="sess-1")
+    assert captured["user_message"] == "hi"
 
-    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
-    adapter.gateway_runner = types.SimpleNamespace(_pending_model_notes={})
 
-    captured = {}
+@pytest.mark.asyncio
+async def test_run_agent_new_session_records_baseline_no_note(monkeypatch):
+    adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
+    captured = await _capture_run_agent(monkeypatch, adapter, user_message="hi", session_id="new-sess")
+    # New session: no note (its system prompt is already built with the
+    # current model), but baseline recorded so a later switch is detected.
+    assert captured["user_message"] == "hi"
+    assert adapter._seen_models["new-sess"] == "glm-5.1"
 
-    async def fake_super(self, **kwargs):
-        captured.update(kwargs)
-        return ({}, {})
 
-    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
-
-    await adapter._run_agent(
-        user_message="plain", conversation_history=[], session_id="sess-x"
+@pytest.mark.asyncio
+async def test_run_agent_effective_model_prefers_override(monkeypatch):
+    adapter = _seen_adapter(
+        monkeypatch,
+        config_model="config-default",
+        seen={"sess-1": "config-default"},
+        override={"sess-1": {"model": "override-model"}},
     )
-
-    assert captured["user_message"] == "plain"
+    captured = await _capture_run_agent(monkeypatch, adapter, user_message="hi", session_id="sess-1")
+    # Effective model = override (not config default) → note announces it.
+    assert captured["user_message"].startswith("[Note: the model has changed and is now override-model")

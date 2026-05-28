@@ -749,23 +749,34 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception:
                 logger.debug("[zet_agent] auto-title hook failed", exc_info=True)
 
-        # Consume a pending model-switch note (queued by the model switch
-        # handlers into GatewayRunner._pending_model_notes) and prepend it to
-        # the user message so the model self-identifies correctly after a
-        # switch. The base APIServerAdapter path does NOT consume these — only
-        # the non-API GatewayRunner._run_agent does — so the device
-        # chat.completions path must consume here, otherwise the queued note
-        # never reaches the model. Try gateway_session_key then session_id
-        # since either may carry the key the handler queued under.
-        gw = getattr(self, "gateway_runner", None)
-        _notes = getattr(gw, "_pending_model_notes", None) if gw is not None else None
-        if _notes:
-            for _k in (gateway_session_key, session_id):
-                if _k and _k in _notes:
-                    _note = _notes.pop(_k, None)
-                    if _note:
+        # Inject a one-shot model-identity note when this session's effective
+        # model changed since we last saw it. The effective model is the
+        # session override if present, else the agent-level config default —
+        # so this single open-time check covers both session-level and
+        # agent-level switches. The last-seen model is persisted
+        # (session_seen_models.json) so a switch is still announced on the
+        # session's next turn even across a gateway restart, and repeated
+        # switches collapse naturally (only the final effective model matters).
+        # A brand-new session (no prior seen value) gets no note — its system
+        # prompt is already built with the current model — we just record the
+        # baseline so a later switch is detected.
+        try:
+            if session_id:
+                _eff_model = self._effective_model(session_id, gateway_session_key)
+                if _eff_model:
+                    _seen = self._ensure_seen_models()
+                    _prev = _seen.get(session_id)
+                    if _prev and _prev != _eff_model:
+                        _note = (
+                            f"[Note: the model has changed and is now {_eff_model}. "
+                            f"Adjust your self-identification accordingly.]"
+                        )
                         user_message = f"{_note}\n\n{user_message}"
-                    break
+                    if _prev != _eff_model:
+                        _seen[session_id] = _eff_model
+                        self._save_seen_models()
+        except Exception:
+            logger.debug("[zet_agent] model-identity note hook failed", exc_info=True)
 
         old_session_key = os.environ.get("HERMES_SESSION_KEY")
         old_exec_ask = os.environ.get("HERMES_EXEC_ASK")
@@ -795,6 +806,47 @@ class ZetAgentAdapter(APIServerAdapter):
                 os.environ.pop("HERMES_EXEC_ASK", None)
             else:
                 os.environ["HERMES_EXEC_ASK"] = old_exec_ask
+
+    def _effective_model(self, session_id: Optional[str], gateway_session_key: Optional[str]) -> str:
+        """Return the model this session will actually use this turn: the
+        session override's model if present, else the agent-level config
+        default. Mirrors the model resolution in ``_create_agent`` so the
+        open-time identity check compares against what the agent really runs.
+        """
+        gw = getattr(self, "gateway_runner", None)
+        key = gateway_session_key or session_id
+        if gw is not None and key:
+            try:
+                override = getattr(gw, "_session_model_overrides", {}).get(key)
+            except Exception:
+                override = None
+            if override and override.get("model"):
+                return override["model"]
+        try:
+            from gateway.run import _resolve_gateway_model
+            return _resolve_gateway_model() or ""
+        except Exception:
+            logger.debug("[zet_agent] _resolve_gateway_model failed", exc_info=True)
+            return ""
+
+    def _ensure_seen_models(self) -> Dict[str, str]:
+        """Lazily load (once) the persisted per-session last-seen model map."""
+        if not getattr(self, "_seen_loaded", False):
+            try:
+                from gateway.session_seen_models import load_seen_models
+                self._seen_models = load_seen_models()
+            except Exception:
+                self._seen_models = {}
+                logger.debug("[zet_agent] load_seen_models failed", exc_info=True)
+            self._seen_loaded = True
+        return self._seen_models
+
+    def _save_seen_models(self) -> None:
+        try:
+            from gateway.session_seen_models import save_seen_models
+            save_seen_models(getattr(self, "_seen_models", {}))
+        except Exception:
+            logger.debug("[zet_agent] save_seen_models failed", exc_info=True)
 
     @staticmethod
     def _extract_first_user_message(agent: Any) -> str:
@@ -1156,7 +1208,6 @@ class ZetAgentAdapter(APIServerAdapter):
         new_api_key = body.get("api_key", "")
         new_api_mode = body.get("api_mode", "")
         new_context_length = body.get("context_length", None)
-        old_model = body.get("old_model", "")
         if not new_model:
             return web.json_response({"ok": False, "error": "model is required"}, status=400)
 
@@ -1198,27 +1249,11 @@ class ZetAgentAdapter(APIServerAdapter):
             logger.warning("model-switch: config write failed: %s", exc)
             return web.json_response({"ok": False, "error": f"config write: {exc}"}, status=500)
 
-        # Notify already-running sessions (no session-level override) that the
-        # default model changed. These sessions reuse their persisted system
-        # prompt, whose `Model:` line still names the old model, so they need an
-        # explicit note to self-identify correctly on the next turn. Sessions
-        # created after this switch rebuild the prompt with the new model and
-        # need no note. Mirrors the gateway /model command path.
-        if old_model and old_model != new_model:
-            note = (
-                f"[Note: model was just switched from {old_model} to {new_model}. "
-                f"Adjust your self-identification accordingly.]"
-            )
-        else:
-            note = (
-                f"[Note: model was just switched to {new_model}. "
-                f"Adjust your self-identification accordingly.]"
-            )
-        try:
-            self._queue_model_note_for_active_sessions(note)
-        except Exception as exc:
-            logger.warning("model-switch: queue note failed: %s", exc)
-
+        # Note: the model-identity note is no longer pushed here. zet_agent's
+        # _run_agent detects the effective-model change at the session's next
+        # turn (open-time compare against the persisted last-seen model) and
+        # injects the note then — which also covers sessions that aren't
+        # currently active. See _run_agent / session_seen_models.py.
         logger.info(
             "model-switch: model=%s provider=%s (config.yaml only, session overrides preserved)",
             new_model, new_provider,
@@ -1226,48 +1261,6 @@ class ZetAgentAdapter(APIServerAdapter):
         return web.json_response({
             "ok": True, "model": new_model,
         })
-
-    def _queue_model_note_for_active_sessions(self, note: str) -> int:
-        """Queue a one-shot model-switch note for every active session that
-        has no session-level override.
-
-        Active = cached between turns (``_agent_cache``) or mid-turn
-        (``_running_agents``). Sessions with a session-level override are
-        skipped: an agent-level default switch does not affect them. Returns
-        the number of sessions the note was queued for.
-        """
-        gw = getattr(self, "gateway_runner", None)
-        if gw is None:
-            return 0
-        overrides = getattr(gw, "_session_model_overrides", None) or {}
-        notes = getattr(gw, "_pending_model_notes", None)
-        if notes is None:
-            notes = {}
-            try:
-                gw._pending_model_notes = notes
-            except Exception:
-                return 0
-
-        keys = set()
-        cache = getattr(gw, "_agent_cache", None)
-        if cache is not None:
-            lock = getattr(gw, "_agent_cache_lock", None)
-            if lock is not None:
-                with lock:
-                    keys.update(cache.keys())
-            else:
-                keys.update(list(cache.keys()))
-        running = getattr(gw, "_running_agents", None)
-        if running is not None:
-            keys.update(list(running.keys()))
-
-        queued = 0
-        for sk in keys:
-            if sk in overrides:
-                continue
-            notes[sk] = note
-            queued += 1
-        return queued
 
     async def _handle_session_model_switch(self, request: "web.Request") -> "web.Response":
         """POST /v1/sessions/{session_id}/model/switch — session-level model override.
@@ -1335,24 +1328,13 @@ class ZetAgentAdapter(APIServerAdapter):
                         "session-model-switch: evict_cached_agent failed for %s: %s",
                         session_id, exc,
                     )
-            # Queue a one-shot note that GatewayRunner._run_agent prepends to
-            # this session's next user message, so the freshly-rebuilt agent
-            # knows its model changed and self-identifies correctly. Kept out
-            # of stored history to preserve prompt cache (mirrors the gateway
-            # /model command path).
-            notes = getattr(gw, "_pending_model_notes", None)
-            if notes is None:
-                notes = {}
-                try:
-                    gw._pending_model_notes = notes
-                except Exception:
-                    notes = None
-            if notes is not None:
-                notes[session_id] = (
-                    f"[Note: model for this session was just switched to {new_model}. "
-                    f"Adjust your self-identification accordingly.]"
-                )
 
+        # The model-identity note is injected by _run_agent at the session's
+        # next turn (open-time compare against the persisted last-seen model),
+        # not here — so it works uniformly with agent-level switches and
+        # survives gateway restarts. This handler only persists the override
+        # (via local-server's session_model_overrides.json) and evicts the
+        # cached agent so the next turn rebuilds with the new model.
         logger.info(
             "session-model-switch: session=%s model=%s provider=%s",
             session_id, new_model, new_provider,
