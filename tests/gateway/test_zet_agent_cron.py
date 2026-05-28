@@ -203,3 +203,142 @@ def test_append_run_error_to_output(tmp_path):
     assert run_file.read_text(encoding="utf-8") == before
 
     zc._LATEST_OUTPUT_PATH.pop("job-r", None)
+
+
+def test_handoff_session_when_origin_deleted(tmp_path, monkeypatch):
+    """deliver=origin 但源对话已删 → 新建承接会话、打 origin_recreated、回写 job.origin。"""
+    import hermes_state
+    import cron.jobs as cron_jobs
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    monkeypatch.delenv("ZET_CHAT_APPEND_URL", raising=False)
+    from hermes_state import SessionDB
+
+    AID = "agent-x"
+    SID = f"zettlab:userA:{AID}:orig001"
+    JID = "jobH"
+    job = {
+        "id": JID, "name": "喝水提醒", "prompt": "提醒喝水", "skills": [], "skill": None,
+        "schedule": {"kind": "cron", "expr": "0 9 * * *", "display": "每天09:00"},
+        "schedule_display": "每天09:00", "repeat": {"times": None, "completed": 0},
+        "enabled": True, "state": "scheduled", "deliver": "origin",
+        "origin": {"platform": "zet_agent", "chat_id": SID, "chat_name": "喝水对话"},
+        "timezone": "UTC", "last_status": None, "last_error": None, "last_delivery_error": None,
+    }
+    cron_jobs.save_jobs([job])
+
+    db = SessionDB()
+    db.create_session(SID, source="chat", user_id="userA")
+    db.close()
+    SessionDB().delete_session(SID)  # 用户删除源对话
+    assert SessionDB().get_session(SID) is None
+
+    zc._LATEST_OUTPUT[JID] = "# Cron Job: 喝水提醒\n\n## Response\n\n该喝水啦！💧\n"
+    try:
+        ret = zc._try_persist_to_session(JID, True, None, None, job)
+    finally:
+        zc._LATEST_OUTPUT.pop(JID, None)
+
+    # 不再是投递失败
+    assert ret is None
+    # job.origin 被重指到一个新的同 user/agent 会话
+    new_id = cron_jobs.get_job(JID)["origin"]["chat_id"]
+    assert new_id != SID
+    assert new_id.startswith(f"zettlab:userA:{AID}:")
+    # 新会话真建出来了，老会话没被复活
+    assert SessionDB().get_session(new_id) is not None
+    assert SessionDB().get_session(SID) is None
+    # 承接消息带 origin_recreated 标记（App 暂不渲染，仅数据标记）+ cron 正文
+    msgs = SessionDB().get_messages(new_id)
+    blob = " ".join((m.get("content") or "") for m in msgs if isinstance(m.get("content"), str))
+    assert '"origin_recreated": true' in blob
+    assert "该喝水啦" in blob
+
+
+def test_silent_run_skips_session_persist(monkeypatch):
+    import gateway.platforms.zet_agent_cron as zc
+
+    job = {
+        "id": "job-s",
+        "deliver": "origin",
+        "origin": {"platform": "zet_agent", "chat_id": "sess-s"},
+    }
+
+    # 静默运行绝不能落卡 → SessionDB 一旦被构造就说明漏了守卫
+    def _boom(*_a, **_k):
+        raise AssertionError("SessionDB constructed for a silent run")
+
+    monkeypatch.setattr("hermes_state.SessionDB", _boom)
+
+    # no_agent 脚本无输出（窗口外提醒）→ 静默，跳过落卡
+    zc._LATEST_OUTPUT["job-s"] = (
+        "# Cron Job: 起身提醒\n\n**Job ID:** job-s\n"
+        "**Mode:** no_agent (script)\n**Status:** silent (empty output)\n"
+    )
+    assert zc._is_silent_run("job-s") is True
+    assert zc._try_persist_to_session("job-s", True, None, None, job) is None
+
+    # wakeAgent=false 门控同样是静默
+    zc._LATEST_OUTPUT["job-s"] = (
+        "# Cron Job: 看门狗\n\n**Mode:** no_agent (script)\n"
+        "**Status:** silent (wakeAgent=false)\n"
+    )
+    assert zc._is_silent_run("job-s") is True
+
+    # agent 回复 [SILENT] → 静默，跳过落卡
+    zc._LATEST_OUTPUT["job-s"] = "# Cron Job: x\n\n## Response\n\n[SILENT]\n"
+    assert zc._is_silent_run("job-s") is True
+    assert zc._try_persist_to_session("job-s", True, None, None, job) is None
+
+    # 真实产出 → 非静默（正常落卡路径不受影响）
+    zc._LATEST_OUTPUT["job-s"] = "# Cron Job: x\n\n## Response\n\n日报已生成。\n"
+    assert zc._is_silent_run("job-s") is False
+
+    # 无缓存输出 → 非静默（fail-open，不误吞真运行）
+    assert zc._is_silent_run("never-seen-job") is False
+
+    zc._LATEST_OUTPUT.pop("job-s", None)
+
+
+def test_cron_summary_carries_next_run_at_and_timezone(tmp_path, monkeypatch):
+    """App 据 next_run_at 把循环任务展示时间本地化、据 timezone 区分字面可信与否；
+    两者都从 job 透传进 cron-summary 元数据，无值时省略。"""
+    import json as _json
+
+    import hermes_state
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+
+    def _meta(content: str) -> dict:
+        fence = content.split("```cron-summary\n", 1)[1].split("\n```", 1)[0]
+        return _json.loads(fence)
+
+    job = {
+        "id": "job-tz",
+        "name": "喝水提醒",
+        "schedule": {"kind": "cron", "expr": "30 2 * * *", "display": "30 2 * * *"},
+        "next_run_at": "2026-05-29T02:30:00+00:00",
+        "timezone": "Asia/Shanghai",
+        "deliver": "origin",
+        "origin": {"platform": "zet_agent", "chat_id": "c1"},
+    }
+    meta = _meta(zc._build_typed_message_content(job, "job-tz", True, None, None))
+    assert meta["next_run_at"] == "2026-05-29T02:30:00+00:00"
+    assert meta["timezone"] == "Asia/Shanghai"
+
+    # 旧 job：无 timezone / next_run_at → 字段省略，App 走原字面回退
+    legacy = {
+        "id": "job-legacy",
+        "name": "每日新闻",
+        "schedule": {"kind": "cron", "expr": "0 12 * * *", "display": "0 12 * * *"},
+        "deliver": "origin",
+        "origin": {"platform": "zet_agent", "chat_id": "c1"},
+    }
+    meta2 = _meta(zc._build_typed_message_content(legacy, "job-legacy", True, None, None))
+    assert "next_run_at" not in meta2
+    assert "timezone" not in meta2
