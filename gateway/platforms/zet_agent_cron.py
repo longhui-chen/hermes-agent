@@ -40,6 +40,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import stat as _stat
 from typing import Any, Dict, List, Optional
 
@@ -50,6 +51,11 @@ _PATCH_SENTINEL = "__zet_agent_cron_patched__"
 # job_id → most recent saved markdown content. Populated by the
 # save_job_output wrapper, drained by the mark_job_run wrapper.
 _LATEST_OUTPUT: Dict[str, str] = {}
+
+# job_id → most recent saved markdown file path. Lets the mark_job_run
+# wrapper append a "## Delivery Error" section to the very file the run just
+# wrote, so the App's per-run history can show delivery failures distinctly.
+_LATEST_OUTPUT_PATH: Dict[str, Any] = {}
 
 # Tool calls whose successful execution we treat as "produced a file this
 # turn". Keep in sync with zettlab-local-server/internal/chat/handler/
@@ -96,6 +102,49 @@ def _combine_delivery_errors(existing: Optional[str], added: str) -> str:
     return added
 
 
+def _fence_safe(text: str) -> str:
+    """把 error 串里的 ``` 折成 `` —— 防它破坏外层 fenced block / 让 App parser
+    （parseCronRunStatus 的 `[\\s\\S]*?(?:\\n```|$)`）提前截断。两个 backtick
+    不构成 fence，技术 error 串的字面 backtick 数量无语义损失。"""
+    return re.sub(r"`{3,}", "``", text)
+
+
+def _append_delivery_error_to_output(job_id: str, delivery_error: str) -> None:
+    """Append a "## Delivery Error" section to the run's saved markdown.
+
+    A run that executed fine but failed to deliver otherwise looks like a plain
+    success in the App's per-run history (the job record's last_delivery_error
+    only ever holds the latest run). Best-effort — never raises into the cron
+    loop. App parser: zettlab-app services/cron-jobs.ts::parseCronRunStatus.
+    """
+    path = _LATEST_OUTPUT_PATH.get(job_id)
+    if not path or not delivery_error:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"\n## Delivery Error\n\n```\n{_fence_safe(delivery_error)}\n```\n")
+    except OSError as e:
+        _dbg(f"_append_delivery_error_to_output FAILED job={job_id}: {e!r}")
+
+
+def _append_run_error_to_output(job_id: str, reason: str) -> None:
+    """Append a "## Error" section to the run's saved markdown so the App's
+    per-run history (parseCronRunStatus) reads this run as failed — matching
+    the cron-summary card / job last_status. Needed when mark_job_run downgrades
+    a "fake success": scheduler already wrote the .md as a success doc before we
+    flipped success, so without this the run history would still show success.
+    Best-effort — never raises into the cron loop.
+    """
+    path = _LATEST_OUTPUT_PATH.get(job_id)
+    if not path or not reason:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"\n## Error\n\n```\n{_fence_safe(reason)}\n```\n")
+    except OSError as e:
+        _dbg(f"_append_run_error_to_output FAILED job={job_id}: {e!r}")
+
+
 def _dbg(msg: str) -> None:
     """Best-effort debug log to /tmp/zet_agent_cron.log — useful during
     development since hermes child stdout/stderr land in zerolog inside
@@ -127,7 +176,9 @@ def install() -> None:
 
     def _wrapped_save(job_id: str, output: str):
         _LATEST_OUTPUT[job_id] = output
-        return _orig_save(job_id, output)
+        saved = _orig_save(job_id, output)
+        _LATEST_OUTPUT_PATH[job_id] = saved
+        return saved
 
     def _wrapped_mark(
         job_id: str,
@@ -145,6 +196,17 @@ def install() -> None:
             job_snapshot = None
 
         will_be_auto_deleted = _will_hit_repeat_limit(job_snapshot)
+
+        # 把"没干活的假成功"降级成 failed（在下方生成 App 卡片之前）。
+        # 同时给 run .md 补 "## Error"，让详情页运行历史也读成 failed —— scheduler
+        # 早把 .md 当成功文档写盘了，不补这刀运行历史仍显示成功，三个面不一致。
+        if success:
+            _fake_reason = _detect_fake_success(job_id)
+            if _fake_reason:
+                _dbg(f"_wrapped_mark: fake-success job={job_id}: {_fake_reason}")
+                success = False
+                error = error or _fake_reason
+                _append_run_error_to_output(job_id, _fake_reason)
 
         effective_delivery_error = delivery_error
         try:
@@ -165,6 +227,9 @@ def install() -> None:
                 effective_delivery_error,
                 f"zet_agent session persist failed: {e}",
             )
+
+        if effective_delivery_error:
+            _append_delivery_error_to_output(job_id, effective_delivery_error)
 
         try:
             result = _orig_mark(
@@ -191,6 +256,7 @@ def install() -> None:
             return result
         finally:
             _LATEST_OUTPUT.pop(job_id, None)
+            _LATEST_OUTPUT_PATH.pop(job_id, None)
 
     setattr(_wrapped_mark, _PATCH_SENTINEL, True)
     setattr(_wrapped_save, _PATCH_SENTINEL, True)
@@ -364,6 +430,91 @@ def install() -> None:
     logger.info("zet_agent_cron: installed cron persistence hooks on cron.scheduler")
 
 
+# ── Fake-success detection (ZET-1048) ───────────────────────────────
+# 意图宣告句（"我要去做X"），须配合"0 工具执行"才用于降级。中英覆盖。
+_INTENT_ANNOUNCE_RE = re.compile(
+    r"^\s*"
+    r"(?:[^\n。.!?！？]{0,12}[,，、:：]\s*)?"  # 可选短开场白，如 "好的，" / "Sure,"
+    r"("
+    r"i['’]?ll\b|i\s+will\b|i['’]?m\s+going\s+to\b|i\s+am\s+going\s+to\b|"
+    r"let\s+me\b|let['’]?s\b|sure[,.\s]|one\s+moment\b|hold\s+on\b|"
+    r"give\s+me\s+a\s+moment\b|"
+    r"我(将|来|这就|马上|现在)|让我|稍等|请稍候|马上(去|为)|现在(就)?(去|来|帮|为)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _count_tool_activity(job_id: str) -> Optional[int]:
+    """最近一次 cron session 的 tool_call + tool 结果数；读不到返回 None（fail-open）。"""
+    if not job_id:
+        return None
+    try:
+        from hermes_state import SessionDB
+    except ImportError:
+        return None
+    db = SessionDB()
+    try:
+        prefix = f"cron_{job_id}_"
+        like = (
+            prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            + "%"
+        )
+        try:
+            with db._lock:
+                cursor = db._conn.execute(
+                    "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' "
+                    "ORDER BY started_at DESC LIMIT 1",
+                    (like,),
+                )
+                row = cursor.fetchone()
+        except Exception as _e:
+            _dbg(f"_count_tool_activity: session lookup FAILED: {_e!r}")
+            return None
+        if not row:
+            return None
+        try:
+            messages = db.get_messages(row["id"])
+        except Exception as _e:
+            _dbg(f"_count_tool_activity: get_messages FAILED: {_e!r}")
+            return None
+        count = 0
+        for msg in messages:
+            role = msg.get("role")
+            if role == "assistant":
+                tcs = msg.get("tool_calls")
+                if isinstance(tcs, list):
+                    count += len(tcs)
+            elif role == "tool":
+                count += 1
+        return count
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def _detect_fake_success(job_id: str) -> Optional[str]:
+    """短意图句 + 本轮 0 工具执行 → 返回失败原因，否则 None（fail-open，不误降真成功）。"""
+    try:
+        body = _extract_response_body(_LATEST_OUTPUT.get(job_id, "")).strip()
+    except Exception:
+        return None
+    if not body:
+        return None  # 空 body 上游已 soft-fail (#8585)
+    if len(body) > 400 or not _INTENT_ANNOUNCE_RE.search(body):
+        return None  # 实质内容 / 非意图句 = 真答案
+    tool_activity = _count_tool_activity(job_id)
+    if tool_activity is None or tool_activity > 0:
+        return None  # 读不到，或工具跑了 → 保持成功
+    return (
+        "agent announced an action but executed no tools and produced no "
+        "result (model stream likely interrupted mid tool-call, or no tool "
+        "call was emitted)"
+    )
+
+
 # ── Persist to hermes SessionDB ─────────────────────────────────────
 
 def _try_persist_to_session(
@@ -440,6 +591,8 @@ def _try_notify_chat_append(session_id: str, msg_id: int, content: str) -> None:
         "msg_id": int(msg_id) if msg_id is not None else 0,
         "role": "assistant",
         "content": content,
+        # App 据此识别 cron 消息：turn 忙时排队、turn done 后再插入对话流末尾。
+        "kind": "cron_summary",
     }
     try:
         import urllib.request
