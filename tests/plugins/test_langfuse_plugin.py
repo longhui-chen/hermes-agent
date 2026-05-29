@@ -704,3 +704,47 @@ class TestToolObservationKeying:
         assert ended["output"] == {"status": "done"}
         assert not state.tools
 
+
+# ---------------------------------------------------------------------------
+# Per-device fleet scoping: HERMES_LANGFUSE_SN threads the device serial onto
+# every root trace (user_id + "sn:<serial>" tag + metadata.device_sn) so a
+# multi-device deployment can be sliced by device in Langfuse. Exercises the
+# pure helper directly — no SDK stub needed.
+# ---------------------------------------------------------------------------
+
+class TestDeviceSerialScoping:
+    def _mod(self):
+        return importlib.import_module("plugins.observability.langfuse")
+
+    _ATTRS = dict(task_id="t", platform="cli", provider="custom",
+                  model="glm-5.1", api_mode="chat")
+
+    def test_no_sn_matches_legacy_behaviour(self, monkeypatch):
+        monkeypatch.delenv("HERMES_LANGFUSE_SN", raising=False)
+        mod = self._mod()
+        metadata, tags, user_id = mod._root_trace_attributes(**self._ATTRS)
+        assert user_id is None
+        assert tags == ["hermes", "langfuse"]
+        assert "device_sn" not in metadata
+        # Existing metadata keys are untouched.
+        assert metadata["model"] == "glm-5.1"
+        assert metadata["source"] == "hermes"
+
+    def test_sn_threads_through_all_three_dimensions(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGFUSE_SN", "WY210260528GT102")
+        mod = self._mod()
+        metadata, tags, user_id = mod._root_trace_attributes(**self._ATTRS)
+        assert user_id == "WY210260528GT102"
+        assert tags == ["hermes", "langfuse", "sn:WY210260528GT102"]
+        assert metadata["device_sn"] == "WY210260528GT102"
+
+    def test_blank_sn_is_ignored(self, monkeypatch):
+        # Whitespace-only env (e.g. unset-but-exported) must not produce an
+        # empty user_id or a stray "sn:" tag.
+        monkeypatch.setenv("HERMES_LANGFUSE_SN", "   ")
+        mod = self._mod()
+        metadata, tags, user_id = mod._root_trace_attributes(**self._ATTRS)
+        assert user_id is None
+        assert tags == ["hermes", "langfuse"]
+        assert "device_sn" not in metadata
+
