@@ -2,6 +2,33 @@
 
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
+---
+
+## ⚠️ Engineering Hard Rules — 全员 / 全 Agent 必须遵守（镜像自 monorepo）
+
+> 本节与 monorepo [`zettlab-product-dev/AGENTS.md`](https://github.com/zettlab/zettlab-product-dev/blob/main/AGENTS.md) 同源。**即使只克隆本子仓库 workspace 单独开发（cursor / claude / codex / windsurf 等），也必须遵守这 5 条**。任何 PR / spec / plan 都要主动声明对它们的影响（哪怕"无影响"也写一行）。
+>
+> 任何更新先改 monorepo 权威源，再同步到本文件；本文件不允许独立演化。
+
+1. **内存预算先于一切（端侧 2 GB 硬上限）** — 本子项目直接跑在 2 GB 板上，**且 Python runtime 内存占用比 Go 高**，是最容易被 OOM 的进程之一。禁止常驻无界 cache / 全量 history 留内存 / 模型在多个 profile 重复加载；每个 profile 的 child process 必须有显式 RSS 上限和回收策略。
+
+2. **稳定性 & 高可用是默认目标** — 外部依赖（LLM provider / OSS / connector / 本机 local-server）必须配 timeout + retry + 降级；profile 子进程必须能被 supervisor 拉起；state mutation（profile config / tool registry）优先 atomic-rename + backup。新功能要能回答 "它怎么坏？怎么自愈？"。
+
+3. **Agent 使用必须安全** — MCP / connector / skill 涉及 user data / token / shell / fs / sql 操作必须显式 owner / scope / path / cmd allowlist 校验。**禁止把 cloud user token 透传给本机 shell；禁止把 LLM 输出直接拼成 sql / shell / fs path 而不 sanitize；禁止 connector 默认拿全量 scope。** 新增 connector / tool / skill / mcp server 合入前 PR 描述必须回答 "最坏情况能造成什么伤害"。
+
+4. **客户端 ↔ 后端接口兼容性（API Compat）** — `hermes-agent` 对外提供 OpenAI 兼容 `/v1/chat/completions` + SSE 是 **hot path 契约**，`zettlab-app` / `zettlab-web` / `zettlab-local-server` 都依赖：
+   - **禁止破坏 OpenAI 兼容契约** —— request / response schema、SSE event 字段、role / tool-call 命名必须与 OpenAI spec 保持向后兼容。
+   - 内部专有字段（zettlab.\* 扩展）必须为新增、可选，老客户端忽略后仍能跑通基本对话。
+   - **契约改动必须同时改完所有消费方**（app + web + local-server），并在 PR 描述列出影响的端到端路径。
+   - SSE event 字段（`delta.content`、`tool_calls`、自定义 `agent.status` 等）、消息存储格式属于 hot path，改动必须配 e2e 验证脚本。
+   - 老客户端 release 周期慢，新行为默认走 capability negotiation 或 profile-level feature flag。
+
+5. **冲突时优先级：高可用 > 安全 > 性能** — 性能优化不允许偷偷牺牲稳定 / 安全；必须 trade 时在 PR 显式声明并 review。
+
+完成清单（HR1-HR5 逐项确认）见 monorepo `AGENTS.md` 末尾。
+
+---
+
 ## Development Environment
 
 ```bash

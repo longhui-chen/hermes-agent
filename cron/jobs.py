@@ -25,10 +25,33 @@ from hermes_time import now as _hermes_now
 from utils import atomic_replace
 
 try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError:
+    from backports.zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # type: ignore[no-redef]
+
+try:
     from croniter import croniter
     HAS_CRONITER = True
 except ImportError:
     HAS_CRONITER = False
+
+
+def _validate_tz_name(name: Optional[str]) -> Optional[str]:
+    """Validate IANA timezone name; return canonical string or None.
+
+    Empty / None means "no per-job timezone" — falls back to the hermes
+    instance's configured timezone (HERMES_TIMEZONE / config.yaml / system).
+    """
+    if name is None:
+        return None
+    text = str(name).strip()
+    if not text:
+        return None
+    try:
+        ZoneInfo(text)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"Invalid timezone {text!r}: {exc}")
+    return text
 
 # =============================================================================
 # Configuration
@@ -206,16 +229,21 @@ def parse_duration(s: str) -> int:
     return value * multipliers[unit]
 
 
-def parse_schedule(schedule: str) -> Dict[str, Any]:
+def parse_schedule(schedule: str, *, tz_name: Optional[str] = None) -> Dict[str, Any]:
     """
     Parse schedule string into structured format.
-    
+
     Returns dict with:
         - kind: "once" | "interval" | "cron"
         - For "once": "run_at" (ISO timestamp)
         - For "interval": "minutes" (int)
         - For "cron": "expr" (cron expression)
-    
+
+    ``tz_name`` is an optional IANA timezone (e.g. ``"Asia/Shanghai"``) used to
+    anchor *naive* ISO timestamps. With ``tz_name`` set, ``"2026-05-25T10:30"``
+    is interpreted as 10:30 wall-clock in that zone instead of the system local
+    zone — without it, the result depends on where hermes happens to run.
+
     Examples:
         "30m"              → once in 30 minutes
         "2h"               → once in 2 hours
@@ -264,8 +292,26 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
             dt = datetime.fromisoformat(schedule.replace('Z', '+00:00'))
             # Make naive timestamps timezone-aware at parse time so the stored
             # value doesn't depend on the system timezone matching at check time.
+            # When the caller supplied a tz_name (per-job timezone), interpret
+            # the naive wall-clock in that zone — otherwise fall back to system
+            # local (preserves pre-tz-aware behaviour).
             if dt.tzinfo is None:
-                dt = dt.astimezone()  # Interpret as local timezone
+                anchor_tz = None
+                if tz_name:
+                    try:
+                        anchor_tz = ZoneInfo(tz_name)
+                    except (ZoneInfoNotFoundError, ValueError):
+                        logger.warning(
+                            "parse_schedule: invalid tz_name %r, falling back "
+                            "to system local; create_job._validate_tz_name "
+                            "should normally catch this earlier",
+                            tz_name,
+                        )
+                        anchor_tz = None
+                if anchor_tz is not None:
+                    dt = dt.replace(tzinfo=anchor_tz)
+                else:
+                    dt = dt.astimezone()  # Interpret as local timezone
             return {
                 "kind": "once",
                 "run_at": dt.isoformat(),
@@ -373,11 +419,23 @@ def _compute_grace_seconds(schedule: dict) -> int:
     return MIN_GRACE
 
 
-def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None) -> Optional[str]:
+def compute_next_run(
+    schedule: Dict[str, Any],
+    last_run_at: Optional[str] = None,
+    *,
+    tz_name: Optional[str] = None,
+) -> Optional[str]:
     """
     Compute the next run time for a schedule.
 
     Returns ISO timestamp string, or None if no more runs.
+
+    ``tz_name`` is a per-job IANA timezone (e.g. ``"Asia/Shanghai"``).
+    Only the cron branch is timezone-sensitive — ``"6 23 * * *"`` means
+    different wall-clock instants in different zones. Interval/once jobs
+    operate on absolute datetimes, so the job-level tz doesn't change
+    their behaviour. When ``tz_name`` is None, fall back to the hermes
+    instance's configured timezone via _hermes_now().
     """
     now = _hermes_now()
 
@@ -405,13 +463,30 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
                 schedule.get("expr"),
             )
             return None
+
+        # Resolve the timezone to evaluate the cron expression in.
+        # Per-job tz wins; otherwise inherit the hermes instance's tz.
+        job_tz = None
+        if tz_name:
+            try:
+                job_tz = ZoneInfo(tz_name)
+            except (ZoneInfoNotFoundError, ValueError):
+                logger.warning(
+                    "Invalid per-job timezone %r; falling back to hermes default.",
+                    tz_name,
+                )
+
         # Use last_run_at as the croniter base when available, consistent
         # with interval jobs.  This ensures that after a crash/restart,
         # the next run is anchored to the actual last execution time
         # rather than to an arbitrary restart time.
-        base_time = now
         if last_run_at:
             base_time = _ensure_aware(datetime.fromisoformat(last_run_at))
+        else:
+            base_time = now
+        if job_tz is not None:
+            base_time = base_time.astimezone(job_tz)
+
         cron = croniter(schedule["expr"], base_time)
         next_run = cron.get_next(datetime)
         return next_run.isoformat()
@@ -546,6 +621,7 @@ def create_job(
     workdir: Optional[str] = None,
     profile: Optional[str] = None,
     no_agent: bool = False,
+    timezone: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -599,7 +675,10 @@ def create_job(
     Returns:
         The created job dict
     """
-    parsed_schedule = parse_schedule(schedule)
+    # Validate the per-job timezone up-front so parse_schedule can honour it
+    # for naive ISO timestamps (e.g. "2026-05-25T10:30" → 10:30 wall in tz).
+    normalized_tz = _validate_tz_name(timezone)
+    parsed_schedule = parse_schedule(schedule, tz_name=normalized_tz)
 
     # Normalize repeat: treat 0 or negative values as None (infinite)
     if repeat is not None and repeat <= 0:
@@ -673,8 +752,9 @@ def create_job(
         "paused_at": None,
         "paused_reason": None,
         "created_at": now,
-        "next_run_at": compute_next_run(parsed_schedule),
+        "next_run_at": compute_next_run(parsed_schedule, tz_name=normalized_tz),
         "last_run_at": None,
+        "timezone": normalized_tz,
         "last_status": None,
         "last_error": None,
         "last_delivery_error": None,
@@ -782,8 +862,19 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             else:
                 updates["profile"] = _normalize_profile(_profile)
 
+        # Validate timezone if present.  Empty / None clears the per-job tz
+        # and falls back to the hermes instance's configured tz.
+        if "timezone" in updates:
+            updates["timezone"] = _validate_tz_name(updates["timezone"])
+
         updated = _apply_skill_fields({**job, **updates})
         schedule_changed = "schedule" in updates
+        # A bare timezone change must also recompute next_run_at — otherwise
+        # the user fixes their tz and the next firing still uses the old
+        # wall-clock until the next mark_job_run.
+        timezone_changed = (
+            "timezone" in updates and updates["timezone"] != job.get("timezone")
+        )
 
         if "skills" in updates or "skill" in updates:
             normalized_skills = _normalize_skill_list(updated.get("skill"), updated.get("skills"))
@@ -796,17 +887,24 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             # instead of a pre-parsed dict.  Normalize it the same way
             # create_job() does so downstream code can call .get() safely.
             if isinstance(updated_schedule, str):
-                updated_schedule = parse_schedule(updated_schedule)
+                updated_schedule = parse_schedule(
+                    updated_schedule, tz_name=updated.get("timezone")
+                )
                 updated["schedule"] = updated_schedule
             updated["schedule_display"] = updates.get(
                 "schedule_display",
                 updated_schedule.get("display", updated.get("schedule_display")),
             )
-            if updated.get("state") != "paused":
-                updated["next_run_at"] = compute_next_run(updated_schedule)
+
+        if (schedule_changed or timezone_changed) and updated.get("state") != "paused":
+            updated["next_run_at"] = compute_next_run(
+                updated["schedule"], tz_name=updated.get("timezone")
+            )
 
         if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
-            updated["next_run_at"] = compute_next_run(updated["schedule"])
+            updated["next_run_at"] = compute_next_run(
+                updated["schedule"], tz_name=updated.get("timezone")
+            )
 
         jobs[i] = updated
         save_jobs(jobs)
@@ -836,7 +934,7 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     if not job:
         return None
 
-    next_run_at = compute_next_run(job["schedule"])
+    next_run_at = compute_next_run(job["schedule"], tz_name=job.get("timezone"))
     return update_job(
         job["id"],
         {
@@ -924,7 +1022,9 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         return
                 
                 # Compute next run
-                job["next_run_at"] = compute_next_run(job["schedule"], now)
+                job["next_run_at"] = compute_next_run(
+                    job["schedule"], now, tz_name=job.get("timezone")
+                )
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't
@@ -981,7 +1081,9 @@ def advance_next_run(job_id: str) -> bool:
                 if kind not in {"cron", "interval"}:
                     return False
                 now = _hermes_now().isoformat()
-                new_next = compute_next_run(job["schedule"], now)
+                new_next = compute_next_run(
+                    job["schedule"], now, tz_name=job.get("timezone")
+                )
                 if new_next and new_next != job.get("next_run_at"):
                     job["next_run_at"] = new_next
                     save_jobs(jobs)
@@ -1033,7 +1135,9 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             # silently skipped forever; recompute next_run_at from the
             # schedule so they pick up at their next scheduled tick.
             if not recovered_next and kind in {"cron", "interval"}:
-                recovered_next = compute_next_run(schedule, now.isoformat())
+                recovered_next = compute_next_run(
+                    schedule, now.isoformat(), tz_name=job.get("timezone")
+                )
                 if recovered_next:
                     recovery_kind = kind
 
@@ -1066,7 +1170,9 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             if kind in {"cron", "interval"} and (now - next_run_dt).total_seconds() > grace:
                 # Job is past its catch-up grace window — this is a stale missed run.
                 # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
-                new_next = compute_next_run(schedule, now.isoformat())
+                new_next = compute_next_run(
+                    schedule, now.isoformat(), tz_name=job.get("timezone")
+                )
                 if new_next:
                     logger.info(
                         "Job '%s' missed its scheduled time (%s, grace=%ds). "

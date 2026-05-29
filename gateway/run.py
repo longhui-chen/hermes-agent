@@ -1674,7 +1674,9 @@ class GatewayRunner:
     _restart_detached: bool = False
     _restart_via_service: bool = False
     _stop_task: Optional[asyncio.Task] = None
-    _session_model_overrides: Dict[str, Dict[str, str]] = {}
+    _mcp_discovery_task: Optional[asyncio.Task] = None
+    _accept_hooks: bool = False
+    _session_model_overrides: Dict[str, Dict[str, Any]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
 
     def __init__(self, config: Optional[GatewayConfig] = None):
@@ -1710,18 +1712,20 @@ class GatewayRunner:
         self._exit_cleanly = False
         self._exit_with_failure = False
         self._exit_reason: Optional[str] = None
-        self._exit_code: Optional[int] = None
+        self._exit_code = None
         self._draining = False
         self._restart_requested = False
         self._restart_task_started = False
         self._restart_detached = False
         self._restart_via_service = False
-        self._stop_task: Optional[asyncio.Task] = None
+        self._stop_task = None
+        self._mcp_discovery_task = None
+        self._accept_hooks = False
         
         # Track running agents per session for interrupt support
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
-        self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
+        self._running_agents_ts = {}  # start timestamp per session
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
         # Overflow buffer for explicit /queue commands.  The adapter-level
         # _pending_messages dict is a single slot per session (designed for
@@ -1760,10 +1764,10 @@ class GatewayRunner:
 
         # Per-session model overrides from /model command.
         # Key: session_key, Value: dict with model/provider/api_key/base_url/api_mode
-        self._session_model_overrides: Dict[str, Dict[str, str]] = {}
+        self._session_model_overrides = {}
         # Per-session reasoning effort overrides from /reasoning.
         # Key: session_key, Value: parsed reasoning config dict.
-        self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
+        self._session_reasoning_overrides = {}
         self._kanban_notifier_profile = self._active_profile_name()
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
@@ -1834,6 +1838,23 @@ class GatewayRunner:
                     )
             except Exception as exc:
                 logger.debug("state.db auto-maintenance skipped: %s", exc)
+
+        # Restore explicit session-level model overrides written by the
+        # Zettlab local-server. Local-server owns the control-plane state;
+        # Hermes consumes this profile-local JSON at startup and only keeps
+        # runtime overrides in memory afterwards.
+        try:
+            from gateway.session_model_overrides import load_session_model_overrides
+
+            stored = load_session_model_overrides()
+            if stored:
+                self._session_model_overrides.update(stored)
+                logger.info(
+                    "session-model-overrides: restored %d from profile json",
+                    len(stored),
+                )
+        except Exception as exc:
+            logger.debug("session-model-overrides restore skipped: %s", exc)
 
         # Opportunistic shadow-repo cleanup — deletes orphan/stale
         # checkpoint repos under ~/.hermes/checkpoints/.  Opt-in via
@@ -1915,7 +1936,7 @@ class GatewayRunner:
             return
 
         connected = self.config.get_connected_platforms()
-        messaging_platforms = [p for p in connected if p not in {Platform.LOCAL, Platform.API_SERVER, Platform.WEBHOOK}]
+        messaging_platforms = [p for p in connected if p not in {Platform.LOCAL, Platform.API_SERVER, Platform.ZET_AGENT, Platform.WEBHOOK}]
         if not messaging_platforms:
             return
 
@@ -2377,6 +2398,7 @@ class GatewayRunner:
                 "api_key": override.get("api_key"),
                 "base_url": override.get("base_url"),
                 "api_mode": override.get("api_mode"),
+                "config_context_length": override.get("context_length"),
             }
             if override_runtime.get("api_key"):
                 logger.debug(
@@ -2445,6 +2467,7 @@ class GatewayRunner:
             "base_url": runtime_kwargs.get("base_url"),
             "provider": runtime_kwargs.get("provider"),
             "api_mode": runtime_kwargs.get("api_mode"),
+            "config_context_length": runtime_kwargs.get("config_context_length"),
             "command": runtime_kwargs.get("command"),
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
@@ -2457,6 +2480,7 @@ class GatewayRunner:
                 runtime["provider"],
                 runtime["base_url"],
                 runtime["api_mode"],
+                runtime["config_context_length"],
                 runtime["command"],
                 tuple(runtime["args"]),
             ),
@@ -4054,19 +4078,18 @@ class GatewayRunner:
                 "plugin discovery failed at gateway startup", exc_info=True,
             )
 
-        # Register declarative shell hooks from cli-config.yaml.  Gateway
-        # has no TTY, so consent has to come from one of the three opt-in
-        # channels (--accept-hooks on launch, HERMES_ACCEPT_HOOKS env var,
-        # or hooks_auto_accept: true in config.yaml).  We pass
-        # accept_hooks=False here and let register_from_config resolve
-        # the effective value from env + config itself — the CLI-side
-        # registration already honored --accept-hooks, and re-reading
-        # hooks_auto_accept here would just duplicate that lookup.
-        # Failures are logged but must never block gateway startup.
+        # Register declarative shell hooks from cli-config.yaml. Gateway has
+        # no TTY, so consent has to come from --accept-hooks, the
+        # HERMES_ACCEPT_HOOKS env var, or hooks_auto_accept: true in config.
+        # Keep this after plugin discovery so plugin block decisions keep
+        # their established precedence over shell-hook blocks.
         try:
             from hermes_cli.config import load_config
             from agent.shell_hooks import register_from_config
-            register_from_config(load_config(), accept_hooks=False)
+            register_from_config(
+                load_config(),
+                accept_hooks=bool(getattr(self, "_accept_hooks", False)),
+            )
         except Exception:
             logger.debug(
                 "shell-hook registration failed at gateway startup",
@@ -6393,6 +6416,15 @@ class GatewayRunner:
                 logger.warning("API Server: aiohttp not installed")
                 return None
             return APIServerAdapter(config)
+
+        elif platform == Platform.ZET_AGENT:
+            from gateway.platforms.zet_agent import ZetAgentAdapter, check_zet_agent_requirements
+            if not check_zet_agent_requirements():
+                logger.warning("Zet Agent: aiohttp not installed")
+                return None
+            adapter = ZetAgentAdapter(config)
+            adapter.gateway_runner = self
+            return adapter
 
         elif platform == Platform.WEBHOOK:
             from gateway.platforms.webhook import WebhookAdapter, check_webhook_requirements
@@ -13385,6 +13417,13 @@ class GatewayRunner:
         wrapper can invoke the same path whether the user confirmed via
         button, text reply, or has the confirm gate disabled.
         """
+        discovery_task = getattr(self, "_mcp_discovery_task", None)
+        if discovery_task is not None and not discovery_task.done():
+            return (
+                "MCP discovery is still initializing in the background. "
+                "Please retry `/reload-mcp` after it finishes."
+            )
+
         loop = asyncio.get_running_loop()
         try:
             from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
@@ -15231,6 +15270,9 @@ class GatewayRunner:
             val = override.get(key)
             if val is not None:
                 runtime_kwargs[key] = val
+        context_length = override.get("context_length")
+        if context_length is not None:
+            runtime_kwargs["config_context_length"] = context_length
         return model, runtime_kwargs
 
     def _is_intentional_model_switch(self, session_key: str, agent_model: str) -> bool:
@@ -18354,7 +18396,12 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     logger.info("Cron ticker stopped")
 
 
-async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
+async def start_gateway(
+    config: Optional[GatewayConfig] = None,
+    replace: bool = False,
+    verbosity: Optional[int] = 0,
+    accept_hooks: bool = False,
+) -> bool:
     """
     Start the gateway and run until interrupted.
     
@@ -18367,6 +18414,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         replace: If True, kill any existing gateway instance before starting.
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
+        accept_hooks: Auto-approve configured shell hooks for this gateway process.
     """
     # ── Duplicate-instance guard ──────────────────────────────────────
     # Prevent two gateways from running under the same HERMES_HOME.
@@ -18716,20 +18764,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     atexit.register(remove_pid_file)
     atexit.register(release_gateway_runtime_lock)
 
-    # MCP tool discovery — run in an executor so the asyncio event loop
-    # stays responsive even when a configured MCP server is slow or
-    # unreachable.  discover_mcp_tools() uses a blocking 120s wait
-    # internally; calling it from the loop thread would freeze platform
-    # heartbeats (Discord shard, Telegram polling) until it returned.
-    # See #16856.
-    try:
-        from tools.mcp_tool import discover_mcp_tools
-        _loop = asyncio.get_running_loop()
-        await _loop.run_in_executor(None, discover_mcp_tools)
-    except Exception as e:
-        logger.debug("MCP tool discovery failed: %s", e)
-
     # Start the gateway
+    runner._accept_hooks = accept_hooks
     success = await runner.start()
     if not success:
         return False
@@ -18737,6 +18773,43 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         if runner.exit_reason:
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
         return True
+
+    # MCP tool discovery can spend up to 120s inside blocking connection
+    # waits when a configured server is slow, unreachable, or returns 401.
+    # Schedule it after the gateway HTTP surface is listening so /health
+    # readiness and normal chat are not coupled to optional MCP startup.
+    def _start_mcp_discovery_task() -> asyncio.Task:
+        task_loop = asyncio.get_running_loop()
+        discovery_done = task_loop.create_future()
+
+        def _mark_discovery_done() -> None:
+            if not discovery_done.done():
+                discovery_done.set_result(None)
+
+        def _discover_mcp_tools_thread() -> None:
+            try:
+                from tools.mcp_tool import discover_mcp_tools
+                discover_mcp_tools()
+            except Exception:
+                logger.warning("MCP tool discovery failed", exc_info=True)
+            finally:
+                try:
+                    task_loop.call_soon_threadsafe(_mark_discovery_done)
+                except RuntimeError:
+                    pass
+
+        threading.Thread(
+            target=_discover_mcp_tools_thread,
+            daemon=True,
+            name="mcp-discovery",
+        ).start()
+
+        async def _wait_for_discovery() -> None:
+            await discovery_done
+
+        return asyncio.create_task(_wait_for_discovery())
+
+    runner._mcp_discovery_task = _start_mcp_discovery_task()
     
     # Start background cron ticker so scheduled jobs fire automatically.
     # Pass the event loop so cron delivery can use live adapters (E2EE support).
@@ -18750,28 +18823,52 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     )
     cron_thread.start()
     
-    # Wait for shutdown
-    await runner.wait_for_shutdown()
+    try:
+        # Wait for shutdown
+        await runner.wait_for_shutdown()
+    finally:
+        # Stop cron ticker cleanly before tearing down tools it may use.
+        cron_stop.set()
+        cron_thread.join(timeout=5)
+
+        mcp_task = runner._mcp_discovery_task
+        mcp_discovery_still_running = False
+        if mcp_task is not None and not mcp_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(mcp_task), timeout=5)
+            except asyncio.TimeoutError:
+                mcp_discovery_still_running = True
+                logger.warning(
+                    "MCP discovery is still running during gateway shutdown; "
+                    "skipping concurrent MCP shutdown and forcing child cleanup."
+                )
+                mcp_task.cancel()
+                await asyncio.gather(mcp_task, return_exceptions=True)
+            except Exception:
+                pass
+
+        # Close MCP server connections.
+        try:
+            if mcp_discovery_still_running:
+                from tools.mcp_tool import _kill_orphaned_mcp_children
+                _kill_orphaned_mcp_children(include_active=True)
+            else:
+                from tools.mcp_tool import shutdown_mcp_servers
+                shutdown_mcp_servers()
+        except Exception:
+            pass
 
     if runner.should_exit_with_failure:
         if runner.exit_reason:
             logger.error("Gateway exiting with failure: %s", runner.exit_reason)
         return False
-    
-    # Stop cron ticker cleanly
-    cron_stop.set()
-    cron_thread.join(timeout=5)
 
     # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
+    # The cron ticker and MCP servers were already torn down in the finally
+    # above — MCP via the fork's mcp_discovery_still_running-aware path — so the
+    # only thing left to stop here is the upstream planned-stop watcher thread.
     _planned_stop_watcher_stop.set()
     _planned_stop_watcher_thread.join(timeout=2)
-
-    # Close MCP server connections
-    try:
-        from tools.mcp_tool import shutdown_mcp_servers
-        shutdown_mcp_servers()
-    except Exception:
-        pass
 
     # Stop the periodic memory monitor (if it was started above).
     # This also emits one final "[MEMORY] shutdown rss=..." line so the

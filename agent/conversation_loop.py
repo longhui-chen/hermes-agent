@@ -1937,7 +1937,36 @@ def run_conversation(
                     agent.thinking_callback("")
                 api_elapsed = time.time() - api_start_time
                 agent._vprint(f"{agent.log_prefix}⚡ Interrupted during API call.", force=True)
-                agent._persist_session(messages, conversation_history)
+                # ZET-641: two-mode interrupt behavior. Decision pivot is
+                # whether the agent had produced any *visible* output
+                # before the interrupt fired:
+                #
+                #   - has visible output (some assistant text streamed):
+                #     persist a partial "interrupted" assistant message
+                #     so the user keeps what they already saw.
+                #
+                #   - pure-thinking interrupt (no visible text, no
+                #     committed tool yet): discard the whole turn. The
+                #     app retracts the user message back into the input
+                #     box; we mirror that server-side by rolling user_msg
+                #     out of `messages` so state.db doesn't keep a
+                #     phantom row. Reasoning is intentionally NOT
+                #     captured as a separate persistence target — the
+                #     user's directive is "no separate thinking storage",
+                #     so we don't accumulate it for fallback writes.
+                partial_text = (getattr(agent, "_current_streamed_assistant_text", "") or "").strip()
+                if partial_text:
+                    messages.append({
+                        "role": "assistant",
+                        "content": partial_text,
+                        "interrupted": True,
+                    })
+                    agent._persist_session(messages, conversation_history)
+                else:
+                    agent._discard_current_turn_on_interrupt(messages)
+                    # Skip _persist_session — the final persist at end
+                    # of run_conversation will see the rolled-back tail
+                    # and write nothing new.
                 interrupted = True
                 final_response = f"Operation interrupted: waiting for model response ({api_elapsed:.1f}s elapsed)."
                 break
@@ -3859,36 +3888,38 @@ def run_conversation(
                 if _tc_names == {"execute_code"}:
                     agent.iteration_budget.refund()
                 
-                # Use real token counts from the API response to decide
-                # compression.  prompt_tokens + completion_tokens is the
-                # actual context size the provider reported plus the
-                # assistant turn — a tight lower bound for the next prompt.
-                # Tool results appended above aren't counted yet, but the
-                # threshold (default 50%) leaves ample headroom; if tool
-                # results push past it, the next API call will report the
-                # real total and trigger compression then.
+                # Decide compression from the *current* request shape —
+                # i.e. the messages just augmented with tool results by
+                # _execute_tool_calls above — not from the previous API
+                # response's reported prompt_tokens.
                 #
-                # If last_prompt_tokens is 0 (stale after API disconnect
-                # or provider returned no usage data), fall back to rough
-                # estimate to avoid missing compression.  Without this,
-                # a session can grow unbounded after disconnects because
-                # should_compress(0) never fires.  (#2153)
+                # last_prompt_tokens predates the tool results we just
+                # appended; a single large tool output (terminal/read_file
+                # dumping multi-MB stdout, web_search aggregating long
+                # pages) can push the next request well past the threshold
+                # while last_prompt_tokens is still under it. The old
+                # reactive check would then fire only AFTER the oversized
+                # request had been sent — by which point the provider may
+                # have already errored out, truncated, or returned empty.
+                # See board28 NAS-PM / MaxClaw token-usage timeline
+                # (~1.6M tokens in a single turn vs the 50% / 500K
+                # threshold on a 1M context model).
+                #
+                # estimate_request_tokens_rough already includes tool
+                # schemas (#14695) and counts images at a flat per-image
+                # rate (#12026 et al.), matching what the preflight
+                # compression check uses at turn entry. Take max with
+                # last_prompt_tokens so we never regress on the disconnect
+                # fallback (#2153) — should_compress(0) would never fire,
+                # but max(estimate, 0) does — and so an authoritative
+                # provider-reported count from the prior request acts as a
+                # floor when the rough estimate (4 chars/token) would
+                # under-count multipart payloads / control tokens.
                 _compressor = agent.context_compressor
-                if _compressor.last_prompt_tokens > 0:
-                    # Only use prompt_tokens — completion/reasoning
-                    # tokens don't consume context window space.
-                    # Thinking models (GLM-5.1, QwQ, DeepSeek R1)
-                    # inflate completion_tokens with reasoning,
-                    # causing premature compression.  (#12026)
-                    _real_tokens = _compressor.last_prompt_tokens
-                else:
-                    # Include tool schemas — with 50+ tools enabled
-                    # these add 20-30K tokens the messages-only
-                    # estimate misses, which can skip compression
-                    # past the configured threshold (#14695).
-                    _real_tokens = estimate_request_tokens_rough(
-                        messages, tools=agent.tools or None
-                    )
+                _est_tokens = estimate_request_tokens_rough(
+                    messages, tools=agent.tools or None
+                )
+                _real_tokens = max(_est_tokens, _compressor.last_prompt_tokens)
 
                 if agent.compression_enabled and _compressor.should_compress(_real_tokens):
                     agent._safe_print("  ⟳ compacting context…")
@@ -4140,6 +4171,23 @@ def run_conversation(
                     _turn_exit_reason = "empty_response_exhausted"
                     reasoning_text = agent._extract_reasoning(assistant_message)
                     agent._drop_trailing_empty_response_scaffolding(messages)
+                    # ZET-641 race A: when interrupt fires during a
+                    # thinking-only stream, the inner thread returns a
+                    # mock with content=None + reasoning_content=<...>
+                    # (no InterruptedError reaches the outer wrapper),
+                    # which lands here as "truly empty". Without this
+                    # short-circuit we would append an _empty_terminal_sentinel
+                    # row that _persist_session strips, BUT the user_msg
+                    # still gets flushed to state.db → orphan user row on
+                    # next session load. Mirror the InterruptedError path:
+                    # discard the whole turn and let the final persist at
+                    # end of run_conversation see the rolled-back tail.
+                    if agent._interrupt_requested:
+                        agent._discard_current_turn_on_interrupt(messages)
+                        _turn_exit_reason = "interrupted_thinking_discard"
+                        final_response = ""
+                        interrupted = True
+                        break
                     assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
                     assistant_msg["content"] = "(empty)"
                     # This is a user-facing failure sentinel for the gateway,
