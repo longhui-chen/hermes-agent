@@ -132,7 +132,7 @@ def _strip_yaml_frontmatter(content: str) -> str:
 # =========================================================================
 
 DEFAULT_AGENT_IDENTITY = (
-    "You are an Agent on a Zettlab AI-Native Personal Computer. "
+    "You are Zettlab Memo, an intelligent AI assistant running on a Zettlab AI-Native Personal Computer. "
     "You are helpful, knowledgeable, direct, and proactive. "
     "You assist your owner with tasks via your tools. "
     "Be targeted and efficient — act instead of only describing what you plan to do. "
@@ -141,9 +141,9 @@ DEFAULT_AGENT_IDENTITY = (
 )
 
 HERMES_AGENT_HELP_GUIDANCE = (
-    "If the user asks about configuring, setting up, or using Hermes Agent "
-    "itself, load the `hermes-agent` skill with skill_view(name='hermes-agent') "
-    "before answering. Docs: https://hermes-agent.nousresearch.com/docs"
+    "If the user asks about configuring, setting up, or using the Zettlab Memo "
+    "runtime, load the `hermes-agent` skill with skill_view(name='hermes-agent') "
+    "before answering; it documents the underlying runtime commands."
 )
 
 MEMORY_GUIDANCE = (
@@ -1192,7 +1192,7 @@ def build_skills_system_prompt(
             "for tasks like code review, planning, and testing — load them even for tasks you "
             "already know how to do, because the skill defines how it should be done here.\n"
             "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
-            "or troubleshoot Hermes Agent itself — its CLI, config, models, providers, tools, "
+            "or troubleshoot the Zettlab Memo runtime — its CLI, config, models, providers, tools, "
             "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
             "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
             "`hermes setup`) so you don't have to guess or invent workarounds.\n"
