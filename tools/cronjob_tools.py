@@ -725,7 +725,8 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             "schedule": {
                 "type": "string",
                 "description": (
-                    "For create/update. Pick the format based on user intent:\n"
+                    "REQUIRED for action=create (you MUST include this field when "
+                    "action=create). For create/update, pick the format based on user intent:\n"
                     "  - RECURRING (user said 每天/每周/每隔/每N分钟/repeat/every/daily): "
                     "use cron expression 'M H * * *' (e.g. '35 14 * * *' for daily at 14:35) "
                     "or 'every Nm' / 'every Nh' (e.g. 'every 10m' for every 10 minutes).\n"
