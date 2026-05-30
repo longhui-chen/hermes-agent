@@ -43,6 +43,7 @@ PACKAGE_IMPORTS = {
     "google-auth-oauthlib": "google_auth_oauthlib",
     "httpx": "httpx",
     "jinja2": "jinja2",
+    "langfuse": "langfuse",
     "mcp": "mcp",
     "openai": "openai",
     "prompt-toolkit": "prompt_toolkit",
