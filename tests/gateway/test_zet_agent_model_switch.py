@@ -313,3 +313,92 @@ async def test_run_agent_active_session_not_evicted(monkeypatch):
     assert "s_active" in adapter._seen_models
     assert "s_other" not in adapter._seen_models
     assert set(adapter._seen_models) == {"s_active", "s_new"}
+
+
+# ---------------------------------------------------------------------------
+# DELETE /v1/sessions/{sid}/model — inverse of the switch endpoint above.
+# Local-server forwards DELETE here right after deleting the on-disk override
+# from session_model_overrides.json. The handler's contract: drop the live
+# in-memory override + evict the cached agent so the next turn rebuilds on
+# config.yaml's default, preserving conversation history.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_session_model_clear_pops_override_and_evicts(monkeypatch):
+    monkeypatch.setattr(zet_agent, "web", _FakeWeb)
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    adapter._check_auth = lambda request: None
+
+    evicted = []
+    session_id = "zettlab:user1:agent-1:42"
+    gw = types.SimpleNamespace(
+        _session_model_overrides={
+            session_id: {"model": "deepseek-v4", "provider": "custom"},
+            "other-session": {"model": "glm-5", "provider": "custom"},
+        },
+        _evict_cached_agent=lambda sid: evicted.append(sid),
+    )
+    adapter.gateway_runner = gw
+
+    resp = await adapter._handle_session_model_clear(
+        _FakeRequest(None, match_info={"session_id": session_id})
+    )
+
+    assert resp.status == 200
+    assert resp.payload["ok"] is True
+    assert resp.payload["cleared"] is True
+    assert resp.payload["session_id"] == session_id
+    # Target session's override is gone; the unrelated entry survives.
+    assert session_id not in gw._session_model_overrides
+    assert "other-session" in gw._session_model_overrides
+    # Cached agent for this session was evicted so the next turn rebuilds.
+    assert evicted == [session_id]
+
+
+@pytest.mark.asyncio
+async def test_session_model_clear_is_idempotent_when_no_override(monkeypatch):
+    """Clearing a session that has no override returns cleared=False without
+    invoking the eviction hook — there is no cached agent built on a stale
+    override to throw away, so calling evict would be a wasted rebuild."""
+    monkeypatch.setattr(zet_agent, "web", _FakeWeb)
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    adapter._check_auth = lambda request: None
+
+    evicted = []
+    gw = types.SimpleNamespace(
+        _session_model_overrides={},  # No overrides at all.
+        _evict_cached_agent=lambda sid: evicted.append(sid),
+    )
+    adapter.gateway_runner = gw
+
+    resp = await adapter._handle_session_model_clear(
+        _FakeRequest(None, match_info={"session_id": "ghost-session"})
+    )
+
+    assert resp.status == 200
+    assert resp.payload["ok"] is True
+    assert resp.payload["cleared"] is False
+    assert evicted == []  # Eviction skipped on no-op.
+
+
+@pytest.mark.asyncio
+async def test_session_model_clear_without_gateway_runner(monkeypatch):
+    """If gateway_runner isn't wired (pathological / startup race), the handler
+    must still return 200 cleared=False rather than raise — local-server's
+    forward path is best-effort and any 5xx would mask the persisted delete."""
+    monkeypatch.setattr(zet_agent, "web", _FakeWeb)
+
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    adapter._check_auth = lambda request: None
+    adapter.gateway_runner = None
+
+    resp = await adapter._handle_session_model_clear(
+        _FakeRequest(None, match_info={"session_id": "any-session"})
+    )
+
+    assert resp.status == 200
+    assert resp.payload["ok"] is True
+    assert resp.payload["cleared"] is False
