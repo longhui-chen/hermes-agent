@@ -3,7 +3,7 @@
 ZPK_OUTPUT ?= build/zettlab-claw.zpk
 ZPK_SRC_DIR := zpk/lib/hermes-agent
 PYPI_INDEX_URL ?= https://pypi.tuna.tsinghua.edu.cn/simple/
-ZPK_INSTALL_SPEC ?= .[all]
+ZPK_INSTALL_SPEC ?= .[all,langfuse]
 ZPK_PACK_JOBS ?= 0
 ZPK_VERBOSE ?= 0
 ZPK_LOG_DIR ?= build
@@ -25,7 +25,7 @@ ZPK_EXCLUDES := \
 	--exclude=build \
 	--exclude=dist \
 	--exclude=data \
-	--exclude=logs \
+	--exclude=./logs \
 	--exclude=tmp \
 	--exclude=tests \
 	--exclude=docs \
@@ -35,7 +35,7 @@ ZPK_EXCLUDES := \
 	--exclude=ui-tui \
 	--exclude=nix \
 	--exclude=./environments \
-	--exclude=packaging \
+	--exclude=./packaging \
 	--exclude='*.egg-info' \
 	--exclude=wandb \
 	--exclude=testlogs \
@@ -66,7 +66,7 @@ zpk-venv:
 			exit 1; \
 		}; \
 	fi
-	@venv/bin/python scripts/check_zpk_payload.py
+	@ZPK_INSTALL_SPEC="$(ZPK_INSTALL_SPEC)" venv/bin/python scripts/check_zpk_payload.py
 
 zpk-stage: zpk-venv
 	@echo "Staging hermes-agent ZPK payload..."

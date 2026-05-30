@@ -99,6 +99,13 @@ pty = [
   "pywinpty==2.0.15; sys_platform == 'win32'",
 ]
 honcho = ["honcho-ai==2.0.1"]
+# Langfuse observability — opt-in LLM tracing for the bundled
+# observability/langfuse plugin. Deliberately kept OUT of [all] (opt-in
+# backend policy), but bundled into the ZPK image via
+# ZPK_INSTALL_SPEC=.[all,langfuse] so OTA devices ship the SDK. The plugin
+# stays disabled until explicitly enabled + credentialed, so an unbundled
+# device pays no import cost. propagate_attributes(user_id=...) needs >=4.
+langfuse = ["langfuse==4.7.1"]
 mcp = ["mcp==1.26.0"]
 homeassistant = ["aiohttp==3.13.3"]
 sms = ["aiohttp==3.13.3"]
