@@ -1369,6 +1369,67 @@ class ZetAgentAdapter(APIServerAdapter):
             "model": new_model,
         })
 
+    async def _handle_session_model_clear(self, request: "web.Request") -> "web.Response":
+        """DELETE /v1/sessions/{session_id}/model — clear a session model override.
+
+        The inverse of POST /v1/sessions/{session_id}/model/switch: drop the
+        in-memory override for this single session so the next turn falls back
+        to the agent default (config.yaml ``model.default``) — the exact same
+        fallback a fresh session uses (see ``_resolve_turn_agent_config``,
+        which re-resolves the config model every turn and only overlays an
+        override when one is present).
+
+        Conversation history is preserved — unlike ``/new`` and ``/reset``,
+        which also wipe the session. We only pop the override + evict the
+        cached agent so the next turn rebuilds on the default model.
+
+        Local-server owns persistence: it deletes the entry from
+        ``session_model_overrides.json`` and calls this to drop the live
+        override. A session with no override is a successful no-op
+        (idempotent — DELETE semantics).
+
+        Auth: ZET_AGENT_KEY Bearer (same as the switch endpoint).
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "")
+        if not session_id:
+            return web.json_response(
+                _openai_error("session_id is required"), status=400,
+            )
+
+        cleared = False
+        gw = getattr(self, "gateway_runner", None)
+        if gw is not None:
+            overrides = getattr(gw, "_session_model_overrides", None)
+            if overrides is not None and session_id in overrides:
+                overrides.pop(session_id, None)
+                cleared = True
+            # Only evict when we actually removed an override: an un-overridden
+            # session's cached agent is already built on the default model, so
+            # dropping it would force a needless rebuild.
+            if cleared:
+                evict = getattr(gw, "_evict_cached_agent", None)
+                if callable(evict):
+                    try:
+                        evict(session_id)
+                    except Exception as exc:
+                        logger.warning(
+                            "session-model-clear: evict_cached_agent failed for %s: %s",
+                            session_id, exc,
+                        )
+
+        logger.info(
+            "session-model-clear: session=%s cleared=%s", session_id, cleared,
+        )
+        return web.json_response({
+            "ok": True,
+            "session_id": session_id,
+            "cleared": cleared,
+        })
+
     # ------------------------------------------------------------------
     # ZET-900 — skill / connector reload control endpoints
     # ------------------------------------------------------------------
@@ -1627,6 +1688,10 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_post(
                 "/v1/sessions/{session_id}/model/switch",
                 self._handle_session_model_switch,
+            )
+            self._app.router.add_delete(
+                "/v1/sessions/{session_id}/model",
+                self._handle_session_model_clear,
             )
 
             # ZET-900 — skill / connector reload control endpoints.
