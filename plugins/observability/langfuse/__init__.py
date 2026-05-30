@@ -575,6 +575,14 @@ def _root_trace_attributes(
     if device_sn:
         metadata["device_sn"] = device_sn
         tags.append(f"sn:{device_sn}")
+    # zettlab-local-server runs one hermes gateway per agent profile and exports
+    # ZET_AGENT_ID into the child env (the same id embedded in the session id).
+    # Surface it as a tag + metadata so traces can be filtered/grouped by agent
+    # in Langfuse without parsing the session id. Empty off-device → omitted.
+    agent_id = _env("ZET_AGENT_ID")
+    if agent_id:
+        metadata["agent_id"] = agent_id
+        tags.append(f"agent:{agent_id}")
     return metadata, tags, (device_sn or None)
 
 

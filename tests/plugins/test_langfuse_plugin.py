@@ -721,6 +721,7 @@ class TestDeviceSerialScoping:
 
     def test_no_sn_matches_legacy_behaviour(self, monkeypatch):
         monkeypatch.delenv("HERMES_LANGFUSE_SN", raising=False)
+        monkeypatch.delenv("ZET_AGENT_ID", raising=False)
         mod = self._mod()
         metadata, tags, user_id = mod._root_trace_attributes(**self._ATTRS)
         assert user_id is None
@@ -732,16 +733,39 @@ class TestDeviceSerialScoping:
 
     def test_sn_threads_through_all_three_dimensions(self, monkeypatch):
         monkeypatch.setenv("HERMES_LANGFUSE_SN", "WY210260528GT102")
+        monkeypatch.delenv("ZET_AGENT_ID", raising=False)
         mod = self._mod()
         metadata, tags, user_id = mod._root_trace_attributes(**self._ATTRS)
         assert user_id == "WY210260528GT102"
         assert tags == ["hermes", "langfuse", "sn:WY210260528GT102"]
         assert metadata["device_sn"] == "WY210260528GT102"
 
+    def test_agent_id_adds_tag_and_metadata(self, monkeypatch):
+        monkeypatch.delenv("HERMES_LANGFUSE_SN", raising=False)
+        monkeypatch.setenv("ZET_AGENT_ID", "cd8266b8-6d70-4302-a835-b6989e173321")
+        mod = self._mod()
+        metadata, tags, user_id = mod._root_trace_attributes(**self._ATTRS)
+        assert metadata["agent_id"] == "cd8266b8-6d70-4302-a835-b6989e173321"
+        assert "agent:cd8266b8-6d70-4302-a835-b6989e173321" in tags
+        # agent_id is independent of device_sn / user_id
+        assert user_id is None
+        assert "device_sn" not in metadata
+
+    def test_sn_and_agent_both_present(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGFUSE_SN", "WY210260528GT104")
+        monkeypatch.setenv("ZET_AGENT_ID", "main")
+        mod = self._mod()
+        metadata, tags, user_id = mod._root_trace_attributes(**self._ATTRS)
+        assert user_id == "WY210260528GT104"
+        assert tags == ["hermes", "langfuse", "sn:WY210260528GT104", "agent:main"]
+        assert metadata["device_sn"] == "WY210260528GT104"
+        assert metadata["agent_id"] == "main"
+
     def test_blank_sn_is_ignored(self, monkeypatch):
         # Whitespace-only env (e.g. unset-but-exported) must not produce an
         # empty user_id or a stray "sn:" tag.
         monkeypatch.setenv("HERMES_LANGFUSE_SN", "   ")
+        monkeypatch.delenv("ZET_AGENT_ID", raising=False)
         mod = self._mod()
         metadata, tags, user_id = mod._root_trace_attributes(**self._ATTRS)
         assert user_id is None
