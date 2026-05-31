@@ -58,16 +58,16 @@ jobs:
         run: |
           set -euo pipefail
           # 内置板清单（新增板改这里；deploy 的 matrix 从本 job 的输出展开）。
-          declare -A HOSTS=( [board13]=192.168.1.13 [board154]=192.168.1.154 [board4]=192.168.1.4 )
+          declare -A HOSTS=( [board13]=192.168.1.13 [board154]=192.168.1.154 [board4]=192.168.1.4 [board26]=192.168.1.26 [board39]=192.168.1.39 )
           SEL="${TARGETS_INPUT:-board13,board154}"
-          [ "$SEL" = "all" ] && SEL="board13,board154,board4"
+          [ "$SEL" = "all" ] && SEL="board13,board154,board4,board26,board39"
           ITEMS=""; COUNT=0
           IFS=',' read -ra NAMES <<< "$SEL"
           for raw in "${NAMES[@]}"; do
             n="${raw// /}"
             [ -z "$n" ] && continue
             if [ -z "${HOSTS[$n]:-}" ]; then
-              echo "::warning::unknown board '$n' ignored (valid: board13, board154, board4, all)"
+              echo "::warning::unknown board '$n' ignored (valid: board13, board154, board4, board26, board39, all)"
               continue
             fi
             ITEMS="${ITEMS}{\"name\":\"$n\",\"host\":\"${HOSTS[$n]}\",\"port\":22},"
