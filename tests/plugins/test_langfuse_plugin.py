@@ -772,3 +772,99 @@ class TestDeviceSerialScoping:
         assert tags == ["hermes", "langfuse"]
         assert "device_sn" not in metadata
 
+
+# ---------------------------------------------------------------------------
+# Root-trace SDK fallback: propagate_attributes carries tags + user_id, but
+# user_id is best-effort. If the installed SDK rejects the kwarg, _start_root_trace
+# must retry WITHOUT user_id so the sn:/agent: tags still land — rather than
+# dropping straight to an untagged trace. On a real device HERMES_LANGFUSE_SN is
+# always set, so without the retry an SDK that rejects user_id would silently
+# lose every trace's tags.
+# ---------------------------------------------------------------------------
+
+class _NullCtx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeRootSpan:
+    def set_trace_io(self, *, input=None):
+        self.io = input
+
+
+class _FakeRootCtx:
+    def __init__(self, span):
+        self._span = span
+
+    def __enter__(self):
+        return self._span
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeRootClient:
+    def create_trace_id(self, *, seed):
+        return f"tid::{seed}"
+
+    def start_as_current_observation(self, **kwargs):
+        return _FakeRootCtx(_FakeRootSpan())
+
+
+class _RecordingPropagate:
+    """Stub for langfuse.propagate_attributes; optionally rejects user_id."""
+
+    def __init__(self, *, reject_user_id):
+        self.calls: list[dict] = []
+        self._reject_user_id = reject_user_id
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        if self._reject_user_id and "user_id" in kwargs:
+            raise TypeError(
+                "propagate_attributes() got an unexpected keyword argument 'user_id'"
+            )
+        return _NullCtx()
+
+
+class TestRootTraceUserIdFallback:
+    def _mod(self):
+        return importlib.import_module("plugins.observability.langfuse")
+
+    _KW = dict(task_id="t", session_id="s", platform="cli", provider="custom",
+               model="glm-5.1", api_mode="chat", messages=[])
+
+    def test_user_id_rejection_retries_without_it_and_keeps_tags(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGFUSE_SN", "WY-1")
+        monkeypatch.delenv("ZET_AGENT_ID", raising=False)
+        mod = self._mod()
+        rec = _RecordingPropagate(reject_user_id=True)
+        monkeypatch.setattr(mod, "propagate_attributes", rec)
+
+        state = mod._start_root_trace("k", client=_FakeRootClient(), **self._KW)
+
+        # Called twice: first with user_id (rejected), then retried without it —
+        # and the retry STILL carries the sn: tag, so device filtering survives.
+        assert len(rec.calls) == 2
+        assert rec.calls[0].get("user_id") == "WY-1"
+        assert "user_id" not in rec.calls[1]
+        assert "sn:WY-1" in rec.calls[1]["tags"]
+        assert state.root_span is not None
+
+    def test_user_id_accepted_does_not_retry(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGFUSE_SN", "WY-2")
+        monkeypatch.delenv("ZET_AGENT_ID", raising=False)
+        mod = self._mod()
+        rec = _RecordingPropagate(reject_user_id=False)
+        monkeypatch.setattr(mod, "propagate_attributes", rec)
+
+        mod._start_root_trace("k", client=_FakeRootClient(), **self._KW)
+
+        # Happy path: a single call carrying both user_id and the sn: tag.
+        assert len(rec.calls) == 1
+        assert rec.calls[0].get("user_id") == "WY-2"
+        assert "sn:WY-2" in rec.calls[0]["tags"]
+

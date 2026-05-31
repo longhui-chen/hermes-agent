@@ -599,39 +599,8 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     if session_id:
         trace_ctx["session_id"] = session_id
 
-    if propagate_attributes is not None:
-        try:
-            # user_id is best-effort: if an older SDK rejects the kwarg the
-            # except branch below still records device_sn via metadata.
-            propagate_kwargs: Dict[str, Any] = {
-                "session_id": session_id or task_key,
-                "trace_name": "Hermes turn",
-                "tags": trace_tags,
-            }
-            if user_id:
-                propagate_kwargs["user_id"] = user_id
-            with propagate_attributes(**propagate_kwargs):
-                root_ctx = client.start_as_current_observation(
-                    trace_context=trace_ctx,
-                    name="Hermes turn",
-                    as_type="chain",
-                    input=trace_input,
-                    metadata=metadata,
-                    end_on_exit=False,
-                )
-                root_span = root_ctx.__enter__()
-        except Exception:
-            root_ctx = client.start_as_current_observation(
-                trace_context=trace_ctx,
-                name="Hermes turn",
-                as_type="chain",
-                input=trace_input,
-                metadata=metadata,
-                end_on_exit=False,
-            )
-            root_span = root_ctx.__enter__()
-    else:
-        root_ctx = client.start_as_current_observation(
+    def _open_root():
+        ctx = client.start_as_current_observation(
             trace_context=trace_ctx,
             name="Hermes turn",
             as_type="chain",
@@ -639,7 +608,32 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
             metadata=metadata,
             end_on_exit=False,
         )
-        root_span = root_ctx.__enter__()
+        return ctx, ctx.__enter__()
+
+    if propagate_attributes is not None:
+        propagate_kwargs: Dict[str, Any] = {
+            "session_id": session_id or task_key,
+            "trace_name": "Hermes turn",
+            "tags": trace_tags,
+        }
+        if user_id:
+            propagate_kwargs["user_id"] = user_id
+        try:
+            with propagate_attributes(**propagate_kwargs):
+                root_ctx, root_span = _open_root()
+        except Exception:
+            # user_id is best-effort — an older SDK may reject the kwarg. Retry
+            # without it so the sn:/agent: tags still land on the trace; only if
+            # propagate is itself unusable do we fall back to an untagged trace
+            # (device_sn is recorded via metadata either way).
+            propagate_kwargs.pop("user_id", None)
+            try:
+                with propagate_attributes(**propagate_kwargs):
+                    root_ctx, root_span = _open_root()
+            except Exception:
+                root_ctx, root_span = _open_root()
+    else:
+        root_ctx, root_span = _open_root()
 
     try:
         root_span.set_trace_io(input=trace_input)
