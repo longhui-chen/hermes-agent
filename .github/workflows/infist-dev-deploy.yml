@@ -143,10 +143,12 @@ jobs:
           APP_ROOT=$(dirname "$(dirname "$HERMES_LINK")")   # wrapper 在 <app_root>/bin/hermes
           HERMES_SRC="$APP_ROOT/lib/hermes-agent"
           WRAPPER="$APP_ROOT/bin/hermes"
-          # 必须是 OTA current 布局
+          # readlink -f 跟随 current 软链解析到真实版本目录（如 .../0.0.1/...），
+          # 故校验 apps/com.zettlab.claw/<ver>/lib/hermes-agent，不强求字面 current
+          # （这个版本目录就是 current 指向、实际跑的源码，覆盖它即 dev 覆盖当前 ZPK 版本）。
           case "$HERMES_SRC" in
-            */current/lib/hermes-agent) : ;;
-            *) echo "::error::HERMES_SRC=$HERMES_SRC 不是 OTA current 布局，板子可能没走 ZPK bootstrap"; exit 1 ;;
+            */apps/com.zettlab.claw/*/lib/hermes-agent) : ;;
+            *) echo "::error::HERMES_SRC=$HERMES_SRC 不是 OTA com.zettlab.claw 布局，板子可能没走 ZPK bootstrap"; exit 1 ;;
           esac
           [ -x "$WRAPPER" ] || { echo "::error::缺 zpk wrapper $WRAPPER"; exit 1; }
           # 防御：wrapper 须设 bundled env，否则插件失效（旧 ZPK 漏设，见 PR #73）
