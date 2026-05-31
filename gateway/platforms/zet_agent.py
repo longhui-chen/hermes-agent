@@ -1504,30 +1504,62 @@ class ZetAgentAdapter(APIServerAdapter):
 
         # ZET-1139 — also push the invalidation through to existing sessions.
         # Skills appear inside the system prompt, so the same SessionDB-clear
-        # + cached-agent-invalidate pair used by /v1/profile/reload applies.
-        # Fail-soft: a failure in either step is logged but doesn't fail the
-        # response — clearing the in-process cache (above) still benefits
-        # newly-started sessions, which matches the pre-ZET-1139 contract.
-        db_rows_cleared = 0
-        invalidated = 0
+        # + cached-agent-invalidate pair used by /v1/profile/reload applies,
+        # with the same asymmetric failure semantics:
+        #
+        #   - DB clear is CRITICAL: without it continuing sessions keep
+        #     replaying the stored prompt (without the new skill) from
+        #     SQLite. Returning 200 here while DB clear silently failed
+        #     would re-introduce the ZET-1139 regression for skill changes.
+        #     So a DB clear failure (or a missing SessionDB / gateway_runner)
+        #     returns 500.
+        #   - in-process invalidate is fail-soft: with DB already cleared,
+        #     the next turn rebuilds from the cleared DB regardless of
+        #     whether we managed to drop the in-process cache too.
         gw = getattr(self, "gateway_runner", None)
-        if gw is not None:
-            session_db = getattr(gw, "_session_db", None)
-            if session_db is not None:
-                try:
-                    db_rows_cleared = session_db.clear_all_system_prompts()
-                except Exception:
-                    logger.warning(
-                        "[zet_agent] skills-reload: DB clear failed (continuing)",
-                        exc_info=True,
-                    )
-            try:
-                invalidated = gw.invalidate_all_cached_agents()
-            except Exception:
-                logger.warning(
-                    "[zet_agent] skills-reload: invalidate-all failed (continuing)",
-                    exc_info=True,
-                )
+        if gw is None:
+            logger.error("[zet_agent] skills-reload: no gateway_runner")
+            return web.json_response(
+                _openai_error(
+                    "skills reload incomplete: no gateway runner",
+                    err_type="server_error",
+                ),
+                status=500,
+            )
+        session_db = getattr(gw, "_session_db", None)
+        if session_db is None:
+            logger.error("[zet_agent] skills-reload: no SessionDB on runner")
+            return web.json_response(
+                _openai_error(
+                    "skills reload incomplete: no session db on runner",
+                    err_type="server_error",
+                ),
+                status=500,
+            )
+        try:
+            db_rows_cleared = session_db.clear_all_system_prompts()
+        except Exception as exc:
+            logger.exception(
+                "[zet_agent] skills-reload: DB clear failed; "
+                "returning 500 so caller can fall back",
+            )
+            return web.json_response(
+                _openai_error(
+                    f"skills reload db clear failed: {exc}",
+                    err_type="server_error",
+                ),
+                status=500,
+            )
+
+        invalidated = 0
+        try:
+            invalidated = gw.invalidate_all_cached_agents()
+        except Exception:
+            logger.warning(
+                "[zet_agent] skills-reload: invalidate-all failed "
+                "(DB cleared, sessions still rebuild next turn)",
+                exc_info=True,
+            )
 
         logger.info(
             "[zet_agent] skills-reload: cleared prompt cache + rescanned "
@@ -1631,13 +1663,23 @@ class ZetAgentAdapter(APIServerAdapter):
         stored system_prompt to preserve the Anthropic prefix-cache prefix
         across turns).
 
-        Two-step hot reload (both required — see comment inline):
+        Two-step hot reload (semantics deliberately asymmetric):
           1. ``SessionDB.clear_all_system_prompts()`` nulls every session's
              stored prompt so the continuing-session rebuild is forced.
+             **Critical** — without this the change is invisible to old
+             sessions; failure here returns 500 so the local-server caller
+             falls through to ``registry.Stop`` (lazy-respawn picks up the
+             new file). The whole ZET-1139 hot-reload value depends on this
+             succeeding, so swallowing the error and returning 200 would
+             silently regress the very bug we're fixing.
           2. ``GatewayRunner.invalidate_all_cached_agents()`` clears the
              in-process ``_cached_system_prompt`` on every cached AIAgent
              so the next turn rebuilds from disk (re-runs SOUL.md /
-             IDENTITY.md / context-files / memory loaders).
+             IDENTITY.md / context-files / memory loaders). **fail-soft**
+             — step 1 already covers correctness (in-process cache is
+             rebuilt from the now-cleared DB), so a failure here is logged
+             and reported in the response count without poisoning the
+             status code.
 
         Distinct from ``/v1/skills/reload`` (also extends to existing
         sessions now, but additionally clears the skills LRU + on-disk
@@ -1645,16 +1687,15 @@ class ZetAgentAdapter(APIServerAdapter):
         a prompt change). Use this endpoint when only the prompt text on
         disk changed.
 
-        Failure handling is fail-soft: a DB or invalidate exception is
-        logged but the call still returns 200 with whatever count it
-        managed. The local-server caller already has its own Stop+respawn
-        fall-back for hard failures (see ``ChangePromptText`` dispatch in
-        ``internal/agent/lifecycle/lifecycle.go``).
-
         Auth: ZET_AGENT_KEY Bearer (same as chat).
 
-        Response: ``{"reloaded": true, "invalidated_sessions": <int>,
-                     "db_rows_cleared": <int>}``.
+        Response (200): ``{"reloaded": true, "invalidated_sessions": <int>,
+                           "db_rows_cleared": <int>}``.
+        Response (500): when the critical DB-clear step fails (no
+        SessionDB, write exception). Body is the standard OpenAI error
+        envelope so callers can surface the reason. local-server then
+        falls back to ``registry.Stop`` (see
+        ``internal/agent/lifecycle/lifecycle.go``).
         """
         auth_err = self._check_auth(request)
         if auth_err:
@@ -1671,29 +1712,49 @@ class ZetAgentAdapter(APIServerAdapter):
                 status=500,
             )
 
-        # Step 1: clear DB-stored prompts. The in-process invalidation
-        # below is moot without this — the continuing-session rebuild
-        # path would simply reload the stale prompt from SQLite.
-        db_rows_cleared = 0
+        # Step 1 (CRITICAL): clear DB-stored prompts. Without this the
+        # continuing-session rebuild path keeps replaying the old prompt
+        # from SQLite — exactly the ZET-1139 regression we're fixing.
+        # Any failure here means we cannot keep our hot-reload contract,
+        # so return 500 to let the local-server caller fall back to
+        # ``registry.Stop`` (lazy respawn reads the new file fresh).
         session_db = getattr(gw, "_session_db", None)
-        if session_db is not None:
-            try:
-                db_rows_cleared = session_db.clear_all_system_prompts()
-            except Exception:
-                logger.warning(
-                    "[zet_agent] profile-reload: DB clear failed (continuing)",
-                    exc_info=True,
-                )
+        if session_db is None:
+            logger.error("[zet_agent] profile-reload: no SessionDB on runner")
+            return web.json_response(
+                _openai_error(
+                    "profile reload unavailable: no session db on runner",
+                    err_type="server_error",
+                ),
+                status=500,
+            )
+        try:
+            db_rows_cleared = session_db.clear_all_system_prompts()
+        except Exception as exc:
+            logger.exception(
+                "[zet_agent] profile-reload: DB clear failed; "
+                "returning 500 so local-server falls back to Stop",
+            )
+            return web.json_response(
+                _openai_error(
+                    f"profile reload db clear failed: {exc}",
+                    err_type="server_error",
+                ),
+                status=500,
+            )
 
-        # Step 2: drop in-process cached prompts so existing sessions
-        # rebuild on next turn. Without this, only newly-created sessions
-        # would notice the on-disk change.
+        # Step 2 (FAIL-SOFT): drop in-process cached prompts so existing
+        # sessions rebuild on the next turn. Without this the next turn
+        # would still rebuild from the cleared DB anyway — just one turn
+        # later than ideal — so a failure here is not worth tearing down
+        # the gateway over.
         invalidated = 0
         try:
             invalidated = gw.invalidate_all_cached_agents()
         except Exception:
             logger.warning(
-                "[zet_agent] profile-reload: invalidate-all failed (continuing)",
+                "[zet_agent] profile-reload: invalidate-all failed "
+                "(DB cleared, sessions still rebuild next turn)",
                 exc_info=True,
             )
 

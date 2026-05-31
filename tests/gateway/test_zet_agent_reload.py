@@ -144,18 +144,22 @@ async def test_profile_reload_no_gateway_runner_returns_500(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_profile_reload_db_failure_is_failsoft(monkeypatch):
-    """A DB clear exception is logged and swallowed — the endpoint still
-    returns 200 so the in-process invalidate can still run."""
+async def test_profile_reload_db_failure_returns_500(monkeypatch):
+    """A DB clear exception is CRITICAL — without DB clear the continuing
+    session would replay the stale stored_prompt from SQLite, exactly the
+    ZET-1139 bug this PR fixes. Returning 200 here would silently regress
+    the fix and also short-circuit local-server's registry.Stop fallback
+    (reload.Forward only checks HTTP status). So we return 500 instead.
+    Reviewed-by: iwgyyyy on PR #77."""
     runner = _make_runner(invalidate_returns=2, db_raises=True)
     adapter = _make_adapter(monkeypatch, gateway_runner=runner)
 
     resp = await adapter._handle_profile_reload(_FakeRequest())
 
-    assert resp.status == 200
-    assert resp.payload["db_rows_cleared"] == 0
-    assert resp.payload["invalidated_sessions"] == 2
-    runner.invalidate_all_cached_agents.assert_called_once_with()
+    assert resp.status == 500
+    # invalidate must NOT be called when DB clear failed — we want to
+    # surface the failure cleanly, not partially apply.
+    runner.invalidate_all_cached_agents.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -173,17 +177,19 @@ async def test_profile_reload_invalidate_failure_is_failsoft(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_profile_reload_missing_session_db_skips_db_step(monkeypatch):
-    """If the gateway has no SessionDB (test/mock paths), DB clear is
-    skipped and only invalidate runs."""
+async def test_profile_reload_missing_session_db_returns_500(monkeypatch):
+    """No SessionDB on the runner is treated as a critical configuration
+    error (production gateway always has one) — same reasoning as the DB
+    clear failure path: returning 200 would let local-server skip its
+    registry.Stop fallback while the new SOUL.md is invisible to all
+    existing sessions."""
     runner = _make_runner(invalidate_returns=1, no_db=True)
     adapter = _make_adapter(monkeypatch, gateway_runner=runner)
 
     resp = await adapter._handle_profile_reload(_FakeRequest())
 
-    assert resp.status == 200
-    assert resp.payload["db_rows_cleared"] == 0
-    assert resp.payload["invalidated_sessions"] == 1
+    assert resp.status == 500
+    runner.invalidate_all_cached_agents.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -295,8 +301,10 @@ def test_invalidate_all_cached_agents_skips_broken_agents():
 
 @pytest.mark.asyncio
 async def test_skills_reload_invalidate_failure_does_not_fail_response(monkeypatch):
-    """Skills reload's primary contract (clear skill cache + rescan) keeps
-    working even if the new invalidate-existing-sessions step blows up."""
+    """Skills reload's primary contract (clear skill cache + rescan + DB
+    clear) keeps working even if the new invalidate-existing-sessions
+    step blows up — the DB has already been cleared so the next turn
+    rebuilds fresh anyway."""
     runner = _make_runner(invalidate_raises=True)
     adapter = _make_adapter(monkeypatch, gateway_runner=runner)
 
@@ -311,3 +319,41 @@ async def test_skills_reload_invalidate_failure_does_not_fail_response(monkeypat
     assert resp.status == 200
     assert resp.payload["cleared"] is True
     assert resp.payload["invalidated_sessions"] == 0
+
+
+@pytest.mark.asyncio
+async def test_skills_reload_db_failure_returns_500(monkeypatch):
+    """DB clear failure on skills/reload is also critical — without it
+    continuing sessions won't see new skills. Same semantics as
+    profile/reload's DB failure path."""
+    runner = _make_runner(db_raises=True)
+    adapter = _make_adapter(monkeypatch, gateway_runner=runner)
+
+    import agent.prompt_builder as pb
+    import agent.skill_commands as sc
+    monkeypatch.setattr(pb, "clear_skills_system_prompt_cache",
+                        lambda clear_snapshot=False: None)
+    monkeypatch.setattr(sc, "scan_skill_commands", lambda: ["a"])
+
+    resp = await adapter._handle_skills_reload(_FakeRequest())
+
+    assert resp.status == 500
+    runner.invalidate_all_cached_agents.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_skills_reload_missing_session_db_returns_500(monkeypatch):
+    """No SessionDB → 500 (same reasoning as profile_reload)."""
+    runner = _make_runner(no_db=True)
+    adapter = _make_adapter(monkeypatch, gateway_runner=runner)
+
+    import agent.prompt_builder as pb
+    import agent.skill_commands as sc
+    monkeypatch.setattr(pb, "clear_skills_system_prompt_cache",
+                        lambda clear_snapshot=False: None)
+    monkeypatch.setattr(sc, "scan_skill_commands", lambda: ["a"])
+
+    resp = await adapter._handle_skills_reload(_FakeRequest())
+
+    assert resp.status == 500
+    runner.invalidate_all_cached_agents.assert_not_called()
