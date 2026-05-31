@@ -14087,6 +14087,47 @@ class GatewayRunner:
             with _lock:
                 self._agent_cache.pop(session_key, None)
 
+    def invalidate_all_cached_agents(self) -> int:
+        """Force every cached agent to rebuild its system prompt on the next turn.
+
+        Unlike _evict_cached_agent which drops the AIAgent instance entirely,
+        this keeps the instance (and therefore its OpenAI/httpx clients, MCP
+        handles, and tool state) and only clears the cached system prompt via
+        the upstream _invalidate_system_prompt() — the same hook /new, /clear,
+        and /branch use when they need to pick up fresh SOUL.md / IDENTITY.md
+        / memories from disk.
+
+        Used by the prompt-class reload endpoints (/v1/profile/reload,
+        /v1/skills/reload) to make on-disk profile changes take effect on the
+        current session without restarting the gateway. Returns the number of
+        agents successfully invalidated; individual failures are swallowed so
+        one broken agent doesn't block the rest.
+
+        Snapshot under the lock, then invalidate without it — the upstream
+        _invalidate_system_prompt may touch disk (memory_store.load_from_disk)
+        and we don't want that under the cache lock.
+        """
+        _lock = getattr(self, "_agent_cache_lock", None)
+        if _lock is None:
+            return 0
+        with _lock:
+            agents = list(self._agent_cache.values())
+        count = 0
+        for agent in agents:
+            invalidate = getattr(agent, "_invalidate_system_prompt", None)
+            if not callable(invalidate):
+                continue
+            try:
+                invalidate()
+                count += 1
+            except Exception:
+                logger.warning(
+                    "invalidate_all_cached_agents: agent %r failed",
+                    type(agent).__name__,
+                    exc_info=True,
+                )
+        return count
+
     @staticmethod
     def _init_cached_agent_for_turn(agent: Any, interrupt_depth: int) -> None:
         """Reset per-turn state on a cached agent before a new turn starts.
