@@ -64,6 +64,34 @@ def _make_runner(*, invalidate_returns=3, db_clears=7,
     return runner
 
 
+class _StubLock:
+    """Threading-lock stub usable as a context manager — the real
+    invalidate_all_cached_agents uses ``with self._agent_cache_lock:``."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+
+def _make_runner_with_real_cache(*, agents):
+    """Build a GatewayRunner-style stub with a populated _agent_cache that
+    mirrors the production tuple shape ``(agent, signature)``. Used to
+    exercise the real invalidate_all_cached_agents loop (the simpler
+    MagicMock runner above stops at "did it get called", not "does it
+    correctly walk the cache value shape")."""
+    from collections import OrderedDict
+    runner = MagicMock()
+    runner._agent_cache = OrderedDict(
+        (f"sess-{i}", (a, "sig-stub")) for i, a in enumerate(agents)
+    )
+    runner._agent_cache_lock = _StubLock()
+    runner._session_db = MagicMock()
+    runner._session_db.clear_all_system_prompts.return_value = 0
+    return runner
+
+
 # =========================================================================
 # /v1/profile/reload
 # =========================================================================
@@ -203,6 +231,66 @@ async def test_skills_reload_also_invalidates_current_sessions(monkeypatch):
     }
     runner._session_db.clear_all_system_prompts.assert_called_once_with()
     runner.invalidate_all_cached_agents.assert_called_once_with()
+
+
+# =========================================================================
+# Real invalidate_all_cached_agents loop (against the production tuple
+# value shape) — guards against the regression where the loop walked the
+# raw tuple instead of unwrapping the agent and silently invalidated zero.
+# =========================================================================
+
+
+def test_invalidate_all_cached_agents_unwraps_tuple_values():
+    """The real cache stores (agent, signature) tuples (gateway/run.py
+    L15382). invalidate_all_cached_agents must unwrap to find the agent
+    or it'll silently no-op even with a full cache — exactly the
+    sim-01 production regression caught during e2e."""
+    from gateway.run import GatewayRunner
+
+    a1 = MagicMock()
+    a2 = MagicMock()
+    a3 = MagicMock()
+    runner = _make_runner_with_real_cache(agents=[a1, a2, a3])
+
+    count = GatewayRunner.invalidate_all_cached_agents(runner)
+
+    assert count == 3, "expected 3 agents invalidated through the tuple values"
+    a1._invalidate_system_prompt.assert_called_once_with()
+    a2._invalidate_system_prompt.assert_called_once_with()
+    a3._invalidate_system_prompt.assert_called_once_with()
+
+
+def test_invalidate_all_cached_agents_tolerates_bare_agent_value():
+    """Defensive: if a future refactor switches cache values from
+    (agent, sig) tuple to bare agent, the loop still works."""
+    from gateway.run import GatewayRunner
+    from collections import OrderedDict
+
+    a1 = MagicMock()
+    runner = MagicMock()
+    runner._agent_cache = OrderedDict([("sess-0", a1)])  # bare agent, no tuple
+    runner._agent_cache_lock = _StubLock()
+
+    count = GatewayRunner.invalidate_all_cached_agents(runner)
+
+    assert count == 1
+    a1._invalidate_system_prompt.assert_called_once_with()
+
+
+def test_invalidate_all_cached_agents_skips_broken_agents():
+    """One agent without _invalidate_system_prompt doesn't block others."""
+    from gateway.run import GatewayRunner
+
+    good = MagicMock()
+    bad = object()  # plain object — no _invalidate_system_prompt
+    raises = MagicMock()
+    raises._invalidate_system_prompt.side_effect = RuntimeError("agent boom")
+
+    runner = _make_runner_with_real_cache(agents=[good, bad, raises])
+    count = GatewayRunner.invalidate_all_cached_agents(runner)
+
+    assert count == 1  # only `good` counted
+    good._invalidate_system_prompt.assert_called_once_with()
 
 
 @pytest.mark.asyncio

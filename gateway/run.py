@@ -14106,14 +14106,21 @@ class GatewayRunner:
         Snapshot under the lock, then invalidate without it — the upstream
         _invalidate_system_prompt may touch disk (memory_store.load_from_disk)
         and we don't want that under the cache lock.
+
+        Cache values are ``(agent, signature)`` tuples (see the cache insert
+        in _run_agent around L15382); the agent itself is the first element.
+        We accept either shape — bare agent or tuple — so a future cache-value
+        refactor doesn't silently turn this into a zero-count no-op the way
+        a naive ``getattr(value, "_invalidate_system_prompt", ...)`` would.
         """
         _lock = getattr(self, "_agent_cache_lock", None)
         if _lock is None:
             return 0
         with _lock:
-            agents = list(self._agent_cache.values())
+            entries = list(self._agent_cache.values())
         count = 0
-        for agent in agents:
+        for entry in entries:
+            agent = entry[0] if isinstance(entry, tuple) and entry else entry
             invalidate = getattr(agent, "_invalidate_system_prompt", None)
             if not callable(invalidate):
                 continue
