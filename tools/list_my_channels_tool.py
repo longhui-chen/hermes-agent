@@ -20,7 +20,10 @@ LIST_MY_CHANNELS_SCHEMA = {
         "List the IM channels (e.g. WeChat, Feishu, Discord) this agent is "
         "currently connected to. Read-only. Use when the user asks which "
         "messaging channels are linked / connected. Returns channel kind, name, "
-        "and status — no credentials, no management details."
+        "and status — no credentials, no management details. NOTE: a channel "
+        "being connected does NOT mean you can proactively message it; use "
+        "send_channel_message, which may fail (no recent conversation / not a "
+        "verified owner). Do not promise to send before calling it."
     ),
     "parameters": {"type": "object", "properties": {}, "required": []},
 }

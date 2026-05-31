@@ -60,6 +60,7 @@ _HERMES_CORE_TOOLS = [
     "send_message",
     # List THIS agent's connected IM channels (gated on zet_agent env via check_fn)
     "list_my_channels",
+    "send_channel_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     # Kanban multi-agent coordination — only in schema when the agent is
