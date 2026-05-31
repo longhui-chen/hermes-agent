@@ -12417,24 +12417,45 @@ class AIAgent:
                 # the previous turn so the Anthropic cache prefix matches.
                 self._cached_system_prompt = stored_prompt
             else:
-                # First turn of a new session — build from scratch.
+                # No stored prompt — must build fresh. Two reasons we get
+                # here:
+                #   (a) Brand-new session (no prior turn ever ran).
+                #   (b) Continuing session whose stored_prompt was just
+                #       cleared by /v1/profile/reload or /v1/skills/reload
+                #       (ZET-1139 — see SessionDB.clear_all_system_prompts).
+                # Both need a rebuild, but the "on_session_start" hook
+                # MUST only fire for case (a). Hook subscribers (Honcho
+                # memory plugin, etc.) treat it as a one-shot session
+                # init signal — re-firing on every reload would
+                # double-init the plugin's session-scoped state.
+                #
+                # `conversation_history` is the only reliable signal: if
+                # it's empty/None this is a brand-new session; if it has
+                # turns, this is a continuing session that just had its
+                # cache cleared.
                 self._cached_system_prompt = self._build_system_prompt(system_message)
-                # Plugin hook: on_session_start
-                # Fired once when a brand-new session is created (not on
-                # continuation).  Plugins can use this to initialise
-                # session-scoped state (e.g. warm a memory cache).
-                try:
-                    from hermes_cli.plugins import invoke_hook as _invoke_hook
-                    _invoke_hook(
-                        "on_session_start",
-                        session_id=self.session_id,
-                        model=self.model,
-                        platform=getattr(self, "platform", None) or "",
-                    )
-                except Exception as exc:
-                    logger.warning("on_session_start hook failed: %s", exc)
 
-                # Store the system prompt snapshot in SQLite
+                is_brand_new_session = not conversation_history
+                if is_brand_new_session:
+                    # Plugin hook: on_session_start
+                    # Fired once when a brand-new session is created (not
+                    # on continuation, not after a hot-reload-driven
+                    # rebuild). Plugins can use this to initialise
+                    # session-scoped state (e.g. warm a memory cache).
+                    try:
+                        from hermes_cli.plugins import invoke_hook as _invoke_hook
+                        _invoke_hook(
+                            "on_session_start",
+                            session_id=self.session_id,
+                            model=self.model,
+                            platform=getattr(self, "platform", None) or "",
+                        )
+                    except Exception as exc:
+                        logger.warning("on_session_start hook failed: %s", exc)
+
+                # Store the system prompt snapshot in SQLite, whether
+                # brand-new or post-reload rebuild — the next turn must
+                # be able to reuse it to keep the prefix cache warm.
                 if self._session_db:
                     try:
                         self._session_db.update_system_prompt(self.session_id, self._cached_system_prompt)
