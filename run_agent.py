@@ -141,7 +141,7 @@ from tools.browser_tool import cleanup_browser
 from agent.memory_manager import StreamingContextScrubber, build_memory_context_block, sanitize_context
 from agent.think_scrubber import StreamingThinkScrubber
 from agent.retry_utils import jittered_backoff
-from agent.error_classifier import classify_api_error, FailoverReason
+from agent.error_classifier import classify_api_error, normalized_provider_error_code, FailoverReason
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
     MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
@@ -5269,6 +5269,33 @@ class AIAgent:
                         context["reset_at"] = time.time() + float(sec_match.group(1))
 
         return context
+
+    def _provider_error_payload(self, classified, error: Exception) -> Dict[str, Any]:
+        """Build the safe, structured provider-error payload for chat surfaces."""
+        payload: Dict[str, Any] = {
+            "code": normalized_provider_error_code(classified),
+            "reason": classified.reason.value,
+        }
+        if classified.provider:
+            payload["provider"] = classified.provider
+        elif getattr(self, "provider", None):
+            payload["provider"] = getattr(self, "provider")
+        if classified.model:
+            payload["model"] = classified.model
+        elif getattr(self, "model", None):
+            payload["model"] = getattr(self, "model")
+        if classified.status_code is not None:
+            payload["status_code"] = classified.status_code
+        if classified.provider_error_code:
+            payload["provider_error_code"] = classified.provider_error_code
+        message = classified.message or self._summarize_api_error(error)
+        if message:
+            payload["provider_message"] = message[:500]
+        payload["retryable"] = bool(classified.retryable)
+        payload["recoverable"] = bool(
+            classified.retryable or classified.should_compress or classified.should_fallback
+        )
+        return payload
 
     def _usage_summary_for_api_request_hook(self, response: Any) -> Optional[Dict[str, Any]]:
         """Token buckets for ``post_api_request`` plugins (no raw ``response`` object)."""
@@ -14500,6 +14527,7 @@ class AIAgent:
                                 "partial": True,
                                 "failed": True,
                                 "compression_exhausted": True,
+                                "provider_error": self._provider_error_payload(classified, api_error),
                             }
                         self._emit_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
 
@@ -14531,6 +14559,7 @@ class AIAgent:
                                 "partial": True,
                                 "failed": True,
                                 "compression_exhausted": True,
+                                "provider_error": self._provider_error_payload(classified, api_error),
                             }
 
                     # Check for context-length errors BEFORE generic 4xx handler.
@@ -14584,6 +14613,7 @@ class AIAgent:
                                     "partial": True,
                                     "failed": True,
                                     "compression_exhausted": True,
+                                    "provider_error": self._provider_error_payload(classified, api_error),
                                 }
                             restart_with_compressed_messages = True
                             break
@@ -14657,6 +14687,7 @@ class AIAgent:
                                 "partial": True,
                                 "failed": True,
                                 "compression_exhausted": True,
+                                "provider_error": self._provider_error_payload(classified, api_error),
                             }
                         self._emit_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
 
@@ -14690,6 +14721,7 @@ class AIAgent:
                                 "partial": True,
                                 "failed": True,
                                 "compression_exhausted": True,
+                                "provider_error": self._provider_error_payload(classified, api_error),
                             }
 
                     # Check for non-retryable client errors.  The classifier
@@ -14799,6 +14831,7 @@ class AIAgent:
                             "completed": False,
                             "failed": True,
                             "error": str(api_error),
+                            "provider_error": self._provider_error_payload(classified, api_error),
                         }
 
                     if retry_count >= max_retries:
@@ -14882,6 +14915,7 @@ class AIAgent:
                             "completed": False,
                             "failed": True,
                             "error": _final_summary,
+                            "provider_error": self._provider_error_payload(classified, api_error),
                         }
 
                     # For rate limits, respect the Retry-After header if present

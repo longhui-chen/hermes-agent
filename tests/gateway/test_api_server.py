@@ -850,6 +850,16 @@ class TestChatCompletionsEndpoint:
             "error": "provider auth failed",
             "messages": [],
             "api_calls": 1,
+            "provider_error": {
+                "code": "provider_billing",
+                "reason": "billing",
+                "provider": "openrouter",
+                "model": "gpt-5",
+                "status_code": 402,
+                "provider_error_code": "insufficient_credits",
+                "provider_message": "insufficient credits",
+                "recoverable": False,
+            },
         }
 
         app = _create_app(adapter)
@@ -869,7 +879,14 @@ class TestChatCompletionsEndpoint:
 
         assert "event: hermes.error" in body
         assert '"message": "provider auth failed"' in body
-        assert '"code": "agent_error"' in body
+        assert '"code": "provider_billing"' in body
+        assert '"reason": "billing"' in body
+        assert '"provider": "openrouter"' in body
+        assert '"model": "gpt-5"' in body
+        assert '"status_code": 402' in body
+        assert '"provider_error_code": "insufficient_credits"' in body
+        assert '"provider_message": "insufficient credits"' in body
+        assert '"recoverable": false' in body
         assert '"finish_reason": "error"' in body
         assert "[DONE]" in body
 
