@@ -188,14 +188,32 @@ jobs:
           [ -z "$UV_BIN" ] && [ -x "$HOME/.local/bin/uv" ] && UV_BIN="$HOME/.local/bin/uv"
           if [ -n "$UV_BIN" ] && [ -x venv/bin/python ]; then
             echo "=== uv pip install -e .[all,langfuse] (editable, 保留 venv) ==="
-            if ! "$UV_BIN" pip install --python venv/bin/python -e ".[all,langfuse]" 2>&1 | tail -8; then
-              echo "增量装失败，fallback init-hermes-env.sh 重建 venv"
+            # 解耦 uv 退出码与末尾 | tail：heredoc 内只有 set -e、无 pipefail，
+            # `if ! uv ... | tail` 判的是 tail 的退出码（恒 0），uv 失败被吞、
+            # fallback 永不触发、workflow 假绿（见 ZET-1188）。改取 PIPESTATUS[0]。
+            "$UV_BIN" pip install --python venv/bin/python -e ".[all,langfuse]" 2>&1 | tail -8
+            uv_rc=${PIPESTATUS[0]}
+            if [ "$uv_rc" -ne 0 ]; then
+              echo "增量装失败（uv rc=$uv_rc），fallback init-hermes-env.sh 重建 venv"
               ./init-hermes-env.sh 2>&1 | tail -12
             fi
           else
             echo "=== 无 uv 或无 venv，init-hermes-env.sh 重建 ==="
             ./init-hermes-env.sh 2>&1 | tail -12
           fi
+
+          # 5b. langfuse SDK 装后自检（opt-in extra：主 spec .[all,langfuse] 才带，
+          #     fallback 的 init-hermes-env.sh 走 .[all] 不含它 → 这里兜底确认/补装）。
+          #     缺 SDK 时 langfuse 插件惰性空转、设备静默不出 trace（ZET-1188）。
+          if ! venv/bin/python -c "import langfuse" >/dev/null 2>&1; then
+            echo "::warning::langfuse SDK 缺失（疑 fallback 重建漏装 opt-in extra），补装 langfuse==4.7.1"
+            venv/bin/python -m pip install "langfuse==4.7.1" 2>&1 | tail -8 || true
+          fi
+          if ! venv/bin/python -c "import langfuse" >/dev/null 2>&1; then
+            echo "::error::langfuse SDK 仍 import 失败 —— 设备将不出 trace，fail job"
+            exit 1
+          fi
+          echo "✓ langfuse SDK 自检通过"
 
           # 6. 关键：不动 /usr/local/bin/hermes（保持指 wrapper），确认仍指 wrapper
           NOW=$(readlink -f /usr/local/bin/hermes 2>/dev/null || true)
