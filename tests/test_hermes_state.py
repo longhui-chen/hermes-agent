@@ -85,6 +85,33 @@ class TestSessionLifecycle:
         session = db.get_session("s1")
         assert session["system_prompt"] == "You are a helpful assistant."
 
+    def test_clear_all_system_prompts_nulls_filled_rows(self, db):
+        """clear_all_system_prompts nulls every row that had a prompt."""
+        db.create_session(session_id="s1", source="cli")
+        db.update_system_prompt("s1", "old prompt 1")
+        db.create_session(session_id="s2", source="cli")
+        db.update_system_prompt("s2", "old prompt 2")
+        db.create_session(session_id="s3", source="cli")
+        # s3 has no system_prompt set — should not be counted in rowcount.
+
+        cleared = db.clear_all_system_prompts()
+        assert cleared == 2
+
+        assert db.get_session("s1")["system_prompt"] is None
+        assert db.get_session("s2")["system_prompt"] is None
+        assert db.get_session("s3")["system_prompt"] is None
+
+    def test_clear_all_system_prompts_idempotent(self, db):
+        """A second call returns 0 rows cleared — nothing left to null."""
+        db.create_session(session_id="s1", source="cli")
+        db.update_system_prompt("s1", "p")
+        assert db.clear_all_system_prompts() == 1
+        assert db.clear_all_system_prompts() == 0
+
+    def test_clear_all_system_prompts_empty_db(self, db):
+        """No sessions → 0 cleared, no error."""
+        assert db.clear_all_system_prompts() == 0
+
     def test_update_token_counts(self, db):
         db.create_session(session_id="s1", source="cli")
         db.update_token_counts("s1", input_tokens=200, output_tokens=100)
