@@ -183,3 +183,76 @@ def test_handle_channel_delivery_invalid_token_is_error(monkeypatch):
     assert called == []
     assert err is not None and "invalid channel target" in err
     assert remaining_deliver == "origin"
+
+
+# --- chunking: long content split under local-server's rune cap ---
+
+def test_send_to_channel_chunks_long_content(monkeypatch):
+    monkeypatch.setenv("ZET_CHAT_APPEND_URL", "http://127.0.0.1:9090/api/v1/internal/chat/append")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "tok")
+    posts = []
+
+    class FakeResp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self, *a): return json.dumps({"code": 200, "data": {"message_id": "m"}}).encode()
+
+    def fake_urlopen(req, timeout=None):
+        posts.append(json.loads(req.data.decode())["text"])
+        return FakeResp()
+
+    long_content = "水" * 9000  # well over the 4000-rune endpoint cap
+    with patch("urllib.request.urlopen", fake_urlopen):
+        err = _send_to_channel("wechat", long_content, "job-long")
+    assert err is None
+    assert len(posts) >= 2, "long content must be split into multiple sends"
+    # every posted chunk must be under local-server's 4000-rune cap (no 'text too long')
+    assert all(len(p) < 4000 for p in posts), [len(p) for p in posts]
+
+
+def test_send_to_channel_short_content_single_post(monkeypatch):
+    monkeypatch.setenv("ZET_CHAT_APPEND_URL", "http://127.0.0.1:9090/api/v1/internal/chat/append")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "tok")
+    posts = []
+
+    class FakeResp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self, *a): return json.dumps({"code": 200, "data": {"message_id": "m"}}).encode()
+
+    def fake_urlopen(req, timeout=None):
+        posts.append(json.loads(req.data.decode())["text"])
+        return FakeResp()
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        err = _send_to_channel("wechat", "该喝水啦 💧", "job-short")
+    assert err is None
+    assert posts == ["该喝水啦 💧"], "short content must be one unchanged send"
+
+
+def test_send_to_channel_chunk_failure_surfaces(monkeypatch):
+    monkeypatch.setenv("ZET_CHAT_APPEND_URL", "http://127.0.0.1:9090/api/v1/internal/chat/append")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "tok")
+    calls = {"n": 0}
+
+    class OkResp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self, *a): return json.dumps({"code": 200, "data": {"message_id": "m"}}).encode()
+
+    class FailResp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self, *a): return json.dumps({"code": 95005, "data": {"detail": "send failed"}}).encode()
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        return FailResp() if calls["n"] == 2 else OkResp()  # 2nd chunk fails
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        err = _send_to_channel("wechat", "水" * 9000, "job-x")
+    assert err is not None and "part 2/" in err  # failure surfaced, not silent

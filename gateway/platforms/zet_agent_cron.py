@@ -130,22 +130,11 @@ def _resolve_channel_send_url():
     return urlunsplit((parts.scheme, parts.netloc, _CHANNEL_SEND_PATH, "", ""))
 
 
-def _send_to_channel(kind: str, content: str, job_id: str):
-    """POST a cron result to a bound IM channel via local-server. Returns an
-    error string on failure, or None on success — the caller folds the error
-    into the cron job's last_delivery_error.
-
-    Reuses Phase A's send endpoint + verified-owner gate; the recipient is the
-    channel's verified owner (resolved server-side). source="cron" tags the audit.
-    """
-    url = _resolve_channel_send_url()
-    if not url:
-        return "channel delivery: ZET_CHAT_APPEND_URL unset"
-    token = os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN", "").strip()
-    if not token:
-        return "channel delivery: action token unavailable"
+def _post_channel_chunk(url: str, token: str, kind: str, text: str, job_id: str):
+    """POST one (already-chunked) text to local-server's channel send endpoint.
+    Returns None on success or an error string on failure."""
     payload = json.dumps(
-        {"target_ref": _CHANNEL_DELIVER_PREFIX + kind, "text": content, "source": "cron", "job_id": job_id}
+        {"target_ref": _CHANNEL_DELIVER_PREFIX + kind, "text": text, "source": "cron", "job_id": job_id}
     ).encode("utf-8")
     try:
         import urllib.request
@@ -168,6 +157,36 @@ def _send_to_channel(kind: str, content: str, job_id: str):
     if isinstance(parsed, dict) and isinstance(parsed.get("data"), dict):
         detail = parsed["data"].get("detail", "")
     return f"channel:{kind} delivery failed: {detail or body[:200]}"
+
+
+def _send_to_channel(kind: str, content: str, job_id: str):
+    """Deliver a cron result to a bound IM channel via local-server. Returns an
+    error string on failure, or None on success — the caller folds the error
+    into the cron job's last_delivery_error.
+
+    Long content is chunked under local-server's per-message rune cap (mirroring
+    how native send_message chunks before delivery) and sent piece by piece; each
+    chunk is a separate send (separate channel message + cron_send audit). Any
+    chunk failure is surfaced (never silently dropped).
+
+    Reuses Phase A's send endpoint + verified-owner gate; the recipient is the
+    channel's verified owner (resolved server-side). source="cron" tags the audit.
+    """
+    url = _resolve_channel_send_url()
+    if not url:
+        return "channel delivery: ZET_CHAT_APPEND_URL unset"
+    token = os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN", "").strip()
+    if not token:
+        return "channel delivery: action token unavailable"
+    from tools.channel_text import chunk_channel_text
+    chunks = chunk_channel_text(content)
+    errors = []
+    for idx, chunk in enumerate(chunks):
+        err = _post_channel_chunk(url, token, kind, chunk, job_id)
+        if err:
+            label = f" (part {idx + 1}/{len(chunks)})" if len(chunks) > 1 else ""
+            errors.append(f"{err}{label}")
+    return "; ".join(errors) if errors else None
 
 
 def _handle_channel_delivery(job: dict, content: str):

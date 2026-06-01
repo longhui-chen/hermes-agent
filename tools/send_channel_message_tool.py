@@ -56,6 +56,30 @@ def _check_send_channel_message():
     )
 
 
+def _post_channel_send(url, token, target_ref, text):
+    """POST one (already-chunked) text. Returns (message_id, None) on success or
+    (None, error_str) on failure."""
+    payload = json.dumps({"target_ref": target_ref, "text": text, "source": "llm"}).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={_ACTION_TOKEN_HEADER: token, "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=8.0) as resp:
+            body = resp.read().decode("utf-8")
+        parsed = json.loads(body)
+    except Exception as e:
+        return None, f"failed to send via local-server: {e}"
+    if isinstance(parsed, dict) and parsed.get("code") == 200:
+        return (parsed.get("data") or {}).get("message_id"), None
+    detail = ""
+    if isinstance(parsed, dict) and isinstance(parsed.get("data"), dict):
+        detail = str(parsed["data"].get("detail", ""))
+    return None, f"send failed: {detail or body[:200]}"
+
+
 def send_channel_message_tool(args, **kw):
     args = args or {}
     target_ref = str(args.get("target_ref", "")).strip()
@@ -69,27 +93,22 @@ def send_channel_message_tool(args, **kw):
     if not token:
         return json.dumps({"error": "agent action token unavailable"}, ensure_ascii=False)
 
-    payload = json.dumps({"target_ref": target_ref, "text": text, "source": "llm"}).encode("utf-8")
-    try:
-        req = urllib.request.Request(
-            url,
-            data=payload,
-            headers={_ACTION_TOKEN_HEADER: token, "Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=8.0) as resp:
-            body = resp.read().decode("utf-8")
-        parsed = json.loads(body)
-    except Exception as e:
-        return json.dumps({"error": f"failed to send via local-server: {e}"}, ensure_ascii=False)
+    # Chunk long text under local-server's per-message rune cap (mirrors native
+    # send_message delivery); each chunk is a separate send.
+    from tools.channel_text import chunk_channel_text
+    chunks = chunk_channel_text(text)
 
-    if isinstance(parsed, dict) and parsed.get("code") == 200:
-        data = parsed.get("data") or {}
-        return json.dumps({"message_id": data.get("message_id")}, ensure_ascii=False)
-    detail = ""
-    if isinstance(parsed, dict) and isinstance(parsed.get("data"), dict):
-        detail = str(parsed["data"].get("detail", ""))
-    return json.dumps({"error": f"send failed: {detail or body[:200]}"}, ensure_ascii=False)
+    message_ids = []
+    for idx, chunk in enumerate(chunks):
+        mid, err = _post_channel_send(url, token, target_ref, chunk)
+        if err:
+            label = f" (part {idx + 1}/{len(chunks)})" if len(chunks) > 1 else ""
+            return json.dumps({"error": f"{err}{label}"}, ensure_ascii=False)
+        message_ids.append(mid)
+
+    if len(message_ids) > 1:
+        return json.dumps({"message_id": message_ids[-1], "parts": len(message_ids)}, ensure_ascii=False)
+    return json.dumps({"message_id": message_ids[0] if message_ids else None}, ensure_ascii=False)
 
 
 from tools.registry import registry  # noqa: E402
