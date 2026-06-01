@@ -76,3 +76,44 @@ def test_exception_does_not_raise(monkeypatch):
     with patch("urllib.request.urlopen", side_effect=Exception("boom")):
         out = json.loads(send_channel_message_tool({"target_ref": "channel:wechat", "text": "hi"}))
     assert "error" in out
+
+
+def test_long_text_chunked_into_multiple_posts(monkeypatch):
+    monkeypatch.setenv("ZET_CHAT_APPEND_URL", "http://127.0.0.1:9090/api/v1/internal/chat/append")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "tok")
+    posts = []
+
+    class FakeResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return json.dumps({"code": 200, "data": {"message_id": "m"}}).encode()
+
+    def fake_urlopen(req, timeout=None):
+        posts.append(json.loads(req.data.decode())["text"])
+        return FakeResp()
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        out = json.loads(send_channel_message_tool({"target_ref": "channel:wechat", "text": "水" * 9000}))
+    assert "message_id" in out and out.get("parts", 1) >= 2
+    assert len(posts) >= 2
+    assert all(len(p) < 4000 for p in posts), [len(p) for p in posts]
+
+
+def test_short_text_single_post_no_parts(monkeypatch):
+    monkeypatch.setenv("ZET_CHAT_APPEND_URL", "http://127.0.0.1:9090/api/v1/internal/chat/append")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "tok")
+    posts = []
+
+    class FakeResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return json.dumps({"code": 200, "data": {"message_id": "m1"}}).encode()
+
+    def fake_urlopen(req, timeout=None):
+        posts.append(json.loads(req.data.decode())["text"])
+        return FakeResp()
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        out = json.loads(send_channel_message_tool({"target_ref": "channel:wechat", "text": "你好"}))
+    assert out == {"message_id": "m1"}  # no 'parts' key for single send
+    assert posts == ["你好"]
