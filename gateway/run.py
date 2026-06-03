@@ -553,10 +553,10 @@ if _config_path.exists():
                 os.environ["HERMES_GATEWAY_BUSY_INPUT_MODE"] = str(_display_cfg["busy_input_mode"])
             if "busy_ack_enabled" in _display_cfg:
                 os.environ["HERMES_GATEWAY_BUSY_ACK_ENABLED"] = str(_display_cfg["busy_ack_enabled"])
-        # Timezone: bridge config.yaml → HERMES_TIMEZONE env var.
-        _tz_cfg = _cfg.get("timezone", "")
-        if _tz_cfg and isinstance(_tz_cfg, str):
-            os.environ["HERMES_TIMEZONE"] = _tz_cfg.strip()
+        # Timezone: no longer bridged to HERMES_TIMEZONE env — hermes_time reads
+        # config.yaml `timezone` live (fingerprint-gated). Pinning it into env
+        # would freeze the value for the process lifetime. See spec
+        # 2026-06-02-timezone-propagation-design.
         # Security settings
         _security_cfg = _cfg.get("security", {})
         if isinstance(_security_cfg, dict):
