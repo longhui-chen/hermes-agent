@@ -623,6 +623,13 @@ def create_job(
     # Validate the per-job timezone up-front so parse_schedule can honour it
     # for naive ISO timestamps (e.g. "2026-05-25T10:30" → 10:30 wall in tz).
     normalized_tz = _validate_tz_name(timezone)
+    if normalized_tz is None:
+        # All-fixed policy (ZET-1258): pin the device's current timezone at
+        # creation so wall-clock is deterministic no matter which path created
+        # the job (LLM cronjob tool / HTTP) — both converge here. To restore
+        # follow-live later, thread an opt-out param to skip this.
+        from hermes_time import get_timezone_name
+        normalized_tz = get_timezone_name()
     parsed_schedule = parse_schedule(schedule, tz_name=normalized_tz)
 
     # Normalize repeat: treat 0 or negative values as None (infinite)

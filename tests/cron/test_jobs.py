@@ -449,8 +449,12 @@ class TestUpdateJob:
         pytest.importorskip("croniter")
         now = datetime(2026, 5, 8, 6, 0, 0, tzinfo=timezone.utc)
         monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        # All-fixed policy (ZET-1258): omitted tz is pinned to the device tz at
+        # creation. Pin it to UTC so the create-time baseline below is
+        # deterministic (otherwise it reads the host's real zone).
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "UTC")
 
-        # Created without tz — next_run lands at 23:06 UTC.
+        # Created without tz — pinned to UTC, next_run lands at 23:06 UTC.
         job = create_job(prompt="x", schedule="6 23 * * *")
         before = datetime.fromisoformat(job["next_run_at"]).astimezone(timezone.utc)
         assert before == datetime(2026, 5, 8, 23, 6, 0, tzinfo=timezone.utc)
@@ -467,6 +471,16 @@ class TestUpdateJob:
         )
         updated = update_job(job["id"], {"timezone": ""})
         assert updated["timezone"] is None
+
+    def test_create_job_pins_device_tz_when_timezone_omitted(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Tokyo")
+        job = create_job(prompt="p", schedule="30 10 * * *")  # 不传 timezone
+        assert job["timezone"] == "Asia/Tokyo", "omitted timezone must be pinned to device tz"
+
+    def test_create_job_keeps_explicit_timezone(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Tokyo")
+        job = create_job(prompt="p", schedule="30 10 * * *", timezone="America/New_York")
+        assert job["timezone"] == "America/New_York", "explicit per-job tz must win over device default"
 
 
 class TestPauseResumeJob:
