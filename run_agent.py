@@ -414,6 +414,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        config_context_length: int = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -484,6 +485,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            config_context_length=config_context_length,
         )
 
     def _get_session_db_for_recall(self):
@@ -800,6 +802,23 @@ class AIAgent:
                 self.status_callback("warn", message)
             except Exception:
                 logger.debug("status_callback error in _emit_warning", exc_info=True)
+
+    def _emit_structured_status(self, event_type: str, payload: Dict[str, Any]) -> None:
+        """Emit a structured gateway status event without changing CLI output.
+
+        Only fires when the wired ``status_callback`` opted in via the
+        ``_hermes_accepts_structured_status`` marker (set by the gateway's
+        zet_agent wrapper). CLI/other consumers that only understand the
+        ``(kind, message)`` lifecycle/warn contract are left untouched.
+        """
+        if not self.status_callback:
+            return
+        if not getattr(self.status_callback, "_hermes_accepts_structured_status", False):
+            return
+        try:
+            self.status_callback(event_type, payload)
+        except Exception:
+            logger.debug("status_callback error in _emit_structured_status", exc_info=True)
 
     # ── Buffered retry/fallback status ────────────────────────────────────
     # Retry and fallback chains were flooding the CLI/gateway with status
@@ -1425,6 +1444,28 @@ class AIAgent:
             msg = messages[idx]
             if isinstance(msg, dict) and msg.get("role") == "user":
                 msg["content"] = override
+
+    def _discard_current_turn_on_interrupt(self, messages: list) -> None:
+        """ZET-641: roll back the current turn when an interrupt fires
+        before the agent produced any visible output (no streaming text,
+        no committed tool call).
+
+        After this, messages ends at the previous turn's tail — the
+        user's message for this turn is gone, no assistant scaffolding
+        either. The app side mirrors this by retracting the user bubble
+        back into the input box; without server-side rollback, state.db
+        would keep a phantom user row that re-surfaces on next session
+        load (orphan user message, no reply).
+
+        Idempotent: if there is no current-turn user message tracked,
+        does nothing. Also clears the streamed-assistant buffers so a
+        stale fragment doesn't leak into the next turn.
+        """
+        idx = getattr(self, "_persist_user_message_idx", None)
+        if isinstance(idx, int) and 0 <= idx < len(messages) and isinstance(messages[idx], dict) and messages[idx].get("role") == "user":
+            del messages[idx:]
+        self._persist_user_message_idx = None
+        self._current_streamed_assistant_text = ""
 
     def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Save session state to both JSON log and SQLite on any exit path.

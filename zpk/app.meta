@@ -1,0 +1,8 @@
+{
+  "app_id": "com.zettlab.claw",
+  "display_name": "Hermes Agent",
+  "requirements": {
+    "min_nas_version": "0.0.1-alpha",
+    "min_ram_gb": 2
+  }
+}

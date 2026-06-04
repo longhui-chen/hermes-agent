@@ -7461,12 +7461,12 @@ def _restore_stashed_changes(
 # =========================================================================
 
 OFFICIAL_REPO_URLS = {
-    "https://github.com/NousResearch/hermes-agent.git",
-    "git@github.com:NousResearch/hermes-agent.git",
-    "https://github.com/NousResearch/hermes-agent",
-    "git@github.com:NousResearch/hermes-agent",
+    "https://github.com/zettlab/hermes-agent.git",
+    "git@github.com:zettlab/hermes-agent.git",
+    "https://github.com/zettlab/hermes-agent",
+    "git@github.com:zettlab/hermes-agent",
 }
-OFFICIAL_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
+OFFICIAL_REPO_URL = "https://github.com/zettlab/hermes-agent.git"
 SKIP_UPSTREAM_PROMPT_FILE = ".skip_upstream_prompt"
 
 
@@ -11132,19 +11132,27 @@ def _prepare_agent_startup(args) -> None:
             "plugin discovery failed at CLI startup",
             exc_info=True,
         )
-    try:
-        # MCP tool discovery — no event loop running in CLI/TUI startup,
-        # so inline is safe.  Moved here from model_tools.py module scope
-        # to avoid freezing the gateway's event loop on its first message
-        # via the same lazy import path (#16856).
-        from tools.mcp_tool import discover_mcp_tools
+    # zettlab cold-start: gateway run defers MCP discovery so the daemon
+    # comes up fast; discovery then happens lazily on the first message.
+    # Other agent commands (chat/acp/rl/cron/mcp serve) still discover now.
+    _defer_mcp_discovery = (
+        args.command == "gateway"
+        and getattr(args, "gateway_command", None) == "run"
+    )
+    if not _defer_mcp_discovery:
+        try:
+            # MCP tool discovery — no event loop running in CLI/TUI startup,
+            # so inline is safe.  Moved here from model_tools.py module scope
+            # to avoid freezing the gateway's event loop on its first message
+            # via the same lazy import path (#16856).
+            from tools.mcp_tool import discover_mcp_tools
 
-        discover_mcp_tools()
-    except Exception:
-        logger.debug(
-            "MCP tool discovery failed at CLI startup",
-            exc_info=True,
-        )
+            discover_mcp_tools()
+        except Exception:
+            logger.debug(
+                "MCP tool discovery failed at CLI startup",
+                exc_info=True,
+            )
     try:
         from hermes_cli.config import load_config
         from agent.shell_hooks import register_from_config
@@ -11717,7 +11725,7 @@ def main():
         "providers", help="List available proxy upstream providers"
     )
     proxy_parser.set_defaults(func=cmd_proxy)
-    gateway_parser.set_defaults(func=cmd_gateway)
+    gateway_parser.set_defaults(func=cmd_gateway, gateway_command="run")
 
     # =========================================================================
     # lsp command
