@@ -6294,9 +6294,17 @@ class AIAgent:
             except Exception:
                 pass
 
-        from hermes_time import now as _hermes_now
+        from hermes_time import now as _hermes_now, get_timezone_name as _hermes_tz_name
         now = _hermes_now()
-        timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')}"
+        # Surface the active timezone (live device tz) so the model can answer
+        # "what timezone am I in" and reason about wall-clock scheduling. IANA
+        # name when resolvable, always with the UTC offset (honest even when only
+        # the server-local/UTC fallback applies).
+        _tz_off = now.strftime('%z')  # e.g. "+0800"; now is tz-aware so present
+        _tz_off = f"UTC{_tz_off[:3]}:{_tz_off[3:]}" if len(_tz_off) == 5 else "UTC"
+        _tz_name = _hermes_tz_name()
+        _tz_label = f"{_tz_name} ({_tz_off})" if _tz_name else _tz_off
+        timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')} — timezone {_tz_label}"
         if self.pass_session_id and self.session_id:
             timestamp_line += f"\nSession ID: {self.session_id}"
         if self.model:

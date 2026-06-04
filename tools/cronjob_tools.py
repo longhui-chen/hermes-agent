@@ -711,11 +711,10 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                     "the job's wall-clock time is evaluated in. Affects cron expressions "
                     "(e.g. '30 10 * * *' fires at 10:30 in this zone) and naive one-shot "
                     "ISO timestamps ('2026-05-25T10:30' is interpreted as this zone's wall time). "
-                    "Omit to inherit the hermes instance default — but when the surrounding "
-                    "platform (Zettlab gateway / app) already injected a timezone in the "
-                    "request, that value is propagated automatically and you should not "
-                    "override it unless the user explicitly named a different zone "
-                    "(e.g. '北京时间', 'UTC 02:30'). On update, pass empty string to clear."
+                    "Omit to use the device's current timezone, pinned at creation "
+                    "(the job does NOT follow later device timezone changes). Set this "
+                    "only when the user explicitly named a different per-job zone "
+                    "(e.g. 'UTC 02:30'). On update, pass empty string to clear."
                 ),
             },
         },

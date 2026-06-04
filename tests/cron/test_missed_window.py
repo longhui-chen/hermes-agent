@@ -24,9 +24,7 @@ from cron.jobs import (
 
 
 def _reset_hermes_time_cache():
-    hermes_time._cached_tz = None
-    hermes_time._cached_tz_name = None
-    hermes_time._cache_resolved = False
+    hermes_time.reset_cache()
 
 
 @pytest.fixture
