@@ -6,7 +6,7 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 ## ⚠️ Engineering Hard Rules — 全员 / 全 Agent 必须遵守（镜像自 monorepo）
 
-> 本节与 monorepo [`zettlab-product-dev/AGENTS.md`](https://github.com/zettlab/zettlab-product-dev/blob/main/AGENTS.md) 同源。**即使只克隆本子仓库 workspace 单独开发（cursor / claude / codex / windsurf 等），也必须遵守这 5 条**。任何 PR / spec / plan 都要主动声明对它们的影响（哪怕"无影响"也写一行）。
+> 本节与 monorepo [`zettlab-product-dev/AGENTS.md`](https://github.com/zettlab/zettlab-product-dev/blob/main/AGENTS.md) 同源。**即使只克隆本子仓库 workspace 单独开发（cursor / claude / codex / windsurf 等），也必须遵守这 6 条**。任何 PR / spec / plan 都要主动声明对它们的影响（哪怕"无影响"也写一行）。
 >
 > 任何更新先改 monorepo 权威源，再同步到本文件；本文件不允许独立演化。
 
@@ -24,6 +24,7 @@ Instructions for AI coding assistants and developers working on the hermes-agent
    - 老客户端 release 周期慢，新行为默认走 capability negotiation 或 profile-level feature flag。
 
 5. **冲突时优先级：高可用 > 安全 > 性能** — 性能优化不允许偷偷牺牲稳定 / 安全；必须 trade 时在 PR 显式声明并 review。
+6. **配置文件唯一生效位置 = `{应用仓库}/zpk/config/*.yaml`** — 只有 `zpk/config/<repo>.yaml` 会被打进 zpk 包、被 systemd `serve -c .../current/config/<repo>.yaml` 读取生效。禁止新增 / 依赖 `config.example.yaml` / `config.board.yaml` / 仓库根 `config.yaml` 等不打包的配置（不生效 + 漂移）。改配置只改 `zpk/config/<repo>.yaml`；部署（build-bundle / remote-install / OTA）只以它为 SRC；dev 差异走 `ZLS_*` 环境变量 / `ZLS_DATA_DIR`，不要 `cp config.example.yaml config.yaml`。
 
 完成清单（HR1-HR5 逐项确认）见 monorepo `AGENTS.md` 末尾。
 
