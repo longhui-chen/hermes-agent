@@ -477,8 +477,12 @@ class TestUpdateJob:
         pytest.importorskip("croniter")
         now = datetime(2026, 5, 8, 6, 0, 0, tzinfo=timezone.utc)
         monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        # All-fixed policy (ZET-1258): omitted tz is pinned to the device tz at
+        # creation. Pin it to UTC so the create-time baseline below is
+        # deterministic (otherwise it reads the host's real zone).
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "UTC")
 
-        # Created without tz — next_run lands at 23:06 UTC.
+        # Created without tz — pinned to UTC, next_run lands at 23:06 UTC.
         job = create_job(prompt="x", schedule="6 23 * * *")
         before = datetime.fromisoformat(job["next_run_at"]).astimezone(timezone.utc)
         assert before == datetime(2026, 5, 8, 23, 6, 0, tzinfo=timezone.utc)
@@ -495,6 +499,16 @@ class TestUpdateJob:
         )
         updated = update_job(job["id"], {"timezone": ""})
         assert updated["timezone"] is None
+
+    def test_create_job_pins_device_tz_when_timezone_omitted(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Tokyo")
+        job = create_job(prompt="p", schedule="30 10 * * *")  # 不传 timezone
+        assert job["timezone"] == "Asia/Tokyo", "omitted timezone must be pinned to device tz"
+
+    def test_create_job_keeps_explicit_timezone(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Tokyo")
+        job = create_job(prompt="p", schedule="30 10 * * *", timezone="America/New_York")
+        assert job["timezone"] == "America/New_York", "explicit per-job tz must win over device default"
 
 
 class TestPauseResumeJob:
@@ -1162,3 +1176,23 @@ class TestSaveJobOutput:
         with pytest.raises(ValueError, match="output path"):
             save_job_output(str(tmp_cron_dir / "outside"), "# Results")
         assert not (tmp_cron_dir / "outside").exists()
+
+
+class TestUpdateTimezoneRecompute:
+    def test_interval_next_run_unchanged_on_tz_patch(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Shanghai")
+        from cron.jobs import create_job, update_job
+        job = create_job(prompt="p", schedule="every 30m")
+        before = job["next_run_at"]
+        updated = update_job(job["id"], {"timezone": "Europe/London"})
+        assert updated["timezone"] == "Europe/London"
+        assert updated["next_run_at"] == before, "interval next_run must NOT shift on a pure tz change"
+
+    def test_cron_next_run_shifts_on_tz_patch(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Shanghai")
+        from cron.jobs import create_job, update_job
+        job = create_job(prompt="p", schedule="30 10 * * *")   # 10:30 Shanghai
+        before = job["next_run_at"]
+        updated = update_job(job["id"], {"timezone": "Asia/Tokyo"})  # 10:30 Tokyo (UTC+9)
+        assert updated["next_run_at"] != before, "cron next_run must shift to new tz wall-clock"
+        # 10:30 Tokyo == 09:30 Shanghai；UTC 上 Tokyo 早 1h

@@ -454,21 +454,24 @@ class TestUnifiedCronjobTool:
         # And the next_run_at must carry the +08:00 offset.
         assert stored["next_run_at"].endswith("+08:00")
 
-    def test_create_without_timezone_leaves_field_none(self):
-        """No timezone arg → the per-job tz stays None and the job falls
-        back to hermes' instance default (the existing pre-fix behaviour
-        we must not regress)."""
+    def test_create_without_timezone_pins_device_tz(self, monkeypatch):
+        """No timezone arg → ZET-1258 pins the device tz at create time so the
+        job keeps firing at the same wall-clock even if the device tz later
+        changes. (Supersedes the older leave-it-None contract.)"""
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Shanghai")
         from cron.jobs import get_job
 
         created = json.loads(
             cronjob(action="create", prompt="Daily", schedule="30 10 * * *")
         )
         stored = get_job(created["job_id"])
-        assert stored["timezone"] is None
+        assert stored["timezone"] == "Asia/Shanghai"
 
-    def test_create_whitespace_timezone_normalized_to_none(self):
-        """A whitespace-only string should be treated as "not supplied", not
-        as a bogus IANA name that throws."""
+    def test_create_whitespace_timezone_pins_device_tz(self, monkeypatch):
+        """A whitespace-only string is treated as "not supplied" — and like the
+        omitted case it pins the device tz (ZET-1258) instead of throwing on a
+        bogus IANA name."""
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Shanghai")
         from cron.jobs import get_job
 
         created = json.loads(
@@ -477,7 +480,7 @@ class TestUnifiedCronjobTool:
             )
         )
         stored = get_job(created["job_id"])
-        assert stored["timezone"] is None
+        assert stored["timezone"] == "Asia/Shanghai"
 
     def test_update_sets_timezone_and_recomputes_next_run(self):
         from cron.jobs import get_job
