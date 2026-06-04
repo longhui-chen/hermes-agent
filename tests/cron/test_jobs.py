@@ -1135,3 +1135,23 @@ class TestSaveJobOutput:
         assert output_file.exists()
         assert output_file.read_text() == "# Results\nEverything ok."
         assert "test123" in str(output_file)
+
+
+class TestUpdateTimezoneRecompute:
+    def test_interval_next_run_unchanged_on_tz_patch(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Shanghai")
+        from cron.jobs import create_job, update_job
+        job = create_job(prompt="p", schedule="every 30m")
+        before = job["next_run_at"]
+        updated = update_job(job["id"], {"timezone": "Europe/London"})
+        assert updated["timezone"] == "Europe/London"
+        assert updated["next_run_at"] == before, "interval next_run must NOT shift on a pure tz change"
+
+    def test_cron_next_run_shifts_on_tz_patch(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Shanghai")
+        from cron.jobs import create_job, update_job
+        job = create_job(prompt="p", schedule="30 10 * * *")   # 10:30 Shanghai
+        before = job["next_run_at"]
+        updated = update_job(job["id"], {"timezone": "Asia/Tokyo"})  # 10:30 Tokyo (UTC+9)
+        assert updated["next_run_at"] != before, "cron next_run must shift to new tz wall-clock"
+        # 10:30 Tokyo == 09:30 Shanghai；UTC 上 Tokyo 早 1h

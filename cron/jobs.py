@@ -828,7 +828,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updated_schedule.get("display", updated.get("schedule_display")),
             )
 
-        if (schedule_changed or timezone_changed) and updated.get("state") != "paused":
+        # interval/once next_run 与 tz 无关：纯 tz 变更只该让 cron 重算，否则
+        # compute_next_run(无 last_run_at) 会把 interval 重置成 now+间隔。
+        tz_only_recompute = timezone_changed and updated["schedule"].get("kind") == "cron"
+        if (schedule_changed or tz_only_recompute) and updated.get("state") != "paused":
             updated["next_run_at"] = compute_next_run(
                 updated["schedule"], tz_name=updated.get("timezone")
             )
