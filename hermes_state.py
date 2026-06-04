@@ -800,6 +800,32 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def clear_all_system_prompts(self) -> int:
+        """Null out the cached system_prompt for every session in this DB.
+
+        Each agent owns its own state.db (path is per-agent under
+        profiles/<agent_id>/state.db), so "all sessions" here is already
+        scoped to a single agent — no agent_id filter is needed.
+
+        The continuing-session rebuild path in AIAgent re-uses the stored
+        system_prompt when present (to preserve the Anthropic prefix-cache
+        prefix across turns); when SOUL.md / IDENTITY.md / profile metadata
+        change on disk, the stored prompts go stale and the next turn would
+        otherwise keep replaying the old prompt. Clearing the column forces
+        every session's next turn to rebuild from disk.
+
+        Called by the prompt-class reload endpoints
+        (/v1/profile/reload, /v1/skills/reload). Returns the row count
+        actually updated (i.e. sessions that had a non-null prompt).
+        """
+        def _do(conn):
+            cur = conn.execute(
+                "UPDATE sessions SET system_prompt = NULL "
+                "WHERE system_prompt IS NOT NULL"
+            )
+            return cur.rowcount
+        return self._execute_write(_do)
+
     def update_token_counts(
         self,
         session_id: str,

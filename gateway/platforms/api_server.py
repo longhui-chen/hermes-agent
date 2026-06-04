@@ -365,13 +365,37 @@ def _chat_stream_error_payload(result: Dict[str, Any], finish_reason: str) -> Op
     err_msg = _short_error_text(result.get("error"))
     if not (is_partial or is_failed or not completed or finish_reason == "error"):
         return None
-    return {
+    provider_error = result.get("provider_error")
+    payload = {
         "message": err_msg or "Agent run did not complete.",
         "code": "output_truncated" if finish_reason == "length" else "agent_error",
         "completed": completed,
         "partial": is_partial,
         "failed": is_failed,
     }
+    if isinstance(provider_error, dict):
+        code = _short_error_text(provider_error.get("code"), limit=120)
+        if code and finish_reason != "length":
+            payload["code"] = code
+        for key in (
+            "reason",
+            "provider",
+            "model",
+            "status_code",
+            "provider_error_code",
+            "provider_message",
+        ):
+            value = provider_error.get(key)
+            if isinstance(value, str):
+                clean = value.strip()
+                if clean:
+                    payload[key] = clean[:500]
+            elif isinstance(value, int):
+                payload[key] = value
+        recoverable = provider_error.get("recoverable")
+        if isinstance(recoverable, bool):
+            payload["recoverable"] = recoverable
+    return payload
 
 
 def _tool_completion_payload(

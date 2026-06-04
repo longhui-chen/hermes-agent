@@ -1,0 +1,262 @@
+# 手动把指定分支的 hermes-agent 源码 dev 覆盖到 Infist 办公室 OTA 板
+# （board13 / board154 / board4）。hermes 纯 Python，无需 build。
+#
+# 触发：仅 workflow_dispatch（手动）。无 push 自动触发 —— 推 main 不会自动刷
+#   任何板，必须显式 dispatch（或经 skill infist-office-update-hermes）。
+#   board4 这类"模拟生产"板：默认 dispatch（留空）也不刷，只有 targets 显式
+#   点名（或 all）才动。
+#
+# 板子分工：
+#   board13 / board154 → 默认刷（不指定 targets 时就这俩）
+#   board4 → "模拟生产"板，须显式 targets 点名（或 all）才刷
+#   board229 / board28 等跨子网板 → 不在范围（board184 LAN 够不到；云 NAS 走
+#     deploy-cloudnas.yml）。注：板清单唯一真相源 = prepare job 的 HOSTS。
+#
+# 部署语义（dev 源码覆盖，对称 local-server 的 infist-dev-deploy）：
+#   - 只换 OTA 板上 current/lib/hermes-agent 的源码（plugins/ skills/ 一并更新），
+#     保留板上 venv + .env，uv 增量装新依赖（editable），不动 OTA data.db。
+#   - **关键：保留 ZPK 的 bin/hermes wrapper，绝不把 /usr/local/bin/hermes 重指到
+#     venv/bin/hermes。** wrapper 里设 HERMES_BUNDLED_PLUGINS/SKILLS（PR #73），
+#     插件靠它生效；绕过 wrapper（device-update 的旧做法）会让 bundled 插件失效
+#     "No plugins installed"。
+#   - local-server fork hermes（无全局 daemon），故部署后 restart local-server，
+#     下次 chat lazy-spawn 新源码的 hermes。验证 = `hermes plugins list`（走
+#     wrapper，确认插件生效）+ local-server /health。
+#   - 下次手机 OTA / 重装 ZPK 会覆盖回 ZPK 版 —— dev 覆盖是临时态，OTA 是生产真相。
+#
+# 前提：板子已走过 ZPK（有 current/bin/hermes wrapper + venv）；board184 注册为
+#   self-hosted runner；仓库配 secret BOARD_SSH_PASSWORD。
+
+name: infist-dev-deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: "CSV of board names. Default deploys board13,board154 only; board4 must be named explicitly. 'all' = whole matrix (incl board4)."
+        required: false
+        default: 'board13,board154'
+
+concurrency:
+  group: infist-dev-deploy-hermes
+  cancel-in-progress: true
+
+jobs:
+  prepare:
+    name: Resolve targets
+    runs-on: [self-hosted, board184]
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.sel.outputs.matrix }}
+      count:  ${{ steps.sel.outputs.count }}
+    steps:
+      - name: Resolve targets from input
+        id: sel
+        env:
+          TARGETS_INPUT: ${{ inputs.targets }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 内置板清单（新增板改这里；deploy 的 matrix 从本 job 的输出展开）。
+          declare -A HOSTS=( [board13]=192.168.1.13 [board154]=192.168.1.154 [board4]=192.168.1.4 [board26]=192.168.1.26 [board39]=192.168.1.39 )
+          SEL="${TARGETS_INPUT:-board13,board154}"
+          [ "$SEL" = "all" ] && SEL="board13,board154,board4,board26,board39"
+          ITEMS=""; COUNT=0
+          IFS=',' read -ra NAMES <<< "$SEL"
+          for raw in "${NAMES[@]}"; do
+            n="${raw// /}"
+            [ -z "$n" ] && continue
+            if [ -z "${HOSTS[$n]:-}" ]; then
+              echo "::warning::unknown board '$n' ignored (valid: board13, board154, board4, board26, board39, all)"
+              continue
+            fi
+            ITEMS="${ITEMS}{\"name\":\"$n\",\"host\":\"${HOSTS[$n]}\",\"port\":22},"
+            COUNT=$((COUNT+1))
+          done
+          MATRIX="{\"include\":[${ITEMS%,}]}"
+          echo "Resolved targets (count=$COUNT): $MATRIX"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "count=$COUNT"   >> "$GITHUB_OUTPUT"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "::error::no valid boards in targets='${TARGETS_INPUT:-}'"; exit 1
+          fi
+
+  package:
+    name: Package hermes source
+    needs: prepare
+    runs-on: [self-hosted, board184]
+    timeout-minutes: 10
+    outputs:
+      sha_short: ${{ steps.meta.outputs.sha_short }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Meta + git archive (tracked files only — venv/.env/__pycache__ are gitignored)
+        id: meta
+        run: |
+          set -e
+          echo "sha_short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "HEAD: $(git log -1 --oneline)"
+          # git archive 只打 tracked 文件：自动排除 gitignored 的 venv/ .env
+          # __pycache__/ 等运行时产物；plugins/ skills/ 是 tracked，会带上。
+          git archive --format=tar.gz -o "/tmp/hermes-src-${{ github.run_id }}.tgz" HEAD
+          ls -lh "/tmp/hermes-src-${{ github.run_id }}.tgz"
+
+  deploy:
+    name: Deploy → ${{ matrix.name }}
+    needs: [prepare, package]
+    runs-on: [self-hosted, board184]
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      # 动态 matrix：只展开 prepare 选中的板 → 指定一台就只有一个 deploy job。
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Deploy to ${{ matrix.name }}
+        env:
+          SSHPASS: ${{ secrets.BOARD_SSH_PASSWORD }}
+          SRC: /tmp/hermes-src-${{ github.run_id }}.tgz
+          HOST: ${{ matrix.host }}
+          PORT: ${{ matrix.port }}
+          NAME: ${{ matrix.name }}
+          SHA: ${{ needs.package.outputs.sha_short }}
+        run: |
+          set -e
+
+          echo "=== scp board184 → $NAME ($HOST:$PORT) ==="
+          time sshpass -e scp -P "$PORT" \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "$SRC" "root@$HOST:/tmp/hermes-src.new.tgz"
+
+          echo "=== deploy on $NAME ==="
+          sshpass -e ssh -p "$PORT" \
+            -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+            "root@$HOST" bash -s <<'DEPLOY'
+          set -e
+
+          # 1. 从 wrapper 解析 hermes 源码路径（不硬编码；对称 local-server 从
+          #    systemd unit 解析）。/usr/local/bin/hermes → <app_root>/bin/hermes(wrapper)
+          HERMES_LINK=$(readlink -f /usr/local/bin/hermes 2>/dev/null || true)
+          if [ -z "$HERMES_LINK" ] || [ ! -e "$HERMES_LINK" ]; then
+            echo "::error::/usr/local/bin/hermes 解析不到（板子可能没走过 ZPK）"; exit 1
+          fi
+          APP_ROOT=$(dirname "$(dirname "$HERMES_LINK")")   # wrapper 在 <app_root>/bin/hermes
+          HERMES_SRC="$APP_ROOT/lib/hermes-agent"
+          WRAPPER="$APP_ROOT/bin/hermes"
+          # readlink -f 跟随 current 软链解析到真实版本目录（如 .../0.0.1/...），
+          # 故校验 apps/com.zettlab.claw/<ver>/lib/hermes-agent，不强求字面 current
+          # （这个版本目录就是 current 指向、实际跑的源码，覆盖它即 dev 覆盖当前 ZPK 版本）。
+          case "$HERMES_SRC" in
+            */apps/com.zettlab.claw/*/lib/hermes-agent) : ;;
+            *) echo "::error::HERMES_SRC=$HERMES_SRC 不是 OTA com.zettlab.claw 布局，板子可能没走 ZPK bootstrap"; exit 1 ;;
+          esac
+          [ -x "$WRAPPER" ] || { echo "::error::缺 zpk wrapper $WRAPPER"; exit 1; }
+          # 防御：wrapper 须设 bundled env，否则插件失效（旧 ZPK 漏设，见 PR #73）
+          grep -q HERMES_BUNDLED_PLUGINS "$WRAPPER" \
+            || echo "::warning::wrapper 未设 HERMES_BUNDLED_PLUGINS — 插件可能失效，板子 ZPK 太旧需更新"
+          echo "HERMES_SRC=$HERMES_SRC"
+          echo "WRAPPER=$WRAPPER"
+
+          ts=$(date +%Y%m%d-%H%M%S)
+
+          # 2. 保留 venv + .env；备份旧源码（去 venv 后）供回滚
+          [ -d "$HERMES_SRC/venv" ] && mv "$HERMES_SRC/venv" "/tmp/hermes-venv-keep.$$" || echo "no existing venv"
+          [ -f "$HERMES_SRC/.env" ] && cp "$HERMES_SRC/.env" "/tmp/hermes-env-keep.$$" || true
+          BACKUP="/tmp/hermes-src.bak-$ts.tgz"
+          tar czf "$BACKUP" -C "$HERMES_SRC" . 2>/dev/null || true
+          echo "BACKUP_SRC=$BACKUP"
+
+          # 3. 清空源码目录（venv 已移出），解新源码。
+          #    注：hermes_home/data 软链在 <app_root 父目录>/data（com.zettlab.claw/data），
+          #    不在 HERMES_SRC，故清空这里不碰 hermes_home。
+          find "$HERMES_SRC" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
+          tar xzf /tmp/hermes-src.new.tgz -C "$HERMES_SRC"
+
+          # 4. 放回 venv + .env
+          [ -d "/tmp/hermes-venv-keep.$$" ] && mv "/tmp/hermes-venv-keep.$$" "$HERMES_SRC/venv" || true
+          [ -f "/tmp/hermes-env-keep.$$" ] && cp "/tmp/hermes-env-keep.$$" "$HERMES_SRC/.env" || true
+
+          # 5. uv 把新源码装进 venv（editable → 改源码即生效；对齐 ZPK 的 .[all,langfuse]
+          #    install spec）。保留现有 venv 增量装；无 venv / 增量失败则用 init-hermes-env.sh 重建。
+          export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+          export UV_DEFAULT_INDEX="https://pypi.tuna.tsinghua.edu.cn/simple/"
+          export PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple/"
+          export UV_PYTHON_DOWNLOADS=never
+          cd "$HERMES_SRC"
+          UV_BIN=""
+          command -v uv >/dev/null 2>&1 && UV_BIN=uv
+          [ -z "$UV_BIN" ] && [ -x "$HOME/.local/bin/uv" ] && UV_BIN="$HOME/.local/bin/uv"
+          if [ -n "$UV_BIN" ] && [ -x venv/bin/python ]; then
+            echo "=== uv pip install -e .[all,langfuse] (editable, 保留 venv) ==="
+            # 解耦 uv 退出码与末尾 | tail：heredoc 内只有 set -e、无 pipefail，
+            # `if ! uv ... | tail` 判的是 tail 的退出码（恒 0），uv 失败被吞、
+            # fallback 永不触发、workflow 假绿（见 ZET-1188）。改取 PIPESTATUS[0]。
+            "$UV_BIN" pip install --python venv/bin/python -e ".[all,langfuse]" 2>&1 | tail -8
+            uv_rc=${PIPESTATUS[0]}
+            if [ "$uv_rc" -ne 0 ]; then
+              echo "增量装失败（uv rc=$uv_rc），fallback init-hermes-env.sh 重建 venv"
+              ./init-hermes-env.sh 2>&1 | tail -12
+            fi
+          else
+            echo "=== 无 uv 或无 venv，init-hermes-env.sh 重建 ==="
+            ./init-hermes-env.sh 2>&1 | tail -12
+          fi
+
+          # 5b. langfuse SDK 装后自检（opt-in extra：主 spec .[all,langfuse] 才带，
+          #     fallback 的 init-hermes-env.sh 走 .[all] 不含它 → 这里兜底确认/补装）。
+          #     缺 SDK 时 langfuse 插件惰性空转、设备静默不出 trace（ZET-1188）。
+          if ! venv/bin/python -c "import langfuse" >/dev/null 2>&1; then
+            echo "::warning::langfuse SDK 缺失（疑 fallback 重建漏装 opt-in extra），补装 langfuse==4.7.1"
+            venv/bin/python -m pip install "langfuse==4.7.1" 2>&1 | tail -8 || true
+          fi
+          if ! venv/bin/python -c "import langfuse" >/dev/null 2>&1; then
+            echo "::error::langfuse SDK 仍 import 失败 —— 设备将不出 trace，fail job"
+            exit 1
+          fi
+          echo "✓ langfuse SDK 自检通过"
+
+          # 6. 关键：不动 /usr/local/bin/hermes（保持指 wrapper），确认仍指 wrapper
+          NOW=$(readlink -f /usr/local/bin/hermes 2>/dev/null || true)
+          if [ "$NOW" != "$WRAPPER" ]; then
+            echo "::warning::/usr/local/bin/hermes 指向 $NOW（期望 wrapper $WRAPPER）— 修回 wrapper"
+            ln -sfn "$WRAPPER" /usr/local/bin/hermes
+          fi
+
+          # 7. 验证插件生效（走 wrapper，设 HERMES_BUNDLED_* env）
+          echo "=== hermes plugins list (验证 bundled 插件) ==="
+          /usr/local/bin/hermes plugins list 2>&1 | head -25 \
+            || echo "::warning::hermes plugins list 失败（命令可能不存在或启动报错，看上面输出）"
+
+          # 8. restart local-server（它 fork hermes lazy-spawn；无全局 hermes daemon）
+          systemctl restart zettlab-local-server
+
+          # 9. local-server health（最多 60s）
+          OK=0
+          for i in $(seq 1 30); do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 2 http://127.0.0.1:9090/health 2>/dev/null || echo "000")
+            if [ "$code" = "200" ]; then
+              echo "health: 200 (after ${i}×2s probe)"; OK=1; break
+            fi
+            sleep 2
+          done
+          if [ "$OK" != "1" ]; then
+            echo "::error::local-server health failed after 60s, last code=$code"
+            systemctl status zettlab-local-server --no-pager | tail -20
+            journalctl -u zettlab-local-server --since "1 minute ago" --no-pager | tail -30
+            exit 1
+          fi
+
+          echo "DEPLOYED_SRC=$HERMES_SRC"
+          echo "BACKUP_SRC=$BACKUP"
+          DEPLOY
+
+          echo "=== ${{ matrix.name }} @ ${{ needs.package.outputs.sha_short }} hermes 部署完成 ==="
+
+  cleanup:
+    needs: [package, deploy]
+    if: always()
+    runs-on: [self-hosted, board184]
+    steps:
+      - name: Clean package artifact
+        run: |
+          rm -f "/tmp/hermes-src-${{ github.run_id }}.tgz" || true

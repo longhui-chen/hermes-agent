@@ -29,6 +29,17 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 ---
 
+## ⚠️ 测试纪律（Test Discipline）— 镜像自 monorepo
+
+> 与 monorepo [`zettlab-product-dev/AGENTS.md`](https://github.com/zettlab/zettlab-product-dev/blob/main/AGENTS.md)「测试纪律」同源。权威源在 monorepo，先改那里再同步本文件。
+
+写代码就要写测试：每段新增 / 改动代码都要带**单元测试 + 流程测试**两类（流程 / 集成测试用例名或路径含 `integration|e2e|flow|smoke|scenario|journey`）。用 `pytest`（注意 async），LLM provider / connector 上游在边界 mock，单测不许真打外网。提交 / 合并前必须跑绿：
+
+- 本仓库单独跑：`python -m pytest`（CI 用 `python -m pytest -q`）
+- 在 monorepo 跑（失败自动派单）：`just qa --only hermes-agent`
+
+`just qa` 失败会按**责任人路由表**（monorepo `scripts/test-harness/owners.json`）自动在 Linear 开缺陷单并 assign。本子项目主要落在：云端大模型网关 / 模型接入 / provider / `/v1/chat/completions` → **zhouxudong**、Connector / Wiki / skill / MCP tool → **xulixing**。新增功能模块时同步更新路由表。
+
 ## Development Environment
 
 ```bash

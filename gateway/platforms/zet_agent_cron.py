@@ -79,6 +79,143 @@ def _target_to_deliver_value(target: dict) -> str:
     return value
 
 
+_CHANNEL_DELIVER_PREFIX = "channel:"
+_CHANNEL_SEND_PATH = "/api/v1/internal/agent/channels/send"
+_ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
+
+
+def _split_channel_targets(deliver):
+    """Split a cron ``deliver`` string into (channel_kinds, remaining, invalid).
+
+    ``deliver`` is comma-separated (e.g. "origin,channel:wechat"). channel:<kind>
+    targets are pulled out here — NOT via scheduler._resolve_delivery_targets,
+    because channel:<kind> is not a known platform and would be dropped.
+
+    Returns:
+      - channel_kinds: valid kinds (e.g. ["wechat"])
+      - remaining: non-channel tokens re-joined, handed back to the original path
+      - invalid: malformed channel tokens (e.g. "channel:" with no kind). The
+        caller turns these into a delivery error — they are NOT silently dropped,
+        so a misconfigured deliver reaches last_delivery_error.
+    """
+    if not deliver:
+        return [], "", []
+    kinds = []
+    remaining = []
+    invalid = []
+    for raw in str(deliver).split(","):
+        tok = raw.strip()
+        if not tok:
+            continue
+        if tok.startswith(_CHANNEL_DELIVER_PREFIX):
+            kind = tok[len(_CHANNEL_DELIVER_PREFIX):].strip()
+            if kind:
+                kinds.append(kind)
+            else:
+                invalid.append(tok)  # "channel:" with empty kind — surface it
+            continue
+        remaining.append(tok)
+    return kinds, ",".join(remaining), invalid
+
+
+def _resolve_channel_send_url():
+    """Derive local-server's channel-send endpoint from ZET_CHAT_APPEND_URL."""
+    raw = os.environ.get("ZET_CHAT_APPEND_URL", "").strip()
+    if not raw:
+        return None
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(raw)
+    if not parts.scheme or not parts.netloc:
+        return None
+    return urlunsplit((parts.scheme, parts.netloc, _CHANNEL_SEND_PATH, "", ""))
+
+
+def _post_channel_chunk(url: str, token: str, kind: str, text: str, job_id: str):
+    """POST one (already-chunked) text to local-server's channel send endpoint.
+    Returns None on success or an error string on failure."""
+    payload = json.dumps(
+        {"target_ref": _CHANNEL_DELIVER_PREFIX + kind, "text": text, "source": "cron", "job_id": job_id}
+    ).encode("utf-8")
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={_ACTION_TOKEN_HEADER: token, "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=8.0) as resp:
+            # Read the full body — local-server's error envelope is tiny, and a
+            # truncated read could split the JSON and hide the real "detail".
+            body = resp.read().decode("utf-8", errors="replace")
+        parsed = json.loads(body)
+    except Exception as e:
+        return f"channel:{kind} delivery failed: {e}"
+    if isinstance(parsed, dict) and parsed.get("code") == 200:
+        return None
+    detail = ""
+    if isinstance(parsed, dict) and isinstance(parsed.get("data"), dict):
+        detail = parsed["data"].get("detail", "")
+    return f"channel:{kind} delivery failed: {detail or body[:200]}"
+
+
+def _send_to_channel(kind: str, content: str, job_id: str):
+    """Deliver a cron result to a bound IM channel via local-server. Returns an
+    error string on failure, or None on success — the caller folds the error
+    into the cron job's last_delivery_error.
+
+    Long content is chunked under local-server's per-message rune cap (mirroring
+    how native send_message chunks before delivery) and sent piece by piece; each
+    chunk is a separate send (separate channel message + cron_send audit). Any
+    chunk failure is surfaced (never silently dropped).
+
+    Reuses Phase A's send endpoint + verified-owner gate; the recipient is the
+    channel's verified owner (resolved server-side). source="cron" tags the audit.
+    """
+    url = _resolve_channel_send_url()
+    if not url:
+        return "channel delivery: ZET_CHAT_APPEND_URL unset"
+    token = os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN", "").strip()
+    if not token:
+        return "channel delivery: action token unavailable"
+    from tools.channel_text import chunk_channel_text
+    chunks = chunk_channel_text(content)
+    errors = []
+    for idx, chunk in enumerate(chunks):
+        err = _post_channel_chunk(url, token, kind, chunk, job_id)
+        if err:
+            label = f" (part {idx + 1}/{len(chunks)})" if len(chunks) > 1 else ""
+            errors.append(f"{err}{label}")
+    return "; ".join(errors) if errors else None
+
+
+def _handle_channel_delivery(job: dict, content: str):
+    """Process channel: targets in a cron job's deliver string.
+
+    Returns (error_or_none, remaining_deliver_str, had_channel_targets).
+    - error: combined error string if any channel send failed OR any channel
+      token was malformed, else None
+    - remaining_deliver_str: deliver tokens minus channel: ones (for the
+      original deliver path to handle)
+    - had_channel_targets: whether any channel: token (valid OR invalid) present
+    """
+    kinds, remaining, invalid = _split_channel_targets(job.get("deliver"))
+    if not kinds and not invalid:
+        return None, remaining, False
+    job_id = str(job.get("id", ""))
+    errors = []
+    # malformed tokens (e.g. "channel:") become explicit errors — never silently
+    # dropped, so a misconfigured deliver lands in last_delivery_error.
+    for bad in invalid:
+        errors.append(f"invalid channel target {bad!r} (expected channel:<kind>)")
+    for kind in kinds:
+        err = _send_to_channel(kind, content, job_id)
+        if err:
+            errors.append(err)
+    combined = "; ".join(errors) if errors else None
+    return combined, remaining, True
+
+
 def _resolve_zet_agent_chat_id(job: dict) -> str:
     origin = job.get("origin") or {}
     if isinstance(origin, dict):
@@ -311,6 +448,28 @@ def install() -> None:
             _orig_deliver_result = _sched._deliver_result
 
             def _wrapped_deliver_result(job, content, adapters=None, loop=None):
+                channel_err = None
+                had_channel = False
+                try:
+                    channel_err, remaining_deliver, had_channel = _handle_channel_delivery(job, content)
+                    if had_channel:
+                        if not remaining_deliver:
+                            # only channel targets — no original delivery to run
+                            return channel_err
+                        # strip channel tokens, let the rest flow through below
+                        job = dict(job)
+                        job["deliver"] = remaining_deliver
+                except Exception as _e:
+                    # do NOT swallow — the whole point of this is no silent
+                    # delivery failures. Surface the pre-handle crash as an error.
+                    _dbg(f"_deliver_result channel pre-handle FAILED: {_e!r}")
+                    channel_err = f"channel delivery pre-handle failed: {_e}"
+
+                # Existing zet_agent delivery logic — preserved, EXCEPT the
+                # zet-only "bypass" branch becomes a flag instead of `return None`,
+                # so a channel send error can never be discarded by an early return.
+                orig_err = None
+                bypassed = False
                 try:
                     targets = _sched._resolve_delivery_targets(job)
                     zet_targets = [
@@ -325,15 +484,24 @@ def install() -> None:
                             _dbg(
                                 f"_deliver_result: bypass zet_agent delivery job={job.get('id')}"
                             )
-                            return None
-                        job = dict(job)
-                        job["origin"] = None
-                        job["deliver"] = ",".join(
-                            _target_to_deliver_value(t) for t in other_targets
-                        )
+                            bypassed = True  # was: return None — now a flag so channel_err survives
+                        else:
+                            job = dict(job)
+                            job["origin"] = None
+                            job["deliver"] = ",".join(
+                                _target_to_deliver_value(t) for t in other_targets
+                            )
                 except Exception as _e:
                     _dbg(f"_deliver_result patch pre-check FAILED: {_e!r}")
-                return _orig_deliver_result(job, content, adapters=adapters, loop=loop)
+
+                if not bypassed:
+                    orig_err = _orig_deliver_result(job, content, adapters=adapters, loop=loop)
+
+                # combine channel + original delivery errors — neither is ever
+                # silently dropped, including when the zet_agent path bypassed.
+                if channel_err and orig_err:
+                    return f"{channel_err}; {orig_err}"
+                return channel_err or orig_err
 
             setattr(_wrapped_deliver_result, _PATCH_SENTINEL, True)
             _sched._deliver_result = _wrapped_deliver_result

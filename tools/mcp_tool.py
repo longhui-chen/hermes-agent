@@ -3457,6 +3457,75 @@ def discover_mcp_tools() -> List[str]:
     return tool_names
 
 
+def reload_single_mcp_server(server_name: str) -> List[str]:
+    """Disconnect+reconnect exactly ONE MCP server, leaving all others alone.
+
+    Used by the gateway's ``POST /v1/connectors/reload`` control endpoint so
+    a connector-policy change (e.g. the ``zettlab_connectors`` channel gaining
+    a newly-allowed ``linear.*`` tool) can be picked up without bouncing every
+    other MCP server the agent has connected — which ``shutdown_mcp_servers()``
+    would do (it also stops the whole background MCP loop).
+
+    Steps:
+      1. If the named server is currently connected, run its ``shutdown()`` on
+         the background MCP loop. ``MCPServerTask.shutdown()`` deregisters its
+         own tools from the registry, so we don't touch the registry directly.
+         Then drop it from ``_servers`` so discovery treats it as missing.
+      2. Call ``discover_mcp_tools()``, which reads ``config.yaml`` fresh and
+         reconnects only servers *not* already in ``_servers`` — i.e. just the
+         one we removed (or, if it was never connected, connects it for the
+         first time). Already-connected servers are left untouched (idempotent).
+
+    Args:
+        server_name: The MCP server key as it appears in ``config.yaml``
+            ``mcp_servers`` (e.g. ``"zettlab_connectors"``).
+
+    Returns:
+        List of ALL currently registered MCP tool names across every connected
+        server (same shape as ``discover_mcp_tools()``), so the caller can
+        report a tools total.
+    """
+    if not _MCP_AVAILABLE:
+        logger.debug("MCP SDK not available -- skipping single-server reload")
+        return []
+
+    # Step 1: tear down just this one server, if it is connected. We snapshot
+    # under the lock, shut down outside it (the shutdown runs on the MCP loop),
+    # then remove the entry under the lock again.
+    with _lock:
+        server = _servers.get(server_name)
+
+    if server is not None:
+        loop = None
+        with _lock:
+            loop = _mcp_loop
+        if loop is not None and loop.is_running():
+            try:
+                # Run the server's own shutdown on the MCP loop so the anyio
+                # cancel-scope teardown happens in the Task that opened it.
+                _run_on_mcp_loop(server.shutdown, timeout=20)
+            except Exception as exc:
+                logger.warning(
+                    "MCP single-reload: shutdown of '%s' failed: %s",
+                    server_name, exc,
+                )
+        else:
+            logger.debug(
+                "MCP single-reload: loop not running while tearing down '%s'; "
+                "proceeding to rediscover",
+                server_name,
+            )
+        # Drop the (now shut-down) entry so discover_mcp_tools() sees it as
+        # missing and reconnects it. Deregistration of its tools already
+        # happened inside MCPServerTask.shutdown().
+        with _lock:
+            _servers.pop(server_name, None)
+
+    # Step 2: reconnect. discover_mcp_tools() is idempotent for the servers
+    # still connected and will (re)connect only the missing ones.
+    return discover_mcp_tools()
+
+
 def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
     """Check if an MCP tool belongs to a server that supports parallel tool calls.
 

@@ -123,7 +123,7 @@ from tools.browser_tool import cleanup_browser
 from agent.memory_manager import StreamingContextScrubber, build_memory_context_block, sanitize_context
 from agent.think_scrubber import StreamingThinkScrubber
 from agent.retry_utils import jittered_backoff
-from agent.error_classifier import classify_api_error, FailoverReason
+from agent.error_classifier import classify_api_error, normalized_provider_error_code, FailoverReason
 from agent.redact import redact_sensitive_text
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
@@ -1807,6 +1807,33 @@ class AIAgent:
         """Forwarder — see ``agent.agent_runtime_helpers.extract_api_error_context``."""
         from agent.agent_runtime_helpers import extract_api_error_context
         return extract_api_error_context(error)
+
+    def _provider_error_payload(self, classified, error: Exception) -> Dict[str, Any]:
+        """Build the safe, structured provider-error payload for chat surfaces."""
+        payload: Dict[str, Any] = {
+            "code": normalized_provider_error_code(classified),
+            "reason": classified.reason.value,
+        }
+        if classified.provider:
+            payload["provider"] = classified.provider
+        elif getattr(self, "provider", None):
+            payload["provider"] = getattr(self, "provider")
+        if classified.model:
+            payload["model"] = classified.model
+        elif getattr(self, "model", None):
+            payload["model"] = getattr(self, "model")
+        if classified.status_code is not None:
+            payload["status_code"] = classified.status_code
+        if classified.provider_error_code:
+            payload["provider_error_code"] = classified.provider_error_code
+        message = classified.message or self._summarize_api_error(error)
+        if message:
+            payload["provider_message"] = message[:500]
+        payload["retryable"] = bool(classified.retryable)
+        payload["recoverable"] = bool(
+            classified.retryable or classified.should_compress or classified.should_fallback
+        )
+        return payload
 
     def _usage_summary_for_api_request_hook(self, response: Any) -> Optional[Dict[str, Any]]:
         """Token buckets for ``post_api_request`` plugins (no raw ``response`` object)."""

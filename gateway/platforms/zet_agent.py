@@ -151,6 +151,13 @@ def _approval_timeout_seconds() -> float:
 # without truncation. Beyond that, the APP can elide.
 TITLE_MAX_LEN = 60
 
+# Name of the single MCP server that carries Zettlab connector tools
+# (linear.*, etc). local-server injects this server into each agent's
+# profile config.yaml at spawn (see spawn.go). POST /v1/connectors/reload
+# reconnects ONLY this server so a connector-policy change is picked up
+# without bouncing any other MCP server the agent may have connected.
+ZETTLAB_CONNECTORS_SERVER_NAME = "zettlab_connectors"
+
 
 # Zettlab APP 平台的工作风格补丁。
 #
@@ -178,6 +185,11 @@ ZETTLAB_WORKFLOW_ADDENDUM = """\
 
 用户已经明确指定全部关键参数（频率、时间、目标、内容）时直接执行，无需再 clarify。
 信息查询、闲聊、回答问题不要 clarify。
+
+## 用户画像语言
+
+写入长期用户画像（memory 工具 target="user"，即 USER.md）时，必须使用简体中文。
+姓名、产品名、命令、代码标识符可以保留原文，但描述用户特征、偏好、沟通风格的正文必须写成中文。
 """
 
 
@@ -1362,6 +1374,406 @@ class ZetAgentAdapter(APIServerAdapter):
             "model": new_model,
         })
 
+    async def _handle_session_model_clear(self, request: "web.Request") -> "web.Response":
+        """DELETE /v1/sessions/{session_id}/model — clear a session model override.
+
+        The inverse of POST /v1/sessions/{session_id}/model/switch: drop the
+        in-memory override for this single session so the next turn falls back
+        to the agent default (config.yaml ``model.default``) — the exact same
+        fallback a fresh session uses (see ``_resolve_turn_agent_config``,
+        which re-resolves the config model every turn and only overlays an
+        override when one is present).
+
+        Conversation history is preserved — unlike ``/new`` and ``/reset``,
+        which also wipe the session. We only pop the override + evict the
+        cached agent so the next turn rebuilds on the default model.
+
+        Local-server owns persistence: it deletes the entry from
+        ``session_model_overrides.json`` and calls this to drop the live
+        override. A session with no override is a successful no-op
+        (idempotent — DELETE semantics).
+
+        Auth: ZET_AGENT_KEY Bearer (same as the switch endpoint).
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        session_id = request.match_info.get("session_id", "")
+        if not session_id:
+            return web.json_response(
+                _openai_error("session_id is required"), status=400,
+            )
+
+        cleared = False
+        gw = getattr(self, "gateway_runner", None)
+        if gw is not None:
+            overrides = getattr(gw, "_session_model_overrides", None)
+            if overrides is not None and session_id in overrides:
+                overrides.pop(session_id, None)
+                cleared = True
+            # Only evict when we actually removed an override: an un-overridden
+            # session's cached agent is already built on the default model, so
+            # dropping it would force a needless rebuild.
+            if cleared:
+                evict = getattr(gw, "_evict_cached_agent", None)
+                if callable(evict):
+                    try:
+                        evict(session_id)
+                    except Exception as exc:
+                        logger.warning(
+                            "session-model-clear: evict_cached_agent failed for %s: %s",
+                            session_id, exc,
+                        )
+
+        logger.info(
+            "session-model-clear: session=%s cleared=%s", session_id, cleared,
+        )
+        return web.json_response({
+            "ok": True,
+            "session_id": session_id,
+            "cleared": cleared,
+        })
+
+    # ------------------------------------------------------------------
+    # ZET-900 — skill / connector reload control endpoints
+    # ------------------------------------------------------------------
+
+    async def _handle_skills_reload(self, request: "web.Request") -> "web.Response":
+        """POST /v1/skills/reload — drop the skills prompt cache + rescan,
+        and force every session (including ones currently chatting) to
+        rebuild its system prompt on the next turn.
+
+        Called by zettlab-local-server right after a skillhub install/uninstall
+        lands a bundle in ``<profile>/skills/__skillhub__/...`` (see ZET-900
+        plan §4.1b). The install path is pure Go and never touches this
+        process, so without this nudge the in-process skills index stays stale
+        until the next cold start.
+
+        Behaviour:
+          - ``clear_skills_system_prompt_cache(clear_snapshot=True)`` drops the
+            in-process LRU and the on-disk snapshot, so a freshly-built system
+            prompt re-scans the on-disk skill set.
+          - ``scan_skill_commands()`` refreshes the slash-command table and
+            gives us the current skill count for the response.
+          - ``SessionDB.clear_all_system_prompts()`` nulls every session's
+            stored system_prompt so the continuing-session rebuild is forced
+            (without this, the next turn would just reload the stale prompt
+            from SQLite — see ZET-1139).
+          - ``GatewayRunner.invalidate_all_cached_agents()`` drops the
+            in-process ``_cached_system_prompt`` on every cached AIAgent so
+            the next turn rebuilds it fresh.
+
+        The four steps together guarantee skill changes land on the very next
+        turn for every session. The first two are skill-specific; the last
+        two are the same hot-reload pair ``/v1/profile/reload`` uses for
+        SOUL/IDENTITY/profile-text changes (skills also live in the system
+        prompt, so the same invalidation applies).
+
+        Auth: ZET_AGENT_KEY Bearer (same as chat).
+
+        Response: ``{"cleared": true, "skills_total": <int>,
+                     "invalidated_sessions": <int>, "db_rows_cleared": <int>}``.
+        The first two fields are stable for older local-server callers; the
+        last two are new in ZET-1139 and may be ignored by old callers.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            from agent.prompt_builder import clear_skills_system_prompt_cache
+            from agent.skill_commands import scan_skill_commands
+        except Exception as exc:
+            logger.exception("[zet_agent] skills-reload: import failed")
+            return web.json_response(
+                _openai_error(
+                    f"skills reload modules unavailable: {exc}",
+                    err_type="server_error",
+                ),
+                status=500,
+            )
+
+        try:
+            clear_skills_system_prompt_cache(clear_snapshot=True)
+            skill_commands = scan_skill_commands()
+            skills_total = len(skill_commands)
+        except Exception as exc:
+            logger.exception("[zet_agent] skills-reload failed")
+            return web.json_response(
+                _openai_error(
+                    f"skills reload failed: {exc}", err_type="server_error",
+                ),
+                status=500,
+            )
+
+        # ZET-1139 — also push the invalidation through to existing sessions.
+        # Skills appear inside the system prompt, so the same SessionDB-clear
+        # + cached-agent-invalidate pair used by /v1/profile/reload applies,
+        # with the same asymmetric failure semantics:
+        #
+        #   - DB clear is CRITICAL: without it continuing sessions keep
+        #     replaying the stored prompt (without the new skill) from
+        #     SQLite. Returning 200 here while DB clear silently failed
+        #     would re-introduce the ZET-1139 regression for skill changes.
+        #     So a DB clear failure (or a missing SessionDB / gateway_runner)
+        #     returns 500.
+        #   - in-process invalidate is fail-soft: with DB already cleared,
+        #     the next turn rebuilds from the cleared DB regardless of
+        #     whether we managed to drop the in-process cache too.
+        gw = getattr(self, "gateway_runner", None)
+        if gw is None:
+            logger.error("[zet_agent] skills-reload: no gateway_runner")
+            return web.json_response(
+                _openai_error(
+                    "skills reload incomplete: no gateway runner",
+                    err_type="server_error",
+                ),
+                status=500,
+            )
+        session_db = getattr(gw, "_session_db", None)
+        if session_db is None:
+            logger.error("[zet_agent] skills-reload: no SessionDB on runner")
+            return web.json_response(
+                _openai_error(
+                    "skills reload incomplete: no session db on runner",
+                    err_type="server_error",
+                ),
+                status=500,
+            )
+        try:
+            db_rows_cleared = session_db.clear_all_system_prompts()
+        except Exception as exc:
+            logger.exception(
+                "[zet_agent] skills-reload: DB clear failed; "
+                "returning 500 so caller can fall back",
+            )
+            return web.json_response(
+                _openai_error(
+                    f"skills reload db clear failed: {exc}",
+                    err_type="server_error",
+                ),
+                status=500,
+            )
+
+        invalidated = 0
+        try:
+            invalidated = gw.invalidate_all_cached_agents()
+        except Exception:
+            logger.warning(
+                "[zet_agent] skills-reload: invalidate-all failed "
+                "(DB cleared, sessions still rebuild next turn)",
+                exc_info=True,
+            )
+
+        logger.info(
+            "[zet_agent] skills-reload: cleared prompt cache + rescanned "
+            "(%d skill(s)); %d session(s) invalidated, %d DB row(s) cleared",
+            skills_total, invalidated, db_rows_cleared,
+        )
+        return web.json_response({
+            "cleared": True,
+            "skills_total": skills_total,
+            "invalidated_sessions": invalidated,
+            "db_rows_cleared": db_rows_cleared,
+        })
+
+    async def _handle_connectors_reload(self, request: "web.Request") -> "web.Response":
+        """POST /v1/connectors/reload — reconnect ONLY the zettlab_connectors
+        MCP server and re-pull its tool table.
+
+        Called by zettlab-local-server after installing/uninstalling a
+        connector-skill (ZET-900 plan §4.2). The connector MCP server's
+        ``tools/list`` is policy-gated and dynamic: a tool only appears if the
+        agent's connector policy allows it. The tool table is frozen when the
+        gateway first connects, so a policy change made after start-up is
+        invisible until we explicitly reconnect this server.
+
+        We reconnect ONLY ``zettlab_connectors`` — never a full
+        ``shutdown_mcp_servers()`` — to avoid disturbing any other MCP server
+        the agent has connected (a full shutdown also stops the whole MCP
+        background loop). The single-server reconnect lives in
+        ``tools/mcp_tool.reload_single_mcp_server`` (tear down just that server
+        via its own ``shutdown()`` which self-deregisters its tools, then
+        ``discover_mcp_tools()`` to reconnect the now-missing one).
+
+        Runs the (blocking) reconnect in an executor so the aiohttp event loop
+        is not stalled while the MCP handshake happens on its background loop.
+
+        This only serves *new* sessions — it does not invalidate the current
+        session's cached agent. That matches the skills-reload boundary.
+
+        Auth: ZET_AGENT_KEY Bearer (same as chat).
+
+        Response: ``{"reloaded": true, "tools_total": <int>}`` where
+        ``tools_total`` is the count of ALL registered MCP tools (across every
+        connected server) after the reconnect.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            from tools.mcp_tool import reload_single_mcp_server
+        except Exception as exc:
+            logger.exception("[zet_agent] connectors-reload: import failed")
+            return web.json_response(
+                _openai_error(
+                    f"mcp reload module unavailable: {exc}",
+                    err_type="server_error",
+                ),
+                status=500,
+            )
+
+        import asyncio
+        loop = asyncio.get_running_loop()
+        try:
+            tools = await loop.run_in_executor(
+                None,
+                reload_single_mcp_server,
+                ZETTLAB_CONNECTORS_SERVER_NAME,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[zet_agent] connectors-reload failed for server '%s': %s",
+                ZETTLAB_CONNECTORS_SERVER_NAME, exc,
+            )
+            return web.json_response(
+                _openai_error(
+                    f"connector reload failed: {exc}", err_type="server_error",
+                ),
+                status=500,
+            )
+
+        tools_total = len(tools or [])
+        logger.info(
+            "[zet_agent] connectors-reload: reconnected '%s'; %d MCP tool(s) total",
+            ZETTLAB_CONNECTORS_SERVER_NAME, tools_total,
+        )
+        return web.json_response({
+            "reloaded": True,
+            "tools_total": tools_total,
+        })
+
+    async def _handle_profile_reload(self, request: "web.Request") -> "web.Response":
+        """POST /v1/profile/reload — make a profile-text change (SOUL.md,
+        IDENTITY.md, agent name/description, in-prompt context files) take
+        effect on the next turn of every session, including ones currently
+        chatting.
+
+        Called by zettlab-local-server after a config write that mutates a
+        prompt-class file on disk. Without this endpoint, the change would
+        be invisible to existing sessions until the user manually starts a
+        new conversation (the continuing-session rebuild path re-uses the
+        stored system_prompt to preserve the Anthropic prefix-cache prefix
+        across turns).
+
+        Two-step hot reload (semantics deliberately asymmetric):
+          1. ``SessionDB.clear_all_system_prompts()`` nulls every session's
+             stored prompt so the continuing-session rebuild is forced.
+             **Critical** — without this the change is invisible to old
+             sessions; failure here returns 500 so the local-server caller
+             falls through to ``registry.Stop`` (lazy-respawn picks up the
+             new file). The whole ZET-1139 hot-reload value depends on this
+             succeeding, so swallowing the error and returning 200 would
+             silently regress the very bug we're fixing.
+          2. ``GatewayRunner.invalidate_all_cached_agents()`` clears the
+             in-process ``_cached_system_prompt`` on every cached AIAgent
+             so the next turn rebuilds from disk (re-runs SOUL.md /
+             IDENTITY.md / context-files / memory loaders). **fail-soft**
+             — step 1 already covers correctness (in-process cache is
+             rebuilt from the now-cleared DB), so a failure here is logged
+             and reported in the response count without poisoning the
+             status code.
+
+        Distinct from ``/v1/skills/reload`` (also extends to existing
+        sessions now, but additionally clears the skills LRU + on-disk
+        snapshot) and ``/v1/connectors/reload`` (MCP server reconnect, not
+        a prompt change). Use this endpoint when only the prompt text on
+        disk changed.
+
+        Auth: ZET_AGENT_KEY Bearer (same as chat).
+
+        Response (200): ``{"reloaded": true, "invalidated_sessions": <int>,
+                           "db_rows_cleared": <int>}``.
+        Response (500): when the critical DB-clear step fails (no
+        SessionDB, write exception). Body is the standard OpenAI error
+        envelope so callers can surface the reason. local-server then
+        falls back to ``registry.Stop`` (see
+        ``internal/agent/lifecycle/lifecycle.go``).
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        gw = getattr(self, "gateway_runner", None)
+        if gw is None:
+            logger.error("[zet_agent] profile-reload: no gateway_runner")
+            return web.json_response(
+                _openai_error(
+                    "profile reload unavailable: no gateway runner",
+                    err_type="server_error",
+                ),
+                status=500,
+            )
+
+        # Step 1 (CRITICAL): clear DB-stored prompts. Without this the
+        # continuing-session rebuild path keeps replaying the old prompt
+        # from SQLite — exactly the ZET-1139 regression we're fixing.
+        # Any failure here means we cannot keep our hot-reload contract,
+        # so return 500 to let the local-server caller fall back to
+        # ``registry.Stop`` (lazy respawn reads the new file fresh).
+        session_db = getattr(gw, "_session_db", None)
+        if session_db is None:
+            logger.error("[zet_agent] profile-reload: no SessionDB on runner")
+            return web.json_response(
+                _openai_error(
+                    "profile reload unavailable: no session db on runner",
+                    err_type="server_error",
+                ),
+                status=500,
+            )
+        try:
+            db_rows_cleared = session_db.clear_all_system_prompts()
+        except Exception as exc:
+            logger.exception(
+                "[zet_agent] profile-reload: DB clear failed; "
+                "returning 500 so local-server falls back to Stop",
+            )
+            return web.json_response(
+                _openai_error(
+                    f"profile reload db clear failed: {exc}",
+                    err_type="server_error",
+                ),
+                status=500,
+            )
+
+        # Step 2 (FAIL-SOFT): drop in-process cached prompts so existing
+        # sessions rebuild on the next turn. Without this the next turn
+        # would still rebuild from the cleared DB anyway — just one turn
+        # later than ideal — so a failure here is not worth tearing down
+        # the gateway over.
+        invalidated = 0
+        try:
+            invalidated = gw.invalidate_all_cached_agents()
+        except Exception:
+            logger.warning(
+                "[zet_agent] profile-reload: invalidate-all failed "
+                "(DB cleared, sessions still rebuild next turn)",
+                exc_info=True,
+            )
+
+        logger.info(
+            "[zet_agent] profile-reload: %d session(s) invalidated, "
+            "%d DB row(s) cleared",
+            invalidated, db_rows_cleared,
+        )
+        return web.json_response({
+            "reloaded": True,
+            "invalidated_sessions": invalidated,
+            "db_rows_cleared": db_rows_cleared,
+        })
+
     # ------------------------------------------------------------------
     # connect — extend base routes with our respond endpoints
     # ------------------------------------------------------------------
@@ -1474,6 +1886,32 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_post(
                 "/v1/sessions/{session_id}/model/switch",
                 self._handle_session_model_switch,
+            )
+            self._app.router.add_delete(
+                "/v1/sessions/{session_id}/model",
+                self._handle_session_model_clear,
+            )
+
+            # ZET-900 — skill / connector reload control endpoints.
+            # Triggered by zettlab-local-server after a skillhub install /
+            # uninstall lands so the running gateway picks up new skills
+            # (prompt cache) and connector tools (zettlab_connectors MCP)
+            # without a cold restart. Auth: ZET_AGENT_KEY Bearer.
+            self._app.router.add_post(
+                "/v1/skills/reload",
+                self._handle_skills_reload,
+            )
+            self._app.router.add_post(
+                "/v1/connectors/reload",
+                self._handle_connectors_reload,
+            )
+            # ZET-1139 — hot reload for profile-text changes (SOUL.md,
+            # IDENTITY.md, agent name/description, in-prompt context
+            # files). Triggered by zettlab-local-server after a config
+            # write that mutates a prompt-class file on disk.
+            self._app.router.add_post(
+                "/v1/profile/reload",
+                self._handle_profile_reload,
             )
 
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())

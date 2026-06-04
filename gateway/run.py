@@ -15466,6 +15466,54 @@ class GatewayRunner:
             with _lock:
                 self._agent_cache.pop(session_key, None)
 
+    def invalidate_all_cached_agents(self) -> int:
+        """Force every cached agent to rebuild its system prompt on the next turn.
+
+        Unlike _evict_cached_agent which drops the AIAgent instance entirely,
+        this keeps the instance (and therefore its OpenAI/httpx clients, MCP
+        handles, and tool state) and only clears the cached system prompt via
+        the upstream _invalidate_system_prompt() — the same hook /new, /clear,
+        and /branch use when they need to pick up fresh SOUL.md / IDENTITY.md
+        / memories from disk.
+
+        Used by the prompt-class reload endpoints (/v1/profile/reload,
+        /v1/skills/reload) to make on-disk profile changes take effect on the
+        current session without restarting the gateway. Returns the number of
+        agents successfully invalidated; individual failures are swallowed so
+        one broken agent doesn't block the rest.
+
+        Snapshot under the lock, then invalidate without it — the upstream
+        _invalidate_system_prompt may touch disk (memory_store.load_from_disk)
+        and we don't want that under the cache lock.
+
+        Cache values are ``(agent, signature)`` tuples (see the cache insert
+        in _run_agent around L15382); the agent itself is the first element.
+        We accept either shape — bare agent or tuple — so a future cache-value
+        refactor doesn't silently turn this into a zero-count no-op the way
+        a naive ``getattr(value, "_invalidate_system_prompt", ...)`` would.
+        """
+        _lock = getattr(self, "_agent_cache_lock", None)
+        if _lock is None:
+            return 0
+        with _lock:
+            entries = list(self._agent_cache.values())
+        count = 0
+        for entry in entries:
+            agent = entry[0] if isinstance(entry, tuple) and entry else entry
+            invalidate = getattr(agent, "_invalidate_system_prompt", None)
+            if not callable(invalidate):
+                continue
+            try:
+                invalidate()
+                count += 1
+            except Exception:
+                logger.warning(
+                    "invalidate_all_cached_agents: agent %r failed",
+                    type(agent).__name__,
+                    exc_info=True,
+                )
+        return count
+
     @staticmethod
     def _init_cached_agent_for_turn(agent: Any, interrupt_depth: int) -> None:
         """Reset per-turn state on a cached agent before a new turn starts.
