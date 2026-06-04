@@ -401,6 +401,7 @@ class TestOSTimezoneLiveRead:
     def teardown_method(self):
         hermes_time.reset_cache()
         os.environ.pop("HERMES_TIMEZONE", None)
+        os.environ.pop("ZET_AGENT_ENABLED", None)
 
     def test_reads_etc_timezone_when_no_env(self, tmp_path, monkeypatch):
         os.environ.pop("HERMES_TIMEZONE", None)
@@ -413,6 +414,32 @@ class TestOSTimezoneLiveRead:
         hermes_time.reset_cache()
         assert hermes_time.get_timezone_name() == "Asia/Tokyo"
         assert hermes_time.now().utcoffset() == timedelta(hours=9)
+
+    def test_generic_config_timezone_wins_over_os_timezone(self, tmp_path, monkeypatch):
+        os.environ.pop("HERMES_TIMEZONE", None)
+        os.environ.pop("ZET_AGENT_ENABLED", None)
+        tzfile = tmp_path / "timezone"
+        tzfile.write_text("Asia/Tokyo\n")
+        config = tmp_path / "config.yaml"
+        config.write_text("timezone: Europe/London\n")
+        monkeypatch.setattr(hermes_time, "ETC_TIMEZONE", str(tzfile))
+        monkeypatch.setattr(hermes_time, "ETC_LOCALTIME", str(tmp_path / "nonexistent"))
+        monkeypatch.setattr(hermes_time, "get_config_path", lambda: config)
+        hermes_time.reset_cache()
+        assert hermes_time.get_timezone_name() == "Europe/London"
+
+    def test_zettlab_device_os_timezone_wins_over_stale_config(self, tmp_path, monkeypatch):
+        os.environ.pop("HERMES_TIMEZONE", None)
+        os.environ["ZET_AGENT_ENABLED"] = "true"
+        tzfile = tmp_path / "timezone"
+        tzfile.write_text("Asia/Tokyo\n")
+        config = tmp_path / "config.yaml"
+        config.write_text("timezone: Europe/London\n")
+        monkeypatch.setattr(hermes_time, "ETC_TIMEZONE", str(tzfile))
+        monkeypatch.setattr(hermes_time, "ETC_LOCALTIME", str(tmp_path / "nonexistent"))
+        monkeypatch.setattr(hermes_time, "get_config_path", lambda: config)
+        hermes_time.reset_cache()
+        assert hermes_time.get_timezone_name() == "Asia/Tokyo"
 
     def test_picks_up_change_after_file_rewrite(self, tmp_path, monkeypatch):
         os.environ.pop("HERMES_TIMEZONE", None)

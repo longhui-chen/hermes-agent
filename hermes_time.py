@@ -54,14 +54,11 @@ def reset_cache() -> None:
     _cached_fp = None
 
 
-def _resolve_timezone_name() -> str:
-    """Read the configured IANA timezone string (or empty string)."""
-    # 1. Environment variable (highest priority — set by Supervisor, etc.)
-    tz_env = os.getenv("HERMES_TIMEZONE", "").strip()
-    if tz_env:
-        return tz_env
+def _is_zettlab_device_mode() -> bool:
+    return os.getenv("ZET_AGENT_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
 
-    # 2. config.yaml ``timezone`` key
+
+def _read_config_timezone() -> str:
     try:
         import yaml
         config_path = get_config_path()
@@ -73,13 +70,40 @@ def _resolve_timezone_name() -> str:
                 return tz_cfg.strip()
     except Exception:
         pass
+    return ""
 
-    # 3. OS system timezone — so APP → timedatectl → /etc/timezone propagates
-    #    without HERMES_TIMEZONE being pinned into the process env.
+
+def _read_os_timezone() -> str:
     for reader in (_read_etc_timezone, _read_localtime_symlink, _read_timedatectl):
         tz_os = reader()
         if tz_os:
             return tz_os
+    return ""
+
+
+def _resolve_timezone_name() -> str:
+    """Read the configured IANA timezone string (or empty string)."""
+    # 1. Environment variable (highest priority — explicit operator override).
+    tz_env = os.getenv("HERMES_TIMEZONE", "").strip()
+    if tz_env:
+        return tz_env
+
+    # 2. Zettlab device mode: APP changes the OS timezone via timedatectl, so
+    #    OS timezone must win over any stale non-committed config.yaml value.
+    if _is_zettlab_device_mode():
+        tz_os = _read_os_timezone()
+        if tz_os:
+            return tz_os
+
+    # 3. config.yaml ``timezone`` key (generic Hermes behavior).
+    tz_cfg = _read_config_timezone()
+    if tz_cfg:
+        return tz_cfg
+
+    # 4. OS system timezone fallback.
+    tz_os = _read_os_timezone()
+    if tz_os:
+        return tz_os
 
     return ""
 
@@ -167,6 +191,7 @@ def _source_fingerprint():
 
     return (
         os.getenv("HERMES_TIMEZONE", "").strip(),
+        os.getenv("ZET_AGENT_ENABLED", "").strip().lower(),
         stat_fp(str(get_config_path()), True),
         etc_timezone_fp,
         localtime_fp,
