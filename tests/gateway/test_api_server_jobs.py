@@ -11,6 +11,7 @@ Covers:
 """
 
 import json
+import logging
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -151,6 +152,9 @@ class TestCreateJob:
                     "name": "test-job",
                     "schedule": "*/5 * * * *",
                     "prompt": "do something",
+                }, headers={
+                    "X-Forwarded-For": "203.0.113.11",
+                    "User-Agent": "cron-client",
                 })
                 assert resp.status == 200
                 data = await resp.json()
@@ -160,6 +164,10 @@ class TestCreateJob:
                 assert call_kwargs["name"] == "test-job"
                 assert call_kwargs["schedule"] == "*/5 * * * *"
                 assert call_kwargs["prompt"] == "do something"
+                assert call_kwargs["origin"]["platform"] == "api_server"
+                assert call_kwargs["origin"]["chat_id"] == "api"
+                assert call_kwargs["origin"]["forwarded_for"] == "203.0.113.11"
+                assert call_kwargs["origin"]["user_agent"] == "cron-client"
 
     @pytest.mark.asyncio
     async def test_create_job_missing_name(self, adapter):
@@ -363,9 +371,11 @@ class TestCreateJob:
                 assert "chat_id" in data["error"].lower() or "long" in data["error"].lower()
 
     @pytest.mark.asyncio
-    async def test_create_job_no_origin_omitted_from_kwargs(self, adapter):
-        """When origin isn't supplied, don't pass kwarg at all — preserves
-        backward-compat with callers (curl, tests) that never knew about it."""
+    async def test_create_job_records_request_origin_when_not_supplied(self, adapter):
+        """When the caller doesn't supply origin, the API server still stamps
+        request provenance (platform/source metadata) on the cron job so
+        HTTP-created jobs are auditable. An explicit body ``origin`` overrides it
+        (see test_create_job_with_origin_passthrough)."""
         app = _create_app(adapter)
         mock_create = MagicMock(return_value=SAMPLE_JOB)
         async with TestClient(TestServer(app)) as cli:
@@ -380,7 +390,7 @@ class TestCreateJob:
                 })
                 assert resp.status == 200
                 call_kwargs = mock_create.call_args[1]
-                assert "origin" not in call_kwargs
+                assert call_kwargs["origin"]["platform"] == "api_server"
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +439,29 @@ class TestGetJob:
                 assert resp.status == 400
                 data = await resp.json()
                 assert "Invalid" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_invalid_job_id_logs_source_context(self, adapter, caplog):
+        """Invalid job-id probes log source metadata for later investigation."""
+        app = _create_app(adapter)
+        caplog.set_level(logging.WARNING, logger="gateway.platforms.api_server")
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.get(
+                    "/api/jobs/..%2F..%2F..%2Fetc%2Fpasswd",
+                    headers={
+                        "X-Forwarded-For": "203.0.113.9",
+                        "User-Agent": "probe scanner",
+                    },
+                )
+                assert resp.status == 400
+
+        message = caplog.text
+        assert "Cron jobs API rejected invalid job_id" in message
+        assert "203.0.113.9" in message
+        assert "GET" in message
+        assert "/api/jobs/" in message
+        assert "probe scanner" in message
 
 
 # ---------------------------------------------------------------------------

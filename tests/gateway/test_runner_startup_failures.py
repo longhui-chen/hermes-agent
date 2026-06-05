@@ -202,6 +202,7 @@ async def test_start_gateway_schedules_mcp_discovery_after_runner_start(monkeypa
             self.exit_code = None
             self.adapters = {}
             self._restart_requested = False
+            self._restart_via_service = False
 
         async def start(self):
             events.append("runner.start")
@@ -275,6 +276,7 @@ async def test_start_gateway_does_not_wait_for_slow_mcp_discovery(monkeypatch, t
             self.exit_code = None
             self.adapters = {}
             self._restart_requested = False
+            self._restart_via_service = False
             self._mcp_discovery_task = None
 
         async def start(self):
@@ -348,6 +350,7 @@ async def test_start_gateway_shutdown_cleanup_runs_on_failure_exit(monkeypatch, 
             self.exit_code = None
             self.adapters = {}
             self._restart_requested = False
+            self._restart_via_service = False
             self._mcp_discovery_task = None
 
         async def start(self):
@@ -442,6 +445,7 @@ async def test_start_gateway_replace_force_uses_terminate_pid(monkeypatch, tmp_p
         lambda **kwargs: 0,
     )
     monkeypatch.setattr("gateway.status.terminate_pid", lambda pid, force=False: calls.append((pid, force)))
+    monkeypatch.setattr("gateway.status._pid_exists", lambda pid: True)
     monkeypatch.setattr("gateway.run.os.getpid", lambda: 100)
     monkeypatch.setattr("gateway.run.os.kill", lambda pid, sig: None)
     monkeypatch.setattr("time.sleep", lambda _: None)

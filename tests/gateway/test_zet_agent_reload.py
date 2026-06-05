@@ -15,6 +15,10 @@ from gateway.platforms.zet_agent import ZetAgentAdapter
 class _FakeRequest:
     def __init__(self, auth="Bearer test-key"):
         self.headers = {"Authorization": auth} if auth else {}
+        # Upstream's api_server _request_audit_context reads these directly
+        # when logging auth-rejection audit context.
+        self.method = "POST"
+        self.path_qs = "/v1/profile/reload"
 
 
 class _FakeResponse:
