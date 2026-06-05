@@ -64,13 +64,10 @@ def _optional_dependencies() -> dict[str, list[str]]:
 
 
 def _lazy_deps_specs() -> dict[str, tuple[str, ...]]:
-    import sys
+    # tests/conftest.py puts the repo root on sys.path; tools.lazy_deps is
+    # stdlib-only at import time, so no venv deps are needed here.
+    from tools.lazy_deps import LAZY_DEPS
 
-    sys.path.insert(0, str(REPO_ROOT))
-    try:
-        from tools.lazy_deps import LAZY_DEPS
-    finally:
-        sys.path.pop(0)
     return dict(LAZY_DEPS)
 
 
@@ -84,7 +81,9 @@ def test_zpk_install_spec_bakes_in_device_required_extras() -> None:
     )
 
 
-_PIN_RE = re.compile(r"^\s*([A-Za-z0-9_.\-]+)\s*(?:\[[A-Za-z0-9_,\- ]+\])?\s*==\s*(\S+)")
+# Version group must stop at ';' so PEP 508 environment markers
+# ("pkg==1.0; sys_platform != 'win32'") don't leak into the version.
+_PIN_RE = re.compile(r"^\s*([A-Za-z0-9_.\-]+)\s*(?:\[[A-Za-z0-9_,\- ]+\])?\s*==\s*([^\s;]+)")
 
 
 def _normalize(name: str) -> str:
