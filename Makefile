@@ -3,7 +3,12 @@
 ZPK_OUTPUT ?= build/zettlab-claw.zpk
 ZPK_SRC_DIR := zpk/lib/hermes-agent
 PYPI_INDEX_URL ?= https://pypi.tuna.tsinghua.edu.cn/simple/
-ZPK_INSTALL_SPEC ?= .[all,langfuse]
+# ZET-1399: `anthropic` left `[all]` on 2026-05-12 in favour of lazy install,
+# but on ZPK devices the lazy-install ladder (uv -> pip -> ensurepip) is fully
+# broken: no system uv, uv-created venvs ship without pip, and Debian splits
+# ensurepip into the (absent) python3.11-venv package. Anything a device needs
+# at runtime must therefore be baked into the ZPK venv here.
+ZPK_INSTALL_SPEC ?= .[all,langfuse,anthropic]
 ZPK_PACK_JOBS ?= 0
 ZPK_VERBOSE ?= 0
 ZPK_LOG_DIR ?= build
@@ -62,6 +67,16 @@ zpk-venv:
 	else \
 		UV_LINK_MODE=copy uv $(ZPK_UV_FLAGS) pip install --python venv/bin/python --index-url "$(PYPI_INDEX_URL)" "$(ZPK_INSTALL_SPEC)" >"$(ZPK_UV_INSTALL_LOG)" 2>&1 || { \
 			echo "uv pip install failed; showing last 160 log lines from $(ZPK_UV_INSTALL_LOG)"; \
+			tail -n 160 "$(ZPK_UV_INSTALL_LOG)" 2>/dev/null || true; \
+			exit 1; \
+		}; \
+	fi
+	@echo "Seeding pip into ZPK venv (device-side lazy-install fallback)..."
+	@if [ "$(ZPK_VERBOSE)" = "1" ]; then \
+		UV_LINK_MODE=copy uv $(ZPK_UV_FLAGS) pip install --python venv/bin/python --index-url "$(PYPI_INDEX_URL)" pip; \
+	else \
+		UV_LINK_MODE=copy uv $(ZPK_UV_FLAGS) pip install --python venv/bin/python --index-url "$(PYPI_INDEX_URL)" pip >>"$(ZPK_UV_INSTALL_LOG)" 2>&1 || { \
+			echo "uv pip install (pip seed) failed; showing last 160 log lines from $(ZPK_UV_INSTALL_LOG)"; \
 			tail -n 160 "$(ZPK_UV_INSTALL_LOG)" 2>/dev/null || true; \
 			exit 1; \
 		}; \
