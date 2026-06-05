@@ -1,6 +1,0 @@
-{
-  "boards": [
-    { "name": "board-1" },
-    { "name": "board-2", "enabled": false }
-  ]
-}
