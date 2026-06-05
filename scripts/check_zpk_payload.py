@@ -34,6 +34,7 @@ CORE_IMPORTS = [
 PACKAGE_IMPORTS = {
     "agent-client-protocol": "acp",
     "aiohttp": "aiohttp",
+    "anthropic": "anthropic",
     "croniter": "croniter",
     "fastapi": "fastapi",
     "fire": "fire",
@@ -63,8 +64,10 @@ PACKAGE_IMPORTS = {
 SKIP_PACKAGES = {
     # Quarantined / intentionally absent.
     "mistralai",
-    # Lazy provider and backend deps.
-    "anthropic",
+    # Lazy provider and backend deps.  NOTE: `anthropic` is NOT in this set —
+    # it is baked into the ZPK via ZPK_INSTALL_SPEC (ZET-1399: the lazy-install
+    # ladder is broken on devices), so when the install spec names its extra
+    # the import must be verified, not skipped.
     "exa-py",
     "firecrawl-py",
     "parallel-web",
@@ -242,6 +245,13 @@ def main() -> int:
 
     version_output = _check_command([_hermes_command(), "--version"])
     print(f"hermes --version ok: {version_output}")
+
+    # ZET-1399: devices have no system uv and Debian ships ensurepip in the
+    # absent python3.11-venv package, so the venv-seeded pip is the ONLY
+    # working tier of the tools/lazy_deps.py install ladder on a ZPK device.
+    # A payload without it silently bricks every lazy-installable backend.
+    pip_output = _check_command([sys.executable, "-m", "pip", "--version"])
+    print(f"pip seed ok: {pip_output}")
 
     _check_imports(CORE_IMPORTS)
     print(f"core imports ok: {', '.join(CORE_IMPORTS)}")
