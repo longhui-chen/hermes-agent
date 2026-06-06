@@ -1173,32 +1173,23 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             schedule = job.get("schedule", {})
             kind = schedule.get("kind")
 
-            # For recurring jobs, check if the scheduled time is stale
-            # (gateway was down and missed the window). Fast-forward to
-            # the next future occurrence instead of firing a stale run.
+            # For recurring jobs, a next_run_at far in the past means the gateway
+            # was down (or not resident) across the scheduled time. We still run
+            # it ONCE to catch up — tick() calls advance_next_run() before
+            # execution, which recomputes next_run_at from *now*, so this stays
+            # at-most-once with no backlog burst no matter how many periods were
+            # missed. Previously a >grace miss was silently fast-forwarded and
+            # dropped: e.g. a daily 09:00 job missed by >2h never ran that day and
+            # left no failure record (ZET-1413; same root cause as ZET-1334).
             grace = _compute_grace_seconds(schedule)
             if kind in {"cron", "interval"} and (now - next_run_dt).total_seconds() > grace:
-                # Job is past its catch-up grace window — this is a stale missed run.
-                # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
-                new_next = compute_next_run(
-                    schedule, now.isoformat(), tz_name=job.get("timezone")
+                logger.info(
+                    "Job '%s' missed its scheduled time (%s, grace=%ds) — "
+                    "catching up once.",
+                    job.get("name", job["id"]),
+                    next_run,
+                    grace,
                 )
-                if new_next:
-                    logger.info(
-                        "Job '%s' missed its scheduled time (%s, grace=%ds). "
-                        "Fast-forwarding to next run: %s",
-                        job.get("name", job["id"]),
-                        next_run,
-                        grace,
-                        new_next,
-                    )
-                    # Update the job in storage
-                    for rj in raw_jobs:
-                        if rj["id"] == job["id"]:
-                            rj["next_run_at"] = new_next
-                            needs_save = True
-                            break
-                    continue  # Skip this run
 
             due.append(job)
 

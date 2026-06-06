@@ -870,24 +870,32 @@ class TestGetDueJobs:
         assert len(due) == 1
         assert due[0]["id"] == job["id"]
 
-    def test_stale_past_due_skipped(self, tmp_cron_dir):
-        """Recurring jobs past their dynamic grace window are fast-forwarded, not fired.
+    def test_stale_past_due_catches_up_once(self, tmp_cron_dir):
+        """Recurring jobs past their grace window catch up ONCE (not silently skipped).
 
         For an hourly job, grace = 30 min. Setting 35 min late exceeds the window.
+        The missed run still fires once; advance_next_run() (called by tick before
+        execution) then moves next_run_at to the future so it does not backlog.
         """
+        from cron.jobs import _ensure_aware, _hermes_now, advance_next_run
+
         job = create_job(prompt="Stale", schedule="every 1h")
         # Force next_run_at to 35 minutes ago (beyond the 30-min grace for hourly)
         jobs = load_jobs()
         jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=35)).isoformat()
         save_jobs(jobs)
 
+        # Missed run is caught up once instead of silently dropped.
         due = get_due_jobs()
-        assert len(due) == 0
-        # next_run_at should be fast-forwarded to the future
+        assert len(due) == 1
+        assert due[0]["id"] == job["id"]
+
+        # tick advances next_run_at to the future → no backlog on the next tick.
+        advance_next_run(job["id"])
         updated = get_job(job["id"])
-        from cron.jobs import _ensure_aware, _hermes_now
         next_dt = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
         assert next_dt > _hermes_now()
+        assert get_due_jobs() == []
 
     def test_future_not_returned(self, tmp_cron_dir):
         create_job(prompt="Not yet", schedule="every 1h")
