@@ -1473,10 +1473,33 @@ class AIAgent:
         Ensures conversations are never lost, even on errors or early returns.
         """
         self._drop_trailing_empty_response_scaffolding(messages)
+        self._drop_length_continuation_scaffolding(messages)
         self._apply_persist_user_message_override(messages)
         self._session_messages = messages
         self._save_session_log(messages)
         self._flush_messages_to_session_db(messages, conversation_history)
+
+    def _drop_length_continuation_scaffolding(self, messages: List[Dict]) -> None:
+        """Remove internal length-continuation prompts from durable transcripts."""
+        if not messages:
+            return
+        raw_last_flushed = getattr(self, "_last_flushed_db_idx", 0)
+        last_flushed_idx = raw_last_flushed if isinstance(raw_last_flushed, int) else 0
+        removed_before_flush_idx = 0
+        if last_flushed_idx > 0:
+            removed_before_flush_idx = sum(
+                1 for msg in messages[:last_flushed_idx]
+                if isinstance(msg, dict) and msg.get("_length_continuation_synthetic")
+            )
+        messages[:] = [
+            msg for msg in messages
+            if not (
+                isinstance(msg, dict)
+                and msg.get("_length_continuation_synthetic")
+            )
+        ]
+        if removed_before_flush_idx:
+            self._last_flushed_db_idx = max(0, last_flushed_idx - removed_before_flush_idx)
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
@@ -1496,6 +1519,7 @@ class AIAgent:
             and (
                 messages[-1].get("_empty_recovery_synthetic")
                 or messages[-1].get("_empty_terminal_sentinel")
+                or messages[-1].get("_length_continuation_synthetic")
             )
         ):
             messages.pop()
@@ -1553,6 +1577,8 @@ class AIAgent:
             start_idx = len(conversation_history) if conversation_history else 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
             for msg in messages[flush_from:]:
+                if msg.get("_length_continuation_synthetic"):
+                    continue
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
                 # Persist multimodal tool results as their text summary only —

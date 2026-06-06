@@ -1708,6 +1708,7 @@ def run_conversation(
                                 continue_msg = {
                                     "role": "user",
                                     "content": _continue_content,
+                                    "_length_continuation_synthetic": True,
                                 }
                                 messages.append(continue_msg)
                                 agent._session_messages = messages
@@ -4295,6 +4296,7 @@ def run_conversation(
                         messages[-1].get("_thinking_prefill")
                         or messages[-1].get("_empty_recovery_synthetic")
                         or messages[-1].get("_empty_terminal_sentinel")
+                        or messages[-1].get("_length_continuation_synthetic")
                     )
                 ):
                     messages.pop()

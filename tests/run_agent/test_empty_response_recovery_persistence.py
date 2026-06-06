@@ -92,3 +92,28 @@ def test_persist_session_strips_marked_terminal_empty_sentinel():
     assert messages == [{"role": "user", "content": "continue"}]
     assert agent.flushed_session_db_messages[-1] == messages
     assert all(not msg.get("_empty_terminal_sentinel") for msg in messages)
+
+
+def test_persist_session_strips_trailing_length_continuation_prompt():
+    agent = _agent_with_stubbed_persistence()
+    messages = [
+        {"role": "user", "content": "write a long answer"},
+        {"role": "assistant", "content": "partial", "finish_reason": "length"},
+        {
+            "role": "user",
+            "content": (
+                "[System: Your previous response was truncated by the output "
+                "length limit. Continue exactly where you left off.]"
+            ),
+            "_length_continuation_synthetic": True,
+        },
+    ]
+
+    AIAgent._persist_session(agent, messages, conversation_history=[])
+
+    assert messages == [
+        {"role": "user", "content": "write a long answer"},
+        {"role": "assistant", "content": "partial", "finish_reason": "length"},
+    ]
+    assert agent.flushed_session_db_messages[-1] == messages
+    assert all(not msg.get("_length_continuation_synthetic") for msg in messages)
