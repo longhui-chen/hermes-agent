@@ -1,10 +1,11 @@
 """设备停机错过窗口（失败场景）的回归测试。
 
 覆盖 cron/jobs.py 两条行为：
-  - ``_compute_grace_seconds``：宽限窗口 = 周期一半，clamp 在 120s(2min) ~ 7200s(2h)
+  - ``_compute_grace_seconds``：迟到判定窗口 = 周期一半，clamp 在 120s(2min) ~ 7200s(2h)
   - ``get_due_jobs``：recurring 任务 next_run_at 在过去时
-      · 超过 grace → fast-forward 跳到下一个未来时刻、不进 due（网关停机不积压补推）
-      · 在 grace 内 → 进 due（补跑一次）
+      · 超过 grace → 进 due 补跑一次，并记录 missed-window 日志
+      · 在 grace 内 → 进 due 正常补跑一次
+    真正避免积压 burst 的推进发生在 scheduler.tick 调用 ``advance_next_run`` 时。
 """
 
 import os
@@ -71,7 +72,7 @@ class TestComputeGraceSeconds:
 
 
 class TestGetDueJobsMissedWindow:
-    """网关停机错过窗口：超过 grace → fast-forward 不补推；grace 内 → 补跑一次。
+    """网关停机错过窗口：超过 grace 和 grace 内都补跑一次，不积压 burst。
 
     用 ``every 1h`` → grace = 3600//2 = 1800s。
     """

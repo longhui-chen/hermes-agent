@@ -388,11 +388,12 @@ def _recoverable_oneshot_run_at(
 
 
 def _compute_grace_seconds(schedule: dict) -> int:
-    """Compute how late a job can be and still catch up instead of fast-forwarding.
+    """Compute the lateness threshold used to classify a missed recurring run.
 
     Uses half the schedule period, clamped between 120 seconds and 2 hours.
-    This ensures daily jobs can catch up if missed by up to 2 hours,
-    while frequent jobs (every 5-10 min) still fast-forward quickly.
+    Stale runs beyond this threshold are still caught up once; the threshold is
+    kept for diagnostics/logging so operators can distinguish a normal late tick
+    from a gateway-down or device-sleep catch-up.
     """
     MIN_GRACE = 120
     MAX_GRACE = 7200  # 2 hours
@@ -1105,10 +1106,10 @@ def advance_next_run(job_id: str) -> bool:
 def get_due_jobs() -> List[Dict[str, Any]]:
     """Get all jobs that are due to run now.
 
-    For recurring jobs (cron/interval), if the scheduled time is stale
-    (more than one period in the past, e.g. because the gateway was down),
-    the job is fast-forwarded to the next future run instead of firing
-    immediately.  This prevents a burst of missed jobs on gateway restart.
+    For recurring jobs (cron/interval), stale missed runs still enter the due
+    list once. scheduler.tick() advances next_run_at from the current time
+    before execution, so even if many periods were missed while the gateway was
+    down, restart produces one catch-up run rather than a backlog burst.
     """
     with _jobs_file_lock:
         return _get_due_jobs_locked()

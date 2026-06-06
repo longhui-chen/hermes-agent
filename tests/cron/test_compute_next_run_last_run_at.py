@@ -39,7 +39,8 @@ class TestCronComputeNextRunUsesLastRunAt:
         # With last_run_at as base (Apr 6 14:10), next is Apr 6 18:00.
         # With now as base (Apr 10 22:00), next is Apr 11 00:00.
         # The fix should use last_run_at, returning Apr 6 18:00
-        # (stale detection in get_due_jobs() fast-forwards from there).
+        # (missed-window catch-up in get_due_jobs() will surface one stale run;
+        # scheduler.tick then advances next_run_at from now before execution).
         assert next_dt.date().isoformat() == "2026-04-06", (
             f"Expected next run on Apr 6 (from last_run_at), got {next_dt}"
         )
