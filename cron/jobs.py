@@ -388,11 +388,12 @@ def _recoverable_oneshot_run_at(
 
 
 def _compute_grace_seconds(schedule: dict) -> int:
-    """Compute how late a job can be and still catch up instead of fast-forwarding.
+    """Compute the lateness threshold used to classify a missed recurring run.
 
     Uses half the schedule period, clamped between 120 seconds and 2 hours.
-    This ensures daily jobs can catch up if missed by up to 2 hours,
-    while frequent jobs (every 5-10 min) still fast-forward quickly.
+    Stale runs beyond this threshold are still caught up once; the threshold is
+    kept for diagnostics/logging so operators can distinguish a normal late tick
+    from a gateway-down or device-sleep catch-up.
     """
     MIN_GRACE = 120
     MAX_GRACE = 7200  # 2 hours
@@ -1105,10 +1106,10 @@ def advance_next_run(job_id: str) -> bool:
 def get_due_jobs() -> List[Dict[str, Any]]:
     """Get all jobs that are due to run now.
 
-    For recurring jobs (cron/interval), if the scheduled time is stale
-    (more than one period in the past, e.g. because the gateway was down),
-    the job is fast-forwarded to the next future run instead of firing
-    immediately.  This prevents a burst of missed jobs on gateway restart.
+    For recurring jobs (cron/interval), stale missed runs still enter the due
+    list once. scheduler.tick() advances next_run_at from the current time
+    before execution, so even if many periods were missed while the gateway was
+    down, restart produces one catch-up run rather than a backlog burst.
     """
     with _jobs_file_lock:
         return _get_due_jobs_locked()
@@ -1173,32 +1174,23 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             schedule = job.get("schedule", {})
             kind = schedule.get("kind")
 
-            # For recurring jobs, check if the scheduled time is stale
-            # (gateway was down and missed the window). Fast-forward to
-            # the next future occurrence instead of firing a stale run.
+            # For recurring jobs, a next_run_at far in the past means the gateway
+            # was down (or not resident) across the scheduled time. We still run
+            # it ONCE to catch up — tick() calls advance_next_run() before
+            # execution, which recomputes next_run_at from *now*, so this stays
+            # at-most-once with no backlog burst no matter how many periods were
+            # missed. Previously a >grace miss was silently fast-forwarded and
+            # dropped: e.g. a daily 09:00 job missed by >2h never ran that day and
+            # left no failure record (ZET-1413; same root cause as ZET-1334).
             grace = _compute_grace_seconds(schedule)
             if kind in {"cron", "interval"} and (now - next_run_dt).total_seconds() > grace:
-                # Job is past its catch-up grace window — this is a stale missed run.
-                # Grace scales with schedule period: daily=2h, hourly=30m, 10min=5m.
-                new_next = compute_next_run(
-                    schedule, now.isoformat(), tz_name=job.get("timezone")
+                logger.info(
+                    "Job '%s' missed its scheduled time (%s, grace=%ds) — "
+                    "catching up once.",
+                    job.get("name", job["id"]),
+                    next_run,
+                    grace,
                 )
-                if new_next:
-                    logger.info(
-                        "Job '%s' missed its scheduled time (%s, grace=%ds). "
-                        "Fast-forwarding to next run: %s",
-                        job.get("name", job["id"]),
-                        next_run,
-                        grace,
-                        new_next,
-                    )
-                    # Update the job in storage
-                    for rj in raw_jobs:
-                        if rj["id"] == job["id"]:
-                            rj["next_run_at"] = new_next
-                            needs_save = True
-                            break
-                    continue  # Skip this run
 
             due.append(job)
 

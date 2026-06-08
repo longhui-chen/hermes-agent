@@ -1,10 +1,11 @@
 """设备停机错过窗口（失败场景）的回归测试。
 
 覆盖 cron/jobs.py 两条行为：
-  - ``_compute_grace_seconds``：宽限窗口 = 周期一半，clamp 在 120s(2min) ~ 7200s(2h)
+  - ``_compute_grace_seconds``：迟到判定窗口 = 周期一半，clamp 在 120s(2min) ~ 7200s(2h)
   - ``get_due_jobs``：recurring 任务 next_run_at 在过去时
-      · 超过 grace → fast-forward 跳到下一个未来时刻、不进 due（网关停机不积压补推）
-      · 在 grace 内 → 进 due（补跑一次）
+      · 超过 grace → 进 due 补跑一次，并记录 missed-window 日志
+      · 在 grace 内 → 进 due 正常补跑一次
+    真正避免积压 burst 的推进发生在 scheduler.tick 调用 ``advance_next_run`` 时。
 """
 
 import os
@@ -16,6 +17,7 @@ import hermes_time
 import cron.jobs as jobs_module
 from cron.jobs import (
     _compute_grace_seconds,
+    advance_next_run,
     create_job,
     get_due_jobs,
     load_jobs,
@@ -70,12 +72,16 @@ class TestComputeGraceSeconds:
 
 
 class TestGetDueJobsMissedWindow:
-    """网关停机错过窗口：超过 grace → fast-forward 不补推；grace 内 → 补跑一次。
+    """网关停机错过窗口：超过 grace 和 grace 内都补跑一次，不积压 burst。
 
     用 ``every 1h`` → grace = 3600//2 = 1800s。
     """
 
-    def test_stale_run_fast_forwarded_not_backlogged(self, cron_storage):
+    def test_stale_run_catches_up_once_then_no_backlog(self, cron_storage):
+        # 停机错过窗口（>grace）应当【补跑一次】，而不是静默跳过——否则 daily 任务
+        # 09:00 被错过 >2h 当天永久不跑且无失败记录（ZET-1413 / ZET-1334）。
+        # 但仍须 at-most-once：补跑后 next_run_at 由 advance_next_run（tick 在执行
+        # 前调用，以 now 为基准重算）推到未来，下个 tick 不再积压补推。
         create_job(prompt="x", schedule="every 1h")
         jobs = load_jobs()
         # next_run_at 在 3 小时前，远超 grace(1800s) —— 模拟网关停机错过
@@ -84,13 +90,17 @@ class TestGetDueJobsMissedWindow:
         ).isoformat()
         save_jobs(jobs)
 
+        # 第一次 tick：错过的那次进 due（补跑一次）
         due = get_due_jobs()
+        assert len(due) == 1
 
-        # 不积压补推：这条不进 due
-        assert due == []
-        # fast-forward：next_run_at 被推到未来
+        # tick 在执行前推进 next_run_at（模拟 scheduler.tick 的 advance_next_run）
+        advance_next_run(due[0]["id"])
         new_next = datetime.fromisoformat(load_jobs()[0]["next_run_at"])
         assert new_next > datetime.now(timezone.utc)
+
+        # 第二次 tick：next_run_at 已是未来 → 不再补推（无积压 burst）
+        assert get_due_jobs() == []
 
     def test_recent_miss_within_grace_catches_up(self, cron_storage):
         create_job(prompt="x", schedule="every 1h")
