@@ -110,6 +110,44 @@ class TestParseSchedule:
         with pytest.raises(ValueError):
             parse_schedule("99 99 99 99 99")
 
+    def test_naive_iso_with_tz_name_anchors_in_that_zone(self):
+        """The ZET-942 naive-ISO branch: '2030-05-25T10:30' with tz_name=
+        'Asia/Shanghai' must mean 10:30 *Shanghai wall-clock*, not whatever
+        zone hermes happens to run in."""
+        result = parse_schedule("2030-05-25T10:30", tz_name="Asia/Shanghai")
+        assert result["kind"] == "once"
+        run_at = datetime.fromisoformat(result["run_at"])
+        # Wall-clock components are unchanged; the offset is +08:00.
+        assert run_at.hour == 10
+        assert run_at.minute == 30
+        assert run_at.utcoffset() == timedelta(hours=8)
+
+    def test_naive_iso_without_tz_name_uses_system_local(self):
+        """No tz_name → fall back to pre-feature behaviour so legacy callers
+        that never knew about tz_name keep getting system-local interpretation."""
+        result = parse_schedule("2030-05-25T10:30")
+        run_at = datetime.fromisoformat(result["run_at"])
+        # Whatever the system tz is, the wall-clock components survive; only
+        # the offset reflects local zone.
+        assert run_at.hour == 10
+        assert run_at.minute == 30
+        assert run_at.tzinfo is not None  # never naive
+
+    def test_explicit_offset_iso_ignores_tz_name(self):
+        """An ISO timestamp that already carries an offset wins over tz_name —
+        we never rewrite a user-supplied offset."""
+        result = parse_schedule("2030-05-25T10:30+05:00", tz_name="Asia/Shanghai")
+        run_at = datetime.fromisoformat(result["run_at"])
+        assert run_at.utcoffset() == timedelta(hours=5)
+
+    def test_invalid_tz_name_falls_back_to_system_local(self):
+        """A bogus tz_name shouldn't crash parsing — graceful fallback to
+        system local so a misconfigured client doesn't break job creation."""
+        result = parse_schedule("2030-05-25T10:30", tz_name="Mars/Olympus_Mons")
+        run_at = datetime.fromisoformat(result["run_at"])
+        # Anchor failed → fell back to astimezone() path → tz-aware result.
+        assert run_at.tzinfo is not None
+
 
 # =========================================================================
 # compute_next_run
@@ -171,6 +209,54 @@ class TestComputeNextRun:
 
     def test_unknown_kind_returns_none(self):
         assert compute_next_run({"kind": "unknown"}) is None
+
+    def test_cron_with_tz_name_evaluates_in_that_zone(self, monkeypatch):
+        """The classic bug: '6 23 * * *' should mean 23:06 *in the user's zone*,
+        not 23:06 UTC. With tz_name='Asia/Shanghai' and a hermes default of UTC,
+        the next firing should be the next 23:06 Shanghai = 15:06 UTC."""
+        pytest.importorskip("croniter")
+        # Pin hermes "now" to a UTC moment well before next 23:06 Shanghai
+        # 2026-05-08 06:00:00 UTC = 14:00 Shanghai. Next 23:06 Shanghai is
+        # the same Shanghai day = 15:06 UTC same day.
+        now = datetime(2026, 5, 8, 6, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        schedule = {"kind": "cron", "expr": "6 23 * * *"}
+        result = compute_next_run(schedule, tz_name="Asia/Shanghai")
+        assert result is not None
+
+        next_dt = datetime.fromisoformat(result)
+        assert next_dt.astimezone(timezone.utc) == datetime(
+            2026, 5, 8, 15, 6, 0, tzinfo=timezone.utc
+        )
+
+    def test_cron_without_tz_name_uses_hermes_default(self, monkeypatch):
+        """When no per-job tz is provided, behaviour matches pre-feature: cron
+        runs in whatever timezone _hermes_now() returns."""
+        pytest.importorskip("croniter")
+        now = datetime(2026, 5, 8, 6, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        schedule = {"kind": "cron", "expr": "6 23 * * *"}
+        result = compute_next_run(schedule)
+        # No tz_name → croniter base is hermes-now (UTC here) → next 23:06 UTC.
+        next_dt = datetime.fromisoformat(result)
+        assert next_dt.astimezone(timezone.utc) == datetime(
+            2026, 5, 8, 23, 6, 0, tzinfo=timezone.utc
+        )
+
+    def test_cron_invalid_tz_name_falls_back_safely(self, monkeypatch):
+        """Bad tz at compute time logs and falls back rather than crashing —
+        keeps the scheduler robust against jobs.json that somehow stored a
+        zone the runtime doesn't know (e.g. tzdata mismatch on a NAS image)."""
+        pytest.importorskip("croniter")
+        now = datetime(2026, 5, 8, 6, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        schedule = {"kind": "cron", "expr": "6 23 * * *"}
+        # Should not raise, should return a value (using fallback).
+        result = compute_next_run(schedule, tz_name="Mars/Olympus_Mons")
+        assert result is not None
 
 
 # =========================================================================
@@ -324,6 +410,102 @@ class TestUpdateJob:
         # Original job still resolvable, no rename happened.
         assert get_job(job["id"]) is not None
         assert get_job("../escape") is None
+
+    def test_create_job_persists_timezone(self, tmp_cron_dir):
+        pytest.importorskip("croniter")
+        job = create_job(
+            prompt="Daily greet", schedule="6 23 * * *", timezone="Asia/Shanghai"
+        )
+        assert job["timezone"] == "Asia/Shanghai"
+        fetched = get_job(job["id"])
+        assert fetched["timezone"] == "Asia/Shanghai"
+
+    def test_create_job_naive_iso_honours_timezone(self, tmp_cron_dir):
+        """ZET-942 once-job branch: a naive ISO schedule combined with a
+        per-job timezone anchors the wall-clock in that zone instead of
+        whatever the hermes pod's system tz happens to be."""
+        job = create_job(
+            prompt="Reminder", schedule="2030-05-25T10:30", timezone="Asia/Shanghai"
+        )
+        run_at = datetime.fromisoformat(job["schedule"]["run_at"])
+        assert run_at.utcoffset() == timedelta(hours=8)
+        assert run_at.hour == 10 and run_at.minute == 30
+        next_run = datetime.fromisoformat(job["next_run_at"])
+        assert next_run.utcoffset() == timedelta(hours=8)
+
+    def test_create_job_invalid_timezone_raises_with_message(self, tmp_cron_dir):
+        with pytest.raises(ValueError, match="Invalid timezone"):
+            create_job(
+                prompt="X", schedule="every 1h", timezone="Mars/Olympus_Mons"
+            )
+
+    def test_update_job_changes_timezone_recomputes_next_run(self, tmp_cron_dir):
+        """Bare timezone PATCH must move next_run_at — otherwise the user
+        fixes their tz and the next firing still uses the stale wall-clock."""
+        pytest.importorskip("croniter")
+        job = create_job(
+            prompt="Daily", schedule="30 10 * * *", timezone="Asia/Shanghai"
+        )
+        old_next = datetime.fromisoformat(job["next_run_at"])
+        assert old_next.utcoffset() == timedelta(hours=8)
+
+        updated = update_job(job["id"], {"timezone": "UTC"})
+        new_next = datetime.fromisoformat(updated["next_run_at"])
+        assert new_next.utcoffset() == timedelta(0)
+
+    def test_update_job_empty_timezone_clears_field(self, tmp_cron_dir):
+        """Empty string means "remove the per-job tz override" — matches the
+        cronjob_tools contract documented in the schema description."""
+        pytest.importorskip("croniter")
+        job = create_job(
+            prompt="Daily", schedule="30 10 * * *", timezone="Asia/Shanghai"
+        )
+        updated = update_job(job["id"], {"timezone": ""})
+        assert updated["timezone"] is None
+
+    def test_create_job_invalid_timezone_raises(self, tmp_cron_dir):
+        with pytest.raises(ValueError):
+            create_job(prompt="x", schedule="every 1h", timezone="Mars/Olympus_Mons")
+
+    def test_update_timezone_only_recomputes_next_run(self, tmp_cron_dir, monkeypatch):
+        """User fixes a wrong tz; next_run_at must move even though schedule
+        didn't change. Otherwise the user has to also re-set the schedule
+        which is the surprising/buggy behaviour we just fixed."""
+        pytest.importorskip("croniter")
+        now = datetime(2026, 5, 8, 6, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        # All-fixed policy (ZET-1258): omitted tz is pinned to the device tz at
+        # creation. Pin it to UTC so the create-time baseline below is
+        # deterministic (otherwise it reads the host's real zone).
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "UTC")
+
+        # Created without tz — pinned to UTC, next_run lands at 23:06 UTC.
+        job = create_job(prompt="x", schedule="6 23 * * *")
+        before = datetime.fromisoformat(job["next_run_at"]).astimezone(timezone.utc)
+        assert before == datetime(2026, 5, 8, 23, 6, 0, tzinfo=timezone.utc)
+
+        updated = update_job(job["id"], {"timezone": "Asia/Shanghai"})
+        after = datetime.fromisoformat(updated["next_run_at"]).astimezone(timezone.utc)
+        # 23:06 Shanghai = 15:06 UTC.
+        assert after == datetime(2026, 5, 8, 15, 6, 0, tzinfo=timezone.utc)
+
+    def test_update_clear_timezone_with_empty_string(self, tmp_cron_dir):
+        pytest.importorskip("croniter")
+        job = create_job(
+            prompt="x", schedule="every 1h", timezone="Asia/Shanghai"
+        )
+        updated = update_job(job["id"], {"timezone": ""})
+        assert updated["timezone"] is None
+
+    def test_create_job_pins_device_tz_when_timezone_omitted(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Tokyo")
+        job = create_job(prompt="p", schedule="30 10 * * *")  # 不传 timezone
+        assert job["timezone"] == "Asia/Tokyo", "omitted timezone must be pinned to device tz"
+
+    def test_create_job_keeps_explicit_timezone(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Tokyo")
+        job = create_job(prompt="p", schedule="30 10 * * *", timezone="America/New_York")
+        assert job["timezone"] == "America/New_York", "explicit per-job tz must win over device default"
 
 
 class TestPauseResumeJob:
@@ -685,24 +867,32 @@ class TestGetDueJobs:
         assert len(due) == 1
         assert due[0]["id"] == job["id"]
 
-    def test_stale_past_due_skipped(self, tmp_cron_dir):
-        """Recurring jobs past their dynamic grace window are fast-forwarded, not fired.
+    def test_stale_past_due_catches_up_once(self, tmp_cron_dir):
+        """Recurring jobs past their grace window catch up ONCE (not silently skipped).
 
         For an hourly job, grace = 30 min. Setting 35 min late exceeds the window.
+        The missed run still fires once; advance_next_run() (called by tick before
+        execution) then moves next_run_at to the future so it does not backlog.
         """
+        from cron.jobs import _ensure_aware, _hermes_now, advance_next_run
+
         job = create_job(prompt="Stale", schedule="every 1h")
         # Force next_run_at to 35 minutes ago (beyond the 30-min grace for hourly)
         jobs = load_jobs()
         jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=35)).isoformat()
         save_jobs(jobs)
 
+        # Missed run is caught up once instead of silently dropped.
         due = get_due_jobs()
-        assert len(due) == 0
-        # next_run_at should be fast-forwarded to the future
+        assert len(due) == 1
+        assert due[0]["id"] == job["id"]
+
+        # tick advances next_run_at to the future → no backlog on the next tick.
+        advance_next_run(job["id"])
         updated = get_job(job["id"])
-        from cron.jobs import _ensure_aware, _hermes_now
         next_dt = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
         assert next_dt > _hermes_now()
+        assert get_due_jobs() == []
 
     def test_future_not_returned(self, tmp_cron_dir):
         create_job(prompt="Not yet", schedule="every 1h")
@@ -991,3 +1181,23 @@ class TestSaveJobOutput:
         with pytest.raises(ValueError, match="output path"):
             save_job_output(str(tmp_cron_dir / "outside"), "# Results")
         assert not (tmp_cron_dir / "outside").exists()
+
+
+class TestUpdateTimezoneRecompute:
+    def test_interval_next_run_unchanged_on_tz_patch(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Shanghai")
+        from cron.jobs import create_job, update_job
+        job = create_job(prompt="p", schedule="every 30m")
+        before = job["next_run_at"]
+        updated = update_job(job["id"], {"timezone": "Europe/London"})
+        assert updated["timezone"] == "Europe/London"
+        assert updated["next_run_at"] == before, "interval next_run must NOT shift on a pure tz change"
+
+    def test_cron_next_run_shifts_on_tz_patch(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Shanghai")
+        from cron.jobs import create_job, update_job
+        job = create_job(prompt="p", schedule="30 10 * * *")   # 10:30 Shanghai
+        before = job["next_run_at"]
+        updated = update_job(job["id"], {"timezone": "Asia/Tokyo"})  # 10:30 Tokyo (UTC+9)
+        assert updated["next_run_at"] != before, "cron next_run must shift to new tz wall-clock"
+        # 10:30 Tokyo == 09:30 Shanghai；UTC 上 Tokyo 早 1h

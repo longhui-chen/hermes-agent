@@ -8,12 +8,15 @@ silently corrupts non-ASCII content.
 
 These tests ensure:
   1. PLW1514 stays in ``[tool.ruff.lint.select]``
-  2. The CI workflow's blocking step still invokes ``ruff check .``
-  3. pyproject.toml has ``preview = true`` (required — PLW1514 is a
+  2. pyproject.toml has ``preview = true`` (required — PLW1514 is a
      preview rule in ruff 0.15.x)
 
-If someone removes any of these, CI stops enforcing UTF-8-explicit
+If someone removes either, ``ruff check`` stops enforcing UTF-8-explicit
 opens and we're back to the original Windows-regression trap.
+
+(The zettlab fork runs its own CI and does not ship upstream's
+``.github/workflows/lint.yml``, so the workflow-shape assertions that
+upstream keeps here were dropped.)
 """
 
 from __future__ import annotations
@@ -65,50 +68,3 @@ class TestRuffConfig:
             "becomes a stable rule, you can drop preview=true but must "
             "verify PLW1514 still fires in a sample test run first."
         )
-
-
-class TestLintWorkflow:
-    WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "lint.yml"
-
-    def test_workflow_exists(self):
-        assert self.WORKFLOW_PATH.exists(), (
-            f"CI workflow missing: {self.WORKFLOW_PATH}"
-        )
-
-    def test_workflow_has_blocking_ruff_step(self):
-        """The workflow must run a blocking ``ruff check .`` step
-        (one without --exit-zero) so violations fail the job."""
-        content = self.WORKFLOW_PATH.read_text(encoding="utf-8")
-        # Look for the blocking step's named line + its command.  We want
-        # at least one ``ruff check .`` that does NOT have ``--exit-zero``
-        # nearby.
-        # Split into lines and find ruff check invocations
-        lines = content.splitlines()
-        found_blocking = False
-        for i, line in enumerate(lines):
-            stripped = line.strip()
-            if stripped.startswith("ruff check") and "--exit-zero" not in stripped:
-                # Also check it's not piped to `|| true` which would mask
-                # the exit code.
-                window = " ".join(lines[i:i + 3])
-                if "|| true" not in window:
-                    found_blocking = True
-                    break
-        assert found_blocking, (
-            "lint.yml no longer contains a blocking ``ruff check .`` step "
-            "(one without --exit-zero and not masked by || true).  "
-            "Restore it — the PLW1514 rule is only useful if CI actually "
-            "fails on violation."
-        )
-
-    def test_workflow_yaml_is_valid(self):
-        """Workflow file must parse as valid YAML (can't ship a broken
-        CI config to main)."""
-        import yaml
-        content = self.WORKFLOW_PATH.read_text(encoding="utf-8")
-        try:
-            parsed = yaml.safe_load(content)
-        except yaml.YAMLError as exc:
-            pytest.fail(f"lint.yml is not valid YAML: {exc}")
-        assert isinstance(parsed, dict)
-        assert "jobs" in parsed

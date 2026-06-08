@@ -8428,12 +8428,12 @@ def _discard_stashed_changes(
 # =========================================================================
 
 OFFICIAL_REPO_URLS = {
-    "https://github.com/NousResearch/hermes-agent.git",
-    "git@github.com:NousResearch/hermes-agent.git",
-    "https://github.com/NousResearch/hermes-agent",
-    "git@github.com:NousResearch/hermes-agent",
+    "https://github.com/zettlab/hermes-agent.git",
+    "git@github.com:zettlab/hermes-agent.git",
+    "https://github.com/zettlab/hermes-agent",
+    "git@github.com:zettlab/hermes-agent",
 }
-OFFICIAL_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
+OFFICIAL_REPO_URL = "https://github.com/zettlab/hermes-agent.git"
 SKIP_UPSTREAM_PROMPT_FILE = ".skip_upstream_prompt"
 
 
@@ -13218,7 +13218,7 @@ def main():
         "providers", help="List available proxy upstream providers"
     )
     proxy_parser.set_defaults(func=cmd_proxy)
-    gateway_parser.set_defaults(func=cmd_gateway)
+    gateway_parser.set_defaults(func=cmd_gateway, gateway_command="run")
 
     # =========================================================================
     # lsp command

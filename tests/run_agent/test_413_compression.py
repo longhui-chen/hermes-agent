@@ -428,6 +428,7 @@ class TestPreflightCompression:
         agent.compression_enabled = False
         events = []
         agent.status_callback = lambda ev, msg: events.append((ev, msg))
+        setattr(agent.status_callback, "_hermes_accepts_structured_status", True)
 
         def _fake_compress(messages, current_tokens=None, focus_topic=None):
             events.append(("compress", "started"))
@@ -448,7 +449,52 @@ class TestPreflightCompression:
         assert new_system_prompt == "new system prompt"
         assert events[0][0] == "lifecycle"
         assert "Compacting context" in events[0][1]
-        assert events[1] == ("compress", "started")
+        assert events[1][0] == "context.compaction"
+        assert events[1][1]["state"] == "started"
+        assert events[1][1]["old_session_id"] == agent.session_id
+        assert events[2] == ("compress", "started")
+        assert events[-1][0] == "context.compaction"
+        assert events[-1][1]["state"] == "succeeded"
+        assert events[-1][1]["after_messages"] == 1
+
+    def test_compress_context_emits_failed_compaction_status(self, agent):
+        """Compression failures should surface as structured failed events."""
+        events = []
+        agent.status_callback = lambda ev, payload: events.append((ev, payload))
+        setattr(agent.status_callback, "_hermes_accepts_structured_status", True)
+
+        with patch.object(agent.context_compressor, "compress", side_effect=RuntimeError("boom")):
+            with pytest.raises(RuntimeError, match="boom"):
+                agent._compress_context(
+                    [{"role": "user", "content": "hello"}],
+                    "system prompt",
+                    approx_tokens=1234,
+                )
+
+        compaction_events = [payload for ev, payload in events if ev == "context.compaction"]
+        assert [e["state"] for e in compaction_events] == ["started", "failed"]
+        assert compaction_events[-1]["message"] == "上下文压缩失败"
+        assert "boom" in compaction_events[-1]["error"]
+
+    def test_compress_context_does_not_send_dicts_to_legacy_status_callback(self, agent):
+        """Legacy status callbacks should keep receiving only text status updates."""
+        events = []
+        agent.status_callback = lambda ev, payload: events.append((ev, payload))
+
+        with (
+            patch.object(agent.context_compressor, "compress", return_value=[
+                {"role": "user", "content": f"{SUMMARY_PREFIX}\nPrevious conversation"},
+            ]),
+            patch.object(agent, "_build_system_prompt", return_value="new system prompt"),
+            patch("run_agent.estimate_request_tokens_rough", return_value=42),
+        ):
+            agent._compress_context(
+                [{"role": "user", "content": "hello"}],
+                "system prompt",
+                approx_tokens=1234,
+            )
+
+        assert [ev for ev, _ in events] == ["lifecycle"]
 
     def test_preflight_compresses_oversized_history(self, agent):
         """When loaded history exceeds the model's context threshold, compress before API call."""

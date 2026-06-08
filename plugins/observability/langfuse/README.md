@@ -44,7 +44,26 @@ HERMES_LANGFUSE_RELEASE=v1.0.0       # release tag
 HERMES_LANGFUSE_SAMPLE_RATE=0.5      # sample 50% of traces
 HERMES_LANGFUSE_MAX_CHARS=12000      # max chars per field (default: 12000)
 HERMES_LANGFUSE_DEBUG=true           # verbose plugin logging
+HERMES_LANGFUSE_SN=WY210260528GT102  # device serial — see "Per-device fleets" below
 ```
+
+## Per-device fleets
+
+Running one Hermes gateway per device? Set `HERMES_LANGFUSE_SN` to the device
+serial and every trace is tagged with the device it came from, three ways:
+
+- **`user_id`** — each device shows up in Langfuse's **Users** view, so you get
+  per-device cost / trace-count / latency dashboards for free. This scales to
+  thousands of devices (high cardinality is fine here, unlike `environment`).
+- **tag `sn:<serial>`** — one-click filtering in the traces list.
+- **`metadata.device_sn`** — exact-match filtering and export.
+
+On Zettlab devices `zettlab-local-server` injects this automatically from
+`device.sn` when it spawns the per-agent gateway — you don't set it by hand.
+Leave it unset and traces behave exactly as before (no `user_id`, no `sn:` tag).
+
+> Don't overload `HERMES_LANGFUSE_ENV` with the serial for this — `environment`
+> is a low-cardinality dimension (prod / staging / dev), not a per-device key.
 
 ## Disable
 
