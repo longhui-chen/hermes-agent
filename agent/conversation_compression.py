@@ -631,6 +631,7 @@ def compress_context(
         agent.session_id or "none", _pre_msg_count, len(compressed),
         f"{_compressed_est:,}",
     )
+    _release_lock()
     agent._emit_structured_status(
         "context.compaction",
         {

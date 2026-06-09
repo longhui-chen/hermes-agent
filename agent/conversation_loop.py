@@ -2825,6 +2825,45 @@ def run_conversation(
                 # is NOT a transient rate limit — retrying or switching
                 # credentials won't help.  Reduce context to 200k (the
                 # standard tier) and compress.
+                _overflow_reasons = {
+                    FailoverReason.long_context_tier,
+                    FailoverReason.payload_too_large,
+                    FailoverReason.context_overflow,
+                }
+                if (
+                    classified.reason in _overflow_reasons
+                    and not getattr(agent, "compression_enabled", True)
+                ):
+                    agent._flush_status_buffer()
+                    agent._vprint(
+                        f"{agent.log_prefix}❌ Context overflow, but auto-compaction is disabled "
+                        f"(compression.enabled: false).",
+                        force=True,
+                    )
+                    agent._vprint(
+                        f"{agent.log_prefix}   💡 Run /compress to compact manually, /new to start fresh, "
+                        f"switch to a larger-context model, or reduce attachments.",
+                        force=True,
+                    )
+                    logger.error(
+                        f"{agent.log_prefix}Context overflow ({classified.reason.value}) with "
+                        f"auto-compaction disabled — not compressing."
+                    )
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "messages": messages,
+                        "completed": False,
+                        "api_calls": api_call_count,
+                        "error": (
+                            "Context overflow and auto-compaction is disabled "
+                            "(compression.enabled: false). Run /compress to compact manually, "
+                            "/new to start fresh, or switch to a larger-context model."
+                        ),
+                        "partial": True,
+                        "failed": True,
+                        "compaction_disabled": True,
+                    }
+
                 if classified.reason == FailoverReason.long_context_tier:
                     _reduced_ctx = 200000
                     compressor = agent.context_compressor

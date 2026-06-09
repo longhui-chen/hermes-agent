@@ -3182,6 +3182,30 @@ class TestStateMeta:
         assert db.get_meta("key") == "v2"
 
 
+class TestCompressionLocks:
+    def test_acquire_release_cycle(self, db):
+        assert db.try_acquire_compression_lock("sess-1", "holder-a") is True
+        assert db.get_compression_lock_holder("sess-1") == "holder-a"
+        assert db.try_acquire_compression_lock("sess-1", "holder-b") is False
+
+        db.release_compression_lock("sess-1", "holder-b")
+        assert db.get_compression_lock_holder("sess-1") == "holder-a"
+
+        db.release_compression_lock("sess-1", "holder-a")
+        assert db.get_compression_lock_holder("sess-1") is None
+        assert db.try_acquire_compression_lock("sess-1", "holder-b") is True
+
+    def test_expired_lock_can_be_reclaimed(self, db):
+        assert db.try_acquire_compression_lock("sess-2", "holder-a") is True
+        db._conn.execute(
+            "UPDATE compression_locks SET expires_at = ? WHERE session_id = ?",
+            (time.time() - 1, "sess-2"),
+        )
+        db._conn.commit()
+        assert db.try_acquire_compression_lock("sess-2", "holder-b") is True
+        assert db.get_compression_lock_holder("sess-2") == "holder-b"
+
+
 class TestVacuum:
     def test_vacuum_runs_without_error(self, db):
         """VACUUM must succeed on a fresh DB (no rows to reclaim)."""
