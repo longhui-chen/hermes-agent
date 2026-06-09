@@ -1,15 +1,10 @@
 name: LinearB AI Review → Feishu
 
 # LinearB 的 AI 代码评审在 GitHub 上以 check_run `lb/linearb_ai_review` 的形式出现。
-# 该 check 一完成就触发本 workflow → 解析评审结论 → 推一张报告卡片到飞书。
-#
-# 只处理「PR 合并到 main」的评审：base 分支必须是 main，否则跳过。
-# 结论二元化（已去掉评分）：
-#   - 正文含 `LGTM` 且无问题块            → ✅ 通过（无缺陷）
-#   - 含 `N issues detected` / 问题块      → ❌ 不通过（列出缺陷）
-#   - `Review timed out…`（系统过载没跑完）→ 不发（评审没出真结果，避免误报「0 个问题也不通过」）
-#
-# 逻辑与 scripts/linearb/report.js 保持一致（那份是唯一真源 + 本地测试入口）。
+# 该 check 一完成就触发本 workflow，解析评审结论 → 推一张报告卡片到飞书。
+# 评审本身是 COMMENTED 模式(conclusion 恒为 success)，所以"通过/不通过"按评审正文判：
+#   - "LGTM"            → ✅ 通过
+#   - "N issues detected" → ❌ 不通过（按问题数×严重度算 0-100 评分）
 
 on:
   check_run:
@@ -39,33 +34,34 @@ jobs:
             const cr = context.payload.check_run;
             const summary = (cr.output && cr.output.summary) || '';
 
-            // ── 判定：pass / fail / skip（与 scripts/linearb/report.js 同步）──
-            function classifyReview(body) {
-              body = body || '';
+            // ── 解析评审 ──
+            function parseReview(body) {
+              const m = body.match(/\*\*(\d+)\s+issues?\s+detected/i);
+              const declared = m ? parseInt(m[1], 10) : 0;
               const issues = [];
-              const re = /<summary><strong>([\s\S]*?)<\/strong><\/summary>/g;
+              const re = /<summary><strong>(.*?)<\/strong><\/summary>/gs;
               let mm;
               while ((mm = re.exec(body)) !== null) {
-                const raw = mm[1].replace(/<kbd>[\s\S]*?<\/kbd>/g, '').replace(/<[^>]+>/g, '').trim();
+                const raw = mm[1].replace(/<kbd>.*?<\/kbd>/g, '').replace(/<[^>]+>/g, '').trim();
                 const dash = raw.indexOf(' - ');
                 const cat = (dash > 0 ? raw.slice(0, dash) : raw).trim();
                 const title = (dash > 0 ? raw.slice(dash + 3) : '').trim();
                 issues.push({ cat, title });
               }
-              const dm = body.match(/\*\*(\d+)\s+issues?\s+detected/i);
-              const declared = dm ? parseInt(dm[1], 10) : 0;
               const count = issues.length || declared;
-              if (count > 0) return { verdict: 'fail', issues, count };
-              if (/\bLGTM\b/.test(body)) return { verdict: 'pass', issues: [], count: 0 };
-              return { verdict: 'skip', issues: [], count: 0 };
+              const pass = !count && /LGTM/.test(body);
+              const weight = (c) => /security|🔒/i.test(c) ? 30 : /bug|🐞/i.test(c) ? 20 : /perf|🚀/i.test(c) ? 15 : 10;
+              let score = pass ? 100 : Math.max(0, 100 - issues.reduce((s, i) => s + weight(i.cat), 0));
+              if (!pass && issues.length === 0 && count > 0) score = Math.max(0, 100 - count * 20);
+              return { pass, count, issues, score };
             }
+            const grade = (s) => s >= 90 ? 'A · 优秀' : s >= 75 ? 'B · 良好' : s >= 60 ? 'C · 需改进' : s >= 40 ? 'D · 较差' : 'E · 高风险';
 
-            const cls = classifyReview(summary);
-            if (cls.verdict === 'skip') { core.info('评审未出真结果（超时/不可判定），跳过'); return; }
+            const review = parseReview(summary);
 
-            // ── 定位 PR（作者 / 链接 / 标题 / 分支）──
+            // ── 定位 PR（作者 / 链接 / 标题）──
             let pr = (cr.pull_requests && cr.pull_requests[0]) || null;
-            let prTitle = '', author = '', prUrl = '', baseRef = '', headRef = '', prNum = 0;
+            let prTitle = '', author = '', prUrl = '', baseRef = '', headRef = '';
             try {
               if (!pr) {
                 const { data } = await github.rest.repos.listPullRequestsAssociatedWithCommit(
@@ -73,31 +69,29 @@ jobs:
                 pr = data && data[0];
               }
               if (pr) {
-                prNum = pr.number;
+                const num = pr.number;
                 const { data: full } = await github.rest.pulls.get(
-                  { owner: context.repo.owner, repo: context.repo.repo, pull_number: prNum });
+                  { owner: context.repo.owner, repo: context.repo.repo, pull_number: num });
                 prTitle = full.title; author = full.user.login; prUrl = full.html_url;
                 baseRef = full.base.ref; headRef = full.head.ref;
               }
             } catch (e) { core.warning('取 PR 失败: ' + e.message); }
             if (!prUrl) { core.info('该 check 未关联 PR，跳过'); return; }
 
-            // 只报「合并到 main」的 PR
-            if (baseRef !== 'main') { core.info(`base=${baseRef} 非 main，跳过`); return; }
-
-            // ── 组飞书卡片（无评分）──
-            const ok = cls.verdict === 'pass';
-            const head = ok ? '✅ LinearB 评审通过' : `❌ LinearB 评审不通过 — 发现 ${cls.count} 个缺陷`;
+            // ── 组飞书卡片 ──
+            const ok = review.pass;
+            const head = ok ? '✅ LinearB 评审通过' : `❌ LinearB 评审不通过 — 发现 ${review.count} 个问题`;
             const lines = [
               `**仓库**：${context.repo.repo}`,
-              `**PR**：[#${prNum} ${prTitle}](${prUrl})`,
+              `**PR**：[#${pr.number} ${prTitle}](${prUrl})`,
               `**提交者**：${author}`,
               `**分支**：${baseRef} ← ${headRef}`,
-              `**结论**：${ok ? '✅ 通过（无缺陷）' : `❌ 不通过（${cls.count} 个缺陷）`}`,
+              `**结论**：${ok ? '✅ 通过 (LGTM)' : '❌ 不通过'}`,
+              `**代码整体评分**：${review.score}/100 · ${grade(review.score)}`,
             ];
-            if (!ok && cls.issues.length) {
-              lines.push('\n**缺陷清单**：');
-              cls.issues.forEach((it, i) => lines.push(`${i + 1}. ${it.cat}${it.title ? ' — ' + it.title : ''}`));
+            if (!ok && review.issues.length) {
+              lines.push('\n**问题清单**：');
+              review.issues.forEach((it, i) => lines.push(`${i + 1}. ${it.cat} — ${it.title}`));
             }
             const card = {
               msg_type: 'interactive',
@@ -107,7 +101,7 @@ jobs:
                 elements: [
                   { tag: 'div', text: { tag: 'lark_md', content: lines.join('\n') } },
                   { tag: 'hr' },
-                  { tag: 'note', elements: [{ tag: 'plain_text', content: 'LinearB AI Review · PR → main · check_run 自动触发' }] },
+                  { tag: 'note', elements: [{ tag: 'plain_text', content: 'LinearB AI Review · check_run 自动触发 · 评分按问题数×严重度推导' }] },
                   { tag: 'action', elements: [{ tag: 'button', text: { tag: 'plain_text', content: '打开 PR' }, type: 'primary', url: prUrl }] },
                 ],
               },
