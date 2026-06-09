@@ -4,9 +4,9 @@ name: LinearB AI Review → Feishu
 # 该 check 一完成就触发本 workflow → 解析评审结论 → 推一张报告卡片到飞书。
 #
 # 只处理「PR 合并到 main」的评审：base 分支必须是 main，否则跳过。
-# 结论二元化（已去掉评分）：
-#   - 正文含 `LGTM` 且无问题块            → ✅ 通过（无缺陷）
-#   - 含 `N issues detected` / 问题块      → ❌ 不通过（列出缺陷）
+# 结论二元化（已去掉评分）+「只在不通过时通知」：
+#   - 含 `N issues detected` / 问题块      → ❌ 不通过 → 推飞书（列出缺陷）
+#   - 正文含 `LGTM` 且无问题块            → ✅ 通过 → 不发消息（按用户要求，通过不打扰）
 #   - `Review timed out…`（系统过载没跑完）→ 不发（评审没出真结果，避免误报「0 个问题也不通过」）
 #
 # 逻辑与 scripts/linearb/report.js 保持一致（那份是唯一真源 + 本地测试入口）。
@@ -61,7 +61,9 @@ jobs:
             }
 
             const cls = classifyReview(summary);
-            if (cls.verdict === 'skip') { core.info('评审未出真结果（超时/不可判定），跳过'); return; }
+            // 只在「不通过」时通知：通过(pass)不打扰，超时/不可判定(skip)也不发。
+            // 等价于 report.js 的 shouldNotify(cls)（cls.verdict === 'fail'）。
+            if (cls.verdict !== 'fail') { core.info(`评审 verdict=${cls.verdict}（非 fail），不通知`); return; }
 
             // ── 定位 PR（作者 / 链接 / 标题 / 分支）──
             let pr = (cr.pull_requests && cr.pull_requests[0]) || null;
@@ -85,25 +87,47 @@ jobs:
             // 只报「合并到 main」的 PR
             if (baseRef !== 'main') { core.info(`base=${baseRef} 非 main，跳过`); return; }
 
-            // ── 组飞书卡片（无评分）──
-            const ok = cls.verdict === 'pass';
-            const head = ok ? '✅ LinearB 评审通过' : `❌ LinearB 评审不通过 — 发现 ${cls.count} 个缺陷`;
+            // ── 组飞书卡片（无评分；与 scripts/linearb/report.js 同步）──
+            // lark_md 转义：PR 标题 / 分支 / 作者 / issue 文案均用户可控，不转义可注入伪造链接或假「结论」行。
+            const esc = (s) => String(s == null ? '' : s)
+              .replace(/[\r\n]+/g, ' ').replace(/\\/g, '\\\\').replace(/([\[\]()*_~`])/g, '\\$1');
+
+            // GitHub 登录名 → 飞书 open_id（不通过时 @ 出作者本人）。来源 roster ∩ feishu_user_mappings。
+            // best-effort：对不上的作者退化为纯文本、不 @。新人按 'login': 'ou_…' 补充。
+            const OPENID_BY_GH = {
+              gezhengbin888: 'ou_6d44b270588ec7b5412c8335925f4c9c',
+              jiadalin: 'ou_4926ad189bebb111e58174fddcd0c631',
+              jiafu0: 'ou_68e206186246b8336751a1b4318a423d',
+              maohan1013: 'ou_777c2bb1c519ade96982dfa9bd95ff7b',
+              'zettlab-penggang': 'ou_f9a42c51f8685afc19297d7686be08ad',
+              setLylToxlx: 'ou_8962010d0f2c3c6b528e3add6b423afa',
+              'zettlab-zlw': 'ou_ff1e2a3baf3542a239ffbbb1160a4328',
+              'zett-jay': 'ou_a3d71d7a50ce96d7321dcf5f51a9de38',
+              'zettlab-yangheng': 'ou_4bf61a33459b577986693d3eed2b2471',
+              'yoran-wu': 'ou_eabbc9e4aa743c7cf8683fa88c1a386c',
+              tiger573: 'ou_ffde9661231d9f9d6c6659d15974eb34',
+            };
+            const atTag = (login) => OPENID_BY_GH[login] ? `<at id=${OPENID_BY_GH[login]}></at>` : '';
+
+            // 走到这里 cls.verdict 必为 'fail'（pass/skip 已早退不通知）
+            const head = `❌ LinearB 评审不通过 — 发现 ${cls.count} 个缺陷`;
+            const at = atTag(author);
             const lines = [
-              `**仓库**：${context.repo.repo}`,
-              `**PR**：[#${prNum} ${prTitle}](${prUrl})`,
-              `**提交者**：${author}`,
-              `**分支**：${baseRef} ← ${headRef}`,
-              `**结论**：${ok ? '✅ 通过（无缺陷）' : `❌ 不通过（${cls.count} 个缺陷）`}`,
+              `**仓库**：${esc(context.repo.repo)}`,
+              `**PR**：[#${prNum} ${esc(prTitle)}](${prUrl})`,
+              `**提交者**：${at ? at + ' ' : ''}${esc(author)}`,
+              `**分支**：${esc(baseRef)} ← ${esc(headRef)}`,
+              `**结论**：❌ 不通过（${cls.count} 个缺陷）`,
             ];
-            if (!ok && cls.issues.length) {
+            if (cls.issues.length) {
               lines.push('\n**缺陷清单**：');
-              cls.issues.forEach((it, i) => lines.push(`${i + 1}. ${it.cat}${it.title ? ' — ' + it.title : ''}`));
+              cls.issues.forEach((it, i) => lines.push(`${i + 1}. ${esc(it.cat)}${it.title ? ' — ' + esc(it.title) : ''}`));
             }
             const card = {
               msg_type: 'interactive',
               card: {
                 config: { wide_screen_mode: true },
-                header: { template: ok ? 'green' : 'red', title: { tag: 'plain_text', content: head } },
+                header: { template: 'red', title: { tag: 'plain_text', content: head } },
                 elements: [
                   { tag: 'div', text: { tag: 'lark_md', content: lines.join('\n') } },
                   { tag: 'hr' },
