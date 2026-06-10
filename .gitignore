@@ -50,6 +50,9 @@ privvy*
 images/
 __pycache__/
 hermes_agent.egg-info/
+# Python build artifacts (setuptools/uv build intermediates + dist output)
+/build/
+/dist/
 wandb/
 testlogs
 

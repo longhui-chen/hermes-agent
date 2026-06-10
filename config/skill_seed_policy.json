@@ -1,0 +1,51 @@
+{
+  "version": 3,
+  "mode": "allowlist",
+  "_comment": "Policy-driven seed allowlist (seeding mechanism ONLY — this PR does NOT modify skills/ and does NOT de-brand). A NEW profile seeds only the ids in 'seed' (27 of the 76 bundled skills); everything not listed — including future upstream skills — is NOT seeded (fail-closed). The seed SET is decoupled from skills/: this policy is the only thing that decides composition, so the upstream skill tree is never trimmed for curation, and skills/ is kept verbatim upstream (no renames, no content edits). De-branding the seeded skills whose upstream names carry a vendor brand (e.g. claude-design, baoyu-infographic) is intentionally OUT OF SCOPE here and handled in a SEPARATE follow-up PR; until then they are seeded under their upstream names. Ids are matched against each bundled skill's SKILL.md frontmatter `name`; a stale id (renamed/removed upstream) fails the CI guard (tools/check_seed_policy.py).",
+  "status": "FROZEN 2026-06-10 — 27-skill seed set = the Feishu table's preset (预置保留 24 + 去品牌后保留 3). Pure allowlist over the PRISTINE upstream skills/ (no in-place renames/content edits); the 3 brand-named skills are seeded under their upstream names here and de-branded in a separate follow-up PR.",
+  "source": {
+    "feishu_wiki_node": "WsXCwKZPtiaN8bksir1cdq2anMf",
+    "feishu_base": "Dec5ba8QGaBJfBsjTpRcSFAlnsg",
+    "feishu_table": "tblZlQE3Zb8IhcFB",
+    "feishu_view": "vew4jCMkBg",
+    "snapshot_date": "2026-06-09",
+    "scoped_to": "main's 76 skills @ origin/main",
+    "table_tally": { "预置保留": 24, "去品牌后保留": 3, "转为可选（不预置）": 37, "移除": 27, "total": 91 },
+    "note": "27 seed = 预置保留 24 + 去品牌后保留 3 (claude-design / baoyu-infographic / nano-pdf)。本 PR 只做 seeding 机制、skills/ 原封不动,这 3 个按上游原名预置;去品牌(改名/内容)走单独的 follow-up PR。"
+  },
+  "seed": [
+    "airtable",
+    "architecture-diagram",
+    "arxiv",
+    "baoyu-infographic",
+    "blogwatcher",
+    "claude-design",
+    "excalidraw",
+    "gif-search",
+    "github-code-review",
+    "google-workspace",
+    "hermes-agent",
+    "himalaya",
+    "humanizer",
+    "kanban-orchestrator",
+    "kanban-worker",
+    "maps",
+    "nano-pdf",
+    "notion",
+    "obsidian",
+    "openhue",
+    "plan",
+    "popular-web-designs",
+    "requesting-code-review",
+    "scheduled-task-wizard",
+    "songwriting-and-ai-music",
+    "xurl",
+    "youtube-content"
+  ],
+  "runtime_required": [
+    "hermes-agent",
+    "kanban-worker",
+    "kanban-orchestrator",
+    "requesting-code-review"
+  ]
+}

@@ -407,10 +407,35 @@ echo "Syncing bundled skills to ~/.hermes/skills/ ..."
 if "$SCRIPT_DIR/venv/bin/python" "$SCRIPT_DIR/tools/skills_sync.py" 2>/dev/null; then
     echo -e "${GREEN}✓${NC} Skills synced"
 else
-    # Fallback: copy if sync script fails (missing deps, etc.)
-    if [ -d "$SCRIPT_DIR/skills" ]; then
-        cp -rn "$SCRIPT_DIR/skills/"* "$HERMES_SKILLS_DIR/" 2>/dev/null || true
-        echo -e "${GREEN}✓${NC} Skills copied"
+    # Fallback (python seeder unavailable): copy ONLY the policy's seed set from
+    # the pre-baked manifest — policy-correct without running python. Never
+    # bulk-copy the whole bundle (that would seed the un-curated full set).
+    manifest="$SCRIPT_DIR/config/seed_fallback_manifest.txt"
+    if [ ! -f "$manifest" ]; then
+        echo "  (skill seed manifest missing; skills will seed on first 'hermes' run)"
+    # Only seed into an EMPTY profile — the seed policy applies to NEW profiles
+    # only. Matches the empty-profile gate in scripts/install.sh / install.ps1 so
+    # an existing profile is never flipped to policy-managed by the fallback.
+    elif [ ! "$(ls -A "$HERMES_SKILLS_DIR/" 2>/dev/null | grep -v '.bundled_manifest')" ]; then
+        seed_failures=0
+        # `|| [ -n "$src" ]` so a manifest whose last line lacks a trailing
+        # newline still processes that final seed.
+        while IFS= read -r src || [ -n "$src" ]; do
+            [ -z "$src" ] && continue
+            dest="${src#*/}"
+            mkdir -p "$HERMES_SKILLS_DIR/$(dirname "$dest")"
+            cp -rn "$SCRIPT_DIR/$src" "$HERMES_SKILLS_DIR/$dest" 2>/dev/null \
+                || seed_failures=$((seed_failures + 1))
+        done < "$manifest"
+        # Only write the policy-managed marker when every seed copied. On partial
+        # failure, skip it and report honestly — the first 'hermes' run (no
+        # manifest -> treated as new) re-seeds under policy and completes the rest.
+        if [ "$seed_failures" -eq 0 ]; then
+            : > "$HERMES_SKILLS_DIR/.seed_policy"
+            echo -e "${GREEN}✓${NC} Skills seeded from policy fallback"
+        else
+            echo -e "${YELLOW}⚠${NC} Skill fallback seeding incomplete ($seed_failures copy failure(s)); marker not written — the first 'hermes' run will complete seeding under policy."
+        fi
     fi
 fi
 
