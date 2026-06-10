@@ -1,4 +1,4 @@
-skills/autonomous-ai-agents/hermes-agent
+skills/autonomous-ai-agents/zettlab-memo-setup
 skills/creative/architecture-diagram
 skills/creative/baoyu-infographic
 skills/creative/claude-design

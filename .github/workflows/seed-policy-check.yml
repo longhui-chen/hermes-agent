@@ -1,9 +1,11 @@
 name: seed-policy-check
 
-# Seed-policy guard. config/skill_seed_policy.json is a pure allowlist deciding
-# what a new profile seeds; this PR keeps skills/ upstream-verbatim and does NOT
-# de-brand (that is a separate follow-up). This workflow keeps the policy
-# consistent with the upstream tree and exercises the seed-time sync logic.
+# Seed-policy + de-brand guard. config/skill_seed_policy.json is a pure allowlist
+# deciding what a new profile seeds. This workflow keeps the policy consistent
+# with the bundled skill tree and exercises the seed-time sync logic; it also
+# (de-brand follow-up) guards the de-branded sibling zettlab-memo-setup, which
+# must stay brand-clean and structurally in sync with upstream hermes-agent
+# (tools/check_sibling_debrand.py).
 
 on:
   pull_request:
@@ -13,7 +15,10 @@ on:
       - 'config/seed_fallback_manifest.txt'
       - 'tools/skills_sync.py'
       - 'tools/check_seed_policy.py'
+      - 'tools/check_sibling_debrand.py'
+      - 'config/sibling_upstream_baseline.json'
       - 'tests/tools/test_skills_sync.py'
+      - 'tests/tools/test_check_sibling_debrand.py'
       - 'website/scripts/generate-skill-docs.py'
       - 'website/scripts/extract-skills.py'
       # Packaging / install chain — these decide whether the wheel/sdist/ZPK
@@ -40,12 +45,14 @@ jobs:
           python-version: '3.11'
       - name: Validate seed policy (fail-closed)
         run: python tools/check_seed_policy.py
+      - name: De-branded sibling stays brand-clean + in sync with upstream hermes-agent
+        run: python tools/check_sibling_debrand.py
       - name: Seed/sync + packaging unit tests
         run: |
           # pytest-timeout is required: the repo's pyproject addopts sets
           # --timeout/--timeout-method, and pytest exits 4 (usage error) without it.
           python -m pip install --quiet pyyaml==6.0.3 pytest==9.0.2 pytest-timeout==2.4.0 setuptools==82.0.1
-          python -m pytest tests/tools/test_skills_sync.py tests/test_packaging_data_files.py tests/test_packaging_metadata.py -q
+          python -m pytest tests/tools/test_skills_sync.py tests/tools/test_check_sibling_debrand.py tests/test_packaging_data_files.py tests/test_packaging_metadata.py -q
       - name: Wheel ships the seed policy + skill trees
         run: |
           python -m pip install --quiet build==1.5.0
