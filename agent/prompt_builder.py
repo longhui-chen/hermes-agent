@@ -130,7 +130,7 @@ DEFAULT_AGENT_IDENTITY = (
 
 HERMES_AGENT_HELP_GUIDANCE = (
     "If the user asks about configuring, setting up, or using the Zettlab Memo "
-    "runtime, load the `hermes-agent` skill with skill_view(name='hermes-agent') "
+    "runtime, load the `zettlab-memo-setup` skill with skill_view(name='zettlab-memo-setup') "
     "before answering; it documents the underlying runtime commands."
 )
 
@@ -1253,7 +1253,7 @@ def build_skills_system_prompt(
             "already know how to do, because the skill defines how it should be done here.\n"
             "Whenever the user asks you to configure, set up, install, enable, disable, modify, "
             "or troubleshoot the Zettlab Memo runtime — its CLI, config, models, providers, tools, "
-            "skills, voice, gateway, plugins, or any feature — load the `hermes-agent` skill "
+            "skills, voice, gateway, plugins, or any feature — load the `zettlab-memo-setup` skill "
             "first. It has the actual commands (e.g. `hermes config set …`, `hermes tools`, "
             "`hermes setup`) so you don't have to guess or invent workarounds.\n"
             "If a skill has issues, fix it with skill_manage(action='patch').\n"
