@@ -237,6 +237,35 @@ def _modules_for_package(package: str) -> list[str]:
     return modules
 
 
+def _check_seed_policy() -> None:
+    """Seed-policy guard: a packaged build that ships a seed policy must seed the
+    curated bundled-skill set on a fresh profile.
+
+    Resolves the policy / bundled skills exactly the way runtime does (via
+    tools.skills_sync) and runs a real seed into a throwaway HERMES_HOME.
+    Tolerant: an un-curated build (no policy) is skipped rather than failed, so
+    this never breaks a payload that legitimately ships no seed policy.
+    """
+    code = (
+        "import os, tempfile, sys\n"
+        "os.environ['HERMES_HOME'] = tempfile.mkdtemp()\n"
+        "from tools import skills_sync as s\n"
+        "pol = s._read_seed_policy()\n"
+        "if pol is None:\n"
+        "    print('seed policy: none (un-curated build) — skipped'); sys.exit(0)\n"
+        "bd = s._get_bundled_dir()\n"
+        "if not bd.exists():\n"
+        "    print('FAIL bundled skills dir missing: %s' % bd); sys.exit(3)\n"
+        "r = s.sync_skills(quiet=True)\n"
+        "want = len(pol['seed_set']); got = len(r.get('copied', []))\n"
+        "if r.get('policy_error') or got != want:\n"
+        "    print('FAIL seeded %d, policy wants %d (policy_error=%s)' % (got, want, r.get('policy_error'))); sys.exit(3)\n"
+        "print('seed policy ok: %d curated skills seeded (policy + config resolved)' % got)\n"
+    )
+    out = _check_command([sys.executable, "-c", code])
+    print(out.splitlines()[-1] if out else "seed policy check ran")
+
+
 def main() -> int:
     install_spec = os.environ.get("ZPK_INSTALL_SPEC", DEFAULT_INSTALL_SPEC)
     extras = _parse_install_spec(install_spec)
@@ -255,6 +284,8 @@ def main() -> int:
 
     _check_imports(CORE_IMPORTS)
     print(f"core imports ok: {', '.join(CORE_IMPORTS)}")
+
+    _check_seed_policy()
 
     pyproject = _load_pyproject()
     optional_deps = pyproject.get("project", {}).get("optional-dependencies", {})

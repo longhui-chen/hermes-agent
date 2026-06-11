@@ -268,14 +268,15 @@ hermes-acp = "acp_adapter.entry:main"
 [tool.setuptools]
 py-modules = ["run_agent", "model_tools", "toolsets", "batch_runner", "trajectory_compressor", "toolset_distributions", "cli", "hermes_bootstrap", "hermes_constants", "hermes_state", "hermes_time", "hermes_logging", "utils", "mcp_serve"]
 
-[tool.setuptools.data-files]
-# i18n catalogs. locales/ is a bare data directory (no __init__.py), so it is
-# neither a package (packages.find) nor package-data (which attaches to a
-# package). data-files ships it in the wheel; MANIFEST.in `graft locales`
-# ships it in the sdist. Without this, sealed installs (pip wheel, Nix store
-# venv) drop the catalogs and gateway/CLI commands surface raw i18n keys like
-# `gateway.reset.header_default` (#27632, #35374, #23943).
-locales = ["locales/*.yaml"]
+# NOTE: [tool.setuptools.data-files] is intentionally NOT declared here — it is
+# defined programmatically in setup.py instead. The bundled skill trees (skills/,
+# optional-skills/) must keep their nested category/skill structure in the wheel,
+# and static pyproject data-files globs flatten it.
+# pyproject fields take precedence over setup.py, so declaring data-files here
+# (even just for locales) silently overrides setup.py and drops every skill from
+# the wheel. locales/, config/* and the skill trees all ship via setup.py
+# data_files (wheel) + MANIFEST.in (sdist). See setup.py for the rationale.
+# (#27632/#35374 i18n catalogs still ship — verified in the wheel.)
 
 [tool.setuptools.package-data]
 hermes_cli = ["web_dist/**/*", "tui_dist/**/*", "scripts/install.sh", "scripts/install.ps1"]

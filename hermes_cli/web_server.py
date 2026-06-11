@@ -6889,6 +6889,7 @@ async def create_profile_endpoint(body: ProfileCreate):
         clone = body.clone_from_default or body.clone_all
         clone_from = "default" if clone else None
         clone_config = body.clone_from_default and not body.clone_all
+    seed_skills_result = None
     try:
         path = profiles_mod.create_profile(
             name=body.name,
@@ -6904,7 +6905,7 @@ async def create_profile_endpoint(body: ProfileCreate):
         # user-installed skills. When no_skills=True, create_profile() wrote
         # the opt-out marker and seed_profile_skills() will no-op.
         if not clone:
-            profiles_mod.seed_profile_skills(path, quiet=True)
+            seed_skills_result = profiles_mod.seed_profile_skills(path, quiet=True)
 
         # Match the CLI's profile-create flow: named profiles should get a
         # wrapper in ~/.local/bin when the alias is safe to create.
@@ -6931,7 +6932,17 @@ async def create_profile_endpoint(body: ProfileCreate):
         except Exception:
             _log.exception("Setting model for new profile %s failed", body.name)
 
-    return {"ok": True, "name": body.name, "path": str(path), "model_set": model_set}
+    response = {"ok": True, "name": body.name, "path": str(path), "model_set": model_set}
+    if seed_skills_result and seed_skills_result.get("policy_error"):
+        # Surface the fail-closed seed-policy error the dashboard would otherwise
+        # never see: the profile was created, but bundled skills were NOT seeded
+        # (seed policy corrupt/missing). Mirrors the CLI create warning.
+        response["skills_warning"] = (
+            "Profile created, but bundled skills were NOT seeded: the seed policy "
+            "is present but unreadable/corrupt (fail-closed). Fix "
+            "config/skill_seed_policy.json and run `hermes update`."
+        )
+    return response
 
 
 @app.get("/api/profiles/active")
