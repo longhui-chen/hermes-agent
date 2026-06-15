@@ -28,6 +28,11 @@ jobs:
       github.repository_owner == 'zettlab'
     runs-on: ubuntu-latest
     steps:
+      # checkout 仅为读取 open_id 注册表（scripts/test-harness/feishu/feishu_openid_registry.json）
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/test-harness/feishu/feishu_openid_registry.json
+          sparse-checkout-cone-mode: false
       - name: Parse LinearB review and notify Feishu
         uses: actions/github-script@v8
         env:
@@ -63,7 +68,14 @@ jobs:
             const cls = classifyReview(summary);
             // 只在「不通过」时通知：通过(pass)不打扰，超时/不可判定(skip)也不发。
             // 等价于 report.js 的 shouldNotify(cls)（cls.verdict === 'fail'）。
-            if (cls.verdict !== 'fail') { core.info(`评审 verdict=${cls.verdict}（非 fail），不通知`); return; }
+            if (cls.verdict !== 'fail') {
+              // skip 但正文不像超时 → 可能 LinearB 改了 LGTM 措辞/输出格式导致判定失效，
+              // 告警以便及时发现（pass / 真超时不告警，避免噪声）。
+              if (cls.verdict === 'skip' && !/timed out|temporary system load|try again/i.test(summary)) {
+                core.warning(`评审 verdict=skip 但未识别为超时，疑似 LinearB 输出格式有变。Summary: ${summary.slice(0, 200)}`);
+              }
+              core.info(`评审 verdict=${cls.verdict}（非 fail），不通知`); return;
+            }
 
             // ── 定位 PR（作者 / 链接 / 标题 / 分支）──
             let pr = (cr.pull_requests && cr.pull_requests[0]) || null;
@@ -92,21 +104,18 @@ jobs:
             const esc = (s) => String(s == null ? '' : s)
               .replace(/[\r\n]+/g, ' ').replace(/\\/g, '\\\\').replace(/([\[\]()*_~`])/g, '\\$1');
 
-            // GitHub 登录名 → 飞书 open_id（不通过时 @ 出作者本人）。来源 roster ∩ feishu_user_mappings。
-            // best-effort：对不上的作者退化为纯文本、不 @。新人按 'login': 'ou_…' 补充。
-            const OPENID_BY_GH = {
-              gezhengbin888: 'ou_6d44b270588ec7b5412c8335925f4c9c',
-              jiadalin: 'ou_4926ad189bebb111e58174fddcd0c631',
-              jiafu0: 'ou_68e206186246b8336751a1b4318a423d',
-              maohan1013: 'ou_777c2bb1c519ade96982dfa9bd95ff7b',
-              'zettlab-penggang': 'ou_f9a42c51f8685afc19297d7686be08ad',
-              setLylToxlx: 'ou_8962010d0f2c3c6b528e3add6b423afa',
-              'zettlab-zlw': 'ou_ff1e2a3baf3542a239ffbbb1160a4328',
-              'zett-jay': 'ou_a3d71d7a50ce96d7321dcf5f51a9de38',
-              'zettlab-yangheng': 'ou_4bf61a33459b577986693d3eed2b2471',
-              'yoran-wu': 'ou_eabbc9e4aa743c7cf8683fa88c1a386c',
-              tiger573: 'ou_ffde9661231d9f9d6c6659d15974eb34',
-            };
+            // GitHub 登录名 → 飞书 open_id（不通过时 @ 出作者本人）。
+            // 唯一真源 = scripts/test-harness/feishu/feishu_openid_registry.json 的 at_by_github
+            //（旧 webhook 维度）。加人改 build_registry.py 重生成，不要在此硬编码。
+            // 读不到（理论上 checkout 总在）则退化为空表：作者不 @、不报错。
+            // 注意：github-script 里相对 require 解析的是 action 目录而非仓库，必须用绝对路径。
+            let OPENID_BY_GH = {};
+            try {
+              const ws = process.env.GITHUB_WORKSPACE || process.cwd();
+              OPENID_BY_GH = require(`${ws}/scripts/test-harness/feishu/feishu_openid_registry.json`).at_by_github || {};
+            } catch (e) {
+              core.warning('读取 open_id 注册表失败，本次不 @ 作者：' + e.message);
+            }
             const atTag = (login) => OPENID_BY_GH[login] ? `<at id=${OPENID_BY_GH[login]}></at>` : '';
 
             // 走到这里 cls.verdict 必为 'fail'（pass/skip 已早退不通知）
@@ -137,4 +146,12 @@ jobs:
               },
             };
             const resp = await fetch(hook, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(card) });
-            core.info('Feishu: ' + (await resp.text()));
+            // 校验飞书响应：HTTP 非 2xx 或飞书 code!=0 都算失败，setFailed 让 CI 红——
+            // 不校验 = 通知坏了（限流/签名错/payload 非法）但 CI 全绿，无人知晓。
+            const respText = await resp.text();
+            let result; try { result = JSON.parse(respText); } catch (e) { result = {}; }
+            if (!resp.ok || result.code !== 0) {
+              core.setFailed(`Feishu webhook 失败: HTTP ${resp.status}, body: ${respText}`);
+            } else {
+              core.info('Feishu 通知成功: ' + respText);
+            }
