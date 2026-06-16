@@ -27,11 +27,11 @@ def isolate_skills(tmp_path, monkeypatch):
     return skills_dir
 
 
-def _make_skill_content(body_chars: int) -> str:
+def _make_skill_content(body_chars: int, name: str = "test-skill") -> str:
     """Generate valid SKILL.md content with a body of the given character count."""
     frontmatter = (
         "---\n"
-        "name: test-skill\n"
+        f"name: {name}\n"
         "description: A test skill\n"
         "---\n"
     )
@@ -63,12 +63,12 @@ class TestCreateSkillSizeLimit:
     """create action rejects oversized content."""
 
     def test_create_within_limit(self, isolate_skills):
-        content = _make_skill_content(5000)
+        content = _make_skill_content(5000, name="small-skill")
         result = json.loads(skill_manage(action="create", name="small-skill", content=content))
         assert result["success"] is True
 
     def test_create_over_limit(self, isolate_skills):
-        content = _make_skill_content(MAX_SKILL_CONTENT_CHARS + 100)
+        content = _make_skill_content(MAX_SKILL_CONTENT_CHARS + 100, name="huge-skill")
         result = json.loads(skill_manage(action="create", name="huge-skill", content=content))
         assert result["success"] is False
         assert "100,000" in result["error"]
@@ -88,13 +88,11 @@ class TestEditSkillSizeLimit:
 
     def test_edit_over_limit(self, isolate_skills):
         # Create a small skill first
-        small = _make_skill_content(1000)
+        small = _make_skill_content(1000, name="grow-me")
         json.loads(skill_manage(action="create", name="grow-me", content=small))
 
         # Try to edit it to be oversized
-        big = _make_skill_content(MAX_SKILL_CONTENT_CHARS + 100)
-        # Fix the name in frontmatter
-        big = big.replace("name: test-skill", "name: grow-me")
+        big = _make_skill_content(MAX_SKILL_CONTENT_CHARS + 100, name="grow-me")
         result = json.loads(skill_manage(action="edit", name="grow-me", content=big))
         assert result["success"] is False
         assert "100,000" in result["error"]
@@ -105,7 +103,7 @@ class TestPatchSkillSizeLimit:
 
     def test_patch_that_would_exceed_limit(self, isolate_skills):
         # Create a skill near the limit
-        near_limit = _make_skill_content(MAX_SKILL_CONTENT_CHARS - 50)
+        near_limit = _make_skill_content(MAX_SKILL_CONTENT_CHARS - 50, name="near-limit")
         json.loads(skill_manage(action="create", name="near-limit", content=near_limit))
 
         # Patch that adds enough to go over
@@ -123,8 +121,7 @@ class TestPatchSkillSizeLimit:
         # Manually create an oversized skill (simulating hand-placed)
         skill_dir = tmp_path / "skills" / "bloated"
         skill_dir.mkdir(parents=True)
-        oversized = _make_skill_content(MAX_SKILL_CONTENT_CHARS + 5000)
-        oversized = oversized.replace("name: test-skill", "name: bloated")
+        oversized = _make_skill_content(MAX_SKILL_CONTENT_CHARS + 5000, name="bloated")
         (skill_dir / "SKILL.md").write_text(oversized, encoding="utf-8")
         assert len(oversized) > MAX_SKILL_CONTENT_CHARS
 
@@ -142,7 +139,7 @@ class TestPatchSkillSizeLimit:
 
     def test_patch_supporting_file_size_limit(self, isolate_skills):
         """Patch on a supporting file also checks size."""
-        small = _make_skill_content(1000)
+        small = _make_skill_content(1000, name="with-ref")
         json.loads(skill_manage(action="create", name="with-ref", content=small))
         # Create a supporting file
         json.loads(skill_manage(
@@ -167,7 +164,7 @@ class TestWriteFileSizeLimit:
     """write_file action enforces both char and byte limits."""
 
     def test_write_file_over_char_limit(self, isolate_skills):
-        small = _make_skill_content(1000)
+        small = _make_skill_content(1000, name="file-test")
         json.loads(skill_manage(action="create", name="file-test", content=small))
 
         result = json.loads(skill_manage(
@@ -180,7 +177,7 @@ class TestWriteFileSizeLimit:
         assert "100,000" in result["error"]
 
     def test_write_file_within_limit(self, isolate_skills):
-        small = _make_skill_content(1000)
+        small = _make_skill_content(1000, name="file-ok")
         json.loads(skill_manage(action="create", name="file-ok", content=small))
 
         result = json.loads(skill_manage(
@@ -201,8 +198,7 @@ class TestHandPlacedSkillsNoLimit:
 
         skill_dir = tmp_path / "skills" / "manual-giant"
         skill_dir.mkdir(parents=True)
-        huge = _make_skill_content(200_000)
-        huge = huge.replace("name: test-skill", "name: manual-giant")
+        huge = _make_skill_content(200_000, name="manual-giant")
         (skill_dir / "SKILL.md").write_text(huge, encoding="utf-8")
 
         result = json.loads(skill_view("manual-giant"))
