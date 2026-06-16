@@ -122,7 +122,7 @@ class BrowserUseBrowserProvider(BrowserProvider):
         return self._get_config_or_none(refresh_token=False) is not None
 
     # ------------------------------------------------------------------
-    # Config resolution (direct API key OR Zettlab / managed Nous gateway)
+    # Config resolution (direct API key OR managed Nous gateway)
     # ------------------------------------------------------------------
 
     def _get_config_or_none(self, *, refresh_token: bool = True) -> Optional[Dict[str, Any]]:
@@ -134,10 +134,9 @@ class BrowserUseBrowserProvider(BrowserProvider):
             resolve_managed_tool_gateway,
         )
         from tools.tool_backend_helpers import prefers_gateway
-        from tools.zettlab_tool_gateway import resolve_zettlab_tool_gateway
 
-        # Direct API key wins unless the user has explicitly opted into a
-        # managed gateway via ``tool_gateway.browser: gateway``.
+        # Direct API key wins unless the user has explicitly opted into the
+        # managed Nous gateway via ``tool_gateway.browser: gateway``.
         api_key = os.environ.get("BROWSER_USE_API_KEY")
         if api_key and not prefers_gateway("browser"):
             return {
@@ -146,19 +145,7 @@ class BrowserUseBrowserProvider(BrowserProvider):
                 "managed_mode": False,
             }
 
-        # Zettlab-managed gateway: explicit BROWSER_USE_GATEWAY_URL injected by
-        # local-server (no Nous entitlement). The device IoT identity is
-        # attached downstream; the token here is a local placeholder.
-        zettlab = resolve_zettlab_tool_gateway("browser-use")
-        if zettlab is not None:
-            return {
-                "api_key": zettlab.token,
-                "base_url": zettlab.gateway_origin.rstrip("/"),
-                "managed_mode": True,
-            }
-
-        # Nous-managed gateway. Keep availability scans off the synchronous
-        # OAuth refresh path.
+        # Keep availability scans off the synchronous OAuth refresh path.
         managed = resolve_managed_tool_gateway(
             "browser-use",
             token_reader=None if refresh_token else peek_nous_access_token,

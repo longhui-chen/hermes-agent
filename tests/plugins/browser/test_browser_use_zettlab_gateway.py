@@ -1,6 +1,6 @@
 """browser-use provider integration with the Zettlab managed gateway.
 
-Verifies the device path: with BROWSER_USE_GATEWAY_URL + TOOL_GATEWAY_USER_TOKEN
+Verifies the device path: with BROWSER_USE_GATEWAY_URL + ZETTLAB_TOOL_GATEWAY_TOKEN
 injected (by local-server) and no commercial key, the provider resolves a
 managed config pointed at the Zettlab gateway without any Nous entitlement.
 """
@@ -16,7 +16,7 @@ _LOOPBACK = "http://127.0.0.1:9090/api/v1/browser-use"
 _ENV_KEYS = (
     "BROWSER_USE_API_KEY",
     "BROWSER_USE_GATEWAY_URL",
-    "TOOL_GATEWAY_USER_TOKEN",
+    "ZETTLAB_TOOL_GATEWAY_TOKEN",
     "TOOL_GATEWAY_DOMAIN",
 )
 
@@ -29,7 +29,7 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _zettlab_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BROWSER_USE_GATEWAY_URL", _LOOPBACK)
-    monkeypatch.setenv("TOOL_GATEWAY_USER_TOKEN", "local-browser-use")
+    monkeypatch.setenv("ZETTLAB_TOOL_GATEWAY_TOKEN", "local-browser-use")
 
 
 def test_zettlab_gateway_resolves_managed_config(monkeypatch: pytest.MonkeyPatch) -> None:

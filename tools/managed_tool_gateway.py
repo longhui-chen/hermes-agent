@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 from hermes_constants import get_hermes_home
 from tools.tool_backend_helpers import managed_nous_tools_enabled
+from tools.zettlab_tool_gateway import resolve_zettlab_tool_gateway
 
 _DEFAULT_TOOL_GATEWAY_DOMAIN = "nousresearch.com"
 _DEFAULT_TOOL_GATEWAY_SCHEME = "https"
@@ -153,7 +154,27 @@ def resolve_managed_tool_gateway(
     gateway_builder: Optional[Callable[[str], str]] = None,
     token_reader: Optional[Callable[[], Optional[str]]] = None,
 ) -> Optional[ManagedToolGatewayConfig]:
-    """Resolve shared managed-tool gateway config for a vendor."""
+    """Resolve shared managed-tool gateway config for a vendor.
+
+    Zettlab-managed gateway takes precedence: when local-server has injected an
+    explicit ``{VENDOR}_GATEWAY_URL`` (its loopback proxy) the tool is served
+    through the Zettlab gateway with no Nous Portal entitlement required. The
+    device IoT identity is attached downstream; the token carried here is a
+    local placeholder. Centralizing it here means every gateway-backed tool
+    (current and future) gets the Zettlab path without per-provider wiring.
+    See tools/zettlab_tool_gateway.py.
+    """
+    zettlab = resolve_zettlab_tool_gateway(vendor)
+    if zettlab is not None:
+        return ManagedToolGatewayConfig(
+            vendor=vendor,
+            gateway_origin=zettlab.gateway_origin,
+            # ManagedToolGatewayConfig is upstream's shape; for the Zettlab path
+            # this field carries the local placeholder token, not a Nous token.
+            nous_user_token=zettlab.token,
+            managed_mode=True,
+        )
+
     if not managed_nous_tools_enabled():
         return None
 
