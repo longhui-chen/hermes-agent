@@ -1394,6 +1394,81 @@ class TestChatCompletionsEndpoint:
         assert completed[0]["connector_error"]["status"] == 403
 
     @pytest.mark.asyncio
+    async def test_stream_tool_complete_preserves_connector_reauth_next_action(self, adapter):
+        import asyncio
+        import json as _json
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                ts_cb = kwargs.get("tool_start_callback")
+                tc_cb = kwargs.get("tool_complete_callback")
+                if ts_cb:
+                    ts_cb("call_weread_1", "weread_get_bookshelf", {})
+                if tc_cb:
+                    tc_cb(
+                        "call_weread_1",
+                        "weread_get_bookshelf",
+                        {},
+                        _json.dumps({
+                            "error": "expired",
+                            "errorCode": "expired",
+                            "connector_error": {
+                                "errorCode": "expired",
+                                "provider": "weread",
+                                "connectionId": "conn-weread",
+                                "toolName": "weread.get_bookshelf",
+                                "detail": "provider_token_rejected",
+                                "nextAction": {
+                                    "type": "reauth",
+                                    "provider": "weread",
+                                    "connectionId": "conn-weread",
+                                    "toolName": "weread.get_bookshelf",
+                                },
+                            },
+                        }),
+                    )
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("Please reconnect WeRead.")
+                return (
+                    {"final_response": "Please reconnect WeRead.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "list weread bookshelf"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        events = []
+        lines = body.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip() != "event: hermes.tool.progress":
+                continue
+            for follow in lines[i + 1: i + 4]:
+                if follow.startswith("data: "):
+                    events.append(_json.loads(follow[len("data: "):]))
+                    break
+        completed = [event for event in events if event.get("status") == "completed"]
+        assert len(completed) == 1
+        assert completed[0]["outcome"] == "error"
+        assert completed[0]["errorCode"] == "expired"
+        connector_error = completed[0]["connector_error"]
+        assert connector_error["errorCode"] == "expired"
+        assert connector_error["detail"] == "provider_token_rejected"
+        assert connector_error["nextAction"]["type"] == "reauth"
+        assert connector_error["nextAction"]["connectionId"] == "conn-weread"
+
+    @pytest.mark.asyncio
     async def test_stream_tool_complete_treats_empty_error_fields_as_success(self, adapter):
         import asyncio
         import json as _json
