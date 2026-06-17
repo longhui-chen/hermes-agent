@@ -30,6 +30,7 @@ from gateway.platforms.api_server import (
     ResponseStore,
     _IdempotencyCache,
     _derive_chat_session_id,
+    _tool_completion_payload,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -48,6 +49,38 @@ class TestCheckRequirements:
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", False)
     def test_returns_false_without_aiohttp(self):
         assert check_api_server_requirements() is False
+
+
+class TestToolCompletionPayload:
+    def test_promotes_connector_error_printed_by_execute_code_output(self):
+        printed = {
+            "ok": False,
+            "error": {
+                "code": "connector_runtime_auth_required",
+                "message": "ZETTLAB_CONNECTORS_AUTH_TOKEN is not set for this skill session.",
+            },
+            "connector_error": {
+                "code": "connector_runtime_auth_required",
+                "errorCode": "connector_runtime_auth_required",
+                "provider": "weread",
+                "nextAction": {"type": "refresh_connector_context"},
+            },
+        }
+        payload = _tool_completion_payload(
+            "call_exec_1",
+            "execute_code",
+            json.dumps({
+                "status": "error",
+                "error": "Script exited with code 1",
+                "output": json.dumps(printed),
+            }),
+        )
+
+        assert payload["outcome"] == "error"
+        assert payload["errorCode"] == "connector_runtime_auth_required"
+        assert payload["provider"] == "weread"
+        assert payload["connector_error"]["provider"] == "weread"
+        assert payload["connector_error"]["nextAction"]["type"] == "refresh_connector_context"
 
 
 # ---------------------------------------------------------------------------

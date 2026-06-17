@@ -417,6 +417,7 @@ def _tool_completion_payload(
             decoded = None
     if not isinstance(decoded, dict):
         return payload
+    decoded = _promote_connector_error_from_tool_output(decoded)
 
     has_error = _has_tool_error_value(decoded.get("error"))
     has_error_code = _has_tool_error_value(decoded.get("errorCode"))
@@ -446,6 +447,44 @@ def _tool_completion_payload(
             if value is not None and wire_key not in payload:
                 payload[wire_key] = value
     return payload
+
+
+def _promote_connector_error_from_tool_output(decoded: Dict[str, Any]) -> Dict[str, Any]:
+    """Promote connector runtime JSON printed by execute_code/terminal wrappers.
+
+    Preset connector skills call a bundled ``connector_runtime.py`` script.
+    When the script exits non-zero through execute_code, the tool result shape
+    is ``{"status":"error","error":"Script exited...", "output":"{...}"}``.
+    The structured connector error lives in ``output`` unless we lift it here.
+    """
+    if _has_tool_error_value(decoded.get("connector_error")):
+        return decoded
+    output = decoded.get("output")
+    if not isinstance(output, str):
+        return decoded
+    text = output.strip()
+    if not text:
+        return decoded
+    try:
+        printed = json.loads(text)
+    except json.JSONDecodeError:
+        return decoded
+    if not isinstance(printed, dict):
+        return decoded
+    connector_error = printed.get("connector_error")
+    if not _has_tool_error_value(connector_error):
+        return decoded
+    promoted = dict(decoded)
+    promoted["connector_error"] = connector_error
+    error_obj = printed.get("error")
+    if isinstance(error_obj, dict):
+        code = error_obj.get("code") or error_obj.get("errorCode") or error_obj.get("error_code")
+        message = error_obj.get("message")
+        if _has_tool_error_value(code):
+            promoted["errorCode"] = code
+        if not _has_tool_error_value(promoted.get("error")) and _has_tool_error_value(message):
+            promoted["error"] = message
+    return promoted
 
 
 def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Response":
