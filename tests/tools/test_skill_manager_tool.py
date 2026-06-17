@@ -915,6 +915,39 @@ class TestOfficialConnectorSkillGuard:
         assert "official Zettlab connector preset" in result["error"]
         assert not (tmp_path / "zettlab-microsoft-teams").exists()
 
+    def test_create_all_registration_intake_connector_presets_is_refused(self, tmp_path):
+        official_connector_skills = [
+            "zettlab-github",
+            "zettlab-notion",
+            "zettlab-linear",
+            "zettlab-google-workspace",
+            "zettlab-microsoft-entra",
+            "zettlab-feishu-lark",
+            "zettlab-jira",
+            "zettlab-slack",
+            "zettlab-x-twitter",
+            "zettlab-figma",
+            "zettlab-cloudflare",
+            "zettlab-mailchimp",
+            "zettlab-netlify",
+            "zettlab-render",
+            "zettlab-sentry",
+            "zettlab-vercel",
+            "zettlab-ghost",
+            "zettlab-airtable",
+            "zettlab-asana",
+            "zettlab-dropbox",
+            "zettlab-zoom",
+        ]
+
+        with _skill_dir(tmp_path):
+            for name in official_connector_skills:
+                result = _create_skill(name, _skill_content(name))
+
+                assert result["success"] is False, name
+                assert "official Zettlab connector preset" in result["error"]
+                assert not (tmp_path / name).exists()
+
     def test_edit_non_official_dir_with_official_frontmatter_is_refused(self, tmp_path):
         with _skill_dir(tmp_path):
             _create_skill("shadow-linear", _skill_content("shadow-linear"))
