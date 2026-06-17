@@ -170,11 +170,40 @@ VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')
 # Subdirectories allowed for write_file/remove_file
 ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets"}
 
-OFFICIAL_CONNECTOR_SKILL_NAMES = frozenset(
+CURRENT_CONNECTOR_PRESET_SKILL_NAMES = frozenset(
     {
         "authorized-connectors",
+        "connector-manager",
         "custom-connectors",
         "nas-web-connect",
+        "airtable",
+        "asana",
+        "cloudflare",
+        "dropbox",
+        "feishu-lark",
+        "figma",
+        "ghost",
+        "github",
+        "google-workspace",
+        "jira",
+        "linear",
+        "mailchimp",
+        "microsoft-entra",
+        "microsoft-teams",
+        "netlify",
+        "notion",
+        "render",
+        "sentry",
+        "slack",
+        "vercel",
+        "weread",
+        "x-twitter",
+        "zoom",
+    }
+)
+
+LEGACY_CONNECTOR_PRESET_SKILL_NAMES = frozenset(
+    {
         "zettlab-airtable",
         "zettlab-asana",
         "zettlab-cloudflare",
@@ -200,6 +229,8 @@ OFFICIAL_CONNECTOR_SKILL_NAMES = frozenset(
         "zettlab-zoom",
     }
 )
+
+OFFICIAL_CONNECTOR_SKILL_NAMES = CURRENT_CONNECTOR_PRESET_SKILL_NAMES | LEGACY_CONNECTOR_PRESET_SKILL_NAMES
 
 
 def _official_connector_skill_guard(*names: Optional[str]) -> Optional[str]:

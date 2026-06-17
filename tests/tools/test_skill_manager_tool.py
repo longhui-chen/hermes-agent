@@ -861,19 +861,19 @@ class TestOfficialConnectorSkillGuard:
     def test_create_official_connector_skill_is_refused(self, tmp_path):
         with _skill_dir(tmp_path):
             result = _create_skill(
-                "zettlab-weread",
-                VALID_SKILL_CONTENT.replace("name: test-skill", "name: zettlab-weread"),
+                "weread",
+                VALID_SKILL_CONTENT.replace("name: test-skill", "name: weread"),
             )
 
         assert result["success"] is False
         assert "official Zettlab connector preset" in result["error"]
-        assert not (tmp_path / "zettlab-weread").exists()
+        assert not (tmp_path / "weread").exists()
 
     def test_create_non_official_dir_with_official_frontmatter_is_refused(self, tmp_path):
         with _skill_dir(tmp_path):
             result = _create_skill(
                 "shadow-linear",
-                _skill_content("zettlab-linear"),
+                _skill_content("linear"),
             )
 
         assert result["success"] is False
@@ -888,56 +888,67 @@ class TestOfficialConnectorSkillGuard:
         assert "official Zettlab connector preset" in result["error"]
         assert not (tmp_path / "nas-web-connect").exists()
 
-    def test_create_zettlab_airtable_is_refused(self, tmp_path):
+    def test_create_airtable_is_refused(self, tmp_path):
         with _skill_dir(tmp_path):
-            result = _create_skill("zettlab-airtable", _skill_content("zettlab-airtable"))
+            result = _create_skill("airtable", _skill_content("airtable"))
 
         assert result["success"] is False
         assert "official Zettlab connector preset" in result["error"]
-        assert not (tmp_path / "zettlab-airtable").exists()
+        assert not (tmp_path / "airtable").exists()
 
-    def test_create_zettlab_x_twitter_is_refused(self, tmp_path):
+    def test_create_x_twitter_is_refused(self, tmp_path):
         with _skill_dir(tmp_path):
-            result = _create_skill("zettlab-x-twitter", _skill_content("zettlab-x-twitter"))
+            result = _create_skill("x-twitter", _skill_content("x-twitter"))
 
         assert result["success"] is False
         assert "official Zettlab connector preset" in result["error"]
-        assert not (tmp_path / "zettlab-x-twitter").exists()
+        assert not (tmp_path / "x-twitter").exists()
 
-    def test_create_zettlab_microsoft_teams_is_refused(self, tmp_path):
+    def test_create_microsoft_teams_is_refused(self, tmp_path):
         with _skill_dir(tmp_path):
             result = _create_skill(
-                "zettlab-microsoft-teams",
-                _skill_content("zettlab-microsoft-teams"),
+                "microsoft-teams",
+                _skill_content("microsoft-teams"),
             )
 
         assert result["success"] is False
         assert "official Zettlab connector preset" in result["error"]
-        assert not (tmp_path / "zettlab-microsoft-teams").exists()
+        assert not (tmp_path / "microsoft-teams").exists()
+
+    def test_create_legacy_zettlab_connector_skill_is_refused(self, tmp_path):
+        with _skill_dir(tmp_path):
+            result = _create_skill(
+                "zettlab-linear",
+                _skill_content("zettlab-linear"),
+            )
+
+        assert result["success"] is False
+        assert "official Zettlab connector preset" in result["error"]
+        assert not (tmp_path / "zettlab-linear").exists()
 
     def test_create_all_registration_intake_connector_presets_is_refused(self, tmp_path):
         official_connector_skills = [
-            "zettlab-github",
-            "zettlab-notion",
-            "zettlab-linear",
-            "zettlab-google-workspace",
-            "zettlab-microsoft-entra",
-            "zettlab-feishu-lark",
-            "zettlab-jira",
-            "zettlab-slack",
-            "zettlab-x-twitter",
-            "zettlab-figma",
-            "zettlab-cloudflare",
-            "zettlab-mailchimp",
-            "zettlab-netlify",
-            "zettlab-render",
-            "zettlab-sentry",
-            "zettlab-vercel",
-            "zettlab-ghost",
-            "zettlab-airtable",
-            "zettlab-asana",
-            "zettlab-dropbox",
-            "zettlab-zoom",
+            "github",
+            "notion",
+            "linear",
+            "google-workspace",
+            "microsoft-entra",
+            "feishu-lark",
+            "jira",
+            "slack",
+            "x-twitter",
+            "figma",
+            "cloudflare",
+            "mailchimp",
+            "netlify",
+            "render",
+            "sentry",
+            "vercel",
+            "ghost",
+            "airtable",
+            "asana",
+            "dropbox",
+            "zoom",
         ]
 
         with _skill_dir(tmp_path):
@@ -951,23 +962,23 @@ class TestOfficialConnectorSkillGuard:
     def test_edit_non_official_dir_with_official_frontmatter_is_refused(self, tmp_path):
         with _skill_dir(tmp_path):
             _create_skill("shadow-linear", _skill_content("shadow-linear"))
-            result = _edit_skill("shadow-linear", _skill_content("zettlab-linear"))
+            result = _edit_skill("shadow-linear", _skill_content("linear"))
 
         assert result["success"] is False
         assert "official Zettlab connector preset" in result["error"]
         content = (tmp_path / "shadow-linear" / "SKILL.md").read_text()
         assert "name: shadow-linear" in content
-        assert "name: zettlab-linear" not in content
+        assert "name: linear" not in content
 
     def test_patch_profile_local_official_connector_skill_is_refused(self, tmp_path):
-        skill_dir = tmp_path / "zettlab-linear"
+        skill_dir = tmp_path / "linear"
         skill_dir.mkdir()
         (skill_dir / "SKILL.md").write_text(
-            "---\nname: zettlab-linear\ndescription: polluted local copy.\n---\n\nOLD_MARKER\n"
+            "---\nname: linear\ndescription: polluted local copy.\n---\n\nOLD_MARKER\n"
         )
 
         with _skill_dir(tmp_path):
-            result = _patch_skill("zettlab-linear", "OLD_MARKER", "NEW_MARKER")
+            result = _patch_skill("linear", "OLD_MARKER", "NEW_MARKER")
 
         assert result["success"] is False
         assert "official Zettlab connector preset" in result["error"]
@@ -980,18 +991,18 @@ class TestOfficialConnectorSkillGuard:
         (skill_dir / "SKILL.md").write_text(_skill_content("shadow-linear"))
 
         with _skill_dir(tmp_path):
-            result = _patch_skill("shadow-linear", "name: shadow-linear", "name: zettlab-linear")
+            result = _patch_skill("shadow-linear", "name: shadow-linear", "name: linear")
 
         assert result["success"] is False
         assert "official Zettlab connector preset" in result["error"]
         assert "name: shadow-linear" in (skill_dir / "SKILL.md").read_text()
-        assert "name: zettlab-linear" not in (skill_dir / "SKILL.md").read_text()
+        assert "name: linear" not in (skill_dir / "SKILL.md").read_text()
 
     def test_patch_non_official_dir_with_existing_official_frontmatter_is_refused(self, tmp_path):
         skill_dir = tmp_path / "shadow-linear"
         skill_dir.mkdir()
         (skill_dir / "SKILL.md").write_text(
-            "---\nname: zettlab-linear\ndescription: polluted local copy.\n---\n\nOLD_MARKER\n"
+            "---\nname: linear\ndescription: polluted local copy.\n---\n\nOLD_MARKER\n"
         )
 
         with _skill_dir(tmp_path):
@@ -1006,10 +1017,10 @@ class TestOfficialConnectorSkillGuard:
         local = tmp_path / "local"
         external = tmp_path / "vault"
         local.mkdir(); external.mkdir()
-        skill_dir = _write_external_skill(external, name="zettlab-linear")
+        skill_dir = _write_external_skill(external, name="linear")
 
         with _two_roots(local, external):
-            result = _write_file("zettlab-linear", "references/notes.md", "# Notes\n")
+            result = _write_file("linear", "references/notes.md", "# Notes\n")
 
         assert result["success"] is False
         assert "official Zettlab connector preset" in result["error"]
