@@ -888,6 +888,33 @@ class TestOfficialConnectorSkillGuard:
         assert "official Zettlab connector preset" in result["error"]
         assert not (tmp_path / "nas-web-connect").exists()
 
+    def test_create_zettlab_airtable_is_refused(self, tmp_path):
+        with _skill_dir(tmp_path):
+            result = _create_skill("zettlab-airtable", _skill_content("zettlab-airtable"))
+
+        assert result["success"] is False
+        assert "official Zettlab connector preset" in result["error"]
+        assert not (tmp_path / "zettlab-airtable").exists()
+
+    def test_create_zettlab_x_twitter_is_refused(self, tmp_path):
+        with _skill_dir(tmp_path):
+            result = _create_skill("zettlab-x-twitter", _skill_content("zettlab-x-twitter"))
+
+        assert result["success"] is False
+        assert "official Zettlab connector preset" in result["error"]
+        assert not (tmp_path / "zettlab-x-twitter").exists()
+
+    def test_create_zettlab_microsoft_teams_is_refused(self, tmp_path):
+        with _skill_dir(tmp_path):
+            result = _create_skill(
+                "zettlab-microsoft-teams",
+                _skill_content("zettlab-microsoft-teams"),
+            )
+
+        assert result["success"] is False
+        assert "official Zettlab connector preset" in result["error"]
+        assert not (tmp_path / "zettlab-microsoft-teams").exists()
+
     def test_edit_non_official_dir_with_official_frontmatter_is_refused(self, tmp_path):
         with _skill_dir(tmp_path):
             _create_skill("shadow-linear", _skill_content("shadow-linear"))

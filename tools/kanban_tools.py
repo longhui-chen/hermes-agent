@@ -1272,7 +1272,7 @@ KANBAN_CREATE_SCHEMA = {
                     "worker (in addition to the built-in kanban-worker "
                     "skill). Use this to pin a task to a specialist "
                     "context — e.g. ['translation'] for a translation "
-                    "task, ['github-code-review'] for a reviewer task. "
+                    "task, ['requesting-code-review'] for a reviewer task. "
                     "The names must match skills installed on the "
                     "assignee's profile."
                 ),

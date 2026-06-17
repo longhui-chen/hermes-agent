@@ -175,11 +175,14 @@ OFFICIAL_CONNECTOR_SKILL_NAMES = frozenset(
         "authorized-connectors",
         "custom-connectors",
         "nas-web-connect",
+        "zettlab-airtable",
         "zettlab-github",
         "zettlab-google-workspace",
         "zettlab-linear",
+        "zettlab-microsoft-teams",
         "zettlab-notion",
         "zettlab-weread",
+        "zettlab-x-twitter",
     }
 )
 

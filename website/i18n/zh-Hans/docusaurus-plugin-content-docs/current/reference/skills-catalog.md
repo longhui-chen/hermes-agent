@@ -82,17 +82,6 @@ Hermes 在执行 `hermes update` 时也会同步内置技能，但同步清单�
 | 技能 | 描述 | 路径 |
 |-------|-------------|------|
 
-## github
-
-| 技能 | 描述 | 路径 |
-|-------|-------------|------|
-| [`codebase-inspection`](/user-guide/skills/bundled/github/github-codebase-inspection) | 使用 pygount 检查代码库：代码行数、语言、占比。 | `github/codebase-inspection` |
-| [`github-auth`](/user-guide/skills/bundled/github/github-github-auth) | GitHub 认证配置：HTTPS token、SSH 密钥、gh CLI 登录。 | `github/github-auth` |
-| [`github-code-review`](/user-guide/skills/bundled/github/github-github-code-review) | 审查 PR：通过 gh 或 REST API 查看 diff、添加行内评论。 | `github/github-code-review` |
-| [`github-issues`](/user-guide/skills/bundled/github/github-github-issues) | 通过 gh 或 REST API 创建、分类、标记、分配 GitHub issue。 | `github/github-issues` |
-| [`github-pr-workflow`](/user-guide/skills/bundled/github/github-github-pr-workflow) | GitHub PR 生命周期：分支、提交、开启、CI、合并。 | `github/github-pr-workflow` |
-| [`github-repo-management`](/user-guide/skills/bundled/github/github-github-repo-management) | 克隆/创建/fork 仓库；管理远程、发布版本。 | `github/github-repo-management` |
-
 ## mcp
 
 | 技能 | 描述 | 路径 |
@@ -130,14 +119,10 @@ Hermes 在执行 `hermes update` 时也会同步内置技能，但同步清单�
 
 | 技能 | 描述 | 路径 |
 |-------|-------------|------|
-| [`airtable`](/user-guide/skills/bundled/productivity/productivity-airtable) | 通过 curl 调用 Airtable REST API：记录增删改查、过滤、upsert。 | `productivity/airtable` |
-| [`google-workspace`](/user-guide/skills/bundled/productivity/productivity-google-workspace) | 通过 gws CLI 或 Python 操作 Gmail、Calendar、Drive、Docs、Sheets。 | `productivity/google-workspace` |
 | [`maps`](/user-guide/skills/bundled/productivity/productivity-maps) | 通过 OpenStreetMap/OSRM 进行地理编码、POI 查询、路线规划、时区查询。 | `productivity/maps` |
 | [`nano-pdf`](/user-guide/skills/bundled/productivity/productivity-nano-pdf) | 通过 nano-pdf CLI 编辑 PDF 文本/错别字/标题（自然语言 prompt）。 | `productivity/nano-pdf` |
-| [`notion`](/user-guide/skills/bundled/productivity/productivity-notion) | Notion API + ntn CLI：页面、数据库、Markdown、Workers。 | `productivity/notion` |
 | [`ocr-and-documents`](/user-guide/skills/bundled/productivity/productivity-ocr-and-documents) | 从 PDF/扫描件中提取文本（pymupdf、marker-pdf）。 | `productivity/ocr-and-documents` |
 | [`powerpoint`](/user-guide/skills/bundled/productivity/productivity-powerpoint) | 创建、读取、编辑 .pptx 演示文稿、幻灯片、备注、模板。 | `productivity/powerpoint` |
-| [`teams-meeting-pipeline`](/user-guide/skills/bundled/productivity/productivity-teams-meeting-pipeline) | 通过 Hermes CLI 操作 Teams 会议摘要流水线——汇总会议、检查流水线状态、重放任务、管理 Microsoft Graph 订阅。 | `productivity/teams-meeting-pipeline` |
 
 ## red-teaming
 
@@ -165,7 +150,6 @@ Hermes 在执行 `hermes update` 时也会同步内置技能，但同步清单�
 
 | 技能 | 描述 | 路径 |
 |-------|-------------|------|
-| [`xurl`](/user-guide/skills/bundled/social-media/social-media-xurl) | 通过 xurl CLI 操作 X/Twitter：发帖、搜索、私信、媒体、v2 API。 | `social-media/xurl` |
 
 ## software-development
 
