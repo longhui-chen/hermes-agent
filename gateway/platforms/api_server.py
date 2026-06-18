@@ -473,18 +473,65 @@ def _promote_connector_error_from_tool_output(decoded: Dict[str, Any]) -> Dict[s
         return decoded
     connector_error = printed.get("connector_error")
     if not _has_tool_error_value(connector_error):
+        connector_error = _connector_error_from_json_rpc_error(printed.get("error"))
+    if not _has_tool_error_value(connector_error):
         return decoded
     promoted = dict(decoded)
     promoted["connector_error"] = connector_error
     error_obj = printed.get("error")
     if isinstance(error_obj, dict):
-        code = error_obj.get("code") or error_obj.get("errorCode") or error_obj.get("error_code")
+        code = (
+            _connector_error_code(connector_error)
+            or error_obj.get("code")
+            or error_obj.get("errorCode")
+            or error_obj.get("error_code")
+        )
         message = error_obj.get("message")
         if _has_tool_error_value(code):
             promoted["errorCode"] = code
         if not _has_tool_error_value(promoted.get("error")) and _has_tool_error_value(message):
             promoted["error"] = message
+    elif _has_tool_error_value(_connector_error_code(connector_error)):
+        promoted["errorCode"] = _connector_error_code(connector_error)
     return promoted
+
+
+def _connector_error_code(connector_error: Any) -> Any:
+    if not isinstance(connector_error, dict):
+        return None
+    return connector_error.get("errorCode") or connector_error.get("code") or connector_error.get("error_code")
+
+
+def _connector_error_from_json_rpc_error(error_obj: Any) -> Optional[Dict[str, Any]]:
+    """Normalize connector state carried in JSON-RPC ``error.data`` output."""
+    if not isinstance(error_obj, dict):
+        return None
+    data = error_obj.get("data")
+    if not isinstance(data, dict):
+        return None
+    code = data.get("errorCode") or data.get("code") or data.get("error_code")
+    next_action = data.get("nextAction") or data.get("next_action")
+    provider = data.get("provider")
+    if not isinstance(provider, str) and isinstance(next_action, dict):
+        provider = next_action.get("provider")
+    if not _has_tool_error_value(code) or not isinstance(provider, str) or not provider.strip():
+        return None
+
+    connector_error: Dict[str, Any] = {
+        "code": code,
+        "errorCode": code,
+        "provider": provider.strip(),
+    }
+    message = data.get("message") or error_obj.get("message")
+    if _has_tool_error_value(message):
+        connector_error["message"] = _short_error_text(message)
+    if isinstance(next_action, dict):
+        connector_error["nextAction"] = next_action
+    for key in ("connectionId", "connection_id", "toolName", "tool_name", "accountAlias", "account_alias"):
+        value = data.get(key)
+        if value is not None:
+            connector_error[key] = value
+    return connector_error
 
 
 def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Response":

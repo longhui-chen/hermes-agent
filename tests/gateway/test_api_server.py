@@ -82,6 +82,40 @@ class TestToolCompletionPayload:
         assert payload["connector_error"]["provider"] == "weread"
         assert payload["connector_error"]["nextAction"]["type"] == "refresh_connector_context"
 
+    def test_promotes_json_rpc_connector_error_data_from_terminal_output(self):
+        printed = {
+            "error": {
+                "code": -32000,
+                "message": "Connector disabled for this chat.",
+                "data": {
+                    "errorCode": "denied_by_chat_override",
+                    "nextAction": {
+                        "type": "enable_chat_override",
+                        "provider": "linear",
+                        "toolName": "linear.list_issues",
+                    },
+                },
+            },
+        }
+        payload = _tool_completion_payload(
+            "call_terminal_1",
+            "terminal",
+            json.dumps({
+                "status": "error",
+                "error": "Command failed",
+                "output": json.dumps(printed),
+            }),
+        )
+
+        assert payload["outcome"] == "error"
+        assert payload["errorCode"] == "denied_by_chat_override"
+        assert payload["provider"] == "linear"
+        connector_error = payload["connector_error"]
+        assert connector_error["errorCode"] == "denied_by_chat_override"
+        assert connector_error["provider"] == "linear"
+        assert connector_error["nextAction"]["type"] == "enable_chat_override"
+        assert connector_error["nextAction"]["toolName"] == "linear.list_issues"
+
 
 # ---------------------------------------------------------------------------
 # ResponseStore
