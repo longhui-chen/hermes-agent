@@ -731,15 +731,35 @@ def test_retry_tolerates_malformed_result_tuple(monkeypatch):
     assert calls["n"] == 1  # malformed → not retried
 
 
-def test_channel_failure_regex_ignores_multiline_job_name():
-    """issue_2 regression: dropping re.DOTALL stops '.*?' from spanning newlines,
-    so a pathological multi-line job name can't make the matcher mis-span and
-    replace non-failure content. A normal single-line failure still matches."""
+def test_redact_channel_failure_multiline_name_no_leak():
+    """ZET-1565 review (KILLY000): job names are stored verbatim, so an interior
+    newline defeated the `.*?` regex and leaked the raw error to channel bridges.
+    Exact-prefix reconstruction redacts a multi-line-named failure instead."""
     import gateway.platforms.zet_agent_cron as zc
 
-    pathological = "⚠️ Cron job 'multi\nline' failed:\nbody"
-    assert zc._CHANNEL_FAILURE_RE.match(pathological) is None
-    assert zc._CHANNEL_FAILURE_RE.match("⚠️ Cron job 'daily' failed:\nboom") is not None
+    job = {"id": "j1", "name": "multi\nline"}
+    raw = f"⚠️ Cron job 'multi\nline' failed:\n{_RAW_502}"
+    out = zc._redact_channel_failure(job, raw)
+    # the raw stack / internal URL / 502 must be gone
+    assert "RuntimeError" not in out and "us-iam-gw" not in out and "502" not in out
+    assert "执行失败" in out  # friendly line rendered
+
+
+def test_redact_channel_failure_single_line_and_passthrough():
+    import gateway.platforms.zet_agent_cron as zc
+
+    job = {"id": "j2", "name": "daily"}
+    out = zc._redact_channel_failure(job, f"⚠️ Cron job 'daily' failed:\n{_RAW_502}")
+    assert "502" not in out and "daily" in out
+    # name-absent falls back to the job id in the upstream template
+    job_noname = {"id": "abc123"}
+    out2 = zc._redact_channel_failure(
+        job_noname, f"⚠️ Cron job 'abc123' failed:\n{_RAW_502}"
+    )
+    assert "502" not in out2
+    # non-failure content (and falsy) passes through untouched
+    assert zc._redact_channel_failure(job, "hello world") == "hello world"
+    assert zc._redact_channel_failure(job, "") == ""
 
 
 def test_failure_template_self_check_matches_live_upstream():
@@ -766,7 +786,7 @@ def test_failure_template_self_check_warns_on_drift(monkeypatch):
 
 
 def test_failure_template_self_check_warns_on_partial_drift(monkeypatch):
-    """Prefix intact but the "failed:" wording changed → _CHANNEL_FAILURE_RE
+    """Prefix intact but the "failed:" wording changed → _redact_channel_failure
     would stop matching; the check must still warn (it verifies BOTH fragments,
     not just the prefix), else raw errors leak silently."""
     import gateway.platforms.zet_agent_cron as zc
@@ -798,8 +818,11 @@ def test_classify_failure_codes():
 
     assert zc._classify_failure(_RAW_502) == ("upstream_unavailable", True)
     assert zc._classify_failure("HTTP 503") == ("upstream_unavailable", True)
+    # Real upstream #8585 sentinel — note it embeds "timeout"; empty-result must
+    # win over the retryable-keyword match, else it's mislabeled retryable.
     assert zc._classify_failure(
-        "Agent completed but produced empty response (model error...)"
+        "Agent completed but produced empty response "
+        "(model error, timeout, or misconfiguration)"
     ) == ("empty_response", False)
     assert zc._classify_failure("ValueError: bad config") == ("agent_error", False)
     assert zc._classify_failure(None) == ("unknown", False)

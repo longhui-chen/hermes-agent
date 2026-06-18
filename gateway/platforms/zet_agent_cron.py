@@ -466,12 +466,8 @@ def install() -> None:
             _orig_deliver_result = _sched._deliver_result
 
             def _wrapped_deliver_result(job, content, adapters=None, loop=None):
-                # Friendly-ize the upstream failure template before delivery.
-                if content and _CHANNEL_FAILURE_RE.match(content):
-                    raw = content.split("\n", 1)[1] if "\n" in content else ""
-                    # name-only (matches the App card path); _friendly_failure
-                    # falls back to a generic label rather than a raw job id.
-                    content = _friendly_failure(job.get("name", ""), raw)
+                # De-identify the upstream failure template before delivery.
+                content = _redact_channel_failure(job, content)
                 channel_err = None
                 had_channel = False
                 try:
@@ -868,26 +864,23 @@ _RETRY_BACKOFF_S = _env_int("ZET_CRON_RETRY_BACKOFF_S", 45, lo=0, hi=600)
 _shutdown = threading.Event()
 atexit.register(_shutdown.set)
 
-# The two literal fragments _CHANNEL_FAILURE_RE depends on — the job name sits
-# between them ("⚠️ Cron job '<name>' failed:\n" is the upstream template). BOTH
-# must survive an upstream sync, or the regex silently stops matching and raw
-# errors leak through channel delivery.
+# The two literal fragments _redact_channel_failure depends on — the job name
+# sits between them ("⚠️ Cron job '<name>' failed:\n" is the upstream template).
+# BOTH must survive an upstream sync, or the redaction silently stops matching
+# and raw errors leak through channel delivery.
 _CHANNEL_FAILURE_FRAGMENTS = ("⚠️ Cron job '", "' failed:")
-# No re.DOTALL: '.' must not cross newlines, so '.*?' can't span lines and a
-# multi-line job name can't make the matcher misread non-failure content.
-_CHANNEL_FAILURE_RE = re.compile(r"^⚠️ Cron job '.*?' failed:\n")
 
 
 def _warn_if_failure_template_drifted(scheduler_source: str) -> bool:
     """True if upstream's failure template is intact; else _dbg-warn and False.
 
-    Checks BOTH literal fragments the regex needs, not just the prefix: a
+    Checks BOTH literal fragments the redaction needs, not just the prefix: a
     wording/case change to "failed:" alone would otherwise pass silently while
-    _CHANNEL_FAILURE_RE quietly stops matching and raw errors start leaking."""
+    _redact_channel_failure quietly stops matching and raw errors start leaking."""
     if all(frag in scheduler_source for frag in _CHANNEL_FAILURE_FRAGMENTS):
         return True
     _dbg("WARNING: upstream cron failure template changed — "
-         "_CHANNEL_FAILURE_RE may no longer match; raw errors could leak")
+         "_redact_channel_failure may no longer match; raw errors could leak")
     return False
 
 # code → default-locale reason (clients localize off the code).
@@ -908,10 +901,13 @@ def _classify_failure(error: Optional[str]) -> tuple[str, bool]:
     empty_response, agent_error, unknown."""
     if not error or not error.strip():
         return ("unknown", False)
-    if _is_retryable_error(error):
-        return ("upstream_unavailable", True)
+    # Empty-result BEFORE retryable: upstream's #8585 sentinel ("...produced
+    # empty response (model error, timeout, or misconfiguration)") contains
+    # "timeout", which would otherwise be misread as transient/retryable.
     if _EMPTY_RESULT_RE.search(error):
         return ("empty_response", False)
+    if _is_retryable_error(error):
+        return ("upstream_unavailable", True)
     return ("agent_error", False)
 
 
@@ -920,6 +916,25 @@ def _friendly_failure(job_name: str, error: Optional[str]) -> str:
     name = (job_name or "").strip() or "定时任务"
     code, _ = _classify_failure(error)
     return f"⚠️ 定时任务「{name}」执行失败：{_FAILURE_REASON[code]}。"
+
+
+def _redact_channel_failure(job: dict, content: Optional[str]):
+    """De-identify upstream's raw failure template before channel delivery;
+    pass anything else through unchanged.
+
+    Detects the template by reconstructing the EXACT prefix upstream builds
+    (``⚠️ Cron job '<name>' failed:\\n``, name = ``job.get('name', job['id'])``)
+    from this job's own name/id and slicing by its length — NOT a regex. Job
+    names are stored verbatim (cron/jobs.py only end-strips), so an interior
+    newline in the name would defeat a ``.*?`` regex and leak the raw error to
+    channel bridges; an exact-prefix match handles it."""
+    if not content:
+        return content
+    template_name = job.get("name", job.get("id", ""))
+    prefix = f"⚠️ Cron job '{template_name}' failed:\n"
+    if not content.startswith(prefix):
+        return content
+    return _friendly_failure(job.get("name", ""), content[len(prefix):])
 
 
 def _is_retryable_failure_result(result) -> bool:
