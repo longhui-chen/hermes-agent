@@ -16,8 +16,10 @@ Why a monkey patch instead of editing cron/scheduler.py
 hermes-agent is a fork that periodically syncs from upstream. Editing
 cron/scheduler.py directly creates merge conflicts every release.
 
-We patch ``cron.scheduler.{save_job_output, mark_job_run}`` at module
-import time (triggered by zet_agent_cron.pth in the venv site-packages).
+We patch ``cron.scheduler.{save_job_output, mark_job_run, run_job,
+_deliver_result, _resolve_origin}`` (and ``APIServerAdapter._create_agent``)
+at module import time (triggered by zet_agent_cron.pth in the venv
+site-packages).
 
 Auto-install: ``install()`` runs on module import. The .pth line forces
 import at Python startup, so patches are in place before any cron job
@@ -36,12 +38,14 @@ Failure modes
   CronSummaryCard still renders from the JSON metadata alone.
 """
 
+import atexit
 import json
 import logging
 import mimetypes
 import os
 import re
 import stat as _stat
+import threading
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -421,6 +425,20 @@ def install() -> None:
     _sched.mark_job_run = _wrapped_mark
     _dbg("install() patched mark_job_run + save_job_output OK")
 
+    # ── run_job retry wrapper — auto-retry clean transient failures.
+    try:
+        if not getattr(_sched.run_job, _PATCH_SENTINEL, False):
+            _orig_run_job = _sched.run_job
+
+            def _wrapped_run_job(job):
+                return _run_job_with_retry(_orig_run_job, job)
+
+            setattr(_wrapped_run_job, _PATCH_SENTINEL, True)
+            _sched.run_job = _wrapped_run_job
+            _dbg("install() patched run_job OK")
+    except Exception as _e:
+        _dbg(f"install() run_job patch FAILED: {_e!r}")
+
     # ── scheduler delivery patch — keep Zettlab-specific delivery out of
     # upstream cron/scheduler.py. App cron output is persisted below in
     # _wrapped_mark via SessionDB + ZET_CHAT_APPEND_URL; scheduler's generic
@@ -448,6 +466,12 @@ def install() -> None:
             _orig_deliver_result = _sched._deliver_result
 
             def _wrapped_deliver_result(job, content, adapters=None, loop=None):
+                # Friendly-ize the upstream failure template before delivery.
+                if content and _CHANNEL_FAILURE_RE.match(content):
+                    raw = content.split("\n", 1)[1] if "\n" in content else ""
+                    # name-only (matches the App card path); _friendly_failure
+                    # falls back to a generic label rather than a raw job id.
+                    content = _friendly_failure(job.get("name", ""), raw)
                 channel_err = None
                 had_channel = False
                 try:
@@ -508,6 +532,13 @@ def install() -> None:
             _dbg("install() patched scheduler._deliver_result OK")
     except Exception as _e:
         _dbg(f"install() scheduler delivery patch FAILED: {_e!r}")
+
+    # Warn if the upstream failure template friendly-ize depends on has drifted.
+    try:
+        import inspect as _inspect
+        _warn_if_failure_template_drifted(_inspect.getsource(_sched))
+    except Exception as _e:
+        _dbg(f"install() failure-template self-check skipped: {_e!r}")
 
     # ── _create_agent patch — set HERMES_SESSION_* contextvars ────────
     #
@@ -632,6 +663,26 @@ _INTENT_ANNOUNCE_RE = re.compile(
 )
 
 
+def _cron_session_like(job_id: str) -> str:
+    """LIKE pattern (ESCAPE '\\') matching this job's cron sessions: cron_<id>_*."""
+    prefix = f"cron_{job_id}_"
+    return prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+def _tool_activity_in_messages(messages) -> int:
+    """tool_call + tool-result count across one session's message list."""
+    count = 0
+    for msg in messages:
+        role = msg.get("role")
+        if role == "assistant":
+            tcs = msg.get("tool_calls")
+            if isinstance(tcs, list):
+                count += len(tcs)
+        elif role == "tool":
+            count += 1
+    return count
+
+
 def _count_tool_activity(job_id: str) -> Optional[int]:
     """最近一次 cron session 的 tool_call + tool 结果数；读不到返回 None（fail-open）。"""
     if not job_id:
@@ -642,17 +693,12 @@ def _count_tool_activity(job_id: str) -> Optional[int]:
         return None
     db = SessionDB()
     try:
-        prefix = f"cron_{job_id}_"
-        like = (
-            prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            + "%"
-        )
         try:
             with db._lock:
                 cursor = db._conn.execute(
                     "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' "
                     "ORDER BY started_at DESC LIMIT 1",
-                    (like,),
+                    (_cron_session_like(job_id),),
                 )
                 row = cursor.fetchone()
         except Exception as _e:
@@ -665,21 +711,85 @@ def _count_tool_activity(job_id: str) -> Optional[int]:
         except Exception as _e:
             _dbg(f"_count_tool_activity: get_messages FAILED: {_e!r}")
             return None
-        count = 0
-        for msg in messages:
-            role = msg.get("role")
-            if role == "assistant":
-                tcs = msg.get("tool_calls")
-                if isinstance(tcs, list):
-                    count += len(tcs)
-            elif role == "tool":
-                count += 1
-        return count
+        return _tool_activity_in_messages(messages)
     finally:
         try:
             db.close()
         except Exception:
             pass
+
+
+def _list_cron_session_ids(job_id: str) -> Optional[set]:
+    """All session ids for this job (cron_<id>_*); None if unreadable (fail-open)."""
+    if not job_id:
+        return None
+    try:
+        from hermes_state import SessionDB
+    except ImportError:
+        return None
+    db = SessionDB()
+    try:
+        with db._lock:
+            cursor = db._conn.execute(
+                "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\'",
+                (_cron_session_like(job_id),),
+            )
+            return {r["id"] for r in cursor.fetchall()}
+    except Exception as _e:
+        _dbg(f"_list_cron_session_ids FAILED: {_e!r}")
+        return None
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def _count_session_tool_activity(session_id: str) -> Optional[int]:
+    """tool_call + tool-result count for one session; None if unreadable."""
+    if not session_id:
+        return None
+    try:
+        from hermes_state import SessionDB
+    except ImportError:
+        return None
+    db = SessionDB()
+    try:
+        try:
+            messages = db.get_messages(session_id)
+        except Exception as _e:
+            _dbg(f"_count_session_tool_activity: get_messages FAILED: {_e!r}")
+            return None
+        return _tool_activity_in_messages(messages)
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+def _attempt_tool_activity(job_id: str, baseline: Optional[set]) -> Optional[int]:
+    """Total tool activity in cron sessions THIS run produced — i.e. sessions
+    whose id is not in ``baseline`` (the id set captured ONCE before the first
+    attempt). Measuring against the fixed pre-run baseline (rather than
+    re-snapshotting per attempt) keeps a retry that reuses the same
+    second-precision session id counted: ``INSERT OR IGNORE`` lets the retry's
+    tool calls land in the existing row, but that id is still absent from
+    ``baseline`` so its tools are still summed. Reads messages only for this
+    run's sessions, so cost is O(attempts), not O(historical sessions). 0 →
+    nothing ran, safe to retry; None → unresolved, caller skips."""
+    if baseline is None:
+        return None
+    now = _list_cron_session_ids(job_id)
+    if now is None:
+        return None
+    total = 0
+    for sid in (now - baseline):
+        c = _count_session_tool_activity(sid)
+        if c is None:
+            return None
+        total += c
+    return total
 
 
 def _detect_fake_success(job_id: str) -> Optional[str]:
@@ -724,6 +834,145 @@ def _is_silent_run(job_id: str) -> bool:
     if _SILENT_STATUS_RE.search(doc):
         return True
     return _SILENT_MARKER in _extract_response_body(doc).strip().upper()
+
+
+# ── Failure classification / friendly messaging ────────────────────
+# Transient upstream errors (gateway timeout / 5xx / connection) — retryable.
+_RETRYABLE_ERROR_RE = re.compile(
+    r"(?:\b50[234]\b|context deadline exceeded|Client\.Timeout"
+    r"|timeout|timed out|temporarily unavailable|overloaded|rate.?limit"
+    r"|connection (?:reset|refused|aborted|error)|read tcp|\bEOF\b)",
+    re.IGNORECASE,
+)
+# Ran but produced nothing usable (#8585 / fake-success).
+_EMPTY_RESULT_RE = re.compile(
+    r"empty response|produced no|executed no tools|no response generated",
+    re.IGNORECASE,
+)
+
+def _env_int(name: str, default: int, *, lo: int, hi: int) -> int:
+    """Env int clamped to [lo, hi]; falls back to default on missing/garbage."""
+    try:
+        v = int(os.environ.get(name, "").strip())
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, v))
+
+
+# Auto-retry budget for clean (zero-tool-activity) transient failures.
+# ZET_CRON_RETRY_MAX=0 disables retries.
+_MAX_RUN_RETRIES = _env_int("ZET_CRON_RETRY_MAX", 2, lo=0, hi=10)
+_RETRY_BACKOFF_S = _env_int("ZET_CRON_RETRY_BACKOFF_S", 45, lo=0, hi=600)
+
+# Set at exit so a backoff wait aborts instead of stalling the pool's wait=True drain.
+_shutdown = threading.Event()
+atexit.register(_shutdown.set)
+
+# The two literal fragments _CHANNEL_FAILURE_RE depends on — the job name sits
+# between them ("⚠️ Cron job '<name>' failed:\n" is the upstream template). BOTH
+# must survive an upstream sync, or the regex silently stops matching and raw
+# errors leak through channel delivery.
+_CHANNEL_FAILURE_FRAGMENTS = ("⚠️ Cron job '", "' failed:")
+# No re.DOTALL: '.' must not cross newlines, so '.*?' can't span lines and a
+# multi-line job name can't make the matcher misread non-failure content.
+_CHANNEL_FAILURE_RE = re.compile(r"^⚠️ Cron job '.*?' failed:\n")
+
+
+def _warn_if_failure_template_drifted(scheduler_source: str) -> bool:
+    """True if upstream's failure template is intact; else _dbg-warn and False.
+
+    Checks BOTH literal fragments the regex needs, not just the prefix: a
+    wording/case change to "failed:" alone would otherwise pass silently while
+    _CHANNEL_FAILURE_RE quietly stops matching and raw errors start leaking."""
+    if all(frag in scheduler_source for frag in _CHANNEL_FAILURE_FRAGMENTS):
+        return True
+    _dbg("WARNING: upstream cron failure template changed — "
+         "_CHANNEL_FAILURE_RE may no longer match; raw errors could leak")
+    return False
+
+# code → default-locale reason (clients localize off the code).
+_FAILURE_REASON = {
+    "upstream_unavailable": "AI 服务暂时繁忙",
+    "empty_response": "本次未产出有效结果",
+    "agent_error": "执行出错",
+    "unknown": "执行失败",
+}
+
+
+def _is_retryable_error(error: Optional[str]) -> bool:
+    return bool(error and _RETRYABLE_ERROR_RE.search(error))
+
+
+def _classify_failure(error: Optional[str]) -> tuple[str, bool]:
+    """Raw error → stable (code, retryable). Codes: upstream_unavailable,
+    empty_response, agent_error, unknown."""
+    if not error or not error.strip():
+        return ("unknown", False)
+    if _is_retryable_error(error):
+        return ("upstream_unavailable", True)
+    if _EMPTY_RESULT_RE.search(error):
+        return ("empty_response", False)
+    return ("agent_error", False)
+
+
+def _friendly_failure(job_name: str, error: Optional[str]) -> str:
+    """Default-locale failure line; never leaks the raw error."""
+    name = (job_name or "").strip() or "定时任务"
+    code, _ = _classify_failure(error)
+    return f"⚠️ 定时任务「{name}」执行失败：{_FAILURE_REASON[code]}。"
+
+
+def _is_retryable_failure_result(result) -> bool:
+    """True only for a well-formed FAILED run whose error reads transient.
+
+    Defensive on the upstream contract: ``run_job`` returns
+    ``(success, doc, output, error)``, but if a future sync ever returns a
+    shorter tuple we treat it as non-retryable rather than let an IndexError
+    propagate out and crash the scheduler's job-runner thread."""
+    if not isinstance(result, (tuple, list)) or len(result) < 4:
+        return False
+    return not result[0] and _is_retryable_error(result[3])
+
+
+def _run_job_with_retry(orig_run_job, job):
+    """Re-run a transient failure, but only while this run has produced zero
+    tool activity (vs a fixed pre-run baseline) so side effects never repeat."""
+    job_id = job.get("id", "")
+    # Run once (never retry) when retries are off, or when the job has side
+    # effects the tool-activity guard can't see:
+    #   • _MAX_RUN_RETRIES == 0 — retries disabled; also skips the baseline DB
+    #     query on every cron tick for deployments that set RETRY_MAX=0.
+    #   • no_agent / script jobs — a pre-run script (cron/scheduler.py runs
+    #     job["script"] BEFORE the LLM, for both no_agent and ordinary agent
+    #     jobs) can write files / call webhooks / rotate state. That work is not
+    #     Hermes tool activity, so _attempt_tool_activity would read 0 ("safe")
+    #     and a retry after an LLM 502 would re-execute the script's side effects.
+    if _MAX_RUN_RETRIES == 0 or job.get("no_agent") or job.get("script"):
+        return orig_run_job(job)
+    # Pre-run id snapshot, captured ONCE (ids only — no message reads). The guard
+    # counts tools only in sessions absent from this set, so it never re-reads
+    # the job's history and a reused same-second session id stays counted.
+    baseline = _list_cron_session_ids(job_id)
+    result = orig_run_job(job)
+    attempts = 0
+    # _is_retryable_failure_result bounds-checks the tuple; result[3] is the
+    # error for agent jobs (script jobs are short-circuited above).
+    while attempts < _MAX_RUN_RETRIES and _is_retryable_failure_result(result):
+        activity = _attempt_tool_activity(job_id, baseline)
+        if activity != 0:  # None (unresolved) or >0 (work ran) → don't repeat
+            _dbg(f"run_job: skip retry job={job_id} run_activity={activity}")
+            break
+        attempts += 1
+        _dbg(
+            f"run_job: transient failure job={job_id} "
+            f"retry {attempts}/{_MAX_RUN_RETRIES} after {_RETRY_BACKOFF_S}s"
+        )
+        # Interruptible backoff: True iff shutdown signalled mid-wait.
+        if _shutdown.wait(_RETRY_BACKOFF_S):
+            _dbg(f"run_job: shutdown during backoff — abort retry job={job_id}")
+            break
+        result = orig_run_job(job)
+    return result
 
 
 # ── Persist to hermes SessionDB ─────────────────────────────────────
@@ -865,8 +1114,11 @@ def _build_typed_message_content(
         ```cron-summary
         {"job_id":"...","name":"...","schedule":"...","prompt":"...",
          "deliver":{...},"repeat":{...},"last_run_result":"success",
-         "scheduled_at":"...","delivery_error":""}
+         "scheduled_at":"...","delivery_error":"",
+         "failure":{"code":"upstream_unavailable","retryable":true}}
         ```
+
+    `failure` is set only on failed runs; clients localize off `code`.
 
         <body — agent's final response or error summary>
 
@@ -914,11 +1166,20 @@ def _build_typed_message_content(
         # 仅作为数据标记保留（便于后续区分/排查这类承接会话）。
         metadata["origin_recreated"] = True
 
+    if not success:
+        # Structured failure for client-side i18n (clients localize off `code`).
+        _code, _retryable = _classify_failure(error)
+        metadata["failure"] = {"code": _code, "retryable": _retryable}
+
     attachments = _collect_produced_files(job_id)
     if attachments:
         metadata["attachments"] = attachments
 
-    body = _extract_response_body(_LATEST_OUTPUT.get(job_id, "")) or (error or "").strip()
+    if success:
+        body = _extract_response_body(_LATEST_OUTPUT.get(job_id, ""))
+    else:
+        # Friendly fallback; raw FAILED doc stays in the run .md.
+        body = _friendly_failure(job.get("name", ""), error)
 
     parts = [
         "```cron-summary",
@@ -957,17 +1218,12 @@ def _collect_produced_files(job_id: str) -> List[Dict[str, Any]]:
 
     db = SessionDB()
     try:
-        prefix = f"cron_{job_id}_"
-        like = (
-            prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            + "%"
-        )
         try:
             with db._lock:
                 cursor = db._conn.execute(
                     "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' "
                     "ORDER BY started_at DESC LIMIT 1",
-                    (like,),
+                    (_cron_session_like(job_id),),
                 )
                 row = cursor.fetchone()
         except Exception as _e:
@@ -975,7 +1231,7 @@ def _collect_produced_files(job_id: str) -> List[Dict[str, Any]]:
             return []
         if not row:
             _dbg(
-                f"_collect_produced_files: no cron session matching prefix={prefix}"
+                f"_collect_produced_files: no cron session matching prefix=cron_{job_id}_"
             )
             return []
         sid = row["id"]
