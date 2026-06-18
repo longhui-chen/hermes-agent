@@ -79,6 +79,7 @@ Thread safety:
 
 import asyncio
 import concurrent.futures
+import ipaddress
 import inspect
 import json
 import logging
@@ -531,6 +532,68 @@ class NonMcpEndpointError(ConnectionError):
     Subclasses :class:`ConnectionError` so callers that only catch the broad
     class still treat it as a connection problem.
     """
+
+
+_MCP_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _mcp_bypass_env_proxy(url: str) -> bool:
+    """Return True when an MCP HTTP client should connect directly.
+
+    macOS exposes system proxy settings through Python's ``urllib`` proxy
+    helpers. httpx reads those settings when ``trust_env=True``, even when the
+    shell environment is otherwise clean. Loopback and LAN MCP endpoints are
+    local device/user services, so MCP preflight and the real transport should
+    not route them through a corporate or developer proxy.
+    """
+    try:
+        parsed = urlparse(str(url))
+    except Exception:
+        return False
+
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    if host in {"localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"}:
+        return True
+    if host.endswith(".localhost"):
+        return True
+
+    host_for_ip = host.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(host_for_ip)
+    except ValueError:
+        return False
+
+    return (
+        addr.is_loopback
+        or addr.is_private
+        or addr.is_link_local
+        or addr.is_unspecified
+        or (isinstance(addr, ipaddress.IPv4Address) and addr in _MCP_CGNAT_NETWORK)
+    )
+
+
+def _mcp_preflight_bypass_env_proxy(url: str) -> bool:
+    """Backward-compatible alias for older tests/imports."""
+    return _mcp_bypass_env_proxy(url)
+
+
+def _mcp_direct_http_transport(httpx_module, ssl_verify=True, client_cert=None):
+    """Build a direct HTTPX transport for local/private MCP endpoints.
+
+    Passing an explicit transport prevents AsyncClient from installing
+    environment proxy routing, while ``trust_env=True`` on the transport still
+    lets HTTPX load SSL_CERT_FILE / SSL_CERT_DIR for private HTTPS MCP servers.
+    """
+    kwargs = {
+        "proxy": None,
+        "verify": ssl_verify,
+        "trust_env": True,
+    }
+    if client_cert is not None:
+        kwargs["cert"] = client_cert
+    return httpx_module.AsyncHTTPTransport(**kwargs)
 
 
 def _validate_remote_mcp_url(server_name: str, url: Any) -> str:
@@ -1514,12 +1577,19 @@ class MCPServerTask:
             return  # No httpx → skip probe; SDK import would have failed first.
 
         client_kwargs: dict = {
-            "verify": ssl_verify,
             "follow_redirects": True,
             "timeout": _httpx.Timeout(timeout),
         }
-        if client_cert is not None:
-            client_kwargs["cert"] = client_cert
+        if _mcp_bypass_env_proxy(url):
+            client_kwargs["transport"] = _mcp_direct_http_transport(
+                _httpx,
+                ssl_verify=ssl_verify,
+                client_cert=client_cert,
+            )
+        else:
+            client_kwargs["verify"] = ssl_verify
+            if client_cert is not None:
+                client_kwargs["cert"] = client_cert
 
         probe_headers = dict(headers) if headers else {}
         try:
@@ -1690,15 +1760,28 @@ class MCPServerTask:
             client_kwargs: dict = {
                 "follow_redirects": True,
                 "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
-                "verify": ssl_verify,
                 "event_hooks": {"response": [_strip_auth_on_cross_origin_redirect]},
             }
             if headers:
                 client_kwargs["headers"] = headers
             if _oauth_auth is not None:
                 client_kwargs["auth"] = _oauth_auth
-            if client_cert is not None:
-                client_kwargs["cert"] = client_cert
+            if _mcp_bypass_env_proxy(url):
+                # Mirror the preflight probe: use an explicit direct transport
+                # for loopback/private/link-local/CGNAT targets so env/system
+                # proxy routing is bypassed, but keep transport trust_env=True
+                # so private HTTPS MCP servers can still use SSL_CERT_FILE /
+                # SSL_CERT_DIR CA bundles. Public URLs keep the default client
+                # path so corporate proxies still apply.
+                client_kwargs["transport"] = _mcp_direct_http_transport(
+                    httpx,
+                    ssl_verify=ssl_verify,
+                    client_cert=client_cert,
+                )
+            else:
+                client_kwargs["verify"] = ssl_verify
+                if client_cert is not None:
+                    client_kwargs["cert"] = client_cert
 
             # Caller owns the client lifecycle — the SDK skips cleanup when
             # http_client is provided, so we wrap in async-with.

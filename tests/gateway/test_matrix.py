@@ -2784,6 +2784,10 @@ class TestMatrixProxyConfig:
     def _make_adapter(self, monkeypatch, proxy_env=None):
         monkeypatch.setenv("MATRIX_ACCESS_TOKEN", "syt_test")
         monkeypatch.setenv("MATRIX_HOMESERVER", "https://matrix.example.org")
+        from gateway.platforms import base as platform_base
+        # Disable host macOS system proxy detection before importing the adapter;
+        # these tests exercise env/MATRIX_PROXY handling only.
+        monkeypatch.setattr(platform_base, "_detect_macos_system_proxy", lambda: None)
         # Clear generic proxy vars so they don't leak from the host
         for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
                     "https_proxy", "http_proxy", "all_proxy", "MATRIX_PROXY"):
