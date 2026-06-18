@@ -79,6 +79,7 @@ Thread safety:
 
 import asyncio
 import concurrent.futures
+import ipaddress
 import inspect
 import json
 import logging
@@ -531,6 +532,46 @@ class NonMcpEndpointError(ConnectionError):
     Subclasses :class:`ConnectionError` so callers that only catch the broad
     class still treat it as a connection problem.
     """
+
+
+_MCP_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _mcp_preflight_bypass_env_proxy(url: str) -> bool:
+    """Return True when MCP preflight should connect directly.
+
+    macOS exposes system proxy settings through Python's ``urllib`` proxy
+    helpers. httpx reads those settings when ``trust_env=True``, even when the
+    shell environment is otherwise clean. Loopback and LAN MCP endpoints are
+    local device/user services, so preflight should not route them through a
+    corporate or developer proxy.
+    """
+    try:
+        parsed = urlparse(str(url))
+    except Exception:
+        return False
+
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    if host in {"localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"}:
+        return True
+    if host.endswith(".localhost"):
+        return True
+
+    host_for_ip = host.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(host_for_ip)
+    except ValueError:
+        return False
+
+    return (
+        addr.is_loopback
+        or addr.is_private
+        or addr.is_link_local
+        or addr.is_unspecified
+        or (isinstance(addr, ipaddress.IPv4Address) and addr in _MCP_CGNAT_NETWORK)
+    )
 
 
 def _validate_remote_mcp_url(server_name: str, url: Any) -> str:
@@ -1518,6 +1559,8 @@ class MCPServerTask:
             "follow_redirects": True,
             "timeout": _httpx.Timeout(timeout),
         }
+        if _mcp_preflight_bypass_env_proxy(url):
+            client_kwargs["trust_env"] = False
         if client_cert is not None:
             client_kwargs["cert"] = client_cert
 

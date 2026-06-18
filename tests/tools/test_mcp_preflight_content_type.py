@@ -19,7 +19,7 @@ from contextlib import contextmanager
 
 import pytest
 
-from tools.mcp_tool import MCPServerTask, NonMcpEndpointError
+from tools.mcp_tool import MCPServerTask, NonMcpEndpointError, _mcp_preflight_bypass_env_proxy
 
 
 def _make_task(name: str = "probe_srv") -> MCPServerTask:
@@ -27,6 +27,14 @@ def _make_task(name: str = "probe_srv") -> MCPServerTask:
     task = MCPServerTask.__new__(MCPServerTask)
     task.name = name
     return task
+
+
+@pytest.mark.parametrize("url", [
+    "http://[fe80::1%25en0]/mcp",
+    "http://[fe80::1%en0]/mcp",
+])
+def test_zone_scoped_ipv6_link_local_bypasses_env_proxy(url):
+    assert _mcp_preflight_bypass_env_proxy(url) is True
 
 
 @contextmanager
@@ -235,3 +243,30 @@ def test_ssl_verify_and_cert_forwarded(monkeypatch):
     assert captured.get("verify") is False
     assert captured.get("cert") == "/path/to/cert.pem"
     assert captured.get("follow_redirects") is True
+
+
+def test_loopback_probe_disables_env_proxy(monkeypatch):
+    captured: dict = {}
+
+    import httpx
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def head(self, url, headers=None):
+            return httpx.Response(200, headers={"content-type": "application/json"})
+
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    task = _make_task()
+    asyncio.run(task._preflight_content_type(
+        "http://127.0.0.1:8765/mcp",
+        timeout=3.0,
+    ))
+    assert captured.get("trust_env") is False
