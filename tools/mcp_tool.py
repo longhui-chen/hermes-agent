@@ -84,6 +84,7 @@ Thread safety:
 import asyncio
 import contextvars
 import concurrent.futures
+import ipaddress
 import inspect
 import json
 import logging
@@ -629,6 +630,68 @@ class NonMcpEndpointError(ConnectionError):
     Subclasses :class:`ConnectionError` so callers that only catch the broad
     class still treat it as a connection problem.
     """
+
+
+_MCP_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _mcp_bypass_env_proxy(url: str) -> bool:
+    """Return True when an MCP HTTP client should connect directly.
+
+    macOS exposes system proxy settings through Python's ``urllib`` proxy
+    helpers. httpx reads those settings when ``trust_env=True``, even when the
+    shell environment is otherwise clean. Loopback and LAN MCP endpoints are
+    local device/user services, so MCP preflight and the real transport should
+    not route them through a corporate or developer proxy.
+    """
+    try:
+        parsed = urlparse(str(url))
+    except Exception:
+        return False
+
+    host = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not host:
+        return False
+    if host in {"localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"}:
+        return True
+    if host.endswith(".localhost"):
+        return True
+
+    host_for_ip = host.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(host_for_ip)
+    except ValueError:
+        return False
+
+    return (
+        addr.is_loopback
+        or addr.is_private
+        or addr.is_link_local
+        or addr.is_unspecified
+        or (isinstance(addr, ipaddress.IPv4Address) and addr in _MCP_CGNAT_NETWORK)
+    )
+
+
+def _mcp_preflight_bypass_env_proxy(url: str) -> bool:
+    """Backward-compatible alias for older tests/imports."""
+    return _mcp_bypass_env_proxy(url)
+
+
+def _mcp_direct_http_transport(httpx_module, ssl_verify=True, client_cert=None):
+    """Build a direct HTTPX transport for local/private MCP endpoints.
+
+    Passing an explicit transport prevents AsyncClient from installing
+    environment proxy routing, while ``trust_env=True`` on the transport still
+    lets HTTPX load SSL_CERT_FILE / SSL_CERT_DIR for private HTTPS MCP servers.
+    """
+    kwargs = {
+        "proxy": None,
+        "verify": ssl_verify,
+        "trust_env": True,
+    }
+    if client_cert is not None:
+        kwargs["cert"] = client_cert
+    return httpx_module.AsyncHTTPTransport(**kwargs)
 
 
 def _validate_remote_mcp_url(server_name: str, url: Any) -> str:
@@ -1905,12 +1968,19 @@ class MCPServerTask:
             return  # No httpx → skip probe; SDK import would have failed first.
 
         client_kwargs: dict = {
-            "verify": ssl_verify,
             "follow_redirects": True,
             "timeout": _httpx.Timeout(timeout),
         }
-        if client_cert is not None:
-            client_kwargs["cert"] = client_cert
+        if _mcp_bypass_env_proxy(url):
+            client_kwargs["transport"] = _mcp_direct_http_transport(
+                _httpx,
+                ssl_verify=ssl_verify,
+                client_cert=client_cert,
+            )
+        else:
+            client_kwargs["verify"] = ssl_verify
+            if client_cert is not None:
+                client_kwargs["cert"] = client_cert
 
         probe_headers = dict(headers) if headers else {}
         try:
@@ -2083,15 +2153,28 @@ class MCPServerTask:
             client_kwargs: dict = {
                 "follow_redirects": True,
                 "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
-                "verify": ssl_verify,
                 "event_hooks": {"response": [_strip_auth_on_cross_origin_redirect]},
             }
             if headers:
                 client_kwargs["headers"] = headers
             if _oauth_auth is not None:
                 client_kwargs["auth"] = _oauth_auth
-            if client_cert is not None:
-                client_kwargs["cert"] = client_cert
+            if _mcp_bypass_env_proxy(url):
+                # Mirror the preflight probe: use an explicit direct transport
+                # for loopback/private/link-local/CGNAT targets so env/system
+                # proxy routing is bypassed, but keep transport trust_env=True
+                # so private HTTPS MCP servers can still use SSL_CERT_FILE /
+                # SSL_CERT_DIR CA bundles. Public URLs keep the default client
+                # path so corporate proxies still apply.
+                client_kwargs["transport"] = _mcp_direct_http_transport(
+                    httpx,
+                    ssl_verify=ssl_verify,
+                    client_cert=client_cert,
+                )
+            else:
+                client_kwargs["verify"] = ssl_verify
+                if client_cert is not None:
+                    client_kwargs["cert"] = client_cert
 
             # Caller owns the client lifecycle — the SDK skips cleanup when
             # http_client is provided, so we wrap in async-with.
@@ -4170,6 +4253,75 @@ def discover_mcp_tools() -> List[str]:
         logger.info(summary)
 
     return tool_names
+
+
+def reload_single_mcp_server(server_name: str) -> List[str]:
+    """Disconnect+reconnect exactly ONE MCP server, leaving all others alone.
+
+    Used by the gateway's ``POST /v1/connectors/reload`` control endpoint so
+    a connector-policy change (e.g. the ``zettlab_connectors`` channel gaining
+    a newly-allowed ``linear.*`` tool) can be picked up without bouncing every
+    other MCP server the agent has connected — which ``shutdown_mcp_servers()``
+    would do (it also stops the whole background MCP loop).
+
+    Steps:
+      1. If the named server is currently connected, run its ``shutdown()`` on
+         the background MCP loop. ``MCPServerTask.shutdown()`` deregisters its
+         own tools from the registry, so we don't touch the registry directly.
+         Then drop it from ``_servers`` so discovery treats it as missing.
+      2. Call ``discover_mcp_tools()``, which reads ``config.yaml`` fresh and
+         reconnects only servers *not* already in ``_servers`` — i.e. just the
+         one we removed (or, if it was never connected, connects it for the
+         first time). Already-connected servers are left untouched (idempotent).
+
+    Args:
+        server_name: The MCP server key as it appears in ``config.yaml``
+            ``mcp_servers`` (e.g. ``"zettlab_connectors"``).
+
+    Returns:
+        List of ALL currently registered MCP tool names across every connected
+        server (same shape as ``discover_mcp_tools()``), so the caller can
+        report a tools total.
+    """
+    if not _MCP_AVAILABLE:
+        logger.debug("MCP SDK not available -- skipping single-server reload")
+        return []
+
+    # Step 1: tear down just this one server, if it is connected. We snapshot
+    # under the lock, shut down outside it (the shutdown runs on the MCP loop),
+    # then remove the entry under the lock again.
+    with _lock:
+        server = _servers.get(server_name)
+
+    if server is not None:
+        loop = None
+        with _lock:
+            loop = _mcp_loop
+        if loop is not None and loop.is_running():
+            try:
+                # Run the server's own shutdown on the MCP loop so the anyio
+                # cancel-scope teardown happens in the Task that opened it.
+                _run_on_mcp_loop(server.shutdown, timeout=20)
+            except Exception as exc:
+                logger.warning(
+                    "MCP single-reload: shutdown of '%s' failed: %s",
+                    server_name, exc,
+                )
+        else:
+            logger.debug(
+                "MCP single-reload: loop not running while tearing down '%s'; "
+                "proceeding to rediscover",
+                server_name,
+            )
+        # Drop the (now shut-down) entry so discover_mcp_tools() sees it as
+        # missing and reconnects it. Deregistration of its tools already
+        # happened inside MCPServerTask.shutdown().
+        with _lock:
+            _servers.pop(server_name, None)
+
+    # Step 2: reconnect. discover_mcp_tools() is idempotent for the servers
+    # still connected and will (re)connect only the missing ones.
+    return discover_mcp_tools()
 
 
 def is_mcp_tool_parallel_safe(tool_name: str) -> bool:

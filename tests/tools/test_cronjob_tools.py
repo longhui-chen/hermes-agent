@@ -453,6 +453,124 @@ class TestUnifiedCronjobTool:
         stored = get_job(created["job_id"])
         assert stored["deliver"] == "telegram"
 
+    # =====================================================================
+    # Per-job timezone wiring (ZET-942) — schema exposure, create/update
+    # passthrough, normalization. The hermes-side compute_next_run is
+    # already covered in tests/cron/test_jobs.py; here we lock in the
+    # LLM-facing surface so the tool can no longer regress to "timezone
+    # silently dropped before reaching create_job()".
+    # =====================================================================
+
+    def test_schema_exposes_timezone_parameter(self):
+        """Without the schema entry, the LLM has no way to discover the
+        parameter exists. Lock the contract."""
+        from tools.cronjob_tools import CRONJOB_SCHEMA
+
+        props = CRONJOB_SCHEMA["parameters"]["properties"]
+        assert "timezone" in props
+        assert props["timezone"]["type"] == "string"
+
+    def test_create_with_timezone_persists_to_job(self):
+        from cron.jobs import get_job
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Daily",
+                schedule="30 10 * * *",
+                timezone="Asia/Shanghai",
+            )
+        )
+        assert created["success"] is True
+        stored = get_job(created["job_id"])
+        assert stored["timezone"] == "Asia/Shanghai"
+        # And the next_run_at must carry the +08:00 offset.
+        assert stored["next_run_at"].endswith("+08:00")
+
+    def test_create_without_timezone_pins_device_tz(self, monkeypatch):
+        """No timezone arg → ZET-1258 pins the device tz at create time so the
+        job keeps firing at the same wall-clock even if the device tz later
+        changes. (Supersedes the older leave-it-None contract.)"""
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Shanghai")
+        from cron.jobs import get_job
+
+        created = json.loads(
+            cronjob(action="create", prompt="Daily", schedule="30 10 * * *")
+        )
+        stored = get_job(created["job_id"])
+        assert stored["timezone"] == "Asia/Shanghai"
+
+    def test_create_whitespace_timezone_pins_device_tz(self, monkeypatch):
+        """A whitespace-only string is treated as "not supplied" — and like the
+        omitted case it pins the device tz (ZET-1258) instead of throwing on a
+        bogus IANA name."""
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Shanghai")
+        from cron.jobs import get_job
+
+        created = json.loads(
+            cronjob(
+                action="create", prompt="x", schedule="every 1h", timezone="   "
+            )
+        )
+        stored = get_job(created["job_id"])
+        assert stored["timezone"] == "Asia/Shanghai"
+
+    def test_update_sets_timezone_and_recomputes_next_run(self):
+        from cron.jobs import get_job
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Daily",
+                schedule="30 10 * * *",
+                timezone="UTC",
+            )
+        )
+        utc_next = get_job(created["job_id"])["next_run_at"]
+        assert utc_next.endswith("+00:00")
+
+        updated = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                timezone="Asia/Shanghai",
+            )
+        )
+        assert updated["success"] is True
+        assert get_job(created["job_id"])["next_run_at"].endswith("+08:00")
+
+    def test_update_empty_timezone_clears_field(self):
+        """Empty string is the documented "clear the per-job tz override"
+        signal — must reach update_job() and persist as None."""
+        from cron.jobs import get_job
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="x",
+                schedule="every 1h",
+                timezone="Asia/Shanghai",
+            )
+        )
+        updated = json.loads(
+            cronjob(action="update", job_id=created["job_id"], timezone="")
+        )
+        assert updated["success"] is True
+        assert get_job(created["job_id"])["timezone"] is None
+
+    def test_create_invalid_timezone_surfaces_error(self):
+        """A bogus IANA name should fail loudly — the LLM (or App) wrote
+        garbage and we want to flag it, not silently drop the job."""
+        result = cronjob(
+            action="create",
+            prompt="x",
+            schedule="every 1h",
+            timezone="Mars/Olympus_Mons",
+        )
+        payload = json.loads(result)
+        assert payload["success"] is False
+        assert "timezone" in payload["error"].lower() or "invalid" in payload["error"].lower()
+
 
 # =========================================================================
 # Per-job model/provider override resolution
@@ -463,7 +581,7 @@ from tools.cronjob_tools import _resolve_model_override  # noqa: E402
 
 class TestResolveModelOverride:
     """`_resolve_model_override` must not silently hijack a job that meant to
-    use a configured custom endpoint (e.g. ``providers.custom`` → cliproxy).
+    use a configured custom endpoint (e.g. ``providers.custom`` -> cliproxy).
     Regression for cron jobs with ``provider: "custom"`` falling back to codex.
     """
 
@@ -488,7 +606,7 @@ class TestResolveModelOverride:
         provider, model = _resolve_model_override(
             {"provider": "custom", "model": "gpt-5.4"}
         )
-        # No matching custom entry → fall back to pinning the main provider.
+        # No matching custom entry -> fall back to pinning the main provider.
         assert provider == "openai-codex"
         assert model == "gpt-5.4"
 

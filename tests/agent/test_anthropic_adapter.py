@@ -29,6 +29,27 @@ from agent.anthropic_adapter import (
 from agent.transports import get_transport
 
 
+@pytest.fixture(autouse=True)
+def _no_host_keychain(monkeypatch):
+    """Default the macOS Keychain reader to None for every test in this module.
+
+    On macOS ``_read_claude_code_credentials_from_keychain()`` shells out to
+    ``security find-generic-password``. The token-resolution tests below mock
+    ``subprocess.run`` for their own purposes and assume an empty keychain, so on
+    a Darwin host the reader either runs into their MagicMock'd subprocess
+    (``TypeError: ... not MagicMock``) or leaks a real ``sk-ant-oat`` token —
+    both are host-only failures that pass on Linux CI (where the reader returns
+    None early because ``platform.system() != "Darwin"``). None of these tests
+    exercise the keychain success path (that lives in test_anthropic_keychain.py),
+    so disabling it here is safe. Mirrors the per-class ``no_keychain`` fixture
+    already on ``TestReadClaudeCodeCredentials``.
+    """
+    monkeypatch.setattr(
+        "agent.anthropic_adapter._read_claude_code_credentials_from_keychain",
+        lambda: None,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------

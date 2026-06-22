@@ -75,6 +75,7 @@ class ClassifiedError:
     provider: Optional[str] = None
     model: Optional[str] = None
     message: str = ""
+    provider_error_code: str = ""
     error_context: Dict[str, Any] = field(default_factory=dict)
 
     # Recovery action hints — the retry loop checks these instead of
@@ -89,12 +90,101 @@ class ClassifiedError:
         return self.reason in {FailoverReason.auth, FailoverReason.auth_permanent}
 
 
+def normalized_provider_error_code(classified: ClassifiedError) -> str:
+    """Return the stable Zettlab chat error code for a provider failure."""
+
+    status = classified.status_code
+    reason = classified.reason
+
+    if status in {408, 504}:
+        return "provider_timeout"
+    if status == 409:
+        return "provider_conflict"
+    if status == 413:
+        return "payload_too_large"
+    if status in {423, 424, 425}:
+        return "provider_unavailable"
+    if status is not None and 400 <= status < 500 and status not in {
+        400,
+        401,
+        402,
+        403,
+        404,
+        422,
+        429,
+    }:
+        return "provider_client_error"
+    if status == 502:
+        return "provider_bad_gateway"
+    if status == 507:
+        return "provider_billing"
+
+    if reason == FailoverReason.billing:
+        return "provider_billing"
+    if reason == FailoverReason.rate_limit:
+        return "provider_rate_limit"
+    if reason in {FailoverReason.auth, FailoverReason.auth_permanent}:
+        return "provider_forbidden" if status == 403 else "provider_auth"
+    if reason == FailoverReason.provider_policy_blocked:
+        return "provider_policy_blocked"
+    if reason == FailoverReason.model_not_found:
+        return "provider_model_not_found"
+    if reason == FailoverReason.timeout:
+        if status is None:
+            return "provider_network_error"
+        return "provider_timeout"
+    if reason == FailoverReason.overloaded:
+        return "provider_overloaded"
+    if reason == FailoverReason.server_error:
+        return "provider_server_error"
+    if reason == FailoverReason.context_overflow:
+        return "context_overflow"
+    if reason in {FailoverReason.payload_too_large, FailoverReason.image_too_large}:
+        return "payload_too_large"
+    if reason in {
+        FailoverReason.format_error,
+        FailoverReason.thinking_signature,
+        FailoverReason.llama_cpp_grammar_pattern,
+    }:
+        return "provider_bad_request"
+    if reason in {
+        FailoverReason.long_context_tier,
+        FailoverReason.oauth_long_context_beta_forbidden,
+    }:
+        return "provider_forbidden"
+
+    if status is None:
+        return "provider_error"
+    if status in {400, 422}:
+        return "provider_bad_request"
+    if status == 401:
+        return "provider_auth"
+    if status == 402:
+        return "provider_billing"
+    if status == 403:
+        return "provider_forbidden"
+    if status == 404:
+        return "provider_endpoint_not_found"
+    if status == 429:
+        return "provider_rate_limit"
+    if status == 500:
+        return "provider_server_error"
+    if status in {503, 529}:
+        return "provider_overloaded"
+    if 400 <= status < 500:
+        return "provider_client_error"
+    if 500 <= status < 600:
+        return "provider_server_error"
+    return "provider_error"
+
+
 
 # ── Provider-specific patterns ──────────────────────────────────────────
 
 # Patterns that indicate billing exhaustion (not transient rate limit)
 _BILLING_PATTERNS = [
     "insufficient credits",
+    "insufficient_credits",
     "insufficient_quota",
     "insufficient balance",
     "credit balance",
@@ -519,6 +609,8 @@ def classify_api_error(
     if _metadata_msg and _metadata_msg not in _raw_msg and _metadata_msg not in _body_msg:
         parts.append(_metadata_msg)
     error_msg = " ".join(parts)
+    if not error_code:
+        error_code = _extract_error_code_from_text(error_msg)
     provider_lower = (provider or "").strip().lower()
     model_lower = (model or "").strip().lower()
 
@@ -529,6 +621,7 @@ def classify_api_error(
             "provider": provider,
             "model": model,
             "message": _extract_message(error, body),
+            "provider_error_code": error_code,
         }
         defaults.update(overrides)
         return ClassifiedError(**defaults)
@@ -1299,6 +1392,23 @@ def _extract_error_body(error: Exception) -> dict:
     return {}
 
 
+_ERROR_CODE_TEXT_PATTERNS = (
+    "insufficient_credits",
+    "insufficient_quota",
+    "billing_not_active",
+    "payment_required",
+    "rate_limit_exceeded",
+    "resource_exhausted",
+    "model_not_found",
+    "model_not_available",
+    "invalid_model",
+    "context_length_exceeded",
+    "max_tokens_exceeded",
+    "invalid_api_key",
+    "invalid_request_error",
+)
+
+
 def _extract_error_code(body: dict) -> str:
     """Extract an error code string from the response body."""
     if not body:
@@ -1340,12 +1450,22 @@ def _extract_error_code(body: dict) -> str:
             if nested_code:
                 return nested_code
 
+    if isinstance(error_obj, str) and error_obj.strip():
+        return error_obj.strip()
     # Top-level code
     code = body.get("code") or body.get("error_code") or ""
     if isinstance(code, (str, int)):
         text = str(code).strip()
         if text and text != "400":
             return text
+    return ""
+
+
+def _extract_error_code_from_text(text: str) -> str:
+    lower = text.lower()
+    for pattern in _ERROR_CODE_TEXT_PATTERNS:
+        if pattern in lower:
+            return pattern
     return ""
 
 

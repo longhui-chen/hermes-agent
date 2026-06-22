@@ -1459,10 +1459,10 @@ if _config_path.exists():
                 os.environ["HERMES_GATEWAY_BUSY_TEXT_MODE"] = str(_display_cfg["busy_text_mode"])
             if "busy_ack_enabled" in _display_cfg:
                 os.environ["HERMES_GATEWAY_BUSY_ACK_ENABLED"] = str(_display_cfg["busy_ack_enabled"])
-        # Timezone: bridge config.yaml → HERMES_TIMEZONE env var.
-        _tz_cfg = _cfg.get("timezone", "")
-        if _tz_cfg and isinstance(_tz_cfg, str):
-            os.environ["HERMES_TIMEZONE"] = _tz_cfg.strip()
+        # Timezone: no longer bridged to HERMES_TIMEZONE env — hermes_time reads
+        # config.yaml `timezone` live (fingerprint-gated). Pinning it into env
+        # would freeze the value for the process lifetime. See spec
+        # 2026-06-02-timezone-propagation-design.
         # Security settings
         _security_cfg = _cfg.get("security", {})
         if isinstance(_security_cfg, dict):
@@ -2377,7 +2377,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _restart_via_service: bool = False
     _restart_command_source: Optional[SessionSource] = None
     _stop_task: Optional[asyncio.Task] = None
-    _session_model_overrides: Dict[str, Dict[str, str]] = {}
+    _mcp_discovery_task: Optional[asyncio.Task] = None
+    _accept_hooks: bool = False
+    _session_model_overrides: Dict[str, Dict[str, Any]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
 
@@ -2429,7 +2431,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._exit_cleanly = False
         self._exit_with_failure = False
         self._exit_reason: Optional[str] = None
-        self._exit_code: Optional[int] = None
+        self._exit_code = None
         self._draining = False
         self._restart_requested = False
         # Set by shutdown_signal_handler when a SIGTERM/SIGINT arrived
@@ -2447,6 +2449,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._restart_via_service = False
         self._restart_command_source: Optional[SessionSource] = None
         self._stop_task: Optional[asyncio.Task] = None
+        self._mcp_discovery_task: Optional[asyncio.Task] = None
+        self._accept_hooks = False
         
         # Track running agents per session for interrupt support
         # Key: session_key, Value: AIAgent instance
@@ -2506,10 +2510,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Per-session model overrides from /model command.
         # Key: session_key, Value: dict with model/provider/api_key/base_url/api_mode
-        self._session_model_overrides: Dict[str, Dict[str, str]] = {}
+        self._session_model_overrides = {}
         # Per-session reasoning effort overrides from /reasoning.
         # Key: session_key, Value: parsed reasoning config dict.
-        self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
+        self._session_reasoning_overrides = {}
         self._kanban_notifier_profile = self._active_profile_name()
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
@@ -2608,6 +2612,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.debug("state.db auto-maintenance skipped: %s", exc)
 
+        # Restore explicit session-level model overrides written by the
+        # Zettlab local-server. Local-server owns the control-plane state;
+        # Hermes consumes this profile-local JSON at startup and only keeps
+        # runtime overrides in memory afterwards.
+        try:
+            from gateway.session_model_overrides import load_session_model_overrides
+
+            stored = load_session_model_overrides()
+            if stored:
+                self._session_model_overrides.update(stored)
+                logger.info(
+                    "session-model-overrides: restored %d from profile json",
+                    len(stored),
+                )
+        except Exception as exc:
+            logger.debug("session-model-overrides restore skipped: %s", exc)
+
         # Opportunistic shadow-repo cleanup — deletes orphan/stale
         # checkpoint repos under ~/.hermes/checkpoints/.  Opt-in via
         # checkpoints.auto_prune, idempotent via .last_prune marker.
@@ -2688,7 +2709,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         connected = self.config.get_connected_platforms()
-        messaging_platforms = [p for p in connected if p not in {Platform.LOCAL, Platform.API_SERVER, Platform.WEBHOOK}]
+        messaging_platforms = [p for p in connected if p not in {Platform.LOCAL, Platform.API_SERVER, Platform.ZET_AGENT, Platform.WEBHOOK}]
         if not messaging_platforms:
             return
 
@@ -3219,6 +3240,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "base_url": override.get("base_url"),
                 "api_mode": override.get("api_mode"),
                 "max_tokens": override.get("max_tokens"),
+                "config_context_length": override.get("context_length"),
             }
             if override_runtime.get("api_key"):
                 logger.debug(
@@ -3313,6 +3335,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "base_url": runtime_kwargs.get("base_url"),
             "provider": runtime_kwargs.get("provider"),
             "api_mode": runtime_kwargs.get("api_mode"),
+            "config_context_length": runtime_kwargs.get("config_context_length"),
             "command": runtime_kwargs.get("command"),
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
@@ -3326,6 +3349,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime["provider"],
                 runtime["base_url"],
                 runtime["api_mode"],
+                runtime["config_context_length"],
                 runtime["command"],
                 tuple(runtime["args"]),
             ),
@@ -5321,7 +5345,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from hermes_cli.config import load_config
             from agent.shell_hooks import register_from_config
-            register_from_config(load_config(), accept_hooks=False)
+            register_from_config(
+                load_config(),
+                accept_hooks=bool(getattr(self, "_accept_hooks", False)),
+            )
         except Exception:
             logger.debug(
                 "shell-hook registration failed at gateway startup",
@@ -7064,6 +7091,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("API Server: aiohttp not installed")
                 return None
             return APIServerAdapter(config)
+
+        elif platform == Platform.ZET_AGENT:
+            from gateway.platforms.zet_agent import ZetAgentAdapter, check_zet_agent_requirements
+            if not check_zet_agent_requirements():
+                logger.warning("Zet Agent: aiohttp not installed")
+                return None
+            adapter = ZetAgentAdapter(config)
+            adapter.gateway_runner = self
+            return adapter
 
         elif platform == Platform.WEBHOOK:
             from gateway.platforms.webhook import WebhookAdapter, check_webhook_requirements
@@ -11614,6 +11650,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         wrapper can invoke the same path whether the user confirmed via
         button, text reply, or has the confirm gate disabled.
         """
+        discovery_task = getattr(self, "_mcp_discovery_task", None)
+        if discovery_task is not None and not discovery_task.done():
+            return (
+                "MCP discovery is still initializing in the background. "
+                "Please retry `/reload-mcp` after it finishes."
+            )
+
         loop = asyncio.get_running_loop()
         try:
             from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
@@ -13364,6 +13407,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             val = override.get(key)
             if val is not None:
                 runtime_kwargs[key] = val
+        context_length = override.get("context_length")
+        if context_length is not None:
+            runtime_kwargs["config_context_length"] = context_length
         return model, runtime_kwargs
 
     def _is_intentional_model_switch(self, session_key: str, agent_model: str) -> bool:
@@ -13656,6 +13702,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._release_evicted_agent_soft(agent)
             except Exception:
                 pass
+
+    def invalidate_all_cached_agents(self) -> int:
+        """Force every cached agent to rebuild its system prompt on the next turn.
+
+        Unlike _evict_cached_agent which drops the AIAgent instance entirely,
+        this keeps the instance (and therefore its OpenAI/httpx clients, MCP
+        handles, and tool state) and only clears the cached system prompt via
+        the upstream _invalidate_system_prompt() — the same hook /new, /clear,
+        and /branch use when they need to pick up fresh SOUL.md / IDENTITY.md
+        / memories from disk.
+
+        Used by the prompt-class reload endpoints (/v1/profile/reload,
+        /v1/skills/reload) to make on-disk profile changes take effect on the
+        current session without restarting the gateway. Returns the number of
+        agents successfully invalidated; individual failures are swallowed so
+        one broken agent doesn't block the rest.
+
+        Snapshot under the lock, then invalidate without it — the upstream
+        _invalidate_system_prompt may touch disk (memory_store.load_from_disk)
+        and we don't want that under the cache lock.
+
+        Cache values are ``(agent, signature)`` tuples (see the cache insert
+        in _run_agent around L15382); the agent itself is the first element.
+        We accept either shape — bare agent or tuple — so a future cache-value
+        refactor doesn't silently turn this into a zero-count no-op the way
+        a naive ``getattr(value, "_invalidate_system_prompt", ...)`` would.
+        """
+        _lock = getattr(self, "_agent_cache_lock", None)
+        if _lock is None:
+            return 0
+        with _lock:
+            entries = list(self._agent_cache.values())
+        count = 0
+        for entry in entries:
+            agent = entry[0] if isinstance(entry, tuple) and entry else entry
+            invalidate = getattr(agent, "_invalidate_system_prompt", None)
+            if not callable(invalidate):
+                continue
+            try:
+                invalidate()
+                count += 1
+            except Exception:
+                logger.warning(
+                    "invalidate_all_cached_agents: agent %r failed",
+                    type(agent).__name__,
+                    exc_info=True,
+                )
+        return count
 
     @staticmethod
     def _init_cached_agent_for_turn(agent: Any, interrupt_depth: int) -> None:
@@ -17039,7 +17133,12 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     InProcessCronScheduler().start(stop_event, adapters=adapters, loop=loop, interval=interval)
 
 
-async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
+async def start_gateway(
+    config: Optional[GatewayConfig] = None,
+    replace: bool = False,
+    verbosity: Optional[int] = 0,
+    accept_hooks: bool = False,
+) -> bool:
     """
     Start the gateway and run until interrupted.
     
@@ -17052,6 +17151,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         replace: If True, kill any existing gateway instance before starting.
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
+        accept_hooks: Auto-approve configured shell hooks for this gateway process.
     """
     # ── Duplicate-instance guard ──────────────────────────────────────
     # Prevent two gateways from running under the same HERMES_HOME.
@@ -17201,6 +17301,33 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Idempotent, so repeated calls from AIAgent.__init__ won't duplicate.
     from hermes_logging import setup_logging, _safe_stderr
     setup_logging(hermes_home=_hermes_home, mode="gateway")
+
+    # Periodic process memory usage logging (gateway only) — emits a
+    # grep-friendly "[MEMORY] rss=...MB ..." line every N minutes so
+    # slow leaks in the long-lived gateway process show up as a time
+    # series in agent.log / gateway.log.  Ported from cline/cline#10343.
+    # Controlled by the logging.memory_monitor section in config.yaml.
+    try:
+        from gateway import memory_monitor as _memory_monitor
+
+        _mm_cfg = {}
+        try:
+            # config is loaded a few lines up; re-read the logging section
+            # here so we pick up user overrides without coupling to local
+            # variable names inside the start_gateway body.
+            from hermes_cli.config import load_config as _load_cli_config
+
+            _mm_cfg = (_load_cli_config() or {}).get("logging", {}).get("memory_monitor", {}) or {}
+        except Exception:
+            _mm_cfg = {}
+        if _mm_cfg.get("enabled", True):
+            try:
+                _mm_interval = float(_mm_cfg.get("interval_seconds", 300))
+            except (TypeError, ValueError):
+                _mm_interval = 300.0
+            _memory_monitor.start_memory_monitoring(interval_seconds=_mm_interval)
+    except Exception as _mm_exc:
+        logger.debug("Failed to start memory monitor: %s", _mm_exc)
 
     # Optional stderr handler — level driven by -v/-q flags on the CLI.
     # verbosity=None (-q/--quiet): no stderr output
@@ -17408,22 +17535,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     atexit.register(remove_pid_file)
     atexit.register(release_gateway_runtime_lock)
 
-    _ensure_windows_gateway_venv_imports()
-
-    # MCP tool discovery — run in an executor so the asyncio event loop
-    # stays responsive even when a configured MCP server is slow or
-    # unreachable.  discover_mcp_tools() uses a blocking 120s wait
-    # internally; calling it from the loop thread would freeze platform
-    # heartbeats (Discord shard, Telegram polling) until it returned.
-    # See #16856.
-    try:
-        from tools.mcp_tool import discover_mcp_tools
-        _loop = asyncio.get_running_loop()
-        await _loop.run_in_executor(None, discover_mcp_tools)
-    except Exception as e:
-        logger.debug("MCP tool discovery failed: %s", e)
-
     # Start the gateway
+    runner._accept_hooks = accept_hooks
     success = await runner.start()
     if not success:
         return False
@@ -17431,6 +17544,43 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         if runner.exit_reason:
             logger.error("Gateway exiting cleanly: %s", runner.exit_reason)
         return True
+
+    # MCP tool discovery can spend up to 120s inside blocking connection
+    # waits when a configured server is slow, unreachable, or returns 401.
+    # Schedule it after the gateway HTTP surface is listening so /health
+    # readiness and normal chat are not coupled to optional MCP startup.
+    def _start_mcp_discovery_task() -> asyncio.Task:
+        task_loop = asyncio.get_running_loop()
+        discovery_done = task_loop.create_future()
+
+        def _mark_discovery_done() -> None:
+            if not discovery_done.done():
+                discovery_done.set_result(None)
+
+        def _discover_mcp_tools_thread() -> None:
+            try:
+                from tools.mcp_tool import discover_mcp_tools
+                discover_mcp_tools()
+            except Exception:
+                logger.warning("MCP tool discovery failed", exc_info=True)
+            finally:
+                try:
+                    task_loop.call_soon_threadsafe(_mark_discovery_done)
+                except RuntimeError:
+                    pass
+
+        threading.Thread(
+            target=_discover_mcp_tools_thread,
+            daemon=True,
+            name="mcp-discovery",
+        ).start()
+
+        async def _wait_for_discovery() -> None:
+            await discovery_done
+
+        return asyncio.create_task(_wait_for_discovery())
+
+    runner._mcp_discovery_task = _start_mcp_discovery_task()
     
     # Start the background cron scheduler via the resolved provider so
     # scheduled jobs fire automatically. The built-in provider is the
@@ -17461,31 +17611,60 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     )
     housekeeping_thread.start()
     
-    # Wait for shutdown
-    await runner.wait_for_shutdown()
+    try:
+        # Wait for shutdown
+        await runner.wait_for_shutdown()
+    finally:
+        # Stop cron ticker cleanly before tearing down tools it may use.
+        cron_stop.set()
+        cron_thread.join(timeout=5)
+
+        mcp_task = runner._mcp_discovery_task
+        mcp_discovery_still_running = False
+        if mcp_task is not None and not mcp_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(mcp_task), timeout=5)
+            except asyncio.TimeoutError:
+                mcp_discovery_still_running = True
+                logger.warning(
+                    "MCP discovery is still running during gateway shutdown; "
+                    "skipping concurrent MCP shutdown and forcing child cleanup."
+                )
+                mcp_task.cancel()
+                await asyncio.gather(mcp_task, return_exceptions=True)
+            except Exception:
+                pass
+
+        # Close MCP server connections.
+        try:
+            if mcp_discovery_still_running:
+                from tools.mcp_tool import _kill_orphaned_mcp_children
+                _kill_orphaned_mcp_children(include_active=True)
+            else:
+                from tools.mcp_tool import shutdown_mcp_servers
+                shutdown_mcp_servers()
+        except Exception:
+            pass
 
     if runner.should_exit_with_failure:
         if runner.exit_reason:
             logger.error("Gateway exiting with failure: %s", runner.exit_reason)
         return False
-    
-    # Stop cron scheduler + housekeeping cleanly
-    cron_stop.set()
-    try:
-        cron_provider.stop()
-    except Exception as e:
-        logger.debug("Cron provider stop() error: %s", e)
-    cron_thread.join(timeout=5)
-    housekeeping_thread.join(timeout=5)
 
     # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
+    # The cron ticker and MCP servers were already torn down in the finally
+    # above — MCP via the fork's mcp_discovery_still_running-aware path — so the
+    # only thing left to stop here is the upstream planned-stop watcher thread.
     _planned_stop_watcher_stop.set()
     _planned_stop_watcher_thread.join(timeout=2)
 
-    # Close MCP server connections
+    # Stop the periodic memory monitor (if it was started above).
+    # This also emits one final "[MEMORY] shutdown rss=..." line so the
+    # last RSS reading before gateway exit is always in the log.
     try:
-        from tools.mcp_tool import shutdown_mcp_servers
-        shutdown_mcp_servers()
+        from gateway import memory_monitor as _memory_monitor
+
+        _memory_monitor.stop_memory_monitoring(timeout=2.0)
     except Exception:
         pass
 

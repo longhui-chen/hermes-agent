@@ -82,6 +82,15 @@ let
   # compiled, so it never carries a __pycache__ dir to exclude.
   bundledLocales = lib.cleanSource ../locales;
 
+  # Seed policy + its derived installer fallback manifest. Shipped next to
+  # skills/ in the store so tools.skills_sync._read_seed_policy() resolves it via
+  # _get_bundled_dir().parent / "config" / "skill_seed_policy.json". WITHOUT this
+  # a fresh Nix profile finds NO policy (the file is absent, not the env override)
+  # and falls back to the upstream "seed everything" path — seeding all bundled
+  # skills instead of the curated seed set. config/ is bare text (policy json +
+  # manifest), so plain cleanSource is enough.
+  bundledConfig = lib.cleanSource ../config;
+
   runtimeDeps = [
     nodejs
     ripgrep
@@ -167,6 +176,7 @@ stdenv.mkDerivation (finalAttrs: {
     cp -r ${bundledSkills} $out/share/hermes-agent/skills
     cp -r ${bundledPlugins} $out/share/hermes-agent/plugins
     cp -r ${bundledLocales} $out/share/hermes-agent/locales
+    cp -r ${bundledConfig} $out/share/hermes-agent/config
     cp -r ${hermesWeb} $out/share/hermes-agent/web_dist
 
     mkdir -p $out/ui-tui

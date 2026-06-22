@@ -1,3 +1,8 @@
+import asyncio
+import sys
+import threading
+import types
+
 import pytest
 from unittest.mock import AsyncMock
 
@@ -172,6 +177,239 @@ async def test_start_gateway_verbosity_imports_redacting_formatter(monkeypatch, 
     ok = await start_gateway(config=GatewayConfig(), replace=False, verbosity=1)
 
     assert ok is True
+
+
+@pytest.mark.asyncio
+async def test_start_gateway_schedules_mcp_discovery_after_runner_start(monkeypatch, tmp_path):
+    """A slow/broken MCP server must not block gateway readiness.
+
+    local-server waits on /health from the platform adapter; MCP discovery is
+    optional tool setup and should run only after the gateway has started.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    events: list[str] = []
+    release = asyncio.Event()
+    discovered = asyncio.Event()
+    loop = asyncio.get_running_loop()
+
+    class _RunningRunner:
+        def __init__(self, config):
+            self.config = config
+            self.should_exit_cleanly = False
+            self.should_exit_with_failure = False
+            self.exit_reason = None
+            self.exit_code = None
+            self.adapters = {}
+            self._restart_requested = False
+            self._restart_via_service = False
+
+        async def start(self):
+            events.append("runner.start")
+            return True
+
+        async def wait_for_shutdown(self):
+            events.append("runner.wait")
+            await release.wait()
+
+        async def stop(self):
+            return None
+
+    def _discover_mcp_tools():
+        events.append("mcp.discovery")
+        loop.call_soon_threadsafe(discovered.set)
+
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr("gateway.status.write_pid_file", lambda: None)
+    monkeypatch.setattr("gateway.status.remove_pid_file", lambda: None)
+    monkeypatch.setattr("gateway.status.acquire_gateway_runtime_lock", lambda: True)
+    monkeypatch.setattr("gateway.status.release_gateway_runtime_lock", lambda: None)
+    monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
+    monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
+    monkeypatch.setattr("hermes_logging._add_rotating_handler", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "agent.shell_hooks.register_from_config",
+        lambda _cfg, accept_hooks=False: None,
+    )
+    monkeypatch.setattr("gateway.run.GatewayRunner", _RunningRunner)
+    monkeypatch.setattr("gateway.run._start_cron_ticker", lambda *args, **kwargs: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool",
+        types.SimpleNamespace(
+            discover_mcp_tools=_discover_mcp_tools,
+            shutdown_mcp_servers=lambda: None,
+        ),
+    )
+
+    from gateway.run import start_gateway
+
+    task = asyncio.create_task(
+        start_gateway(config=GatewayConfig(), replace=False, verbosity=None)
+    )
+    await asyncio.wait_for(discovered.wait(), timeout=1)
+    assert "runner.wait" in events
+
+    release.set()
+    assert await task is True
+    assert events[0] == "runner.start"
+    assert events.index("mcp.discovery") > events.index("runner.start")
+
+
+@pytest.mark.asyncio
+async def test_start_gateway_does_not_wait_for_slow_mcp_discovery(monkeypatch, tmp_path):
+    """Gateway readiness must not wait for a slow MCP discovery thread."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    events: list[str] = []
+    release = asyncio.Event()
+    start_finished = asyncio.Event()
+    release_mcp = threading.Event()
+    mcp_started = threading.Event()
+
+    class _RunningRunner:
+        def __init__(self, config):
+            self.config = config
+            self.should_exit_cleanly = False
+            self.should_exit_with_failure = False
+            self.exit_reason = None
+            self.exit_code = None
+            self.adapters = {}
+            self._restart_requested = False
+            self._restart_via_service = False
+            self._mcp_discovery_task = None
+
+        async def start(self):
+            events.append("runner.start")
+            return True
+
+        async def wait_for_shutdown(self):
+            events.append("runner.wait")
+            start_finished.set()
+            await release.wait()
+
+        async def stop(self):
+            return None
+
+    def _discover_mcp_tools():
+        mcp_started.set()
+        release_mcp.wait(timeout=2)
+        events.append("mcp.discovery.done")
+
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr("gateway.status.write_pid_file", lambda: None)
+    monkeypatch.setattr("gateway.status.remove_pid_file", lambda: None)
+    monkeypatch.setattr("gateway.status.acquire_gateway_runtime_lock", lambda: True)
+    monkeypatch.setattr("gateway.status.release_gateway_runtime_lock", lambda: None)
+    monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
+    monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
+    monkeypatch.setattr("hermes_logging._add_rotating_handler", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "agent.shell_hooks.register_from_config",
+        lambda _cfg, accept_hooks=False: None,
+    )
+    monkeypatch.setattr("gateway.run.GatewayRunner", _RunningRunner)
+    monkeypatch.setattr("gateway.run._start_cron_ticker", lambda *args, **kwargs: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool",
+        types.SimpleNamespace(
+            discover_mcp_tools=_discover_mcp_tools,
+            shutdown_mcp_servers=lambda: None,
+        ),
+    )
+
+    from gateway.run import start_gateway
+
+    task = asyncio.create_task(
+        start_gateway(config=GatewayConfig(), replace=False, verbosity=None)
+    )
+    await asyncio.wait_for(start_finished.wait(), timeout=1)
+
+    assert events == ["runner.start", "runner.wait"]
+    assert mcp_started.wait(timeout=1)
+
+    release_mcp.set()
+    release.set()
+    assert await asyncio.wait_for(task, timeout=1) is True
+    assert "mcp.discovery.done" in events
+
+
+@pytest.mark.asyncio
+async def test_start_gateway_shutdown_cleanup_runs_on_failure_exit(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    calls: list[str] = []
+
+    class _FailureRunner:
+        def __init__(self, config):
+            self.config = config
+            self.should_exit_cleanly = False
+            self.should_exit_with_failure = True
+            self.exit_reason = "adapter failed"
+            self.exit_code = None
+            self.adapters = {}
+            self._restart_requested = False
+            self._restart_via_service = False
+            self._mcp_discovery_task = None
+
+        async def start(self):
+            return True
+
+        async def wait_for_shutdown(self):
+            calls.append("runner.wait")
+
+        async def stop(self):
+            return None
+
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr("gateway.status.write_pid_file", lambda: None)
+    monkeypatch.setattr("gateway.status.remove_pid_file", lambda: None)
+    monkeypatch.setattr("gateway.status.acquire_gateway_runtime_lock", lambda: True)
+    monkeypatch.setattr("gateway.status.release_gateway_runtime_lock", lambda: None)
+    monkeypatch.setattr("tools.skills_sync.sync_skills", lambda quiet=True: None)
+    monkeypatch.setattr("hermes_logging.setup_logging", lambda hermes_home, mode: tmp_path)
+    monkeypatch.setattr("hermes_logging._add_rotating_handler", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "agent.shell_hooks.register_from_config",
+        lambda _cfg, accept_hooks=False: None,
+    )
+    monkeypatch.setattr("gateway.run.GatewayRunner", _FailureRunner)
+    monkeypatch.setattr("gateway.run._start_cron_ticker", lambda *args, **kwargs: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool",
+        types.SimpleNamespace(
+            discover_mcp_tools=lambda: calls.append("mcp.discovery"),
+            shutdown_mcp_servers=lambda: calls.append("mcp.shutdown"),
+        ),
+    )
+
+    from gateway.run import start_gateway
+
+    ok = await start_gateway(config=GatewayConfig(), replace=False, verbosity=None)
+
+    assert ok is False
+    assert "runner.wait" in calls
+    assert "mcp.shutdown" in calls
+
+
+@pytest.mark.asyncio
+async def test_reload_mcp_returns_busy_during_startup_discovery():
+    runner = GatewayRunner.__new__(GatewayRunner)
+
+    async def _never_finishes():
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(_never_finishes())
+    runner._mcp_discovery_task = task
+    try:
+        result = await GatewayRunner._execute_mcp_reload(runner, types.SimpleNamespace())
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert "still initializing" in result
 
 
 @pytest.mark.asyncio

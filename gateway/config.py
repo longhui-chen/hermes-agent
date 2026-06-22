@@ -165,6 +165,8 @@ class Platform(Enum):
     QQBOT = "qqbot"
     YUANBAO = "yuanbao"
     RELAY = "relay"  # generic relay adapter fronted by the connector (EXPERIMENTAL)
+    ZET_AGENT = "zet_agent"
+
     @classmethod
     def _missing_(cls, value):
         """Accept unknown platform names only for known plugin adapters.
@@ -287,7 +289,7 @@ class SessionResetPolicy:
     at_hour: int = 4  # Hour for daily reset (0-23, local time)
     idle_minutes: int = 1440  # Minutes of inactivity before reset (24 hours)
     notify: bool = True  # Send a notification to the user when auto-reset occurs
-    notify_exclude_platforms: tuple = ("api_server", "webhook")  # Platforms that don't get reset notifications
+    notify_exclude_platforms: tuple = ("api_server", "zet_agent", "webhook")  # Platforms that don't get reset notifications
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -311,7 +313,7 @@ class SessionResetPolicy:
             at_hour=at_hour if at_hour is not None else 4,
             idle_minutes=idle_minutes if idle_minutes is not None else 1440,
             notify=_coerce_bool(notify, True),
-            notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "webhook"),
+            notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "zet_agent", "webhook"),
         )
 
 
@@ -471,6 +473,7 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     Platform.EMAIL: lambda cfg: bool(cfg.extra.get("address")),
     Platform.SMS: lambda cfg: bool(os.getenv("TWILIO_ACCOUNT_SID")),
     Platform.API_SERVER: lambda cfg: True,
+    Platform.ZET_AGENT: lambda cfg: True,
     Platform.WEBHOOK: lambda cfg: True,
     Platform.MSGRAPH_WEBHOOK: lambda cfg: bool(
         str(cfg.extra.get("client_state") or "").strip()
@@ -1702,6 +1705,32 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         api_server_model_name = os.getenv("API_SERVER_MODEL_NAME", "")
         if api_server_model_name:
             config.platforms[Platform.API_SERVER].extra["model_name"] = api_server_model_name
+
+    # Zet Agent — APIServerAdapter subclass with extended SSE events
+    # (reasoning.delta / hermes.approval / hermes.clarify / conversation.title)
+    # mounted on event: hermes.tool.progress with payload.type discriminator.
+    zet_agent_enabled = os.getenv("ZET_AGENT_ENABLED", "").lower() in ("true", "1", "yes")
+    zet_agent_key = os.getenv("ZET_AGENT_KEY", "")
+    zet_agent_port = os.getenv("ZET_AGENT_PORT")
+    zet_agent_host = os.getenv("ZET_AGENT_HOST")
+    zet_agent_cors_origins = os.getenv("ZET_AGENT_CORS_ORIGINS", "")
+    if zet_agent_enabled or zet_agent_key:
+        if Platform.ZET_AGENT not in config.platforms:
+            config.platforms[Platform.ZET_AGENT] = PlatformConfig()
+        config.platforms[Platform.ZET_AGENT].enabled = True
+        if zet_agent_key:
+            config.platforms[Platform.ZET_AGENT].extra["key"] = zet_agent_key
+        if zet_agent_port:
+            try:
+                config.platforms[Platform.ZET_AGENT].extra["port"] = int(zet_agent_port)
+            except ValueError:
+                pass
+        if zet_agent_host:
+            config.platforms[Platform.ZET_AGENT].extra["host"] = zet_agent_host
+        if zet_agent_cors_origins:
+            origins = [o.strip() for o in zet_agent_cors_origins.split(",") if o.strip()]
+            if origins:
+                config.platforms[Platform.ZET_AGENT].extra["cors_origins"] = origins
 
     # Webhook platform
     webhook_enabled = os.getenv("WEBHOOK_ENABLED", "").lower() in {"true", "1", "yes"}

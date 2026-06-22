@@ -24,7 +24,10 @@ class HermesAgent < Formula
     venv.pip_install resources
     venv.pip_install buildpath
 
-    pkgshare.install "skills", "optional-skills"
+    # config/ ships next to skills/ so _read_seed_policy() resolves the seed
+    # allowlist (pkgshare/config relative to HERMES_BUNDLED_SKILLS=pkgshare/skills).
+    # Without it a fresh Homebrew profile seeds the full un-curated set.
+    pkgshare.install "skills", "optional-skills", "config"
 
     %w[hermes hermes-agent hermes-acp].each do |exe|
       next unless (libexec/"bin"/exe).exist?

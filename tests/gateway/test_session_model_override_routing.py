@@ -73,6 +73,7 @@ def _codex_override():
         "api_key": "***",
         "base_url": "https://chatgpt.com/backend-api/codex",
         "api_mode": "codex_responses",
+        "context_length": 1_000_000,
     }
 
 
@@ -123,6 +124,7 @@ def test_run_agent_prefers_session_override_over_global_runtime(monkeypatch):
     assert _CapturingAgent.last_init["api_mode"] == "codex_responses"
     assert _CapturingAgent.last_init["base_url"] == "https://chatgpt.com/backend-api/codex"
     assert _CapturingAgent.last_init["api_key"] == "***"
+    assert _CapturingAgent.last_init["config_context_length"] == 1_000_000
     assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "high"}
 
 
@@ -162,7 +164,25 @@ async def test_background_task_prefers_session_override_over_global_runtime(monk
     assert _CapturingAgent.last_init["api_mode"] == "codex_responses"
     assert _CapturingAgent.last_init["base_url"] == "https://chatgpt.com/backend-api/codex"
     assert _CapturingAgent.last_init["api_key"] == "***"
+    assert _CapturingAgent.last_init["config_context_length"] == 1_000_000
     assert _CapturingAgent.last_init["reasoning_config"] == {"enabled": True, "effort": "high"}
+
+
+def test_session_override_context_length_affects_route_signature():
+    runner = _make_runner()
+    session_key = "agent:main:local:dm"
+    runner._session_model_overrides[session_key] = _codex_override()
+
+    model, runtime_kwargs = runner._resolve_session_agent_runtime(
+        session_key=session_key,
+        user_config={"model": {"default": "glm-5"}},
+    )
+    assert model == "gpt-5.4"
+    assert runtime_kwargs["config_context_length"] == 1_000_000
+
+    route = runner._resolve_turn_agent_config("ping", model, runtime_kwargs)
+    assert route["runtime"]["config_context_length"] == 1_000_000
+    assert route["signature"][4] == 1_000_000
 
 def test_gateway_auth_fallback_uses_fallback_model_from_config(tmp_path, monkeypatch):
     """Regression: fallback provider must not inherit the primary model.
@@ -260,4 +280,3 @@ fallback_providers:
     assert runtime_kwargs["api_key"] == "env-secret"
     assert runtime_kwargs["base_url"] == "https://fallback.example/v1"
     assert runtime_kwargs["model"] == "fallback-model"
-

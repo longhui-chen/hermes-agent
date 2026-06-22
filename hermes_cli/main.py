@@ -733,6 +733,25 @@ def _mark_termux_bundled_skills_synced() -> None:
         pass
 
 
+def _warn_if_seed_policy_error(result, indent: str = "  ") -> bool:
+    """Surface a fail-closed seed-policy error carried by a sync result.
+
+    sync_skills() returns ``policy_error=True`` (and seeds nothing) when the seed
+    policy is present but unreadable/corrupt, or a policy-managed profile's policy
+    has vanished. Callers MUST surface this instead of reporting "up to date" /
+    "Re-seeded 0" / stamping success — otherwise the fail-closed condition is
+    invisible on the very ``hermes update`` path users are told to run. Returns
+    True (and prints) when an error was present."""
+    if result and result.get("policy_error"):
+        print(
+            f"{indent}✗ Skills NOT seeded: the seed policy is present but "
+            f"unreadable/corrupt (fail-closed). Fix config/skill_seed_policy.json, "
+            f"then re-run."
+        )
+        return True
+    return False
+
+
 def _sync_bundled_skills_for_startup() -> bool:
     """Sync bundled skills, but skip unchanged Termux checkouts cheaply.
 
@@ -745,7 +764,11 @@ def _sync_bundled_skills_for_startup() -> bool:
 
     from tools.skills_sync import sync_skills
 
-    sync_skills(quiet=True)
+    synced = sync_skills(quiet=True)
+    if synced and synced.get("policy_error"):
+        # Leave the checkout marked unsynced so a later start retries once the
+        # policy is fixed, instead of stamping success and suppressing the retry.
+        return False
     _mark_termux_bundled_skills_synced()
     return True
 
@@ -6090,7 +6113,8 @@ def _update_via_zip(args):
         if result.get("cleaned"):
             print(f"  − {len(result['cleaned'])} removed from manifest")
         if not result["copied"] and not result.get("updated"):
-            print("  ✓ Skills are up to date")
+            if not _warn_if_seed_policy_error(result):
+                print("  ✓ Skills are up to date")
     except Exception:
         pass
 
@@ -6356,12 +6380,12 @@ def _discard_stashed_changes(
 # =========================================================================
 
 OFFICIAL_REPO_URLS = {
-    "https://github.com/NousResearch/hermes-agent.git",
-    "git@github.com:NousResearch/hermes-agent.git",
-    "https://github.com/NousResearch/hermes-agent",
-    "git@github.com:NousResearch/hermes-agent",
+    "https://github.com/zettlab/hermes-agent.git",
+    "git@github.com:zettlab/hermes-agent.git",
+    "https://github.com/zettlab/hermes-agent",
+    "git@github.com:zettlab/hermes-agent",
 }
-OFFICIAL_REPO_URL = "https://github.com/NousResearch/hermes-agent.git"
+OFFICIAL_REPO_URL = "https://github.com/zettlab/hermes-agent.git"
 SKIP_UPSTREAM_PROMPT_FILE = ".skip_upstream_prompt"
 
 
@@ -9088,7 +9112,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
             if result.get("cleaned"):
                 print(f"  − {len(result['cleaned'])} removed from manifest")
             if not result["copied"] and not result.get("updated"):
-                print("  ✓ Skills are up to date")
+                if not _warn_if_seed_policy_error(result):
+                    print("  ✓ Skills are up to date")
         except Exception as e:
             logger.debug("Skills sync during update failed: %s", e)
 
@@ -9112,6 +9137,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         r = seed_profile_skills(p.path, quiet=True)
                         if r and r.get("skipped_opt_out"):
                             status = "opted out (--no-skills)"
+                        elif r and r.get("policy_error"):
+                            status = (
+                                "seed policy corrupt — NOT seeded "
+                                "(fix config/skill_seed_policy.json)"
+                            )
                         elif r:
                             copied = len(r.get("copied", []))
                             updated = len(r.get("updated", []))
@@ -10278,6 +10308,18 @@ def cmd_profile(args):
                     print(
                         "No bundled skills seeded (--no-skills). "
                         "Delete .no-bundled-skills in the profile to opt back in."
+                    )
+                elif result and result.get("policy_error"):
+                    # The profile itself is created; only skill seeding failed
+                    # (fail-closed corrupt policy). This is intentionally NON-fatal
+                    # and exit 0, consistent with the generic "could not be seeded"
+                    # branch below — the user fixes the policy and `hermes update`
+                    # re-seeds. The warning is loud so it is never silent.
+                    print(
+                        "⚠ Skills seed FAILED: the seed policy is present but "
+                        "unreadable/corrupt, so no skills were seeded (fail-closed). "
+                        "Fix config/skill_seed_policy.json and run "
+                        "`hermes update` to retry."
                     )
                 elif result:
                     copied = len(result.get("copied", []))

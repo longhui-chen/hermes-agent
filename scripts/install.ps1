@@ -1932,14 +1932,42 @@ Delete the contents (or this file) to use the default personality.
     if (Test-Path $pythonExe) {
         try {
             & $pythonExe "$InstallDir\tools\skills_sync.py" 2>$null
-            Write-Success "Skills synced to $HermesHome\skills"
+            # `&` does NOT throw on a native non-zero exit, so check explicitly:
+            # exit 2 = fail-closed corrupt policy (seeded nothing). Throw so the
+            # catch runs the pre-baked manifest fallback instead of reporting a
+            # bogus success.
+            if ($LASTEXITCODE -ne 0) {
+                throw "skills_sync.py exited with $LASTEXITCODE"
+            }
+            Write-Success "Skills synced to ~/.hermes/skills/"
         } catch {
-            # Fallback: simple directory copy
-            $bundledSkills = "$InstallDir\skills"
+            # Fallback (python seeder unavailable): copy ONLY the policy's seed
+            # set from the pre-baked manifest — policy-correct without python.
+            # Never bulk-copy the whole bundle (would seed the un-curated set).
+            $manifest = "$InstallDir\config\seed_fallback_manifest.txt"
             $userSkills = "$HermesHome\skills"
-            if ((Test-Path $bundledSkills) -and -not (Get-ChildItem $userSkills -Exclude '.bundled_manifest' -ErrorAction SilentlyContinue)) {
-                Copy-Item -Path "$bundledSkills\*" -Destination $userSkills -Recurse -Force -ErrorAction SilentlyContinue
-                Write-Success "Skills copied to $HermesHome\skills"
+            if ((Test-Path $manifest) -and -not (Get-ChildItem $userSkills -Exclude '.bundled_manifest' -ErrorAction SilentlyContinue)) {
+                $seedFailures = 0
+                foreach ($src in (Get-Content $manifest | Where-Object { $_.Trim() -ne '' })) {
+                    $rel = ($src -split '/', 2)[1]            # strip first path component
+                    $destDir = Split-Path -Parent "$userSkills\$($rel -replace '/', '\')"
+                    New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+                    try {
+                        Copy-Item -Path "$InstallDir\$($src -replace '/', '\')" -Destination "$userSkills\$($rel -replace '/', '\')" -Recurse -Force -ErrorAction Stop
+                    } catch {
+                        $seedFailures++
+                    }
+                }
+                # Only mark the profile policy-managed when every seed copied. On
+                # partial failure, skip the marker and report honestly — the first
+                # 'hermes' run (no manifest -> treated as new) re-seeds under
+                # policy and completes the missing skills.
+                if ($seedFailures -eq 0) {
+                    New-Item -ItemType File -Force -Path "$userSkills\.seed_policy" | Out-Null
+                    Write-Success "Skills seeded from policy fallback"
+                } else {
+                    Write-Warn "Skill fallback seeding incomplete ($seedFailures copy failure(s)); marker not written — the first 'hermes' run will complete seeding under policy."
+                }
             }
         }
     }

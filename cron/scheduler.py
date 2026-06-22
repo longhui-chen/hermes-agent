@@ -1294,6 +1294,43 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     return _scan_assembled_cron_prompt("\n".join(parts), job, has_skills=True)
 
 
+def _build_job_persist_prompt(job: dict) -> str:
+    """Build the user-facing prompt that gets stored in sessions.messages.
+
+    AIAgent.run_conversation receives ``_build_job_prompt`` output as
+    ``user_message`` (cron_hint preamble + script/context blocks + skill
+    wrappers + the operator's prompt — everything the LLM needs at
+    runtime). But that whole assembly also lands in ``sessions.messages``
+    role=user content, so the App's home list / per-session history
+    surface the entire ``[IMPORTANT: You are running as a scheduled cron
+    job. ...]`` preamble as if the user typed it.
+
+    Hermes already has a clean-history channel for this exact case:
+    ``run_conversation(user_message=..., persist_user_message=...)`` —
+    ``_apply_persist_user_message_override`` rewrites the in-memory
+    messages list before persistence so DB and JSONL log carry the
+    cleaner string. cron just wasn't using it.
+
+    This helper produces the cleaner string. It is the operator's
+    original ``job["prompt"]`` verbatim — no cron_hint, no skill
+    wrapper, no script-output framing. Empty prompts (skill-only crons)
+    fall back to a synthesized label so the resumed conversation
+    doesn't render an empty user bubble.
+
+    Note: ``job["prompt"]`` is already injection-scanned at create/update
+    time by ``tools/cronjob_tools.py::_scan_cron_prompt``; we re-scan the
+    fully-assembled prompt for runtime-loaded skill content in
+    ``_scan_assembled_cron_prompt`` but that's the LLM-facing scan path.
+    The persist string is just the user's own text and needs no
+    additional scanning here.
+    """
+    user_prompt = (job.get("prompt") or "").strip()
+    if user_prompt:
+        return user_prompt
+    label = job.get("name") or job.get("id") or "unknown"
+    return f"_(cron job: {label})_"
+
+
 def _scan_assembled_cron_prompt(
     assembled: str,
     job: dict,
@@ -1544,6 +1581,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
+    # persist_prompt is the clean operator-typed text we hand to
+    # run_conversation(persist_user_message=...) so sessions.messages
+    # stores the user-facing prompt rather than the full LLM payload
+    # (which carries cron_hint preamble, skill wrappers, etc).
+    persist_prompt = _build_job_persist_prompt(job)
     origin = _resolve_origin(job)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -1853,7 +1895,17 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        # persist_user_message: AIAgent.run_conversation receives the full
+        # cron payload as user_message but persists persist_prompt (just
+        # the operator's job["prompt"]) via _apply_persist_user_message_override
+        # before flushing to sessions.messages. LLM behavior unchanged,
+        # history clean.
+        _cron_future = _cron_pool.submit(
+            _cron_context.run,
+            agent.run_conversation,
+            prompt,
+            persist_user_message=persist_prompt,
+        )
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
@@ -1951,7 +2003,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
 ## Prompt
 
-{prompt}
+{persist_prompt}
 
 ## Response
 
@@ -1973,7 +2025,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
 ## Prompt
 
-{prompt}
+{persist_prompt}
 
 ## Error
 

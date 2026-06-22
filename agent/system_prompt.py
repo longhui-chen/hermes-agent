@@ -161,7 +161,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
-    # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
+    # Pointer to the zettlab-memo-setup skill for user questions about the runtime itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
@@ -441,7 +441,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         except Exception:
             pass
 
-    from hermes_time import now as _hermes_now
+    from hermes_time import now as _hermes_now, get_timezone_name as _hermes_tz_name
     now = _hermes_now()
     # Date-only (not minute-precision) so the system prompt is byte-stable
     # for the full day.  Minute-precision changes invalidate prefix-cache KV
@@ -449,7 +449,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # session resume without a stored prompt).  The model can still query the
     # exact wall-clock time via tools when it actually needs it.
     # Credit: @iamfoz (PR #20451).
-    timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y')}"
+    #
+    # Surface the active timezone (live device tz, ZET-1258) so the model can
+    # answer "what timezone am I in" and reason about wall-clock scheduling.
+    # IANA name when resolvable, always with the UTC offset. The label is
+    # byte-stable too (changes only when the device timezone changes), so it
+    # does not regress the date-only cache stability above.
+    _tz_off = now.strftime('%z')  # e.g. "+0800"; now is tz-aware so present
+    _tz_off = f"UTC{_tz_off[:3]}:{_tz_off[3:]}" if len(_tz_off) == 5 else "UTC"
+    _tz_name = _hermes_tz_name()
+    _tz_label = f"{_tz_name} ({_tz_off})" if _tz_name else _tz_off
+    timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y')} — timezone {_tz_label}"
     if agent.pass_session_id and agent.session_id:
         timestamp_line += f"\nSession ID: {agent.session_id}"
     if agent.model:

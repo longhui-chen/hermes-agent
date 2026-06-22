@@ -492,6 +492,7 @@ def cronjob(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
+    timezone: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -558,6 +559,7 @@ def cronjob(
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
+                timezone=_normalize_optional_job_value(timezone),
             )
             _notify_provider_jobs_changed_safe()
             return json.dumps(
@@ -709,6 +711,10 @@ def cronjob(
                             success=False,
                         )
                 updates["no_agent"] = target_no_agent
+            if timezone is not None:
+                # Empty string clears the per-job tz (falls back to hermes
+                # instance tz); otherwise normalize and let update_job validate.
+                updates["timezone"] = _normalize_optional_job_value(timezone)
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -771,7 +777,20 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "schedule": {
                 "type": "string",
-                "description": "REQUIRED for action=create. For create/update: '30m', 'every 2h', '0 9 * * *', or ISO timestamp. Examples: '30m' (every 30 minutes), 'every 2h' (every 2 hours), '0 9 * * *' (daily at 9am), '2026-06-01T09:00:00' (one-shot). You MUST include this field when action=create."
+                "description": (
+                    "REQUIRED for action=create (you MUST include this field when "
+                    "action=create). For create/update, pick the format based on user intent:\n"
+                    "  - RECURRING (user said 每天/每周/每隔/每N分钟/repeat/every/daily): "
+                    "use cron expression 'M H * * *' (e.g. '35 14 * * *' for daily at 14:35) "
+                    "or 'every Nm' / 'every Nh' (e.g. 'every 10m' for every 10 minutes).\n"
+                    "  - ONE-SHOT (user said a single specific time, no repetition): "
+                    "use ISO timestamp 'YYYY-MM-DDTHH:MM:SS' or a duration like '30m' / '2h' / '1d' "
+                    "(meaning from now).\n"
+                    "WARNING: A bare duration ('10m') or ISO timestamp fires ONCE and the job is "
+                    "marked completed — do NOT use these formats when the user wants the job to "
+                    "repeat. If unsure (e.g. '每10分钟提醒我喝水一次' — '一次' here means 'each "
+                    "cycle', not 'only once'), default to 'every Nm' so the job keeps firing."
+                ),
             },
             "name": {
                 "type": "string",
@@ -779,11 +798,41 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "repeat": {
                 "type": "integer",
-                "description": "Optional repeat count. Omit for defaults (once for one-shot, forever for recurring)."
+                "description": (
+                    "Optional total execution cap. OMIT this parameter entirely to get the "
+                    "correct default behavior: one-shot schedules run 1 time, recurring schedules "
+                    "(cron / every-N) run FOREVER. "
+                    "Do NOT pass a large sentinel like 999999 to mean 'forever' — that creates "
+                    "a hard cap and the job will eventually stop. "
+                    "Only set this when the user explicitly says a finite count "
+                    "(e.g. '提醒我 3 次' → repeat=3)."
+                ),
             },
             "deliver": {
                 "type": "string",
-                "description": "Omit this parameter to auto-deliver back to the current chat and topic (recommended). Auto-detection preserves thread/topic context. Only set explicitly when the user asks to deliver somewhere OTHER than the current conversation. Values: 'origin' (same as omitting), 'local' (no delivery, save only), 'all' (fan out to every connected home channel), or platform:chat_id:thread_id for a specific destination. Combine with comma: 'origin,all' delivers to the origin plus every other connected channel. Examples: 'telegram:-1001234567890:17585', 'discord:#engineering', 'sms:+15551234567', 'all'. WARNING: 'platform:chat_id' without :thread_id loses topic targeting. 'all' resolves at fire time, so a job created before a channel was wired up will pick it up automatically once connected."
+                "description": (
+                    "ALLOWED VALUES (anything else silently drops messages):\n"
+                    "  - omit / 'origin' — auto-deliver to the current chat (recommended)\n"
+                    "  - 'local' — save output to file only, no delivery\n"
+                    "  - 'all' — fan out to every connected home channel "
+                    "(resolves at fire time; if no channels are wired up the delivery resolves "
+                    "to empty and the cron output goes nowhere — last_delivery_error="
+                    "'no delivery target resolved for deliver=all'. Don't pick 'all' unless "
+                    "the user explicitly asked for cross-channel broadcast.)\n"
+                    "  - '<platform>:<chat_id>[:<thread_id>]' — explicit destination "
+                    "(e.g. 'telegram:-1001234567890:17585', 'discord:#engineering')\n"
+                    "  - comma-separated combinations (e.g. 'origin,all' = origin plus every "
+                    "other connected channel)\n"
+                    "Do NOT invent values like 'everyone', 'broadcast', 'channel' — only the "
+                    "above are recognized.\n"
+                    "If a previous task's last_delivery_error mentions \"unknown platform "
+                    "'zettlab'\", that error is known cosmetic noise — the message DID reach "
+                    "the user via WebSocket. Do NOT 'fix' it by changing deliver to 'all' or "
+                    "any other value; leave deliver as is (omit / 'origin').\n\n"
+                    "Auto-detection preserves thread/topic context — only set explicitly when "
+                    "the user asks for a different destination. WARNING: 'platform:chat_id' "
+                    "without ':thread_id' loses topic targeting."
+                ),
             },
             "skills": {
                 "type": "array",
@@ -849,6 +898,23 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "string",
                 "description": "Optional absolute path to run the job from. When set, AGENTS.md / CLAUDE.md / .cursorrules from that directory are injected into the system prompt, and the terminal/file/code_exec tools use it as their working directory — useful for running a job inside a specific project repo. Must be an absolute path that exists. When unset (default), preserves the original behaviour: no project context files, tools use the scheduler's cwd. On update, pass an empty string to clear. Jobs with workdir run sequentially (not parallel) to keep per-job directories isolated."
             },
+            "profile": {
+                "type": "string",
+                "description": "Optional Hermes profile name to run the job under. When set, the scheduler resolves that profile, applies a context-local Hermes home override, loads that profile's config/.env for the run, and bridges HERMES_HOME into subprocesses. Any temporary process-environment changes from profile .env loading are restored after the job exits. Use 'default' for the root Hermes profile. Named profiles must already exist. When unset (default), preserves the scheduler's existing profile. On update, pass an empty string to clear. Jobs with profile run sequentially (not parallel) to keep profile-scoped runtime state isolated."
+            },
+            "timezone": {
+                "type": "string",
+                "description": (
+                    "IANA timezone name (e.g. 'Asia/Shanghai', 'America/New_York', 'UTC') "
+                    "the job's wall-clock time is evaluated in. Affects cron expressions "
+                    "(e.g. '30 10 * * *' fires at 10:30 in this zone) and naive one-shot "
+                    "ISO timestamps ('2026-05-25T10:30' is interpreted as this zone's wall time). "
+                    "Omit to use the device's current timezone, pinned at creation "
+                    "(the job does NOT follow later device timezone changes). Set this "
+                    "only when the user explicitly named a different per-job zone "
+                    "(e.g. 'UTC 02:30'). On update, pass empty string to clear."
+                ),
+            },
         },
         "required": ["action"]
     }
@@ -904,6 +970,7 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        timezone=args.get("timezone"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,

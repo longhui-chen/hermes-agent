@@ -244,6 +244,38 @@ VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')
 # Subdirectories allowed for write_file/remove_file
 ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets"}
 
+OFFICIAL_CONNECTOR_SKILL_NAMES = frozenset(
+    {
+        "authorized-connectors",
+        "custom-connectors",
+        "nas-web-connect",
+        "zettlab-github",
+        "zettlab-google-workspace",
+        "zettlab-linear",
+        "zettlab-notion",
+        "zettlab-weread",
+    }
+)
+
+
+def _official_connector_skill_guard(*names: Optional[str]) -> Optional[str]:
+    """Refuse skill_manage mutations for bundled connector preset skills."""
+    protected_name = None
+    for raw_name in names:
+        if not raw_name:
+            continue
+        candidate = str(raw_name).strip()
+        if candidate in OFFICIAL_CONNECTOR_SKILL_NAMES:
+            protected_name = candidate
+            break
+    if protected_name is None:
+        return None
+    return (
+        f"Skill '{protected_name}' is an official Zettlab connector preset and is "
+        "read-only in Hermes profiles. Update zettlab-presets and redeploy "
+        "instead of mutating it with skill_manage."
+    )
+
 
 # =============================================================================
 # Validation helpers
@@ -325,6 +357,54 @@ def _validate_frontmatter(content: str) -> Optional[str]:
         return "SKILL.md must have content after the frontmatter (instructions, procedures, etc.)."
 
     return None
+
+
+def _frontmatter_name(content: str) -> Tuple[Optional[str], Optional[str]]:
+    """Return the SKILL.md frontmatter name, or an error string."""
+    err = _validate_frontmatter(content)
+    if err:
+        return None, err
+
+    end_match = re.search(r'\n---\s*\n', content[3:])
+    yaml_content = content[3:end_match.start() + 3]
+    parsed = yaml.safe_load(yaml_content)
+    name = str(parsed.get("name", "")).strip()
+    return name, None
+
+
+def _validate_skill_frontmatter_name(name: str, content: str) -> Optional[str]:
+    """Ensure a SKILL.md declares the same name as its directory/request."""
+    frontmatter_name, err = _frontmatter_name(content)
+    if err:
+        return err
+    guard_err = _official_connector_skill_guard(name, frontmatter_name)
+    if guard_err:
+        return guard_err
+    if frontmatter_name != name:
+        return (
+            f"SKILL.md frontmatter name '{frontmatter_name}' must match "
+            f"skill directory/request name '{name}'."
+        )
+    return None
+
+
+def _existing_skill_frontmatter_guard(name: str, skill_dir: Path) -> Optional[str]:
+    """Guard mutations using the requested name and existing SKILL.md name."""
+    guard_err = _official_connector_skill_guard(name)
+    if guard_err:
+        return guard_err
+
+    skill_md = skill_dir / "SKILL.md"
+    if not skill_md.exists():
+        return None
+    try:
+        content = skill_md.read_text(encoding="utf-8")
+    except OSError as exc:
+        return f"Could not read existing SKILL.md for '{name}': {exc}"
+    frontmatter_name, err = _frontmatter_name(content)
+    if err:
+        return None
+    return _official_connector_skill_guard(frontmatter_name)
 
 
 def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[str]:
@@ -568,7 +648,7 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
         return {"success": False, "error": err}
 
     # Validate content
-    err = _validate_frontmatter(content)
+    err = _validate_skill_frontmatter_name(name, content)
     if err:
         return {"success": False, "error": err}
 
@@ -626,7 +706,7 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
 
 def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     """Replace the SKILL.md of any existing skill (full rewrite)."""
-    err = _validate_frontmatter(content)
+    err = _validate_skill_frontmatter_name(name, content)
     if err:
         return {"success": False, "error": err}
 
@@ -637,6 +717,9 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    err = _existing_skill_frontmatter_guard(name, existing["path"])
+    if err:
+        return {"success": False, "error": err}
 
     skill_md = existing["path"] / "SKILL.md"
     # Back up original content for rollback
@@ -688,6 +771,9 @@ def _patch_skill(
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    err = _existing_skill_frontmatter_guard(name, existing["path"])
+    if err:
+        return {"success": False, "error": err}
 
     skill_dir = existing["path"]
 
@@ -740,7 +826,7 @@ def _patch_skill(
 
     # If patching SKILL.md, validate frontmatter is still intact
     if not file_path:
-        err = _validate_frontmatter(new_content)
+        err = _validate_skill_frontmatter_name(name, new_content)
         if err:
             return {
                 "success": False,
@@ -783,6 +869,9 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    err = _existing_skill_frontmatter_guard(name, existing["path"])
+    if err:
+        return {"success": False, "error": err}
 
     pinned_err = _pinned_guard(name)
     if pinned_err:
@@ -858,6 +947,9 @@ def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name, " Create it first with action='create'.")}
+    err = _existing_skill_frontmatter_guard(name, existing["path"])
+    if err:
+        return {"success": False, "error": err}
 
     target, err = _resolve_skill_target(existing["path"], file_path)
     if err:
@@ -892,6 +984,9 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
     existing = _find_skill(name)
     if not existing:
         return {"success": False, "error": _skill_not_found_error(name)}
+    err = _existing_skill_frontmatter_guard(name, existing["path"])
+    if err:
+        return {"success": False, "error": err}
 
     skill_dir = existing["path"]
 
