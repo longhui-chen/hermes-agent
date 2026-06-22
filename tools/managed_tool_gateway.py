@@ -156,11 +156,10 @@ def resolve_managed_tool_gateway(
 ) -> Optional[ManagedToolGatewayConfig]:
     """Resolve shared managed-tool gateway config for a vendor.
 
-    Zettlab-managed gateway takes precedence: when local-server has injected an
-    explicit ``{VENDOR}_GATEWAY_URL`` (its loopback proxy) the tool is served
-    through the Zettlab gateway with no Nous Portal entitlement required. The
-    device IoT identity is attached downstream; the token carried here is a
-    local placeholder. Centralizing it here means every gateway-backed tool
+    Zettlab-managed gateway takes precedence: when local-server has injected
+    its generic callback URL plus the per-agent action token, Hermes derives the
+    vendor route and serves the tool through local-server with no Nous Portal
+    entitlement required. Centralizing it here means every gateway-backed tool
     (current and future) gets the Zettlab path without per-provider wiring.
     See tools/zettlab_tool_gateway.py.
     """

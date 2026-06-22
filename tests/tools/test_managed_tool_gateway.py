@@ -135,11 +135,11 @@ def test_is_managed_tool_gateway_ready_skips_refresh_for_expired_cached_token(tm
 
 
 def test_zettlab_gateway_resolves_before_nous_entitlement_gate(monkeypatch):
-    # On a Zettlab device (no Nous entitlement) an explicit per-vendor gateway
-    # URL + the Zettlab token placeholder must still resolve a managed config,
-    # centrally, so every gateway-backed tool works without per-provider wiring.
-    monkeypatch.setenv("BROWSER_USE_GATEWAY_URL", "http://127.0.0.1:9090/api/v1/browser-use")
-    monkeypatch.setenv("ZETTLAB_TOOL_GATEWAY_TOKEN", "local-tool-gateway")
+    # On a Zettlab device (no Nous entitlement) the generic local-server
+    # callback/action env must still resolve a managed config, centrally, so
+    # every gateway-backed tool works without per-provider wiring.
+    monkeypatch.setenv("ZET_CHAT_APPEND_URL", "http://127.0.0.1:9090/api/v1/internal/chat/append")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-tool-gateway")
     with patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=False):
         result = resolve_managed_tool_gateway("browser-use")
     assert result is not None
@@ -148,9 +148,16 @@ def test_zettlab_gateway_resolves_before_nous_entitlement_gate(monkeypatch):
     assert result.managed_mode is True
 
 
-def test_zettlab_gateway_not_triggered_without_vendor_url(monkeypatch):
-    # No per-vendor gateway URL → fall through to the Nous gate (closed here).
-    monkeypatch.delenv("BROWSER_USE_GATEWAY_URL", raising=False)
-    monkeypatch.setenv("ZETTLAB_TOOL_GATEWAY_TOKEN", "local-tool-gateway")
+def test_zettlab_gateway_not_triggered_without_local_server_callback(monkeypatch):
+    # No local-server callback URL → fall through to the Nous gate (closed here).
+    monkeypatch.delenv("ZET_CHAT_APPEND_URL", raising=False)
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-tool-gateway")
+    with patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=False):
+        assert resolve_managed_tool_gateway("browser-use") is None
+
+
+def test_old_zettlab_vendor_url_env_does_not_bypass_nous_gate(monkeypatch):
+    monkeypatch.setenv("BROWSER_USE_GATEWAY_URL", "http://127.0.0.1:9090/api/v1/browser-use")
+    monkeypatch.setenv("ZETTLAB_TOOL_GATEWAY_TOKEN", "old-placeholder")
     with patch.object(managed_tool_gateway, "managed_nous_tools_enabled", return_value=False):
         assert resolve_managed_tool_gateway("browser-use") is None

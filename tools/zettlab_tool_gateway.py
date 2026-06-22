@@ -8,24 +8,20 @@ The difference is who operates the gateway and how the caller is authorized.
 - Nous path (managed_tool_gateway): gated by a Nous Portal subscription /
   tool-pool entitlement; the agent carries a Nous OAuth token.
 - Zettlab path (this module): used on Zettlab devices, where Hermes runs as a
-  child of local-server. local-server injects an explicit per-vendor gateway
-  URL (e.g. ``BROWSER_USE_GATEWAY_URL`` → its loopback proxy) plus the shared
-  ``ZETTLAB_TOOL_GATEWAY_TOKEN`` placeholder. Authorization is the device's IoT
-  identity, attached by local-server downstream — NOT a Nous account — so this
-  path deliberately does NOT consult ``managed_nous_tools_enabled()``. Presence
-  of an explicit gateway URL is itself the signal that a managed gateway is
-  configured.
+  child of local-server. local-server injects the generic callback URL
+  (``ZET_CHAT_APPEND_URL``) and the per-agent action token
+  (``ZETTLAB_AGENT_ACTION_TOKEN``). Hermes derives the loopback gateway URL for
+  each supported vendor from that local-server origin. Authorization is the
+  action token accepted by local-server — NOT a Nous account — so this path
+  deliberately does NOT consult ``managed_nous_tools_enabled()``.
 
 This is resolved once, centrally, from :func:`resolve_managed_tool_gateway`
 (it returns the Zettlab config before the Nous entitlement gate), so every
 gateway-backed tool gets the Zettlab path with no per-provider wiring.
 
-A dedicated ``ZETTLAB_TOOL_GATEWAY_TOKEN`` (not Nous' ``TOOL_GATEWAY_USER_TOKEN``)
-is used so the placeholder can never leak into Nous token-read paths.
-
-Resolution is purely from explicit env (no nousresearch.com default): a device
-without the gateway configured gets ``None`` and the caller falls back to the
-Nous path or local execution.
+Resolution is purely from local-server env (no nousresearch.com default): a
+device without local-server callback/action env gets ``None`` and the caller
+falls back to the Nous path or local execution.
 """
 
 from __future__ import annotations
@@ -34,8 +30,18 @@ import logging
 import os
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
+
+_LOCAL_SERVER_ANCHOR_ENVS = (
+    "ZET_CHAT_APPEND_URL",
+    "ZETTLAB_AGENT_SHARE_ACTION_URL",
+)
+_ACTION_TOKEN_ENV = "ZETTLAB_AGENT_ACTION_TOKEN"
+_VENDOR_GATEWAY_PATHS = {
+    "browser-use": "/api/v1/browser-use",
+}
 
 
 @dataclass(frozen=True)
@@ -49,28 +55,41 @@ class ZettlabToolGatewayConfig:
     token: str
 
 
-def explicit_vendor_gateway_url(vendor: str) -> str:
-    """Return the explicitly-configured ``{VENDOR}_GATEWAY_URL``, or "".
+def _local_server_origin() -> str:
+    for env_key in _LOCAL_SERVER_ANCHOR_ENVS:
+        raw = os.getenv(env_key, "").strip()
+        if not raw:
+            continue
+        parts = urlsplit(raw)
+        if not parts.scheme or not parts.netloc:
+            logger.debug("Ignoring malformed %s for Zettlab gateway: %r", env_key, raw)
+            continue
+        return urlunsplit((parts.scheme, parts.netloc, "", "", "")).rstrip("/")
+    return ""
 
-    Unlike :func:`managed_tool_gateway.build_vendor_gateway_url`, this never
-    falls back to a shared domain or the nousresearch.com default: only an
-    explicit per-vendor override counts as a Zettlab-managed gateway.
-    """
-    vendor_key = f"{vendor.upper().replace('-', '_')}_GATEWAY_URL"
-    return os.getenv(vendor_key, "").strip().rstrip("/")
+
+def local_server_gateway_url(vendor: str) -> str:
+    """Return the local-server loopback gateway URL for a supported vendor."""
+    path = _VENDOR_GATEWAY_PATHS.get(vendor)
+    if not path:
+        return ""
+    origin = _local_server_origin()
+    if not origin:
+        return ""
+    return f"{origin}{path}"
 
 
 def resolve_zettlab_tool_gateway(vendor: str) -> Optional[ZettlabToolGatewayConfig]:
-    """Resolve the Zettlab-managed gateway for a vendor from explicit env.
+    """Resolve the Zettlab-managed gateway for a vendor from local-server env.
 
-    Returns ``None`` unless both an explicit ``{VENDOR}_GATEWAY_URL`` and the
-    ``ZETTLAB_TOOL_GATEWAY_TOKEN`` placeholder are present (both injected by
-    local-server when ``browser_use.enabled``). No Nous entitlement check.
+    Returns ``None`` unless local-server has injected a valid callback/action
+    environment and the vendor has a route in ``_VENDOR_GATEWAY_PATHS``. No Nous
+    entitlement check.
     """
-    origin = explicit_vendor_gateway_url(vendor)
+    origin = local_server_gateway_url(vendor)
     if not origin:
         return None
-    token = os.getenv("ZETTLAB_TOOL_GATEWAY_TOKEN", "").strip()
+    token = os.getenv(_ACTION_TOKEN_ENV, "").strip()
     if not token:
         return None
     return ZettlabToolGatewayConfig(vendor=vendor, gateway_origin=origin, token=token)
