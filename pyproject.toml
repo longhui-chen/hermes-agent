@@ -249,8 +249,8 @@ termux-all = [
 dingtalk = ["dingtalk-stream==0.24.3", "alibabacloud-dingtalk==2.2.42", "qrcode==7.4.2"]
 feishu = ["lark-oapi==1.5.3", "qrcode==7.4.2"]
 google = [
-  # Required by the google-workspace skill (Gmail, Calendar, Drive, Contacts,
-  # Sheets, Docs).  Declared here so packagers (Nix, Homebrew) ship them with
+  # Required by the Google Chat platform adapter and its user-OAuth attachment
+  # delivery flow. Declared here so packagers (Nix, Homebrew) ship them with
   # the [all] extra and users don't hit runtime `pip install` paths that fail
   # in environments without pip (e.g. Nix-managed Python).
   "google-api-python-client==2.194.0",

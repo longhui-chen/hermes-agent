@@ -203,6 +203,32 @@ def _inject_context_hermes_home(env: dict) -> None:
         pass
 
 
+def _inject_session_contextvars(env: dict) -> None:
+    """Bridge the per-task session ContextVars into a subprocess environment.
+
+    The gateway binds the per-turn session state (``HERMES_SESSION_*`` /
+    ``HERMES_CRON_*``) as task-local ``contextvars``, which do NOT propagate to
+    child processes. Both the foreground (``_make_run_env``) and background
+    (``_sanitize_subprocess_env``) env builders call this at spawn time so the
+    child inherits the per-task value, overriding any stale process-global
+    ``os.environ`` value a concurrent same-agent turn may have clobbered — this
+    is what lets a connector skill forward the correct ``HERMES_SESSION_KEY`` so
+    local-server routes its connector call to that session's own token.
+
+    No-op on CLI/cron (gateway not importable) or where a var was never set in
+    this context (still ``_UNSET``) or was explicitly cleared to ``""`` — those
+    fall back to whatever the base env already carried.
+    """
+    try:
+        from gateway.session_context import _UNSET, _VAR_MAP
+    except Exception:
+        return
+    for name, var in _VAR_MAP.items():
+        value = var.get()
+        if value is not _UNSET and value:
+            env[name] = value
+
+
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
@@ -229,6 +255,12 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
 
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(sanitized)
+
+    # Bridge per-task session ContextVars into the background subprocess env
+    # (same as _make_run_env). Without this, a connector skill spawned on the
+    # background path falls back to the racy process-global os.environ
+    # HERMES_SESSION_KEY and may route to another session's connector token.
+    _inject_session_contextvars(sanitized)
 
     return sanitized
 
@@ -387,16 +419,9 @@ def _make_run_env(env: dict) -> dict:
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(run_env)
 
-    # Inject ContextVar-based session vars into subprocess env.
-    # ContextVars don't propagate to child processes, so we bridge them here.
-    try:
-        from gateway.session_context import _UNSET, _VAR_MAP
-        for var_name, var in _VAR_MAP.items():
-            value = var.get()
-            if value is not _UNSET and value:
-                run_env[var_name] = value
-    except Exception:
-        pass
+    # Bridge per-task session ContextVars into the foreground subprocess env.
+    # ContextVars don't propagate to child processes, so we inject them here.
+    _inject_session_contextvars(run_env)
 
     return run_env
 

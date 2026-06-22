@@ -244,18 +244,67 @@ VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')
 # Subdirectories allowed for write_file/remove_file
 ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets"}
 
-OFFICIAL_CONNECTOR_SKILL_NAMES = frozenset(
+CURRENT_CONNECTOR_PRESET_SKILL_NAMES = frozenset(
     {
         "authorized-connectors",
+        "connector-manager",
         "custom-connectors",
         "nas-web-connect",
-        "zettlab-github",
-        "zettlab-google-workspace",
-        "zettlab-linear",
-        "zettlab-notion",
-        "zettlab-weread",
+        "airtable",
+        "asana",
+        "cloudflare",
+        "dropbox",
+        "feishu-lark",
+        "figma",
+        "ghost",
+        "github",
+        "google-workspace",
+        "jira",
+        "linear",
+        "mailchimp",
+        "microsoft-entra",
+        "microsoft-teams",
+        "netlify",
+        "notion",
+        "render",
+        "sentry",
+        "slack",
+        "vercel",
+        "weread",
+        "x-twitter",
+        "zoom",
     }
 )
+
+LEGACY_CONNECTOR_PRESET_SKILL_NAMES = frozenset(
+    {
+        "zettlab-airtable",
+        "zettlab-asana",
+        "zettlab-cloudflare",
+        "zettlab-dropbox",
+        "zettlab-feishu-lark",
+        "zettlab-figma",
+        "zettlab-ghost",
+        "zettlab-github",
+        "zettlab-google-workspace",
+        "zettlab-jira",
+        "zettlab-linear",
+        "zettlab-mailchimp",
+        "zettlab-microsoft-entra",
+        "zettlab-microsoft-teams",
+        "zettlab-netlify",
+        "zettlab-notion",
+        "zettlab-render",
+        "zettlab-sentry",
+        "zettlab-slack",
+        "zettlab-vercel",
+        "zettlab-weread",
+        "zettlab-x-twitter",
+        "zettlab-zoom",
+    }
+)
+
+OFFICIAL_CONNECTOR_SKILL_NAMES = CURRENT_CONNECTOR_PRESET_SKILL_NAMES | LEGACY_CONNECTOR_PRESET_SKILL_NAMES
 
 
 def _official_connector_skill_guard(*names: Optional[str]) -> Optional[str]:

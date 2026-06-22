@@ -55,7 +55,7 @@ Every installed skill is automatically available as a slash command:
 # In the CLI or any messaging platform:
 /gif-search funny cats
 /axolotl help me fine-tune Llama 3 on my dataset
-/github-pr-workflow create a PR for the auth refactor
+/requesting-code-review verify my auth refactor before commit
 /plan design a rollout for migrating our auth provider
 
 # Just the skill name loads it and lets the agent ask what you need:
@@ -299,10 +299,10 @@ Skill bundles are tiny YAML files that group several skills under a single slash
 ```bash
 # Create a bundle for backend feature work
 hermes bundles create backend-dev \
-  --skill github-code-review \
+  --skill requesting-code-review \
   --skill test-driven-development \
-  --skill github-pr-workflow \
-  -d "Backend feature work — review, test, PR workflow"
+  --skill systematic-debugging \
+  -d "Backend feature work — review, test, debugging"
 ```
 
 Then in the CLI or any gateway platform:
@@ -321,12 +321,12 @@ Bundles live in **`~/.hermes/skill-bundles/<slug>.yaml`** and look like this:
 name: backend-dev
 description: Backend feature work — review, test, PR workflow.
 skills:
-  - github-code-review
+  - requesting-code-review
   - test-driven-development
-  - github-pr-workflow
+  - systematic-debugging
 instruction: |
   Always start by writing failing tests, then implement.
-  Open the PR through the standard workflow with co-author tags.
+  Verify the final diff before handing it off.
 ```
 
 Fields:
@@ -462,8 +462,8 @@ hermes skills check                               # Check installed hub skills f
 hermes skills update                              # Reinstall hub skills with upstream changes when needed
 hermes skills audit                               # Re-scan all hub skills for security
 hermes skills uninstall k8s                       # Remove a hub skill
-hermes skills reset google-workspace              # Un-stick a bundled skill from "user-modified" (see below)
-hermes skills reset google-workspace --restore    # Also restore the bundled version, deleting your local edits
+hermes skills reset plan                          # Un-stick a bundled skill from "user-modified" (see below)
+hermes skills reset plan --restore                # Also restore the bundled version, deleting your local edits
 hermes skills publish skills/my-skill --to github --repo owner/repo
 hermes skills snapshot export setup.json          # Export skill config
 hermes skills tap add myorg/skills-repo           # Add a custom GitHub source
@@ -812,21 +812,21 @@ The protection is good, but it has one sharp edge. If you edit a bundled skill a
 ```bash
 # Safe: clears the manifest entry for this skill. Your current copy is preserved,
 # but the next sync re-baselines against it so future updates work normally.
-hermes skills reset google-workspace
+hermes skills reset plan
 
 # Full restore: also deletes your local copy and re-copies the current bundled
 # version. Use this when you want the pristine upstream skill back.
-hermes skills reset google-workspace --restore
+hermes skills reset plan --restore
 
 # Non-interactive (e.g. in scripts or TUI mode) — skip the --restore confirmation.
-hermes skills reset google-workspace --restore --yes
+hermes skills reset plan --restore --yes
 ```
 
 The same command works in chat as a slash command:
 
 ```text
-/skills reset google-workspace
-/skills reset google-workspace --restore
+/skills reset plan
+/skills reset plan --restore
 ```
 
 :::note Profiles
@@ -845,7 +845,7 @@ All the same commands work with `/skills`:
 /skills install openai/skills/skill-creator --force
 /skills check
 /skills update
-/skills reset google-workspace
+/skills reset plan
 /skills list
 ```
 

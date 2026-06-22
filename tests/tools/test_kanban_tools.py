@@ -993,13 +993,13 @@ def test_create_accepts_skills_list(worker_env):
     out = kt._handle_create({
         "title": "skilled",
         "assignee": "linguist",
-        "skills": ["translation", "github-code-review"],
+        "skills": ["translation", "requesting-code-review"],
     })
     d = json.loads(out)
     assert d["ok"] is True
     with kb.connect() as conn:
         task = kb.get_task(conn, d["task_id"])
-    assert task.skills == ["translation", "github-code-review"]
+    assert task.skills == ["translation", "requesting-code-review"]
 
 
 def test_create_accepts_skills_string(worker_env):
