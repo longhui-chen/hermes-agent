@@ -880,6 +880,36 @@ def _reload_runtime_env_preserving_config_authority() -> None:
     agent_cfg = cfg.get("agent", {})
     if isinstance(agent_cfg, dict) and "max_turns" in agent_cfg:
         os.environ["HERMES_MAX_ITERATIONS"] = str(agent_cfg["max_turns"])
+    _apply_config_timezone_authority(cfg)
+
+
+def _apply_config_timezone_authority(cfg: dict) -> None:
+    """Make config.yaml's ``timezone`` authoritative WITHOUT freezing it.
+
+    Unlike the other config→env bridge keys (HERMES_MAX_ITERATIONS, …), the
+    timezone is resolved LIVE by ``hermes_time`` (fingerprint-gated) with the
+    precedence ``HERMES_TIMEZONE`` env > device-mode OS tz > config.yaml > OS
+    fallback.  Pinning config.yaml into ``HERMES_TIMEZONE`` (the way the other
+    keys are bridged) would freeze it for the process lifetime and shadow both
+    later config.yaml edits AND the device's OS timezone — which the App sets
+    via ``timedatectl`` and which is meant to win over a stale config.yaml
+    value.
+
+    So instead of pinning, config.yaml is made authoritative by DROPPING a
+    stale ``.env``-sourced ``HERMES_TIMEZONE``, letting ``hermes_time`` fall
+    through to its live config.yaml read.  A genuine operator override
+    (``HERMES_TIMEZONE`` exported in the real environment) is left untouched.
+    """
+    tz = cfg.get("timezone") if isinstance(cfg, dict) else None
+    if not (isinstance(tz, str) and tz.strip()):
+        return
+    if "HERMES_TIMEZONE" not in os.environ:
+        return
+    from hermes_cli.env_loader import env_var_was_operator_set
+    if not env_var_was_operator_set("HERMES_TIMEZONE"):
+        # Value came from ~/.hermes/.env or the project .env — config.yaml
+        # wins over it, and hermes_time reads config.yaml live.
+        del os.environ["HERMES_TIMEZONE"]
 
 
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
@@ -1019,10 +1049,12 @@ if _config_path.exists():
                 os.environ["HERMES_GATEWAY_BUSY_TEXT_MODE"] = str(_display_cfg["busy_text_mode"])
             if "busy_ack_enabled" in _display_cfg:
                 os.environ["HERMES_GATEWAY_BUSY_ACK_ENABLED"] = str(_display_cfg["busy_ack_enabled"])
-        # Timezone: no longer bridged to HERMES_TIMEZONE env — hermes_time reads
-        # config.yaml `timezone` live (fingerprint-gated). Pinning it into env
-        # would freeze the value for the process lifetime. See spec
-        # 2026-06-02-timezone-propagation-design.
+        # Timezone: config.yaml is authoritative over a stale .env value, but
+        # is NOT pinned into HERMES_TIMEZONE — hermes_time reads config.yaml
+        # live (fingerprint-gated) and pinning would freeze it for the process
+        # lifetime (shadowing live edits + the device-mode OS timezone). We
+        # instead drop a stale .env HERMES_TIMEZONE so the live read wins.
+        _apply_config_timezone_authority(_cfg)
         # Security settings
         _security_cfg = _cfg.get("security", {})
         if isinstance(_security_cfg, dict):
