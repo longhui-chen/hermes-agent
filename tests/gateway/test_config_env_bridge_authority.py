@@ -283,20 +283,37 @@ def test_invalid_config_timezone_keeps_valid_env(hermes_home: Path) -> None:
     assert resolved["first"] == "UTC"
 
 
-def test_device_mode_strips_stale_env_without_config_tz(monkeypatch) -> None:
-    """In Zettlab device mode, a stale .env HERMES_TIMEZONE must be dropped even
-    when config.yaml has no timezone, so the App's OS timezone (set via
-    timedatectl) wins instead of the stale value."""
+def test_device_mode_strips_stale_env_when_os_tz_resolves(monkeypatch) -> None:
+    """Device mode + a resolvable OS timezone (set by the App via timedatectl):
+    the stale .env HERMES_TIMEZONE is dropped so the OS tz wins, even with no
+    config timezone."""
     import gateway.run as gateway_run
 
     monkeypatch.setenv("HERMES_TIMEZONE", "UTC")  # simulate a .env-injected value
     # Classify it as NOT operator-set (came from .env, not the pre-load snapshot).
     monkeypatch.setattr("gateway.run.env_var_was_operator_set", lambda name: False)
     monkeypatch.setattr("hermes_time._is_zettlab_device_mode", lambda: True)
+    monkeypatch.setattr("hermes_time._read_os_timezone", lambda: "Asia/Shanghai")
 
     gateway_run._apply_config_timezone_authority({})  # config has no timezone
 
     assert "HERMES_TIMEZONE" not in os.environ
+
+
+def test_device_mode_keeps_stale_env_when_os_tz_unresolvable(monkeypatch) -> None:
+    """Device mode but NO resolvable OS tz (fresh board before the App ran
+    timedatectl) and no config tz: the stale .env value is KEPT — stripping
+    would leave nothing valid and downgrade to server-local time."""
+    import gateway.run as gateway_run
+
+    monkeypatch.setenv("HERMES_TIMEZONE", "UTC")
+    monkeypatch.setattr("gateway.run.env_var_was_operator_set", lambda name: False)
+    monkeypatch.setattr("hermes_time._is_zettlab_device_mode", lambda: True)
+    monkeypatch.setattr("hermes_time._read_os_timezone", lambda: "")  # OS tz unset
+
+    gateway_run._apply_config_timezone_authority({})
+
+    assert os.environ.get("HERMES_TIMEZONE") == "UTC"
 
 
 def test_env_value_survives_when_config_omits_key(hermes_home: Path) -> None:

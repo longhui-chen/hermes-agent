@@ -917,11 +917,13 @@ def _apply_config_timezone_authority(cfg: dict) -> None:
     stale ``.env``-injected ``HERMES_TIMEZONE`` so ``hermes_time`` resolves
     live.  A genuine operator override (``HERMES_TIMEZONE`` exported in the
     real environment) is always preserved.  We drop the stale value ONLY when
-    something better will actually win — otherwise we'd downgrade a working
+    something VALID will actually win — otherwise we'd downgrade a working
     .env value to server-local time:
       • config.yaml provides a VALID IANA timezone (config is authoritative); or
-      • Zettlab device mode is on (the OS timezone the App set must win over a
-        stale .env value, even when config.yaml has no / an invalid timezone).
+      • Zettlab device mode is on AND the OS timezone the App set resolves (so
+        it wins over the stale .env).  If the OS tz isn't set yet — e.g. a fresh
+        board before the App ran ``timedatectl`` — we KEEP the .env value rather
+        than fall through to server-local.
     """
     if "HERMES_TIMEZONE" not in os.environ:
         return
@@ -930,9 +932,17 @@ def _apply_config_timezone_authority(cfg: dict) -> None:
 
     tz = cfg.get("timezone") if isinstance(cfg, dict) else None
     config_has_valid_tz = isinstance(tz, str) and _is_valid_iana_timezone(tz.strip())
-    from hermes_time import _is_zettlab_device_mode
-    if config_has_valid_tz or _is_zettlab_device_mode():
-        del os.environ["HERMES_TIMEZONE"]
+    from hermes_time import _is_zettlab_device_mode, _read_os_timezone
+    device_os_tz_wins = (
+        _is_zettlab_device_mode()
+        and _is_valid_iana_timezone((_read_os_timezone() or "").strip())
+    )
+    if config_has_valid_tz or device_os_tz_wins:
+        # pop (not del): the per-turn reload path can run concurrently across
+        # sessions; another turn may have already removed it after our
+        # membership check, and del would KeyError out of the reload caller
+        # (which is not wrapped in try/except).
+        os.environ.pop("HERMES_TIMEZONE", None)
 
 
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
