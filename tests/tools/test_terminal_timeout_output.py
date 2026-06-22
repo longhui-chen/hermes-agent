@@ -1,7 +1,10 @@
 """Verify that terminal command timeouts preserve partial output."""
+import pytest
+
 from tools.environments.local import LocalEnvironment
 
 
+@pytest.mark.live_system_guard_bypass
 class TestTimeoutPreservesPartialOutput:
     """When a command times out, any output captured before the deadline
     should be included in the result — not discarded."""
