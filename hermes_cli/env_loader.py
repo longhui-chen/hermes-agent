@@ -50,6 +50,18 @@ _APPLIED_HOMES: set[str] = set()
 # retain every injected secret (API key / token) in a process-lifetime global.
 _ORIGINAL_PROCESS_ENV: frozenset[str] | None = None
 
+# Membership alone (above) cannot tell a *genuine* operator export from one a
+# stale ``.env`` clobbered: ``load_hermes_dotenv()`` loads ``.env`` with
+# ``override=True``, so operator ``HERMES_TIMEZONE=Asia/Tokyo`` + stale ``.env``
+# ``HERMES_TIMEZONE=UTC`` leaves ``UTC`` in ``os.environ`` while the NAME still
+# reads as operator-set — the stale value then masquerades as the override.  For
+# the SMALL allowlist of non-secret, live-resolved keys below we therefore also
+# snapshot the operator VALUE and re-assert it after every .env load.  Keep this
+# list tiny and non-secret — snapshotting secret values into a process-lifetime
+# global is exactly what _ORIGINAL_PROCESS_ENV (key-set only) avoids.
+_LIVE_RESOLVED_ENV_KEYS: frozenset[str] = frozenset({"HERMES_TIMEZONE"})
+_ORIGINAL_OPERATOR_VALUES: dict[str, str] | None = None
+
 
 def env_var_was_operator_set(name: str) -> bool:
     """Return True if ``name`` was present in the real process environment.
@@ -247,12 +259,19 @@ def load_hermes_dotenv(
       the user env exists.
     - if no user env exists, the project `.env` also overrides stale shell vars.
     """
-    global _ORIGINAL_PROCESS_ENV
+    global _ORIGINAL_PROCESS_ENV, _ORIGINAL_OPERATOR_VALUES
     if _ORIGINAL_PROCESS_ENV is None:
         # First .env load in this process — capture the pristine env-var names
         # before any override so env_var_was_operator_set() can distinguish
         # operator exports from .env-injected values for the process lifetime.
         _ORIGINAL_PROCESS_ENV = frozenset(os.environ)
+        # Also snapshot the VALUES of the small non-secret live-resolved allowlist
+        # so a genuine operator export survives the stale-.env override below.
+        _ORIGINAL_OPERATOR_VALUES = {
+            key: os.environ[key]
+            for key in _LIVE_RESOLVED_ENV_KEYS
+            if key in os.environ
+        }
 
     loaded: list[Path] = []
 
@@ -273,6 +292,17 @@ def load_hermes_dotenv(
     if project_env_path and project_env_path.exists():
         _load_dotenv_with_fallback(project_env_path, override=not loaded)
         loaded.append(project_env_path)
+
+    # Re-assert operator-exported values for the live-resolved allowlist: the
+    # .env loads above run with override=True and may have clobbered a genuine
+    # operator export (e.g. HERMES_TIMEZONE) with a stale value. Because
+    # env_var_was_operator_set() keys off NAME membership only, without this the
+    # stale .env value would masquerade as the operator override. Keys the
+    # operator did NOT export are absent from the snapshot, so a stale-only .env
+    # value is left in place (and correctly read as non-operator).
+    if _ORIGINAL_OPERATOR_VALUES:
+        for key, value in _ORIGINAL_OPERATOR_VALUES.items():
+            os.environ[key] = value
 
     _apply_external_secret_sources(home_path)
 

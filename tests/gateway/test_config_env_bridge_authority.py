@@ -267,6 +267,26 @@ def test_operator_env_timezone_survives_config(hermes_home: Path) -> None:
     assert resolved["first"] == "Asia/Tokyo"
 
 
+def test_operator_env_timezone_wins_over_stale_dotenv(hermes_home: Path) -> None:
+    """A genuine operator override must beat a STALE .env of the same name.
+
+    The .env is loaded with override=True, so it clobbers the operator's
+    HERMES_TIMEZONE in os.environ; env_var_was_operator_set() keys off name
+    membership only, so without re-asserting the snapshotted operator VALUE the
+    stale .env value (UTC) would masquerade as the override. The operator value
+    (Asia/Tokyo) must win over both the stale .env (UTC) and config.yaml.
+    """
+    _write_config(hermes_home, timezone="America/Los_Angeles")
+    _write_env(hermes_home, {"HERMES_TIMEZONE": "UTC"})
+
+    resolved = _run_resolved_timezone(
+        hermes_home,
+        initial_env={"HERMES_TIMEZONE": "Asia/Tokyo"},
+    )
+
+    assert resolved["first"] == "Asia/Tokyo"
+
+
 def test_invalid_config_timezone_keeps_valid_env(hermes_home: Path) -> None:
     """A typo'd config.yaml timezone must NOT strip a valid .env value.
 
