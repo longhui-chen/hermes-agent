@@ -172,6 +172,7 @@ class TestSIGKILLEscalation:
         not __import__("shutil").which("bash"),
         reason="Requires bash"
     )
+    @pytest.mark.live_system_guard_bypass
     def test_sigterm_trap_killed_within_2s(self):
         """A process that traps SIGTERM should be SIGKILL'd after 1s grace."""
         from tools.interrupt import set_interrupt

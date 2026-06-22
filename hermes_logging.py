@@ -168,7 +168,7 @@ class ZettosJSONFormatter(logging.Formatter):
     # Strip the leading ``[session_id]`` tag (with leading space) inserted
     # by ``_install_session_record_factory`` since we surface it as an
     # attribute instead of bleeding it into the message body.
-    _SESSION_TAG_RE = re.compile(r"^\s*\[([^\]]+)\]\s+")
+    _SESSION_TAG_RE = re.compile(r"^\s*\[([^\]]+)\]\s*")
 
     def __init__(self, inner: logging.Formatter) -> None:
         super().__init__()

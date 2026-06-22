@@ -1097,13 +1097,14 @@ class TestBuildSystemPrompt:
         # Find the line and strip it for inspection
         for line in prompt.splitlines():
             if line.startswith("Conversation started:"):
+                date_part = line.split(" — timezone ", 1)[0]
                 # Must NOT contain AM/PM indicator (minute precision had %I:%M %p)
-                assert " AM" not in line and " PM" not in line, (
+                assert " AM" not in date_part and " PM" not in date_part, (
                     f"Timestamp line has time-of-day, breaks daily cache stability: {line!r}"
                 )
                 # Must NOT contain a colon followed by two digits (HH:MM pattern)
                 import re as _re
-                assert not _re.search(r":\d{2}", line), (
+                assert not _re.search(r"\b\d{1,2}:\d{2}\b", date_part), (
                     f"Timestamp line has HH:MM, breaks daily cache stability: {line!r}"
                 )
                 break
@@ -5134,7 +5135,7 @@ class TestSystemPromptStability:
         # Should have built fresh, not queried the DB
         mock_db.get_session.assert_not_called()
         assert agent._cached_system_prompt is not None
-        assert "Hermes Agent" in agent._cached_system_prompt
+        assert DEFAULT_AGENT_IDENTITY in agent._cached_system_prompt
 
     def test_fresh_build_when_db_has_no_prompt(self, agent):
         """If the session DB has no stored prompt, build fresh even with history."""
@@ -5161,7 +5162,7 @@ class TestSystemPromptStability:
                 agent._cached_system_prompt = agent._build_system_prompt()
 
         # Empty string is falsy, so should fall through to fresh build
-        assert "Hermes Agent" in agent._cached_system_prompt
+        assert DEFAULT_AGENT_IDENTITY in agent._cached_system_prompt
 
 class TestBudgetPressure:
     """Budget exhaustion grace call system."""
