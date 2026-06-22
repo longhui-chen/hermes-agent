@@ -14,6 +14,8 @@ fixes both halves — streams output AND idle-kills the process.
 import sys as _sys
 import time
 
+import pytest
+
 from hermes_cli.main import _run_with_idle_timeout
 
 
@@ -39,6 +41,7 @@ def test_propagates_nonzero_exit(tmp_path):
     assert "boom" in result.stdout
 
 
+@pytest.mark.live_system_guard_bypass
 def test_kills_process_on_idle_timeout(tmp_path):
     # Sleeps without printing — exactly the failure mode users see when
     # `npm run build` stalls. Idle timeout must terminate it.

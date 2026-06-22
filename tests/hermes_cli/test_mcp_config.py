@@ -648,6 +648,10 @@ class TestMcpRemoveEvictsManager:
         monkeypatch.setattr(
             "hermes_cli.mcp_config.get_hermes_home", lambda: tmp_path
         )
+        monkeypatch.setattr(
+            "tools.mcp_oauth._configure_callback_port",
+            lambda cfg: cfg.setdefault("_resolved_port", 45123),
+        )
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
         from tools.mcp_oauth_manager import get_manager, reset_manager_for_tests
@@ -745,4 +749,3 @@ class TestMcpLogin:
 
         assert "Authenticated — 3 tool(s) available" in out
         assert "no OAuth token" not in out
-

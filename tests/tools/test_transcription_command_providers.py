@@ -24,6 +24,7 @@ import wave
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 
 from tools.transcription_tools import (
     BUILTIN_STT_PROVIDERS,
@@ -381,6 +382,7 @@ class TestTranscribeCommandSTT:
         assert "exited with code 7" in result["error"]
         assert "boom" in result["error"]
 
+    @pytest.mark.live_system_guard_bypass
     def test_timeout_returns_clean_error(self, tmp_path):
         audio = _make_silent_wav(tmp_path / "input.wav")
         interpreter = sys.executable
