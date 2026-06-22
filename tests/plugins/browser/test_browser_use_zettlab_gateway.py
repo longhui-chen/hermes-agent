@@ -7,6 +7,8 @@ managed config pointed at the Zettlab gateway without any Nous entitlement.
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 
 from plugins.browser.browser_use.provider import BrowserUseBrowserProvider
@@ -18,6 +20,7 @@ _ENV_KEYS = (
     "BROWSER_USE_GATEWAY_URL",
     "ZETTLAB_TOOL_GATEWAY_TOKEN",
     "TOOL_GATEWAY_DOMAIN",
+    "TOOL_GATEWAY_USER_TOKEN",
 )
 
 
@@ -58,4 +61,5 @@ def test_direct_key_takes_precedence(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_unconfigured_device_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
     # No gateway, no key, no Nous account → browser-use unavailable.
-    assert BrowserUseBrowserProvider()._get_config_or_none() is None
+    with patch("tools.managed_tool_gateway.managed_nous_tools_enabled", return_value=False):
+        assert BrowserUseBrowserProvider()._get_config_or_none() is None
