@@ -406,17 +406,21 @@ class TestSearchHints:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(
+# The 3 Hermes-config-block tests put their fake config under tmp_path, which on
+# macOS is /private/var/folders/... — caught by the generic system-path guard
+# BEFORE the Hermes-config-specific message they assert. Skip just those on
+# darwin (covered on Linux, the device platform, in CI); the sibling
+# /etc/passwd and normal-file tests use fixed paths and must keep running.
+_skip_macos_tmp_config = pytest.mark.skipif(
     sys.platform == "darwin",
-    reason=(
-        "macOS tmp_path lives under /private/var/folders, which the generic "
-        "system-path guard blocks before the Hermes-config-specific message "
-        "these tests assert. Covered on Linux (the device platform) in CI."
-    ),
+    reason="macOS tmp_path under /private/var/folders trips the generic system-path guard before the Hermes-config message",
 )
+
+
 class TestSensitivePathCheck:
     """Verify that _check_sensitive_path blocks writes to protected locations."""
 
+    @_skip_macos_tmp_config
     def test_hermes_config_blocked_for_write_file(self, tmp_path, monkeypatch):
         fake_config = tmp_path / "config.yaml"
         monkeypatch.setattr("tools.file_tools._hermes_config_resolved", str(fake_config))
@@ -427,6 +431,7 @@ class TestSensitivePathCheck:
         assert "error" in result
         assert "Hermes config" in result["error"]
 
+    @_skip_macos_tmp_config
     def test_hermes_config_blocked_via_tilde_path(self, tmp_path, monkeypatch):
         fake_config = tmp_path / "config.yaml"
         monkeypatch.setattr("tools.file_tools._hermes_config_resolved", str(fake_config))
@@ -437,6 +442,7 @@ class TestSensitivePathCheck:
         assert "error" in result
         assert "Hermes config" in result["error"]
 
+    @_skip_macos_tmp_config
     def test_hermes_config_blocked_for_patch(self, tmp_path, monkeypatch):
         fake_config = tmp_path / "config.yaml"
         fake_config.write_text("approvals:\n  mode: manual\n")

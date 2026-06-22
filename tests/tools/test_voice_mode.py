@@ -90,6 +90,7 @@ class TestPulseSocketReachable:
         try:
             s.bind(str(sock_path))
         except OSError:
+            s.close()
             pytest.skip("AF_UNIX socket unavailable here (sandbox denial or path too long)")
         s.close()
         monkeypatch.delenv("PULSE_SERVER", raising=False)
