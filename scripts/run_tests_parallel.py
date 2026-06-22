@@ -251,6 +251,7 @@ def _run_one_file(
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
+    coverage: bool = False,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
 
@@ -278,7 +279,13 @@ def _run_one_file(
     timeouts inside the subprocess; this outer timeout exists only to
     bound a pathologically slow or hung file as a whole.
     """
-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    if coverage:
+        # Run this file's pytest under coverage. parallel mode (config:
+        # [tool.coverage.run] parallel=true) makes each subprocess write its
+        # own data file, which the runner combines after the whole suite.
+        cmd = [sys.executable, "-m", "coverage", "run", "-m", "pytest", str(file), *pytest_args]
+    else:
+        cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
     subproc_start = time.monotonic()
     proc = subprocess.Popen(
         cmd,
@@ -598,6 +605,54 @@ def _slice_files(
     return target
 
 
+def _finalize_coverage(repo_root: Path) -> None:
+    """Combine per-file coverage data, emit cov.json, and print a summary.
+
+    Each per-file subprocess wrote its own .coverage.<host>.<pid>.<rand>
+    (parallel mode). We merge them and render:
+      • cov.json — coverage.py JSON (has ``totals.percent_covered``), consumed
+        by the monorepo coverage gate (scripts/test-harness/coverage_gate.py);
+      • a short console report.
+    Best-effort: a coverage tooling failure must not change the suite's exit
+    code (tests already passed/failed on their own merits).
+    """
+    cov_json = repo_root / "cov.json"
+    combine = subprocess.run(
+        [sys.executable, "-m", "coverage", "combine"],
+        cwd=repo_root, capture_output=True, text=True,
+    )
+    # `combine` exits non-zero with "No data to combine" when no data files
+    # were produced (e.g. every file errored). Surface other failures only.
+    blob = (combine.stdout + combine.stderr)
+    if combine.returncode != 0 and "No data to combine" not in blob:
+        print(f"  coverage combine failed: {blob.strip()}", file=sys.stderr)
+    json_proc = subprocess.run(
+        [sys.executable, "-m", "coverage", "json", "-o", str(cov_json)],
+        cwd=repo_root, capture_output=True, text=True,
+    )
+    if json_proc.returncode != 0 or not cov_json.exists():
+        print(
+            f"  coverage json failed: {(json_proc.stderr or json_proc.stdout).strip()}",
+            file=sys.stderr,
+        )
+        return
+    try:
+        pct = json.loads(cov_json.read_text()).get("totals", {}).get("percent_covered")
+    except (json.JSONDecodeError, OSError):
+        pct = None
+    print()
+    print("=== Coverage ===")
+    if pct is not None:
+        print(f"  Total: {pct:.1f}%   →   {_format_file(cov_json, repo_root)}")
+    else:
+        print(f"  cov.json written → {_format_file(cov_json, repo_root)}")
+    # Console report (best-effort; --skip-covered keeps it short).
+    subprocess.run(
+        [sys.executable, "-m", "coverage", "report", "--skip-covered"],
+        cwd=repo_root, check=False,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -619,6 +674,18 @@ def main() -> int:
         "--include-integration",
         action="store_true",
         help="Don't skip integration/ e2e/ during discovery",
+    )
+    parser.add_argument(
+        "--coverage",
+        action="store_true",
+        default=bool(os.environ.get("HERMES_TEST_COVERAGE")),
+        help=(
+            "Measure code coverage: each per-file pytest runs under "
+            "`coverage run` (parallel mode), then the data files are combined "
+            "into cov.json (coverage.py JSON — has totals.percent_covered, "
+            "consumed by the monorepo coverage gate). "
+            "Env: HERMES_TEST_COVERAGE. Requires the `coverage` package."
+        ),
     )
     parser.add_argument(
         "--file-timeout",
@@ -776,12 +843,20 @@ def main() -> int:
             if rc != 0:
                 _print_inline_failure(fpath, output, repo_root, pytest_passthrough)
 
+    if args.coverage:
+        # Clear any stale .coverage* data so combine only sees this run.
+        subprocess.run(
+            [sys.executable, "-m", "coverage", "erase"],
+            cwd=repo_root, check=False,
+        )
+
     with ThreadPoolExecutor(max_workers=args.jobs) as pool:
         futures: List[Future] = []
         for file in files:
             t0 = time.monotonic()
             fut = pool.submit(
-                _run_one_file, file, pytest_passthrough, repo_root, args.file_timeout
+                _run_one_file, file, pytest_passthrough, repo_root, args.file_timeout,
+                args.coverage,
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
             futures.append(fut)
@@ -795,6 +870,11 @@ def main() -> int:
     print()
     pct = (tests_done / total_tests * 100) if total_tests else 0
     print(f"=== Summary: {len(files)} files, {tests_passed} tests passed, {tests_failed} failed ({pct:.0f}% complete) in {elapsed:.1f}s ({args.jobs} workers) ===")
+
+    # Combine per-file coverage + emit cov.json before any failure return, so
+    # the gate gets data even when some tests fail.
+    if args.coverage:
+        _finalize_coverage(repo_root)
 
     # Save durations for future --slice runs. Each slice writes its own
     # partial test_durations.json; a CI merge step joins them later.
