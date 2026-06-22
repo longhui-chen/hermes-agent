@@ -38,15 +38,17 @@ _SECRET_SOURCES: dict[str, str] = {}
 # config re-parse, and the ASCII sanitization sweep still ran every time.
 _APPLIED_HOMES: set[str] = set()
 
-# Snapshot of the process environment taken once, before this process's FIRST
-# .env load.  It lets callers tell a value the operator genuinely exported in
-# the real environment (shell / systemd unit / container spec) from one a
-# ``.env`` file injected.  ``load_hermes_dotenv()`` loads ``~/.hermes/.env``
-# with ``override=True``, so after it runs the two are indistinguishable —
-# hence the pre-load capture.  Consumed by config→env authority logic for
-# live-resolved keys like HERMES_TIMEZONE, where config.yaml must win over a
-# *stale .env* value without clobbering a real operator override.
-_ORIGINAL_PROCESS_ENV: dict[str, str] | None = None
+# Snapshot of the env-var NAMES present before this process's FIRST .env load.
+# It lets callers tell a value the operator genuinely exported in the real
+# environment (shell / systemd unit / container spec) from one a ``.env`` file
+# injected.  ``load_hermes_dotenv()`` loads ``~/.hermes/.env`` with
+# ``override=True``, so after it runs the two are indistinguishable — hence the
+# pre-load capture.  Consumed by config→env authority logic for live-resolved
+# keys like HERMES_TIMEZONE, where config.yaml must win over a *stale .env*
+# value without clobbering a real operator override.  We keep only the key set
+# (not values) — the question is pure membership, and snapshotting values would
+# retain every injected secret (API key / token) in a process-lifetime global.
+_ORIGINAL_PROCESS_ENV: frozenset[str] | None = None
 
 
 def env_var_was_operator_set(name: str) -> bool:
@@ -247,10 +249,10 @@ def load_hermes_dotenv(
     """
     global _ORIGINAL_PROCESS_ENV
     if _ORIGINAL_PROCESS_ENV is None:
-        # First .env load in this process — capture the pristine environment
+        # First .env load in this process — capture the pristine env-var names
         # before any override so env_var_was_operator_set() can distinguish
         # operator exports from .env-injected values for the process lifetime.
-        _ORIGINAL_PROCESS_ENV = dict(os.environ)
+        _ORIGINAL_PROCESS_ENV = frozenset(os.environ)
 
     loaded: list[Path] = []
 

@@ -267,6 +267,38 @@ def test_operator_env_timezone_survives_config(hermes_home: Path) -> None:
     assert resolved["first"] == "Asia/Tokyo"
 
 
+def test_invalid_config_timezone_keeps_valid_env(hermes_home: Path) -> None:
+    """A typo'd config.yaml timezone must NOT strip a valid .env value.
+
+    Dropping the .env value only helps when something better will win; if the
+    config zone is invalid, stripping would downgrade resolution to
+    server-local time — worse than the working .env value. So a bad config
+    zone leaves the .env value in place.
+    """
+    _write_config(hermes_home, timezone="Not/A/Zone")
+    _write_env(hermes_home, {"HERMES_TIMEZONE": "UTC"})
+
+    resolved = _run_resolved_timezone(hermes_home, initial_env={})
+
+    assert resolved["first"] == "UTC"
+
+
+def test_device_mode_strips_stale_env_without_config_tz(monkeypatch) -> None:
+    """In Zettlab device mode, a stale .env HERMES_TIMEZONE must be dropped even
+    when config.yaml has no timezone, so the App's OS timezone (set via
+    timedatectl) wins instead of the stale value."""
+    import gateway.run as gateway_run
+
+    monkeypatch.setenv("HERMES_TIMEZONE", "UTC")  # simulate a .env-injected value
+    # Classify it as NOT operator-set (came from .env, not the pre-load snapshot).
+    monkeypatch.setattr("gateway.run.env_var_was_operator_set", lambda name: False)
+    monkeypatch.setattr("hermes_time._is_zettlab_device_mode", lambda: True)
+
+    gateway_run._apply_config_timezone_authority({})  # config has no timezone
+
+    assert "HERMES_TIMEZONE" not in os.environ
+
+
 def test_env_value_survives_when_config_omits_key(hermes_home: Path) -> None:
     """If config.yaml doesn't set max_turns, .env value must still pass through.
 

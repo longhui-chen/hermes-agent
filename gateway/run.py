@@ -847,7 +847,7 @@ _hermes_home = get_hermes_home()
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
 from dotenv import load_dotenv  # noqa: F401  # backward-compat for tests that monkeypatch this symbol
-from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.env_loader import env_var_was_operator_set, load_hermes_dotenv
 _env_path = _hermes_home / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
 
@@ -883,6 +883,25 @@ def _reload_runtime_env_preserving_config_authority() -> None:
     _apply_config_timezone_authority(cfg)
 
 
+def _is_valid_iana_timezone(name: str) -> bool:
+    """True if ``name`` is a real IANA zone — quiet (no logging side effect).
+
+    Mirrors the validity gate ``hermes_time._get_zoneinfo`` applies, but
+    without its warning log: we call this only to DECIDE whether dropping a
+    stale .env value is safe. A "falling back to server local" warning would
+    be both noisy (every startup + reload) and misleading — we KEEP the .env
+    value precisely when the config zone is invalid.
+    """
+    if not name:
+        return False
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(name)
+        return True
+    except Exception:
+        return False
+
+
 def _apply_config_timezone_authority(cfg: dict) -> None:
     """Make config.yaml's ``timezone`` authoritative WITHOUT freezing it.
 
@@ -891,24 +910,28 @@ def _apply_config_timezone_authority(cfg: dict) -> None:
     precedence ``HERMES_TIMEZONE`` env > device-mode OS tz > config.yaml > OS
     fallback.  Pinning config.yaml into ``HERMES_TIMEZONE`` (the way the other
     keys are bridged) would freeze it for the process lifetime and shadow both
-    later config.yaml edits AND the device's OS timezone — which the App sets
-    via ``timedatectl`` and which is meant to win over a stale config.yaml
-    value.
+    later config.yaml edits AND the device's OS timezone (which the App sets
+    via ``timedatectl`` and which must win over a stale value).
 
-    So instead of pinning, config.yaml is made authoritative by DROPPING a
-    stale ``.env``-sourced ``HERMES_TIMEZONE``, letting ``hermes_time`` fall
-    through to its live config.yaml read.  A genuine operator override
-    (``HERMES_TIMEZONE`` exported in the real environment) is left untouched.
+    So instead of pinning, we make config.yaml authoritative by DROPPING a
+    stale ``.env``-injected ``HERMES_TIMEZONE`` so ``hermes_time`` resolves
+    live.  A genuine operator override (``HERMES_TIMEZONE`` exported in the
+    real environment) is always preserved.  We drop the stale value ONLY when
+    something better will actually win — otherwise we'd downgrade a working
+    .env value to server-local time:
+      • config.yaml provides a VALID IANA timezone (config is authoritative); or
+      • Zettlab device mode is on (the OS timezone the App set must win over a
+        stale .env value, even when config.yaml has no / an invalid timezone).
     """
-    tz = cfg.get("timezone") if isinstance(cfg, dict) else None
-    if not (isinstance(tz, str) and tz.strip()):
-        return
     if "HERMES_TIMEZONE" not in os.environ:
         return
-    from hermes_cli.env_loader import env_var_was_operator_set
-    if not env_var_was_operator_set("HERMES_TIMEZONE"):
-        # Value came from ~/.hermes/.env or the project .env — config.yaml
-        # wins over it, and hermes_time reads config.yaml live.
+    if env_var_was_operator_set("HERMES_TIMEZONE"):
+        return  # genuine operator override — never touch it
+
+    tz = cfg.get("timezone") if isinstance(cfg, dict) else None
+    config_has_valid_tz = isinstance(tz, str) and _is_valid_iana_timezone(tz.strip())
+    from hermes_time import _is_zettlab_device_mode
+    if config_has_valid_tz or _is_zettlab_device_mode():
         del os.environ["HERMES_TIMEZONE"]
 
 
