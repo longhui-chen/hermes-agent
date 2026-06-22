@@ -412,6 +412,11 @@ class TestDispatchersTriggerPluginDiscovery:
                 web_tools, "_load_web_config",
                 lambda: {"extract_backend": "firecrawl"},
             )
+            monkeypatch.setattr(
+                web_tools,
+                "async_is_safe_url",
+                lambda _url: asyncio.sleep(0, result=True),
+            )
             # Sanity: registry IS empty before the tool call.
             assert web_search_registry.get_provider("firecrawl") is None
 
@@ -492,4 +497,3 @@ class TestDispatchersTriggerPluginDiscovery:
             assert web_search_registry.get_provider("brave-free") is not None
         finally:
             restore()
-

@@ -21,6 +21,7 @@
 #   scripts/run_tests.sh tests/foo.py               # single file
 #   scripts/run_tests.sh tests/foo.py -- --tb=long  # path + pytest args
 #   scripts/run_tests.sh -- -v --tb=long            # pytest args only
+#   scripts/run_tests.sh --coverage                 # + cov.json (coverage gate)
 #
 # Everything after a literal '--' is passed through to each per-file
 # pytest invocation. Positional path arguments before '--' override

@@ -151,9 +151,10 @@ def test_main_gateway_default_run_preserves_accept_hooks(monkeypatch):
     assert calls == ["plugins", "hooks:True", "gateway:run:True"]
 
 
-def test_main_chat_still_discovers_mcp_at_cli_startup(monkeypatch):
+def test_main_chat_starts_mcp_discovery_at_cli_startup(monkeypatch):
     import hermes_cli.config as config_mod
     import hermes_cli.main as main_mod
+    import hermes_cli.mcp_startup as mcp_startup_mod
 
     calls: list[str] = []
 
@@ -171,10 +172,10 @@ def test_main_chat_still_discovers_mcp_at_cli_startup(monkeypatch):
         "tools.mcp_tool",
         SimpleNamespace(discover_mcp_tools=lambda: calls.append("mcp")),
     )
-    monkeypatch.setitem(
-        sys.modules,
-        "hermes_cli.mcp_startup",
-        SimpleNamespace(start_background_mcp_discovery=lambda **_: calls.append("mcp-bg")),
+    monkeypatch.setattr(
+        mcp_startup_mod,
+        "start_background_mcp_discovery",
+        lambda *, logger, thread_name: calls.append(f"mcp-bg:{thread_name}"),
     )
     monkeypatch.setitem(
         sys.modules,
@@ -189,7 +190,7 @@ def test_main_chat_still_discovers_mcp_at_cli_startup(monkeypatch):
 
     main_mod.main()
 
-    assert calls == ["plugins", "mcp-bg", "hooks:False", "chat"]
+    assert calls == ["plugins", "mcp-bg:cli-mcp-discovery", "hooks:False", "chat"]
 
 
 def _install_fake_gateway_run(monkeypatch, start_gateway):

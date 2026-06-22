@@ -196,6 +196,7 @@ class TestPtyBridgeClose:
         bridge.close()  # must not raise
         assert not bridge.is_alive()
 
+    @pytest.mark.live_system_guard_bypass
     def test_close_terminates_long_running_child(self):
         bridge = PtyBridge.spawn(["/bin/sh", "-c", "sleep 30"])
         pid = bridge.pid

@@ -214,6 +214,8 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_KANBAN_CLAIM_LOCK",
     "HERMES_KANBAN_DISPATCH_IN_GATEWAY",
     "HERMES_TENANT",
+    "HERMES_DUMP_REQUESTS",
+    "HERMES_DUMP_REQUEST_STDOUT",
     # Dashboard OAuth auth gate (PR #30156). When set, the bundled
     # dashboard-auth `nous` plugin auto-registers itself on plugin discovery,
     # which is triggered by any `/api/status` call. That leaks a provider
