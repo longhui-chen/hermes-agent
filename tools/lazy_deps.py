@@ -157,12 +157,14 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "terminal.modal": ("modal==1.3.4",),
     "terminal.daytona": ("daytona==0.155.0",),
 
-    # ─── Skills ────────────────────────────────────────────────────────────
-    "skill.google_workspace": (
+    # ─── Platforms ─────────────────────────────────────────────────────────
+    "platform.google_chat": (
         "google-api-python-client==2.194.0",
         "google-auth-oauthlib==1.3.1",
         "google-auth-httplib2==0.3.1",
     ),
+
+    # ─── Skills ────────────────────────────────────────────────────────────
     "skill.youtube": ("youtube-transcript-api==1.2.4",),
 
     # ─── Tools ─────────────────────────────────────────────────────────────
