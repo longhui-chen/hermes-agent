@@ -38,6 +38,31 @@ _SECRET_SOURCES: dict[str, str] = {}
 # config re-parse, and the ASCII sanitization sweep still ran every time.
 _APPLIED_HOMES: set[str] = set()
 
+# Snapshot of the env-var NAMES present before this process's FIRST .env load.
+# It lets callers tell a value the operator genuinely exported in the real
+# environment (shell / systemd unit / container spec) from one a ``.env`` file
+# injected.  ``load_hermes_dotenv()`` loads ``~/.hermes/.env`` with
+# ``override=True``, so after it runs the two are indistinguishable — hence the
+# pre-load capture.  Consumed by config→env authority logic for live-resolved
+# keys like HERMES_TIMEZONE, where config.yaml must win over a *stale .env*
+# value without clobbering a real operator override.  We keep only the key set
+# (not values) — the question is pure membership, and snapshotting values would
+# retain every injected secret (API key / token) in a process-lifetime global.
+_ORIGINAL_PROCESS_ENV: frozenset[str] | None = None
+
+
+def env_var_was_operator_set(name: str) -> bool:
+    """Return True if ``name`` was present in the real process environment.
+
+    "Operator-set" means the variable existed BEFORE this process loaded any
+    ``.env`` file (exported in the shell, the systemd unit, or the container
+    spec) — as opposed to being injected by ``~/.hermes/.env`` or the project
+    ``.env``.  Returns False when no snapshot has been taken yet (no .env load
+    has happened) or the variable was absent from the original environment.
+    """
+    snapshot = _ORIGINAL_PROCESS_ENV
+    return snapshot is not None and name in snapshot
+
 
 def get_secret_source(env_var: str) -> str | None:
     """Return the label of the secret source that supplied ``env_var``, if any.
@@ -222,6 +247,13 @@ def load_hermes_dotenv(
       the user env exists.
     - if no user env exists, the project `.env` also overrides stale shell vars.
     """
+    global _ORIGINAL_PROCESS_ENV
+    if _ORIGINAL_PROCESS_ENV is None:
+        # First .env load in this process — capture the pristine env-var names
+        # before any override so env_var_was_operator_set() can distinguish
+        # operator exports from .env-injected values for the process lifetime.
+        _ORIGINAL_PROCESS_ENV = frozenset(os.environ)
+
     loaded: list[Path] = []
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
