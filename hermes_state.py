@@ -1430,7 +1430,7 @@ class SessionDB:
         if not session_id or not holder:
             return False
         now = time.time()
-        expires_at = now + max(1.0, float(ttl_seconds))
+        expires_at = now + max(0.0, float(ttl_seconds))
 
         def _do(conn):
             conn.execute(

@@ -830,6 +830,44 @@ class TestToolResultPreflightCompression:
         mock_compress.assert_called_once()
         assert result["completed"] is True
 
+    def test_small_tool_result_defers_when_recent_real_usage_fit(self, agent):
+        """Schema-heavy rough estimates should not re-compact after a fitting call."""
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 100_000
+        agent.context_compressor.last_prompt_tokens = 58_000
+        agent.context_compressor.last_real_prompt_tokens = 58_000
+        agent.context_compressor.last_rough_tokens_when_real_prompt_fit = 113_000
+
+        tc = SimpleNamespace(
+            id="tc1", type="function",
+            function=SimpleNamespace(name="web_search", arguments='{"query":"tiny"}'),
+        )
+        tool_resp = _mock_response(
+            content=None, finish_reason="tool_calls", tool_calls=[tc],
+            usage={"prompt_tokens": 58_000, "completion_tokens": 100, "total_tokens": 58_100},
+        )
+        ok_resp = _mock_response(
+            content="Continued without rotation", finish_reason="stop",
+            usage={"prompt_tokens": 59_000, "completion_tokens": 100, "total_tokens": 59_100},
+        )
+        agent.client.chat.completions.create.side_effect = [tool_resp, ok_resp]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="ok"),
+            patch("agent.conversation_loop.estimate_request_tokens_rough", return_value=114_000),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        mock_compress.assert_not_called()
+        assert result["completed"] is True
+        assert result["final_response"] == "Continued without rotation"
+        assert agent.context_compressor.last_rough_tokens_when_real_prompt_fit == 114_000
+
 
 class TestOverflowWithCompactionDisabled:
     """When ``compression.enabled`` is False, overflow recovery must not compact."""

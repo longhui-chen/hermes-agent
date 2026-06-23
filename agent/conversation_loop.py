@@ -622,9 +622,15 @@ def run_conversation(
         _compressor = agent.context_compressor
         _defer_preflight = getattr(
             _compressor,
-            "should_defer_preflight_to_real_usage",
-            lambda _tokens: False,
+            "should_defer_rough_estimate_to_real_usage",
+            None,
         )
+        if _defer_preflight is None:
+            _defer_preflight = getattr(
+                _compressor,
+                "should_defer_preflight_to_real_usage",
+                lambda _tokens: False,
+            )
         _preflight_deferred = _defer_preflight(_preflight_tokens)
 
         if not _preflight_deferred:
@@ -4179,14 +4185,7 @@ def run_conversation(
                 # floor when the rough estimate (4 chars/token) would
                 # under-count multipart payloads / control tokens.
                 _compressor = agent.context_compressor
-                if _compressor.last_prompt_tokens > 0:
-                    # Only use prompt_tokens — completion/reasoning
-                    # tokens don't consume context window space.
-                    # Thinking models (GLM-5.1, QwQ, DeepSeek R1)
-                    # inflate completion_tokens with reasoning,
-                    # causing premature compression.  (#12026)
-                    _real_tokens = _compressor.last_prompt_tokens
-                elif _compressor.last_prompt_tokens == -1:
+                if _compressor.last_prompt_tokens == -1:
                     # Compression just ran and no API-reported prompt count
                     # has arrived yet. Avoid treating a schema-heavy rough
                     # post-compression estimate as real context pressure.
@@ -4196,15 +4195,46 @@ def run_conversation(
                     # these add 20-30K tokens the messages-only
                     # estimate misses, which can skip compression
                     # past the configured threshold (#14695).
-                    _real_tokens = estimate_request_tokens_rough(
+                    _rough_tokens = estimate_request_tokens_rough(
                         messages, tools=agent.tools or None
                     )
+                    _real_tokens = _rough_tokens
+                    if _compressor.last_prompt_tokens > 0:
+                        # Only use prompt_tokens — completion/reasoning
+                        # tokens don't consume context window space.
+                        # Thinking models (GLM-5.1, QwQ, DeepSeek R1)
+                        # inflate completion_tokens with reasoning,
+                        # causing premature compression.  (#12026)
+                        _real_tokens = max(_real_tokens, _compressor.last_prompt_tokens)
 
-                if agent.compression_enabled and _compressor.should_compress(_real_tokens):
+                _in_loop_deferred = False
+                if agent.compression_enabled and _real_tokens > 0:
+                    _defer_rough_estimate = getattr(
+                        _compressor,
+                        "should_defer_rough_estimate_to_real_usage",
+                        None,
+                    )
+                    if _defer_rough_estimate is None:
+                        _defer_rough_estimate = getattr(
+                            _compressor,
+                            "should_defer_preflight_to_real_usage",
+                            lambda _tokens: False,
+                        )
+                    _in_loop_deferred = _defer_rough_estimate(_rough_tokens)
+
+                if _in_loop_deferred:
+                    logger.info(
+                        "Skipping in-loop compression: rough estimate ~%s >= %s, "
+                        "but last real provider prompt was %s after compression",
+                        f"{_rough_tokens:,}",
+                        f"{_compressor.threshold_tokens:,}",
+                        f"{_compressor.last_real_prompt_tokens:,}",
+                    )
+                elif agent.compression_enabled and _compressor.should_compress(_real_tokens):
                     agent._safe_print("  ⟳ compacting context…")
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
-                        approx_tokens=agent.context_compressor.last_prompt_tokens,
+                        approx_tokens=_real_tokens,
                         task_id=effective_task_id,
                     )
                     # Compression created a new session — clear history so
