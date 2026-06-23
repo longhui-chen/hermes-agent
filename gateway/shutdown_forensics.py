@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -229,8 +230,8 @@ def spawn_async_diagnostic(
     script = (
         f"echo '=== shutdown diagnostic @ {signal_name} ==='; "
         "echo '--- date ---'; date -u +%Y-%m-%dT%H:%M:%SZ; "
-        "echo '--- ps auxf (top 60 by cpu) ---'; "
-        "ps auxf --sort=-pcpu 2>/dev/null | head -60; "
+        "echo '--- ps aux (top 60 by cpu) ---'; "
+        "ps aux 2>/dev/null | sort -nrk 3 | head -60 || true; "
         "echo '--- pstree of self ---'; "
         f"pstree -plau {os.getpid()} 2>/dev/null | head -40 || true; "
         "echo '--- /proc/loadavg ---'; "
@@ -254,8 +255,12 @@ def spawn_async_diagnostic(
         # would also reap us anyway, but defense in depth).  Without
         # start_new_session, a SIGKILL on our cgroup takes the diag down
         # before it can flush.
+        cmd = ["bash", "-c", script]
+        timeout_bin = shutil.which("timeout")
+        if timeout_bin:
+            cmd = [timeout_bin, f"{timeout_seconds:.0f}", *cmd]
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            cmd,
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,

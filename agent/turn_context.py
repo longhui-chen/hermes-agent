@@ -279,9 +279,15 @@ def build_turn_context(
         _compressor = agent.context_compressor
         _defer_preflight = getattr(
             _compressor,
-            "should_defer_preflight_to_real_usage",
-            lambda _tokens: False,
+            "should_defer_rough_estimate_to_real_usage",
+            None,
         )
+        if _defer_preflight is None:
+            _defer_preflight = getattr(
+                _compressor,
+                "should_defer_preflight_to_real_usage",
+                lambda _tokens: False,
+            )
         _preflight_deferred = _defer_preflight(_preflight_tokens)
 
         if not _preflight_deferred:
