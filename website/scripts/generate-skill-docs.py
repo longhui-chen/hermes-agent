@@ -48,7 +48,7 @@ SKILL_SOURCES = [
 
 # Pages the user had previously hand-written in user-guide/skills/.
 # We leave these alone (they get first-class sidebar treatment separately).
-HAND_WRITTEN = {"godmode.md", "google-workspace.md"}
+HAND_WRITTEN = {"google-workspace.md"}
 
 # Keep generated bundled docs in lock-step with what a new profile actually
 # seeds (config/skill_seed_policy.json — a pure allowlist over upstream-verbatim
@@ -637,7 +637,7 @@ def build_sidebar_items(entries: list[tuple[dict[str, Any], dict[str, Any]]]) ->
 
     Structure:
     Skills
-    ├── (hand-written pages first: godmode, google-workspace)
+    ├── (hand-written pages first: google-workspace)
     ├── Bundled
     │   ├── apple
     │   │   ├── apple-apple-notes

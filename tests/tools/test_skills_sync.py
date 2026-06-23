@@ -1,6 +1,7 @@
 """Tests for tools/skills_sync.py — manifest-based skill seeding and updating."""
 
 import json
+import shutil
 from pathlib import Path
 from unittest.mock import patch
 
@@ -1230,6 +1231,95 @@ class TestOptOutToggleAndRemove:
             assert "EDITED" in (skills_dir / "beta" / "SKILL.md").read_text()
             # non-bundled local skill never considered
             assert (skills_dir / "mine" / "SKILL.md").exists()
+
+
+class TestUpdateBackupRecovery:
+    """Regression tests for backup handling in the bundled-update path."""
+
+    def _setup(self, tmp_path, bundled_text="# Old v2 (updated)"):
+        """Bundled dir with one flat skill, plus user dirs."""
+        bundled = tmp_path / "bundled_skills"
+        (bundled / "old-skill").mkdir(parents=True)
+        (bundled / "old-skill" / "SKILL.md").write_text(bundled_text)
+        skills_dir = tmp_path / "user_skills"
+        skills_dir.mkdir()
+        manifest_file = skills_dir / ".bundled_manifest"
+        return bundled, skills_dir, manifest_file
+
+    def _patches(self, bundled, skills_dir, manifest_file):
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(patch("tools.skills_sync._get_bundled_dir", return_value=bundled))
+        stack.enter_context(patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"))
+        stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", skills_dir))
+        stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", manifest_file))
+        return stack
+
+    def _seed_synced_copy(self, skills_dir, manifest_file, text="# Old v1"):
+        """User copy of old-skill whose hash matches the manifest origin."""
+        dest = skills_dir / "old-skill"
+        dest.mkdir(parents=True)
+        (dest / "SKILL.md").write_text(text)
+        with patch("tools.skills_sync.MANIFEST_FILE", manifest_file):
+            _write_manifest({"old-skill": _dir_hash(dest)})
+        return dest
+
+    def test_stale_backup_does_not_poison_failed_update(self, tmp_path):
+        """A leftover .bak must not nest the live copy or corrupt restore."""
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        dest = self._seed_synced_copy(skills_dir, manifest_file)
+
+        stale = skills_dir / "old-skill.bak"
+        stale.mkdir()
+        (stale / "SKILL.md").write_text("# stale junk from an earlier failure")
+
+        def _boom(src, dst, **kwargs):
+            raise OSError("simulated copy failure")
+
+        with self._patches(bundled, skills_dir, manifest_file), \
+                patch("tools.skills_sync.shutil.copytree", side_effect=_boom):
+            sync_skills(quiet=True)
+
+        assert (dest / "SKILL.md").read_text() == "# Old v1"
+        assert not (dest / "old-skill").exists()
+        assert not (skills_dir / "old-skill.bak").exists()
+
+    def test_orphaned_backup_is_recovered_not_treated_as_deleted(self, tmp_path):
+        """Crash between move and copytree must not lose the skill."""
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        dest = self._seed_synced_copy(skills_dir, manifest_file)
+        shutil.move(str(dest), str(skills_dir / "old-skill.bak"))
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+
+        assert (dest / "SKILL.md").exists()
+        assert (dest / "SKILL.md").read_text() == "# Old v2 (updated)"
+        assert "old-skill" in result["updated"]
+        assert not (skills_dir / "old-skill.bak").exists()
+
+    def test_partial_copy_failure_restores_original(self, tmp_path):
+        """A half-written dest must not block restore-on-failure."""
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        dest = self._seed_synced_copy(skills_dir, manifest_file)
+
+        def _partial_then_fail(src, dst, **kwargs):
+            Path(dst).mkdir(parents=True, exist_ok=True)
+            (Path(dst) / "PARTIAL").write_text("half-written")
+            raise OSError("simulated failure mid-copy")
+
+        with self._patches(bundled, skills_dir, manifest_file), \
+                patch("tools.skills_sync.shutil.copytree", side_effect=_partial_then_fail):
+            sync_skills(quiet=True)
+
+        assert (dest / "SKILL.md").read_text() == "# Old v1"
+        assert not (dest / "PARTIAL").exists()
+        assert not (skills_dir / "old-skill.bak").exists()
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result2 = sync_skills(quiet=True)
+        assert "old-skill" in result2["updated"]
+        assert result2["user_modified"] == []
 
 
 class TestSeedTimeCuration:
