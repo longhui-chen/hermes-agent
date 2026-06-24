@@ -369,8 +369,12 @@ def _apply_user_default_headers(headers: dict | None) -> dict | None:
     main turn would succeed but title/compression/vision calls to the same
     endpoint would still fail. (#40033)
 
-    Returns the merged dict, or the original ``headers`` (possibly ``None``)
-    when nothing is configured. No allocation when there are no overrides.
+    Also stamps the zettlab credit-ledger ``X-Task-Id``/``X-Scene-Type`` headers
+    for the current session (see ``billing_task_id``) so auxiliary spend is
+    attributed to its task card.
+
+    Returns the merged dict (user overrides + billing headers), or the original
+    ``headers`` (possibly ``None``) when there is nothing to add.
     """
     merged = dict(headers or {})
     try:

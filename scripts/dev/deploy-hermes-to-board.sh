@@ -17,16 +17,18 @@
 #   - Default editable install is --no-deps (fast/safe: the board venv already
 #     has [all,langfuse] from its ZPK). Pass FULL_DEPS=1 to do .[all,langfuse].
 #
-# Usage:
-#   BOARD_HOST=192.168.31.98 BOARD_PASS=Zettlab2023 ./scripts/dev/deploy-hermes-to-board.sh
-#   FULL_DEPS=1 BOARD_HOST=... ./scripts/dev/deploy-hermes-to-board.sh   # reinstall deps too
+# Usage (BOARD_PASS is the board's root ssh password — pass it at the command
+# line / from your shell env, never hardcode it here):
+#   BOARD_HOST=192.168.31.98 BOARD_PASS=*** ./scripts/dev/deploy-hermes-to-board.sh
+#   FULL_DEPS=1 BOARD_HOST=... BOARD_PASS=*** ./scripts/dev/deploy-hermes-to-board.sh  # reinstall deps too
 
 set -euo pipefail
 
 BOARD_HOST="${BOARD_HOST:-192.168.31.98}"
 BOARD_PORT="${BOARD_PORT:-22}"
 BOARD_USER="${BOARD_USER:-root}"
-BOARD_PASS="${BOARD_PASS:-Zettlab2023}"
+# Required; no committed default — mirrors the CI workflow's secrets.BOARD_SSH_PASSWORD.
+BOARD_PASS="${BOARD_PASS:?BOARD_PASS (board root ssh password) is required; set it in your env, do not hardcode}"
 FULL_DEPS="${FULL_DEPS:-0}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
