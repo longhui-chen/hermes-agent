@@ -5,7 +5,7 @@
     "people_count": 58,
     "legacy_only_count": 28,
     "at_by_github_count": 27,
-    "at_by_github_active_count": 35,
+    "at_by_github_active_count": 36,
     "regenerate": "python3 scripts/test-harness/feishu/build_registry.py",
     "active_app_id": "cli_a97acaec84389cc0",
     "active_app_note": "at_by_github_active = 应用机器人 cli_a97 维度的 GitHub login->open_id，供 linearb-feishu-report（应用机器人/话题模式）@作者使用。旧 at_by_github 为 webhook 维度，仅旧流程兜底。"
@@ -740,8 +740,8 @@
     "zxd-zettlab": "ou_f268f83c107b29d6b5b9c6867090d44e"
   },
   "at_by_github_active": {
-    "2pgcn": "ou_b4255723a4013c7ffd7f22840f2c2f7d",
     "707367586": "ou_8de19982853903b1d1b044de3c9bd5ff",
+    "2pgcn": "ou_b4255723a4013c7ffd7f22840f2c2f7d",
     "Adrien9210": "ou_6d03c09a25a54f584da53a19a22b38d2",
     "Joey-1122": "ou_6b0a8086331150805e878a02a5ba2eed",
     "KILLY000": "ou_646678db42413610ef78bc334afae507",
@@ -756,6 +756,7 @@
     "jiadalin": "ou_ee4f4461b8fe293623da43e835c4d19c",
     "jiafu0": "ou_486e2f5a5491be65acfa225380260e2a",
     "liao3841054": "ou_2f809fbbfd7d1e51ad6ab412deaf391d",
+    "liricooo": "ou_90eb2f880d50b63ce7b20dad4c754ca1",
     "liulovegame": "ou_d8a11054dc5dce2d259f8311ac54a3fb",
     "maohan1013": "ou_a00a28193941b7bd04d3d486fe51b0af",
     "noahgwok": "ou_27d9bb8c5814f5dff8b7b56151da05e7",
