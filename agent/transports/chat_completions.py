@@ -31,26 +31,32 @@ def _apply_zettlab_billing_headers(api_kwargs: Dict[str, Any], params: Dict[str,
     third-party provider. Applied to BOTH the legacy and profile build paths —
     the NAS ai-proxy agent runs with provider=custom, which takes the legacy path.
     """
-    from gateway.session_context import billing_task_id_for, billing_task_title_encoded
+    # Best-effort: credit attribution must never break the main request path.
+    # Wrapped in try/except like auxiliary_client._apply_user_default_headers so a
+    # billing import/lookup error can't bubble up and abort build_kwargs.
+    try:
+        from gateway.session_context import billing_task_id_for, billing_task_title_encoded
 
-    task_id = billing_task_id_for(params.get("session_id"))
-    if not task_id:
+        task_id = billing_task_id_for(params.get("session_id"))
+        if not task_id:
+            return
+        existing = api_kwargs.get("extra_headers")
+        headers: Dict[str, str] = {}
+        if isinstance(existing, dict):
+            headers.update({
+                str(k): str(v) for k, v in existing.items() if k and v is not None
+            })
+        headers.setdefault("X-Task-Id", task_id)
+        headers.setdefault("X-Scene-Type", "agent")
+        # Cron runs also stamp the job name as X-Task-Title so the ledger's cron
+        # task card shows the real name (and survives the job being deleted).
+        # Empty for interactive sessions, which carry no title here.
+        task_title = billing_task_title_encoded()
+        if task_title:
+            headers.setdefault("X-Task-Title", task_title)
+        api_kwargs["extra_headers"] = headers
+    except Exception:
         return
-    existing = api_kwargs.get("extra_headers")
-    headers: Dict[str, str] = {}
-    if isinstance(existing, dict):
-        headers.update({
-            str(k): str(v) for k, v in existing.items() if k and v is not None
-        })
-    headers.setdefault("X-Task-Id", task_id)
-    headers.setdefault("X-Scene-Type", "agent")
-    # Cron runs also stamp the job name as X-Task-Title so the ledger's cron task
-    # card shows the real name (and survives the job being deleted). Empty for
-    # interactive sessions, which carry no title here.
-    task_title = billing_task_title_encoded()
-    if task_title:
-        headers.setdefault("X-Task-Title", task_title)
-    api_kwargs["extra_headers"] = headers
 
 
 def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> dict | None:
