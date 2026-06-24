@@ -65,14 +65,17 @@ jobs:
             2) 评审标准：以仓库根 REVIEW.md 为最高优先级，叠加 CLAUDE.md / AGENTS.md 的 Engineering Hard Rules
                （内存预算 2GB、HA & 自愈、Agent 安全、API 向后兼容、配置唯一生效位置）。
                只把「合并前应修的真 bug / 安全 / 契约破坏」标为 Important，风格类最多 Nit。
-            3) 评审结束后，用文件写工具把机器可读结论写到 ./codereview-result.json，schema：
+            3) 分析一完成、问题清单一确定，就【第一时间】用文件写工具把机器可读结论写到
+               ./codereview-result.json —— 不要等行内评论全贴完再写。行内评论可以之后再补；
+               若临近轮次上限，优先保证这个文件已落盘（它驱动飞书通知，丢了就整条评审"报错"且发不出卡片）。schema：
                {"verdict":"pass"|"fail","important":<int>,"nit":<int>,"pre_existing":<int>,
                 "issues":[{"severity":"important"|"nit"|"pre_existing","file":"<path>","line":<int>,"title":"<one line>"}]}
                有任一 important 则 verdict=fail，否则 pass。这个文件只给内部通知用，不要贴到 PR。
           # 用 opus-4-8（评审质量最强；~10-15min/PR，异步不挡合并）。
-          # max-turns 给足：/code-review 插件固定开销就要 ~15+ 轮，砍太低会 error_max_turns 直接失败
+          # max-turns：大仓 + 大 PR（如 zettlab-server）50 轮会 error_max_turns；给到 100（~16min，仍在 30min timeout 内）。
+          # 配合上面"尽早落盘结论文件"，即使偶发轮次耗尽，飞书通知也不丢。
           claude_args: |
-            --max-turns 50
+            --max-turns 100
             --model claude-opus-4-8
             --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Write"
 
