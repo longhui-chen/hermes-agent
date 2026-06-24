@@ -1033,3 +1033,85 @@ class TestChatCompletionsGeminiNativeExtraBodyStrip:
         )
         eb = kw.get("extra_body")
         assert eb and "tags" in eb
+
+
+class TestChatCompletionsZettlabTaskHeaders:
+    """X-Task-Id / X-Scene-Type injection for zettlab credit-ledger task grouping."""
+
+    def test_zettlab_session_injects_task_headers(self, transport):
+        msgs = [{"role": "user", "content": "hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-4o",
+            messages=msgs,
+            timeout=30.0,
+            session_id="zettlab:u1:agent-a:abc123",
+        )
+        headers = kw.get("extra_headers") or {}
+        assert headers.get("X-Task-Id") == "zettlab:u1:agent-a:abc123"
+        assert headers.get("X-Scene-Type") == "agent"
+
+    def test_non_zettlab_session_omits_task_headers(self, transport):
+        msgs = [{"role": "user", "content": "hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-4o",
+            messages=msgs,
+            timeout=30.0,
+            session_id="local-session-123",
+        )
+        headers = kw.get("extra_headers") or {}
+        assert "X-Task-Id" not in headers
+
+    def test_missing_session_omits_task_headers(self, transport):
+        msgs = [{"role": "user", "content": "hi"}]
+        kw = transport.build_kwargs(model="gpt-4o", messages=msgs, timeout=30.0)
+        headers = kw.get("extra_headers") or {}
+        assert "X-Task-Id" not in headers
+
+    def test_cron_session_collapses_to_stable_job_task_id(self, transport):
+        # cron_<job>_<YYYYMMDD>_<HHMMSS> -> cron_<job> so all runs of a cron job
+        # aggregate into one credit-ledger task card.
+        msgs = [{"role": "user", "content": "hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-4o",
+            messages=msgs,
+            timeout=30.0,
+            session_id="cron_4b2628798006_20260624_104233",
+        )
+        headers = kw.get("extra_headers") or {}
+        assert headers.get("X-Task-Id") == "cron_4b2628798006"
+        assert headers.get("X-Scene-Type") == "agent"
+
+    def test_cron_session_stamps_encoded_job_title(self, transport):
+        # run_job sets HERMES_CRON_TASK_TITLE; it surfaces as a percent-encoded
+        # X-Task-Title so the ledger's cron card shows the real job name.
+        from urllib.parse import unquote
+
+        from gateway.session_context import _VAR_MAP
+
+        _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("站立提醒")
+        try:
+            kw = transport.build_kwargs(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "hi"}],
+                timeout=30.0,
+                session_id="cron_job1_20260624_104233",
+            )
+            headers = kw.get("extra_headers") or {}
+            assert headers.get("X-Task-Id") == "cron_job1"
+            assert unquote(headers.get("X-Task-Title", "")) == "站立提醒"
+        finally:
+            _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("")
+
+    def test_interactive_session_omits_task_title(self, transport):
+        # No cron title var -> X-Task-Title must not be stamped on conversations.
+        from gateway.session_context import _VAR_MAP
+
+        _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("")
+        kw = transport.build_kwargs(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": "hi"}],
+            timeout=30.0,
+            session_id="zettlab:u1:agent-a:abc123",
+        )
+        headers = kw.get("extra_headers") or {}
+        assert "X-Task-Title" not in headers
