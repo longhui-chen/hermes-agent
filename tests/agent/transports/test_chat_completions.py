@@ -1033,3 +1033,36 @@ class TestChatCompletionsGeminiNativeExtraBodyStrip:
         )
         eb = kw.get("extra_body")
         assert eb and "tags" in eb
+
+
+class TestChatCompletionsZettlabTaskHeaders:
+    """X-Task-Id / X-Scene-Type injection for zettlab credit-ledger task grouping."""
+
+    def test_zettlab_session_injects_task_headers(self, transport):
+        msgs = [{"role": "user", "content": "hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-4o",
+            messages=msgs,
+            timeout=30.0,
+            session_id="zettlab:u1:agent-a:abc123",
+        )
+        headers = kw.get("extra_headers") or {}
+        assert headers.get("X-Task-Id") == "zettlab:u1:agent-a:abc123"
+        assert headers.get("X-Scene-Type") == "agent"
+
+    def test_non_zettlab_session_omits_task_headers(self, transport):
+        msgs = [{"role": "user", "content": "hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-4o",
+            messages=msgs,
+            timeout=30.0,
+            session_id="local-session-123",
+        )
+        headers = kw.get("extra_headers") or {}
+        assert "X-Task-Id" not in headers
+
+    def test_missing_session_omits_task_headers(self, transport):
+        msgs = [{"role": "user", "content": "hi"}]
+        kw = transport.build_kwargs(model="gpt-4o", messages=msgs, timeout=30.0)
+        headers = kw.get("extra_headers") or {}
+        assert "X-Task-Id" not in headers
