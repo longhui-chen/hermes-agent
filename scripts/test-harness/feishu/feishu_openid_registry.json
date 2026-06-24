@@ -1,11 +1,14 @@
 {
   "_meta": {
-    "note": "飞书 open_id 权威注册表。open_id 为 CURRENT_APP 维度，@人首选；open_id_legacy 为旧 webhook 机器人维度，仅当用旧机器人发送时兜底。at_by_github 为旧 webhook 维度的 GitHub login->open_id，供 linearb 流程消费。",
+    "note": "飞书 open_id 权威注册表。open_id 为 CURRENT_APP 维度，@人首选；open_id_legacy 为旧 webhook 机器人维度，仅当用旧机器人发送时兜底。linearb-feishu-report 应使用 at_by_github_active（应用机器人 cli_a97 维度）；旧 at_by_github 仅供旧 webhook 流程兜底。",
     "current_app_id": "cli_a98867442059900c",
     "people_count": 58,
     "legacy_only_count": 28,
     "at_by_github_count": 27,
-    "regenerate": "python3 scripts/test-harness/feishu/build_registry.py"
+    "at_by_github_active_count": 12,
+    "regenerate": "python3 scripts/test-harness/feishu/build_registry.py",
+    "active_app_id": "cli_a97acaec84389cc0",
+    "active_app_note": "at_by_github_active = 应用机器人 cli_a97 维度的 GitHub login->open_id，供 linearb-feishu-report（应用机器人/话题模式）@作者使用。旧 at_by_github 为 webhook 维度，仅旧流程兜底。"
   },
   "people": [
     {
@@ -735,5 +738,19 @@
     "zettlab-yangheng": "ou_4bf61a33459b577986693d3eed2b2471",
     "zettlab-zlw": "ou_ff1e2a3baf3542a239ffbbb1160a4328",
     "zxd-zettlab": "ou_f268f83c107b29d6b5b9c6867090d44e"
+  },
+  "at_by_github_active": {
+    "Adrien9210": "ou_6d03c09a25a54f584da53a19a22b38d2",
+    "xiangweidong-zettlab": "ou_4b3f244e9e06f3124729c3f72cfaf20f",
+    "yoran-wu": "ou_06e34ba295a3eaf78c0cc845f4ba8f80",
+    "707367586": "ou_8de19982853903b1d1b044de3c9bd5ff",
+    "liao3841054": "ou_2f809fbbfd7d1e51ad6ab412deaf391d",
+    "xuyunlong698": "ou_c1e281a4d7ce171472a162badaa4d434",
+    "jiafu0": "ou_486e2f5a5491be65acfa225380260e2a",
+    "hongxin-zettlab": "ou_ca32f58f689c4e697d8e09096c3c06ec",
+    "gezhengbin888": "ou_d3d88d0643dbc48a0ba7dfa93406e623",
+    "x1cai": "ou_2581c54fa4e912ad970b7eb3ae420d7e",
+    "xlaya": "ou_abfb779416d275e0985894423128f925",
+    "zett-jay": "ou_ce2fda1bce9f063f03d61669e055d42f"
   }
 }
