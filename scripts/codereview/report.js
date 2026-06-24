@@ -201,39 +201,64 @@ function buildCard(repo, pr, cls, opts = {}) {
     : `❌ Claude 代码评审不通过 — ${cls.count} 个问题`;
   const authorAt = !ok && atAuthor ? atTag(pr.author) : '';
   const tally = `🔴 ${c.important} · 🟡 ${c.nit} · 🟣 ${c.pre_existing}`;
-  const lines = [
+
+  // 常显区（= 截图里红框）：仓库 / PR / 提交者，扫一眼就知道是谁的哪个 PR。
+  const headLines = [
     `**仓库**：${esc(repo)}`,
     `**PR**：[#${pr.number} ${esc(pr.title)}](${pr.url})`,
     `**提交者**：${authorAt ? authorAt + ' ' : ''}${esc(pr.author)}`,
+  ];
+  // 折叠区：分支 / 结论 / 严重度 / 问题清单，点「展开详情」才显示，不刷屏。
+  const detailLines = [
     `**分支**：${esc(pr.base)} ← ${esc(pr.head)}`,
     `**结论**：${ok ? '✅ 通过（无需合并前修复的问题）' : `❌ 不通过（${cls.count} 个问题）`}`,
     `**严重度**：${tally}`,
   ];
   if (!ok && cls.issues && cls.issues.length) {
-    lines.push('\n**问题清单**：');
+    detailLines.push('\n**问题清单**：');
     cls.issues.slice(0, 10).forEach((it, i) => {
       const icon = SEV_ICON[it.sev] || '•';
       const loc = it.loc ? ` \`${esc(it.loc)}\`` : '';
-      lines.push(`${i + 1}. ${icon}${loc}${it.title ? ' — ' + esc(it.title) : ''}`);
+      detailLines.push(`${i + 1}. ${icon}${loc}${it.title ? ' — ' + esc(it.title) : ''}`);
     });
-    if (cls.issues.length > 10) lines.push(`… 另有 ${cls.issues.length - 10} 项，详见 PR 行内评论`);
+    if (cls.issues.length > 10) detailLines.push(`… 另有 ${cls.issues.length - 10} 项，详见 PR 行内评论`);
   } else if (!ok) {
-    lines.push('\n详见 PR 的 **Claude Code Review** check（Files changed 行内标注 / Details 严重度表）。');
+    detailLines.push('\n详见 PR 的 **Claude Code Review** check（Files changed 行内标注 / Details 严重度表）。');
   }
   const note = opts.isReply
     ? 'Claude /code-review · 同一 PR 复评 · 话题回复'
     : 'Claude /code-review (ultra) · PR → main · 自动触发';
+
+  // 飞书 card schema 2.0：用 collapsible_panel 做「红框常显 + 其余下拉展开」。
   return {
     msg_type: 'interactive',
     card: {
-      config: { wide_screen_mode: true },
+      schema: '2.0',
+      config: { wide_screen_mode: true, update_multi: true },
       header: { template: ok ? 'green' : 'red', title: { tag: 'plain_text', content: head } },
-      elements: [
-        { tag: 'div', text: { tag: 'lark_md', content: lines.join('\n') } },
-        { tag: 'hr' },
-        { tag: 'note', elements: [{ tag: 'plain_text', content: note }] },
-        { tag: 'action', elements: [{ tag: 'button', text: { tag: 'plain_text', content: '打开 PR' }, type: 'primary', url: pr.url }] },
-      ],
+      body: {
+        elements: [
+          { tag: 'markdown', content: headLines.join('\n') },
+          {
+            tag: 'collapsible_panel',
+            expanded: false,
+            header: {
+              title: { tag: 'markdown', content: '**展开详情**（分支 · 结论 · 严重度 · 问题清单）' },
+              vertical_align: 'center',
+              icon: { tag: 'standard_icon', token: 'down-small-ccm_outlined', size: '16px 16px' },
+              icon_position: 'right',
+              icon_expanded_angle: -180,
+            },
+            elements: [
+              { tag: 'markdown', content: detailLines.join('\n') },
+            ],
+          },
+          { tag: 'hr' },
+          // card 2.0 不支持 note 标签：脚注改用灰色 markdown；按钮跳转改用 behaviors.open_url。
+          { tag: 'markdown', content: `<font color='grey'>${note}</font>` },
+          { tag: 'button', text: { tag: 'plain_text', content: '打开 PR' }, type: 'primary', width: 'default', behaviors: [{ type: 'open_url', default_url: pr.url }] },
+        ],
+      },
     },
   };
 }
@@ -242,7 +267,8 @@ function buildCard(repo, pr, cls, opts = {}) {
 // 而 incoming webhook 要求 {msg_type, card}。把这层 API 形状转换收在一处，避免发送/回复
 // 路径与 buildCard 返回形状漂移。
 function interactiveCardContent(card) {
-  if (!card || card.msg_type !== 'interactive' || !card.card || !Array.isArray(card.card.elements)) {
+  const body = card && card.card && card.card.body;
+  if (!card || card.msg_type !== 'interactive' || !body || !Array.isArray(body.elements)) {
     throw new Error('invalid interactive card payload');
   }
   return JSON.stringify(card.card);
