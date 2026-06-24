@@ -19,6 +19,31 @@ from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
 
 
+def _apply_zettlab_billing_headers(api_kwargs: Dict[str, Any], params: Dict[str, Any]) -> None:
+    """Forward the conversation session_id as X-Task-Id for zettlab credit-ledger
+    task grouping (mini-api 08-ai.md -> ai-api scene_params -> ai-cloud
+    ledger.task_id), so a multi-step Agent task's per-turn consumption aggregates
+    into one task card. The local-server ai-proxy relays these headers to the IAM
+    gateway. Gated on the ``zettlab:`` session prefix so the billing headers are
+    only emitted on the NAS path and never leak to a third-party provider.
+
+    Applied to BOTH the legacy and profile build paths — the NAS ai-proxy agent
+    runs with provider=custom, which takes the legacy path.
+    """
+    session_id = params.get("session_id")
+    if not (isinstance(session_id, str) and session_id.startswith("zettlab:")):
+        return
+    existing = api_kwargs.get("extra_headers")
+    headers: Dict[str, str] = {}
+    if isinstance(existing, dict):
+        headers.update({
+            str(k): str(v) for k, v in existing.items() if k and v is not None
+        })
+    headers.setdefault("X-Task-Id", session_id)
+    headers.setdefault("X-Scene-Type", "agent")
+    api_kwargs["extra_headers"] = headers
+
+
 def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> dict | None:
     """Translate Hermes/OpenRouter-style reasoning config to Gemini thinkingConfig."""
     if reasoning_config is None or not isinstance(reasoning_config, dict):
@@ -453,6 +478,8 @@ class ChatCompletionsTransport(ProviderTransport):
         if overrides:
             api_kwargs.update(overrides)
 
+        _apply_zettlab_billing_headers(api_kwargs, params)
+
         return api_kwargs
 
     def _build_kwargs_from_profile(self, profile, model, sanitized, tools, params):
@@ -595,27 +622,7 @@ class ChatCompletionsTransport(ProviderTransport):
             if extra_body:
                 api_kwargs["extra_body"] = extra_body
 
-        # Zettlab credit-ledger task grouping: forward the conversation
-        # session_id as X-Task-Id so a multi-step Agent task's per-turn
-        # consumption aggregates into one "task card" in the credit ledger
-        # (zettlab mini-api 08-ai.md → ai-api scene_params → ai-cloud
-        # ledger.task_id). The local-server ai-proxy relays these headers to
-        # the IAM gateway. Gated on the ``zettlab:`` session prefix so the
-        # billing headers are only emitted on the NAS path and never leak to
-        # a third-party provider.
-        _session_id = params.get("session_id")
-        if isinstance(_session_id, str) and _session_id.startswith("zettlab:"):
-            _existing = api_kwargs.get("extra_headers")
-            _headers: dict[str, str] = {}
-            if isinstance(_existing, dict):
-                _headers.update({
-                    str(k): str(v)
-                    for k, v in _existing.items()
-                    if k and v is not None
-                })
-            _headers.setdefault("X-Task-Id", _session_id)
-            _headers.setdefault("X-Scene-Type", "agent")
-            api_kwargs["extra_headers"] = _headers
+        _apply_zettlab_billing_headers(api_kwargs, params)
 
         return api_kwargs
 
