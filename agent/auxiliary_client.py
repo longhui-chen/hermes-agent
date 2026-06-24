@@ -384,19 +384,19 @@ def _apply_user_default_headers(headers: dict | None) -> dict | None:
                 continue
             merged[str(key)] = str(value)
     # Zettlab credit-ledger task grouping: attribute auxiliary calls
-    # (compression / title / vision) to the conversation by stamping X-Task-Id,
-    # so they aggregate into the conversation's task card instead of surfacing
-    # as orphan model rows in the ledger. Each aux client is built fresh per
-    # call, so reading the concurrency-safe session contextvar here is always
-    # current (no stale cross-session reuse). Gate on the ``zettlab:`` prefix so
-    # the billing headers never leak to a third-party provider.
+    # (compression / title / vision) to the conversation/cron task by stamping
+    # X-Task-Id, so they aggregate into its task card instead of surfacing as
+    # orphan model rows. Each aux client is built fresh per call, so reading the
+    # concurrency-safe session contextvar here is always current (no stale
+    # cross-session reuse). billing_task_id() maps interactive vs cron sessions
+    # and returns '' for non-NAS sessions (no leak to third-party providers).
     try:
-        from gateway.session_context import get_session_env
-        session_id = get_session_env("HERMES_SESSION_ID", "")
+        from gateway.session_context import billing_task_id
+        task_id = billing_task_id()
     except Exception:
-        session_id = ""
-    if isinstance(session_id, str) and session_id.startswith("zettlab:"):
-        merged.setdefault("X-Task-Id", session_id)
+        task_id = ""
+    if task_id:
+        merged.setdefault("X-Task-Id", task_id)
         merged.setdefault("X-Scene-Type", "agent")
     return merged or headers
 

@@ -36,6 +36,7 @@ needs to replace the import + call site:
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
 """
 
+import re
 from contextvars import ContextVar
 from typing import Any
 
@@ -195,3 +196,38 @@ def get_session_env(name: str, default: str = "") -> str:
             return value
     # Fall back to os.environ for CLI, cron, and test compatibility
     return os.getenv(name, default)
+
+
+# ---------------------------------------------------------------------------
+# Credit-ledger task attribution
+# ---------------------------------------------------------------------------
+
+# Cron sessions are ``cron_<job_id>_<YYYYMMDD>_<HHMMSS>`` (a fresh id per run).
+# Strip the trailing date+time so every run of a job collapses to a stable
+# ``cron_<job_id>`` — the credit ledger then aggregates all runs into one task
+# card per cron job instead of one card per minute.
+_CRON_RUN_TS_RE = re.compile(r"_\d{8}_\d{6}$")
+
+
+def billing_task_id_for(session_id: str) -> str:
+    """Map a session_id to the credit-ledger task_id to attribute spend to.
+
+    - Interactive sessions (``zettlab:<uid>:<agent>:<rand>``) → used as-is, so a
+      conversation's turns aggregate into one task card.
+    - Cron sessions (``cron_<job>_<YYYYMMDD>_<HHMMSS>``) → collapsed to a stable
+      ``cron_<job>`` so all runs of a cron job aggregate into one card.
+    - Anything else → '' (don't attribute; also avoids leaking X-Task-Id to
+      third-party providers on non-NAS sessions).
+    """
+    if not isinstance(session_id, str) or not session_id:
+        return ""
+    if session_id.startswith("zettlab:"):
+        return session_id
+    if session_id.startswith("cron_"):
+        return _CRON_RUN_TS_RE.sub("", session_id)
+    return ""
+
+
+def billing_task_id() -> str:
+    """``billing_task_id_for`` for the current session context (env/contextvar)."""
+    return billing_task_id_for(get_session_env("HERMES_SESSION_ID", ""))

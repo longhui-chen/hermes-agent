@@ -20,18 +20,21 @@ from agent.transports.types import NormalizedResponse, ToolCall, Usage
 
 
 def _apply_zettlab_billing_headers(api_kwargs: Dict[str, Any], params: Dict[str, Any]) -> None:
-    """Forward the conversation session_id as X-Task-Id for zettlab credit-ledger
+    """Forward the conversation/cron session as X-Task-Id for zettlab credit-ledger
     task grouping (mini-api 08-ai.md -> ai-api scene_params -> ai-cloud
-    ledger.task_id), so a multi-step Agent task's per-turn consumption aggregates
-    into one task card. The local-server ai-proxy relays these headers to the IAM
-    gateway. Gated on the ``zettlab:`` session prefix so the billing headers are
-    only emitted on the NAS path and never leak to a third-party provider.
+    ledger.task_id), so a multi-step task's per-turn consumption aggregates into
+    one task card. The local-server ai-proxy relays these headers to the IAM
+    gateway.
 
-    Applied to BOTH the legacy and profile build paths — the NAS ai-proxy agent
-    runs with provider=custom, which takes the legacy path.
+    The session -> task_id mapping (interactive vs cron, see billing_task_id_for)
+    also gates non-NAS sessions to '' so the billing headers never leak to a
+    third-party provider. Applied to BOTH the legacy and profile build paths —
+    the NAS ai-proxy agent runs with provider=custom, which takes the legacy path.
     """
-    session_id = params.get("session_id")
-    if not (isinstance(session_id, str) and session_id.startswith("zettlab:")):
+    from gateway.session_context import billing_task_id_for
+
+    task_id = billing_task_id_for(params.get("session_id"))
+    if not task_id:
         return
     existing = api_kwargs.get("extra_headers")
     headers: Dict[str, str] = {}
@@ -39,7 +42,7 @@ def _apply_zettlab_billing_headers(api_kwargs: Dict[str, Any], params: Dict[str,
         headers.update({
             str(k): str(v) for k, v in existing.items() if k and v is not None
         })
-    headers.setdefault("X-Task-Id", session_id)
+    headers.setdefault("X-Task-Id", task_id)
     headers.setdefault("X-Scene-Type", "agent")
     api_kwargs["extra_headers"] = headers
 

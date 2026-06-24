@@ -4017,3 +4017,19 @@ def test_apply_user_default_headers_skips_non_zettlab_session():
         assert not headers or "X-Task-Id" not in headers
     finally:
         set_current_session_id("")
+
+
+def test_apply_user_default_headers_collapses_cron_session():
+    """A cron run's aux calls aggregate into one per-job task card: the
+    cron_<job>_<date>_<time> session collapses to a stable cron_<job> task_id."""
+    from agent.auxiliary_client import _apply_user_default_headers
+    from gateway.session_context import set_current_session_id
+
+    set_current_session_id("cron_4b2628798006_20260624_104233")
+    try:
+        headers = _apply_user_default_headers(None)
+        assert headers is not None
+        assert headers.get("X-Task-Id") == "cron_4b2628798006"
+        assert headers.get("X-Scene-Type") == "agent"
+    finally:
+        set_current_session_id("")

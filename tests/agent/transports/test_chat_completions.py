@@ -1066,3 +1066,17 @@ class TestChatCompletionsZettlabTaskHeaders:
         kw = transport.build_kwargs(model="gpt-4o", messages=msgs, timeout=30.0)
         headers = kw.get("extra_headers") or {}
         assert "X-Task-Id" not in headers
+
+    def test_cron_session_collapses_to_stable_job_task_id(self, transport):
+        # cron_<job>_<YYYYMMDD>_<HHMMSS> -> cron_<job> so all runs of a cron job
+        # aggregate into one credit-ledger task card.
+        msgs = [{"role": "user", "content": "hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-4o",
+            messages=msgs,
+            timeout=30.0,
+            session_id="cron_4b2628798006_20260624_104233",
+        )
+        headers = kw.get("extra_headers") or {}
+        assert headers.get("X-Task-Id") == "cron_4b2628798006"
+        assert headers.get("X-Scene-Type") == "agent"
