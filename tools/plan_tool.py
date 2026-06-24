@@ -24,6 +24,22 @@ returns the plan as a formatted text block so the agent can still describe it.
 import json
 from typing import List, Optional, Dict, Any, Callable
 
+# 内存上限（HR-1）：LLM 可能吐超大计划，封顶防止单次 present_plan 撑爆内存 / 上下文。
+_MAX_GROUPS = 20
+_MAX_ITEMS_PER_GROUP = 50
+_MAX_ITEM_LEN = 500
+
+
+def _format_plan_text(title: str, groups: List[Dict[str, Any]]) -> str:
+    """把结构化计划渲染成纯文本块（无 UI 卡片的平台用，如 CLI / messaging）。"""
+    lines = [f"📋 {title}"]
+    for g in groups:
+        header = f"{g.get('icon', '')} {g.get('label', '')}".strip()
+        lines.append(f"\n{header} ({g.get('count', 0)})")
+        for item in g.get("items", []):
+            lines.append(f"  • {item}")
+    return "\n".join(lines)
+
 
 def present_plan(
     title: str,
@@ -54,31 +70,43 @@ def present_plan(
 
     title = title.strip()
 
-    # Normalise groups: ensure required fields, clip oversized items lists.
+    # Normalise + clip：封顶 groups / 每组 items 数 / 单条长度（HR-1，防超大计划）。
     cleaned_groups: List[Dict[str, Any]] = []
-    for g in (groups or []):
+    for g in (groups or [])[:_MAX_GROUPS]:
         if not isinstance(g, dict):
             continue
-        items = [str(i).strip() for i in (g.get("items") or []) if str(i).strip()]
+        items = [
+            str(i).strip()[:_MAX_ITEM_LEN]
+            for i in (g.get("items") or [])
+            if str(i).strip()
+        ][:_MAX_ITEMS_PER_GROUP]
         label = str(g.get("label", "")).strip() or "Steps"
         icon = str(g.get("icon", "")).strip() or ""
-        count = int(g.get("count") or len(items)) if g.get("count") is not None else len(items)
+        # count 一律以裁剪后的 items 实际条数为准（schema 里 count 可选；传了也忽略，
+        # 避免「模型给的 count」与实际条目数不一致）。
         cleaned_groups.append({
             "icon": icon,
             "label": label,
-            "count": count,
+            "count": len(items),
             "items": items,
         })
 
     if callback is not None:
+        # zet_agent：推 hermes.plan SSE → App 渲染结构化确认卡。
         try:
             callback(title, cleaned_groups)
         except Exception:
             pass
+        return (
+            "Plan presented to user. "
+            "Stop and wait for the user's confirmation before executing."
+        )
 
+    # 无 callback（CLI / messaging / api_server，无确认卡）：返回格式化计划文本，
+    # 让 agent 能把计划完整呈现给用户，再停下等确认——否则计划内容丢失且 agent 空等。
     return (
-        "Plan presented to user. "
-        "Stop and wait for the user's confirmation before executing."
+        _format_plan_text(title, cleaned_groups)
+        + "\n\nReview the plan above and reply to confirm (e.g. \"go\" / \"confirm\") before I proceed."
     )
 
 
@@ -128,7 +156,7 @@ PLAN_SCHEMA = {
                         },
                         "count": {
                             "type": "integer",
-                            "description": "Number of items in this group.",
+                            "description": "Optional. Ignored if provided — count is derived from items.",
                         },
                         "items": {
                             "type": "array",
@@ -136,7 +164,7 @@ PLAN_SCHEMA = {
                             "description": "Concrete steps in this group (1-5 items).",
                         },
                     },
-                    "required": ["icon", "label", "count", "items"],
+                    "required": ["icon", "label", "items"],
                 },
             },
         },
