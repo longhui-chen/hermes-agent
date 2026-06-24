@@ -99,13 +99,28 @@ jobs:
             const verdict = fail
               ? `🔴 发现 ${imp} 个需合并前修复的问题${nit ? `（另 ${nit} 个 nit）` : ''}，详见行内评论。`
               : `✅ 未发现需合并前修复的问题${nit ? `（${nit} 个 nit 见行内评论）` : ''}。`;
-            const body = [
+            // 问题清单：与飞书卡片同源（codereview-result.json 的 issues 数组），让 GitHub 这条评论也能一眼看全。
+            const ICON = { important: '🔴', nit: '🟡', pre_existing: '🟣' };
+            const RANK = { important: 0, nit: 1, pre_existing: 2 };
+            const issues = (Array.isArray(r.issues) ? r.issues : [])
+              .slice().sort((a, b) => (RANK[a && a.severity] ?? 9) - (RANK[b && b.severity] ?? 9));
+            const lines = [
               '🤖 本 PR 已由 Claude **`/code-review ultra`** 自动评审。',
               '',
               verdict,
-              '',
-              '<sub>引擎：anthropics/claude-code-action · 评审口径见仓库 REVIEW.md · 不通过结论同步至飞书 zettlab-ai-codereview 并 @ 作者</sub>',
-            ].join('\n');
+            ];
+            if (issues.length) {
+              lines.push('', '<details open><summary><b>问题清单</b></summary>', '');
+              issues.slice(0, 20).forEach((it, i) => {
+                const loc = [it && it.file, it && it.line].filter(x => x != null && x !== '').join(':');
+                const t = (it && it.title) ? String(it.title).replace(/\r?\n/g, ' ').trim() : '';
+                lines.push(`${i + 1}. ${ICON[it && it.severity] || '•'} ${loc ? `\`${loc}\`` : ''}${t ? ` — ${t}` : ''}`);
+              });
+              if (issues.length > 20) lines.push('', `…另有 ${issues.length - 20} 项，详见行内评论。`);
+              lines.push('', '</details>');
+            }
+            lines.push('', '<sub>引擎：anthropics/claude-code-action · 评审口径见仓库 REVIEW.md · 不通过结论同步至飞书 zettlab-ai-codereview 并 @ 作者</sub>');
+            const body = lines.join('\n');
             await github.rest.issues.createComment({
               owner: context.repo.owner, repo: context.repo.repo,
               issue_number: context.payload.pull_request.number, body,
