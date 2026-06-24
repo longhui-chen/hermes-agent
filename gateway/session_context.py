@@ -67,6 +67,11 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
+# Human-readable cron job name for the current run — stamped as X-Task-Title so
+# the credit ledger's cron task card shows the real job name (and survives the
+# job being deleted, since the App can no longer resolve it from the live list).
+# Set per-job in run_job(); empty for interactive sessions.
+_CRON_TASK_TITLE: ContextVar = ContextVar("HERMES_CRON_TASK_TITLE", default=_UNSET)
 
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
@@ -81,6 +86,7 @@ _VAR_MAP = {
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
+    "HERMES_CRON_TASK_TITLE": _CRON_TASK_TITLE,
 }
 
 
@@ -231,3 +237,18 @@ def billing_task_id_for(session_id: str) -> str:
 def billing_task_id() -> str:
     """``billing_task_id_for`` for the current session context (env/contextvar)."""
     return billing_task_id_for(get_session_env("HERMES_SESSION_ID", ""))
+
+
+def billing_task_title_encoded() -> str:
+    """Percent-encoded cron job name for the current run, for the X-Task-Title header.
+
+    Only cron runs set ``HERMES_CRON_TASK_TITLE`` (see run_job), so this returns
+    '' for interactive sessions. HTTP headers are ASCII-only, so the (possibly
+    CJK) title is percent-encoded here; ai-api ``url.QueryUnescape``-decodes it
+    once at the boundary before persisting to ``scene_params.task_title``.
+    Returns '' when there is no title to stamp.
+    """
+    from urllib.parse import quote
+
+    title = get_session_env("HERMES_CRON_TASK_TITLE", "").strip()
+    return quote(title, safe="") if title else ""

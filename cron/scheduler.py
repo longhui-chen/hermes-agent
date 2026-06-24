@@ -1633,9 +1633,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
         "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
         "HERMES_CRON_AUTO_DELIVER_THREAD_ID",
+        "HERMES_CRON_TASK_TITLE",
     )
     for _var_name in _cron_delivery_vars:
         _VAR_MAP[_var_name].set("")
+    # Stamp the human-readable job name so auxiliary + main LLM calls carry it as
+    # X-Task-Title → ai-cloud ledger scene_params.task_title → the App's cron task
+    # card shows the real name even after the job is deleted (it can no longer be
+    # resolved from the live cron list). Reset to "" above so it never leaks across
+    # jobs in the parallel pool.
+    _VAR_MAP["HERMES_CRON_TASK_TITLE"].set(job_name or "")
 
     # Per-job working directory.  When set (and validated at create/update
     # time), we point TERMINAL_CWD at it so:

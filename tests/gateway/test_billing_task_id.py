@@ -5,9 +5,13 @@ id so every run aggregates into one ledger task card; non-NAS sessions map to ''
 so X-Task-Id is never stamped on third-party-provider calls.
 """
 
+from urllib.parse import unquote
+
 from gateway.session_context import (
+    _VAR_MAP,
     billing_task_id,
     billing_task_id_for,
+    billing_task_title_encoded,
     set_current_session_id,
 )
 
@@ -35,3 +39,22 @@ def test_billing_task_id_reads_current_session_context():
         assert billing_task_id() == "cron_job123"
     finally:
         set_current_session_id("")
+
+
+def test_billing_task_title_encoded_percent_encodes_cron_job_name():
+    # run_job sets HERMES_CRON_TASK_TITLE to the job name; HTTP headers are
+    # ASCII-only so a CJK title must be percent-encoded (ai-api QueryUnescape-
+    # decodes it once). Assert it's ASCII-safe and round-trips, without
+    # hard-coding the UTF-8 byte sequence.
+    _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("站立提醒 (每分钟)")
+    try:
+        enc = billing_task_title_encoded()
+        assert enc.isascii() and " " not in enc
+        assert unquote(enc) == "站立提醒 (每分钟)"
+    finally:
+        _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("")
+
+
+def test_billing_task_title_encoded_empty_when_unset():
+    _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("")
+    assert billing_task_title_encoded() == ""

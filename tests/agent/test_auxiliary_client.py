@@ -4033,3 +4033,38 @@ def test_apply_user_default_headers_collapses_cron_session():
         assert headers.get("X-Scene-Type") == "agent"
     finally:
         set_current_session_id("")
+
+
+def test_apply_user_default_headers_stamps_cron_job_title():
+    """A cron run's aux calls also carry the percent-encoded job name as
+    X-Task-Title so the ledger's cron task card shows the real name."""
+    from urllib.parse import unquote
+
+    from agent.auxiliary_client import _apply_user_default_headers
+    from gateway.session_context import _VAR_MAP, set_current_session_id
+
+    set_current_session_id("cron_4b2628798006_20260624_104233")
+    _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("站立提醒")
+    try:
+        headers = _apply_user_default_headers(None)
+        assert headers is not None
+        assert headers.get("X-Task-Id") == "cron_4b2628798006"
+        assert unquote(headers.get("X-Task-Title", "")) == "站立提醒"
+    finally:
+        set_current_session_id("")
+        _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("")
+
+
+def test_apply_user_default_headers_interactive_omits_title():
+    """Interactive sessions carry no cron title var, so no X-Task-Title."""
+    from agent.auxiliary_client import _apply_user_default_headers
+    from gateway.session_context import _VAR_MAP, set_current_session_id
+
+    set_current_session_id("zettlab:u1:agent-a:abc")
+    _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("")
+    try:
+        headers = _apply_user_default_headers(None)
+        assert headers is not None
+        assert "X-Task-Title" not in headers
+    finally:
+        set_current_session_id("")

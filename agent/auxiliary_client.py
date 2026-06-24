@@ -395,13 +395,18 @@ def _apply_user_default_headers(headers: dict | None) -> dict | None:
     # cross-session reuse). billing_task_id() maps interactive vs cron sessions
     # and returns '' for non-NAS sessions (no leak to third-party providers).
     try:
-        from gateway.session_context import billing_task_id
+        from gateway.session_context import billing_task_id, billing_task_title_encoded
         task_id = billing_task_id()
+        task_title = billing_task_title_encoded() if task_id else ""
     except Exception:
         task_id = ""
+        task_title = ""
     if task_id:
         merged.setdefault("X-Task-Id", task_id)
         merged.setdefault("X-Scene-Type", "agent")
+        # Cron job name → X-Task-Title (empty for interactive); see chat_completions.
+        if task_title:
+            merged.setdefault("X-Task-Title", task_title)
     return merged or headers
 
 

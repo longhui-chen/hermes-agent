@@ -31,7 +31,7 @@ def _apply_zettlab_billing_headers(api_kwargs: Dict[str, Any], params: Dict[str,
     third-party provider. Applied to BOTH the legacy and profile build paths —
     the NAS ai-proxy agent runs with provider=custom, which takes the legacy path.
     """
-    from gateway.session_context import billing_task_id_for
+    from gateway.session_context import billing_task_id_for, billing_task_title_encoded
 
     task_id = billing_task_id_for(params.get("session_id"))
     if not task_id:
@@ -44,6 +44,12 @@ def _apply_zettlab_billing_headers(api_kwargs: Dict[str, Any], params: Dict[str,
         })
     headers.setdefault("X-Task-Id", task_id)
     headers.setdefault("X-Scene-Type", "agent")
+    # Cron runs also stamp the job name as X-Task-Title so the ledger's cron task
+    # card shows the real name (and survives the job being deleted). Empty for
+    # interactive sessions, which carry no title here.
+    task_title = billing_task_title_encoded()
+    if task_title:
+        headers.setdefault("X-Task-Title", task_title)
     api_kwargs["extra_headers"] = headers
 
 
