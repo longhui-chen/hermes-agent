@@ -3988,3 +3988,32 @@ class TestAuxiliaryMaxTokensParam:
         ):
             assert auxiliary_max_tokens_param(4096, model="") == {"max_tokens": 4096}
             assert auxiliary_max_tokens_param(4096, model=None) == {"max_tokens": 4096}
+
+
+def test_apply_user_default_headers_stamps_task_id_for_zettlab_session():
+    """Auxiliary calls under a zettlab session get X-Task-Id/X-Scene-Type so
+    their spend joins the conversation's credit-ledger task card."""
+    from agent.auxiliary_client import _apply_user_default_headers
+    from gateway.session_context import set_current_session_id
+
+    set_current_session_id("zettlab:u1:agent-a:abc")
+    try:
+        headers = _apply_user_default_headers(None)
+        assert headers is not None
+        assert headers.get("X-Task-Id") == "zettlab:u1:agent-a:abc"
+        assert headers.get("X-Scene-Type") == "agent"
+    finally:
+        set_current_session_id("")
+
+
+def test_apply_user_default_headers_skips_non_zettlab_session():
+    """Non-zettlab sessions must not get billing headers (no leak to 3rd parties)."""
+    from agent.auxiliary_client import _apply_user_default_headers
+    from gateway.session_context import set_current_session_id
+
+    set_current_session_id("local-session-xyz")
+    try:
+        headers = _apply_user_default_headers(None)
+        assert not headers or "X-Task-Id" not in headers
+    finally:
+        set_current_session_id("")

@@ -372,18 +372,32 @@ def _apply_user_default_headers(headers: dict | None) -> dict | None:
     Returns the merged dict, or the original ``headers`` (possibly ``None``)
     when nothing is configured. No allocation when there are no overrides.
     """
+    merged = dict(headers or {})
     try:
         from hermes_cli.config import cfg_get, load_config
         user_headers = cfg_get(load_config(), "model", "default_headers")
     except Exception:
-        return headers
-    if not isinstance(user_headers, dict) or not user_headers:
-        return headers
-    merged = dict(headers or {})
-    for key, value in user_headers.items():
-        if value is None:
-            continue
-        merged[str(key)] = str(value)
+        user_headers = None
+    if isinstance(user_headers, dict):
+        for key, value in user_headers.items():
+            if value is None:
+                continue
+            merged[str(key)] = str(value)
+    # Zettlab credit-ledger task grouping: attribute auxiliary calls
+    # (compression / title / vision) to the conversation by stamping X-Task-Id,
+    # so they aggregate into the conversation's task card instead of surfacing
+    # as orphan model rows in the ledger. Each aux client is built fresh per
+    # call, so reading the concurrency-safe session contextvar here is always
+    # current (no stale cross-session reuse). Gate on the ``zettlab:`` prefix so
+    # the billing headers never leak to a third-party provider.
+    try:
+        from gateway.session_context import get_session_env
+        session_id = get_session_env("HERMES_SESSION_ID", "")
+    except Exception:
+        session_id = ""
+    if isinstance(session_id, str) and session_id.startswith("zettlab:"):
+        merged.setdefault("X-Task-Id", session_id)
+        merged.setdefault("X-Scene-Type", "agent")
     return merged or headers
 
 
