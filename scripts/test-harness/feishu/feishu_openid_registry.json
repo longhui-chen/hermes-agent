@@ -5,7 +5,7 @@
     "people_count": 58,
     "legacy_only_count": 28,
     "at_by_github_count": 27,
-    "at_by_github_active_count": 12,
+    "at_by_github_active_count": 26,
     "regenerate": "python3 scripts/test-harness/feishu/build_registry.py",
     "active_app_id": "cli_a97acaec84389cc0",
     "active_app_note": "at_by_github_active = 应用机器人 cli_a97 维度的 GitHub login->open_id，供 linearb-feishu-report（应用机器人/话题模式）@作者使用。旧 at_by_github 为 webhook 维度，仅旧流程兜底。"
@@ -740,17 +740,31 @@
     "zxd-zettlab": "ou_f268f83c107b29d6b5b9c6867090d44e"
   },
   "at_by_github_active": {
-    "Adrien9210": "ou_6d03c09a25a54f584da53a19a22b38d2",
-    "xiangweidong-zettlab": "ou_4b3f244e9e06f3124729c3f72cfaf20f",
-    "yoran-wu": "ou_06e34ba295a3eaf78c0cc845f4ba8f80",
     "707367586": "ou_8de19982853903b1d1b044de3c9bd5ff",
-    "liao3841054": "ou_2f809fbbfd7d1e51ad6ab412deaf391d",
-    "xuyunlong698": "ou_c1e281a4d7ce171472a162badaa4d434",
-    "jiafu0": "ou_486e2f5a5491be65acfa225380260e2a",
-    "hongxin-zettlab": "ou_ca32f58f689c4e697d8e09096c3c06ec",
+    "Adrien9210": "ou_6d03c09a25a54f584da53a19a22b38d2",
+    "Sivan-wycx": "ou_4b51dd8c8addbd8441375b7c73859b68",
+    "Thomas0x1f": "ou_40424262c2a099259254fb3428d0fa50",
+    "fguizc": "ou_e398270bf0056ecb52bbb03018d416a4",
     "gezhengbin888": "ou_d3d88d0643dbc48a0ba7dfa93406e623",
+    "hongxin-zettlab": "ou_ca32f58f689c4e697d8e09096c3c06ec",
+    "iwgyyyy": "ou_591631c7bbbea0fa3119cc2bff0852fd",
+    "jiadalin": "ou_ee4f4461b8fe293623da43e835c4d19c",
+    "jiafu0": "ou_486e2f5a5491be65acfa225380260e2a",
+    "liao3841054": "ou_2f809fbbfd7d1e51ad6ab412deaf391d",
+    "maohan1013": "ou_a00a28193941b7bd04d3d486fe51b0af",
+    "noahgwok": "ou_27d9bb8c5814f5dff8b7b56151da05e7",
+    "setLylToxlx": "ou_96d0ff5aabdce0dc8e0f8ca1423fa6e7",
+    "weihengling": "ou_f59307db5f275244585eed9b2965d688",
     "x1cai": "ou_2581c54fa4e912ad970b7eb3ae420d7e",
+    "xiangweidong-zettlab": "ou_4b3f244e9e06f3124729c3f72cfaf20f",
     "xlaya": "ou_abfb779416d275e0985894423128f925",
-    "zett-jay": "ou_ce2fda1bce9f063f03d61669e055d42f"
+    "xuyunlong698": "ou_c1e281a4d7ce171472a162badaa4d434",
+    "yoran-wu": "ou_06e34ba295a3eaf78c0cc845f4ba8f80",
+    "zett-jay": "ou_ce2fda1bce9f063f03d61669e055d42f",
+    "zettlab-dengjie": "ou_ee90672addd2b2f5f6cd9bb15f477581",
+    "zettlab-penggang": "ou_b4255723a4013c7ffd7f22840f2c2f7d",
+    "zettlab-yangheng": "ou_b86cc255c6ea9c647ac45c005622a9e8",
+    "zettlab-zlw": "ou_dd7bff2a849f5f654fdab5987ffe1385",
+    "zxd-zettlab": "ou_e6ebfee296bae85ee687bebf28d58da3"
   }
 }
