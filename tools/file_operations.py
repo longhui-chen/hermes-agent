@@ -30,6 +30,7 @@ import re
 import json
 import urllib.request
 from urllib.parse import urlsplit, urlunsplit
+from contextvars import ContextVar
 import difflib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -723,6 +724,27 @@ def normalize_search_pagination(offset: Any = DEFAULT_SEARCH_OFFSET,
     normalized_offset = max(0, _coerce_int(offset, DEFAULT_SEARCH_OFFSET))
     normalized_limit = max(1, _coerce_int(limit, DEFAULT_SEARCH_LIMIT))
     return normalized_offset, normalized_limit
+
+
+# Per-turn correlation token (zettlab local-server's request-body metadata.turn_id),
+# echoed back as the X-Zettlab-Turn-Id header on NAS agent-search fallbacks so
+# local-server pins the result card to THIS turn (ByTurnIDForAgent) instead of
+# guessing the agent's newest turn (ActiveByAgent). Scoped to this feature — one
+# writer (the api_server handler, via set_zettlab_turn_id) and one reader
+# (_zettlab_nas_fallback) — so it stays here rather than becoming a first-class
+# session var. Context-local: an os.environ copy would be process-global and
+# reintroduce the very concurrent-same-agent-turn race the turn pinning fixes.
+_ZETTLAB_TURN_ID: ContextVar = ContextVar("zettlab_nas_turn_id", default="")
+
+
+def set_zettlab_turn_id(turn_id: str) -> None:
+    """Set (or clear, with "") the current turn's NAS correlation token.
+
+    Called by the api_server handler inside its run-in-executor thread, and
+    cleared to "" in the same finally as the other session context — so a
+    reused pool thread never leaks a prior turn's id into a turn that had none.
+    """
+    _ZETTLAB_TURN_ID.set(turn_id or "")
 
 
 class ShellFileOperations(FileOperations):
@@ -1931,7 +1953,12 @@ class ShellFileOperations(FileOperations):
             pattern, path=path, target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context,
         )
-        if result.total_count == 0 and os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN"):
+        # Only fall back when the workspace search genuinely found nothing.
+        # An errored result (path not found, bad regex, rg/grep hard failure)
+        # also has total_count == 0, but routing it to NAS would mask the real
+        # error behind an unrelated NAS hit — surface the workspace error.
+        if (result.total_count == 0 and not result.error
+                and os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN")):
             nas = self._zettlab_nas_fallback(pattern, limit)
             if nas is not None and nas.total_count > 0:
                 return nas
@@ -1957,6 +1984,12 @@ class ShellFileOperations(FileOperations):
             return None
         return urlunsplit((parts.scheme, parts.netloc, "/api/v1/file/index/agent-search", "", ""))
 
+    @staticmethod
+    def _zettlab_turn_id() -> str:
+        """Current turn's correlation token (set via set_zettlab_turn_id from the
+        api_server handler's metadata.turn_id). "" when local-server sent none."""
+        return _ZETTLAB_TURN_ID.get().strip()
+
     def _zettlab_nas_fallback(self, pattern: str, limit: int) -> Optional[SearchResult]:
         """Query local-server NAS agent-search; returns None on any error.
 
@@ -1981,14 +2014,23 @@ class ShellFileOperations(FileOperations):
             "modes": ["name", "content"],
             "limit": min(max(int(limit or 50), 1), 200),
         }).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "X-Zettlab-Agent-Action-Token": token,
+        }
+        # Echo back the turn local-server tagged this completion with (request
+        # body metadata.turn_id, plumbed onto the session context). local-server
+        # pins the result card to this exact turn (ByTurnIDForAgent); absent it,
+        # it guesses the agent's newest turn (ActiveByAgent), which races with
+        # concurrent same-agent turns. Empty when local-server didn't send one.
+        turn_id = self._zettlab_turn_id()
+        if turn_id:
+            headers["X-Zettlab-Turn-Id"] = turn_id
         req = urllib.request.Request(
             url,
             data=body,
             method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "X-Zettlab-Agent-Action-Token": token,
-            },
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:

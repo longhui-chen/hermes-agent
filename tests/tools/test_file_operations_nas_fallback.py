@@ -90,6 +90,46 @@ def test_fallback_success_returns_note_not_files(monkeypatch, file_ops):
     assert captured["timeout"] == 10
 
 
+# --- turn_id header (D1) -----------------------------------------------------
+
+def test_fallback_sends_turn_id_header_when_present(monkeypatch, file_ops):
+    _zettlab_env(monkeypatch)
+    from tools.file_operations import set_zettlab_turn_id
+
+    captured = {}
+    payload = {"data": {"items": [{"path": "/nas/a.pdf"}], "total_count": 1}}
+    # The api_server handler pins this turn's metadata.turn_id onto the feature
+    # contextvar; the fallback must echo it back as X-Zettlab-Turn-Id so
+    # local-server injects the card into THIS exact turn (ByTurnIDForAgent).
+    set_zettlab_turn_id("t_abc-123")
+    try:
+        with patch("urllib.request.urlopen", _fake_urlopen(payload, captured)):
+            result = file_ops._zettlab_nas_fallback("report", 50)
+    finally:
+        set_zettlab_turn_id("")
+
+    assert result is not None
+    # urllib.request.Request stores header names .capitalize()-folded.
+    assert captured["req"].headers.get("X-zettlab-turn-id") == "t_abc-123"
+
+
+def test_fallback_omits_turn_id_header_when_absent(monkeypatch, file_ops):
+    _zettlab_env(monkeypatch)
+    from tools.file_operations import set_zettlab_turn_id
+
+    captured = {}
+    payload = {"data": {"items": [{"path": "/nas/a.pdf"}], "total_count": 1}}
+    # No turn_id this turn (local-server sent none): header absent, not empty.
+    set_zettlab_turn_id("")
+    try:
+        with patch("urllib.request.urlopen", _fake_urlopen(payload, captured)):
+            file_ops._zettlab_nas_fallback("report", 50)
+    finally:
+        set_zettlab_turn_id("")
+
+    assert "X-zettlab-turn-id" not in captured["req"].headers
+
+
 # --- empty ------------------------------------------------------------------
 
 def test_fallback_empty_items_returns_none(monkeypatch, file_ops):
@@ -171,3 +211,16 @@ def test_search_returns_empty_when_fallback_none(monkeypatch, file_ops):
          patch.object(file_ops, "_zettlab_nas_fallback", return_value=None):
         out = file_ops.search("x")
     assert out is empty  # graceful: valid empty search, not an error
+
+
+def test_search_skips_fallback_on_workspace_error(monkeypatch, file_ops):
+    # D2: an errored workspace search (path not found, bad regex, rg/grep hard
+    # failure) also has total_count == 0, but must surface the error — not be
+    # masked by an unrelated NAS hit.
+    _zettlab_env(monkeypatch)
+    errored = SearchResult(error="Path not found: /missing", total_count=0)
+    with patch.object(file_ops, "_search_workspace", return_value=errored), \
+         patch.object(file_ops, "_zettlab_nas_fallback") as fb:
+        out = file_ops.search("x", path="/missing")
+    assert out is errored
+    fb.assert_not_called()
