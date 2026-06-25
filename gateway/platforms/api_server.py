@@ -4079,7 +4079,10 @@ class APIServerAdapter(BasePlatformAdapter):
             finally:
                 clear_session_vars(tokens)
 
-        return await loop.run_in_executor(None, _run)
+        from contextvars import copy_context
+
+        ctx = copy_context()
+        return await loop.run_in_executor(None, ctx.run, _run)
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming

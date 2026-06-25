@@ -138,6 +138,41 @@ async def test_prefixed_chat_hits_handler_inside_profile_scope(profile_homes, mo
 
 
 @pytest.mark.asyncio
+async def test_prefixed_chat_scope_reaches_agent_executor(profile_homes, monkeypatch):
+    """The agent is created in an executor thread, so profile context must cross it."""
+    seen = []
+    adapter = _make_adapter()
+
+    class FakeAgent:
+        session_prompt_tokens = 1
+        session_completion_tokens = 1
+        session_total_tokens = 2
+        session_id = "sid"
+
+        def run_conversation(self, **_kwargs):
+            return {"final_response": "ok", "completed": True}
+
+    def fake_create_agent(**_kwargs):
+        from hermes_constants import get_hermes_home
+
+        seen.append(get_hermes_home())
+        return FakeAgent()
+
+    monkeypatch.setattr(adapter, "_create_agent", fake_create_agent)
+
+    with adapter._profile_api_scope("coder"):
+        result, usage = await adapter._run_agent(
+            user_message="hello",
+            conversation_history=[],
+            session_id="sid",
+        )
+
+    assert result["final_response"] == "ok"
+    assert usage["total_tokens"] == 2
+    assert seen == [profile_homes["coder"]]
+
+
+@pytest.mark.asyncio
 async def test_prefixed_model_switch_writes_scoped_profile_config(profile_homes):
     for home in profile_homes.values():
         (home / "config.yaml").write_text(
