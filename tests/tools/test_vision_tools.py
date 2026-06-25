@@ -682,6 +682,37 @@ class TestBase64SizeLimit:
 
         assert result["success"] is True
 
+    @pytest.mark.asyncio
+    async def test_runtime_vision_config_controls_timeout_and_temperature(self, tmp_path):
+        """Session-scoped auxiliary.vision config should affect the LLM call."""
+        from agent import auxiliary_client as aux
+
+        img = tmp_path / "small.png"
+        img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+
+        mock_response = MagicMock()
+        mock_choice = MagicMock()
+        mock_choice.message.content = "Small image"
+        mock_response.choices = [mock_choice]
+
+        aux.clear_runtime_main()
+        try:
+            aux.set_runtime_auxiliary_task_configs(
+                {"vision": {"timeout": 222, "temperature": 0.3}}
+            )
+            with patch(
+                "tools.vision_tools.async_call_llm",
+                new_callable=AsyncMock,
+                return_value=mock_response,
+            ) as mock_llm:
+                result = json.loads(await vision_analyze_tool(str(img), "describe this"))
+        finally:
+            aux.clear_runtime_main()
+
+        assert result["success"] is True
+        assert mock_llm.await_args.kwargs["timeout"] == 222
+        assert mock_llm.await_args.kwargs["temperature"] == 0.3
+
 
 # ---------------------------------------------------------------------------
 # Error classification for 400 responses

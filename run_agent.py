@@ -4517,6 +4517,9 @@ class AIAgent:
         Custom/local models absent from models.dev would otherwise be
         misclassified as non-vision and have their images stripped.
         """
+        runtime_override = getattr(self, "runtime_supports_vision", None)
+        if isinstance(runtime_override, bool):
+            return runtime_override
         try:
             from hermes_cli.config import load_config
             from agent.image_routing import _lookup_supports_vision
