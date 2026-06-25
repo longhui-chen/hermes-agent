@@ -1746,7 +1746,9 @@ def _try_resolve_fallback_provider() -> dict | None:
     from hermes_cli.runtime_provider import resolve_runtime_provider
     try:
         import yaml as _y
-        cfg_path = _hermes_home / "config.yaml"
+        from hermes_constants import get_hermes_home_override
+        override_home = get_hermes_home_override()
+        cfg_path = ((Path(override_home) if override_home else _hermes_home) / "config.yaml")
         if not cfg_path.exists():
             return None
         with open(cfg_path, encoding="utf-8") as _f:
@@ -2075,7 +2077,12 @@ def _load_gateway_config() -> dict:
     gateway honors administrator-pinned values — neither read_raw_config nor a
     direct yaml.safe_load carries the managed merge on its own. Fail-open.
     """
-    config_path = _hermes_home / 'config.yaml'
+    try:
+        from hermes_constants import get_hermes_home_override
+        override_home = get_hermes_home_override()
+    except Exception:
+        override_home = None
+    config_path = (Path(override_home) if override_home else _hermes_home) / 'config.yaml'
     raw: dict = {}
     used_canonical = False
     try:

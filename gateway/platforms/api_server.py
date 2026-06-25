@@ -42,8 +42,9 @@ import re
 import sqlite3
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 try:
     from aiohttp import web
@@ -1007,7 +1008,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
-        self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        # Lazy-init SessionDB for session continuity.  In multiplex mode this
+        # is keyed by the scoped HERMES_HOME so profiles never share state.db.
+        self._session_db: Optional[Any] = None
+        self._session_dbs: Dict[str, Any] = {}
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -1231,6 +1235,26 @@ class APIServerAdapter(BasePlatformAdapter):
         Sessions are persisted to ``state.db`` so that ``hermes sessions list``
         shows API-server conversations alongside CLI and gateway ones.
         """
+        try:
+            from hermes_constants import get_hermes_home
+            scoped_home = str(get_hermes_home().resolve())
+        except Exception:
+            scoped_home = ""
+
+        if scoped_home:
+            existing = self._session_dbs.get(scoped_home)
+            if existing is not None:
+                return existing
+            try:
+                from hermes_state import SessionDB
+                db = SessionDB()
+                self._session_dbs[scoped_home] = db
+                if self._session_db is None:
+                    self._session_db = db
+                return db
+            except Exception as e:
+                logger.debug("SessionDB unavailable for API server: %s", e)
+
         if self._session_db is None:
             try:
                 from hermes_state import SessionDB
@@ -1238,6 +1262,81 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("SessionDB unavailable for API server: %s", e)
         return self._session_db
+
+    @staticmethod
+    def _multiplex_profile_homes() -> Dict[str, Path]:
+        """Return valid `/p/{profile}` targets keyed by URL profile name."""
+        try:
+            from hermes_cli.profiles import profiles_to_serve
+            homes = {name: Path(home) for name, home in profiles_to_serve(multiplex=True)}
+            if "default" in homes:
+                homes.setdefault("main", homes["default"])
+            return homes
+        except Exception:
+            return {}
+
+    @contextmanager
+    def _profile_api_scope(self, profile: str):
+        """Scope one HTTP handler to a profile HERMES_HOME."""
+        homes = self._multiplex_profile_homes()
+        profile_home = homes.get((profile or "").strip())
+        if profile_home is None:
+            raise web.HTTPNotFound(
+                text=json.dumps({"error": f"Unknown profile: {profile}"}),
+                content_type="application/json",
+            )
+
+        try:
+            from gateway.run import _profile_runtime_scope
+        except Exception:
+            _profile_runtime_scope = None
+
+        if _profile_runtime_scope is not None:
+            with _profile_runtime_scope(profile_home):
+                yield profile_home
+            return
+
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        token = set_hermes_home_override(str(profile_home))
+        try:
+            yield profile_home
+        finally:
+            reset_hermes_home_override(token)
+
+    def _profile_handler(
+        self,
+        handler: Callable[["web.Request"], Awaitable["web.Response"]],
+    ) -> Callable[["web.Request"], Awaitable["web.Response"]]:
+        """Wrap an existing route handler so `/p/{profile}` changes runtime scope."""
+        async def _wrapped(request: "web.Request") -> "web.Response":
+            profile = request.match_info.get("profile", "")
+            with self._profile_api_scope(profile) as profile_home:
+                request["hermes_profile"] = profile
+                request["hermes_profile_home"] = str(profile_home)
+                return await handler(request)
+
+        return _wrapped
+
+    def _register_profile_api_routes(
+        self,
+        router: "web.UrlDispatcher",
+        *,
+        chat_handler: Optional[Callable[["web.Request"], Awaitable["web.Response"]]] = None,
+    ) -> None:
+        """Register `/p/{profile}` mirrors for local-server multiplex mode."""
+        chat = chat_handler or self._handle_chat_completions
+        router.add_get("/p/{profile}/health", self._profile_handler(self._handle_health))
+        router.add_get("/p/{profile}/v1/health", self._profile_handler(self._handle_health))
+        router.add_post("/p/{profile}/v1/chat/completions", self._profile_handler(chat))
+
+        router.add_get("/p/{profile}/api/jobs", self._profile_handler(self._handle_list_jobs))
+        router.add_post("/p/{profile}/api/jobs", self._profile_handler(self._handle_create_job))
+        router.add_get("/p/{profile}/api/jobs/{job_id}", self._profile_handler(self._handle_get_job))
+        router.add_patch("/p/{profile}/api/jobs/{job_id}", self._profile_handler(self._handle_update_job))
+        router.add_delete("/p/{profile}/api/jobs/{job_id}", self._profile_handler(self._handle_delete_job))
+        router.add_post("/p/{profile}/api/jobs/{job_id}/pause", self._profile_handler(self._handle_pause_job))
+        router.add_post("/p/{profile}/api/jobs/{job_id}/resume", self._profile_handler(self._handle_resume_job))
+        router.add_post("/p/{profile}/api/jobs/{job_id}/run", self._profile_handler(self._handle_run_job))
 
     # ------------------------------------------------------------------
     # Agent creation helper
@@ -4619,6 +4718,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
             self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+            self._register_profile_api_routes(self._app.router)
 
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated by a
             # NAS-minted JWT (NOT API_SERVER_KEY), so it has its own auth path.
