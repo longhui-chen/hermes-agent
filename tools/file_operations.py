@@ -27,6 +27,8 @@ Usage:
 
 import os
 import re
+import json
+import urllib.request
 import difflib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -1862,6 +1864,61 @@ class ShellFileOperations(FileOperations):
     # =========================================================================
     
     def search(self, pattern: str, path: str = ".", target: str = "content",
+               file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
+               output_mode: str = "content", context: int = 0) -> SearchResult:
+        """Search workspace; on Zettlab devices fall back to NAS agent-search when empty."""
+        result = self._search_workspace(
+            pattern, path=path, target=target, file_glob=file_glob,
+            limit=limit, offset=offset, output_mode=output_mode, context=context,
+        )
+        if result.total_count == 0 and os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN"):
+            nas = self._zettlab_nas_fallback(pattern, limit)
+            if nas is not None and nas.total_count > 0:
+                return nas
+        return result
+
+    def _zettlab_nas_fallback(self, pattern: str, limit: int) -> Optional[SearchResult]:
+        """Query local-server NAS agent-search; returns None on any error."""
+        token = os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN")
+        query = (pattern or "").strip()
+        if not token or not query:
+            return None
+        base = os.environ.get("ZETTLAB_LOCAL_SERVER_URL", "http://127.0.0.1:9090").rstrip("/")
+        body = json.dumps({
+            "q": query,
+            "modes": ["name", "content", "semantic"],
+            "limit": min(max(int(limit or 50), 1), 200),
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            base + "/api/v1/file/index/agent-search",
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Zettlab-Agent-Action-Token": token,
+            },
+        )
+        # 45s: cold c-engine 首次调用约 30s（热调用 ~1-2s）。
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            return None
+        data = payload.get("data") or {}
+        files = [
+            it.get("path") or it.get("filename")
+            for it in (data.get("items") or [])
+            if it.get("path") or it.get("filename")
+        ]
+        if not files:
+            return None
+        return SearchResult(
+            files=files,
+            total_count=int(data.get("total_count") or len(files)),
+            truncated=bool(data.get("truncated")),
+        )
+
+    def _search_workspace(self, pattern: str, path: str = ".", target: str = "content",
                file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
                output_mode: str = "content", context: int = 0) -> SearchResult:
         """
