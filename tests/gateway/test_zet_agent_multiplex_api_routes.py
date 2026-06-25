@@ -1,5 +1,6 @@
 """Phase 1: zet_agent `/p/<profile>` API routes for local-server mux mode."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -238,6 +239,63 @@ async def test_prefixed_jobs_use_scoped_profile_home(profile_homes, monkeypatch)
         (profile_homes["main"], True),
         (profile_homes["coder"], False),
     ]
+
+
+@pytest.mark.asyncio
+async def test_prefixed_jobs_read_scoped_cron_store(profile_homes, monkeypatch):
+    import cron.jobs as cron_jobs
+    import gateway.platforms.api_server as api_server
+
+    def write_jobs(home: Path, job_id: str, name: str) -> None:
+        cron_dir = home / "cron"
+        cron_dir.mkdir(parents=True, exist_ok=True)
+        (cron_dir / "jobs.json").write_text(
+            json.dumps(
+                {
+                    "jobs": [
+                        {
+                            "id": job_id,
+                            "name": name,
+                            "prompt": "ping",
+                            "enabled": True,
+                            "schedule": {
+                                "kind": "interval",
+                                "minutes": 10,
+                                "display": "every 10m",
+                            },
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    write_jobs(profile_homes["main"], "main-job", "main job")
+    write_jobs(profile_homes["coder"], "coder-job", "coder job")
+
+    monkeypatch.setattr(api_server, "_CRON_AVAILABLE", True)
+    monkeypatch.setattr(api_server, "_cron_list", cron_jobs.list_jobs)
+
+    adapter = _make_adapter()
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        main_resp = await cli.get(
+            "/p/main/api/jobs?include_disabled=true",
+            headers={"Authorization": "Bearer test-key"},
+        )
+        coder_resp = await cli.get(
+            "/p/coder/api/jobs?include_disabled=true",
+            headers={"Authorization": "Bearer test-key"},
+        )
+        main_data = await main_resp.json()
+        coder_data = await coder_resp.json()
+
+    assert main_resp.status == 200
+    assert coder_resp.status == 200
+    assert [job["id"] for job in main_data["jobs"]] == ["main-job"]
+    assert [job["id"] for job in coder_data["jobs"]] == ["coder-job"]
 
 
 @pytest.mark.asyncio

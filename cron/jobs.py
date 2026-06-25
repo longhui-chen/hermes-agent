@@ -84,9 +84,21 @@ OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
 
+def _cron_dir() -> Path:
+    return get_hermes_home().resolve() / "cron"
+
+
+def _jobs_file() -> Path:
+    return _cron_dir() / "jobs.json"
+
+
+def _output_dir() -> Path:
+    return _cron_dir() / "output"
+
+
 def _jobs_lock_file() -> Path:
     """Return the advisory lock path for the current cron directory."""
-    return CRON_DIR / ".jobs.lock"
+    return _cron_dir() / ".jobs.lock"
 
 
 @contextlib.contextmanager
@@ -171,7 +183,7 @@ def _job_output_dir(job_id: str) -> Path:
         raise ValueError(f"Invalid cron job id for output path: {job_id!r}")
     if Path(text).is_absolute() or Path(text).drive:
         raise ValueError(f"Invalid cron job id for output path: {job_id!r}")
-    return OUTPUT_DIR / text
+    return _output_dir() / text
 
 
 def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
@@ -278,10 +290,12 @@ def _secure_file(path: Path):
 
 def ensure_dirs():
     """Ensure cron directories exist with secure permissions."""
-    CRON_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    _secure_dir(CRON_DIR)
-    _secure_dir(OUTPUT_DIR)
+    cron_dir = _cron_dir()
+    output_dir = _output_dir()
+    cron_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _secure_dir(cron_dir)
+    _secure_dir(output_dir)
 
 
 # =============================================================================
@@ -582,19 +596,20 @@ def compute_next_run(
 def load_jobs() -> List[Dict[str, Any]]:
     """Load all jobs from storage."""
     ensure_dirs()
-    if not JOBS_FILE.exists():
+    jobs_file = _jobs_file()
+    if not jobs_file.exists():
         return []
 
     _strict_retry = False  # track whether we used the strict=False fallback
 
     try:
-        with open(JOBS_FILE, 'r', encoding='utf-8') as f:
+        with open(jobs_file, 'r', encoding='utf-8') as f:
             data = json.load(f)
     except json.JSONDecodeError:
         # Retry with strict=False to handle bare control chars in string values
         _strict_retry = True
         try:
-            with open(JOBS_FILE, 'r', encoding='utf-8') as f:
+            with open(jobs_file, 'r', encoding='utf-8') as f:
                 data = json.loads(f.read(), strict=False)
         except Exception as e:
             logger.error("Failed to auto-repair jobs.json: %s", e)
@@ -630,14 +645,15 @@ def load_jobs() -> List[Dict[str, Any]]:
 def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage. Caller must hold _jobs_lock()."""
     ensure_dirs()
-    fd, tmp_path = tempfile.mkstemp(dir=str(JOBS_FILE.parent), suffix='.tmp', prefix='.jobs_')
+    jobs_file = _jobs_file()
+    fd, tmp_path = tempfile.mkstemp(dir=str(jobs_file.parent), suffix='.tmp', prefix='.jobs_')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump({"jobs": jobs, "updated_at": _hermes_now().isoformat()}, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        atomic_replace(tmp_path, JOBS_FILE)
-        _secure_file(JOBS_FILE)
+        atomic_replace(tmp_path, jobs_file)
+        _secure_file(jobs_file)
     except BaseException:
         try:
             os.unlink(tmp_path)
