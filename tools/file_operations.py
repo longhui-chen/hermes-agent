@@ -29,6 +29,7 @@ import os
 import re
 import json
 import urllib.request
+from urllib.parse import urlsplit, urlunsplit
 import difflib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -244,7 +245,8 @@ class SearchResult:
     total_count: int = 0
     truncated: bool = False
     error: Optional[str] = None
-    
+    note: Optional[str] = None
+
     def to_dict(self) -> dict:
         result = {"total_count": self.total_count}
         if self.matches:
@@ -260,6 +262,8 @@ class SearchResult:
             result["truncated"] = True
         if self.error:
             result["error"] = self.error
+        if self.note:
+            result["note"] = self.note
         return result
 
 
@@ -1877,20 +1881,52 @@ class ShellFileOperations(FileOperations):
                 return nas
         return result
 
+    @staticmethod
+    def _zettlab_agent_search_url() -> Optional[str]:
+        """Derive the NAS agent-search endpoint from ZET_CHAT_APPEND_URL.
+
+        ZET_CHAT_APPEND_URL is injected by the registry and points at the
+        loopback local-server (<base>/api/v1/internal/chat/append). We reuse its
+        scheme+netloc and swap the path — same primitive as list_my_channels /
+        send_channel_message. Deriving from the registry-injected URL (instead of
+        a standalone ZETTLAB_LOCAL_SERVER_URL env) keeps the per-agent action
+        token loopback-only: a stale/hostile env can no longer redirect it to an
+        external host. Returns None when the env var is absent or malformed.
+        """
+        raw = os.environ.get("ZET_CHAT_APPEND_URL", "").strip()
+        if not raw:
+            return None
+        parts = urlsplit(raw)
+        if not parts.scheme or not parts.netloc:
+            return None
+        return urlunsplit((parts.scheme, parts.netloc, "/api/v1/file/index/agent-search", "", ""))
+
     def _zettlab_nas_fallback(self, pattern: str, limit: int) -> Optional[SearchResult]:
-        """Query local-server NAS agent-search; returns None on any error."""
+        """Query local-server NAS agent-search; returns None on any error.
+
+        On a hit, local-server injects the matches as preview cards into this
+        agent's current chat turn (rendered in App/Web). The tool therefore
+        returns only a count + a note — never the raw file list: the paths are
+        filename/semantic-level hits (no line numbers / content), so listing them
+        would (a) be misread as content matches and (b) duplicate the cards the
+        user already sees.
+        """
         token = os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN")
         query = (pattern or "").strip()
-        if not token or not query:
+        url = self._zettlab_agent_search_url()
+        if not token or not query or not url:
             return None
-        base = os.environ.get("ZETTLAB_LOCAL_SERVER_URL", "http://127.0.0.1:9090").rstrip("/")
+        # Default to name+content only (matches local-server's own default).
+        # Semantic is opt-in: forcing it here would drag every empty-workspace
+        # search behind the c-engine cold start (~30s) instead of returning the
+        # fast FTS hits.
         body = json.dumps({
             "q": query,
-            "modes": ["name", "content", "semantic"],
+            "modes": ["name", "content"],
             "limit": min(max(int(limit or 50), 1), 200),
         }).encode("utf-8")
         req = urllib.request.Request(
-            base + "/api/v1/file/index/agent-search",
+            url,
             data=body,
             method="POST",
             headers={
@@ -1898,24 +1934,33 @@ class ShellFileOperations(FileOperations):
                 "X-Zettlab-Agent-Action-Token": token,
             },
         )
-        # 45s: cold c-engine 首次调用约 30s（热调用 ~1-2s）。
         try:
-            with urllib.request.urlopen(req, timeout=45) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
+            # Parse inside the try so any malformed reply (non-dict payload,
+            # non-dict items, non-numeric total_count) degrades to None rather
+            # than turning a valid empty search into a tool error.
+            if not isinstance(payload, dict):
+                return None
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                return None
+            hits = sum(
+                1 for it in (data.get("items") or [])
+                if isinstance(it, dict) and (it.get("path") or it.get("filename"))
+            )
+            if not hits:
+                return None
+            total = int(data.get("total_count") or hits)
         except Exception:
             return None
-        data = payload.get("data") or {}
-        files = [
-            it.get("path") or it.get("filename")
-            for it in (data.get("items") or [])
-            if it.get("path") or it.get("filename")
-        ]
-        if not files:
-            return None
         return SearchResult(
-            files=files,
-            total_count=int(data.get("total_count") or len(files)),
-            truncated=bool(data.get("truncated")),
+            total_count=total,
+            note=(
+                f"{hits} NAS file(s) matched and were rendered as preview cards in "
+                "the chat — the user already sees them. Do not list, repeat, or "
+                "describe these results; just continue with the user's request."
+            ),
         )
 
     def _search_workspace(self, pattern: str, path: str = ".", target: str = "content",
