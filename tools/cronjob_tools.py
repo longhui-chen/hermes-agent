@@ -33,6 +33,16 @@ from cron.jobs import (
 )
 
 
+def _notify_provider_jobs_changed_safe() -> None:
+    """Tell the active cron scheduler provider the job set changed (no-op for
+    the built-in). Best-effort — never lets a provider error break the tool."""
+    try:
+        from cron.scheduler import _notify_provider_jobs_changed
+        _notify_provider_jobs_changed()
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Cron prompt scanning
 # ---------------------------------------------------------------------------
@@ -307,15 +317,23 @@ def _resolve_model_override(model_obj: Optional[Dict[str, Any]]) -> tuple:
         return (None, None)
     model_name = (model_obj.get("model") or "").strip() or None
     provider_name = (model_obj.get("provider") or "").strip() or None
-    # Bare "custom" is an incomplete spec — the canonical form is
-    # "custom:<name>" matching a custom_providers entry. LLMs frequently
+    # Bare "custom" is usually an incomplete spec — the canonical form is
+    # "custom:<name>" matching a custom_providers entry, and LLMs frequently
     # supply the bare type because the schema does not advertise the
-    # ":<name>" suffix, which used to bypass the pinning path below and
-    # leave the job stored with an unresolvable "custom" provider. Treat
-    # the bare value as "no provider supplied" so the current main
-    # provider gets pinned instead.
+    # ":<name>" suffix. It is only a problem when it can't resolve at runtime:
+    # a user may literally name a ``providers.custom`` (or custom_providers
+    # "custom") entry, in which case the job should keep ``provider="custom"``
+    # and run against that endpoint. Only when no such entry exists do we treat
+    # the bare value as "no provider supplied" and pin the current main
+    # provider below — otherwise pinning to ``model.provider`` (e.g. codex)
+    # silently hijacks a job that meant to use the configured custom endpoint.
     if provider_name == "custom":
-        provider_name = None
+        try:
+            from hermes_cli.runtime_provider import has_named_custom_provider
+            if not has_named_custom_provider("custom"):
+                provider_name = None
+        except Exception:
+            provider_name = None
     if model_name and not provider_name:
         # Pin to the current main provider so the job is stable
         try:
@@ -432,8 +450,6 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
-    if job.get("profile"):
-        result["profile"] = job["profile"]
     return result
 
 
@@ -456,7 +472,6 @@ def cronjob(
     context_from: Optional[Union[str, List[str]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
-    profile: Optional[str] = None,
     no_agent: Optional[bool] = None,
     timezone: Optional[str] = None,
     task_id: str = None,
@@ -524,10 +539,10 @@ def cronjob(
                 context_from=context_from,
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
-                profile=_normalize_optional_job_value(profile),
                 no_agent=_no_agent,
                 timezone=_normalize_optional_job_value(timezone),
             )
+            _notify_provider_jobs_changed_safe()
             return json.dumps(
                 {
                     "success": True,
@@ -583,6 +598,7 @@ def cronjob(
             removed = remove_job(job_id)
             if not removed:
                 return tool_error(f"Failed to remove job '{job_id}'", success=False)
+            _notify_provider_jobs_changed_safe()
             return json.dumps(
                 {
                     "success": True,
@@ -598,10 +614,12 @@ def cronjob(
 
         if normalized == "pause":
             updated = pause_job(job_id, reason=reason)
+            _notify_provider_jobs_changed_safe()
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         if normalized == "resume":
             updated = resume_job(job_id)
+            _notify_provider_jobs_changed_safe()
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         if normalized in {"run", "run_now", "trigger"}:
@@ -660,10 +678,6 @@ def cronjob(
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
                 updates["workdir"] = _normalize_optional_job_value(workdir) or None
-            if profile is not None:
-                # Empty string clears the field (restores old behaviour);
-                # otherwise pass raw — update_job() validates / normalizes.
-                updates["profile"] = _normalize_optional_job_value(profile) or None
             if no_agent is not None:
                 # Toggling no_agent on/off at update time. If flipping to True,
                 # we need a script to already exist on the job (or be part of
@@ -698,6 +712,7 @@ def cronjob(
             if not updates:
                 return tool_error("No updates provided.", success=False)
             updated = update_job(job_id, updates)
+            _notify_provider_jobs_changed_safe()
             return json.dumps({"success": True, "job": _format_job(updated)}, indent=2)
 
         return tool_error(f"Unknown cron action '{action}'", success=False)
@@ -935,7 +950,6 @@ registry.register(
         context_from=args.get("context_from"),
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
-        profile=args.get("profile"),
         no_agent=args.get("no_agent"),
         timezone=args.get("timezone"),
         task_id=kw.get("task_id"),

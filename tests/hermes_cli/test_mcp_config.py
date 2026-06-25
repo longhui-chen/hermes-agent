@@ -11,6 +11,14 @@ from pathlib import Path
 import pytest
 
 
+def _set_interactive_stdin(monkeypatch, *, is_tty: bool = True) -> None:
+    from unittest.mock import MagicMock
+
+    mock_stdin = MagicMock()
+    mock_stdin.isatty.return_value = is_tty
+    monkeypatch.setattr("tools.mcp_oauth.sys.stdin", mock_stdin)
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -653,6 +661,7 @@ class TestMcpRemoveEvictsManager:
             lambda cfg: cfg.setdefault("_resolved_port", 45123),
         )
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _set_interactive_stdin(monkeypatch)
 
         from tools.mcp_oauth_manager import get_manager, reset_manager_for_tests
         reset_manager_for_tests()

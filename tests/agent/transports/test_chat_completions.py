@@ -843,6 +843,130 @@ class TestChatCompletionsNormalize:
         nr = transport.normalize_response(r)
         assert nr.provider_data == {"reasoning_content": "model-extra scratchpad"}
 
+    def test_refusal_field_promoted_to_content_filter(self, transport):
+        """OpenAI-compatible proxies (e.g. Nous Portal fronting Anthropic) can
+        surface a Claude refusal via ``message.refusal`` with empty content and
+        ``finish_reason="stop"``. Promote it to content + a ``content_filter``
+        finish reason so the agent loop's refusal handler surfaces it instead
+        of retrying an empty response three times and giving up."""
+        r = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None, tool_calls=None, reasoning_content=None,
+                    refusal="I can't help with that.",
+                ),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
+        nr = transport.normalize_response(r)
+        assert nr.finish_reason == "content_filter"
+        assert nr.content == "I can't help with that."
+        assert nr.provider_data == {"refusal": "I can't help with that."}
+
+    def test_refusal_none_is_noop(self, transport):
+        """The common case: ``refusal`` is None → behavior unchanged."""
+        r = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content="hello", tool_calls=None, reasoning_content=None,
+                    refusal=None,
+                ),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
+        nr = transport.normalize_response(r)
+        assert nr.finish_reason == "stop"
+        assert nr.content == "hello"
+        assert nr.provider_data is None
+
+    def test_refusal_preserves_explicit_content_filter_finish_reason(self, transport):
+        """When the proxy already sets ``finish_reason="content_filter"`` and
+        also provides refusal text, surface the text without disturbing the
+        finish reason."""
+        r = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None, tool_calls=None, reasoning_content=None,
+                    refusal="declined",
+                ),
+                finish_reason="content_filter",
+            )],
+            usage=None,
+        )
+        nr = transport.normalize_response(r)
+        assert nr.finish_reason == "content_filter"
+        assert nr.content == "declined"
+        assert nr.provider_data == {"refusal": "declined"}
+
+    def test_explicit_content_filter_finish_reason_passes_through(self, transport):
+        """OpenRouter (and other OpenAI-compatible providers) surface an
+        upstream Claude / moderation refusal as ``finish_reason="content_filter"``
+        — often with empty content and no ``message.refusal`` field. The
+        transport must pass that finish reason straight through so the loop's
+        content_filter refusal handler fires; no ``message.refusal`` required.
+        This is the OpenRouter coverage path (OpenRouter uses the default
+        chat_completions transport)."""
+        r = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None, tool_calls=None, reasoning_content=None,
+                    refusal=None,
+                ),
+                finish_reason="content_filter",
+            )],
+            usage=None,
+        )
+        nr = transport.normalize_response(r)
+        assert nr.finish_reason == "content_filter"
+        assert nr.content is None
+
+    def test_refusal_does_not_clobber_existing_content(self, transport):
+        """If the model emitted real text *and* a refusal note, the turn is a
+        normal usable response: keep the visible text, record the refusal in
+        provider_data, and do NOT promote to a terminal content_filter (which
+        would discard the model's actual work by reframing it as a failure)."""
+        r = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content="partial answer", tool_calls=None,
+                    reasoning_content=None, refusal="cannot continue",
+                ),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
+        nr = transport.normalize_response(r)
+        assert nr.content == "partial answer"
+        assert nr.finish_reason == "stop"
+        assert nr.provider_data == {"refusal": "cannot continue"}
+
+    def test_refusal_with_tool_calls_is_not_promoted(self, transport):
+        """A response that carries tool calls alongside a refusal note is a
+        usable tool turn — record the refusal but keep the tool calls and do
+        NOT terminate it as a content_filter refusal."""
+        tc = SimpleNamespace(
+            id="call_1", type="function",
+            function=SimpleNamespace(name="do_thing", arguments="{}"),
+        )
+        r = SimpleNamespace(
+            choices=[SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None, tool_calls=[tc],
+                    reasoning_content=None, refusal="cannot continue",
+                ),
+                finish_reason="tool_calls",
+            )],
+            usage=None,
+        )
+        nr = transport.normalize_response(r)
+        # Tool calls survive; finish reason is untouched; content not clobbered.
+        assert nr.tool_calls and nr.tool_calls[0].name == "do_thing"
+        assert nr.finish_reason == "tool_calls"
+        assert nr.content in (None, "")
+        assert nr.provider_data == {"refusal": "cannot continue"}
+
 
 class TestChatCompletionsCacheStats:
 
@@ -909,3 +1033,85 @@ class TestChatCompletionsGeminiNativeExtraBodyStrip:
         )
         eb = kw.get("extra_body")
         assert eb and "tags" in eb
+
+
+class TestChatCompletionsZettlabTaskHeaders:
+    """X-Task-Id / X-Scene-Type injection for zettlab credit-ledger task grouping."""
+
+    def test_zettlab_session_injects_task_headers(self, transport):
+        msgs = [{"role": "user", "content": "hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-4o",
+            messages=msgs,
+            timeout=30.0,
+            session_id="zettlab:u1:agent-a:abc123",
+        )
+        headers = kw.get("extra_headers") or {}
+        assert headers.get("X-Task-Id") == "zettlab:u1:agent-a:abc123"
+        assert headers.get("X-Scene-Type") == "agent"
+
+    def test_non_zettlab_session_omits_task_headers(self, transport):
+        msgs = [{"role": "user", "content": "hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-4o",
+            messages=msgs,
+            timeout=30.0,
+            session_id="local-session-123",
+        )
+        headers = kw.get("extra_headers") or {}
+        assert "X-Task-Id" not in headers
+
+    def test_missing_session_omits_task_headers(self, transport):
+        msgs = [{"role": "user", "content": "hi"}]
+        kw = transport.build_kwargs(model="gpt-4o", messages=msgs, timeout=30.0)
+        headers = kw.get("extra_headers") or {}
+        assert "X-Task-Id" not in headers
+
+    def test_cron_session_collapses_to_stable_job_task_id(self, transport):
+        # cron_<job>_<YYYYMMDD>_<HHMMSS> -> cron_<job> so all runs of a cron job
+        # aggregate into one credit-ledger task card.
+        msgs = [{"role": "user", "content": "hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-4o",
+            messages=msgs,
+            timeout=30.0,
+            session_id="cron_4b2628798006_20260624_104233",
+        )
+        headers = kw.get("extra_headers") or {}
+        assert headers.get("X-Task-Id") == "cron_4b2628798006"
+        assert headers.get("X-Scene-Type") == "agent"
+
+    def test_cron_session_stamps_encoded_job_title(self, transport):
+        # run_job sets HERMES_CRON_TASK_TITLE; it surfaces as a percent-encoded
+        # X-Task-Title so the ledger's cron card shows the real job name.
+        from urllib.parse import unquote
+
+        from gateway.session_context import _VAR_MAP
+
+        _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("站立提醒")
+        try:
+            kw = transport.build_kwargs(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "hi"}],
+                timeout=30.0,
+                session_id="cron_job1_20260624_104233",
+            )
+            headers = kw.get("extra_headers") or {}
+            assert headers.get("X-Task-Id") == "cron_job1"
+            assert unquote(headers.get("X-Task-Title", "")) == "站立提醒"
+        finally:
+            _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("")
+
+    def test_interactive_session_omits_task_title(self, transport):
+        # No cron title var -> X-Task-Title must not be stamped on conversations.
+        from gateway.session_context import _VAR_MAP
+
+        _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("")
+        kw = transport.build_kwargs(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": "hi"}],
+            timeout=30.0,
+            session_id="zettlab:u1:agent-a:abc123",
+        )
+        headers = kw.get("extra_headers") or {}
+        assert "X-Task-Title" not in headers

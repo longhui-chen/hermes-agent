@@ -1,5 +1,6 @@
 graft skills
 graft optional-skills
+graft optional-mcps
 graft locales
 include config/skill_seed_policy.json
 include config/seed_fallback_manifest.txt
