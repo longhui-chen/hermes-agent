@@ -8,6 +8,8 @@ HERMES_BIN="$HERMES_SRC/venv/bin/hermes"
 HERMES_PYTHON="$HERMES_SRC/venv/bin/python"
 HERMES_LINK="/usr/local/bin/hermes"
 
+source "$APP_ROOT/zpk-systemd.sh"
+
 echo "Installing hermes-agent from $APP_ROOT ..."
 
 if [ ! -f "$HERMES_SRC/pyproject.toml" ]; then
@@ -31,6 +33,9 @@ fi
 
 mkdir -p "$(dirname "$HERMES_LINK")"
 ln -sfn "$APP_BASE/current/bin/hermes" "$HERMES_LINK"
+
+"$APP_ROOT/prepare-mux-service.sh"
+install_systemd_services "$APP_ROOT"
 
 echo "Install complete."
 echo "  hermes: $APP_BASE/current/bin/hermes"
