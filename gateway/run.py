@@ -1313,14 +1313,13 @@ from contextlib import contextmanager as _contextmanager
 
 # Platforms that bind a host TCP port (HTTP/webhook listeners). In a profile
 # multiplexer the default profile owns the single shared listener and serves
-# every profile through the /p/<profile>/ URL prefix, so a SECONDARY profile
-# enabling one of these is always a misconfiguration: it would try to bind a
-# port already held by the default's listener. We hard-error on it rather than
-# silently dropping the adapter (see _start_one_profile_adapters).
+# every profile through the /p/<profile>/ URL prefix, so a secondary profile
+# must not bind one of these again.
 # Stored as platform .value strings since the Platform enum is imported below.
 _PORT_BINDING_PLATFORM_VALUES = frozenset({
     "webhook",
     "api_server",
+    "zet_agent",
     "msgraph_webhook",
     "feishu",
     "wecom_callback",
@@ -6898,21 +6897,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for platform, platform_config in profile_cfg.platforms.items():
             if not platform_config.enabled:
                 continue
-            # A secondary profile must NOT enable a port-binding platform: the
-            # default profile's listener already serves every profile via the
-            # /p/<profile>/ prefix, so a second bind can only collide. This is a
-            # config error, not a transient failure — fail fast and loud.
+            # A secondary profile must NOT bind a listener: the default
+            # profile's listener already serves every profile via /p/<profile>/.
+            # Skip here instead of aborting so existing profile configs remain
+            # compatible when multiplex mode is enabled.
             if platform.value in _PORT_BINDING_PLATFORM_VALUES:
-                raise MultiplexConfigError(
-                    f"Profile '{profile_name}' enables the port-binding platform "
-                    f"'{platform.value}', but gateway.multiplex_profiles is on. The "
-                    f"default profile owns the single shared HTTP listener and "
-                    f"serves every profile through the /p/{profile_name}/ URL "
-                    f"prefix — a secondary profile cannot bind its own port. "
-                    f"Remove platforms.{platform.value} from profile "
-                    f"'{profile_name}'s config.yaml (configure it only on the "
-                    f"default profile)."
+                logger.info(
+                    "Skipping port-binding platform %s for secondary profile %s "
+                    "(served by shared multiplex listener)",
+                    platform.value,
+                    profile_name,
                 )
+                continue
             with _profile_runtime_scope(profile_home):
                 adapter = self._create_adapter(platform, platform_config)
             if not adapter:
