@@ -821,6 +821,7 @@ class ZetAgentAdapter(APIServerAdapter):
         agent_ref=None,
         gateway_session_key: Optional[str] = None,
         response_mode: Optional[str] = None,
+        turn_id: Optional[str] = None,
     ):
         """Wrap base ``_run_agent`` to (1) push the auto-title before
         kicking off the agent thread and (2) bind the session-scoped env
@@ -903,6 +904,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 response_mode=response_mode,
+                turn_id=turn_id,
             )
         finally:
             if old_session_key is None:
