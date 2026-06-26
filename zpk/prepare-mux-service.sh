@@ -66,7 +66,12 @@ def indent_of(line: str) -> int:
 
 gateway_idx = None
 for i, line in enumerate(lines):
-    if line.strip() == "gateway:" and indent_of(line) == 0:
+    stripped = line.strip()
+    if stripped == "gateway:" and indent_of(line) == 0:
+        gateway_idx = i
+        break
+    if stripped in {"gateway: {}", "gateway: null"} and indent_of(line) == 0:
+        lines[i] = "gateway:\n"
         gateway_idx = i
         break
 
