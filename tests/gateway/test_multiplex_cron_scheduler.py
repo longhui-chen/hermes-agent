@@ -104,3 +104,41 @@ def test_running_job_key_is_profile_qualified(tmp_path, monkeypatch):
 
     assert key_a != key_b
     assert key_a[1] == key_b[1] == "same-job"
+
+
+def test_context_from_reads_active_profile_output_dir(tmp_path, monkeypatch):
+    from cron.scheduler import _build_job_prompt
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    default_home = tmp_path / "default"
+    profile_home = tmp_path / "profiles" / "worker"
+    source_job_id = "abcdef123456"
+    default_output = default_home / "cron" / "output" / source_job_id
+    profile_output = profile_home / "cron" / "output" / source_job_id
+    default_output.mkdir(parents=True)
+    profile_output.mkdir(parents=True)
+    (default_output / "2026-01-01_00-00-00.md").write_text(
+        "default output must not leak",
+        encoding="utf-8",
+    )
+    (profile_output / "2026-01-01_00-00-00.md").write_text(
+        "profile scoped output",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        prompt = _build_job_prompt(
+            {
+                "id": "feed00000000",
+                "name": "profile-job",
+                "prompt": "Summarize it",
+                "context_from": [source_job_id],
+            }
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    assert "profile scoped output" in prompt
+    assert "default output must not leak" not in prompt

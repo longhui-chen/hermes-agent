@@ -7574,12 +7574,19 @@ def _annotate_cron_job(job: Dict[str, Any], profile: str, home: Path) -> Dict[st
 def _cron_profile_scope(home: Path):
     """Scope cron helpers to one profile home without mutating module globals."""
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
 
-    token = set_hermes_home_override(str(home))
+    home_token = set_hermes_home_override(str(home))
+    secret_token = set_secret_scope(build_profile_secret_scope(Path(home)))
     try:
         yield
     finally:
-        reset_hermes_home_override(token)
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
 
 
 def _call_cron_for_profile(profile: Optional[str], func_name: str, *args, **kwargs):
