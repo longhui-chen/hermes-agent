@@ -17205,6 +17205,82 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     InProcessCronScheduler().start(stop_event, adapters=adapters, loop=loop, interval=interval)
 
 
+def _multiplex_cron_profiles() -> List[tuple[str, Path]]:
+    """Return profile homes that should run cron under gateway multiplexing.
+
+    The gateway still exposes `/p/default` for compatibility, but local-server
+    managed devices use a real `main` profile. When both exist, the root
+    default home is legacy/unscoped state and must not keep firing old jobs.
+    """
+    from hermes_cli.profiles import profiles_to_serve
+
+    profiles = list(profiles_to_serve(multiplex=True))
+    if any(name == "main" for name, _home in profiles):
+        profiles = [(name, home) for name, home in profiles if name != "default"]
+    return profiles
+
+
+def _run_profile_cron_scheduler(
+    stop_event: threading.Event,
+    profile_name: str,
+    profile_home: Path,
+    *,
+    adapters=None,
+    loop=None,
+) -> None:
+    """Run one cron scheduler under a profile's HERMES_HOME scope."""
+    try:
+        from cron.scheduler_provider import resolve_cron_scheduler
+
+        with _profile_runtime_scope(profile_home):
+            resolve_cron_scheduler().start(stop_event, adapters=adapters, loop=loop)
+    except Exception:
+        logger.exception("Profile cron scheduler failed for %s", profile_name)
+
+
+def _start_gateway_cron_schedulers(
+    runner: "GatewayRunner",
+    stop_event: threading.Event,
+    *,
+    loop=None,
+) -> List[threading.Thread]:
+    """Start cron scheduler thread(s) for the gateway runtime."""
+    if not getattr(runner.config, "multiplex_profiles", False):
+        from cron.scheduler_provider import resolve_cron_scheduler
+
+        cron_provider = resolve_cron_scheduler()
+        thread = threading.Thread(
+            target=cron_provider.start,
+            args=(stop_event,),
+            kwargs={"adapters": runner.adapters, "loop": loop},
+            daemon=True,
+            name="cron-scheduler",
+        )
+        thread.start()
+        return [thread]
+
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+    except Exception:
+        active = "default"
+    else:
+        active = get_active_profile_name() or "default"
+
+    threads: List[threading.Thread] = []
+    for profile_name, profile_home in _multiplex_cron_profiles():
+        adapters = runner.adapters if profile_name == active else runner._profile_adapters.get(profile_name, {})
+        thread = threading.Thread(
+            target=_run_profile_cron_scheduler,
+            args=(stop_event, profile_name, profile_home),
+            kwargs={"adapters": adapters, "loop": loop},
+            daemon=True,
+            name=f"cron-scheduler-{profile_name}",
+        )
+        thread.start()
+        threads.append(thread)
+    return threads
+
+
 async def start_gateway(
     config: Optional[GatewayConfig] = None,
     replace: bool = False,
@@ -17659,17 +17735,12 @@ async def start_gateway(
     # historical in-process 60s ticker; an external provider (e.g. chronos)
     # may arm a schedule and return. Pass the event loop so cron delivery can
     # use live adapters (E2EE support).
-    from cron.scheduler_provider import resolve_cron_scheduler
     cron_stop = threading.Event()
-    cron_provider = resolve_cron_scheduler()
-    cron_thread = threading.Thread(
-        target=cron_provider.start,
-        args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
-        daemon=True,
-        name="cron-scheduler",
+    cron_threads = _start_gateway_cron_schedulers(
+        runner,
+        cron_stop,
+        loop=asyncio.get_running_loop(),
     )
-    cron_thread.start()
 
     # Gateway-only periodic housekeeping (channel dir, cache cleanup, paste
     # sweep, curator) — runs independently of which cron provider is active.
@@ -17689,7 +17760,8 @@ async def start_gateway(
     finally:
         # Stop cron ticker cleanly before tearing down tools it may use.
         cron_stop.set()
-        cron_thread.join(timeout=5)
+        for cron_thread in cron_threads:
+            cron_thread.join(timeout=5)
 
         mcp_task = runner._mcp_discovery_task
         mcp_discovery_still_running = False

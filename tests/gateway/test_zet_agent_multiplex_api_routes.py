@@ -102,6 +102,24 @@ async def test_prefixed_main_health_is_registered(profile_homes):
 
 
 @pytest.mark.asyncio
+async def test_prefixed_models_route_is_registered(profile_homes):
+    adapter = _make_adapter()
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(
+            "/p/coder/v1/models",
+            headers={"Authorization": "Bearer test-key"},
+        )
+        data = await resp.json()
+
+    assert resp.status == 200
+    assert data["object"] == "list"
+    assert data["data"][0]["id"] == "hermes-agent"
+
+
+@pytest.mark.asyncio
 async def test_prefixed_chat_hits_handler_inside_profile_scope(profile_homes, monkeypatch):
     seen = []
     adapter = _make_adapter()

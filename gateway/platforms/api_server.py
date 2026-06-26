@@ -1327,6 +1327,7 @@ class APIServerAdapter(BasePlatformAdapter):
         chat = chat_handler or self._handle_chat_completions
         router.add_get("/p/{profile}/health", self._profile_handler(self._handle_health))
         router.add_get("/p/{profile}/v1/health", self._profile_handler(self._handle_health))
+        router.add_get("/p/{profile}/v1/models", self._profile_handler(self._handle_models))
         router.add_post("/p/{profile}/v1/chat/completions", self._profile_handler(chat))
 
         router.add_get("/p/{profile}/api/jobs", self._profile_handler(self._handle_list_jobs))
