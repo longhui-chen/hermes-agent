@@ -1158,6 +1158,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 groups=function_args.get("groups", []),
                 callback=getattr(agent, "plan_emit_callback", None),
             )
+            agent._zet_agent_plan_presented = True
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('present_plan', function_args, tool_duration, result=function_result)}")
