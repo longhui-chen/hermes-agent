@@ -1038,6 +1038,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # is keyed by the scoped HERMES_HOME so profiles never share state.db.
         self._session_db: Optional[Any] = None
         self._session_dbs: Dict[str, Any] = {}
+        # Profile-home -> in-flight chat-completions count.  GatewayRunner
+        # tracks messaging-platform sessions separately; local-server reaches
+        # Hermes through this API path, so profile unload must also see these.
+        self._active_chat_runs_by_home: Dict[str, int] = {}
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -1288,6 +1292,40 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("SessionDB unavailable for API server: %s", e)
         return self._session_db
+
+    @staticmethod
+    def _profile_home_key(profile_home: Optional[Any] = None) -> str:
+        """Return the canonical cache key for a profile home."""
+        try:
+            if profile_home is not None:
+                return str(Path(profile_home).resolve())
+            from hermes_constants import get_hermes_home
+            return str(get_hermes_home().resolve())
+        except Exception:
+            return str(profile_home or "")
+
+    def _begin_profile_chat_run(self, profile_home: Optional[Any] = None) -> str:
+        key = self._profile_home_key(profile_home)
+        if key:
+            self._active_chat_runs_by_home[key] = (
+                self._active_chat_runs_by_home.get(key, 0) + 1
+            )
+        return key
+
+    def _end_profile_chat_run(self, profile_home_key: str) -> None:
+        if not profile_home_key:
+            return
+        remaining = self._active_chat_runs_by_home.get(profile_home_key, 0) - 1
+        if remaining > 0:
+            self._active_chat_runs_by_home[profile_home_key] = remaining
+        else:
+            self._active_chat_runs_by_home.pop(profile_home_key, None)
+
+    def _active_profile_chat_runs(self, profile_home: Optional[Any] = None) -> int:
+        key = self._profile_home_key(profile_home)
+        if not key:
+            return 0
+        return int(self._active_chat_runs_by_home.get(key, 0) or 0)
 
     @staticmethod
     def _multiplex_profile_homes() -> Dict[str, Path]:
@@ -2298,6 +2336,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # The structured callbacks are strictly richer (they carry the
             # tool_call id), so they own the chat-completions SSE channel.
             agent_ref = [None]
+            profile_run_key = self._begin_profile_chat_run(
+                request.get("hermes_profile_home")
+            )
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
@@ -2314,6 +2355,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
             agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
+            agent_task.add_done_callback(
+                lambda _fut, key=profile_run_key: self._end_profile_chat_run(key)
+            )
 
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
@@ -2323,15 +2367,21 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
         async def _compute_completion():
-            return await self._run_agent(
-                user_message=user_message,
-                conversation_history=history,
-                ephemeral_system_prompt=system_prompt,
-                session_id=session_id,
-                gateway_session_key=gateway_session_key,
-                response_mode=response_mode,
-                turn_id=turn_id,
+            profile_run_key = self._begin_profile_chat_run(
+                request.get("hermes_profile_home")
             )
+            try:
+                return await self._run_agent(
+                    user_message=user_message,
+                    conversation_history=history,
+                    ephemeral_system_prompt=system_prompt,
+                    session_id=session_id,
+                    gateway_session_key=gateway_session_key,
+                    response_mode=response_mode,
+                    turn_id=turn_id,
+                )
+            finally:
+                self._end_profile_chat_run(profile_run_key)
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:

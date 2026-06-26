@@ -1905,6 +1905,18 @@ class ZetAgentAdapter(APIServerAdapter):
             return auth_err
 
         profile_home = _request_value(request, "hermes_profile_home")
+        active_api_runs = self._active_profile_chat_runs(profile_home)
+        if active_api_runs:
+            return web.json_response(
+                {
+                    "unloaded": False,
+                    "error": "profile has active sessions",
+                    "active_sessions": active_api_runs,
+                    "active_api_runs": active_api_runs,
+                },
+                status=409,
+            )
+
         runtime_unload = {}
         gw = getattr(self, "gateway_runner", None)
         if gw is not None:
@@ -1943,7 +1955,7 @@ class ZetAgentAdapter(APIServerAdapter):
 
         closed_session_db = False
         if profile_home:
-            db = self._session_dbs.pop(str(profile_home), None)
+            db = self._session_dbs.pop(self._profile_home_key(profile_home), None)
             if db is not None:
                 close = getattr(db, "close", None)
                 if callable(close):

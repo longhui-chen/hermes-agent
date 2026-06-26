@@ -1,6 +1,7 @@
 """Phase 1: HTTP-inbound /p/<profile>/ routing for the webhook adapter."""
 import pytest
 
+from gateway.config import PlatformConfig
 from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionSource, build_session_key
 
@@ -71,3 +72,60 @@ class TestWebhookProfileResolution:
             lambda multiplex: [(n, None) for n in served],
         )
         assert adapter._resolve_request_profile(Req("ghost")) is REJ
+
+
+class TestZetAgentProfileUnload:
+    class _FakeRequest(dict):
+        def __init__(self, profile_home):
+            super().__init__(
+                hermes_profile="coder",
+                hermes_profile_home=str(profile_home),
+            )
+            self.headers = {"Authorization": "Bearer test-key"}
+            self.method = "POST"
+            self.path_qs = "/p/coder/v1/profile/unload"
+            self.remote = "127.0.0.1"
+            self.transport = None
+
+    @pytest.mark.asyncio
+    async def test_active_chat_completion_blocks_profile_unload(self, tmp_path):
+        from gateway.platforms.zet_agent import ZetAgentAdapter
+
+        profile_home = tmp_path / "profiles" / "coder"
+        profile_home.mkdir(parents=True)
+        adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+
+        run_key = adapter._begin_profile_chat_run(profile_home)
+        try:
+            response = await adapter._handle_profile_unload(
+                self._FakeRequest(profile_home)
+            )
+        finally:
+            adapter._end_profile_chat_run(run_key)
+
+        assert response.status == 409
+        assert '"active_api_runs": 1' in response.text
+
+    @pytest.mark.asyncio
+    async def test_profile_unload_closes_session_db_with_resolved_home_key(self, tmp_path):
+        from gateway.platforms.zet_agent import ZetAgentAdapter
+
+        class _DB:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        profile_home = tmp_path / "profiles" / "coder"
+        profile_home.mkdir(parents=True)
+        adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+        db = _DB()
+        adapter._session_dbs[adapter._profile_home_key(profile_home)] = db
+
+        response = await adapter._handle_profile_unload(
+            self._FakeRequest(profile_home / ".")
+        )
+
+        assert response.status == 200
+        assert db.closed is True
+        assert adapter._session_dbs == {}

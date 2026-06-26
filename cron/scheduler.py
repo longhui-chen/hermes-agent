@@ -46,9 +46,17 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 try:
-    from agent.secret_scope import get_secret as _get_scoped_secret
+    from agent.secret_scope import (
+        build_profile_secret_scope as _build_profile_secret_scope,
+        get_secret as _get_scoped_secret,
+        _is_global_env as _is_secret_global_env,
+        is_multiplex_active as _is_secret_multiplex_active,
+    )
 except Exception:  # pragma: no cover - standalone cron invocations before agent package import
+    _build_profile_secret_scope = None
     _get_scoped_secret = None
+    _is_secret_global_env = None
+    _is_secret_multiplex_active = None
 
 
 _ENV_REF_RE = re.compile(r"\${([^}]+)}")
@@ -58,6 +66,20 @@ def _cron_env(name: str, default: str = "") -> str:
     """Read a cron env value from the active profile scope when available."""
     if _get_scoped_secret is None:
         return os.getenv(name, default)
+    if (
+        _build_profile_secret_scope is not None
+        and _is_secret_global_env is not None
+        and _is_secret_multiplex_active is not None
+        and _is_secret_multiplex_active()
+        and not _is_secret_global_env(name)
+    ):
+        try:
+            fresh_scope = _build_profile_secret_scope(get_hermes_home())
+            value = fresh_scope.get(name)
+            if value is not None:
+                return str(value)
+        except Exception:
+            logger.debug("Failed to refresh cron env %s from profile .env", name, exc_info=True)
     value = _get_scoped_secret(name, default)
     return default if value is None else str(value)
 
