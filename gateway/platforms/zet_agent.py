@@ -199,6 +199,18 @@ ZETTLAB_WORKFLOW_ADDENDUM = """\
 用户已经明确指定全部关键参数（频率、时间、目标、内容）时直接执行，无需再 clarify。
 信息查询、闲聊、回答问题不要 clarify。
 
+## 计划先行（Plan-First）
+
+面对复杂多步任务（涉及 3 个以上阶段、不可逆操作或大量数据变更）时：
+1. 先调用 `present_plan` 工具，把执行计划结构化呈现给用户（分组列出每步要做什么）。
+2. 调用后立即停下，等用户明确说"开始"/"确认"/"go" 等确认信号后再执行。
+3. 执行阶段用 `todo` 工具逐步记录和更新进度，每完成一步立即把对应 todo 标记为 completed。
+
+用户说"plan 模式"、"计划模式"、"先给计划"、"先别执行"或"等我确认"时，也按上述 App 计划卡片流程处理。
+不要加载名为 `plan` 的 markdown skill，也不要写 `.hermes/plans`；那是 CLI/文档计划模式，不是 Zettlab App 的确认卡片。
+
+简单的单步请求、查询、闲聊不需要 present_plan，直接执行即可。
+
 ## 用户画像语言
 
 写入长期用户画像（memory 工具 target="user"，即 USER.md）时，必须使用简体中文。
@@ -512,6 +524,59 @@ class ZetAgentAdapter(APIServerAdapter):
 
         return _ask
 
+    # ------------------------------------------------------------------
+    # Todo emit — non-blocking, fires after each todo tool call
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_todo_emit_cb(stream_q: Any):
+        """Return a sync ``(todos, summary) -> None`` callback.
+
+        Called by tool_executor immediately after todo_tool() returns.
+        Pushes a ``hermes.todo`` event onto the SSE extension lane so
+        the APP can re-render the todo panel in real time.
+
+        Non-blocking: no threading.Event, no HTTP respond path.
+        """
+        def _emit(todos: List[Dict[str, Any]], summary: Dict[str, Any]) -> None:
+            payload = {
+                "type": "hermes.todo",
+                "todos": todos,
+                "summary": summary,
+            }
+            try:
+                stream_q.put(("__tool_progress__", payload))
+            except Exception:
+                logger.debug("[zet_agent] todo emit push failed", exc_info=True)
+
+        return _emit
+
+    # ------------------------------------------------------------------
+    # Plan emit — non-blocking, fires when agent calls present_plan
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_plan_emit_cb(stream_q: Any):
+        """Return a sync ``(title, groups) -> None`` callback.
+
+        Called by tool_executor when the agent invokes present_plan.
+        Pushes a ``hermes.plan`` event onto the SSE extension lane.
+        present_plan() returns a stop-and-wait instruction to the agent
+        immediately after, so this callback never blocks.
+        """
+        def _emit(title: str, groups: List[Dict[str, Any]]) -> None:
+            payload = {
+                "type": "hermes.plan",
+                "title": title,
+                "groups": groups,
+            }
+            try:
+                stream_q.put(("__tool_progress__", payload))
+            except Exception:
+                logger.debug("[zet_agent] plan emit push failed", exc_info=True)
+
+        return _emit
+
     def _discard_clarify_entry(self, session_id: str, entry: _ClarifyEntry) -> None:
         """Remove an unresolved entry (push failure or timeout). The
         respond handler removes via popleft on success; this path
@@ -722,6 +787,21 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception:
                 logger.warning("[zet_agent] failed to attach clarify_callback", exc_info=True)
 
+        # 3b. Todo emit: push hermes.todo event after each todo write/read.
+        # Non-blocking — tool_executor calls this after todo_tool() returns.
+        try:
+            agent.todo_emit_callback = self._make_todo_emit_cb(stream_q)
+        except Exception:
+            logger.warning("[zet_agent] failed to attach todo_emit_callback", exc_info=True)
+
+        # 3c. Plan emit: push hermes.plan event when present_plan is called.
+        # Non-blocking — tool_executor calls this, present_plan returns
+        # immediately with a stop-and-wait instruction to the agent.
+        try:
+            agent.plan_emit_callback = self._make_plan_emit_cb(stream_q)
+        except Exception:
+            logger.warning("[zet_agent] failed to attach plan_emit_callback", exc_info=True)
+
         # 4. Approval: register a per-session notify callback.
         # We don't unregister here because chat.completions reuses the
         # same session_id across turns; unregistration happens on
@@ -753,6 +833,8 @@ class ZetAgentAdapter(APIServerAdapter):
         tool_complete_callback=None,
         agent_ref=None,
         gateway_session_key: Optional[str] = None,
+        response_mode: Optional[str] = None,
+        turn_id: Optional[str] = None,
     ):
         """Wrap base ``_run_agent`` to (1) push the auto-title before
         kicking off the agent thread and (2) bind the session-scoped env
@@ -834,6 +916,8 @@ class ZetAgentAdapter(APIServerAdapter):
                 tool_complete_callback=tool_complete_callback,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                response_mode=response_mode,
+                turn_id=turn_id,
             )
         finally:
             if old_session_key is None:

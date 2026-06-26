@@ -1675,6 +1675,20 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     )
     for _var_name in _cron_delivery_vars:
         _VAR_MAP[_var_name].set("")
+    # Stamp the human-readable job name so auxiliary + main LLM calls carry it as
+    # X-Task-Title → ai-cloud ledger scene_params.task_title → the App's cron task
+    # card shows the real name even after the job is deleted (it can no longer be
+    # resolved from the live cron list). This is billing/display semantics (not a
+    # delivery target), so it's set explicitly here rather than via the delivery
+    # tuple above. It's always assigned per job below, so it can't leak across
+    # jobs in the parallel pool.
+    #
+    # Use the job NAME (fall back to the opaque job_id, never the prompt): an
+    # HTTP header has a hard size limit and the prompt can be long / sensitive,
+    # so we must not let an unnamed job spill its whole prompt into a header.
+    # Cap length too (ai-api re-caps at 255 runes after percent-decoding).
+    _cron_task_title = (str(job.get("name") or "").strip() or job_id)[:200]
+    _VAR_MAP["HERMES_CRON_TASK_TITLE"].set(_cron_task_title)
 
     # Per-job working directory.  When set (and validated at create/update
     # time), we point TERMINAL_CWD at it so:

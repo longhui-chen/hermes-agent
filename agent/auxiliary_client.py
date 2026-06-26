@@ -369,21 +369,44 @@ def _apply_user_default_headers(headers: dict | None) -> dict | None:
     main turn would succeed but title/compression/vision calls to the same
     endpoint would still fail. (#40033)
 
-    Returns the merged dict, or the original ``headers`` (possibly ``None``)
-    when nothing is configured. No allocation when there are no overrides.
+    Also stamps the zettlab credit-ledger ``X-Task-Id``/``X-Scene-Type`` headers
+    for the current session (see ``billing_task_id``) so auxiliary spend is
+    attributed to its task card.
+
+    Returns the merged dict (user overrides + billing headers), or the original
+    ``headers`` (possibly ``None``) when there is nothing to add.
     """
+    merged = dict(headers or {})
     try:
         from hermes_cli.config import cfg_get, load_config
         user_headers = cfg_get(load_config(), "model", "default_headers")
     except Exception:
-        return headers
-    if not isinstance(user_headers, dict) or not user_headers:
-        return headers
-    merged = dict(headers or {})
-    for key, value in user_headers.items():
-        if value is None:
-            continue
-        merged[str(key)] = str(value)
+        user_headers = None
+    if isinstance(user_headers, dict):
+        for key, value in user_headers.items():
+            if value is None:
+                continue
+            merged[str(key)] = str(value)
+    # Zettlab credit-ledger task grouping: attribute auxiliary calls
+    # (compression / title / vision) to the conversation/cron task by stamping
+    # X-Task-Id, so they aggregate into its task card instead of surfacing as
+    # orphan model rows. Each aux client is built fresh per call, so reading the
+    # concurrency-safe session contextvar here is always current (no stale
+    # cross-session reuse). billing_task_id() maps interactive vs cron sessions
+    # and returns '' for non-NAS sessions (no leak to third-party providers).
+    try:
+        from gateway.session_context import billing_task_id, billing_task_title_encoded
+        task_id = billing_task_id()
+        task_title = billing_task_title_encoded() if task_id else ""
+    except Exception:
+        task_id = ""
+        task_title = ""
+    if task_id:
+        merged.setdefault("X-Task-Id", task_id)
+        merged.setdefault("X-Scene-Type", "agent")
+        # Cron job name → X-Task-Title (empty for interactive); see chat_completions.
+        if task_title:
+            merged.setdefault("X-Task-Title", task_title)
     return merged or headers
 
 

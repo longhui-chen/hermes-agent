@@ -6,6 +6,7 @@ from unittest.mock import ANY, call, patch
 
 from model_tools import (
     handle_function_call,
+    get_tool_definitions,
     get_all_tool_names,
     get_toolset_for_tool,
     _AGENT_LOOP_TOOLS,
@@ -209,9 +210,17 @@ class TestHandleFunctionCall:
 class TestAgentLoopTools:
     def test_expected_tools_in_set(self):
         assert "todo" in _AGENT_LOOP_TOOLS
+        assert "present_plan" in _AGENT_LOOP_TOOLS
         assert "memory" in _AGENT_LOOP_TOOLS
         assert "session_search" in _AGENT_LOOP_TOOLS
         assert "delegate_task" in _AGENT_LOOP_TOOLS
+
+    def test_todo_toolset_exposes_plan_preview_tool(self):
+        tool_defs = get_tool_definitions(enabled_toolsets=["todo"], quiet_mode=True)
+        tool_names = {tool["function"]["name"] for tool in tool_defs}
+
+        assert "todo" in tool_names
+        assert "present_plan" in tool_names
 
     def test_no_regular_tools_in_set(self):
         assert "web_search" not in _AGENT_LOOP_TOOLS

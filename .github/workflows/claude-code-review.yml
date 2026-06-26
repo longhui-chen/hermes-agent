@@ -36,7 +36,7 @@ jobs:
       github.repository_owner == 'zettlab' &&
       github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    timeout-minutes: 30          # opus 评审较慢，给足时间避免被掐断
+    timeout-minutes: 45          # opus 评审较慢 + 大 PR（44 文件）轮次多，给足时间
     steps:
       - name: Checkout PR (full context)
         uses: actions/checkout@v4
@@ -45,6 +45,9 @@ jobs:
 
       - name: Run Claude /code-review
         id: review
+        # 跑满轮次（error_max_turns）不直接判红：评审本身已尽力（行内评论 + 结论文件多半已落盘）。
+        # 最终绿/红由末尾「Gate on review result」按"是否产出结论文件"裁定 —— 区分"轮次不够"和"真故障"。
+        continue-on-error: true
         uses: anthropics/claude-code-action@v1
         with:
           # 用订阅 OAuth token（claude setup-token 生成）——无需单独 API key/账单。
@@ -65,14 +68,17 @@ jobs:
             2) 评审标准：以仓库根 REVIEW.md 为最高优先级，叠加 CLAUDE.md / AGENTS.md 的 Engineering Hard Rules
                （内存预算 2GB、HA & 自愈、Agent 安全、API 向后兼容、配置唯一生效位置）。
                只把「合并前应修的真 bug / 安全 / 契约破坏」标为 Important，风格类最多 Nit。
-            3) 评审结束后，用文件写工具把机器可读结论写到 ./codereview-result.json，schema：
+            3) 分析一完成、问题清单一确定，就【第一时间】用文件写工具把机器可读结论写到
+               ./codereview-result.json —— 不要等行内评论全贴完再写。行内评论可以之后再补；
+               若临近轮次上限，优先保证这个文件已落盘（它驱动飞书通知，丢了就整条评审"报错"且发不出卡片）。schema：
                {"verdict":"pass"|"fail","important":<int>,"nit":<int>,"pre_existing":<int>,
                 "issues":[{"severity":"important"|"nit"|"pre_existing","file":"<path>","line":<int>,"title":"<one line>"}]}
                有任一 important 则 verdict=fail，否则 pass。这个文件只给内部通知用，不要贴到 PR。
           # 用 opus-4-8（评审质量最强；~10-15min/PR，异步不挡合并）。
-          # max-turns 给足：/code-review 插件固定开销就要 ~15+ 轮，砍太低会 error_max_turns 直接失败
+          # max-turns：大 PR（如 #246 改 44 个文件）50/100 轮都不够；给到 150。
+          # 即便如此仍可能不够 → 靠 continue-on-error + 尽早落盘 + 末尾 Gate 兜底：产出了结论就算绿。
           claude_args: |
-            --max-turns 50
+            --max-turns 150
             --model claude-opus-4-8
             --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Write"
 
@@ -145,3 +151,17 @@ jobs:
             catch (e) { core.info('未产出 codereview-result.json（评审可能未完成/被跳过），不通知: ' + e.message); return; }
             const { notifyFromActionResult } = require(`${process.env.GITHUB_WORKSPACE}/scripts/codereview/notify.js`);
             await notifyFromActionResult({ github, context, core, result });
+
+      # 终判：评审只要产出了结论文件（= Claude 已给出 verdict，哪怕跑满轮次被 action 标 fail）就算成功（绿）。
+      # 只有连结论文件都没有（真·鉴权/基础设施/超时失败）才让 check 红 —— 保留对真故障的可见性，
+      # 同时不再因"大 PR 轮次不够"把一次有效评审误判为失败。
+      - name: Gate on review result
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "${GITHUB_WORKSPACE}/codereview-result.json" ]; then
+            echo "✅ 评审已产出结论文件，视为成功（即便评审步骤因轮次上限被标记 fail）"
+            exit 0
+          fi
+          echo "::error::评审未产出 codereview-result.json —— 真实失败（鉴权/基础设施/超时），需排查"
+          exit 1

@@ -103,6 +103,39 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
     )
 
 
+def _zet_agent_plan_mode_block_message(agent, function_name: str, function_args: dict) -> Optional[str]:
+    """Block legacy markdown plan-mode paths in Zettlab App sessions."""
+    if (getattr(agent, "platform", "") or "") != "zet_agent":
+        return None
+
+    if function_name == "skill_view":
+        name = str(function_args.get("name") or "").strip().lower()
+        file_path = str(function_args.get("file_path") or "").strip()
+        if name == "plan" and not file_path:
+            return (
+                "Zettlab App plan mode uses the `present_plan` tool to render "
+                "a structured confirmation card. Do not load the markdown "
+                "`plan` skill here. Call `present_plan` with `title` and "
+                "`groups`, then stop and wait for user confirmation."
+            )
+
+    if function_name == "write_file":
+        path = str(function_args.get("path") or "").replace("\\", "/")
+        if (
+            path == ".hermes/plans"
+            or path.startswith(".hermes/plans/")
+            or "/.hermes/plans/" in path
+            or path.endswith("/.hermes/plans")
+        ):
+            return (
+                "Writing `.hermes/plans` is disabled for Zettlab App plan mode. "
+                "Use `present_plan` to show the plan in the App and wait for "
+                "confirmation instead of saving a markdown plan file."
+            )
+
+    return None
+
+
 def _emit_cancelled_terminal_post_tool_call(
     agent,
     *,
@@ -342,20 +375,25 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 middleware_trace=list(middleware_trace),
             )
         else:
-            try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                block_message = get_pre_tool_call_block_message(
-                    function_name,
-                    function_args,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    middleware_trace=list(middleware_trace),
-                )
-            except Exception:
-                block_message = None
+            block_message = _zet_agent_plan_mode_block_message(agent, function_name, function_args)
+            block_error_type = "zet_agent_plan_mode_block"
+            if block_message is None:
+                try:
+                    from hermes_cli.plugins import get_pre_tool_call_block_message
+                    block_message = get_pre_tool_call_block_message(
+                        function_name,
+                        function_args,
+                        task_id=effective_task_id or "",
+                        session_id=getattr(agent, "session_id", "") or "",
+                        tool_call_id=getattr(tool_call, "id", "") or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        middleware_trace=list(middleware_trace),
+                    )
+                    block_error_type = "plugin_block"
+                except Exception:
+                    block_message = None
+                    block_error_type = "plugin_block"
 
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
@@ -367,7 +405,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     effective_task_id=effective_task_id,
                     tool_call_id=getattr(tool_call, "id", "") or "",
                     status="blocked",
-                    error_type="plugin_block",
+                    error_type=block_error_type,
                     error_message=block_message,
                     middleware_trace=list(middleware_trace),
                 )
@@ -833,20 +871,24 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _block_msg = _ts_scope_block
             _block_error_type = "tool_scope_block"
         else:
-            try:
-                from hermes_cli.plugins import get_pre_tool_call_block_message
-                _block_msg = get_pre_tool_call_block_message(
-                    function_name,
-                    function_args,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    middleware_trace=list(middleware_trace),
-                )
-            except Exception:
-                pass
+            _block_msg = _zet_agent_plan_mode_block_message(agent, function_name, function_args)
+            if _block_msg is not None:
+                _block_error_type = "zet_agent_plan_mode_block"
+            else:
+                try:
+                    from hermes_cli.plugins import get_pre_tool_call_block_message
+                    _block_msg = get_pre_tool_call_block_message(
+                        function_name,
+                        function_args,
+                        task_id=effective_task_id or "",
+                        session_id=getattr(agent, "session_id", "") or "",
+                        tool_call_id=getattr(tool_call, "id", "") or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        middleware_trace=list(middleware_trace),
+                    )
+                except Exception:
+                    pass
 
         _guardrail_block_decision: ToolGuardrailDecision | None = None
         if _block_msg is None:
@@ -980,6 +1022,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
+            # Emit hermes.todo event onto the SSE stream (zet_agent platform).
+            # todo_emit_callback is injected by ZetAgentAdapter._create_agent
+            # when a stream_q is available; absent it, this is a no-op.
+            _todo_emit_cb = getattr(agent, "todo_emit_callback", None)
+            if callable(_todo_emit_cb):
+                try:
+                    import json as _json
+                    _todo_payload = _json.loads(function_result)
+                    _todo_emit_cb(_todo_payload.get("todos", []), _todo_payload.get("summary", {}))
+                except Exception:
+                    pass
         elif function_name == "session_search":
             def _execute(next_args: dict) -> Any:
                 session_db = agent._get_session_db_for_recall()
@@ -1098,6 +1151,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('read_terminal', function_args, tool_duration, result=function_result)}")
+        elif function_name == "present_plan":
+            from tools.plan_tool import present_plan as _present_plan
+            function_result = _present_plan(
+                title=function_args.get("title", ""),
+                groups=function_args.get("groups", []),
+                callback=getattr(agent, "plan_emit_callback", None),
+            )
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl('present_plan', function_args, tool_duration, result=function_result)}")
         elif function_name == "delegate_task":
             tasks_arg = function_args.get("tasks")
             if tasks_arg and isinstance(tasks_arg, list):

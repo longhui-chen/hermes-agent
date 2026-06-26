@@ -153,6 +153,134 @@ def _ra():
     return run_agent
 
 
+def _should_force_present_plan_tool_choice(agent: Any, user_message: str) -> bool:
+    """Return True when a Zettlab App turn explicitly asks for plan-first UI.
+
+    The product "plan mode" is a structured App card, not Hermes' markdown
+    plan skill.  Force the first model call to produce a ``present_plan`` tool
+    call for explicit plan-mode requests so weak models cannot silently fall
+    back to plain text.
+    """
+    if (getattr(agent, "platform", "") or "") != "zet_agent":
+        return False
+    response_mode = str(getattr(agent, "_zet_agent_response_mode", "") or "").strip().lower()
+    if response_mode == "plan":
+        return True
+    valid_tool_names = getattr(agent, "valid_tool_names", None) or set()
+    if "present_plan" not in valid_tool_names:
+        return False
+
+    text = str(user_message or "").strip().lower()
+    if not text:
+        return False
+    compact = re.sub(r"\s+", "", text)
+
+    if "present_plan" in text:
+        return True
+    if "plan模式" in compact or "计划模式" in compact:
+        return True
+    if re.search(r"(开启|打开|进入|启用|启动).{0,12}(plan|计划)", compact):
+        return True
+
+    mentions_plan = "plan" in compact or "计划" in compact
+    wants_review_before_work = any(
+        marker in compact
+        for marker in (
+            "先别执行",
+            "不要执行",
+            "不执行",
+            "等我确认",
+            "等用户确认",
+            "确认后",
+            "只输出计划",
+            "只写计划",
+            "先给",
+            "先列",
+            "先看",
+        )
+    )
+    return mentions_plan and wants_review_before_work
+
+
+def _api_tools_include(api_kwargs: Dict[str, Any], tool_name: str) -> bool:
+    tools = api_kwargs.get("tools")
+    if not isinstance(tools, list):
+        return False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function")
+        if isinstance(fn, dict) and fn.get("name") == tool_name:
+            return True
+        if tool.get("name") == tool_name:
+            return True
+    return False
+
+
+def _is_deepseek_thinking_default_model(agent: Any) -> bool:
+    model = str(getattr(agent, "model", "") or "").strip().lower()
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    base_url = str(getattr(agent, "base_url", "") or "").strip().lower()
+
+    return (
+        "deepseek-v4" in model
+        or "deepseek-v3.2" in model
+        or provider.startswith("deepseek")
+        or "api.deepseek.com" in base_url
+    )
+
+
+def _disable_deepseek_thinking_for_tool_choice(agent: Any, api_kwargs: Dict[str, Any]) -> bool:
+    if not _is_deepseek_thinking_default_model(agent):
+        return False
+
+    extra_body = api_kwargs.get("extra_body")
+    if not isinstance(extra_body, dict):
+        extra_body = {}
+    else:
+        extra_body = dict(extra_body)
+
+    extra_body["thinking"] = {"type": "disabled"}
+    api_kwargs["extra_body"] = extra_body
+    api_kwargs.pop("reasoning_effort", None)
+    return True
+
+
+def _apply_forced_present_plan_tool_choice(agent: Any, api_kwargs: Dict[str, Any]) -> bool:
+    """Force the first Zettlab plan-mode request to call present_plan."""
+    if not getattr(agent, "_zet_agent_force_present_plan_pending", False):
+        return False
+
+    # Consume the flag once.  The follow-up call after the tool result must be
+    # free to produce normal text instead of calling present_plan again.
+    agent._zet_agent_force_present_plan_pending = False
+
+    if getattr(agent, "api_mode", "") != "chat_completions":
+        logger.info(
+            "zet_agent plan mode: cannot force present_plan for api_mode=%s",
+            getattr(agent, "api_mode", ""),
+        )
+        return False
+    if not _api_tools_include(api_kwargs, "present_plan"):
+        logger.warning(
+            "zet_agent plan mode requested but present_plan is missing from API tools"
+        )
+        return False
+
+    api_kwargs["tool_choice"] = {
+        "type": "function",
+        "function": {"name": "present_plan"},
+    }
+    disabled_thinking = _disable_deepseek_thinking_for_tool_choice(agent, api_kwargs)
+    if disabled_thinking:
+        logger.info(
+            "zet_agent plan mode: forcing tool_choice=present_plan with DeepSeek thinking disabled"
+        )
+    else:
+        logger.info("zet_agent plan mode: forcing tool_choice=present_plan")
+    return True
+
+
 def _nous_entitlement_message(capability: str) -> str:
     try:
         from hermes_cli.nous_account import (
@@ -548,6 +676,11 @@ def run_conversation(
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
     # Main conversation loop counters (pure locals consumed by the loop below).
+    # Zettlab App plan 模式：本轮是否强制首轮模型调用产出 present_plan
+    #（消费见 _apply_forced_present_plan_tool_choice）。
+    agent._zet_agent_force_present_plan_pending = _should_force_present_plan_tool_choice(
+        agent, original_user_message
+    )
     api_call_count = 0
     final_response = None
     interrupted = False
@@ -990,6 +1123,7 @@ def run_conversation(
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
                 api_kwargs = agent._build_api_kwargs(api_messages)
+                _apply_forced_present_plan_tool_choice(agent, api_kwargs)
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":

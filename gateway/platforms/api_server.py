@@ -132,6 +132,32 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
+def _extract_response_mode(body: Dict[str, Any]) -> str:
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("response_mode", metadata.get("responseMode", ""))
+    mode = str(raw or "").strip().lower()
+    return "plan" if mode == "plan" else ""
+
+
+def _extract_turn_id(body: Dict[str, Any]) -> str:
+    """Extract metadata.turn_id (zettlab local-server's per-turn correlation
+    token) so the NAS agent-search fallback can echo it back as the
+    X-Zettlab-Turn-Id header. Reject only what would corrupt that header
+    (whitespace / control chars); don't restrict the charset further —
+    local-server accepts any trimmed token, so a stricter filter would silently
+    drop valid ids and lose the precise-turn pinning."""
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("turn_id", metadata.get("turnId", ""))
+    tid = str(raw or "").strip()
+    if not tid or any(c.isspace() or ord(c) < 0x20 for c in tid):
+        return ""
+    return tid
+
+
 def _normalize_chat_content(
     content: Any, *, _max_depth: int = 10, _depth: int = 0,
 ) -> str:
@@ -2102,6 +2128,8 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+        response_mode = _extract_response_mode(body)
+        turn_id = _extract_turn_id(body)
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -2280,6 +2308,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                response_mode=response_mode,
+                turn_id=turn_id,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -2299,11 +2329,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 gateway_session_key=gateway_session_key,
+                response_mode=response_mode,
+                turn_id=turn_id,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
-            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
+            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream", "metadata"])
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
             except Exception as e:
@@ -4038,6 +4070,8 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        response_mode: Optional[str] = None,
+        turn_id: Optional[str] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4054,6 +4088,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _run():
             from gateway.session_context import clear_session_vars, set_session_vars
+            from tools.file_operations import set_zettlab_turn_id
 
             tokens = set_session_vars(
                 platform="api_server",
@@ -4061,6 +4096,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 session_key=gateway_session_key or session_id or "",
                 session_id=session_id or "",
             )
+            # turn_id is NAS-fallback-only, not a general session attribute, so
+            # it rides its own feature-scoped contextvar (set/cleared alongside
+            # the session vars to stay leak-free on reused executor threads).
+            set_zettlab_turn_id(turn_id or "")
             try:
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
@@ -4073,6 +4112,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 if agent_ref is not None:
                     agent_ref[0] = agent
+                if response_mode:
+                    agent._zet_agent_response_mode = response_mode
                 effective_task_id = session_id or str(uuid.uuid4())
                 result = agent.run_conversation(
                     user_message=user_message,
@@ -4093,6 +4134,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 return result, usage
             finally:
                 clear_session_vars(tokens)
+                set_zettlab_turn_id("")
 
         from contextvars import copy_context
 
