@@ -217,6 +217,21 @@ def _api_tools_include(api_kwargs: Dict[str, Any], tool_name: str) -> bool:
     return False
 
 
+def _error_text(error: Exception) -> str:
+    parts = []
+    for value in (
+        getattr(error, "body", None),
+        getattr(error, "message", None),
+        error,
+    ):
+        if value:
+            try:
+                parts.append(str(value))
+            except Exception:
+                pass
+    return " ".join(parts).lower()
+
+
 def _is_deepseek_thinking_default_model(agent: Any) -> bool:
     model = str(getattr(agent, "model", "") or "").strip().lower()
     provider = str(getattr(agent, "provider", "") or "").strip().lower()
@@ -230,10 +245,71 @@ def _is_deepseek_thinking_default_model(agent: Any) -> bool:
     )
 
 
-def _disable_deepseek_thinking_for_tool_choice(agent: Any, api_kwargs: Dict[str, Any]) -> bool:
-    if not _is_deepseek_thinking_default_model(agent):
-        return False
+def _is_zettlab_ai_proxy_route(agent: Any) -> bool:
+    base_url = str(getattr(agent, "base_url", "") or "").strip().lower()
+    return "/api/v1/ai-proxy/v1" in base_url
 
+
+def _should_disable_thinking_for_forced_tool_choice(agent: Any) -> bool:
+    return (
+        bool(getattr(agent, "_zet_agent_force_present_plan_disable_thinking", False))
+        or _is_deepseek_thinking_default_model(agent)
+        or _is_zettlab_ai_proxy_route(agent)
+    )
+
+
+def _is_thinking_tool_choice_rejection(error: Exception) -> bool:
+    text = _error_text(error)
+    return (
+        "thinking mode" in text
+        and "tool_choice" in text
+        and ("does not support" in text or "not support" in text)
+    )
+
+
+def _is_unsupported_thinking_parameter_error(error: Exception) -> bool:
+    text = _error_text(error)
+    if "thinking" not in text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "unsupported parameter",
+            "unsupported_parameter",
+            "unknown parameter",
+            "unknown_parameter",
+            "unrecognized parameter",
+            "unrecognized request argument",
+            "does not support parameter",
+            "not support parameter",
+        )
+    )
+
+
+def _is_unsupported_tools_or_tool_choice_error(error: Exception) -> bool:
+    text = _error_text(error)
+    if not any(
+        name in text
+        for name in ("tools", "tool_choice", "tool calling", "function calling")
+    ):
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "unsupported parameter",
+            "unsupported_parameter",
+            "unknown parameter",
+            "unknown_parameter",
+            "unrecognized parameter",
+            "unrecognized request argument",
+            "does not support",
+            "not support",
+            "is not supported",
+        )
+    )
+
+
+def _disable_thinking_for_forced_tool_choice(api_kwargs: Dict[str, Any]) -> None:
     extra_body = api_kwargs.get("extra_body")
     if not isinstance(extra_body, dict):
         extra_body = {}
@@ -243,7 +319,134 @@ def _disable_deepseek_thinking_for_tool_choice(agent: Any, api_kwargs: Dict[str,
     extra_body["thinking"] = {"type": "disabled"}
     api_kwargs["extra_body"] = extra_body
     api_kwargs.pop("reasoning_effort", None)
-    return True
+
+
+def _apply_plan_text_fallback_request(api_kwargs: Dict[str, Any]) -> None:
+    api_kwargs.pop("tools", None)
+    api_kwargs.pop("tool_choice", None)
+    api_kwargs.pop("parallel_tool_calls", None)
+    extra_body = api_kwargs.get("extra_body")
+    if (
+        isinstance(extra_body, dict)
+        and extra_body.get("thinking") == {"type": "disabled"}
+    ):
+        extra_body = dict(extra_body)
+        extra_body.pop("thinking", None)
+        if extra_body:
+            api_kwargs["extra_body"] = extra_body
+        else:
+            api_kwargs.pop("extra_body", None)
+    messages = api_kwargs.get("messages")
+    if not isinstance(messages, list):
+        return
+    fallback_hint = (
+        "\n\n[Zettlab App plan mode fallback: this model endpoint does not "
+        "support tool calling. Write a concise structured plan only. Do not "
+        "execute the plan. Group the plan into phases with short bullet steps.]"
+    )
+    patched = list(messages)
+    for idx in range(len(patched) - 1, -1, -1):
+        msg = patched[idx]
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            patched[idx] = {**msg, "content": content + fallback_hint}
+            api_kwargs["messages"] = patched
+        return
+
+
+def _plain_text_plan_groups(text: str) -> List[Dict[str, Any]]:
+    lines = [line.strip() for line in str(text or "").splitlines()]
+    groups: List[Dict[str, Any]] = []
+    current = {"icon": "", "label": "Plan", "items": []}
+
+    def flush_current() -> None:
+        items = [item for item in current["items"] if item][:8]
+        if items:
+            groups.append({
+                "icon": current["icon"],
+                "label": current["label"] or "Plan",
+                "count": len(items),
+                "items": items,
+            })
+
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        heading = re.sub(r"^#{1,6}\s*", "", line).strip()
+        heading = re.sub(r"^\*\*(.*?)\*\*$", r"\1", heading).strip()
+        if (
+            (raw.startswith("#") or heading.endswith(":"))
+            and len(heading) <= 80
+        ):
+            flush_current()
+            current = {
+                "icon": "",
+                "label": heading.rstrip(":") or "Plan",
+                "items": [],
+            }
+            continue
+        item = re.sub(
+            r"^\s*(?:[-*•]|\d+[.)]|[一二三四五六七八九十]+[、.])\s*",
+            "",
+            line,
+        ).strip()
+        if item:
+            current["items"].append(item[:500])
+    flush_current()
+
+    if not groups:
+        compact = re.sub(r"\s+", " ", str(text or "")).strip()
+        if compact:
+            groups.append({
+                "icon": "",
+                "label": "Plan",
+                "count": 1,
+                "items": [compact[:500]],
+            })
+    return groups[:6]
+
+
+def _plain_text_plan_title(text: str) -> str:
+    for line in str(text or "").splitlines():
+        cleaned = re.sub(r"^#{1,6}\s*", "", line).strip()
+        cleaned = re.sub(r"^\*\*(.*?)\*\*$", r"\1", cleaned).strip()
+        cleaned = cleaned.rstrip(":")
+        if cleaned:
+            return cleaned[:80]
+    return "Plan"
+
+
+def _emit_plain_text_plan_if_needed(agent: Any, final_response: str) -> None:
+    if (getattr(agent, "platform", "") or "") != "zet_agent":
+        return
+    if not getattr(agent, "_zet_agent_plan_mode_active", False):
+        return
+    if getattr(agent, "_zet_agent_plan_presented", False):
+        return
+    callback = getattr(agent, "plan_emit_callback", None)
+    if callback is None:
+        return
+    groups = _plain_text_plan_groups(final_response)
+    if not groups:
+        return
+    try:
+        from tools.plan_tool import present_plan as _present_plan
+
+        _present_plan(
+            title=_plain_text_plan_title(final_response),
+            groups=groups,
+            callback=callback,
+        )
+        agent._zet_agent_plan_presented = True
+        logger.info("zet_agent plan mode: synthesized plan card from text response")
+    except Exception:
+        logger.warning(
+            "zet_agent plan mode: failed to synthesize text plan card",
+            exc_info=True,
+        )
 
 
 def _apply_forced_present_plan_tool_choice(agent: Any, api_kwargs: Dict[str, Any]) -> bool:
@@ -271,10 +474,11 @@ def _apply_forced_present_plan_tool_choice(agent: Any, api_kwargs: Dict[str, Any
         "type": "function",
         "function": {"name": "present_plan"},
     }
-    disabled_thinking = _disable_deepseek_thinking_for_tool_choice(agent, api_kwargs)
+    disabled_thinking = _should_disable_thinking_for_forced_tool_choice(agent)
     if disabled_thinking:
+        _disable_thinking_for_forced_tool_choice(api_kwargs)
         logger.info(
-            "zet_agent plan mode: forcing tool_choice=present_plan with DeepSeek thinking disabled"
+            "zet_agent plan mode: forcing tool_choice=present_plan with thinking disabled"
         )
     else:
         logger.info("zet_agent plan mode: forcing tool_choice=present_plan")
@@ -678,9 +882,13 @@ def run_conversation(
     # Main conversation loop counters (pure locals consumed by the loop below).
     # Zettlab App plan 模式：本轮是否强制首轮模型调用产出 present_plan
     #（消费见 _apply_forced_present_plan_tool_choice）。
-    agent._zet_agent_force_present_plan_pending = _should_force_present_plan_tool_choice(
+    agent._zet_agent_plan_mode_active = _should_force_present_plan_tool_choice(
         agent, original_user_message
     )
+    agent._zet_agent_force_present_plan_pending = agent._zet_agent_plan_mode_active
+    agent._zet_agent_force_present_plan_disable_thinking = False
+    agent._zet_agent_plan_text_fallback = False
+    agent._zet_agent_plan_presented = False
     api_call_count = 0
     final_response = None
     interrupted = False
@@ -1123,7 +1331,11 @@ def run_conversation(
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
                 api_kwargs = agent._build_api_kwargs(api_messages)
-                _apply_forced_present_plan_tool_choice(agent, api_kwargs)
+                if getattr(agent, "_zet_agent_plan_text_fallback", False):
+                    _apply_plan_text_fallback_request(api_kwargs)
+                    logger.info("zet_agent plan mode: using no-tools text fallback request")
+                else:
+                    _apply_forced_present_plan_tool_choice(agent, api_kwargs)
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -2373,6 +2585,57 @@ def run_conversation(
                         f"switching to text-only mode for this session"
                         + (". Stripped images from history and retrying." if _imgs_removed else "."),
                         force=True,
+                    )
+                    continue
+
+                if (
+                    getattr(agent, "_zet_agent_force_present_plan_pending", False) is False
+                    and getattr(agent, "_zet_agent_force_present_plan_disable_thinking", False) is False
+                    and _is_thinking_tool_choice_rejection(api_error)
+                    and not _retry.plan_tool_choice_thinking_retry_attempted
+                ):
+                    _retry.plan_tool_choice_thinking_retry_attempted = True
+                    agent._zet_agent_force_present_plan_pending = True
+                    agent._zet_agent_force_present_plan_disable_thinking = True
+                    logger.warning(
+                        "%sProvider rejected forced present_plan with thinking enabled; "
+                        "retrying once with thinking disabled",
+                        agent.log_prefix,
+                    )
+                    continue
+
+                if (
+                    getattr(agent, "_zet_agent_force_present_plan_disable_thinking", False) is True
+                    and (
+                        _is_thinking_tool_choice_rejection(api_error)
+                        or _is_unsupported_thinking_parameter_error(api_error)
+                    )
+                    and not _retry.plan_text_fallback_retry_attempted
+                ):
+                    _retry.plan_text_fallback_retry_attempted = True
+                    agent._zet_agent_force_present_plan_pending = False
+                    agent._zet_agent_force_present_plan_disable_thinking = False
+                    agent._zet_agent_plan_text_fallback = True
+                    logger.warning(
+                        "%sProvider rejected the thinking disable parameter; "
+                        "retrying plan mode as text fallback without tools",
+                        agent.log_prefix,
+                    )
+                    continue
+
+                if (
+                    getattr(agent, "_zet_agent_plan_mode_active", False) is True
+                    and _is_unsupported_tools_or_tool_choice_error(api_error)
+                    and not _retry.plan_text_fallback_retry_attempted
+                ):
+                    _retry.plan_text_fallback_retry_attempted = True
+                    agent._zet_agent_force_present_plan_pending = False
+                    agent._zet_agent_force_present_plan_disable_thinking = False
+                    agent._zet_agent_plan_text_fallback = True
+                    logger.warning(
+                        "%sProvider rejected tool-calling parameters; "
+                        "retrying plan mode as text fallback without tools",
+                        agent.log_prefix,
                     )
                     continue
 
@@ -4656,6 +4919,7 @@ def run_conversation(
                     length_continue_retries = 0
                 
                 final_response = agent._strip_think_blocks(final_response).strip()
+                _emit_plain_text_plan_if_needed(agent, final_response)
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
