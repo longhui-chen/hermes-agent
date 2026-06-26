@@ -73,3 +73,34 @@ def test_multiplex_cron_scheduler_runs_each_profile_under_profile_home(tmp_path,
         ],
         key=lambda item: str(item[0]),
     )
+
+
+def test_cron_env_reads_active_profile_secret_scope(monkeypatch):
+    from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
+    from cron import scheduler
+
+    monkeypatch.setenv("HERMES_MODEL", "outer-model")
+    set_multiplex_active(True)
+    token = set_secret_scope({"HERMES_MODEL": "profile-model"})
+    try:
+        assert scheduler._cron_env("HERMES_MODEL", "") == "profile-model"
+    finally:
+        reset_secret_scope(token)
+        set_multiplex_active(False)
+
+
+def test_running_job_key_is_profile_qualified(tmp_path, monkeypatch):
+    from cron import scheduler
+
+    home_a = tmp_path / "profiles" / "a"
+    home_b = tmp_path / "profiles" / "b"
+    home_a.mkdir(parents=True)
+    home_b.mkdir(parents=True)
+
+    monkeypatch.setattr(scheduler, "_hermes_home", home_a)
+    key_a = scheduler._running_job_key({"id": "same-job"})
+    monkeypatch.setattr(scheduler, "_hermes_home", home_b)
+    key_b = scheduler._running_job_key({"id": "same-job"})
+
+    assert key_a != key_b
+    assert key_a[1] == key_b[1] == "same-job"

@@ -1328,7 +1328,19 @@ class APIServerAdapter(BasePlatformAdapter):
         router.add_get("/p/{profile}/health", self._profile_handler(self._handle_health))
         router.add_get("/p/{profile}/v1/health", self._profile_handler(self._handle_health))
         router.add_get("/p/{profile}/v1/models", self._profile_handler(self._handle_models))
+        router.add_get("/p/{profile}/v1/skills", self._profile_handler(self._handle_skills))
+        router.add_get("/p/{profile}/v1/toolsets", self._profile_handler(self._handle_toolsets))
         router.add_post("/p/{profile}/v1/chat/completions", self._profile_handler(chat))
+
+        router.add_get("/p/{profile}/api/sessions", self._profile_handler(self._handle_list_sessions))
+        router.add_post("/p/{profile}/api/sessions", self._profile_handler(self._handle_create_session))
+        router.add_get("/p/{profile}/api/sessions/{session_id}", self._profile_handler(self._handle_get_session))
+        router.add_patch("/p/{profile}/api/sessions/{session_id}", self._profile_handler(self._handle_patch_session))
+        router.add_delete("/p/{profile}/api/sessions/{session_id}", self._profile_handler(self._handle_delete_session))
+        router.add_get("/p/{profile}/api/sessions/{session_id}/messages", self._profile_handler(self._handle_session_messages))
+        router.add_post("/p/{profile}/api/sessions/{session_id}/fork", self._profile_handler(self._handle_fork_session))
+        router.add_post("/p/{profile}/api/sessions/{session_id}/chat", self._profile_handler(self._handle_session_chat))
+        router.add_post("/p/{profile}/api/sessions/{session_id}/chat/stream", self._profile_handler(self._handle_session_chat_stream))
 
         router.add_get("/p/{profile}/api/jobs", self._profile_handler(self._handle_list_jobs))
         router.add_post("/p/{profile}/api/jobs", self._profile_handler(self._handle_create_job))
@@ -1338,6 +1350,8 @@ class APIServerAdapter(BasePlatformAdapter):
         router.add_post("/p/{profile}/api/jobs/{job_id}/pause", self._profile_handler(self._handle_pause_job))
         router.add_post("/p/{profile}/api/jobs/{job_id}/resume", self._profile_handler(self._handle_resume_job))
         router.add_post("/p/{profile}/api/jobs/{job_id}/run", self._profile_handler(self._handle_run_job))
+        if _CRON_AVAILABLE:
+            router.add_post("/p/{profile}/api/cron/fire", self._profile_handler(self._handle_cron_fire))
 
     # ------------------------------------------------------------------
     # Agent creation helper

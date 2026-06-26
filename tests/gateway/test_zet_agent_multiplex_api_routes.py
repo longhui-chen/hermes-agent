@@ -1,5 +1,6 @@
 """Phase 1: zet_agent `/p/<profile>` API routes for local-server mux mode."""
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -257,6 +258,112 @@ async def test_prefixed_jobs_use_scoped_profile_home(profile_homes, monkeypatch)
         (profile_homes["main"], True),
         (profile_homes["coder"], False),
     ]
+
+
+@pytest.mark.asyncio
+async def test_prefixed_cron_fire_uses_scoped_profile_home(profile_homes, monkeypatch):
+    import gateway.platforms.api_server as api_server
+
+    seen = []
+
+    class SpyProvider:
+        def fire_due(self, job_id, *, adapters=None, loop=None):
+            from hermes_constants import get_hermes_home
+            seen.append((get_hermes_home(), job_id))
+            return True
+
+    monkeypatch.setattr(api_server, "_CRON_AVAILABLE", True)
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: SpyProvider())
+    monkeypatch.setattr(
+        "plugins.cron.chronos.verify.get_fire_verifier",
+        lambda: (lambda **_kwargs: {"purpose": "cron_fire"}),
+    )
+
+    adapter = _make_adapter()
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/p/coder/api/cron/fire",
+            json={"job_id": "nightly"},
+            headers={"Authorization": "Bearer fire-token"},
+        )
+
+    assert resp.status == 202
+    for _ in range(50):
+        if seen:
+            break
+        await asyncio.sleep(0.01)
+    assert seen == [(profile_homes["coder"], "nightly")]
+
+
+@pytest.mark.asyncio
+async def test_prefixed_profile_unload_calls_targeted_runner(profile_homes):
+    calls = []
+
+    class FakeRunner:
+        async def unload_profile_runtime(self, profile):
+            calls.append(profile)
+            return {"evicted_sessions": 2, "disconnected_adapters": 1}
+
+    adapter = _make_adapter()
+    adapter.gateway_runner = FakeRunner()
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/p/coder/v1/profile/unload",
+            headers={"Authorization": "Bearer test-key"},
+        )
+        data = await resp.json()
+
+    assert resp.status == 200
+    assert calls == ["coder"]
+    assert data["evicted_sessions"] == 2
+    assert data["disconnected_adapters"] == 1
+
+
+@pytest.mark.asyncio
+async def test_prefixed_profile_unload_blocks_active_sessions(profile_homes):
+    class FakeRunner:
+        async def unload_profile_runtime(self, profile):
+            return {
+                "blocked": True,
+                "active_sessions": 1,
+                "evicted_sessions": 0,
+                "disconnected_adapters": 0,
+            }
+
+    adapter = _make_adapter()
+    adapter.gateway_runner = FakeRunner()
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/p/coder/v1/profile/unload",
+            headers={"Authorization": "Bearer test-key"},
+        )
+        data = await resp.json()
+
+    assert resp.status == 409
+    assert data["unloaded"] is False
+    assert data["active_sessions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_gateway_profile_unload_blocks_pending_sentinel():
+    from gateway.run import _AGENT_PENDING_SENTINEL, GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._running_agents = {"agent:coder:api_server:dm:sid": _AGENT_PENDING_SENTINEL}
+
+    result = await runner.unload_profile_runtime("coder")
+
+    assert result["blocked"] is True
+    assert result["active_sessions"] == 1
 
 
 @pytest.mark.asyncio

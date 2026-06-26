@@ -13824,6 +13824,138 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return count
 
     @staticmethod
+    def _profile_session_key_prefix(profile: Optional[str]) -> str:
+        try:
+            from gateway.session import _session_key_namespace
+            return _session_key_namespace(profile) + ":"
+        except Exception:
+            normalized = (profile or "main").strip() or "main"
+            if normalized == "default":
+                normalized = "main"
+            return f"agent:{normalized}:"
+
+    def invalidate_cached_agents_for_profile(self, profile: Optional[str]) -> int:
+        """Invalidate cached agents whose session key belongs to one profile."""
+        prefix = self._profile_session_key_prefix(profile)
+        _lock = getattr(self, "_agent_cache_lock", None)
+        if _lock is None:
+            return 0
+        with _lock:
+            entries = [
+                value
+                for key, value in self._agent_cache.items()
+                if str(key).startswith(prefix)
+            ]
+        count = 0
+        for entry in entries:
+            agent = entry[0] if isinstance(entry, tuple) and entry else entry
+            invalidate = getattr(agent, "_invalidate_system_prompt", None)
+            if not callable(invalidate):
+                continue
+            try:
+                invalidate()
+                count += 1
+            except Exception:
+                logger.warning(
+                    "invalidate_cached_agents_for_profile(%s): agent %r failed",
+                    profile,
+                    type(agent).__name__,
+                    exc_info=True,
+                )
+        return count
+
+    def _evict_cached_agents_for_profile(self, profile: Optional[str]) -> int:
+        """Drop cached agents and session model overrides owned by one profile."""
+        prefix = self._profile_session_key_prefix(profile)
+        _lock = getattr(self, "_agent_cache_lock", None)
+        evicted_entries = []
+        if _lock is not None:
+            with _lock:
+                keys = [
+                    key
+                    for key in list(self._agent_cache.keys())
+                    if str(key).startswith(prefix)
+                ]
+                for key in keys:
+                    evicted_entries.append(self._agent_cache.pop(key, None))
+        else:
+            _cache = getattr(self, "_agent_cache", None)
+            if _cache is not None:
+                keys = [key for key in list(_cache.keys()) if str(key).startswith(prefix)]
+                for key in keys:
+                    evicted_entries.append(_cache.pop(key, None))
+
+        overrides = getattr(self, "_session_model_overrides", None)
+        if isinstance(overrides, dict):
+            for key in list(overrides.keys()):
+                if str(key).startswith(prefix):
+                    overrides.pop(key, None)
+
+        running_ids = {
+            id(agent)
+            for agent in getattr(self, "_running_agents", {}).values()
+            if agent is not None and agent is not _AGENT_PENDING_SENTINEL
+        }
+        cleaned = 0
+        for entry in evicted_entries:
+            agent = entry[0] if isinstance(entry, tuple) and entry else entry
+            if agent is None or agent is _AGENT_PENDING_SENTINEL:
+                continue
+            if id(agent) in running_ids:
+                logger.warning(
+                    "profile-unload: cached agent for profile %s is still running; "
+                    "removed from cache but deferred resource cleanup",
+                    profile,
+                )
+                continue
+            try:
+                self._cleanup_agent_resources(agent)
+                cleaned += 1
+            except Exception:
+                logger.warning(
+                    "profile-unload: cleanup failed for profile %s",
+                    profile,
+                    exc_info=True,
+                )
+        return cleaned
+
+    async def unload_profile_runtime(self, profile: Optional[str]) -> dict:
+        """Release in-process runtime state owned by a multiplex profile."""
+        prefix = self._profile_session_key_prefix(profile)
+        active_sessions = [
+            key
+            for key, agent in getattr(self, "_running_agents", {}).items()
+            if str(key).startswith(prefix)
+            and agent is not None
+        ]
+        if active_sessions:
+            logger.warning(
+                "profile-unload: refusing to unload profile %s; %d session(s) still running",
+                profile,
+                len(active_sessions),
+            )
+            return {
+                "blocked": True,
+                "active_sessions": len(active_sessions),
+                "evicted_sessions": 0,
+                "disconnected_adapters": 0,
+            }
+        cleaned_agents = self._evict_cached_agents_for_profile(profile)
+        disconnected_adapters = 0
+        profile_name = (profile or "").strip()
+        adapter_map = None
+        if profile_name:
+            adapter_map = getattr(self, "_profile_adapters", {}).pop(profile_name, None)
+        if adapter_map:
+            for platform, adapter in list(adapter_map.items()):
+                await self._safe_adapter_disconnect(adapter, platform)
+                disconnected_adapters += 1
+        return {
+            "evicted_sessions": cleaned_agents,
+            "disconnected_adapters": disconnected_adapters,
+        }
+
+    @staticmethod
     def _init_cached_agent_for_turn(agent: Any, interrupt_depth: int) -> None:
         """Reset per-turn state on a cached agent before a new turn starts.
 

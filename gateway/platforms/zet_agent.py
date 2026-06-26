@@ -1774,12 +1774,16 @@ class ZetAgentAdapter(APIServerAdapter):
         # would still rebuild from the cleared DB anyway — just one turn
         # later than ideal — so a failure here is not worth tearing down
         # the gateway over.
+        profile = _request_value(request, "hermes_profile")
         invalidated = 0
         try:
-            invalidated = gw.invalidate_all_cached_agents()
+            if profile and hasattr(gw, "invalidate_cached_agents_for_profile"):
+                invalidated = gw.invalidate_cached_agents_for_profile(profile)
+            else:
+                invalidated = gw.invalidate_all_cached_agents()
         except Exception:
             logger.warning(
-                "[zet_agent] profile-reload: invalidate-all failed "
+                "[zet_agent] profile-reload: invalidate failed "
                 "(DB cleared, sessions still rebuild next turn)",
                 exc_info=True,
             )
@@ -1817,6 +1821,42 @@ class ZetAgentAdapter(APIServerAdapter):
             return auth_err
 
         profile_home = _request_value(request, "hermes_profile_home")
+        runtime_unload = {}
+        gw = getattr(self, "gateway_runner", None)
+        if gw is not None:
+            try:
+                profile = _request_value(request, "hermes_profile")
+                unload = getattr(gw, "unload_profile_runtime", None)
+                if callable(unload):
+                    runtime_unload = await unload(profile)
+                else:
+                    runtime_unload = {
+                        "evicted_sessions": gw.invalidate_all_cached_agents(),
+                        "disconnected_adapters": 0,
+                    }
+            except Exception:
+                logger.warning(
+                    "[zet_agent] profile-unload: runtime unload failed",
+                    exc_info=True,
+                )
+                return web.json_response(
+                    _openai_error(
+                        "profile unload failed: runtime state could not be released",
+                        err_type="server_error",
+                    ),
+                    status=500,
+                )
+
+        if runtime_unload.get("blocked"):
+            return web.json_response(
+                {
+                    "unloaded": False,
+                    "error": "profile has active sessions",
+                    "active_sessions": int(runtime_unload.get("active_sessions", 0) or 0),
+                },
+                status=409,
+            )
+
         closed_session_db = False
         if profile_home:
             db = self._session_dbs.pop(str(profile_home), None)
@@ -1832,21 +1872,11 @@ class ZetAgentAdapter(APIServerAdapter):
                         )
                 closed_session_db = True
 
-        invalidated = 0
-        gw = getattr(self, "gateway_runner", None)
-        if gw is not None:
-            try:
-                invalidated = gw.invalidate_all_cached_agents()
-            except Exception:
-                logger.warning(
-                    "[zet_agent] profile-unload: invalidate-all failed",
-                    exc_info=True,
-                )
-
         return web.json_response({
             "unloaded": True,
             "closed_session_db": closed_session_db,
-            "invalidated_sessions": invalidated,
+            "evicted_sessions": int(runtime_unload.get("evicted_sessions", 0) or 0),
+            "disconnected_adapters": int(runtime_unload.get("disconnected_adapters", 0) or 0),
         })
 
     # ------------------------------------------------------------------
