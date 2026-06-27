@@ -7,6 +7,7 @@ from agent.conversation_loop import (
     _is_thinking_tool_choice_rejection,
     _is_unsupported_tools_or_tool_choice_error,
     _is_unsupported_thinking_parameter_error,
+    _should_end_after_present_plan,
     _should_force_present_plan_tool_choice,
 )
 from agent.tool_executor import _zet_agent_plan_mode_block_message
@@ -223,6 +224,31 @@ def test_plain_text_plan_response_is_emitted_as_plan_card():
     assert title == "减肥计划"
     assert groups[0]["label"] == "准备"
     assert groups[0]["items"] == ["记录当前体重", "清理高糖零食"]
+
+
+def test_present_plan_tool_result_ends_zet_agent_plan_turn():
+    assert _should_end_after_present_plan(
+        _agent(
+            _zet_agent_plan_mode_active=True,
+            _zet_agent_plan_presented=True,
+        )
+    )
+
+
+def test_present_plan_tool_result_does_not_end_regular_tool_turns():
+    assert not _should_end_after_present_plan(
+        _agent(
+            _zet_agent_plan_mode_active=False,
+            _zet_agent_plan_presented=True,
+        )
+    )
+    assert not _should_end_after_present_plan(
+        _agent(
+            platform="telegram",
+            _zet_agent_plan_mode_active=True,
+            _zet_agent_plan_presented=True,
+        )
+    )
 
 
 def test_plain_text_plan_response_does_not_emit_duplicate_card():

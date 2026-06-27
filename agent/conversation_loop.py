@@ -449,6 +449,14 @@ def _emit_plain_text_plan_if_needed(agent: Any, final_response: str) -> None:
         )
 
 
+def _should_end_after_present_plan(agent: Any) -> bool:
+    return (
+        (getattr(agent, "platform", "") or "") == "zet_agent"
+        and bool(getattr(agent, "_zet_agent_plan_mode_active", False))
+        and bool(getattr(agent, "_zet_agent_plan_presented", False))
+    )
+
+
 def _apply_forced_present_plan_tool_choice(agent: Any, api_kwargs: Dict[str, Any]) -> bool:
     """Force the first Zettlab plan-mode request to call present_plan."""
     if not getattr(agent, "_zet_agent_force_present_plan_pending", False):
@@ -4456,6 +4464,15 @@ def run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+
+                if _should_end_after_present_plan(agent):
+                    _turn_exit_reason = "text_response(plan_presented)"
+                    final_response = ""
+                    logger.info(
+                        "zet_agent plan mode: present_plan emitted; ending turn "
+                        "without a post-tool LLM follow-up"
+                    )
+                    break
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
