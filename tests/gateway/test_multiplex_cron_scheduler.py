@@ -1,5 +1,6 @@
 """Multiplex gateway cron scheduler scoping."""
 
+import threading
 from types import SimpleNamespace
 
 from gateway.config import GatewayConfig
@@ -30,6 +31,7 @@ def test_multiplex_cron_scheduler_runs_each_profile_under_profile_home(tmp_path,
     from hermes_constants import get_hermes_home
 
     seen = []
+    seen_event = threading.Event()
     default_home = tmp_path / ".hermes"
     main_home = default_home / "profiles" / "main"
     family_home = default_home / "profiles" / "family-manager"
@@ -39,6 +41,9 @@ def test_multiplex_cron_scheduler_runs_each_profile_under_profile_home(tmp_path,
     class DummyScheduler:
         def start(self, stop_event, *, adapters=None, loop=None):
             seen.append((get_hermes_home(), adapters))
+            if len(seen) >= 2:
+                seen_event.set()
+            stop_event.wait(timeout=5)
 
     monkeypatch.setattr(
         "hermes_cli.profiles.profiles_to_serve",
@@ -59,10 +64,12 @@ def test_multiplex_cron_scheduler_runs_each_profile_under_profile_home(tmp_path,
             "main": main_adapters,
         },
     )
-    import threading
-
     stop_event = threading.Event()
-    threads = _start_gateway_cron_schedulers(runner, stop_event)
+    threads = _start_gateway_cron_schedulers(runner, stop_event, reconcile_interval=0.05)
+    try:
+        assert seen_event.wait(timeout=2)
+    finally:
+        stop_event.set()
     for thread in threads:
         thread.join(timeout=2)
 
@@ -73,6 +80,99 @@ def test_multiplex_cron_scheduler_runs_each_profile_under_profile_home(tmp_path,
         ],
         key=lambda item: str(item[0]),
     )
+
+
+def test_multiplex_cron_reconciler_starts_new_profiles(tmp_path, monkeypatch):
+    from hermes_constants import get_hermes_home
+
+    default_home = tmp_path / ".hermes"
+    main_home = default_home / "profiles" / "main"
+    worker_home = default_home / "profiles" / "worker"
+    served = {"main": main_home}
+    seen_homes = []
+    seen_worker = threading.Event()
+
+    class DummyScheduler:
+        def start(self, stop_event, *, adapters=None, loop=None):
+            home = get_hermes_home()
+            seen_homes.append(home)
+            if home == worker_home:
+                seen_worker.set()
+            stop_event.wait(timeout=5)
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda multiplex: list(served.items()),
+    )
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: DummyScheduler())
+
+    runner = SimpleNamespace(
+        config=GatewayConfig(multiplex_profiles=True),
+        adapters={},
+        _profile_adapters={
+            "main": {"api_server": object()},
+            "worker": {"api_server": object()},
+        },
+    )
+    stop_event = threading.Event()
+    threads = _start_gateway_cron_schedulers(runner, stop_event, reconcile_interval=0.05)
+    try:
+        served["worker"] = worker_home
+        assert seen_worker.wait(timeout=2)
+    finally:
+        stop_event.set()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert main_home in seen_homes
+    assert worker_home in seen_homes
+
+
+def test_multiplex_cron_reconciler_stops_removed_profiles(tmp_path, monkeypatch):
+    from hermes_constants import get_hermes_home
+
+    default_home = tmp_path / ".hermes"
+    main_home = default_home / "profiles" / "main"
+    retired_home = default_home / "profiles" / "retired"
+    served = {"main": main_home, "retired": retired_home}
+    seen_retired = threading.Event()
+    stopped_retired = threading.Event()
+
+    class DummyScheduler:
+        def start(self, stop_event, *, adapters=None, loop=None):
+            home = get_hermes_home()
+            if home == retired_home:
+                seen_retired.set()
+            stop_event.wait(timeout=5)
+            if home == retired_home:
+                stopped_retired.set()
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda multiplex: list(served.items()),
+    )
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: DummyScheduler())
+
+    runner = SimpleNamespace(
+        config=GatewayConfig(multiplex_profiles=True),
+        adapters={},
+        _profile_adapters={
+            "main": {"api_server": object()},
+            "retired": {"api_server": object()},
+        },
+    )
+    stop_event = threading.Event()
+    threads = _start_gateway_cron_schedulers(runner, stop_event, reconcile_interval=0.05)
+    try:
+        assert seen_retired.wait(timeout=2)
+        served.pop("retired")
+        assert stopped_retired.wait(timeout=2)
+    finally:
+        stop_event.set()
+    for thread in threads:
+        thread.join(timeout=2)
 
 
 def test_cron_env_reads_active_profile_secret_scope(monkeypatch):

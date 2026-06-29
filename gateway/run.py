@@ -17366,11 +17366,131 @@ def _run_profile_cron_scheduler(
         logger.exception("Profile cron scheduler failed for %s", profile_name)
 
 
+def _profile_cron_adapters(runner: "GatewayRunner", profile_name: str):
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+    except Exception:
+        active = "default"
+    else:
+        active = get_active_profile_name() or "default"
+
+    if profile_name == active:
+        return runner.adapters
+    return runner._profile_adapters.get(profile_name, {})
+
+
+def _start_profile_cron_scheduler_thread(
+    runner: "GatewayRunner",
+    profile_name: str,
+    profile_home: Path,
+    stop_event: threading.Event,
+    *,
+    loop=None,
+) -> threading.Thread:
+    thread = threading.Thread(
+        target=_run_profile_cron_scheduler,
+        args=(stop_event, profile_name, profile_home),
+        kwargs={
+            "adapters": _profile_cron_adapters(runner, profile_name),
+            "loop": loop,
+        },
+        daemon=True,
+        name=f"cron-scheduler-{profile_name}",
+    )
+    thread.start()
+    return thread
+
+
+def _stop_profile_cron_scheduler(
+    profile_name: str,
+    entry: tuple[Path, threading.Event, threading.Thread],
+    *,
+    timeout: float,
+) -> None:
+    _profile_home, stop_event, thread = entry
+    stop_event.set()
+    thread.join(timeout=timeout)
+    if thread.is_alive():
+        logger.warning(
+            "Profile cron scheduler did not stop cleanly for %s",
+            profile_name,
+        )
+
+
+def _run_multiplex_cron_reconciler(
+    runner: "GatewayRunner",
+    stop_event: threading.Event,
+    *,
+    loop=None,
+    reconcile_interval: float = 60.0,
+) -> None:
+    """Keep mux profile cron schedulers aligned with the profile set."""
+    entries: Dict[str, tuple[Path, threading.Event, threading.Thread]] = {}
+
+    try:
+        while not stop_event.is_set():
+            try:
+                profiles = {name: home for name, home in _multiplex_cron_profiles()}
+                for profile_name, profile_home in profiles.items():
+                    existing = entries.get(profile_name)
+                    if existing and existing[0] == profile_home and existing[2].is_alive():
+                        continue
+                    if existing:
+                        _stop_profile_cron_scheduler(profile_name, existing, timeout=1)
+
+                    profile_stop = threading.Event()
+                    thread = _start_profile_cron_scheduler_thread(
+                        runner,
+                        profile_name,
+                        profile_home,
+                        profile_stop,
+                        loop=loop,
+                    )
+                    entries[profile_name] = (profile_home, profile_stop, thread)
+                    logger.info("Started mux profile cron scheduler for %s", profile_name)
+
+                for profile_name in list(entries):
+                    if profile_name not in profiles:
+                        _stop_profile_cron_scheduler(
+                            profile_name,
+                            entries.pop(profile_name),
+                            timeout=5,
+                        )
+                        logger.info("Stopped mux profile cron scheduler for %s", profile_name)
+            except Exception:
+                logger.exception("Mux profile cron reconciliation failed")
+
+            stop_event.wait(timeout=reconcile_interval)
+    finally:
+        for profile_name, entry in list(entries.items()):
+            _stop_profile_cron_scheduler(profile_name, entry, timeout=5)
+        entries.clear()
+
+
+def _start_multiplex_cron_reconciler(
+    runner: "GatewayRunner",
+    stop_event: threading.Event,
+    *,
+    loop=None,
+    reconcile_interval: float = 60.0,
+) -> threading.Thread:
+    thread = threading.Thread(
+        target=_run_multiplex_cron_reconciler,
+        args=(runner, stop_event),
+        kwargs={"loop": loop, "reconcile_interval": reconcile_interval},
+        daemon=True,
+        name="cron-scheduler-mux-reconciler",
+    )
+    thread.start()
+    return thread
+
+
 def _start_gateway_cron_schedulers(
     runner: "GatewayRunner",
     stop_event: threading.Event,
     *,
     loop=None,
+    reconcile_interval: float = 60.0,
 ) -> List[threading.Thread]:
     """Start cron scheduler thread(s) for the gateway runtime."""
     if not getattr(runner.config, "multiplex_profiles", False):
@@ -17387,26 +17507,14 @@ def _start_gateway_cron_schedulers(
         thread.start()
         return [thread]
 
-    try:
-        from hermes_cli.profiles import get_active_profile_name
-    except Exception:
-        active = "default"
-    else:
-        active = get_active_profile_name() or "default"
-
-    threads: List[threading.Thread] = []
-    for profile_name, profile_home in _multiplex_cron_profiles():
-        adapters = runner.adapters if profile_name == active else runner._profile_adapters.get(profile_name, {})
-        thread = threading.Thread(
-            target=_run_profile_cron_scheduler,
-            args=(stop_event, profile_name, profile_home),
-            kwargs={"adapters": adapters, "loop": loop},
-            daemon=True,
-            name=f"cron-scheduler-{profile_name}",
+    return [
+        _start_multiplex_cron_reconciler(
+            runner,
+            stop_event,
+            loop=loop,
+            reconcile_interval=reconcile_interval,
         )
-        thread.start()
-        threads.append(thread)
-    return threads
+    ]
 
 
 async def start_gateway(
