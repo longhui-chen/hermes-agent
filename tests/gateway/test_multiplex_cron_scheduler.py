@@ -1,7 +1,11 @@
 """Multiplex gateway cron scheduler scoping."""
 
+import asyncio
 import threading
+import time
 from types import SimpleNamespace
+
+import pytest
 
 from gateway.config import GatewayConfig
 from gateway.run import _multiplex_cron_profiles, _start_gateway_cron_schedulers
@@ -129,6 +133,140 @@ def test_multiplex_cron_reconciler_starts_new_profiles(tmp_path, monkeypatch):
     assert worker_home in seen_homes
 
 
+def test_multiplex_cron_reconciler_does_not_restart_returning_provider(tmp_path, monkeypatch):
+    default_home = tmp_path / ".hermes"
+    main_home = default_home / "profiles" / "main"
+    starts = 0
+
+    class ReturningScheduler:
+        def start(self, stop_event, *, adapters=None, loop=None):
+            nonlocal starts
+            starts += 1
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda multiplex: [("main", main_home)],
+    )
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: ReturningScheduler())
+
+    runner = SimpleNamespace(
+        config=GatewayConfig(multiplex_profiles=True),
+        adapters={},
+        _profile_adapters={"main": {"api_server": object()}},
+    )
+    stop_event = threading.Event()
+    threads = _start_gateway_cron_schedulers(runner, stop_event, reconcile_interval=0.05)
+    try:
+        assert _wait_until(lambda: starts == 1, timeout=2)
+        threading.Event().wait(timeout=0.15)
+        assert starts == 1
+    finally:
+        stop_event.set()
+    for thread in threads:
+        thread.join(timeout=2)
+
+
+def test_multiplex_cron_reconciler_uses_primary_adapters_for_active_profile(tmp_path, monkeypatch):
+    from hermes_constants import get_hermes_home
+
+    default_home = tmp_path / ".hermes"
+    main_home = default_home / "profiles" / "main"
+    main_adapters = {"api_server": object()}
+    seen = []
+    seen_event = threading.Event()
+
+    class DummyScheduler:
+        def start(self, stop_event, *, adapters=None, loop=None):
+            seen.append((get_hermes_home(), adapters))
+            seen_event.set()
+            stop_event.wait(timeout=5)
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda multiplex: [("main", main_home)],
+    )
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "main")
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: DummyScheduler())
+
+    def fail_start_one_profile_adapters(*args, **kwargs):
+        raise AssertionError("active profile must use runner.adapters")
+
+    runner = SimpleNamespace(
+        config=GatewayConfig(multiplex_profiles=True),
+        adapters=main_adapters,
+        _profile_adapters={},
+        _start_one_profile_adapters=fail_start_one_profile_adapters,
+    )
+    stop_event = threading.Event()
+    threads = _start_gateway_cron_schedulers(runner, stop_event, reconcile_interval=0.05)
+    try:
+        assert seen_event.wait(timeout=2)
+    finally:
+        stop_event.set()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert seen == [(main_home, main_adapters)]
+
+
+@pytest.mark.asyncio
+async def test_multiplex_cron_reconciler_starts_adapters_for_new_profiles(tmp_path, monkeypatch):
+    from hermes_constants import get_hermes_home
+
+    default_home = tmp_path / ".hermes"
+    main_home = default_home / "profiles" / "main"
+    worker_home = default_home / "profiles" / "worker"
+    served = {"main": main_home}
+    worker_adapters = {"api_server": object()}
+    seen_worker = threading.Event()
+    seen = []
+
+    class DummyScheduler:
+        def start(self, stop_event, *, adapters=None, loop=None):
+            seen.append((get_hermes_home(), adapters))
+            if get_hermes_home() == worker_home and adapters is worker_adapters:
+                seen_worker.set()
+            stop_event.wait(timeout=5)
+
+    async def start_one_profile_adapters(profile_name, profile_home, claimed):
+        assert profile_name == "worker"
+        assert profile_home == worker_home
+        runner._profile_adapters[profile_name] = worker_adapters
+        return 1
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda multiplex: list(served.items()),
+    )
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: DummyScheduler())
+
+    runner = SimpleNamespace(
+        config=GatewayConfig(multiplex_profiles=True),
+        adapters={},
+        _profile_adapters={"main": {"api_server": object()}},
+        _adapter_credential_fingerprint=lambda adapter: None,
+        _start_one_profile_adapters=start_one_profile_adapters,
+    )
+    stop_event = threading.Event()
+    threads = _start_gateway_cron_schedulers(
+        runner,
+        stop_event,
+        loop=asyncio.get_running_loop(),
+        reconcile_interval=0.05,
+    )
+    try:
+        served["worker"] = worker_home
+        assert await _wait_thread_event(seen_worker, timeout=2)
+    finally:
+        stop_event.set()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert (worker_home, worker_adapters) in seen
+
+
 def test_multiplex_cron_reconciler_stops_removed_profiles(tmp_path, monkeypatch):
     from hermes_constants import get_hermes_home
 
@@ -173,6 +311,24 @@ def test_multiplex_cron_reconciler_stops_removed_profiles(tmp_path, monkeypatch)
         stop_event.set()
     for thread in threads:
         thread.join(timeout=2)
+
+
+def _wait_until(predicate, *, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        threading.Event().wait(timeout=0.01)
+    return predicate()
+
+
+async def _wait_thread_event(event: threading.Event, *, timeout: float) -> bool:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        if event.is_set():
+            return True
+        await asyncio.sleep(0.01)
+    return event.is_set()
 
 
 def test_cron_env_reads_active_profile_secret_scope(monkeypatch):

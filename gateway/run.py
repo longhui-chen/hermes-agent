@@ -17366,17 +17366,102 @@ def _run_profile_cron_scheduler(
         logger.exception("Profile cron scheduler failed for %s", profile_name)
 
 
-def _profile_cron_adapters(runner: "GatewayRunner", profile_name: str):
+def _multiplex_active_profile_name() -> str:
     try:
         from hermes_cli.profiles import get_active_profile_name
+        return get_active_profile_name() or "default"
     except Exception:
-        active = "default"
-    else:
-        active = get_active_profile_name() or "default"
+        return "default"
 
-    if profile_name == active:
+
+def _multiplex_adapter_claims(
+    runner: "GatewayRunner",
+    *,
+    exclude_profile: Optional[str] = None,
+) -> Dict[tuple, str]:
+    """Build credential claims for dynamic mux adapter startup."""
+    claims: Dict[tuple, str] = {}
+    active = _multiplex_active_profile_name()
+
+    for platform, adapter in getattr(runner, "adapters", {}).items():
+        fp = runner._adapter_credential_fingerprint(adapter)
+        if fp is not None:
+            claims[(platform, fp)] = active
+
+    for profile_name, adapter_map in getattr(runner, "_profile_adapters", {}).items():
+        if profile_name == exclude_profile:
+            continue
+        for platform, adapter in adapter_map.items():
+            fp = runner._adapter_credential_fingerprint(adapter)
+            if fp is not None:
+                claims[(platform, fp)] = profile_name
+    return claims
+
+
+def _ensure_profile_cron_adapters(
+    runner: "GatewayRunner",
+    profile_name: str,
+    profile_home: Path,
+    *,
+    loop=None,
+) -> Dict:
+    """Ensure a mux profile has its adapter map before cron fires jobs."""
+    if profile_name == _multiplex_active_profile_name():
         return runner.adapters
+    adapters = runner._profile_adapters.get(profile_name)
+    if adapters is not None:
+        return adapters
+    if loop is None:
+        logger.warning(
+            "Cannot start adapters for mux profile %s before cron: gateway loop missing",
+            profile_name,
+        )
+        return {}
+
+    claims = _multiplex_adapter_claims(runner, exclude_profile=profile_name)
+    future = safe_schedule_threadsafe(
+        runner._start_one_profile_adapters(profile_name, profile_home, claims),
+        loop,
+        logger=logger,
+        log_message=f"Mux profile adapter startup scheduling failed for {profile_name}",
+    )
+    if future is None:
+        return {}
+    try:
+        future.result(timeout=30)
+    except Exception:
+        logger.exception("Failed to start adapters for mux profile %s", profile_name)
     return runner._profile_adapters.get(profile_name, {})
+
+
+def _unload_profile_cron_adapters(
+    runner: "GatewayRunner",
+    profile_name: str,
+    *,
+    loop=None,
+) -> None:
+    if profile_name == _multiplex_active_profile_name():
+        return
+    if profile_name not in getattr(runner, "_profile_adapters", {}):
+        return
+    if loop is None:
+        logger.warning(
+            "Cannot unload adapters for mux profile %s: gateway loop missing",
+            profile_name,
+        )
+        return
+    future = safe_schedule_threadsafe(
+        runner.unload_profile_runtime(profile_name),
+        loop,
+        logger=logger,
+        log_message=f"Mux profile adapter unload scheduling failed for {profile_name}",
+    )
+    if future is None:
+        return
+    try:
+        future.result(timeout=30)
+    except Exception:
+        logger.exception("Failed to unload adapters for mux profile %s", profile_name)
 
 
 def _start_profile_cron_scheduler_thread(
@@ -17387,11 +17472,17 @@ def _start_profile_cron_scheduler_thread(
     *,
     loop=None,
 ) -> threading.Thread:
+    adapters = _ensure_profile_cron_adapters(
+        runner,
+        profile_name,
+        profile_home,
+        loop=loop,
+    )
     thread = threading.Thread(
         target=_run_profile_cron_scheduler,
         args=(stop_event, profile_name, profile_home),
         kwargs={
-            "adapters": _profile_cron_adapters(runner, profile_name),
+            "adapters": adapters,
             "loop": loop,
         },
         daemon=True,
@@ -17433,10 +17524,15 @@ def _run_multiplex_cron_reconciler(
                 profiles = {name: home for name, home in _multiplex_cron_profiles()}
                 for profile_name, profile_home in profiles.items():
                     existing = entries.get(profile_name)
-                    if existing and existing[0] == profile_home and existing[2].is_alive():
+                    if existing and existing[0] == profile_home:
                         continue
                     if existing:
                         _stop_profile_cron_scheduler(profile_name, existing, timeout=1)
+                        _unload_profile_cron_adapters(
+                            runner,
+                            profile_name,
+                            loop=loop,
+                        )
 
                     profile_stop = threading.Event()
                     thread = _start_profile_cron_scheduler_thread(
@@ -17455,6 +17551,11 @@ def _run_multiplex_cron_reconciler(
                             profile_name,
                             entries.pop(profile_name),
                             timeout=5,
+                        )
+                        _unload_profile_cron_adapters(
+                            runner,
+                            profile_name,
+                            loop=loop,
                         )
                         logger.info("Stopped mux profile cron scheduler for %s", profile_name)
             except Exception:
