@@ -20,11 +20,14 @@ from agent.transports.types import NormalizedResponse, ToolCall, Usage
 
 
 def _apply_zettlab_billing_headers(api_kwargs: Dict[str, Any], params: Dict[str, Any]) -> None:
-    """Forward the conversation/cron session as X-Task-Id for zettlab credit-ledger
-    task grouping (mini-api 08-ai.md -> ai-api scene_params -> ai-cloud
-    ledger.task_id), so a multi-step task's per-turn consumption aggregates into
-    one task card. The local-server ai-proxy relays these headers to the IAM
-    gateway.
+    """Forward the conversation/cron session as stable Zettlab headers.
+
+    X-Task-Id drives credit-ledger task grouping (mini-api 08-ai.md -> ai-api
+    scene_params -> ai-cloud ledger.task_id), so a multi-step task's per-turn
+    consumption aggregates into one task card. X-Zettlab-Conversation-ID gives
+    ai-gateway an explicit sticky/canary routing key using the same stable
+    session-derived value. The local-server ai-proxy relays these headers to the
+    IAM gateway.
 
     The session -> task_id mapping (interactive vs cron, see billing_task_id_for)
     also gates non-NAS sessions to '' so the billing headers never leak to a
@@ -47,6 +50,7 @@ def _apply_zettlab_billing_headers(api_kwargs: Dict[str, Any], params: Dict[str,
                 str(k): str(v) for k, v in existing.items() if k and v is not None
             })
         headers.setdefault("X-Task-Id", task_id)
+        headers.setdefault("X-Zettlab-Conversation-ID", task_id)
         headers.setdefault("X-Scene-Type", "agent")
         # Cron runs also stamp the job name as X-Task-Title so the ledger's cron
         # task card shows the real name (and survives the job being deleted).

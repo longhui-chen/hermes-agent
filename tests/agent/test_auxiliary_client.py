@@ -3991,8 +3991,7 @@ class TestAuxiliaryMaxTokensParam:
 
 
 def test_apply_user_default_headers_stamps_task_id_for_zettlab_session():
-    """Auxiliary calls under a zettlab session get X-Task-Id/X-Scene-Type so
-    their spend joins the conversation's credit-ledger task card."""
+    """Auxiliary calls under a zettlab session get task and routing headers."""
     from agent.auxiliary_client import _apply_user_default_headers
     from gateway.session_context import set_current_session_id
 
@@ -4001,6 +4000,7 @@ def test_apply_user_default_headers_stamps_task_id_for_zettlab_session():
         headers = _apply_user_default_headers(None)
         assert headers is not None
         assert headers.get("X-Task-Id") == "zettlab:u1:agent-a:abc"
+        assert headers.get("X-Zettlab-Conversation-ID") == "zettlab:u1:agent-a:abc"
         assert headers.get("X-Scene-Type") == "agent"
     finally:
         set_current_session_id("")
@@ -4015,6 +4015,7 @@ def test_apply_user_default_headers_skips_non_zettlab_session():
     try:
         headers = _apply_user_default_headers(None)
         assert not headers or "X-Task-Id" not in headers
+        assert not headers or "X-Zettlab-Conversation-ID" not in headers
     finally:
         set_current_session_id("")
 
@@ -4030,6 +4031,7 @@ def test_apply_user_default_headers_collapses_cron_session():
         headers = _apply_user_default_headers(None)
         assert headers is not None
         assert headers.get("X-Task-Id") == "cron_4b2628798006"
+        assert headers.get("X-Zettlab-Conversation-ID") == "cron_4b2628798006"
         assert headers.get("X-Scene-Type") == "agent"
     finally:
         set_current_session_id("")
