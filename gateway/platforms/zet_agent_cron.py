@@ -944,10 +944,10 @@ _shutdown = threading.Event()
 atexit.register(_shutdown.set)
 
 # The two literal fragments _redact_channel_failure depends on — the job name
-# sits between them ("⚠️ Cron job '<name>' failed:\n" is the upstream template).
+# sits between them ("⚠️ Cron '<name>' failed:\n" is the upstream template).
 # BOTH must survive an upstream sync, or the redaction silently stops matching
 # and raw errors leak through channel delivery.
-_CHANNEL_FAILURE_FRAGMENTS = ("⚠️ Cron job '", "' failed:")
+_CHANNEL_FAILURE_FRAGMENTS = ("⚠️ Cron '", "' failed:")
 
 
 def _warn_if_failure_template_drifted(scheduler_source: str) -> bool:
@@ -1062,7 +1062,7 @@ def _redact_channel_failure(job: dict, content: Optional[str]):
     pass anything else through unchanged.
 
     Detects the template by reconstructing the EXACT prefix upstream builds
-    (``⚠️ Cron job '<name>' failed:\\n``, name = ``job.get('name', job['id'])``)
+    (``⚠️ Cron '<name>' failed:\\n``, name = ``job.get('name', job['id'])``)
     from this job's own name/id and slicing by its length — NOT a regex. Job
     names are stored verbatim (cron/jobs.py only end-strips), so an interior
     newline in the name would defeat a ``.*?`` regex and leak the raw error to
@@ -1070,7 +1070,7 @@ def _redact_channel_failure(job: dict, content: Optional[str]):
     if not content:
         return content
     template_name = job.get("name", job.get("id", ""))
-    prefix = f"⚠️ Cron job '{template_name}' failed:\n"
+    prefix = f"⚠️ Cron '{template_name}' failed:\n"
     if not content.startswith(prefix):
         return content
     return _friendly_failure(job.get("name", ""), content[len(prefix):])
@@ -1327,6 +1327,20 @@ def _build_typed_message_content(
         "last_run_result": "success" if success else "failed",
         "scheduled_at": _now_iso(),
     }
+    if job.get("source") == "calendar":
+        metadata["source"] = "calendar"
+        for _key in (
+            "calendar_provider",
+            "calendar_connection_id",
+            "calendar_id",
+            "calendar_series_id",
+            "calendar_original_start",
+            "calendar_etag",
+            "content",
+        ):
+            _value = job.get(_key)
+            if _value:
+                metadata[_key] = _value
     # next_run_at 是绝对时刻（带 offset），App 据此把循环任务的展示时间换算到设备
     # 本地时区——绕开"cron 表达式按哪个时区写的"歧义（旧 job 存 UTC 表达式 +
     # timezone=None，按字面显示会差 8 小时）。timezone 一并带上：App 用它区分
@@ -1352,7 +1366,9 @@ def _build_typed_message_content(
     if attachments:
         metadata["attachments"] = attachments
 
-    if success:
+    if success and job.get("source") == "calendar":
+        body = str(job.get("content") or job.get("name") or "").strip()
+    elif success:
         body = _extract_response_body(_LATEST_OUTPUT.get(job_id, ""))
     else:
         # Friendly fallback; raw FAILED doc stays in the run .md.

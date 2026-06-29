@@ -2371,6 +2371,47 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     _refresh_cron_dotenv_for_legacy_process()
 
     # ---------------------------------------------------------------
+    # calendar reminder (notify-only) short-circuit — deliver a pre-
+    # rendered notification, no script, no agent, no LLM.
+    # ---------------------------------------------------------------
+    # These jobs are written straight into jobs.json by zettlab-local-
+    # server's calendar sync (source="calendar"): a one-shot "once"
+    # schedule whose ``content`` is the reminder text, already materialized
+    # at sync time. Unlike no_agent (which needs a script to produce
+    # stdout), there is nothing to run — we just deliver ``content`` and the
+    # device turns the delivered output into a push notification
+    # (kind=cron_summary). Placed before the no_agent block so a calendar
+    # job never trips the "no_agent requires a script" guard. Additive and
+    # self-contained to stay a small diff over upstream cron.
+    schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
+    if (
+        job.get("source") == "calendar"
+        and job.get("no_agent") is True
+        and schedule.get("kind") == "once"
+    ):
+        now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+        content = str(job.get("content") or job.get("name") or "").strip()
+        if not content:
+            logger.info("Job '%s' (calendar): empty content — silent run", job_id)
+            silent_doc = (
+                f"# Cron Job: {job_name}\n\n"
+                f"**Job ID:** {job_id}\n"
+                f"**Run Time:** {now_iso}\n"
+                f"**Mode:** calendar (notify-only)\n"
+                f"**Status:** silent (empty content)\n"
+            )
+            return True, silent_doc, SILENT_MARKER, None
+        doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {now_iso}\n"
+            f"**Mode:** calendar (notify-only)\n\n"
+            f"---\n\n"
+            f"{content}\n"
+        )
+        return True, doc, content, None
+
+    # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
     # ---------------------------------------------------------------
     # This mirrors the classic "run a bash script on a timer, send its

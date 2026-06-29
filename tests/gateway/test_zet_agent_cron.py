@@ -558,6 +558,44 @@ def test_collect_produced_files_rejects_agent_output_without_agent_scope(tmp_pat
     assert zc._collect_produced_files("jobNoScope", {"origin": {"platform": "zet_agent"}}) == []
 
 
+def test_cron_summary_carries_calendar_metadata(tmp_path, monkeypatch):
+    import json as _json
+
+    import hermes_state
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+
+    content = zc._build_typed_message_content(
+        {
+            "id": "cal-job",
+            "name": "项目评审",
+            "source": "calendar",
+            "calendar_provider": "device",
+            "calendar_connection_id": "dev",
+            "calendar_id": "local-cal",
+            "calendar_series_id": "series-1",
+            "calendar_original_start": "2026-06-26T07:00:00Z",
+            "content": "项目评审",
+            "schedule": {"kind": "once", "run_at": "2026-06-26T07:00:00Z"},
+            "deliver": "origin",
+            "origin": {"platform": "zet_agent", "chat_id": "zettlab:u1:main:calendar-reminders"},
+        },
+        "cal-job",
+        True,
+        None,
+        None,
+    )
+    fence = content.split("```cron-summary\n", 1)[1].split("\n```", 1)[0]
+    meta = _json.loads(fence)
+    assert meta["source"] == "calendar"
+    assert meta["calendar_provider"] == "device"
+    assert meta["calendar_id"] == "local-cal"
+    assert meta["calendar_original_start"] == "2026-06-26T07:00:00Z"
+    assert meta["content"] == "项目评审"
+    assert content.endswith("\n项目评审")
+
+
 # ── ZET-1565: friendly failure messaging + run-level auto-retry ──────
 
 _RAW_502 = (
