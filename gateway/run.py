@@ -17355,6 +17355,7 @@ def _run_profile_cron_scheduler(
     *,
     adapters=None,
     loop=None,
+    failed_event: Optional[threading.Event] = None,
 ) -> None:
     """Run one cron scheduler under a profile's HERMES_HOME scope."""
     try:
@@ -17363,6 +17364,8 @@ def _run_profile_cron_scheduler(
         with _profile_runtime_scope(profile_home):
             resolve_cron_scheduler().start(stop_event, adapters=adapters, loop=loop)
     except Exception:
+        if failed_event is not None:
+            failed_event.set()
         logger.exception("Profile cron scheduler failed for %s", profile_name)
 
 
@@ -17404,6 +17407,7 @@ def _ensure_profile_cron_adapters(
     profile_home: Path,
     *,
     loop=None,
+    stop_event: Optional[threading.Event] = None,
 ) -> Dict:
     """Ensure a mux profile has its adapter map before cron fires jobs."""
     if profile_name == _multiplex_active_profile_name():
@@ -17428,7 +17432,13 @@ def _ensure_profile_cron_adapters(
     if future is None:
         return {}
     try:
-        future.result(timeout=30)
+        _wait_future_interruptibly(
+            future,
+            stop_event=stop_event,
+            timeout=30,
+            profile_name=profile_name,
+            action="start adapters",
+        )
     except Exception:
         logger.exception("Failed to start adapters for mux profile %s", profile_name)
     return runner._profile_adapters.get(profile_name, {})
@@ -17439,6 +17449,7 @@ def _unload_profile_cron_adapters(
     profile_name: str,
     *,
     loop=None,
+    stop_event: Optional[threading.Event] = None,
 ) -> None:
     if profile_name == _multiplex_active_profile_name():
         return
@@ -17459,9 +17470,46 @@ def _unload_profile_cron_adapters(
     if future is None:
         return
     try:
-        future.result(timeout=30)
+        _wait_future_interruptibly(
+            future,
+            stop_event=stop_event,
+            timeout=30,
+            profile_name=profile_name,
+            action="unload adapters",
+        )
     except Exception:
         logger.exception("Failed to unload adapters for mux profile %s", profile_name)
+
+
+def _wait_future_interruptibly(
+    future,
+    *,
+    stop_event: Optional[threading.Event],
+    timeout: float,
+    profile_name: str,
+    action: str,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            future.cancel()
+            logger.info(
+                "Stopped waiting to %s for mux profile %s during shutdown",
+                action,
+                profile_name,
+            )
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            future.cancel()
+            raise TimeoutError(
+                f"Timed out waiting to {action} for mux profile {profile_name}"
+            )
+        try:
+            future.result(timeout=min(0.5, remaining))
+            return
+        except TimeoutError:
+            continue
 
 
 def _start_profile_cron_scheduler_thread(
@@ -17471,34 +17519,38 @@ def _start_profile_cron_scheduler_thread(
     stop_event: threading.Event,
     *,
     loop=None,
-) -> threading.Thread:
+    shutdown_event: Optional[threading.Event] = None,
+) -> tuple[threading.Thread, threading.Event]:
     adapters = _ensure_profile_cron_adapters(
         runner,
         profile_name,
         profile_home,
         loop=loop,
+        stop_event=shutdown_event,
     )
+    failed_event = threading.Event()
     thread = threading.Thread(
         target=_run_profile_cron_scheduler,
         args=(stop_event, profile_name, profile_home),
         kwargs={
             "adapters": adapters,
             "loop": loop,
+            "failed_event": failed_event,
         },
         daemon=True,
         name=f"cron-scheduler-{profile_name}",
     )
     thread.start()
-    return thread
+    return thread, failed_event
 
 
 def _stop_profile_cron_scheduler(
     profile_name: str,
-    entry: tuple[Path, threading.Event, threading.Thread],
+    entry: tuple[Path, threading.Event, threading.Thread, threading.Event],
     *,
     timeout: float,
 ) -> None:
-    _profile_home, stop_event, thread = entry
+    _profile_home, stop_event, thread, _failed_event = entry
     stop_event.set()
     thread.join(timeout=timeout)
     if thread.is_alive():
@@ -17516,7 +17568,7 @@ def _run_multiplex_cron_reconciler(
     reconcile_interval: float = 60.0,
 ) -> None:
     """Keep mux profile cron schedulers aligned with the profile set."""
-    entries: Dict[str, tuple[Path, threading.Event, threading.Thread]] = {}
+    entries: Dict[str, tuple[Path, threading.Event, threading.Thread, threading.Event]] = {}
 
     try:
         while not stop_event.is_set():
@@ -17524,25 +17576,34 @@ def _run_multiplex_cron_reconciler(
                 profiles = {name: home for name, home in _multiplex_cron_profiles()}
                 for profile_name, profile_home in profiles.items():
                     existing = entries.get(profile_name)
-                    if existing and existing[0] == profile_home:
+                    if existing and existing[0] == profile_home and not existing[3].is_set():
                         continue
                     if existing:
+                        home_changed = existing[0] != profile_home
                         _stop_profile_cron_scheduler(profile_name, existing, timeout=1)
-                        _unload_profile_cron_adapters(
-                            runner,
-                            profile_name,
-                            loop=loop,
-                        )
+                        if home_changed:
+                            _unload_profile_cron_adapters(
+                                runner,
+                                profile_name,
+                                loop=loop,
+                                stop_event=stop_event,
+                            )
 
                     profile_stop = threading.Event()
-                    thread = _start_profile_cron_scheduler_thread(
+                    thread, failed_event = _start_profile_cron_scheduler_thread(
                         runner,
                         profile_name,
                         profile_home,
                         profile_stop,
                         loop=loop,
+                        shutdown_event=stop_event,
                     )
-                    entries[profile_name] = (profile_home, profile_stop, thread)
+                    entries[profile_name] = (
+                        profile_home,
+                        profile_stop,
+                        thread,
+                        failed_event,
+                    )
                     logger.info("Started mux profile cron scheduler for %s", profile_name)
 
                 for profile_name in list(entries):
@@ -17556,6 +17617,7 @@ def _run_multiplex_cron_reconciler(
                             runner,
                             profile_name,
                             loop=loop,
+                            stop_event=stop_event,
                         )
                         logger.info("Stopped mux profile cron scheduler for %s", profile_name)
             except Exception:

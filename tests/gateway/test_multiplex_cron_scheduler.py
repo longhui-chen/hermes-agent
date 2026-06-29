@@ -137,6 +137,7 @@ def test_multiplex_cron_reconciler_does_not_restart_returning_provider(tmp_path,
     default_home = tmp_path / ".hermes"
     main_home = default_home / "profiles" / "main"
     starts = 0
+    unloaded = []
 
     class ReturningScheduler:
         def start(self, stop_event, *, adapters=None, loop=None):
@@ -154,6 +155,7 @@ def test_multiplex_cron_reconciler_does_not_restart_returning_provider(tmp_path,
         config=GatewayConfig(multiplex_profiles=True),
         adapters={},
         _profile_adapters={"main": {"api_server": object()}},
+        unload_profile_runtime=lambda profile_name: unloaded.append(profile_name),
     )
     stop_event = threading.Event()
     threads = _start_gateway_cron_schedulers(runner, stop_event, reconcile_interval=0.05)
@@ -161,6 +163,46 @@ def test_multiplex_cron_reconciler_does_not_restart_returning_provider(tmp_path,
         assert _wait_until(lambda: starts == 1, timeout=2)
         threading.Event().wait(timeout=0.15)
         assert starts == 1
+    finally:
+        stop_event.set()
+    for thread in threads:
+        thread.join(timeout=2)
+    assert unloaded == []
+
+
+def test_multiplex_cron_reconciler_restarts_failed_provider(tmp_path, monkeypatch):
+    default_home = tmp_path / ".hermes"
+    main_home = default_home / "profiles" / "main"
+    starts = 0
+
+    class FailingThenBlockingScheduler:
+        def start(self, stop_event, *, adapters=None, loop=None):
+            nonlocal starts
+            starts += 1
+            if starts == 1:
+                raise RuntimeError("boom")
+            stop_event.wait(timeout=5)
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda multiplex: [("main", main_home)],
+    )
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler",
+        lambda: FailingThenBlockingScheduler(),
+    )
+
+    runner = SimpleNamespace(
+        config=GatewayConfig(multiplex_profiles=True),
+        adapters={},
+        _profile_adapters={"main": {"api_server": object()}},
+        unload_profile_runtime=lambda profile_name: None,
+    )
+    stop_event = threading.Event()
+    threads = _start_gateway_cron_schedulers(runner, stop_event, reconcile_interval=0.05)
+    try:
+        assert _wait_until(lambda: starts >= 2, timeout=2)
     finally:
         stop_event.set()
     for thread in threads:
@@ -300,6 +342,7 @@ def test_multiplex_cron_reconciler_stops_removed_profiles(tmp_path, monkeypatch)
             "main": {"api_server": object()},
             "retired": {"api_server": object()},
         },
+        unload_profile_runtime=lambda profile_name: None,
     )
     stop_event = threading.Event()
     threads = _start_gateway_cron_schedulers(runner, stop_event, reconcile_interval=0.05)
