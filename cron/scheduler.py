@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import load_config
+from hermes_cli.env_loader import load_hermes_dotenv as _load_hermes_dotenv
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,16 @@ def _cron_env(name: str, default: str = "") -> str:
             logger.debug("Failed to refresh cron env %s from profile .env", name, exc_info=True)
     value = _get_scoped_secret(name, default)
     return default if value is None else str(value)
+
+
+def _refresh_cron_dotenv_for_legacy_process() -> None:
+    """Reload .env before cron runs in non-multiplex gateway processes."""
+    try:
+        if _is_secret_multiplex_active is not None and _is_secret_multiplex_active():
+            return
+        _load_hermes_dotenv(hermes_home=get_hermes_home())
+    except Exception:
+        logger.debug("Failed to refresh cron dotenv", exc_info=True)
 
 
 def _expand_env_vars_scoped(obj):
@@ -1471,6 +1482,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    _refresh_cron_dotenv_for_legacy_process()
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.

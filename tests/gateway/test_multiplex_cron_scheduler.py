@@ -435,6 +435,41 @@ def test_cron_env_refreshes_profile_dotenv_each_read(tmp_path, monkeypatch):
         set_multiplex_active(False)
 
 
+def test_cron_dotenv_refresh_runs_for_legacy_process(tmp_path, monkeypatch):
+    from agent.secret_scope import set_multiplex_active
+    from cron import scheduler
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    calls = []
+    home_token = set_hermes_home_override(str(tmp_path / ".hermes"))
+    set_multiplex_active(False)
+    monkeypatch.setattr(scheduler, "_load_hermes_dotenv", lambda **kwargs: calls.append(kwargs))
+    try:
+        scheduler._refresh_cron_dotenv_for_legacy_process()
+    finally:
+        reset_hermes_home_override(home_token)
+
+    assert calls == [{"hermes_home": tmp_path / ".hermes"}]
+
+
+def test_cron_dotenv_refresh_skips_multiplex_process(tmp_path, monkeypatch):
+    from agent.secret_scope import set_multiplex_active
+    from cron import scheduler
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    calls = []
+    home_token = set_hermes_home_override(str(tmp_path / ".hermes"))
+    set_multiplex_active(True)
+    monkeypatch.setattr(scheduler, "_load_hermes_dotenv", lambda **kwargs: calls.append(kwargs))
+    try:
+        scheduler._refresh_cron_dotenv_for_legacy_process()
+    finally:
+        reset_hermes_home_override(home_token)
+        set_multiplex_active(False)
+
+    assert calls == []
+
+
 def test_cron_env_keeps_process_global_cron_limits(tmp_path, monkeypatch):
     from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
     from cron import scheduler

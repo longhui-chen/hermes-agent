@@ -64,6 +64,24 @@ else:
 def indent_of(line: str) -> int:
     return len(line) - len(line.lstrip(" "))
 
+def inline_gateway_items(value: str) -> list[str]:
+    value = value.strip()
+    if not (value.startswith("{") and value.endswith("}")):
+        return []
+    body = value[1:-1].strip()
+    if not body:
+        return []
+    out = []
+    for item in body.split(","):
+        if ":" not in item:
+            continue
+        key, val = item.split(":", 1)
+        key = key.strip()
+        val = val.strip()
+        if key:
+            out.append(f"  {key}: {val}\n")
+    return out
+
 gateway_idx = None
 for i, line in enumerate(lines):
     stripped = line.strip()
@@ -72,6 +90,11 @@ for i, line in enumerate(lines):
         break
     if stripped in {"gateway: {}", "gateway: null"} and indent_of(line) == 0:
         lines[i] = "gateway:\n"
+        gateway_idx = i
+        break
+    if stripped.startswith("gateway:") and indent_of(line) == 0:
+        inline_items = inline_gateway_items(stripped.split(":", 1)[1])
+        lines[i:i + 1] = ["gateway:\n", *inline_items]
         gateway_idx = i
         break
 
