@@ -72,7 +72,7 @@ setup_pypi_mirror() {
     fi
 
     echo "  fastest PyPI mirror: $winner"
-    local fallback="https://pypi.org/simple/"  # 仅 uv 用作 first-index fallback
+    local fallback="https://pypi.org/simple/"  # 仅 uv 用作最低优先级 fallback
 
     # 只有 http 源才需要放开 TLS 校验（pip 对 http index 必须 trusted-host 才放行，
     # https 不需要、也绝不放开）。候选里唯一的 http 源就是阿里云 VPC 内网镜像。
@@ -97,17 +97,25 @@ index-url = $winner$pip_trust"
 
     if ! $uv_ok; then
         mkdir -p "$(dirname "$uv_toml")"
-        # uv 默认 index-strategy=first-index：主源(default)命中就用、找不到才查下一个，
-        # 按顺序、不跨源取最高版本 = 真 fallback(无 dependency confusion)，故保留
-        # pypi.org 作 fallback。allow-insecure-host 是顶层 key，须在任何 [[index]] 之前。
-        _atomic_write "$uv_toml" "${uv_insecure}[[index]]
-url = \"$winner\"
-default = true
-
-[[index]]
-url = \"$fallback\""
+        # uv 默认 index-strategy=first-index：按 index 顺序查找、不跨源取最高版本 =
+        # 真 fallback(无 dependency confusion)。注意 default=true 是最低优先级，
+        # 所以 winner 作为普通 index，pypi.org 才标 default 作兜底。
+        # allow-insecure-host 是顶层 key，须在任何 [[index]] 之前。
+        _atomic_write "$uv_toml" "$(_uv_index_config "$winner" "$fallback" "$uv_insecure")"
         echo "  wrote $uv_toml"
     fi
+}
+
+_uv_index_config() {
+    local primary="$1" fallback="$2" prefix="${3:-}"
+
+    if [ "$primary" = "$fallback" ]; then
+        printf '%s[[index]]\nurl = "%s"\ndefault = true\n' "$prefix" "$primary"
+        return 0
+    fi
+
+    printf '%s[[index]]\nurl = "%s"\n\n[[index]]\nurl = "%s"\ndefault = true\n' \
+        "$prefix" "$primary" "$fallback"
 }
 
 # 原子替换 + 备份：写前把已存在的 dest 备份到 .bak，再 tmp→mv 原子换上避免半写；
