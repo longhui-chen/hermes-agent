@@ -44,6 +44,13 @@ setup_pypi_mirror || true
 
 "$APP_ROOT/prepare-mux-service.sh"
 install_systemd_services "$APP_ROOT"
+if command -v systemctl >/dev/null 2>&1 && systemctl cat hermes-agent-mux.service >/dev/null 2>&1; then
+    if systemctl restart hermes-agent-mux.service; then
+        echo "hermes-agent-mux.service restarted."
+    else
+        echo "warning: failed to restart hermes-agent-mux.service; local-server mux migration will stay gated by health check" >&2
+    fi
+fi
 
 echo "Install complete."
 echo "  hermes: $APP_BASE/current/bin/hermes"

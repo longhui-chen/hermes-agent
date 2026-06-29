@@ -1,6 +1,7 @@
 """Multiplex gateway cron scheduler scoping."""
 
 import asyncio
+import concurrent.futures
 import threading
 import time
 from types import SimpleNamespace
@@ -8,7 +9,11 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.config import GatewayConfig
-from gateway.run import _multiplex_cron_profiles, _start_gateway_cron_schedulers
+from gateway.run import (
+    _multiplex_cron_profiles,
+    _start_gateway_cron_schedulers,
+    _wait_future_interruptibly,
+)
 
 
 def test_multiplex_cron_profiles_skip_legacy_default_when_main_exists(tmp_path, monkeypatch):
@@ -372,6 +377,24 @@ async def _wait_thread_event(event: threading.Event, *, timeout: float) -> bool:
             return True
         await asyncio.sleep(0.01)
     return event.is_set()
+
+
+def test_wait_future_interruptibly_preserves_inner_timeout_error():
+    future = concurrent.futures.Future()
+    future.set_exception(TimeoutError("inner timeout"))
+
+    try:
+        _wait_future_interruptibly(
+            future,
+            stop_event=None,
+            timeout=1,
+            profile_name="main",
+            action="start adapters",
+        )
+    except TimeoutError as exc:
+        assert str(exc) == "inner timeout"
+    else:
+        raise AssertionError("inner TimeoutError should be preserved")
 
 
 def test_cron_env_reads_active_profile_secret_scope(monkeypatch):

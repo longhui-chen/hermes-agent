@@ -1330,6 +1330,10 @@ class ZetAgentAdapter(APIServerAdapter):
 
         Expected body: {"model": "...", "provider": "...", "base_url": "...", "api_key": "...", "api_mode"?: "...", "context_length"?: 123}
         """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
         try:
             body = await request.json()
         except Exception:

@@ -140,7 +140,11 @@ fi
 
 write_mux_env
 enable_mux_config
-stop_legacy_per_profile_gateways
+if [ "${HERMES_STOP_LEGACY_GATEWAYS:-0}" = "1" ]; then
+    stop_legacy_per_profile_gateways
+else
+    echo "Legacy per-profile Hermes gateways left running; switchover cleanup is deferred until mux is healthy and local-server is ready."
+fi
 
 echo "Hermes multiplex service prepared."
 echo "  env: $ENV_FILE"

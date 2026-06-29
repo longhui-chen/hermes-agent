@@ -17509,6 +17509,8 @@ def _wait_future_interruptibly(
             future.result(timeout=min(0.5, remaining))
             return
         except TimeoutError:
+            if future.done():
+                raise
             continue
 
 

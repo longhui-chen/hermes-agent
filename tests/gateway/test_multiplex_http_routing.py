@@ -129,3 +129,40 @@ class TestZetAgentProfileUnload:
         assert response.status == 200
         assert db.closed is True
         assert adapter._session_dbs == {}
+
+
+class TestZetAgentModelSwitchAuth:
+    class _FakeRequest(dict):
+        def __init__(self, authorization=None):
+            super().__init__(
+                hermes_profile="coder",
+                hermes_profile_home="/tmp/hermes-test-profile",
+            )
+            self.headers = {}
+            if authorization is not None:
+                self.headers["Authorization"] = authorization
+            self.method = "POST"
+            self.path_qs = "/p/coder/v1/model/switch"
+            self.remote = "127.0.0.1"
+            self.transport = None
+
+        async def json(self):
+            raise AssertionError("unauthorized model switch must not parse JSON")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("authorization", "status"),
+        [
+            (None, 401),
+            ("Bearer wrong-key", 401),
+        ],
+    )
+    async def test_profile_model_switch_requires_bearer(self, authorization, status):
+        from gateway.platforms.zet_agent import ZetAgentAdapter
+
+        adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+        response = await adapter._handle_model_switch(
+            self._FakeRequest(authorization)
+        )
+
+        assert response.status == status
