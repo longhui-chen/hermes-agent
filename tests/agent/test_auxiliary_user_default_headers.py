@@ -136,8 +136,8 @@ class TestAuxClientHonorsUserDefaultHeaders:
         headers = mock_openai.call_args.kwargs.get("default_headers", {}) or {}
         assert headers.get("User-Agent") == "curl/8.7.1"
 
-    def test_openrouter_provider_stamps_zettlab_session_headers(self, tmp_path, monkeypatch):
-        """OpenRouter has a dedicated resolver path; it must not bypass routing headers."""
+    def test_openrouter_provider_does_not_cache_zettlab_session_headers(self, tmp_path, monkeypatch):
+        """OpenRouter default_headers are cached, so session headers stay per request."""
         _write_config(tmp_path, {"model": {"default": "test-model"}})
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
 
@@ -154,13 +154,13 @@ class TestAuxClientHonorsUserDefaultHeaders:
         assert client is not None
         assert model == "openrouter/model"
         headers = mock_openai.call_args.kwargs.get("default_headers", {}) or {}
-        assert headers.get("X-Task-Id") == "zettlab:u1:agent-a:abc"
-        assert headers.get("X-Zettlab-Conversation-ID") == "zettlab:u1:agent-a:abc"
-        assert headers.get("X-Scene-Type") == "agent"
+        assert "X-Task-Id" not in headers
+        assert "X-Zettlab-Conversation-ID" not in headers
+        assert "X-Scene-Type" not in headers
         assert headers.get("X-Title") == "Hermes Agent"
 
-    def test_nous_provider_stamps_zettlab_session_headers(self, tmp_path):
-        """Nous runtime refresh has its own OpenAI constructor path."""
+    def test_nous_provider_does_not_cache_zettlab_session_headers(self, tmp_path):
+        """Nous default_headers are cached, so session headers stay per request."""
         _write_config(tmp_path, {"model": {"default": "test-model"}})
 
         from gateway.session_context import set_current_session_id
@@ -183,6 +183,6 @@ class TestAuxClientHonorsUserDefaultHeaders:
         assert client is not None
         assert model
         headers = mock_openai.call_args.kwargs.get("default_headers", {}) or {}
-        assert headers.get("X-Task-Id") == "zettlab:u1:agent-a:abc"
-        assert headers.get("X-Zettlab-Conversation-ID") == "zettlab:u1:agent-a:abc"
-        assert headers.get("X-Scene-Type") == "agent"
+        assert "X-Task-Id" not in headers
+        assert "X-Zettlab-Conversation-ID" not in headers
+        assert "X-Scene-Type" not in headers

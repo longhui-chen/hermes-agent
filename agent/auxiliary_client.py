@@ -369,12 +369,7 @@ def _apply_user_default_headers(headers: dict | None) -> dict | None:
     main turn would succeed but title/compression/vision calls to the same
     endpoint would still fail. (#40033)
 
-    Also stamps the zettlab ``X-Task-Id``/``X-Zettlab-Conversation-ID``/
-    ``X-Scene-Type`` headers for the current session (see ``billing_task_id``)
-    so auxiliary spend is attributed to its task card and ai-gateway can keep
-    sticky/canary routing stable.
-
-    Returns the merged dict (user overrides + billing headers), or the original
+    Returns the merged dict (user overrides), or the original
     ``headers`` (possibly ``None``) when there is nothing to add.
     """
     merged = dict(headers or {})
@@ -388,6 +383,18 @@ def _apply_user_default_headers(headers: dict | None) -> dict | None:
             if value is None:
                 continue
             merged[str(key)] = str(value)
+    return merged or headers
+
+
+def _apply_zettlab_session_headers(headers: dict | None) -> dict | None:
+    """Stamp per-request Zettlab billing/routing headers for the current session.
+
+    These headers must never live in cached OpenAI ``default_headers``: auxiliary
+    clients are cached across turns/sessions, while the Zettlab conversation id
+    is request-scoped. Keep them in ``extra_headers`` on each create() call so a
+    cache hit cannot leak another conversation's sticky-routing key.
+    """
+    merged = dict(headers or {})
     # Zettlab credit-ledger task grouping: attribute auxiliary calls
     # (compression / title / vision) to the conversation/cron task by stamping
     # X-Task-Id, so they aggregate into its task card instead of surfacing as
@@ -5165,6 +5172,10 @@ def _build_call_kwargs(
         merged_extra.setdefault("tags", []).extend(_nous_portal_tags())
     if merged_extra:
         kwargs["extra_body"] = merged_extra
+
+    extra_headers = _apply_zettlab_session_headers(kwargs.get("extra_headers"))
+    if extra_headers:
+        kwargs["extra_headers"] = extra_headers
 
     return kwargs
 
