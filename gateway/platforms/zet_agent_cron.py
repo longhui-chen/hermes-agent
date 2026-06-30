@@ -673,6 +673,33 @@ _INTENT_ANNOUNCE_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+_SCRIPT_FRAGMENT_RE = re.compile(r"^[`'\"]?[A-Za-z0-9_.-]+\.(?:py|pyc|pyo)[`'\"]?$", re.IGNORECASE)
+
+
+def _detect_malformed_response_fragment(body: str) -> Optional[str]:
+    """Return a fake-success reason for tiny truncated/code-fragment bodies.
+
+    Cron summaries are user-facing notifications. A body like "`.app" is not a
+    valid result; it is a broken markdown/code fragment from an interrupted or
+    derailed model response. Keep this intentionally narrow so short real
+    reminders ("OK", "Done", "已同步") stay deliverable.
+    """
+    compact = (body or "").strip()
+    if not compact or len(compact) > 120:
+        return None
+    if "\n" in compact:
+        return None
+    if compact.count("`") % 2 == 1:
+        return (
+            "agent produced no user-facing result; got a malformed markdown "
+            "fragment"
+        )
+    if _SCRIPT_FRAGMENT_RE.match(compact):
+        return (
+            "agent produced no user-facing result; got a helper script "
+            "filename"
+        )
+    return None
 
 
 def _cron_session_like(job_id: str) -> str:
@@ -805,13 +832,16 @@ def _attempt_tool_activity(job_id: str, baseline: Optional[set]) -> Optional[int
 
 
 def _detect_fake_success(job_id: str) -> Optional[str]:
-    """短意图句 + 本轮 0 工具执行 → 返回失败原因，否则 None（fail-open，不误降真成功）。"""
+    """Return a failure reason when a successful run has no user-facing result."""
     try:
         body = _extract_response_body(_LATEST_OUTPUT.get(job_id, "")).strip()
     except Exception:
         return None
     if not body:
         return None  # 空 body 上游已 soft-fail (#8585)
+    malformed = _detect_malformed_response_fragment(body)
+    if malformed:
+        return malformed
     if len(body) > 400 or not _INTENT_ANNOUNCE_RE.search(body):
         return None  # 实质内容 / 非意图句 = 真答案
     tool_activity = _count_tool_activity(job_id)
@@ -1616,6 +1646,8 @@ def _is_external_cron_deliverable(path: Path) -> bool:
     suffix = path.suffix.lower()
     if suffix not in _CRON_ATTACHMENT_EXTERNAL_SUFFIXES:
         return False
+    if _looks_like_agent_output_path(path):
+        return False
     path_s = str(path)
     for marker in ("/hermes_sandbox_", "/hermes_exec_"):
         if marker in path_s:
@@ -1630,6 +1662,16 @@ def _is_external_cron_deliverable(path: Path) -> bool:
         if first in _CRON_ATTACHMENT_TEMP_DIRS or second in _CRON_ATTACHMENT_TEMP_DIRS:
             return False
     return True
+
+
+def _looks_like_agent_output_path(path: Path) -> bool:
+    parts = path.parts
+    for i, part in enumerate(parts):
+        if part != "agents":
+            continue
+        if i + 3 < len(parts) and parts[i + 1] == "data" and parts[i + 3] == "output":
+            return True
+    return False
 
 
 def _is_under_any_root(path: Path, roots: List[Path]) -> bool:
