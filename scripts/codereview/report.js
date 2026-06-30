@@ -1,28 +1,34 @@
-// Codex GPT-5.5 code review → 飞书报告：判定 + 卡片的唯一真源（single source of truth）。
+// Official Codex code review → 飞书报告：判定 + 卡片的唯一真源（single source of truth）。
 //
 // 既被本地回归测试（scripts/codereview/test_report.js）直接 require，
-// 也经 scripts/codereview/notify.js 被托管 Code Review 的 check_run 路径
-// 和自托管 Codex GitHub Action 路径消费。
+// 也经 scripts/codereview/notify.js 被官方 Codex Review 的 pull_request_review
+// / check_run 监听路径消费。
 //
 // 背景：把 PR 评审结论统一成 pass / fail / skip，再决定是否给飞书发卡片。
-// 评审结论有两种来源，本文件给两种来源各一个 adapter，下游卡片/判定逻辑共用：
+// 评审结论有三种来源，本文件给每种来源各一个 adapter，下游卡片/判定逻辑共用：
 //
-//   A) 托管 Code Review。
-//      它在 GitHub 上以 check_run 出现，结论从 check 的
-//      output.text 里读。末尾带一行机器可读标记（官方文档承诺的稳定契约）：
+//   A) 官方 Codex Review 的 check_run。
+//      如果 GitHub 上出现 Codex check_run，结论从 check 的 output.text 里读。
+//      兼容旧托管路径末尾的机器可读标记：
 //        <!-- bughunter-severity: {"normal":2,"nit":1,"pre_existing":0} -->
-//      normal=🔴 Important（合并前应修的真 bug）、nit=🟡 次要、pre_existing=🟣 存量。
-//      output.text 里还有一张「严重度 | 文件:行 | 问题」表，best-effort 解析成缺陷清单。
+//      normal=🔴 Important（合并前应修的真 bug）、nit=🟡 次要、pre_existing=🟣 存量；
+//      output.text 里若有「严重度 | 文件:行 | 问题」表，best-effort 解析成缺陷清单。
 //      → classifyCheckRun(checkRun)
 //
-//   B) 自托管 GitHub Action（openai/codex-action@v1）。
+//   B) 官方 Codex Review 的 pull_request_review。
+//      Codex 像 reviewer 一样提交 PR review；只要该 review 里有行内评论，就按 Important
+//      通知飞书。若 review body 明确显示报错 / 超时 / 额度问题，则按基础设施失败通知。
+//      → classifyPullRequestReview(review, reviewComments)
+//
+//   C) 历史自托管 GitHub Action（openai/codex-action@v1）。
 //      评审在 CI 里跑，prompt 要求 Codex GPT-5.5 额外吐一个 codereview-result.json，
 //      形如 {"verdict":"fail","important":2,"nit":1,"issues":[{severity,file,line,title}]}。
+//      当前 workflow 已移除；保留 adapter 只为旧测试/兼容历史通知数据。
 //      → classifyActionResult(json)
 //
 // 判定二元化（与 linearb 流程一致）：有「合并前应修的真 bug」=不通过，否则=通过。
-// 托管 check_run 报错/超时/拿不到结论=skip（不发，避免误报「0 个问题也不通过」）；
-// 自托管 Action 连 codereview-result.json 都没产出时，是 CI/鉴权/基础设施故障，单独发故障卡片。
+// 官方 Codex 报错/超时/额度问题=基础设施失败（发群排查）；拿不到结论=skip（不误报）。
+// 历史自托管 Action 连 codereview-result.json 都没产出时，也按 CI/鉴权/基础设施故障通知。
 // 「只在不通过时通知」：通过不打扰。默认门槛 = normal(Important) > 0，可用环境变量
 // CODEREVIEW_NOTIFY_ON=any 放宽到「含 nit 也通知」。
 
@@ -58,6 +64,43 @@ function parseSeverityTable(text) {
   return out;
 }
 
+function isInfrastructureFailureText(text) {
+  return /encountered an error|timed out|spend cap|rate limit|quota|usage limit|was skipped|failed to run|could not run|internal error/i.test(String(text || ''));
+}
+
+function cleanIssueTitle(value) {
+  const s = String(value || '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/[#>*_~]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return s.length > 180 ? `${s.slice(0, 177)}...` : s;
+}
+
+function infrastructureFailure(source, failure = {}) {
+  const reason = oneLine(failure.reason, 'unknown error');
+  const status = oneLine(failure.status || '');
+  const runUrl = oneLine(failure.runUrl || '');
+  const titleParts = [source || 'Codex review infrastructure failure'];
+  if (status) titleParts.push(status);
+  if (reason) titleParts.push(`原因：${reason}`);
+  if (runUrl) titleParts.push(`链接：${runUrl}`);
+  return {
+    verdict: 'fail',
+    reason: 'infra_failure',
+    kind: 'infra_failure',
+    counts: { important: 1, nit: 0, pre_existing: 0 },
+    issues: [{
+      sev: 'important',
+      loc: failure.loc || 'Codex Review',
+      title: titleParts.join(' · '),
+    }],
+    count: 1,
+  };
+}
+
 /**
  * 把「托管 Code Review」的 check_run 判定为 pass / fail / skip。
  * @param {{name?:string, output?:{title?:string, summary?:string, text?:string}}} checkRun
@@ -71,12 +114,16 @@ function classifyCheckRun(checkRun, env) {
   const text = String(output.text || output.summary || '');
   const empty = { important: 0, nit: 0, pre_existing: 0 };
 
-  // 评审报错 / 超时（基础设施没跑完）→ skip，绝不当成「0 问题也不通过」误报。
+  // 评审报错 / 超时（基础设施没跑完）→ 基础设施失败通知；但只扫 title + summary（短状态字段）。
   // ⚠️ 只扫 title + summary（短状态字段），**绝不**扫 findings 正文 text——否则一条形如
-  //   「请求 timed out 时会一直 hang」的真不通过缺陷会被误判为 skip 而不通知（false-negative）。
+  //   「请求 timed out 时会一直 hang」的真不通过缺陷会被误判为 infra failure。
   //   真正的基础设施信号（'Code review encountered an error / timed out'）只出现在 title。
-  if (/encountered an error|timed out|spend cap|was skipped/i.test(title + ' ' + summary)) {
-    return { verdict: 'skip', reason: 'error_or_timeout', counts: empty, issues: [], count: 0 };
+  if (isInfrastructureFailureText(title + ' ' + summary)) {
+    return infrastructureFailure('Codex check_run 未完成评审', {
+      status: checkRun && checkRun.conclusion ? `conclusion=${checkRun.conclusion}` : '',
+      reason: title || summary || 'Codex check_run failed',
+      runUrl: checkRun && checkRun.html_url,
+    });
   }
 
   // 机器可读严重度标记（官方稳定契约）。
@@ -105,6 +152,63 @@ function classifyCheckRun(checkRun, env) {
     return { verdict: 'fail', reason: 'issues', counts, issues, count: trigger };
   }
   return { verdict: 'pass', reason: 'clean', counts, issues, count: 0 };
+}
+
+/**
+ * 把官方 Codex 的 pull_request_review 判定为 pass / fail / skip。
+ * 官方集成会像普通 reviewer 一样在 PR 里留下 review + 行内评论；当前没有
+ * codereview-result.json 这类结构化文件，所以用保守策略：
+ * - 有行内 review comment：按 Important 通知（官方 Codex review 本身只应报高优问题）。
+ * - review body 明确报错/超时/额度：基础设施失败通知。
+ * - 明确 clean：pass，不发。
+ * - 其它：skip，避免把普通状态文本误当代码问题。
+ *
+ * @param {{body?:string,state?:string,html_url?:string,submitted_at?:string}} review
+ * @param {Array<{path?:string,line?:number,original_line?:number,body?:string}>} reviewComments
+ */
+function classifyPullRequestReview(review, reviewComments) {
+  const body = String((review && review.body) || '');
+  const comments = Array.isArray(reviewComments) ? reviewComments : [];
+  const statusText = body.slice(0, 2000);
+  if (isInfrastructureFailureText(statusText)) {
+    return infrastructureFailure('Codex PR review 未完成评审', {
+      status: review && review.state ? `state=${review.state}` : '',
+      reason: cleanIssueTitle(statusText) || 'Codex review failed',
+      runUrl: review && review.html_url,
+    });
+  }
+  const issues = comments
+    .filter((c) => c && String(c.body || '').trim())
+    .map((c) => ({
+      sev: 'important',
+      loc: [c.path, c.line || c.original_line].filter((x) => x != null && x !== '').join(':'),
+      title: cleanIssueTitle(c.body),
+    }));
+  if (issues.length) {
+    return {
+      verdict: 'fail',
+      reason: 'issues',
+      counts: { important: issues.length, nit: 0, pre_existing: 0 },
+      issues,
+      count: issues.length,
+    };
+  }
+  if (/no issues|no problems|looks good|lgtm|no blocking/i.test(body)) {
+    return {
+      verdict: 'pass',
+      reason: 'clean',
+      counts: { important: 0, nit: 0, pre_existing: 0 },
+      issues: [],
+      count: 0,
+    };
+  }
+  return {
+    verdict: 'skip',
+    reason: 'inconclusive',
+    counts: { important: 0, nit: 0, pre_existing: 0 },
+    issues: [],
+    count: 0,
+  };
 }
 
 /**
@@ -154,18 +258,10 @@ function classifyActionFailure(failure = {}) {
   if (step) titleParts.push(`review step=${step}`);
   if (reason) titleParts.push(`原因：${reason}`);
   if (runUrl) titleParts.push(`Actions：${runUrl}`);
-  return {
-    verdict: 'fail',
-    reason: 'infra_failure',
-    kind: 'infra_failure',
-    counts: { important: 1, nit: 0, pre_existing: 0 },
-    issues: [{
-      sev: 'important',
-      loc: '.github/workflows/codex-code-review.yml',
-      title: titleParts.join(' · '),
-    }],
-    count: 1,
-  };
+  return infrastructureFailure('历史自托管 Codex Action 未产出结果', {
+    loc: '.github/workflows/codex-code-review.yml',
+    reason: titleParts.join(' · '),
+  });
 }
 
 /**
@@ -231,10 +327,10 @@ function buildCard(repo, pr, cls, opts = {}) {
   const infra = cls.reason === 'infra_failure' || cls.kind === 'infra_failure';
   const c = cls.counts || { important: 0, nit: 0, pre_existing: 0 };
   const head = ok
-    ? '✅ Codex GPT-5.5 代码评审通过'
+    ? '✅ Codex 代码评审通过'
     : infra
-      ? '🚨 Codex GPT-5.5 代码评审基础设施失败'
-    : `❌ Codex GPT-5.5 代码评审不通过 — ${cls.count} 个问题`;
+      ? '🚨 Codex 代码评审基础设施失败'
+    : `❌ Codex 代码评审不通过 — ${cls.count} 个问题`;
   const authorAt = !ok && atAuthor ? atTag(pr.author) : '';
   const tally = `🔴 ${c.important} · 🟡 ${c.nit} · 🟣 ${c.pre_existing}`;
 
@@ -259,11 +355,11 @@ function buildCard(repo, pr, cls, opts = {}) {
     });
     if (cls.issues.length > 10) detailLines.push(`… 另有 ${cls.issues.length - 10} 项，详见 PR 行内评论`);
   } else if (!ok) {
-    detailLines.push('\n详见 PR 的 **Codex GPT-5.5 Code Review** 评论。');
+    detailLines.push('\n详见 PR 的 **Codex Code Review** 评论。');
   }
   const note = opts.isReply
-    ? infra ? 'Codex GPT-5.5 · 同一 PR 复评 · 基础设施故障回复' : 'Codex GPT-5.5 · 同一 PR 复评 · 话题回复'
-    : infra ? 'Codex GPT-5.5 · PR → main · 基础设施故障自动告警' : 'Codex GPT-5.5 · PR → main · 自动触发';
+    ? infra ? 'Codex · 同一 PR 复评 · 基础设施故障回复' : 'Codex · 同一 PR 复评 · 话题回复'
+    : infra ? 'Codex · PR → main · 基础设施故障自动告警' : 'Codex · PR → main · 自动触发';
 
   // 飞书 card schema 2.0：用 collapsible_panel 做「红框常显 + 其余下拉展开」。
   return {
@@ -312,8 +408,10 @@ function interactiveCardContent(card) {
 
 module.exports = {
   classifyCheckRun,
+  classifyPullRequestReview,
   classifyActionResult,
   classifyActionFailure,
+  isInfrastructureFailureText,
   parseSeverityTable,
   shouldNotify,
   buildCard,
