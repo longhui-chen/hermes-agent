@@ -1054,38 +1054,35 @@ class TestChatCompletionsEndpoint:
                 )
 
             assert resp.status == 200
-            assert mock_run.await_args.kwargs["request_overrides"] == {
-                "response_format": {"type": "text"},
-            }
+            assert mock_run.await_args.kwargs["request_overrides"] is None
 
     def test_structured_response_format_rejects_unsupported_transports(self, adapter):
-        with patch.object(
-            adapter,
-            "_create_agent",
-            return_value=MagicMock(api_mode="anthropic_messages", provider="anthropic", base_url=""),
-        ):
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_mode": "anthropic_messages", "provider": "anthropic", "base_url": ""},
+        ), patch.object(adapter, "_create_agent") as mock_create:
             assert "Anthropic" in adapter._response_format_transport_error(
                 {"response_format": {"type": "json_object"}}
             )
+            mock_create.assert_not_called()
 
-        with patch.object(
-            adapter,
-            "_create_agent",
-            return_value=MagicMock(
-                api_mode="chat_completions",
-                provider="google-gemini-cli",
-                base_url="cloudcode-pa://google",
-            ),
-        ):
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={
+                "api_mode": "chat_completions",
+                "provider": "google-gemini-cli",
+                "base_url": "cloudcode-pa://google",
+            },
+        ), patch.object(adapter, "_create_agent") as mock_create:
             assert "Gemini" in adapter._response_format_transport_error(
                 {"response_format": {"type": "json_object"}}
             )
+            mock_create.assert_not_called()
 
-        with patch.object(
-            adapter,
-            "_create_agent",
-            return_value=MagicMock(api_mode="anthropic_messages", provider="anthropic", base_url=""),
-        ) as mock_create:
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_mode": "anthropic_messages", "provider": "anthropic", "base_url": ""},
+        ), patch.object(adapter, "_create_agent") as mock_create:
             assert adapter._response_format_transport_error({"response_format": {"type": "text"}}) is None
             mock_create.assert_not_called()
 

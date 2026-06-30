@@ -1498,7 +1498,13 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         return agent
 
-    def _response_format_transport_error(self, request_overrides: Optional[Dict[str, Any]]) -> Optional[str]:
+    def _response_format_transport_error(
+        self,
+        request_overrides: Optional[Dict[str, Any]],
+        *,
+        session_id: Optional[str] = None,
+        gateway_session_key: Optional[str] = None,
+    ) -> Optional[str]:
         response_format = (request_overrides or {}).get("response_format")
         if response_format is None:
             return None
@@ -1507,15 +1513,35 @@ class APIServerAdapter(BasePlatformAdapter):
         if not response_format_requires_structured_output(response_format):
             return None
         try:
-            agent = self._create_agent(request_overrides=request_overrides)
+            from gateway.run import _resolve_runtime_agent_kwargs
+
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
         except Exception:
             return None
-        if getattr(agent, "api_mode", None) == "anthropic_messages":
+
+        override_key = gateway_session_key or session_id
+        if override_key:
+            try:
+                override = getattr(
+                    getattr(self, "gateway_runner", None),
+                    "_session_model_overrides",
+                    {},
+                ).get(override_key)
+            except Exception:
+                override = None
+            if override:
+                for key in ("provider", "base_url", "api_mode"):
+                    value = override.get(key)
+                    if value is not None:
+                        runtime_kwargs[key] = value
+
+        api_mode = getattr(self, "api_mode", None) or runtime_kwargs.get("api_mode")
+        if api_mode == "anthropic_messages":
             return "response_format is not supported by the Anthropic Messages transport."
-        if getattr(agent, "api_mode", None) != "chat_completions":
+        if api_mode != "chat_completions":
             return None
-        provider = str(getattr(agent, "provider", "") or "").strip().lower()
-        base_url = str(getattr(agent, "base_url", "") or "")
+        provider = str(runtime_kwargs.get("provider") or "").strip().lower()
+        base_url = str(runtime_kwargs.get("base_url") or "")
         try:
             from agent.gemini_native_adapter import is_native_gemini_base_url
 
@@ -2310,10 +2336,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     _openai_error(response_format_error, param="response_format"),
                     status=400,
                 )
-            request_overrides["response_format"] = response_format
+            from agent.response_format import response_format_requires_structured_output
+
+            if response_format_requires_structured_output(response_format):
+                request_overrides["response_format"] = response_format
 
         if stream:
-            response_format_transport_error = self._response_format_transport_error(request_overrides or None)
+            response_format_transport_error = self._response_format_transport_error(
+                request_overrides or None,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+            )
             if response_format_transport_error:
                 return web.json_response(
                     _openai_error(response_format_transport_error, param="response_format"),

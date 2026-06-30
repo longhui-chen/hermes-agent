@@ -627,6 +627,7 @@ class ZetAgentAdapter(APIServerAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        request_overrides: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Build the agent for the zet_agent platform, then attach extra callbacks.
 
@@ -733,6 +734,7 @@ class ZetAgentAdapter(APIServerAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
+            request_overrides=request_overrides,
         )
 
         stream_q = self._sniff_stream_q(
@@ -835,6 +837,7 @@ class ZetAgentAdapter(APIServerAdapter):
         gateway_session_key: Optional[str] = None,
         response_mode: Optional[str] = None,
         turn_id: Optional[str] = None,
+        request_overrides: Optional[Dict[str, Any]] = None,
     ):
         """Wrap base ``_run_agent`` to (1) push the auto-title before
         kicking off the agent thread and (2) bind the session-scoped env
@@ -918,6 +921,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 gateway_session_key=gateway_session_key,
                 response_mode=response_mode,
                 turn_id=turn_id,
+                request_overrides=request_overrides,
             )
         finally:
             if old_session_key is None:
