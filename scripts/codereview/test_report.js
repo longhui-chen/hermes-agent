@@ -170,7 +170,8 @@ assert(/不通过（2 个问题）/.test(cardFail), '不通过卡片文案正确
 assert(/🔴 2 · 🟡 1 · 🟣 0/.test(cardFail), '卡片含严重度 tally');
 assert(/session\.ts:142/.test(cardFail), '卡片含问题清单的 file:line');
 assert(/不通过（3 个问题）/.test(cardPriority), 'P1+P2 卡片按全部 Codex comments 展示问题数');
-assert(/img\.shields\.io\/badge\/P1-orange/.test(cardPriority) && /img\.shields\.io\/badge\/P2-yellow/.test(cardPriority), 'P1/P2 卡片复用 Codex badge 图标');
+assert(/🟠 P1/.test(cardPriority) && /🟡 P2/.test(cardPriority), 'P1/P2 卡片使用 emoji 文本标识');
+assert(!/img\.shields\.io|!\[P[0-2] Badge/.test(cardPriority), 'P1/P2 卡片不再使用远程 badge 图片');
 assert(!/🔴 3/.test(cardPriority), 'P1+P2 卡片不再把所有 issue 画成红色 important');
 assert(/基础设施失败/.test(cardInfra) && /codereview-result\.json/.test(cardInfra), '基础设施失败卡片文案正确');
 

@@ -82,22 +82,22 @@ function cleanIssueTitle(value) {
 const PRIORITY = {
   p0: {
     label: 'P0',
-    badge: '![P0 Badge](https://img.shields.io/badge/P0-red?style=flat)',
+    badge: '🔴 P0',
     sev: 'important',
   },
   p1: {
     label: 'P1',
-    badge: '![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)',
+    badge: '🟠 P1',
     sev: 'important',
   },
   p2: {
     label: 'P2',
-    badge: '![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)',
+    badge: '🟡 P2',
     sev: 'nit',
   },
 };
 
-function priorityBadgeMarkdown(priority) {
+function priorityLabel(priority) {
   return PRIORITY[priority] ? PRIORITY[priority].badge : '';
 }
 
@@ -393,14 +393,14 @@ const SEV_ICON = { important: '🔴', nit: '🟡', pre_existing: '🟣' };
 function priorityTally(priorityCounts) {
   if (!priorityCounts) return '';
   return [
-    `${priorityBadgeMarkdown('p0')} ${priorityCounts.p0 || 0}`,
-    `${priorityBadgeMarkdown('p1')} ${priorityCounts.p1 || 0}`,
-    `${priorityBadgeMarkdown('p2')} ${priorityCounts.p2 || 0}`,
+    `${priorityLabel('p0')} ${priorityCounts.p0 || 0}`,
+    `${priorityLabel('p1')} ${priorityCounts.p1 || 0}`,
+    `${priorityLabel('p2')} ${priorityCounts.p2 || 0}`,
   ].join(' · ');
 }
 
 function issueMarker(issue) {
-  if (issue && issue.priority) return priorityBadgeMarkdown(issue.priority) || '•';
+  if (issue && issue.priority) return priorityLabel(issue.priority) || '•';
   return SEV_ICON[issue && issue.sev] || '•';
 }
 
