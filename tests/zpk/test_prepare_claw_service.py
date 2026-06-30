@@ -63,6 +63,7 @@ def test_zpk_agent_service_names_are_device_facing():
     assert "EnvironmentFile=-__APP_BASE__/data/secrets/zettlab-claw.env" in service
     assert '"service_name": "zettlab-claw"' in package_meta
     assert "systemctl restart zettlab-claw.service" not in install
+    assert "systemctl start zettlab-claw.service" in install
     assert "systemctl start zettlab-claw.service" in start
     assert "systemctl stop zettlab-claw.service" in stop
     assert "zettlab-claw.service" in uninstall
@@ -78,4 +79,6 @@ def test_zpk_install_removes_legacy_shared_gateway_unit():
     assert "hermes-agent-mux.service" in install
     assert "systemctl stop \"$legacy_service\"" in install
     assert "systemctl disable \"$legacy_service\"" in install
+    assert "LEGACY_GATEWAY_SERVICE_REMOVED=true" in install
+    assert "start_replacement_service_after_legacy_cleanup" in install
     assert "hermes-agent-mux.service" in uninstall

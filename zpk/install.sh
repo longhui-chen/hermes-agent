@@ -15,6 +15,8 @@ source "$APP_ROOT/zpk-systemd.sh"
 # shellcheck source=zpk/pypi-mirror.sh
 source "$APP_ROOT/pypi-mirror.sh" 2>/dev/null || true
 
+LEGACY_GATEWAY_SERVICE_REMOVED=false
+
 cleanup_legacy_systemd_services() {
     if ! command -v systemctl >/dev/null 2>&1; then
         return 0
@@ -44,6 +46,22 @@ cleanup_legacy_systemd_services() {
     rm -rf "/etc/systemd/system/$legacy_service.d"
     rm -f "$APP_BASE/data/secrets/hermes-agent-mux.env"
     systemctl daemon-reload 2>/dev/null || true
+    LEGACY_GATEWAY_SERVICE_REMOVED=true
+}
+
+start_replacement_service_after_legacy_cleanup() {
+    if [ "$LEGACY_GATEWAY_SERVICE_REMOVED" != "true" ]; then
+        return 0
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! systemctl cat zettlab-claw.service >/dev/null 2>&1; then
+        echo "warning: zettlab-claw.service is not installed after legacy cleanup" >&2
+        return 1
+    fi
+    systemctl start zettlab-claw.service
+    echo "zettlab-claw.service started after legacy service cleanup."
 }
 
 echo "Installing zettlab-claw from $APP_ROOT ..."
@@ -76,6 +94,7 @@ setup_pypi_mirror || true
 "$APP_ROOT/prepare-claw-service.sh"
 install_systemd_services "$APP_ROOT"
 cleanup_legacy_systemd_services
+start_replacement_service_after_legacy_cleanup
 
 echo "Install complete."
 echo "  hermes: $APP_BASE/current/bin/hermes"
