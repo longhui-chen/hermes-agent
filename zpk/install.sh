@@ -73,9 +73,9 @@ ln -sfn "$APP_BASE/current/bin/hermes" "$HERMES_LINK"
 # 探测并写 PyPI 镜像源（境内 lazy-install 提速）；失败不阻断安装
 setup_pypi_mirror || true
 
-cleanup_legacy_systemd_services
 "$APP_ROOT/prepare-claw-service.sh"
 install_systemd_services "$APP_ROOT"
+cleanup_legacy_systemd_services
 
 echo "Install complete."
 echo "  hermes: $APP_BASE/current/bin/hermes"
