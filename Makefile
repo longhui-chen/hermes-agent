@@ -97,7 +97,8 @@ zpk-stage: zpk-venv
 	cp "$$python_bin" "$(ZPK_SRC_DIR)/venv/bin/python3.11"
 	@chmod 0755 "$(ZPK_SRC_DIR)/venv/bin/python" "$(ZPK_SRC_DIR)/venv/bin/python3" "$(ZPK_SRC_DIR)/venv/bin/python3.11"
 	@find "$(ZPK_SRC_DIR)" -type l -delete
-	@chmod 0755 zpk/install.sh zpk/update.sh zpk/uninstall.sh zpk/bin/hermes
+	@chmod 0755 zpk/install.sh zpk/update.sh zpk/uninstall.sh zpk/bin/hermes \
+		zpk/zpk-systemd.sh zpk/prepare-mux-service.sh zpk/init.d/start.sh zpk/init.d/stop.sh
 	@echo "Hermes-agent ZPK payload staged at $(ZPK_SRC_DIR)"
 
 zpk-pack: zpk-stage

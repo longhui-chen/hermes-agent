@@ -40,10 +40,73 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
-from hermes_cli.config import load_config, _expand_env_vars
+from hermes_cli.config import load_config
+from hermes_cli.env_loader import load_hermes_dotenv as _load_hermes_dotenv
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
+
+try:
+    from agent.secret_scope import (
+        build_profile_secret_scope as _build_profile_secret_scope,
+        get_secret as _get_scoped_secret,
+        _is_global_env as _is_secret_global_env,
+        is_multiplex_active as _is_secret_multiplex_active,
+    )
+except Exception:  # pragma: no cover - standalone cron invocations before agent package import
+    _build_profile_secret_scope = None
+    _get_scoped_secret = None
+    _is_secret_global_env = None
+    _is_secret_multiplex_active = None
+
+
+_ENV_REF_RE = re.compile(r"\${([^}]+)}")
+
+
+def _cron_env(name: str, default: str = "") -> str:
+    """Read a cron env value from the active profile scope when available."""
+    if _get_scoped_secret is None:
+        return os.getenv(name, default)
+    if (
+        _build_profile_secret_scope is not None
+        and _is_secret_global_env is not None
+        and _is_secret_multiplex_active is not None
+        and _is_secret_multiplex_active()
+        and not _is_secret_global_env(name)
+    ):
+        try:
+            fresh_scope = _build_profile_secret_scope(get_hermes_home())
+            value = fresh_scope.get(name)
+            if value is not None:
+                return str(value)
+        except Exception:
+            logger.debug("Failed to refresh cron env %s from profile .env", name, exc_info=True)
+    value = _get_scoped_secret(name, default)
+    return default if value is None else str(value)
+
+
+def _refresh_cron_dotenv_for_legacy_process() -> None:
+    """Reload .env before cron runs in non-multiplex gateway processes."""
+    try:
+        if _is_secret_multiplex_active is not None and _is_secret_multiplex_active():
+            return
+        _load_hermes_dotenv(hermes_home=get_hermes_home())
+    except Exception:
+        logger.debug("Failed to refresh cron dotenv", exc_info=True)
+
+
+def _expand_env_vars_scoped(obj):
+    """Recursively expand ``${VAR}`` references through the cron profile scope."""
+    if isinstance(obj, str):
+        return _ENV_REF_RE.sub(
+            lambda match: _cron_env(match.group(1), match.group(0)),
+            obj,
+        )
+    if isinstance(obj, dict):
+        return {key: _expand_env_vars_scoped(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_env_vars_scoped(item) for item in obj]
+    return obj
 
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
@@ -289,6 +352,15 @@ def _get_lock_paths() -> tuple[Path, Path]:
     return lock_dir, lock_dir / ".tick.lock"
 
 
+def _running_job_key(job: dict) -> tuple[str, str]:
+    """Return a profile-qualified key for the in-process cron running guard."""
+    try:
+        home_key = str(_get_hermes_home().resolve())
+    except Exception:
+        home_key = str(_get_hermes_home())
+    return home_key, str(job["id"])
+
+
 def _resolve_origin(job: dict) -> Optional[dict]:
     """Extract origin info from a job, preserving any extra routing metadata.
 
@@ -385,11 +457,11 @@ def _get_home_target_chat_id(platform_name: str) -> str:
     env_var = _resolve_home_env_var(platform_name)
     if not env_var:
         return ""
-    value = os.getenv(env_var, "")
+    value = _cron_env(env_var, "")
     if not value:
         legacy = _LEGACY_HOME_TARGET_ENV_VARS.get(env_var)
         if legacy:
-            value = os.getenv(legacy, "")
+            value = _cron_env(legacy, "")
     return value
 
 
@@ -408,14 +480,14 @@ def _get_home_target_thread_id(platform_name: str) -> Optional[str]:
     if not env_var:
         return None
     if platform_name.lower() == "telegram":
-        cron_thread = os.getenv("TELEGRAM_CRON_THREAD_ID", "").strip()
+        cron_thread = _cron_env("TELEGRAM_CRON_THREAD_ID", "").strip()
         if cron_thread:
             return cron_thread
-    value = os.getenv(f"{env_var}_THREAD_ID", "").strip()
+    value = _cron_env(f"{env_var}_THREAD_ID", "").strip()
     if not value:
         legacy = _LEGACY_HOME_TARGET_ENV_VARS.get(env_var)
         if legacy:
-            value = os.getenv(f"{legacy}_THREAD_ID", "").strip()
+            value = _cron_env(f"{legacy}_THREAD_ID", "").strip()
     return value or None
 
 
@@ -920,7 +992,7 @@ def _get_script_timeout() -> int:
         except Exception:
             logger.warning("Invalid patched _SCRIPT_TIMEOUT=%r; using env/config/default", _SCRIPT_TIMEOUT)
 
-    env_value = os.getenv("HERMES_CRON_SCRIPT_TIMEOUT", "").strip()
+    env_value = _cron_env("HERMES_CRON_SCRIPT_TIMEOUT", "").strip()
     if env_value:
         try:
             timeout = int(float(env_value))
@@ -1144,7 +1216,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     # Inject output from referenced cron jobs as context.
     context_from = job.get("context_from")
     if context_from:
-        from cron.jobs import OUTPUT_DIR
+        from cron.jobs import _output_dir
         if isinstance(context_from, str):
             context_from = [context_from]
         for source_job_id in context_from:
@@ -1159,7 +1231,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 )
                 continue
             try:
-                job_output_dir = OUTPUT_DIR / source_job_id
+                job_output_dir = _output_dir() / source_job_id
                 if not job_output_dir.exists():
                     continue  # silent skip — no output yet
                 output_files = sorted(
@@ -1410,6 +1482,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    _refresh_cron_dotenv_for_legacy_process()
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -1676,14 +1749,6 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
 
     try:
-        # Re-read .env and config.yaml fresh every run so provider/key
-        # changes take effect without a gateway restart.
-        from dotenv import load_dotenv
-        try:
-            load_dotenv(str(_get_hermes_home() / ".env"), override=True, encoding="utf-8")
-        except UnicodeDecodeError:
-            load_dotenv(str(_get_hermes_home() / ".env"), override=True, encoding="latin-1")
-
         delivery_target = _resolve_delivery_target(job)
         if delivery_target:
             _VAR_MAP["HERMES_CRON_AUTO_DELIVER_PLATFORM"].set(delivery_target["platform"])
@@ -1694,7 +1759,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                 else str(delivery_target["thread_id"])
             )
 
-        model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+        model = job.get("model") or _cron_env("HERMES_MODEL", "") or ""
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
@@ -1713,7 +1778,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     _cfg = managed_scope.apply_managed_overlay(_cfg)
                 except Exception:
                     pass
-                _cfg = _expand_env_vars(_cfg)
+                _cfg = _expand_env_vars_scoped(_cfg)
                 _model_cfg = _cfg.get("model", {})
                 if not job.get("model"):
                     if isinstance(_model_cfg, str):
@@ -1743,7 +1808,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         prefill_messages = None
         agent_cfg = _cfg.get("agent", {}) if isinstance(_cfg.get("agent", {}), dict) else {}
         prefill_file = (
-            os.getenv("HERMES_PREFILL_MESSAGES_FILE", "")
+            _cron_env("HERMES_PREFILL_MESSAGES_FILE", "")
             or _cfg.get("prefill_messages_file", "")
             or agent_cfg.get("prefill_messages_file", "")
         )
@@ -1890,7 +1955,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         #
         # Uses the agent's built-in activity tracker (updated by
         # _touch_activity() on every tool call, API call, and stream delta).
-        _raw_cron_timeout = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
+        _raw_cron_timeout = _cron_env("HERMES_CRON_TIMEOUT", "").strip()
         if _raw_cron_timeout:
             try:
                 _cron_timeout = float(_raw_cron_timeout)
@@ -2233,7 +2298,7 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
         _max_workers: Optional[int] = None
         try:
-            _env_par = os.getenv("HERMES_CRON_MAX_PARALLEL", "").strip()
+            _env_par = _cron_env("HERMES_CRON_MAX_PARALLEL", "").strip()
             if _env_par:
                 _max_workers = int(_env_par) or None
         except (ValueError, TypeError):
@@ -2281,19 +2346,20 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
             membership is released in the worker's finally block.
             """
             job_id = job["id"]
+            running_key = _running_job_key(job)
             with _running_lock:
-                if job_id in _running_job_ids:
+                if running_key in _running_job_ids:
                     logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                     return None
-                _running_job_ids.add(job_id)
+                _running_job_ids.add(running_key)
             _ctx = contextvars.copy_context()
 
-            def _run_and_release(j=job, ctx=_ctx):
+            def _run_and_release(j=job, ctx=_ctx, key=running_key):
                 try:
                     return ctx.run(_process_job, j)
                 finally:
                     with _running_lock:
-                        _running_job_ids.discard(j["id"])
+                        _running_job_ids.discard(key)
 
             return pool.submit(_run_and_release)
 

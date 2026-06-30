@@ -16,6 +16,14 @@ done
 
 echo "Uninstalling hermes-agent (keep data: $KEEP_DATA) ..."
 
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop hermes-agent-mux.service 2>/dev/null || true
+    systemctl disable hermes-agent-mux.service 2>/dev/null || true
+    rm -f /lib/systemd/system/hermes-agent-mux.service /etc/systemd/system/hermes-agent-mux.service
+    rm -rf /etc/systemd/system/hermes-agent-mux.service.d
+    systemctl daemon-reload 2>/dev/null || true
+fi
+
 echo "  stopping hermes processes under $APP_BASE"
 PIDS=""
 if command -v pgrep >/dev/null 2>&1; then
