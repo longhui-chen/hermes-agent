@@ -1029,6 +1029,67 @@ class TestChatCompletionsEndpoint:
             }
 
     @pytest.mark.asyncio
+    async def test_text_response_format_is_accepted(self, adapter):
+        mock_result = {
+            "final_response": "ok",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "Return text"}],
+                        "stream": False,
+                        "response_format": {"type": "text"},
+                    },
+                )
+
+            assert resp.status == 200
+            assert mock_run.await_args.kwargs["request_overrides"] == {
+                "response_format": {"type": "text"},
+            }
+
+    def test_structured_response_format_rejects_unsupported_transports(self, adapter):
+        with patch.object(
+            adapter,
+            "_create_agent",
+            return_value=MagicMock(api_mode="anthropic_messages", provider="anthropic", base_url=""),
+        ):
+            assert "Anthropic" in adapter._response_format_transport_error(
+                {"response_format": {"type": "json_object"}}
+            )
+
+        with patch.object(
+            adapter,
+            "_create_agent",
+            return_value=MagicMock(
+                api_mode="chat_completions",
+                provider="google-gemini-cli",
+                base_url="cloudcode-pa://google",
+            ),
+        ):
+            assert "Gemini" in adapter._response_format_transport_error(
+                {"response_format": {"type": "json_object"}}
+            )
+
+        with patch.object(
+            adapter,
+            "_create_agent",
+            return_value=MagicMock(api_mode="anthropic_messages", provider="anthropic", base_url=""),
+        ) as mock_create:
+            assert adapter._response_format_transport_error({"response_format": {"type": "text"}}) is None
+            mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_stream_true_returns_sse(self, adapter):
         """stream=true returns SSE format with the full response."""
         app = _create_app(adapter)
@@ -1044,7 +1105,10 @@ class TestChatCompletionsEndpoint:
                     {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
                 )
 
-            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent) as mock_run:
+            with (
+                patch.object(adapter, "_response_format_transport_error", return_value=None),
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent) as mock_run,
+            ):
                 resp = await cli.post(
                     "/v1/chat/completions",
                     json={
@@ -1064,6 +1128,34 @@ class TestChatCompletionsEndpoint:
                 assert "data: " in body
                 assert "[DONE]" in body
                 assert "Hello!" in body
+
+    @pytest.mark.asyncio
+    async def test_stream_response_format_error_returns_400_before_sse(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(
+                    adapter,
+                    "_response_format_transport_error",
+                    return_value="response_format is not supported by the Gemini transport.",
+                ),
+                patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run,
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+
+            assert resp.status == 400
+            assert "text/event-stream" not in resp.headers.get("Content-Type", "")
+            data = await resp.json()
+            assert data["error"]["param"] == "response_format"
+            mock_run.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_stream_string_false_returns_json_completion(self, adapter):

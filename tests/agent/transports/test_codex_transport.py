@@ -150,6 +150,17 @@ class TestCodexBuildKwargs:
         assert kw["text"] == {"format": {"type": "json_object"}}
         assert transport.preflight_kwargs(kw)["text"] == {"format": {"type": "json_object"}}
 
+    def test_response_format_text_is_noop(self, transport):
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=messages,
+            tools=[],
+            request_overrides={"response_format": {"type": "text"}},
+        )
+        assert "response_format" not in kw
+        assert "text" not in kw
+
     def test_response_format_json_schema_maps_to_text_format(self, transport):
         schema = {
             "type": "object",

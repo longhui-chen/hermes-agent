@@ -1026,6 +1026,27 @@ class TestChatCompletionsGeminiNativeExtraBodyStrip:
                 request_overrides={"response_format": {"type": "json_object"}},
             )
 
+    def test_response_format_rejected_when_endpoint_is_gemini_cloudcode(self, transport):
+        with pytest.raises(ValueError, match="response_format"):
+            transport.build_kwargs(
+                "gemini-2.5-flash",
+                [{"role": "user", "content": "hi"}],
+                None,
+                provider_name="google-gemini-cli",
+                base_url="cloudcode-pa://google",
+                request_overrides={"response_format": {"type": "json_object"}},
+            )
+
+    def test_text_response_format_dropped_for_native_gemini(self, transport):
+        kw = transport.build_kwargs(
+            "gemini-2.5-flash",
+            [{"role": "user", "content": "hi"}],
+            None,
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+            request_overrides={"response_format": {"type": "text"}},
+        )
+        assert "response_format" not in kw
+
     def test_tags_preserved_on_nous_endpoint(self, transport):
         kw = transport.build_kwargs(
             "hermes-3-405b",

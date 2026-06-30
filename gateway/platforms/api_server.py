@@ -837,27 +837,9 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
 
 
 def _validate_chat_response_format(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        return "Invalid 'response_format' field"
-    fmt_type = value.get("type")
-    if fmt_type == "json_object":
-        return None
-    if fmt_type != "json_schema":
-        return "Unsupported 'response_format.type'"
-    schema_payload = value.get("json_schema")
-    if not isinstance(schema_payload, dict):
-        return "'response_format.json_schema' must be an object"
-    if not isinstance(schema_payload.get("schema"), dict):
-        return "'response_format.json_schema.schema' must be an object"
-    name = schema_payload.get("name")
-    if name is not None and not isinstance(name, str):
-        return "'response_format.json_schema.name' must be a string"
-    strict = schema_payload.get("strict")
-    if strict is not None and not isinstance(strict, bool):
-        return "'response_format.json_schema.strict' must be a boolean"
-    return None
+    from agent.response_format import validate_chat_response_format
+
+    return validate_chat_response_format(value)
 
 
 if AIOHTTP_AVAILABLE:
@@ -1515,6 +1497,34 @@ class APIServerAdapter(BasePlatformAdapter):
             request_overrides=request_overrides,
         )
         return agent
+
+    def _response_format_transport_error(self, request_overrides: Optional[Dict[str, Any]]) -> Optional[str]:
+        response_format = (request_overrides or {}).get("response_format")
+        if response_format is None:
+            return None
+        from agent.response_format import response_format_requires_structured_output
+
+        if not response_format_requires_structured_output(response_format):
+            return None
+        try:
+            agent = self._create_agent(request_overrides=request_overrides)
+        except Exception:
+            return None
+        if getattr(agent, "api_mode", None) == "anthropic_messages":
+            return "response_format is not supported by the Anthropic Messages transport."
+        if getattr(agent, "api_mode", None) != "chat_completions":
+            return None
+        provider = str(getattr(agent, "provider", "") or "").strip().lower()
+        base_url = str(getattr(agent, "base_url", "") or "")
+        try:
+            from agent.gemini_native_adapter import is_native_gemini_base_url
+
+            native_gemini = is_native_gemini_base_url(base_url)
+        except Exception:
+            native_gemini = False
+        if provider == "google-gemini-cli" or base_url.lower().startswith("cloudcode-pa://") or native_gemini:
+            return "response_format is not supported by the Gemini transport."
+        return None
 
     # ------------------------------------------------------------------
     # HTTP Handlers
@@ -2303,6 +2313,13 @@ class APIServerAdapter(BasePlatformAdapter):
             request_overrides["response_format"] = response_format
 
         if stream:
+            response_format_transport_error = self._response_format_transport_error(request_overrides or None)
+            if response_format_transport_error:
+                return web.json_response(
+                    _openai_error(response_format_transport_error, param="response_format"),
+                    status=400,
+                )
+
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
 
