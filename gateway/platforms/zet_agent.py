@@ -79,6 +79,7 @@ import os
 import threading
 import time
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
@@ -104,6 +105,18 @@ from gateway.platforms import zet_agent_cron as _zet_agent_cron
 _zet_agent_cron.install()
 
 logger = logging.getLogger(__name__)
+
+
+def _request_value(request: Any, key: str, default: Any = None) -> Any:
+    """Read aiohttp request mapping values while tolerating simple test fakes."""
+    getter = getattr(request, "get", None)
+    if callable(getter):
+        return getter(key, default)
+    try:
+        return request[key]
+    except Exception:
+        return default
+
 
 # Upper bound on the per-session last-seen-model map so a long-lived process
 # with many sessions cannot grow it (or its on-disk JSON) without bound
@@ -1317,6 +1330,10 @@ class ZetAgentAdapter(APIServerAdapter):
 
         Expected body: {"model": "...", "provider": "...", "base_url": "...", "api_key": "...", "api_mode"?: "...", "context_length"?: 123}
         """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
         try:
             body = await request.json()
         except Exception:
@@ -1337,6 +1354,7 @@ class ZetAgentAdapter(APIServerAdapter):
         # take precedence per session (same as hermes /model --global).
         try:
             from gateway.run import _load_gateway_config, _hermes_home
+            from hermes_constants import get_hermes_home_override
             from utils import atomic_yaml_write
             cfg = _load_gateway_config()
             model_slot = cfg.get("model", {})
@@ -1363,7 +1381,8 @@ class ZetAgentAdapter(APIServerAdapter):
                 else:
                     model_slot.pop("context_length", None)
             cfg["model"] = model_slot
-            config_path = _hermes_home / "config.yaml"
+            override_home = get_hermes_home_override()
+            config_path = (Path(override_home) if override_home else _hermes_home) / "config.yaml"
             atomic_yaml_write(config_path, cfg)
         except Exception as exc:
             logger.warning("model-switch: config write failed: %s", exc)
@@ -1615,7 +1634,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 ),
                 status=500,
             )
-        session_db = getattr(gw, "_session_db", None)
+        if _request_value(request, "hermes_profile_home"):
+            session_db = self._ensure_session_db()
+        else:
+            session_db = getattr(gw, "_session_db", None)
         if session_db is None:
             logger.error("[zet_agent] skills-reload: no SessionDB on runner")
             return web.json_response(
@@ -1807,7 +1829,10 @@ class ZetAgentAdapter(APIServerAdapter):
         # Any failure here means we cannot keep our hot-reload contract,
         # so return 500 to let the local-server caller fall back to
         # ``registry.Stop`` (lazy respawn reads the new file fresh).
-        session_db = getattr(gw, "_session_db", None)
+        if _request_value(request, "hermes_profile_home"):
+            session_db = self._ensure_session_db()
+        else:
+            session_db = getattr(gw, "_session_db", None)
         if session_db is None:
             logger.error("[zet_agent] profile-reload: no SessionDB on runner")
             return web.json_response(
@@ -1837,12 +1862,16 @@ class ZetAgentAdapter(APIServerAdapter):
         # would still rebuild from the cleared DB anyway — just one turn
         # later than ideal — so a failure here is not worth tearing down
         # the gateway over.
+        profile = _request_value(request, "hermes_profile")
         invalidated = 0
         try:
-            invalidated = gw.invalidate_all_cached_agents()
+            if profile and hasattr(gw, "invalidate_cached_agents_for_profile"):
+                invalidated = gw.invalidate_cached_agents_for_profile(profile)
+            else:
+                invalidated = gw.invalidate_all_cached_agents()
         except Exception:
             logger.warning(
-                "[zet_agent] profile-reload: invalidate-all failed "
+                "[zet_agent] profile-reload: invalidate failed "
                 "(DB cleared, sessions still rebuild next turn)",
                 exc_info=True,
             )
@@ -1856,6 +1885,98 @@ class ZetAgentAdapter(APIServerAdapter):
             "reloaded": True,
             "invalidated_sessions": invalidated,
             "db_rows_cleared": db_rows_cleared,
+        })
+
+    async def _handle_runtime_reset(self, request: "web.Request") -> "web.Response":
+        """POST /v1/runtime/reset — reset one profile's in-memory runtime view.
+
+        In multiplex mode local-server uses this for the user-facing
+        "restart agent" action. Reuse the profile-reload invalidation path:
+        continuing sessions drop stored prompts and cached AIAgent instances
+        are evicted before the next turn. The shared gateway process stays up.
+        """
+        return await self._handle_profile_reload(request)
+
+    async def _handle_profile_unload(self, request: "web.Request") -> "web.Response":
+        """POST /v1/profile/unload — release cached state for one profile.
+
+        local-server calls this before deleting the profile directory. The
+        endpoint is deliberately best-effort: it never deletes files and only
+        releases in-process caches owned by this adapter / runner.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        profile_home = _request_value(request, "hermes_profile_home")
+        active_api_runs = self._active_profile_chat_runs(profile_home)
+        if active_api_runs:
+            return web.json_response(
+                {
+                    "unloaded": False,
+                    "error": "profile has active sessions",
+                    "active_sessions": active_api_runs,
+                    "active_api_runs": active_api_runs,
+                },
+                status=409,
+            )
+
+        runtime_unload = {}
+        gw = getattr(self, "gateway_runner", None)
+        if gw is not None:
+            try:
+                profile = _request_value(request, "hermes_profile")
+                unload = getattr(gw, "unload_profile_runtime", None)
+                if callable(unload):
+                    runtime_unload = await unload(profile)
+                else:
+                    runtime_unload = {
+                        "evicted_sessions": gw.invalidate_all_cached_agents(),
+                        "disconnected_adapters": 0,
+                    }
+            except Exception:
+                logger.warning(
+                    "[zet_agent] profile-unload: runtime unload failed",
+                    exc_info=True,
+                )
+                return web.json_response(
+                    _openai_error(
+                        "profile unload failed: runtime state could not be released",
+                        err_type="server_error",
+                    ),
+                    status=500,
+                )
+
+        if runtime_unload.get("blocked"):
+            return web.json_response(
+                {
+                    "unloaded": False,
+                    "error": "profile has active sessions",
+                    "active_sessions": int(runtime_unload.get("active_sessions", 0) or 0),
+                },
+                status=409,
+            )
+
+        closed_session_db = False
+        if profile_home:
+            db = self._session_dbs.pop(self._profile_home_key(profile_home), None)
+            if db is not None:
+                close = getattr(db, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:
+                        logger.warning(
+                            "[zet_agent] profile-unload: SessionDB close failed",
+                            exc_info=True,
+                        )
+                closed_session_db = True
+
+        return web.json_response({
+            "unloaded": True,
+            "closed_session_db": closed_session_db,
+            "evicted_sessions": int(runtime_unload.get("evicted_sessions", 0) or 0),
+            "disconnected_adapters": int(runtime_unload.get("disconnected_adapters", 0) or 0),
         })
 
     # ------------------------------------------------------------------
@@ -1996,6 +2117,66 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_post(
                 "/v1/profile/reload",
                 self._handle_profile_reload,
+            )
+            self._app.router.add_post(
+                "/v1/runtime/reset",
+                self._handle_runtime_reset,
+            )
+            self._app.router.add_post(
+                "/v1/profile/unload",
+                self._handle_profile_unload,
+            )
+            self._register_profile_api_routes(
+                self._app.router,
+                chat_handler=self._diagnostic_chat_completions,
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/skills/reload",
+                self._profile_handler(self._handle_skills_reload),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/connectors/reload",
+                self._profile_handler(self._handle_connectors_reload),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/profile/reload",
+                self._profile_handler(self._handle_profile_reload),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/runtime/reset",
+                self._profile_handler(self._handle_runtime_reset),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/profile/unload",
+                self._profile_handler(self._handle_profile_unload),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/model/switch",
+                self._profile_handler(self._handle_model_switch),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/sessions/{session_id}/model/switch",
+                self._profile_handler(self._handle_session_model_switch),
+            )
+            self._app.router.add_delete(
+                "/p/{profile}/v1/sessions/{session_id}/model",
+                self._profile_handler(self._handle_session_model_clear),
+            )
+            self._app.router.add_get(
+                "/p/{profile}/v1/sessions/{session_id}/pending",
+                self._profile_handler(self._handle_pending),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/sessions/{session_id}/approval/respond",
+                self._profile_handler(self._handle_approval_respond),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/sessions/{session_id}/clarify/respond",
+                self._profile_handler(self._handle_clarify_respond),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/sessions/{session_id}/interrupt",
+                self._profile_handler(self._handle_session_interrupt),
             )
 
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())

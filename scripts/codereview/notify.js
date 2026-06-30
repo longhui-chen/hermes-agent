@@ -1,19 +1,21 @@
-// Claude /code-review → 飞书：编排层（取 token → 定位 PR → 起话题/回复话题 → 回写锚点）。
+// Official Codex code review → 飞书：编排层（取 token → 定位 PR → 起话题/回复话题 → 回写锚点）。
 //
-// 两个入口，共用同一套话题/卡片/发送逻辑：
-//   notifyFromCheckRun({github,context,core})    —— 托管 Code Review 的 check_run 路径
-//   notifyFromActionResult({github,context,core,result,pr}) —— 自托管 Action 的 JSON 路径
+// 入口共用同一套话题/卡片/发送逻辑：
+//   notifyFromOfficialCodexEvent({github,context,core}) —— 官方 Codex pull_request_review / check_run 监听
+//   notifyFromCheckRun({github,context,core})           —— Codex check_run 路径
+//   notifyFromPullRequestReview({github,context,core})  —— Codex PR review 路径
+//   notifyFromActionResult / notifyFromActionFailure    —— 历史自托管 Action 兼容路径
 //
 // 由各 workflow 的 github-script 步骤 require 后调用。判定 + 卡片真源 =
 // scripts/codereview/report.js（本文件只做 IO 编排）。发送机制与 linearb-feishu-report 一致：
 // 同一只应用机器人 (cli_a97acaec84389cc0)，「每 PR 一话题」——首次不通过发根卡片并 @ 作者一次，
-// 把飞书 message_id 回写成 PR 隐藏标记评论 <!-- claude-review-feishu-thread:<mid> -->；后续复评
+// 把飞书 message_id 回写成 PR 隐藏标记评论 <!-- codex-review-feishu-thread:<mid> -->；后续复评
 // 不通过用 reply_in_thread 收进同话题，不重复 @。只处理 base=main、只在不通过时通知。
 // 用与 linearb 不同的话题锚点前缀，两套评审各自独立成话题，互不污染。
 
 const crypto = require('crypto');
 const FEISHU = 'https://open.feishu.cn/open-apis';
-const MARK = '<!-- claude-review-feishu-thread:';
+const MARK = '<!-- codex-review-feishu-thread:';
 
 function validFeishuMessageId(value) {
   return typeof value === 'string' && /^om_[A-Za-z0-9_-]{16,80}$/.test(value);
@@ -125,7 +127,7 @@ async function postToThread({ github, context, core }, { cls, prData, env, dedup
   const newMid = result.json.data && result.json.data.message_id;
   if (!validFeishuMessageId(newMid)) { core.setFailed(`Feishu 根消息缺少有效 message_id: ${JSON.stringify(result.json.data || {})}`); return; }
   core.info(`根消息发送成功 message_id=${newMid}`);
-  const markBody = `${MARK}${newMid} -->\n<sub>Claude /code-review 评审话题锚点（自动维护，请勿删除）</sub>`;
+  const markBody = `${MARK}${newMid} -->\n<sub>Codex 代码评审话题锚点（自动维护，请勿删除）</sub>`;
   try {
     if (markerCommentId) await github.rest.issues.updateComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: markerCommentId, body: markBody });
     else await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: prNum, body: markBody });
@@ -147,18 +149,82 @@ async function resolvePr(github, context, hint) {
   return { number: full.number, title: full.title, url: full.html_url, author: full.user.login, base: full.base.ref, head: full.head.ref };
 }
 
-/** 入口 A：托管 Code Review 的 `Claude Code Review` check_run 完成事件。 */
+function hasCodexName(value) {
+  return /\bcodex\b/i.test(String(value || ''));
+}
+
+function isCodexUser(user) {
+  const login = String((user && user.login) || '').toLowerCase();
+  const type = String((user && user.type) || '').toLowerCase();
+  return hasCodexName(login) && (!type || type === 'bot' || /\[bot\]$/.test(login));
+}
+
+function isCodexCheckRun(cr) {
+  if (!cr) return false;
+  const names = [
+    cr.name,
+    cr.check_suite && cr.check_suite.app && cr.check_suite.app.name,
+    cr.app && cr.app.name,
+    cr.app && cr.app.slug,
+    cr.app && cr.app.owner && cr.app.owner.login,
+  ];
+  return names.some(hasCodexName);
+}
+
+function isCodexPullRequestReview(review) {
+  if (!review) return false;
+  if (isCodexUser(review.user)) return true;
+  return hasCodexName(review.author_association) && isCodexUser(review.user);
+}
+
+async function listCommentsForReview(github, context, prNum, reviewId) {
+  const comments = await github.paginate(github.rest.pulls.listReviewComments,
+    { owner: context.repo.owner, repo: context.repo.repo, pull_number: prNum, per_page: 100 });
+  return comments.filter((c) => {
+    const cid = c.pull_request_review_id || c.review_id;
+    return String(cid || '') === String(reviewId || '');
+  });
+}
+
+/** 入口 A：托管 Code Review 的 check_run 完成事件。 */
 async function notifyFromCheckRun({ github, context, core }) {
   const { classifyCheckRun, shouldNotify } = require('./report');
-  const env = readFeishuEnv(core); if (!env) return;
   const cr = context.payload.check_run;
+  if (!isCodexCheckRun(cr)) { core.info(`check_run=${cr && cr.name} 不是 Codex，跳过`); return; }
   const cls = classifyCheckRun(cr, process.env);
   if (!shouldNotify(cls)) { core.info(`评审 verdict=${cls.verdict}（reason=${cls.reason}），不通知`); return; }
+  const env = readFeishuEnv(core); if (!env) return;
   const prData = await resolvePr(github, context, (cr.pull_requests && cr.pull_requests[0]) || null);
   if (!prData) { core.info('该 check 未关联 PR，跳过'); return; }
   if (prData.base !== 'main') { core.info(`base=${prData.base} 非 main，跳过`); return; }
   const dedupeKey = `${cr.id || cr.head_sha}:${cr.head_sha}:${(cr.completed_at || cr.updated_at || '')}`;
   await postToThread({ github, context, core }, { cls, prData, env, dedupeKey });
+}
+
+/** 入口 B：官方 Codex 作为 PR reviewer 提交 review。 */
+async function notifyFromPullRequestReview({ github, context, core }) {
+  const { classifyPullRequestReview, shouldNotify } = require('./report');
+  const review = context.payload.review;
+  if (!isCodexPullRequestReview(review)) {
+    core.info(`pull_request_review author=${review && review.user && review.user.login} 不是 Codex，跳过`);
+    return;
+  }
+  const eventPr = context.payload.pull_request;
+  const prData = await resolvePr(github, context, eventPr ? { number: eventPr.number } : null);
+  if (!prData) { core.info('无法定位 PR，跳过'); return; }
+  if (prData.base !== 'main') { core.info(`base=${prData.base} 非 main，跳过`); return; }
+  const comments = await listCommentsForReview(github, context, prData.number, review && review.id);
+  const cls = classifyPullRequestReview(review, comments);
+  if (!shouldNotify(cls)) { core.info(`评审 verdict=${cls.verdict}（reason=${cls.reason}），不通知`); return; }
+  const env = readFeishuEnv(core); if (!env) return;
+  const dedupeKey = `review:${review.id || ''}:${review.submitted_at || review.updated_at || ''}:${comments.length}`;
+  await postToThread({ github, context, core }, { cls, prData, env, dedupeKey });
+}
+
+async function notifyFromOfficialCodexEvent({ github, context, core }) {
+  if (context.eventName === 'check_run') return notifyFromCheckRun({ github, context, core });
+  if (context.eventName === 'pull_request_review') return notifyFromPullRequestReview({ github, context, core });
+  core.info(`event=${context.eventName} 不支持，跳过`);
 }
 
 /** 入口 B：自托管 Action 评审产出的 codereview-result.json + 当前 PR 上下文。 */
@@ -175,4 +241,30 @@ async function notifyFromActionResult({ github, context, core, result }) {
   await postToThread({ github, context, core }, { cls, prData, env, dedupeKey });
 }
 
-module.exports = { notifyFromCheckRun, notifyFromActionResult, validFeishuMessageId, shouldRecreateRootOnReplyFailure, MARK };
+/** 入口 C：自托管 Action 没有产出 codereview-result.json，说明评审基础设施失败。 */
+async function notifyFromActionFailure({ github, context, core, failure }) {
+  const { classifyActionFailure, shouldNotify } = require('./report');
+  const env = readFeishuEnv(core); if (!env) return;
+  const cls = classifyActionFailure(failure || {});
+  if (!shouldNotify(cls)) { core.info(`评审 verdict=${cls.verdict}（reason=${cls.reason}），不通知`); return; }
+  const eventPr = context.payload.pull_request;
+  const prData = await resolvePr(github, context, eventPr ? { number: eventPr.number } : null);
+  if (!prData) { core.info('无法定位 PR，跳过'); return; }
+  if (prData.base !== 'main') { core.info(`base=${prData.base} 非 main，跳过`); return; }
+  const runId = (failure && failure.runId) || process.env.GITHUB_RUN_ID || '';
+  const dedupeKey = `action-failure:${context.sha}:${runId}:${cls.reason}`;
+  await postToThread({ github, context, core }, { cls, prData, env, dedupeKey });
+}
+
+module.exports = {
+  notifyFromOfficialCodexEvent,
+  notifyFromCheckRun,
+  notifyFromPullRequestReview,
+  notifyFromActionResult,
+  notifyFromActionFailure,
+  validFeishuMessageId,
+  shouldRecreateRootOnReplyFailure,
+  isCodexCheckRun,
+  isCodexPullRequestReview,
+  MARK,
+};

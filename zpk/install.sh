@@ -8,6 +8,8 @@ HERMES_BIN="$HERMES_SRC/venv/bin/hermes"
 HERMES_PYTHON="$HERMES_SRC/venv/bin/python"
 HERMES_LINK="/usr/local/bin/hermes"
 
+source "$APP_ROOT/zpk-systemd.sh"
+
 # PyPI 镜像是辅助提速功能：其脚本缺失/损坏不应阻断 hermes 核心安装（HR2），
 # 故容错 source；下面 setup_pypi_mirror 未定义时也会被 `|| true` 优雅跳过。
 # shellcheck source=zpk/pypi-mirror.sh
@@ -39,6 +41,16 @@ ln -sfn "$APP_BASE/current/bin/hermes" "$HERMES_LINK"
 
 # 探测并写 PyPI 镜像源（境内 lazy-install 提速）；失败不阻断安装
 setup_pypi_mirror || true
+
+"$APP_ROOT/prepare-mux-service.sh"
+install_systemd_services "$APP_ROOT"
+if command -v systemctl >/dev/null 2>&1 && systemctl cat hermes-agent-mux.service >/dev/null 2>&1; then
+    if systemctl restart hermes-agent-mux.service; then
+        echo "hermes-agent-mux.service restarted."
+    else
+        echo "warning: failed to restart hermes-agent-mux.service; local-server mux migration will stay gated by health check" >&2
+    fi
+fi
 
 echo "Install complete."
 echo "  hermes: $APP_BASE/current/bin/hermes"

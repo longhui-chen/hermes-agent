@@ -1313,14 +1313,13 @@ from contextlib import contextmanager as _contextmanager
 
 # Platforms that bind a host TCP port (HTTP/webhook listeners). In a profile
 # multiplexer the default profile owns the single shared listener and serves
-# every profile through the /p/<profile>/ URL prefix, so a SECONDARY profile
-# enabling one of these is always a misconfiguration: it would try to bind a
-# port already held by the default's listener. We hard-error on it rather than
-# silently dropping the adapter (see _start_one_profile_adapters).
+# every profile through the /p/<profile>/ URL prefix, so a secondary profile
+# must not bind one of these again.
 # Stored as platform .value strings since the Platform enum is imported below.
 _PORT_BINDING_PLATFORM_VALUES = frozenset({
     "webhook",
     "api_server",
+    "zet_agent",
     "msgraph_webhook",
     "feishu",
     "wecom_callback",
@@ -1746,7 +1745,9 @@ def _try_resolve_fallback_provider() -> dict | None:
     from hermes_cli.runtime_provider import resolve_runtime_provider
     try:
         import yaml as _y
-        cfg_path = _hermes_home / "config.yaml"
+        from hermes_constants import get_hermes_home_override
+        override_home = get_hermes_home_override()
+        cfg_path = ((Path(override_home) if override_home else _hermes_home) / "config.yaml")
         if not cfg_path.exists():
             return None
         with open(cfg_path, encoding="utf-8") as _f:
@@ -2075,7 +2076,12 @@ def _load_gateway_config() -> dict:
     gateway honors administrator-pinned values — neither read_raw_config nor a
     direct yaml.safe_load carries the managed merge on its own. Fail-open.
     """
-    config_path = _hermes_home / 'config.yaml'
+    try:
+        from hermes_constants import get_hermes_home_override
+        override_home = get_hermes_home_override()
+    except Exception:
+        override_home = None
+    config_path = (Path(override_home) if override_home else _hermes_home) / 'config.yaml'
     raw: dict = {}
     used_canonical = False
     try:
@@ -6891,21 +6897,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for platform, platform_config in profile_cfg.platforms.items():
             if not platform_config.enabled:
                 continue
-            # A secondary profile must NOT enable a port-binding platform: the
-            # default profile's listener already serves every profile via the
-            # /p/<profile>/ prefix, so a second bind can only collide. This is a
-            # config error, not a transient failure — fail fast and loud.
+            # A secondary profile must NOT bind a listener: the default
+            # profile's listener already serves every profile via /p/<profile>/.
+            # Skip here instead of aborting so existing profile configs remain
+            # compatible when multiplex mode is enabled.
             if platform.value in _PORT_BINDING_PLATFORM_VALUES:
-                raise MultiplexConfigError(
-                    f"Profile '{profile_name}' enables the port-binding platform "
-                    f"'{platform.value}', but gateway.multiplex_profiles is on. The "
-                    f"default profile owns the single shared HTTP listener and "
-                    f"serves every profile through the /p/{profile_name}/ URL "
-                    f"prefix — a secondary profile cannot bind its own port. "
-                    f"Remove platforms.{platform.value} from profile "
-                    f"'{profile_name}'s config.yaml (configure it only on the "
-                    f"default profile)."
+                logger.info(
+                    "Skipping port-binding platform %s for secondary profile %s "
+                    "(served by shared multiplex listener)",
+                    platform.value,
+                    profile_name,
                 )
+                continue
             with _profile_runtime_scope(profile_home):
                 adapter = self._create_adapter(platform, platform_config)
             if not adapter:
@@ -13817,6 +13820,138 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return count
 
     @staticmethod
+    def _profile_session_key_prefix(profile: Optional[str]) -> str:
+        try:
+            from gateway.session import _session_key_namespace
+            return _session_key_namespace(profile) + ":"
+        except Exception:
+            normalized = (profile or "main").strip() or "main"
+            if normalized == "default":
+                normalized = "main"
+            return f"agent:{normalized}:"
+
+    def invalidate_cached_agents_for_profile(self, profile: Optional[str]) -> int:
+        """Invalidate cached agents whose session key belongs to one profile."""
+        prefix = self._profile_session_key_prefix(profile)
+        _lock = getattr(self, "_agent_cache_lock", None)
+        if _lock is None:
+            return 0
+        with _lock:
+            entries = [
+                value
+                for key, value in self._agent_cache.items()
+                if str(key).startswith(prefix)
+            ]
+        count = 0
+        for entry in entries:
+            agent = entry[0] if isinstance(entry, tuple) and entry else entry
+            invalidate = getattr(agent, "_invalidate_system_prompt", None)
+            if not callable(invalidate):
+                continue
+            try:
+                invalidate()
+                count += 1
+            except Exception:
+                logger.warning(
+                    "invalidate_cached_agents_for_profile(%s): agent %r failed",
+                    profile,
+                    type(agent).__name__,
+                    exc_info=True,
+                )
+        return count
+
+    def _evict_cached_agents_for_profile(self, profile: Optional[str]) -> int:
+        """Drop cached agents and session model overrides owned by one profile."""
+        prefix = self._profile_session_key_prefix(profile)
+        _lock = getattr(self, "_agent_cache_lock", None)
+        evicted_entries = []
+        if _lock is not None:
+            with _lock:
+                keys = [
+                    key
+                    for key in list(self._agent_cache.keys())
+                    if str(key).startswith(prefix)
+                ]
+                for key in keys:
+                    evicted_entries.append(self._agent_cache.pop(key, None))
+        else:
+            _cache = getattr(self, "_agent_cache", None)
+            if _cache is not None:
+                keys = [key for key in list(_cache.keys()) if str(key).startswith(prefix)]
+                for key in keys:
+                    evicted_entries.append(_cache.pop(key, None))
+
+        overrides = getattr(self, "_session_model_overrides", None)
+        if isinstance(overrides, dict):
+            for key in list(overrides.keys()):
+                if str(key).startswith(prefix):
+                    overrides.pop(key, None)
+
+        running_ids = {
+            id(agent)
+            for agent in getattr(self, "_running_agents", {}).values()
+            if agent is not None and agent is not _AGENT_PENDING_SENTINEL
+        }
+        cleaned = 0
+        for entry in evicted_entries:
+            agent = entry[0] if isinstance(entry, tuple) and entry else entry
+            if agent is None or agent is _AGENT_PENDING_SENTINEL:
+                continue
+            if id(agent) in running_ids:
+                logger.warning(
+                    "profile-unload: cached agent for profile %s is still running; "
+                    "removed from cache but deferred resource cleanup",
+                    profile,
+                )
+                continue
+            try:
+                self._cleanup_agent_resources(agent)
+                cleaned += 1
+            except Exception:
+                logger.warning(
+                    "profile-unload: cleanup failed for profile %s",
+                    profile,
+                    exc_info=True,
+                )
+        return cleaned
+
+    async def unload_profile_runtime(self, profile: Optional[str]) -> dict:
+        """Release in-process runtime state owned by a multiplex profile."""
+        prefix = self._profile_session_key_prefix(profile)
+        active_sessions = [
+            key
+            for key, agent in getattr(self, "_running_agents", {}).items()
+            if str(key).startswith(prefix)
+            and agent is not None
+        ]
+        if active_sessions:
+            logger.warning(
+                "profile-unload: refusing to unload profile %s; %d session(s) still running",
+                profile,
+                len(active_sessions),
+            )
+            return {
+                "blocked": True,
+                "active_sessions": len(active_sessions),
+                "evicted_sessions": 0,
+                "disconnected_adapters": 0,
+            }
+        cleaned_agents = self._evict_cached_agents_for_profile(profile)
+        disconnected_adapters = 0
+        profile_name = (profile or "").strip()
+        adapter_map = None
+        if profile_name:
+            adapter_map = getattr(self, "_profile_adapters", {}).pop(profile_name, None)
+        if adapter_map:
+            for platform, adapter in list(adapter_map.items()):
+                await self._safe_adapter_disconnect(adapter, platform)
+                disconnected_adapters += 1
+        return {
+            "evicted_sessions": cleaned_agents,
+            "disconnected_adapters": disconnected_adapters,
+        }
+
+    @staticmethod
     def _init_cached_agent_for_turn(agent: Any, interrupt_depth: int) -> None:
         """Reset per-turn state on a cached agent before a new turn starts.
 
@@ -17198,6 +17333,355 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     InProcessCronScheduler().start(stop_event, adapters=adapters, loop=loop, interval=interval)
 
 
+def _multiplex_cron_profiles() -> List[tuple[str, Path]]:
+    """Return profile homes that should run cron under gateway multiplexing.
+
+    The gateway still exposes `/p/default` for compatibility, but local-server
+    managed devices use a real `main` profile. When both exist, the root
+    default home is legacy/unscoped state and must not keep firing old jobs.
+    """
+    from hermes_cli.profiles import profiles_to_serve
+
+    profiles = list(profiles_to_serve(multiplex=True))
+    if any(name == "main" for name, _home in profiles):
+        profiles = [(name, home) for name, home in profiles if name != "default"]
+    return profiles
+
+
+def _run_profile_cron_scheduler(
+    stop_event: threading.Event,
+    profile_name: str,
+    profile_home: Path,
+    *,
+    adapters=None,
+    loop=None,
+    failed_event: Optional[threading.Event] = None,
+) -> None:
+    """Run one cron scheduler under a profile's HERMES_HOME scope."""
+    try:
+        from cron.scheduler_provider import resolve_cron_scheduler
+
+        with _profile_runtime_scope(profile_home):
+            resolve_cron_scheduler().start(stop_event, adapters=adapters, loop=loop)
+    except Exception:
+        if failed_event is not None:
+            failed_event.set()
+        logger.exception("Profile cron scheduler failed for %s", profile_name)
+
+
+def _multiplex_active_profile_name() -> str:
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return get_active_profile_name() or "default"
+    except Exception:
+        return "default"
+
+
+def _multiplex_adapter_claims(
+    runner: "GatewayRunner",
+    *,
+    exclude_profile: Optional[str] = None,
+) -> Dict[tuple, str]:
+    """Build credential claims for dynamic mux adapter startup."""
+    claims: Dict[tuple, str] = {}
+    active = _multiplex_active_profile_name()
+
+    for platform, adapter in getattr(runner, "adapters", {}).items():
+        fp = runner._adapter_credential_fingerprint(adapter)
+        if fp is not None:
+            claims[(platform, fp)] = active
+
+    for profile_name, adapter_map in getattr(runner, "_profile_adapters", {}).items():
+        if profile_name == exclude_profile:
+            continue
+        for platform, adapter in adapter_map.items():
+            fp = runner._adapter_credential_fingerprint(adapter)
+            if fp is not None:
+                claims[(platform, fp)] = profile_name
+    return claims
+
+
+def _ensure_profile_cron_adapters(
+    runner: "GatewayRunner",
+    profile_name: str,
+    profile_home: Path,
+    *,
+    loop=None,
+    stop_event: Optional[threading.Event] = None,
+) -> Dict:
+    """Ensure a mux profile has its adapter map before cron fires jobs."""
+    if profile_name == _multiplex_active_profile_name():
+        return runner.adapters
+    adapters = runner._profile_adapters.get(profile_name)
+    if adapters is not None:
+        return adapters
+    if loop is None:
+        logger.warning(
+            "Cannot start adapters for mux profile %s before cron: gateway loop missing",
+            profile_name,
+        )
+        return {}
+
+    claims = _multiplex_adapter_claims(runner, exclude_profile=profile_name)
+    future = safe_schedule_threadsafe(
+        runner._start_one_profile_adapters(profile_name, profile_home, claims),
+        loop,
+        logger=logger,
+        log_message=f"Mux profile adapter startup scheduling failed for {profile_name}",
+    )
+    if future is None:
+        return {}
+    try:
+        _wait_future_interruptibly(
+            future,
+            stop_event=stop_event,
+            timeout=30,
+            profile_name=profile_name,
+            action="start adapters",
+        )
+    except Exception:
+        logger.exception("Failed to start adapters for mux profile %s", profile_name)
+    return runner._profile_adapters.get(profile_name, {})
+
+
+def _unload_profile_cron_adapters(
+    runner: "GatewayRunner",
+    profile_name: str,
+    *,
+    loop=None,
+    stop_event: Optional[threading.Event] = None,
+) -> None:
+    if profile_name == _multiplex_active_profile_name():
+        return
+    if profile_name not in getattr(runner, "_profile_adapters", {}):
+        return
+    if loop is None:
+        logger.warning(
+            "Cannot unload adapters for mux profile %s: gateway loop missing",
+            profile_name,
+        )
+        return
+    future = safe_schedule_threadsafe(
+        runner.unload_profile_runtime(profile_name),
+        loop,
+        logger=logger,
+        log_message=f"Mux profile adapter unload scheduling failed for {profile_name}",
+    )
+    if future is None:
+        return
+    try:
+        _wait_future_interruptibly(
+            future,
+            stop_event=stop_event,
+            timeout=30,
+            profile_name=profile_name,
+            action="unload adapters",
+        )
+    except Exception:
+        logger.exception("Failed to unload adapters for mux profile %s", profile_name)
+
+
+def _wait_future_interruptibly(
+    future,
+    *,
+    stop_event: Optional[threading.Event],
+    timeout: float,
+    profile_name: str,
+    action: str,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            future.cancel()
+            logger.info(
+                "Stopped waiting to %s for mux profile %s during shutdown",
+                action,
+                profile_name,
+            )
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            future.cancel()
+            raise TimeoutError(
+                f"Timed out waiting to {action} for mux profile {profile_name}"
+            )
+        try:
+            future.result(timeout=min(0.5, remaining))
+            return
+        except TimeoutError:
+            if future.done():
+                raise
+            continue
+
+
+def _start_profile_cron_scheduler_thread(
+    runner: "GatewayRunner",
+    profile_name: str,
+    profile_home: Path,
+    stop_event: threading.Event,
+    *,
+    loop=None,
+    shutdown_event: Optional[threading.Event] = None,
+) -> tuple[threading.Thread, threading.Event]:
+    adapters = _ensure_profile_cron_adapters(
+        runner,
+        profile_name,
+        profile_home,
+        loop=loop,
+        stop_event=shutdown_event,
+    )
+    failed_event = threading.Event()
+    thread = threading.Thread(
+        target=_run_profile_cron_scheduler,
+        args=(stop_event, profile_name, profile_home),
+        kwargs={
+            "adapters": adapters,
+            "loop": loop,
+            "failed_event": failed_event,
+        },
+        daemon=True,
+        name=f"cron-scheduler-{profile_name}",
+    )
+    thread.start()
+    return thread, failed_event
+
+
+def _stop_profile_cron_scheduler(
+    profile_name: str,
+    entry: tuple[Path, threading.Event, threading.Thread, threading.Event],
+    *,
+    timeout: float,
+) -> None:
+    _profile_home, stop_event, thread, _failed_event = entry
+    stop_event.set()
+    thread.join(timeout=timeout)
+    if thread.is_alive():
+        logger.warning(
+            "Profile cron scheduler did not stop cleanly for %s",
+            profile_name,
+        )
+
+
+def _run_multiplex_cron_reconciler(
+    runner: "GatewayRunner",
+    stop_event: threading.Event,
+    *,
+    loop=None,
+    reconcile_interval: float = 60.0,
+) -> None:
+    """Keep mux profile cron schedulers aligned with the profile set."""
+    entries: Dict[str, tuple[Path, threading.Event, threading.Thread, threading.Event]] = {}
+
+    try:
+        while not stop_event.is_set():
+            try:
+                profiles = {name: home for name, home in _multiplex_cron_profiles()}
+                for profile_name, profile_home in profiles.items():
+                    existing = entries.get(profile_name)
+                    if existing and existing[0] == profile_home and not existing[3].is_set():
+                        continue
+                    if existing:
+                        home_changed = existing[0] != profile_home
+                        _stop_profile_cron_scheduler(profile_name, existing, timeout=1)
+                        if home_changed:
+                            _unload_profile_cron_adapters(
+                                runner,
+                                profile_name,
+                                loop=loop,
+                                stop_event=stop_event,
+                            )
+
+                    profile_stop = threading.Event()
+                    thread, failed_event = _start_profile_cron_scheduler_thread(
+                        runner,
+                        profile_name,
+                        profile_home,
+                        profile_stop,
+                        loop=loop,
+                        shutdown_event=stop_event,
+                    )
+                    entries[profile_name] = (
+                        profile_home,
+                        profile_stop,
+                        thread,
+                        failed_event,
+                    )
+                    logger.info("Started mux profile cron scheduler for %s", profile_name)
+
+                for profile_name in list(entries):
+                    if profile_name not in profiles:
+                        _stop_profile_cron_scheduler(
+                            profile_name,
+                            entries.pop(profile_name),
+                            timeout=5,
+                        )
+                        _unload_profile_cron_adapters(
+                            runner,
+                            profile_name,
+                            loop=loop,
+                            stop_event=stop_event,
+                        )
+                        logger.info("Stopped mux profile cron scheduler for %s", profile_name)
+            except Exception:
+                logger.exception("Mux profile cron reconciliation failed")
+
+            stop_event.wait(timeout=reconcile_interval)
+    finally:
+        for profile_name, entry in list(entries.items()):
+            _stop_profile_cron_scheduler(profile_name, entry, timeout=5)
+        entries.clear()
+
+
+def _start_multiplex_cron_reconciler(
+    runner: "GatewayRunner",
+    stop_event: threading.Event,
+    *,
+    loop=None,
+    reconcile_interval: float = 60.0,
+) -> threading.Thread:
+    thread = threading.Thread(
+        target=_run_multiplex_cron_reconciler,
+        args=(runner, stop_event),
+        kwargs={"loop": loop, "reconcile_interval": reconcile_interval},
+        daemon=True,
+        name="cron-scheduler-mux-reconciler",
+    )
+    thread.start()
+    return thread
+
+
+def _start_gateway_cron_schedulers(
+    runner: "GatewayRunner",
+    stop_event: threading.Event,
+    *,
+    loop=None,
+    reconcile_interval: float = 60.0,
+) -> List[threading.Thread]:
+    """Start cron scheduler thread(s) for the gateway runtime."""
+    if not getattr(runner.config, "multiplex_profiles", False):
+        from cron.scheduler_provider import resolve_cron_scheduler
+
+        cron_provider = resolve_cron_scheduler()
+        thread = threading.Thread(
+            target=cron_provider.start,
+            args=(stop_event,),
+            kwargs={"adapters": runner.adapters, "loop": loop},
+            daemon=True,
+            name="cron-scheduler",
+        )
+        thread.start()
+        return [thread]
+
+    return [
+        _start_multiplex_cron_reconciler(
+            runner,
+            stop_event,
+            loop=loop,
+            reconcile_interval=reconcile_interval,
+        )
+    ]
+
+
 async def start_gateway(
     config: Optional[GatewayConfig] = None,
     replace: bool = False,
@@ -17652,17 +18136,12 @@ async def start_gateway(
     # historical in-process 60s ticker; an external provider (e.g. chronos)
     # may arm a schedule and return. Pass the event loop so cron delivery can
     # use live adapters (E2EE support).
-    from cron.scheduler_provider import resolve_cron_scheduler
     cron_stop = threading.Event()
-    cron_provider = resolve_cron_scheduler()
-    cron_thread = threading.Thread(
-        target=cron_provider.start,
-        args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
-        daemon=True,
-        name="cron-scheduler",
+    cron_threads = _start_gateway_cron_schedulers(
+        runner,
+        cron_stop,
+        loop=asyncio.get_running_loop(),
     )
-    cron_thread.start()
 
     # Gateway-only periodic housekeeping (channel dir, cache cleanup, paste
     # sweep, curator) — runs independently of which cron provider is active.
@@ -17682,7 +18161,8 @@ async def start_gateway(
     finally:
         # Stop cron ticker cleanly before tearing down tools it may use.
         cron_stop.set()
-        cron_thread.join(timeout=5)
+        for cron_thread in cron_threads:
+            cron_thread.join(timeout=5)
 
         mcp_task = runner._mcp_discovery_task
         mcp_discovery_still_running = False
