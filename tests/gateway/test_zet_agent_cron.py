@@ -344,6 +344,136 @@ def test_cron_summary_carries_next_run_at_and_timezone(tmp_path, monkeypatch):
     assert "timezone" not in meta2
 
 
+def test_collect_produced_files_walks_current_output_run_and_filters_helpers(tmp_path, monkeypatch):
+    """ZET-1793: cron attachments come from the current output run, not every
+    tool-call path or every historical file in a reused output bucket."""
+    import json as _json
+    import os
+    import time
+
+    import hermes_state
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+
+    from hermes_state import SessionDB
+
+    agent_id = "d87dcb35-cf11-44d3-8ca3-8d9b01cfb090"
+    bucket = tmp_path / "volume1" / "subvol" / "agents" / "data" / agent_id / "output" / "BMlfeWtIkAHx"
+    bucket.mkdir(parents=True)
+    current_report = bucket / "reddit_report_2026-06-28.html"
+    current_report.write_text("<html>today</html>", encoding="utf-8")
+    old_report = bucket / "reddit_report_2026-06-27.html"
+    old_report.write_text("<html>old</html>", encoding="utf-8")
+    tmp_script = tmp_path / "tmp" / "gen_report.py"
+    tmp_script.parent.mkdir()
+    tmp_script.write_text("print('helper')", encoding="utf-8")
+
+    now = time.time()
+    os.utime(current_report, (now, now))
+    os.utime(tmp_script, (now, now))
+    os.utime(old_report, (now - 86_400, now - 86_400))
+
+    sid = "cron_jobR_20260628_143034"
+    db = SessionDB()
+    db.create_session(sid, source="cron", user_id="userA")
+    with db._lock:
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 10, sid))
+    db.append_message(
+        sid,
+        role="assistant",
+        content="I will write a helper script.",
+        tool_calls=[
+            {
+                "name": "write_file",
+                "arguments": _json.dumps({"path": str(tmp_script), "content": "print('helper')"}),
+            }
+        ],
+    )
+    db.append_message(
+        sid,
+        role="assistant",
+        content="Running report generator.",
+        tool_calls=[
+            {
+                "name": "terminal",
+                "arguments": _json.dumps({"command": f"python3 {tmp_script}"}),
+            }
+        ],
+    )
+    db.append_message(
+        sid,
+        role="tool",
+        tool_name="terminal",
+        content=f"REPORT: {current_report}\nSIZE: {current_report.stat().st_size}",
+    )
+    db.close()
+
+    job = {"origin": {"platform": "zet_agent", "chat_id": f"zettlab:userA:{agent_id}:chat1"}}
+    attachments = zc._collect_produced_files("jobR", job)
+
+    assert [a["name"] for a in attachments] == ["reddit_report_2026-06-28.html"]
+    assert attachments[0]["path"] == str(current_report.resolve())
+    assert attachments[0]["mime"] == "text/html"
+
+
+def test_collect_produced_files_allows_external_chat_deliverables(tmp_path, monkeypatch):
+    """A report created outside the output bucket is still a user deliverable
+    when the current cron run mentions it; temp/helper scripts remain hidden."""
+    import json as _json
+    import os
+    import time
+
+    import hermes_state
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    monkeypatch.setattr(zc, "_CRON_ATTACHMENT_TEMP_DIRS", frozenset({"tmp", "var/tmp"}))
+
+    from hermes_state import SessionDB
+
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    report = root_dir / "nas-youtube-report-2026-06-29.html"
+    report.write_text("<html>youtube report</html>", encoding="utf-8")
+    tmp_script = tmp_path / "tmp" / "gen_report.py"
+    tmp_script.parent.mkdir()
+    tmp_script.write_text("open('/root/nas-youtube-report.html', 'w')", encoding="utf-8")
+
+    now = time.time()
+    os.utime(report, (now, now))
+    os.utime(tmp_script, (now, now))
+
+    sid = "cron_jobY_20260629_143034"
+    db = SessionDB()
+    db.create_session(sid, source="cron", user_id="userA")
+    with db._lock:
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 5, sid))
+    db.append_message(
+        sid,
+        role="assistant",
+        content="Generating the YouTube report.",
+        tool_calls=[
+            {
+                "name": "write_file",
+                "arguments": _json.dumps({"path": str(tmp_script), "content": "helper"}),
+            }
+        ],
+    )
+    db.append_message(
+        sid,
+        role="tool",
+        tool_name="terminal",
+        content=f"wrote report: {report}\nhelper: {tmp_script}",
+    )
+    db.close()
+
+    attachments = zc._collect_produced_files("jobY", {"origin": {"platform": "zet_agent"}})
+
+    assert [a["name"] for a in attachments] == ["nas-youtube-report-2026-06-29.html"]
+    assert attachments[0]["path"] == str(report.resolve())
+
+
 # ── ZET-1565: friendly failure messaging + run-level auto-retry ──────
 
 _RAW_502 = (

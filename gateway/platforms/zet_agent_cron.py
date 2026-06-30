@@ -46,7 +46,8 @@ import os
 import re
 import stat as _stat
 import threading
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,21 @@ _PRODUCE_TOOL_NAMES = frozenset({
     "write_file", "edit_file",
 })
 _PATH_KEYS = ("file_path", "notebook_path", "path")
+_CRON_ATTACHMENT_LIMIT = 32
+_CRON_ATTACHMENT_SCAN_FILE_LIMIT = 2000
+_CRON_ATTACHMENT_MTIME_SLACK_S = 60.0
+_CRON_ATTACHMENT_EXCLUDED_SUFFIXES = frozenset({
+    ".py", ".pyc", ".pyo",
+})
+_CRON_ATTACHMENT_EXTERNAL_SUFFIXES = frozenset({
+    ".csv", ".doc", ".docx", ".gif", ".htm", ".html", ".jpeg", ".jpg",
+    ".json", ".md", ".mp3", ".mp4", ".pdf", ".png", ".ppt", ".pptx",
+    ".txt", ".wav", ".webm", ".xls", ".xlsx", ".xml", ".zip",
+})
+_CRON_ATTACHMENT_TEMP_DIRS = frozenset({
+    "tmp", "var/tmp", "private/tmp",
+})
+_ABSOLUTE_PATH_RE = re.compile(r"(?<![\w./-])/{1,3}[^\s\"'<>`|)]{2,}")
 
 
 def _is_zet_agent_platform(platform: Any) -> bool:
@@ -1186,7 +1202,7 @@ def _build_typed_message_content(
         _code, _retryable = _classify_failure(error)
         metadata["failure"] = {"code": _code, "retryable": _retryable}
 
-    attachments = _collect_produced_files(job_id)
+    attachments = _collect_produced_files(job_id, job)
     if attachments:
         metadata["attachments"] = attachments
 
@@ -1208,11 +1224,14 @@ def _build_typed_message_content(
     return "\n".join(parts)
 
 
-def _collect_produced_files(job_id: str) -> List[Dict[str, Any]]:
-    """Enumerate files written by Write/Edit-class tool calls in this job's
-    most recent cron session. Result is embedded into cron-summary metadata
-    so downstream clients (App, channel bridges) can render attachments
-    without re-deriving them from raw history.
+def _collect_produced_files(job_id: str, job: Optional[dict] = None) -> List[Dict[str, Any]]:
+    """Enumerate files produced by this job's most recent cron session.
+
+    The authoritative source is the session's agent-scoped output bucket,
+    filtered to this run's time window. Write/Edit-class tool calls are used as
+    hints and as a direct fast path only after the same output-root validation.
+    This catches terminal/execute_code side-effect deliverables while refusing
+    helper scripts, temp files, and old files in a reused shared bucket.
 
     Why look up the cron session by prefix instead of capturing it at
     save_job_output time: hermes upstream owns cron/scheduler.py and we
@@ -1220,8 +1239,8 @@ def _collect_produced_files(job_id: str) -> List[Dict[str, Any]]:
     `cron_{job_id}_{YYYYMMDD_HHMMSS}` is stable enough to query by.
 
     Silent degradation: any failure (no SessionDB, no matching session,
-    unreadable path, malformed tool_calls) yields an empty list — the
-    cron summary still ships without an attachments field.
+    unreadable path, malformed tool_calls) yields an empty list — the cron
+    summary still ships without an attachments field.
     """
     if not job_id:
         return []
@@ -1236,7 +1255,7 @@ def _collect_produced_files(job_id: str) -> List[Dict[str, Any]]:
         try:
             with db._lock:
                 cursor = db._conn.execute(
-                    "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' "
+                    "SELECT id, started_at FROM sessions WHERE id LIKE ? ESCAPE '\\' "
                     "ORDER BY started_at DESC LIMIT 1",
                     (_cron_session_like(job_id),),
                 )
@@ -1251,6 +1270,10 @@ def _collect_produced_files(job_id: str) -> List[Dict[str, Any]]:
             return []
         sid = row["id"]
         try:
+            started_at = float(row["started_at"])
+        except (TypeError, ValueError):
+            started_at = None
+        try:
             messages = db.get_messages(sid)
         except Exception as _e:
             _dbg(f"_collect_produced_files: get_messages FAILED sid={sid}: {_e!r}")
@@ -1261,8 +1284,29 @@ def _collect_produced_files(job_id: str) -> List[Dict[str, Any]]:
         except Exception:
             pass
 
-    seen: set = set()
+    agent_ids = _cron_agent_ids(job)
+    path_hints = _cron_path_hints(messages)
+    output_roots = _cron_output_bucket_roots(path_hints, agent_ids)
+
+    seen: set[str] = set()
     produced: List[Dict[str, Any]] = []
+    min_mtime = None
+    if started_at is not None:
+        min_mtime = max(0.0, started_at - _CRON_ATTACHMENT_MTIME_SLACK_S)
+
+    def _add(raw_path: str, *, require_mtime: bool, allow_external: bool = False) -> None:
+        if len(produced) >= _CRON_ATTACHMENT_LIMIT:
+            return
+        item = _cron_attachment_for_path(
+            raw_path,
+            output_roots,
+            seen,
+            min_mtime if require_mtime else None,
+            allow_external=allow_external,
+        )
+        if item:
+            produced.append(item)
+
     for msg in messages:
         if msg.get("role") != "assistant":
             continue
@@ -1299,23 +1343,222 @@ def _collect_produced_files(job_id: str) -> List[Dict[str, Any]]:
                 if v:
                     path = str(v).strip()
                     break
-            if not path or path in seen:
-                continue
-            seen.add(path)
-            try:
-                st = os.stat(path)
-            except OSError:
-                continue
-            if not _stat.S_ISREG(st.st_mode):
-                continue
-            mime, _enc = mimetypes.guess_type(path)
-            produced.append({
-                "path": path,
-                "name": os.path.basename(path),
-                "size": st.st_size,
-                "mime": mime or "application/octet-stream",
-            })
+            if path:
+                _add(path, require_mtime=True, allow_external=True)
+    for root in output_roots:
+        if len(produced) >= _CRON_ATTACHMENT_LIMIT:
+            break
+        for path in _iter_cron_output_files(root):
+            _add(str(path), require_mtime=True)
+            if len(produced) >= _CRON_ATTACHMENT_LIMIT:
+                break
+    for path in path_hints:
+        _add(path, require_mtime=True, allow_external=True)
+        if len(produced) >= _CRON_ATTACHMENT_LIMIT:
+            break
     return produced
+
+
+def _cron_agent_ids(job: Optional[dict]) -> set[str]:
+    ids: set[str] = set()
+    env_agent_id = os.environ.get("ZET_AGENT_ID", "").strip()
+    if env_agent_id:
+        ids.add(env_agent_id)
+    origin = (job or {}).get("origin") if isinstance(job, dict) else None
+    chat_id = ""
+    if isinstance(origin, dict):
+        chat_id = str(origin.get("chat_id", "") or "")
+    parts = chat_id.split(":", 3)
+    if len(parts) == 4 and parts[0] == "zettlab" and parts[2]:
+        ids.add(parts[2])
+    return ids
+
+
+def _cron_path_hints(messages: Iterable[dict]) -> List[str]:
+    hints: List[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        for value in (msg.get("content"), msg.get("tool_calls")):
+            _extend_path_hints(hints, value)
+            if len(hints) >= 256:
+                return hints
+    return hints
+
+
+def _extend_path_hints(out: List[str], value: Any) -> None:
+    if value in (None, "", [], {}):
+        return
+    try:
+        if isinstance(value, str):
+            text = value
+        else:
+            text = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        text = str(value)
+    for match in _ABSOLUTE_PATH_RE.finditer(text[:200_000]):
+        raw = _clean_cron_path_hint(match.group(0))
+        if raw:
+            out.append(raw)
+            if len(out) >= 256:
+                return
+
+
+def _clean_cron_path_hint(raw: str) -> str:
+    value = (raw or "").strip().strip("`*.,;:，。；：")
+    value = value.rstrip("\\")
+    if value.startswith("//") and not value.startswith("///"):
+        return ""
+    if value.startswith("///"):
+        value = "/" + value.lstrip("/")
+    return value
+
+
+def _cron_output_bucket_roots(path_hints: Iterable[str], agent_ids: set[str]) -> List[Path]:
+    if not agent_ids:
+        return []
+    roots: List[Path] = []
+    seen: set[str] = set()
+    for raw in path_hints:
+        root = _cron_output_bucket_root(raw, agent_ids)
+        if root is None:
+            continue
+        try:
+            resolved = root.resolve()
+        except OSError:
+            continue
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(resolved)
+        if len(roots) >= 8:
+            break
+    return roots
+
+
+def _cron_output_bucket_root(raw_path: str, agent_ids: set[str]) -> Optional[Path]:
+    path = _clean_cron_path_hint(raw_path)
+    if not path.startswith("/"):
+        return None
+    parts = Path(path).parts
+    if "agents" not in parts or "data" not in parts or "output" not in parts:
+        return None
+    try:
+        agents_idx = parts.index("agents")
+        data_idx = agents_idx + 1
+        if parts[data_idx] != "data":
+            return None
+        output_idx = parts.index("output", data_idx + 1)
+    except (IndexError, ValueError):
+        return None
+    if output_idx + 1 >= len(parts):
+        return None
+    agent_id = parts[data_idx + 1] if data_idx + 1 < len(parts) else ""
+    if agent_ids and agent_id not in agent_ids:
+        return None
+    root = Path(*parts[:output_idx + 2])
+    try:
+        st = os.stat(root)
+    except OSError:
+        return None
+    if not _stat.S_ISDIR(st.st_mode):
+        return None
+    return root
+
+
+def _iter_cron_output_files(root: Path) -> Iterable[Path]:
+    scanned = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for name in sorted(filenames):
+            scanned += 1
+            if scanned > _CRON_ATTACHMENT_SCAN_FILE_LIMIT:
+                return
+            if name.startswith("."):
+                continue
+            yield Path(dirpath) / name
+
+
+def _cron_attachment_for_path(
+    raw_path: str,
+    roots: List[Path],
+    seen: set[str],
+    min_mtime: Optional[float],
+    *,
+    allow_external: bool = False,
+) -> Optional[Dict[str, Any]]:
+    path = _clean_cron_path_hint(raw_path)
+    if not path.startswith("/"):
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not _stat.S_ISREG(st.st_mode):
+        return None
+    if min_mtime is not None and st.st_mtime < min_mtime:
+        return None
+    if Path(path).suffix.lower() in _CRON_ATTACHMENT_EXCLUDED_SUFFIXES:
+        return None
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        return None
+    under_output_root = _is_under_any_root(resolved, roots)
+    if not under_output_root and not (
+        allow_external and _is_external_cron_deliverable(resolved)
+    ):
+        return None
+    key = str(resolved)
+    if key in seen:
+        return None
+    seen.add(key)
+    mime, _enc = mimetypes.guess_type(str(resolved))
+    return {
+        "path": str(resolved),
+        "name": resolved.name,
+        "size": st.st_size,
+        "mime": mime or "application/octet-stream",
+    }
+
+
+def _is_external_cron_deliverable(path: Path) -> bool:
+    """Allow user-facing files created outside the canonical output bucket.
+
+    This intentionally admits reports like /root/nas-youtube-report.html while
+    keeping temporary scripts, sandbox scratch files, and extensionless system
+    paths out of chat attachments.
+    """
+    suffix = path.suffix.lower()
+    if suffix not in _CRON_ATTACHMENT_EXTERNAL_SUFFIXES:
+        return False
+    path_s = str(path)
+    for marker in ("/hermes_sandbox_", "/hermes_exec_"):
+        if marker in path_s:
+            return False
+    try:
+        parts = path.relative_to(path.anchor).parts
+    except ValueError:
+        parts = path.parts
+    if parts:
+        first = parts[0]
+        second = f"{parts[0]}/{parts[1]}" if len(parts) > 1 else ""
+        if first in _CRON_ATTACHMENT_TEMP_DIRS or second in _CRON_ATTACHMENT_TEMP_DIRS:
+            return False
+    return True
+
+
+def _is_under_any_root(path: Path, roots: List[Path]) -> bool:
+    path_s = str(path)
+    for root in roots:
+        root_s = str(root)
+        try:
+            if os.path.commonpath([root_s, path_s]) == root_s:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def _will_hit_repeat_limit(job: Optional[dict]) -> bool:
