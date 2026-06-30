@@ -268,6 +268,59 @@ def test_handoff_session_when_origin_deleted(tmp_path, monkeypatch):
     assert "该喝水啦" in blob
 
 
+def test_calendar_reminder_session_is_created_without_handoff(tmp_path, monkeypatch):
+    """calendar-reminders 是 APP/local-server 合成会话，不存在时应原地创建。"""
+    import hermes_state
+    import cron.jobs as cron_jobs
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    monkeypatch.delenv("ZET_CHAT_APPEND_URL", raising=False)
+    from hermes_state import SessionDB
+
+    SID = "zettlab:userA:main:calendar-reminders"
+    JID = "calJob"
+    job = {
+        "id": JID,
+        "name": "喝水提醒",
+        "source": "calendar",
+        "content": "喝水提醒",
+        "prompt": "喝水提醒",
+        "skills": [],
+        "skill": None,
+        "schedule": {"kind": "once", "run_at": "2026-06-29T07:45:00Z"},
+        "repeat": {"times": 1, "completed": 0},
+        "enabled": True,
+        "state": "scheduled",
+        "deliver": "origin",
+        "origin": {"platform": "zet_agent", "chat_id": SID, "chat_name": "Calendar Reminders"},
+        "timezone": "UTC",
+        "last_status": None,
+        "last_error": None,
+        "last_delivery_error": None,
+    }
+    cron_jobs.save_jobs([job])
+    assert SessionDB().get_session(SID) is None
+
+    zc._LATEST_OUTPUT[JID] = "# Cron Job: 喝水提醒\n\n## Response\n\n喝水提醒\n"
+    try:
+        ret = zc._try_persist_to_session(JID, True, None, None, job)
+    finally:
+        zc._LATEST_OUTPUT.pop(JID, None)
+
+    assert ret is None
+    assert cron_jobs.get_job(JID)["origin"]["chat_id"] == SID
+    assert SessionDB().get_session(SID) is not None
+    msgs = SessionDB().get_messages(SID)
+    blob = " ".join((m.get("content") or "") for m in msgs if isinstance(m.get("content"), str))
+    assert '"origin_recreated": true' not in blob
+    assert '"source": "calendar"' in blob
+    assert "喝水提醒" in blob
+
+
 def test_silent_run_skips_session_persist(monkeypatch):
     import gateway.platforms.zet_agent_cron as zc
 

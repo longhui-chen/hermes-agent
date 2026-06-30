@@ -311,6 +311,12 @@ def _handoff_session_id(old_id: str) -> Optional[str]:
     return f"zettlab:{parts[1]}:{parts[2]}:{uuid.uuid4().hex[:12]}"
 
 
+def _is_calendar_reminders_session(session_id: str) -> bool:
+    """APP/local-server use this fixed synthetic chat for imported calendar reminders."""
+    parts = session_id.split(":", 3)
+    return len(parts) == 4 and parts[0] == "zettlab" and parts[3] == "calendar-reminders"
+
+
 def _fence_safe(text: str) -> str:
     """把 error 串里的 ``` 折成 `` —— 防它破坏外层 fenced block / 让 App parser
     （parseCronRunStatus 的 `[\\s\\S]*?(?:\\n```|$)`）提前截断。两个 backtick
@@ -1209,8 +1215,13 @@ def _try_persist_to_session(
         target_id = origin_chat_id
         origin_recreated = False
         if db.get_session(origin_chat_id) is None:
-            new_id = _handoff_session_id(origin_chat_id)
-            if new_id:
+            if _is_calendar_reminders_session(origin_chat_id):
+                db.create_session(origin_chat_id, source="zet_agent", user_id=_user_id_from(origin_chat_id))
+                _dbg(f"_try_persist: created synthetic calendar reminder session {origin_chat_id}")
+            else:
+                new_id = _handoff_session_id(origin_chat_id)
+                if not new_id:
+                    raise RuntimeError(f"cannot derive handoff session for missing origin {origin_chat_id!r}")
                 # source 与正常 App 会话一致（run_agent 用 platform 名），让承接会话
                 # 跟用户手建的对话同档，避免别处按 source 的隐性差异。
                 db.create_session(new_id, source="zet_agent", user_id=_user_id_from(origin_chat_id))
