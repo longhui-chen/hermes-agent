@@ -4256,6 +4256,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         session_tokens = set_session_vars(
                             platform="api_server",
                             session_key=approval_session_key,
+                            session_id=session_id or "",
                         )
                         register_gateway_notify(approval_session_key, _approval_notify)
                         r = agent.run_conversation(

@@ -1578,17 +1578,19 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
             _mark_provider_unhealthy("openrouter", ttl=60)
             return None, None
         base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
+        headers = _apply_user_default_headers(build_or_headers())
         logger.debug("Auxiliary client: OpenRouter via pool")
         return OpenAI(api_key=or_key, base_url=base_url,
-                       default_headers=build_or_headers()), model or _OPENROUTER_MODEL
+                       default_headers=headers), model or _OPENROUTER_MODEL
 
     or_key = explicit_api_key or os.getenv("OPENROUTER_API_KEY")
     if not or_key:
         _mark_provider_unhealthy("openrouter", ttl=60)
         return None, None
+    headers = _apply_user_default_headers(build_or_headers())
     logger.debug("Auxiliary client: OpenRouter")
     return OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL,
-                   default_headers=build_or_headers()), model or _OPENROUTER_MODEL
+                   default_headers=headers), model or _OPENROUTER_MODEL
 
 
 def _describe_openrouter_unavailable() -> str:
@@ -1683,6 +1685,7 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
         OpenAI(
             api_key=api_key,
             base_url=base_url,
+            default_headers=_apply_user_default_headers(None),
         ),
         model,
     )
@@ -4541,7 +4544,11 @@ def _refresh_nous_auxiliary_client(
         return None, model
 
     fresh_key, fresh_base_url = runtime
-    sync_client = OpenAI(api_key=fresh_key, base_url=fresh_base_url)
+    sync_client = OpenAI(
+        api_key=fresh_key,
+        base_url=fresh_base_url,
+        default_headers=_apply_user_default_headers(None),
+    )
     final_model = model
 
     current_loop = None
