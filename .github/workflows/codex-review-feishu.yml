@@ -1,0 +1,55 @@
+name: Codex Review → Feishu
+
+# 监听官方 Codex GitHub Code Review 产物，把不通过 / 基础设施失败发到飞书评审群。
+# 这条 workflow 不运行 Codex、不需要 OPENAI_API_KEY，也不会产生 OpenAI API 计费；
+# Codex review 本身由 chatgpt.com/codex/settings/code-review 控制并消耗 Codex 会员额度。
+#
+# 监听两类 GitHub 产物：
+# - pull_request_review：官方 Codex 像 reviewer 一样提交行内评论时触发；
+# - check_run：若官方 Codex 同时产出 check，报错/超时/额度失败也能进群。
+#
+# 飞书出站通知仍由 GitHub Actions 直接调用飞书 OpenAPI。165 上的对话机器人只负责群里
+# @ 机器人后的代码问答和每小时同步 workspace，不参与这条出站通知链路。
+
+on:
+  pull_request_review:
+    types: [submitted]
+  check_run:
+    types: [completed]
+
+concurrency:
+  group: codex-review-feishu-${{ github.repository }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.event.review.id || github.event.check_run.id || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: write
+  checks: read
+
+jobs:
+  report:
+    if: github.repository_owner == 'zettlab'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout notification scripts
+        uses: actions/checkout@v5
+        with:
+          sparse-checkout: |
+            scripts/codereview
+            scripts/test-harness/feishu/feishu_openid_registry.json
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Parse official Codex review and post to Feishu thread
+        uses: actions/github-script@v8
+        env:
+          CODEREVIEW_FEISHU_APP_ID: ${{ secrets.CODEREVIEW_FEISHU_APP_ID }}
+          CODEREVIEW_FEISHU_APP_SECRET: ${{ secrets.CODEREVIEW_FEISHU_APP_SECRET }}
+          CODEREVIEW_FEISHU_CHAT_ID: ${{ secrets.CODEREVIEW_FEISHU_CHAT_ID }}
+          CODEREVIEW_NOTIFY_ON: important
+        with:
+          script: |
+            const { notifyFromOfficialCodexEvent } = require(`${process.env.GITHUB_WORKSPACE}/scripts/codereview/notify.js`);
+            await notifyFromOfficialCodexEvent({ github, context, core });
