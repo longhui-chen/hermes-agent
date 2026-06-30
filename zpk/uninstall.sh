@@ -17,12 +17,16 @@ done
 echo "Uninstalling zettlab-claw (keep data: $KEEP_DATA) ..."
 
 if command -v systemctl >/dev/null 2>&1; then
-    systemctl stop zettlab-claw.service 2>/dev/null || true
-    systemctl disable zettlab-claw.service 2>/dev/null || true
-    rm -f /lib/systemd/system/zettlab-claw.service /etc/systemd/system/zettlab-claw.service
-    rm -rf /etc/systemd/system/zettlab-claw.service.d
+    for service in zettlab-claw.service hermes-agent-mux.service; do
+        systemctl stop "$service" 2>/dev/null || true
+        systemctl disable "$service" 2>/dev/null || true
+        rm -f "/lib/systemd/system/$service" "/etc/systemd/system/$service"
+        rm -rf "/etc/systemd/system/$service.d"
+    done
     systemctl daemon-reload 2>/dev/null || true
 fi
+
+rm -f "$APP_BASE/data/secrets/hermes-agent-mux.env"
 
 echo "  stopping hermes processes under $APP_BASE"
 PIDS=""

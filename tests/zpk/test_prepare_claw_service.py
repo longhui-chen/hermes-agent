@@ -56,7 +56,26 @@ def test_zpk_agent_service_names_are_device_facing():
     service = (repo_root / "zpk" / "init.d" / "zettlab-claw.service").read_text(encoding="utf-8")
     package_meta = (repo_root / "zpk" / "package.meta").read_text(encoding="utf-8")
     install = (repo_root / "zpk" / "install.sh").read_text(encoding="utf-8")
+    start = (repo_root / "zpk" / "init.d" / "start.sh").read_text(encoding="utf-8")
+    stop = (repo_root / "zpk" / "init.d" / "stop.sh").read_text(encoding="utf-8")
+    uninstall = (repo_root / "zpk" / "uninstall.sh").read_text(encoding="utf-8")
 
     assert "EnvironmentFile=-__APP_BASE__/data/secrets/zettlab-claw.env" in service
     assert '"service_name": "zettlab-claw"' in package_meta
-    assert "systemctl restart zettlab-claw.service" in install
+    assert "systemctl restart zettlab-claw.service" not in install
+    assert "systemctl start zettlab-claw.service" in start
+    assert "systemctl stop zettlab-claw.service" in stop
+    assert "zettlab-claw.service" in uninstall
+
+
+def test_zpk_install_removes_legacy_shared_gateway_unit():
+    repo_root = Path(__file__).resolve().parents[2]
+
+    install = (repo_root / "zpk" / "install.sh").read_text(encoding="utf-8")
+    uninstall = (repo_root / "zpk" / "uninstall.sh").read_text(encoding="utf-8")
+
+    assert "cleanup_legacy_systemd_services" in install
+    assert "hermes-agent-mux.service" in install
+    assert "systemctl stop \"$legacy_service\"" in install
+    assert "systemctl disable \"$legacy_service\"" in install
+    assert "hermes-agent-mux.service" in uninstall
