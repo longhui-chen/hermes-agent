@@ -111,9 +111,33 @@ const prReviewFail = classifyPullRequestReview(
   { state: 'COMMENTED', body: 'Codex reviewed this PR.' },
   [{ path: 'src/session.ts', line: 42, body: 'Token refresh can race with logout.' }],
 );
+const prReviewPriority = classifyPullRequestReview(
+  { state: 'COMMENTED', body: 'Codex reviewed this PR.' },
+  [
+    {
+      path: 'internal/file/pkg/upgrade/precondition.go',
+      line: 45,
+      body: '**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)</sub></sub>  Use the OTA firmware source for version gating**\n\nDetails.\n\nUseful? React with 👍 / 👎.',
+    },
+    {
+      path: 'internal/file/pkg/upgrade/script.go',
+      line: 79,
+      body: '**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Reject symlinked OTA scripts before executing**\n\nDetails.',
+    },
+    {
+      path: 'internal/file/pkg/upgrade/steps.go',
+      line: 95,
+      body: '**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Re-run the preset step when the user root changes**\n\nDetails.',
+    },
+  ],
+);
 const prReviewPass = classifyPullRequestReview({ state: 'COMMENTED', body: 'No issues found.' }, []);
 const prReviewInfra = classifyPullRequestReview({ state: 'COMMENTED', body: 'Code review timed out because of a temporary issue.' }, []);
 assert(prReviewFail.verdict === 'fail' && prReviewFail.count === 1 && /src\/session\.ts:42/.test(prReviewFail.issues[0].loc), 'PR review 行内评论 → 不通过并合成 file:line');
+assert(prReviewPriority.verdict === 'fail' && prReviewPriority.count === 1, 'PR review P1+P2 → P0/P1 触发通知计数为 1');
+assert(prReviewPriority.counts.important === 1 && prReviewPriority.counts.nit === 2, 'PR review P1+2xP2 → legacy important/nit 计数正确');
+assert(prReviewPriority.priorityCounts.p1 === 1 && prReviewPriority.priorityCounts.p2 === 2, 'PR review 解析 Codex P1/P2 badge 计数');
+assert(prReviewPriority.issues[0].priority === 'p1' && prReviewPriority.issues[0].title === 'Use the OTA firmware source for version gating', 'PR review issue 标题去掉 badge/sub/useful 尾巴');
 assert(prReviewPass.verdict === 'pass', 'PR review 明确无问题 → 通过');
 assert(prReviewInfra.verdict === 'fail' && prReviewInfra.reason === 'infra_failure', 'PR review 报错/超时正文 → 基础设施失败');
 assert(isCodexPullRequestReview({ user: { login: 'codex[bot]', type: 'Bot' } }) === true, 'Codex PR reviewer 识别');
@@ -138,12 +162,16 @@ assert(shouldNotify(aInfra) === true, 'Action 基础设施失败 → 发飞书')
 // ── 卡片 ──
 const cardPass = JSON.stringify(buildCard('demo', PR(1), cPass));
 const cardFail = JSON.stringify(buildCard('demo', PR(2), cFail));
+const cardPriority = JSON.stringify(buildCard('demo', PR(553), prReviewPriority));
 const cardInfra = JSON.stringify(buildCard('demo', PR(5), aInfra));
 assert(!/评分|\/100|score/i.test(cardPass + cardFail), '卡片无评分项（二元结论）');
 assert(/Codex 代码评审通过/.test(cardPass) && /通过（无需合并前修复的问题）/.test(cardPass), '通过卡片文案正确');
 assert(/不通过（2 个问题）/.test(cardFail), '不通过卡片文案正确');
 assert(/🔴 2 · 🟡 1 · 🟣 0/.test(cardFail), '卡片含严重度 tally');
 assert(/session\.ts:142/.test(cardFail), '卡片含问题清单的 file:line');
+assert(/不通过（3 个问题）/.test(cardPriority), 'P1+P2 卡片按全部 Codex comments 展示问题数');
+assert(/img\.shields\.io\/badge\/P1-orange/.test(cardPriority) && /img\.shields\.io\/badge\/P2-yellow/.test(cardPriority), 'P1/P2 卡片复用 Codex badge 图标');
+assert(!/🔴 3/.test(cardPriority), 'P1+P2 卡片不再把所有 issue 画成红色 important');
 assert(/基础设施失败/.test(cardInfra) && /codereview-result\.json/.test(cardInfra), '基础设施失败卡片文案正确');
 
 // ── @ 作者：已知 → 注入 <at>，未知 → 不 @ 不报错 ──
