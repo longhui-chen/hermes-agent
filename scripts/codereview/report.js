@@ -1,27 +1,28 @@
-// Claude /code-review (ultra) → 飞书报告：判定 + 卡片的唯一真源（single source of truth）。
+// Codex GPT-5.5 code review → 飞书报告：判定 + 卡片的唯一真源（single source of truth）。
 //
 // 既被本地回归测试（scripts/codereview/test_report.js）直接 require，
-// 也经 scripts/codereview/notify.js 被 .github/workflows/claude-review-feishu.reusable.yml
-// （托管 Code Review 的 check_run 路径）和 .github/workflows/claude-code-review.yml（自托管路径）消费。
+// 也经 scripts/codereview/notify.js 被托管 Code Review 的 check_run 路径
+// 和自托管 Codex GitHub Action 路径消费。
 //
-// 背景：把 Claude 的 PR 评审结论统一成 pass / fail / skip，再决定是否给飞书发卡片。
-// Claude 的评审结论有两种来源，本文件给两种来源各一个 adapter，下游卡片/判定逻辑共用：
+// 背景：把 PR 评审结论统一成 pass / fail / skip，再决定是否给飞书发卡片。
+// 评审结论有两种来源，本文件给两种来源各一个 adapter，下游卡片/判定逻辑共用：
 //
-//   A) 托管 Code Review（claude.ai 管理后台开通，= /code-review ultra 的产品化常驻形态）。
-//      它在 GitHub 上以 check_run `Claude Code Review` 出现，结论从 check 的
+//   A) 托管 Code Review。
+//      它在 GitHub 上以 check_run 出现，结论从 check 的
 //      output.text 里读。末尾带一行机器可读标记（官方文档承诺的稳定契约）：
 //        <!-- bughunter-severity: {"normal":2,"nit":1,"pre_existing":0} -->
 //      normal=🔴 Important（合并前应修的真 bug）、nit=🟡 次要、pre_existing=🟣 存量。
 //      output.text 里还有一张「严重度 | 文件:行 | 问题」表，best-effort 解析成缺陷清单。
 //      → classifyCheckRun(checkRun)
 //
-//   B) 自托管 GitHub Action（anthropics/claude-code-action@v1 + code-review 插件）。
-//      评审在 CI 里跑，prompt 要求 Claude 额外吐一个 codereview-result.json，
+//   B) 自托管 GitHub Action（openai/codex-action@v1）。
+//      评审在 CI 里跑，prompt 要求 Codex GPT-5.5 额外吐一个 codereview-result.json，
 //      形如 {"verdict":"fail","important":2,"nit":1,"issues":[{severity,file,line,title}]}。
 //      → classifyActionResult(json)
 //
-// 判定二元化（与 linearb 流程一致）：有「合并前应修的真 bug」=不通过，否则=通过；
-// 评审报错/超时/拿不到结论=skip（不发，避免误报「0 个问题也不通过」）。
+// 判定二元化（与 linearb 流程一致）：有「合并前应修的真 bug」=不通过，否则=通过。
+// 托管 check_run 报错/超时/拿不到结论=skip（不发，避免误报「0 个问题也不通过」）；
+// 自托管 Action 连 codereview-result.json 都没产出时，是 CI/鉴权/基础设施故障，单独发故障卡片。
 // 「只在不通过时通知」：通过不打扰。默认门槛 = normal(Important) > 0，可用环境变量
 // CODEREVIEW_NOTIFY_ON=any 放宽到「含 nit 也通知」。
 
@@ -135,6 +136,38 @@ function classifyActionResult(json, env) {
   return { verdict: 'pass', reason: 'clean', counts, issues, count: 0 };
 }
 
+function oneLine(value, fallback = '') {
+  const s = String(value == null ? fallback : value).replace(/\s+/g, ' ').trim();
+  return s.length > 260 ? `${s.slice(0, 257)}...` : s;
+}
+
+/**
+ * 自托管 Action 未产出 codereview-result.json 时的基础设施故障分类。
+ * 这不是“评审发现代码问题”，但它会让主干保护失去可信评审结果，必须通知群里排查。
+ * @param {{reason?:string, stepOutcome?:string, stepConclusion?:string, runUrl?:string}} failure
+ */
+function classifyActionFailure(failure = {}) {
+  const reason = oneLine(failure.reason, 'unknown error');
+  const step = oneLine(failure.stepOutcome || failure.stepConclusion || '');
+  const runUrl = oneLine(failure.runUrl || '');
+  const titleParts = ['未产出 codereview-result.json'];
+  if (step) titleParts.push(`review step=${step}`);
+  if (reason) titleParts.push(`原因：${reason}`);
+  if (runUrl) titleParts.push(`Actions：${runUrl}`);
+  return {
+    verdict: 'fail',
+    reason: 'infra_failure',
+    kind: 'infra_failure',
+    counts: { important: 1, nit: 0, pre_existing: 0 },
+    issues: [{
+      sev: 'important',
+      loc: '.github/workflows/codex-code-review.yml',
+      title: titleParts.join(' · '),
+    }],
+    count: 1,
+  };
+}
+
 /**
  * 是否应该给飞书发报告。与 linearb 流程一致：只有 fail 才推；pass / skip 都不发（不打扰）。
  * @param {{verdict:string}} cls
@@ -169,7 +202,7 @@ function atTag(login) {
   return id ? `<at id=${id}></at>` : '';
 }
 
-// lark_md 转义：PR 标题 / 分支 / 作者 / Claude issue 文案均为用户可控，不转义可注入伪造
+// lark_md 转义：PR 标题 / 分支 / 作者 / Codex issue 文案均为用户可控，不转义可注入伪造
 // 可点击链接，或用换行塞入假「**结论**：✅ 通过」行伪造结论。pr.number 为整数、
 // pr.url 取自 GitHub html_url（可信）不转义。
 // ⚠️ 必须中和尖括号 < > —— 否则攻击者用 PR 标题/分支/文件名塞入 `<at id=all></at>`（伪造 @、甚至 @所有人）
@@ -195,10 +228,13 @@ const SEV_ICON = { important: '🔴', nit: '🟡', pre_existing: '🟣' };
 function buildCard(repo, pr, cls, opts = {}) {
   const atAuthor = opts.atAuthor !== false;
   const ok = cls.verdict === 'pass';
+  const infra = cls.reason === 'infra_failure' || cls.kind === 'infra_failure';
   const c = cls.counts || { important: 0, nit: 0, pre_existing: 0 };
   const head = ok
-    ? '✅ Claude 代码评审通过'
-    : `❌ Claude 代码评审不通过 — ${cls.count} 个问题`;
+    ? '✅ Codex GPT-5.5 代码评审通过'
+    : infra
+      ? '🚨 Codex GPT-5.5 代码评审基础设施失败'
+    : `❌ Codex GPT-5.5 代码评审不通过 — ${cls.count} 个问题`;
   const authorAt = !ok && atAuthor ? atTag(pr.author) : '';
   const tally = `🔴 ${c.important} · 🟡 ${c.nit} · 🟣 ${c.pre_existing}`;
 
@@ -211,11 +247,11 @@ function buildCard(repo, pr, cls, opts = {}) {
   // 折叠区：分支 / 结论 / 严重度 / 问题清单，点「展开详情」才显示，不刷屏。
   const detailLines = [
     `**分支**：${esc(pr.base)} ← ${esc(pr.head)}`,
-    `**结论**：${ok ? '✅ 通过（无需合并前修复的问题）' : `❌ 不通过（${cls.count} 个问题）`}`,
-    `**严重度**：${tally}`,
+    `**结论**：${ok ? '✅ 通过（无需合并前修复的问题）' : infra ? '🚨 评审基础设施失败（未产出 codereview-result.json）' : `❌ 不通过（${cls.count} 个问题）`}`,
+    `**严重度**：${infra ? '基础设施故障（需排查 Action / Codex 鉴权 / 超时）' : tally}`,
   ];
   if (!ok && cls.issues && cls.issues.length) {
-    detailLines.push('\n**问题清单**：');
+    detailLines.push(infra ? '\n**故障线索**：' : '\n**问题清单**：');
     cls.issues.slice(0, 10).forEach((it, i) => {
       const icon = SEV_ICON[it.sev] || '•';
       const loc = it.loc ? ` \`${esc(it.loc)}\`` : '';
@@ -223,11 +259,11 @@ function buildCard(repo, pr, cls, opts = {}) {
     });
     if (cls.issues.length > 10) detailLines.push(`… 另有 ${cls.issues.length - 10} 项，详见 PR 行内评论`);
   } else if (!ok) {
-    detailLines.push('\n详见 PR 的 **Claude Code Review** check（Files changed 行内标注 / Details 严重度表）。');
+    detailLines.push('\n详见 PR 的 **Codex GPT-5.5 Code Review** 评论。');
   }
   const note = opts.isReply
-    ? 'Claude /code-review · 同一 PR 复评 · 话题回复'
-    : 'Claude /code-review (ultra) · PR → main · 自动触发';
+    ? infra ? 'Codex GPT-5.5 · 同一 PR 复评 · 基础设施故障回复' : 'Codex GPT-5.5 · 同一 PR 复评 · 话题回复'
+    : infra ? 'Codex GPT-5.5 · PR → main · 基础设施故障自动告警' : 'Codex GPT-5.5 · PR → main · 自动触发';
 
   // 飞书 card schema 2.0：用 collapsible_panel 做「红框常显 + 其余下拉展开」。
   return {
@@ -277,6 +313,7 @@ function interactiveCardContent(card) {
 module.exports = {
   classifyCheckRun,
   classifyActionResult,
+  classifyActionFailure,
   parseSeverityTable,
   shouldNotify,
   buildCard,

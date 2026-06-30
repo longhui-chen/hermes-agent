@@ -1,19 +1,20 @@
-// Claude /code-review → 飞书：编排层（取 token → 定位 PR → 起话题/回复话题 → 回写锚点）。
+// Codex GPT-5.5 code review → 飞书：编排层（取 token → 定位 PR → 起话题/回复话题 → 回写锚点）。
 //
-// 两个入口，共用同一套话题/卡片/发送逻辑：
+// 三个入口，共用同一套话题/卡片/发送逻辑：
 //   notifyFromCheckRun({github,context,core})    —— 托管 Code Review 的 check_run 路径
 //   notifyFromActionResult({github,context,core,result,pr}) —— 自托管 Action 的 JSON 路径
+//   notifyFromActionFailure({github,context,core,failure}) —— 自托管 Action 未产出 JSON 的故障路径
 //
 // 由各 workflow 的 github-script 步骤 require 后调用。判定 + 卡片真源 =
 // scripts/codereview/report.js（本文件只做 IO 编排）。发送机制与 linearb-feishu-report 一致：
 // 同一只应用机器人 (cli_a97acaec84389cc0)，「每 PR 一话题」——首次不通过发根卡片并 @ 作者一次，
-// 把飞书 message_id 回写成 PR 隐藏标记评论 <!-- claude-review-feishu-thread:<mid> -->；后续复评
+// 把飞书 message_id 回写成 PR 隐藏标记评论 <!-- codex-review-feishu-thread:<mid> -->；后续复评
 // 不通过用 reply_in_thread 收进同话题，不重复 @。只处理 base=main、只在不通过时通知。
 // 用与 linearb 不同的话题锚点前缀，两套评审各自独立成话题，互不污染。
 
 const crypto = require('crypto');
 const FEISHU = 'https://open.feishu.cn/open-apis';
-const MARK = '<!-- claude-review-feishu-thread:';
+const MARK = '<!-- codex-review-feishu-thread:';
 
 function validFeishuMessageId(value) {
   return typeof value === 'string' && /^om_[A-Za-z0-9_-]{16,80}$/.test(value);
@@ -125,7 +126,7 @@ async function postToThread({ github, context, core }, { cls, prData, env, dedup
   const newMid = result.json.data && result.json.data.message_id;
   if (!validFeishuMessageId(newMid)) { core.setFailed(`Feishu 根消息缺少有效 message_id: ${JSON.stringify(result.json.data || {})}`); return; }
   core.info(`根消息发送成功 message_id=${newMid}`);
-  const markBody = `${MARK}${newMid} -->\n<sub>Claude /code-review 评审话题锚点（自动维护，请勿删除）</sub>`;
+  const markBody = `${MARK}${newMid} -->\n<sub>Codex GPT-5.5 代码评审话题锚点（自动维护，请勿删除）</sub>`;
   try {
     if (markerCommentId) await github.rest.issues.updateComment({ owner: context.repo.owner, repo: context.repo.repo, comment_id: markerCommentId, body: markBody });
     else await github.rest.issues.createComment({ owner: context.repo.owner, repo: context.repo.repo, issue_number: prNum, body: markBody });
@@ -147,7 +148,7 @@ async function resolvePr(github, context, hint) {
   return { number: full.number, title: full.title, url: full.html_url, author: full.user.login, base: full.base.ref, head: full.head.ref };
 }
 
-/** 入口 A：托管 Code Review 的 `Claude Code Review` check_run 完成事件。 */
+/** 入口 A：托管 Code Review 的 check_run 完成事件。 */
 async function notifyFromCheckRun({ github, context, core }) {
   const { classifyCheckRun, shouldNotify } = require('./report');
   const env = readFeishuEnv(core); if (!env) return;
@@ -175,4 +176,19 @@ async function notifyFromActionResult({ github, context, core, result }) {
   await postToThread({ github, context, core }, { cls, prData, env, dedupeKey });
 }
 
-module.exports = { notifyFromCheckRun, notifyFromActionResult, validFeishuMessageId, shouldRecreateRootOnReplyFailure, MARK };
+/** 入口 C：自托管 Action 没有产出 codereview-result.json，说明评审基础设施失败。 */
+async function notifyFromActionFailure({ github, context, core, failure }) {
+  const { classifyActionFailure, shouldNotify } = require('./report');
+  const env = readFeishuEnv(core); if (!env) return;
+  const cls = classifyActionFailure(failure || {});
+  if (!shouldNotify(cls)) { core.info(`评审 verdict=${cls.verdict}（reason=${cls.reason}），不通知`); return; }
+  const eventPr = context.payload.pull_request;
+  const prData = await resolvePr(github, context, eventPr ? { number: eventPr.number } : null);
+  if (!prData) { core.info('无法定位 PR，跳过'); return; }
+  if (prData.base !== 'main') { core.info(`base=${prData.base} 非 main，跳过`); return; }
+  const runId = (failure && failure.runId) || process.env.GITHUB_RUN_ID || '';
+  const dedupeKey = `action-failure:${context.sha}:${runId}:${cls.reason}`;
+  await postToThread({ github, context, core }, { cls, prData, env, dedupeKey });
+}
+
+module.exports = { notifyFromCheckRun, notifyFromActionResult, notifyFromActionFailure, validFeishuMessageId, shouldRecreateRootOnReplyFailure, MARK };

@@ -1,0 +1,253 @@
+name: Codex GPT-5.5 Code Review (self-hosted)
+
+# 自托管评审引擎：PR -> main 时用 openai/codex-action@v1 运行 Codex GPT-5.5。
+# Codex 只读评审 main...PR diff，产出机器可读 codereview-result.json；随后复用
+# scripts/codereview（真源）把不通过结论发进飞书评审群、@ PR 作者，并在 PR 顶层贴结论评论。
+#
+# 鉴权：
+# - Codex: GitHub secret OPENAI_API_KEY（openai/codex-action 会启动 Responses API proxy，避免把 key 暴露给仓库脚本）。
+# - GitHub 评论: workflow 自带 github.token。
+# - 飞书通知: CODEREVIEW_FEISHU_{APP_ID,APP_SECRET,CHAT_ID}（沿用现有配置）。
+#
+# 安全：用 pull_request（非 pull_request_target）—— fork PR 拿不到 secret（评审/通知自动跳过），
+# 且 job 只允许 zettlab 组织内、非 draft PR 触发。Codex job 使用 contents:read、checkout 不持久化凭据、
+# safety-strategy=drop-sudo、sandbox=read-only；不做自动修复、不改代码。
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: codex-code-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  codex-review:
+    if: >-
+      github.repository_owner == 'zettlab' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CODEX_API_KEY_CONFIGURED: ${{ secrets.OPENAI_API_KEY != '' && 'true' || 'false' }}
+    outputs:
+      final_message: ${{ steps.review.outputs.final-message }}
+      review_outcome: ${{ steps.review.outcome }}
+      review_conclusion: ${{ steps.review.conclusion }}
+    steps:
+      - name: Checkout PR merge commit
+        uses: actions/checkout@v5
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Pre-fetch base and head refs
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          git fetch --no-tags origin \
+            "$PR_BASE_REF" \
+            "+refs/pull/$PR_NUMBER/head:refs/remotes/origin/pr/$PR_NUMBER/head"
+
+      - name: Require Codex API key secret
+        if: env.CODEX_API_KEY_CONFIGURED != 'true'
+        shell: bash
+        run: |
+          echo "::error::Missing GitHub secret OPENAI_API_KEY. Codex GPT-5.5 review uses openai/codex-action@v1."
+          exit 1
+
+      - name: Run Codex GPT-5.5 review
+        id: review
+        if: env.CODEX_API_KEY_CONFIGURED == 'true'
+        continue-on-error: true
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          model: gpt-5.5
+          effort: high
+          sandbox: read-only
+          safety-strategy: drop-sudo
+          output-schema-file: .github/codex/codereview-result.schema.json
+          codex-args: '["--ephemeral"]'
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR: ${{ github.event.pull_request.number }}
+            BASE_REF: ${{ github.event.pull_request.base.ref }}
+            BASE_SHA: ${{ github.event.pull_request.base.sha }}
+            HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+
+            You are running as Codex GPT-5.5 in GitHub Actions.
+
+            Review only the changes introduced by this PR, using:
+              git diff --find-renames ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}
+
+            Required review policy:
+            - Read REVIEW.md if present, then repository instruction files that apply to changed files.
+            - Treat the Engineering Hard Rules as blocking review criteria: 2GB device memory budget, stability/self-healing, Agent safety, API backward compatibility, priority order HA > security > performance, and zpk/config as the only effective device config source.
+            - Mark as "important" only true merge-blocking bugs, security issues, contract/API compatibility breaks, data loss risks, or hard-rule violations introduced by this PR.
+            - Mark style, naming, local readability, or low-risk maintainability comments as "nit".
+            - Mark issues that clearly predate this PR as "pre_existing".
+            - Do not propose unrelated refactors.
+            - Do not modify files, do not commit, and do not push.
+
+            Output exactly one JSON object matching .github/codex/codereview-result.schema.json.
+            If there are no merge-blocking issues, use:
+              {"verdict":"pass","important":0,"nit":0,"pre_existing":0,"issues":[]}
+
+  notify:
+    needs: codex-review
+    if: >-
+      always() &&
+      github.repository_owner == 'zettlab' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout PR (notification scripts)
+        uses: actions/checkout@v5
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Materialize Codex review result
+        id: materialize
+        uses: actions/github-script@v8
+        env:
+          CODEX_FINAL_MESSAGE: ${{ needs.codex-review.outputs.final_message }}
+        with:
+          script: |
+            const fs = require('fs');
+            const raw = (process.env.CODEX_FINAL_MESSAGE || '').trim();
+            if (!raw) {
+              core.warning('Codex GPT-5.5 未产出 final-message');
+              core.setOutput('has_result', 'false');
+              return;
+            }
+            function parseReviewResult(value) {
+              try { return JSON.parse(value); } catch (_e) {}
+              const fenced = value.match(/```(?:json)?\s*([\s\S]*?)```/i);
+              if (fenced) {
+                try { return JSON.parse(fenced[1]); } catch (_e) {}
+              }
+              const start = value.indexOf('{');
+              const end = value.lastIndexOf('}');
+              if (start >= 0 && end > start) {
+                return JSON.parse(value.slice(start, end + 1));
+              }
+              throw new Error('Codex final-message is not JSON');
+            }
+            let result;
+            try {
+              result = parseReviewResult(raw);
+            } catch (e) {
+              core.warning(`Codex GPT-5.5 输出无法解析为 codereview-result.json: ${e.message}`);
+              core.setOutput('has_result', 'false');
+              return;
+            }
+            fs.writeFileSync(`${process.env.GITHUB_WORKSPACE}/codereview-result.json`, JSON.stringify(result, null, 2));
+            core.setOutput('has_result', 'true');
+
+      - name: Upload review result artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codereview-result
+          path: codereview-result.json
+          if-no-files-found: ignore
+
+      - name: Post Codex GPT-5.5 attribution comment
+        if: always() && steps.materialize.outputs.has_result == 'true'
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const r = JSON.parse(fs.readFileSync(`${process.env.GITHUB_WORKSPACE}/codereview-result.json`, 'utf8'));
+            const imp = Number(r.important || 0), nit = Number(r.nit || 0);
+            const fail = r.verdict === 'fail' || imp > 0;
+            const verdict = fail
+              ? `🔴 发现 ${imp} 个需合并前修复的问题${nit ? `（另 ${nit} 个 nit）` : ''}，详见问题清单。`
+              : `✅ 未发现需合并前修复的问题${nit ? `（${nit} 个 nit 见问题清单）` : ''}。`;
+            const ICON = { important: '🔴', nit: '🟡', pre_existing: '🟣' };
+            const RANK = { important: 0, nit: 1, pre_existing: 2 };
+            const issues = (Array.isArray(r.issues) ? r.issues : [])
+              .slice().sort((a, b) => (RANK[a && a.severity] ?? 9) - (RANK[b && b.severity] ?? 9));
+            const lines = [
+              '🤖 本 PR 已由 Codex GPT-5.5 自动评审。',
+              '',
+              verdict,
+            ];
+            if (issues.length) {
+              lines.push('', '<details open><summary><b>问题清单</b></summary>', '');
+              issues.slice(0, 20).forEach((it, i) => {
+                const loc = [it && it.file, it && it.line].filter(x => x != null && x !== '').join(':');
+                const t = (it && it.title) ? String(it.title).replace(/\r?\n/g, ' ').trim() : '';
+                lines.push(`${i + 1}. ${ICON[it && it.severity] || '•'} ${loc ? `\`${loc}\`` : ''}${t ? ` — ${t}` : ''}`);
+              });
+              if (issues.length > 20) lines.push('', `…另有 ${issues.length - 20} 项。`);
+              lines.push('', '</details>');
+            }
+            lines.push('', '<sub>引擎：openai/codex-action · 模型：gpt-5.5 · 评审口径见仓库 REVIEW.md · 不通过结论同步至飞书 zettlab-ai-codereview 并 @ 作者</sub>');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number, body: lines.join('\n'),
+            });
+            core.info('已贴 Codex GPT-5.5 归属评论');
+
+      - name: Notify Feishu on findings or infra failure
+        if: always()
+        uses: actions/github-script@v8
+        env:
+          CODEREVIEW_FEISHU_APP_ID: ${{ secrets.CODEREVIEW_FEISHU_APP_ID }}
+          CODEREVIEW_FEISHU_APP_SECRET: ${{ secrets.CODEREVIEW_FEISHU_APP_SECRET }}
+          CODEREVIEW_FEISHU_CHAT_ID: ${{ secrets.CODEREVIEW_FEISHU_CHAT_ID }}
+          CODEREVIEW_NOTIFY_ON: important
+          CODEREVIEW_REVIEW_OUTCOME: ${{ needs.codex-review.outputs.review_outcome }}
+          CODEREVIEW_REVIEW_CONCLUSION: ${{ needs.codex-review.outputs.review_conclusion }}
+          CODEREVIEW_JOB_RESULT: ${{ needs.codex-review.result }}
+          CODEREVIEW_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = `${process.env.GITHUB_WORKSPACE}/codereview-result.json`;
+            const { notifyFromActionResult, notifyFromActionFailure } = require(`${process.env.GITHUB_WORKSPACE}/scripts/codereview/notify.js`);
+            try {
+              const result = JSON.parse(fs.readFileSync(path, 'utf8'));
+              await notifyFromActionResult({ github, context, core, result });
+            } catch (e) {
+              core.warning('未产出 codereview-result.json，发送基础设施故障通知: ' + e.message);
+              await notifyFromActionFailure({
+                github, context, core,
+                failure: {
+                  reason: e.message,
+                  stepOutcome: process.env.CODEREVIEW_REVIEW_OUTCOME,
+                  stepConclusion: process.env.CODEREVIEW_REVIEW_CONCLUSION,
+                  jobResult: process.env.CODEREVIEW_JOB_RESULT,
+                  runUrl: process.env.CODEREVIEW_RUN_URL,
+                  runId: process.env.GITHUB_RUN_ID,
+                },
+              });
+            }
+
+      - name: Gate on review result
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "${GITHUB_WORKSPACE}/codereview-result.json" ]; then
+            echo "✅ Codex GPT-5.5 评审已产出结论文件，视为成功"
+            exit 0
+          fi
+          echo "::error::Codex GPT-5.5 评审未产出 codereview-result.json —— 真实失败（鉴权/基础设施/超时），需排查"
+          exit 1

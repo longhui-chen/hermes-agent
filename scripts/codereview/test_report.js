@@ -6,7 +6,7 @@
 // 严重度表）以及自托管 Action 的 codereview-result.json 形态。
 
 const {
-  classifyCheckRun, classifyActionResult, shouldNotify,
+  classifyCheckRun, classifyActionResult, classifyActionFailure, shouldNotify,
   buildCard, interactiveCardContent, atTag,
 } = require('./report');
 
@@ -14,7 +14,7 @@ const {
 const CR = {
   // 不通过：2 Important + 1 nit，带严重度表
   fail: {
-    name: 'Claude Code Review',
+    name: 'Codex GPT-5.5 Code Review',
     output: {
       title: 'Code review found 3 issues',
       text: [
@@ -32,7 +32,7 @@ const CR = {
   },
   // 通过：0/0/0
   pass: {
-    name: 'Claude Code Review',
+    name: 'Codex GPT-5.5 Code Review',
     output: {
       title: 'No issues found',
       text: 'No blocking issues.\n\n<!-- bughunter-severity: {"normal": 0, "nit": 0, "pre_existing": 0} -->',
@@ -40,20 +40,20 @@ const CR = {
   },
   // 只有 nit：默认门槛（important）不发，CODEREVIEW_NOTIFY_ON=any 才发
   nitOnly: {
-    name: 'Claude Code Review',
+    name: 'Codex GPT-5.5 Code Review',
     output: {
       title: 'Code review found 1 issue',
       text: '| 🟡 Nit | `a.ts:1` | minor |\n\n<!-- bughunter-severity: {"normal": 0, "nit": 1, "pre_existing": 0} -->',
     },
   },
   // 报错 / 超时 → skip（不误报）
-  errored: { name: 'Claude Code Review', output: { title: 'Code review encountered an error', text: '' } },
-  timedOut: { name: 'Claude Code Review', output: { title: 'Code review timed out', text: '' } },
+  errored: { name: 'Codex GPT-5.5 Code Review', output: { title: 'Code review encountered an error', text: '' } },
+  timedOut: { name: 'Codex GPT-5.5 Code Review', output: { title: 'Code review timed out', text: '' } },
   // 没有机器可读标记且标题不明确 → skip（不可判定）
-  inconclusive: { name: 'Claude Code Review', output: { title: 'Review', text: 'partial output...' } },
+  inconclusive: { name: 'Codex GPT-5.5 Code Review', output: { title: 'Review', text: 'partial output...' } },
   // 真不通过，但缺陷正文里出现 'timed out' 字样（REVIEW.md 正要求评审标这类 bug）→ 必须判 fail，不能被误吞
   failWithTimeoutWord: {
-    name: 'Claude Code Review',
+    name: 'Codex GPT-5.5 Code Review',
     output: {
       title: 'Code review found 1 issue',
       text: [
@@ -106,23 +106,28 @@ assert(cTw.verdict === 'fail' && cTw.count === 1, '缺陷正文含 "timed out" �
 // ── Action 适配器 ──
 const aFail = classifyActionResult({ verdict: 'fail', important: 1, nit: 0, issues: [{ severity: 'important', file: 'x.go', line: 12, title: 'nil deref' }] });
 const aPass = classifyActionResult({ verdict: 'pass', important: 0, nit: 0, issues: [] });
+const aInfra = classifyActionFailure({ reason: 'ENOENT: no such file', stepOutcome: 'failure', runUrl: 'https://github.com/zettlab/zettlab-app/actions/runs/1' });
 assert(aFail.verdict === 'fail' && aFail.count === 1 && /x\.go:12/.test(aFail.issues[0].loc), 'Action JSON: important → 不通过, file:line 合成');
 assert(aPass.verdict === 'pass', 'Action JSON: 无问题 → 通过');
 assert(classifyActionResult(null).verdict === 'skip', 'Action JSON 缺失/损坏 → skip');
+assert(aInfra.verdict === 'fail' && aInfra.reason === 'infra_failure' && aInfra.count === 1, 'Action 未产出 JSON → 基础设施失败');
 
 // ── 只在 fail 时通知 ──
 assert(shouldNotify(cFail) === true, '不通过 → 发飞书');
 assert(shouldNotify(cPass) === false, '通过 → 不发（不打扰）');
 assert(shouldNotify(classifyCheckRun(CR.timedOut)) === false, '超时/skip → 不发');
+assert(shouldNotify(aInfra) === true, 'Action 基础设施失败 → 发飞书');
 
 // ── 卡片 ──
 const cardPass = JSON.stringify(buildCard('demo', PR(1), cPass));
 const cardFail = JSON.stringify(buildCard('demo', PR(2), cFail));
+const cardInfra = JSON.stringify(buildCard('demo', PR(5), aInfra));
 assert(!/评分|\/100|score/i.test(cardPass + cardFail), '卡片无评分项（二元结论）');
 assert(/通过（无需合并前修复的问题）/.test(cardPass), '通过卡片文案正确');
 assert(/不通过（2 个问题）/.test(cardFail), '不通过卡片文案正确');
 assert(/🔴 2 · 🟡 1 · 🟣 0/.test(cardFail), '卡片含严重度 tally');
 assert(/session\.ts:142/.test(cardFail), '卡片含问题清单的 file:line');
+assert(/基础设施失败/.test(cardInfra) && /codereview-result\.json/.test(cardInfra), '基础设施失败卡片文案正确');
 
 // ── @ 作者：已知 → 注入 <at>，未知 → 不 @ 不报错 ──
 assert(atTag('gezhengbin888') === '<at id=ou_d3d88d0643dbc48a0ba7dfa93406e623></at>', '已知作者 → 生成 @ 标签(active 维度)');
