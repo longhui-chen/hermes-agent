@@ -837,27 +837,9 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
 
 
 def _validate_chat_response_format(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    if not isinstance(value, dict):
-        return "Invalid 'response_format' field"
-    fmt_type = value.get("type")
-    if fmt_type == "json_object":
-        return None
-    if fmt_type != "json_schema":
-        return "Unsupported 'response_format.type'"
-    schema_payload = value.get("json_schema")
-    if not isinstance(schema_payload, dict):
-        return "'response_format.json_schema' must be an object"
-    if not isinstance(schema_payload.get("schema"), dict):
-        return "'response_format.json_schema.schema' must be an object"
-    name = schema_payload.get("name")
-    if name is not None and not isinstance(name, str):
-        return "'response_format.json_schema.name' must be a string"
-    strict = schema_payload.get("strict")
-    if strict is not None and not isinstance(strict, bool):
-        return "'response_format.json_schema.strict' must be a boolean"
-    return None
+    from agent.response_format import validate_chat_response_format
+
+    return validate_chat_response_format(value)
 
 
 if AIOHTTP_AVAILABLE:
@@ -1515,6 +1497,60 @@ class APIServerAdapter(BasePlatformAdapter):
             request_overrides=request_overrides,
         )
         return agent
+
+    def _response_format_transport_error(
+        self,
+        request_overrides: Optional[Dict[str, Any]],
+        *,
+        session_id: Optional[str] = None,
+        gateway_session_key: Optional[str] = None,
+    ) -> Optional[str]:
+        response_format = (request_overrides or {}).get("response_format")
+        if response_format is None:
+            return None
+        from agent.response_format import response_format_requires_structured_output
+
+        if not response_format_requires_structured_output(response_format):
+            return None
+        try:
+            from gateway.run import _resolve_runtime_agent_kwargs
+
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+        except Exception:
+            return None
+
+        override_key = gateway_session_key or session_id
+        if override_key:
+            try:
+                override = getattr(
+                    getattr(self, "gateway_runner", None),
+                    "_session_model_overrides",
+                    {},
+                ).get(override_key)
+            except Exception:
+                override = None
+            if override:
+                for key in ("provider", "base_url", "api_mode"):
+                    value = override.get(key)
+                    if value is not None:
+                        runtime_kwargs[key] = value
+
+        api_mode = getattr(self, "api_mode", None) or runtime_kwargs.get("api_mode")
+        if api_mode == "anthropic_messages":
+            return "response_format is not supported by the Anthropic Messages transport."
+        if api_mode != "chat_completions":
+            return None
+        provider = str(runtime_kwargs.get("provider") or "").strip().lower()
+        base_url = str(runtime_kwargs.get("base_url") or "")
+        try:
+            from agent.gemini_native_adapter import is_native_gemini_base_url
+
+            native_gemini = is_native_gemini_base_url(base_url)
+        except Exception:
+            native_gemini = False
+        if provider == "google-gemini-cli" or base_url.lower().startswith("cloudcode-pa://") or native_gemini:
+            return "response_format is not supported by the Gemini transport."
+        return None
 
     # ------------------------------------------------------------------
     # HTTP Handlers
@@ -2300,9 +2336,23 @@ class APIServerAdapter(BasePlatformAdapter):
                     _openai_error(response_format_error, param="response_format"),
                     status=400,
                 )
-            request_overrides["response_format"] = response_format
+            from agent.response_format import response_format_requires_structured_output
+
+            if response_format_requires_structured_output(response_format):
+                request_overrides["response_format"] = response_format
 
         if stream:
+            response_format_transport_error = self._response_format_transport_error(
+                request_overrides or None,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+            )
+            if response_format_transport_error:
+                return web.json_response(
+                    _openai_error(response_format_transport_error, param="response_format"),
+                    status=400,
+                )
+
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
 

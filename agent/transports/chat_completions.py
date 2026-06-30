@@ -15,8 +15,22 @@ from typing import Any, Dict
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
 from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
+from agent.response_format import response_format_requires_structured_output
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
+
+
+def _is_gemini_transport_without_response_format(provider_name: str, base_url: Any) -> bool:
+    provider = str(provider_name or "").strip().lower()
+    url = str(base_url or "")
+    if provider == "google-gemini-cli" or url.lower().startswith("cloudcode-pa://"):
+        return True
+    try:
+        from agent.gemini_native_adapter import is_native_gemini_base_url
+
+        return is_native_gemini_base_url(url)
+    except Exception:
+        return False
 
 
 def _apply_zettlab_billing_headers(api_kwargs: Dict[str, Any], params: Dict[str, Any]) -> None:
@@ -491,14 +505,15 @@ class ChatCompletionsTransport(ProviderTransport):
         # Request overrides last (service_tier etc.)
         overrides = params.get("request_overrides")
         if overrides:
-            try:
-                from agent.gemini_native_adapter import is_native_gemini_base_url
-                _native_gemini_for_overrides = is_native_gemini_base_url(params.get("base_url"))
-            except Exception:
-                _native_gemini_for_overrides = False
+            _gemini_without_response_format = _is_gemini_transport_without_response_format(
+                provider_name,
+                base_url,
+            )
             for k, v in overrides.items():
-                if k == "response_format" and _native_gemini_for_overrides:
-                    raise ValueError("response_format is not supported by the native Gemini transport.")
+                if k == "response_format" and _gemini_without_response_format:
+                    if response_format_requires_structured_output(v):
+                        raise ValueError("response_format is not supported by the Gemini transport.")
+                    continue
                 api_kwargs[k] = v
 
         _apply_zettlab_billing_headers(api_kwargs, params)
@@ -615,14 +630,16 @@ class ChatCompletionsTransport(ProviderTransport):
         # Request overrides (user config)
         overrides = params.get("request_overrides")
         if overrides:
-            try:
-                from agent.gemini_native_adapter import is_native_gemini_base_url
-                _native_gemini_for_overrides = is_native_gemini_base_url(params.get("base_url"))
-            except Exception:
-                _native_gemini_for_overrides = False
+            provider_name = str(getattr(profile, "name", "") or params.get("provider_name") or "").strip().lower()
+            _gemini_without_response_format = _is_gemini_transport_without_response_format(
+                provider_name,
+                params.get("base_url"),
+            )
             for k, v in overrides.items():
-                if k == "response_format" and _native_gemini_for_overrides:
-                    raise ValueError("response_format is not supported by the native Gemini transport.")
+                if k == "response_format" and _gemini_without_response_format:
+                    if response_format_requires_structured_output(v):
+                        raise ValueError("response_format is not supported by the Gemini transport.")
+                    continue
                 if k == "extra_body" and isinstance(v, dict):
                     extra_body.update(v)
                 else:
