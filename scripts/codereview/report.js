@@ -16,8 +16,8 @@
 //      → classifyCheckRun(checkRun)
 //
 //   B) 官方 Codex Review 的 pull_request_review。
-//      Codex 像 reviewer 一样提交 PR review；只要该 review 里有行内评论，就按 Important
-//      通知飞书。若 review body 明确显示报错 / 超时 / 额度问题，则按基础设施失败通知。
+//      Codex 像 reviewer 一样提交 PR review；行内评论里的 P0/P1/P2 badge 是优先级真源，
+//      飞书卡片按同一 badge 展示。若 review body 明确显示报错 / 超时 / 额度问题，则按基础设施失败通知。
 //      → classifyPullRequestReview(review, reviewComments)
 //
 //   C) 历史自托管 GitHub Action（openai/codex-action@v1）。
@@ -77,6 +77,66 @@ function cleanIssueTitle(value) {
     .replace(/\s+/g, ' ')
     .trim();
   return s.length > 180 ? `${s.slice(0, 177)}...` : s;
+}
+
+const PRIORITY = {
+  p0: {
+    label: 'P0',
+    badge: '![P0 Badge](https://img.shields.io/badge/P0-red?style=flat)',
+    sev: 'important',
+  },
+  p1: {
+    label: 'P1',
+    badge: '![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)',
+    sev: 'important',
+  },
+  p2: {
+    label: 'P2',
+    badge: '![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)',
+    sev: 'nit',
+  },
+};
+
+function priorityBadgeMarkdown(priority) {
+  return PRIORITY[priority] ? PRIORITY[priority].badge : '';
+}
+
+function parseCodexPriority(text) {
+  const s = String(text || '');
+  const m = s.match(/!\[\s*(P[0-2])\s+Badge\s*\]\([^)]*\)/i) ||
+    s.match(/img\.shields\.io\/badge\/(P[0-2])-/i) ||
+    s.match(/\b(P[0-2])\s*[:：-]/i);
+  return m ? m[1].toLowerCase() : null;
+}
+
+function stripCodexPriorityBadge(text) {
+  return String(text || '')
+    .replace(/<\/?sub>/gi, ' ')
+    .replace(/!\[\s*P[0-2]\s+Badge\s*\]\([^)]*\)/gi, ' ')
+    .replace(/https:\/\/img\.shields\.io\/badge\/P[0-2]-[^)\s]+/gi, ' ')
+    .replace(/\bP[0-2]\s+Badge\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function extractCodexIssueTitle(body) {
+  const raw = String(body || '');
+  const firstBold = raw.match(/^\s*\*\*([\s\S]*?)\*\*/);
+  const firstLine = raw.split(/\r?\n/).map((line) => line.trim()).find(Boolean) || raw;
+  const title = firstBold ? firstBold[1] : firstLine;
+  return cleanIssueTitle(stripCodexPriorityBadge(title));
+}
+
+function priorityCountsForIssues(issues) {
+  const hasPriority = (issues || []).some((issue) => issue && issue.priority);
+  if (!hasPriority) return null;
+  const counts = { p0: 0, p1: 0, p2: 0 };
+  for (const issue of issues || []) {
+    const priority = issue && issue.priority ? issue.priority : 'p1';
+    if (!Object.prototype.hasOwnProperty.call(counts, priority)) continue;
+    counts[priority] += 1;
+  }
+  return counts;
 }
 
 function infrastructureFailure(source, failure = {}) {
@@ -177,20 +237,36 @@ function classifyPullRequestReview(review, reviewComments) {
       runUrl: review && review.html_url,
     });
   }
-  const issues = comments
+  let issues = comments
     .filter((c) => c && String(c.body || '').trim())
-    .map((c) => ({
-      sev: 'important',
-      loc: [c.path, c.line || c.original_line].filter((x) => x != null && x !== '').join(':'),
-      title: cleanIssueTitle(c.body),
-    }));
+    .map((c) => {
+      const priority = parseCodexPriority(c.body);
+      return {
+        sev: priority && PRIORITY[priority] ? PRIORITY[priority].sev : 'important',
+        priority,
+        loc: [c.path, c.line || c.original_line].filter((x) => x != null && x !== '').join(':'),
+        title: extractCodexIssueTitle(c.body),
+      };
+    });
   if (issues.length) {
+    if (issues.some((issue) => issue.priority)) {
+      issues = issues.map((issue) => issue.priority ? issue : { ...issue, priority: 'p1' });
+    }
+    const priorityCounts = priorityCountsForIssues(issues);
+    const counts = priorityCounts
+      ? {
+        important: priorityCounts.p0 + priorityCounts.p1,
+        nit: priorityCounts.p2,
+        pre_existing: 0,
+      }
+      : { important: issues.length, nit: 0, pre_existing: 0 };
     return {
       verdict: 'fail',
       reason: 'issues',
-      counts: { important: issues.length, nit: 0, pre_existing: 0 },
+      counts,
+      priorityCounts,
       issues,
-      count: issues.length,
+      count: counts.important || issues.length,
     };
   }
   if (/no issues|no problems|looks good|lgtm|no blocking/i.test(body)) {
@@ -314,6 +390,26 @@ function esc(s) {
 
 const SEV_ICON = { important: '🔴', nit: '🟡', pre_existing: '🟣' };
 
+function priorityTally(priorityCounts) {
+  if (!priorityCounts) return '';
+  return [
+    `${priorityBadgeMarkdown('p0')} ${priorityCounts.p0 || 0}`,
+    `${priorityBadgeMarkdown('p1')} ${priorityCounts.p1 || 0}`,
+    `${priorityBadgeMarkdown('p2')} ${priorityCounts.p2 || 0}`,
+  ].join(' · ');
+}
+
+function issueMarker(issue) {
+  if (issue && issue.priority) return priorityBadgeMarkdown(issue.priority) || '•';
+  return SEV_ICON[issue && issue.sev] || '•';
+}
+
+function displayIssueCount(cls) {
+  const pc = cls && cls.priorityCounts;
+  if (pc) return (pc.p0 || 0) + (pc.p1 || 0) + (pc.p2 || 0);
+  return cls ? cls.count : 0;
+}
+
 /**
  * 组飞书交互卡片。
  * @param {string} repo 仓库名
@@ -326,13 +422,16 @@ function buildCard(repo, pr, cls, opts = {}) {
   const ok = cls.verdict === 'pass';
   const infra = cls.reason === 'infra_failure' || cls.kind === 'infra_failure';
   const c = cls.counts || { important: 0, nit: 0, pre_existing: 0 };
+  const issueCount = displayIssueCount(cls);
   const head = ok
     ? '✅ Codex 代码评审通过'
     : infra
       ? '🚨 Codex 代码评审基础设施失败'
-    : `❌ Codex 代码评审不通过 — ${cls.count} 个问题`;
+    : `❌ Codex 代码评审不通过 — ${issueCount} 个问题`;
   const authorAt = !ok && atAuthor ? atTag(pr.author) : '';
-  const tally = `🔴 ${c.important} · 🟡 ${c.nit} · 🟣 ${c.pre_existing}`;
+  const tally = cls.priorityCounts
+    ? priorityTally(cls.priorityCounts)
+    : `🔴 ${c.important} · 🟡 ${c.nit} · 🟣 ${c.pre_existing}`;
 
   // 常显区（= 截图里红框）：仓库 / PR / 提交者，扫一眼就知道是谁的哪个 PR。
   const headLines = [
@@ -343,13 +442,13 @@ function buildCard(repo, pr, cls, opts = {}) {
   // 折叠区：分支 / 结论 / 严重度 / 问题清单，点「展开详情」才显示，不刷屏。
   const detailLines = [
     `**分支**：${esc(pr.base)} ← ${esc(pr.head)}`,
-    `**结论**：${ok ? '✅ 通过（无需合并前修复的问题）' : infra ? '🚨 评审基础设施失败（未产出 codereview-result.json）' : `❌ 不通过（${cls.count} 个问题）`}`,
-    `**严重度**：${infra ? '基础设施故障（需排查 Action / Codex 鉴权 / 超时）' : tally}`,
+    `**结论**：${ok ? '✅ 通过（无需合并前修复的问题）' : infra ? '🚨 评审基础设施失败（未产出 codereview-result.json）' : `❌ 不通过（${issueCount} 个问题）`}`,
+    `**${cls.priorityCounts ? '优先级' : '严重度'}**：${infra ? '基础设施故障（需排查 Action / Codex 鉴权 / 超时）' : tally}`,
   ];
   if (!ok && cls.issues && cls.issues.length) {
     detailLines.push(infra ? '\n**故障线索**：' : '\n**问题清单**：');
     cls.issues.slice(0, 10).forEach((it, i) => {
-      const icon = SEV_ICON[it.sev] || '•';
+      const icon = issueMarker(it);
       const loc = it.loc ? ` \`${esc(it.loc)}\`` : '';
       detailLines.push(`${i + 1}. ${icon}${loc}${it.title ? ' — ' + esc(it.title) : ''}`);
     });
