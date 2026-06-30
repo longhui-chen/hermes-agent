@@ -214,7 +214,7 @@ async function notifyFromPullRequestReview({ github, context, core }) {
   if (!prData) { core.info('无法定位 PR，跳过'); return; }
   if (prData.base !== 'main') { core.info(`base=${prData.base} 非 main，跳过`); return; }
   const comments = await listCommentsForReview(github, context, prData.number, review && review.id);
-  const cls = classifyPullRequestReview(review, comments);
+  const cls = classifyPullRequestReview(review, comments, process.env);
   if (!shouldNotify(cls)) { core.info(`评审 verdict=${cls.verdict}（reason=${cls.reason}），不通知`); return; }
   const env = readFeishuEnv(core); if (!env) return;
   const dedupeKey = `review:${review.id || ''}:${review.submitted_at || review.updated_at || ''}:${comments.length}`;

@@ -218,15 +218,16 @@ function classifyCheckRun(checkRun, env) {
  * 把官方 Codex 的 pull_request_review 判定为 pass / fail / skip。
  * 官方集成会像普通 reviewer 一样在 PR 里留下 review + 行内评论；当前没有
  * codereview-result.json 这类结构化文件，所以用保守策略：
- * - 有行内 review comment：按 Important 通知（官方 Codex review 本身只应报高优问题）。
+ * - 有 P0/P1 行内 review comment：按 Important 通知；只有 P2 及以下时视为非阻塞，不发飞书。
  * - review body 明确报错/超时/额度：基础设施失败通知。
  * - 明确 clean：pass，不发。
  * - 其它：skip，避免把普通状态文本误当代码问题。
  *
  * @param {{body?:string,state?:string,html_url?:string,submitted_at?:string}} review
  * @param {Array<{path?:string,line?:number,original_line?:number,body?:string}>} reviewComments
+ * @param {object} [env]
  */
-function classifyPullRequestReview(review, reviewComments) {
+function classifyPullRequestReview(review, reviewComments, env) {
   const body = String((review && review.body) || '');
   const comments = Array.isArray(reviewComments) ? reviewComments : [];
   const statusText = body.slice(0, 2000);
@@ -260,13 +261,25 @@ function classifyPullRequestReview(review, reviewComments) {
         pre_existing: 0,
       }
       : { important: issues.length, nit: 0, pre_existing: 0 };
+    const threshold = notifyThreshold(env);
+    const trigger = threshold === 'any' ? counts.important + counts.nit : counts.important;
+    if (trigger <= 0) {
+      return {
+        verdict: 'pass',
+        reason: 'non_blocking',
+        counts,
+        priorityCounts,
+        issues,
+        count: 0,
+      };
+    }
     return {
       verdict: 'fail',
       reason: 'issues',
       counts,
       priorityCounts,
       issues,
-      count: counts.important || issues.length,
+      count: trigger,
     };
   }
   if (/no issues|no problems|looks good|lgtm|no blocking/i.test(body)) {

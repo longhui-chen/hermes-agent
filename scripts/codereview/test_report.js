@@ -131,6 +131,32 @@ const prReviewPriority = classifyPullRequestReview(
     },
   ],
 );
+const prReviewP2Only = classifyPullRequestReview(
+  { state: 'COMMENTED', body: 'Codex reviewed this PR.' },
+  [
+    {
+      path: 'internal/file/pkg/upgrade/script.go',
+      line: 79,
+      body: '**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Reject symlinked OTA scripts before executing**\n\nDetails.',
+    },
+    {
+      path: 'internal/file/pkg/upgrade/steps.go',
+      line: 95,
+      body: '**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Re-run the preset step when the user root changes**\n\nDetails.',
+    },
+  ],
+);
+const prReviewP2Any = classifyPullRequestReview(
+  { state: 'COMMENTED', body: 'Codex reviewed this PR.' },
+  [
+    {
+      path: 'internal/file/pkg/upgrade/script.go',
+      line: 79,
+      body: '**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Reject symlinked OTA scripts before executing**\n\nDetails.',
+    },
+  ],
+  { CODEREVIEW_NOTIFY_ON: 'any' },
+);
 const prReviewPass = classifyPullRequestReview({ state: 'COMMENTED', body: 'No issues found.' }, []);
 const prReviewInfra = classifyPullRequestReview({ state: 'COMMENTED', body: 'Code review timed out because of a temporary issue.' }, []);
 assert(prReviewFail.verdict === 'fail' && prReviewFail.count === 1 && /src\/session\.ts:42/.test(prReviewFail.issues[0].loc), 'PR review 行内评论 → 不通过并合成 file:line');
@@ -138,6 +164,8 @@ assert(prReviewPriority.verdict === 'fail' && prReviewPriority.count === 1, 'PR 
 assert(prReviewPriority.counts.important === 1 && prReviewPriority.counts.nit === 2, 'PR review P1+2xP2 → legacy important/nit 计数正确');
 assert(prReviewPriority.priorityCounts.p1 === 1 && prReviewPriority.priorityCounts.p2 === 2, 'PR review 解析 Codex P1/P2 badge 计数');
 assert(prReviewPriority.issues[0].priority === 'p1' && prReviewPriority.issues[0].title === 'Use the OTA firmware source for version gating', 'PR review issue 标题去掉 badge/sub/useful 尾巴');
+assert(prReviewP2Only.verdict === 'pass' && prReviewP2Only.reason === 'non_blocking' && prReviewP2Only.count === 0, 'PR review 只有 P2 + 默认门槛(important) → 通过(不发)');
+assert(prReviewP2Any.verdict === 'fail' && prReviewP2Any.count === 1, 'PR review 只有 P2 + NOTIFY_ON=any → 不通过(发)');
 assert(prReviewPass.verdict === 'pass', 'PR review 明确无问题 → 通过');
 assert(prReviewInfra.verdict === 'fail' && prReviewInfra.reason === 'infra_failure', 'PR review 报错/超时正文 → 基础设施失败');
 assert(isCodexPullRequestReview({ user: { login: 'codex[bot]', type: 'Bot' } }) === true, 'Codex PR reviewer 识别');
