@@ -557,6 +557,8 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
     tools_for_api = agent.tools
 
     if agent.api_mode == "anthropic_messages":
+        if (agent.request_overrides or {}).get("response_format") is not None:
+            raise ValueError("response_format is not supported by the Anthropic Messages transport.")
         _transport = agent._get_transport()
         anthropic_messages = agent._prepare_anthropic_messages_for_api(api_messages)
         ctx_len = getattr(agent, "context_compressor", None)

@@ -980,17 +980,23 @@ class TestChatCompletionsEndpoint:
     async def test_invalid_response_format_returns_400(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post(
-                "/v1/chat/completions",
-                json={
-                    "model": "test",
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "response_format": "json_object",
-                },
-            )
-            assert resp.status == 400
-            data = await resp.json()
-            assert "response_format" in data["error"]["message"]
+            for response_format in (
+                "json_object",
+                {"type": "bogus"},
+                {"type": "json_schema"},
+                {"type": "json_schema", "json_schema": {"name": "x"}},
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "response_format": response_format,
+                    },
+                )
+                assert resp.status == 400
+                data = await resp.json()
+                assert "response_format" in data["error"]["message"]
 
     @pytest.mark.asyncio
     async def test_response_format_passed_to_agent_request_overrides(self, adapter):

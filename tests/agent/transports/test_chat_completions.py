@@ -513,6 +513,15 @@ class TestChatCompletionsBuildKwargs:
         )
         assert kw["service_tier"] == "priority"
 
+    def test_response_format_request_override_passes_through(self, transport):
+        msgs = [{"role": "user", "content": "Hi"}]
+        response_format = {"type": "json_object"}
+        kw = transport.build_kwargs(
+            model="gpt-4o", messages=msgs,
+            request_overrides={"response_format": response_format},
+        )
+        assert kw["response_format"] == response_format
+
     def test_fixed_temperature(self, transport):
         """Fixed temperature is now set via ProviderProfile.fixed_temperature."""
         from providers.base import ProviderProfile
@@ -1006,6 +1015,16 @@ class TestChatCompletionsGeminiNativeExtraBodyStrip:
         )
         eb = kw.get("extra_body")
         assert not eb or "tags" not in eb
+
+    def test_response_format_rejected_when_endpoint_is_native_gemini(self, transport):
+        with pytest.raises(ValueError, match="response_format"):
+            transport.build_kwargs(
+                "gemini-2.5-flash",
+                [{"role": "user", "content": "hi"}],
+                None,
+                base_url="https://generativelanguage.googleapis.com/v1beta",
+                request_overrides={"response_format": {"type": "json_object"}},
+            )
 
     def test_tags_preserved_on_nous_endpoint(self, transport):
         kw = transport.build_kwargs(

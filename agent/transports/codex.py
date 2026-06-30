@@ -11,6 +11,33 @@ from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
 
 
+def _responses_text_format_from_chat_response_format(response_format: Any) -> Dict[str, Any]:
+    if not isinstance(response_format, dict):
+        raise ValueError("response_format must be an object.")
+    fmt_type = response_format.get("type")
+    if fmt_type == "json_object":
+        return {"type": "json_object"}
+    if fmt_type != "json_schema":
+        raise ValueError("response_format.type must be 'json_object' or 'json_schema'.")
+    schema_payload = response_format.get("json_schema")
+    if not isinstance(schema_payload, dict):
+        raise ValueError("response_format.json_schema must be an object.")
+    schema = schema_payload.get("schema")
+    if not isinstance(schema, dict):
+        raise ValueError("response_format.json_schema.schema must be an object.")
+    text_format: Dict[str, Any] = {
+        "type": "json_schema",
+        "name": schema_payload.get("name") or "structured_output",
+        "schema": schema,
+    }
+    if "strict" in schema_payload:
+        strict = schema_payload.get("strict")
+        if not isinstance(strict, bool):
+            raise ValueError("response_format.json_schema.strict must be a boolean.")
+        text_format["strict"] = strict
+    return text_format
+
+
 class ResponsesApiTransport(ProviderTransport):
     """Transport for api_mode='codex_responses'.
 
@@ -249,6 +276,12 @@ class ResponsesApiTransport(ProviderTransport):
 
         request_overrides = params.get("request_overrides")
         if request_overrides:
+            request_overrides = dict(request_overrides)
+            response_format = request_overrides.pop("response_format", None)
+            if response_format is not None:
+                kwargs["text"] = {
+                    "format": _responses_text_format_from_chat_response_format(response_format),
+                }
             kwargs.update(request_overrides)
 
         # xAI Responses API rejects ``service_tier`` (HTTP 400 "Argument not
