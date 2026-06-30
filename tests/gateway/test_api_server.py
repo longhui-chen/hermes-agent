@@ -977,6 +977,58 @@ class TestChatCompletionsEndpoint:
             assert resp.status == 400
 
     @pytest.mark.asyncio
+    async def test_invalid_response_format_returns_400(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            for response_format in (
+                "json_object",
+                {"type": "bogus"},
+                {"type": "json_schema"},
+                {"type": "json_schema", "json_schema": {"name": "x"}},
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "response_format": response_format,
+                    },
+                )
+                assert resp.status == 400
+                data = await resp.json()
+                assert "response_format" in data["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_response_format_passed_to_agent_request_overrides(self, adapter):
+        mock_result = {
+            "final_response": '{"ok":true}',
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "Return JSON"}],
+                        "stream": False,
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+
+            assert resp.status == 200
+            assert mock_run.await_args.kwargs["request_overrides"] == {
+                "response_format": {"type": "json_object"},
+            }
+
+    @pytest.mark.asyncio
     async def test_stream_true_returns_sse(self, adapter):
         """stream=true returns SSE format with the full response."""
         app = _create_app(adapter)
@@ -999,9 +1051,13 @@ class TestChatCompletionsEndpoint:
                         "model": "test",
                         "messages": [{"role": "user", "content": "hi"}],
                         "stream": True,
+                        "response_format": {"type": "json_object"},
                     },
                 )
                 assert resp.status == 200
+                assert mock_run.await_args.kwargs["request_overrides"] == {
+                    "response_format": {"type": "json_object"},
+                }
                 assert "text/event-stream" in resp.headers.get("Content-Type", "")
                 assert resp.headers.get("X-Accel-Buffering") == "no"
                 body = await resp.text()
@@ -1084,11 +1140,12 @@ class TestChatCompletionsEndpoint:
                 )
                 assert resp.status == 200
 
-            assert len(fake_task.callbacks) == 1
+            assert len(fake_task.callbacks) == 2
             stream_q = mock_write_sse.call_args.args[4]
             assert stream_q.empty()
             fake_task.callbacks[0](fake_task)
             assert stream_q.get_nowait() is None
+            fake_task.callbacks[1](fake_task)
 
     @pytest.mark.asyncio
     async def test_stream_sends_keepalive_during_quiet_tool_gap(self, adapter):
@@ -3688,6 +3745,7 @@ class TestSessionIdHeader:
         mock_db = MagicMock()
         mock_db.get_messages_as_conversation.return_value = db_history
         auth_adapter._session_db = mock_db
+        auth_adapter._session_dbs[auth_adapter._profile_home_key()] = mock_db
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:

@@ -836,6 +836,30 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
     }
 
 
+def _validate_chat_response_format(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return "Invalid 'response_format' field"
+    fmt_type = value.get("type")
+    if fmt_type == "json_object":
+        return None
+    if fmt_type != "json_schema":
+        return "Unsupported 'response_format.type'"
+    schema_payload = value.get("json_schema")
+    if not isinstance(schema_payload, dict):
+        return "'response_format.json_schema' must be an object"
+    if not isinstance(schema_payload.get("schema"), dict):
+        return "'response_format.json_schema.schema' must be an object"
+    name = schema_payload.get("name")
+    if name is not None and not isinstance(name, str):
+        return "'response_format.json_schema.name' must be a string"
+    strict = schema_payload.get("strict")
+    if strict is not None and not isinstance(strict, bool):
+        return "'response_format.json_schema.strict' must be a boolean"
+    return None
+
+
 if AIOHTTP_AVAILABLE:
     @web.middleware
     async def body_limit_middleware(request, handler):
@@ -1430,6 +1454,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        request_overrides: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1487,6 +1512,7 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
+            request_overrides=request_overrides,
         )
         return agent
 
@@ -2265,6 +2291,16 @@ class APIServerAdapter(BasePlatformAdapter):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
+        request_overrides: Dict[str, Any] = {}
+        response_format = body.get("response_format")
+        if response_format is not None:
+            response_format_error = _validate_chat_response_format(response_format)
+            if response_format_error:
+                return web.json_response(
+                    _openai_error(response_format_error, param="response_format"),
+                    status=400,
+                )
+            request_overrides["response_format"] = response_format
 
         if stream:
             import queue as _q
@@ -2351,6 +2387,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 response_mode=response_mode,
                 turn_id=turn_id,
+                request_overrides=request_overrides or None,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -2379,15 +2416,27 @@ class APIServerAdapter(BasePlatformAdapter):
                     gateway_session_key=gateway_session_key,
                     response_mode=response_mode,
                     turn_id=turn_id,
+                    request_overrides=request_overrides or None,
                 )
             finally:
                 self._end_profile_chat_run(profile_run_key)
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
-            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream", "metadata"])
+            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "response_format", "stream", "metadata"])
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+            except ValueError as e:
+                if "response_format" in str(e):
+                    return web.json_response(
+                        _openai_error(str(e), param="response_format"),
+                        status=400,
+                    )
+                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
+                return web.json_response(
+                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    status=500,
+                )
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -2397,6 +2446,17 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             try:
                 result, usage = await _compute_completion()
+            except ValueError as e:
+                if "response_format" in str(e):
+                    return web.json_response(
+                        _openai_error(str(e), param="response_format"),
+                        status=400,
+                    )
+                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
+                return web.json_response(
+                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    status=500,
+                )
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -4122,6 +4182,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         response_mode: Optional[str] = None,
         turn_id: Optional[str] = None,
+        request_overrides: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -4159,6 +4220,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_start_callback=tool_start_callback,
                     tool_complete_callback=tool_complete_callback,
                     gateway_session_key=gateway_session_key,
+                    request_overrides=request_overrides,
                 )
                 if agent_ref is not None:
                     agent_ref[0] = agent
