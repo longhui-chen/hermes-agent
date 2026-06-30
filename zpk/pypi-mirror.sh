@@ -1,7 +1,7 @@
 #!/bin/bash
 # PyPI 镜像源自动探测 + 写系统级 pip/uv 配置。
 #
-# 由 hermes-agent zpk install.sh / update.sh 在 OTA 安装/升级时调用：在
+# 由 zettlab-claw zpk install.sh / update.sh 在 OTA 安装/升级时调用：在
 # 阿里云内网 / 阿里云公网 / 清华 / pypi.org 几个源里挑最先响应的写入
 # /etc/pip.conf 和 /etc/uv/uv.toml，解决境内（尤其阿里云 ECS）从 pypi.org
 # lazy-install hermes skill 依赖（uv pip install / pip install，见

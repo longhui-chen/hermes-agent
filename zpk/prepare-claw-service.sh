@@ -8,7 +8,7 @@ HERMES_PYTHON="$HERMES_SRC/venv/bin/python"
 HERMES_HOME="$APP_BASE/data/hermes_home"
 SECRET_DIR="$APP_BASE/data/secrets"
 KEY_FILE="$SECRET_DIR/zet_agent.key"
-ENV_FILE="$SECRET_DIR/hermes-agent-mux.env"
+ENV_FILE="$SECRET_DIR/zettlab-claw.env"
 
 generate_key() {
     if command -v openssl >/dev/null 2>&1; then
@@ -21,7 +21,7 @@ print(secrets.token_hex(32))
 PY
 }
 
-write_mux_env() {
+write_agent_env() {
     mkdir -p "$SECRET_DIR"
     chmod 0700 "$SECRET_DIR"
 
@@ -47,7 +47,7 @@ write_mux_env() {
     mv "$ENV_FILE.tmp.$$" "$ENV_FILE"
 }
 
-enable_mux_config() {
+enable_agent_gateway_config() {
     mkdir -p "$HERMES_HOME"
     "$HERMES_PYTHON" - "$HERMES_HOME/config.yaml" <<'PY'
 import os
@@ -142,7 +142,7 @@ stop_legacy_per_profile_gateways() {
     pids="$(ps -eo pid=,args= | awk -v root="$APP_BASE" 'index($0, root) && index($0, " gateway run") && index($0, " -p ") {print $1}' || true)"
     [ -n "$pids" ] || return 0
 
-    echo "Stopping legacy per-profile Hermes gateways: $pids"
+    echo "Stopping legacy per-profile gateway processes: $pids"
     for pid in $pids; do
         [ "$pid" = "$$" ] && continue
         kill "$pid" 2>/dev/null || true
@@ -161,14 +161,14 @@ if [ ! -x "$HERMES_PYTHON" ]; then
     exit 127
 fi
 
-write_mux_env
-enable_mux_config
+write_agent_env
+enable_agent_gateway_config
 if [ "${HERMES_STOP_LEGACY_GATEWAYS:-0}" = "1" ]; then
     stop_legacy_per_profile_gateways
 else
-    echo "Legacy per-profile Hermes gateways left running; switchover cleanup is deferred until mux is healthy and local-server is ready."
+    echo "Legacy per-profile gateways left running; cleanup is deferred until the claw service is healthy and local-server is ready."
 fi
 
-echo "Hermes multiplex service prepared."
+echo "Zettlab Claw service prepared."
 echo "  env: $ENV_FILE"
 echo "  HERMES_HOME: $HERMES_HOME"

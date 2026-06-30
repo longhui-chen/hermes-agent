@@ -15,10 +15,59 @@ source "$APP_ROOT/zpk-systemd.sh"
 # shellcheck source=zpk/pypi-mirror.sh
 source "$APP_ROOT/pypi-mirror.sh" 2>/dev/null || true
 
-echo "Installing hermes-agent from $APP_ROOT ..."
+LEGACY_GATEWAY_SERVICE_REMOVED=false
+
+cleanup_legacy_systemd_services() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 0
+    fi
+
+    # Legacy name from the first shared-gateway ZPK cut. Remove it before
+    # enabling the device-facing zettlab-claw unit, otherwise the old unit can
+    # keep binding the gateway port after upgrade.
+    local legacy_service="hermes-agent-mux.service"
+    local systemd_dir="${SYSTEMD_DIR:-/lib/systemd/system}"
+    local found=false
+
+    if systemctl cat "$legacy_service" >/dev/null 2>&1 \
+        || [ -e "$systemd_dir/$legacy_service" ] \
+        || [ -e "/etc/systemd/system/$legacy_service" ]; then
+        found=true
+    fi
+
+    if [ "$found" = "false" ]; then
+        return 0
+    fi
+
+    echo "Removing legacy gateway service $legacy_service ..."
+    systemctl stop "$legacy_service" 2>/dev/null || true
+    systemctl disable "$legacy_service" 2>/dev/null || true
+    rm -f "$systemd_dir/$legacy_service" "/etc/systemd/system/$legacy_service"
+    rm -rf "/etc/systemd/system/$legacy_service.d"
+    rm -f "$APP_BASE/data/secrets/hermes-agent-mux.env"
+    systemctl daemon-reload 2>/dev/null || true
+    LEGACY_GATEWAY_SERVICE_REMOVED=true
+}
+
+start_replacement_service_after_legacy_cleanup() {
+    if [ "$LEGACY_GATEWAY_SERVICE_REMOVED" != "true" ]; then
+        return 0
+    fi
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 0
+    fi
+    if ! systemctl cat zettlab-claw.service >/dev/null 2>&1; then
+        echo "warning: zettlab-claw.service is not installed after legacy cleanup" >&2
+        return 1
+    fi
+    systemctl start zettlab-claw.service
+    echo "zettlab-claw.service started after legacy service cleanup."
+}
+
+echo "Installing zettlab-claw from $APP_ROOT ..."
 
 if [ ! -f "$HERMES_SRC/pyproject.toml" ]; then
-    echo "missing hermes-agent source: $HERMES_SRC" >&2
+    echo "missing zettlab-claw source: $HERMES_SRC" >&2
     exit 1
 fi
 
@@ -42,15 +91,10 @@ ln -sfn "$APP_BASE/current/bin/hermes" "$HERMES_LINK"
 # 探测并写 PyPI 镜像源（境内 lazy-install 提速）；失败不阻断安装
 setup_pypi_mirror || true
 
-"$APP_ROOT/prepare-mux-service.sh"
+"$APP_ROOT/prepare-claw-service.sh"
 install_systemd_services "$APP_ROOT"
-if command -v systemctl >/dev/null 2>&1 && systemctl cat hermes-agent-mux.service >/dev/null 2>&1; then
-    if systemctl restart hermes-agent-mux.service; then
-        echo "hermes-agent-mux.service restarted."
-    else
-        echo "warning: failed to restart hermes-agent-mux.service; local-server mux migration will stay gated by health check" >&2
-    fi
-fi
+cleanup_legacy_systemd_services
+start_replacement_service_after_legacy_cleanup
 
 echo "Install complete."
 echo "  hermes: $APP_BASE/current/bin/hermes"

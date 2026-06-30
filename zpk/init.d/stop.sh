@@ -1,4 +1,4 @@
 #!/bin/bash
 set -euo pipefail
 
-systemctl stop hermes-agent-mux.service
+systemctl stop zettlab-claw.service
