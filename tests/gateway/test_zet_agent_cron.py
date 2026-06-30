@@ -590,6 +590,72 @@ def test_run_job_with_retry_skips_when_tools_ran(monkeypatch):
     assert calls["n"] == 1  # no retry — partially-executed run must not repeat
 
 
+def test_retry_metadata_explains_partial_tool_activity_skip(monkeypatch):
+    import json as _json
+
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(zc, "_RETRY_BACKOFF_S", 0)
+    monkeypatch.setattr(zc, "_list_cron_session_ids", lambda _jid: set())
+    monkeypatch.setattr(zc, "_attempt_tool_activity", lambda _jid, _before: 4)
+
+    def orig(job):
+        return (False, "out", "", _RAW_502)
+
+    zc._run_job_with_retry(orig, {"id": "paper-job"})
+    content = zc._build_typed_message_content(
+        {"id": "paper-job", "name": "每日论文推荐", "schedule": {"display": "每天10:00"}},
+        "paper-job",
+        False,
+        _RAW_502,
+        None,
+    )
+    meta = _json.loads(content.split("```cron-summary\n", 1)[1].split("\n```", 1)[0])
+
+    assert meta["failure"]["code"] == "upstream_unavailable"
+    assert meta["failure"]["retryable"] is True
+    assert meta["failure"]["retry"] == {
+        "attempts": 0,
+        "max_attempts": zc._MAX_RUN_RETRIES,
+        "skipped_reason": "tool_activity",
+        "tool_activity": 4,
+    }
+    assert "已执行部分步骤" in content
+    assert "为避免重复操作未自动重试" in content
+    assert "RuntimeError" not in content and "us-iam-gw" not in content
+
+
+def test_retry_metadata_records_clean_retry_exhaustion(monkeypatch):
+    import json as _json
+
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(zc, "_RETRY_BACKOFF_S", 0)
+    monkeypatch.setattr(zc, "_list_cron_session_ids", lambda _jid: set())
+    monkeypatch.setattr(zc, "_attempt_tool_activity", lambda _jid, _before: 0)
+
+    calls = {"n": 0}
+
+    def orig(job):
+        calls["n"] += 1
+        return (False, "out", "", _RAW_502)
+
+    zc._run_job_with_retry(orig, {"id": "clean-job"})
+    content = zc._build_typed_message_content(
+        {"id": "clean-job", "name": "早报", "schedule": {"display": "每天"}},
+        "clean-job",
+        False,
+        _RAW_502,
+        None,
+    )
+    meta = _json.loads(content.split("```cron-summary\n", 1)[1].split("\n```", 1)[0])
+
+    assert calls["n"] == 1 + zc._MAX_RUN_RETRIES
+    assert meta["failure"]["retry"]["attempts"] == zc._MAX_RUN_RETRIES
+    assert meta["failure"]["retry"]["skipped_reason"] == "retry_exhausted"
+    assert f"已自动重试 {zc._MAX_RUN_RETRIES} 次仍失败" in content
+
+
 def test_run_job_with_retry_no_retry_on_non_transient(monkeypatch):
     import gateway.platforms.zet_agent_cron as zc
 

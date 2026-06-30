@@ -906,6 +906,46 @@ _FAILURE_REASON = {
     "agent_error": "执行出错",
     "unknown": "执行失败",
 }
+_RETRY_STATE_LIMIT = 512
+_LAST_RETRY_STATE: Dict[str, Dict[str, Any]] = {}
+
+
+def _new_retry_state() -> Dict[str, Any]:
+    return {
+        "attempts": 0,
+        "max_attempts": _MAX_RUN_RETRIES,
+        "retryable": False,
+        "skipped_reason": None,
+        "tool_activity": None,
+    }
+
+
+def _remember_retry_state(job_id: str, state: Dict[str, Any]) -> None:
+    if not job_id:
+        return
+    _LAST_RETRY_STATE[job_id] = dict(state)
+    if len(_LAST_RETRY_STATE) <= _RETRY_STATE_LIMIT:
+        return
+    for key in list(_LAST_RETRY_STATE)[: len(_LAST_RETRY_STATE) - _RETRY_STATE_LIMIT]:
+        _LAST_RETRY_STATE.pop(key, None)
+
+
+def _failure_metadata(job_id: str, error: Optional[str]) -> Dict[str, Any]:
+    code, retryable = _classify_failure(error)
+    failure: Dict[str, Any] = {"code": code, "retryable": retryable}
+    state = _LAST_RETRY_STATE.get(job_id) or {}
+    if retryable and state:
+        retry = {
+            "attempts": int(state.get("attempts") or 0),
+            "max_attempts": int(state.get("max_attempts") or 0),
+        }
+        skipped_reason = state.get("skipped_reason")
+        if skipped_reason:
+            retry["skipped_reason"] = skipped_reason
+        if "tool_activity" in state:
+            retry["tool_activity"] = state.get("tool_activity")
+        failure["retry"] = retry
+    return failure
 
 
 def _is_retryable_error(error: Optional[str]) -> bool:
@@ -927,11 +967,31 @@ def _classify_failure(error: Optional[str]) -> tuple[str, bool]:
     return ("agent_error", False)
 
 
-def _friendly_failure(job_name: str, error: Optional[str]) -> str:
+def _friendly_failure(
+    job_name: str,
+    error: Optional[str],
+    retry_state: Optional[Dict[str, Any]] = None,
+) -> str:
     """Default-locale failure line; never leaks the raw error."""
     name = (job_name or "").strip() or "定时任务"
     code, _ = _classify_failure(error)
-    return f"⚠️ 定时任务「{name}」执行失败：{_FAILURE_REASON[code]}。"
+    reason = _FAILURE_REASON[code]
+    if code == "upstream_unavailable" and retry_state:
+        skipped = retry_state.get("skipped_reason")
+        attempts = int(retry_state.get("attempts") or 0)
+        if skipped == "tool_activity":
+            reason = "AI 服务暂时繁忙。本次已执行部分步骤，为避免重复操作未自动重试"
+        elif skipped == "activity_unknown":
+            reason = "AI 服务暂时繁忙。无法确认本次是否已执行操作，已跳过自动重试"
+        elif skipped == "retry_exhausted":
+            reason = f"AI 服务暂时繁忙。已自动重试 {attempts} 次仍失败"
+        elif skipped in {"no_agent", "job_script"}:
+            reason = "AI 服务暂时繁忙。该任务包含脚本步骤，为避免重复副作用未自动重试"
+        elif skipped == "retries_disabled":
+            reason = "AI 服务暂时繁忙。自动重试当前已关闭"
+        elif skipped == "shutdown":
+            reason = "AI 服务暂时繁忙。系统正在停止，已取消自动重试"
+    return f"⚠️ 定时任务「{name}」执行失败：{reason}。"
 
 
 def _redact_channel_failure(job: dict, content: Optional[str]):
@@ -969,6 +1029,8 @@ def _run_job_with_retry(orig_run_job, job):
     """Re-run a transient failure, but only while this run has produced zero
     tool activity (vs a fixed pre-run baseline) so side effects never repeat."""
     job_id = job.get("id", "")
+    state = _new_retry_state()
+    _LAST_RETRY_STATE.pop(job_id, None)
     # Run once (never retry) when retries are off, or when the job has side
     # effects the tool-activity guard can't see:
     #   • _MAX_RUN_RETRIES == 0 — retries disabled; also skips the baseline DB
@@ -979,7 +1041,17 @@ def _run_job_with_retry(orig_run_job, job):
     #     Hermes tool activity, so _attempt_tool_activity would read 0 ("safe")
     #     and a retry after an LLM 502 would re-execute the script's side effects.
     if _MAX_RUN_RETRIES == 0 or job.get("no_agent") or job.get("script"):
-        return orig_run_job(job)
+        result = orig_run_job(job)
+        if _is_retryable_failure_result(result):
+            state["retryable"] = True
+            if _MAX_RUN_RETRIES == 0:
+                state["skipped_reason"] = "retries_disabled"
+            elif job.get("no_agent"):
+                state["skipped_reason"] = "no_agent"
+            else:
+                state["skipped_reason"] = "job_script"
+            _remember_retry_state(job_id, state)
+        return result
     # Pre-run id snapshot, captured ONCE (ids only — no message reads). The guard
     # counts tools only in sessions absent from this set, so it never re-reads
     # the job's history and a reused same-second session id stays counted.
@@ -989,20 +1061,32 @@ def _run_job_with_retry(orig_run_job, job):
     # _is_retryable_failure_result bounds-checks the tuple; result[3] is the
     # error for agent jobs (script jobs are short-circuited above).
     while attempts < _MAX_RUN_RETRIES and _is_retryable_failure_result(result):
+        state["retryable"] = True
         activity = _attempt_tool_activity(job_id, baseline)
+        state["tool_activity"] = activity
         if activity != 0:  # None (unresolved) or >0 (work ran) → don't repeat
+            state["skipped_reason"] = (
+                "activity_unknown" if activity is None else "tool_activity"
+            )
             _dbg(f"run_job: skip retry job={job_id} run_activity={activity}")
             break
         attempts += 1
+        state["attempts"] = attempts
         _dbg(
             f"run_job: transient failure job={job_id} "
             f"retry {attempts}/{_MAX_RUN_RETRIES} after {_RETRY_BACKOFF_S}s"
         )
         # Interruptible backoff: True iff shutdown signalled mid-wait.
         if _shutdown.wait(_RETRY_BACKOFF_S):
+            state["skipped_reason"] = "shutdown"
             _dbg(f"run_job: shutdown during backoff — abort retry job={job_id}")
             break
         result = orig_run_job(job)
+    if _is_retryable_failure_result(result):
+        state["retryable"] = True
+        if not state.get("skipped_reason") and attempts >= _MAX_RUN_RETRIES:
+            state["skipped_reason"] = "retry_exhausted"
+        _remember_retry_state(job_id, state)
     return result
 
 
@@ -1199,8 +1283,7 @@ def _build_typed_message_content(
 
     if not success:
         # Structured failure for client-side i18n (clients localize off `code`).
-        _code, _retryable = _classify_failure(error)
-        metadata["failure"] = {"code": _code, "retryable": _retryable}
+        metadata["failure"] = _failure_metadata(job_id, error)
 
     attachments = _collect_produced_files(job_id, job)
     if attachments:
@@ -1210,7 +1293,7 @@ def _build_typed_message_content(
         body = _extract_response_body(_LATEST_OUTPUT.get(job_id, ""))
     else:
         # Friendly fallback; raw FAILED doc stays in the run .md.
-        body = _friendly_failure(job.get("name", ""), error)
+        body = _friendly_failure(job.get("name", ""), error, _LAST_RETRY_STATE.get(job_id))
 
     parts = [
         "```cron-summary",
