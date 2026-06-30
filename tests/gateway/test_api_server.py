@@ -977,6 +977,52 @@ class TestChatCompletionsEndpoint:
             assert resp.status == 400
 
     @pytest.mark.asyncio
+    async def test_invalid_response_format_returns_400(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "test",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "response_format": "json_object",
+                },
+            )
+            assert resp.status == 400
+            data = await resp.json()
+            assert "response_format" in data["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_response_format_passed_to_agent_request_overrides(self, adapter):
+        mock_result = {
+            "final_response": '{"ok":true}',
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "Return JSON"}],
+                        "stream": False,
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+
+            assert resp.status == 200
+            assert mock_run.await_args.kwargs["request_overrides"] == {
+                "response_format": {"type": "json_object"},
+            }
+
+    @pytest.mark.asyncio
     async def test_stream_true_returns_sse(self, adapter):
         """stream=true returns SSE format with the full response."""
         app = _create_app(adapter)
@@ -999,9 +1045,13 @@ class TestChatCompletionsEndpoint:
                         "model": "test",
                         "messages": [{"role": "user", "content": "hi"}],
                         "stream": True,
+                        "response_format": {"type": "json_object"},
                     },
                 )
                 assert resp.status == 200
+                assert mock_run.await_args.kwargs["request_overrides"] == {
+                    "response_format": {"type": "json_object"},
+                }
                 assert "text/event-stream" in resp.headers.get("Content-Type", "")
                 assert resp.headers.get("X-Accel-Buffering") == "no"
                 body = await resp.text()

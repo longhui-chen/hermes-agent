@@ -1278,6 +1278,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        request_overrides: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1335,6 +1336,7 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
+            request_overrides=request_overrides,
         )
         return agent
 
@@ -2113,6 +2115,15 @@ class APIServerAdapter(BasePlatformAdapter):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
+        request_overrides: Dict[str, Any] = {}
+        response_format = body.get("response_format")
+        if response_format is not None:
+            if not isinstance(response_format, dict):
+                return web.json_response(
+                    {"error": {"message": "Invalid 'response_format' field", "type": "invalid_request_error"}},
+                    status=400,
+                )
+            request_overrides["response_format"] = response_format
 
         if stream:
             import queue as _q
@@ -2196,6 +2207,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 response_mode=response_mode,
                 turn_id=turn_id,
+                request_overrides=request_overrides or None,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -2217,11 +2229,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 response_mode=response_mode,
                 turn_id=turn_id,
+                request_overrides=request_overrides or None,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
-            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream", "metadata"])
+            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "response_format", "stream", "metadata"])
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
             except Exception as e:
@@ -3958,6 +3971,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         response_mode: Optional[str] = None,
         turn_id: Optional[str] = None,
+        request_overrides: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3995,6 +4009,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_start_callback=tool_start_callback,
                     tool_complete_callback=tool_complete_callback,
                     gateway_session_key=gateway_session_key,
+                    request_overrides=request_overrides,
                 )
                 if agent_ref is not None:
                     agent_ref[0] = agent
