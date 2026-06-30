@@ -15,10 +15,10 @@ source "$APP_ROOT/zpk-systemd.sh"
 # shellcheck source=zpk/pypi-mirror.sh
 source "$APP_ROOT/pypi-mirror.sh" 2>/dev/null || true
 
-echo "Installing hermes-agent from $APP_ROOT ..."
+echo "Installing zettlab-claw from $APP_ROOT ..."
 
 if [ ! -f "$HERMES_SRC/pyproject.toml" ]; then
-    echo "missing hermes-agent source: $HERMES_SRC" >&2
+    echo "missing zettlab-claw source: $HERMES_SRC" >&2
     exit 1
 fi
 
@@ -42,13 +42,13 @@ ln -sfn "$APP_BASE/current/bin/hermes" "$HERMES_LINK"
 # 探测并写 PyPI 镜像源（境内 lazy-install 提速）；失败不阻断安装
 setup_pypi_mirror || true
 
-"$APP_ROOT/prepare-mux-service.sh"
+"$APP_ROOT/prepare-claw-service.sh"
 install_systemd_services "$APP_ROOT"
-if command -v systemctl >/dev/null 2>&1 && systemctl cat hermes-agent-mux.service >/dev/null 2>&1; then
-    if systemctl restart hermes-agent-mux.service; then
-        echo "hermes-agent-mux.service restarted."
+if command -v systemctl >/dev/null 2>&1 && systemctl cat zettlab-claw.service >/dev/null 2>&1; then
+    if systemctl restart zettlab-claw.service; then
+        echo "zettlab-claw.service restarted."
     else
-        echo "warning: failed to restart hermes-agent-mux.service; local-server mux migration will stay gated by health check" >&2
+        echo "warning: failed to restart zettlab-claw.service" >&2
     fi
 fi
 

@@ -49,7 +49,7 @@ ZPK_EXCLUDES := \
 	--exclude=zpk
 
 zpk-venv:
-	@echo "Preparing hermes-agent ZPK venv..."
+	@echo "Preparing zettlab-claw ZPK venv..."
 	@rm -rf venv python-runtime
 	@mkdir -p "$(ZPK_LOG_DIR)"
 	@if [ "$(ZPK_VERBOSE)" = "1" ]; then \
@@ -61,7 +61,7 @@ zpk-venv:
 			exit 1; \
 		}; \
 	fi
-	@echo "Installing hermes-agent dependencies ($(ZPK_INSTALL_SPEC))..."
+	@echo "Installing zettlab-claw dependencies ($(ZPK_INSTALL_SPEC))..."
 	@if [ "$(ZPK_VERBOSE)" = "1" ]; then \
 		UV_LINK_MODE=copy uv $(ZPK_UV_FLAGS) pip install --python venv/bin/python --index-url "$(PYPI_INDEX_URL)" "$(ZPK_INSTALL_SPEC)"; \
 	else \
@@ -84,7 +84,7 @@ zpk-venv:
 	@ZPK_INSTALL_SPEC="$(ZPK_INSTALL_SPEC)" venv/bin/python scripts/check_zpk_payload.py
 
 zpk-stage: zpk-venv
-	@echo "Staging hermes-agent ZPK payload..."
+	@echo "Staging zettlab-claw ZPK payload..."
 	@test -x venv/bin/hermes
 	@rm -rf "$(ZPK_SRC_DIR)"
 	@mkdir -p "$(ZPK_SRC_DIR)"
@@ -98,8 +98,8 @@ zpk-stage: zpk-venv
 	@chmod 0755 "$(ZPK_SRC_DIR)/venv/bin/python" "$(ZPK_SRC_DIR)/venv/bin/python3" "$(ZPK_SRC_DIR)/venv/bin/python3.11"
 	@find "$(ZPK_SRC_DIR)" -type l -delete
 	@chmod 0755 zpk/install.sh zpk/update.sh zpk/uninstall.sh zpk/bin/hermes \
-		zpk/zpk-systemd.sh zpk/prepare-mux-service.sh zpk/init.d/start.sh zpk/init.d/stop.sh
-	@echo "Hermes-agent ZPK payload staged at $(ZPK_SRC_DIR)"
+		zpk/zpk-systemd.sh zpk/prepare-claw-service.sh zpk/init.d/start.sh zpk/init.d/stop.sh
+	@echo "zettlab-claw ZPK payload staged at $(ZPK_SRC_DIR)"
 
 zpk-pack: zpk-stage
 	mkdir -p build
