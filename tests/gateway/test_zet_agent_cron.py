@@ -96,6 +96,15 @@ def test_detect_fake_success(monkeypatch):
     monkeypatch.setattr(zc, "_count_tool_activity", lambda _jid: 2)
     set_body("I'll fetch the weather data for both cities now.")
     assert zc._detect_fake_success("job-x") is None
+    # ZET-1782：工具跑过但最终正文是残缺 code/markdown 片段，也不能当成功推送。
+    set_body("`.app")
+    assert zc._detect_fake_success("job-x") is not None
+    # 同类：只吐出 helper script 文件名，不是用户可读结果。
+    set_body("sync_v2.py")
+    assert zc._detect_fake_success("job-x") is not None
+    # 正常短文本不误伤。
+    set_body("已同步完成。")
+    assert zc._detect_fake_success("job-x") is None
     # session 读不到（None）→ fail-open，不降级
     monkeypatch.setattr(zc, "_count_tool_activity", lambda _jid: None)
     set_body("I'll fetch the weather data for both cities now.")
@@ -344,6 +353,211 @@ def test_cron_summary_carries_next_run_at_and_timezone(tmp_path, monkeypatch):
     assert "timezone" not in meta2
 
 
+def test_collect_produced_files_walks_current_output_run_and_filters_helpers(tmp_path, monkeypatch):
+    """ZET-1793: cron attachments come from the current output run, not every
+    tool-call path or every historical file in a reused output bucket."""
+    import json as _json
+    import os
+    import time
+
+    import hermes_state
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+
+    from hermes_state import SessionDB
+
+    agent_id = "d87dcb35-cf11-44d3-8ca3-8d9b01cfb090"
+    bucket = tmp_path / "volume1" / "subvol" / "agents" / "data" / agent_id / "output" / "BMlfeWtIkAHx"
+    bucket.mkdir(parents=True)
+    current_report = bucket / "reddit_report_2026-06-28.html"
+    current_report.write_text("<html>today</html>", encoding="utf-8")
+    old_report = bucket / "reddit_report_2026-06-27.html"
+    old_report.write_text("<html>old</html>", encoding="utf-8")
+    tmp_script = tmp_path / "tmp" / "gen_report.py"
+    tmp_script.parent.mkdir()
+    tmp_script.write_text("print('helper')", encoding="utf-8")
+
+    now = time.time()
+    os.utime(current_report, (now, now))
+    os.utime(tmp_script, (now, now))
+    os.utime(old_report, (now - 86_400, now - 86_400))
+
+    sid = "cron_jobR_20260628_143034"
+    db = SessionDB()
+    db.create_session(sid, source="cron", user_id="userA")
+    with db._lock:
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 10, sid))
+    db.append_message(
+        sid,
+        role="assistant",
+        content="I will write a helper script.",
+        tool_calls=[
+            {
+                "name": "write_file",
+                "arguments": _json.dumps({"path": str(tmp_script), "content": "print('helper')"}),
+            }
+        ],
+    )
+    db.append_message(
+        sid,
+        role="assistant",
+        content="Running report generator.",
+        tool_calls=[
+            {
+                "name": "terminal",
+                "arguments": _json.dumps({"command": f"python3 {tmp_script}"}),
+            }
+        ],
+    )
+    db.append_message(
+        sid,
+        role="tool",
+        tool_name="terminal",
+        content=f"REPORT: {current_report}\nSIZE: {current_report.stat().st_size}",
+    )
+    db.close()
+
+    job = {"origin": {"platform": "zet_agent", "chat_id": f"zettlab:userA:{agent_id}:chat1"}}
+    attachments = zc._collect_produced_files("jobR", job)
+
+    assert [a["name"] for a in attachments] == ["reddit_report_2026-06-28.html"]
+    assert attachments[0]["path"] == str(current_report.resolve())
+    assert attachments[0]["mime"] == "text/html"
+
+
+def test_collect_produced_files_filters_sync_helper_script(tmp_path, monkeypatch):
+    """ZET-1782: sync helper scripts are not user-facing cron attachments."""
+    import os
+    import time
+
+    import hermes_state
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+
+    from hermes_state import SessionDB
+
+    agent_id = "4c452598-e213-4e86-bc17-412d99bc8ab9"
+    bucket = tmp_path / "volume1" / "subvol" / "agents" / "data" / agent_id / "output" / "fdea6ea26aa1"
+    bucket.mkdir(parents=True)
+    helper = bucket / "sync_v2.py"
+    helper.write_text("print('sync helper')", encoding="utf-8")
+
+    now = time.time()
+    os.utime(helper, (now, now))
+
+    sid = "cron_jobSync_20260627_140004"
+    db = SessionDB()
+    db.create_session(sid, source="cron", user_id="userA")
+    with db._lock:
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 5, sid))
+    db.append_message(
+        sid,
+        role="tool",
+        tool_name="terminal",
+        content=f"checked helper: {helper}",
+    )
+    db.close()
+
+    job = {"origin": {"platform": "zet_agent", "chat_id": f"zettlab:userA:{agent_id}:chat1"}}
+    assert zc._collect_produced_files("jobSync", job) == []
+
+
+def test_collect_produced_files_allows_external_chat_deliverables(tmp_path, monkeypatch):
+    """A report created outside the output bucket is still a user deliverable
+    when the current cron run mentions it; temp/helper scripts remain hidden."""
+    import json as _json
+    import os
+    import time
+
+    import hermes_state
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    monkeypatch.setattr(zc, "_CRON_ATTACHMENT_TEMP_DIRS", frozenset({"tmp", "var/tmp"}))
+
+    from hermes_state import SessionDB
+
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    report = root_dir / "nas-youtube-report-2026-06-29.html"
+    report.write_text("<html>youtube report</html>", encoding="utf-8")
+    tmp_script = tmp_path / "tmp" / "gen_report.py"
+    tmp_script.parent.mkdir()
+    tmp_script.write_text("open('/root/nas-youtube-report.html', 'w')", encoding="utf-8")
+
+    now = time.time()
+    os.utime(report, (now, now))
+    os.utime(tmp_script, (now, now))
+
+    sid = "cron_jobY_20260629_143034"
+    db = SessionDB()
+    db.create_session(sid, source="cron", user_id="userA")
+    with db._lock:
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 5, sid))
+    db.append_message(
+        sid,
+        role="assistant",
+        content="Generating the YouTube report.",
+        tool_calls=[
+            {
+                "name": "write_file",
+                "arguments": _json.dumps({"path": str(tmp_script), "content": "helper"}),
+            }
+        ],
+    )
+    db.append_message(
+        sid,
+        role="tool",
+        tool_name="terminal",
+        content=f"wrote report: {report}\nhelper: {tmp_script}",
+    )
+    db.close()
+
+    attachments = zc._collect_produced_files("jobY", {"origin": {"platform": "zet_agent"}})
+
+    assert [a["name"] for a in attachments] == ["nas-youtube-report-2026-06-29.html"]
+    assert attachments[0]["path"] == str(report.resolve())
+
+
+def test_collect_produced_files_rejects_agent_output_without_agent_scope(tmp_path, monkeypatch):
+    """Agent output paths must not fall through to the external-file fallback."""
+    import os
+    import time
+
+    import hermes_state
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+
+    from hermes_state import SessionDB
+
+    other_agent = "other-agent"
+    bucket = tmp_path / "volume1" / "subvol" / "agents" / "data" / other_agent / "output" / "session-a"
+    bucket.mkdir(parents=True)
+    report = bucket / "report.html"
+    report.write_text("<html>foreign</html>", encoding="utf-8")
+
+    now = time.time()
+    os.utime(report, (now, now))
+
+    sid = "cron_jobNoScope_20260629_143034"
+    db = SessionDB()
+    db.create_session(sid, source="cron", user_id="userA")
+    with db._lock:
+        db._conn.execute("UPDATE sessions SET started_at = ? WHERE id = ?", (now - 5, sid))
+    db.append_message(
+        sid,
+        role="tool",
+        tool_name="terminal",
+        content=f"report: {report}",
+    )
+    db.close()
+
+    assert zc._collect_produced_files("jobNoScope", {"origin": {"platform": "zet_agent"}}) == []
+
+
 # ── ZET-1565: friendly failure messaging + run-level auto-retry ──────
 
 _RAW_502 = (
@@ -406,6 +620,36 @@ def test_build_typed_message_content_failure_is_friendly():
     assert "AI 服务暂时繁忙" in content
 
 
+def test_malformed_cron_success_becomes_empty_response_card(monkeypatch):
+    import json as _json
+
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(zc, "_count_tool_activity", lambda _jid: 3)
+    zc._LATEST_OUTPUT["job-bad"] = "# Cron Job: x\n\n## Response\n\n`.app\n"
+    try:
+        reason = zc._detect_fake_success("job-bad")
+        assert reason is not None
+        content = zc._build_typed_message_content(
+            {
+                "id": "job-bad",
+                "name": "飞书审批费用同步",
+                "schedule": {"display": "Daily at 22:00"},
+            },
+            "job-bad",
+            False,
+            reason,
+            None,
+        )
+    finally:
+        zc._LATEST_OUTPUT.pop("job-bad", None)
+
+    meta = _json.loads(content.split("```cron-summary\n", 1)[1].split("\n```", 1)[0])
+    assert meta["failure"] == {"code": "empty_response", "retryable": False}
+    assert "本次未产出有效结果" in content
+    assert "`.app" not in content
+
+
 def test_run_job_with_retry_retries_clean_transient(monkeypatch):
     import gateway.platforms.zet_agent_cron as zc
 
@@ -458,6 +702,72 @@ def test_run_job_with_retry_skips_when_tools_ran(monkeypatch):
 
     zc._run_job_with_retry(orig, {"id": "j3"})
     assert calls["n"] == 1  # no retry — partially-executed run must not repeat
+
+
+def test_retry_metadata_explains_partial_tool_activity_skip(monkeypatch):
+    import json as _json
+
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(zc, "_RETRY_BACKOFF_S", 0)
+    monkeypatch.setattr(zc, "_list_cron_session_ids", lambda _jid: set())
+    monkeypatch.setattr(zc, "_attempt_tool_activity", lambda _jid, _before: 4)
+
+    def orig(job):
+        return (False, "out", "", _RAW_502)
+
+    zc._run_job_with_retry(orig, {"id": "paper-job"})
+    content = zc._build_typed_message_content(
+        {"id": "paper-job", "name": "每日论文推荐", "schedule": {"display": "每天10:00"}},
+        "paper-job",
+        False,
+        _RAW_502,
+        None,
+    )
+    meta = _json.loads(content.split("```cron-summary\n", 1)[1].split("\n```", 1)[0])
+
+    assert meta["failure"]["code"] == "upstream_unavailable"
+    assert meta["failure"]["retryable"] is True
+    assert meta["failure"]["retry"] == {
+        "attempts": 0,
+        "max_attempts": zc._MAX_RUN_RETRIES,
+        "skipped_reason": "tool_activity",
+        "tool_activity": 4,
+    }
+    assert "已执行部分步骤" in content
+    assert "为避免重复操作未自动重试" in content
+    assert "RuntimeError" not in content and "us-iam-gw" not in content
+
+
+def test_retry_metadata_records_clean_retry_exhaustion(monkeypatch):
+    import json as _json
+
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(zc, "_RETRY_BACKOFF_S", 0)
+    monkeypatch.setattr(zc, "_list_cron_session_ids", lambda _jid: set())
+    monkeypatch.setattr(zc, "_attempt_tool_activity", lambda _jid, _before: 0)
+
+    calls = {"n": 0}
+
+    def orig(job):
+        calls["n"] += 1
+        return (False, "out", "", _RAW_502)
+
+    zc._run_job_with_retry(orig, {"id": "clean-job"})
+    content = zc._build_typed_message_content(
+        {"id": "clean-job", "name": "早报", "schedule": {"display": "每天"}},
+        "clean-job",
+        False,
+        _RAW_502,
+        None,
+    )
+    meta = _json.loads(content.split("```cron-summary\n", 1)[1].split("\n```", 1)[0])
+
+    assert calls["n"] == 1 + zc._MAX_RUN_RETRIES
+    assert meta["failure"]["retry"]["attempts"] == zc._MAX_RUN_RETRIES
+    assert meta["failure"]["retry"]["skipped_reason"] == "retry_exhausted"
+    assert f"已自动重试 {zc._MAX_RUN_RETRIES} 次仍失败" in content
 
 
 def test_run_job_with_retry_no_retry_on_non_transient(monkeypatch):

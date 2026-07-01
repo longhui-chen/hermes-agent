@@ -46,7 +46,8 @@ import os
 import re
 import stat as _stat
 import threading
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,21 @@ _PRODUCE_TOOL_NAMES = frozenset({
     "write_file", "edit_file",
 })
 _PATH_KEYS = ("file_path", "notebook_path", "path")
+_CRON_ATTACHMENT_LIMIT = 32
+_CRON_ATTACHMENT_SCAN_FILE_LIMIT = 2000
+_CRON_ATTACHMENT_MTIME_SLACK_S = 60.0
+_CRON_ATTACHMENT_EXCLUDED_SUFFIXES = frozenset({
+    ".py", ".pyc", ".pyo",
+})
+_CRON_ATTACHMENT_EXTERNAL_SUFFIXES = frozenset({
+    ".csv", ".doc", ".docx", ".gif", ".htm", ".html", ".jpeg", ".jpg",
+    ".json", ".md", ".mp3", ".mp4", ".pdf", ".png", ".ppt", ".pptx",
+    ".txt", ".wav", ".webm", ".xls", ".xlsx", ".xml", ".zip",
+})
+_CRON_ATTACHMENT_TEMP_DIRS = frozenset({
+    "tmp", "var/tmp", "private/tmp",
+})
+_ABSOLUTE_PATH_RE = re.compile(r"(?<![\w./-])/{1,3}[^\s\"'<>`|)]{2,}")
 
 
 def _is_zet_agent_platform(platform: Any) -> bool:
@@ -657,6 +673,33 @@ _INTENT_ANNOUNCE_RE = re.compile(
     r")",
     re.IGNORECASE,
 )
+_SCRIPT_FRAGMENT_RE = re.compile(r"^[`'\"]?[A-Za-z0-9_.-]+\.(?:py|pyc|pyo)[`'\"]?$", re.IGNORECASE)
+
+
+def _detect_malformed_response_fragment(body: str) -> Optional[str]:
+    """Return a fake-success reason for tiny truncated/code-fragment bodies.
+
+    Cron summaries are user-facing notifications. A body like "`.app" is not a
+    valid result; it is a broken markdown/code fragment from an interrupted or
+    derailed model response. Keep this intentionally narrow so short real
+    reminders ("OK", "Done", "已同步") stay deliverable.
+    """
+    compact = (body or "").strip()
+    if not compact or len(compact) > 120:
+        return None
+    if "\n" in compact:
+        return None
+    if compact.count("`") % 2 == 1:
+        return (
+            "agent produced no user-facing result; got a malformed markdown "
+            "fragment"
+        )
+    if _SCRIPT_FRAGMENT_RE.match(compact):
+        return (
+            "agent produced no user-facing result; got a helper script "
+            "filename"
+        )
+    return None
 
 
 def _cron_session_like(job_id: str) -> str:
@@ -789,13 +832,16 @@ def _attempt_tool_activity(job_id: str, baseline: Optional[set]) -> Optional[int
 
 
 def _detect_fake_success(job_id: str) -> Optional[str]:
-    """短意图句 + 本轮 0 工具执行 → 返回失败原因，否则 None（fail-open，不误降真成功）。"""
+    """Return a failure reason when a successful run has no user-facing result."""
     try:
         body = _extract_response_body(_LATEST_OUTPUT.get(job_id, "")).strip()
     except Exception:
         return None
     if not body:
         return None  # 空 body 上游已 soft-fail (#8585)
+    malformed = _detect_malformed_response_fragment(body)
+    if malformed:
+        return malformed
     if len(body) > 400 or not _INTENT_ANNOUNCE_RE.search(body):
         return None  # 实质内容 / 非意图句 = 真答案
     tool_activity = _count_tool_activity(job_id)
@@ -890,6 +936,46 @@ _FAILURE_REASON = {
     "agent_error": "执行出错",
     "unknown": "执行失败",
 }
+_RETRY_STATE_LIMIT = 512
+_LAST_RETRY_STATE: Dict[str, Dict[str, Any]] = {}
+
+
+def _new_retry_state() -> Dict[str, Any]:
+    return {
+        "attempts": 0,
+        "max_attempts": _MAX_RUN_RETRIES,
+        "retryable": False,
+        "skipped_reason": None,
+        "tool_activity": None,
+    }
+
+
+def _remember_retry_state(job_id: str, state: Dict[str, Any]) -> None:
+    if not job_id:
+        return
+    _LAST_RETRY_STATE[job_id] = dict(state)
+    if len(_LAST_RETRY_STATE) <= _RETRY_STATE_LIMIT:
+        return
+    for key in list(_LAST_RETRY_STATE)[: len(_LAST_RETRY_STATE) - _RETRY_STATE_LIMIT]:
+        _LAST_RETRY_STATE.pop(key, None)
+
+
+def _failure_metadata(job_id: str, error: Optional[str]) -> Dict[str, Any]:
+    code, retryable = _classify_failure(error)
+    failure: Dict[str, Any] = {"code": code, "retryable": retryable}
+    state = _LAST_RETRY_STATE.get(job_id) or {}
+    if retryable and state:
+        retry = {
+            "attempts": int(state.get("attempts") or 0),
+            "max_attempts": int(state.get("max_attempts") or 0),
+        }
+        skipped_reason = state.get("skipped_reason")
+        if skipped_reason:
+            retry["skipped_reason"] = skipped_reason
+        if "tool_activity" in state:
+            retry["tool_activity"] = state.get("tool_activity")
+        failure["retry"] = retry
+    return failure
 
 
 def _is_retryable_error(error: Optional[str]) -> bool:
@@ -911,11 +997,31 @@ def _classify_failure(error: Optional[str]) -> tuple[str, bool]:
     return ("agent_error", False)
 
 
-def _friendly_failure(job_name: str, error: Optional[str]) -> str:
+def _friendly_failure(
+    job_name: str,
+    error: Optional[str],
+    retry_state: Optional[Dict[str, Any]] = None,
+) -> str:
     """Default-locale failure line; never leaks the raw error."""
     name = (job_name or "").strip() or "定时任务"
     code, _ = _classify_failure(error)
-    return f"⚠️ 定时任务「{name}」执行失败：{_FAILURE_REASON[code]}。"
+    reason = _FAILURE_REASON[code]
+    if code == "upstream_unavailable" and retry_state:
+        skipped = retry_state.get("skipped_reason")
+        attempts = int(retry_state.get("attempts") or 0)
+        if skipped == "tool_activity":
+            reason = "AI 服务暂时繁忙。本次已执行部分步骤，为避免重复操作未自动重试"
+        elif skipped == "activity_unknown":
+            reason = "AI 服务暂时繁忙。无法确认本次是否已执行操作，已跳过自动重试"
+        elif skipped == "retry_exhausted":
+            reason = f"AI 服务暂时繁忙。已自动重试 {attempts} 次仍失败"
+        elif skipped in {"no_agent", "job_script"}:
+            reason = "AI 服务暂时繁忙。该任务包含脚本步骤，为避免重复副作用未自动重试"
+        elif skipped == "retries_disabled":
+            reason = "AI 服务暂时繁忙。自动重试当前已关闭"
+        elif skipped == "shutdown":
+            reason = "AI 服务暂时繁忙。系统正在停止，已取消自动重试"
+    return f"⚠️ 定时任务「{name}」执行失败：{reason}。"
 
 
 def _redact_channel_failure(job: dict, content: Optional[str]):
@@ -953,6 +1059,8 @@ def _run_job_with_retry(orig_run_job, job):
     """Re-run a transient failure, but only while this run has produced zero
     tool activity (vs a fixed pre-run baseline) so side effects never repeat."""
     job_id = job.get("id", "")
+    state = _new_retry_state()
+    _LAST_RETRY_STATE.pop(job_id, None)
     # Run once (never retry) when retries are off, or when the job has side
     # effects the tool-activity guard can't see:
     #   • _MAX_RUN_RETRIES == 0 — retries disabled; also skips the baseline DB
@@ -963,7 +1071,17 @@ def _run_job_with_retry(orig_run_job, job):
     #     Hermes tool activity, so _attempt_tool_activity would read 0 ("safe")
     #     and a retry after an LLM 502 would re-execute the script's side effects.
     if _MAX_RUN_RETRIES == 0 or job.get("no_agent") or job.get("script"):
-        return orig_run_job(job)
+        result = orig_run_job(job)
+        if _is_retryable_failure_result(result):
+            state["retryable"] = True
+            if _MAX_RUN_RETRIES == 0:
+                state["skipped_reason"] = "retries_disabled"
+            elif job.get("no_agent"):
+                state["skipped_reason"] = "no_agent"
+            else:
+                state["skipped_reason"] = "job_script"
+            _remember_retry_state(job_id, state)
+        return result
     # Pre-run id snapshot, captured ONCE (ids only — no message reads). The guard
     # counts tools only in sessions absent from this set, so it never re-reads
     # the job's history and a reused same-second session id stays counted.
@@ -973,20 +1091,32 @@ def _run_job_with_retry(orig_run_job, job):
     # _is_retryable_failure_result bounds-checks the tuple; result[3] is the
     # error for agent jobs (script jobs are short-circuited above).
     while attempts < _MAX_RUN_RETRIES and _is_retryable_failure_result(result):
+        state["retryable"] = True
         activity = _attempt_tool_activity(job_id, baseline)
+        state["tool_activity"] = activity
         if activity != 0:  # None (unresolved) or >0 (work ran) → don't repeat
+            state["skipped_reason"] = (
+                "activity_unknown" if activity is None else "tool_activity"
+            )
             _dbg(f"run_job: skip retry job={job_id} run_activity={activity}")
             break
         attempts += 1
+        state["attempts"] = attempts
         _dbg(
             f"run_job: transient failure job={job_id} "
             f"retry {attempts}/{_MAX_RUN_RETRIES} after {_RETRY_BACKOFF_S}s"
         )
         # Interruptible backoff: True iff shutdown signalled mid-wait.
         if _shutdown.wait(_RETRY_BACKOFF_S):
+            state["skipped_reason"] = "shutdown"
             _dbg(f"run_job: shutdown during backoff — abort retry job={job_id}")
             break
         result = orig_run_job(job)
+    if _is_retryable_failure_result(result):
+        state["retryable"] = True
+        if not state.get("skipped_reason") and attempts >= _MAX_RUN_RETRIES:
+            state["skipped_reason"] = "retry_exhausted"
+        _remember_retry_state(job_id, state)
     return result
 
 
@@ -1183,10 +1313,9 @@ def _build_typed_message_content(
 
     if not success:
         # Structured failure for client-side i18n (clients localize off `code`).
-        _code, _retryable = _classify_failure(error)
-        metadata["failure"] = {"code": _code, "retryable": _retryable}
+        metadata["failure"] = _failure_metadata(job_id, error)
 
-    attachments = _collect_produced_files(job_id)
+    attachments = _collect_produced_files(job_id, job)
     if attachments:
         metadata["attachments"] = attachments
 
@@ -1194,7 +1323,7 @@ def _build_typed_message_content(
         body = _extract_response_body(_LATEST_OUTPUT.get(job_id, ""))
     else:
         # Friendly fallback; raw FAILED doc stays in the run .md.
-        body = _friendly_failure(job.get("name", ""), error)
+        body = _friendly_failure(job.get("name", ""), error, _LAST_RETRY_STATE.get(job_id))
 
     parts = [
         "```cron-summary",
@@ -1208,11 +1337,14 @@ def _build_typed_message_content(
     return "\n".join(parts)
 
 
-def _collect_produced_files(job_id: str) -> List[Dict[str, Any]]:
-    """Enumerate files written by Write/Edit-class tool calls in this job's
-    most recent cron session. Result is embedded into cron-summary metadata
-    so downstream clients (App, channel bridges) can render attachments
-    without re-deriving them from raw history.
+def _collect_produced_files(job_id: str, job: Optional[dict] = None) -> List[Dict[str, Any]]:
+    """Enumerate files produced by this job's most recent cron session.
+
+    The authoritative source is the session's agent-scoped output bucket,
+    filtered to this run's time window. Write/Edit-class tool calls are used as
+    hints and as a direct fast path only after the same output-root validation.
+    This catches terminal/execute_code side-effect deliverables while refusing
+    helper scripts, temp files, and old files in a reused shared bucket.
 
     Why look up the cron session by prefix instead of capturing it at
     save_job_output time: hermes upstream owns cron/scheduler.py and we
@@ -1220,8 +1352,8 @@ def _collect_produced_files(job_id: str) -> List[Dict[str, Any]]:
     `cron_{job_id}_{YYYYMMDD_HHMMSS}` is stable enough to query by.
 
     Silent degradation: any failure (no SessionDB, no matching session,
-    unreadable path, malformed tool_calls) yields an empty list — the
-    cron summary still ships without an attachments field.
+    unreadable path, malformed tool_calls) yields an empty list — the cron
+    summary still ships without an attachments field.
     """
     if not job_id:
         return []
@@ -1236,7 +1368,7 @@ def _collect_produced_files(job_id: str) -> List[Dict[str, Any]]:
         try:
             with db._lock:
                 cursor = db._conn.execute(
-                    "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' "
+                    "SELECT id, started_at FROM sessions WHERE id LIKE ? ESCAPE '\\' "
                     "ORDER BY started_at DESC LIMIT 1",
                     (_cron_session_like(job_id),),
                 )
@@ -1251,6 +1383,10 @@ def _collect_produced_files(job_id: str) -> List[Dict[str, Any]]:
             return []
         sid = row["id"]
         try:
+            started_at = float(row["started_at"])
+        except (TypeError, ValueError):
+            started_at = None
+        try:
             messages = db.get_messages(sid)
         except Exception as _e:
             _dbg(f"_collect_produced_files: get_messages FAILED sid={sid}: {_e!r}")
@@ -1261,8 +1397,29 @@ def _collect_produced_files(job_id: str) -> List[Dict[str, Any]]:
         except Exception:
             pass
 
-    seen: set = set()
+    agent_ids = _cron_agent_ids(job)
+    path_hints = _cron_path_hints(messages)
+    output_roots = _cron_output_bucket_roots(path_hints, agent_ids)
+
+    seen: set[str] = set()
     produced: List[Dict[str, Any]] = []
+    min_mtime = None
+    if started_at is not None:
+        min_mtime = max(0.0, started_at - _CRON_ATTACHMENT_MTIME_SLACK_S)
+
+    def _add(raw_path: str, *, require_mtime: bool, allow_external: bool = False) -> None:
+        if len(produced) >= _CRON_ATTACHMENT_LIMIT:
+            return
+        item = _cron_attachment_for_path(
+            raw_path,
+            output_roots,
+            seen,
+            min_mtime if require_mtime else None,
+            allow_external=allow_external,
+        )
+        if item:
+            produced.append(item)
+
     for msg in messages:
         if msg.get("role") != "assistant":
             continue
@@ -1299,23 +1456,234 @@ def _collect_produced_files(job_id: str) -> List[Dict[str, Any]]:
                 if v:
                     path = str(v).strip()
                     break
-            if not path or path in seen:
-                continue
-            seen.add(path)
-            try:
-                st = os.stat(path)
-            except OSError:
-                continue
-            if not _stat.S_ISREG(st.st_mode):
-                continue
-            mime, _enc = mimetypes.guess_type(path)
-            produced.append({
-                "path": path,
-                "name": os.path.basename(path),
-                "size": st.st_size,
-                "mime": mime or "application/octet-stream",
-            })
+            if path:
+                _add(path, require_mtime=True, allow_external=True)
+    for root in output_roots:
+        if len(produced) >= _CRON_ATTACHMENT_LIMIT:
+            break
+        for path in _iter_cron_output_files(root):
+            _add(str(path), require_mtime=True)
+            if len(produced) >= _CRON_ATTACHMENT_LIMIT:
+                break
+    for path in path_hints:
+        _add(path, require_mtime=True, allow_external=True)
+        if len(produced) >= _CRON_ATTACHMENT_LIMIT:
+            break
     return produced
+
+
+def _cron_agent_ids(job: Optional[dict]) -> set[str]:
+    ids: set[str] = set()
+    env_agent_id = os.environ.get("ZET_AGENT_ID", "").strip()
+    if env_agent_id:
+        ids.add(env_agent_id)
+    origin = (job or {}).get("origin") if isinstance(job, dict) else None
+    chat_id = ""
+    if isinstance(origin, dict):
+        chat_id = str(origin.get("chat_id", "") or "")
+    parts = chat_id.split(":", 3)
+    if len(parts) == 4 and parts[0] == "zettlab" and parts[2]:
+        ids.add(parts[2])
+    return ids
+
+
+def _cron_path_hints(messages: Iterable[dict]) -> List[str]:
+    hints: List[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        for value in (msg.get("content"), msg.get("tool_calls")):
+            _extend_path_hints(hints, value)
+            if len(hints) >= 256:
+                return hints
+    return hints
+
+
+def _extend_path_hints(out: List[str], value: Any) -> None:
+    if value in (None, "", [], {}):
+        return
+    try:
+        if isinstance(value, str):
+            text = value
+        else:
+            text = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        text = str(value)
+    for match in _ABSOLUTE_PATH_RE.finditer(text[:200_000]):
+        raw = _clean_cron_path_hint(match.group(0))
+        if raw:
+            out.append(raw)
+            if len(out) >= 256:
+                return
+
+
+def _clean_cron_path_hint(raw: str) -> str:
+    value = (raw or "").strip().strip("`*.,;:，。；：")
+    value = value.rstrip("\\")
+    if value.startswith("//") and not value.startswith("///"):
+        return ""
+    if value.startswith("///"):
+        value = "/" + value.lstrip("/")
+    return value
+
+
+def _cron_output_bucket_roots(path_hints: Iterable[str], agent_ids: set[str]) -> List[Path]:
+    if not agent_ids:
+        return []
+    roots: List[Path] = []
+    seen: set[str] = set()
+    for raw in path_hints:
+        root = _cron_output_bucket_root(raw, agent_ids)
+        if root is None:
+            continue
+        try:
+            resolved = root.resolve()
+        except OSError:
+            continue
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(resolved)
+        if len(roots) >= 8:
+            break
+    return roots
+
+
+def _cron_output_bucket_root(raw_path: str, agent_ids: set[str]) -> Optional[Path]:
+    path = _clean_cron_path_hint(raw_path)
+    if not path.startswith("/"):
+        return None
+    parts = Path(path).parts
+    if "agents" not in parts or "data" not in parts or "output" not in parts:
+        return None
+    try:
+        agents_idx = parts.index("agents")
+        data_idx = agents_idx + 1
+        if parts[data_idx] != "data":
+            return None
+        output_idx = parts.index("output", data_idx + 1)
+    except (IndexError, ValueError):
+        return None
+    if output_idx + 1 >= len(parts):
+        return None
+    agent_id = parts[data_idx + 1] if data_idx + 1 < len(parts) else ""
+    if agent_ids and agent_id not in agent_ids:
+        return None
+    root = Path(*parts[:output_idx + 2])
+    try:
+        st = os.stat(root)
+    except OSError:
+        return None
+    if not _stat.S_ISDIR(st.st_mode):
+        return None
+    return root
+
+
+def _iter_cron_output_files(root: Path) -> Iterable[Path]:
+    scanned = 0
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for name in sorted(filenames):
+            scanned += 1
+            if scanned > _CRON_ATTACHMENT_SCAN_FILE_LIMIT:
+                return
+            if name.startswith("."):
+                continue
+            yield Path(dirpath) / name
+
+
+def _cron_attachment_for_path(
+    raw_path: str,
+    roots: List[Path],
+    seen: set[str],
+    min_mtime: Optional[float],
+    *,
+    allow_external: bool = False,
+) -> Optional[Dict[str, Any]]:
+    path = _clean_cron_path_hint(raw_path)
+    if not path.startswith("/"):
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not _stat.S_ISREG(st.st_mode):
+        return None
+    if min_mtime is not None and st.st_mtime < min_mtime:
+        return None
+    if Path(path).suffix.lower() in _CRON_ATTACHMENT_EXCLUDED_SUFFIXES:
+        return None
+    try:
+        resolved = Path(path).resolve()
+    except OSError:
+        return None
+    under_output_root = _is_under_any_root(resolved, roots)
+    if not under_output_root and not (
+        allow_external and _is_external_cron_deliverable(resolved)
+    ):
+        return None
+    key = str(resolved)
+    if key in seen:
+        return None
+    seen.add(key)
+    mime, _enc = mimetypes.guess_type(str(resolved))
+    return {
+        "path": str(resolved),
+        "name": resolved.name,
+        "size": st.st_size,
+        "mime": mime or "application/octet-stream",
+    }
+
+
+def _is_external_cron_deliverable(path: Path) -> bool:
+    """Allow user-facing files created outside the canonical output bucket.
+
+    This intentionally admits reports like /root/nas-youtube-report.html while
+    keeping temporary scripts, sandbox scratch files, and extensionless system
+    paths out of chat attachments.
+    """
+    suffix = path.suffix.lower()
+    if suffix not in _CRON_ATTACHMENT_EXTERNAL_SUFFIXES:
+        return False
+    if _looks_like_agent_output_path(path):
+        return False
+    path_s = str(path)
+    for marker in ("/hermes_sandbox_", "/hermes_exec_"):
+        if marker in path_s:
+            return False
+    try:
+        parts = path.relative_to(path.anchor).parts
+    except ValueError:
+        parts = path.parts
+    if parts:
+        first = parts[0]
+        second = f"{parts[0]}/{parts[1]}" if len(parts) > 1 else ""
+        if first in _CRON_ATTACHMENT_TEMP_DIRS or second in _CRON_ATTACHMENT_TEMP_DIRS:
+            return False
+    return True
+
+
+def _looks_like_agent_output_path(path: Path) -> bool:
+    parts = path.parts
+    for i, part in enumerate(parts):
+        if part != "agents":
+            continue
+        if i + 3 < len(parts) and parts[i + 1] == "data" and parts[i + 3] == "output":
+            return True
+    return False
+
+
+def _is_under_any_root(path: Path, roots: List[Path]) -> bool:
+    path_s = str(path)
+    for root in roots:
+        root_s = str(root)
+        try:
+            if os.path.commonpath([root_s, path_s]) == root_s:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def _will_hit_repeat_limit(job: Optional[dict]) -> bool:
