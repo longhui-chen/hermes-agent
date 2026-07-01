@@ -129,7 +129,12 @@ async def test_session_model_switch_persists_override_no_note(monkeypatch):
     session_id = "zettlab:user1:agent-1:42"
     resp = await adapter._handle_session_model_switch(
         _FakeRequest(
-            {"model": "deepseek-v4", "provider": "custom"},
+            {
+                "model": "deepseek-v4",
+                "provider": "custom",
+                "supports_vision": False,
+                "auxiliary": {"vision": {}},
+            },
             match_info={"session_id": session_id},
         )
     )
@@ -139,6 +144,8 @@ async def test_session_model_switch_persists_override_no_note(monkeypatch):
     # pushed here — it's injected at the session's next turn by _run_agent's
     # open-time effective-model compare.
     assert gw._session_model_overrides[session_id]["model"] == "deepseek-v4"
+    assert gw._session_model_overrides[session_id]["supports_vision"] is False
+    assert gw._session_model_overrides[session_id]["auxiliary"] == {"vision": {}}
     assert evicted == [session_id]
     assert not hasattr(gw, "_pending_model_notes")
 

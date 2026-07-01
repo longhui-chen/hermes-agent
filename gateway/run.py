@@ -3391,7 +3391,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
+    def _resolve_turn_agent_config(
+        self,
+        user_message: str,
+        model: str,
+        runtime_kwargs: dict,
+        session_key: Optional[str] = None,
+    ) -> dict:
         """Build the effective model/runtime config for a single turn.
 
         Always uses the session's primary model/provider.  If `/fast` is
@@ -3412,9 +3418,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "credential_pool": runtime_kwargs.get("credential_pool"),
             "max_tokens": runtime_kwargs.get("max_tokens"),
         }
+        auxiliary_task_configs = self._session_runtime_auxiliary_task_configs(session_key)
+        supports_vision = self._session_runtime_supports_vision(session_key)
         route = {
             "model": model,
             "runtime": runtime,
+            "runtime_auxiliary_task_configs": auxiliary_task_configs,
+            "runtime_supports_vision": supports_vision,
             "signature": (
                 model,
                 runtime["provider"],
@@ -3423,6 +3433,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime["config_context_length"],
                 runtime["command"],
                 tuple(runtime["args"]),
+                json.dumps(auxiliary_task_configs or {}, sort_keys=True, default=str),
+                supports_vision,
             ),
         }
 
@@ -8559,7 +8571,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if image_paths:
                 # Decide routing: native (attach pixels) vs text (vision_analyze
                 # pre-run + prepend description).  See agent/image_routing.py.
-                _img_mode = self._decide_image_input_mode()
+                _turn_route_for_images = None
+                try:
+                    _img_user_config = _load_gateway_config()
+                    _img_model, _img_runtime = self._resolve_session_agent_runtime(
+                        source=source,
+                        session_key=session_key,
+                        user_config=_img_user_config,
+                    )
+                    _turn_route_for_images = self._resolve_turn_agent_config(
+                        message_text,
+                        _img_model,
+                        _img_runtime,
+                        session_key=session_key,
+                    )
+                    self._install_turn_auxiliary_runtime(_turn_route_for_images)
+                except Exception as _img_runtime_exc:
+                    logger.debug(
+                        "image_routing: session runtime resolution failed: %s",
+                        _img_runtime_exc,
+                    )
+                _img_mode = self._decide_image_input_mode(_turn_route_for_images)
                 if _img_mode == "native":
                     # Defer attachment to the run_conversation call site.
                     pending_native = getattr(self, "_pending_native_image_paths_by_session", None)
@@ -11098,8 +11130,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             user_config = _load_gateway_config()
+            session_key = self._session_key_for_source(source)
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
+                session_key=session_key,
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
@@ -11122,7 +11156,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reasoning_config = self._resolve_session_reasoning_config(source=source)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
-            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(
+                prompt, model, runtime_kwargs, session_key=session_key
+            )
 
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).
@@ -11135,6 +11171,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         image_paths.append(path)
                 if image_paths:
                     try:
+                        self._install_turn_auxiliary_runtime(turn_route)
                         enriched_prompt = await self._enrich_message_with_vision(
                             prompt, image_paths,
                         )
@@ -11171,6 +11208,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
+                agent.runtime_auxiliary_task_configs = turn_route.get("runtime_auxiliary_task_configs")
+                agent.runtime_supports_vision = turn_route.get("runtime_supports_vision")
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
@@ -12667,7 +12706,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ctx = copy_context()
         return await loop.run_in_executor(None, ctx.run, func, *args)
 
-    def _decide_image_input_mode(self) -> str:
+    def _decide_image_input_mode(self, turn_route: Optional[dict] = None) -> str:
         """Resolve the image-input routing for the currently active model.
 
         Returns ``"native"`` (attach pixels on the user turn) or ``"text"``
@@ -12685,10 +12724,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cfg = load_config()
             provider = _read_main_provider()
             model = _read_main_model()
+            if isinstance(turn_route, dict):
+                runtime = turn_route.get("runtime") or {}
+                provider = (runtime.get("provider") or provider or "").strip()
+                model = (turn_route.get("model") or model or "").strip()
+                cfg = self._overlay_image_routing_config(cfg, turn_route)
             return decide_image_input_mode(provider, model, cfg)
         except Exception as exc:
             logger.debug("image_routing: decision failed, falling back to text — %s", exc)
             return "text"
+
+    def _overlay_image_routing_config(self, cfg: dict, turn_route: dict) -> dict:
+        """Overlay session-scoped vision routing fields onto config copy."""
+        out = dict(cfg) if isinstance(cfg, dict) else {}
+        auxiliary_task_configs = turn_route.get("runtime_auxiliary_task_configs")
+        if isinstance(auxiliary_task_configs, dict) and "vision" in auxiliary_task_configs:
+            aux = dict(out.get("auxiliary") or {})
+            vision_cfg = auxiliary_task_configs.get("vision")
+            aux["vision"] = dict(vision_cfg) if isinstance(vision_cfg, dict) else {}
+            out["auxiliary"] = aux
+
+        supports_vision = turn_route.get("runtime_supports_vision")
+        if isinstance(supports_vision, bool):
+            model_cfg = dict(out.get("model") or {})
+            model_cfg["default"] = turn_route.get("model") or model_cfg.get("default", "")
+            model_cfg["supports_vision"] = supports_vision
+            out["model"] = model_cfg
+        return out
 
     async def _enrich_message_with_vision(
         self,
@@ -13479,6 +13541,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if context_length is not None:
             runtime_kwargs["config_context_length"] = context_length
         return model, runtime_kwargs
+
+    def _session_runtime_auxiliary_task_configs(self, session_key: Optional[str]) -> Optional[dict]:
+        """Return session-scoped auxiliary task config from model override."""
+        if not session_key:
+            return None
+        override = self._session_model_overrides.get(session_key)
+        if not isinstance(override, dict):
+            return None
+        auxiliary = override.get("auxiliary")
+        if not isinstance(auxiliary, dict):
+            return None
+        cleaned = {}
+        for task, task_config in auxiliary.items():
+            if isinstance(task, str) and isinstance(task_config, dict):
+                cleaned[task] = dict(task_config)
+        return cleaned
+
+    def _session_runtime_supports_vision(self, session_key: Optional[str]) -> Optional[bool]:
+        """Return session-scoped model.supports_vision override if present."""
+        if not session_key:
+            return None
+        override = self._session_model_overrides.get(session_key)
+        if not isinstance(override, dict):
+            return None
+        value = override.get("supports_vision")
+        return value if isinstance(value, bool) else None
+
+    def _install_turn_auxiliary_runtime(self, turn_route: dict) -> None:
+        """Expose the active turn runtime to auxiliary_client."""
+        try:
+            from agent.auxiliary_client import (
+                set_runtime_auxiliary_task_configs,
+                set_runtime_main,
+            )
+            runtime = turn_route.get("runtime") or {}
+            set_runtime_main(
+                runtime.get("provider") or "",
+                turn_route.get("model") or "",
+                base_url=runtime.get("base_url") or "",
+                api_key=runtime.get("api_key") or "",
+                api_mode=runtime.get("api_mode") or "",
+            )
+            set_runtime_auxiliary_task_configs(
+                turn_route.get("runtime_auxiliary_task_configs")
+            )
+        except Exception:
+            logger.debug("session auxiliary runtime install failed", exc_info=True)
 
     def _is_intentional_model_switch(self, session_key: str, agent_model: str) -> bool:
         """Return True if *agent_model* matches an active /model session override."""
@@ -15493,7 +15602,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_message="interim_assistant_callback scheduling error",
                 )
 
-            turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(
+                message, model, runtime_kwargs, session_key=session_key
+            )
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -15607,6 +15718,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
+            agent.runtime_auxiliary_task_configs = turn_route.get("runtime_auxiliary_task_configs")
+            agent.runtime_supports_vision = turn_route.get("runtime_supports_vision")
             agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
             # Discord voice verbal-ack hook (fires once per turn on first tool
             # call; armed only when in a voice channel with the mixer running).

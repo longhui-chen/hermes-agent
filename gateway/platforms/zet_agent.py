@@ -694,6 +694,8 @@ class ZetAgentAdapter(APIServerAdapter):
         # which this adapter's _create_agent bypasses. Check it here.
         gw = getattr(self, "gateway_runner", None)
         override_key = gateway_session_key or session_id
+        runtime_auxiliary_task_configs = None
+        runtime_supports_vision = None
         if gw is not None and override_key:
             override = getattr(gw, "_session_model_overrides", {}).get(override_key)
             if override:
@@ -705,6 +707,12 @@ class ZetAgentAdapter(APIServerAdapter):
                 context_length = override.get("context_length")
                 if context_length is not None:
                     runtime_kwargs["config_context_length"] = context_length
+                auxiliary = override.get("auxiliary")
+                if isinstance(auxiliary, dict):
+                    runtime_auxiliary_task_configs = auxiliary
+                supports_vision = override.get("supports_vision")
+                if isinstance(supports_vision, bool):
+                    runtime_supports_vision = supports_vision
                 logger.info(
                     "session-model-override applied: session=%s model=%s",
                     override_key, model,
@@ -736,6 +744,8 @@ class ZetAgentAdapter(APIServerAdapter):
             gateway_session_key=gateway_session_key,
             request_overrides=request_overrides,
         )
+        agent.runtime_auxiliary_task_configs = runtime_auxiliary_task_configs
+        agent.runtime_supports_vision = runtime_supports_vision
 
         stream_q = self._sniff_stream_q(
             tool_start_callback,
@@ -1437,6 +1447,8 @@ class ZetAgentAdapter(APIServerAdapter):
         new_api_key = body.get("api_key", "")
         new_api_mode = body.get("api_mode", "")
         new_context_length = body.get("context_length", None)
+        new_supports_vision = body.get("supports_vision", None)
+        new_auxiliary = body.get("auxiliary", None)
 
         # Build the override dict — only include keys that were provided.
         override: Dict[str, Any] = {"model": new_model}
@@ -1450,6 +1462,10 @@ class ZetAgentAdapter(APIServerAdapter):
             override["api_mode"] = new_api_mode
         if new_context_length is not None:
             override["context_length"] = new_context_length
+        if isinstance(new_supports_vision, bool):
+            override["supports_vision"] = new_supports_vision
+        if isinstance(new_auxiliary, dict):
+            override["auxiliary"] = new_auxiliary
 
         # Store override in gateway_runner so the next _create_agent call
         # for this session reads the overridden model.

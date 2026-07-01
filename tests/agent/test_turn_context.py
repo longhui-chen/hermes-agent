@@ -107,7 +107,8 @@ def _stub_runtime_main():
     resolution) when the per-test process isolation plugin is disabled. Stub
     it out so the prologue tests stay hermetic.
     """
-    with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None):
+    with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None), \
+         patch("agent.auxiliary_client.set_runtime_auxiliary_task_configs", lambda *a, **k: None):
         yield
 
 
@@ -258,4 +259,3 @@ def test_between_turns_refresh_no_churn_when_unchanged():
         _build(agent)
 
     assert agent.tools is same  # not replaced → no churn
-

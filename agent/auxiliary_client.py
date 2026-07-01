@@ -45,6 +45,7 @@ import logging
 import os
 import threading
 import time
+from contextvars import ContextVar
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
@@ -1787,6 +1788,10 @@ _RUNTIME_MAIN_MODEL: str = ""
 _RUNTIME_MAIN_BASE_URL: str = ""
 _RUNTIME_MAIN_API_KEY: str = ""
 _RUNTIME_MAIN_API_MODE: str = ""
+_RUNTIME_AUXILIARY_TASK_CONFIGS: ContextVar[Dict[str, Dict[str, Any]]] = ContextVar(
+    "runtime_auxiliary_task_configs",
+    default={},
+)
 
 
 def set_runtime_main(
@@ -1826,6 +1831,30 @@ def clear_runtime_main() -> None:
     _RUNTIME_MAIN_BASE_URL = ""
     _RUNTIME_MAIN_API_KEY = ""
     _RUNTIME_MAIN_API_MODE = ""
+    clear_runtime_auxiliary_task_configs()
+
+
+def set_runtime_auxiliary_task_configs(configs: Optional[Dict[str, Any]]) -> None:
+    """Record session-scoped auxiliary task overrides.
+
+    local-server writes these into ``session_model_overrides.json`` when a
+    session model differs from the profile default. They must override
+    config.yaml so a cloud-profile session switched to a custom model does not
+    keep using the profile's cloud ``auxiliary.vision`` route.
+    """
+    normalized: Dict[str, Dict[str, Any]] = {}
+    if isinstance(configs, dict):
+        for task, task_config in configs.items():
+            if not isinstance(task, str) or not task.strip():
+                continue
+            if isinstance(task_config, dict):
+                normalized[task.strip()] = dict(task_config)
+    _RUNTIME_AUXILIARY_TASK_CONFIGS.set(normalized)
+
+
+def clear_runtime_auxiliary_task_configs() -> None:
+    """Clear session-scoped auxiliary task overrides."""
+    _RUNTIME_AUXILIARY_TASK_CONFIGS.set({})
 
 
 def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[str]]:
@@ -4911,6 +4940,9 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     """
     if not task:
         return {}
+    runtime_task_config = _RUNTIME_AUXILIARY_TASK_CONFIGS.get().get(task)
+    if isinstance(runtime_task_config, dict):
+        return dict(runtime_task_config)
     try:
         from hermes_cli.config import load_config
         config = load_config()
