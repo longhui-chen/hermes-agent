@@ -152,6 +152,40 @@ class TestStartRun:
         assert resp.status == 400
 
     @pytest.mark.asyncio
+    async def test_start_rejects_non_string_session_id(self, adapter):
+        app = _create_runs_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/v1/runs",
+                json={"input": "hello", "session_id": 123},
+            )
+            assert resp.status == 400
+            data = await resp.json()
+        assert data["error"]["code"] == "invalid_session_id"
+        assert adapter._run_streams == {}
+        assert adapter._run_statuses == {}
+
+    @pytest.mark.asyncio
+    async def test_start_rejects_control_chars_in_session_id(self, adapter):
+        app = _create_runs_app(adapter)
+        for bad_session_id in (
+            "\rabc",
+            "abc\n",
+            "zettlab:u:a:run\r\nx-bad:1",
+            "zettlab:u:a:bad\x01id",
+        ):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "session_id": bad_session_id},
+                )
+                assert resp.status == 400
+                data = await resp.json()
+            assert data["error"]["code"] == "invalid_session_id"
+            assert adapter._run_streams == {}
+            assert adapter._run_statuses == {}
+
+    @pytest.mark.asyncio
     async def test_start_invalid_history_does_not_allocate_run(self, adapter):
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -231,15 +265,25 @@ class TestRunStatus:
         async with TestClient(TestServer(app)) as cli:
             with patch.object(adapter, "_create_agent") as mock_create:
                 mock_agent = MagicMock()
-                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                captured_context = {}
+
+                def _run_conversation(*_args, **_kwargs):
+                    from gateway.session_context import billing_task_id, get_session_env
+
+                    captured_context["session_id"] = get_session_env("HERMES_SESSION_ID", "")
+                    captured_context["billing_task_id"] = billing_task_id()
+                    return {"final_response": "done"}
+
+                mock_agent.run_conversation.side_effect = _run_conversation
                 mock_agent.session_prompt_tokens = 0
                 mock_agent.session_completion_tokens = 0
                 mock_agent.session_total_tokens = 0
                 mock_create.return_value = mock_agent
+                session_id = "zettlab:dev-user:main:run123"
 
                 resp = await cli.post(
                     "/v1/runs",
-                    json={"input": "hello", "session_id": "space-session"},
+                    json={"input": "hello", "session_id": session_id},
                 )
                 data = await resp.json()
                 run_id = data["run_id"]
@@ -252,8 +296,10 @@ class TestRunStatus:
                     await asyncio.sleep(0.05)
 
                 mock_agent.run_conversation.assert_called_once()
-                assert mock_agent.run_conversation.call_args.kwargs["task_id"] == "space-session"
-                assert status["session_id"] == "space-session"
+                assert mock_agent.run_conversation.call_args.kwargs["task_id"] == session_id
+                assert status["session_id"] == session_id
+                assert captured_context["session_id"] == session_id
+                assert captured_context["billing_task_id"] == session_id
 
     @pytest.mark.asyncio
     async def test_status_not_found_returns_404(self, adapter):

@@ -1076,7 +1076,7 @@ class TestChatCompletionsGeminiNativeExtraBodyStrip:
 
 
 class TestChatCompletionsZettlabTaskHeaders:
-    """X-Task-Id / X-Scene-Type injection for zettlab credit-ledger task grouping."""
+    """Zettlab task/routing header injection for NAS sessions."""
 
     def test_zettlab_session_injects_task_headers(self, transport):
         msgs = [{"role": "user", "content": "hi"}]
@@ -1088,6 +1088,7 @@ class TestChatCompletionsZettlabTaskHeaders:
         )
         headers = kw.get("extra_headers") or {}
         assert headers.get("X-Task-Id") == "zettlab:u1:agent-a:abc123"
+        assert headers.get("X-Zettlab-Conversation-ID") == "zettlab:u1:agent-a:abc123"
         assert headers.get("X-Scene-Type") == "agent"
 
     def test_non_zettlab_session_omits_task_headers(self, transport):
@@ -1100,12 +1101,14 @@ class TestChatCompletionsZettlabTaskHeaders:
         )
         headers = kw.get("extra_headers") or {}
         assert "X-Task-Id" not in headers
+        assert "X-Zettlab-Conversation-ID" not in headers
 
     def test_missing_session_omits_task_headers(self, transport):
         msgs = [{"role": "user", "content": "hi"}]
         kw = transport.build_kwargs(model="gpt-4o", messages=msgs, timeout=30.0)
         headers = kw.get("extra_headers") or {}
         assert "X-Task-Id" not in headers
+        assert "X-Zettlab-Conversation-ID" not in headers
 
     def test_cron_session_collapses_to_stable_job_task_id(self, transport):
         # cron_<job>_<YYYYMMDD>_<HHMMSS> -> cron_<job> so all runs of a cron job
@@ -1119,6 +1122,7 @@ class TestChatCompletionsZettlabTaskHeaders:
         )
         headers = kw.get("extra_headers") or {}
         assert headers.get("X-Task-Id") == "cron_4b2628798006"
+        assert headers.get("X-Zettlab-Conversation-ID") == "cron_4b2628798006"
         assert headers.get("X-Scene-Type") == "agent"
 
     def test_cron_session_stamps_encoded_job_title(self, transport):

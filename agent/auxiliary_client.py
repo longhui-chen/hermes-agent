@@ -370,11 +370,7 @@ def _apply_user_default_headers(headers: dict | None) -> dict | None:
     main turn would succeed but title/compression/vision calls to the same
     endpoint would still fail. (#40033)
 
-    Also stamps the zettlab credit-ledger ``X-Task-Id``/``X-Scene-Type`` headers
-    for the current session (see ``billing_task_id``) so auxiliary spend is
-    attributed to its task card.
-
-    Returns the merged dict (user overrides + billing headers), or the original
+    Returns the merged dict (user overrides), or the original
     ``headers`` (possibly ``None``) when there is nothing to add.
     """
     merged = dict(headers or {})
@@ -388,13 +384,27 @@ def _apply_user_default_headers(headers: dict | None) -> dict | None:
             if value is None:
                 continue
             merged[str(key)] = str(value)
+    return merged or headers
+
+
+def _apply_zettlab_session_headers(headers: dict | None) -> dict | None:
+    """Stamp per-request Zettlab billing/routing headers for the current session.
+
+    These headers must never live in cached OpenAI ``default_headers``: auxiliary
+    clients are cached across turns/sessions, while the Zettlab conversation id
+    is request-scoped. Keep them in ``extra_headers`` on each create() call so a
+    cache hit cannot leak another conversation's sticky-routing key.
+    """
+    merged = dict(headers or {})
     # Zettlab credit-ledger task grouping: attribute auxiliary calls
     # (compression / title / vision) to the conversation/cron task by stamping
     # X-Task-Id, so they aggregate into its task card instead of surfacing as
-    # orphan model rows. Each aux client is built fresh per call, so reading the
-    # concurrency-safe session contextvar here is always current (no stale
-    # cross-session reuse). billing_task_id() maps interactive vs cron sessions
-    # and returns '' for non-NAS sessions (no leak to third-party providers).
+    # orphan model rows. Stamp the same value as X-Zettlab-Conversation-ID so
+    # ai-gateway's model-routing can use an explicit sticky/canary session key.
+    # Each aux client is built fresh per call, so reading the concurrency-safe
+    # session contextvar here is always current (no stale cross-session reuse).
+    # billing_task_id() maps interactive vs cron sessions and returns '' for
+    # non-NAS sessions (no leak to third-party providers).
     try:
         from gateway.session_context import billing_task_id, billing_task_title_encoded
         task_id = billing_task_id()
@@ -404,6 +414,7 @@ def _apply_user_default_headers(headers: dict | None) -> dict | None:
         task_title = ""
     if task_id:
         merged.setdefault("X-Task-Id", task_id)
+        merged.setdefault("X-Zettlab-Conversation-ID", task_id)
         merged.setdefault("X-Scene-Type", "agent")
         # Cron job name → X-Task-Title (empty for interactive); see chat_completions.
         if task_title:
@@ -1575,17 +1586,19 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
             _mark_provider_unhealthy("openrouter", ttl=60)
             return None, None
         base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
+        headers = _apply_user_default_headers(build_or_headers())
         logger.debug("Auxiliary client: OpenRouter via pool")
         return OpenAI(api_key=or_key, base_url=base_url,
-                       default_headers=build_or_headers()), model or _OPENROUTER_MODEL
+                       default_headers=headers), model or _OPENROUTER_MODEL
 
     or_key = explicit_api_key or os.getenv("OPENROUTER_API_KEY")
     if not or_key:
         _mark_provider_unhealthy("openrouter", ttl=60)
         return None, None
+    headers = _apply_user_default_headers(build_or_headers())
     logger.debug("Auxiliary client: OpenRouter")
     return OpenAI(api_key=or_key, base_url=OPENROUTER_BASE_URL,
-                   default_headers=build_or_headers()), model or _OPENROUTER_MODEL
+                   default_headers=headers), model or _OPENROUTER_MODEL
 
 
 def _describe_openrouter_unavailable() -> str:
@@ -1680,6 +1693,7 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
         OpenAI(
             api_key=api_key,
             base_url=base_url,
+            default_headers=_apply_user_default_headers(None),
         ),
         model,
     )
@@ -4566,7 +4580,11 @@ def _refresh_nous_auxiliary_client(
         return None, model
 
     fresh_key, fresh_base_url = runtime
-    sync_client = OpenAI(api_key=fresh_key, base_url=fresh_base_url)
+    sync_client = OpenAI(
+        api_key=fresh_key,
+        base_url=fresh_base_url,
+        default_headers=_apply_user_default_headers(None),
+    )
     final_model = model
 
     current_loop = None
@@ -5186,6 +5204,10 @@ def _build_call_kwargs(
         merged_extra.setdefault("tags", []).extend(_nous_portal_tags())
     if merged_extra:
         kwargs["extra_body"] = merged_extra
+
+    extra_headers = _apply_zettlab_session_headers(kwargs.get("extra_headers"))
+    if extra_headers:
+        kwargs["extra_headers"] = extra_headers
 
     return kwargs
 

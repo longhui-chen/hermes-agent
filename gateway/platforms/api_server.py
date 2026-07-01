@@ -1261,6 +1261,31 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return raw, None
 
+    def _parse_run_session_id(
+        self, raw: Any
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        if raw is None or raw == "":
+            return None, None
+        if not isinstance(raw, str):
+            return None, web.json_response(
+                _openai_error("'session_id' must be a string", code="invalid_session_id"),
+                status=400,
+            )
+        if any(ord(c) < 0x20 for c in raw):
+            return None, web.json_response(
+                _openai_error("Invalid session ID", code="invalid_session_id"),
+                status=400,
+            )
+        session_id = raw.strip()
+        if not session_id:
+            return None, None
+        if len(session_id) > self._MAX_SESSION_HEADER_LEN:
+            return None, web.json_response(
+                _openai_error("Session ID too long", code="invalid_session_id"),
+                status=400,
+            )
+        return session_id, None
+
     # ------------------------------------------------------------------
     # Session DB helper
     # ------------------------------------------------------------------
@@ -4450,8 +4475,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
+        explicit_session_id, session_err = self._parse_run_session_id(body.get("session_id"))
+        if session_err is not None:
+            return session_err
+
         run_id = f"run_{uuid.uuid4().hex}"
-        session_id = body.get("session_id") or stored_session_id or run_id
+        session_id = explicit_session_id or stored_session_id or run_id
         approval_session_key = gateway_session_key or session_id or run_id
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
@@ -4535,6 +4564,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         session_tokens = set_session_vars(
                             platform="api_server",
                             session_key=approval_session_key,
+                            session_id=session_id or "",
                         )
                         register_gateway_notify(approval_session_key, _approval_notify)
                         r = agent.run_conversation(

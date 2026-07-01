@@ -39,6 +39,19 @@ from utils import base_url_host_matches, base_url_hostname, env_int
 logger = logging.getLogger(__name__)
 
 
+def _apply_zettlab_summary_headers(summary_kwargs: Dict[str, Any], agent: Any) -> None:
+    """Stamp Zettlab routing/billing headers on manual summary Chat calls."""
+    try:
+        from agent.transports.chat_completions import _apply_zettlab_billing_headers
+
+        _apply_zettlab_billing_headers(
+            summary_kwargs,
+            {"session_id": getattr(agent, "session_id", "")},
+        )
+    except Exception:
+        return
+
+
 def _ra():
     """Lazy ``run_agent`` reference.
 
@@ -1460,6 +1473,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
             if summary_extra_body:
                 summary_kwargs["extra_body"] = summary_extra_body
+            _apply_zettlab_summary_headers(summary_kwargs, agent)
 
             if agent.api_mode == "anthropic_messages":
                 _tsum = agent._get_transport()
@@ -1513,6 +1527,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
+                _apply_zettlab_summary_headers(summary_kwargs, agent)
 
                 summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary_retry").chat.completions.create(**summary_kwargs)
                 _retry_result = agent._get_transport().normalize_response(summary_response)
