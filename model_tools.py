@@ -551,8 +551,60 @@ def _resolve_active_context_length() -> int:
         model_id = (model_cfg.get("model") or model_cfg.get("default") or "").strip()
         if not model_id:
             return 0
+        raw_context_length = model_cfg.get("context_length")
+        if raw_context_length is not None and not isinstance(raw_context_length, bool):
+            try:
+                context_length = int(raw_context_length)
+                if context_length > 0:
+                    return context_length
+            except (TypeError, ValueError):
+                logger.debug(
+                    "Ignoring invalid model.context_length for tool search: %r",
+                    raw_context_length,
+                )
+
+        custom_providers = None
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
+            custom_providers = get_compatible_custom_providers(cfg)
+        except Exception:
+            raw_custom_providers = cfg.get("custom_providers")
+            custom_providers = raw_custom_providers if isinstance(raw_custom_providers, list) else None
+
+        provider = (model_cfg.get("provider") or "").strip()
+        base_url = (model_cfg.get("base_url") or "").strip()
+        api_key = (model_cfg.get("api_key") or "").strip()
+        if not base_url and provider and isinstance(custom_providers, list):
+            provider_key = provider.lower()
+            for entry in custom_providers:
+                if not isinstance(entry, dict):
+                    continue
+                aliases = (
+                    entry.get("provider_key"),
+                    entry.get("name"),
+                    entry.get("provider"),
+                )
+                if provider_key not in {
+                    str(alias or "").strip().lower() for alias in aliases
+                    if str(alias or "").strip()
+                }:
+                    continue
+                base_url = (entry.get("base_url") or "").strip()
+                if not api_key:
+                    api_key = (entry.get("api_key") or "").strip()
+                    key_env = (entry.get("key_env") or "").strip()
+                    if not api_key and key_env:
+                        api_key = os.environ.get(key_env, "").strip()
+                break
+
         from agent.model_metadata import get_model_context_length
-        return int(get_model_context_length(model_id) or 0)
+        return int(get_model_context_length(
+            model_id,
+            base_url=base_url,
+            api_key=api_key,
+            provider=provider,
+            custom_providers=custom_providers,
+        ) or 0)
     except Exception as e:
         logger.debug("Could not resolve active context length: %s", e)
         return 0

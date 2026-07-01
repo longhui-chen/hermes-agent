@@ -9,6 +9,7 @@ from model_tools import (
     get_tool_definitions,
     get_all_tool_names,
     get_toolset_for_tool,
+    _resolve_active_context_length,
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
     TOOL_TO_TOOLSET_MAP,
@@ -201,6 +202,194 @@ class TestHandleFunctionCall:
         post_call = next(call for call in hook_calls if call[0] == "post_tool_call")
         assert pre_call[1]["middleware_trace"] == expected_trace
         assert post_call[1]["middleware_trace"] == expected_trace
+
+
+# =========================================================================
+# Tool-search context length resolution
+# =========================================================================
+
+class TestToolSearchContextLength:
+    def test_prefers_configured_model_context_length_without_metadata_probe(self, monkeypatch):
+        """Configured model.context_length should be authoritative for the
+        tool-search gate. This prevents cold-start metadata probing when
+        local-server has already written the context window into config.yaml.
+        """
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "model": {
+                    "default": "lite",
+                    "provider": "custom",
+                    "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+                    "api_key": "local-ai-proxy",
+                    "context_length": 200_000,
+                }
+            },
+        )
+
+        def fail_metadata_probe(*args, **kwargs):
+            raise AssertionError(
+                "metadata resolver should not run when model.context_length is set"
+            )
+
+        monkeypatch.setattr(
+            "agent.model_metadata.get_model_context_length",
+            fail_metadata_probe,
+        )
+
+        assert _resolve_active_context_length() == 200_000
+
+    def test_ai_proxy_context_resolution_flow_passes_runtime_to_resolver(self, monkeypatch):
+        """When context_length is absent, pass the ai-proxy provider bundle to
+        the resolver instead of looking up bare model='lite'. Bare lookups can
+        fall through to OpenRouter metadata; the provider bundle keeps the
+        probe on the local /v1/models endpoint.
+        """
+        cfg = {
+            "model": {
+                "default": "lite",
+                "provider": "custom",
+                "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+                "api_key": "local-ai-proxy",
+            },
+            "custom_providers": [
+                {
+                    "name": "zettlab-ai-proxy",
+                    "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+                    "models": {"lite": {"context_length": 200_000}},
+                }
+            ],
+        }
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+        captured = {}
+
+        def fake_get_model_context_length(model, **kwargs):
+            captured["model"] = model
+            captured["kwargs"] = kwargs
+            return 200_000
+
+        monkeypatch.setattr(
+            "agent.model_metadata.get_model_context_length",
+            fake_get_model_context_length,
+        )
+
+        assert _resolve_active_context_length() == 200_000
+        assert captured["model"] == "lite"
+        assert (
+            captured["kwargs"]["base_url"]
+            == "http://127.0.0.1:9090/api/v1/ai-proxy/v1"
+        )
+        assert captured["kwargs"]["api_key"] == "local-ai-proxy"
+        assert captured["kwargs"]["provider"] == "custom"
+        assert captured["kwargs"]["custom_providers"] == cfg["custom_providers"]
+
+    def test_named_provider_context_resolution_flow_uses_provider_base_url(
+        self,
+        monkeypatch,
+    ):
+        """Hermes v12 providers can name the active provider while keeping the
+        endpoint under providers.<key>. Tool-search context resolution must
+        pass that endpoint through so per-model context_length can match.
+        """
+        cfg = {
+            "model": {
+                "default": "lite",
+                "provider": "zettlab-ai-proxy",
+            },
+            "providers": {
+                "zettlab-ai-proxy": {
+                    "name": "Zettlab AI Proxy",
+                    "api": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+                    "api_key": "local-ai-proxy",
+                    "models": {"lite": {"context_length": 200_000}},
+                }
+            },
+        }
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+        captured = {}
+
+        def fake_get_model_context_length(model, **kwargs):
+            captured["model"] = model
+            captured["kwargs"] = kwargs
+            return 200_000
+
+        monkeypatch.setattr(
+            "agent.model_metadata.get_model_context_length",
+            fake_get_model_context_length,
+        )
+
+        assert _resolve_active_context_length() == 200_000
+        assert captured["model"] == "lite"
+        assert (
+            captured["kwargs"]["base_url"]
+            == "http://127.0.0.1:9090/api/v1/ai-proxy/v1"
+        )
+        assert captured["kwargs"]["api_key"] == "local-ai-proxy"
+        assert captured["kwargs"]["provider"] == "zettlab-ai-proxy"
+        assert captured["kwargs"]["custom_providers"][0]["provider_key"] == (
+            "zettlab-ai-proxy"
+        )
+
+    def test_ai_proxy_endpoint_context_resolution_does_not_call_openrouter(
+        self,
+        monkeypatch,
+    ):
+        """If config lacks context_length but has the ai-proxy endpoint, the
+        resolver should stop at local /v1/models metadata and never hit the
+        OpenRouter catalog fallback.
+        """
+        cfg = {
+            "model": {
+                "default": "lite",
+                "provider": "custom",
+                "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+                "api_key": "local-ai-proxy",
+            },
+        }
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+        monkeypatch.setattr(
+            "agent.model_metadata.get_cached_context_length",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "agent.model_metadata.fetch_endpoint_model_metadata",
+            lambda base_url, api_key="": {
+                "lite": {
+                    "id": "lite",
+                    "context_length": 200_000,
+                }
+            },
+        )
+
+        def fail_openrouter_fetch(*args, **kwargs):
+            raise AssertionError("OpenRouter metadata fallback should not run")
+
+        monkeypatch.setattr(
+            "agent.model_metadata.fetch_model_metadata",
+            fail_openrouter_fetch,
+        )
+
+        assert _resolve_active_context_length() == 200_000
+
+    def test_invalid_configured_context_length_falls_back_to_resolver(
+        self,
+        monkeypatch,
+    ):
+        cfg = {
+            "model": {
+                "default": "lite",
+                "provider": "custom",
+                "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+                "context_length": True,
+            }
+        }
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+        monkeypatch.setattr(
+            "agent.model_metadata.get_model_context_length",
+            lambda *args, **kwargs: 200_000,
+        )
+
+        assert _resolve_active_context_length() == 200_000
 
 
 # =========================================================================
