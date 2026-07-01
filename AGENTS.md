@@ -6,6 +6,15 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 ---
 
+## Review guidelines
+
+- GitHub Codex code review 评论必须使用简体中文。
+- 保持严重级别标签 `P0` / `P1` / `P2` 原样，不翻译、不改名；评论标题、影响说明和修复建议用中文表达。
+- 代码符号、标识符、文件路径、路由路径、SQL / 表名、错误码、环境变量、API 名称和协议名保持原文。
+- 每条 finding 要用中文简洁说明用户可见影响或系统风险，并给出需要的修复方向。
+
+---
+
 ## ⚠️ Engineering Hard Rules — 全员 / 全 Agent 必须遵守（镜像自 monorepo）
 
 > 本节与 monorepo [`zettlab-product-dev/AGENTS.md`](https://github.com/zettlab/zettlab-product-dev/blob/main/AGENTS.md) 同源。**即使只克隆本子仓库 workspace 单独开发（cursor / claude / codex / windsurf 等），也必须遵守这 6 条**。任何 PR / spec / plan 都要主动声明对它们的影响（哪怕"无影响"也写一行）。
