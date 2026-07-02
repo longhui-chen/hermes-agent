@@ -9,7 +9,8 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 ## Review guidelines
 
 - GitHub Codex code review 评论必须使用简体中文。
-- 保持严重级别标签 `P0` / `P1` / `P2` 原样，不翻译、不改名；评论标题、影响说明和修复建议用中文表达。
+- GitHub Codex code review 只发布 `P0` / `P1` finding；不要把 `P2` 级别问题作为 GitHub review comment 发出。
+- 保持严重级别标签 `P0` / `P1` 原样，不翻译、不改名；评论标题、影响说明和修复建议用中文表达。
 - 代码符号、标识符、文件路径、路由路径、SQL / 表名、错误码、环境变量、API 名称和协议名保持原文。
 - 每条 finding 要用中文简洁说明用户可见影响或系统风险，并给出需要的修复方向。
 
