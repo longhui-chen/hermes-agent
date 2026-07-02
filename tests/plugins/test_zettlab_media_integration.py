@@ -22,6 +22,7 @@ def test_image_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
 
     image_gen_registry._reset_for_tests()
     image_gen_registry.register_provider(ZettlabImageGenProvider())
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
     monkeypatch.setattr(image_tool, "_read_configured_image_provider", lambda: "zettlab")
     monkeypatch.setattr(image_tool, "_read_configured_image_model", lambda: "seedream-v4")
     monkeypatch.setattr("hermes_cli.plugins._ensure_plugins_discovered", lambda *args, **kwargs: None)
@@ -59,6 +60,7 @@ def test_video_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
 
     video_gen_registry._reset_for_tests()
     video_gen_registry.register_provider(ZettlabVideoGenProvider())
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
     monkeypatch.setattr(video_tool, "_read_configured_video_provider", lambda: "zettlab")
     monkeypatch.setattr(video_tool, "_read_configured_video_model", lambda: "seedance-v1")
     monkeypatch.setattr("hermes_cli.plugins._ensure_plugins_discovered", lambda *args, **kwargs: None)

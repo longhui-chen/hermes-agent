@@ -17,6 +17,7 @@ import requests
 DEFAULT_BASE_URL = "http://127.0.0.1:9090/api/v1/ai-proxy/v1"
 CAPABILITY_TIMEOUT = 5.0
 REQUEST_TIMEOUT = 30.0
+ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
 
 
 class ZettlabMediaError(RuntimeError):
@@ -58,6 +59,13 @@ def get_capabilities(media_type: Optional[str] = None) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ZettlabMediaError("media capability response is not a JSON object")
     return data
+
+
+def action_headers() -> Dict[str, str]:
+    token = os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN", "").strip()
+    if not token:
+        raise ZettlabMediaError("ZETTLAB_AGENT_ACTION_TOKEN is required for media generation")
+    return {ACTION_TOKEN_HEADER: token}
 
 
 def type_capability(media_type: str) -> Dict[str, Any]:
@@ -140,6 +148,7 @@ def create_and_wait(
         "Content-Type": "application/json",
         "X-Scene-Type": "media_generation",
         "X-Step-Title": "media_generation",
+        **action_headers(),
     }
     resp = requests.post(
         f"{base_url(media_type)}/media/generation-jobs",

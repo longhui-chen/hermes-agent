@@ -55,6 +55,7 @@ def test_zettlab_video_provider_reads_capabilities(monkeypatch):
 def test_zettlab_video_generate_creates_media_job(monkeypatch):
     from plugins import zettlab_media_client as client
 
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
     captured = {}
     monkeypatch.setattr(client.requests, "get", lambda url, **kwargs: _Resp(_capabilities()))
 
@@ -92,6 +93,7 @@ def test_zettlab_video_generate_creates_media_job(monkeypatch):
     assert got["job_id"] == "job-video-1"
     assert captured["url"].endswith("/media/generation-jobs")
     assert captured["headers"]["X-Scene-Type"] == "media_generation"
+    assert captured["headers"]["X-Zettlab-Agent-Action-Token"] == "media-token"
     assert captured["json"]["media_type"] == "video"
     assert captured["json"]["model"] == "seedance-v1"
     assert captured["json"]["duration"] == 5

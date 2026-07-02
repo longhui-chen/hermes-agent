@@ -47,6 +47,7 @@ def test_zettlab_image_provider_reads_capabilities(monkeypatch):
 def test_zettlab_image_generate_creates_media_job(monkeypatch):
     from plugins import zettlab_media_client as client
 
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
     captured = {}
 
     def fake_get(url, **kwargs):
@@ -91,6 +92,7 @@ def test_zettlab_image_generate_creates_media_job(monkeypatch):
     assert got["job_id"] == "job-1"
     assert captured["url"].endswith("/media/generation-jobs")
     assert captured["headers"]["X-Scene-Type"] == "media_generation"
+    assert captured["headers"]["X-Zettlab-Agent-Action-Token"] == "media-token"
     assert captured["json"]["media_type"] == "image"
     assert captured["json"]["model"] == "seedream-v4"
     assert captured["json"]["output_count"] == 2
