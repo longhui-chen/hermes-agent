@@ -330,6 +330,46 @@ class TestToolSearchContextLength:
             "zettlab-ai-proxy"
         )
 
+    def test_named_provider_context_resolution_uses_key_env(
+        self,
+        monkeypatch,
+    ):
+        cfg = {
+            "model": {
+                "default": "lite",
+                "provider": "zettlab-ai-proxy",
+            },
+            "providers": {
+                "zettlab-ai-proxy": {
+                    "api": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+                    "key_env": "LOCAL_AI_PROXY_KEY",
+                    "models": {"lite": {"context_length": 200_000}},
+                }
+            },
+        }
+        monkeypatch.setenv("LOCAL_AI_PROXY_KEY", "local-ai-proxy")
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+        captured = {}
+
+        def fake_get_model_context_length(model, **kwargs):
+            captured["model"] = model
+            captured["kwargs"] = kwargs
+            return 200_000
+
+        monkeypatch.setattr(
+            "agent.model_metadata.get_model_context_length",
+            fake_get_model_context_length,
+        )
+
+        assert _resolve_active_context_length() == 200_000
+        assert captured["model"] == "lite"
+        assert (
+            captured["kwargs"]["base_url"]
+            == "http://127.0.0.1:9090/api/v1/ai-proxy/v1"
+        )
+        assert captured["kwargs"]["api_key"] == "local-ai-proxy"
+        assert captured["kwargs"]["provider"] == "zettlab-ai-proxy"
+
     def test_ai_proxy_endpoint_context_resolution_does_not_call_openrouter(
         self,
         monkeypatch,
