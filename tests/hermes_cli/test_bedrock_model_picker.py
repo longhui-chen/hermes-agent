@@ -64,27 +64,14 @@ class _EmptyCredentialPool:
 @contextmanager
 def _mock_non_bedrock_picker_discovery():
     """Keep picker tests focused on Bedrock and avoid local credential/network probes."""
-    from hermes_cli import models as models_mod
     from hermes_cli.providers import HERMES_OVERLAYS
 
     bedrock_overlay = HERMES_OVERLAYS["bedrock"]
-
-    def _cached_provider_model_ids(provider, *args, **kwargs):
-        provider_slug = str(provider or "").strip().lower()
-        if provider_slug in {"bedrock", "aws", "aws-bedrock", "amazon-bedrock", "amazon"}:
-            return models_mod.provider_model_ids(provider, force_refresh=True)
-        return []
 
     with ExitStack() as stack:
         stack.enter_context(patch("agent.models_dev.fetch_models_dev", return_value={}))
         stack.enter_context(patch("hermes_cli.models.get_curated_nous_model_ids", return_value=[]))
         stack.enter_context(patch("hermes_cli.models.fetch_ollama_cloud_models", return_value=[]))
-        stack.enter_context(
-            patch(
-                "hermes_cli.models.cached_provider_model_ids",
-                side_effect=_cached_provider_model_ids,
-            )
-        )
         stack.enter_context(patch("hermes_cli.providers.HERMES_OVERLAYS", {"bedrock": bedrock_overlay}))
         stack.enter_context(patch("hermes_cli.auth._load_auth_store", return_value={}))
         stack.enter_context(patch("agent.credential_pool.load_pool", return_value=_EmptyCredentialPool()))
@@ -205,6 +192,29 @@ class TestListAuthenticatedProvidersBedrock:
         for model_id in bedrock["models"]:
             assert model_id.startswith("eu."), \
                 f"Expected eu.* model ID from live discovery, got {model_id!r}"
+
+    def test_bedrock_cache_is_region_scoped(self, monkeypatch):
+        """A cached US Bedrock listing must not leak into an EU picker open."""
+        from hermes_cli.model_switch import list_authenticated_providers
+        from hermes_cli.models import cached_provider_model_ids
+
+        monkeypatch.setenv("AWS_PROFILE", "my-sso-profile")
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+
+        with _mock_non_bedrock_picker_discovery(), \
+             patch("agent.bedrock_adapter.has_aws_credentials", return_value=True), \
+             patch("agent.bedrock_adapter.discover_bedrock_models", side_effect=_mock_discover):
+            us_seed = cached_provider_model_ids("bedrock")
+            assert all(model_id.startswith("us.") for model_id in us_seed)
+
+            monkeypatch.setenv("AWS_REGION", "eu-central-1")
+            providers = list_authenticated_providers(current_provider="bedrock")
+
+        bedrock = next((p for p in providers if p["slug"] == "bedrock"), None)
+        assert bedrock is not None
+        for model_id in bedrock["models"]:
+            assert model_id.startswith("eu."), \
+                f"Expected eu.* model ID after region switch, got {model_id!r}"
 
     def test_bedrock_total_models_matches_discovery(self, monkeypatch):
         """total_models reflects the actual discovered count."""
