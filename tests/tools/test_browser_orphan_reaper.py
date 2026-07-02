@@ -65,7 +65,8 @@ class TestReapOrphanedBrowserSessions:
         from tools.browser_tool import _reap_orphaned_browser_sessions
         d = _make_socket_dir(fake_tmpdir, "h_dead123456", pid=999999999)
         assert d.exists()
-        _reap_orphaned_browser_sessions()
+        with patch("gateway.status._pid_exists", return_value=False):
+            _reap_orphaned_browser_sessions()
         assert not d.exists()
 
     def test_orphaned_alive_daemon_is_killed(self, fake_tmpdir):

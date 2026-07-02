@@ -1366,16 +1366,16 @@ def test_create_task_with_skills_roundtrips(client):
         json={
             "title": "translate docs",
             "assignee": "linguist",
-            "skills": ["translation", "github-code-review"],
+            "skills": ["translation", "requesting-code-review"],
         },
     )
     assert r.status_code == 200, r.text
     task = r.json()["task"]
-    assert task["skills"] == ["translation", "github-code-review"]
+    assert task["skills"] == ["translation", "requesting-code-review"]
 
     # Fetch via GET /tasks/:id as the drawer does.
     got = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()
-    assert got["task"]["skills"] == ["translation", "github-code-review"]
+    assert got["task"]["skills"] == ["translation", "requesting-code-review"]
 
 
 def test_create_task_without_skills_defaults_to_empty_list(client):

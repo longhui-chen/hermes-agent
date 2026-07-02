@@ -156,6 +156,346 @@ def _ra():
     return run_agent
 
 
+def _should_force_present_plan_tool_choice(agent: Any, user_message: str) -> bool:
+    """Return True when a Zettlab App turn explicitly asks for plan-first UI.
+
+    The product "plan mode" is a structured App card, not Hermes' markdown
+    plan skill.  Force the first model call to produce a ``present_plan`` tool
+    call for explicit plan-mode requests so weak models cannot silently fall
+    back to plain text.
+    """
+    if (getattr(agent, "platform", "") or "") != "zet_agent":
+        return False
+    response_mode = str(getattr(agent, "_zet_agent_response_mode", "") or "").strip().lower()
+    if response_mode == "plan":
+        return True
+    valid_tool_names = getattr(agent, "valid_tool_names", None) or set()
+    if "present_plan" not in valid_tool_names:
+        return False
+
+    text = str(user_message or "").strip().lower()
+    if not text:
+        return False
+    compact = re.sub(r"\s+", "", text)
+
+    if "present_plan" in text:
+        return True
+    if "plan模式" in compact or "计划模式" in compact:
+        return True
+    if re.search(r"(开启|打开|进入|启用|启动).{0,12}(plan|计划)", compact):
+        return True
+
+    mentions_plan = "plan" in compact or "计划" in compact
+    wants_review_before_work = any(
+        marker in compact
+        for marker in (
+            "先别执行",
+            "不要执行",
+            "不执行",
+            "等我确认",
+            "等用户确认",
+            "确认后",
+            "只输出计划",
+            "只写计划",
+            "先给",
+            "先列",
+            "先看",
+        )
+    )
+    return mentions_plan and wants_review_before_work
+
+
+def _api_tools_include(api_kwargs: Dict[str, Any], tool_name: str) -> bool:
+    tools = api_kwargs.get("tools")
+    if not isinstance(tools, list):
+        return False
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function")
+        if isinstance(fn, dict) and fn.get("name") == tool_name:
+            return True
+        if tool.get("name") == tool_name:
+            return True
+    return False
+
+
+def _error_text(error: Exception) -> str:
+    parts = []
+    for value in (
+        getattr(error, "body", None),
+        getattr(error, "message", None),
+        error,
+    ):
+        if value:
+            try:
+                parts.append(str(value))
+            except Exception:
+                pass
+    return " ".join(parts).lower()
+
+
+def _is_deepseek_thinking_default_model(agent: Any) -> bool:
+    model = str(getattr(agent, "model", "") or "").strip().lower()
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    base_url = str(getattr(agent, "base_url", "") or "").strip().lower()
+
+    return (
+        "deepseek-v4" in model
+        or "deepseek-v3.2" in model
+        or provider.startswith("deepseek")
+        or "api.deepseek.com" in base_url
+    )
+
+
+def _is_zettlab_ai_proxy_route(agent: Any) -> bool:
+    base_url = str(getattr(agent, "base_url", "") or "").strip().lower()
+    return "/api/v1/ai-proxy/v1" in base_url
+
+
+def _should_disable_thinking_for_forced_tool_choice(agent: Any) -> bool:
+    return (
+        bool(getattr(agent, "_zet_agent_force_present_plan_disable_thinking", False))
+        or _is_deepseek_thinking_default_model(agent)
+        or _is_zettlab_ai_proxy_route(agent)
+    )
+
+
+def _is_thinking_tool_choice_rejection(error: Exception) -> bool:
+    text = _error_text(error)
+    return (
+        "thinking mode" in text
+        and "tool_choice" in text
+        and ("does not support" in text or "not support" in text)
+    )
+
+
+def _is_unsupported_thinking_parameter_error(error: Exception) -> bool:
+    text = _error_text(error)
+    if "thinking" not in text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "unsupported parameter",
+            "unsupported_parameter",
+            "unknown parameter",
+            "unknown_parameter",
+            "unrecognized parameter",
+            "unrecognized request argument",
+            "does not support parameter",
+            "not support parameter",
+        )
+    )
+
+
+def _is_unsupported_tools_or_tool_choice_error(error: Exception) -> bool:
+    text = _error_text(error)
+    if not any(
+        name in text
+        for name in ("tools", "tool_choice", "tool calling", "function calling")
+    ):
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "unsupported parameter",
+            "unsupported_parameter",
+            "unknown parameter",
+            "unknown_parameter",
+            "unrecognized parameter",
+            "unrecognized request argument",
+            "does not support",
+            "not support",
+            "is not supported",
+        )
+    )
+
+
+def _disable_thinking_for_forced_tool_choice(api_kwargs: Dict[str, Any]) -> None:
+    extra_body = api_kwargs.get("extra_body")
+    if not isinstance(extra_body, dict):
+        extra_body = {}
+    else:
+        extra_body = dict(extra_body)
+
+    extra_body["thinking"] = {"type": "disabled"}
+    api_kwargs["extra_body"] = extra_body
+    api_kwargs.pop("reasoning_effort", None)
+
+
+def _apply_plan_text_fallback_request(api_kwargs: Dict[str, Any]) -> None:
+    api_kwargs.pop("tools", None)
+    api_kwargs.pop("tool_choice", None)
+    api_kwargs.pop("parallel_tool_calls", None)
+    extra_body = api_kwargs.get("extra_body")
+    if (
+        isinstance(extra_body, dict)
+        and extra_body.get("thinking") == {"type": "disabled"}
+    ):
+        extra_body = dict(extra_body)
+        extra_body.pop("thinking", None)
+        if extra_body:
+            api_kwargs["extra_body"] = extra_body
+        else:
+            api_kwargs.pop("extra_body", None)
+    messages = api_kwargs.get("messages")
+    if not isinstance(messages, list):
+        return
+    fallback_hint = (
+        "\n\n[Zettlab App plan mode fallback: this model endpoint does not "
+        "support tool calling. Write a concise structured plan only. Do not "
+        "execute the plan. Group the plan into phases with short bullet steps.]"
+    )
+    patched = list(messages)
+    for idx in range(len(patched) - 1, -1, -1):
+        msg = patched[idx]
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            patched[idx] = {**msg, "content": content + fallback_hint}
+            api_kwargs["messages"] = patched
+        return
+
+
+def _plain_text_plan_groups(text: str) -> List[Dict[str, Any]]:
+    lines = [line.strip() for line in str(text or "").splitlines()]
+    groups: List[Dict[str, Any]] = []
+    current = {"icon": "", "label": "Plan", "items": []}
+
+    def flush_current() -> None:
+        items = [item for item in current["items"] if item][:8]
+        if items:
+            groups.append({
+                "icon": current["icon"],
+                "label": current["label"] or "Plan",
+                "count": len(items),
+                "items": items,
+            })
+
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        heading = re.sub(r"^#{1,6}\s*", "", line).strip()
+        heading = re.sub(r"^\*\*(.*?)\*\*$", r"\1", heading).strip()
+        if (
+            (raw.startswith("#") or heading.endswith(":"))
+            and len(heading) <= 80
+        ):
+            flush_current()
+            current = {
+                "icon": "",
+                "label": heading.rstrip(":") or "Plan",
+                "items": [],
+            }
+            continue
+        item = re.sub(
+            r"^\s*(?:[-*•]|\d+[.)]|[一二三四五六七八九十]+[、.])\s*",
+            "",
+            line,
+        ).strip()
+        if item:
+            current["items"].append(item[:500])
+    flush_current()
+
+    if not groups:
+        compact = re.sub(r"\s+", " ", str(text or "")).strip()
+        if compact:
+            groups.append({
+                "icon": "",
+                "label": "Plan",
+                "count": 1,
+                "items": [compact[:500]],
+            })
+    return groups[:6]
+
+
+def _plain_text_plan_title(text: str) -> str:
+    for line in str(text or "").splitlines():
+        cleaned = re.sub(r"^#{1,6}\s*", "", line).strip()
+        cleaned = re.sub(r"^\*\*(.*?)\*\*$", r"\1", cleaned).strip()
+        cleaned = cleaned.rstrip(":")
+        if cleaned:
+            return cleaned[:80]
+    return "Plan"
+
+
+def _emit_plain_text_plan_if_needed(agent: Any, final_response: str) -> None:
+    if (getattr(agent, "platform", "") or "") != "zet_agent":
+        return
+    if not getattr(agent, "_zet_agent_plan_mode_active", False):
+        return
+    if getattr(agent, "_zet_agent_plan_presented", False):
+        return
+    callback = getattr(agent, "plan_emit_callback", None)
+    if callback is None:
+        return
+    groups = _plain_text_plan_groups(final_response)
+    if not groups:
+        return
+    try:
+        from tools.plan_tool import present_plan as _present_plan
+
+        _present_plan(
+            title=_plain_text_plan_title(final_response),
+            groups=groups,
+            callback=callback,
+        )
+        agent._zet_agent_plan_presented = True
+        logger.info("zet_agent plan mode: synthesized plan card from text response")
+    except Exception:
+        logger.warning(
+            "zet_agent plan mode: failed to synthesize text plan card",
+            exc_info=True,
+        )
+
+
+def _should_end_after_present_plan(agent: Any) -> bool:
+    return (
+        (getattr(agent, "platform", "") or "") == "zet_agent"
+        and bool(getattr(agent, "_zet_agent_plan_mode_active", False))
+        and bool(getattr(agent, "_zet_agent_plan_presented", False))
+    )
+
+
+def _apply_forced_present_plan_tool_choice(agent: Any, api_kwargs: Dict[str, Any]) -> bool:
+    """Force the first Zettlab plan-mode request to call present_plan."""
+    if not getattr(agent, "_zet_agent_force_present_plan_pending", False):
+        return False
+
+    # Consume the flag once.  The follow-up call after the tool result must be
+    # free to produce normal text instead of calling present_plan again.
+    agent._zet_agent_force_present_plan_pending = False
+
+    if getattr(agent, "api_mode", "") != "chat_completions":
+        logger.info(
+            "zet_agent plan mode: cannot force present_plan for api_mode=%s",
+            getattr(agent, "api_mode", ""),
+        )
+        return False
+    if not _api_tools_include(api_kwargs, "present_plan"):
+        logger.warning(
+            "zet_agent plan mode requested but present_plan is missing from API tools"
+        )
+        return False
+
+    api_kwargs["tool_choice"] = {
+        "type": "function",
+        "function": {"name": "present_plan"},
+    }
+    disabled_thinking = _should_disable_thinking_for_forced_tool_choice(agent)
+    if disabled_thinking:
+        _disable_thinking_for_forced_tool_choice(api_kwargs)
+        logger.info(
+            "zet_agent plan mode: forcing tool_choice=present_plan with thinking disabled"
+        )
+    else:
+        logger.info("zet_agent plan mode: forcing tool_choice=present_plan")
+    return True
+
+
 def _nous_entitlement_message(capability: str) -> str:
     try:
         from hermes_cli.nous_account import (
@@ -351,23 +691,36 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             agent.session_id, stored_state,
         )
 
-    # First turn of a new session (or recovering from a broken stored
-    # prompt) — build from scratch.
+    # No stored prompt — must build fresh. Two reasons we get here:
+    #   (a) Brand-new session (no prior turn ever ran).
+    #   (b) Continuing session whose stored prompt was just cleared by
+    #       /v1/profile/reload or /v1/skills/reload (ZET-1139 — see
+    #       SessionDB.clear_all_system_prompts) or is unusable (above).
+    # Both need a rebuild, but the on_session_start hook MUST only fire
+    # for case (a). Hook subscribers (Honcho memory plugin, etc.) treat
+    # it as a one-shot session init signal — re-firing on every reload
+    # would double-init the plugin's session-scoped state.
+    # `conversation_history` is the only reliable signal: empty/None
+    # means brand-new; non-empty means a continuation whose cache was
+    # cleared.
     agent._cached_system_prompt = agent._build_system_prompt(system_message)
 
-    # Plugin hook: on_session_start — fired once when a brand-new
-    # session is created (not on continuation).  Plugins can use this
-    # to initialise session-scoped state (e.g. warm a memory cache).
-    try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_start",
-            session_id=agent.session_id,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
-    except Exception as exc:
-        logger.warning("on_session_start hook failed: %s", exc)
+    is_brand_new_session = not conversation_history
+    if is_brand_new_session:
+        # Plugin hook: on_session_start — fired once when a brand-new
+        # session is created (not on continuation, not after a
+        # hot-reload-driven rebuild).  Plugins can use this to
+        # initialise session-scoped state (e.g. warm a memory cache).
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _invoke_hook(
+                "on_session_start",
+                session_id=agent.session_id,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
+        except Exception as exc:
+            logger.warning("on_session_start hook failed: %s", exc)
 
     # Cold-start credits seed (L3) — fallback for the first-turn path. The TUI/
     # desktop build seeds at session OPEN (see seed_credits_at_session_start in
@@ -598,6 +951,15 @@ def run_conversation(
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
     # Main conversation loop counters (pure locals consumed by the loop below).
+    # Zettlab App plan 模式：本轮是否强制首轮模型调用产出 present_plan
+    #（消费见 _apply_forced_present_plan_tool_choice）。
+    agent._zet_agent_plan_mode_active = _should_force_present_plan_tool_choice(
+        agent, original_user_message
+    )
+    agent._zet_agent_force_present_plan_pending = agent._zet_agent_plan_mode_active
+    agent._zet_agent_force_present_plan_disable_thinking = False
+    agent._zet_agent_plan_text_fallback = False
+    agent._zet_agent_plan_presented = False
     api_call_count = 0
     final_response = None
     interrupted = False
@@ -1071,6 +1433,11 @@ def run_conversation(
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
                 api_kwargs = agent._build_api_kwargs(api_messages)
+                if getattr(agent, "_zet_agent_plan_text_fallback", False):
+                    _apply_plan_text_fallback_request(api_kwargs)
+                    logger.info("zet_agent plan mode: using no-tools text fallback request")
+                else:
+                    _apply_forced_present_plan_tool_choice(agent, api_kwargs)
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
                 if agent.api_mode == "codex_responses":
@@ -1824,6 +2191,7 @@ def run_conversation(
                                 continue_msg = {
                                     "role": "user",
                                     "content": _continue_content,
+                                    "_length_continuation_synthetic": True,
                                 }
                                 messages.append(continue_msg)
                                 agent._session_messages = messages
@@ -2175,21 +2543,41 @@ def run_conversation(
                     agent.thinking_callback("")
                 api_elapsed = time.time() - api_start_time
                 agent._vprint(f"{agent.log_prefix}⚡ Interrupted during API call.", force=True)
-                interrupted = True
-                # Preserve any assistant text already streamed to the user
-                # before the stop landed. Dropping it leaves history with no
-                # record of the half-finished reply on screen, so the next turn
-                # the model "forgets" what it just said — exactly what users hit
-                # when they stop to redirect mid-response.
-                _partial = agent._strip_think_blocks(
+                # ZET-641: two-mode interrupt behavior. Decision pivot is
+                # whether the agent had produced any *visible* output
+                # before the interrupt fired:
+                #
+                #   - has visible output (some assistant text streamed):
+                #     persist a partial "interrupted" assistant message
+                #     so the user keeps what they already saw.
+                #
+                #   - pure-thinking interrupt (no visible text, no
+                #     committed tool yet): discard the whole turn. The
+                #     app retracts the user message back into the input
+                #     box; we mirror that server-side by rolling user_msg
+                #     out of `messages` so state.db doesn't keep a
+                #     phantom row. Reasoning is intentionally NOT
+                #     captured as a separate persistence target — the
+                #     user's directive is "no separate thinking storage",
+                #     so we don't accumulate it for fallback writes.
+                partial_text = agent._strip_think_blocks(
                     getattr(agent, "_current_streamed_assistant_text", "") or ""
                 ).strip()
-                if _partial:
-                    messages.append({"role": "assistant", "content": _partial})
-                    final_response = _partial
+                interrupted = True
+                if partial_text:
+                    messages.append({
+                        "role": "assistant",
+                        "content": partial_text,
+                        "interrupted": True,
+                    })
+                    final_response = partial_text
+                    agent._persist_session(messages, conversation_history)
                 else:
                     final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{api_elapsed:.1f}s elapsed)."
-                agent._persist_session(messages, conversation_history)
+                    agent._discard_current_turn_on_interrupt(messages)
+                    # Skip _persist_session — the final persist at end
+                    # of run_conversation will see the rolled-back tail
+                    # and write nothing new.
                 break
 
             except Exception as api_error:
@@ -2455,6 +2843,57 @@ def run_conversation(
                         f"switching to text-only mode for this session"
                         + (". Stripped images from history and retrying." if _imgs_removed else "."),
                         force=True,
+                    )
+                    continue
+
+                if (
+                    getattr(agent, "_zet_agent_force_present_plan_pending", False) is False
+                    and getattr(agent, "_zet_agent_force_present_plan_disable_thinking", False) is False
+                    and _is_thinking_tool_choice_rejection(api_error)
+                    and not _retry.plan_tool_choice_thinking_retry_attempted
+                ):
+                    _retry.plan_tool_choice_thinking_retry_attempted = True
+                    agent._zet_agent_force_present_plan_pending = True
+                    agent._zet_agent_force_present_plan_disable_thinking = True
+                    logger.warning(
+                        "%sProvider rejected forced present_plan with thinking enabled; "
+                        "retrying once with thinking disabled",
+                        agent.log_prefix,
+                    )
+                    continue
+
+                if (
+                    getattr(agent, "_zet_agent_force_present_plan_disable_thinking", False) is True
+                    and (
+                        _is_thinking_tool_choice_rejection(api_error)
+                        or _is_unsupported_thinking_parameter_error(api_error)
+                    )
+                    and not _retry.plan_text_fallback_retry_attempted
+                ):
+                    _retry.plan_text_fallback_retry_attempted = True
+                    agent._zet_agent_force_present_plan_pending = False
+                    agent._zet_agent_force_present_plan_disable_thinking = False
+                    agent._zet_agent_plan_text_fallback = True
+                    logger.warning(
+                        "%sProvider rejected the thinking disable parameter; "
+                        "retrying plan mode as text fallback without tools",
+                        agent.log_prefix,
+                    )
+                    continue
+
+                if (
+                    getattr(agent, "_zet_agent_plan_mode_active", False) is True
+                    and _is_unsupported_tools_or_tool_choice_error(api_error)
+                    and not _retry.plan_text_fallback_retry_attempted
+                ):
+                    _retry.plan_text_fallback_retry_attempted = True
+                    agent._zet_agent_force_present_plan_pending = False
+                    agent._zet_agent_force_present_plan_disable_thinking = False
+                    agent._zet_agent_plan_text_fallback = True
+                    logger.warning(
+                        "%sProvider rejected tool-calling parameters; "
+                        "retrying plan mode as text fallback without tools",
+                        agent.log_prefix,
                     )
                     continue
 
@@ -2979,6 +3418,45 @@ def run_conversation(
                 # is NOT a transient rate limit — retrying or switching
                 # credentials won't help.  Reduce context to 200k (the
                 # standard tier) and compress.
+                _overflow_reasons = {
+                    FailoverReason.long_context_tier,
+                    FailoverReason.payload_too_large,
+                    FailoverReason.context_overflow,
+                }
+                if (
+                    classified.reason in _overflow_reasons
+                    and not getattr(agent, "compression_enabled", True)
+                ):
+                    agent._flush_status_buffer()
+                    agent._vprint(
+                        f"{agent.log_prefix}❌ Context overflow, but auto-compaction is disabled "
+                        f"(compression.enabled: false).",
+                        force=True,
+                    )
+                    agent._vprint(
+                        f"{agent.log_prefix}   💡 Run /compress to compact manually, /new to start fresh, "
+                        f"switch to a larger-context model, or reduce attachments.",
+                        force=True,
+                    )
+                    logger.error(
+                        f"{agent.log_prefix}Context overflow ({classified.reason.value}) with "
+                        f"auto-compaction disabled — not compressing."
+                    )
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "messages": messages,
+                        "completed": False,
+                        "api_calls": api_call_count,
+                        "error": (
+                            "Context overflow and auto-compaction is disabled "
+                            "(compression.enabled: false). Run /compress to compact manually, "
+                            "/new to start fresh, or switch to a larger-context model."
+                        ),
+                        "partial": True,
+                        "failed": True,
+                        "compaction_disabled": True,
+                    }
+
                 if classified.reason == FailoverReason.long_context_tier:
                     _reduced_ctx = 200000
                     compressor = agent.context_compressor
@@ -3251,6 +3729,7 @@ def run_conversation(
                             "partial": True,
                             "failed": True,
                             "compression_exhausted": True,
+                            "provider_error": agent._provider_error_payload(classified, api_error),
                         }
                     agent._buffer_status(f"⚠️  Request payload too large (413) — compression attempt {compression_attempts}/{max_compression_attempts}...")
 
@@ -3307,6 +3786,7 @@ def run_conversation(
                             "partial": True,
                             "failed": True,
                             "compression_exhausted": True,
+                            "provider_error": agent._provider_error_payload(classified, api_error),
                         }
 
                 # Check for context-length errors BEFORE generic 4xx handler.
@@ -3362,6 +3842,7 @@ def run_conversation(
                                 "partial": True,
                                 "failed": True,
                                 "compression_exhausted": True,
+                                "provider_error": agent._provider_error_payload(classified, api_error),
                             }
                         _retry.restart_with_compressed_messages = True
                         break
@@ -3474,6 +3955,7 @@ def run_conversation(
                             "partial": True,
                             "failed": True,
                             "compression_exhausted": True,
+                            "provider_error": agent._provider_error_payload(classified, api_error),
                         }
                     agent._buffer_status(f"🗜️ Context too large (~{approx_tokens:,} tokens) — compressing ({compression_attempts}/{max_compression_attempts})...")
 
@@ -3519,6 +4001,7 @@ def run_conversation(
                             "partial": True,
                             "failed": True,
                             "compression_exhausted": True,
+                            "provider_error": agent._provider_error_payload(classified, api_error),
                         }
 
                 # Check for non-retryable client errors.  The classifier
@@ -3737,6 +4220,7 @@ def run_conversation(
                         "completed": False,
                         "failed": True,
                         "error": _nonretryable_summary,
+                        "provider_error": agent._provider_error_payload(classified, api_error),
                     }
 
                 if retry_count >= max_retries:
@@ -3933,6 +4417,7 @@ def run_conversation(
                         # different exit code. ``rate_limit`` / ``billing`` here
                         # mean "quota wall, not a task error".
                         "failure_reason": classified.reason.value,
+                        "provider_error": agent._provider_error_payload(classified, api_error),
                     }
 
                 # For rate limits, respect the Retry-After header if present
@@ -4530,6 +5015,15 @@ def run_conversation(
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
 
+                if _should_end_after_present_plan(agent):
+                    _turn_exit_reason = "text_response(plan_presented)"
+                    final_response = ""
+                    logger.info(
+                        "zet_agent plan mode: present_plan emitted; ending turn "
+                        "without a post-tool LLM follow-up"
+                    )
+                    break
+
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision
                     _turn_exit_reason = "guardrail_halt"
@@ -4573,29 +5067,35 @@ def run_conversation(
                 if _tc_names == {"execute_code"}:
                     agent.iteration_budget.refund()
                 
-                # Use real token counts from the API response to decide
-                # compression.  prompt_tokens + completion_tokens is the
-                # actual context size the provider reported plus the
-                # assistant turn — a tight lower bound for the next prompt.
-                # Tool results appended above aren't counted yet, but the
-                # threshold (default 50%) leaves ample headroom; if tool
-                # results push past it, the next API call will report the
-                # real total and trigger compression then.
+                # Decide compression from the *current* request shape —
+                # i.e. the messages just augmented with tool results by
+                # _execute_tool_calls above — not from the previous API
+                # response's reported prompt_tokens.
                 #
-                # If last_prompt_tokens is 0 (stale after API disconnect
-                # or provider returned no usage data), fall back to rough
-                # estimate to avoid missing compression.  Without this,
-                # a session can grow unbounded after disconnects because
-                # should_compress(0) never fires.  (#2153)
+                # last_prompt_tokens predates the tool results we just
+                # appended; a single large tool output (terminal/read_file
+                # dumping multi-MB stdout, web_search aggregating long
+                # pages) can push the next request well past the threshold
+                # while last_prompt_tokens is still under it. The old
+                # reactive check would then fire only AFTER the oversized
+                # request had been sent — by which point the provider may
+                # have already errored out, truncated, or returned empty.
+                # See board28 NAS-PM / MaxClaw token-usage timeline
+                # (~1.6M tokens in a single turn vs the 50% / 500K
+                # threshold on a 1M context model).
+                #
+                # estimate_request_tokens_rough already includes tool
+                # schemas (#14695) and counts images at a flat per-image
+                # rate (#12026 et al.), matching what the preflight
+                # compression check uses at turn entry. Take max with
+                # last_prompt_tokens so we never regress on the disconnect
+                # fallback (#2153) — should_compress(0) would never fire,
+                # but max(estimate, 0) does — and so an authoritative
+                # provider-reported count from the prior request acts as a
+                # floor when the rough estimate (4 chars/token) would
+                # under-count multipart payloads / control tokens.
                 _compressor = agent.context_compressor
-                if _compressor.last_prompt_tokens > 0:
-                    # Only use prompt_tokens — completion/reasoning
-                    # tokens don't consume context window space.
-                    # Thinking models (GLM-5.1, QwQ, DeepSeek R1)
-                    # inflate completion_tokens with reasoning,
-                    # causing premature compression.  (#12026)
-                    _real_tokens = _compressor.last_prompt_tokens
-                elif _compressor.last_prompt_tokens == -1:
+                if _compressor.last_prompt_tokens == -1:
                     # Compression just ran and no API-reported prompt count
                     # has arrived yet. Avoid treating a schema-heavy rough
                     # post-compression estimate as real context pressure.
@@ -4605,15 +5105,46 @@ def run_conversation(
                     # these add 20-30K tokens the messages-only
                     # estimate misses, which can skip compression
                     # past the configured threshold (#14695).
-                    _real_tokens = estimate_request_tokens_rough(
+                    _rough_tokens = estimate_request_tokens_rough(
                         messages, tools=agent.tools or None
                     )
+                    _real_tokens = _rough_tokens
+                    if _compressor.last_prompt_tokens > 0:
+                        # Only use prompt_tokens — completion/reasoning
+                        # tokens don't consume context window space.
+                        # Thinking models (GLM-5.1, QwQ, DeepSeek R1)
+                        # inflate completion_tokens with reasoning,
+                        # causing premature compression.  (#12026)
+                        _real_tokens = max(_real_tokens, _compressor.last_prompt_tokens)
 
-                if agent.compression_enabled and _compressor.should_compress(_real_tokens):
+                _in_loop_deferred = False
+                if agent.compression_enabled and _real_tokens > 0:
+                    _defer_rough_estimate = getattr(
+                        _compressor,
+                        "should_defer_rough_estimate_to_real_usage",
+                        None,
+                    )
+                    if _defer_rough_estimate is None:
+                        _defer_rough_estimate = getattr(
+                            _compressor,
+                            "should_defer_preflight_to_real_usage",
+                            lambda _tokens: False,
+                        )
+                    _in_loop_deferred = _defer_rough_estimate(_rough_tokens)
+
+                if _in_loop_deferred:
+                    logger.info(
+                        "Skipping in-loop compression: rough estimate ~%s >= %s, "
+                        "but last real provider prompt was %s after compression",
+                        f"{_rough_tokens:,}",
+                        f"{_compressor.threshold_tokens:,}",
+                        f"{_compressor.last_real_prompt_tokens:,}",
+                    )
+                elif agent.compression_enabled and _compressor.should_compress(_real_tokens):
                     agent._safe_print("  ⟳ compacting context…")
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
-                        approx_tokens=agent.context_compressor.last_prompt_tokens,
+                        approx_tokens=_real_tokens,
                         task_id=effective_task_id,
                     )
                     conversation_history = conversation_history_after_compression(
@@ -4864,6 +5395,23 @@ def run_conversation(
                     _turn_exit_reason = "empty_response_exhausted"
                     reasoning_text = agent._extract_reasoning(assistant_message)
                     agent._drop_trailing_empty_response_scaffolding(messages)
+                    # ZET-641 race A: when interrupt fires during a
+                    # thinking-only stream, the inner thread returns a
+                    # mock with content=None + reasoning_content=<...>
+                    # (no InterruptedError reaches the outer wrapper),
+                    # which lands here as "truly empty". Without this
+                    # short-circuit we would append an _empty_terminal_sentinel
+                    # row that _persist_session strips, BUT the user_msg
+                    # still gets flushed to state.db → orphan user row on
+                    # next session load. Mirror the InterruptedError path:
+                    # discard the whole turn and let the final persist at
+                    # end of run_conversation see the rolled-back tail.
+                    if agent._interrupt_requested:
+                        agent._discard_current_turn_on_interrupt(messages)
+                        _turn_exit_reason = "interrupted_thinking_discard"
+                        final_response = ""
+                        interrupted = True
+                        break
                     assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
                     assistant_msg["content"] = "(empty)"
                     # This is a user-facing failure sentinel for the gateway,
@@ -4949,6 +5497,7 @@ def run_conversation(
                     length_continue_retries = 0
                 
                 final_response = agent._strip_think_blocks(final_response).strip()
+                _emit_plain_text_plan_if_needed(agent, final_response)
                 
                 final_msg = agent._build_assistant_message(assistant_message, finish_reason)
 
@@ -4964,6 +5513,7 @@ def run_conversation(
                         messages[-1].get("_thinking_prefill")
                         or messages[-1].get("_empty_recovery_synthetic")
                         or messages[-1].get("_empty_terminal_sentinel")
+                        or messages[-1].get("_length_continuation_synthetic")
                     )
                 ):
                     messages.pop()

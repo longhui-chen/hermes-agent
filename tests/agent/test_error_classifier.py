@@ -5,9 +5,11 @@ from agent.error_classifier import (
     ClassifiedError,
     FailoverReason,
     classify_api_error,
+    normalized_provider_error_code,
     _extract_status_code,
     _extract_error_body,
     _extract_error_code,
+    _extract_error_code_from_text,
     _classify_402,
 )
 
@@ -93,6 +95,51 @@ class TestClassifiedError:
         assert e.message == ""
 
 
+class TestNormalizedProviderErrorCode:
+    @pytest.mark.parametrize(
+        ("status_code", "expected"),
+        [
+            (400, "provider_bad_request"),
+            (401, "provider_auth"),
+            (402, "provider_billing"),
+            (403, "provider_forbidden"),
+            (404, "provider_endpoint_not_found"),
+            (405, "provider_client_error"),
+            (409, "provider_conflict"),
+            (413, "payload_too_large"),
+            (429, "provider_rate_limit"),
+            (500, "provider_server_error"),
+            (502, "provider_bad_gateway"),
+            (503, "provider_overloaded"),
+            (504, "provider_timeout"),
+            (507, "provider_billing"),
+            (529, "provider_overloaded"),
+        ],
+    )
+    def test_status_code_mapping(self, status_code, expected):
+        e = ClassifiedError(reason=FailoverReason.unknown, status_code=status_code)
+        assert normalized_provider_error_code(e) == expected
+
+    def test_transport_timeout_without_http_status_is_network_error(self):
+        e = ClassifiedError(reason=FailoverReason.timeout)
+        assert normalized_provider_error_code(e) == "provider_network_error"
+
+    @pytest.mark.parametrize(
+        ("status_code", "expected"),
+        [
+            (409, "provider_conflict"),
+            (413, "payload_too_large"),
+            (418, "provider_client_error"),
+            (423, "provider_unavailable"),
+            (424, "provider_unavailable"),
+            (425, "provider_unavailable"),
+        ],
+    )
+    def test_specific_status_wins_over_generic_format_reason(self, status_code, expected):
+        e = ClassifiedError(reason=FailoverReason.format_error, status_code=status_code)
+        assert normalized_provider_error_code(e) == expected
+
+
 # ── Test: Status code extraction ───────────────────────────────────────
 
 class TestExtractStatusCode:
@@ -175,6 +222,14 @@ class TestExtractErrorCode:
     def test_empty_when_no_code(self):
         assert _extract_error_code({}) == ""
         assert _extract_error_code({"error": {"message": "oops"}}) == ""
+
+    def test_from_string_error_value(self):
+        body = {"error": "insufficient_credits", "success": False}
+        assert _extract_error_code(body) == "insufficient_credits"
+
+    def test_from_error_text_payload(self):
+        text = "HTTP 402: Error code: 402 - {'error': 'insufficient_credits', 'success': False}"
+        assert _extract_error_code_from_text(text) == "insufficient_credits"
 
 
 # ── Test: 402 disambiguation ───────────────────────────────────────────
@@ -1016,6 +1071,15 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="nous", model="gpt-5")
         assert result.reason == FailoverReason.billing
 
+    def test_error_code_insufficient_credits(self):
+        e = MockAPIError(
+            "billing failed",
+            body={"error": {"code": "insufficient_credits"}},
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.billing
+        assert result.provider_error_code == "insufficient_credits"
+
     # ── Message-only patterns (no status code) ──
 
     def test_message_billing_pattern(self):
@@ -1027,6 +1091,41 @@ class TestClassifyApiError:
         e = Exception("Model 'gpt-5' is not available on the Free Tier.")
         result = classify_api_error(e, provider="nous", model="gpt-5")
         assert result.reason == FailoverReason.billing
+
+    def test_string_error_body_billing_code_is_preserved(self):
+        e = MockAPIError(
+            "HTTP 402: Error code: 402 - {'error': 'insufficient_credits', 'success': False}",
+            status_code=402,
+            body={"error": "insufficient_credits", "success": False},
+        )
+        result = classify_api_error(e, provider="openrouter", model="gpt-5")
+        assert result.reason == FailoverReason.billing
+        assert result.provider_error_code == "insufficient_credits"
+        assert normalized_provider_error_code(result) == "provider_billing"
+
+    def test_error_text_billing_code_is_preserved_without_body(self):
+        e = MockAPIError(
+            "HTTP 402: Error code: 402 - {'error': 'insufficient_credits', 'success': False}",
+            status_code=402,
+        )
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.billing
+        assert result.provider_error_code == "insufficient_credits"
+        assert normalized_provider_error_code(result) == "provider_billing"
+
+    @pytest.mark.parametrize(
+        ("status_code", "expected"),
+        [
+            (409, "provider_conflict"),
+            (418, "provider_client_error"),
+            (423, "provider_unavailable"),
+        ],
+    )
+    def test_generic_client_status_keeps_specific_provider_code(self, status_code, expected):
+        e = MockAPIError(f"HTTP {status_code}: provider client failure", status_code=status_code)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.format_error
+        assert normalized_provider_error_code(result) == expected
 
     def test_message_rate_limit_pattern(self):
         e = Exception("rate limit reached for this model")

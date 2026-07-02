@@ -132,6 +132,7 @@ def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
         proc_holder = {}
         started = threading.Event()
         raise_at = [None]  # set by the main thread to tell worker when
+        process_listing_blocked = False
 
         # Drive execute() on a separate thread so we can SIGNAL-interrupt it
         # via a thread-targeted exception without killing our test process.
@@ -156,7 +157,12 @@ def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
             # Walk our children and grand-children to find one running 'sleep 30'
             try:
                 import psutil  # optional — fall back if absent
-                for p in psutil.Process(os.getpid()).children(recursive=True):
+                try:
+                    children = psutil.Process(os.getpid()).children(recursive=True)
+                except (PermissionError, OSError) as exc:
+                    process_listing_blocked = True
+                    children = []
+                for p in children:
                     try:
                         if "sleep 30" in " ".join(p.cmdline()):
                             target_pid = p.pid
@@ -177,6 +183,9 @@ def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
             if target_pid:
                 break
             time.sleep(0.1)
+
+        if target_pid is None and process_listing_blocked:
+            pytest.skip("host process listing is not permitted in this sandbox")
 
         assert target_pid is not None, (
             "test setup: couldn't find 'sleep 30' subprocess after 5 s"

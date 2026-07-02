@@ -1,0 +1,11 @@
+{
+  "app_id": "com.zettlab.claw",
+  "package_name": "zettlab-claw",
+  "version": "0.0.1",
+  "packaged_version": "0.14.0",
+  "update_note": "Package zettlab-claw for Zettlab NAS local-server gateway.",
+  "service_name": "zettlab-claw",
+  "binary": "bin/hermes",
+  "package_type": "app",
+  "app_type": "system"
+}

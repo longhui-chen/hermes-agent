@@ -8512,36 +8512,38 @@ def _annotate_cron_job(job: Dict[str, Any], profile: str, home: Path) -> Dict[st
     return annotated
 
 
+@contextmanager
+def _cron_profile_scope(home: Path):
+    """Scope cron helpers to one profile home without mutating module globals."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+
+    home_token = set_hermes_home_override(str(home))
+    secret_token = set_secret_scope(build_profile_secret_scope(Path(home)))
+    try:
+        yield
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+
 def _call_cron_for_profile(target_profile: Optional[str], func_name: str, *args, **kwargs):
     """Run cron.jobs helpers against the selected profile's cron directory.
 
-    cron.jobs keeps CRON_DIR/JOBS_FILE/OUTPUT_DIR as module globals resolved
-    from the process HERMES_HOME at import time. The dashboard is a single
-    process that can inspect many profiles, so temporarily retarget those
-    globals while holding a lock and restore them immediately after the call.
+    cron.jobs resolves storage from the context-local Hermes home override.
+    The dashboard is a single process that can inspect many profiles, so scope
+    each call under a profile home while holding a lock.
     """
     profile_name, home = _cron_profile_home(target_profile)
     with _CRON_PROFILE_LOCK:
         from cron import jobs as cron_jobs
-        from hermes_constants import (
-            reset_hermes_home_override,
-            set_hermes_home_override,
-        )
 
-        old_cron_dir = cron_jobs.CRON_DIR
-        old_jobs_file = cron_jobs.JOBS_FILE
-        old_output_dir = cron_jobs.OUTPUT_DIR
-        token = set_hermes_home_override(str(home))
-        cron_jobs.CRON_DIR = home / "cron"
-        cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
-        cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
-        try:
+        with _cron_profile_scope(home):
             result = getattr(cron_jobs, func_name)(*args, **kwargs)
-        finally:
-            cron_jobs.CRON_DIR = old_cron_dir
-            cron_jobs.JOBS_FILE = old_jobs_file
-            cron_jobs.OUTPUT_DIR = old_output_dir
-            reset_hermes_home_override(token)
 
     if isinstance(result, list):
         return [_annotate_cron_job(j, profile_name, home) for j in result]
@@ -8789,31 +8791,19 @@ def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
     """Run ONE due cron job end-to-end for ``profile`` via the resolved
     scheduler provider's ``fire_due`` (store CAS claim + ``run_one_job``).
 
-    Retargets the ``cron.jobs`` module globals to the profile's cron dir under
-    the shared lock — same mechanism as ``_call_cron_for_profile`` — so the
-    claim and the run operate on the right profile's ``jobs.json``. Runs with
-    no live adapters; delivery falls back to the per-platform send path (the
-    dashboard process has no gateway adapter handles, exactly like the desktop
-    cron path above).
+    Scopes cron helpers to the profile home under the shared lock — same
+    mechanism as ``_call_cron_for_profile`` — so the claim and run operate on
+    the right profile's ``jobs.json``. Runs with no live adapters; delivery
+    falls back to the per-platform send path (the dashboard process has no
+    gateway adapter handles, exactly like the desktop cron path above).
     """
     _profile_name, home = _cron_profile_home(profile)
     with _CRON_PROFILE_LOCK:
-        from cron import jobs as cron_jobs
         from cron.scheduler_provider import resolve_cron_scheduler
 
-        old_cron_dir = cron_jobs.CRON_DIR
-        old_jobs_file = cron_jobs.JOBS_FILE
-        old_output_dir = cron_jobs.OUTPUT_DIR
-        cron_jobs.CRON_DIR = home / "cron"
-        cron_jobs.JOBS_FILE = cron_jobs.CRON_DIR / "jobs.json"
-        cron_jobs.OUTPUT_DIR = cron_jobs.CRON_DIR / "output"
-        try:
+        with _cron_profile_scope(home):
             provider = resolve_cron_scheduler()
             return bool(provider.fire_due(job_id, adapters=None, loop=None))
-        finally:
-            cron_jobs.CRON_DIR = old_cron_dir
-            cron_jobs.JOBS_FILE = old_jobs_file
-            cron_jobs.OUTPUT_DIR = old_output_dir
 
 
 @app.post("/api/cron/fire")
@@ -10905,6 +10895,7 @@ async def create_profile_endpoint(body: ProfileCreate):
         clone = body.clone_from_default
         clone_from = "default" if clone else None
         clone_config = clone
+    seed_skills_result = None
     try:
         path = profiles_mod.create_profile(
             name=body.name,
@@ -10920,7 +10911,7 @@ async def create_profile_endpoint(body: ProfileCreate):
         # user-installed skills. When no_skills=True, create_profile() wrote
         # the opt-out marker and seed_profile_skills() will no-op.
         if not clone:
-            profiles_mod.seed_profile_skills(path, quiet=True)
+            seed_skills_result = profiles_mod.seed_profile_skills(path, quiet=True)
 
         # Match the CLI's profile-create flow: named profiles should get a
         # wrapper in ~/.local/bin when the alias is safe to create.
@@ -10987,7 +10978,7 @@ async def create_profile_endpoint(body: ProfileCreate):
             )
             hub_installs.append({"identifier": ident, "pid": None})
 
-    return {
+    response = {
         "ok": True,
         "name": body.name,
         "path": str(path),
@@ -10996,6 +10987,16 @@ async def create_profile_endpoint(body: ProfileCreate):
         "skills_disabled": skills_disabled,
         "hub_installs": hub_installs,
     }
+    if seed_skills_result and seed_skills_result.get("policy_error"):
+        # Surface the fail-closed seed-policy error the dashboard would otherwise
+        # never see: the profile was created, but bundled skills were NOT seeded
+        # (seed policy corrupt/missing). Mirrors the CLI create warning.
+        response["skills_warning"] = (
+            "Profile created, but bundled skills were NOT seeded: the seed policy "
+            "is present but unreadable/corrupt (fail-closed). Fix "
+            "config/skill_seed_policy.json and run `hermes update`."
+        )
+    return response
 
 
 @app.get("/api/profiles/active")

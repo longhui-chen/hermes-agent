@@ -139,7 +139,8 @@ def _stub_runtime_main():
     resolution) when the per-test process isolation plugin is disabled. Stub
     it out so the prologue tests stay hermetic.
     """
-    with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None):
+    with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None), \
+         patch("agent.auxiliary_client.set_runtime_auxiliary_task_configs", lambda *a, **k: None):
         yield
 
 
@@ -363,4 +364,3 @@ def test_expired_cooldown_allows_preflight(tmp_path):
     assert isinstance(ctx, TurnContext)
     agent._emit_status.assert_called_once()
     agent._compress_context.assert_called()
-

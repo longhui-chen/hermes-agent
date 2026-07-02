@@ -21,6 +21,19 @@
 // succeeds — the Skills Hub page just shows an empty state, and llms.txt
 // generation is skipped. CI always has the deps installed, so production
 // deploys get real data.
+//
+// Seed policy: extract-skills.py is policy-aware — when
+// config/skill_seed_policy.json is present it filters the built-in Skills Hub
+// to exactly the seeded set (27) over upstream-verbatim skills/, so the
+// Hub (regenerated here every build) matches what a new profile seeds.
+// NOTE: the docusaurus DOC pages (website/docs/.../skills/**, sidebars.ts,
+// reference/skills-catalog.md) are NOT regenerated here — they are produced by
+// website/scripts/generate-skill-docs.py (also policy-aware) and are committed
+// snapshots that predate the policy. Before publishing the curated site, the
+// deploy MUST run generate-skill-docs.py AND prune the orphan pages left for
+// non-seeded skills (the generator writes/updates pages but does not delete
+// stale ones). Until then the committed doc pages still list the full upstream
+// set; only the Hub JSON is curated.
 
 import { spawnSync } from "node:child_process";
 import { mkdirSync, writeFileSync, existsSync, statSync } from "node:fs";

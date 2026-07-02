@@ -258,6 +258,7 @@ class TestMatcher:
 
 
 class TestCallbackSubprocess:
+    @pytest.mark.live_system_guard_bypass
     def test_timeout_returns_none(self, tmp_path):
         # Script that sleeps forever; we set a 1s timeout.
         script = _write_script(

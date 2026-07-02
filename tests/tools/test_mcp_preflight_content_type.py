@@ -29,7 +29,7 @@ from contextlib import contextmanager
 
 import pytest
 
-from tools.mcp_tool import MCPServerTask, NonMcpEndpointError
+from tools.mcp_tool import MCPServerTask, NonMcpEndpointError, _mcp_bypass_env_proxy
 
 
 def _make_task(name: str = "probe_srv") -> MCPServerTask:
@@ -37,6 +37,14 @@ def _make_task(name: str = "probe_srv") -> MCPServerTask:
     task = MCPServerTask.__new__(MCPServerTask)
     task.name = name
     return task
+
+
+@pytest.mark.parametrize("url", [
+    "http://[fe80::1%25en0]/mcp",
+    "http://[fe80::1%en0]/mcp",
+])
+def test_zone_scoped_ipv6_link_local_bypasses_env_proxy(url):
+    assert _mcp_bypass_env_proxy(url) is True
 
 
 @contextmanager
@@ -313,3 +321,193 @@ def test_ssl_verify_and_cert_forwarded(monkeypatch):
     assert captured.get("verify") is False
     assert captured.get("cert") == "/path/to/cert.pem"
     assert captured.get("follow_redirects") is True
+
+
+def test_loopback_probe_uses_direct_transport_and_keeps_env_ca(monkeypatch):
+    captured: dict = {}
+
+    import httpx
+
+    class _FakeTransport:
+        def __init__(self, **kwargs):
+            captured["transport"] = kwargs
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured["client"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def head(self, url, headers=None):
+            return httpx.Response(200, headers={"content-type": "application/json"})
+
+    monkeypatch.setenv("SSL_CERT_FILE", "/tmp/private-ca.pem")
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", _FakeTransport)
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    task = _make_task()
+    asyncio.run(task._preflight_content_type(
+        "https://192.168.1.2:8765/mcp",
+        client_cert="/path/to/client.pem",
+        timeout=3.0,
+    ))
+    client_kwargs = captured["client"]
+    transport_kwargs = captured["transport"]
+    assert "trust_env" not in client_kwargs
+    assert "verify" not in client_kwargs
+    assert client_kwargs["transport"] is not None
+    assert transport_kwargs["proxy"] is None
+    assert transport_kwargs["trust_env"] is True
+    assert transport_kwargs["verify"] is True
+    assert transport_kwargs["cert"] == "/path/to/client.pem"
+
+
+@pytest.mark.parametrize("url", [
+    "https://mcp.example.com/mcp",
+    "http://8.8.8.8/mcp",
+])
+def test_public_probe_keeps_env_proxy(monkeypatch, url):
+    """Negative case: public hosts must NOT disable trust_env on the probe
+    client, so corporate HTTP(S)_PROXY/NO_PROXY settings still apply and the
+    bypass helper never silently widens its blast radius."""
+    captured: dict = {}
+
+    import httpx
+
+    class _FakeTransport:
+        def __init__(self, **kwargs):
+            captured["transport"] = kwargs
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured["client"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def head(self, url, headers=None):
+            return httpx.Response(200, headers={"content-type": "application/json"})
+
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", _FakeTransport)
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+    task = _make_task()
+    asyncio.run(task._preflight_content_type(url, timeout=3.0))
+    assert "trust_env" not in captured["client"]
+    assert "transport" not in captured["client"]
+    assert "transport" not in captured
+
+
+# ---------------------------------------------------------------------------
+# direct transport on the REAL Streamable HTTP transport client (_run_http)
+#
+# The preflight probe and the real handshake use separate httpx clients. The
+# probe using direct transport is not enough: if the SDK's transport client
+# keeps the default env proxy routing, a loopback/private MCP URL passes
+# preflight but the real connection still gets hijacked by a system/env proxy.
+# These tests also assert the direct transport keeps trust_env=True so private
+# HTTPS MCP servers can still use SSL_CERT_FILE / SSL_CERT_DIR CA bundles.
+# lock the actual transport client built at tools/mcp_tool.py's _run_http().
+# ---------------------------------------------------------------------------
+
+def _capture_run_http_kwargs(monkeypatch, url: str, config_overrides: dict | None = None) -> dict:
+    """Drive the real ``_run_http`` far enough to build the transport
+    ``httpx.AsyncClient`` and capture its constructor kwargs.
+
+    We swap ``httpx.AsyncClient`` for a fake whose ``__aenter__`` raises a
+    sentinel, short-circuiting before the MCP SDK transport / ClientSession
+    so the test stays hermetic (no network, no real session)."""
+    import httpx
+
+    from tools import mcp_tool
+
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    class _FakeTransport:
+        def __init__(self, **kwargs):
+            captured["transport"] = kwargs
+
+    class _FakeClient:
+        def __init__(self, **kwargs):
+            captured["client"] = kwargs
+
+        async def __aenter__(self):
+            raise _Sentinel
+
+        async def __aexit__(self, *a):
+            return False
+
+    # Force the non-deprecated transport branch regardless of the locally
+    # installed mcp version; with mcp>=1.24.0 this is already the default.
+    monkeypatch.setattr(mcp_tool, "_MCP_HTTP_AVAILABLE", True)
+    monkeypatch.setattr(mcp_tool, "_MCP_NEW_HTTP", True)
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", _FakeTransport)
+    monkeypatch.setattr(httpx, "AsyncClient", _FakeClient)
+
+    task = _make_task()
+    task._auth_type = "none"
+    task._sampling = None
+
+    try:
+        config = {"url": url}
+        if config_overrides:
+            config.update(config_overrides)
+        asyncio.run(task._run_http(config))
+    except _Sentinel:
+        pass
+    return captured
+
+
+def test_run_http_private_https_uses_direct_transport_and_keeps_env_ca(monkeypatch):
+    monkeypatch.setenv("SSL_CERT_FILE", "/tmp/private-ca.pem")
+    captured = _capture_run_http_kwargs(monkeypatch, "https://192.168.1.2:8765/mcp")
+    client_kwargs = captured["client"]
+    transport_kwargs = captured["transport"]
+    assert "trust_env" not in client_kwargs
+    assert "verify" not in client_kwargs
+    assert "cert" not in client_kwargs
+    assert client_kwargs["transport"] is not None
+    assert transport_kwargs["proxy"] is None
+    assert transport_kwargs["trust_env"] is True
+    assert transport_kwargs["verify"] is True
+    assert "cert" not in transport_kwargs
+
+
+def test_run_http_private_https_direct_transport_forwards_client_cert(monkeypatch, tmp_path):
+    cert_path = tmp_path / "client.pem"
+    cert_path.write_text("test cert", encoding="utf-8")
+    captured = _capture_run_http_kwargs(
+        monkeypatch,
+        "https://192.168.1.2:8765/mcp",
+        {"client_cert": str(cert_path)},
+    )
+    client_kwargs = captured["client"]
+    transport_kwargs = captured["transport"]
+    assert "cert" not in client_kwargs
+    assert transport_kwargs["proxy"] is None
+    assert transport_kwargs["cert"] == str(cert_path)
+
+
+def test_run_http_loopback_uses_direct_transport(monkeypatch):
+    captured = _capture_run_http_kwargs(monkeypatch, "http://127.0.0.1:8765/mcp")
+    assert captured["transport"]["proxy"] is None
+    assert captured["transport"]["trust_env"] is True
+
+
+@pytest.mark.parametrize("url", [
+    "https://mcp.example.com/mcp",
+    "http://8.8.8.8/mcp",
+])
+def test_run_http_public_keeps_env_proxy(monkeypatch, url):
+    captured = _capture_run_http_kwargs(monkeypatch, url)
+    assert "trust_env" not in captured["client"]
+    assert "transport" not in captured["client"]
+    assert "transport" not in captured

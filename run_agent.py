@@ -146,7 +146,7 @@ from tools.browser_tool import cleanup_browser
 
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import sanitize_context
-from agent.error_classifier import FailoverReason
+from agent.error_classifier import normalized_provider_error_code, FailoverReason
 from agent.redact import redact_sensitive_text
 from agent.model_metadata import (
     estimate_request_tokens_rough,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.estimate_request_tokens_rough")
@@ -224,6 +224,7 @@ from utils import atomic_json_write, base_url_host_matches, base_url_hostname, e
 _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_empty_recovery_synthetic",
     "_empty_terminal_sentinel",
+    "_length_continuation_synthetic",
     "_thinking_prefill",
     # verify-on-stop and pre_verify nudges append a synthetic assistant
     # "done" plus a synthetic user nudge to keep the agent going one more
@@ -495,6 +496,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        config_context_length: int = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -570,6 +572,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            config_context_length=config_context_length,
         )
 
     def _get_session_db_for_recall(self):
@@ -935,6 +938,23 @@ class AIAgent:
                 self.notice_clear_callback(key)
             except Exception:
                 logger.debug("notice_clear_callback error in _emit_notice_clear", exc_info=True)
+
+    def _emit_structured_status(self, event_type: str, payload: Dict[str, Any]) -> None:
+        """Emit a structured gateway status event without changing CLI output.
+
+        Only fires when the wired ``status_callback`` opted in via the
+        ``_hermes_accepts_structured_status`` marker (set by the gateway's
+        zet_agent wrapper). CLI/other consumers that only understand the
+        ``(kind, message)`` lifecycle/warn contract are left untouched.
+        """
+        if not self.status_callback:
+            return
+        if not getattr(self.status_callback, "_hermes_accepts_structured_status", False):
+            return
+        try:
+            self.status_callback(event_type, payload)
+        except Exception:
+            logger.debug("status_callback error in _emit_structured_status", exc_info=True)
 
     # ── Buffered retry/fallback status ────────────────────────────────────
     # Retry and fallback chains were flooding the CLI/gateway with status
@@ -1645,6 +1665,28 @@ class AIAgent:
                 if timestamp is not None:
                     msg["timestamp"] = timestamp
 
+    def _discard_current_turn_on_interrupt(self, messages: list) -> None:
+        """ZET-641: roll back the current turn when an interrupt fires
+        before the agent produced any visible output (no streaming text,
+        no committed tool call).
+
+        After this, messages ends at the previous turn's tail — the
+        user's message for this turn is gone, no assistant scaffolding
+        either. The app side mirrors this by retracting the user bubble
+        back into the input box; without server-side rollback, state.db
+        would keep a phantom user row that re-surfaces on next session
+        load (orphan user message, no reply).
+
+        Idempotent: if there is no current-turn user message tracked,
+        does nothing. Also clears the streamed-assistant buffers so a
+        stale fragment doesn't leak into the next turn.
+        """
+        idx = getattr(self, "_persist_user_message_idx", None)
+        if isinstance(idx, int) and 0 <= idx < len(messages) and isinstance(messages[idx], dict) and messages[idx].get("role") == "user":
+            del messages[idx:]
+        self._persist_user_message_idx = None
+        self._current_streamed_assistant_text = ""
+
     def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Save session state to both JSON log and SQLite on any exit path.
 
@@ -1660,9 +1702,32 @@ class AIAgent:
         # Scaffolding removal mutates the live list (desired — ephemeral
         # retry/failure sentinels must not survive into the real transcript).
         self._drop_trailing_empty_response_scaffolding(messages)
+        self._drop_length_continuation_scaffolding(messages)
         self._session_messages = messages
         self._save_session_log(messages)
         self._flush_messages_to_session_db(messages, conversation_history)
+
+    def _drop_length_continuation_scaffolding(self, messages: List[Dict]) -> None:
+        """Remove internal length-continuation prompts from durable transcripts."""
+        if not messages:
+            return
+        raw_last_flushed = getattr(self, "_last_flushed_db_idx", 0)
+        last_flushed_idx = raw_last_flushed if isinstance(raw_last_flushed, int) else 0
+        removed_before_flush_idx = 0
+        if last_flushed_idx > 0:
+            removed_before_flush_idx = sum(
+                1 for msg in messages[:last_flushed_idx]
+                if isinstance(msg, dict) and msg.get("_length_continuation_synthetic")
+            )
+        messages[:] = [
+            msg for msg in messages
+            if not (
+                isinstance(msg, dict)
+                and msg.get("_length_continuation_synthetic")
+            )
+        ]
+        if removed_before_flush_idx:
+            self._last_flushed_db_idx = max(0, last_flushed_idx - removed_before_flush_idx)
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
@@ -1682,6 +1747,7 @@ class AIAgent:
             and (
                 messages[-1].get("_empty_recovery_synthetic")
                 or messages[-1].get("_empty_terminal_sentinel")
+                or messages[-1].get("_length_continuation_synthetic")
             )
         ):
             messages.pop()
@@ -2205,6 +2271,33 @@ class AIAgent:
         """Forwarder — see ``agent.agent_runtime_helpers.extract_api_error_context``."""
         from agent.agent_runtime_helpers import extract_api_error_context
         return extract_api_error_context(error)
+
+    def _provider_error_payload(self, classified, error: Exception) -> Dict[str, Any]:
+        """Build the safe, structured provider-error payload for chat surfaces."""
+        payload: Dict[str, Any] = {
+            "code": normalized_provider_error_code(classified),
+            "reason": classified.reason.value,
+        }
+        if classified.provider:
+            payload["provider"] = classified.provider
+        elif getattr(self, "provider", None):
+            payload["provider"] = getattr(self, "provider")
+        if classified.model:
+            payload["model"] = classified.model
+        elif getattr(self, "model", None):
+            payload["model"] = getattr(self, "model")
+        if classified.status_code is not None:
+            payload["status_code"] = classified.status_code
+        if classified.provider_error_code:
+            payload["provider_error_code"] = classified.provider_error_code
+        message = classified.message or self._summarize_api_error(error)
+        if message:
+            payload["provider_message"] = message[:500]
+        payload["retryable"] = bool(classified.retryable)
+        payload["recoverable"] = bool(
+            classified.retryable or classified.should_compress or classified.should_fallback
+        )
+        return payload
 
     def _usage_summary_for_api_request_hook(self, response: Any) -> Optional[Dict[str, Any]]:
         """Token buckets for ``post_api_request`` plugins (no raw ``response`` object)."""
@@ -4831,6 +4924,9 @@ class AIAgent:
         Custom/local models absent from models.dev would otherwise be
         misclassified as non-vision and have their images stripped.
         """
+        runtime_override = getattr(self, "runtime_supports_vision", None)
+        if isinstance(runtime_override, bool):
+            return runtime_override
         try:
             from hermes_cli.config import load_config
             from agent.image_routing import _lookup_supports_vision

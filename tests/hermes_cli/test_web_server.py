@@ -4127,13 +4127,13 @@ class TestNewEndpoints:
                     {
                         "function": {
                             "name": "skill_view",
-                            "arguments": '{"name":"github-pr-workflow"}',
+                            "arguments": '{"name":"requesting-code-review"}',
                         }
                     },
                     {
                         "function": {
                             "name": "skill_manage",
-                            "arguments": '{"name":"github-code-review"}',
+                            "arguments": '{"name":"systematic-debugging"}',
                         }
                     },
                 ],
@@ -4154,7 +4154,7 @@ class TestNewEndpoints:
         assert len(data["skills"]["top_skills"]) == 2
 
         top_skill = data["skills"]["top_skills"][0]
-        assert top_skill["skill"] == "github-pr-workflow"
+        assert top_skill["skill"] == "requesting-code-review"
         assert top_skill["view_count"] == 1
         assert top_skill["manage_count"] == 0
         assert top_skill["total_count"] == 1

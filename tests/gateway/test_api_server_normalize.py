@@ -1,7 +1,41 @@
 """Tests for _normalize_chat_content in the API server adapter."""
 
 from gateway.platforms import api_server
-from gateway.platforms.api_server import _normalize_chat_content
+from gateway.platforms.api_server import _extract_turn_id, _normalize_chat_content
+
+
+class TestExtractTurnId:
+    """metadata.turn_id is plumbed to the NAS agent-search fallback header."""
+
+    def test_snake_case_turn_id(self):
+        assert _extract_turn_id({"metadata": {"turn_id": "t_abc-123"}}) == "t_abc-123"
+
+    def test_camel_case_turn_id(self):
+        assert _extract_turn_id({"metadata": {"turnId": "t_xyz"}}) == "t_xyz"
+
+    def test_missing_metadata_returns_empty(self):
+        assert _extract_turn_id({}) == ""
+
+    def test_metadata_not_dict_returns_empty(self):
+        assert _extract_turn_id({"metadata": "nope"}) == ""
+
+    def test_missing_turn_id_returns_empty(self):
+        assert _extract_turn_id({"metadata": {"response_mode": "plan"}}) == ""
+
+    def test_surrounding_whitespace_stripped(self):
+        assert _extract_turn_id({"metadata": {"turn_id": "  t_abc  "}}) == "t_abc"
+
+    def test_crlf_injection_dropped(self):
+        # The value lands in an HTTP header; CR/LF (and any header-unsafe byte)
+        # must be rejected outright rather than forwarded.
+        assert _extract_turn_id({"metadata": {"turn_id": "t_a\r\nX-Evil: 1"}}) == ""
+
+    def test_internal_whitespace_dropped(self):
+        assert _extract_turn_id({"metadata": {"turn_id": "t_a b"}}) == ""
+
+    def test_uuid_form_preserved(self):
+        tid = "t_550e8400-e29b-41d4-a716-446655440000"
+        assert _extract_turn_id({"metadata": {"turn_id": tid}}) == tid
 
 
 class TestNormalizeChatContent:

@@ -11,7 +11,16 @@ from pathlib import Path
 from typing import Any, Union
 from urllib.parse import urlparse
 
-import yaml
+try:
+    # Optional: only the YAML helpers below (atomic_yaml_write /
+    # atomic_roundtrip_yaml_update) need pyyaml. Keeping the import soft lets
+    # atomic_replace / atomic_json_write — and therefore the low-level skill
+    # seeder that only uses those — run in a degraded env without pyyaml.
+    # `yaml` stays a module attribute (None if absent) so existing
+    # `patch("utils.yaml.dump", ...)` tests still work when pyyaml is installed.
+    import yaml
+except ImportError:  # pragma: no cover - exercised only in degraded envs
+    yaml = None
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +224,8 @@ def atomic_yaml_write(
         extra_content: Optional string to append after the YAML dump
             (e.g. commented-out sections for user reference).
     """
+    if yaml is None:
+        raise ImportError("pyyaml is required for atomic_yaml_write()")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 

@@ -211,20 +211,6 @@ const sidebars: SidebarsConfig = {
                 },
                 {
                   type: 'category',
-                  label: 'github',
-                  key: 'skills-bundled-github',
-                  collapsed: true,
-                  items: [
-                    'user-guide/skills/bundled/github/github-codebase-inspection',
-                    'user-guide/skills/bundled/github/github-github-auth',
-                    'user-guide/skills/bundled/github/github-github-code-review',
-                    'user-guide/skills/bundled/github/github-github-issues',
-                    'user-guide/skills/bundled/github/github-github-pr-workflow',
-                    'user-guide/skills/bundled/github/github-github-repo-management',
-                  ],
-                },
-                {
-                  type: 'category',
                   label: 'media',
                   key: 'skills-bundled-media',
                   collapsed: true,
@@ -265,15 +251,11 @@ const sidebars: SidebarsConfig = {
                   key: 'skills-bundled-productivity',
                   collapsed: true,
                   items: [
-                    'user-guide/skills/bundled/productivity/productivity-airtable',
-                    'user-guide/skills/bundled/productivity/productivity-google-workspace',
                     'user-guide/skills/bundled/productivity/productivity-maps',
                     'user-guide/skills/bundled/productivity/productivity-nano-pdf',
-                    'user-guide/skills/bundled/productivity/productivity-notion',
                     'user-guide/skills/bundled/productivity/productivity-ocr-and-documents',
                     'user-guide/skills/bundled/productivity/productivity-petdex',
                     'user-guide/skills/bundled/productivity/productivity-powerpoint',
-                    'user-guide/skills/bundled/productivity/productivity-teams-meeting-pipeline',
                   ],
                 },
                 {
@@ -296,15 +278,6 @@ const sidebars: SidebarsConfig = {
                   collapsed: true,
                   items: [
                     'user-guide/skills/bundled/smart-home/smart-home-openhue',
-                  ],
-                },
-                {
-                  type: 'category',
-                  label: 'social-media',
-                  key: 'skills-bundled-social-media',
-                  collapsed: true,
-                  items: [
-                    'user-guide/skills/bundled/social-media/social-media-xurl',
                   ],
                 },
                 {

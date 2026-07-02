@@ -42,8 +42,9 @@ import re
 import sqlite3
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 try:
     from aiohttp import web
@@ -130,6 +131,32 @@ def _coerce_request_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, (int, float)):
         return bool(value)
     return default
+
+
+def _extract_response_mode(body: Dict[str, Any]) -> str:
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("response_mode", metadata.get("responseMode", ""))
+    mode = str(raw or "").strip().lower()
+    return "plan" if mode == "plan" else ""
+
+
+def _extract_turn_id(body: Dict[str, Any]) -> str:
+    """Extract metadata.turn_id (zettlab local-server's per-turn correlation
+    token) so the NAS agent-search fallback can echo it back as the
+    X-Zettlab-Turn-Id header. Reject only what would corrupt that header
+    (whitespace / control chars); don't restrict the charset further —
+    local-server accepts any trimmed token, so a stricter filter would silently
+    drop valid ids and lose the precise-turn pinning."""
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("turn_id", metadata.get("turnId", ""))
+    tid = str(raw or "").strip()
+    if not tid or any(c.isspace() or ord(c) < 0x20 for c in tid):
+        return ""
+    return tid
 
 
 def _normalize_chat_content(
@@ -336,6 +363,232 @@ def _content_has_visible_payload(content: Any) -> bool:
                 if ptype in _IMAGE_PART_TYPES:
                     return True
     return False
+
+
+def _short_error_text(value: Any, *, limit: int = 500) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()[:limit]
+    if isinstance(value, (list, tuple, set, dict)) and not _has_tool_error_value(value):
+        return ""
+    try:
+        text = str(value).strip()
+    except Exception:
+        return ""
+    return text[:limit]
+
+
+def _has_tool_error_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        return any(_has_tool_error_value(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_has_tool_error_value(item) for item in value)
+    return bool(value)
+
+
+def _chat_finish_reason_from_result(result: Dict[str, Any]) -> str:
+    completed = bool(result.get("completed", True))
+    is_partial = bool(result.get("partial"))
+    is_failed = bool(result.get("failed"))
+    err_msg = _short_error_text(result.get("error"))
+    if _chat_result_is_truncated(result):
+        return "length"
+    if is_failed or (not completed and err_msg):
+        return "error"
+    return "stop"
+
+
+def _chat_result_is_truncated(result: Dict[str, Any]) -> bool:
+    if bool(result.get("truncated")):
+        return True
+    completed = bool(result.get("completed", True))
+    is_partial = bool(result.get("partial"))
+    is_failed = bool(result.get("failed"))
+    # run_agent marks response-length exhaustion as partial without failed.
+    # Treat that structured state as length instead of matching localized or
+    # provider-specific error strings such as "max tokens exceeded".
+    return is_partial and not completed and not is_failed
+
+
+def _chat_stream_error_payload(result: Dict[str, Any], finish_reason: str) -> Optional[Dict[str, Any]]:
+    completed = bool(result.get("completed", True))
+    is_partial = bool(result.get("partial"))
+    is_failed = bool(result.get("failed"))
+    err_msg = _short_error_text(result.get("error"))
+    if not (is_partial or is_failed or not completed or finish_reason == "error"):
+        return None
+    provider_error = result.get("provider_error")
+    payload = {
+        "message": err_msg or "Agent run did not complete.",
+        "code": "output_truncated" if finish_reason == "length" else "agent_error",
+        "completed": completed,
+        "partial": is_partial,
+        "failed": is_failed,
+    }
+    if isinstance(provider_error, dict):
+        code = _short_error_text(provider_error.get("code"), limit=120)
+        if code and finish_reason != "length":
+            payload["code"] = code
+        for key in (
+            "reason",
+            "provider",
+            "model",
+            "status_code",
+            "provider_error_code",
+            "provider_message",
+        ):
+            value = provider_error.get(key)
+            if isinstance(value, str):
+                clean = value.strip()
+                if clean:
+                    payload[key] = clean[:500]
+            elif isinstance(value, int):
+                payload[key] = value
+        recoverable = provider_error.get("recoverable")
+        if isinstance(recoverable, bool):
+            payload["recoverable"] = recoverable
+    return payload
+
+
+def _tool_completion_payload(
+    tool_call_id: str,
+    function_name: str,
+    function_result: Any,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "tool": function_name,
+        "toolCallId": tool_call_id,
+        "status": "completed",
+        "outcome": "success",
+    }
+    decoded = function_result if isinstance(function_result, dict) else None
+    if decoded is None and isinstance(function_result, str):
+        try:
+            decoded = json.loads(function_result)
+        except json.JSONDecodeError:
+            decoded = None
+    if not isinstance(decoded, dict):
+        return payload
+    decoded = _promote_connector_error_from_tool_output(decoded)
+
+    has_error = _has_tool_error_value(decoded.get("error"))
+    has_error_code = _has_tool_error_value(decoded.get("errorCode"))
+    connector_error = decoded.get("connector_error")
+    has_connector_error = _has_tool_error_value(connector_error)
+    if not (has_error or has_error_code or has_connector_error):
+        return payload
+
+    error_msg = (
+        _short_error_text(decoded.get("error"))
+        or _short_error_text(decoded.get("errorCode"), limit=120)
+        or "tool_error"
+    )
+    payload["outcome"] = "error"
+    payload["error"] = error_msg
+    if has_error_code:
+        payload["errorCode"] = _short_error_text(decoded.get("errorCode"), limit=120)
+    if isinstance(connector_error, dict):
+        payload["connector_error"] = connector_error
+        for source_key, wire_key in (
+            ("provider", "provider"),
+            ("status", "statusCode"),
+            ("code", "errorCode"),
+            ("errorCode", "errorCode"),
+        ):
+            value = connector_error.get(source_key)
+            if value is not None and wire_key not in payload:
+                payload[wire_key] = value
+    return payload
+
+
+def _promote_connector_error_from_tool_output(decoded: Dict[str, Any]) -> Dict[str, Any]:
+    """Promote connector runtime JSON printed by execute_code/terminal wrappers.
+
+    Preset connector skills call a bundled ``connector_runtime.py`` script.
+    When the script exits non-zero through execute_code, the tool result shape
+    is ``{"status":"error","error":"Script exited...", "output":"{...}"}``.
+    The structured connector error lives in ``output`` unless we lift it here.
+    """
+    if _has_tool_error_value(decoded.get("connector_error")):
+        return decoded
+    output = decoded.get("output")
+    if not isinstance(output, str):
+        return decoded
+    text = output.strip()
+    if not text:
+        return decoded
+    try:
+        printed = json.loads(text)
+    except json.JSONDecodeError:
+        return decoded
+    if not isinstance(printed, dict):
+        return decoded
+    connector_error = printed.get("connector_error")
+    if not _has_tool_error_value(connector_error):
+        connector_error = _connector_error_from_json_rpc_error(printed.get("error"))
+    if not _has_tool_error_value(connector_error):
+        return decoded
+    promoted = dict(decoded)
+    promoted["connector_error"] = connector_error
+    error_obj = printed.get("error")
+    if isinstance(error_obj, dict):
+        code = (
+            _connector_error_code(connector_error)
+            or error_obj.get("code")
+            or error_obj.get("errorCode")
+            or error_obj.get("error_code")
+        )
+        message = error_obj.get("message")
+        if _has_tool_error_value(code):
+            promoted["errorCode"] = code
+        if not _has_tool_error_value(promoted.get("error")) and _has_tool_error_value(message):
+            promoted["error"] = message
+    elif _has_tool_error_value(_connector_error_code(connector_error)):
+        promoted["errorCode"] = _connector_error_code(connector_error)
+    return promoted
+
+
+def _connector_error_code(connector_error: Any) -> Any:
+    if not isinstance(connector_error, dict):
+        return None
+    return connector_error.get("errorCode") or connector_error.get("code") or connector_error.get("error_code")
+
+
+def _connector_error_from_json_rpc_error(error_obj: Any) -> Optional[Dict[str, Any]]:
+    """Normalize connector state carried in JSON-RPC ``error.data`` output."""
+    if not isinstance(error_obj, dict):
+        return None
+    data = error_obj.get("data")
+    if not isinstance(data, dict):
+        return None
+    code = data.get("errorCode") or data.get("code") or data.get("error_code")
+    next_action = data.get("nextAction") or data.get("next_action")
+    provider = data.get("provider")
+    if not isinstance(provider, str) and isinstance(next_action, dict):
+        provider = next_action.get("provider")
+    if not _has_tool_error_value(code) or not isinstance(provider, str) or not provider.strip():
+        return None
+
+    connector_error: Dict[str, Any] = {
+        "code": code,
+        "errorCode": code,
+        "provider": provider.strip(),
+    }
+    message = data.get("message") or error_obj.get("message")
+    if _has_tool_error_value(message):
+        connector_error["message"] = _short_error_text(message)
+    if isinstance(next_action, dict):
+        connector_error["nextAction"] = next_action
+    for key in ("connectionId", "connection_id", "toolName", "tool_name", "accountAlias", "account_alias"):
+        value = data.get(key)
+        if value is not None:
+            connector_error[key] = value
+    return connector_error
 
 
 def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Response":
@@ -592,6 +845,12 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
     }
 
 
+def _validate_chat_response_format(value: Any) -> Optional[str]:
+    from agent.response_format import validate_chat_response_format
+
+    return validate_chat_response_format(value)
+
+
 if AIOHTTP_AVAILABLE:
     @web.middleware
     async def body_limit_middleware(request, handler):
@@ -800,7 +1059,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
-        self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        # Lazy-init SessionDB for session continuity.  In multiplex mode this
+        # is keyed by the scoped HERMES_HOME so profiles never share state.db.
+        self._session_db: Optional[Any] = None
+        self._session_dbs: Dict[str, Any] = {}
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
         # config.yaml gateway.api_server.max_concurrent_runs; 0 disables
@@ -810,6 +1072,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # Number of in-flight runs on the non-streaming chat/responses paths
         # (the /v1/runs path tracks its own in-flight set via _run_streams).
         self._inflight_agent_runs: int = 0
+        # Profile-home -> in-flight chat-completions count.  GatewayRunner
+        # tracks messaging-platform sessions separately; local-server reaches
+        # Hermes through this API path, so profile unload must also see these.
+        self._active_chat_runs_by_home: Dict[str, int] = {}
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -1047,6 +1313,31 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return raw, None
 
+    def _parse_run_session_id(
+        self, raw: Any
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        if raw is None or raw == "":
+            return None, None
+        if not isinstance(raw, str):
+            return None, web.json_response(
+                _openai_error("'session_id' must be a string", code="invalid_session_id"),
+                status=400,
+            )
+        if any(ord(c) < 0x20 for c in raw):
+            return None, web.json_response(
+                _openai_error("Invalid session ID", code="invalid_session_id"),
+                status=400,
+            )
+        session_id = raw.strip()
+        if not session_id:
+            return None, None
+        if len(session_id) > self._MAX_SESSION_HEADER_LEN:
+            return None, web.json_response(
+                _openai_error("Session ID too long", code="invalid_session_id"),
+                status=400,
+            )
+        return session_id, None
+
     # ------------------------------------------------------------------
     # Session DB helper
     # ------------------------------------------------------------------
@@ -1057,6 +1348,26 @@ class APIServerAdapter(BasePlatformAdapter):
         Sessions are persisted to ``state.db`` so that ``hermes sessions list``
         shows API-server conversations alongside CLI and gateway ones.
         """
+        try:
+            from hermes_constants import get_hermes_home
+            scoped_home = str(get_hermes_home().resolve())
+        except Exception:
+            scoped_home = ""
+
+        if scoped_home:
+            existing = self._session_dbs.get(scoped_home)
+            if existing is not None:
+                return existing
+            try:
+                from hermes_state import SessionDB
+                db = SessionDB()
+                self._session_dbs[scoped_home] = db
+                if self._session_db is None:
+                    self._session_db = db
+                return db
+            except Exception as e:
+                logger.debug("SessionDB unavailable for API server: %s", e)
+
         if self._session_db is None:
             try:
                 from hermes_state import SessionDB
@@ -1064,6 +1375,130 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.debug("SessionDB unavailable for API server: %s", e)
         return self._session_db
+
+    @staticmethod
+    def _profile_home_key(profile_home: Optional[Any] = None) -> str:
+        """Return the canonical cache key for a profile home."""
+        try:
+            if profile_home is not None:
+                return str(Path(profile_home).resolve())
+            from hermes_constants import get_hermes_home
+            return str(get_hermes_home().resolve())
+        except Exception:
+            return str(profile_home or "")
+
+    def _begin_profile_chat_run(self, profile_home: Optional[Any] = None) -> str:
+        key = self._profile_home_key(profile_home)
+        if key:
+            self._active_chat_runs_by_home[key] = (
+                self._active_chat_runs_by_home.get(key, 0) + 1
+            )
+        return key
+
+    def _end_profile_chat_run(self, profile_home_key: str) -> None:
+        if not profile_home_key:
+            return
+        remaining = self._active_chat_runs_by_home.get(profile_home_key, 0) - 1
+        if remaining > 0:
+            self._active_chat_runs_by_home[profile_home_key] = remaining
+        else:
+            self._active_chat_runs_by_home.pop(profile_home_key, None)
+
+    def _active_profile_chat_runs(self, profile_home: Optional[Any] = None) -> int:
+        key = self._profile_home_key(profile_home)
+        if not key:
+            return 0
+        return int(self._active_chat_runs_by_home.get(key, 0) or 0)
+
+    @staticmethod
+    def _multiplex_profile_homes() -> Dict[str, Path]:
+        """Return valid `/p/{profile}` targets keyed by URL profile name."""
+        try:
+            from hermes_cli.profiles import profiles_to_serve
+            homes = {name: Path(home) for name, home in profiles_to_serve(multiplex=True)}
+            if "default" in homes:
+                homes.setdefault("main", homes["default"])
+            return homes
+        except Exception:
+            return {}
+
+    @contextmanager
+    def _profile_api_scope(self, profile: str):
+        """Scope one HTTP handler to a profile HERMES_HOME."""
+        homes = self._multiplex_profile_homes()
+        profile_home = homes.get((profile or "").strip())
+        if profile_home is None:
+            raise web.HTTPNotFound(
+                text=json.dumps({"error": f"Unknown profile: {profile}"}),
+                content_type="application/json",
+            )
+
+        try:
+            from gateway.run import _profile_runtime_scope
+        except Exception:
+            _profile_runtime_scope = None
+
+        if _profile_runtime_scope is not None:
+            with _profile_runtime_scope(profile_home):
+                yield profile_home
+            return
+
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        token = set_hermes_home_override(str(profile_home))
+        try:
+            yield profile_home
+        finally:
+            reset_hermes_home_override(token)
+
+    def _profile_handler(
+        self,
+        handler: Callable[["web.Request"], Awaitable["web.Response"]],
+    ) -> Callable[["web.Request"], Awaitable["web.Response"]]:
+        """Wrap an existing route handler so `/p/{profile}` changes runtime scope."""
+        async def _wrapped(request: "web.Request") -> "web.Response":
+            profile = request.match_info.get("profile", "")
+            with self._profile_api_scope(profile) as profile_home:
+                request["hermes_profile"] = profile
+                request["hermes_profile_home"] = str(profile_home)
+                return await handler(request)
+
+        return _wrapped
+
+    def _register_profile_api_routes(
+        self,
+        router: "web.UrlDispatcher",
+        *,
+        chat_handler: Optional[Callable[["web.Request"], Awaitable["web.Response"]]] = None,
+    ) -> None:
+        """Register `/p/{profile}` mirrors for local-server multiplex mode."""
+        chat = chat_handler or self._handle_chat_completions
+        router.add_get("/p/{profile}/health", self._profile_handler(self._handle_health))
+        router.add_get("/p/{profile}/v1/health", self._profile_handler(self._handle_health))
+        router.add_get("/p/{profile}/v1/models", self._profile_handler(self._handle_models))
+        router.add_get("/p/{profile}/v1/skills", self._profile_handler(self._handle_skills))
+        router.add_get("/p/{profile}/v1/toolsets", self._profile_handler(self._handle_toolsets))
+        router.add_post("/p/{profile}/v1/chat/completions", self._profile_handler(chat))
+
+        router.add_get("/p/{profile}/api/sessions", self._profile_handler(self._handle_list_sessions))
+        router.add_post("/p/{profile}/api/sessions", self._profile_handler(self._handle_create_session))
+        router.add_get("/p/{profile}/api/sessions/{session_id}", self._profile_handler(self._handle_get_session))
+        router.add_patch("/p/{profile}/api/sessions/{session_id}", self._profile_handler(self._handle_patch_session))
+        router.add_delete("/p/{profile}/api/sessions/{session_id}", self._profile_handler(self._handle_delete_session))
+        router.add_get("/p/{profile}/api/sessions/{session_id}/messages", self._profile_handler(self._handle_session_messages))
+        router.add_post("/p/{profile}/api/sessions/{session_id}/fork", self._profile_handler(self._handle_fork_session))
+        router.add_post("/p/{profile}/api/sessions/{session_id}/chat", self._profile_handler(self._handle_session_chat))
+        router.add_post("/p/{profile}/api/sessions/{session_id}/chat/stream", self._profile_handler(self._handle_session_chat_stream))
+
+        router.add_get("/p/{profile}/api/jobs", self._profile_handler(self._handle_list_jobs))
+        router.add_post("/p/{profile}/api/jobs", self._profile_handler(self._handle_create_job))
+        router.add_get("/p/{profile}/api/jobs/{job_id}", self._profile_handler(self._handle_get_job))
+        router.add_patch("/p/{profile}/api/jobs/{job_id}", self._profile_handler(self._handle_update_job))
+        router.add_delete("/p/{profile}/api/jobs/{job_id}", self._profile_handler(self._handle_delete_job))
+        router.add_post("/p/{profile}/api/jobs/{job_id}/pause", self._profile_handler(self._handle_pause_job))
+        router.add_post("/p/{profile}/api/jobs/{job_id}/resume", self._profile_handler(self._handle_resume_job))
+        router.add_post("/p/{profile}/api/jobs/{job_id}/run", self._profile_handler(self._handle_run_job))
+        if _CRON_AVAILABLE:
+            router.add_post("/p/{profile}/api/cron/fire", self._profile_handler(self._handle_cron_fire))
 
     # ------------------------------------------------------------------
     # Agent creation helper
@@ -1078,6 +1513,7 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        request_overrides: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -1147,8 +1583,63 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
+            request_overrides=request_overrides,
         )
         return agent
+
+    def _response_format_transport_error(
+        self,
+        request_overrides: Optional[Dict[str, Any]],
+        *,
+        session_id: Optional[str] = None,
+        gateway_session_key: Optional[str] = None,
+    ) -> Optional[str]:
+        response_format = (request_overrides or {}).get("response_format")
+        if response_format is None:
+            return None
+        from agent.response_format import response_format_requires_structured_output
+
+        if not response_format_requires_structured_output(response_format):
+            return None
+        try:
+            from gateway.run import _resolve_runtime_agent_kwargs
+
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+        except Exception:
+            return None
+
+        override_key = gateway_session_key or session_id
+        if override_key:
+            try:
+                override = getattr(
+                    getattr(self, "gateway_runner", None),
+                    "_session_model_overrides",
+                    {},
+                ).get(override_key)
+            except Exception:
+                override = None
+            if override:
+                for key in ("provider", "base_url", "api_mode"):
+                    value = override.get(key)
+                    if value is not None:
+                        runtime_kwargs[key] = value
+
+        api_mode = getattr(self, "api_mode", None) or runtime_kwargs.get("api_mode")
+        if api_mode == "anthropic_messages":
+            return "response_format is not supported by the Anthropic Messages transport."
+        if api_mode != "chat_completions":
+            return None
+        provider = str(runtime_kwargs.get("provider") or "").strip().lower()
+        base_url = str(runtime_kwargs.get("base_url") or "")
+        try:
+            from agent.gemini_native_adapter import is_native_gemini_base_url
+
+            native_gemini = is_native_gemini_base_url(base_url)
+        except Exception:
+            native_gemini = False
+        if provider == "google-gemini-cli" or base_url.lower().startswith("cloudcode-pa://") or native_gemini:
+            return "response_format is not supported by the Gemini transport."
+        return None
 
     # ------------------------------------------------------------------
     # HTTP Handlers
@@ -1855,6 +2346,8 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+        response_mode = _extract_response_mode(body)
+        turn_id = _extract_turn_id(body)
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -1962,8 +2455,32 @@ class APIServerAdapter(BasePlatformAdapter):
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
+        request_overrides: Dict[str, Any] = {}
+        response_format = body.get("response_format")
+        if response_format is not None:
+            response_format_error = _validate_chat_response_format(response_format)
+            if response_format_error:
+                return web.json_response(
+                    _openai_error(response_format_error, param="response_format"),
+                    status=400,
+                )
+            from agent.response_format import response_format_requires_structured_output
+
+            if response_format_requires_structured_output(response_format):
+                request_overrides["response_format"] = response_format
 
         if stream:
+            response_format_transport_error = self._response_format_transport_error(
+                request_overrides or None,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+            )
+            if response_format_transport_error:
+                return web.json_response(
+                    _openai_error(response_format_transport_error, param="response_format"),
+                    status=400,
+                )
+
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
 
@@ -2020,11 +2537,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
-                _stream_q.put(("__tool_progress__", {
-                    "tool": function_name,
-                    "toolCallId": tool_call_id,
-                    "status": "completed",
-                }))
+                _stream_q.put(("__tool_progress__", _tool_completion_payload(
+                    tool_call_id, function_name, function_result,
+                )))
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -2035,6 +2550,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # The structured callbacks are strictly richer (they carry the
             # tool_call id), so they own the chat-completions SSE channel.
             agent_ref = [None]
+            profile_run_key = self._begin_profile_chat_run(
+                request.get("hermes_profile_home")
+            )
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
@@ -2045,10 +2563,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                response_mode=response_mode,
+                turn_id=turn_id,
+                request_overrides=request_overrides or None,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
             agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
+            agent_task.add_done_callback(
+                lambda _fut, key=profile_run_key: self._end_profile_chat_run(key)
+            )
 
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
@@ -2058,19 +2582,39 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
         async def _compute_completion():
-            return await self._run_agent(
-                user_message=user_message,
-                conversation_history=history,
-                ephemeral_system_prompt=system_prompt,
-                session_id=session_id,
-                gateway_session_key=gateway_session_key,
+            profile_run_key = self._begin_profile_chat_run(
+                request.get("hermes_profile_home")
             )
+            try:
+                return await self._run_agent(
+                    user_message=user_message,
+                    conversation_history=history,
+                    ephemeral_system_prompt=system_prompt,
+                    session_id=session_id,
+                    gateway_session_key=gateway_session_key,
+                    response_mode=response_mode,
+                    turn_id=turn_id,
+                    request_overrides=request_overrides or None,
+                )
+            finally:
+                self._end_profile_chat_run(profile_run_key)
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
-            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "stream"])
+            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "response_format", "stream", "metadata"])
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+            except ValueError as e:
+                if "response_format" in str(e):
+                    return web.json_response(
+                        _openai_error(str(e), param="response_format"),
+                        status=400,
+                    )
+                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
+                return web.json_response(
+                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    status=500,
+                )
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -2080,6 +2624,17 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             try:
                 result, usage = await _compute_completion()
+            except ValueError as e:
+                if "response_format" in str(e):
+                    return web.json_response(
+                        _openai_error(str(e), param="response_format"),
+                        status=400,
+                    )
+                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
+                return web.json_response(
+                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    status=500,
+                )
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -2097,12 +2652,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Decide finish_reason. OpenAI uses "length" for truncation, "stop"
         # for normal completion, and downstream SDKs accept "error" / custom
         # codes. See issue #22496.
-        if is_partial and err_msg and "truncat" in err_msg.lower():
-            finish_reason = "length"
-        elif is_failed or (not completed and err_msg):
-            finish_reason = "error"
-        else:
-            finish_reason = "stop"
+        finish_reason = _chat_finish_reason_from_result(result if isinstance(result, dict) else {})
 
         response_headers = {
             "X-Hermes-Session-Id": result.get("session_id", session_id),
@@ -2226,6 +2776,11 @@ class APIServerAdapter(BasePlatformAdapter):
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__hermes_error__":
+                    event_data = json.dumps(item[1])
+                    await response.write(
+                        f"event: hermes.error\ndata: {event_data}\n\n".encode()
+                    )
                 else:
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
@@ -2271,34 +2826,28 @@ class APIServerAdapter(BasePlatformAdapter):
             # the failure is detectable — mirroring the non-streaming path's
             # decision logic (see the finish_reason block above).
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-            result = None
-            agent_error = None
+            result = {}
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
             except Exception as exc:
-                agent_error = exc
-                logger.error(
-                    "Agent task %s failed during SSE streaming: %s", completion_id, exc
-                )
+                logger.warning("Agent task %s failed, usage data lost: %s", completion_id, exc)
+                result = {
+                    "completed": False,
+                    "failed": True,
+                    "error": str(exc),
+                }
+            result_dict = result if isinstance(result, dict) else {}
+            completed = bool(result_dict.get("completed", True))
+            is_partial = bool(result_dict.get("partial"))
+            is_failed = bool(result_dict.get("failed"))
+            raw_err_msg = result_dict.get("error")
+            err_msg = _redact_api_error_text(raw_err_msg) if raw_err_msg else raw_err_msg
 
-            # Inspect the result dict for a flagged (non-exception) failure.
-            is_partial = bool(result.get("partial")) if isinstance(result, dict) else False
-            is_failed = bool(result.get("failed")) if isinstance(result, dict) else False
-            completed = bool(result.get("completed", True)) if isinstance(result, dict) else True
-            err_msg = result.get("error") if isinstance(result, dict) else None
-            if agent_error is not None:
-                is_failed = True
-                err_msg = err_msg or str(agent_error)
-
-            # Decide finish_reason, matching the non-streaming logic: "length"
-            # for truncation, "error" for failure, "stop" for normal completion.
-            if is_partial and err_msg and "truncat" in err_msg.lower():
-                finish_reason = "length"
-            elif agent_error is not None or is_failed or (not completed and err_msg):
-                finish_reason = "error"
-            else:
-                finish_reason = "stop"
+            finish_reason = _chat_finish_reason_from_result(result_dict)
+            error_payload = _chat_stream_error_payload(result_dict, finish_reason)
+            if error_payload:
+                await _emit(("__hermes_error__", error_payload))
 
             # Finish chunk
             finish_chunk = {
@@ -2316,7 +2865,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 if err_msg:
                     finish_chunk["error"] = {
                         "message": err_msg,
-                        "type": type(agent_error).__name__ if agent_error else "agent_error",
+                        "type": "agent_error",
                     }
                 finish_chunk["hermes"] = {
                     "completed": completed,
@@ -3284,7 +3833,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
     # Allowed fields for update — prevents clients injecting arbitrary keys
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled", "timezone"}
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
 
@@ -3310,6 +3859,100 @@ class APIServerAdapter(BasePlatformAdapter):
                 {"error": "Invalid job ID format"}, status=400,
             )
         return job_id, None
+
+    # Bounded so a malicious or malformed origin can't push megabytes into
+    # jobs.json. Chat IDs in zet_agent are typically <80 chars
+    # ("zettlab:local-dev:main:EsGjUc7V-2oA"); 500 leaves headroom for future
+    # formats. User/chat name fields are short labels; 500 is generous.
+    _ORIGIN_PLATFORM_MAX = 200
+    _ORIGIN_TEXT_MAX = 500
+
+    @staticmethod
+    def _validate_origin_field(value) -> Optional["web.Response"]:
+        """Validate a cron job ``origin`` body — the chat session that
+        gets the delivery when ``deliver='origin'`` fires.
+
+        Mirrors the shape ``cronjob_tools._origin_from_env()`` writes in
+        the LLM-tool path: ``{platform, chat_id, chat_name?, thread_id?,
+        user_id?, user_name?}``. APP's preview-confirm-POST path lost
+        this metadata because the handler used to ignore unknown body
+        keys, so jobs landed with ``origin=null`` and the scheduler had
+        nowhere to deliver to (ZET-942 follow-up).
+
+        Returns a 400 web.Response on bad input, None when OK.
+        """
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            return web.json_response(
+                {"error": "origin must be an object"}, status=400,
+            )
+        platform = value.get("platform")
+        chat_id = value.get("chat_id")
+        if not isinstance(platform, str) or not platform.strip():
+            return web.json_response(
+                {"error": "origin.platform is required and must be a non-empty string"},
+                status=400,
+            )
+        if not isinstance(chat_id, str) or not chat_id.strip():
+            return web.json_response(
+                {"error": "origin.chat_id is required and must be a non-empty string"},
+                status=400,
+            )
+        if len(platform) > APIServerAdapter._ORIGIN_PLATFORM_MAX:
+            return web.json_response(
+                {"error": f"origin.platform must be ≤ {APIServerAdapter._ORIGIN_PLATFORM_MAX} characters"},
+                status=400,
+            )
+        if len(chat_id) > APIServerAdapter._ORIGIN_TEXT_MAX:
+            return web.json_response(
+                {"error": f"origin.chat_id must be ≤ {APIServerAdapter._ORIGIN_TEXT_MAX} characters"},
+                status=400,
+            )
+        for k in ("chat_name", "thread_id", "user_id", "user_name"):
+            v = value.get(k)
+            if v is None:
+                continue
+            if not isinstance(v, str):
+                return web.json_response(
+                    {"error": f"origin.{k} must be a string"}, status=400,
+                )
+            if len(v) > APIServerAdapter._ORIGIN_TEXT_MAX:
+                return web.json_response(
+                    {"error": f"origin.{k} must be ≤ {APIServerAdapter._ORIGIN_TEXT_MAX} characters"},
+                    status=400,
+                )
+        return None
+
+    @staticmethod
+    def _validate_timezone_field(value) -> Optional["web.Response"]:
+        """Validate an IANA timezone string from a job request body.
+
+        Returns a 400 response on bad input, or None when value is OK
+        (None, empty string, or a recognised zone). Done at the API layer
+        so clients get a clear 400 instead of the catch-all 500 from the
+        underlying ``_cron_create`` / ``_cron_update`` ValueError.
+        """
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return web.json_response(
+                {"error": "timezone must be a string"}, status=400,
+            )
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # type: ignore[no-redef]
+        try:
+            ZoneInfo(text)
+        except (ZoneInfoNotFoundError, ValueError):
+            return web.json_response(
+                {"error": f"Invalid IANA timezone: {text!r}"}, status=400,
+            )
+        return None
 
     async def _handle_list_jobs(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs — list all cron jobs."""
@@ -3342,6 +3985,8 @@ class APIServerAdapter(BasePlatformAdapter):
             deliver = body.get("deliver", "local")
             skills = body.get("skills")
             repeat = body.get("repeat")
+            timezone = body.get("timezone")
+            origin = body.get("origin")
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -3361,6 +4006,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     return web.json_response({"error": scan_error}, status=400)
             if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
                 return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
+            tz_err = self._validate_timezone_field(timezone)
+            if tz_err:
+                return tz_err
+            origin_err = self._validate_origin_field(origin)
+            if origin_err:
+                return origin_err
 
             kwargs = {
                 "prompt": prompt,
@@ -3373,6 +4024,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
+            if timezone is not None:
+                kwargs["timezone"] = timezone
+            if origin is not None:
+                kwargs["origin"] = origin
 
             job = _cron_create(**kwargs)
             _notify_cron_provider_jobs_changed()
@@ -3429,6 +4084,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 scan_error = _scan_cron_prompt(sanitized["prompt"])
                 if scan_error:
                     return web.json_response({"error": scan_error}, status=400)
+            if "timezone" in sanitized:
+                tz_err = self._validate_timezone_field(sanitized["timezone"])
+                if tz_err:
+                    return tz_err
             job = _cron_update(job_id, sanitized)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
@@ -3790,6 +4449,9 @@ class APIServerAdapter(BasePlatformAdapter):
         tool_complete_callback=None,
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
+        response_mode: Optional[str] = None,
+        turn_id: Optional[str] = None,
+        request_overrides: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -3806,12 +4468,17 @@ class APIServerAdapter(BasePlatformAdapter):
 
         def _run():
             from gateway.session_context import clear_session_vars
+            from tools.file_operations import set_zettlab_turn_id
 
             tokens = self._bind_api_server_session(
                 chat_id=session_id or "",
                 session_key=gateway_session_key or session_id or "",
                 session_id=session_id or "",
             )
+            # turn_id is NAS-fallback-only, not a general session attribute, so
+            # it rides its own feature-scoped contextvar (set/cleared alongside
+            # the session vars to stay leak-free on reused executor threads).
+            set_zettlab_turn_id(turn_id or "")
             try:
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
@@ -3821,9 +4488,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_start_callback=tool_start_callback,
                     tool_complete_callback=tool_complete_callback,
                     gateway_session_key=gateway_session_key,
+                    request_overrides=request_overrides,
                 )
                 if agent_ref is not None:
                     agent_ref[0] = agent
+                if response_mode:
+                    agent._zet_agent_response_mode = response_mode
                 effective_task_id = session_id or str(uuid.uuid4())
                 result = agent.run_conversation(
                     user_message=user_message,
@@ -3844,10 +4514,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 return result, usage
             finally:
                 clear_session_vars(tokens)
+                set_zettlab_turn_id("")
 
+        from contextvars import copy_context
+
+        ctx = copy_context()
         self._inflight_agent_runs += 1
         try:
-            return await loop.run_in_executor(None, _run)
+            return await loop.run_in_executor(None, ctx.run, _run)
         finally:
             self._inflight_agent_runs -= 1
 
@@ -3996,8 +4670,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
+        explicit_session_id, session_err = self._parse_run_session_id(body.get("session_id"))
+        if session_err is not None:
+            return session_err
+
         run_id = f"run_{uuid.uuid4().hex}"
-        session_id = body.get("session_id") or stored_session_id or run_id
+        session_id = explicit_session_id or stored_session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple
@@ -4093,6 +4771,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         approval_token = set_current_session_key(approval_session_key)
                         session_tokens = self._bind_api_server_session(
                             session_key=approval_session_key,
+                            session_id=session_id or "",
                         )
                         register_gateway_notify(approval_session_key, _approval_notify)
                         r = agent.run_conversation(
@@ -4546,6 +5225,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
             self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+            self._register_profile_api_routes(self._app.router)
 
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated by a
             # NAS-minted JWT (NOT API_SERVER_KEY), so it has its own auth path.

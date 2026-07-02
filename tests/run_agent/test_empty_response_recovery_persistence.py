@@ -174,3 +174,28 @@ def test_flush_skips_thinking_prefill_scaffolding():
     agent._flush_messages_to_session_db(messages, conversation_history=[])
 
     assert [r["content"] for r in agent._session_db.rows] == ["hi", "Hello!"]
+
+
+def test_persist_session_strips_trailing_length_continuation_prompt():
+    agent = _agent_with_stubbed_persistence()
+    messages = [
+        {"role": "user", "content": "write a long answer"},
+        {"role": "assistant", "content": "partial", "finish_reason": "length"},
+        {
+            "role": "user",
+            "content": (
+                "[System: Your previous response was truncated by the output "
+                "length limit. Continue exactly where you left off.]"
+            ),
+            "_length_continuation_synthetic": True,
+        },
+    ]
+
+    AIAgent._persist_session(agent, messages, conversation_history=[])
+
+    assert messages == [
+        {"role": "user", "content": "write a long answer"},
+        {"role": "assistant", "content": "partial", "finish_reason": "length"},
+    ]
+    assert agent.flushed_session_db_messages[-1] == messages
+    assert all(not msg.get("_length_continuation_synthetic") for msg in messages)

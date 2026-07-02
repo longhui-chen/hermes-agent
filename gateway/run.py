@@ -1267,7 +1267,7 @@ _hermes_home = get_hermes_home()
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
 from dotenv import load_dotenv  # noqa: F401  # backward-compat for tests that monkeypatch this symbol
-from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.env_loader import env_var_was_operator_set, load_hermes_dotenv
 _env_path = _hermes_home / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).resolve().parents[1] / '.env')
 
@@ -1327,6 +1327,69 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
     agent_cfg = cfg.get("agent", {})
     if isinstance(agent_cfg, dict) and "max_turns" in agent_cfg:
         os.environ["HERMES_MAX_ITERATIONS"] = str(agent_cfg["max_turns"])
+    _apply_config_timezone_authority(cfg)
+
+
+def _is_valid_iana_timezone(name: str) -> bool:
+    """True if ``name`` is a real IANA zone — quiet (no logging side effect).
+
+    Mirrors the validity gate ``hermes_time._get_zoneinfo`` applies, but
+    without its warning log: we call this only to DECIDE whether dropping a
+    stale .env value is safe. A "falling back to server local" warning would
+    be both noisy (every startup + reload) and misleading — we KEEP the .env
+    value precisely when the config zone is invalid.
+    """
+    if not name:
+        return False
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(name)
+        return True
+    except Exception:
+        return False
+
+
+def _apply_config_timezone_authority(cfg: dict) -> None:
+    """Make config.yaml's ``timezone`` authoritative WITHOUT freezing it.
+
+    Unlike the other config→env bridge keys (HERMES_MAX_ITERATIONS, …), the
+    timezone is resolved LIVE by ``hermes_time`` (fingerprint-gated) with the
+    precedence ``HERMES_TIMEZONE`` env > device-mode OS tz > config.yaml > OS
+    fallback.  Pinning config.yaml into ``HERMES_TIMEZONE`` (the way the other
+    keys are bridged) would freeze it for the process lifetime and shadow both
+    later config.yaml edits AND the device's OS timezone (which the App sets
+    via ``timedatectl`` and which must win over a stale value).
+
+    So instead of pinning, we make config.yaml authoritative by DROPPING a
+    stale ``.env``-injected ``HERMES_TIMEZONE`` so ``hermes_time`` resolves
+    live.  A genuine operator override (``HERMES_TIMEZONE`` exported in the
+    real environment) is always preserved.  We drop the stale value ONLY when
+    something VALID will actually win — otherwise we'd downgrade a working
+    .env value to server-local time:
+      • config.yaml provides a VALID IANA timezone (config is authoritative); or
+      • Zettlab device mode is on AND the OS timezone the App set resolves (so
+        it wins over the stale .env).  If the OS tz isn't set yet — e.g. a fresh
+        board before the App ran ``timedatectl`` — we KEEP the .env value rather
+        than fall through to server-local.
+    """
+    if "HERMES_TIMEZONE" not in os.environ:
+        return
+    if env_var_was_operator_set("HERMES_TIMEZONE"):
+        return  # genuine operator override — never touch it
+
+    tz = cfg.get("timezone") if isinstance(cfg, dict) else None
+    config_has_valid_tz = isinstance(tz, str) and _is_valid_iana_timezone(tz.strip())
+    from hermes_time import _is_zettlab_device_mode, _read_os_timezone
+    device_os_tz_wins = (
+        _is_zettlab_device_mode()
+        and _is_valid_iana_timezone((_read_os_timezone() or "").strip())
+    )
+    if config_has_valid_tz or device_os_tz_wins:
+        # pop (not del): the per-turn reload path can run concurrently across
+        # sessions; another turn may have already removed it after our
+        # membership check, and del would KeyError out of the reload caller
+        # (which is not wrapped in try/except).
+        os.environ.pop("HERMES_TIMEZONE", None)
 
 
 def _current_max_iterations() -> int:
@@ -1343,14 +1406,13 @@ from contextlib import contextmanager as _contextmanager
 
 # Platforms that bind a host TCP port (HTTP/webhook listeners). In a profile
 # multiplexer the default profile owns the single shared listener and serves
-# every profile through the /p/<profile>/ URL prefix, so a SECONDARY profile
-# enabling one of these is always a misconfiguration: it would try to bind a
-# port already held by the default's listener. We hard-error on it rather than
-# silently dropping the adapter (see _start_one_profile_adapters).
+# every profile through the /p/<profile>/ URL prefix, so a secondary profile
+# must not bind one of these again.
 # Stored as platform .value strings since the Platform enum is imported below.
 _PORT_BINDING_PLATFORM_VALUES = frozenset({
     "webhook",
     "api_server",
+    "zet_agent",
     "msgraph_webhook",
     "feishu",
     "wecom_callback",
@@ -1553,10 +1615,12 @@ if _config_path.exists():
                 os.environ["HERMES_GATEWAY_BUSY_TEXT_MODE"] = str(_display_cfg["busy_text_mode"])
             if "busy_ack_enabled" in _display_cfg:
                 os.environ["HERMES_GATEWAY_BUSY_ACK_ENABLED"] = str(_display_cfg["busy_ack_enabled"])
-        # Timezone: bridge config.yaml → HERMES_TIMEZONE env var.
-        _tz_cfg = _cfg.get("timezone", "")
-        if _tz_cfg and isinstance(_tz_cfg, str):
-            os.environ["HERMES_TIMEZONE"] = _tz_cfg.strip()
+        # Timezone: config.yaml is authoritative over a stale .env value, but
+        # is NOT pinned into HERMES_TIMEZONE — hermes_time reads config.yaml
+        # live (fingerprint-gated) and pinning would freeze it for the process
+        # lifetime (shadowing live edits + the device-mode OS timezone). We
+        # instead drop a stale .env HERMES_TIMEZONE so the live read wins.
+        _apply_config_timezone_authority(_cfg)
         # Security settings
         _security_cfg = _cfg.get("security", {})
         if isinstance(_security_cfg, dict):
@@ -1830,7 +1894,9 @@ def _try_resolve_fallback_provider() -> dict | None:
     from hermes_cli.runtime_provider import resolve_runtime_provider
     try:
         import yaml as _y
-        cfg_path = _hermes_home / "config.yaml"
+        from hermes_constants import get_hermes_home_override
+        override_home = get_hermes_home_override()
+        cfg_path = ((Path(override_home) if override_home else _hermes_home) / "config.yaml")
         if not cfg_path.exists():
             return None
         with open(cfg_path, encoding="utf-8") as _f:
@@ -2198,7 +2264,12 @@ def _load_gateway_config() -> dict:
     gateway honors administrator-pinned values — neither read_raw_config nor a
     direct yaml.safe_load carries the managed merge on its own. Fail-open.
     """
-    config_path = _hermes_home / 'config.yaml'
+    try:
+        from hermes_constants import get_hermes_home_override
+        override_home = get_hermes_home_override()
+    except Exception:
+        override_home = None
+    config_path = (Path(override_home) if override_home else _hermes_home) / 'config.yaml'
     raw: dict = {}
     used_canonical = False
     try:
@@ -2603,7 +2674,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _restart_command_source: Optional[SessionSource] = None
     _stop_task: Optional[asyncio.Task] = None
     _restart_task: Optional[asyncio.Task] = None
-    _session_model_overrides: Dict[str, Dict[str, str]] = {}
+    _mcp_discovery_task: Optional[asyncio.Task] = None
+    _accept_hooks: bool = False
+    _session_model_overrides: Dict[str, Dict[str, Any]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
 
@@ -2667,7 +2740,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._exit_cleanly = False
         self._exit_with_failure = False
         self._exit_reason: Optional[str] = None
-        self._exit_code: Optional[int] = None
+        self._exit_code = None
         self._draining = False
         # External (NAS-driven) drain state — distinct from the shutdown
         # ``_draining`` flag above. Set by ``_drain_control_watcher`` when the
@@ -2712,6 +2785,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Set on gateway stop so the recreate-on-shutdown path can't resurrect
         # the pool during a real shutdown.
         self._executor_closing = False
+        self._mcp_discovery_task: Optional[asyncio.Task] = None
+        self._accept_hooks = False
         # Track running agents per session for interrupt support
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
@@ -2770,10 +2845,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Per-session model overrides from /model command.
         # Key: session_key, Value: dict with model/provider/api_key/base_url/api_mode
-        self._session_model_overrides: Dict[str, Dict[str, str]] = {}
+        self._session_model_overrides = {}
         # Per-session reasoning effort overrides from /reasoning.
         # Key: session_key, Value: parsed reasoning config dict.
-        self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
+        self._session_reasoning_overrides = {}
         self._kanban_notifier_profile = self._active_profile_name()
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
@@ -2873,6 +2948,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.debug("state.db auto-maintenance skipped: %s", exc)
 
+        # Restore explicit session-level model overrides written by the
+        # Zettlab local-server. Local-server owns the control-plane state;
+        # Hermes consumes this profile-local JSON at startup and only keeps
+        # runtime overrides in memory afterwards.
+        try:
+            from gateway.session_model_overrides import load_session_model_overrides
+
+            stored = load_session_model_overrides()
+            if stored:
+                self._session_model_overrides.update(stored)
+                logger.info(
+                    "session-model-overrides: restored %d from profile json",
+                    len(stored),
+                )
+        except Exception as exc:
+            logger.debug("session-model-overrides restore skipped: %s", exc)
+
         # Opportunistic shadow-repo cleanup — deletes orphan/stale
         # checkpoint repos under ~/.hermes/checkpoints/.  Opt-in via
         # checkpoints.auto_prune, idempotent via .last_prune marker.
@@ -2964,7 +3056,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         connected = self.config.get_connected_platforms()
-        messaging_platforms = [p for p in connected if p not in {Platform.LOCAL, Platform.API_SERVER, Platform.WEBHOOK}]
+        messaging_platforms = [p for p in connected if p not in {Platform.LOCAL, Platform.API_SERVER, Platform.ZET_AGENT, Platform.WEBHOOK}]
         if not messaging_platforms:
             return
 
@@ -3566,6 +3658,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "base_url": override.get("base_url"),
                 "api_mode": override.get("api_mode"),
                 "max_tokens": override.get("max_tokens"),
+                "config_context_length": override.get("context_length"),
             }
             if override_runtime.get("api_key"):
                 logger.debug(
@@ -3645,7 +3738,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
+    def _resolve_turn_agent_config(
+        self,
+        user_message: str,
+        model: str,
+        runtime_kwargs: dict,
+        session_key: Optional[str] = None,
+    ) -> dict:
         """Build the effective model/runtime config for a single turn.
 
         Always uses the session's primary model/provider.  If `/fast` is
@@ -3660,21 +3759,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "base_url": runtime_kwargs.get("base_url"),
             "provider": runtime_kwargs.get("provider"),
             "api_mode": runtime_kwargs.get("api_mode"),
+            "config_context_length": runtime_kwargs.get("config_context_length"),
             "command": runtime_kwargs.get("command"),
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
             "max_tokens": runtime_kwargs.get("max_tokens"),
         }
+        auxiliary_task_configs = self._session_runtime_auxiliary_task_configs(session_key)
+        supports_vision = self._session_runtime_supports_vision(session_key)
         route = {
             "model": model,
             "runtime": runtime,
+            "runtime_auxiliary_task_configs": auxiliary_task_configs,
+            "runtime_supports_vision": supports_vision,
             "signature": (
                 model,
                 runtime["provider"],
                 runtime["base_url"],
                 runtime["api_mode"],
+                runtime["config_context_length"],
                 runtime["command"],
                 tuple(runtime["args"]),
+                json.dumps(auxiliary_task_configs or {}, sort_keys=True, default=str),
+                supports_vision,
             ),
         }
 
@@ -6527,7 +6634,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             from hermes_cli.config import load_config
             from agent.shell_hooks import register_from_config
-            register_from_config(load_config(), accept_hooks=False)
+            register_from_config(
+                load_config(),
+                accept_hooks=bool(getattr(self, "_accept_hooks", False)),
+            )
         except Exception:
             logger.debug(
                 "shell-hook registration failed at gateway startup",
@@ -8080,21 +8190,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for platform, platform_config in profile_cfg.platforms.items():
             if not platform_config.enabled:
                 continue
-            # A secondary profile must NOT enable a port-binding platform: the
-            # default profile's listener already serves every profile via the
-            # /p/<profile>/ prefix, so a second bind can only collide. This is a
-            # config error, not a transient failure — fail fast and loud.
+            # A secondary profile must NOT bind a listener: the default
+            # profile's listener already serves every profile via /p/<profile>/.
+            # Skip here instead of aborting so existing profile configs remain
+            # compatible when multiplex mode is enabled.
             if platform.value in _PORT_BINDING_PLATFORM_VALUES:
-                raise MultiplexConfigError(
-                    f"Profile '{profile_name}' enables the port-binding platform "
-                    f"'{platform.value}', but gateway.multiplex_profiles is on. The "
-                    f"default profile owns the single shared HTTP listener and "
-                    f"serves every profile through the /p/{profile_name}/ URL "
-                    f"prefix — a secondary profile cannot bind its own port. "
-                    f"Remove platforms.{platform.value} from profile "
-                    f"'{profile_name}'s config.yaml (configure it only on the "
-                    f"default profile)."
+                logger.info(
+                    "Skipping port-binding platform %s for secondary profile %s "
+                    "(served by shared multiplex listener)",
+                    platform.value,
+                    profile_name,
                 )
+                continue
             with _profile_runtime_scope(profile_home):
                 adapter = self._create_adapter(platform, platform_config)
             if not adapter:
@@ -8251,6 +8358,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("API Server: aiohttp not installed")
                 return None
             return APIServerAdapter(config)
+
+        elif platform == Platform.ZET_AGENT:
+            from gateway.platforms.zet_agent import ZetAgentAdapter, check_zet_agent_requirements
+            if not check_zet_agent_requirements():
+                logger.warning("Zet Agent: aiohttp not installed")
+                return None
+            adapter = ZetAgentAdapter(config)
+            adapter.gateway_runner = self
+            return adapter
 
         elif platform == Platform.WEBHOOK:
             from gateway.platforms.webhook import WebhookAdapter, check_webhook_requirements
@@ -9866,7 +9982,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if image_paths:
                 # Decide routing: native (attach pixels) vs text (vision_analyze
                 # pre-run + prepend description).  See agent/image_routing.py.
-                _img_mode = self._decide_image_input_mode()
+                _turn_route_for_images = None
+                try:
+                    _img_user_config = _load_gateway_config()
+                    _img_model, _img_runtime = self._resolve_session_agent_runtime(
+                        source=source,
+                        session_key=session_key,
+                        user_config=_img_user_config,
+                    )
+                    _turn_route_for_images = self._resolve_turn_agent_config(
+                        message_text,
+                        _img_model,
+                        _img_runtime,
+                        session_key=session_key,
+                    )
+                    self._install_turn_auxiliary_runtime(_turn_route_for_images)
+                except Exception as _img_runtime_exc:
+                    logger.debug(
+                        "image_routing: session runtime resolution failed: %s",
+                        _img_runtime_exc,
+                    )
+                _img_mode = self._decide_image_input_mode(_turn_route_for_images)
                 if _img_mode == "native":
                     # Defer attachment to the run_conversation call site.
                     pending_native = getattr(self, "_pending_native_image_paths_by_session", None)
@@ -12575,8 +12711,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             user_config = _load_gateway_config()
+            session_key = self._session_key_for_source(source)
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
+                session_key=session_key,
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
@@ -12599,7 +12737,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             reasoning_config = self._resolve_session_reasoning_config(source=source)
             self._reasoning_config = reasoning_config
             self._service_tier = self._load_service_tier()
-            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(
+                prompt, model, runtime_kwargs, session_key=session_key
+            )
 
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).
@@ -12612,6 +12752,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         image_paths.append(path)
                 if image_paths:
                     try:
+                        self._install_turn_auxiliary_runtime(turn_route)
                         enriched_prompt = await self._enrich_message_with_vision(
                             prompt, image_paths,
                         )
@@ -12648,6 +12789,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_db=getattr(self._session_db, "_db", self._session_db),
                     fallback_model=self._fallback_model,
                 )
+                agent.runtime_auxiliary_task_configs = turn_route.get("runtime_auxiliary_task_configs")
+                agent.runtime_supports_vision = turn_route.get("runtime_supports_vision")
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
@@ -13195,6 +13338,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         wrapper can invoke the same path whether the user confirmed via
         button, text reply, or has the confirm gate disabled.
         """
+        discovery_task = getattr(self, "_mcp_discovery_task", None)
+        if discovery_task is not None and not discovery_task.done():
+            return (
+                "MCP discovery is still initializing in the background. "
+                "Please retry `/reload-mcp` after it finishes."
+            )
+
         loop = asyncio.get_running_loop()
         try:
             from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
@@ -14192,7 +14342,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except TypeError:
             executor.shutdown(wait=False)
 
-    def _decide_image_input_mode(self) -> str:
+    def _decide_image_input_mode(self, turn_route: Optional[dict] = None) -> str:
         """Resolve the image-input routing for the currently active model.
 
         Returns ``"native"`` (attach pixels on the user turn) or ``"text"``
@@ -14210,10 +14360,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cfg = load_config()
             provider = _read_main_provider()
             model = _read_main_model()
+            if isinstance(turn_route, dict):
+                runtime = turn_route.get("runtime") or {}
+                provider = (runtime.get("provider") or provider or "").strip()
+                model = (turn_route.get("model") or model or "").strip()
+                cfg = self._overlay_image_routing_config(cfg, turn_route)
             return decide_image_input_mode(provider, model, cfg)
         except Exception as exc:
             logger.debug("image_routing: decision failed, falling back to text — %s", exc)
             return "text"
+
+    def _overlay_image_routing_config(self, cfg: dict, turn_route: dict) -> dict:
+        """Overlay session-scoped vision routing fields onto config copy."""
+        out = dict(cfg) if isinstance(cfg, dict) else {}
+        auxiliary_task_configs = turn_route.get("runtime_auxiliary_task_configs")
+        if isinstance(auxiliary_task_configs, dict) and "vision" in auxiliary_task_configs:
+            aux = dict(out.get("auxiliary") or {})
+            vision_cfg = auxiliary_task_configs.get("vision")
+            aux["vision"] = dict(vision_cfg) if isinstance(vision_cfg, dict) else {}
+            out["auxiliary"] = aux
+
+        supports_vision = turn_route.get("runtime_supports_vision")
+        if isinstance(supports_vision, bool):
+            model_cfg = dict(out.get("model") or {})
+            model_cfg["default"] = turn_route.get("model") or model_cfg.get("default", "")
+            model_cfg["supports_vision"] = supports_vision
+            out["model"] = model_cfg
+        return out
 
     async def _enrich_message_with_vision(
         self,
@@ -14999,7 +15172,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             val = override.get(key)
             if val is not None:
                 runtime_kwargs[key] = val
+        context_length = override.get("context_length")
+        if context_length is not None:
+            runtime_kwargs["config_context_length"] = context_length
         return model, runtime_kwargs
+
+    def _session_runtime_auxiliary_task_configs(self, session_key: Optional[str]) -> Optional[dict]:
+        """Return session-scoped auxiliary task config from model override."""
+        if not session_key:
+            return None
+        override = self._session_model_overrides.get(session_key)
+        if not isinstance(override, dict):
+            return None
+        auxiliary = override.get("auxiliary")
+        if not isinstance(auxiliary, dict):
+            return None
+        cleaned = {}
+        for task, task_config in auxiliary.items():
+            if isinstance(task, str) and isinstance(task_config, dict):
+                cleaned[task] = dict(task_config)
+        return cleaned
+
+    def _session_runtime_supports_vision(self, session_key: Optional[str]) -> Optional[bool]:
+        """Return session-scoped model.supports_vision override if present."""
+        if not session_key:
+            return None
+        override = self._session_model_overrides.get(session_key)
+        if not isinstance(override, dict):
+            return None
+        value = override.get("supports_vision")
+        return value if isinstance(value, bool) else None
+
+    def _install_turn_auxiliary_runtime(self, turn_route: dict) -> None:
+        """Expose the active turn runtime to auxiliary_client."""
+        try:
+            from agent.auxiliary_client import (
+                set_runtime_auxiliary_task_configs,
+                set_runtime_main,
+            )
+            runtime = turn_route.get("runtime") or {}
+            set_runtime_main(
+                runtime.get("provider") or "",
+                turn_route.get("model") or "",
+                base_url=runtime.get("base_url") or "",
+                api_key=runtime.get("api_key") or "",
+                api_mode=runtime.get("api_mode") or "",
+            )
+            set_runtime_auxiliary_task_configs(
+                turn_route.get("runtime_auxiliary_task_configs")
+            )
+        except Exception:
+            logger.debug("session auxiliary runtime install failed", exc_info=True)
 
     def _is_intentional_model_switch(self, session_key: str, agent_model: str) -> bool:
         """Return True if *agent_model* matches an active /model session override."""
@@ -15320,6 +15543,186 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._release_evicted_agent_soft(agent)
             except Exception:
                 pass
+
+    def invalidate_all_cached_agents(self) -> int:
+        """Force every cached agent to rebuild its system prompt on the next turn.
+
+        Unlike _evict_cached_agent which drops the AIAgent instance entirely,
+        this keeps the instance (and therefore its OpenAI/httpx clients, MCP
+        handles, and tool state) and only clears the cached system prompt via
+        the upstream _invalidate_system_prompt() — the same hook /new, /clear,
+        and /branch use when they need to pick up fresh SOUL.md / IDENTITY.md
+        / memories from disk.
+
+        Used by the prompt-class reload endpoints (/v1/profile/reload,
+        /v1/skills/reload) to make on-disk profile changes take effect on the
+        current session without restarting the gateway. Returns the number of
+        agents successfully invalidated; individual failures are swallowed so
+        one broken agent doesn't block the rest.
+
+        Snapshot under the lock, then invalidate without it — the upstream
+        _invalidate_system_prompt may touch disk (memory_store.load_from_disk)
+        and we don't want that under the cache lock.
+
+        Cache values are ``(agent, signature)`` tuples (see the cache insert
+        in _run_agent around L15382); the agent itself is the first element.
+        We accept either shape — bare agent or tuple — so a future cache-value
+        refactor doesn't silently turn this into a zero-count no-op the way
+        a naive ``getattr(value, "_invalidate_system_prompt", ...)`` would.
+        """
+        _lock = getattr(self, "_agent_cache_lock", None)
+        if _lock is None:
+            return 0
+        with _lock:
+            entries = list(self._agent_cache.values())
+        count = 0
+        for entry in entries:
+            agent = entry[0] if isinstance(entry, tuple) and entry else entry
+            invalidate = getattr(agent, "_invalidate_system_prompt", None)
+            if not callable(invalidate):
+                continue
+            try:
+                invalidate()
+                count += 1
+            except Exception:
+                logger.warning(
+                    "invalidate_all_cached_agents: agent %r failed",
+                    type(agent).__name__,
+                    exc_info=True,
+                )
+        return count
+
+    @staticmethod
+    def _profile_session_key_prefix(profile: Optional[str]) -> str:
+        try:
+            from gateway.session import _session_key_namespace
+            return _session_key_namespace(profile) + ":"
+        except Exception:
+            normalized = (profile or "main").strip() or "main"
+            if normalized == "default":
+                normalized = "main"
+            return f"agent:{normalized}:"
+
+    def invalidate_cached_agents_for_profile(self, profile: Optional[str]) -> int:
+        """Invalidate cached agents whose session key belongs to one profile."""
+        prefix = self._profile_session_key_prefix(profile)
+        _lock = getattr(self, "_agent_cache_lock", None)
+        if _lock is None:
+            return 0
+        with _lock:
+            entries = [
+                value
+                for key, value in self._agent_cache.items()
+                if str(key).startswith(prefix)
+            ]
+        count = 0
+        for entry in entries:
+            agent = entry[0] if isinstance(entry, tuple) and entry else entry
+            invalidate = getattr(agent, "_invalidate_system_prompt", None)
+            if not callable(invalidate):
+                continue
+            try:
+                invalidate()
+                count += 1
+            except Exception:
+                logger.warning(
+                    "invalidate_cached_agents_for_profile(%s): agent %r failed",
+                    profile,
+                    type(agent).__name__,
+                    exc_info=True,
+                )
+        return count
+
+    def _evict_cached_agents_for_profile(self, profile: Optional[str]) -> int:
+        """Drop cached agents and session model overrides owned by one profile."""
+        prefix = self._profile_session_key_prefix(profile)
+        _lock = getattr(self, "_agent_cache_lock", None)
+        evicted_entries = []
+        if _lock is not None:
+            with _lock:
+                keys = [
+                    key
+                    for key in list(self._agent_cache.keys())
+                    if str(key).startswith(prefix)
+                ]
+                for key in keys:
+                    evicted_entries.append(self._agent_cache.pop(key, None))
+        else:
+            _cache = getattr(self, "_agent_cache", None)
+            if _cache is not None:
+                keys = [key for key in list(_cache.keys()) if str(key).startswith(prefix)]
+                for key in keys:
+                    evicted_entries.append(_cache.pop(key, None))
+
+        overrides = getattr(self, "_session_model_overrides", None)
+        if isinstance(overrides, dict):
+            for key in list(overrides.keys()):
+                if str(key).startswith(prefix):
+                    overrides.pop(key, None)
+
+        running_ids = {
+            id(agent)
+            for agent in getattr(self, "_running_agents", {}).values()
+            if agent is not None and agent is not _AGENT_PENDING_SENTINEL
+        }
+        cleaned = 0
+        for entry in evicted_entries:
+            agent = entry[0] if isinstance(entry, tuple) and entry else entry
+            if agent is None or agent is _AGENT_PENDING_SENTINEL:
+                continue
+            if id(agent) in running_ids:
+                logger.warning(
+                    "profile-unload: cached agent for profile %s is still running; "
+                    "removed from cache but deferred resource cleanup",
+                    profile,
+                )
+                continue
+            try:
+                self._cleanup_agent_resources(agent)
+                cleaned += 1
+            except Exception:
+                logger.warning(
+                    "profile-unload: cleanup failed for profile %s",
+                    profile,
+                    exc_info=True,
+                )
+        return cleaned
+
+    async def unload_profile_runtime(self, profile: Optional[str]) -> dict:
+        """Release in-process runtime state owned by a multiplex profile."""
+        prefix = self._profile_session_key_prefix(profile)
+        active_sessions = [
+            key
+            for key, agent in getattr(self, "_running_agents", {}).items()
+            if str(key).startswith(prefix)
+            and agent is not None
+        ]
+        if active_sessions:
+            logger.warning(
+                "profile-unload: refusing to unload profile %s; %d session(s) still running",
+                profile,
+                len(active_sessions),
+            )
+            return {
+                "blocked": True,
+                "active_sessions": len(active_sessions),
+                "evicted_sessions": 0,
+                "disconnected_adapters": 0,
+            }
+        cleaned_agents = self._evict_cached_agents_for_profile(profile)
+        disconnected_adapters = 0
+        profile_name = (profile or "").strip()
+        adapter_map = None
+        if profile_name:
+            adapter_map = getattr(self, "_profile_adapters", {}).pop(profile_name, None)
+        if adapter_map:
+            for platform, adapter in list(adapter_map.items()):
+                await self._safe_adapter_disconnect(adapter, platform)
+                disconnected_adapters += 1
+        return {
+            "evicted_sessions": cleaned_agents,
+            "disconnected_adapters": disconnected_adapters,
+        }
 
     @staticmethod
     def _init_cached_agent_for_turn(agent: Any, interrupt_depth: int) -> None:
@@ -16921,7 +17324,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_message="interim_assistant_callback scheduling error",
                 )
 
-            turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(
+                message, model, runtime_kwargs, session_key=session_key
+            )
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -17103,6 +17508,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # who set thinking_progress:true but kept tool_progress:off got a
             # None callback — so _thinking scratch bubbles never relayed even
             # though the progress queue was created for them.
+            agent.runtime_auxiliary_task_configs = turn_route.get("runtime_auxiliary_task_configs")
+            agent.runtime_supports_vision = turn_route.get("runtime_supports_vision")
             agent.tool_progress_callback = progress_callback if needs_progress_queue else None
             # Discord voice verbal-ack hook (fires once per turn on first tool
             # call; armed only when in a voice channel with the mixer running).
@@ -19025,7 +19432,361 @@ def _start_cron_ticker(stop_event: threading.Event, adapters=None, loop=None, in
     InProcessCronScheduler().start(stop_event, adapters=adapters, loop=loop, interval=interval)
 
 
-async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:
+def _multiplex_cron_profiles() -> List[tuple[str, Path]]:
+    """Return profile homes that should run cron under gateway multiplexing.
+
+    The gateway still exposes `/p/default` for compatibility, but local-server
+    managed devices use a real `main` profile. When both exist, the root
+    default home is legacy/unscoped state and must not keep firing old jobs.
+    """
+    from hermes_cli.profiles import profiles_to_serve
+
+    profiles = list(profiles_to_serve(multiplex=True))
+    if any(name == "main" for name, _home in profiles):
+        profiles = [(name, home) for name, home in profiles if name != "default"]
+    return profiles
+
+
+def _run_profile_cron_scheduler(
+    stop_event: threading.Event,
+    profile_name: str,
+    profile_home: Path,
+    *,
+    adapters=None,
+    loop=None,
+    failed_event: Optional[threading.Event] = None,
+) -> None:
+    """Run one cron scheduler under a profile's HERMES_HOME scope."""
+    try:
+        from cron.scheduler_provider import resolve_cron_scheduler
+
+        with _profile_runtime_scope(profile_home):
+            resolve_cron_scheduler().start(stop_event, adapters=adapters, loop=loop)
+    except Exception:
+        if failed_event is not None:
+            failed_event.set()
+        logger.exception("Profile cron scheduler failed for %s", profile_name)
+
+
+def _multiplex_active_profile_name() -> str:
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return get_active_profile_name() or "default"
+    except Exception:
+        return "default"
+
+
+def _multiplex_adapter_claims(
+    runner: "GatewayRunner",
+    *,
+    exclude_profile: Optional[str] = None,
+) -> Dict[tuple, str]:
+    """Build credential claims for dynamic mux adapter startup."""
+    claims: Dict[tuple, str] = {}
+    active = _multiplex_active_profile_name()
+
+    for platform, adapter in getattr(runner, "adapters", {}).items():
+        fp = runner._adapter_credential_fingerprint(adapter)
+        if fp is not None:
+            claims[(platform, fp)] = active
+
+    for profile_name, adapter_map in getattr(runner, "_profile_adapters", {}).items():
+        if profile_name == exclude_profile:
+            continue
+        for platform, adapter in adapter_map.items():
+            fp = runner._adapter_credential_fingerprint(adapter)
+            if fp is not None:
+                claims[(platform, fp)] = profile_name
+    return claims
+
+
+def _ensure_profile_cron_adapters(
+    runner: "GatewayRunner",
+    profile_name: str,
+    profile_home: Path,
+    *,
+    loop=None,
+    stop_event: Optional[threading.Event] = None,
+) -> Dict:
+    """Ensure a mux profile has its adapter map before cron fires jobs."""
+    if profile_name == _multiplex_active_profile_name():
+        return runner.adapters
+    adapters = runner._profile_adapters.get(profile_name)
+    if adapters is not None:
+        return adapters
+    if loop is None:
+        logger.warning(
+            "Cannot start adapters for mux profile %s before cron: gateway loop missing",
+            profile_name,
+        )
+        return {}
+
+    claims = _multiplex_adapter_claims(runner, exclude_profile=profile_name)
+    future = safe_schedule_threadsafe(
+        runner._start_one_profile_adapters(profile_name, profile_home, claims),
+        loop,
+        logger=logger,
+        log_message=f"Mux profile adapter startup scheduling failed for {profile_name}",
+    )
+    if future is None:
+        return {}
+    try:
+        _wait_future_interruptibly(
+            future,
+            stop_event=stop_event,
+            timeout=30,
+            profile_name=profile_name,
+            action="start adapters",
+        )
+    except Exception:
+        logger.exception("Failed to start adapters for mux profile %s", profile_name)
+    return runner._profile_adapters.get(profile_name, {})
+
+
+def _unload_profile_cron_adapters(
+    runner: "GatewayRunner",
+    profile_name: str,
+    *,
+    loop=None,
+    stop_event: Optional[threading.Event] = None,
+) -> None:
+    if profile_name == _multiplex_active_profile_name():
+        return
+    if profile_name not in getattr(runner, "_profile_adapters", {}):
+        return
+    if loop is None:
+        logger.warning(
+            "Cannot unload adapters for mux profile %s: gateway loop missing",
+            profile_name,
+        )
+        return
+    future = safe_schedule_threadsafe(
+        runner.unload_profile_runtime(profile_name),
+        loop,
+        logger=logger,
+        log_message=f"Mux profile adapter unload scheduling failed for {profile_name}",
+    )
+    if future is None:
+        return
+    try:
+        _wait_future_interruptibly(
+            future,
+            stop_event=stop_event,
+            timeout=30,
+            profile_name=profile_name,
+            action="unload adapters",
+        )
+    except Exception:
+        logger.exception("Failed to unload adapters for mux profile %s", profile_name)
+
+
+def _wait_future_interruptibly(
+    future,
+    *,
+    stop_event: Optional[threading.Event],
+    timeout: float,
+    profile_name: str,
+    action: str,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        if stop_event is not None and stop_event.is_set():
+            future.cancel()
+            logger.info(
+                "Stopped waiting to %s for mux profile %s during shutdown",
+                action,
+                profile_name,
+            )
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            future.cancel()
+            raise TimeoutError(
+                f"Timed out waiting to {action} for mux profile {profile_name}"
+            )
+        try:
+            future.result(timeout=min(0.5, remaining))
+            return
+        except TimeoutError:
+            if future.done():
+                raise
+            continue
+
+
+def _start_profile_cron_scheduler_thread(
+    runner: "GatewayRunner",
+    profile_name: str,
+    profile_home: Path,
+    stop_event: threading.Event,
+    *,
+    loop=None,
+    shutdown_event: Optional[threading.Event] = None,
+) -> tuple[threading.Thread, threading.Event]:
+    adapters = _ensure_profile_cron_adapters(
+        runner,
+        profile_name,
+        profile_home,
+        loop=loop,
+        stop_event=shutdown_event,
+    )
+    failed_event = threading.Event()
+    thread = threading.Thread(
+        target=_run_profile_cron_scheduler,
+        args=(stop_event, profile_name, profile_home),
+        kwargs={
+            "adapters": adapters,
+            "loop": loop,
+            "failed_event": failed_event,
+        },
+        daemon=True,
+        name=f"cron-scheduler-{profile_name}",
+    )
+    thread.start()
+    return thread, failed_event
+
+
+def _stop_profile_cron_scheduler(
+    profile_name: str,
+    entry: tuple[Path, threading.Event, threading.Thread, threading.Event],
+    *,
+    timeout: float,
+) -> None:
+    _profile_home, stop_event, thread, _failed_event = entry
+    stop_event.set()
+    thread.join(timeout=timeout)
+    if thread.is_alive():
+        logger.warning(
+            "Profile cron scheduler did not stop cleanly for %s",
+            profile_name,
+        )
+
+
+def _run_multiplex_cron_reconciler(
+    runner: "GatewayRunner",
+    stop_event: threading.Event,
+    *,
+    loop=None,
+    reconcile_interval: float = 60.0,
+) -> None:
+    """Keep mux profile cron schedulers aligned with the profile set."""
+    entries: Dict[str, tuple[Path, threading.Event, threading.Thread, threading.Event]] = {}
+
+    try:
+        while not stop_event.is_set():
+            try:
+                profiles = {name: home for name, home in _multiplex_cron_profiles()}
+                for profile_name, profile_home in profiles.items():
+                    existing = entries.get(profile_name)
+                    if existing and existing[0] == profile_home and not existing[3].is_set():
+                        continue
+                    if existing:
+                        home_changed = existing[0] != profile_home
+                        _stop_profile_cron_scheduler(profile_name, existing, timeout=1)
+                        if home_changed:
+                            _unload_profile_cron_adapters(
+                                runner,
+                                profile_name,
+                                loop=loop,
+                                stop_event=stop_event,
+                            )
+
+                    profile_stop = threading.Event()
+                    thread, failed_event = _start_profile_cron_scheduler_thread(
+                        runner,
+                        profile_name,
+                        profile_home,
+                        profile_stop,
+                        loop=loop,
+                        shutdown_event=stop_event,
+                    )
+                    entries[profile_name] = (
+                        profile_home,
+                        profile_stop,
+                        thread,
+                        failed_event,
+                    )
+                    logger.info("Started mux profile cron scheduler for %s", profile_name)
+
+                for profile_name in list(entries):
+                    if profile_name not in profiles:
+                        _stop_profile_cron_scheduler(
+                            profile_name,
+                            entries.pop(profile_name),
+                            timeout=5,
+                        )
+                        _unload_profile_cron_adapters(
+                            runner,
+                            profile_name,
+                            loop=loop,
+                            stop_event=stop_event,
+                        )
+                        logger.info("Stopped mux profile cron scheduler for %s", profile_name)
+            except Exception:
+                logger.exception("Mux profile cron reconciliation failed")
+
+            stop_event.wait(timeout=reconcile_interval)
+    finally:
+        for profile_name, entry in list(entries.items()):
+            _stop_profile_cron_scheduler(profile_name, entry, timeout=5)
+        entries.clear()
+
+
+def _start_multiplex_cron_reconciler(
+    runner: "GatewayRunner",
+    stop_event: threading.Event,
+    *,
+    loop=None,
+    reconcile_interval: float = 60.0,
+) -> threading.Thread:
+    thread = threading.Thread(
+        target=_run_multiplex_cron_reconciler,
+        args=(runner, stop_event),
+        kwargs={"loop": loop, "reconcile_interval": reconcile_interval},
+        daemon=True,
+        name="cron-scheduler-mux-reconciler",
+    )
+    thread.start()
+    return thread
+
+
+def _start_gateway_cron_schedulers(
+    runner: "GatewayRunner",
+    stop_event: threading.Event,
+    *,
+    loop=None,
+    reconcile_interval: float = 60.0,
+) -> List[threading.Thread]:
+    """Start cron scheduler thread(s) for the gateway runtime."""
+    if not getattr(runner.config, "multiplex_profiles", False):
+        from cron.scheduler_provider import resolve_cron_scheduler
+
+        cron_provider = resolve_cron_scheduler()
+        thread = threading.Thread(
+            target=cron_provider.start,
+            args=(stop_event,),
+            kwargs={"adapters": runner.adapters, "loop": loop},
+            daemon=True,
+            name="cron-scheduler",
+        )
+        thread.start()
+        return [thread]
+
+    return [
+        _start_multiplex_cron_reconciler(
+            runner,
+            stop_event,
+            loop=loop,
+            reconcile_interval=reconcile_interval,
+        )
+    ]
+
+
+async def start_gateway(
+    config: Optional[GatewayConfig] = None,
+    replace: bool = False,
+    verbosity: Optional[int] = 0,
+    accept_hooks: bool = False,
+) -> bool:
     """
     Start the gateway and run until interrupted.
     
@@ -19038,6 +19799,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         replace: If True, kill any existing gateway instance before starting.
                  Useful for systemd services to avoid restart-loop deadlocks
                  when the previous process hasn't fully exited yet.
+        accept_hooks: Auto-approve configured shell hooks for this gateway process.
     """
     # Snapshot the checkout revision now, while sys.modules still matches disk,
     # so a later `git pull` under this long-lived process can be detected (and
@@ -19212,6 +19974,33 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         log_startup_security_warnings(hermes_home=_hermes_home, config=_audit_cfg)
     except Exception as _audit_exc:
         logger.debug("Startup security audit failed (non-fatal): %s", _audit_exc)
+
+    # Periodic process memory usage logging (gateway only) — emits a
+    # grep-friendly "[MEMORY] rss=...MB ..." line every N minutes so
+    # slow leaks in the long-lived gateway process show up as a time
+    # series in agent.log / gateway.log.  Ported from cline/cline#10343.
+    # Controlled by the logging.memory_monitor section in config.yaml.
+    try:
+        from gateway import memory_monitor as _memory_monitor
+
+        _mm_cfg = {}
+        try:
+            # config is loaded a few lines up; re-read the logging section
+            # here so we pick up user overrides without coupling to local
+            # variable names inside the start_gateway body.
+            from hermes_cli.config import load_config as _load_cli_config
+
+            _mm_cfg = (_load_cli_config() or {}).get("logging", {}).get("memory_monitor", {}) or {}
+        except Exception:
+            _mm_cfg = {}
+        if _mm_cfg.get("enabled", True):
+            try:
+                _mm_interval = float(_mm_cfg.get("interval_seconds", 300))
+            except (TypeError, ValueError):
+                _mm_interval = 300.0
+            _memory_monitor.start_memory_monitoring(interval_seconds=_mm_interval)
+    except Exception as _mm_exc:
+        logger.debug("Failed to start memory monitor: %s", _mm_exc)
 
     # Optional stderr handler — level driven by -v/-q flags on the CLI.
     # verbosity=None (-q/--quiet): no stderr output
@@ -19427,21 +20216,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         logger.debug("Nous auth keepalive did not start: %s", exc)
 
     _ensure_windows_gateway_venv_imports()
-
-    # MCP tool discovery — run in an executor so the asyncio event loop
-    # stays responsive even when a configured MCP server is slow or
-    # unreachable.  discover_mcp_tools() uses a blocking 120s wait
-    # internally; calling it from the loop thread would freeze platform
-    # heartbeats (Discord shard, Telegram polling) until it returned.
-    # See #16856.
-    try:
-        from tools.mcp_tool import discover_mcp_tools
-        _loop = asyncio.get_running_loop()
-        await _loop.run_in_executor(None, discover_mcp_tools)
-    except Exception as e:
-        logger.debug("MCP tool discovery failed: %s", e)
-
     # Start the gateway
+    runner._accept_hooks = accept_hooks
     success = await runner.start()
     if not success:
         return False
@@ -19474,23 +20250,55 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         if runner.exit_code is not None:
             raise SystemExit(runner.exit_code)
         return True
+
+    # MCP tool discovery can spend up to 120s inside blocking connection
+    # waits when a configured server is slow, unreachable, or returns 401.
+    # Schedule it after the gateway HTTP surface is listening so /health
+    # readiness and normal chat are not coupled to optional MCP startup.
+    def _start_mcp_discovery_task() -> asyncio.Task:
+        task_loop = asyncio.get_running_loop()
+        discovery_done = task_loop.create_future()
+
+        def _mark_discovery_done() -> None:
+            if not discovery_done.done():
+                discovery_done.set_result(None)
+
+        def _discover_mcp_tools_thread() -> None:
+            try:
+                from tools.mcp_tool import discover_mcp_tools
+                discover_mcp_tools()
+            except Exception:
+                logger.warning("MCP tool discovery failed", exc_info=True)
+            finally:
+                try:
+                    task_loop.call_soon_threadsafe(_mark_discovery_done)
+                except RuntimeError:
+                    pass
+
+        threading.Thread(
+            target=_discover_mcp_tools_thread,
+            daemon=True,
+            name="mcp-discovery",
+        ).start()
+
+        async def _wait_for_discovery() -> None:
+            await discovery_done
+
+        return asyncio.create_task(_wait_for_discovery())
+
+    runner._mcp_discovery_task = _start_mcp_discovery_task()
     
     # Start the background cron scheduler via the resolved provider so
     # scheduled jobs fire automatically. The built-in provider is the
     # historical in-process 60s ticker; an external provider (e.g. chronos)
     # may arm a schedule and return. Pass the event loop so cron delivery can
     # use live adapters (E2EE support).
-    from cron.scheduler_provider import resolve_cron_scheduler
     cron_stop = threading.Event()
-    cron_provider = resolve_cron_scheduler()
-    cron_thread = threading.Thread(
-        target=cron_provider.start,
-        args=(cron_stop,),
-        kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop()},
-        daemon=True,
-        name="cron-scheduler",
+    cron_threads = _start_gateway_cron_schedulers(
+        runner,
+        cron_stop,
+        loop=asyncio.get_running_loop(),
     )
-    cron_thread.start()
 
     # Gateway-only periodic housekeeping (channel dir, cache cleanup, paste
     # sweep, curator) — runs independently of which cron provider is active.
@@ -19504,8 +20312,41 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     )
     housekeeping_thread.start()
     
-    # Wait for shutdown
-    await runner.wait_for_shutdown()
+    try:
+        # Wait for shutdown
+        await runner.wait_for_shutdown()
+    finally:
+        # Stop cron ticker cleanly before tearing down tools it may use.
+        cron_stop.set()
+        for cron_thread in cron_threads:
+            cron_thread.join(timeout=5)
+
+        mcp_task = runner._mcp_discovery_task
+        mcp_discovery_still_running = False
+        if mcp_task is not None and not mcp_task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(mcp_task), timeout=5)
+            except asyncio.TimeoutError:
+                mcp_discovery_still_running = True
+                logger.warning(
+                    "MCP discovery is still running during gateway shutdown; "
+                    "skipping concurrent MCP shutdown and forcing child cleanup."
+                )
+                mcp_task.cancel()
+                await asyncio.gather(mcp_task, return_exceptions=True)
+            except Exception:
+                pass
+
+        # Close MCP server connections.
+        try:
+            if mcp_discovery_still_running:
+                from tools.mcp_tool import _kill_orphaned_mcp_children
+                _kill_orphaned_mcp_children(include_active=True)
+            else:
+                from tools.mcp_tool import shutdown_mcp_servers
+                shutdown_mcp_servers()
+        except Exception:
+            pass
 
     try:
         from hermes_cli.nous_auth_keepalive import stop_nous_auth_keepalive
@@ -19518,24 +20359,21 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         if runner.exit_reason:
             logger.error("Gateway exiting with failure: %s", runner.exit_reason)
         return False
-    
-    # Stop cron scheduler + housekeeping cleanly
-    cron_stop.set()
-    try:
-        cron_provider.stop()
-    except Exception as e:
-        logger.debug("Cron provider stop() error: %s", e)
-    cron_thread.join(timeout=5)
-    housekeeping_thread.join(timeout=5)
 
     # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
+    # The cron ticker and MCP servers were already torn down in the finally
+    # above — MCP via the fork's mcp_discovery_still_running-aware path — so the
+    # only thing left to stop here is the upstream planned-stop watcher thread.
     _planned_stop_watcher_stop.set()
     _planned_stop_watcher_thread.join(timeout=2)
 
-    # Close MCP server connections
+    # Stop the periodic memory monitor (if it was started above).
+    # This also emits one final "[MEMORY] shutdown rss=..." line so the
+    # last RSS reading before gateway exit is always in the log.
     try:
-        from tools.mcp_tool import shutdown_mcp_servers
-        shutdown_mcp_servers()
+        from gateway import memory_monitor as _memory_monitor
+
+        _memory_monitor.stop_memory_monitoring(timeout=2.0)
     except Exception:
         pass
 

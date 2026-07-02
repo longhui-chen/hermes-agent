@@ -102,6 +102,69 @@ class TestFlushDeduplication:
             finally:
                 db.close()
 
+    def test_flush_skips_length_continuation_synthetic_prompt(self):
+        """Length-continuation prompts are provider input only, not transcript."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            db = SessionDB(db_path=db_path)
+
+            agent = self._make_agent(db)
+
+            messages = [
+                {"role": "user", "content": "write a long answer"},
+                {"role": "assistant", "content": "partial", "finish_reason": "length"},
+                {
+                    "role": "user",
+                    "content": (
+                        "[System: Your previous response was truncated by the "
+                        "output length limit. Continue exactly where you left off.]"
+                    ),
+                    "_length_continuation_synthetic": True,
+                },
+                {"role": "assistant", "content": "final answer"},
+            ]
+
+            agent._flush_messages_to_session_db(messages, [])
+
+            rows = db.get_messages(agent.session_id)
+            assert [r["role"] for r in rows] == ["user", "assistant", "assistant"]
+            assert all("previous response was truncated" not in (r["content"] or "") for r in rows)
+            assert agent._last_flushed_db_idx == len(messages)
+
+    def test_length_continuation_cleanup_preserves_flush_index(self):
+        """Cleaning synthetic prompts after a defensive flush must not skip later rows."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            db = SessionDB(db_path=db_path)
+
+            agent = self._make_agent(db)
+
+            messages = [
+                {"role": "user", "content": "write a long answer"},
+                {"role": "assistant", "content": "partial", "finish_reason": "length"},
+                {
+                    "role": "user",
+                    "content": "[System: Your previous response was truncated.]",
+                    "_length_continuation_synthetic": True,
+                },
+            ]
+
+            agent._flush_messages_to_session_db(messages, [])
+            agent._drop_length_continuation_scaffolding(messages)
+            messages.append({"role": "assistant", "content": "final answer"})
+            agent._flush_messages_to_session_db(messages, [])
+
+            rows = db.get_messages(agent.session_id)
+            assert [r["content"] for r in rows] == [
+                "write a long answer",
+                "partial",
+                "final answer",
+            ]
+
     def test_persist_session_multiple_calls_no_duplication(self):
         """Multiple _persist_session calls don't duplicate DB entries."""
         from hermes_state import SessionDB

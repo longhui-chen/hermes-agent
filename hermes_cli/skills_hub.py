@@ -1330,8 +1330,15 @@ def do_opt_in(sync: bool = False,
 
     if sync:
         synced = sync_skills(quiet=True)
-        copied = len(synced.get("copied", []))
-        c.print(f"[dim]Re-seeded {copied} bundled skill(s).[/]")
+        if synced and synced.get("policy_error"):
+            c.print(
+                "[bold red]Skills NOT seeded:[/] the seed policy is present but "
+                "unreadable/corrupt (fail-closed). Fix config/skill_seed_policy.json, "
+                "then re-run."
+            )
+        else:
+            copied = len(synced.get("copied", []))
+            c.print(f"[dim]Re-seeded {copied} bundled skill(s).[/]")
         if invalidate_cache:
             try:
                 from agent.prompt_builder import clear_skills_system_prompt_cache

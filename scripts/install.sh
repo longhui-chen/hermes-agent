@@ -6,7 +6,7 @@
 # Uses uv for desktop/server installs and Python's stdlib venv + pip on Termux.
 #
 # Usage:
-#   curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/zettlab/hermes-agent/main/scripts/install.sh | bash
 #
 # Or with options:
 #   curl -fsSL ... | bash -s -- --no-venv --skip-setup
@@ -1822,10 +1822,31 @@ SOUL_EOF
         if "$INSTALL_DIR/venv/bin/python" "$INSTALL_DIR/tools/skills_sync.py" 2>/dev/null; then
             log_success "Skills synced to ~/.hermes/skills/"
         else
-            # Fallback: simple directory copy if Python sync fails
-            if [ -d "$INSTALL_DIR/skills" ] && [ ! "$(ls -A "$HERMES_HOME/skills/" 2>/dev/null | grep -v '.bundled_manifest')" ]; then
-                cp -r "$INSTALL_DIR/skills/"* "$HERMES_HOME/skills/" 2>/dev/null || true
-                log_success "Skills copied to ~/.hermes/skills/"
+            # Fallback (python seeder unavailable): copy ONLY the policy's seed
+            # set from the pre-baked manifest — policy-correct without python.
+            # Never bulk-copy the whole bundle (would seed the un-curated set).
+            manifest="$INSTALL_DIR/config/seed_fallback_manifest.txt"
+            if [ -f "$manifest" ] && [ ! "$(ls -A "$HERMES_HOME/skills/" 2>/dev/null | grep -v '.bundled_manifest')" ]; then
+                seed_failures=0
+                # `|| [ -n "$src" ]` so a manifest whose last line lacks a
+                # trailing newline still processes that final seed.
+                while IFS= read -r src || [ -n "$src" ]; do
+                    [ -z "$src" ] && continue
+                    dest="${src#*/}"
+                    mkdir -p "$HERMES_HOME/skills/$(dirname "$dest")"
+                    cp -r "$INSTALL_DIR/$src" "$HERMES_HOME/skills/$dest" 2>/dev/null \
+                        || seed_failures=$((seed_failures + 1))
+                done < "$manifest"
+                # Only mark the profile policy-managed when EVERY seed copied. On
+                # partial failure, skip the marker and report honestly: the first
+                # 'hermes' run (no manifest -> treated as new) re-seeds under
+                # policy and completes the missing skills.
+                if [ "$seed_failures" -eq 0 ]; then
+                    : > "$HERMES_HOME/skills/.seed_policy"
+                    log_success "Skills seeded from policy fallback"
+                else
+                    log_warn "Skill fallback seeding incomplete ($seed_failures copy failure(s)); marker not written — the first 'hermes' run will complete seeding under policy."
+                fi
             fi
         fi
     fi

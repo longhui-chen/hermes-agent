@@ -399,6 +399,19 @@ class TestBuildApiKwargsChatCompletionsServiceTier:
         kwargs = agent._build_api_kwargs(messages)
         assert "service_tier" not in kwargs
 
+    def test_anthropic_messages_rejects_response_format_override(self, monkeypatch):
+        agent = _make_agent(
+            monkeypatch,
+            "anthropic",
+            api_mode="anthropic_messages",
+            base_url="https://api.anthropic.com",
+            model="claude-sonnet-4.6",
+        )
+        agent.request_overrides = {"response_format": {"type": "json_object"}}
+        messages = [{"role": "user", "content": "hi"}]
+        with pytest.raises(ValueError, match="response_format"):
+            agent._build_api_kwargs(messages)
+
 
 class TestBuildApiKwargsKimiNoTemperatureOverride:
     def test_kimi_for_coding_omits_temperature(self, monkeypatch):

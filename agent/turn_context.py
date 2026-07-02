@@ -153,13 +153,19 @@ def build_turn_context(
 
     # Tell auxiliary_client what the live main provider/model are for this turn.
     try:
-        from agent.auxiliary_client import set_runtime_main
+        from agent.auxiliary_client import (
+            set_runtime_auxiliary_task_configs,
+            set_runtime_main,
+        )
         set_runtime_main(
             getattr(agent, "provider", "") or "",
             getattr(agent, "model", "") or "",
             base_url=getattr(agent, "base_url", "") or "",
             api_key=getattr(agent, "api_key", "") or "",
             api_mode=getattr(agent, "api_mode", "") or "",
+        )
+        set_runtime_auxiliary_task_configs(
+            getattr(agent, "runtime_auxiliary_task_configs", None)
         )
     except Exception:
         pass
@@ -352,9 +358,15 @@ def build_turn_context(
         _compressor = agent.context_compressor
         _defer_preflight = getattr(
             _compressor,
-            "should_defer_preflight_to_real_usage",
-            lambda _tokens: False,
+            "should_defer_rough_estimate_to_real_usage",
+            None,
         )
+        if _defer_preflight is None:
+            _defer_preflight = getattr(
+                _compressor,
+                "should_defer_preflight_to_real_usage",
+                lambda _tokens: False,
+            )
         _preflight_deferred = _defer_preflight(_preflight_tokens)
 
         if not _preflight_deferred:

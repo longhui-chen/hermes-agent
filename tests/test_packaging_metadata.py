@@ -245,16 +245,29 @@ def test_locale_catalogs_ship_in_both_wheel_and_sdist():
     """Regression test for #27632 / #35374 / #23943.
 
     locales/ is a bare data directory (no __init__.py), so it is invisible to
-    packages.find and to package-data (which attaches to a package). It must be
-    declared as setuptools data-files (wheel) AND grafted in MANIFEST.in
-    (sdist). Without both, sealed installs drop the catalogs and gateway/CLI
-    commands surface raw i18n keys like `gateway.reset.header_default`.
+    packages.find and to package-data (which attaches to a package). It must ship
+    as setuptools data_files (wheel) AND be grafted in MANIFEST.in (sdist).
+
+    The data_files are declared PROGRAMMATICALLY in setup.py — NOT in pyproject's
+    [tool.setuptools.data-files] — because the bundled skill trees (skills/,
+    optional-skills/) need their nested structure preserved,
+    which a static pyproject data-files glob cannot do. A pyproject data-files
+    table also takes precedence over setup.py, so declaring it there (even just
+    for locales) silently drops every skill tree AND locales from the wheel. This
+    test therefore guards both: pyproject must NOT carry the table, and setup.py
+    must ship locales/. Without locales in the wheel, sealed installs surface raw
+    i18n keys like `gateway.reset.header_default`.
     """
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    data_files = data["tool"]["setuptools"].get("data-files", {})
-    assert data_files.get("locales") == ["locales/*.yaml"], (
-        "pyproject [tool.setuptools.data-files] must declare "
-        'locales = ["locales/*.yaml"] so the wheel ships i18n catalogs'
+    assert "data-files" not in data["tool"]["setuptools"], (
+        "[tool.setuptools.data-files] must NOT be declared in pyproject.toml — it "
+        "takes precedence over setup.py and would drop the bundled skill trees "
+        "(and locales) from the wheel. Declare data_files in setup.py instead."
+    )
+
+    setup_src = (REPO_ROOT / "setup.py").read_text(encoding="utf-8")
+    assert '_data_file_tree("locales")' in setup_src, (
+        "setup.py data_files must ship locales/ so the wheel carries i18n catalogs"
     )
 
     manifest = (REPO_ROOT / "MANIFEST.in").read_text(encoding="utf-8")
@@ -262,7 +275,7 @@ def test_locale_catalogs_ship_in_both_wheel_and_sdist():
         "MANIFEST.in must `graft locales` so the sdist ships i18n catalogs"
     )
 
-    # Every on-disk catalog has the .yaml extension the globs above match.
+    # Every on-disk catalog has the .yaml extension the data_files glob matches.
     on_disk = list((REPO_ROOT / "locales").glob("*.yaml"))
     assert on_disk, "expected locales/*.yaml catalogs on disk"
 

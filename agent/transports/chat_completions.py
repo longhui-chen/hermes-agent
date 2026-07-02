@@ -15,8 +15,66 @@ from typing import Any, Dict
 from agent.lmstudio_reasoning import resolve_lmstudio_effort
 from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
+from agent.response_format import response_format_requires_structured_output
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
+
+
+def _is_gemini_transport_without_response_format(provider_name: str, base_url: Any) -> bool:
+    provider = str(provider_name or "").strip().lower()
+    url = str(base_url or "")
+    if provider == "google-gemini-cli" or url.lower().startswith("cloudcode-pa://"):
+        return True
+    try:
+        from agent.gemini_native_adapter import is_native_gemini_base_url
+
+        return is_native_gemini_base_url(url)
+    except Exception:
+        return False
+
+
+def _apply_zettlab_billing_headers(api_kwargs: Dict[str, Any], params: Dict[str, Any]) -> None:
+    """Forward the conversation/cron session as stable Zettlab headers.
+
+    X-Task-Id drives credit-ledger task grouping (mini-api 08-ai.md -> ai-api
+    scene_params -> ai-cloud ledger.task_id), so a multi-step task's per-turn
+    consumption aggregates into one task card. X-Zettlab-Conversation-ID gives
+    ai-gateway an explicit sticky/canary routing key using the same stable
+    session-derived value. The local-server ai-proxy relays these headers to the
+    IAM gateway.
+
+    The session -> task_id mapping (interactive vs cron, see billing_task_id_for)
+    also gates non-NAS sessions to '' so the billing headers never leak to a
+    third-party provider. Applied to BOTH the legacy and profile build paths —
+    the NAS ai-proxy agent runs with provider=custom, which takes the legacy path.
+    """
+    # Best-effort: credit attribution must never break the main request path.
+    # Wrapped in try/except like auxiliary_client._apply_user_default_headers so a
+    # billing import/lookup error can't bubble up and abort build_kwargs.
+    try:
+        from gateway.session_context import billing_task_id_for, billing_task_title_encoded
+
+        task_id = billing_task_id_for(params.get("session_id"))
+        if not task_id:
+            return
+        existing = api_kwargs.get("extra_headers")
+        headers: Dict[str, str] = {}
+        if isinstance(existing, dict):
+            headers.update({
+                str(k): str(v) for k, v in existing.items() if k and v is not None
+            })
+        headers.setdefault("X-Task-Id", task_id)
+        headers.setdefault("X-Zettlab-Conversation-ID", task_id)
+        headers.setdefault("X-Scene-Type", "agent")
+        # Cron runs also stamp the job name as X-Task-Title so the ledger's cron
+        # task card shows the real name (and survives the job being deleted).
+        # Empty for interactive sessions, which carry no title here.
+        task_title = billing_task_title_encoded()
+        if task_title:
+            headers.setdefault("X-Task-Title", task_title)
+        api_kwargs["extra_headers"] = headers
+    except Exception:
+        return
 
 
 def _build_gemini_thinking_config(model: str, reasoning_config: dict | None) -> dict | None:
@@ -449,7 +507,18 @@ class ChatCompletionsTransport(ProviderTransport):
         # Request overrides last (service_tier etc.)
         overrides = params.get("request_overrides")
         if overrides:
-            api_kwargs.update(overrides)
+            _gemini_without_response_format = _is_gemini_transport_without_response_format(
+                provider_name,
+                base_url,
+            )
+            for k, v in overrides.items():
+                if k == "response_format" and _gemini_without_response_format:
+                    if response_format_requires_structured_output(v):
+                        raise ValueError("response_format is not supported by the Gemini transport.")
+                    continue
+                api_kwargs[k] = v
+
+        _apply_zettlab_billing_headers(api_kwargs, params)
 
         return api_kwargs
 
@@ -563,7 +632,16 @@ class ChatCompletionsTransport(ProviderTransport):
         # Request overrides (user config)
         overrides = params.get("request_overrides")
         if overrides:
+            provider_name = str(getattr(profile, "name", "") or params.get("provider_name") or "").strip().lower()
+            _gemini_without_response_format = _is_gemini_transport_without_response_format(
+                provider_name,
+                params.get("base_url"),
+            )
             for k, v in overrides.items():
+                if k == "response_format" and _gemini_without_response_format:
+                    if response_format_requires_structured_output(v):
+                        raise ValueError("response_format is not supported by the Gemini transport.")
+                    continue
                 if k == "extra_body" and isinstance(v, dict):
                     extra_body.update(v)
                 else:
@@ -592,6 +670,8 @@ class ChatCompletionsTransport(ProviderTransport):
                 }
             if extra_body:
                 api_kwargs["extra_body"] = extra_body
+
+        _apply_zettlab_billing_headers(api_kwargs, params)
 
         return api_kwargs
 

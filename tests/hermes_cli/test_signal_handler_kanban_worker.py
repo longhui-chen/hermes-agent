@@ -142,6 +142,7 @@ def _cleanup(proc: subprocess.Popen) -> None:
     sys.platform == "win32",
     reason="SIGTERM semantics differ on Windows; kanban dispatcher is POSIX-only",
 )
+@pytest.mark.live_system_guard_bypass
 def test_sigterm_with_kanban_task_env_terminates_quickly():
     """With HERMES_KANBAN_TASK set, SIGTERM should kill the process in <2s
     even when a non-daemon thread is still alive."""
@@ -154,7 +155,7 @@ def test_sigterm_with_kanban_task_env_terminates_quickly():
         # is immediate. Give generous headroom for slow CI runners.
         deadline = t0 + 2.0
         while time.time() < deadline:
-            if not _is_alive_like_dispatcher(proc.pid):
+            if proc.poll() is not None or not _is_alive_like_dispatcher(proc.pid):
                 elapsed = time.time() - t0
                 assert elapsed < 2.0
                 return
@@ -171,6 +172,7 @@ def test_sigterm_with_kanban_task_env_terminates_quickly():
     sys.platform == "win32",
     reason="SIGTERM semantics differ on Windows; kanban dispatcher is POSIX-only",
 )
+@pytest.mark.live_system_guard_bypass
 def test_sigterm_without_kanban_task_env_uses_keyboard_interrupt_path():
     """Without HERMES_KANBAN_TASK, the original KeyboardInterrupt path runs.
 

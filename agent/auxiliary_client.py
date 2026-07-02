@@ -46,6 +46,7 @@ import logging
 import os
 import threading
 import time
+from contextvars import ContextVar
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
@@ -420,6 +421,7 @@ _PROVIDER_VISION_MODELS: Dict[str, str] = {
 # describe as having no image_in capability. Vision lives on the separate
 # Kimi Platform (api.moonshot.ai, OpenAI-wire, pay-as-you-go).  See #17076.
 _PROVIDERS_WITHOUT_VISION: frozenset = frozenset({
+    "deepseek",
     "kimi-coding",
     "kimi-coding-cn",
 })
@@ -448,21 +450,55 @@ def _apply_user_default_headers(headers: dict | None) -> dict | None:
     main turn would succeed but title/compression/vision calls to the same
     endpoint would still fail. (#40033)
 
-    Returns the merged dict, or the original ``headers`` (possibly ``None``)
-    when nothing is configured. No allocation when there are no overrides.
+    Returns the merged dict (user overrides), or the original
+    ``headers`` (possibly ``None``) when there is nothing to add.
     """
+    merged = dict(headers or {})
     try:
         from hermes_cli.config import cfg_get, load_config
         user_headers = cfg_get(load_config(), "model", "default_headers")
     except Exception:
-        return headers
-    if not isinstance(user_headers, dict) or not user_headers:
-        return headers
+        user_headers = None
+    if isinstance(user_headers, dict):
+        for key, value in user_headers.items():
+            if value is None:
+                continue
+            merged[str(key)] = str(value)
+    return merged or headers
+
+
+def _apply_zettlab_session_headers(headers: dict | None) -> dict | None:
+    """Stamp per-request Zettlab billing/routing headers for the current session.
+
+    These headers must never live in cached OpenAI ``default_headers``: auxiliary
+    clients are cached across turns/sessions, while the Zettlab conversation id
+    is request-scoped. Keep them in ``extra_headers`` on each create() call so a
+    cache hit cannot leak another conversation's sticky-routing key.
+    """
     merged = dict(headers or {})
-    for key, value in user_headers.items():
-        if value is None:
-            continue
-        merged[str(key)] = str(value)
+    # Zettlab credit-ledger task grouping: attribute auxiliary calls
+    # (compression / title / vision) to the conversation/cron task by stamping
+    # X-Task-Id, so they aggregate into its task card instead of surfacing as
+    # orphan model rows. Stamp the same value as X-Zettlab-Conversation-ID so
+    # ai-gateway's model-routing can use an explicit sticky/canary session key.
+    # Each aux client is built fresh per call, so reading the concurrency-safe
+    # session contextvar here is always current (no stale cross-session reuse).
+    # billing_task_id() maps interactive vs cron sessions and returns '' for
+    # non-NAS sessions (no leak to third-party providers).
+    try:
+        from gateway.session_context import billing_task_id, billing_task_title_encoded
+        task_id = billing_task_id()
+        task_title = billing_task_title_encoded() if task_id else ""
+    except Exception:
+        task_id = ""
+        task_title = ""
+    if task_id:
+        merged.setdefault("X-Task-Id", task_id)
+        merged.setdefault("X-Zettlab-Conversation-ID", task_id)
+        merged.setdefault("X-Scene-Type", "agent")
+        # Cron job name → X-Task-Title (empty for interactive); see chat_completions.
+        if task_title:
+            merged.setdefault("X-Task-Title", task_title)
     return merged or headers
 
 
@@ -1750,9 +1786,10 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
         or_key = explicit_api_key or _pool_runtime_api_key(entry)
         if or_key:
             base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
+            headers = _apply_user_default_headers(build_or_headers())
             logger.debug("Auxiliary client: OpenRouter via pool")
             return _create_openai_client(api_key=or_key, base_url=base_url,
-                           default_headers=build_or_headers()), model or _OPENROUTER_MODEL
+                           default_headers=headers), model or _OPENROUTER_MODEL
         # Pool exists but is exhausted (no usable runtime key) — fall through to
         # the OPENROUTER_API_KEY env-var path rather than failing outright.
         logger.debug("Auxiliary client: OpenRouter pool exhausted, trying OPENROUTER_API_KEY")
@@ -1761,9 +1798,10 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
     if not or_key:
         _mark_provider_unhealthy("openrouter", ttl=60)
         return None, None
+    headers = _apply_user_default_headers(build_or_headers())
     logger.debug("Auxiliary client: OpenRouter")
     return _create_openai_client(api_key=or_key, base_url=OPENROUTER_BASE_URL,
-                   default_headers=build_or_headers()), model or _OPENROUTER_MODEL
+                   default_headers=headers), model or _OPENROUTER_MODEL
 
 
 def _describe_openrouter_unavailable() -> str:
@@ -1858,6 +1896,7 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
         _create_openai_client(
             api_key=api_key,
             base_url=base_url,
+            default_headers=_apply_user_default_headers(None),
         ),
         model,
     )
@@ -1966,6 +2005,10 @@ _RUNTIME_MAIN_MODEL: str = ""
 _RUNTIME_MAIN_BASE_URL: str = ""
 _RUNTIME_MAIN_API_KEY: str = ""
 _RUNTIME_MAIN_API_MODE: str = ""
+_RUNTIME_AUXILIARY_TASK_CONFIGS: ContextVar[Dict[str, Dict[str, Any]]] = ContextVar(
+    "runtime_auxiliary_task_configs",
+    default={},
+)
 
 
 def set_runtime_main(
@@ -2005,6 +2048,30 @@ def clear_runtime_main() -> None:
     _RUNTIME_MAIN_BASE_URL = ""
     _RUNTIME_MAIN_API_KEY = ""
     _RUNTIME_MAIN_API_MODE = ""
+    clear_runtime_auxiliary_task_configs()
+
+
+def set_runtime_auxiliary_task_configs(configs: Optional[Dict[str, Any]]) -> None:
+    """Record session-scoped auxiliary task overrides.
+
+    local-server writes these into ``session_model_overrides.json`` when a
+    session model differs from the profile default. They must override
+    config.yaml so a cloud-profile session switched to a custom model does not
+    keep using the profile's cloud ``auxiliary.vision`` route.
+    """
+    normalized: Dict[str, Dict[str, Any]] = {}
+    if isinstance(configs, dict):
+        for task, task_config in configs.items():
+            if not isinstance(task, str) or not task.strip():
+                continue
+            if isinstance(task_config, dict):
+                normalized[task.strip()] = dict(task_config)
+    _RUNTIME_AUXILIARY_TASK_CONFIGS.set(normalized)
+
+
+def clear_runtime_auxiliary_task_configs() -> None:
+    """Clear session-scoped auxiliary task overrides."""
+    _RUNTIME_AUXILIARY_TASK_CONFIGS.set({})
 
 
 def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[str]]:
@@ -5046,7 +5113,11 @@ def _refresh_nous_auxiliary_client(
         return None, model
 
     fresh_key, fresh_base_url = runtime
-    sync_client = _create_openai_client(api_key=fresh_key, base_url=fresh_base_url)
+    sync_client = _create_openai_client(
+        api_key=fresh_key,
+        base_url=fresh_base_url,
+        default_headers=_apply_user_default_headers(None),
+    )
     final_model = model
 
     current_loop = None
@@ -5455,6 +5526,9 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     """
     if not task:
         return {}
+    runtime_task_config = _RUNTIME_AUXILIARY_TASK_CONFIGS.get().get(task)
+    if isinstance(runtime_task_config, dict):
+        return dict(runtime_task_config)
     try:
         from hermes_cli.config import load_config
         config = load_config()
@@ -5712,6 +5786,10 @@ def _build_call_kwargs(
         merged_extra.setdefault("tags", []).extend(_nous_portal_tags())
     if merged_extra:
         kwargs["extra_body"] = merged_extra
+
+    extra_headers = _apply_zettlab_session_headers(kwargs.get("extra_headers"))
+    if extra_headers:
+        kwargs["extra_headers"] = extra_headers
 
     return kwargs
 

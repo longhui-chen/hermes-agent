@@ -72,8 +72,7 @@ def _notify_provider_jobs_changed_safe() -> None:
 #      unicode. `_scan_cron_skill_assembled()` runs against the assembled
 #      prompt with this tighter pattern set.
 #
-# Both scanners share the invisible-unicode check and the GitHub Authorization
-# header exemption.
+# Both scanners share the invisible-unicode check.
 
 # Strict patterns — applied to the user prompt only.
 _CRON_THREAT_PATTERNS = [
@@ -87,27 +86,29 @@ _CRON_THREAT_PATTERNS = [
     (r'rm\s+-rf\s+/', "destructive_root_rm"),
 ]
 
+_CRON_SECRET_VAR_RE = r'\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)\w*\}?'
+
 # Looser pattern set — applied to the assembled prompt when skills are
 # attached. Only patterns whose phrasing is unambiguous in any context;
 # command-shape patterns are dropped because they false-positive on prose
 # in security docs / postmortems. Skill bodies are scanned at install time
 # by `skills_guard.py`, so the runtime cron scan is purely a tripwire for
 # obvious injection directives surviving a malicious skill that slipped
-# through install.
+# through install. Authorization headers carrying secret environment variables
+# remain blocked because connector-backed skills must not preserve direct-token
+# provider fallbacks.
 _CRON_SKILL_ASSEMBLED_PATTERNS = [
     (r'ignore\s+(?:\w+\s+)*(?:previous|all|above|prior)\s+(?:\w+\s+)*instructions', "prompt_injection"),
     (r'do\s+not\s+tell\s+the\s+user', "deception_hide"),
     (r'system\s+prompt\s+override', "sys_prompt_override"),
     (r'disregard\s+(your|all|any)\s+(instructions|rules|guidelines)', "disregard_rules"),
+    (rf'curl\s+[^\n]*(?:-H|--header)\s+["\']Authorization:\s*(?:Bearer|token)\s+{_CRON_SECRET_VAR_RE}["\']', "exfil_curl_auth_header"),
 ]
 
-_CRON_SECRET_VAR_RE = r'\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)\w*\}?'
 _CRON_EXFIL_COMMAND_PATTERNS = [
     # Tighten exfil detection to obvious leak paths: embedding a secret
     # directly in the destination URL, sending it in POST/FORM payloads,
-    # or shipping it via Authorization headers to arbitrary hosts. The
-    # only intended allowlist exception today is the bundled GitHub skill
-    # pattern that talks to api.github.com.
+    # or shipping it via Authorization headers to any host.
     (rf'curl\s+[^\n]*https?://[^\s"\'`]*{_CRON_SECRET_VAR_RE}', "exfil_curl_url"),
     (rf'wget\s+[^\n]*https?://[^\s"\'`]*{_CRON_SECRET_VAR_RE}', "exfil_wget_url"),
     (rf'curl\s+[^\n]*(?:--data(?:-raw|-binary|-urlencode)?|-d|--form|-F)\s+[^\n]*{_CRON_SECRET_VAR_RE}', "exfil_curl_data"),
@@ -168,24 +169,6 @@ def _strip_legitimate_emoji_zwj(prompt: str) -> str:
     return ''.join(cleaned)
 
 
-def _strip_cron_safe_constructs(prompt: str) -> str:
-    """Strip the GitHub `Authorization: token $GITHUB_TOKEN` auth-header
-    pattern so it doesn't trip the broader curl-auth-header exfil rule.
-
-    Allows the bundled GitHub skill fallback without opening a blanket
-    exemption for arbitrary Authorization-header exfiltration.
-    """
-    github_auth_header = re.search(
-        rf'curl\s+[^\n]*(?:-H|--header)\s+["\']Authorization:\s*token\s+{_CRON_SECRET_VAR_RE}["\']'
-        r'\s+["\']?https://api\.github\.com(?:/|\b)',
-        prompt,
-        re.IGNORECASE,
-    )
-    if github_auth_header:
-        return prompt.replace(github_auth_header.group(0), "curl https://api.github.com/user")
-    return prompt
-
-
 def _check_invisible_unicode(prompt: str) -> str:
     """Return an error string if the prompt contains invisible-unicode
     injection markers (ZWJ inside legitimate emoji sequences is allowed).
@@ -235,15 +218,14 @@ def _scan_cron_prompt(prompt: str) -> str:
     there is a smoking gun, not prose. Returns an error string when
     blocked, else empty string.
     """
-    prompt_to_scan = _strip_cron_safe_constructs(prompt)
-    invisible_err = _check_invisible_unicode(prompt_to_scan)
+    invisible_err = _check_invisible_unicode(prompt)
     if invisible_err:
         return invisible_err
     for pattern, pid in _CRON_THREAT_PATTERNS:
-        if re.search(pattern, prompt_to_scan, re.IGNORECASE):
+        if re.search(pattern, prompt, re.IGNORECASE):
             return f"Blocked: prompt matches threat pattern '{pid}'. Cron prompts must not contain injection or exfiltration payloads."
     for pattern, pid in _CRON_EXFIL_COMMAND_PATTERNS:
-        if re.search(pattern, prompt_to_scan, re.IGNORECASE):
+        if re.search(pattern, prompt, re.IGNORECASE):
             return f"Blocked: prompt matches threat pattern '{pid}'. Cron prompts must not contain injection or exfiltration payloads."
     return ""
 
@@ -275,9 +257,8 @@ def _scan_cron_skill_assembled(assembled: str) -> tuple[str, str]:
             "char(s) (%s) from vetted skill content",
             len(removed), ", ".join(removed),
         )
-    prompt_to_scan = _strip_cron_safe_constructs(cleaned)
     for pattern, pid in _CRON_SKILL_ASSEMBLED_PATTERNS:
-        if re.search(pattern, prompt_to_scan, re.IGNORECASE):
+        if re.search(pattern, cleaned, re.IGNORECASE):
             return cleaned, f"Blocked: prompt matches threat pattern '{pid}'. Cron prompts must not contain injection or exfiltration payloads."
     return cleaned, ""
 
@@ -667,6 +648,7 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    timezone: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -740,6 +722,7 @@ def cronjob(
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
                 attach_to_session=attach_to_session,
+                timezone=_normalize_optional_job_value(timezone),
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -931,6 +914,10 @@ def cronjob(
                             success=False,
                         )
                 updates["no_agent"] = target_no_agent
+            if timezone is not None:
+                # Empty string clears the per-job tz (falls back to hermes
+                # instance tz); otherwise normalize and let update_job validate.
+                updates["timezone"] = _normalize_optional_job_value(timezone)
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -993,7 +980,20 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "schedule": {
                 "type": "string",
-                "description": "REQUIRED for action=create. For create/update: '30m', 'every 2h', '0 9 * * *', or ISO timestamp. Examples: '30m' (every 30 minutes), 'every 2h' (every 2 hours), '0 9 * * *' (daily at 9am), '2026-06-01T09:00:00' (one-shot). You MUST include this field when action=create."
+                "description": (
+                    "REQUIRED for action=create (you MUST include this field when "
+                    "action=create). For create/update, pick the format based on user intent:\n"
+                    "  - RECURRING (user said 每天/每周/每隔/每N分钟/repeat/every/daily): "
+                    "use cron expression 'M H * * *' (e.g. '35 14 * * *' for daily at 14:35) "
+                    "or 'every Nm' / 'every Nh' (e.g. 'every 10m' for every 10 minutes).\n"
+                    "  - ONE-SHOT (user said a single specific time, no repetition): "
+                    "use ISO timestamp 'YYYY-MM-DDTHH:MM:SS' or a duration like '30m' / '2h' / '1d' "
+                    "(meaning from now).\n"
+                    "WARNING: A bare duration ('10m') or ISO timestamp fires ONCE and the job is "
+                    "marked completed — do NOT use these formats when the user wants the job to "
+                    "repeat. If unsure (e.g. '每10分钟提醒我喝水一次' — '一次' here means 'each "
+                    "cycle', not 'only once'), default to 'every Nm' so the job keeps firing."
+                ),
             },
             "name": {
                 "type": "string",
@@ -1001,11 +1001,41 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
             },
             "repeat": {
                 "type": "integer",
-                "description": "Optional repeat count. Omit for defaults (once for one-shot, forever for recurring)."
+                "description": (
+                    "Optional total execution cap. OMIT this parameter entirely to get the "
+                    "correct default behavior: one-shot schedules run 1 time, recurring schedules "
+                    "(cron / every-N) run FOREVER. "
+                    "Do NOT pass a large sentinel like 999999 to mean 'forever' — that creates "
+                    "a hard cap and the job will eventually stop. "
+                    "Only set this when the user explicitly says a finite count "
+                    "(e.g. '提醒我 3 次' → repeat=3)."
+                ),
             },
             "deliver": {
                 "type": "string",
-                "description": "Omit this parameter to auto-deliver back to the current chat and topic (recommended). Auto-detection preserves thread/topic context. Only set explicitly when the user asks to deliver somewhere OTHER than the current conversation. Values: 'origin' (same as omitting), 'local' (no delivery, save only), 'all' (fan out to every connected home channel), or platform:chat_id:thread_id for a specific destination. Combine with comma: 'origin,all' delivers to the origin plus every other connected channel. Examples: 'telegram:-1001234567890:17585', 'discord:#engineering', 'sms:+15551234567', 'all'. WARNING: 'platform:chat_id' without :thread_id loses topic targeting. 'all' resolves at fire time, so a job created before a channel was wired up will pick it up automatically once connected."
+                "description": (
+                    "ALLOWED VALUES (anything else silently drops messages):\n"
+                    "  - omit / 'origin' — auto-deliver to the current chat (recommended)\n"
+                    "  - 'local' — save output to file only, no delivery\n"
+                    "  - 'all' — fan out to every connected home channel "
+                    "(resolves at fire time; if no channels are wired up the delivery resolves "
+                    "to empty and the cron output goes nowhere — last_delivery_error="
+                    "'no delivery target resolved for deliver=all'. Don't pick 'all' unless "
+                    "the user explicitly asked for cross-channel broadcast.)\n"
+                    "  - '<platform>:<chat_id>[:<thread_id>]' — explicit destination "
+                    "(e.g. 'telegram:-1001234567890:17585', 'discord:#engineering')\n"
+                    "  - comma-separated combinations (e.g. 'origin,all' = origin plus every "
+                    "other connected channel)\n"
+                    "Do NOT invent values like 'everyone', 'broadcast', 'channel' — only the "
+                    "above are recognized.\n"
+                    "If a previous task's last_delivery_error mentions \"unknown platform "
+                    "'zettlab'\", that error is known cosmetic noise — the message DID reach "
+                    "the user via WebSocket. Do NOT 'fix' it by changing deliver to 'all' or "
+                    "any other value; leave deliver as is (omit / 'origin').\n\n"
+                    "Auto-detection preserves thread/topic context — only set explicitly when "
+                    "the user asks for a different destination. WARNING: 'platform:chat_id' "
+                    "without ':thread_id' loses topic targeting."
+                ),
             },
             "skills": {
                 "type": "array",
@@ -1075,6 +1105,19 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "boolean",
                 "description": "When True, this job becomes CONTINUABLE: the user can reply to its delivery and the agent has the brief in context instead of asking 'what is that?'. On thread-capable platforms (Telegram topics, Discord/Slack threads) a dedicated thread is opened for the job and its replies; on DM-only platforms (WhatsApp/Signal) the brief is mirrored into the origin DM session. Use this for conversational recurring jobs the user will reply to — daily briefings, reminders that kick off follow-up work. Leave unset for fire-and-forget alerts/watchdogs. Overrides the global cron.mirror_delivery config for this one job. Only the origin chat is touched (never fan-out targets); no effect when deliver='local'."
             },
+            "timezone": {
+                "type": "string",
+                "description": (
+                    "IANA timezone name (e.g. 'Asia/Shanghai', 'America/New_York', 'UTC') "
+                    "the job's wall-clock time is evaluated in. Affects cron expressions "
+                    "(e.g. '30 10 * * *' fires at 10:30 in this zone) and naive one-shot "
+                    "ISO timestamps ('2026-05-25T10:30' is interpreted as this zone's wall time). "
+                    "Omit to use the device's current timezone, pinned at creation "
+                    "(the job does NOT follow later device timezone changes). Set this "
+                    "only when the user explicitly named a different per-job zone "
+                    "(e.g. 'UTC 02:30'). On update, pass empty string to clear."
+                ),
+            },
         },
         "required": ["action"]
     }
@@ -1130,6 +1173,7 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        timezone=args.get("timezone"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,

@@ -21,7 +21,7 @@ description: "通过 curl 使用 Shopify Admin 与 Storefront GraphQL API"
 | 许可证 | MIT |
 | 平台 | linux, macos, windows |
 | 标签 | `Shopify`, `E-commerce`, `Commerce`, `API`, `GraphQL` |
-| 相关 skill | [`airtable`](/user-guide/skills/bundled/productivity/productivity-airtable), [`xurl`](/user-guide/skills/bundled/social-media/social-media-xurl) |
+| 相关 skill | 无 |
 
 ## 参考：完整 SKILL.md
 

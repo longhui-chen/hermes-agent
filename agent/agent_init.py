@@ -235,6 +235,7 @@ def init_agent(
     checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
+    config_context_length: int = None,
 ):
     """
     Initialize the AI Agent.
@@ -1477,8 +1478,13 @@ def init_agent(
                 )
     agent._session_init_model_config["max_tokens"] = agent.max_tokens
 
-    # Read explicit context_length override from model config
-    if isinstance(_model_cfg, dict):
+    # Read explicit context_length override. The constructor arg — used by the
+    # gateway to pin a per-session context window without mutating profile
+    # config — takes precedence over model.context_length in config.yaml. The
+    # int-validation and custom_providers fallback below still apply.
+    if config_context_length is not None:
+        _config_context_length = config_context_length
+    elif isinstance(_model_cfg, dict):
         _config_context_length = _model_cfg.get("context_length")
     else:
         _config_context_length = None

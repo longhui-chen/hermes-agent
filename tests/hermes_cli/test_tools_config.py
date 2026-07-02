@@ -959,8 +959,10 @@ class TestPlatformToolsetConsistency:
         from toolsets import TOOLSETS
 
         gateway_includes = set(TOOLSETS["hermes-gateway"]["includes"])
-        # Exclude non-messaging platforms from the check
-        non_messaging = {"cli", "api_server", "cron"}
+        # Exclude non-messaging platforms from the check.
+        # zet_agent is an APIServerAdapter subclass (HTTP /v1/chat/completions
+        # surface, no inbound messaging handler) — same category as api_server.
+        non_messaging = {"cli", "api_server", "zet_agent", "cron"}
         for platform, meta in PLATFORMS.items():
             if platform in non_messaging:
                 continue
@@ -975,7 +977,9 @@ class TestPlatformToolsetConsistency:
         from hermes_cli.tools_config import PLATFORMS as TOOLS_PLATFORMS
         from hermes_cli.skills_config import PLATFORMS as SKILLS_PLATFORMS
 
-        non_messaging = {"api_server"}
+        # Both api_server and zet_agent are HTTP-driven (no interactive TUI
+        # surface), so skills_config filters them out of its display list.
+        non_messaging = {"api_server", "zet_agent"}
         for platform in TOOLS_PLATFORMS:
             if platform in non_messaging:
                 continue

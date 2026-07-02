@@ -10,9 +10,26 @@ Also regenerates:
 (so their table rows link to the new dedicated pages)
 
 Sidebar is updated to nest all per-skill pages under Skills → Bundled / Optional.
+
+Seed policy: when config/skill_seed_policy.json is present, the bundled pages are
+filtered to the seeded allowlist (27) (see discover_skills()), matching what a
+new profile seeds and the policy-aware Skills Hub
+(website/scripts/extract-skills.py). skills/ is kept upstream-verbatim here (this
+PR does not rename/de-brand), so the doc set keys on each skill's frontmatter
+`name` and needs no overlay redirection.
+
+DEPLOY NOTE: this generator WRITES/UPDATES pages but does NOT prune. The
+committed doc pages / sidebars.ts / skills-catalog.md are snapshots that predate
+the policy and still list the full upstream set. To publish the curated site,
+the deploy step must (1) run this script, then (2) delete the orphan pages left
+for non-seeded skills (e.g. compute the expected page set from the policy and
+remove any *.md under the bundled skills docs dir that is not in it) and drop
+their sidebar entries. This PR intentionally does not commit the regenerated
+artifacts to avoid large, quickly-stale doc churn.
 """
 
 from __future__ import annotations
+import json
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -32,6 +49,22 @@ SKILL_SOURCES = [
 # Pages the user had previously hand-written in user-guide/skills/.
 # We leave these alone (they get first-class sidebar treatment separately).
 HAND_WRITTEN = {"google-workspace.md"}
+
+# Keep generated bundled docs in lock-step with what a new profile actually
+# seeds (config/skill_seed_policy.json — a pure allowlist over upstream-verbatim
+# skills/). Without a policy the generator documents every bundled skill
+# (upstream behaviour).
+SEED_POLICY = REPO / "config" / "skill_seed_policy.json"
+
+
+def _load_seed_policy():
+    if not SEED_POLICY.exists():
+        return None
+    try:
+        data = json.loads(SEED_POLICY.read_text(encoding="utf-8"))
+        return {"seed": set(data.get("seed", []))}
+    except (OSError, ValueError):
+        return None
 
 
 _FENCE_RE = re.compile(r"^(?P<indent>\s*)(?P<fence>```+|~~~+)", re.MULTILINE)
@@ -450,11 +483,32 @@ def render_skill_page(
 
 
 def discover_skills() -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    policy = _load_seed_policy()
     results: list[tuple[dict[str, Any], dict[str, Any]]] = []
     for kind, source_dir in SKILL_SOURCES:
         for skill_md in sorted(source_dir.rglob("SKILL.md")):
             meta = derive_skill_meta(skill_md, source_dir, kind)
-            parsed = parse_skill_md(skill_md)
+            # Parse ONCE up front and reuse for both the seed filter and the
+            # result. A malformed SKILL.md is skipped gracefully rather than
+            # crashing the whole doc build — and there is no second, unguarded
+            # parse (the previous split parsed once guarded for the filter and
+            # again unguarded for the append, so a malformed-but-seeded skill
+            # crashed on the second parse).
+            try:
+                parsed = parse_skill_md(skill_md)
+            except Exception:
+                continue
+            # Bundled docs are filtered to the seeded allowlist (over upstream-
+            # verbatim skills/). Optional skills + no-policy: emit all. Key on the
+            # frontmatter `name` — that is what the seed policy lists, matching
+            # skills_sync / extract-skills / check_seed_policy. Keying on the
+            # directory slug instead would silently desync the doc set from the Hub
+            # if a skill's frontmatter `name` ever differs from its dir (e.g. a
+            # future de-brand rename). Fall back to the slug if `name` is absent.
+            if kind == "bundled" and policy is not None:
+                seed_key = parsed["frontmatter"].get("name") or meta["slug"]
+                if seed_key not in policy["seed"]:
+                    continue
             results.append((meta, parsed))
     return results
 

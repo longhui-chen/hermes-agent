@@ -9,6 +9,7 @@ import hashlib
 import json
 from typing import Any, Dict, List, Optional
 
+from agent.response_format import responses_text_format_from_chat_response_format
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
 
@@ -294,6 +295,12 @@ class ResponsesApiTransport(ProviderTransport):
 
         request_overrides = params.get("request_overrides")
         if request_overrides:
+            request_overrides = dict(request_overrides)
+            response_format = request_overrides.pop("response_format", None)
+            if response_format is not None:
+                text_format = responses_text_format_from_chat_response_format(response_format)
+                if text_format is not None:
+                    kwargs["text"] = {"format": text_format}
             kwargs.update(request_overrides)
 
         # xAI Responses API rejects ``service_tier`` (HTTP 400 "Argument not

@@ -56,7 +56,10 @@ class TestEnsureHermesHome:
             ensure_hermes_home()
             soul_path = tmp_path / "SOUL.md"
             assert soul_path.exists()
-            assert soul_path.read_text(encoding="utf-8").strip() != ""
+            content = soul_path.read_text(encoding="utf-8").strip()
+            assert content != ""
+            assert "Zettlab Memo" in content
+            assert "Hermes Agent" not in content
 
     def test_does_not_overwrite_existing_soul_md(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):

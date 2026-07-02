@@ -524,6 +524,15 @@ class TestChatCompletionsBuildKwargs:
         )
         assert kw["service_tier"] == "priority"
 
+    def test_response_format_request_override_passes_through(self, transport):
+        msgs = [{"role": "user", "content": "Hi"}]
+        response_format = {"type": "json_object"}
+        kw = transport.build_kwargs(
+            model="gpt-4o", messages=msgs,
+            request_overrides={"response_format": response_format},
+        )
+        assert kw["response_format"] == response_format
+
     def test_fixed_temperature(self, transport):
         """Fixed temperature is now set via ProviderProfile.fixed_temperature."""
         from providers.base import ProviderProfile
@@ -1018,6 +1027,37 @@ class TestChatCompletionsGeminiNativeExtraBodyStrip:
         eb = kw.get("extra_body")
         assert not eb or "tags" not in eb
 
+    def test_response_format_rejected_when_endpoint_is_native_gemini(self, transport):
+        with pytest.raises(ValueError, match="response_format"):
+            transport.build_kwargs(
+                "gemini-2.5-flash",
+                [{"role": "user", "content": "hi"}],
+                None,
+                base_url="https://generativelanguage.googleapis.com/v1beta",
+                request_overrides={"response_format": {"type": "json_object"}},
+            )
+
+    def test_response_format_rejected_when_endpoint_is_gemini_cloudcode(self, transport):
+        with pytest.raises(ValueError, match="response_format"):
+            transport.build_kwargs(
+                "gemini-2.5-flash",
+                [{"role": "user", "content": "hi"}],
+                None,
+                provider_name="google-gemini-cli",
+                base_url="cloudcode-pa://google",
+                request_overrides={"response_format": {"type": "json_object"}},
+            )
+
+    def test_text_response_format_dropped_for_native_gemini(self, transport):
+        kw = transport.build_kwargs(
+            "gemini-2.5-flash",
+            [{"role": "user", "content": "hi"}],
+            None,
+            base_url="https://generativelanguage.googleapis.com/v1beta",
+            request_overrides={"response_format": {"type": "text"}},
+        )
+        assert "response_format" not in kw
+
     def test_tags_preserved_on_nous_endpoint(self, transport):
         kw = transport.build_kwargs(
             "hermes-3-405b",
@@ -1044,3 +1084,89 @@ class TestChatCompletionsGeminiNativeExtraBodyStrip:
         )
         eb = kw.get("extra_body")
         assert eb and "tags" in eb
+
+
+class TestChatCompletionsZettlabTaskHeaders:
+    """Zettlab task/routing header injection for NAS sessions."""
+
+    def test_zettlab_session_injects_task_headers(self, transport):
+        msgs = [{"role": "user", "content": "hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-4o",
+            messages=msgs,
+            timeout=30.0,
+            session_id="zettlab:u1:agent-a:abc123",
+        )
+        headers = kw.get("extra_headers") or {}
+        assert headers.get("X-Task-Id") == "zettlab:u1:agent-a:abc123"
+        assert headers.get("X-Zettlab-Conversation-ID") == "zettlab:u1:agent-a:abc123"
+        assert headers.get("X-Scene-Type") == "agent"
+
+    def test_non_zettlab_session_omits_task_headers(self, transport):
+        msgs = [{"role": "user", "content": "hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-4o",
+            messages=msgs,
+            timeout=30.0,
+            session_id="local-session-123",
+        )
+        headers = kw.get("extra_headers") or {}
+        assert "X-Task-Id" not in headers
+        assert "X-Zettlab-Conversation-ID" not in headers
+
+    def test_missing_session_omits_task_headers(self, transport):
+        msgs = [{"role": "user", "content": "hi"}]
+        kw = transport.build_kwargs(model="gpt-4o", messages=msgs, timeout=30.0)
+        headers = kw.get("extra_headers") or {}
+        assert "X-Task-Id" not in headers
+        assert "X-Zettlab-Conversation-ID" not in headers
+
+    def test_cron_session_collapses_to_stable_job_task_id(self, transport):
+        # cron_<job>_<YYYYMMDD>_<HHMMSS> -> cron_<job> so all runs of a cron job
+        # aggregate into one credit-ledger task card.
+        msgs = [{"role": "user", "content": "hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-4o",
+            messages=msgs,
+            timeout=30.0,
+            session_id="cron_4b2628798006_20260624_104233",
+        )
+        headers = kw.get("extra_headers") or {}
+        assert headers.get("X-Task-Id") == "cron_4b2628798006"
+        assert headers.get("X-Zettlab-Conversation-ID") == "cron_4b2628798006"
+        assert headers.get("X-Scene-Type") == "agent"
+
+    def test_cron_session_stamps_encoded_job_title(self, transport):
+        # run_job sets HERMES_CRON_TASK_TITLE; it surfaces as a percent-encoded
+        # X-Task-Title so the ledger's cron card shows the real job name.
+        from urllib.parse import unquote
+
+        from gateway.session_context import _VAR_MAP
+
+        _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("站立提醒")
+        try:
+            kw = transport.build_kwargs(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": "hi"}],
+                timeout=30.0,
+                session_id="cron_job1_20260624_104233",
+            )
+            headers = kw.get("extra_headers") or {}
+            assert headers.get("X-Task-Id") == "cron_job1"
+            assert unquote(headers.get("X-Task-Title", "")) == "站立提醒"
+        finally:
+            _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("")
+
+    def test_interactive_session_omits_task_title(self, transport):
+        # No cron title var -> X-Task-Title must not be stamped on conversations.
+        from gateway.session_context import _VAR_MAP
+
+        _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("")
+        kw = transport.build_kwargs(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": "hi"}],
+            timeout=30.0,
+            session_id="zettlab:u1:agent-a:abc123",
+        )
+        headers = kw.get("extra_headers") or {}
+        assert "X-Task-Title" not in headers

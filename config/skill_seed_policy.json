@@ -1,0 +1,53 @@
+{
+  "version": 3,
+  "mode": "allowlist",
+  "_comment": "Policy-driven seed allowlist. A NEW profile seeds only the ids in 'seed' (22 of the bundled skills); everything not listed — including future upstream skills — is NOT seeded (fail-closed). The seed SET is decoupled from skills/ (this policy alone decides composition). skills/ stays upstream-verbatim, with ONE additive exception from the de-brand follow-up: a NEW sibling skill 'zettlab-memo-setup' — a de-branded copy of the upstream 'hermes-agent' runtime skill — is seeded IN PLACE OF 'hermes-agent', so the assistant never surfaces the Hermes / Nous Research identity when a user asks about configuring or using the runtime. The original 'hermes-agent' SKILL.md is left byte-for-byte untouched in skills/ (just no longer seeded) so upstream merges stay clean. The other brand-named bundled skills (claude-design, baoyu-infographic, nano-pdf) are seeded under their upstream names by deliberate decision: they make no self-identity claim, so renaming was judged unnecessary. Ids match each bundled skill's SKILL.md frontmatter `name`; a stale id fails the CI guard (tools/check_seed_policy.py).",
+  "status": "De-brand follow-up (Part 2 — a separate PR stacked on the seeding-mechanism PR). 22-skill seed set: 'hermes-agent' replaced by the ADDED de-branded sibling 'zettlab-memo-setup' (original hermes-agent untouched in skills/, no longer seeded). The other 21 are seeded under their upstream names; claude-design / baoyu-infographic / nano-pdf are intentionally NOT renamed (no self-identity claim).",
+  "source": {
+    "feishu_wiki_node": "WsXCwKZPtiaN8bksir1cdq2anMf",
+    "feishu_base": "Dec5ba8QGaBJfBsjTpRcSFAlnsg",
+    "feishu_table": "tblZlQE3Zb8IhcFB",
+    "feishu_view": "vew4jCMkBg",
+    "snapshot_date": "2026-06-09",
+    "scoped_to": "main's 76 skills @ origin/main",
+    "table_tally": {
+      "预置保留": 24,
+      "去品牌后保留": 3,
+      "转为可选（不预置）": 37,
+      "移除": 27,
+      "total": 91,
+      "current_seed_total": 22
+    },
+    "note": "Feishu 快照分类:预置保留项中已剔除迁往 zettlab-presets 的 connector 业务 skill；当前 seed 集合 = 22。实际落地:只有 hermes-agent 含 Hermes / Nous Research 自我身份信息,改为预置新增的去品牌同功能 sibling 'zettlab-memo-setup'(原 hermes-agent skill 不改、保留在 skills/);claude-design / baoyu-infographic / nano-pdf 评估为无自我身份声明,按上游原名预置、不改名。"
+  },
+  "seed": [
+    "architecture-diagram",
+    "arxiv",
+    "baoyu-infographic",
+    "blogwatcher",
+    "claude-design",
+    "excalidraw",
+    "gif-search",
+    "himalaya",
+    "humanizer",
+    "kanban-orchestrator",
+    "kanban-worker",
+    "maps",
+    "nano-pdf",
+    "obsidian",
+    "openhue",
+    "plan",
+    "popular-web-designs",
+    "requesting-code-review",
+    "scheduled-task-wizard",
+    "songwriting-and-ai-music",
+    "youtube-content",
+    "zettlab-memo-setup"
+  ],
+  "runtime_required": [
+    "zettlab-memo-setup",
+    "kanban-worker",
+    "kanban-orchestrator",
+    "requesting-code-review"
+  ]
+}

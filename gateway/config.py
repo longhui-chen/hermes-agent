@@ -165,6 +165,8 @@ class Platform(Enum):
     QQBOT = "qqbot"
     YUANBAO = "yuanbao"
     RELAY = "relay"  # generic relay adapter fronted by the connector (EXPERIMENTAL)
+    ZET_AGENT = "zet_agent"
+
     @classmethod
     def _missing_(cls, value):
         """Accept unknown platform names only for known plugin adapters.
@@ -287,7 +289,7 @@ class SessionResetPolicy:
     at_hour: int = 4  # Hour for daily reset (0-23, local time)
     idle_minutes: int = 1440  # Minutes of inactivity before reset (24 hours)
     notify: bool = True  # Send a notification to the user when auto-reset occurs
-    notify_exclude_platforms: tuple = ("api_server", "webhook")  # Platforms that don't get reset notifications
+    notify_exclude_platforms: tuple = ("api_server", "zet_agent", "webhook")  # Platforms that don't get reset notifications
     # A background process this many hours old (or older) no longer blocks
     # session idle/daily reset. A forgotten preview server should not keep a
     # session alive forever (#29177). The process is NOT killed — only ignored
@@ -319,7 +321,7 @@ class SessionResetPolicy:
             at_hour=at_hour if at_hour is not None else 4,
             idle_minutes=idle_minutes if idle_minutes is not None else 1440,
             notify=_coerce_bool(notify, True),
-            notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "webhook"),
+            notify_exclude_platforms=tuple(exclude) if exclude is not None else ("api_server", "zet_agent", "webhook"),
             bg_process_max_age_hours=bg_max_age if bg_max_age is not None else 24,
         )
 
@@ -495,6 +497,7 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     ),
     Platform.SIGNAL: lambda cfg: bool(cfg.extra.get("http_url")),
     Platform.API_SERVER: lambda cfg: True,
+    Platform.ZET_AGENT: lambda cfg: True,
     Platform.WEBHOOK: lambda cfg: True,
     Platform.MSGRAPH_WEBHOOK: lambda cfg: bool(
         str(cfg.extra.get("client_state") or "").strip()
@@ -875,14 +878,16 @@ def load_gateway_config() -> GatewayConfig:
             if "thread_sessions_per_user" in yaml_cfg:
                 gw_data["thread_sessions_per_user"] = yaml_cfg["thread_sessions_per_user"]
 
+            gateway_section = yaml_cfg.get("gateway")
+            if isinstance(gateway_section, dict) and "multiplex_profiles" in gateway_section:
+                gw_data["multiplex_profiles"] = gateway_section["multiplex_profiles"]
+
             # Multiplexing flag: accept both the top-level key and the nested
-            # gateway.multiplex_profiles form (from_dict resolves the nested
-            # fallback, but surface the top-level key here for parity with the
-            # other session-scope flags above).
+            # gateway.multiplex_profiles form. Top-level keeps precedence over
+            # nested for parity with max_concurrent_sessions below.
             if "multiplex_profiles" in yaml_cfg:
                 gw_data["multiplex_profiles"] = yaml_cfg["multiplex_profiles"]
 
-            gateway_section = yaml_cfg.get("gateway")
             if isinstance(gateway_section, dict) and "max_concurrent_sessions" in gateway_section:
                 gw_data["max_concurrent_sessions"] = gateway_section["max_concurrent_sessions"]
 
@@ -1578,6 +1583,32 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         api_server_model_name = os.getenv("API_SERVER_MODEL_NAME", "")
         if api_server_model_name:
             config.platforms[Platform.API_SERVER].extra["model_name"] = api_server_model_name
+
+    # Zet Agent — APIServerAdapter subclass with extended SSE events
+    # (reasoning.delta / hermes.approval / hermes.clarify / conversation.title)
+    # mounted on event: hermes.tool.progress with payload.type discriminator.
+    zet_agent_enabled = os.getenv("ZET_AGENT_ENABLED", "").lower() in ("true", "1", "yes")
+    zet_agent_key = os.getenv("ZET_AGENT_KEY", "")
+    zet_agent_port = os.getenv("ZET_AGENT_PORT")
+    zet_agent_host = os.getenv("ZET_AGENT_HOST")
+    zet_agent_cors_origins = os.getenv("ZET_AGENT_CORS_ORIGINS", "")
+    if zet_agent_enabled or zet_agent_key:
+        if Platform.ZET_AGENT not in config.platforms:
+            config.platforms[Platform.ZET_AGENT] = PlatformConfig()
+        config.platforms[Platform.ZET_AGENT].enabled = True
+        if zet_agent_key:
+            config.platforms[Platform.ZET_AGENT].extra["key"] = zet_agent_key
+        if zet_agent_port:
+            try:
+                config.platforms[Platform.ZET_AGENT].extra["port"] = int(zet_agent_port)
+            except ValueError:
+                pass
+        if zet_agent_host:
+            config.platforms[Platform.ZET_AGENT].extra["host"] = zet_agent_host
+        if zet_agent_cors_origins:
+            origins = [o.strip() for o in zet_agent_cors_origins.split(",") if o.strip()]
+            if origins:
+                config.platforms[Platform.ZET_AGENT].extra["cors_origins"] = origins
 
     # Webhook platform
     webhook_enabled = os.getenv("WEBHOOK_ENABLED", "").lower() in {"true", "1", "yes"}

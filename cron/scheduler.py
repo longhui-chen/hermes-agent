@@ -40,11 +40,74 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hermes_constants import get_hermes_home
 from hermes_cli._subprocess_compat import windows_hide_flags
-from hermes_cli.config import load_config, _expand_env_vars
+from hermes_cli.config import load_config
+from hermes_cli.env_loader import load_hermes_dotenv as _load_hermes_dotenv
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
+
+try:
+    from agent.secret_scope import (
+        build_profile_secret_scope as _build_profile_secret_scope,
+        get_secret as _get_scoped_secret,
+        _is_global_env as _is_secret_global_env,
+        is_multiplex_active as _is_secret_multiplex_active,
+    )
+except Exception:  # pragma: no cover - standalone cron invocations before agent package import
+    _build_profile_secret_scope = None
+    _get_scoped_secret = None
+    _is_secret_global_env = None
+    _is_secret_multiplex_active = None
+
+
+_ENV_REF_RE = re.compile(r"\${([^}]+)}")
+
+
+def _cron_env(name: str, default: str = "") -> str:
+    """Read a cron env value from the active profile scope when available."""
+    if _get_scoped_secret is None:
+        return os.getenv(name, default)
+    if (
+        _build_profile_secret_scope is not None
+        and _is_secret_global_env is not None
+        and _is_secret_multiplex_active is not None
+        and _is_secret_multiplex_active()
+        and not _is_secret_global_env(name)
+    ):
+        try:
+            fresh_scope = _build_profile_secret_scope(get_hermes_home())
+            value = fresh_scope.get(name)
+            if value is not None:
+                return str(value)
+        except Exception:
+            logger.debug("Failed to refresh cron env %s from profile .env", name, exc_info=True)
+    value = _get_scoped_secret(name, default)
+    return default if value is None else str(value)
+
+
+def _refresh_cron_dotenv_for_legacy_process() -> None:
+    """Reload .env before cron runs in non-multiplex gateway processes."""
+    try:
+        if _is_secret_multiplex_active is not None and _is_secret_multiplex_active():
+            return
+        _load_hermes_dotenv(hermes_home=get_hermes_home())
+    except Exception:
+        logger.debug("Failed to refresh cron dotenv", exc_info=True)
+
+
+def _expand_env_vars_scoped(obj):
+    """Recursively expand ``${VAR}`` references through the cron profile scope."""
+    if isinstance(obj, str):
+        return _ENV_REF_RE.sub(
+            lambda match: _cron_env(match.group(1), match.group(0)),
+            obj,
+        )
+    if isinstance(obj, dict):
+        return {key: _expand_env_vars_scoped(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_env_vars_scoped(item) for item in obj]
+    return obj
 
 
 def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
@@ -428,6 +491,15 @@ def _get_lock_paths() -> tuple[Path, Path]:
     hermes_home = _get_hermes_home()
     lock_dir = hermes_home / "cron"
     return lock_dir, lock_dir / ".tick.lock"
+
+
+def _running_job_key(job: dict) -> tuple[str, str]:
+    """Return a profile-qualified key for the in-process cron running guard."""
+    try:
+        home_key = str(_get_hermes_home().resolve())
+    except Exception:
+        home_key = str(_get_hermes_home())
+    return home_key, str(job["id"])
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -871,11 +943,11 @@ def _get_home_target_chat_id(platform_name: str) -> str:
     env_var = _resolve_home_env_var(platform_name)
     if not env_var:
         return ""
-    value = os.getenv(env_var, "")
+    value = _cron_env(env_var, "")
     if not value:
         legacy = _LEGACY_HOME_TARGET_ENV_VARS.get(env_var)
         if legacy:
-            value = os.getenv(legacy, "")
+            value = _cron_env(legacy, "")
     return value
 
 
@@ -894,14 +966,14 @@ def _get_home_target_thread_id(platform_name: str) -> Optional[str]:
     if not env_var:
         return None
     if platform_name.lower() == "telegram":
-        cron_thread = os.getenv("TELEGRAM_CRON_THREAD_ID", "").strip()
+        cron_thread = _cron_env("TELEGRAM_CRON_THREAD_ID", "").strip()
         if cron_thread:
             return cron_thread
-    value = os.getenv(f"{env_var}_THREAD_ID", "").strip()
+    value = _cron_env(f"{env_var}_THREAD_ID", "").strip()
     if not value:
         legacy = _LEGACY_HOME_TARGET_ENV_VARS.get(env_var)
         if legacy:
-            value = os.getenv(f"{legacy}_THREAD_ID", "").strip()
+            value = _cron_env(f"{legacy}_THREAD_ID", "").strip()
     return value or None
 
 
@@ -1758,7 +1830,7 @@ def _get_script_timeout() -> int:
         except Exception:
             logger.warning("Invalid patched _SCRIPT_TIMEOUT=%r; using env/config/default", _SCRIPT_TIMEOUT)
 
-    env_value = os.getenv("HERMES_CRON_SCRIPT_TIMEOUT", "").strip()
+    env_value = _cron_env("HERMES_CRON_SCRIPT_TIMEOUT", "").strip()
     if env_value:
         try:
             timeout = int(float(env_value))
@@ -1984,7 +2056,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     # Inject output from referenced cron jobs as context.
     context_from = job.get("context_from")
     if context_from:
-        from cron.jobs import OUTPUT_DIR
+        from cron.jobs import _output_dir
         if isinstance(context_from, str):
             context_from = [context_from]
         for source_job_id in context_from:
@@ -1999,7 +2071,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 )
                 continue
             try:
-                job_output_dir = OUTPUT_DIR / source_job_id
+                job_output_dir = _output_dir() / source_job_id
                 if not job_output_dir.exists():
                     continue  # silent skip — no output yet
                 output_files = sorted(
@@ -2134,6 +2206,43 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     return _scan_assembled_cron_prompt("\n".join(parts), job, has_skills=True)
 
 
+def _build_job_persist_prompt(job: dict) -> str:
+    """Build the user-facing prompt that gets stored in sessions.messages.
+
+    AIAgent.run_conversation receives ``_build_job_prompt`` output as
+    ``user_message`` (cron_hint preamble + script/context blocks + skill
+    wrappers + the operator's prompt — everything the LLM needs at
+    runtime). But that whole assembly also lands in ``sessions.messages``
+    role=user content, so the App's home list / per-session history
+    surface the entire ``[IMPORTANT: You are running as a scheduled cron
+    job. ...]`` preamble as if the user typed it.
+
+    Hermes already has a clean-history channel for this exact case:
+    ``run_conversation(user_message=..., persist_user_message=...)`` —
+    ``_apply_persist_user_message_override`` rewrites the in-memory
+    messages list before persistence so DB and JSONL log carry the
+    cleaner string. cron just wasn't using it.
+
+    This helper produces the cleaner string. It is the operator's
+    original ``job["prompt"]`` verbatim — no cron_hint, no skill
+    wrapper, no script-output framing. Empty prompts (skill-only crons)
+    fall back to a synthesized label so the resumed conversation
+    doesn't render an empty user bubble.
+
+    Note: ``job["prompt"]`` is already injection-scanned at create/update
+    time by ``tools/cronjob_tools.py::_scan_cron_prompt``; we re-scan the
+    fully-assembled prompt for runtime-loaded skill content in
+    ``_scan_assembled_cron_prompt`` but that's the LLM-facing scan path.
+    The persist string is just the user's own text and needs no
+    additional scanning here.
+    """
+    user_prompt = (job.get("prompt") or "").strip()
+    if user_prompt:
+        return user_prompt
+    label = job.get("name") or job.get("id") or "unknown"
+    return f"_(cron job: {label})_"
+
+
 def _scan_assembled_cron_prompt(
     assembled: str,
     job: dict,
@@ -2259,6 +2368,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    _refresh_cron_dotenv_for_legacy_process()
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -2430,6 +2540,11 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
+    # persist_prompt is the clean operator-typed text we hand to
+    # run_conversation(persist_user_message=...) so sessions.messages
+    # stores the user-facing prompt rather than the full LLM payload
+    # (which carries cron_hint preamble, skill wrappers, etc).
+    persist_prompt = _build_job_persist_prompt(job)
     origin = _resolve_origin(job)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -2480,6 +2595,20 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     )
     for _var_name in _cron_delivery_vars:
         _VAR_MAP[_var_name].set("")
+    # Stamp the human-readable job name so auxiliary + main LLM calls carry it as
+    # X-Task-Title → ai-cloud ledger scene_params.task_title → the App's cron task
+    # card shows the real name even after the job is deleted (it can no longer be
+    # resolved from the live cron list). This is billing/display semantics (not a
+    # delivery target), so it's set explicitly here rather than via the delivery
+    # tuple above. It's always assigned per job below, so it can't leak across
+    # jobs in the parallel pool.
+    #
+    # Use the job NAME (fall back to the opaque job_id, never the prompt): an
+    # HTTP header has a hard size limit and the prompt can be long / sensitive,
+    # so we must not let an unnamed job spill its whole prompt into a header.
+    # Cap length too (ai-api re-caps at 255 runes after percent-decoding).
+    _cron_task_title = (str(job.get("name") or "").strip() or job_id)[:200]
+    _VAR_MAP["HERMES_CRON_TASK_TITLE"].set(_cron_task_title)
 
     # Per-job working directory.  When set (and validated at create/update
     # time), we point TERMINAL_CWD at it so:
@@ -2563,7 +2692,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # value is intentionally re-read from storage every tick so a
         # ``cronjob action=update model=...`` after a failed run takes effect
         # on the next tick — there is no in-memory cache.
-        model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+        model = job.get("model") or _cron_env("HERMES_MODEL", "") or ""
 
         # Load config.yaml for model, reasoning, prefill, toolsets, provider routing
         _cfg = {}
@@ -2582,7 +2711,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
                     _cfg = managed_scope.apply_managed_overlay(_cfg)
                 except Exception:
                     pass
-                _cfg = _expand_env_vars(_cfg)
+                _cfg = _expand_env_vars_scoped(_cfg)
                 # Coerce null/missing to {} so a falsy default never
                 # clobbers an already-resolved env value with ``None``.
                 _model_cfg = _cfg.get("model") or {}
@@ -2631,7 +2760,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         prefill_messages = None
         agent_cfg = _cfg.get("agent", {}) if isinstance(_cfg.get("agent", {}), dict) else {}
         prefill_file = (
-            os.getenv("HERMES_PREFILL_MESSAGES_FILE", "")
+            _cron_env("HERMES_PREFILL_MESSAGES_FILE", "")
             or _cfg.get("prefill_messages_file", "")
             or agent_cfg.get("prefill_messages_file", "")
         )
@@ -2838,7 +2967,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         #
         # Uses the agent's built-in activity tracker (updated by
         # _touch_activity() on every tool call, API call, and stream delta).
-        _raw_cron_timeout = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
+        _raw_cron_timeout = _cron_env("HERMES_CRON_TIMEOUT", "").strip()
         if _raw_cron_timeout:
             try:
                 _cron_timeout = float(_raw_cron_timeout)
@@ -2857,7 +2986,17 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        # persist_user_message: AIAgent.run_conversation receives the full
+        # cron payload as user_message but persists persist_prompt (just
+        # the operator's job["prompt"]) via _apply_persist_user_message_override
+        # before flushing to sessions.messages. LLM behavior unchanged,
+        # history clean.
+        _cron_future = _cron_pool.submit(
+            _cron_context.run,
+            agent.run_conversation,
+            prompt,
+            persist_user_message=persist_prompt,
+        )
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
@@ -2990,7 +3129,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
 ## Prompt
 
-{prompt}
+{persist_prompt}
 
 ## Response
 
@@ -3012,7 +3151,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
 
 ## Prompt
 
-{prompt}
+{persist_prompt}
 
 ## Error
 
@@ -3232,7 +3371,7 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
         _max_workers: Optional[int] = None
         try:
-            _env_par = os.getenv("HERMES_CRON_MAX_PARALLEL", "").strip()
+            _env_par = _cron_env("HERMES_CRON_MAX_PARALLEL", "").strip()
             if _env_par:
                 _max_workers = int(_env_par) or None
         except (ValueError, TypeError):
@@ -3282,19 +3421,20 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
             membership is released in the worker's finally block.
             """
             job_id = job["id"]
+            running_key = _running_job_key(job)
             with _running_lock:
-                if job_id in _running_job_ids:
+                if running_key in _running_job_ids:
                     logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                     return None
-                _running_job_ids.add(job_id)
+                _running_job_ids.add(running_key)
             _ctx = contextvars.copy_context()
 
-            def _run_and_release(j=job, ctx=_ctx):
+            def _run_and_release(j=job, ctx=_ctx, key=running_key):
                 try:
                     return ctx.run(_process_job, j)
                 finally:
                     with _running_lock:
-                        _running_job_ids.discard(j["id"])
+                        _running_job_ids.discard(key)
 
             return pool.submit(_run_and_release)
 

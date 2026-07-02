@@ -1281,13 +1281,14 @@ class TestBuildSystemPrompt:
         # Find the line and strip it for inspection
         for line in prompt.splitlines():
             if line.startswith("Conversation started:"):
+                date_part = line.split(" — timezone ", 1)[0]
                 # Must NOT contain AM/PM indicator (minute precision had %I:%M %p)
-                assert " AM" not in line and " PM" not in line, (
+                assert " AM" not in date_part and " PM" not in date_part, (
                     f"Timestamp line has time-of-day, breaks daily cache stability: {line!r}"
                 )
                 # Must NOT contain a colon followed by two digits (HH:MM pattern)
                 import re as _re
-                assert not _re.search(r":\d{2}", line), (
+                assert not _re.search(r"\b\d{1,2}:\d{2}\b", date_part), (
                     f"Timestamp line has HH:MM, breaks daily cache stability: {line!r}"
                 )
                 break
@@ -4601,6 +4602,78 @@ class TestRunConversation:
         assert result["final_response"] == "All done"
         assert result["completed"] is True
 
+    def test_big_tool_result_triggers_compression_before_next_call(self, agent):
+        """In-loop compression must use the *current* request size, not
+        last_prompt_tokens from the previous API response.
+
+        Regression for the board28 1.6M-token MaxClaw scenario: a single
+        terminal/read_file/web_search dump can balloon the messages list
+        between API calls. If we only check last_prompt_tokens (which was
+        recorded BEFORE the tool result was appended), the next request
+        sails past the threshold and the model errors out / empties.
+        """
+        self._setup_agent(agent)
+        agent.compression_enabled = True
+
+        # Force `last_prompt_tokens` to look under-threshold so the OLD
+        # reactive path would explicitly skip compression.
+        agent.context_compressor.last_prompt_tokens = 1_000
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="All done", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+        # A sizeable tool result, but kept under the 100K-char inline
+        # truncation threshold (tools/budget_config.DEFAULT_RESULT_SIZE_CHARS)
+        # so it lands in the messages list at full size. ~80K chars ≈ 20K
+        # token estimate — comfortably above the 1_000 last_prompt_tokens
+        # we seeded, which is the value the old reactive path would have
+        # used.
+        huge_result = "x" * 80_000
+
+        captured_tokens: list[int] = []
+
+        def _spy_should_compress(prompt_tokens=None):
+            # Record what value the caller passed in; assert later.
+            captured_tokens.append(prompt_tokens or 0)
+            return True
+
+        with (
+            patch("run_agent.handle_function_call", return_value=huge_result),
+            patch.object(
+                agent.context_compressor,
+                "should_compress",
+                side_effect=_spy_should_compress,
+            ),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [{"role": "user", "content": "run a command"}],
+                "compressed system prompt",
+            )
+            agent.run_conversation("run a command")
+
+        # _compress_context must have fired despite last_prompt_tokens=1_000.
+        mock_compress.assert_called_once()
+        # And the token figure passed to should_compress must reflect the
+        # appended large tool result — NOT just the 1_000 from
+        # last_prompt_tokens. 80K chars ≈ 20K tokens via the rough
+        # estimator (~4 chars/token).
+        assert captured_tokens, "should_compress was not called"
+        # The in-loop call (post-tool-execution) is the one we care about;
+        # take the max of the recorded values to be robust against any
+        # earlier preflight/auxiliary call sites also calling should_compress.
+        max_tokens = max(captured_tokens)
+        assert max_tokens > 10_000, (
+            f"largest should_compress arg was {max_tokens} tokens; "
+            "expected a current-messages estimate that includes the 80K-char "
+            "tool result (~20K tokens), not the stale last_prompt_tokens=1_000."
+        )
+
     def test_glm_prompt_exceeds_max_length_triggers_compression(self, agent):
         """GLM/Z.AI uses 'Prompt exceeds max length' for context overflow."""
         self._setup_agent(agent)
@@ -6099,7 +6172,7 @@ class TestSystemPromptStability:
         # Should have built fresh, not queried the DB
         mock_db.get_session.assert_not_called()
         assert agent._cached_system_prompt is not None
-        assert "Hermes Agent" in agent._cached_system_prompt
+        assert DEFAULT_AGENT_IDENTITY in agent._cached_system_prompt
 
     def test_fresh_build_when_db_has_no_prompt(self, agent):
         """If the session DB has no stored prompt, build fresh even with history."""
@@ -6126,7 +6199,7 @@ class TestSystemPromptStability:
                 agent._cached_system_prompt = agent._build_system_prompt()
 
         # Empty string is falsy, so should fall through to fresh build
-        assert "Hermes Agent" in agent._cached_system_prompt
+        assert DEFAULT_AGENT_IDENTITY in agent._cached_system_prompt
 
 class TestBudgetPressure:
     """Budget exhaustion grace call system."""

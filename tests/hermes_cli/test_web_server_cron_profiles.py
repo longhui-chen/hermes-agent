@@ -50,6 +50,31 @@ def test_call_cron_for_profile_routes_storage_and_restores_globals(isolated_prof
     assert cron_jobs.OUTPUT_DIR == old_output_dir
 
 
+def test_call_cron_for_profile_installs_profile_secret_scope(isolated_profiles, monkeypatch):
+    from agent.secret_scope import current_secret_scope
+    from cron import jobs as cron_jobs
+    from hermes_cli import web_server
+    from hermes_constants import get_hermes_home
+
+    (isolated_profiles["worker_alpha"] / ".env").write_text(
+        "ANTHROPIC_API_KEY=sk-worker\n",
+        encoding="utf-8",
+    )
+    seen = {}
+
+    def fake_list_jobs(include_disabled=False):
+        seen["home"] = get_hermes_home()
+        seen["scope"] = dict(current_secret_scope() or {})
+        return []
+
+    monkeypatch.setattr(cron_jobs, "list_jobs", fake_list_jobs)
+
+    assert web_server._call_cron_for_profile("worker_alpha", "list_jobs", True) == []
+
+    assert seen["home"] == isolated_profiles["worker_alpha"]
+    assert seen["scope"]["ANTHROPIC_API_KEY"] == "sk-worker"
+
+
 @pytest.mark.asyncio
 async def test_list_cron_jobs_all_includes_default_and_named_profiles(isolated_profiles):
     from hermes_cli import web_server
