@@ -87,6 +87,39 @@ _CRON_ATTACHMENT_TEMP_DIRS = frozenset({
 _ABSOLUTE_PATH_RE = re.compile(r"(?<![\w./-])/{1,3}[^\s\"'<>`|)]{2,}")
 
 
+def _scoped_env(name: str, default: str = "") -> str:
+    """Read an env value through the cron profile secret scope when available.
+
+    Under the multiplex gateway there is no per-agent child process:
+    ZET_CHAT_APPEND_URL / ZET_AGENT_ID / ZETTLAB_AGENT_ACTION_TOKEN live in
+    the profile's ``.env`` (written by zettlab-local-server), NOT in
+    ``os.environ``. ``cron.scheduler._cron_env`` resolves through the active
+    profile secret scope — including a fresh ``.env`` re-read for values
+    written after gateway startup — and falls back to ``os.environ`` in
+    legacy per-profile processes.
+
+    On resolution failure (missing scope / upstream helper renamed) the
+    fallback is mode-dependent: legacy processes read ``os.environ`` (their
+    values were injected per-process, so it is safe), but under an ACTIVE
+    multiplexer we return the default instead — gateway startup loads the
+    active profile's ``.env`` into the process environment, so reading
+    ``os.environ`` here could deliver this cron's result with ANOTHER
+    profile's ZET_CHAT_APPEND_URL / action token. A skipped report beats a
+    cross-profile delivery.
+    """
+    try:
+        from cron.scheduler import _cron_env
+        return _cron_env(name, default)
+    except Exception:
+        try:
+            from agent.secret_scope import is_multiplex_active
+            if is_multiplex_active():
+                return default
+        except Exception:
+            pass
+        return os.environ.get(name, default)
+
+
 def _is_zet_agent_platform(platform: Any) -> bool:
     return str(platform or "").lower() in {"zet_agent", "zettlab"}
 
@@ -140,7 +173,7 @@ def _split_channel_targets(deliver):
 
 def _resolve_channel_send_url():
     """Derive local-server's channel-send endpoint from ZET_CHAT_APPEND_URL."""
-    raw = os.environ.get("ZET_CHAT_APPEND_URL", "").strip()
+    raw = _scoped_env("ZET_CHAT_APPEND_URL").strip()
     if not raw:
         return None
     from urllib.parse import urlsplit, urlunsplit
@@ -195,7 +228,7 @@ def _send_to_channel(kind: str, content: str, job_id: str):
     url = _resolve_channel_send_url()
     if not url:
         return "channel delivery: ZET_CHAT_APPEND_URL unset"
-    token = os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN", "").strip()
+    token = _scoped_env("ZETTLAB_AGENT_ACTION_TOKEN").strip()
     if not token:
         return "channel delivery: action token unavailable"
     from tools.channel_text import chunk_channel_text
@@ -1215,11 +1248,11 @@ def _try_persist_to_session(
 
 
 def _try_notify_chat_append(session_id: str, msg_id: int, content: str) -> None:
-    url = os.environ.get("ZET_CHAT_APPEND_URL", "").strip()
+    url = _scoped_env("ZET_CHAT_APPEND_URL").strip()
     if not url:
         _dbg("_try_notify_chat_append: ZET_CHAT_APPEND_URL unset, skip")
         return
-    agent_id = os.environ.get("ZET_AGENT_ID", "").strip()
+    agent_id = _scoped_env("ZET_AGENT_ID").strip()
     payload = {
         "agent_id": agent_id,
         "session_id": session_id,
@@ -1474,7 +1507,7 @@ def _collect_produced_files(job_id: str, job: Optional[dict] = None) -> List[Dic
 
 def _cron_agent_ids(job: Optional[dict]) -> set[str]:
     ids: set[str] = set()
-    env_agent_id = os.environ.get("ZET_AGENT_ID", "").strip()
+    env_agent_id = _scoped_env("ZET_AGENT_ID").strip()
     if env_agent_id:
         ids.add(env_agent_id)
     origin = (job or {}).get("origin") if isinstance(job, dict) else None
