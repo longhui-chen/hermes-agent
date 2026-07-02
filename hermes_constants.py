@@ -297,7 +297,18 @@ def _profile_home_path(env: dict[str, str] | None = None) -> str | None:
     """Return ``{HERMES_HOME}/home`` when the profile-home directory exists."""
     hermes_home = get_hermes_home_override() or (env or {}).get("HERMES_HOME") or os.getenv("HERMES_HOME")
     if not hermes_home:
-        return None
+        # cron/systemd lines often launch hermes with neither HOME nor
+        # HERMES_HOME. All state reads still resolve through
+        # get_hermes_home()'s platform default, so the HOME policy must see
+        # the same directory — otherwise the missing-HOME fallback in
+        # get_subprocess_home() silently never fires for exactly the
+        # environments it exists for (ZET-1938 cron variant).
+        try:
+            hermes_home = str(get_hermes_home())
+        except Exception:
+            # Path.home() can fail on POSIX with no HOME and no passwd
+            # entry; no resolvable Hermes home means no profile home.
+            return None
     profile_home = os.path.join(hermes_home, "home")
     if os.path.isdir(profile_home):
         return profile_home
@@ -306,6 +317,75 @@ def _profile_home_path(env: dict[str, str] | None = None) -> str | None:
 
 def _is_profile_home(candidate: str | None, profile_home: str | None) -> bool:
     return bool(candidate and profile_home and _norm_home_path(candidate) == _norm_home_path(profile_home))
+
+
+_HOME_FALLBACK_MARKER = "HERMES_HOME_FALLBACK"
+
+
+def _child_env_home(env: dict[str, str]) -> str:
+    """Return the HOME the child process will actually see.
+
+    An explicit env-dict entry wins even when empty: a caller passing
+    ``{"HOME": ""}`` is describing a child that launches with a blank HOME,
+    and the host process's own HOME must not mask that.
+    """
+    if "HOME" in env:
+        return str(env["HOME"] or "").strip()
+    return str(os.getenv("HOME") or "").strip()
+
+
+def _home_fallback_marker_raw(env: dict[str, str]) -> str:
+    """Return the raw ``HERMES_HOME_FALLBACK`` value the child will inherit.
+
+    An explicit env-dict entry wins over ``os.environ`` (mirrors
+    :func:`_child_env_home`): a caller building a child env is describing that
+    child's marker, not the host process's.
+    """
+    raw = env[_HOME_FALLBACK_MARKER] if _HOME_FALLBACK_MARKER in env else os.getenv(_HOME_FALLBACK_MARKER, "")
+    return str(raw or "").strip()
+
+
+def _looks_like_profile_home(path: str | None) -> bool:
+    """Return True when *path* has the ``{HERMES_HOME}/home`` shape.
+
+    The missing-HOME fallback always injects ``os.path.join(hermes_home,
+    "home")``, so a fallback-injected HOME's final path component is literally
+    ``home``. A real OS-account home almost never is (it is the username:
+    ``alice``, ``root``, …). This is the only signal available for a legacy
+    bare-``"1"`` marker, which — unlike the modern marker — does not record the
+    source path it injected.
+    """
+    norm = _norm_home_path(path)
+    return bool(norm) and os.path.basename(norm.rstrip("/\\")) == "home"
+
+
+def _home_fallback_marked(env: dict[str, str]) -> bool:
+    """Return True when HOME in *env* was injected by the missing-HOME fallback.
+
+    The marker records the source profile-home *path* it injected (older
+    releases wrote a bare ``"1"``). It only vouches for a HOME it still equals:
+    if an intermediate layer reset HOME to some other value (a wrapper's
+    ``export HOME=/home/user``, ``sudo -E``, or a tool passing
+    ``env_vars={"HOME": …}``) without clearing the inherited marker, the marker
+    is stale and must NOT be trusted — otherwise the auto-mode cross-profile
+    branch would hijack that explicit HOME back to this hop's profile home,
+    pointing the child's ``~``-addressed credential stores at the wrong dir.
+
+    * Path-carrying marker: fallback-injected iff ``marker == current HOME``.
+    * Legacy ``"1"`` marker (no source path): can only be honored via shape —
+      the inherited HOME must look like a ``{HERMES_HOME}/home`` profile home.
+      A HOME reset to a real user home (basename ``alice``/``root``/…) is then
+      treated as user-pinned, closing the same hijack for legacy markers.
+    """
+    raw = _home_fallback_marker_raw(env)
+    if not raw:
+        return False
+    current_home = _child_env_home(env)
+    if raw == "1":
+        # Legacy marker without source info: trust only when HOME still has the
+        # profile-home shape the fallback injects.
+        return _looks_like_profile_home(current_home)
+    return _norm_home_path(raw) == _norm_home_path(current_home)
 
 
 def _iter_real_home_candidates(env: dict[str, str] | None = None) -> list[str]:
@@ -359,18 +439,12 @@ def get_real_home(env: dict[str, str] | None = None) -> str:
     return "/tmp"
 
 
-def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
-    """Return a subprocess ``HOME`` override, if one should be applied.
+def _resolve_subprocess_home(env: dict[str, str] | None = None) -> tuple[str | None, bool]:
+    """Resolve the subprocess HOME override for :func:`get_subprocess_home`.
 
-    Policy is controlled by ``terminal.home_mode`` (bridged to
-    ``TERMINAL_HOME_MODE``):
-
-    * ``auto`` (default): host installs keep the real user HOME; containers use
-      ``{HERMES_HOME}/home`` for persistent state. If a host parent already has
-      HOME pointed at the profile home, repair subprocesses back to real HOME.
-    * ``real``: always prefer the real OS-user HOME.
-    * ``profile``: use ``{HERMES_HOME}/home`` when it exists, preserving the
-      older strict per-profile tool-config isolation.
+    Returns ``(home, from_missing_home_fallback)``; the flag is True only
+    when *home* came from the POSIX missing-HOME fallback, so
+    :func:`apply_subprocess_home_env` can mark the injection for descendants.
     """
     env = env or {}
     profile_home = _profile_home_path(env)
@@ -381,18 +455,74 @@ def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
         mode = "real"
 
     if mode == "profile":
-        return profile_home
+        return profile_home, False
 
     real_home = get_real_home(env)
-    current_home = str(env.get("HOME") or os.getenv("HOME", "")).strip()
+    current_home = _child_env_home(env)
     if mode == "real":
-        return real_home if _norm_home_path(real_home) != _norm_home_path(current_home) else None
+        return (real_home if _norm_home_path(real_home) != _norm_home_path(current_home) else None), False
 
     if profile_home and is_container():
-        return profile_home
+        return profile_home, False
+    if sys.platform != "win32" and not current_home and profile_home:
+        # "Keep the real user HOME" needs a HOME to keep. systemd system
+        # services (and cron) start Hermes with no HOME anywhere in the
+        # process chain; without an override, ``~``-addressed credential
+        # stores (e.g. lark-cli's ~/.lark-cli, ~/.local/share/lark-cli)
+        # resolve nowhere. Fall back to the profile home — the pre-v0.17
+        # directory-gated behavior — so those stores stay reachable even
+        # when the terminal.home_mode pin was never delivered (ZET-1938).
+        # Deliberately no real-HOME fallback here: inventing a HOME the
+        # parent never had is a separate policy decision. POSIX-only:
+        # Windows hosts never carry HOME (only USERPROFILE), so a missing
+        # HOME there is the normal state, not the systemd/cron failure —
+        # pinning it would redirect MSYS/git-bash tools (git, ssh, gh)
+        # away from the real ~/.gitconfig and ~/.ssh on every install.
+        return profile_home, True
+    if _home_fallback_marked(env) and not _is_profile_home(current_home, profile_home):
+        # HOME was fallback-injected by an ancestor (the marker vouches it is
+        # not user-pinned), but this hop's profile home differs from the
+        # inherited HOME — i.e. HERMES_HOME was switched A→B between hops
+        # (set_hermes_home_override / an env-dict swap) while HOME kept
+        # pointing at profile A's home. Left alone, B's children would
+        # read/write A's ~-addressed credential stores (cross-profile leak).
+        # Re-point HOME at B's own profile home when it exists. No target
+        # profile home for B means there is nothing better to inject — keep
+        # the inherited HOME rather than inventing one.
+        if profile_home:
+            return profile_home, True
+        return None, False
     if _is_profile_home(current_home, profile_home):
-        return real_home if _norm_home_path(real_home) != _norm_home_path(current_home) else None
-    return None
+        if _home_fallback_marked(env):
+            # This profile HOME was injected by the fallback above, one
+            # process level up. "Repairing" it would flip descendants back
+            # to the real-HOME guess the fallback exists to avoid,
+            # re-breaking every second hop of a nested hermes chain.
+            return None, False
+        return (real_home if _norm_home_path(real_home) != _norm_home_path(current_home) else None), False
+    return None, False
+
+
+def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
+    """Return a subprocess ``HOME`` override, if one should be applied.
+
+    Policy is controlled by ``terminal.home_mode`` (bridged to
+    ``TERMINAL_HOME_MODE``):
+
+    * ``auto`` (default): host installs keep the real user HOME; containers use
+      ``{HERMES_HOME}/home`` for persistent state. If a host parent already has
+      HOME pointed at the profile home, repair subprocesses back to real HOME —
+      unless ``HERMES_HOME_FALLBACK`` marks it as fallback-injected. That marker
+      records the *source* profile home, so a hop that switched HERMES_HOME
+      A→B while inheriting profile-A's HOME re-points HOME at B's own profile
+      home instead of leaking A's credential dir. POSIX hosts launched with no
+      HOME at all (systemd system services, cron) fall back to the profile home
+      when it exists; Windows hosts (which never set HOME) are left untouched.
+    * ``real``: always prefer the real OS-user HOME.
+    * ``profile``: use ``{HERMES_HOME}/home`` when it exists, preserving the
+      older strict per-profile tool-config isolation.
+    """
+    return _resolve_subprocess_home(env)[0]
 
 
 def apply_subprocess_home_env(env: dict[str, str]) -> None:
@@ -400,9 +530,29 @@ def apply_subprocess_home_env(env: dict[str, str]) -> None:
     real_home = get_real_home(env)
     if real_home:
         env["HERMES_REAL_HOME"] = real_home
-    home = get_subprocess_home(env)
+    home, from_fallback = _resolve_subprocess_home(env)
     if home:
         env["HOME"] = home
+        if from_fallback:
+            # Mark the injection so nested hermes levels can tell "the
+            # fallback put HOME here" apart from "the user pinned HOME
+            # here" — only the latter is repaired back to the real HOME.
+            # Record the injected profile-home path (not a bare "1"). The
+            # marker's presence tells a nested hop this HOME is fallback-
+            # injected; that hop then compares the inherited HOME against its
+            # own profile home to decide keep (same profile) vs. re-inject
+            # (cross profile), closing the cross-profile credential leak.
+            # Storing the path (rather than "1") also keeps the marker
+            # self-describing for debugging.
+            env[_HOME_FALLBACK_MARKER] = home
+            return
+    # No fallback injection this hop. If a marker is riding along but no longer
+    # vouches for the HOME the child will actually see (an intermediate layer
+    # reset HOME out from under it), it is stale — drop it so a deeper hop is
+    # not misled into re-hijacking the now-explicit HOME. The same-profile keep
+    # path leaves the marker in place because there it still matches HOME.
+    if _HOME_FALLBACK_MARKER in env and not _home_fallback_marked(env):
+        del env[_HOME_FALLBACK_MARKER]
 
 
 VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")

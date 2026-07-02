@@ -95,10 +95,16 @@ def _resolve_home_dir() -> str:
 
 def _build_subprocess_env() -> dict[str, str]:
     env = os.environ.copy()
-    home = _resolve_home_dir()
-    env["HOME"] = home
+    # Let the Hermes HOME policy decide first (home_mode / profile / the
+    # ZET-1938 missing-HOME fallback). Seeding env["HOME"] beforehand made
+    # apply_subprocess_home_env() see a non-empty HOME, so the missing-HOME
+    # fallback never fired and the ACP child got the /tmp-or-pwd guess from
+    # _resolve_home_dir() instead of the profile home. Only use that guess as
+    # a last resort so the child is never launched with a blank HOME.
     from hermes_constants import apply_subprocess_home_env
     apply_subprocess_home_env(env)
+    if not env.get("HOME", "").strip():
+        env["HOME"] = _resolve_home_dir()
     return env
 
 
