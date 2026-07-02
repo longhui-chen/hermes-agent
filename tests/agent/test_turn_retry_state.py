@@ -25,6 +25,8 @@ EXPECTED_FIELDS = {
     "multimodal_tool_content_retry_attempted",
     "oauth_1m_beta_retry_attempted",
     "llama_cpp_grammar_retry_attempted",
+    "plan_tool_choice_thinking_retry_attempted",
+    "plan_text_fallback_retry_attempted",
     "primary_recovery_attempted",
     "has_retried_429",
     "restart_with_compressed_messages",
@@ -56,8 +58,10 @@ def test_loop_control_vars_are_not_on_state():
 def test_guards_are_independently_mutable():
     s = TurnRetryState()
     s.codex_auth_retry_attempted = True
+    s.plan_tool_choice_thinking_retry_attempted = True
     s.restart_with_compressed_messages = True
     assert s.codex_auth_retry_attempted is True
+    assert s.plan_tool_choice_thinking_retry_attempted is True
     assert s.restart_with_compressed_messages is True
     # untouched guards stay False
     assert s.has_retried_429 is False
