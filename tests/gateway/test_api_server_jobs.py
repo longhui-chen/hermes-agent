@@ -275,6 +275,26 @@ class TestCreateJob:
                 assert "timezone" in data["error"].lower()
 
     @pytest.mark.asyncio
+    async def test_create_job_validation_error_returns_400(self, adapter):
+        """Storage-layer validation failures are client errors, not 500s."""
+        app = _create_app(adapter)
+        mock_create = MagicMock(side_effect=ValueError("one-shot is in the past"))
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "2026-06-30T09:00:00",
+                    "timezone": "Asia/Shanghai",
+                })
+                assert resp.status == 400
+                data = await resp.json()
+                assert "past" in data["error"]
+
+    @pytest.mark.asyncio
     async def test_create_job_with_origin_passthrough(self, adapter):
         """POST /api/jobs forwards origin dict into _cron_create.
 
@@ -566,6 +586,27 @@ class TestUpdateJob:
                 assert resp.status == 400
                 data = await resp.json()
                 assert "timezone" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_update_job_validation_error_returns_400(self, adapter):
+        app = _create_app(adapter)
+        mock_update = MagicMock(side_effect=ValueError("one-shot is in the past"))
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_update", mock_update
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={
+                        "schedule": "2026-06-30T09:00:00",
+                        "timezone": "Asia/Shanghai",
+                    },
+                )
+                assert resp.status == 400
+                data = await resp.json()
+                assert "past" in data["error"]
 
 
 # ---------------------------------------------------------------------------

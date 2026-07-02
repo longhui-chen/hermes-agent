@@ -481,6 +481,13 @@ def _recoverable_oneshot_run_at(
     return None
 
 
+def _stale_oneshot_error(schedule: Dict[str, Any], fallback: Any) -> ValueError:
+    run_at = schedule.get("run_at") or schedule.get("display") or fallback
+    return ValueError(
+        f"One-shot schedule is in the past and cannot be scheduled: {run_at}"
+    )
+
+
 def _compute_grace_seconds(schedule: dict) -> int:
     """Compute the lateness threshold used to classify a missed recurring run.
 
@@ -791,6 +798,10 @@ def create_job(
     if deliver is None:
         deliver = "origin" if origin else "local"
 
+    initial_next_run_at = compute_next_run(parsed_schedule, tz_name=normalized_tz)
+    if parsed_schedule["kind"] == "once" and initial_next_run_at is None:
+        raise _stale_oneshot_error(parsed_schedule, schedule)
+
     job_id = uuid.uuid4().hex[:12]
     now = _hermes_now().isoformat()
 
@@ -850,7 +861,7 @@ def create_job(
         "paused_at": None,
         "paused_reason": None,
         "created_at": now,
-        "next_run_at": compute_next_run(parsed_schedule, tz_name=normalized_tz),
+        "next_run_at": initial_next_run_at,
         "last_run_at": None,
         "timezone": normalized_tz,
         "last_status": None,
@@ -993,11 +1004,17 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updated["next_run_at"] = compute_next_run(
                     updated["schedule"], tz_name=updated.get("timezone")
                 )
+                if updated["schedule"].get("kind") == "once" and not updated["next_run_at"]:
+                    fallback_schedule = updates.get("schedule_display") or updates.get("schedule")
+                    raise _stale_oneshot_error(updated["schedule"], fallback_schedule)
 
             if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
                 updated["next_run_at"] = compute_next_run(
                     updated["schedule"], tz_name=updated.get("timezone")
                 )
+                if updated["schedule"].get("kind") == "once" and not updated["next_run_at"]:
+                    fallback_schedule = updates.get("schedule_display") or updates.get("schedule")
+                    raise _stale_oneshot_error(updated["schedule"], fallback_schedule)
 
             jobs[i] = updated
             save_jobs(jobs)
