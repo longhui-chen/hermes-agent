@@ -334,3 +334,13 @@ def test_try_notify_chat_append_mux_posts_profile_values(tmp_path, monkeypatch):
     assert payload["agent_id"] == "alice"
     assert payload["session_id"] == "sess-1"
     assert payload["kind"] == "cron_summary"
+
+
+def test_scoped_env_mux_never_falls_back_to_process_environ(tmp_path, monkeypatch):
+    # Gateway startup loads the ACTIVE profile's .env into os.environ, so under
+    # mux a resolution failure (no scope installed here) must yield the default,
+    # not the process env — or this cron's report would be delivered with
+    # another profile's URL/token (codex P1).
+    monkeypatch.setenv("ZET_CHAT_APPEND_URL", "http://127.0.0.1:9999/other-profile")
+    with _mux_profile(tmp_path, "OTHER=1\n"):
+        assert zc._scoped_env("ZET_CHAT_APPEND_URL") == ""

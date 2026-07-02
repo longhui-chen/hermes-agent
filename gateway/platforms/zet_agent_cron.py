@@ -96,13 +96,27 @@ def _scoped_env(name: str, default: str = "") -> str:
     ``os.environ``. ``cron.scheduler._cron_env`` resolves through the active
     profile secret scope — including a fresh ``.env`` re-read for values
     written after gateway startup — and falls back to ``os.environ`` in
-    legacy per-profile processes. Fallback here keeps this hook working if
-    an upstream sync ever renames that private helper.
+    legacy per-profile processes.
+
+    On resolution failure (missing scope / upstream helper renamed) the
+    fallback is mode-dependent: legacy processes read ``os.environ`` (their
+    values were injected per-process, so it is safe), but under an ACTIVE
+    multiplexer we return the default instead — gateway startup loads the
+    active profile's ``.env`` into the process environment, so reading
+    ``os.environ`` here could deliver this cron's result with ANOTHER
+    profile's ZET_CHAT_APPEND_URL / action token. A skipped report beats a
+    cross-profile delivery.
     """
     try:
         from cron.scheduler import _cron_env
         return _cron_env(name, default)
     except Exception:
+        try:
+            from agent.secret_scope import is_multiplex_active
+            if is_multiplex_active():
+                return default
+        except Exception:
+            pass
         return os.environ.get(name, default)
 
 
