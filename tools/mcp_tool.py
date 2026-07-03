@@ -302,9 +302,19 @@ _MAX_BACKOFF_SECONDS = 60
 _DEFAULT_KEEPALIVE_INTERVAL = 180  # seconds between liveness pings
 _MIN_KEEPALIVE_INTERVAL = 5        # clamp floor for configured intervals
 
-# Environment variables that are safe to pass to stdio subprocesses
+# Environment variables that are safe to pass to stdio subprocesses.
+#
+# HERMES_HOME / HERMES_HOME_FALLBACK / TERMINAL_HOME_MODE are location/mode
+# flags (no secrets): the subprocess HOME contract (apply_subprocess_home_env,
+# applied in _build_safe_env) needs HERMES_HOME to resolve {HERMES_HOME}/home,
+# and the child must carry all three onward so a nested-hermes grandchild keeps
+# its fallback-injected profile HOME instead of re-hijacking it — TERMINAL_HOME_MODE
+# in particular, or a second hop re-enters ``auto`` and repairs HOME back to the
+# real dir, dropping the profile isolation the parent pinned (same rationale as
+# execute_code's _HERMES_CHILD_ALLOWED; ZET-1938).
 _SAFE_ENV_KEYS = frozenset({
     "PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "SHELL", "TMPDIR",
+    "HERMES_HOME", "HERMES_HOME_FALLBACK", "TERMINAL_HOME_MODE",
 })
 
 _SAFE_ENV_KEYS_CASE_INSENSITIVE = frozenset({
@@ -384,6 +394,32 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
             env[key] = value
     if user_env:
         env.update(user_env)
+    # Bridge the context-local Hermes home override (a per-request profile pin
+    # set via set_hermes_home_override) into the child's HERMES_HOME before
+    # applying the HOME contract. ContextVars don't cross process boundaries,
+    # and the contract resolves HOME from the *override*, so without this the
+    # child would carry the stale process-global HERMES_HOME while its HOME
+    # points at the override's profile home — a split that flips on a nested
+    # hermes-as-MCP hop. Mirrors _inject_context_hermes_home in the terminal
+    # spawn paths (tools/environments/local.py).
+    from hermes_constants import apply_subprocess_home_env, get_hermes_home_override
+    _override = get_hermes_home_override()
+    if _override:
+        env["HERMES_HOME"] = _override
+    # Apply the shared subprocess HOME contract after user_env so it sees the
+    # final HOME the child will launch with. On a host with a real HOME this is
+    # a no-op; on a systemd/cron host with no HOME (ZET-1938) it falls HOME back
+    # to {HERMES_HOME}/home so the MCP server's ~-addressed credentials resolve.
+    apply_subprocess_home_env(env)
+    # apply_subprocess_home_env unconditionally writes HERMES_REAL_HOME — the
+    # OS-account home (e.g. /Users/alice), which carries the login username.
+    # Unlike the other spawn paths (terminal/lsp/codex) that inherit the full
+    # host env, this one is a deliberate whitelist gate onto potentially
+    # untrusted third-party MCP servers, so drop that username-bearing value:
+    # the child never needs it (HOME is already resolved above; REAL_HOME is
+    # only an internal repair-branch reference), and leaking it would defeat
+    # the whitelist's purpose.
+    env.pop("HERMES_REAL_HOME", None)
     return env
 
 

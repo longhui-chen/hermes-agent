@@ -9,10 +9,41 @@ from __future__ import annotations
 
 import pytest
 
+import hermes_constants
 from hermes_cli.runtime_provider import (
     _VALID_API_MODES,
     _maybe_apply_codex_app_server_runtime,
 )
+
+
+class _FakePopen:
+    """Minimal Popen stand-in that records the env it was spawned with.
+
+    Kept module-level so the HOME-contract tests below can reuse it without
+    re-declaring the same boilerplate in every test.
+    """
+
+    captured: dict = {}
+
+    def __init__(self, cmd, *args, **kwargs):
+        type(self).captured = {"cmd": cmd, "env": dict(kwargs.get("env") or {})}
+        self.stdin = None
+        self.stdout = None
+        self.stderr = None
+        self.pid = 1
+        self.returncode = None
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        pass
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        pass
 
 
 class TestApiModeRegistration:
@@ -378,3 +409,87 @@ class TestSpawnEnvSecretStripping:
         monkeypatch.setenv("HOME", "/users/alice")
         env = self._capture_spawn_env(monkeypatch)
         assert env.get("HOME") == "/users/alice"
+
+
+class TestSpawnEnvHomeContract:
+    """The codex spawn env must flow through the shared subprocess HOME
+    contract (hermes_constants.apply_subprocess_home_env).
+
+    Codex's shell tool spawns gh/git/npm/aws — all of which read credentials
+    from ``$HOME``. On a host with a real HOME the contract is a no-op (auto
+    mode keeps the user HOME untouched), but on a systemd/cron host launched
+    with no HOME anywhere (ZET-1938) those children would otherwise resolve
+    ``~`` nowhere. The contract falls back to ``{HERMES_HOME}/home`` there.
+    """
+
+    def _spawn_and_capture_env(self, monkeypatch, **client_kwargs):
+        import subprocess
+
+        from agent.transports import codex_app_server as cas
+
+        monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+        client = cas.CodexAppServerClient(**client_kwargs)
+        client._closed = True
+        return _FakePopen.captured["env"]
+
+    def test_missing_home_falls_back_to_profile_home(self, tmp_path, monkeypatch):
+        """systemd/cron host: no HOME anywhere → inject the profile home so
+        codex's shell subprocesses can address ``~``-stored credentials."""
+        monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+        monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+        monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.delenv("HERMES_HOME_FALLBACK", raising=False)
+        hermes_home = tmp_path / ".hermes"
+        profile_home = hermes_home / "home"
+        profile_home.mkdir(parents=True)
+        monkeypatch.delenv("HOME", raising=False)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        env = self._spawn_and_capture_env(monkeypatch, codex_bin="codex")
+        assert env.get("HOME") == str(profile_home)
+
+    def test_real_home_is_preserved(self, tmp_path, monkeypatch):
+        """Host with a real HOME: auto mode must leave it untouched — codex's
+        gh/git subprocesses keep finding the user's real ~/.config, ~/.ssh."""
+        monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+        monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+        monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.delenv("HERMES_HOME_FALLBACK", raising=False)
+        hermes_home = tmp_path / ".hermes"
+        (hermes_home / "home").mkdir(parents=True)
+        real_home = tmp_path / "real-home"
+        real_home.mkdir()
+        monkeypatch.setenv("HOME", str(real_home))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        env = self._spawn_and_capture_env(monkeypatch, codex_bin="codex")
+        assert env.get("HOME") == str(real_home)
+
+    def test_contextvar_override_bridges_hermes_home(self, tmp_path, monkeypatch):
+        """set_hermes_home_override(A) with process HERMES_HOME=B: the spawn env
+        must carry HERMES_HOME=A (the override the contract resolved HOME from),
+        so codex and any nested hermes stay on the same profile as HOME."""
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+        monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+        monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.delenv("HERMES_HOME_FALLBACK", raising=False)
+        a = tmp_path / "profileA" / ".hermes"
+        b = tmp_path / "profileB" / ".hermes"
+        (a / "home").mkdir(parents=True)
+        (b / "home").mkdir(parents=True)
+        monkeypatch.delenv("HOME", raising=False)
+        monkeypatch.setenv("HERMES_HOME", str(b))
+
+        token = set_hermes_home_override(str(a))
+        try:
+            env = self._spawn_and_capture_env(monkeypatch, codex_bin="codex")
+        finally:
+            reset_hermes_home_override(token)
+
+        assert env.get("HERMES_HOME") == str(a)
+        assert env.get("HOME") == str(a / "home")

@@ -438,6 +438,57 @@ class TestUnifiedCronjobTool:
         listing = json.loads(cronjob(action="list"))
         assert listing["jobs"][0]["skills"] == ["blogwatcher", "maps"]
 
+    def test_create_rejects_stale_one_shot(self, monkeypatch):
+        """Regression for ZET-1861: do not report success for a one-shot whose
+        requested run time is already stale."""
+        from datetime import datetime, timezone
+
+        monkeypatch.setattr(
+            "cron.jobs._hermes_now",
+            lambda: datetime(2026, 6, 30, 13, 5, 0, tzinfo=timezone.utc),
+        )
+
+        result = json.loads(
+            cronjob(
+                action="create",
+                prompt="提醒用户：现在是早上9点，请给管越发会议纪要。",
+                schedule="2026-06-30T09:00:00",
+                timezone="Asia/Shanghai",
+            )
+        )
+
+        assert result["success"] is False
+        assert "past" in result["error"]
+        assert json.loads(cronjob(action="list"))["count"] == 0
+
+    def test_update_rejects_stale_one_shot(self, monkeypatch):
+        from datetime import datetime, timezone
+
+        monkeypatch.setattr(
+            "cron.jobs._hermes_now",
+            lambda: datetime(2026, 6, 30, 13, 5, 0, tzinfo=timezone.utc),
+        )
+
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Reminder",
+                schedule="every 1h",
+                timezone="Asia/Shanghai",
+            )
+        )
+        result = json.loads(
+            cronjob(
+                action="update",
+                job_id=created["job_id"],
+                schedule="2026-06-30T09:00:00",
+                timezone="Asia/Shanghai",
+            )
+        )
+
+        assert result["success"] is False
+        assert "past" in result["error"]
+
     def test_multi_skill_default_name_prefers_prompt_when_present(self):
         result = json.loads(
             cronjob(

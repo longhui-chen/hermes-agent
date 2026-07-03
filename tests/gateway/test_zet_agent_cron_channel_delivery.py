@@ -1,5 +1,6 @@
 """Tests for channel: delivery handling in zet_agent_cron."""
 
+import contextlib
 import json
 from unittest.mock import patch
 
@@ -256,3 +257,90 @@ def test_send_to_channel_chunk_failure_surfaces(monkeypatch):
     with patch("urllib.request.urlopen", fake_urlopen):
         err = _send_to_channel("wechat", "水" * 9000, "job-x")
     assert err is not None and "part 2/" in err  # failure surfaced, not silent
+
+
+# --- Multiplex gateway: env resolution via profile secret scope ---
+# Under the mux gateway ZET_CHAT_APPEND_URL / ZET_AGENT_ID / the action token
+# live in the profile's .env (written by zettlab-local-server), NOT in
+# os.environ. _scoped_env must resolve them through cron.scheduler._cron_env's
+# fresh profile-.env re-read; a bare os.environ.get here is exactly the bug
+# that made mux cron runs skip their chat-append report silently.
+
+
+@contextlib.contextmanager
+def _mux_profile(tmp_path, dotenv_body: str):
+    """Simulate the mux runtime: multiplex active + hermes home overridden to a
+    profile dir whose .env carries the local-server-written values."""
+    from agent.secret_scope import set_multiplex_active
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    (tmp_path / ".env").write_text(dotenv_body, encoding="utf-8")
+    set_multiplex_active(True)
+    token = set_hermes_home_override(str(tmp_path))
+    try:
+        yield
+    finally:
+        reset_hermes_home_override(token)
+        set_multiplex_active(False)
+
+
+def test_scoped_env_mux_reads_profile_dotenv(tmp_path, monkeypatch):
+    monkeypatch.delenv("ZET_CHAT_APPEND_URL", raising=False)
+    with _mux_profile(tmp_path, "ZET_CHAT_APPEND_URL=http://127.0.0.1:9420/api/v1/internal/chat/append\n"):
+        assert zc._scoped_env("ZET_CHAT_APPEND_URL") == "http://127.0.0.1:9420/api/v1/internal/chat/append"
+
+
+def test_scoped_env_mux_unset_returns_default_without_raising(tmp_path, monkeypatch):
+    # Value absent from the profile .env and from os.environ: must yield the
+    # default (→ hook skips, as before the fix) instead of letting the
+    # fail-closed UnscopedSecretError escape into the cron worker.
+    monkeypatch.delenv("ZET_AGENT_ID", raising=False)
+    with _mux_profile(tmp_path, "OTHER=1\n"):
+        assert zc._scoped_env("ZET_AGENT_ID") == ""
+
+
+def test_resolve_channel_send_url_mux(tmp_path, monkeypatch):
+    monkeypatch.delenv("ZET_CHAT_APPEND_URL", raising=False)
+    with _mux_profile(tmp_path, "ZET_CHAT_APPEND_URL=http://127.0.0.1:9420/api/v1/internal/chat/append\n"):
+        assert _resolve_channel_send_url() == "http://127.0.0.1:9420/api/v1/internal/agent/channels/send"
+
+
+def test_try_notify_chat_append_mux_posts_profile_values(tmp_path, monkeypatch):
+    monkeypatch.delenv("ZET_CHAT_APPEND_URL", raising=False)
+    monkeypatch.delenv("ZET_AGENT_ID", raising=False)
+    posts = []
+
+    class FakeResp:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self, *a): return b"{}"
+
+    def fake_urlopen(req, timeout=None):
+        posts.append((req.full_url, json.loads(req.data.decode())))
+        return FakeResp()
+
+    dotenv = (
+        "ZET_CHAT_APPEND_URL=http://127.0.0.1:9420/api/v1/internal/chat/append\n"
+        "ZET_AGENT_ID=alice\n"
+    )
+    with _mux_profile(tmp_path, dotenv):
+        with patch("urllib.request.urlopen", fake_urlopen):
+            zc._try_notify_chat_append("sess-1", 7, "cron output")
+
+    assert len(posts) == 1, "mux cron report must POST chat append"
+    url, payload = posts[0]
+    assert url == "http://127.0.0.1:9420/api/v1/internal/chat/append"
+    assert payload["agent_id"] == "alice"
+    assert payload["session_id"] == "sess-1"
+    assert payload["kind"] == "cron_summary"
+
+
+def test_scoped_env_mux_never_falls_back_to_process_environ(tmp_path, monkeypatch):
+    # Gateway startup loads the ACTIVE profile's .env into os.environ, so under
+    # mux a resolution failure (no scope installed here) must yield the default,
+    # not the process env — or this cron's report would be delivered with
+    # another profile's URL/token (codex P1).
+    monkeypatch.setenv("ZET_CHAT_APPEND_URL", "http://127.0.0.1:9999/other-profile")
+    with _mux_profile(tmp_path, "OTHER=1\n"):
+        assert zc._scoped_env("ZET_CHAT_APPEND_URL") == ""
