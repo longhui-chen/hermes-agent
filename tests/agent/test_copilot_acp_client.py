@@ -289,3 +289,41 @@ def test_run_prompt_preserves_real_home_over_profile_home(monkeypatch, tmp_path)
 
     assert captured["kwargs"]["env"]["HOME"] == str(real_home)
     assert "HERMES_HOME_FALLBACK" not in captured["kwargs"]["env"]
+
+
+def test_run_prompt_bridges_context_hermes_home_override(monkeypatch, tmp_path):
+    """A per-request set_hermes_home_override(A) with process HERMES_HOME=B
+    must reach the ACP child consistently: the HOME contract resolves HOME
+    from override A, so the child's HERMES_HOME must be A too (not the stale
+    process-global B), or a nested hermes-as-ACP hop flips HOME off A.
+
+    Mirrors the same bridge on the MCP/LSP/codex spawn paths.
+    """
+    import hermes_constants
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+    monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+    monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+    monkeypatch.delenv("HERMES_HOME_FALLBACK", raising=False)
+
+    a = tmp_path / "profileA" / ".hermes"
+    b = tmp_path / "profileB" / ".hermes"
+    (a / "home").mkdir(parents=True)
+    (b / "home").mkdir(parents=True)
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(b))
+
+    captured = {}
+    client = _make_home_client(tmp_path)
+
+    token = set_hermes_home_override(str(a))
+    try:
+        with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+            with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+                client._run_prompt("hello", timeout_seconds=1)
+    finally:
+        reset_hermes_home_override(token)
+
+    assert captured["kwargs"]["env"]["HERMES_HOME"] == str(a)
+    assert captured["kwargs"]["env"]["HOME"] == str(a / "home")

@@ -293,6 +293,29 @@ def _norm_home_path(path: str | None) -> str:
         return os.path.normcase(raw)
 
 
+def _same_home_path(a: str | None, b: str | None) -> bool:
+    """Return True when *a* and *b* name the same home dir, symlinks resolved.
+
+    The path-carrying fallback marker and the inherited HOME can reach the same
+    profile home through different spellings when the Hermes tree is symlinked
+    (``/data/hermes`` -> ``/mnt/vol/hermes``): the marker is written via one
+    path, HOME read via the canonical one. A plain ``_norm_home_path`` (abspath,
+    no symlink resolution) then sees them as different and the marker is wrongly
+    treated as stale. Canonicalize both ends first; fall back to the textual
+    compare when they already match textually (covers non-existent paths, where
+    ``realpath`` is a no-op anyway).
+    """
+    if _norm_home_path(a) == _norm_home_path(b):
+        return True
+    ra, rb = a or "", b or ""
+    if not ra or not rb:
+        return False
+    try:
+        return os.path.normcase(os.path.realpath(ra)) == os.path.normcase(os.path.realpath(rb))
+    except OSError:
+        return False
+
+
 def _profile_home_path(env: dict[str, str] | None = None) -> str | None:
     """Return ``{HERMES_HOME}/home`` when the profile-home directory exists."""
     hermes_home = get_hermes_home_override() or (env or {}).get("HERMES_HOME") or os.getenv("HERMES_HOME")
@@ -316,7 +339,13 @@ def _profile_home_path(env: dict[str, str] | None = None) -> str | None:
 
 
 def _is_profile_home(candidate: str | None, profile_home: str | None) -> bool:
-    return bool(candidate and profile_home and _norm_home_path(candidate) == _norm_home_path(profile_home))
+    # Symlink-aware (via _same_home_path), matching the path-carrying marker
+    # comparison in _home_fallback_marked. Without this the two diverge on a
+    # symlinked profile tree: a reverse-symlink HOME (a symlinked spelling of
+    # {HERMES_HOME}/home) would not be recognized here as the profile home, so
+    # get_real_home() would hand the profile home back as the OS real home and
+    # a home_mode=real child would get HOME pinned to the profile dir.
+    return bool(candidate and profile_home and _same_home_path(candidate, profile_home))
 
 
 _HOME_FALLBACK_MARKER = "HERMES_HOME_FALLBACK"
@@ -354,9 +383,22 @@ def _looks_like_profile_home(path: str | None) -> bool:
     ``alice``, ``root``, …). This is the only signal available for a legacy
     bare-``"1"`` marker, which — unlike the modern marker — does not record the
     source path it injected.
+
+    A real, top-level OS home whose basename happens to be ``home`` — ``/home``,
+    ``/srv/home``, ``/mnt/home`` — must NOT match: a genuine ``{HERMES_HOME}/home``
+    profile home lives under a real Hermes tree, so its parent is never the
+    filesystem root or a direct child of it. Reuse the same shallow-parent
+    threshold :func:`secure_parent_dir` uses (parent with fewer than 3 parts),
+    so a legacy ``"1"`` marker riding on ``HOME=/home`` is not mistaken for a
+    fallback injection and does not hijack HOME to the profile dir.
     """
     norm = _norm_home_path(path)
-    return bool(norm) and os.path.basename(norm.rstrip("/\\")) == "home"
+    if not norm or os.path.basename(norm.rstrip("/\\")) != "home":
+        return False
+    parent = os.path.dirname(norm.rstrip("/\\"))
+    # ``/home`` -> parent ``/`` (1 part); ``/srv/home`` -> ``/srv`` (2 parts).
+    # A real profile home's parent (``.../profiles/coder``) has more.
+    return len(Path(parent).parts) >= 3
 
 
 def _home_fallback_marked(env: dict[str, str]) -> bool:
@@ -372,20 +414,27 @@ def _home_fallback_marked(env: dict[str, str]) -> bool:
     pointing the child's ``~``-addressed credential stores at the wrong dir.
 
     * Path-carrying marker: fallback-injected iff ``marker == current HOME``.
-    * Legacy ``"1"`` marker (no source path): can only be honored via shape —
-      the inherited HOME must look like a ``{HERMES_HOME}/home`` profile home.
-      A HOME reset to a real user home (basename ``alice``/``root``/…) is then
-      treated as user-pinned, closing the same hijack for legacy markers.
+    * Legacy ``"1"`` marker (no source path): honored when the inherited HOME
+      is *exactly* this hop's ``{HERMES_HOME}/home`` (same-profile, robust even
+      for a shallow single-segment HERMES_HOME like ``/tmp`` → ``/tmp/home``),
+      OR — for a cross-profile A→B hop where HOME is profile A's home, unknown
+      to this hop — has the deep ``{HERMES_HOME}/home`` shape. A HOME reset to a
+      real user home (basename ``alice``/``root``/…, or a top-level ``/home``)
+      is neither, so it is treated as user-pinned, closing the hijack.
     """
     raw = _home_fallback_marker_raw(env)
     if not raw:
         return False
     current_home = _child_env_home(env)
     if raw == "1":
-        # Legacy marker without source info: trust only when HOME still has the
-        # profile-home shape the fallback injects.
+        # Legacy marker without source info. Same-profile: exact match against
+        # this hop's profile home (covers shallow HERMES_HOME the shape guard's
+        # parts>=3 threshold would reject). Cross-profile A→B: fall back to the
+        # deep {HERMES_HOME}/home shape, since A's home is unknown here.
+        if _is_profile_home(current_home, _profile_home_path(env)):
+            return True
         return _looks_like_profile_home(current_home)
-    return _norm_home_path(raw) == _norm_home_path(current_home)
+    return _same_home_path(raw, current_home)
 
 
 def _iter_real_home_candidates(env: dict[str, str] | None = None) -> list[str]:

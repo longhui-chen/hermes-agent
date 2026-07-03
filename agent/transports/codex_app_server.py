@@ -114,6 +114,24 @@ class CodexAppServerClient:
         # Codex emits tracing to stderr; default WARN keeps it quiet for users.
         spawn_env.setdefault("RUST_LOG", "warn")
 
+        # Bridge the context-local Hermes home override into the child's
+        # HERMES_HOME before the HOME contract runs. ContextVars don't cross
+        # process boundaries and the contract resolves HOME from the override,
+        # so without this the child's HERMES_HOME (stale process-global) and its
+        # HOME (override's profile home) would split. Mirrors the terminal spawn
+        # paths (_inject_context_hermes_home in tools/environments/local.py).
+        from hermes_constants import apply_subprocess_home_env, get_hermes_home_override
+        _override = get_hermes_home_override()
+        if _override:
+            spawn_env["HERMES_HOME"] = _override
+        # Route through the shared subprocess HOME contract. On a host with a
+        # real HOME this is a no-op (auto mode keeps it), so codex's shell tool
+        # subprocesses — gh/git/npm/aws — still find the user's real ~/.config,
+        # ~/.ssh. On a systemd/cron host with no HOME (ZET-1938) it falls HOME
+        # back to {HERMES_HOME}/home so those children can address ~ at all.
+        # CODEX_HOME (codex's own state) is a separate axis and is untouched.
+        apply_subprocess_home_env(spawn_env)
+
         self._proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,

@@ -989,3 +989,230 @@ class TestPythonProcessUnchanged:
         assert sub_home in (None, str(hermes_home / "home"), original_home)
         assert os.environ.get("HOME") == original_home
         assert str(Path.home()) == original_path_home
+
+
+class TestFallbackMarkerSymlinkedProfile:
+    """The path-carrying marker==HOME comparison must canonicalize symlinks.
+
+    A symlinked profile tree (e.g. ``/data/hermes`` -> ``/mnt/vol/hermes``)
+    yields a marker written through one path and a HOME read through the other.
+    A pure textual abspath/normcase compare sees them as different, wrongly
+    concludes the marker is stale, and drops it — after which a later A->B
+    switch has no marker to re-inject B's home from, leaking A's credential dir.
+    """
+
+    def _host_mode(self, monkeypatch):
+        monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+        monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+        monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.delenv("HERMES_HOME_FALLBACK", raising=False)
+
+    def test_marker_survives_symlinked_profile_home(self, tmp_path, monkeypatch):
+        """marker (via symlink path) and HOME (via realpath) must compare equal
+        so apply_subprocess_home_env does not delete the marker as stale."""
+        self._host_mode(monkeypatch)
+        real_dir = tmp_path / "real" / ".hermes"
+        (real_dir / "home").mkdir(parents=True)
+        link_dir = tmp_path / "link-hermes"
+        link_dir.symlink_to(real_dir, target_is_directory=True)
+
+        marker_home = str(link_dir / "home")   # marker written via symlink path
+        home_via_real = str((real_dir / "home").resolve())  # HOME via realpath
+        monkeypatch.delenv("HOME", raising=False)
+
+        from hermes_constants import apply_subprocess_home_env
+        env = {
+            "HERMES_HOME": str(real_dir),
+            "HOME": home_via_real,
+            "HERMES_HOME_FALLBACK": marker_home,
+            "PATH": "/usr/bin",
+        }
+        apply_subprocess_home_env(env)
+        # Same profile via symlink: marker must be kept (not dropped as stale).
+        assert env.get("HERMES_HOME_FALLBACK") == marker_home
+        assert env.get("HOME") == home_via_real
+
+
+class TestLegacyMarkerShapeGuard:
+    """The legacy ``"1"`` marker shape heuristic must not mistake a real,
+    top-level OS home whose basename happens to be ``home`` (``/home``,
+    ``/srv/home``, ``/mnt/home``) for a fallback-injected profile home."""
+
+    def _host_mode(self, monkeypatch):
+        monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+        monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+        monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.delenv("HERMES_HOME_FALLBACK", raising=False)
+
+    def test_top_level_home_with_legacy_marker_is_not_hijacked(self, tmp_path, monkeypatch):
+        """HOME=/home + legacy "1" marker + HERMES_HOME elsewhere: /home is a
+        real OS home, not a {HERMES_HOME}/home profile home — must be kept."""
+        self._host_mode(monkeypatch)
+        hermes_home = tmp_path / ".hermes"
+        (hermes_home / "home").mkdir(parents=True)
+        monkeypatch.delenv("HOME", raising=False)
+
+        from hermes_constants import get_subprocess_home
+        for shallow in ("/home", "/srv/home", "/mnt/home"):
+            env = {
+                "HERMES_HOME": str(hermes_home),
+                "HOME": shallow,
+                "HERMES_HOME_FALLBACK": "1",  # legacy, no source path
+            }
+            # Not a profile home (top-level parent) -> not fallback-injected ->
+            # no hijack to this hop's profile home.
+            assert get_subprocess_home(env) is None, shallow
+
+    def test_genuine_profile_home_with_legacy_marker_still_recognized(self, tmp_path, monkeypatch):
+        """A real deep {HERMES_HOME}/home with a legacy "1" marker (same
+        profile) is still recognized as fallback-injected and kept — the guard
+        must not over-tighten and re-break the legacy same-profile path."""
+        self._host_mode(monkeypatch)
+        profile_dir = tmp_path / ".hermes" / "profiles" / "coder"
+        profile_home = profile_dir / "home"
+        profile_home.mkdir(parents=True)
+        real_home = tmp_path / "real-home"
+        real_home.mkdir()
+        monkeypatch.delenv("HOME", raising=False)
+
+        from hermes_constants import get_subprocess_home
+        env = {
+            "HERMES_HOME": str(profile_dir),
+            "HOME": str(profile_home),
+            "HERMES_HOME_FALLBACK": "1",
+            "HERMES_REAL_HOME": str(real_home),
+        }
+        # same-profile keep: recognized as fallback, no repair to real home.
+        assert get_subprocess_home(env) is None
+
+
+class TestIsProfileHomeSymlinkAware:
+    """get_real_home()/_is_profile_home() must resolve symlinks like the marker
+    side (_same_home_path) does, or the two diverge on a symlinked profile tree.
+
+    Reverse-symlink: HERMES_HOME via the canonical path but the inherited HOME
+    via a symlinked spelling of {HERMES_HOME}/home. A text-only _is_profile_home
+    fails to recognize the symlinked HOME as the profile home, so get_real_home
+    returns it as the "real" home — and terminal.home_mode=real then pins HOME
+    to the profile dir, hiding the OS user's ~/.ssh, ~/.gitconfig.
+    """
+
+    def _host_mode(self, monkeypatch):
+        monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+        monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+        monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.delenv("HERMES_HOME_FALLBACK", raising=False)
+
+    def test_reverse_symlink_home_is_recognized_as_profile_home(self, tmp_path, monkeypatch):
+        """The core defect: HOME reaches {HERMES_HOME}/home via a symlinked
+        spelling. get_real_home must NOT hand that symlinked profile home back
+        as the OS real home — _is_profile_home has to resolve symlinks (like
+        the marker side) so the profile-home HOME candidate is skipped.
+
+        No explicit HERMES_REAL_HOME here: with one set it wins the candidate
+        race and masks the bug. We only assert the profile home is rejected.
+        """
+        self._host_mode(monkeypatch)
+        real_dir = tmp_path / "real" / ".hermes"
+        (real_dir / "home").mkdir(parents=True)
+        link_dir = tmp_path / "link-hermes"
+        link_dir.symlink_to(real_dir, target_is_directory=True)
+
+        # HERMES_HOME canonical; inherited HOME via the symlinked spelling.
+        home_via_link = str(link_dir / "home")
+        monkeypatch.delenv("HOME", raising=False)
+        monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+
+        from hermes_constants import get_real_home
+        env = {
+            "HERMES_HOME": str(real_dir),
+            "HOME": home_via_link,             # symlinked {HERMES_HOME}/home
+            "HERMES_HOME_FALLBACK": home_via_link,  # fallback-injected
+        }
+        got = get_real_home(env)
+        # Must not return the profile home under any spelling.
+        assert os.path.realpath(got) != os.path.realpath(home_via_link)
+        assert os.path.realpath(got) != os.path.realpath(str(real_dir / "home"))
+
+    def test_real_mode_reverse_symlink_repairs_off_profile_home(self, tmp_path, monkeypatch):
+        """real mode with an explicit HERMES_REAL_HOME: HOME (symlinked profile
+        home) must be repaired to the real OS home. Pre-fix, _is_profile_home's
+        text compare fails to see HOME as the profile home, so the real-mode
+        equality check (real != current) can misbehave on symlinked trees."""
+        self._host_mode(monkeypatch)
+        real_dir = tmp_path / "real" / ".hermes"
+        (real_dir / "home").mkdir(parents=True)
+        link_dir = tmp_path / "link-hermes"
+        link_dir.symlink_to(real_dir, target_is_directory=True)
+        real_home = tmp_path / "os-user-home"
+        real_home.mkdir()
+        home_via_link = str(link_dir / "home")
+        monkeypatch.delenv("HOME", raising=False)
+
+        from hermes_constants import get_real_home, get_subprocess_home
+        env = {
+            "HERMES_HOME": str(real_dir),
+            "HOME": home_via_link,
+            "HERMES_HOME_FALLBACK": home_via_link,
+            "HERMES_REAL_HOME": str(real_home),
+            "TERMINAL_HOME_MODE": "real",
+        }
+        assert get_real_home(env) == str(real_home)
+        assert get_subprocess_home(env) == str(real_home)
+
+
+class TestLegacyMarkerShallowHermesHome:
+    """A single-segment HERMES_HOME (/tmp, /app, /data) yields a shallow profile
+    home ({HERMES_HOME}/home) whose parent has only 2 path parts. The parts>=3
+    shape guard must not drop the same-profile legacy anti-flip for these: an
+    exact match against this hop's {HERMES_HOME}/home recognizes them, while
+    /home / /srv/home (not this hop's profile home) stay excluded."""
+
+    def _host_mode(self, monkeypatch):
+        monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+        monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+        monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.delenv("HERMES_HOME_FALLBACK", raising=False)
+
+    def test_shallow_tmp_home_exact_match_keeps_anti_flip(self, tmp_path, monkeypatch):
+        """Genuinely 2-part-parent profile home (HERMES_HOME=/tmp -> /tmp/home,
+        parent /tmp) with a legacy "1" marker: exact match against
+        {HERMES_HOME}/home must recognize it even though parts>=3 rejects it,
+        so anti-flip holds and HOME is not repaired to the real-home guess."""
+        self._host_mode(monkeypatch)
+        real_home = tmp_path / "real-home"
+        real_home.mkdir()
+        monkeypatch.delenv("HOME", raising=False)
+        # Force a real 2-part-parent profile home via the resolver, without
+        # depending on a writable /tmp/home on the test host.
+        monkeypatch.setattr(
+            hermes_constants, "_profile_home_path",
+            lambda env=None: "/tmp/home",
+        )
+
+        from hermes_constants import get_subprocess_home
+        env = {
+            "HERMES_HOME": "/tmp",
+            "HOME": "/tmp/home",              # == {HERMES_HOME}/home, shallow parent
+            "HERMES_HOME_FALLBACK": "1",
+            "HERMES_REAL_HOME": str(real_home),
+        }
+        # same-profile keep via exact match: no repair to real home.
+        assert get_subprocess_home(env) is None
+
+    def test_shallow_non_profile_home_still_not_hijacked(self, tmp_path, monkeypatch):
+        """/home + legacy "1" while HERMES_HOME points elsewhere: /home is not
+        this hop's {HERMES_HOME}/home and is shallow -> still not hijacked."""
+        self._host_mode(monkeypatch)
+        hermes_home = tmp_path / ".hermes"
+        (hermes_home / "home").mkdir(parents=True)
+        monkeypatch.delenv("HOME", raising=False)
+
+        from hermes_constants import get_subprocess_home
+        for shallow in ("/home", "/srv/home"):
+            env = {
+                "HERMES_HOME": str(hermes_home),  # profile home != /home
+                "HOME": shallow,
+                "HERMES_HOME_FALLBACK": "1",
+            }
+            assert get_subprocess_home(env) is None, shallow
