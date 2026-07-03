@@ -94,11 +94,19 @@ _SECRET_SUBSTRINGS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL",
 # are non-secret runtime-location flags (the same set hermes_cli treats as the
 # runtime location) that repo-root modules a sandbox script imports may read at
 # import time.  None match _SECRET_SUBSTRINGS.
+#
+# HERMES_HOME_FALLBACK is the same class of flag: it records the profile home
+# that the missing-HOME fallback injected (see hermes_constants). It must
+# survive scrubbing so a grandchild spawned by an execute_code sandbox inside
+# a nested hermes chain keeps its profile HOME — dropping it lets the child's
+# apply_subprocess_home_env() "repair" HOME back to the pwd-guessed real home
+# (/root) and re-break ZET-1938 on the second hop.
 _HERMES_CHILD_ALLOWED = frozenset({
     "HERMES_HOME",
     "HERMES_PROFILE",
     "HERMES_CONFIG",
     "HERMES_ENV",
+    "HERMES_HOME_FALLBACK",
 })
 
 # Windows-only: a handful of variables are required by the OS/CRT itself.
