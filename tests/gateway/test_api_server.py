@@ -1553,6 +1553,50 @@ class TestChatCompletionsEndpoint:
         assert "[DONE]" in body
 
     @pytest.mark.asyncio
+    async def test_stream_agent_failure_hermes_error_is_redacted(self, adapter):
+        raw_secret = "sk-stream-error-leak-1234567890"
+        mock_result = {
+            "final_response": "",
+            "completed": False,
+            "partial": False,
+            "failed": True,
+            "error": f"provider auth failed OPENAI_API_KEY={raw_secret}",
+            "messages": [],
+            "api_calls": 1,
+            "provider_error": {
+                "code": "provider_auth",
+                "reason": "auth",
+                "provider": "openrouter",
+                "model": "gpt-5",
+                "status_code": 401,
+                "provider_error_code": "invalid_api_key",
+                "provider_message": f"upstream rejected AWS_SECRET_ACCESS_KEY={raw_secret}",
+                "recoverable": True,
+            },
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+            assert resp.status == 200
+            body = await resp.text()
+
+        assert "event: hermes.error" in body
+        assert raw_secret not in body
+        assert "OPENAI_API_KEY=" in body
+        assert "AWS_SECRET_ACCESS_KEY=" in body
+        assert '"finish_reason": "error"' in body
+
+    @pytest.mark.asyncio
     async def test_stream_partial_agent_result_uses_length_finish_reason(self, adapter):
         mock_result = {
             "final_response": "partial answer",

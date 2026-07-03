@@ -1592,7 +1592,9 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
             job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
             kind = job.get("schedule", {}).get("kind")
             if kind in {"cron", "interval"}:
-                nxt = compute_next_run(job["schedule"], now.isoformat())
+                nxt = compute_next_run(
+                    job["schedule"], now.isoformat(), tz_name=job.get("timezone")
+                )
                 if nxt:
                     job["next_run_at"] = nxt
             save_jobs(jobs)
@@ -1698,7 +1700,9 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             and _timezone_offset_mismatch(raw_next_run_dt, now)
             and _stored_wall_clock_is_future(raw_next_run_dt, now)
         ):
-            new_next = compute_next_run(schedule, now.isoformat())
+            new_next = compute_next_run(
+                schedule, now.isoformat(), tz_name=job.get("timezone")
+            )
             if new_next:
                 logger.info(
                     "Job '%s' next_run_at offset changed (%s -> %s). "
@@ -1730,7 +1734,9 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 # Job is past its catch-up grace window — skip accumulated
                 # missed runs but still execute once now to avoid deferring
                 # indefinitely (e.g. a long-running job just finished).
-                new_next = compute_next_run(schedule, now.isoformat())
+                new_next = compute_next_run(
+                    schedule, now.isoformat(), tz_name=job.get("timezone")
+                )
                 if new_next:
                     logger.info(
                         "Job '%s' missed its scheduled time (%s, grace=%ds). "

@@ -20,6 +20,7 @@ from cron.jobs import (
     remove_job,
     mark_job_run,
     advance_next_run,
+    claim_job_for_fire,
     claim_dispatch,
     get_due_jobs,
     save_job_output,
@@ -996,6 +997,42 @@ class TestGetDueJobs:
         assert survived is not None, "job should survive (3 > 1 completed)"
         assert survived["repeat"]["completed"] == 1
 
+    def test_external_fire_claim_preserves_per_job_timezone(self, tmp_cron_dir, monkeypatch):
+        pytest.importorskip("croniter")
+        now = datetime(2026, 5, 8, 6, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job(
+            prompt="Shanghai evening",
+            schedule="6 23 * * *",
+            timezone="Asia/Shanghai",
+        )
+
+        assert claim_job_for_fire(job["id"]) is True
+
+        updated = get_job(job["id"])
+        next_run = datetime.fromisoformat(updated["next_run_at"]).astimezone(timezone.utc)
+        assert next_run == datetime(2026, 5, 8, 15, 6, 0, tzinfo=timezone.utc)
+
+    def test_stale_catchup_preserves_per_job_timezone(self, tmp_cron_dir, monkeypatch):
+        pytest.importorskip("croniter")
+        now = datetime(2026, 5, 8, 6, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job(
+            prompt="Shanghai evening",
+            schedule="6 23 * * *",
+            timezone="Asia/Shanghai",
+        )
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = "2026-05-07T15:06:00+00:00"
+        save_jobs(jobs)
+
+        due = get_due_jobs()
+        assert [j["id"] for j in due] == [job["id"]]
+        next_run = datetime.fromisoformat(get_job(job["id"])["next_run_at"]).astimezone(timezone.utc)
+        assert next_run == datetime(2026, 5, 8, 15, 6, 0, tzinfo=timezone.utc)
+
     def test_future_not_returned(self, tmp_cron_dir):
         create_job(prompt="Not yet", schedule="every 1h")
         due = get_due_jobs()
@@ -1175,6 +1212,40 @@ class TestGetDueJobs:
         assert get_due_jobs() == []
         repaired = datetime.fromisoformat(get_job("cron-tz-migrate")["next_run_at"])
         assert repaired == datetime(2026, 5, 19, 21, 0, 0, tzinfo=current_tz)
+
+    def test_cron_offset_migration_recompute_preserves_per_job_timezone(self, tmp_cron_dir, monkeypatch):
+        pytest.importorskip("croniter")
+        now = datetime(2026, 5, 8, 16, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs(
+            [{
+                "id": "cron-per-job-tz-migrate",
+                "name": "Per-job timezone migrate",
+                "prompt": "...",
+                "schedule": {"kind": "cron", "expr": "6 23 * * *", "display": "6 23 * * *"},
+                "schedule_display": "6 23 * * *",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "created_at": "2026-05-07T23:06:00+08:00",
+                "next_run_at": "2026-05-08T23:06:00+08:00",
+                "last_run_at": "2026-05-07T23:06:00+08:00",
+                "last_status": "ok",
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+                "timezone": "Asia/Shanghai",
+            }]
+        )
+
+        assert get_due_jobs() == []
+        repaired = datetime.fromisoformat(
+            get_job("cron-per-job-tz-migrate")["next_run_at"]
+        ).astimezone(timezone.utc)
+        assert repaired == datetime(2026, 5, 9, 15, 6, 0, tzinfo=timezone.utc)
 
     def test_cron_offset_migration_does_not_repair_already_passed_wall_time(self, tmp_cron_dir, monkeypatch):
         current_tz = timezone(timedelta(hours=2))

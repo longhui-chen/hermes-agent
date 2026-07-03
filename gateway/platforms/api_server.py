@@ -419,7 +419,7 @@ def _chat_stream_error_payload(result: Dict[str, Any], finish_reason: str) -> Op
     completed = bool(result.get("completed", True))
     is_partial = bool(result.get("partial"))
     is_failed = bool(result.get("failed"))
-    err_msg = _short_error_text(result.get("error"))
+    err_msg = _redact_api_error_text(_short_error_text(result.get("error")))
     if not (is_partial or is_failed or not completed or finish_reason == "error"):
         return None
     provider_error = result.get("provider_error")
@@ -444,7 +444,7 @@ def _chat_stream_error_payload(result: Dict[str, Any], finish_reason: str) -> Op
         ):
             value = provider_error.get(key)
             if isinstance(value, str):
-                clean = value.strip()
+                clean = _redact_api_error_text(value.strip())
                 if clean:
                     payload[key] = clean[:500]
             elif isinstance(value, int):
