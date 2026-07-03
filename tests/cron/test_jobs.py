@@ -433,6 +433,46 @@ class TestUpdateJob:
         next_run = datetime.fromisoformat(job["next_run_at"])
         assert next_run.utcoffset() == timedelta(hours=8)
 
+    def test_create_job_rejects_stale_one_shot(self, tmp_cron_dir, monkeypatch):
+        """A past one-shot must fail closed instead of creating a scheduled job
+        with next_run_at=None that can never fire."""
+        now = datetime(2026, 6, 30, 13, 5, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        with pytest.raises(ValueError, match="in the past"):
+            create_job(
+                prompt="Reminder",
+                schedule="2026-06-30T09:00:00",
+                timezone="Asia/Shanghai",
+            )
+
+        assert load_jobs() == []
+
+    def test_update_job_rejects_stale_one_shot(self, tmp_cron_dir, monkeypatch):
+        """Updating an existing job must not recreate a scheduled job with
+        next_run_at=None."""
+        now = datetime(2026, 6, 30, 13, 5, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job(
+            prompt="Reminder",
+            schedule="every 1h",
+            timezone="Asia/Shanghai",
+        )
+
+        with pytest.raises(ValueError, match="in the past"):
+            update_job(
+                job["id"],
+                {
+                    "schedule": "2026-06-30T09:00:00",
+                    "timezone": "Asia/Shanghai",
+                },
+            )
+
+        stored = get_job(job["id"])
+        assert stored["schedule"]["kind"] == "interval"
+        assert stored["next_run_at"]
+
     def test_create_job_invalid_timezone_raises_with_message(self, tmp_cron_dir):
         with pytest.raises(ValueError, match="Invalid timezone"):
             create_job(
