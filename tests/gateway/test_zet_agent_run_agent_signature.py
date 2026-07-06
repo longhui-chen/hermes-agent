@@ -60,3 +60,14 @@ def test_zet_agent_create_agent_covers_base_signature():
         "When you add a param to the base _create_agent, mirror it in this override "
         "(or switch the override to **kwargs) — chat completions calls this through the subclass."
     )
+
+
+def test_zet_agent_connect_covers_base_signature():
+    base_params, _ = _keyword_params(APIServerAdapter.connect)
+    override_params, has_var_kw = _keyword_params(ZetAgentAdapter.connect)
+    missing = base_params - override_params
+    assert has_var_kw or not missing, (
+        f"ZetAgentAdapter.connect override is missing base keyword(s): {sorted(missing)}. "
+        "Gateway startup and reconnect both call connect(is_reconnect=...), so "
+        "signature drift prevents the zet_agent gateway from binding its health port."
+    )

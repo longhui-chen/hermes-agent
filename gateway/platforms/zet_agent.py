@@ -2003,10 +2003,14 @@ class ZetAgentAdapter(APIServerAdapter):
     # connect — extend base routes with our respond endpoints
     # ------------------------------------------------------------------
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Start the aiohttp server, registering our extra routes
         before the base class sets up the runner (which freezes the
         router).
+
+        ``is_reconnect`` is accepted to preserve the BasePlatformAdapter
+        connect contract; zet_agent does not need different cold-start versus
+        reconnect behavior.
 
         We monkey-patch ``self._app.router`` immediately after the
         base method has built the application but before the freeze
