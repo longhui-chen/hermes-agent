@@ -47,7 +47,9 @@ def test_prepare_claw_service_normalizes_inline_gateway_config(tmp_path: Path):
     assert "  host: 127.0.0.1\n" in config
     assert "  multiplex_profiles: true\n" in config
     assert env_path.exists()
-    assert "ZET_AGENT_KEY=" in env_path.read_text(encoding="utf-8")
+    env_text = env_path.read_text(encoding="utf-8")
+    assert "ZET_AGENT_KEY=" in env_text
+    assert "ZETTLAB_PRESETS_DIR=/volume1/subvol/agents/zettlab-presets/current\n" in env_text
 
 
 def test_zpk_agent_service_names_are_device_facing():

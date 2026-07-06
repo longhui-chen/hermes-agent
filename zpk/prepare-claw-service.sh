@@ -9,6 +9,7 @@ HERMES_HOME="$APP_BASE/data/hermes_home"
 SECRET_DIR="$APP_BASE/data/secrets"
 KEY_FILE="$SECRET_DIR/zet_agent.key"
 ENV_FILE="$SECRET_DIR/zettlab-claw.env"
+ZETTLAB_PRESETS_DIR="${ZETTLAB_PRESETS_DIR:-/volume1/subvol/agents/zettlab-presets/current}"
 
 generate_key() {
     if command -v openssl >/dev/null 2>&1; then
@@ -42,6 +43,7 @@ write_agent_env() {
         printf 'ZET_AGENT_ENABLED=true\n'
         printf 'ZET_AGENT_HOST=127.0.0.1\n'
         printf 'ZET_AGENT_PORT=7900\n'
+        printf 'ZETTLAB_PRESETS_DIR=%s\n' "$ZETTLAB_PRESETS_DIR"
     } > "$ENV_FILE.tmp.$$"
     chmod 0600 "$ENV_FILE.tmp.$$"
     mv "$ENV_FILE.tmp.$$" "$ENV_FILE"
