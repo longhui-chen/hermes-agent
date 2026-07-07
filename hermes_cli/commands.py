@@ -836,10 +836,12 @@ def _collect_gateway_skill_entries(
     skill_triples: list[tuple[str, str, str]] = []
     try:
         from agent.skill_commands import get_skill_commands
-        from tools.skills_tool import SKILLS_DIR
+        from tools.skills_tool import _active_skills_dir
         from agent.skill_utils import get_external_skills_dirs
-        _skills_dir = str(SKILLS_DIR.resolve())
-        _hub_dir = str((SKILLS_DIR / ".hub").resolve()).rstrip("/") + "/"
+
+        skills_dir = _active_skills_dir()
+        _skills_dir = str(skills_dir.resolve())
+        _hub_dir = str((skills_dir / ".hub").resolve()).rstrip("/") + "/"
         # Build set of allowed directory prefixes: local skills dir + any
         # user-configured ``skills.external_dirs``. Ensure each prefix ends
         # with ``/`` so ``/my-skills`` does not also match ``/my-skills-extra``.
@@ -1017,10 +1019,11 @@ def discord_skill_commands_by_category(
     try:
         from agent.skill_commands import get_skill_commands
         from agent.skill_utils import get_external_skills_dirs
-        from tools.skills_tool import SKILLS_DIR
+        from tools.skills_tool import _active_skills_dir
 
-        _skills_dir = SKILLS_DIR.resolve()
-        _hub_dir = (SKILLS_DIR / ".hub").resolve()
+        skills_dir = _active_skills_dir()
+        _skills_dir = skills_dir.resolve()
+        _hub_dir = (skills_dir / ".hub").resolve()
         # Build list of (resolved_root, is_local) tuples. Each external dir
         # becomes its own scan root for category derivation — a skill at
         # ``<external>/mlops/foo/SKILL.md`` is still categorized as "mlops".
@@ -1041,8 +1044,8 @@ def discord_skill_commands_by_category(
             if not skill_path:
                 continue
             sp = _P(skill_path).resolve()
-            # Hub skills are loaded via the skill hub, not surfaced as
-            # slash commands.
+            # .hub contains hub cache/catalog entries, not profile-installed
+            # skills. Profile-local __skillhub__ installs remain eligible.
             if str(sp).startswith(str(_hub_dir)):
                 continue
             # Accept skill if it lives under any scan root; record the
