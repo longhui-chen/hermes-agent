@@ -1,3 +1,4 @@
+import json
 import os
 import shutil
 import subprocess
@@ -133,9 +134,11 @@ def test_zpk_agent_service_names_are_device_facing():
     stop = (repo_root / "zpk" / "init.d" / "stop.sh").read_text(encoding="utf-8")
     uninstall = (repo_root / "zpk" / "uninstall.sh").read_text(encoding="utf-8")
 
+    meta = json.loads(package_meta)
+
     assert "EnvironmentFile=-__APP_BASE__/data/secrets/zettlab-claw.env" in service
-    assert '"service_name": "zettlab-claw"' in package_meta
-    assert '"restart": 1' in package_meta
+    assert meta["service_name"] == "zettlab-claw"
+    assert "restart" not in meta
     assert "systemctl restart zettlab-claw.service" not in install
     assert "systemctl start zettlab-claw.service" in install
     assert "systemctl start zettlab-claw.service" in start
