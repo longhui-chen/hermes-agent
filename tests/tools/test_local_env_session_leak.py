@@ -29,6 +29,7 @@ import pytest
 
 import gateway.session_context as sc
 from gateway.session_context import _VAR_MAP, clear_session_vars, set_session_vars
+from tools.code_execution_tool import _inject_execute_code_session_context_env, _scrub_child_env
 from tools.environments.local import _make_run_env, _sanitize_subprocess_env, hermes_subprocess_env
 
 # The full set of session vars the bridge owns.
@@ -302,3 +303,33 @@ def test_hermes_subprocess_env_unengaged_preserves_fallback(monkeypatch):
     # not engaged (autouse fixture leaves _session_context_engaged False)
     env = hermes_subprocess_env()
     assert env.get("HERMES_SESSION_KEY") == "cli-fallback-key"
+
+
+# --------------------------------------------------------------------------- #
+# execute_code sandbox child env
+# --------------------------------------------------------------------------- #
+
+def test_execute_code_child_gets_bound_session_routing_without_connector_bearer(monkeypatch):
+    """execute_code should know its session key but not receive connector tokens.
+
+    The sandbox child can route helper RPCs back to the right chat session via
+    HERMES_SESSION_KEY, while ZETTLAB_CONNECTORS_AUTH_TOKEN stays out of the
+    arbitrary Python environment.
+    """
+    monkeypatch.setenv("HERMES_SESSION_KEY", "foreign-session")
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_URL", "http://127.0.0.1:9090/api/v1/internal/connectors/rpc")
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "connector-bearer")
+    tokens = set_session_vars(
+        session_key="real-session",
+        platform="api",
+        chat_id="chat-1",
+    )
+    try:
+        env = _scrub_child_env(os.environ, is_passthrough=lambda _: False, is_windows=False)
+        _inject_execute_code_session_context_env(env)
+    finally:
+        clear_session_vars(tokens)
+
+    assert env.get("HERMES_SESSION_KEY") == "real-session"
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in env
+    assert "ZETTLAB_CONNECTORS_URL" not in env
