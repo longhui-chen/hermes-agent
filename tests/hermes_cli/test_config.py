@@ -59,6 +59,9 @@ class TestEnsureHermesHome:
             content = soul_path.read_text(encoding="utf-8").strip()
             assert content != ""
             assert "Zettlab Memo" in content
+            assert "generalist" in content
+            assert "fallback entry point" in content
+            assert "SkillHub" in content
             assert "Hermes Agent" not in content
 
     def test_does_not_overwrite_existing_soul_md(self, tmp_path):

@@ -12,6 +12,7 @@ import contextvars
 from collections import OrderedDict
 from pathlib import Path
 
+from hermes_cli.default_soul import DEFAULT_SOUL_MD
 from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
 from typing import Optional
 
@@ -123,14 +124,7 @@ def _strip_yaml_frontmatter(content: str) -> str:
 # Constants
 # =========================================================================
 
-DEFAULT_AGENT_IDENTITY = (
-    "You are Zettlab Memo, an intelligent AI assistant running on a Zettlab AI-Native Personal Computer. "
-    "You are helpful, knowledgeable, direct, and proactive. "
-    "You assist your owner with tasks via your tools. "
-    "Be targeted and efficient — act instead of only describing what you plan to do. "
-    "For long-running tasks, keep the owner posted on your progress as you go, "
-    "so they always know what you have done and what is coming next."
-)
+DEFAULT_AGENT_IDENTITY = DEFAULT_SOUL_MD
 
 HERMES_AGENT_HELP_GUIDANCE = (
     "If the user asks about configuring, setting up, or using the Zettlab Memo "
