@@ -1341,9 +1341,13 @@ def _build_typed_message_content(
     if job.get("source") == "calendar":
         metadata["source"] = "calendar"
         for _key in (
+            "calendar_source_type",
+            "calendar_source_instance_id",
+            "calendar_source_platform",
             "calendar_provider",
             "calendar_connection_id",
             "calendar_id",
+            "calendar_event_id",
             "calendar_series_id",
             "calendar_original_start",
             "calendar_etag",
