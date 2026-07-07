@@ -1076,10 +1076,13 @@ def _redact_channel_failure(job: dict, content: Optional[str]):
     if not content:
         return content
     template_name = job.get("name", job.get("id", ""))
-    prefix = f"⚠️ Cron '{template_name}' failed:\n"
-    if not content.startswith(prefix):
-        return content
-    return _friendly_failure(job.get("name", ""), content[len(prefix):])
+    for prefix in (
+        f"⚠️ Cron '{template_name}' failed:\n",
+        f"⚠️ Cron job '{template_name}' failed:\n",
+    ):
+        if content.startswith(prefix):
+            return _friendly_failure(job.get("name", ""), content[len(prefix):])
+    return content
 
 
 def _is_retryable_failure_result(result) -> bool:
