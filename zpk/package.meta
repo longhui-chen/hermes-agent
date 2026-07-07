@@ -7,5 +7,6 @@
   "service_name": "zettlab-claw",
   "binary": "bin/hermes",
   "package_type": "app",
-  "app_type": "system"
+  "app_type": "system",
+  "restart": 1
 }

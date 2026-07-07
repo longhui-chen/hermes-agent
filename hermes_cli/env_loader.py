@@ -59,7 +59,10 @@ _ORIGINAL_PROCESS_ENV: frozenset[str] | None = None
 # snapshot the operator VALUE and re-assert it after every .env load.  Keep this
 # list tiny and non-secret — snapshotting secret values into a process-lifetime
 # global is exactly what _ORIGINAL_PROCESS_ENV (key-set only) avoids.
-_LIVE_RESOLVED_ENV_KEYS: frozenset[str] = frozenset({"HERMES_TIMEZONE"})
+_LIVE_RESOLVED_ENV_KEYS: frozenset[str] = frozenset({
+    "HERMES_TIMEZONE",
+    "ZETTLAB_PRESETS_DIR",
+})
 _ORIGINAL_OPERATOR_VALUES: dict[str, str] | None = None
 
 
