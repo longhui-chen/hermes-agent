@@ -49,6 +49,7 @@ detect_zettlab_presets_dir() {
 }
 
 ZETTLAB_PRESETS_DIR="$(detect_zettlab_presets_dir)"
+ZETTLAB_PRESETS_DIR="$(printf '%s' "$ZETTLAB_PRESETS_DIR" | tr -d '\r\n')"
 
 generate_key() {
     if command -v openssl >/dev/null 2>&1; then

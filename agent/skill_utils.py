@@ -515,7 +515,7 @@ def get_external_skills_dirs() -> List[Path]:
             seen.add(p)
             result.append(p)
         else:
-            logger.debug("External skills dir does not exist, skipping: %s", p)
+            logger.warning("External skills dir does not exist, skipping: %s", p)
 
     if cache_key is not None:
         _EXTERNAL_DIRS_CACHE[cache_key] = (raw_dirs_tuple, fingerprint, list(result))
