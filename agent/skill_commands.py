@@ -27,7 +27,9 @@ _skill_commands_skills_dir_key: Optional[str] = None
 _skill_commands_cache: Dict[
     tuple[Optional[str], Optional[str]], Dict[str, Dict[str, Any]]
 ] = {}
+_skill_commands_generations: Dict[Optional[str], int] = {}
 _skill_commands_lock = threading.RLock()
+_skill_commands_reload_lock = threading.RLock()
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -386,6 +388,8 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     global _skill_commands, _skill_commands_platform, _skill_commands_skills_dir_key
     scope_key = _current_skill_commands_scope_key()
     platform_key, skills_dir_key = scope_key
+    with _skill_commands_lock:
+        scan_generation = _skill_commands_generations.get(skills_dir_key, 0)
     commands: Dict[str, Dict[str, Any]] = {}
     try:
         from tools.skills_tool import (
@@ -453,6 +457,8 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     except Exception:
         pass
     with _skill_commands_lock:
+        if _skill_commands_generations.get(skills_dir_key, 0) != scan_generation:
+            return commands
         _skill_commands_platform = platform_key
         _skill_commands_skills_dir_key = skills_dir_key
         _skill_commands = commands
@@ -479,7 +485,7 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
             return _skill_commands
 
         cached = _skill_commands_cache.get(scope_key)
-        if cached is not None:
+        if cached:
             _skill_commands_platform = platform_key
             _skill_commands_skills_dir_key = skills_dir_key
             _skill_commands = cached
@@ -498,6 +504,23 @@ def _cached_skill_commands_for_current_scope() -> Dict[str, Dict[str, Any]]:
         ):
             return _skill_commands
         return _skill_commands_cache.get(scope_key, {})
+
+
+def _invalidate_other_skill_command_scopes(
+    scope_key: tuple[Optional[str], Optional[str]]
+) -> None:
+    _, skills_dir_key = scope_key
+    with _skill_commands_lock:
+        for cached_scope in list(_skill_commands_cache):
+            if cached_scope != scope_key and cached_scope[1] == skills_dir_key:
+                _skill_commands_cache.pop(cached_scope, None)
+
+
+def _bump_skill_command_generation(skills_dir_key: Optional[str]) -> None:
+    with _skill_commands_lock:
+        _skill_commands_generations[skills_dir_key] = (
+            _skill_commands_generations.get(skills_dir_key, 0) + 1
+        )
 
 
 def reload_skills() -> Dict[str, Any]:
@@ -539,30 +562,36 @@ def reload_skills() -> Dict[str, Any]:
             out[bare] = (info or {}).get("description") or ""
         return out
 
-    before = _snapshot(_cached_skill_commands_for_current_scope())
+    with _skill_commands_reload_lock:
+        scope_key = _current_skill_commands_scope_key()
+        _, skills_dir_key = scope_key
+        before = _snapshot(_cached_skill_commands_for_current_scope())
 
-    # Rescan the skills dir for the current scope and atomically replace that
-    # scoped cache entry.
-    new_commands = scan_skill_commands()
+        _bump_skill_command_generation(skills_dir_key)
 
-    after = _snapshot(new_commands)
+        # Rescan the skills dir for the current scope and atomically replace that
+        # scoped cache entry.
+        new_commands = scan_skill_commands()
+        _invalidate_other_skill_command_scopes(scope_key)
 
-    added_names = sorted(set(after) - set(before))
-    removed_names = sorted(set(before) - set(after))
-    unchanged = sorted(set(after) & set(before))
+        after = _snapshot(new_commands)
 
-    added = [{"name": n, "description": after[n]} for n in added_names]
-    # For removed skills, use the description we had cached pre-rescan
-    # (the skill file is gone so we can't re-read it).
-    removed = [{"name": n, "description": before[n]} for n in removed_names]
+        added_names = sorted(set(after) - set(before))
+        removed_names = sorted(set(before) - set(after))
+        unchanged = sorted(set(after) & set(before))
 
-    return {
-        "added": added,
-        "removed": removed,
-        "unchanged": unchanged,
-        "total": len(after),
-        "commands": len(new_commands),
-    }
+        added = [{"name": n, "description": after[n]} for n in added_names]
+        # For removed skills, use the description we had cached pre-rescan
+        # (the skill file is gone so we can't re-read it).
+        removed = [{"name": n, "description": before[n]} for n in removed_names]
+
+        return {
+            "added": added,
+            "removed": removed,
+            "unchanged": unchanged,
+            "total": len(after),
+            "commands": len(new_commands),
+        }
 
 
 def resolve_skill_command_key(command: str) -> Optional[str]:
