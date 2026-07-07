@@ -1,6 +1,7 @@
 """Tests for agent/skill_commands.py — skill slash command scanning and platform filtering."""
 
 import os
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
@@ -288,6 +289,82 @@ class TestScanSkillCommands:
         assert "/alpha-only" not in beta_commands
         assert beta_message is not None
         assert "# beta-only" in beta_message
+
+    def test_concurrent_profile_scans_do_not_share_mutable_command_map(
+        self, tmp_path, monkeypatch
+    ):
+        """Concurrent profile scans must publish separate scoped command maps."""
+        import agent.skill_commands as sc_mod
+        import agent.skill_utils as skill_utils
+        from agent.skill_commands import get_skill_commands
+
+        process_skills = tmp_path / "process-home" / "skills"
+        alpha_home = tmp_path / "profiles" / "alpha"
+        beta_home = tmp_path / "profiles" / "beta"
+        alpha_skills = alpha_home / "skills"
+        beta_skills = beta_home / "skills"
+        process_skills.mkdir(parents=True)
+        _make_skill(alpha_skills, "alpha-only")
+        _make_skill(beta_skills, "beta-only")
+
+        monkeypatch.setattr(skills_tool_module, "_DEFAULT_SKILLS_DIR", process_skills)
+        monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", process_skills)
+        monkeypatch.setattr(sc_mod, "_skill_commands", {})
+        monkeypatch.setattr(sc_mod, "_skill_commands_platform", None)
+        monkeypatch.setattr(sc_mod, "_skill_commands_skills_dir_key", None)
+        monkeypatch.setattr(sc_mod, "_skill_commands_cache", {})
+
+        real_iter = skill_utils.iter_skill_index_files
+        alpha_yielded = threading.Event()
+        beta_done = threading.Event()
+
+        def interleaved_iter_skill_index_files(scan_dir, filename):
+            scan_path = Path(scan_dir)
+            if scan_path == alpha_skills:
+                for item in real_iter(scan_dir, filename):
+                    yield item
+                    alpha_yielded.set()
+                    assert beta_done.wait(5)
+                return
+            if scan_path == beta_skills:
+                assert alpha_yielded.wait(5)
+                for item in real_iter(scan_dir, filename):
+                    yield item
+                beta_done.set()
+                return
+            yield from real_iter(scan_dir, filename)
+
+        monkeypatch.setattr(
+            skill_utils,
+            "iter_skill_index_files",
+            interleaved_iter_skill_index_files,
+        )
+
+        results = {}
+        errors = []
+
+        def run_for_profile(name, home):
+            token = set_hermes_home_override(str(home))
+            try:
+                results[name] = dict(get_skill_commands())
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                reset_hermes_home_override(token)
+
+        alpha_thread = threading.Thread(target=run_for_profile, args=("alpha", alpha_home))
+        beta_thread = threading.Thread(target=run_for_profile, args=("beta", beta_home))
+        alpha_thread.start()
+        assert alpha_yielded.wait(5)
+        beta_thread.start()
+        alpha_thread.join(5)
+        beta_thread.join(5)
+
+        assert not alpha_thread.is_alive()
+        assert not beta_thread.is_alive()
+        assert errors == []
+        assert set(results["alpha"]) == {"/alpha-only"}
+        assert set(results["beta"]) == {"/beta-only"}
 
     def test_get_skill_commands_rescans_when_session_platform_changes(self, tmp_path):
         """``HERMES_SESSION_PLATFORM`` from the gateway session context must

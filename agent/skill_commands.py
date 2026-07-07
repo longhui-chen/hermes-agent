@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -23,6 +24,10 @@ logger = logging.getLogger(__name__)
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
 _skill_commands_skills_dir_key: Optional[str] = None
+_skill_commands_cache: Dict[
+    tuple[Optional[str], Optional[str]], Dict[str, Dict[str, Any]]
+] = {}
+_skill_commands_lock = threading.RLock()
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -149,6 +154,13 @@ def _resolve_skill_commands_skills_dir_key() -> Optional[str]:
             return str(skills_dir)
     except Exception:
         return None
+
+
+def _current_skill_commands_scope_key() -> tuple[Optional[str], Optional[str]]:
+    return (
+        _resolve_skill_commands_platform(),
+        _resolve_skill_commands_skills_dir_key(),
+    )
 
 
 def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:
@@ -372,9 +384,9 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
     global _skill_commands, _skill_commands_platform, _skill_commands_skills_dir_key
-    _skill_commands_platform = _resolve_skill_commands_platform()
-    _skill_commands_skills_dir_key = _resolve_skill_commands_skills_dir_key()
-    _skill_commands = {}
+    scope_key = _current_skill_commands_scope_key()
+    platform_key, skills_dir_key = scope_key
+    commands: Dict[str, Dict[str, Any]] = {}
     try:
         from tools.skills_tool import (
             _active_skills_dir,
@@ -430,7 +442,7 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     cmd_name = _SKILL_MULTI_HYPHEN.sub('-', cmd_name).strip('-')
                     if not cmd_name:
                         continue
-                    _skill_commands[f"/{cmd_name}"] = {
+                    commands[f"/{cmd_name}"] = {
                         "name": name,
                         "description": description or f"Invoke the {name} skill",
                         "skill_md_path": str(skill_md),
@@ -440,7 +452,12 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     continue
     except Exception:
         pass
-    return _skill_commands
+    with _skill_commands_lock:
+        _skill_commands_platform = platform_key
+        _skill_commands_skills_dir_key = skills_dir_key
+        _skill_commands = commands
+        _skill_commands_cache[scope_key] = commands
+    return commands
 
 
 def get_skill_commands() -> Dict[str, Dict[str, Any]]:
@@ -450,14 +467,37 @@ def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     so single-process multi-profile gateways never reuse another profile's
     slash-command cache.
     """
-    current_skills_dir_key = _resolve_skill_commands_skills_dir_key()
-    if (
-        not _skill_commands
-        or _skill_commands_platform != _resolve_skill_commands_platform()
-        or _skill_commands_skills_dir_key != current_skills_dir_key
-    ):
-        scan_skill_commands()
-    return _skill_commands
+    global _skill_commands, _skill_commands_platform, _skill_commands_skills_dir_key
+    scope_key = _current_skill_commands_scope_key()
+    platform_key, skills_dir_key = scope_key
+    with _skill_commands_lock:
+        if (
+            _skill_commands
+            and _skill_commands_platform == platform_key
+            and _skill_commands_skills_dir_key == skills_dir_key
+        ):
+            return _skill_commands
+
+        cached = _skill_commands_cache.get(scope_key)
+        if cached is not None:
+            _skill_commands_platform = platform_key
+            _skill_commands_skills_dir_key = skills_dir_key
+            _skill_commands = cached
+            return cached
+
+    return scan_skill_commands()
+
+
+def _cached_skill_commands_for_current_scope() -> Dict[str, Dict[str, Any]]:
+    scope_key = _current_skill_commands_scope_key()
+    platform_key, skills_dir_key = scope_key
+    with _skill_commands_lock:
+        if (
+            _skill_commands_platform == platform_key
+            and _skill_commands_skills_dir_key == skills_dir_key
+        ):
+            return _skill_commands
+        return _skill_commands_cache.get(scope_key, {})
 
 
 def reload_skills() -> Dict[str, Any]:
@@ -499,10 +539,10 @@ def reload_skills() -> Dict[str, Any]:
             out[bare] = (info or {}).get("description") or ""
         return out
 
-    before = _snapshot(_skill_commands)
+    before = _snapshot(_cached_skill_commands_for_current_scope())
 
-    # Rescan the skills dir. ``scan_skill_commands`` resets
-    # ``_skill_commands = {}`` internally and repopulates it.
+    # Rescan the skills dir for the current scope and atomically replace that
+    # scoped cache entry.
     new_commands = scan_skill_commands()
 
     after = _snapshot(new_commands)
