@@ -110,6 +110,7 @@ def test_zpk_agent_service_names_are_device_facing():
 
     assert "EnvironmentFile=-__APP_BASE__/data/secrets/zettlab-claw.env" in service
     assert '"service_name": "zettlab-claw"' in package_meta
+    assert '"restart": 1' in package_meta
     assert "systemctl restart zettlab-claw.service" not in install
     assert "systemctl start zettlab-claw.service" in install
     assert "systemctl start zettlab-claw.service" in start
