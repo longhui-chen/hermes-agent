@@ -766,6 +766,32 @@ _clamp_telegram_names = _clamp_command_names
 # Shared skill/plugin collection for gateway platforms
 # ---------------------------------------------------------------------------
 
+def _relative_to_or_false(path, root) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _matching_skill_root(path, roots):
+    for root in roots:
+        if _relative_to_or_false(path, root):
+            return root
+    try:
+        resolved_path = path.resolve()
+    except Exception:
+        return None
+    for root in roots:
+        try:
+            resolved_root = root.resolve()
+        except Exception:
+            continue
+        if _relative_to_or_false(resolved_path, resolved_root):
+            return resolved_root
+    return None
+
+
 def _collect_gateway_skill_entries(
     platform: str,
     max_slots: int,
@@ -780,7 +806,7 @@ def _collect_gateway_skill_entries(
       2. Built-in skill commands (fill remaining slots, alphabetical)
 
     Only skills are trimmed when the cap is reached.
-    Hub-installed skills are excluded.  Per-platform disabled skills are
+    Hub cache entries are excluded.  Per-platform disabled skills are
     excluded.
 
     Args:
@@ -838,29 +864,32 @@ def _collect_gateway_skill_entries(
         from agent.skill_commands import get_skill_commands
         from tools.skills_tool import _active_skills_dir
         from agent.skill_utils import get_external_skills_dirs
+        from pathlib import Path as _P
 
         skills_dir = _active_skills_dir()
-        _skills_dir = str(skills_dir.resolve())
-        _hub_dir = str((skills_dir / ".hub").resolve()).rstrip("/") + "/"
-        # Build set of allowed directory prefixes: local skills dir + any
-        # user-configured ``skills.external_dirs``. Ensure each prefix ends
-        # with ``/`` so ``/my-skills`` does not also match ``/my-skills-extra``.
+        _hub_roots = [skills_dir / ".hub", (skills_dir / ".hub").resolve()]
+        # Build set of allowed roots: local skills dir + any user-configured
+        # ``skills.external_dirs``.
         # Without this widening, external skills are visible in
         # ``hermes skills list`` and the agent's ``/skill-name`` dispatch but
         # silently excluded from gateway slash menus (#8110).
-        _allowed_prefixes = [_skills_dir.rstrip("/") + "/"]
-        _allowed_prefixes.extend(
-            str(d).rstrip("/") + "/" for d in get_external_skills_dirs()
-        )
+        _allowed_roots = [skills_dir, skills_dir.resolve()]
+        for ext in get_external_skills_dirs():
+            try:
+                ext_path = _P(ext)
+                _allowed_roots.extend([ext_path, ext_path.resolve()])
+            except Exception:
+                continue
         skill_cmds = get_skill_commands()
         for cmd_key in sorted(skill_cmds):
             info = skill_cmds[cmd_key]
             skill_path = info.get("skill_md_path", "")
             if not skill_path:
                 continue
-            if not any(skill_path.startswith(prefix) for prefix in _allowed_prefixes):
+            sp = _P(skill_path)
+            if _matching_skill_root(sp, _allowed_roots) is None:
                 continue
-            if skill_path.startswith(_hub_dir):
+            if _matching_skill_root(sp, _hub_roots) is not None:
                 continue
             skill_name = info.get("name", "")
             if skill_name in _platform_disabled:
@@ -1022,16 +1051,16 @@ def discord_skill_commands_by_category(
         from tools.skills_tool import _active_skills_dir
 
         skills_dir = _active_skills_dir()
-        _skills_dir = skills_dir.resolve()
-        _hub_dir = (skills_dir / ".hub").resolve()
-        # Build list of (resolved_root, is_local) tuples. Each external dir
+        _hub_roots = [skills_dir / ".hub", (skills_dir / ".hub").resolve()]
+        # Build list of scan roots. Each external dir
         # becomes its own scan root for category derivation — a skill at
         # ``<external>/mlops/foo/SKILL.md`` is still categorized as "mlops".
-        _scan_roots: list[_P] = [_skills_dir]
+        _scan_roots: list[_P] = [skills_dir, skills_dir.resolve()]
         try:
             for ext in get_external_skills_dirs():
                 try:
-                    _scan_roots.append(_P(ext).resolve())
+                    ext_path = _P(ext)
+                    _scan_roots.extend([ext_path, ext_path.resolve()])
                 except Exception:
                     continue
         except Exception:
@@ -1043,21 +1072,14 @@ def discord_skill_commands_by_category(
             skill_path = info.get("skill_md_path", "")
             if not skill_path:
                 continue
-            sp = _P(skill_path).resolve()
+            sp = _P(skill_path)
             # .hub contains hub cache/catalog entries, not profile-installed
             # skills. Profile-local __skillhub__ installs remain eligible.
-            if str(sp).startswith(str(_hub_dir)):
+            if _matching_skill_root(sp, _hub_roots) is not None:
                 continue
             # Accept skill if it lives under any scan root; record the
             # matching root so we can derive the category correctly.
-            matched_root: _P | None = None
-            for root in _scan_roots:
-                try:
-                    sp.relative_to(root)
-                except ValueError:
-                    continue
-                matched_root = root
-                break
+            matched_root = _matching_skill_root(sp, _scan_roots)
             if matched_root is None:
                 continue
 
@@ -1109,7 +1131,10 @@ def discord_skill_commands_by_category(
 
             # Determine category from the relative path within the matched
             # scan root. e.g. creative/ascii-art/SKILL.md → ("creative", ...)
-            rel = sp.parent.relative_to(matched_root)
+            try:
+                rel = sp.parent.relative_to(matched_root)
+            except ValueError:
+                rel = sp.resolve().parent.relative_to(matched_root.resolve())
             parts = rel.parts
             if len(parts) >= 2:
                 cat = parts[0]

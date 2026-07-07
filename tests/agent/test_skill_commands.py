@@ -290,6 +290,36 @@ class TestScanSkillCommands:
         assert beta_message is not None
         assert "# beta-only" in beta_message
 
+    def test_get_skill_commands_rescans_empty_profile_after_first_skill_install(
+        self, tmp_path, monkeypatch
+    ):
+        """An empty profile cache must not hide the first newly-installed skill."""
+        import agent.skill_commands as sc_mod
+        from agent.skill_commands import get_skill_commands
+
+        process_skills = tmp_path / "process-home" / "skills"
+        profile_home = tmp_path / "profiles" / "empty-then-installed"
+        profile_skills = profile_home / "skills"
+        process_skills.mkdir(parents=True)
+        profile_skills.mkdir(parents=True)
+
+        monkeypatch.setattr(skills_tool_module, "_DEFAULT_SKILLS_DIR", process_skills)
+        monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", process_skills)
+        monkeypatch.setattr(sc_mod, "_skill_commands", {})
+        monkeypatch.setattr(sc_mod, "_skill_commands_platform", None)
+        monkeypatch.setattr(sc_mod, "_skill_commands_skills_dir_key", None)
+        monkeypatch.setattr(sc_mod, "_skill_commands_cache", {})
+
+        token = set_hermes_home_override(str(profile_home))
+        try:
+            assert dict(get_skill_commands()) == {}
+            _make_skill(profile_skills, "first-installed")
+            commands = dict(get_skill_commands())
+        finally:
+            reset_hermes_home_override(token)
+
+        assert set(commands) == {"/first-installed"}
+
     def test_concurrent_profile_scans_do_not_share_mutable_command_map(
         self, tmp_path, monkeypatch
     ):
