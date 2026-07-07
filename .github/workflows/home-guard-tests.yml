@@ -10,9 +10,10 @@ name: home-guard-tests
 # Mirrors the mature pytest pattern from seed-policy-check.yml (the repo's one
 # working CI pytest job): pytest-timeout is mandatory because pyproject's addopts
 # sets --timeout/--timeout-method and pytest exits 4 (usage error) without it;
-# setuptools is needed for a few import-time deps. httpx / mcp / starlette are
-# added because two of the home-guard test modules import runtime-provider and
-# the MCP tool, which pull those in during collection (verified in a clean venv).
+# setuptools is needed for a few import-time deps. httpx / requests / mcp / starlette /
+# openai are added because home-guard test modules import runtime-provider,
+# the MCP tool, and Copilot ACP's OpenAI-compatible typed response shim during
+# collection (verified in a clean venv).
 
 on:
   pull_request:
@@ -50,13 +51,16 @@ jobs:
           # pytest-timeout is required: pyproject addopts sets --timeout/
           # --timeout-method, and pytest exits 4 (usage error) without it.
           # setuptools covers a few import-time deps.
-          # httpx / mcp / starlette: two of the modules below import
+          # httpx / requests / mcp / starlette: modules below import
           # hermes_cli.runtime_provider (pulls httpx) and tools.mcp_tool's
-          # MCP-SDK symbols (pulls mcp + starlette) at collection time — pins
-          # match pyproject ([mcp] extra + core httpx).
+          # MCP-SDK symbols (pulls mcp + starlette), while MCP sampling tests
+          # patch agent.auxiliary_client (pulls requests through model_metadata)
+          # at runtime — pins match pyproject ([mcp] extra + core deps).
+          # openai: agent/copilot_acp_client imports OpenAI SDK typed tool-call
+          # models at collection time; pin matches pyproject core dependency.
           python -m pip install --quiet \
             pyyaml==6.0.3 pytest==9.0.2 pytest-timeout==2.4.0 setuptools==82.0.1 \
-            "httpx[socks]==0.28.1" mcp==1.26.0 starlette==1.0.1
+            "httpx[socks]==0.28.1" requests==2.33.0 mcp==1.26.0 starlette==1.0.1 openai==2.24.0
           # Only tests/agent/lsp/test_client_home_contract.py from the LSP dir:
           # the rest of that dir uses pytest-asyncio and spawns a real mock LSP
           # server (unrelated to the HOME guard, extra deps). Windows-only cases

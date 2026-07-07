@@ -215,6 +215,26 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     return scrubbed
 
 
+def _inject_execute_code_session_context_env(env: dict) -> None:
+    """Bridge non-secret gateway session routing vars into execute_code.
+
+    The execute_code child must not receive connector bearer tokens or model
+    credentials, but it may need the same HERMES_SESSION_* routing metadata as
+    terminal() so helper RPCs can stay bound to the correct chat session.
+    """
+    try:
+        from tools.environments.local import _inject_session_context_env
+    except Exception:
+        return
+    _inject_session_context_env(env)
+    logger.debug(
+        "execute_code: session routing env injected "
+        "(session_key_present=%s, connector_auth_present=%s)",
+        bool(env.get("HERMES_SESSION_KEY")),
+        bool(env.get("ZETTLAB_CONNECTORS_AUTH_TOKEN")),
+    )
+
+
 def check_sandbox_requirements() -> bool:
     """Code execution sandbox requires a POSIX OS for Unix domain sockets."""
     if not SANDBOX_AVAILABLE:
@@ -1286,6 +1306,7 @@ def execute_code(
         # passed through — without those, the child can't create a socket
         # or spawn a subprocess.  See ``_scrub_child_env`` for the rules.
         child_env = _scrub_child_env(os.environ)
+        _inject_execute_code_session_context_env(child_env)
         child_env["HERMES_RPC_SOCKET"] = rpc_endpoint
         child_env["HERMES_RPC_TOKEN"] = rpc_token
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"
