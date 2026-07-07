@@ -9,7 +9,46 @@ HERMES_HOME="$APP_BASE/data/hermes_home"
 SECRET_DIR="$APP_BASE/data/secrets"
 KEY_FILE="$SECRET_DIR/zet_agent.key"
 ENV_FILE="$SECRET_DIR/zettlab-claw.env"
-ZETTLAB_PRESETS_DIR="${ZETTLAB_PRESETS_DIR:-/volume1/subvol/agents/zettlab-presets/current}"
+DEFAULT_ZETTLAB_PRESETS_DIR="/volume1/subvol/agents/zettlab-presets/current"
+LEGACY_ZETTLAB_PRESETS_DIR="/volume1/agents/zettlab-presets/current"
+
+env_file_value() {
+    [ -f "$ENV_FILE" ] || return 1
+    local name value
+    while IFS='=' read -r name value; do
+        [ "$name" = "$1" ] || continue
+        printf '%s\n' "$value"
+        return 0
+    done < "$ENV_FILE"
+    return 1
+}
+
+detect_zettlab_presets_dir() {
+    if [ -n "${ZETTLAB_PRESETS_DIR:-}" ]; then
+        printf '%s\n' "$ZETTLAB_PRESETS_DIR"
+        return
+    fi
+
+    local existing
+    existing="$(env_file_value ZETTLAB_PRESETS_DIR || true)"
+    if [ -n "$existing" ]; then
+        printf '%s\n' "$existing"
+        return
+    fi
+
+    if [ -d "$DEFAULT_ZETTLAB_PRESETS_DIR" ]; then
+        printf '%s\n' "$DEFAULT_ZETTLAB_PRESETS_DIR"
+        return
+    fi
+    if [ -d "$LEGACY_ZETTLAB_PRESETS_DIR" ]; then
+        printf '%s\n' "$LEGACY_ZETTLAB_PRESETS_DIR"
+        return
+    fi
+
+    printf '%s\n' "$DEFAULT_ZETTLAB_PRESETS_DIR"
+}
+
+ZETTLAB_PRESETS_DIR="$(detect_zettlab_presets_dir)"
 
 generate_key() {
     if command -v openssl >/dev/null 2>&1; then
