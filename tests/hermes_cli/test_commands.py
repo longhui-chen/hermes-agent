@@ -1560,6 +1560,49 @@ class TestDiscordSkillCommands:
         assert "/gif-search" in keys
         assert "/code-review" in keys
 
+    def test_profile_local_skillhub_skill_is_included(self, tmp_path, monkeypatch):
+        """Profile-local SkillHub installs must not be filtered by process home."""
+        from unittest.mock import patch
+
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        import tools.skills_tool as skills_tool
+
+        process_skills = tmp_path / "process-home" / "skills"
+        profile_home = tmp_path / "profiles" / "general-assistant"
+        skill_dir = (
+            profile_home
+            / "skills"
+            / "__skillhub__"
+            / "Zettlab Official"
+            / "kingdee-k3cloud"
+        )
+        process_skills.mkdir(parents=True)
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("---\nname: kingdee-k3cloud\n---\n")
+        fake_cmds = {
+            "/kingdee-k3cloud": {
+                "name": "kingdee-k3cloud",
+                "description": "Kingdee ERP",
+                "skill_md_path": str(skill_dir / "SKILL.md"),
+                "skill_dir": str(skill_dir),
+            },
+        }
+
+        monkeypatch.setattr(skills_tool, "_DEFAULT_SKILLS_DIR", process_skills)
+        monkeypatch.setattr(skills_tool, "SKILLS_DIR", process_skills)
+        token = set_hermes_home_override(str(profile_home))
+        try:
+            with patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds):
+                entries, hidden = discord_skill_commands(
+                    max_slots=50,
+                    reserved_names=set(),
+                )
+        finally:
+            reset_hermes_home_override(token)
+
+        assert ("kingdee-k3cloud", "Kingdee ERP", "/kingdee-k3cloud") in entries
+        assert hidden == 0
+
     def test_names_allow_hyphens(self, tmp_path, monkeypatch):
         """Discord names should keep hyphens (unlike Telegram's _ sanitization)."""
         from unittest.mock import patch
@@ -1790,6 +1833,52 @@ class TestDiscordSkillCommandsByCategory:
         assert "media" in categories
         assert len(categories["creative"]) == 2
         assert len(categories["media"]) == 1
+        assert uncategorized == []
+        assert hidden == 0
+
+    def test_profile_local_skillhub_skill_is_grouped_from_active_profile_root(
+        self, tmp_path, monkeypatch
+    ):
+        from unittest.mock import patch
+
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        import tools.skills_tool as skills_tool
+
+        process_skills = tmp_path / "process-home" / "skills"
+        profile_home = tmp_path / "profiles" / "general-assistant"
+        skill_dir = (
+            profile_home
+            / "skills"
+            / "__skillhub__"
+            / "Zettlab Official"
+            / "kingdee-k3cloud"
+        )
+        process_skills.mkdir(parents=True)
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("---\nname: kingdee-k3cloud\n---\n")
+        fake_cmds = {
+            "/kingdee-k3cloud": {
+                "name": "kingdee-k3cloud",
+                "description": "Kingdee ERP",
+                "skill_md_path": str(skill_dir / "SKILL.md"),
+            },
+        }
+
+        monkeypatch.setattr(skills_tool, "_DEFAULT_SKILLS_DIR", process_skills)
+        monkeypatch.setattr(skills_tool, "SKILLS_DIR", process_skills)
+        token = set_hermes_home_override(str(profile_home))
+        try:
+            with patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds):
+                categories, uncategorized, hidden = discord_skill_commands_by_category(
+                    reserved_names=set(),
+                )
+        finally:
+            reset_hermes_home_override(token)
+
+        assert "__skillhub__" in categories
+        assert ("kingdee-k3cloud", "Kingdee ERP", "/kingdee-k3cloud") in categories[
+            "__skillhub__"
+        ]
         assert uncategorized == []
         assert hidden == 0
 

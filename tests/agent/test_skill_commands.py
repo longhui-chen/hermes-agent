@@ -1,12 +1,14 @@
 """Tests for agent/skill_commands.py — skill slash command scanning and platform filtering."""
 
 import os
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 import tools.skills_tool as skills_tool_module
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from agent.skill_commands import (
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
@@ -57,6 +59,50 @@ class TestScanSkillCommands:
             result = scan_skill_commands()
         assert "/my-skill" in result
         assert result["/my-skill"]["name"] == "my-skill"
+
+    def test_scan_and_invocation_use_active_profile_skills_dir_after_global_import(
+        self, tmp_path, monkeypatch
+    ):
+        process_home = tmp_path / "process-home"
+        profile_home = tmp_path / "profiles" / "general-assistant"
+        process_skills = process_home / "skills"
+        profile_skills = profile_home / "skills"
+        process_skills.mkdir(parents=True)
+        profile_skill = (
+            profile_skills
+            / "__skillhub__"
+            / "Zettlab Official"
+            / "kingdee-k3cloud"
+        )
+        profile_skill.mkdir(parents=True)
+        _make_skill(process_skills, "process-only")
+        (profile_skill / "SKILL.md").write_text(
+            "---\n"
+            "name: kingdee-k3cloud\n"
+            "description: profile SkillHub skill\n"
+            "---\n\n"
+            "# Kingdee\n\nProfile-local instructions.\n",
+            encoding="utf-8",
+        )
+
+        import agent.skill_commands as sc_mod
+
+        monkeypatch.setattr(skills_tool_module, "_DEFAULT_SKILLS_DIR", process_skills)
+        monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", process_skills)
+        monkeypatch.setattr(sc_mod, "_skill_commands", {})
+        monkeypatch.setattr(sc_mod, "_skill_commands_platform", None)
+
+        token = set_hermes_home_override(str(profile_home))
+        try:
+            result = scan_skill_commands()
+            message = build_skill_invocation_message("/kingdee-k3cloud")
+        finally:
+            reset_hermes_home_override(token)
+
+        assert "/kingdee-k3cloud" in result
+        assert "/process-only" not in result
+        assert message is not None
+        assert "Profile-local instructions" in message
 
     def test_empty_dir(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
@@ -202,6 +248,123 @@ class TestScanSkillCommands:
 
             assert "/telegram-only" not in telegram_again
             assert "/discord-only" in telegram_again
+
+    def test_get_skill_commands_rescans_when_active_profile_skills_dir_changes(
+        self, tmp_path, monkeypatch
+    ):
+        """Single-process multi-profile gateways must not share slash caches."""
+        import agent.skill_commands as sc_mod
+        from agent.skill_commands import get_skill_commands
+
+        process_skills = tmp_path / "process-home" / "skills"
+        alpha_home = tmp_path / "profiles" / "alpha"
+        beta_home = tmp_path / "profiles" / "beta"
+        process_skills.mkdir(parents=True)
+        _make_skill(process_skills, "process-only")
+        _make_skill(alpha_home / "skills", "alpha-only")
+        _make_skill(beta_home / "skills", "beta-only")
+
+        monkeypatch.setattr(skills_tool_module, "_DEFAULT_SKILLS_DIR", process_skills)
+        monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", process_skills)
+        monkeypatch.setattr(sc_mod, "_skill_commands", {})
+        monkeypatch.setattr(sc_mod, "_skill_commands_platform", None)
+        monkeypatch.setattr(sc_mod, "_skill_commands_skills_dir_key", None)
+
+        alpha_token = set_hermes_home_override(str(alpha_home))
+        try:
+            alpha_commands = dict(get_skill_commands())
+        finally:
+            reset_hermes_home_override(alpha_token)
+
+        beta_token = set_hermes_home_override(str(beta_home))
+        try:
+            beta_commands = dict(get_skill_commands())
+            beta_message = build_skill_invocation_message("/beta-only")
+        finally:
+            reset_hermes_home_override(beta_token)
+
+        assert "/alpha-only" in alpha_commands
+        assert "/beta-only" not in alpha_commands
+        assert "/beta-only" in beta_commands
+        assert "/alpha-only" not in beta_commands
+        assert beta_message is not None
+        assert "# beta-only" in beta_message
+
+    def test_concurrent_profile_scans_do_not_share_mutable_command_map(
+        self, tmp_path, monkeypatch
+    ):
+        """Concurrent profile scans must publish separate scoped command maps."""
+        import agent.skill_commands as sc_mod
+        import agent.skill_utils as skill_utils
+        from agent.skill_commands import get_skill_commands
+
+        process_skills = tmp_path / "process-home" / "skills"
+        alpha_home = tmp_path / "profiles" / "alpha"
+        beta_home = tmp_path / "profiles" / "beta"
+        alpha_skills = alpha_home / "skills"
+        beta_skills = beta_home / "skills"
+        process_skills.mkdir(parents=True)
+        _make_skill(alpha_skills, "alpha-only")
+        _make_skill(beta_skills, "beta-only")
+
+        monkeypatch.setattr(skills_tool_module, "_DEFAULT_SKILLS_DIR", process_skills)
+        monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", process_skills)
+        monkeypatch.setattr(sc_mod, "_skill_commands", {})
+        monkeypatch.setattr(sc_mod, "_skill_commands_platform", None)
+        monkeypatch.setattr(sc_mod, "_skill_commands_skills_dir_key", None)
+        monkeypatch.setattr(sc_mod, "_skill_commands_cache", {})
+
+        real_iter = skill_utils.iter_skill_index_files
+        alpha_yielded = threading.Event()
+        beta_done = threading.Event()
+
+        def interleaved_iter_skill_index_files(scan_dir, filename):
+            scan_path = Path(scan_dir)
+            if scan_path == alpha_skills:
+                for item in real_iter(scan_dir, filename):
+                    yield item
+                    alpha_yielded.set()
+                    assert beta_done.wait(5)
+                return
+            if scan_path == beta_skills:
+                assert alpha_yielded.wait(5)
+                for item in real_iter(scan_dir, filename):
+                    yield item
+                beta_done.set()
+                return
+            yield from real_iter(scan_dir, filename)
+
+        monkeypatch.setattr(
+            skill_utils,
+            "iter_skill_index_files",
+            interleaved_iter_skill_index_files,
+        )
+
+        results = {}
+        errors = []
+
+        def run_for_profile(name, home):
+            token = set_hermes_home_override(str(home))
+            try:
+                results[name] = dict(get_skill_commands())
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                reset_hermes_home_override(token)
+
+        alpha_thread = threading.Thread(target=run_for_profile, args=("alpha", alpha_home))
+        beta_thread = threading.Thread(target=run_for_profile, args=("beta", beta_home))
+        alpha_thread.start()
+        assert alpha_yielded.wait(5)
+        beta_thread.start()
+        alpha_thread.join(5)
+        beta_thread.join(5)
+
+        assert not alpha_thread.is_alive()
+        assert not beta_thread.is_alive()
+        assert errors == []
+        assert set(results["alpha"]) == {"/alpha-only"}
+        assert set(results["beta"]) == {"/beta-only"}
 
     def test_get_skill_commands_rescans_when_session_platform_changes(self, tmp_path):
         """``HERMES_SESSION_PLATFORM`` from the gateway session context must
