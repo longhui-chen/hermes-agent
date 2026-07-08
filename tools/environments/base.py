@@ -460,6 +460,23 @@ class BaseEnvironment(ABC):
             return f"$HOME/{shlex.quote(cwd[2:])}"
         return shlex.quote(cwd)
 
+    def _after_snapshot_source_script(self) -> list[str]:
+        """Shell lines to run after sourcing the persisted snapshot.
+
+        Backends can use this to override values from a shared snapshot before
+        the user command runs. The default is intentionally empty.
+        """
+        return []
+
+    def _before_snapshot_dump_script(self) -> list[str]:
+        """Shell lines to run after the user command but before export -p.
+
+        Backends can use this to remove non-persistent, per-call values before
+        the environment is written back into the session snapshot. The default
+        is intentionally empty.
+        """
+        return []
+
     def _wrap_command(self, command: str, cwd: str) -> str:
         """Build the full bash script that sources snapshot, cd's, runs command,
         re-dumps env vars, and emits CWD markers."""
@@ -492,6 +509,7 @@ class BaseEnvironment(ABC):
             parts.append(
                 f"source {_quoted_snap} >/dev/null 2>&1 || true"
             )
+        parts.extend(self._after_snapshot_source_script())
 
         # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
         # ``$HOME`` so suffixes with spaces remain a single shell word.
@@ -502,6 +520,7 @@ class BaseEnvironment(ABC):
         # Run the actual command
         parts.append(f"eval '{escaped}'")
         parts.append("__hermes_ec=$?")
+        parts.extend(self._before_snapshot_dump_script())
 
         # Re-dump env vars to snapshot (atomic replacement to avoid races).
         # Chain mv on the export succeeding so a failed/partial dump never

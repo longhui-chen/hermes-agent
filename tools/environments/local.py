@@ -4,6 +4,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -352,6 +353,11 @@ def _apply_profile_secret_scope_env(env: dict, *, inject: bool) -> None:
     bearer access; they only scrub stale globals/snapshots so profile A cannot
     leak into profile B.
     """
+    if not inject:
+        for key in _PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
+            env.pop(key, None)
+        return
+
     try:
         from agent.secret_scope import current_secret_scope, is_multiplex_active
     except Exception:
@@ -366,6 +372,44 @@ def _apply_profile_secret_scope_env(env: dict, *, inject: bool) -> None:
             env[key] = str(scope[key])
         else:
             env.pop(key, None)
+
+
+def _is_multiplex_secret_scope_active() -> bool:
+    try:
+        from agent.secret_scope import is_multiplex_active
+        return is_multiplex_active()
+    except Exception:
+        return False
+
+
+def _profile_secret_scope_shell_script(*, inject: bool) -> list[str]:
+    """Return shell lines for per-call connector runtime env handling.
+
+    The LocalEnvironment snapshot is shared by terminal sessions and is sourced
+    before every command. Connector runtime env is profile-scoped, so it must
+    not live in that shared snapshot or in the Popen env. Instead, foreground
+    terminal commands in multiplex mode get the current profile's values after
+    the snapshot is sourced, and every run unsets them before the snapshot is
+    written back.
+    """
+    if not _is_multiplex_secret_scope_active():
+        return []
+
+    scope = None
+    if inject:
+        try:
+            from agent.secret_scope import current_secret_scope
+            scope = current_secret_scope()
+        except Exception:
+            scope = None
+
+    lines: list[str] = []
+    for key in sorted(_PROFILE_SCOPED_SUBPROCESS_ENV_KEYS):
+        if inject and scope is not None and key in scope:
+            lines.append(f"export {key}={shlex.quote(str(scope[key]))}")
+        else:
+            lines.append(f"unset {key}")
+    return lines
 
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
@@ -827,7 +871,12 @@ def _make_run_env(env: dict) -> dict:
     # cross-session leak guard — strips _UNSET vars when a concurrent host is
     # engaged so a sibling session's os.environ mirror can't leak in).
     _inject_session_context_env(run_env)
-    _apply_profile_secret_scope_env(run_env, inject=True)
+    if _is_multiplex_secret_scope_active():
+        # Do not put connector bearer into Popen env: BaseEnvironment sources a
+        # shared terminal snapshot before each command and later writes env back
+        # to it. LocalEnvironment injects the active profile's connector env via
+        # shell hook after source, then unsets it before snapshot persistence.
+        _apply_profile_secret_scope_env(run_env, inject=False)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)
@@ -931,6 +980,12 @@ class LocalEnvironment(BaseEnvironment):
             cwd = os.path.expanduser(cwd)
         super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
         self.init_session()
+
+    def _after_snapshot_source_script(self) -> list[str]:
+        return _profile_secret_scope_shell_script(inject=True)
+
+    def _before_snapshot_dump_script(self) -> list[str]:
+        return _profile_secret_scope_shell_script(inject=False)
 
     def get_temp_dir(self) -> str:
         """Return a shell-safe writable temp dir for local execution.
