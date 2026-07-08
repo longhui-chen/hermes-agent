@@ -1,6 +1,8 @@
 import json
+import os
 import sys
 import textwrap
+from io import StringIO
 
 from tools import terminal_tool as terminal_tool_module
 
@@ -29,6 +31,37 @@ def _write_connector_runtime_with_import(tmp_path):
 
         print("connector token ok: " + str(os.environ.get("ZETTLAB_CONNECTORS_AUTH_TOKEN") == "runner-token"))
         print("dependency=" + shadowed_dependency.VALUE)
+        """
+    ).lstrip())
+    return script
+
+
+def _write_connector_runtime_with_global_mutation(tmp_path):
+    script = tmp_path / "presets" / "skills" / "linear" / "scripts" / "connector_runtime.py"
+    script.parent.mkdir(parents=True)
+    script.write_text(textwrap.dedent(
+        """
+        import os
+        import sys
+
+        os.environ["PARENT_SHOULD_NOT_SEE"] = os.environ.get("ZETTLAB_CONNECTORS_AUTH_TOKEN", "")
+        sys.path[:] = ["connector-only-path"]
+        os.chdir("/")
+        print("worker token ok: " + str(os.environ.get("ZETTLAB_CONNECTORS_AUTH_TOKEN") == "runner-token"))
+        """
+    ).lstrip())
+    return script
+
+
+def _write_connector_runtime_sleep(tmp_path):
+    script = tmp_path / "presets" / "skills" / "linear" / "scripts" / "connector_runtime.py"
+    script.parent.mkdir(parents=True)
+    script.write_text(textwrap.dedent(
+        """
+        import time
+
+        time.sleep(30)
+        print("should not finish")
         """
     ).lstrip())
     return script
@@ -87,6 +120,61 @@ def test_connector_runtime_direct_runner_does_not_spawn_token_child(monkeypatch,
     assert result["connector_runtime_direct"] is True
     assert result["exit_code"] == 0
     assert "connector token ok: True" in result["output"]
+
+
+def test_connector_runtime_direct_runner_preserves_parent_process_globals(monkeypatch, tmp_path):
+    """Worker env/path/cwd/stdout mutations cannot bleed into the gateway process."""
+    _write_connector_runtime_with_global_mutation(tmp_path)
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "runner-token")
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root: True,
+    )
+    original_cwd = os.getcwd()
+    original_path = list(sys.path)
+    original_stdout = sys.stdout
+    sys.stdout = StringIO()
+    try:
+        result = json.loads(terminal_tool_module._run_connector_runtime_command_if_allowed(
+            'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py"',
+            cwd=str(tmp_path),
+            timeout=5,
+        ))
+    finally:
+        captured_parent_stdout = sys.stdout.getvalue()
+        sys.stdout = original_stdout
+
+    assert result["connector_runtime_direct"] is True
+    assert result["exit_code"] == 0
+    assert "worker token ok: True" in result["output"]
+    assert "PARENT_SHOULD_NOT_SEE" not in os.environ
+    assert os.getcwd() == original_cwd
+    assert sys.path == original_path
+    assert captured_parent_stdout == ""
+
+
+def test_connector_runtime_direct_runner_timeout_restores_control(monkeypatch, tmp_path):
+    _write_connector_runtime_sleep(tmp_path)
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "runner-token")
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root: True,
+    )
+
+    result = json.loads(terminal_tool_module._run_connector_runtime_command_if_allowed(
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py"',
+        cwd=str(tmp_path),
+        timeout=1,
+    ))
+
+    assert result["connector_runtime_direct"] is True
+    assert result["exit_code"] == 124
+    assert "timed out" in result["error"]
+    assert "should not finish" not in result["output"]
 
 
 def test_connector_runtime_direct_runner_isolates_pythonpath(monkeypatch, tmp_path):

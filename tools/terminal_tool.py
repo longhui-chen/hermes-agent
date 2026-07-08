@@ -34,6 +34,7 @@ Usage:
 import importlib.util
 import json
 import logging
+import multiprocessing
 import os
 import platform
 import re
@@ -47,6 +48,7 @@ import traceback
 import atexit
 import shutil
 import subprocess
+import queue as queue_module
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -963,7 +965,6 @@ import sys
 
 _CONNECTOR_RUNTIME_SCRIPT = "connector_runtime.py"
 _CONNECTOR_RUNTIME_SHELL_PUNCTUATION = set(";&|<>")
-_CONNECTOR_RUNTIME_EXEC_LOCK = threading.RLock()
 _CONNECTOR_RUNTIME_TRUST_CUTOFF = time.time()
 
 
@@ -1183,6 +1184,113 @@ def _connector_runtime_isolated_sys_path(*, script: Path, cwd: Path) -> list[str
     return allowed
 
 
+def _connector_runtime_max_output_chars() -> int:
+    try:
+        from tools.tool_output_limits import get_max_bytes
+
+        return get_max_bytes()
+    except Exception:
+        return 20000
+
+
+def _truncate_connector_runtime_output(output: str, max_output_chars: int) -> str:
+    if len(output) <= max_output_chars:
+        return output
+    head_chars = int(max_output_chars * 0.4)
+    tail_chars = max_output_chars - head_chars
+    omitted = len(output) - head_chars - tail_chars
+    return (
+        output[:head_chars]
+        + f"\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted "
+        + f"out of {len(output)} total] ...\n\n"
+        + output[-tail_chars:]
+    )
+
+
+def _connector_runtime_worker_main(
+    result_queue,
+    argv: list[str],
+    connector_env: dict[str, str],
+    isolated_path: list[str],
+    run_cwd: str,
+    max_output_chars: int,
+) -> None:
+    """Run connector_runtime.py in a forked worker with process-local globals."""
+    stdout = StringIO()
+    returncode = 0
+    try:
+        os.environ.clear()
+        os.environ.update(connector_env)
+        os.environ.pop("PYTHONPATH", None)
+        sys.argv = [argv[1], *[str(arg) for arg in argv[2:]]]
+        sys.path = list(isolated_path)
+        os.chdir(run_cwd)
+        try:
+            with redirect_stdout(stdout), redirect_stderr(stdout):
+                runpy.run_path(argv[1], run_name="__main__")
+        except SystemExit as e:
+            code = e.code
+            if isinstance(code, int):
+                returncode = code
+            elif code is None:
+                returncode = 0
+            else:
+                returncode = 1
+                print(code, file=stdout)
+        except Exception:
+            returncode = 1
+            traceback.print_exc(file=stdout)
+        result_queue.put({
+            "output": _truncate_connector_runtime_output(stdout.getvalue(), max_output_chars),
+            "returncode": returncode,
+        })
+    except BaseException:
+        fallback = StringIO()
+        traceback.print_exc(file=fallback)
+        result_queue.put({
+            "output": _truncate_connector_runtime_output(fallback.getvalue(), max_output_chars),
+            "returncode": 1,
+        })
+
+
+def _run_connector_runtime_worker(
+    *,
+    argv: list[str],
+    connector_env: dict[str, str],
+    isolated_path: list[str],
+    run_cwd: str,
+    timeout: int,
+    max_output_chars: int,
+) -> tuple[str, int, bool]:
+    if "fork" not in multiprocessing.get_all_start_methods():
+        raise RuntimeError("connector runtime direct runner requires fork isolation")
+    ctx = multiprocessing.get_context("fork")
+    result_queue = ctx.Queue(maxsize=1)
+    worker = ctx.Process(
+        target=_connector_runtime_worker_main,
+        args=(result_queue, argv, connector_env, isolated_path, run_cwd, max_output_chars),
+    )
+    worker.daemon = True
+    worker.start()
+    worker.join(max(1, int(timeout or 1)))
+    if worker.is_alive():
+        worker.terminate()
+        worker.join(1)
+        if worker.is_alive() and hasattr(worker, "kill"):
+            worker.kill()
+            worker.join(1)
+        return "", 124, True
+    try:
+        result = result_queue.get_nowait()
+    except queue_module.Empty:
+        return "", int(worker.exitcode or 1), False
+    return (
+        str(result.get("output") or ""),
+        int(result.get("returncode") or 0),
+        False,
+    )
+
+
 def _run_connector_runtime_command_if_allowed(
     command: str,
     *,
@@ -1194,12 +1302,6 @@ def _run_connector_runtime_command_if_allowed(
         return None
 
     secret_values: list[str] = []
-    original_environ = os.environ.copy()
-    original_argv = list(sys.argv)
-    original_path = list(sys.path)
-    original_cwd = os.getcwd()
-    stdout = StringIO()
-    returncode = 0
     try:
         from tools.environments.local import build_connector_runtime_env
 
@@ -1208,38 +1310,25 @@ def _run_connector_runtime_command_if_allowed(
             connector_env.get("ZETTLAB_CONNECTORS_AUTH_TOKEN", ""),
             connector_env.get("ZETTLAB_CONNECTORS_URL", ""),
         ]
-        run_cwd = cwd if cwd and os.path.isdir(cwd) else original_cwd
+        run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
         isolated_path = _connector_runtime_isolated_sys_path(
             script=Path(argv[1]),
             cwd=Path(run_cwd),
         )
-        with _CONNECTOR_RUNTIME_EXEC_LOCK:
-            os.environ.clear()
-            os.environ.update(connector_env)
-            os.environ.pop("PYTHONPATH", None)
-            sys.argv = [argv[1], *[str(arg) for arg in argv[2:]]]
-            sys.path = isolated_path
-            os.chdir(run_cwd)
-            try:
-                with redirect_stdout(stdout), redirect_stderr(stdout):
-                    runpy.run_path(argv[1], run_name="__main__")
-            except SystemExit as e:
-                code = e.code
-                if isinstance(code, int):
-                    returncode = code
-                elif code is None:
-                    returncode = 0
-                else:
-                    returncode = 1
-                    print(code, file=stdout)
-            except Exception:
-                returncode = 1
-                traceback.print_exc(file=stdout)
+        output, returncode, timed_out = _run_connector_runtime_worker(
+            argv=argv,
+            connector_env=connector_env,
+            isolated_path=isolated_path,
+            run_cwd=run_cwd,
+            timeout=timeout,
+            max_output_chars=_connector_runtime_max_output_chars(),
+        )
         return _connector_runtime_result_json(
             command=command,
-            output=stdout.getvalue(),
+            output=output,
             returncode=returncode,
             secret_values=secret_values,
+            timed_out=timed_out,
         )
     except Exception as e:
         return json.dumps({
@@ -1248,16 +1337,6 @@ def _run_connector_runtime_command_if_allowed(
             "error": f"Connector runtime execution failed: {type(e).__name__}: {e}",
             "connector_runtime_direct": True,
         }, ensure_ascii=False)
-    finally:
-        with _CONNECTOR_RUNTIME_EXEC_LOCK:
-            os.environ.clear()
-            os.environ.update(original_environ)
-            sys.argv = original_argv
-            sys.path = original_path
-            try:
-                os.chdir(original_cwd)
-            except OSError:
-                pass
 
 
 # Tool description for LLM
