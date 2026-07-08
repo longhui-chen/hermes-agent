@@ -1144,17 +1144,18 @@ def _connector_runtime_result_json(
 
 def _connector_runtime_isolated_sys_path(*, script: Path, cwd: Path) -> list[str]:
     """Build a Python import path that excludes model-writable command context."""
-    blocked: set[Path] = set()
+    blocked_exact: set[Path] = set()
+    blocked_roots: set[Path] = set()
     for raw in ("", ".", str(cwd), os.getcwd()):
         try:
-            blocked.add(Path(raw or ".").resolve())
+            blocked_exact.add(Path(raw or ".").resolve())
         except OSError:
             pass
     for raw in os.environ.get("PYTHONPATH", "").split(os.pathsep):
         if not raw:
             continue
         try:
-            blocked.add(Path(raw).resolve())
+            blocked_roots.add(Path(raw).resolve())
         except OSError:
             pass
 
@@ -1173,9 +1174,9 @@ def _connector_runtime_isolated_sys_path(*, script: Path, cwd: Path) -> list[str
             resolved = Path(raw).resolve()
         except OSError:
             continue
-        if resolved in blocked:
+        if resolved in blocked_exact:
             continue
-        if cwd in (resolved, *resolved.parents):
+        if any(resolved == root or root in resolved.parents for root in blocked_roots):
             continue
         text = str(resolved)
         if text not in seen:
@@ -1207,6 +1208,13 @@ def _truncate_connector_runtime_output(output: str, max_output_chars: int) -> st
     )
 
 
+def _redact_exact_connector_runtime_secrets(output: str, secret_values: list[str]) -> str:
+    for secret in secret_values:
+        if secret:
+            output = output.replace(secret, "[REDACTED]")
+    return output
+
+
 def _connector_runtime_worker_main(
     result_queue,
     argv: list[str],
@@ -1214,6 +1222,7 @@ def _connector_runtime_worker_main(
     isolated_path: list[str],
     run_cwd: str,
     max_output_chars: int,
+    secret_values: list[str],
 ) -> None:
     """Run connector_runtime.py in a forked worker with process-local globals."""
     stdout = StringIO()
@@ -1240,15 +1249,23 @@ def _connector_runtime_worker_main(
         except Exception:
             returncode = 1
             traceback.print_exc(file=stdout)
+        output = _redact_exact_connector_runtime_secrets(
+            stdout.getvalue(),
+            secret_values,
+        )
         result_queue.put({
-            "output": _truncate_connector_runtime_output(stdout.getvalue(), max_output_chars),
+            "output": _truncate_connector_runtime_output(output, max_output_chars),
             "returncode": returncode,
         })
     except BaseException:
         fallback = StringIO()
         traceback.print_exc(file=fallback)
+        output = _redact_exact_connector_runtime_secrets(
+            fallback.getvalue(),
+            secret_values,
+        )
         result_queue.put({
-            "output": _truncate_connector_runtime_output(fallback.getvalue(), max_output_chars),
+            "output": _truncate_connector_runtime_output(output, max_output_chars),
             "returncode": 1,
         })
 
@@ -1261,14 +1278,30 @@ def _run_connector_runtime_worker(
     run_cwd: str,
     timeout: int,
     max_output_chars: int,
+    secret_values: list[str],
 ) -> tuple[str, int, bool]:
-    if "fork" not in multiprocessing.get_all_start_methods():
-        raise RuntimeError("connector runtime direct runner requires fork isolation")
-    ctx = multiprocessing.get_context("fork")
+    methods = multiprocessing.get_all_start_methods()
+    start_method = (
+        "fork" if "fork" in methods
+        else "spawn" if "spawn" in methods
+        else "forkserver" if "forkserver" in methods
+        else None
+    )
+    if start_method is None:
+        raise RuntimeError("connector runtime direct runner requires multiprocessing isolation")
+    ctx = multiprocessing.get_context(start_method)
     result_queue = ctx.Queue(maxsize=1)
     worker = ctx.Process(
         target=_connector_runtime_worker_main,
-        args=(result_queue, argv, connector_env, isolated_path, run_cwd, max_output_chars),
+        args=(
+            result_queue,
+            argv,
+            connector_env,
+            isolated_path,
+            run_cwd,
+            max_output_chars,
+            secret_values,
+        ),
     )
     worker.daemon = True
     worker.start()
@@ -1322,6 +1355,7 @@ def _run_connector_runtime_command_if_allowed(
             run_cwd=run_cwd,
             timeout=timeout,
             max_output_chars=_connector_runtime_max_output_chars(),
+            secret_values=secret_values,
         )
         return _connector_runtime_result_json(
             command=command,

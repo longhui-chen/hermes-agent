@@ -1,5 +1,6 @@
 import json
 import os
+import queue
 import sys
 import textwrap
 from io import StringIO
@@ -177,6 +178,23 @@ def test_connector_runtime_direct_runner_timeout_restores_control(monkeypatch, t
     assert "should not finish" not in result["output"]
 
 
+def test_connector_runtime_isolated_sys_path_preserves_venv_under_root(monkeypatch):
+    fake_site_packages = "/root/.hermes/hermes-agent/venv/lib/python3.11/site-packages"
+    monkeypatch.setattr(
+        terminal_tool_module.sys,
+        "path",
+        ["/root", fake_site_packages, ""],
+    )
+
+    isolated = terminal_tool_module._connector_runtime_isolated_sys_path(
+        script=terminal_tool_module.Path("/presets/skills/linear/scripts/connector_runtime.py"),
+        cwd=terminal_tool_module.Path("/root"),
+    )
+
+    assert "/root" not in isolated
+    assert fake_site_packages in isolated
+
+
 def test_connector_runtime_direct_runner_isolates_pythonpath(monkeypatch, tmp_path):
     """A model-writable cwd/PYTHONPATH module cannot run after token injection."""
     safe_dep = tmp_path / "safe"
@@ -209,6 +227,114 @@ def test_connector_runtime_direct_runner_isolates_pythonpath(monkeypatch, tmp_pa
     assert result["exit_code"] == 0
     assert "dependency=safe" in result["output"]
     assert "runner-token" not in result["output"]
+
+
+def test_connector_runtime_direct_runner_redacts_before_truncating(monkeypatch, tmp_path):
+    secret = "SECRET-" + ("x" * 64) + "-END"
+    script = tmp_path / "presets" / "skills" / "linear" / "scripts" / "connector_runtime.py"
+    script.parent.mkdir(parents=True)
+    script.write_text(textwrap.dedent(
+        f"""
+        import os
+
+        print("prefix-" + os.environ["ZETTLAB_CONNECTORS_AUTH_TOKEN"] + "-suffix")
+        """
+    ).lstrip())
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", secret)
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root: True,
+    )
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_max_output_chars",
+        lambda: 45,
+    )
+
+    result = json.loads(terminal_tool_module._run_connector_runtime_command_if_allowed(
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py"',
+        cwd=str(tmp_path),
+        timeout=5,
+    ))
+
+    assert result["connector_runtime_direct"] is True
+    assert result["exit_code"] == 0
+    assert "SECRET-" not in result["output"]
+    assert "-END" not in result["output"]
+    assert "xxxxxxxx" not in result["output"]
+
+
+def test_connector_runtime_worker_uses_spawn_when_fork_unavailable(monkeypatch):
+    used = {}
+
+    class FakeQueue:
+        def __init__(self, maxsize=0):
+            self.items = []
+
+        def put(self, item):
+            self.items.append(item)
+
+        def get_nowait(self):
+            if not self.items:
+                raise queue.Empty
+            return self.items.pop(0)
+
+    class FakeProcess:
+        def __init__(self, target, args):
+            self.target = target
+            self.args = args
+            self.daemon = False
+            self.exitcode = 0
+
+        def start(self):
+            result_queue = self.args[0]
+            result_queue.put({"output": "ok", "returncode": 0})
+
+        def join(self, timeout=None):
+            return None
+
+        def is_alive(self):
+            return False
+
+    class FakeContext:
+        def Queue(self, maxsize=0):
+            return FakeQueue(maxsize=maxsize)
+
+        def Process(self, target, args):
+            return FakeProcess(target, args)
+
+    monkeypatch.setattr(
+        terminal_tool_module.multiprocessing,
+        "get_all_start_methods",
+        lambda: ["spawn"],
+    )
+
+    def fake_get_context(method):
+        used["method"] = method
+        return FakeContext()
+
+    monkeypatch.setattr(
+        terminal_tool_module.multiprocessing,
+        "get_context",
+        fake_get_context,
+    )
+
+    output, returncode, timed_out = terminal_tool_module._run_connector_runtime_worker(
+        argv=["python3", "/presets/skills/linear/scripts/connector_runtime.py"],
+        connector_env={},
+        isolated_path=[],
+        run_cwd="/",
+        timeout=5,
+        max_output_chars=100,
+        secret_values=[],
+    )
+
+    assert used["method"] == "spawn"
+    assert output == "ok"
+    assert returncode == 0
+    assert timed_out is False
 
 
 def test_compound_connector_runtime_command_does_not_receive_token(monkeypatch, tmp_path):
