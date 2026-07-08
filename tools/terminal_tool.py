@@ -34,16 +34,23 @@ Usage:
 import importlib.util
 import json
 import logging
+import multiprocessing
 import os
 import platform
 import re
+import runpy
 import shlex
 import stat
+import sysconfig
 import time
 import threading
+import traceback
 import atexit
 import shutil
 import subprocess
+import queue as queue_module
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -958,22 +965,7 @@ import sys
 
 _CONNECTOR_RUNTIME_SCRIPT = "connector_runtime.py"
 _CONNECTOR_RUNTIME_SHELL_PUNCTUATION = set(";&|<>")
-_CONNECTOR_RUNTIME_STDIN_WRAPPER = r"""
-import json
-import os
-import runpy
-import sys
-
-payload = json.loads(sys.stdin.read() or "{}")
-env = payload.get("env") or {}
-script = payload["script"]
-argv = payload.get("argv") or [script]
-for key, value in env.items():
-    if value is not None:
-        os.environ[str(key)] = str(value)
-sys.argv = [script, *[str(arg) for arg in argv[1:]]]
-runpy.run_path(script, run_name="__main__")
-"""
+_CONNECTOR_RUNTIME_TRUST_CUTOFF = time.time()
 
 
 def _is_python_executable_token(token: str) -> bool:
@@ -992,10 +984,16 @@ def _path_writable_by_current_user(path: Path) -> bool:
     euid = os.geteuid() if hasattr(os, "geteuid") else None
     mode = stat.S_IMODE(st.st_mode)
     if euid == 0:
-        # Packaged zpk services currently run as root. Treat root-owned, non
-        # group/world-writable components as trusted so official presets still
-        # work, while rejecting paths another account can swap underneath us.
-        return st.st_uid != 0 or bool(mode & (stat.S_IWGRP | stat.S_IWOTH))
+        # A root-running terminal can rewrite root-owned files even when mode
+        # bits look read-only. Trust only the packaged tree that was already in
+        # place before this module was loaded; anything changed afterward may
+        # have been swapped by a model-controlled root terminal.
+        return (
+            st.st_uid != 0
+            or bool(mode & (stat.S_IWGRP | stat.S_IWOTH))
+            or st.st_mtime > _CONNECTOR_RUNTIME_TRUST_CUTOFF
+            or st.st_ctime > _CONNECTOR_RUNTIME_TRUST_CUTOFF
+        )
     if euid is not None and st.st_uid == euid:
         return True
     try:
@@ -1144,6 +1142,188 @@ def _connector_runtime_result_json(
     }, ensure_ascii=False)
 
 
+def _connector_runtime_isolated_sys_path(*, script: Path, cwd: Path) -> list[str]:
+    """Build a Python import path that excludes model-writable command context."""
+    blocked_exact: set[Path] = set()
+    blocked_roots: set[Path] = set()
+    for raw in ("", ".", str(cwd), os.getcwd()):
+        try:
+            blocked_exact.add(Path(raw or ".").resolve())
+        except OSError:
+            pass
+    for raw in os.environ.get("PYTHONPATH", "").split(os.pathsep):
+        if not raw:
+            continue
+        try:
+            blocked_roots.add(Path(raw).resolve())
+        except OSError:
+            pass
+
+    allowed: list[str] = []
+    candidate_paths = list(sys.path)
+    for key in ("stdlib", "platstdlib", "purelib", "platlib"):
+        value = sysconfig.get_paths().get(key)
+        if value:
+            candidate_paths.append(value)
+
+    seen: set[str] = set()
+    for raw in candidate_paths:
+        if not raw:
+            continue
+        try:
+            resolved = Path(raw).resolve()
+        except OSError:
+            continue
+        if resolved in blocked_exact:
+            continue
+        if any(resolved == root or root in resolved.parents for root in blocked_roots):
+            continue
+        text = str(resolved)
+        if text not in seen:
+            seen.add(text)
+            allowed.append(text)
+    return allowed
+
+
+def _connector_runtime_max_output_chars() -> int:
+    try:
+        from tools.tool_output_limits import get_max_bytes
+
+        return get_max_bytes()
+    except Exception:
+        return 20000
+
+
+def _truncate_connector_runtime_output(output: str, max_output_chars: int) -> str:
+    if len(output) <= max_output_chars:
+        return output
+    head_chars = int(max_output_chars * 0.4)
+    tail_chars = max_output_chars - head_chars
+    omitted = len(output) - head_chars - tail_chars
+    return (
+        output[:head_chars]
+        + f"\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted "
+        + f"out of {len(output)} total] ...\n\n"
+        + output[-tail_chars:]
+    )
+
+
+def _redact_exact_connector_runtime_secrets(output: str, secret_values: list[str]) -> str:
+    for secret in secret_values:
+        if secret:
+            output = output.replace(secret, "[REDACTED]")
+    return output
+
+
+def _connector_runtime_worker_main(
+    result_queue,
+    argv: list[str],
+    connector_env: dict[str, str],
+    isolated_path: list[str],
+    run_cwd: str,
+    max_output_chars: int,
+    secret_values: list[str],
+) -> None:
+    """Run connector_runtime.py in a forked worker with process-local globals."""
+    stdout = StringIO()
+    returncode = 0
+    try:
+        os.environ.clear()
+        os.environ.update(connector_env)
+        os.environ.pop("PYTHONPATH", None)
+        sys.argv = [argv[1], *[str(arg) for arg in argv[2:]]]
+        sys.path = list(isolated_path)
+        os.chdir(run_cwd)
+        try:
+            with redirect_stdout(stdout), redirect_stderr(stdout):
+                runpy.run_path(argv[1], run_name="__main__")
+        except SystemExit as e:
+            code = e.code
+            if isinstance(code, int):
+                returncode = code
+            elif code is None:
+                returncode = 0
+            else:
+                returncode = 1
+                print(code, file=stdout)
+        except Exception:
+            returncode = 1
+            traceback.print_exc(file=stdout)
+        output = _redact_exact_connector_runtime_secrets(
+            stdout.getvalue(),
+            secret_values,
+        )
+        result_queue.put({
+            "output": _truncate_connector_runtime_output(output, max_output_chars),
+            "returncode": returncode,
+        })
+    except BaseException:
+        fallback = StringIO()
+        traceback.print_exc(file=fallback)
+        output = _redact_exact_connector_runtime_secrets(
+            fallback.getvalue(),
+            secret_values,
+        )
+        result_queue.put({
+            "output": _truncate_connector_runtime_output(output, max_output_chars),
+            "returncode": 1,
+        })
+
+
+def _run_connector_runtime_worker(
+    *,
+    argv: list[str],
+    connector_env: dict[str, str],
+    isolated_path: list[str],
+    run_cwd: str,
+    timeout: int,
+    max_output_chars: int,
+    secret_values: list[str],
+) -> tuple[str, int, bool]:
+    methods = multiprocessing.get_all_start_methods()
+    start_method = (
+        "fork" if "fork" in methods
+        else "spawn" if "spawn" in methods
+        else "forkserver" if "forkserver" in methods
+        else None
+    )
+    if start_method is None:
+        raise RuntimeError("connector runtime direct runner requires multiprocessing isolation")
+    ctx = multiprocessing.get_context(start_method)
+    result_queue = ctx.Queue(maxsize=1)
+    worker = ctx.Process(
+        target=_connector_runtime_worker_main,
+        args=(
+            result_queue,
+            argv,
+            connector_env,
+            isolated_path,
+            run_cwd,
+            max_output_chars,
+            secret_values,
+        ),
+    )
+    worker.daemon = True
+    worker.start()
+    worker.join(max(1, int(timeout or 1)))
+    if worker.is_alive():
+        worker.terminate()
+        worker.join(1)
+        if worker.is_alive() and hasattr(worker, "kill"):
+            worker.kill()
+            worker.join(1)
+        return "", 124, True
+    try:
+        result = result_queue.get_nowait()
+    except queue_module.Empty:
+        return "", int(worker.exitcode or 1), False
+    return (
+        str(result.get("output") or ""),
+        int(result.get("returncode") or 0),
+        False,
+    )
+
+
 def _run_connector_runtime_command_if_allowed(
     command: str,
     *,
@@ -1159,47 +1339,30 @@ def _run_connector_runtime_command_if_allowed(
         from tools.environments.local import build_connector_runtime_env
 
         connector_env = build_connector_runtime_env()
-        from tools.environments.local import _sanitize_subprocess_env
-
-        run_env = _sanitize_subprocess_env(os.environ)
         secret_values = [
             connector_env.get("ZETTLAB_CONNECTORS_AUTH_TOKEN", ""),
             connector_env.get("ZETTLAB_CONNECTORS_URL", ""),
         ]
-        payload = json.dumps({
-            "script": argv[1],
-            "argv": argv[1:],
-            "env": connector_env,
-        })
-        run_cwd = cwd if cwd and os.path.isdir(cwd) else None
-        completed = subprocess.run(
-            [sys.executable, "-c", _CONNECTOR_RUNTIME_STDIN_WRAPPER],
-            cwd=run_cwd,
-            env=run_env,
-            capture_output=True,
-            text=True,
+        run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
+        isolated_path = _connector_runtime_isolated_sys_path(
+            script=Path(argv[1]),
+            cwd=Path(run_cwd),
+        )
+        output, returncode, timed_out = _run_connector_runtime_worker(
+            argv=argv,
+            connector_env=connector_env,
+            isolated_path=isolated_path,
+            run_cwd=run_cwd,
             timeout=timeout,
-            input=payload,
+            max_output_chars=_connector_runtime_max_output_chars(),
+            secret_values=secret_values,
         )
         return _connector_runtime_result_json(
             command=command,
-            output=(completed.stdout or "") + (completed.stderr or ""),
-            returncode=completed.returncode,
+            output=output,
+            returncode=returncode,
             secret_values=secret_values,
-        )
-    except subprocess.TimeoutExpired as e:
-        stdout = e.stdout or ""
-        stderr = e.stderr or ""
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode(errors="replace")
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode(errors="replace")
-        return _connector_runtime_result_json(
-            command=command,
-            output=stdout + stderr,
-            returncode=124,
-            secret_values=secret_values,
-            timed_out=True,
+            timed_out=timed_out,
         )
     except Exception as e:
         return json.dumps({

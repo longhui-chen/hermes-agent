@@ -12,6 +12,7 @@ from unittest.mock import patch, MagicMock
 import pytest
 
 from tools.environments.singularity import (
+    SingularityEnvironment,
     _find_singularity_executable,
     _ensure_singularity_available,
 )
@@ -75,3 +76,41 @@ class TestEnsureSingularityAvailable:
         with patch("shutil.which", return_value=None):
             with pytest.raises(RuntimeError, match="Neither.*apptainer.*nor.*singularity"):
                 _ensure_singularity_available()
+
+
+class TestSingularityConnectorEnvScrub:
+    """Connector profile env must not leak into Apptainer commands."""
+
+    def test_run_bash_uses_cleanenv_and_sanitized_host_env(self, monkeypatch):
+        captured = {}
+        env = SingularityEnvironment.__new__(SingularityEnvironment)
+        env.executable = "apptainer"
+        env.instance_id = "hermes_test"
+        env._instance_started = True
+
+        monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "host-token")
+        monkeypatch.setenv("ZETTLAB_CONNECTORS_URL", "http://127.0.0.1/rpc")
+        monkeypatch.setenv("ZET_AGENT_ID", "agent-1")
+
+        def fake_popen(cmd, stdin_data=None, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs.get("env", {})
+            return MagicMock()
+
+        monkeypatch.setattr("tools.environments.singularity._popen_bash", fake_popen)
+
+        env._run_bash("env", login=True)
+
+        assert "--cleanenv" in captured["cmd"]
+        assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in captured["env"]
+        assert "ZETTLAB_CONNECTORS_URL" not in captured["env"]
+        assert "ZET_AGENT_ID" not in captured["env"]
+
+    def test_snapshot_ephemeral_env_keys_include_connector_runtime(self):
+        env = SingularityEnvironment.__new__(SingularityEnvironment)
+
+        keys = set(env._snapshot_ephemeral_env_keys())
+
+        assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" in keys
+        assert "ZETTLAB_CONNECTORS_URL" in keys
+        assert "ZET_AGENT_ID" in keys
