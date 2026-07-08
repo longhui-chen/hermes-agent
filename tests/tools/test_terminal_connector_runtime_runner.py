@@ -1,6 +1,5 @@
 import json
 import os
-import queue
 import sys
 import textwrap
 from io import StringIO
@@ -95,8 +94,8 @@ def test_connector_runtime_direct_runner_flow_receives_profile_scoped_env(monkey
     assert "connector_agent=agent-1" in result["output"]
 
 
-def test_connector_runtime_direct_runner_does_not_spawn_token_child(monkeypatch, tmp_path):
-    """Connector bearer stays in the controlled runner, not child env/stdin."""
+def test_connector_runtime_direct_runner_keeps_token_out_of_popen_env(monkeypatch, tmp_path):
+    """Connector bearer is delivered over stdin to the allowlisted runner."""
     _write_connector_runtime(tmp_path)
     monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
     monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "runner-token")
@@ -106,9 +105,13 @@ def test_connector_runtime_direct_runner_does_not_spawn_token_child(monkeypatch,
         "_connector_runtime_path_is_trusted",
         lambda path, presets_root: True,
     )
+    captured = {}
 
     def fake_run(argv, **kwargs):
-        raise AssertionError("direct connector runner must not spawn a token child")
+        captured["argv"] = argv
+        captured["env"] = kwargs.get("env", {})
+        captured["input"] = kwargs.get("input", "")
+        return terminal_tool_module.subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
 
     monkeypatch.setattr(terminal_tool_module.subprocess, "run", fake_run)
 
@@ -120,7 +123,11 @@ def test_connector_runtime_direct_runner_does_not_spawn_token_child(monkeypatch,
 
     assert result["connector_runtime_direct"] is True
     assert result["exit_code"] == 0
-    assert "connector token ok: True" in result["output"]
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in captured["env"]
+    assert "ZETTLAB_CONNECTORS_URL" not in captured["env"]
+    assert "runner-token" in captured["input"]
+    assert "http://127.0.0.1/rpc" in captured["input"]
+    assert captured["argv"][:2] == [sys.executable, "-c"]
 
 
 def test_connector_runtime_direct_runner_preserves_parent_process_globals(monkeypatch, tmp_path):
@@ -247,11 +254,9 @@ def test_connector_runtime_direct_runner_redacts_before_truncating(monkeypatch, 
         "_connector_runtime_path_is_trusted",
         lambda path, presets_root: True,
     )
-    monkeypatch.setattr(
-        terminal_tool_module,
-        "_connector_runtime_max_output_chars",
-        lambda: 45,
-    )
+    from tools import tool_output_limits
+
+    monkeypatch.setattr(tool_output_limits, "get_max_bytes", lambda: 45)
 
     result = json.loads(terminal_tool_module._run_connector_runtime_command_if_allowed(
         'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py"',
@@ -264,77 +269,6 @@ def test_connector_runtime_direct_runner_redacts_before_truncating(monkeypatch, 
     assert "SECRET-" not in result["output"]
     assert "-END" not in result["output"]
     assert "xxxxxxxx" not in result["output"]
-
-
-def test_connector_runtime_worker_uses_spawn_when_fork_unavailable(monkeypatch):
-    used = {}
-
-    class FakeQueue:
-        def __init__(self, maxsize=0):
-            self.items = []
-
-        def put(self, item):
-            self.items.append(item)
-
-        def get_nowait(self):
-            if not self.items:
-                raise queue.Empty
-            return self.items.pop(0)
-
-    class FakeProcess:
-        def __init__(self, target, args):
-            self.target = target
-            self.args = args
-            self.daemon = False
-            self.exitcode = 0
-
-        def start(self):
-            result_queue = self.args[0]
-            result_queue.put({"output": "ok", "returncode": 0})
-
-        def join(self, timeout=None):
-            return None
-
-        def is_alive(self):
-            return False
-
-    class FakeContext:
-        def Queue(self, maxsize=0):
-            return FakeQueue(maxsize=maxsize)
-
-        def Process(self, target, args):
-            return FakeProcess(target, args)
-
-    monkeypatch.setattr(
-        terminal_tool_module.multiprocessing,
-        "get_all_start_methods",
-        lambda: ["spawn"],
-    )
-
-    def fake_get_context(method):
-        used["method"] = method
-        return FakeContext()
-
-    monkeypatch.setattr(
-        terminal_tool_module.multiprocessing,
-        "get_context",
-        fake_get_context,
-    )
-
-    output, returncode, timed_out = terminal_tool_module._run_connector_runtime_worker(
-        argv=["python3", "/presets/skills/linear/scripts/connector_runtime.py"],
-        connector_env={},
-        isolated_path=[],
-        run_cwd="/",
-        timeout=5,
-        max_output_chars=100,
-        secret_values=[],
-    )
-
-    assert used["method"] == "spawn"
-    assert output == "ok"
-    assert returncode == 0
-    assert timed_out is False
 
 
 def test_compound_connector_runtime_command_does_not_receive_token(monkeypatch, tmp_path):

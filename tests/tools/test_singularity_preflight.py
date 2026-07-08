@@ -81,6 +81,37 @@ class TestEnsureSingularityAvailable:
 class TestSingularityConnectorEnvScrub:
     """Connector profile env must not leak into Apptainer commands."""
 
+    def test_start_instance_uses_cleanenv_and_sanitized_host_env(self, monkeypatch):
+        captured = {}
+        env = SingularityEnvironment.__new__(SingularityEnvironment)
+        env.executable = "apptainer"
+        env.instance_id = "hermes_test"
+        env.image = "/tmp/hermes.sif"
+        env._persistent = False
+        env._overlay_dir = None
+        env._memory = 0
+        env._cpu = 0
+        env._instance_started = False
+
+        monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "host-token")
+        monkeypatch.setenv("ZETTLAB_CONNECTORS_URL", "http://127.0.0.1/rpc")
+        monkeypatch.setenv("ZET_AGENT_ID", "agent-1")
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs.get("env", {})
+            return MagicMock(returncode=0, stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        env._start_instance()
+
+        assert "--cleanenv" in captured["cmd"]
+        assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in captured["env"]
+        assert "ZETTLAB_CONNECTORS_URL" not in captured["env"]
+        assert "ZET_AGENT_ID" not in captured["env"]
+        assert env._instance_started is True
+
     def test_run_bash_uses_cleanenv_and_sanitized_host_env(self, monkeypatch):
         captured = {}
         env = SingularityEnvironment.__new__(SingularityEnvironment)
