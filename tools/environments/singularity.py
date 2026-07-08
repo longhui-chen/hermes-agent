@@ -15,6 +15,10 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_constants import get_hermes_home
+from tools.environments.local import (
+    PROFILE_SCOPED_SUBPROCESS_ENV_KEYS,
+    _sanitize_subprocess_env,
+)
 from tools.environments.base import (
     BaseEnvironment,
     _load_json_store,
@@ -236,14 +240,25 @@ class SingularityEnvironment(BaseEnvironment):
         if not self._instance_started:
             raise RuntimeError("Singularity instance not started")
 
-        cmd = [self.executable, "exec",
-               f"instance://{self.instance_id}"]
+        cmd = [
+            self.executable,
+            "exec",
+            "--cleanenv",
+            f"instance://{self.instance_id}",
+        ]
         if login:
             cmd.extend(["bash", "-l", "-c", cmd_string])
         else:
             cmd.extend(["bash", "-c", cmd_string])
 
-        return _popen_bash(cmd, stdin_data)
+        return _popen_bash(
+            cmd,
+            stdin_data,
+            env=_sanitize_subprocess_env(os.environ),
+        )
+
+    def _snapshot_ephemeral_env_keys(self) -> tuple[str, ...]:
+        return tuple(sorted(PROFILE_SCOPED_SUBPROCESS_ENV_KEYS))
 
     def cleanup(self):
         """Stop the instance. If persistent, the overlay dir survives."""

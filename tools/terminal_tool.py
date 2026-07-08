@@ -37,13 +37,18 @@ import logging
 import os
 import platform
 import re
+import runpy
 import shlex
 import stat
+import sysconfig
 import time
 import threading
+import traceback
 import atexit
 import shutil
 import subprocess
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -958,22 +963,8 @@ import sys
 
 _CONNECTOR_RUNTIME_SCRIPT = "connector_runtime.py"
 _CONNECTOR_RUNTIME_SHELL_PUNCTUATION = set(";&|<>")
-_CONNECTOR_RUNTIME_STDIN_WRAPPER = r"""
-import json
-import os
-import runpy
-import sys
-
-payload = json.loads(sys.stdin.read() or "{}")
-env = payload.get("env") or {}
-script = payload["script"]
-argv = payload.get("argv") or [script]
-for key, value in env.items():
-    if value is not None:
-        os.environ[str(key)] = str(value)
-sys.argv = [script, *[str(arg) for arg in argv[1:]]]
-runpy.run_path(script, run_name="__main__")
-"""
+_CONNECTOR_RUNTIME_EXEC_LOCK = threading.RLock()
+_CONNECTOR_RUNTIME_TRUST_CUTOFF = time.time()
 
 
 def _is_python_executable_token(token: str) -> bool:
@@ -992,10 +983,16 @@ def _path_writable_by_current_user(path: Path) -> bool:
     euid = os.geteuid() if hasattr(os, "geteuid") else None
     mode = stat.S_IMODE(st.st_mode)
     if euid == 0:
-        # Packaged zpk services currently run as root. Treat root-owned, non
-        # group/world-writable components as trusted so official presets still
-        # work, while rejecting paths another account can swap underneath us.
-        return st.st_uid != 0 or bool(mode & (stat.S_IWGRP | stat.S_IWOTH))
+        # A root-running terminal can rewrite root-owned files even when mode
+        # bits look read-only. Trust only the packaged tree that was already in
+        # place before this module was loaded; anything changed afterward may
+        # have been swapped by a model-controlled root terminal.
+        return (
+            st.st_uid != 0
+            or bool(mode & (stat.S_IWGRP | stat.S_IWOTH))
+            or st.st_mtime > _CONNECTOR_RUNTIME_TRUST_CUTOFF
+            or st.st_ctime > _CONNECTOR_RUNTIME_TRUST_CUTOFF
+        )
     if euid is not None and st.st_uid == euid:
         return True
     try:
@@ -1144,6 +1141,48 @@ def _connector_runtime_result_json(
     }, ensure_ascii=False)
 
 
+def _connector_runtime_isolated_sys_path(*, script: Path, cwd: Path) -> list[str]:
+    """Build a Python import path that excludes model-writable command context."""
+    blocked: set[Path] = set()
+    for raw in ("", ".", str(cwd), os.getcwd()):
+        try:
+            blocked.add(Path(raw or ".").resolve())
+        except OSError:
+            pass
+    for raw in os.environ.get("PYTHONPATH", "").split(os.pathsep):
+        if not raw:
+            continue
+        try:
+            blocked.add(Path(raw).resolve())
+        except OSError:
+            pass
+
+    allowed: list[str] = []
+    candidate_paths = list(sys.path)
+    for key in ("stdlib", "platstdlib", "purelib", "platlib"):
+        value = sysconfig.get_paths().get(key)
+        if value:
+            candidate_paths.append(value)
+
+    seen: set[str] = set()
+    for raw in candidate_paths:
+        if not raw:
+            continue
+        try:
+            resolved = Path(raw).resolve()
+        except OSError:
+            continue
+        if resolved in blocked:
+            continue
+        if cwd in (resolved, *resolved.parents):
+            continue
+        text = str(resolved)
+        if text not in seen:
+            seen.add(text)
+            allowed.append(text)
+    return allowed
+
+
 def _run_connector_runtime_command_if_allowed(
     command: str,
     *,
@@ -1155,51 +1194,52 @@ def _run_connector_runtime_command_if_allowed(
         return None
 
     secret_values: list[str] = []
+    original_environ = os.environ.copy()
+    original_argv = list(sys.argv)
+    original_path = list(sys.path)
+    original_cwd = os.getcwd()
+    stdout = StringIO()
+    returncode = 0
     try:
         from tools.environments.local import build_connector_runtime_env
 
         connector_env = build_connector_runtime_env()
-        from tools.environments.local import _sanitize_subprocess_env
-
-        run_env = _sanitize_subprocess_env(os.environ)
         secret_values = [
             connector_env.get("ZETTLAB_CONNECTORS_AUTH_TOKEN", ""),
             connector_env.get("ZETTLAB_CONNECTORS_URL", ""),
         ]
-        payload = json.dumps({
-            "script": argv[1],
-            "argv": argv[1:],
-            "env": connector_env,
-        })
-        run_cwd = cwd if cwd and os.path.isdir(cwd) else None
-        completed = subprocess.run(
-            [sys.executable, "-c", _CONNECTOR_RUNTIME_STDIN_WRAPPER],
-            cwd=run_cwd,
-            env=run_env,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            input=payload,
+        run_cwd = cwd if cwd and os.path.isdir(cwd) else original_cwd
+        isolated_path = _connector_runtime_isolated_sys_path(
+            script=Path(argv[1]),
+            cwd=Path(run_cwd),
         )
+        with _CONNECTOR_RUNTIME_EXEC_LOCK:
+            os.environ.clear()
+            os.environ.update(connector_env)
+            os.environ.pop("PYTHONPATH", None)
+            sys.argv = [argv[1], *[str(arg) for arg in argv[2:]]]
+            sys.path = isolated_path
+            os.chdir(run_cwd)
+            try:
+                with redirect_stdout(stdout), redirect_stderr(stdout):
+                    runpy.run_path(argv[1], run_name="__main__")
+            except SystemExit as e:
+                code = e.code
+                if isinstance(code, int):
+                    returncode = code
+                elif code is None:
+                    returncode = 0
+                else:
+                    returncode = 1
+                    print(code, file=stdout)
+            except Exception:
+                returncode = 1
+                traceback.print_exc(file=stdout)
         return _connector_runtime_result_json(
             command=command,
-            output=(completed.stdout or "") + (completed.stderr or ""),
-            returncode=completed.returncode,
+            output=stdout.getvalue(),
+            returncode=returncode,
             secret_values=secret_values,
-        )
-    except subprocess.TimeoutExpired as e:
-        stdout = e.stdout or ""
-        stderr = e.stderr or ""
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode(errors="replace")
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode(errors="replace")
-        return _connector_runtime_result_json(
-            command=command,
-            output=stdout + stderr,
-            returncode=124,
-            secret_values=secret_values,
-            timed_out=True,
         )
     except Exception as e:
         return json.dumps({
@@ -1208,6 +1248,16 @@ def _run_connector_runtime_command_if_allowed(
             "error": f"Connector runtime execution failed: {type(e).__name__}: {e}",
             "connector_runtime_direct": True,
         }, ensure_ascii=False)
+    finally:
+        with _CONNECTOR_RUNTIME_EXEC_LOCK:
+            os.environ.clear()
+            os.environ.update(original_environ)
+            sys.argv = original_argv
+            sys.path = original_path
+            try:
+                os.chdir(original_cwd)
+            except OSError:
+                pass
 
 
 # Tool description for LLM
