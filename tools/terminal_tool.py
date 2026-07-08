@@ -37,6 +37,8 @@ import logging
 import os
 import platform
 import re
+import shlex
+import stat
 import time
 import threading
 import atexit
@@ -952,6 +954,260 @@ from tools.environments.modal import ModalEnvironment as _ModalEnvironment
 from tools.environments.managed_modal import ManagedModalEnvironment as _ManagedModalEnvironment
 from tools.managed_tool_gateway import is_managed_tool_gateway_ready
 import sys
+
+
+_CONNECTOR_RUNTIME_SCRIPT = "connector_runtime.py"
+_CONNECTOR_RUNTIME_SHELL_PUNCTUATION = set(";&|<>")
+_CONNECTOR_RUNTIME_STDIN_WRAPPER = r"""
+import json
+import os
+import runpy
+import sys
+
+payload = json.loads(sys.stdin.read() or "{}")
+env = payload.get("env") or {}
+script = payload["script"]
+argv = payload.get("argv") or [script]
+for key, value in env.items():
+    if value is not None:
+        os.environ[str(key)] = str(value)
+sys.argv = [script, *[str(arg) for arg in argv[1:]]]
+runpy.run_path(script, run_name="__main__")
+"""
+
+
+def _is_python_executable_token(token: str) -> bool:
+    name = Path(token).name.lower()
+    return (
+        name in {"python", "python3", "python.exe", "python3.exe"}
+        or re.fullmatch(r"python3\.\d+(?:\.exe)?", name) is not None
+    )
+
+
+def _path_writable_by_current_user(path: Path) -> bool:
+    try:
+        st = path.stat()
+    except OSError:
+        return True
+    euid = os.geteuid() if hasattr(os, "geteuid") else None
+    mode = stat.S_IMODE(st.st_mode)
+    if euid == 0:
+        # Packaged zpk services currently run as root. Treat root-owned, non
+        # group/world-writable components as trusted so official presets still
+        # work, while rejecting paths another account can swap underneath us.
+        return st.st_uid != 0 or bool(mode & (stat.S_IWGRP | stat.S_IWOTH))
+    if euid is not None and st.st_uid == euid:
+        return True
+    try:
+        groups = set(os.getgroups())
+        egid = os.getegid()
+        groups.add(egid)
+    except Exception:
+        groups = set()
+    if st.st_gid in groups and mode & stat.S_IWGRP:
+        return True
+    return bool(mode & stat.S_IWOTH)
+
+
+def _connector_runtime_path_is_trusted(path: Path, presets_root: Path) -> bool:
+    """Return True only for official presets paths the terminal user cannot edit."""
+    try:
+        resolved_path = path.resolve(strict=True)
+        resolved_root = presets_root.resolve(strict=True)
+        relative = resolved_path.relative_to(resolved_root)
+    except (OSError, ValueError):
+        return False
+
+    # Symlinks are resolved above; now check every concrete parent from the
+    # filesystem root through the runner. If the Hermes service user can write
+    # or replace any component, model-controlled terminal commands can swap the
+    # trusted tree before the connector runner starts.
+    root_ancestors = list(resolved_root.parents)
+    current = resolved_root
+    components = [*root_ancestors, resolved_root]
+    for part in relative.parts:
+        current = current / part
+        components.append(current)
+    return not any(_path_writable_by_current_user(component) for component in components)
+
+
+def _resolve_connector_runtime_script(raw_path: str) -> Optional[Path]:
+    presets_dir = os.environ.get("ZETTLAB_PRESETS_DIR", "")
+    if not presets_dir:
+        return None
+    path_text = raw_path
+    for prefix in ("$ZETTLAB_PRESETS_DIR/", "${ZETTLAB_PRESETS_DIR}/"):
+        if raw_path.startswith(prefix):
+            path_text = os.path.join(presets_dir, raw_path[len(prefix):])
+            break
+    else:
+        normalized_raw = raw_path[2:] if raw_path.startswith("./") else raw_path
+        if normalized_raw.startswith("skills/"):
+            path_text = os.path.join(presets_dir, normalized_raw)
+
+    try:
+        presets_root = Path(os.path.expandvars(os.path.expanduser(presets_dir))).resolve()
+        path = Path(os.path.expandvars(os.path.expanduser(path_text))).resolve()
+    except Exception:
+        return None
+
+    try:
+        path.relative_to(presets_root)
+    except ValueError:
+        return None
+
+    parts = path.parts
+    if len(parts) < 4:
+        return None
+    if parts[-1] != _CONNECTOR_RUNTIME_SCRIPT:
+        return None
+    if parts[-2] != "scripts" or parts[-4] != "skills":
+        return None
+    if not path.is_file():
+        return None
+    if not _connector_runtime_path_is_trusted(path, presets_root):
+        return None
+    return path
+
+
+def _parse_connector_runtime_command(command: str) -> Optional[list[str]]:
+    """Return argv for the dedicated connector runner, or None if not exact.
+
+    The allowlist intentionally accepts only a direct Python invocation of a
+    presets skill's scripts/connector_runtime.py. Shell punctuation rejects
+    compound commands such as `connector_runtime.py ... ; env`, so injected
+    connector env can never be observed by a following shell fragment.
+    """
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+
+    if len(tokens) < 2 or not _is_python_executable_token(tokens[0]):
+        return None
+    for token in tokens:
+        if token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION:
+            return None
+
+    script = _resolve_connector_runtime_script(tokens[1])
+    if script is None:
+        return None
+    return [sys.executable, str(script), *tokens[2:]]
+
+
+def _connector_runtime_result_json(
+    *,
+    command: str,
+    output: str,
+    returncode: int,
+    secret_values: list[str] | None = None,
+    timed_out: bool = False,
+) -> str:
+    from tools.ansi_strip import strip_ansi
+    from agent.redact import redact_sensitive_text
+
+    output = strip_ansi(output)
+    for secret in secret_values or []:
+        if secret:
+            output = output.replace(secret, "[REDACTED]")
+    try:
+        from tools.tool_output_limits import get_max_bytes
+
+        max_output_chars = get_max_bytes()
+    except Exception:
+        max_output_chars = 20000
+    if len(output) > max_output_chars:
+        head_chars = int(max_output_chars * 0.4)
+        tail_chars = max_output_chars - head_chars
+        omitted = len(output) - head_chars - tail_chars
+        output = (
+            output[:head_chars]
+            + f"\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted "
+            + f"out of {len(output)} total] ...\n\n"
+            + output[-tail_chars:]
+        )
+    output = redact_sensitive_text(
+        output.strip(),
+        force=True,
+        code_file=False,
+    ) if output else ""
+    return json.dumps({
+        "output": output,
+        "exit_code": 124 if timed_out else returncode,
+        "error": (
+            f"Command timed out while running connector runtime"
+            if timed_out else None
+        ),
+        "connector_runtime_direct": True,
+    }, ensure_ascii=False)
+
+
+def _run_connector_runtime_command_if_allowed(
+    command: str,
+    *,
+    cwd: str,
+    timeout: int,
+) -> Optional[str]:
+    argv = _parse_connector_runtime_command(command)
+    if argv is None:
+        return None
+
+    secret_values: list[str] = []
+    try:
+        from tools.environments.local import build_connector_runtime_env
+
+        connector_env = build_connector_runtime_env()
+        from tools.environments.local import _sanitize_subprocess_env
+
+        run_env = _sanitize_subprocess_env(os.environ)
+        secret_values = [
+            connector_env.get("ZETTLAB_CONNECTORS_AUTH_TOKEN", ""),
+            connector_env.get("ZETTLAB_CONNECTORS_URL", ""),
+        ]
+        payload = json.dumps({
+            "script": argv[1],
+            "argv": argv[1:],
+            "env": connector_env,
+        })
+        run_cwd = cwd if cwd and os.path.isdir(cwd) else None
+        completed = subprocess.run(
+            [sys.executable, "-c", _CONNECTOR_RUNTIME_STDIN_WRAPPER],
+            cwd=run_cwd,
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            input=payload,
+        )
+        return _connector_runtime_result_json(
+            command=command,
+            output=(completed.stdout or "") + (completed.stderr or ""),
+            returncode=completed.returncode,
+            secret_values=secret_values,
+        )
+    except subprocess.TimeoutExpired as e:
+        stdout = e.stdout or ""
+        stderr = e.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        return _connector_runtime_result_json(
+            command=command,
+            output=stdout + stderr,
+            returncode=124,
+            secret_values=secret_values,
+            timed_out=True,
+        )
+    except Exception as e:
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": f"Connector runtime execution failed: {type(e).__name__}: {e}",
+            "connector_runtime_direct": True,
+        }, ensure_ascii=False)
 
 
 # Tool description for LLM
@@ -2119,6 +2375,27 @@ def terminal_tool(
                     "error": guidance,
                     "status": "error",
                 }, ensure_ascii=False)
+
+        if workdir:
+            workdir_error = _validate_workdir(workdir)
+            if workdir_error:
+                logger.warning("Blocked dangerous workdir: %s (command: %s)",
+                               workdir[:200], _safe_command_preview(command))
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": workdir_error,
+                    "status": "blocked"
+                }, ensure_ascii=False)
+
+        if not background and not pty:
+            connector_runtime_result = _run_connector_runtime_command_if_allowed(
+                command,
+                cwd=workdir or cwd,
+                timeout=effective_timeout,
+            )
+            if connector_runtime_result is not None:
+                return connector_runtime_result
 
         # Start cleanup thread
         _start_cleanup_thread()

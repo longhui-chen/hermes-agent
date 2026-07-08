@@ -18,6 +18,7 @@ from typing import Optional
 
 from tools.environments.base import BaseEnvironment, _popen_bash
 from tools.environments.local import (
+    PROFILE_SCOPED_SUBPROCESS_ENV_KEYS,
     _HERMES_PROVIDER_ENV_BLOCKLIST,
     _is_hermes_internal_secret,
 )
@@ -91,6 +92,12 @@ def _normalize_env_dict(env: dict | None) -> dict[str, str]:
         normalized[key] = value
 
     return normalized
+
+
+def _scrub_profile_scoped_env(env: dict[str, str]) -> dict[str, str]:
+    for key in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
+        env.pop(key, None)
+    return env
 
 
 def _load_hermes_env_vars() -> dict[str, str]:
@@ -604,7 +611,7 @@ class DockerEnvironment(BaseEnvironment):
         self._persist_across_processes = persist_across_processes
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
-        self._env = _normalize_env_dict(env)
+        self._env = _scrub_profile_scoped_env(_normalize_env_dict(env))
         self._container_id: Optional[str] = None
         self._labels: dict[str, str] = {}
         self._image: str = ""
@@ -985,8 +992,10 @@ class DockerEnvironment(BaseEnvironment):
         them into the snapshot.  Subsequent execute() calls don't need -e flags.
         """
         exec_env: dict[str, str] = dict(self._env)
+        profile_scoped_keys = set(PROFILE_SCOPED_SUBPROCESS_ENV_KEYS)
+        _scrub_profile_scoped_env(exec_env)
 
-        explicit_forward_keys = set(self._forward_env)
+        explicit_forward_keys = set(self._forward_env) - profile_scoped_keys
         passthrough_keys: set[str] = set()
         try:
             from tools.env_passthrough import get_all_passthrough
@@ -1001,7 +1010,10 @@ class DockerEnvironment(BaseEnvironment):
         _implicit_forward = {
             k for k in passthrough_keys if not _is_hermes_internal_secret(k)
         }
-        forward_keys = explicit_forward_keys | (_implicit_forward - _HERMES_PROVIDER_ENV_BLOCKLIST)
+        forward_keys = (
+            explicit_forward_keys
+            | (_implicit_forward - _HERMES_PROVIDER_ENV_BLOCKLIST)
+        ) - profile_scoped_keys
         hermes_env = _load_hermes_env_vars() if forward_keys else {}
         for key in sorted(forward_keys):
             value = os.getenv(key)
@@ -1014,6 +1026,9 @@ class DockerEnvironment(BaseEnvironment):
         for key in sorted(exec_env):
             args.extend(["-e", f"{key}={exec_env[key]}"])
         return args
+
+    def _snapshot_ephemeral_env_keys(self) -> tuple[str, ...]:
+        return tuple(sorted(PROFILE_SCOPED_SUBPROCESS_ENV_KEYS))
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,

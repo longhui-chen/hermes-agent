@@ -176,6 +176,10 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
         is_windows = _IS_WINDOWS
 
     scrubbed = {}
+    try:
+        from tools.environments.local import PROFILE_SCOPED_SUBPROCESS_ENV_KEYS
+    except Exception:
+        PROFILE_SCOPED_SUBPROCESS_ENV_KEYS = frozenset()
     # Non-secret HERMES_* vars dropped by the tightened allowlist (#27303). The
     # broad "HERMES_" prefix used to pass these through; now only the
     # operational set does. The drop is intentional (those vars can carry
@@ -185,6 +189,8 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     # diagnosable and points at the env_passthrough opt-in escape hatch.
     _dropped_hermes = []
     for k, v in source_env.items():
+        if k in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
+            continue
         if is_passthrough(k):
             scrubbed[k] = v
             continue

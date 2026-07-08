@@ -394,7 +394,11 @@ class BaseEnvironment(ABC):
         # static path is shlex-quoted (Windows/Git-Bash drive letters, spaces)
         # with ``$BASHPID`` left outside the quotes so it still expands.
         _snap_tmp = shlex.quote(self._snapshot_path + ".tmp.") + "$BASHPID"
+        unset_ephemeral = "\n".join(self._unset_snapshot_ephemeral_env_script())
+        if unset_ephemeral:
+            unset_ephemeral += "\n"
         bootstrap = (
+            unset_ephemeral +
             f"export -p > {_snap_tmp}\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
@@ -460,6 +464,17 @@ class BaseEnvironment(ABC):
             return f"$HOME/{shlex.quote(cwd[2:])}"
         return shlex.quote(cwd)
 
+    def _snapshot_ephemeral_env_keys(self) -> tuple[str, ...]:
+        """Env keys that must not survive sourcing or re-dumping snapshots."""
+        return ()
+
+    def _unset_snapshot_ephemeral_env_script(self) -> list[str]:
+        lines = []
+        for key in self._snapshot_ephemeral_env_keys():
+            if key and key.replace("_", "").isalnum() and not key[0].isdigit():
+                lines.append(f"unset {key}")
+        return lines
+
     def _wrap_command(self, command: str, cwd: str) -> str:
         """Build the full bash script that sources snapshot, cd's, runs command,
         re-dumps env vars, and emits CWD markers."""
@@ -492,6 +507,7 @@ class BaseEnvironment(ABC):
             parts.append(
                 f"source {_quoted_snap} >/dev/null 2>&1 || true"
             )
+        parts.extend(self._unset_snapshot_ephemeral_env_script())
 
         # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
         # ``$HOME`` so suffixes with spaces remain a single shell word.
@@ -502,6 +518,7 @@ class BaseEnvironment(ABC):
         # Run the actual command
         parts.append(f"eval '{escaped}'")
         parts.append("__hermes_ec=$?")
+        parts.extend(self._unset_snapshot_ephemeral_env_script())
 
         # Re-dump env vars to snapshot (atomic replacement to avoid races).
         # Chain mv on the export succeeding so a failed/partial dump never

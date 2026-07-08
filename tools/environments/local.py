@@ -330,6 +330,63 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(var_name, None)
 
 
+PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset({
+    # Connector skill runtime routing. These are generated per Zettlab agent
+    # profile by local-server and live in <profile>/.env under the multiplex
+    # gateway, so subprocesses must receive the current profile's scope instead
+    # of whatever os.environ/shell snapshot happened to contain.
+    "ZETTLAB_CONNECTORS_URL",
+    "ZETTLAB_CONNECTORS_AUTH_TOKEN",
+    "ZET_AGENT_ID",
+})
+
+
+def _apply_profile_secret_scope_env(env: dict, *, inject: bool) -> None:
+    """Scrub profile-scoped connector runtime vars from generic subprocess env.
+
+    The multiplex gateway intentionally avoids merging every profile's .env into
+    process-global os.environ. Generic terminal/background/helper subprocesses
+    are not the connector-specific runner, so they must never inherit connector
+    bearer material from globals, extra env, or a shell snapshot. Connector
+    skills that need these values must receive them through a dedicated,
+    allowlisted connector execution path instead of the general terminal path.
+    """
+    for key in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
+        env.pop(key, None)
+
+
+def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
+    """Build env for the dedicated connector_runtime.py runner.
+
+    This is intentionally separate from the generic terminal env. Connector
+    runtime bearer may be supplied to the allowlisted runner subprocess, but it
+    must not be inherited by arbitrary model-authored shell commands.
+    """
+    env = _sanitize_subprocess_env(os.environ, base_env)
+
+    scope = None
+    multiplex_active = False
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+        multiplex_active = is_multiplex_active()
+        scope = current_secret_scope()
+    except Exception:
+        scope = None
+
+    for key in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
+        value = None
+        if scope is not None:
+            value = scope.get(key)
+        elif not multiplex_active:
+            value = os.environ.get(key)
+        if value is not None:
+            env[key] = str(value)
+        else:
+            env.pop(key, None)
+    return env
+
+
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
@@ -366,6 +423,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     # Same cross-session leak guard as _make_run_env, for the background/PTY
     # spawn path (process_registry.spawn_local builds env via this function).
     _inject_session_context_env(sanitized)
+    _apply_profile_secret_scope_env(sanitized, inject=False)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
@@ -489,6 +547,7 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # session's identity. Strip _UNSET session vars when engaged so that can't
     # happen; single uniform policy across every spawn surface.
     _inject_session_context_env(env)
+    _apply_profile_secret_scope_env(env, inject=False)
 
     return env
 
@@ -787,6 +846,10 @@ def _make_run_env(env: dict) -> dict:
     # cross-session leak guard — strips _UNSET vars when a concurrent host is
     # engaged so a sibling session's os.environ mirror can't leak in).
     _inject_session_context_env(run_env)
+    # The generic terminal path is model-controlled shell. Connector bearer
+    # must only flow through a dedicated allowlisted connector runner, not via
+    # Popen env or the shared shell snapshot.
+    _apply_profile_secret_scope_env(run_env, inject=False)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)
@@ -890,6 +953,9 @@ class LocalEnvironment(BaseEnvironment):
             cwd = os.path.expanduser(cwd)
         super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
         self.init_session()
+
+    def _snapshot_ephemeral_env_keys(self) -> tuple[str, ...]:
+        return tuple(sorted(PROFILE_SCOPED_SUBPROCESS_ENV_KEYS))
 
     def get_temp_dir(self) -> str:
         """Return a shell-safe writable temp dir for local execution.
