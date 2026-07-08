@@ -362,6 +362,27 @@ def test_docker_env_appears_in_run_command(monkeypatch):
     assert "GNUPGHOME=/root/.gnupg" in run_args_str
 
 
+def test_docker_env_scrubs_profile_scoped_connector_runtime_at_container_create(monkeypatch):
+    """docker run -e must not receive connector bearer from docker_env."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(env={
+        "ZETTLAB_CONNECTORS_URL": "http://from-docker-env",
+        "ZETTLAB_CONNECTORS_AUTH_TOKEN": "docker-env-token",
+        "ZET_AGENT_ID": "agent-from-docker-env",
+        "SAFE_TOKEN": "safe-value",
+    })
+
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    run_args_str = " ".join(run_calls[0][0])
+    assert "ZETTLAB_CONNECTORS_URL" not in run_args_str
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in run_args_str
+    assert "ZET_AGENT_ID" not in run_args_str
+    assert "SAFE_TOKEN=safe-value" in run_args_str
+
+
 def test_docker_env_appears_in_init_env_args(monkeypatch):
     """Explicit docker_env values should appear in _build_init_env_args."""
     env = _make_execute_only_env()

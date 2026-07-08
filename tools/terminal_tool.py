@@ -38,6 +38,7 @@ import os
 import platform
 import re
 import shlex
+import stat
 import time
 import threading
 import atexit
@@ -967,6 +968,49 @@ def _is_python_executable_token(token: str) -> bool:
     )
 
 
+def _path_writable_by_current_user(path: Path) -> bool:
+    try:
+        st = path.stat()
+    except OSError:
+        return True
+    euid = os.geteuid() if hasattr(os, "geteuid") else None
+    if euid == 0:
+        return True
+    mode = stat.S_IMODE(st.st_mode)
+    if euid is not None and st.st_uid == euid:
+        return True
+    try:
+        groups = set(os.getgroups())
+        egid = os.getegid()
+        groups.add(egid)
+    except Exception:
+        groups = set()
+    if st.st_gid in groups and mode & stat.S_IWGRP:
+        return True
+    return bool(mode & stat.S_IWOTH)
+
+
+def _connector_runtime_path_is_trusted(path: Path, presets_root: Path) -> bool:
+    """Return True only for official presets paths the terminal user cannot edit."""
+    try:
+        resolved_path = path.resolve(strict=True)
+        resolved_root = presets_root.resolve(strict=True)
+        relative = resolved_path.relative_to(resolved_root)
+    except (OSError, ValueError):
+        return False
+
+    # Symlinks are resolved above; now check every concrete directory between
+    # the presets root and the runner file. If the Hermes service user can
+    # write or owns any component, model-controlled terminal commands can
+    # replace the runner before asking for connector bearer.
+    current = resolved_root
+    components = [resolved_root]
+    for part in relative.parts:
+        current = current / part
+        components.append(current)
+    return not any(_path_writable_by_current_user(component) for component in components)
+
+
 def _resolve_connector_runtime_script(raw_path: str) -> Optional[Path]:
     presets_dir = os.environ.get("ZETTLAB_PRESETS_DIR", "")
     if not presets_dir:
@@ -1000,6 +1044,8 @@ def _resolve_connector_runtime_script(raw_path: str) -> Optional[Path]:
     if parts[-2] != "scripts" or parts[-4] != "skills":
         return None
     if not path.is_file():
+        return None
+    if not _connector_runtime_path_is_trusted(path, presets_root):
         return None
     return path
 
@@ -1036,12 +1082,16 @@ def _connector_runtime_result_json(
     command: str,
     output: str,
     returncode: int,
+    secret_values: list[str] | None = None,
     timed_out: bool = False,
 ) -> str:
     from tools.ansi_strip import strip_ansi
-    from agent.redact import redact_terminal_output
+    from agent.redact import redact_sensitive_text
 
     output = strip_ansi(output)
+    for secret in secret_values or []:
+        if secret:
+            output = output.replace(secret, "[REDACTED]")
     try:
         from tools.tool_output_limits import get_max_bytes
 
@@ -1058,7 +1108,11 @@ def _connector_runtime_result_json(
             + f"out of {len(output)} total] ...\n\n"
             + output[-tail_chars:]
         )
-    output = redact_terminal_output(output.strip(), command) if output else ""
+    output = redact_sensitive_text(
+        output.strip(),
+        force=True,
+        code_file=False,
+    ) if output else ""
     return json.dumps({
         "output": output,
         "exit_code": 124 if timed_out else returncode,
@@ -1080,10 +1134,15 @@ def _run_connector_runtime_command_if_allowed(
     if argv is None:
         return None
 
+    secret_values: list[str] = []
     try:
         from tools.environments.local import build_connector_runtime_env
 
         run_env = build_connector_runtime_env()
+        secret_values = [
+            run_env.get("ZETTLAB_CONNECTORS_AUTH_TOKEN", ""),
+            run_env.get("ZETTLAB_CONNECTORS_URL", ""),
+        ]
         run_cwd = cwd if cwd and os.path.isdir(cwd) else None
         completed = subprocess.run(
             argv,
@@ -1098,6 +1157,7 @@ def _run_connector_runtime_command_if_allowed(
             command=command,
             output=(completed.stdout or "") + (completed.stderr or ""),
             returncode=completed.returncode,
+            secret_values=secret_values,
         )
     except subprocess.TimeoutExpired as e:
         stdout = e.stdout or ""
@@ -1110,6 +1170,7 @@ def _run_connector_runtime_command_if_allowed(
             command=command,
             output=stdout + stderr,
             returncode=124,
+            secret_values=secret_values,
             timed_out=True,
         )
     except Exception as e:

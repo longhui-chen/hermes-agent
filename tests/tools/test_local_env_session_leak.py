@@ -429,6 +429,33 @@ def test_local_snapshot_wrapper_unsets_connector_runtime_before_and_after_comman
     assert eval_idx < second_unset_idx < dump_idx
 
 
+def test_local_snapshot_bootstrap_unsets_connector_runtime_before_first_dump():
+    """init_session must not publish connector bearer in the initial snapshot."""
+    env = LocalEnvironment.__new__(LocalEnvironment)
+    env.cwd = "/tmp"
+    env._session_id = "bootstrap-test"
+    env._snapshot_path = "/tmp/hermes-snapshot-bootstrap.sh"
+    env._cwd_file = "/tmp/hermes-cwd-bootstrap.txt"
+    env._cwd_marker = "__HERMES_CWD_bootstrap_test__"
+    env._snapshot_timeout = 5
+    captured: dict[str, str] = {}
+
+    class _Proc:
+        pass
+
+    env._run_bash = lambda script, **kwargs: captured.setdefault("script", script) or _Proc()
+    env._wait_for_process = lambda proc, **kwargs: {"returncode": 0, "output": ""}
+    env._update_cwd = lambda result: None
+
+    env.init_session()
+    script = captured["script"]
+
+    unset_idx = script.index("unset ZETTLAB_CONNECTORS_AUTH_TOKEN")
+    dump_idx = script.index("export -p >")
+
+    assert unset_idx < dump_idx
+
+
 def test_build_connector_runtime_env_uses_profile_scope(monkeypatch):
     """Only the allowlisted connector runner receives current profile values."""
     from agent import secret_scope as ss

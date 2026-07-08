@@ -94,6 +94,12 @@ def _normalize_env_dict(env: dict | None) -> dict[str, str]:
     return normalized
 
 
+def _scrub_profile_scoped_env(env: dict[str, str]) -> dict[str, str]:
+    for key in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
+        env.pop(key, None)
+    return env
+
+
 def _load_hermes_env_vars() -> dict[str, str]:
     """Load ~/.hermes/.env values without failing Docker command execution."""
     try:
@@ -605,7 +611,7 @@ class DockerEnvironment(BaseEnvironment):
         self._persist_across_processes = persist_across_processes
         self._task_id = task_id
         self._forward_env = _normalize_forward_env_names(forward_env)
-        self._env = _normalize_env_dict(env)
+        self._env = _scrub_profile_scoped_env(_normalize_env_dict(env))
         self._container_id: Optional[str] = None
         self._labels: dict[str, str] = {}
         self._image: str = ""
@@ -987,8 +993,7 @@ class DockerEnvironment(BaseEnvironment):
         """
         exec_env: dict[str, str] = dict(self._env)
         profile_scoped_keys = set(PROFILE_SCOPED_SUBPROCESS_ENV_KEYS)
-        for key in profile_scoped_keys:
-            exec_env.pop(key, None)
+        _scrub_profile_scoped_env(exec_env)
 
         explicit_forward_keys = set(self._forward_env) - profile_scoped_keys
         passthrough_keys: set[str] = set()

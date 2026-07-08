@@ -394,7 +394,11 @@ class BaseEnvironment(ABC):
         # static path is shlex-quoted (Windows/Git-Bash drive letters, spaces)
         # with ``$BASHPID`` left outside the quotes so it still expands.
         _snap_tmp = shlex.quote(self._snapshot_path + ".tmp.") + "$BASHPID"
+        unset_ephemeral = "\n".join(self._unset_snapshot_ephemeral_env_script())
+        if unset_ephemeral:
+            unset_ephemeral += "\n"
         bootstrap = (
+            unset_ephemeral +
             f"export -p > {_snap_tmp}\n"
             # Dump function definitions, filtering out private (``_``-prefixed)
             # helpers — mainly bash-completion internals (``_git``, ``_make``…)
