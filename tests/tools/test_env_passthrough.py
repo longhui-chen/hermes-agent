@@ -217,6 +217,20 @@ class TestTerminalIntegration:
             assert var not in result
             assert "PATH" in result
 
+    def test_passthrough_cannot_override_connector_runtime_scope(self):
+        """Connector runtime vars are dedicated-runner only, never passthrough."""
+        from tools.environments.local import (
+            PROFILE_SCOPED_SUBPROCESS_ENV_KEYS,
+            _make_run_env,
+            _sanitize_subprocess_env,
+        )
+
+        for var in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
+            register_env_passthrough([var])
+            assert not is_env_passthrough(var)
+            assert var not in _sanitize_subprocess_env({var: "secret", "PATH": "/usr/bin"})
+            assert var not in _make_run_env({var: "secret"})
+
     def test_passthrough_allows_auxiliary_non_secret_routing(self):
         """AUXILIARY_*_PROVIDER / _MODEL and GATEWAY_RELAY routing hints are not
         secrets, so a skill may still register them (they're not protected)."""

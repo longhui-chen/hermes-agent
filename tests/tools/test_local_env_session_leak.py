@@ -554,3 +554,20 @@ def test_execute_code_child_gets_bound_session_routing_without_connector_bearer(
     assert env.get("HERMES_SESSION_KEY") == "real-session"
     assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in env
     assert "ZETTLAB_CONNECTORS_URL" not in env
+
+
+def test_execute_code_scrubs_connector_runtime_even_when_passthrough_allows_it(monkeypatch):
+    """Connector runtime keys must not be recoverable through env_passthrough."""
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_URL", "http://127.0.0.1:9090/rpc")
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "connector-bearer")
+    monkeypatch.setenv("ZET_AGENT_ID", "agent-1")
+
+    env = _scrub_child_env(
+        os.environ,
+        is_passthrough=lambda name: name.startswith("ZET"),
+        is_windows=False,
+    )
+
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in env
+    assert "ZETTLAB_CONNECTORS_URL" not in env
+    assert "ZET_AGENT_ID" not in env

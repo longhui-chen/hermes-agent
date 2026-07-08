@@ -1,4 +1,5 @@
 import json
+import subprocess
 import sys
 import textwrap
 
@@ -44,6 +45,39 @@ def test_connector_runtime_direct_runner_receives_profile_scoped_env(monkeypatch
     assert result["exit_code"] == 0
     assert "connector token ok: True" in result["output"]
     assert "connector_agent=agent-1" in result["output"]
+
+
+def test_connector_runtime_direct_runner_does_not_put_token_in_popen_env(monkeypatch, tmp_path):
+    """Connector bearer is delivered over stdin, not process env."""
+    _write_connector_runtime(tmp_path)
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "runner-token")
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_URL", "http://127.0.0.1/rpc")
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root: True,
+    )
+    captured = {}
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = argv
+        captured["env"] = kwargs["env"]
+        captured["input"] = kwargs["input"]
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(terminal_tool_module.subprocess, "run", fake_run)
+
+    result = json.loads(terminal_tool_module._run_connector_runtime_command_if_allowed(
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py" list-tools',
+        cwd=str(tmp_path),
+        timeout=5,
+    ))
+
+    assert result["connector_runtime_direct"] is True
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in captured["env"]
+    assert "ZETTLAB_CONNECTORS_URL" not in captured["env"]
+    assert "runner-token" in captured["input"]
 
 
 def test_compound_connector_runtime_command_does_not_receive_token(monkeypatch, tmp_path):
@@ -116,13 +150,33 @@ def test_parser_rejects_writable_presets_runner_by_default(monkeypatch, tmp_path
     assert parsed is None
 
 
-def test_connector_runtime_trust_rejects_root_service_user(monkeypatch, tmp_path):
+def test_connector_runtime_trust_rejects_non_root_owned_tree_for_root_service(monkeypatch, tmp_path):
     script = _write_connector_runtime(tmp_path)
     monkeypatch.setattr(terminal_tool_module.os, "geteuid", lambda: 0, raising=False)
 
     assert terminal_tool_module._connector_runtime_path_is_trusted(
         script,
         tmp_path / "presets",
+    ) is False
+
+
+def test_connector_runtime_trust_checks_presets_parent_directories(monkeypatch, tmp_path):
+    script = _write_connector_runtime(tmp_path)
+    presets_root = tmp_path / "presets"
+    writable_parent = tmp_path
+
+    def fake_writable(path):
+        return path == writable_parent
+
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_path_writable_by_current_user",
+        fake_writable,
+    )
+
+    assert terminal_tool_module._connector_runtime_path_is_trusted(
+        script,
+        presets_root,
     ) is False
 
 

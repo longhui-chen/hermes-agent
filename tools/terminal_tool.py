@@ -958,6 +958,22 @@ import sys
 
 _CONNECTOR_RUNTIME_SCRIPT = "connector_runtime.py"
 _CONNECTOR_RUNTIME_SHELL_PUNCTUATION = set(";&|<>")
+_CONNECTOR_RUNTIME_STDIN_WRAPPER = r"""
+import json
+import os
+import runpy
+import sys
+
+payload = json.loads(sys.stdin.read() or "{}")
+env = payload.get("env") or {}
+script = payload["script"]
+argv = payload.get("argv") or [script]
+for key, value in env.items():
+    if value is not None:
+        os.environ[str(key)] = str(value)
+sys.argv = [script, *[str(arg) for arg in argv[1:]]]
+runpy.run_path(script, run_name="__main__")
+"""
 
 
 def _is_python_executable_token(token: str) -> bool:
@@ -974,9 +990,12 @@ def _path_writable_by_current_user(path: Path) -> bool:
     except OSError:
         return True
     euid = os.geteuid() if hasattr(os, "geteuid") else None
-    if euid == 0:
-        return True
     mode = stat.S_IMODE(st.st_mode)
+    if euid == 0:
+        # Packaged zpk services currently run as root. Treat root-owned, non
+        # group/world-writable components as trusted so official presets still
+        # work, while rejecting paths another account can swap underneath us.
+        return st.st_uid != 0 or bool(mode & (stat.S_IWGRP | stat.S_IWOTH))
     if euid is not None and st.st_uid == euid:
         return True
     try:
@@ -999,12 +1018,13 @@ def _connector_runtime_path_is_trusted(path: Path, presets_root: Path) -> bool:
     except (OSError, ValueError):
         return False
 
-    # Symlinks are resolved above; now check every concrete directory between
-    # the presets root and the runner file. If the Hermes service user can
-    # write or owns any component, model-controlled terminal commands can
-    # replace the runner before asking for connector bearer.
+    # Symlinks are resolved above; now check every concrete parent from the
+    # filesystem root through the runner. If the Hermes service user can write
+    # or replace any component, model-controlled terminal commands can swap the
+    # trusted tree before the connector runner starts.
+    root_ancestors = list(resolved_root.parents)
     current = resolved_root
-    components = [resolved_root]
+    components = [*root_ancestors, resolved_root]
     for part in relative.parts:
         current = current / part
         components.append(current)
@@ -1138,20 +1158,28 @@ def _run_connector_runtime_command_if_allowed(
     try:
         from tools.environments.local import build_connector_runtime_env
 
-        run_env = build_connector_runtime_env()
+        connector_env = build_connector_runtime_env()
+        from tools.environments.local import _sanitize_subprocess_env
+
+        run_env = _sanitize_subprocess_env(os.environ)
         secret_values = [
-            run_env.get("ZETTLAB_CONNECTORS_AUTH_TOKEN", ""),
-            run_env.get("ZETTLAB_CONNECTORS_URL", ""),
+            connector_env.get("ZETTLAB_CONNECTORS_AUTH_TOKEN", ""),
+            connector_env.get("ZETTLAB_CONNECTORS_URL", ""),
         ]
+        payload = json.dumps({
+            "script": argv[1],
+            "argv": argv[1:],
+            "env": connector_env,
+        })
         run_cwd = cwd if cwd and os.path.isdir(cwd) else None
         completed = subprocess.run(
-            argv,
+            [sys.executable, "-c", _CONNECTOR_RUNTIME_STDIN_WRAPPER],
             cwd=run_cwd,
             env=run_env,
             capture_output=True,
             text=True,
             timeout=timeout,
-            stdin=subprocess.DEVNULL,
+            input=payload,
         )
         return _connector_runtime_result_json(
             command=command,
