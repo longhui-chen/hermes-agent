@@ -37,6 +37,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import time
 import threading
 import atexit
@@ -952,6 +953,172 @@ from tools.environments.modal import ModalEnvironment as _ModalEnvironment
 from tools.environments.managed_modal import ManagedModalEnvironment as _ManagedModalEnvironment
 from tools.managed_tool_gateway import is_managed_tool_gateway_ready
 import sys
+
+
+_CONNECTOR_RUNTIME_SCRIPT = "connector_runtime.py"
+_CONNECTOR_RUNTIME_SHELL_PUNCTUATION = set(";&|<>")
+
+
+def _is_python_executable_token(token: str) -> bool:
+    name = Path(token).name.lower()
+    return (
+        name in {"python", "python3", "python.exe", "python3.exe"}
+        or re.fullmatch(r"python3\.\d+(?:\.exe)?", name) is not None
+    )
+
+
+def _resolve_connector_runtime_script(raw_path: str) -> Optional[Path]:
+    presets_dir = os.environ.get("ZETTLAB_PRESETS_DIR", "")
+    if not presets_dir:
+        return None
+    path_text = raw_path
+    for prefix in ("$ZETTLAB_PRESETS_DIR/", "${ZETTLAB_PRESETS_DIR}/"):
+        if raw_path.startswith(prefix):
+            path_text = os.path.join(presets_dir, raw_path[len(prefix):])
+            break
+    else:
+        normalized_raw = raw_path[2:] if raw_path.startswith("./") else raw_path
+        if normalized_raw.startswith("skills/"):
+            path_text = os.path.join(presets_dir, normalized_raw)
+
+    try:
+        presets_root = Path(os.path.expandvars(os.path.expanduser(presets_dir))).resolve()
+        path = Path(os.path.expandvars(os.path.expanduser(path_text))).resolve()
+    except Exception:
+        return None
+
+    try:
+        path.relative_to(presets_root)
+    except ValueError:
+        return None
+
+    parts = path.parts
+    if len(parts) < 4:
+        return None
+    if parts[-1] != _CONNECTOR_RUNTIME_SCRIPT:
+        return None
+    if parts[-2] != "scripts" or parts[-4] != "skills":
+        return None
+    if not path.is_file():
+        return None
+    return path
+
+
+def _parse_connector_runtime_command(command: str) -> Optional[list[str]]:
+    """Return argv for the dedicated connector runner, or None if not exact.
+
+    The allowlist intentionally accepts only a direct Python invocation of a
+    presets skill's scripts/connector_runtime.py. Shell punctuation rejects
+    compound commands such as `connector_runtime.py ... ; env`, so injected
+    connector env can never be observed by a following shell fragment.
+    """
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+
+    if len(tokens) < 2 or not _is_python_executable_token(tokens[0]):
+        return None
+    for token in tokens:
+        if token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION:
+            return None
+
+    script = _resolve_connector_runtime_script(tokens[1])
+    if script is None:
+        return None
+    return [sys.executable, str(script), *tokens[2:]]
+
+
+def _connector_runtime_result_json(
+    *,
+    command: str,
+    output: str,
+    returncode: int,
+    timed_out: bool = False,
+) -> str:
+    from tools.ansi_strip import strip_ansi
+    from agent.redact import redact_terminal_output
+
+    output = strip_ansi(output)
+    try:
+        from tools.tool_output_limits import get_max_bytes
+
+        max_output_chars = get_max_bytes()
+    except Exception:
+        max_output_chars = 20000
+    if len(output) > max_output_chars:
+        head_chars = int(max_output_chars * 0.4)
+        tail_chars = max_output_chars - head_chars
+        omitted = len(output) - head_chars - tail_chars
+        output = (
+            output[:head_chars]
+            + f"\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted "
+            + f"out of {len(output)} total] ...\n\n"
+            + output[-tail_chars:]
+        )
+    output = redact_terminal_output(output.strip(), command) if output else ""
+    return json.dumps({
+        "output": output,
+        "exit_code": 124 if timed_out else returncode,
+        "error": (
+            f"Command timed out while running connector runtime"
+            if timed_out else None
+        ),
+        "connector_runtime_direct": True,
+    }, ensure_ascii=False)
+
+
+def _run_connector_runtime_command_if_allowed(
+    command: str,
+    *,
+    cwd: str,
+    timeout: int,
+) -> Optional[str]:
+    argv = _parse_connector_runtime_command(command)
+    if argv is None:
+        return None
+
+    try:
+        from tools.environments.local import build_connector_runtime_env
+
+        run_env = build_connector_runtime_env()
+        run_cwd = cwd if cwd and os.path.isdir(cwd) else None
+        completed = subprocess.run(
+            argv,
+            cwd=run_cwd,
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            stdin=subprocess.DEVNULL,
+        )
+        return _connector_runtime_result_json(
+            command=command,
+            output=(completed.stdout or "") + (completed.stderr or ""),
+            returncode=completed.returncode,
+        )
+    except subprocess.TimeoutExpired as e:
+        stdout = e.stdout or ""
+        stderr = e.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        return _connector_runtime_result_json(
+            command=command,
+            output=stdout + stderr,
+            returncode=124,
+            timed_out=True,
+        )
+    except Exception as e:
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": f"Connector runtime execution failed: {type(e).__name__}: {e}",
+            "connector_runtime_direct": True,
+        }, ensure_ascii=False)
 
 
 # Tool description for LLM
@@ -2119,6 +2286,27 @@ def terminal_tool(
                     "error": guidance,
                     "status": "error",
                 }, ensure_ascii=False)
+
+        if workdir:
+            workdir_error = _validate_workdir(workdir)
+            if workdir_error:
+                logger.warning("Blocked dangerous workdir: %s (command: %s)",
+                               workdir[:200], _safe_command_preview(command))
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": workdir_error,
+                    "status": "blocked"
+                }, ensure_ascii=False)
+
+        if not background and not pty:
+            connector_runtime_result = _run_connector_runtime_command_if_allowed(
+                command,
+                cwd=workdir or cwd,
+                timeout=effective_timeout,
+            )
+            if connector_runtime_result is not None:
+                return connector_runtime_result
 
         # Start cleanup thread
         _start_cleanup_thread()

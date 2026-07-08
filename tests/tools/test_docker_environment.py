@@ -403,6 +403,38 @@ def test_docker_env_and_forward_env_merge_in_init_args(monkeypatch):
     assert "TOKEN=secret123" in args_str
 
 
+def test_init_env_args_scrubs_profile_scoped_connector_runtime(monkeypatch):
+    """Docker init_session must not snapshot connector bearer from any source."""
+    env = _make_execute_only_env(forward_env=[
+        "ZETTLAB_CONNECTORS_URL",
+        "ZETTLAB_CONNECTORS_AUTH_TOKEN",
+        "ZET_AGENT_ID",
+        "SAFE_TOKEN",
+    ])
+    env._env = {
+        "ZETTLAB_CONNECTORS_URL": "http://from-docker-env",
+        "ZETTLAB_CONNECTORS_AUTH_TOKEN": "docker-env-token",
+        "ZET_AGENT_ID": "docker-env-agent",
+    }
+
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_URL", "http://from-shell")
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "shell-token")
+    monkeypatch.setenv("ZET_AGENT_ID", "shell-agent")
+    monkeypatch.setenv("SAFE_TOKEN", "safe-value")
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {
+        "ZETTLAB_CONNECTORS_AUTH_TOKEN": "dotenv-token",
+        "SAFE_TOKEN": "dotenv-safe",
+    })
+
+    args = env._build_init_env_args()
+    args_str = " ".join(args)
+
+    assert "ZETTLAB_CONNECTORS_URL" not in args_str
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in args_str
+    assert "ZET_AGENT_ID" not in args_str
+    assert "SAFE_TOKEN=safe-value" in args_str
+
+
 
 def test_normalize_env_dict_filters_invalid_keys():
     """_normalize_env_dict should reject invalid variable names."""

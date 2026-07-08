@@ -330,7 +330,7 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(var_name, None)
 
 
-_PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset({
+PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset({
     # Connector skill runtime routing. These are generated per Zettlab agent
     # profile by local-server and live in <profile>/.env under the multiplex
     # gateway, so subprocesses must receive the current profile's scope instead
@@ -351,8 +351,40 @@ def _apply_profile_secret_scope_env(env: dict, *, inject: bool) -> None:
     skills that need these values must receive them through a dedicated,
     allowlisted connector execution path instead of the general terminal path.
     """
-    for key in _PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
+    for key in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
         env.pop(key, None)
+
+
+def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
+    """Build env for the dedicated connector_runtime.py runner.
+
+    This is intentionally separate from the generic terminal env. Connector
+    runtime bearer may be supplied to the allowlisted runner subprocess, but it
+    must not be inherited by arbitrary model-authored shell commands.
+    """
+    env = _sanitize_subprocess_env(os.environ, base_env)
+
+    scope = None
+    multiplex_active = False
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+        multiplex_active = is_multiplex_active()
+        scope = current_secret_scope()
+    except Exception:
+        scope = None
+
+    for key in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
+        value = None
+        if scope is not None:
+            value = scope.get(key)
+        elif not multiplex_active:
+            value = os.environ.get(key)
+        if value is not None:
+            env[key] = str(value)
+        else:
+            env.pop(key, None)
+    return env
 
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
@@ -921,6 +953,9 @@ class LocalEnvironment(BaseEnvironment):
             cwd = os.path.expanduser(cwd)
         super().__init__(cwd=cwd or os.getcwd(), timeout=timeout, env=env)
         self.init_session()
+
+    def _snapshot_ephemeral_env_keys(self) -> tuple[str, ...]:
+        return tuple(sorted(PROFILE_SCOPED_SUBPROCESS_ENV_KEYS))
 
     def get_temp_dir(self) -> str:
         """Return a shell-safe writable temp dir for local execution.
