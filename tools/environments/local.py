@@ -330,6 +330,44 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(var_name, None)
 
 
+_PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset({
+    # Connector skill runtime routing. These are generated per Zettlab agent
+    # profile by local-server and live in <profile>/.env under the multiplex
+    # gateway, so subprocesses must receive the current profile's scope instead
+    # of whatever os.environ/shell snapshot happened to contain.
+    "ZETTLAB_CONNECTORS_URL",
+    "ZETTLAB_CONNECTORS_AUTH_TOKEN",
+    "ZET_AGENT_ID",
+})
+
+
+def _apply_profile_secret_scope_env(env: dict, *, inject: bool) -> None:
+    """Bridge or scrub profile-scoped connector runtime vars.
+
+    The multiplex gateway intentionally avoids merging every profile's .env into
+    process-global os.environ. Terminal skills still execute in child processes,
+    though, and connector preset scripts read their runtime URL/token from env.
+    In multiplex mode the active secret scope is authoritative for those keys on
+    the foreground terminal path. Other spawn surfaces do not need connector
+    bearer access; they only scrub stale globals/snapshots so profile A cannot
+    leak into profile B.
+    """
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+    except Exception:
+        return
+
+    if not is_multiplex_active():
+        return
+
+    scope = current_secret_scope()
+    for key in _PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
+        if inject and scope is not None and key in scope:
+            env[key] = str(scope[key])
+        else:
+            env.pop(key, None)
+
+
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
@@ -366,6 +404,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     # Same cross-session leak guard as _make_run_env, for the background/PTY
     # spawn path (process_registry.spawn_local builds env via this function).
     _inject_session_context_env(sanitized)
+    _apply_profile_secret_scope_env(sanitized, inject=False)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
@@ -489,6 +528,7 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # session's identity. Strip _UNSET session vars when engaged so that can't
     # happen; single uniform policy across every spawn surface.
     _inject_session_context_env(env)
+    _apply_profile_secret_scope_env(env, inject=False)
 
     return env
 
@@ -787,6 +827,7 @@ def _make_run_env(env: dict) -> dict:
     # cross-session leak guard — strips _UNSET vars when a concurrent host is
     # engaged so a sibling session's os.environ mirror can't leak in).
     _inject_session_context_env(run_env)
+    _apply_profile_secret_scope_env(run_env, inject=True)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)

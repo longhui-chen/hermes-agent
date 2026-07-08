@@ -63,6 +63,21 @@ def _engage():
     sc._session_context_engaged = True
 
 
+@pytest.fixture(autouse=True)
+def _isolate_secret_scope():
+    """Clean multiplex/profile secret scope around env-bridge tests."""
+    from agent import secret_scope as ss
+
+    saved_active = ss.is_multiplex_active()
+    token = ss.set_secret_scope(None)
+    ss.set_multiplex_active(False)
+    try:
+        yield
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(saved_active)
+
+
 # --------------------------------------------------------------------------- #
 # Foreground path (_make_run_env)
 # --------------------------------------------------------------------------- #
@@ -303,6 +318,92 @@ def test_hermes_subprocess_env_unengaged_preserves_fallback(monkeypatch):
     # not engaged (autouse fixture leaves _session_context_engaged False)
     env = hermes_subprocess_env()
     assert env.get("HERMES_SESSION_KEY") == "cli-fallback-key"
+
+
+# --------------------------------------------------------------------------- #
+# multiplex profile-scoped connector runtime env
+# --------------------------------------------------------------------------- #
+
+def test_make_run_env_uses_profile_scoped_connector_runtime(monkeypatch):
+    """Terminal skills must receive the active profile's connector env.
+
+    The gateway process may have stale globals from another profile, and the
+    LocalEnvironment snapshot may also carry stale values. In multiplex mode the
+    current secret scope is authoritative for connector runtime routing.
+    """
+    from agent import secret_scope as ss
+
+    ss.set_multiplex_active(True)
+    monkeypatch.setenv(
+        "ZETTLAB_CONNECTORS_URL",
+        "http://127.0.0.1:9090/api/v1/internal/connectors/rpc?agent_id=foreign",
+    )
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "foreign-token")
+    monkeypatch.setenv("ZET_AGENT_ID", "foreign")
+    token = ss.set_secret_scope({
+        "ZETTLAB_CONNECTORS_URL": "http://127.0.0.1:9090/api/v1/internal/connectors/rpc?agent_id=main",
+        "ZETTLAB_CONNECTORS_AUTH_TOKEN": "main-token",
+        "ZET_AGENT_ID": "main",
+    })
+    try:
+        env = _make_run_env({
+            "ZETTLAB_CONNECTORS_URL": "http://127.0.0.1:9090/api/v1/internal/connectors/rpc?agent_id=snapshot",
+            "ZETTLAB_CONNECTORS_AUTH_TOKEN": "snapshot-token",
+            "ZET_AGENT_ID": "snapshot",
+        })
+    finally:
+        ss.reset_secret_scope(token)
+
+    assert env["ZETTLAB_CONNECTORS_URL"].endswith("agent_id=main")
+    assert env["ZETTLAB_CONNECTORS_AUTH_TOKEN"] == "main-token"
+    assert env["ZET_AGENT_ID"] == "main"
+
+
+def test_make_run_env_strips_connector_runtime_without_profile_scope(monkeypatch):
+    """Multiplex mode must not inherit stale connector env without a scope."""
+    from agent import secret_scope as ss
+
+    ss.set_multiplex_active(True)
+    monkeypatch.setenv(
+        "ZETTLAB_CONNECTORS_URL",
+        "http://127.0.0.1:9090/api/v1/internal/connectors/rpc?agent_id=foreign",
+    )
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "foreign-token")
+    monkeypatch.setenv("ZET_AGENT_ID", "foreign")
+
+    env = _make_run_env({})
+
+    assert "ZETTLAB_CONNECTORS_URL" not in env
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in env
+    assert "ZET_AGENT_ID" not in env
+
+
+def test_sanitize_and_nonterminal_spawn_scrub_connector_runtime_env(monkeypatch):
+    """Background/PTY and helper spawn paths must not receive connector bearer."""
+    from agent import secret_scope as ss
+
+    ss.set_multiplex_active(True)
+    monkeypatch.setenv(
+        "ZETTLAB_CONNECTORS_URL",
+        "http://127.0.0.1:9090/api/v1/internal/connectors/rpc?agent_id=foreign",
+    )
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "foreign-token")
+    monkeypatch.setenv("ZET_AGENT_ID", "foreign")
+    token = ss.set_secret_scope({
+        "ZETTLAB_CONNECTORS_URL": "http://127.0.0.1:9090/api/v1/internal/connectors/rpc?agent_id=profile-b",
+        "ZETTLAB_CONNECTORS_AUTH_TOKEN": "profile-b-token",
+        "ZET_AGENT_ID": "profile-b",
+    })
+    try:
+        sanitized = _sanitize_subprocess_env({})
+        helper = hermes_subprocess_env()
+    finally:
+        ss.reset_secret_scope(token)
+
+    for env in (sanitized, helper):
+        assert "ZETTLAB_CONNECTORS_URL" not in env
+        assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in env
+        assert "ZET_AGENT_ID" not in env
 
 
 # --------------------------------------------------------------------------- #
