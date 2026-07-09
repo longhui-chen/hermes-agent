@@ -59,6 +59,9 @@ class TestEnsureHermesHome:
             content = soul_path.read_text(encoding="utf-8").strip()
             assert content != ""
             assert "Zettlab Memo" in content
+            assert "generalist" in content
+            assert "fallback entry point" in content
+            assert "SkillHub" in content
             assert "Hermes Agent" not in content
 
     def test_does_not_overwrite_existing_soul_md(self, tmp_path):
@@ -79,6 +82,38 @@ class TestEnsureHermesHome:
             soul_path.write_text(_LEGACY_TEMPLATE_SOULS[0] + "\n", encoding="utf-8")
             ensure_hermes_home()
             assert soul_path.read_text(encoding="utf-8") == DEFAULT_SOUL_MD
+
+    def test_upgrades_legacy_stock_default_soul_md(self, tmp_path):
+        # Previous built-in defaults also carry no user intent when matched
+        # exactly, so they should be upgraded to the current General Assistant
+        # default without using unsafe prefix matching.
+        from hermes_cli.default_soul import DEFAULT_SOUL_MD, _LEGACY_TEMPLATE_SOULS
+
+        for legacy in _LEGACY_TEMPLATE_SOULS[:2]:
+            with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+                soul_path = tmp_path / "SOUL.md"
+                soul_path.write_text(legacy + "\n", encoding="utf-8")
+                ensure_hermes_home()
+                assert soul_path.read_text(encoding="utf-8") == DEFAULT_SOUL_MD
+                soul_path.unlink()
+
+    def test_preserves_legacy_stock_default_with_user_suffix(self, tmp_path):
+        from hermes_cli.default_soul import _LEGACY_TEMPLATE_SOULS
+
+        custom = _LEGACY_TEMPLATE_SOULS[0] + "\nKeep my owner-specific workflow."
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            soul_path = tmp_path / "SOUL.md"
+            soul_path.write_text(custom, encoding="utf-8")
+            ensure_hermes_home()
+            assert soul_path.read_text(encoding="utf-8") == custom
+
+    def test_installer_and_docker_souls_match_default(self):
+        from hermes_cli.default_soul import DEFAULT_SOUL_MD
+
+        root = Path(__file__).resolve().parents[2]
+        assert DEFAULT_SOUL_MD in (root / "scripts" / "install.sh").read_text(encoding="utf-8")
+        assert DEFAULT_SOUL_MD in (root / "scripts" / "install.ps1").read_text(encoding="utf-8")
+        assert (root / "docker" / "SOUL.md").read_text(encoding="utf-8").rstrip("\n") == DEFAULT_SOUL_MD
 
     def test_preserves_legacy_template_with_user_persona(self, tmp_path):
         # If the user typed a persona alongside the scaffold, the content no

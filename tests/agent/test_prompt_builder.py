@@ -1020,6 +1020,9 @@ class TestPromptBuilderConstants:
     def test_default_identity_non_empty(self):
         assert len(DEFAULT_AGENT_IDENTITY) > 50
         assert "Zettlab Memo" in DEFAULT_AGENT_IDENTITY
+        assert "generalist" in DEFAULT_AGENT_IDENTITY
+        assert "fallback entry point" in DEFAULT_AGENT_IDENTITY
+        assert "SkillHub" in DEFAULT_AGENT_IDENTITY
         assert "Hermes Agent" not in DEFAULT_AGENT_IDENTITY
 
     def test_platform_hints_known_platforms(self):
