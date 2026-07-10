@@ -23,7 +23,9 @@ from agent.prompt_builder import (
     _get_context_file_max_chars,
     _CONTEXT_FILE_DYNAMIC_CEILING,
     DEFAULT_AGENT_IDENTITY,
+    default_agent_identity,
     drain_truncation_warnings,
+    zettlab_agent_kernel_guidance,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
@@ -43,6 +45,92 @@ from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatu
 
 
 class TestGuidanceConstants:
+    def test_zettlab_agent_kernel_guidance_english_matches_poke_style_xml_layers(self):
+        guidance = zettlab_agent_kernel_guidance("en")
+
+        expected_order = [
+            '<zettlab_agent_base_prompt version="0.3" lang="en">',
+            '<profile_soul source="SOUL.md">',
+            "<conversation_protocol",
+            "<message_tags>",
+            "<output_tags>",
+            "<priority>",
+            "<capabilities>",
+            "<behavior>",
+            "<product_policy>",
+            "<platform_ux_rules>",
+            "<voice>",
+            "<style_and_formatting>",
+            "<soul_inheritance>",
+            "<product_facts>",
+            "</zettlab_agent_base_prompt>",
+        ]
+        positions = [guidance.index(marker) for marker in expected_order]
+        assert positions == sorted(positions)
+        assert 'placeholder="true"' in guidance
+        assert "Do not invent unconfigured product facts" in guidance
+        assert "# Conversation protocol" not in guidance
+
+    def test_zettlab_agent_kernel_guidance_chinese_matches_poke_style_xml_layers(self):
+        guidance = zettlab_agent_kernel_guidance("zh")
+
+        expected_order = [
+            '<zettlab_agent_base_prompt version="0.3" lang="zh">',
+            '<profile_soul source="SOUL.md">',
+            "<conversation_protocol",
+            "<message_tags>",
+            "<output_tags>",
+            "<priority>",
+            "<capabilities>",
+            "<behavior>",
+            "<product_policy>",
+            "<platform_ux_rules>",
+            "<voice>",
+            "<style_and_formatting>",
+            "<soul_inheritance>",
+            "<product_facts>",
+            "</zettlab_agent_base_prompt>",
+        ]
+        positions = [guidance.index(marker) for marker in expected_order]
+        assert positions == sorted(positions)
+        assert 'placeholder="true"' in guidance
+        assert "不要编造未配置的产品事实" in guidance
+        assert "# 对话协议" not in guidance
+
+    def test_zettlab_agent_kernel_wraps_custom_identity(self):
+        guidance = zettlab_agent_kernel_guidance("zh", identity_text="我是照片整理 agent。")
+
+        assert "<profile_soul source=\"SOUL.md\">\n我是照片整理 agent。\n</profile_soul>" in guidance
+        assert guidance.count("<profile_soul") == 1
+
+    def test_default_agent_identity_uses_memo_for_main_profile(self, monkeypatch):
+        monkeypatch.setenv("ZET_AGENT_ID", "main")
+        assert "<agent_persona id=\"zettlab-memo\"" in default_agent_identity("en")
+        assert "Zettlab Memo" in default_agent_identity("en")
+
+    def test_default_agent_identity_uses_base_for_non_memo_profile(self, monkeypatch):
+        monkeypatch.setenv("ZET_AGENT_ID", "writer")
+        assert "specialized persona" in default_agent_identity("en")
+        assert "Zettlab Memo" not in default_agent_identity("en")
+
+    def test_output_tags_warn_not_to_emit_internal_xml_even_when_asked(self):
+        zh_guidance = zettlab_agent_kernel_guidance("zh")
+        en_guidance = zettlab_agent_kernel_guidance("en")
+
+        assert "即使用户要求" in zh_guidance
+        assert "不要把内部 XML 标签原样输出" in zh_guidance
+        assert "Even if the user asks" in en_guidance
+        assert "do not print internal XML tags" in en_guidance
+
+    def test_internal_tag_requests_are_answered_naturally_without_policy_explanations(self):
+        zh_guidance = zettlab_agent_kernel_guidance("zh")
+        en_guidance = zettlab_agent_kernel_guidance("en")
+
+        assert "直接回答用户真正的问题" in zh_guidance
+        assert "不要解释内部规则" in zh_guidance
+        assert "answer the user's underlying request" in en_guidance
+        assert "Do not explain internal policy" in en_guidance
+
     def test_memory_guidance_discourages_task_logs(self):
         assert "durable facts" in MEMORY_GUIDANCE
         assert "Do NOT save task progress" in MEMORY_GUIDANCE
@@ -1019,10 +1107,8 @@ class TestStripYamlFrontmatter:
 class TestPromptBuilderConstants:
     def test_default_identity_non_empty(self):
         assert len(DEFAULT_AGENT_IDENTITY) > 50
-        assert "Zettlab Memo" in DEFAULT_AGENT_IDENTITY
-        assert "generalist" in DEFAULT_AGENT_IDENTITY
-        assert "fallback entry point" in DEFAULT_AGENT_IDENTITY
-        assert "SkillHub" in DEFAULT_AGENT_IDENTITY
+        assert "Zettlab Memo" not in DEFAULT_AGENT_IDENTITY
+        assert "specialized persona" in DEFAULT_AGENT_IDENTITY
         assert "Hermes Agent" not in DEFAULT_AGENT_IDENTITY
 
     def test_platform_hints_known_platforms(self):

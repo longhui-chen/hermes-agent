@@ -62,10 +62,26 @@ class TestCodexBuildKwargs:
         kw = transport.build_kwargs(model="gpt-5.4", messages=messages, tools=[])
         assert kw["instructions"] == "Custom system prompt"
 
-    def test_no_system_uses_default(self, transport):
+    @pytest.mark.parametrize(
+        ("profile", "expected", "forbidden"),
+        [
+            pytest.param("main", "Zettlab Memo", "specialized persona", id="memo"),
+            pytest.param("writer", "specialized persona", "Zettlab Memo", id="base"),
+        ],
+    )
+    def test_no_system_uses_profile_default(
+        self,
+        transport,
+        monkeypatch,
+        profile,
+        expected,
+        forbidden,
+    ):
+        monkeypatch.setenv("ZET_AGENT_ID", profile)
         messages = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(model="gpt-5.4", messages=messages, tools=[])
-        assert kw["instructions"]  # should be non-empty default
+        assert expected in kw["instructions"]
+        assert forbidden not in kw["instructions"]
 
     def test_reasoning_config(self, transport):
         messages = [{"role": "user", "content": "Hi"}]

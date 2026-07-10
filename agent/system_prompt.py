@@ -27,7 +27,6 @@ import json
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
-    DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
@@ -42,6 +41,8 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     drain_truncation_warnings,
+    default_agent_identity,
+    zettlab_agent_kernel_guidance,
 )
 from agent.runtime_cwd import resolve_context_cwd
 
@@ -151,15 +152,22 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
     # cwd project instructions disabled.
     _soul_loaded = False
+    _identity_text = ""
     if agent.load_soul_identity or not agent.skip_context_files:
         _soul_content = _r.load_soul_md(_ctx_len)
         if _soul_content:
-            stable_parts.append(_soul_content)
+            _identity_text = _soul_content
             _soul_loaded = True
 
     if not _soul_loaded:
-        # Fallback to hardcoded identity
-        stable_parts.append(DEFAULT_AGENT_IDENTITY)
+        # Fallback to hardcoded identity (language tracks device region).
+        _identity_text = default_agent_identity()
+
+    # Shared XML-ish Zettlab agent base prompt for every agent. It wraps the
+    # active profile SOUL.md (or neutral fallback), then defines runtime-level
+    # protocol, capability boundaries, behaviour, voice/style, SOUL inheritance
+    # contract, and product-facts placeholders.
+    stable_parts.append(zettlab_agent_kernel_guidance(identity_text=_identity_text))
 
     # Pointer to the zettlab-memo-setup skill for user questions about the runtime itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)

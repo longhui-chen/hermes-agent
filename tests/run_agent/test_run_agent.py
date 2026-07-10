@@ -24,7 +24,7 @@ import run_agent
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
 from agent.memory_manager import MemoryManager
-from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+from agent.prompt_builder import default_agent_identity
 
 
 # ---------------------------------------------------------------------------
@@ -1229,7 +1229,7 @@ class TestHydrateTodoStore:
 class TestBuildSystemPrompt:
     def test_always_has_identity(self, agent):
         prompt = agent._build_system_prompt()
-        assert DEFAULT_AGENT_IDENTITY in prompt
+        assert default_agent_identity() in prompt
 
     def test_can_use_soul_identity_even_when_context_files_are_skipped(self):
         with (
@@ -1249,7 +1249,7 @@ class TestBuildSystemPrompt:
             prompt = agent._build_system_prompt()
 
         assert "SOUL IDENTITY" in prompt
-        assert DEFAULT_AGENT_IDENTITY not in prompt
+        assert default_agent_identity() not in prompt
 
     def test_includes_system_message(self, agent):
         prompt = agent._build_system_prompt(system_message="Custom instruction")
@@ -6172,7 +6172,7 @@ class TestSystemPromptStability:
         # Should have built fresh, not queried the DB
         mock_db.get_session.assert_not_called()
         assert agent._cached_system_prompt is not None
-        assert DEFAULT_AGENT_IDENTITY in agent._cached_system_prompt
+        assert default_agent_identity() in agent._cached_system_prompt
 
     def test_fresh_build_when_db_has_no_prompt(self, agent):
         """If the session DB has no stored prompt, build fresh even with history."""
@@ -6199,7 +6199,7 @@ class TestSystemPromptStability:
                 agent._cached_system_prompt = agent._build_system_prompt()
 
         # Empty string is falsy, so should fall through to fresh build
-        assert DEFAULT_AGENT_IDENTITY in agent._cached_system_prompt
+        assert default_agent_identity() in agent._cached_system_prompt
 
 class TestBudgetPressure:
     """Budget exhaustion grace call system."""

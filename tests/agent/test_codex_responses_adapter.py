@@ -178,6 +178,32 @@ def test_preflight_still_rejects_unknown_tool_type():
         _preflight_codex_api_kwargs(kwargs, allow_stream=True)
 
 
+@pytest.mark.parametrize(
+    ("profile", "expected", "forbidden"),
+    [
+        pytest.param("main", "Zettlab Memo", "specialized persona", id="memo"),
+        pytest.param("writer", "specialized persona", "Zettlab Memo", id="base"),
+    ],
+)
+def test_preflight_empty_instructions_uses_profile_identity(
+    monkeypatch,
+    profile,
+    expected,
+    forbidden,
+):
+    monkeypatch.setenv("ZET_AGENT_ID", profile)
+    kwargs = {
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [{"role": "user", "content": "hi"}],
+    }
+
+    result = _preflight_codex_api_kwargs(kwargs)
+
+    assert expected in result["instructions"]
+    assert forbidden not in result["instructions"]
+
+
 # ---------------------------------------------------------------------------
 # _format_responses_error — adapted from anomalyco/opencode#28757.
 # Provider failures should surface BOTH the code (rate_limit_exceeded /

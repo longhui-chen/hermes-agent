@@ -299,7 +299,7 @@ _EXTRA_ENV_KEYS = frozenset({
 import yaml
 
 from hermes_cli.colors import Colors, color
-from hermes_cli.default_soul import DEFAULT_SOUL_MD, is_legacy_template_soul
+from hermes_cli.default_soul import default_soul_md, is_legacy_template_soul
 
 
 # =============================================================================
@@ -821,10 +821,11 @@ def _secure_file(path):
 def _ensure_default_soul_md(home: Path) -> None:
     """Seed a default SOUL.md into HERMES_HOME, upgrading legacy empty templates.
 
-    First run: write DEFAULT_SOUL_MD. Existing installs whose SOUL.md is still
-    the old comment-only scaffold (seeded by older install.sh / install.ps1 /
-    docker images, which shadowed the runtime default) get upgraded in place to
-    DEFAULT_SOUL_MD. A SOUL.md the user actually customized is never touched.
+    First run: write the active default SOUL. Existing installs whose SOUL.md is
+    still one of the old stock defaults (seeded by older install.sh /
+    install.ps1 / docker images, which shadowed the runtime default) get
+    upgraded in place to the active default SOUL. A SOUL.md the user actually
+    customized is never touched.
     """
     soul_path = home / "SOUL.md"
     if soul_path.exists():
@@ -835,7 +836,7 @@ def _ensure_default_soul_md(home: Path) -> None:
         if not is_legacy_template_soul(existing):
             return
         # Legacy empty template -> upgrade to the real default in place.
-    soul_path.write_text(DEFAULT_SOUL_MD, encoding="utf-8")
+    soul_path.write_text(default_soul_md(), encoding="utf-8")
     _secure_file(soul_path)
 
 

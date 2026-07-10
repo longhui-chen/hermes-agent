@@ -58,11 +58,42 @@ class TestEnsureHermesHome:
             assert soul_path.exists()
             content = soul_path.read_text(encoding="utf-8").strip()
             assert content != ""
+            assert '<agent_persona id="zettlab-memo"' in content
             assert "Zettlab Memo" in content
-            assert "generalist" in content
-            assert "fallback entry point" in content
-            assert "SkillHub" in content
+            assert "resident assistant" in content
+            assert "fallback entry point" not in content
             assert "Hermes Agent" not in content
+
+    def test_creates_base_soul_md_for_non_memo_profile(self, tmp_path):
+        profile_home = tmp_path / "profiles" / "writer"
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile_home), "ZET_AGENT_ID": "writer"}):
+            ensure_hermes_home()
+            soul_path = profile_home / "SOUL.md"
+            assert soul_path.exists()
+            content = soul_path.read_text(encoding="utf-8").strip()
+            assert content != ""
+            assert "specialized persona" in content
+            assert "Zettlab Memo" not in content
+
+    def test_infers_non_memo_profile_from_hermes_home(self, tmp_path):
+        profile_home = tmp_path / "profiles" / "writer"
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}, clear=False):
+            os.environ.pop("ZET_AGENT_ID", None)
+            os.environ.pop("HERMES_PROFILE_NAME", None)
+            os.environ.pop("HERMES_PROFILE", None)
+            ensure_hermes_home()
+            content = (profile_home / "SOUL.md").read_text(encoding="utf-8")
+            assert "specialized persona" in content
+            assert "Zettlab Memo" not in content
+
+    def test_creates_memo_soul_md_for_main_profile(self, tmp_path):
+        profile_home = tmp_path / "profiles" / "main"
+        with patch.dict(os.environ, {"HERMES_HOME": str(profile_home), "ZET_AGENT_ID": "main"}):
+            ensure_hermes_home()
+            content = (profile_home / "SOUL.md").read_text(encoding="utf-8")
+            assert "<agent_persona id=\"zettlab-memo\"" in content
+            assert "Zettlab Memo" in content
+            assert "specialized persona" not in content
 
     def test_does_not_overwrite_existing_soul_md(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
@@ -71,49 +102,20 @@ class TestEnsureHermesHome:
             ensure_hermes_home()
             assert soul_path.read_text(encoding="utf-8") == "custom soul"
 
-    def test_upgrades_legacy_template_soul_md(self, tmp_path):
-        # Older installers seeded a comment-only scaffold that shadowed the
-        # runtime default. A SOUL.md still matching that scaffold carries no
-        # user persona and should be upgraded in place to DEFAULT_SOUL_MD.
+    def test_upgrades_all_legacy_stock_soul_md(self, tmp_path):
+        # Older installers seeded stock defaults that shadowed the runtime
+        # default. A SOUL.md still matching one carries no user persona and
+        # should be upgraded in place to DEFAULT_SOUL_MD.
         from hermes_cli.default_soul import DEFAULT_SOUL_MD, _LEGACY_TEMPLATE_SOULS
 
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            soul_path = tmp_path / "SOUL.md"
-            soul_path.write_text(_LEGACY_TEMPLATE_SOULS[0] + "\n", encoding="utf-8")
-            ensure_hermes_home()
-            assert soul_path.read_text(encoding="utf-8") == DEFAULT_SOUL_MD
-
-    def test_upgrades_legacy_stock_default_soul_md(self, tmp_path):
-        # Previous built-in defaults also carry no user intent when matched
-        # exactly, so they should be upgraded to the current General Assistant
-        # default without using unsafe prefix matching.
-        from hermes_cli.default_soul import DEFAULT_SOUL_MD, _LEGACY_TEMPLATE_SOULS
-
-        for legacy in _LEGACY_TEMPLATE_SOULS[:2]:
-            with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-                soul_path = tmp_path / "SOUL.md"
+        for index, legacy in enumerate(_LEGACY_TEMPLATE_SOULS):
+            home = tmp_path / str(index)
+            home.mkdir()
+            with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
+                soul_path = home / "SOUL.md"
                 soul_path.write_text(legacy + "\n", encoding="utf-8")
                 ensure_hermes_home()
                 assert soul_path.read_text(encoding="utf-8") == DEFAULT_SOUL_MD
-                soul_path.unlink()
-
-    def test_preserves_legacy_stock_default_with_user_suffix(self, tmp_path):
-        from hermes_cli.default_soul import _LEGACY_TEMPLATE_SOULS
-
-        custom = _LEGACY_TEMPLATE_SOULS[0] + "\nKeep my owner-specific workflow."
-        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
-            soul_path = tmp_path / "SOUL.md"
-            soul_path.write_text(custom, encoding="utf-8")
-            ensure_hermes_home()
-            assert soul_path.read_text(encoding="utf-8") == custom
-
-    def test_installer_and_docker_souls_match_default(self):
-        from hermes_cli.default_soul import DEFAULT_SOUL_MD
-
-        root = Path(__file__).resolve().parents[2]
-        assert DEFAULT_SOUL_MD in (root / "scripts" / "install.sh").read_text(encoding="utf-8")
-        assert DEFAULT_SOUL_MD in (root / "scripts" / "install.ps1").read_text(encoding="utf-8")
-        assert (root / "docker" / "SOUL.md").read_text(encoding="utf-8").rstrip("\n") == DEFAULT_SOUL_MD
 
     def test_preserves_legacy_template_with_user_persona(self, tmp_path):
         # If the user typed a persona alongside the scaffold, the content no
@@ -126,6 +128,27 @@ class TestEnsureHermesHome:
             soul_path.write_text(mixed, encoding="utf-8")
             ensure_hermes_home()
             assert soul_path.read_text(encoding="utf-8") == mixed
+
+    def test_preserves_every_legacy_stock_default_with_user_suffix(self, tmp_path):
+        from hermes_cli.default_soul import _LEGACY_TEMPLATE_SOULS
+
+        for index, legacy in enumerate(_LEGACY_TEMPLATE_SOULS):
+            home = tmp_path / str(index)
+            home.mkdir()
+            custom = legacy + "\nKeep my owner-specific workflow."
+            with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
+                soul_path = home / "SOUL.md"
+                soul_path.write_text(custom, encoding="utf-8")
+                ensure_hermes_home()
+                assert soul_path.read_text(encoding="utf-8") == custom
+
+    def test_installer_and_docker_souls_match_memo_default(self):
+        from hermes_cli.default_soul import DEFAULT_SOUL_MD
+
+        root = Path(__file__).resolve().parents[2]
+        assert DEFAULT_SOUL_MD in (root / "scripts" / "install.sh").read_text(encoding="utf-8")
+        assert DEFAULT_SOUL_MD in (root / "scripts" / "install.ps1").read_text(encoding="utf-8")
+        assert (root / "docker" / "SOUL.md").read_text(encoding="utf-8").rstrip("\n") == DEFAULT_SOUL_MD
 
 
 class TestLoadConfigDefaults:
