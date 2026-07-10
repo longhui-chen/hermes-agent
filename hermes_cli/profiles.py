@@ -1111,7 +1111,7 @@ def create_profile(
     if not soul_path.exists():
         try:
             from hermes_cli.default_soul import default_soul_md
-            soul_path.write_text(default_soul_md(profile=canon), encoding="utf-8")
+            soul_path.write_text(default_soul_md(), encoding="utf-8")
         except Exception:
             pass  # best-effort — don't fail profile creation over this
 

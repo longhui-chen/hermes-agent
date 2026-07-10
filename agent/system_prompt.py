@@ -160,7 +160,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             _soul_loaded = True
 
     if not _soul_loaded:
-        # Fallback to hardcoded identity (language tracks device region).
+        # Fall back to the neutral runtime identity for the active language.
         _identity_text = default_agent_identity()
 
     # Shared XML-ish Zettlab agent base prompt for every agent. It wraps the

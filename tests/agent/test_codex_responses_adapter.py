@@ -179,17 +179,15 @@ def test_preflight_still_rejects_unknown_tool_type():
 
 
 @pytest.mark.parametrize(
-    ("profile", "expected", "forbidden"),
+    "profile",
     [
-        pytest.param("main", "Zettlab Memo", "specialized persona", id="memo"),
-        pytest.param("writer", "specialized persona", "Zettlab Memo", id="base"),
+        pytest.param("main", id="main"),
+        pytest.param("writer", id="writer"),
     ],
 )
 def test_preflight_empty_instructions_uses_profile_identity(
     monkeypatch,
     profile,
-    expected,
-    forbidden,
 ):
     monkeypatch.setenv("ZET_AGENT_ID", profile)
     kwargs = {
@@ -200,8 +198,8 @@ def test_preflight_empty_instructions_uses_profile_identity(
 
     result = _preflight_codex_api_kwargs(kwargs)
 
-    assert expected in result["instructions"]
-    assert forbidden not in result["instructions"]
+    assert "specialized persona" in result["instructions"]
+    assert "Zettlab Memo" not in result["instructions"]
 
 
 # ---------------------------------------------------------------------------

@@ -165,19 +165,12 @@ class TestCreateProfile:
                         "plans", "workspace", "cron"]:
             assert (profile_dir / subdir).is_dir(), f"Missing subdir: {subdir}"
 
-    def test_fresh_profile_seeds_base_soul_not_memo(self, profile_env):
-        profile_dir = create_profile("coder", no_alias=True)
+    @pytest.mark.parametrize("profile", ["coder", "main", "memo"])
+    def test_fresh_profile_always_seeds_neutral_soul(self, profile_env, profile):
+        profile_dir = create_profile(profile, no_alias=True)
         content = (profile_dir / "SOUL.md").read_text(encoding="utf-8")
         assert "specialized persona" in content
         assert "Zettlab Memo" not in content
-
-    @pytest.mark.parametrize("profile", ["main", "memo"])
-    def test_fresh_system_profile_seeds_memo_soul(self, profile_env, profile):
-        profile_dir = create_profile(profile, no_alias=True)
-        content = (profile_dir / "SOUL.md").read_text(encoding="utf-8")
-        assert '<agent_persona id="zettlab-memo"' in content
-        assert "Zettlab Memo" in content
-        assert "specialized persona" not in content
 
     def test_seeds_placeholder_env_file(self, profile_env):
         """Fresh profiles get their own .env (owner-only) so channel/env

@@ -102,7 +102,7 @@ class TestCodingContextBlock:
 
 
 class TestZettlabPromptKernel:
-    def test_xml_kernel_wraps_base_identity_for_non_memo_profile(self, monkeypatch):
+    def test_xml_kernel_wraps_neutral_identity_for_named_profile(self, monkeypatch):
         monkeypatch.setenv("ZETTLAB_AGENT_LANG", "zh")
         monkeypatch.setenv("HERMES_AGENT_LANG", "zh")
         monkeypatch.setenv("ZET_AGENT_ID", "writer")
@@ -123,7 +123,7 @@ class TestZettlabPromptKernel:
         assert "# 对话协议" not in stable
         assert "# 语气与风格" not in stable
 
-    def test_xml_kernel_wraps_memo_identity_for_main_profile(self, monkeypatch):
+    def test_xml_kernel_does_not_infer_memo_from_main_profile(self, monkeypatch):
         monkeypatch.setenv("ZETTLAB_AGENT_LANG", "zh")
         monkeypatch.setenv("HERMES_AGENT_LANG", "zh")
         monkeypatch.setenv("ZET_AGENT_ID", "main")
@@ -131,6 +131,6 @@ class TestZettlabPromptKernel:
         stable = _stable_prompt(_make_agent())
 
         assert "<profile_soul source=\"SOUL.md\">" in stable
-        assert "<agent_persona id=\"zettlab-memo\"" in stable
-        assert "你是 Zettlab Memo" in stable
-        assert "不要默认自己是任何具名专家" not in stable
+        assert "<agent_persona id=\"zettlab-memo\"" not in stable
+        assert "你是 Zettlab Memo" not in stable
+        assert "不要默认自己是任何具名专家" in stable

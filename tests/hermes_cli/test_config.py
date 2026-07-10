@@ -58,33 +58,21 @@ class TestEnsureHermesHome:
             assert soul_path.exists()
             content = soul_path.read_text(encoding="utf-8").strip()
             assert content != ""
-            assert '<agent_persona id="zettlab-memo"' in content
-            assert "Zettlab Memo" in content
-            assert "resident assistant" in content
-            assert "fallback entry point" not in content
-            assert "Hermes Agent" not in content
-
-    def test_creates_base_soul_md_for_non_memo_profile(self, tmp_path):
-        profile_home = tmp_path / "profiles" / "writer"
-        with patch.dict(os.environ, {"HERMES_HOME": str(profile_home), "ZET_AGENT_ID": "writer"}):
-            ensure_hermes_home()
-            soul_path = profile_home / "SOUL.md"
-            assert soul_path.exists()
-            content = soul_path.read_text(encoding="utf-8").strip()
-            assert content != ""
             assert "specialized persona" in content
             assert "Zettlab Memo" not in content
 
-    def test_infers_non_memo_profile_from_hermes_home(self, tmp_path):
-        profile_home = tmp_path / "profiles" / "writer"
-        with patch.dict(os.environ, {"HERMES_HOME": str(profile_home)}, clear=False):
-            os.environ.pop("ZET_AGENT_ID", None)
-            os.environ.pop("HERMES_PROFILE_NAME", None)
-            os.environ.pop("HERMES_PROFILE", None)
+    @pytest.mark.parametrize("profile", ["writer", "main", "memo", "default", "root"])
+    def test_profile_name_never_changes_seeded_soul(self, tmp_path, profile):
+        profile_home = tmp_path / "profiles" / profile
+        with patch.dict(
+            os.environ,
+            {"HERMES_HOME": str(profile_home), "ZET_AGENT_ID": profile},
+        ):
             ensure_hermes_home()
-            content = (profile_home / "SOUL.md").read_text(encoding="utf-8")
-            assert "specialized persona" in content
-            assert "Zettlab Memo" not in content
+
+        content = (profile_home / "SOUL.md").read_text(encoding="utf-8")
+        assert "specialized persona" in content
+        assert "Zettlab Memo" not in content
 
     def test_context_local_profile_home_seeds_neutral_soul(self, tmp_path):
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -105,15 +93,6 @@ class TestEnsureHermesHome:
         assert "specialized persona" in content
         assert "Zettlab Memo" not in content
 
-    def test_creates_memo_soul_md_for_main_profile(self, tmp_path):
-        profile_home = tmp_path / "profiles" / "main"
-        with patch.dict(os.environ, {"HERMES_HOME": str(profile_home), "ZET_AGENT_ID": "main"}):
-            ensure_hermes_home()
-            content = (profile_home / "SOUL.md").read_text(encoding="utf-8")
-            assert "<agent_persona id=\"zettlab-memo\"" in content
-            assert "Zettlab Memo" in content
-            assert "specialized persona" not in content
-
     def test_does_not_overwrite_existing_soul_md(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             soul_path = tmp_path / "SOUL.md"
@@ -121,47 +100,23 @@ class TestEnsureHermesHome:
             ensure_hermes_home()
             assert soul_path.read_text(encoding="utf-8") == "custom soul"
 
-    def test_upgrades_all_legacy_stock_soul_md(self, tmp_path):
-        # Older installers seeded stock defaults that shadowed the runtime
-        # default. A SOUL.md still matching one carries no user persona and
-        # should be upgraded in place to DEFAULT_SOUL_MD.
-        from hermes_cli.default_soul import DEFAULT_SOUL_MD, _LEGACY_TEMPLATE_SOULS
-
-        for index, legacy in enumerate(_LEGACY_TEMPLATE_SOULS):
-            home = tmp_path / str(index)
-            home.mkdir()
-            with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
-                soul_path = home / "SOUL.md"
-                soul_path.write_text(legacy + "\n", encoding="utf-8")
-                ensure_hermes_home()
-                assert soul_path.read_text(encoding="utf-8") == DEFAULT_SOUL_MD
-
-    def test_preserves_legacy_template_with_user_persona(self, tmp_path):
-        # If the user typed a persona alongside the scaffold, the content no
-        # longer matches the known empty template — leave it untouched.
-        from hermes_cli.default_soul import _LEGACY_TEMPLATE_SOULS
-
-        mixed = _LEGACY_TEMPLATE_SOULS[0] + "\nYou are a helpful pirate."
+    @pytest.mark.parametrize(
+        "existing",
+        [
+            "You are Zettlab Memo, an intelligent AI assistant.",
+            '<agent_persona id="zettlab-memo"><name>Zettlab Memo</name></agent_persona>',
+            "# Hub Agent\n\nPackage-authored specialist persona.",
+            "# Hermes Agent Persona\n\n<!-- historical scaffold -->",
+        ],
+    )
+    def test_never_migrates_existing_profile_owned_soul(self, tmp_path, existing):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             soul_path = tmp_path / "SOUL.md"
-            soul_path.write_text(mixed, encoding="utf-8")
+            soul_path.write_text(existing, encoding="utf-8")
             ensure_hermes_home()
-            assert soul_path.read_text(encoding="utf-8") == mixed
+            assert soul_path.read_text(encoding="utf-8") == existing
 
-    def test_preserves_every_legacy_stock_default_with_user_suffix(self, tmp_path):
-        from hermes_cli.default_soul import _LEGACY_TEMPLATE_SOULS
-
-        for index, legacy in enumerate(_LEGACY_TEMPLATE_SOULS):
-            home = tmp_path / str(index)
-            home.mkdir()
-            custom = legacy + "\nKeep my owner-specific workflow."
-            with patch.dict(os.environ, {"HERMES_HOME": str(home)}):
-                soul_path = home / "SOUL.md"
-                soul_path.write_text(custom, encoding="utf-8")
-                ensure_hermes_home()
-                assert soul_path.read_text(encoding="utf-8") == custom
-
-    def test_installer_and_docker_souls_match_memo_default(self):
+    def test_installer_and_docker_souls_match_neutral_default(self):
         from hermes_cli.default_soul import DEFAULT_SOUL_MD
 
         root = Path(__file__).resolve().parents[2]

@@ -103,12 +103,12 @@ class TestGuidanceConstants:
         assert "<profile_soul source=\"SOUL.md\">\n我是照片整理 agent。\n</profile_soul>" in guidance
         assert guidance.count("<profile_soul") == 1
 
-    def test_default_agent_identity_uses_memo_for_main_profile(self, monkeypatch):
+    def test_default_agent_identity_is_neutral_for_main_profile(self, monkeypatch):
         monkeypatch.setenv("ZET_AGENT_ID", "main")
-        assert "<agent_persona id=\"zettlab-memo\"" in default_agent_identity("en")
-        assert "Zettlab Memo" in default_agent_identity("en")
+        assert "specialized persona" in default_agent_identity("en")
+        assert "Zettlab Memo" not in default_agent_identity("en")
 
-    def test_default_agent_identity_uses_base_for_non_memo_profile(self, monkeypatch):
+    def test_default_agent_identity_is_neutral_for_named_profile(self, monkeypatch):
         monkeypatch.setenv("ZET_AGENT_ID", "writer")
         assert "specialized persona" in default_agent_identity("en")
         assert "Zettlab Memo" not in default_agent_identity("en")
@@ -788,7 +788,8 @@ class TestBuildContextFilesPrompt:
         with patch("pathlib.Path.home", return_value=fake_home):
             result = build_context_files_prompt(cwd=str(tmp_path))
         assert "Project Context" in result
-        assert "Zettlab Memo" in result
+        assert "specialized persona" in result
+        assert "Zettlab Memo" not in result
 
     def test_loads_agents_md(self, tmp_path):
         (tmp_path / "AGENTS.md").write_text("Use Ruff for linting.")

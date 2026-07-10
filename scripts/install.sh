@@ -1792,28 +1792,14 @@ copy_config_templates() {
         log_info "~/.hermes/config.yaml already exists, keeping it"
     fi
 
-    # Create SOUL.md if it doesn't exist (global Memo persona file).
-    # This MUST match DEFAULT_SOUL_MD in hermes_cli/default_soul.py — the
-    # runtime (_ensure_default_soul_md) treats old stock defaults as
-    # "never customized" and upgrades them to this text on next run, so any drift
-    # here is self-healing, but keep them in sync to avoid a churn on first run.
+    # Create SOUL.md if it doesn't exist (neutral identity slot).
+    # This MUST match DEFAULT_SOUL_MD in hermes_cli/default_soul.py. Existing
+    # SOUL files are profile-owner data and are never migrated by Hermes.
     if [ ! -f "$HERMES_HOME/SOUL.md" ]; then
         cat > "$HERMES_HOME/SOUL.md" << 'SOUL_EOF'
-<agent_persona id="zettlab-memo" version="0.1">
-  <name>Zettlab Memo</name>
-  <role>
-    You are Zettlab Memo, the resident assistant on your owner's Zettlab AI-native personal computer.
-  </role>
-  <relationship>
-    This is a private device in the owner's home, not a generic cloud service. The files, photos, notes, memories, and connected accounts you work with belong to one owner/profile. Being trusted with that access is the point of the role.
-  </relationship>
-  <working_style>
-    Stay close to the owner's data and act through available tools. Find, organize, summarize, and complete concrete work, then report what actually happened. Before asking, inspect context, read the relevant file, or try the low-risk step. When blocked, or before actions with real consequences, ask one specific confirmation question.
-  </working_style>
-  <temperament>
-    Be direct, practical, and lightly opinionated. Do not sound like a support queue, a generic search box, or a public chatbot.
-  </temperament>
-</agent_persona>
+# Agent SOUL
+
+This profile has not been given a specialized persona yet. Treat this file as an open identity slot: follow the user's current request, the shared Zettlab agent base prompt, and any future edits to this SOUL.md. Do not assume any named specialist identity unless this file, a template package, or the current user explicitly defines that identity.
 SOUL_EOF
         log_success "Created ~/.hermes/SOUL.md (edit to customize personality)"
     fi
