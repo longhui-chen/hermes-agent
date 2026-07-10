@@ -16,7 +16,7 @@ ZPK_UV_VENV_LOG ?= $(ZPK_LOG_DIR)/zpk-uv-venv.log
 ZPK_UV_INSTALL_LOG ?= $(ZPK_LOG_DIR)/zpk-uv-install.log
 ZPK_UV_FLAGS ?= --no-progress
 
-ZPK_EXCLUDES := \
+ZPK_GLOBAL_EXCLUDES := \
 	--exclude=.git \
 	--exclude=.gk \
 	--exclude=.worktrees \
@@ -27,26 +27,33 @@ ZPK_EXCLUDES := \
 	--exclude=.pytest_cache \
 	--exclude=.ruff_cache \
 	--exclude=.mypy_cache \
-	--exclude=build \
-	--exclude=dist \
-	--exclude=data \
+	--exclude='*.egg-info'
+
+# These are repository-root build and development paths. Keep the ./ prefix:
+# an unanchored tar exclude also removes same-named runtime directories inside
+# plugins/ and venv/ (for example plugins/web and botocore/data).
+ZPK_ROOT_EXCLUDES := \
+	--exclude=./build \
+	--exclude=./dist \
+	--exclude=./data \
 	--exclude=./logs \
-	--exclude=tmp \
-	--exclude=tests \
-	--exclude=docs \
-	--exclude=examples \
-	--exclude=website \
-	--exclude=web \
-	--exclude=ui-tui \
-	--exclude=nix \
+	--exclude=./tmp \
+	--exclude=./tests \
+	--exclude=./docs \
+	--exclude=./examples \
+	--exclude=./website \
+	--exclude=./web \
+	--exclude=./ui-tui \
+	--exclude=./nix \
 	--exclude=./environments \
 	--exclude=./packaging \
-	--exclude='*.egg-info' \
-	--exclude=wandb \
-	--exclude=testlogs \
-	--exclude=venv/.zpk-venv.stamp \
-	--exclude=venv/.zpk-install-spec \
-	--exclude=zpk
+	--exclude=./wandb \
+	--exclude=./testlogs \
+	--exclude=./venv/.zpk-venv.stamp \
+	--exclude=./venv/.zpk-install-spec \
+	--exclude=./zpk
+
+ZPK_EXCLUDES := $(ZPK_GLOBAL_EXCLUDES) $(ZPK_ROOT_EXCLUDES)
 
 zpk-venv:
 	@echo "Preparing zettlab-claw ZPK venv..."
@@ -97,6 +104,7 @@ zpk-stage: zpk-venv
 	cp "$$python_bin" "$(ZPK_SRC_DIR)/venv/bin/python3.11"
 	@chmod 0755 "$(ZPK_SRC_DIR)/venv/bin/python" "$(ZPK_SRC_DIR)/venv/bin/python3" "$(ZPK_SRC_DIR)/venv/bin/python3.11"
 	@find "$(ZPK_SRC_DIR)" -type l -delete
+	@python3 scripts/check_zpk_stage.py "$(ZPK_SRC_DIR)"
 	@chmod 0755 zpk/install.sh zpk/update.sh zpk/uninstall.sh zpk/bin/hermes \
 		zpk/zpk-systemd.sh zpk/prepare-claw-service.sh zpk/init.d/start.sh zpk/init.d/stop.sh
 	@echo "zettlab-claw ZPK payload staged at $(ZPK_SRC_DIR)"
