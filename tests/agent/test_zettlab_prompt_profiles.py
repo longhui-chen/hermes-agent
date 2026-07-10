@@ -145,6 +145,25 @@ def test_specialist_soul_is_wrapped_without_memo_bleed(monkeypatch):
     assert '<must_not_override locked="true">' in stable
 
 
+def test_profile_soul_voice_overrides_shared_neutral_voice_flow(monkeypatch):
+    monkeypatch.setenv("ZET_AGENT_ID", "main")
+    monkeypatch.setenv("HERMES_AGENT_LANG", "zh")
+    memo_soul = (
+        '<agent_persona id="zettlab-memo" version="0.2">\n'
+        "  <voice>Sound like a clever, living friend. Gentle teasing is welcome.</voice>\n"
+        "</agent_persona>"
+    )
+
+    stable = _stable_prompt(memo_soul)
+
+    assert stable.count(memo_soul) == 1
+    assert "clever, living friend" in stable
+    assert "Gentle teasing is welcome" in stable
+    assert "SOUL.md 可以定义更温暖、俏皮或正式的 voice" in stable
+    assert "就服从这层更具体的人格" in stable
+    assert "不要凭空表演人格" in stable
+
+
 def test_specialist_soul_cannot_remove_locked_base_policy(monkeypatch):
     monkeypatch.setenv("ZET_AGENT_ID", "ops")
     monkeypatch.setenv("HERMES_AGENT_LANG", "en")

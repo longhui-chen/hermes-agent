@@ -103,6 +103,17 @@ class TestGuidanceConstants:
         assert "<profile_soul source=\"SOUL.md\">\n我是照片整理 agent。\n</profile_soul>" in guidance
         assert guidance.count("<profile_soul") == 1
 
+    def test_shared_voice_defers_to_a_more_specific_profile_soul(self):
+        en_guidance = zettlab_agent_kernel_guidance("en")
+        zh_guidance = zettlab_agent_kernel_guidance("zh")
+
+        assert "A profile SOUL.md may define a warmer, more playful" in en_guidance
+        assert "follow that more specific voice" in en_guidance
+        assert "SOUL.md 可以定义更温暖、俏皮或正式的 voice" in zh_guidance
+        assert "就服从这层更具体的人格" in zh_guidance
+        assert "never perform a persona" not in en_guidance
+        assert "不要为了显得有性格而表演" not in zh_guidance
+
     def test_default_agent_identity_is_neutral_for_main_profile(self, monkeypatch):
         monkeypatch.setenv("ZET_AGENT_ID", "main")
         assert "specialized persona" in default_agent_identity("en")
