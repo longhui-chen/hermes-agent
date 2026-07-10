@@ -101,7 +101,7 @@ def test_profile_prompt_use_cases(
     assert '<confirmation_policy locked="true">' in stable
 
 
-@pytest.mark.parametrize("profile", ["main", "memo", "default"])
+@pytest.mark.parametrize("profile", ["main", "memo", "default", "root"])
 def test_memo_profiles_use_memo_soul_fallback(monkeypatch, profile):
     monkeypatch.setenv("ZET_AGENT_ID", profile)
     monkeypatch.setenv("HERMES_AGENT_LANG", "zh")
@@ -150,6 +150,25 @@ def test_profile_name_can_be_inferred_from_hermes_home(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(profile_home))
 
     assert default_soul_md("en") == base_soul_md("en")
+
+
+def test_context_local_profile_fallback_flow_uses_neutral_soul(monkeypatch, tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    root_home = tmp_path / ".hermes"
+    profile_home = root_home / "profiles" / "writer"
+    monkeypatch.setenv("HERMES_HOME", str(root_home))
+    monkeypatch.setenv("ZET_AGENT_ID", "main")
+
+    token = set_hermes_home_override(profile_home)
+    try:
+        assert default_soul_md("en") == base_soul_md("en")
+        stable = _stable_prompt()
+    finally:
+        reset_hermes_home_override(token)
+
+    assert "specialized persona" in stable
+    assert "Zettlab Memo" not in stable
 
 
 def test_custom_specialist_soul_is_wrapped_without_memo_bleed(monkeypatch):

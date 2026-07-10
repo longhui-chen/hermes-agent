@@ -86,6 +86,25 @@ class TestEnsureHermesHome:
             assert "specialized persona" in content
             assert "Zettlab Memo" not in content
 
+    def test_context_local_profile_home_seeds_neutral_soul(self, tmp_path):
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        root_home = tmp_path / ".hermes"
+        profile_home = root_home / "profiles" / "writer"
+        with patch.dict(
+            os.environ,
+            {"HERMES_HOME": str(root_home), "ZET_AGENT_ID": "main"},
+        ):
+            token = set_hermes_home_override(profile_home)
+            try:
+                ensure_hermes_home()
+            finally:
+                reset_hermes_home_override(token)
+
+        content = (profile_home / "SOUL.md").read_text(encoding="utf-8")
+        assert "specialized persona" in content
+        assert "Zettlab Memo" not in content
+
     def test_creates_memo_soul_md_for_main_profile(self, tmp_path):
         profile_home = tmp_path / "profiles" / "main"
         with patch.dict(os.environ, {"HERMES_HOME": str(profile_home), "ZET_AGENT_ID": "main"}):

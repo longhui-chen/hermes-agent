@@ -100,11 +100,36 @@ def _resolve_lang(lang: str | None = None) -> str:
     return "en"
 
 
+def _profile_name_from_home(home: str | Path) -> str:
+    """Return a named profile from ``<root>/profiles/<name>``, if present."""
+    path = Path(home)
+    if path.parent.name == "profiles" and path.name:
+        return path.name.lower()
+    return ""
+
+
 def _resolve_profile_name(profile: str | None = None) -> str:
-    """Infer the active profile name without importing hermes_cli.profiles."""
+    """Infer the active profile name without importing hermes_cli.profiles.
+
+    The context-local home override must win over process-wide environment
+    variables. Multiplex gateways use that override to isolate concurrent
+    profile requests while deliberately leaving ``os.environ`` untouched.
+    """
+    if profile and profile.strip():
+        return profile.strip().lower()
+
+    # Lazy import keeps this lightweight module independent from agent.* while
+    # honoring Hermes's canonical per-request profile isolation contract.
+    from hermes_constants import get_hermes_home_override
+
+    home_override = get_hermes_home_override()
+    if home_override:
+        # An override pointing at the root home intentionally resolves to the
+        # root/default Memo slot, so do not fall through to stale process env.
+        return _profile_name_from_home(home_override)
+
     raw = (
-        profile
-        or os.environ.get("ZET_AGENT_ID")
+        os.environ.get("ZET_AGENT_ID")
         or os.environ.get("HERMES_PROFILE_NAME")
         or os.environ.get("HERMES_PROFILE")
         or ""
@@ -114,18 +139,16 @@ def _resolve_profile_name(profile: str | None = None) -> str:
 
     home = os.environ.get("HERMES_HOME", "").strip()
     if home:
-        path = Path(home)
-        if path.parent.name == "profiles" and path.name:
-            return path.name.lower()
+        return _profile_name_from_home(home)
 
     return ""
 
 
 def _is_memo_profile(profile: str | None = None) -> bool:
-    """Return True for the system Memo/main/default slot."""
+    """Return True for the system Memo/main/default/root slot."""
     name = _resolve_profile_name(profile)
     if name:
-        return name in {"main", "memo", "default"}
+        return name in {"main", "memo", "default", "root"}
     # No profile signal means the root/default Hermes home. In Zettlab builds
     # that root slot is the system Memo agent.
     return True
