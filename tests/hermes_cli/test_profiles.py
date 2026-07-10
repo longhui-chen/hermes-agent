@@ -171,6 +171,14 @@ class TestCreateProfile:
         assert "specialized persona" in content
         assert "Zettlab Memo" not in content
 
+    @pytest.mark.parametrize("profile", ["main", "memo"])
+    def test_fresh_system_profile_seeds_memo_soul(self, profile_env, profile):
+        profile_dir = create_profile(profile, no_alias=True)
+        content = (profile_dir / "SOUL.md").read_text(encoding="utf-8")
+        assert '<agent_persona id="zettlab-memo"' in content
+        assert "Zettlab Memo" in content
+        assert "specialized persona" not in content
+
     def test_seeds_placeholder_env_file(self, profile_env):
         """Fresh profiles get their own .env (owner-only) so channel/env
         writes are profile-scoped from day one instead of falling through
