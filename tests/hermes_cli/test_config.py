@@ -62,7 +62,7 @@ class TestEnsureHermesHome:
             assert "Zettlab Memo" not in content
 
     @pytest.mark.parametrize("profile", ["writer", "main", "memo", "default", "root"])
-    def test_profile_name_never_changes_seeded_soul(self, tmp_path, profile):
+    def test_zettlab_managed_profile_does_not_seed_soul(self, tmp_path, profile):
         profile_home = tmp_path / "profiles" / profile
         with patch.dict(
             os.environ,
@@ -70,11 +70,9 @@ class TestEnsureHermesHome:
         ):
             ensure_hermes_home()
 
-        content = (profile_home / "SOUL.md").read_text(encoding="utf-8")
-        assert "specialized persona" in content
-        assert "Zettlab Memo" not in content
+        assert not (profile_home / "SOUL.md").exists()
 
-    def test_context_local_profile_home_seeds_neutral_soul(self, tmp_path):
+    def test_context_local_zettlab_profile_home_does_not_seed_soul(self, tmp_path):
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
         root_home = tmp_path / ".hermes"
@@ -89,9 +87,7 @@ class TestEnsureHermesHome:
             finally:
                 reset_hermes_home_override(token)
 
-        content = (profile_home / "SOUL.md").read_text(encoding="utf-8")
-        assert "specialized persona" in content
-        assert "Zettlab Memo" not in content
+        assert not (profile_home / "SOUL.md").exists()
 
     def test_does_not_overwrite_existing_soul_md(self, tmp_path):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):

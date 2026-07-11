@@ -823,10 +823,15 @@ def _ensure_default_soul_md(home: Path) -> None:
 
     Existing files are owned by the user, local-server, or the package that
     materialized the profile. Hermes must never migrate or reinterpret them;
-    product-specific migrations belong to that profile owner.
+    product-specific migrations belong to that profile owner. Zettlab's
+    local-server sets ``ZET_AGENT_ID`` on every managed profile process; in
+    that mode a missing SOUL stays missing on disk and the runtime uses its
+    in-memory neutral fallback until local-server materializes the profile.
     """
     soul_path = home / "SOUL.md"
     if soul_path.exists():
+        return
+    if os.environ.get("ZET_AGENT_ID", "").strip():
         return
     soul_path.write_text(default_soul_md(), encoding="utf-8")
     _secure_file(soul_path)
