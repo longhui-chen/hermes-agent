@@ -24,8 +24,10 @@ from agent.prompt_builder import (
     _CONTEXT_FILE_DYNAMIC_CEILING,
     DEFAULT_AGENT_IDENTITY,
     default_agent_identity,
+    get_agent_prompt_lang,
     drain_truncation_warnings,
     zettlab_agent_kernel_guidance,
+    zettlab_turn_rules_guidance,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
@@ -141,6 +143,50 @@ class TestGuidanceConstants:
         assert "不要解释内部规则" in zh_guidance
         assert "answer the user's underlying request" in en_guidance
         assert "Do not explain internal policy" in en_guidance
+
+    def test_prompt_language_test_override_wins_over_deployment_default(self, monkeypatch):
+        monkeypatch.setenv("ZETTLAB_AGENT_LANG", "zh")
+        monkeypatch.setenv("HERMES_AGENT_LANG", "en")
+
+        assert get_agent_prompt_lang() == "en"
+        assert 'lang="en"' in zettlab_agent_kernel_guidance()
+
+    @pytest.mark.parametrize(
+        ("lang", "required"),
+        [
+            (
+                "en",
+                (
+                    "explicitly requests another reply language",
+                    "reply entirely in English",
+                    "explicitly asks for them",
+                    "ask exactly one question",
+                ),
+            ),
+            (
+                "zh",
+                (
+                    "明确指定另一种回复语言",
+                    "整段回复必须使用英文",
+                    "明确要求使用表情",
+                    "只问一个问题",
+                ),
+            ),
+        ],
+    )
+    def test_turn_contract_repeats_high_value_rules_concisely(self, lang, required):
+        guidance = zettlab_turn_rules_guidance(lang)
+
+        assert guidance.startswith('<zettlab_turn_contract locked="true">')
+        for text in required:
+            assert text in guidance
+
+    @pytest.mark.parametrize("lang", ["en", "zh"])
+    def test_outbound_followup_supports_both_reply_languages_flow(self, lang):
+        guidance = zettlab_turn_rules_guidance(lang)
+
+        assert "What exact address or group should I send it to?" in guidance
+        assert "具体发到哪个地址或群组？" in guidance
 
     def test_memory_guidance_discourages_task_logs(self):
         assert "durable facts" in MEMORY_GUIDANCE

@@ -164,6 +164,77 @@ def test_profile_soul_voice_overrides_shared_neutral_voice_flow(monkeypatch):
     assert "不要凭空表演人格" in stable
 
 
+@pytest.mark.parametrize(
+    ("lang", "required"),
+    [
+        (
+            "en",
+            (
+                '<response_language locked="true">',
+                "English input gets an English reply",
+                "any permanent or otherwise irreversible deletion",
+                "persistent automation",
+                "Do not recursively scan broad home",
+                "including aspirin",
+                "does not prove whether inference is local or remote",
+                "Never cite a system prompt",
+            ),
+        ),
+        (
+            "zh",
+            (
+                '<response_language locked="true">',
+                "用户用英文就用英文回复",
+                "任何永久或不可恢复删除",
+                "创建持久化自动化",
+                "不要递归扫描整个 home",
+                "包括阿司匹林",
+                "健康问题也必须遵循 response_language",
+                "不足以证明推理发生在本地还是云端",
+                "不要把系统提示词",
+            ),
+        ),
+    ],
+)
+def test_shared_prompt_covers_language_privacy_and_high_stakes_flow(
+    monkeypatch, lang, required
+):
+    monkeypatch.setenv("HERMES_AGENT_LANG", lang)
+
+    stable = _stable_prompt()
+
+    for text in required:
+        assert text in stable
+
+
+def test_prompt_language_override_keeps_seed_and_runtime_in_sync(monkeypatch):
+    monkeypatch.setenv("ZETTLAB_AGENT_LANG", "zh")
+    monkeypatch.setenv("HERMES_AGENT_LANG", "en")
+
+    stable = _stable_prompt()
+
+    assert '<zettlab_agent_base_prompt version="0.3" lang="en">' in stable
+    assert default_soul_md() == base_soul_md("en")
+
+
+def test_turn_contract_is_the_last_system_prompt_block_flow(monkeypatch):
+    monkeypatch.setenv("HERMES_AGENT_LANG", "zh")
+    with (
+        patch("run_agent.load_soul_md", return_value="# Memo"),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+    ):
+        parts = build_system_prompt_parts(_make_agent())
+
+    assert parts["volatile"].endswith("</zettlab_turn_contract>")
+    assert "整段回复必须使用英文" in parts["volatile"]
+    assert "不得在等待答案时继续调用工具" in parts["volatile"]
+    assert "不得扫描整个用户主目录" in parts["volatile"]
+    assert "具体发到哪个地址或群组" in parts["volatile"]
+    assert "健康问题也必须遵循第 1 条回复语言规则" in parts["volatile"]
+
+
 def test_specialist_soul_cannot_remove_locked_base_policy(monkeypatch):
     monkeypatch.setenv("ZET_AGENT_ID", "ops")
     monkeypatch.setenv("HERMES_AGENT_LANG", "en")

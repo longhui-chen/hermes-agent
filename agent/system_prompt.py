@@ -43,6 +43,7 @@ from agent.prompt_builder import (
     drain_truncation_warnings,
     default_agent_identity,
     zettlab_agent_kernel_guidance,
+    zettlab_turn_rules_guidance,
 )
 from agent.runtime_cwd import resolve_context_cwd
 
@@ -477,6 +478,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if agent.provider:
         timestamp_line += f"\nProvider: {agent.provider}"
     volatile_parts.append(timestamp_line)
+
+    # Keep the highest-value behavioral invariants at the very end of the
+    # system prompt. The full prompt can be long after skills, context files,
+    # memory, and runtime hints; a concise recency anchor prevents weaker
+    # models from treating early policy as distant background.
+    volatile_parts.append(zettlab_turn_rules_guidance())
 
     return {
         "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),

@@ -38,8 +38,8 @@ def _resolve_lang(lang: str | None = None) -> str:
         raw = lang.strip().lower()
     else:
         raw = (
-            os.environ.get("ZETTLAB_AGENT_LANG")
-            or os.environ.get("HERMES_AGENT_LANG")
+            os.environ.get("HERMES_AGENT_LANG")
+            or os.environ.get("ZETTLAB_AGENT_LANG")
             or ""
         ).strip().lower()
     if raw in ("zh", "cn", "zh-cn", "zh-hans", "chinese", "mandarin"):
