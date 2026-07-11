@@ -6,6 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from agent.system_prompt import build_system_prompt_parts
+from hermes_cli.config import ensure_hermes_home
 from hermes_cli.default_soul import (
     DEFAULT_SOUL_MD,
     base_soul_md,
@@ -117,6 +118,46 @@ def test_materialized_dynamic_soul_is_consumed_once(
     assert source
     assert identity in stable
     assert stable.count(soul_text) == 1
+    assert DEFAULT_SOUL_MD not in stable
+    assert stable.count('<profile_soul source="SOUL.md">') == 1
+
+
+@pytest.mark.parametrize("startup_order", ["hermes-first", "local-first"])
+def test_zettlab_managed_startup_order_materializes_memo_once_flow(
+    monkeypatch, tmp_path, startup_order
+):
+    profile_home = tmp_path / "profiles" / "main"
+    soul_path = profile_home / "SOUL.md"
+    memo_soul = (
+        '<agent_persona id="zettlab-memo" version="0.4">\n'
+        "  <name>Zettlab Memo</name>\n"
+        "  <mission>Permanent default General Assistant.</mission>\n"
+        "</agent_persona>"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("ZET_AGENT_ID", "main")
+    monkeypatch.setenv("HERMES_AGENT_LANG", "en")
+
+    if startup_order == "local-first":
+        profile_home.mkdir(parents=True)
+        soul_path.write_text(memo_soul, encoding="utf-8")
+
+    ensure_hermes_home()
+
+    if startup_order == "hermes-first":
+        assert not soul_path.exists()
+        soul_path.write_text(memo_soul, encoding="utf-8")
+    else:
+        assert soul_path.read_text(encoding="utf-8") == memo_soul
+
+    with (
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+    ):
+        stable = build_system_prompt_parts(_make_agent())["stable"]
+
+    assert stable.count(memo_soul) == 1
     assert DEFAULT_SOUL_MD not in stable
     assert stable.count('<profile_soul source="SOUL.md">') == 1
 
