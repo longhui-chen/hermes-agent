@@ -1169,6 +1169,27 @@ class TestPromptBuilderConstants:
         assert "specialized persona" in DEFAULT_AGENT_IDENTITY
         assert "Hermes Agent" not in DEFAULT_AGENT_IDENTITY
 
+    def test_default_identity_layers_brand_on_general_assistant_contract(self):
+        assert DEFAULT_AGENT_IDENTITY.startswith(
+            "You are Zettlab Memo, an intelligent AI assistant running on a Zettlab AI-Native Personal Computer."
+        )
+        for phrase in [
+            "built-in main agent for this device",
+            "generalist all-in-one assistant",
+            "file work such as PDF / Word / Excel reading and summarization",
+            "daily tasks such as todos, daily reports, translation, travel planning, and information lookup",
+            "suggest switching to the relevant specialist agent",
+            "Act first, narrate second",
+            "Load a skill's instructions before using it",
+        ]:
+            assert phrase in DEFAULT_AGENT_IDENTITY
+        for old_stock_phrase in [
+            "created by Nous Research",
+            "helpful, knowledgeable, and direct",
+            "# Hermes Agent Persona",
+        ]:
+            assert old_stock_phrase not in DEFAULT_AGENT_IDENTITY
+
     def test_platform_hints_known_platforms(self):
         assert "whatsapp" in PLATFORM_HINTS
         assert "whatsapp_cloud" in PLATFORM_HINTS
