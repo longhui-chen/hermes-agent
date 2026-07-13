@@ -115,26 +115,42 @@ class ZetGoalDriver:
 
     _CANCEL_MARK_TTL_S = 180.0
 
+    def _scope_key(self, session_id: str) -> str:
+        """Key the in-memory per-session state (locks / cancel marks / barrier
+        timers) by profile home + sid: the driver is a singleton on the
+        adapter while ``/p/{profile}`` only swaps the runtime scope — two
+        profiles can legitimately own the same bare session_id (CLI-created
+        sessions share naming), and cross-profile timer replacement/cancel
+        would strand the other profile's waiting goal (codex P1)."""
+        try:
+            from hermes_constants import get_hermes_home
+
+            return f"{get_hermes_home()}|{session_id}"
+        except Exception:
+            return session_id
+
     def _session_lock(self, session_id: str) -> threading.Lock:
+        key = self._scope_key(session_id)
         with self._lock:
-            lk = self._session_locks.get(session_id)
+            lk = self._session_locks.get(key)
             if lk is None:
                 lk = threading.Lock()
-                self._session_locks[session_id] = lk
+                self._session_locks[key] = lk
             return lk
 
     def _prune_session_lock(self, session_id: str) -> None:
+        key = self._scope_key(session_id)
         with self._lock:
-            self._session_locks.pop(session_id, None)
-            self._cancel_marks.pop(session_id, None)
+            self._session_locks.pop(key, None)
+            self._cancel_marks.pop(key, None)
 
     def _mark_user_cancel(self, session_id: str) -> None:
         with self._lock:
-            self._cancel_marks[session_id] = time.time()
+            self._cancel_marks[self._scope_key(session_id)] = time.time()
 
     def _consume_user_cancel(self, session_id: str) -> bool:
         with self._lock:
-            at = self._cancel_marks.pop(session_id, None)
+            at = self._cancel_marks.pop(self._scope_key(session_id), None)
         return at is not None and (time.time() - at) <= self._CANCEL_MARK_TTL_S
 
     def _spawn(self, fn, *args, **kwargs) -> None:
@@ -448,11 +464,18 @@ class ZetGoalDriver:
                 # the continuation so the next round fires without a user
                 # message. Direct call — we're already off the event loop
                 # (asyncio.to_thread) and the context carries the mux scope.
-                cont = mgr.next_continuation_prompt()
-                if cont:
-                    proj = dict(proj)
-                    proj["round"] = self._cumulative_round(session_id, mgr.state.turns_used) + 1
-                    self.report(session_id, proj, continuation=cont)
+                #
+                # 幂等防抖（codex P1）：resume 被重试时，上一条 resume 的续轮
+                # 可能已在跑 —— 有在途 turn 就不再下发，否则同 goal 并发起轮
+                # 重复烧预算。无在途 turn 才重踢（LS 的 error 重踢正是此场景，
+                # 它下发前已确认会话空闲）；LS 侧另有 one-turn-per-session +
+                # stale-anchor 兜底毫秒级窗口。
+                if not self._session_turn_active(session_id):
+                    cont = mgr.next_continuation_prompt()
+                    if cont:
+                        proj = dict(proj)
+                        proj["round"] = self._cumulative_round(session_id, mgr.state.turns_used) + 1
+                        self.report(session_id, proj, continuation=cont)
             return proj
 
     # ------------------------------------------------------------------
@@ -524,7 +547,14 @@ class ZetGoalDriver:
         The first caller moves the data; later calls only fill gaps — the
         merge never overwrites keys already present under the new sid, and
         the old row is tombstoned so a stale copy can't clobber fresh
-        new-sid state."""
+        new-sid state.
+
+        Crash-ordering (codex P1): the NEW sid enters the index FIRST — a
+        crash at any later step leaves at worst both sids indexed, and
+        reconcile prunes the old (cleared) one harmlessly. The old order
+        (remove old → add new last) had a window where neither the old nor
+        the new sid could lead reconcile to the live goal."""
+        self._index_add(new_sid)
         side = self._load_sidecar(old_sid)
         if side:
             existing = self._load_sidecar(new_sid)
@@ -533,11 +563,11 @@ class ZetGoalDriver:
                 self._save_sidecar(new_sid, merged)
             self._save_sidecar(old_sid, {})
         self._index_remove(old_sid)
-        self._index_add(new_sid)
+        old_key, new_key = self._scope_key(old_sid), self._scope_key(new_sid)
         with self._lock:
-            at = self._cancel_marks.pop(old_sid, None)
-            if at is not None and at > self._cancel_marks.get(new_sid, 0.0):
-                self._cancel_marks[new_sid] = at
+            at = self._cancel_marks.pop(old_key, None)
+            if at is not None and at > self._cancel_marks.get(new_key, 0.0):
+                self._cancel_marks[new_key] = at
 
     def _after_turn_sync(
         self,
@@ -656,12 +686,29 @@ class ZetGoalDriver:
 
     def _cancel_barrier_timer(self, session_id: str) -> None:
         with self._lock:
-            t = self._barrier_timers.pop(session_id, None)
+            t = self._barrier_timers.pop(self._scope_key(session_id), None)
         if t is not None:
             try:
                 t.cancel()
             except Exception:
                 pass
+
+    def _kick_after_barrier(self, session_id: str, mgr: Any) -> None:
+        """Barrier satisfied → issue the continuation (wakeup + schedule 共用
+        的续跑路径)。Caller holds the session lock. 下发前复核在途 turn
+        （codex P1）：barrier 等待期间用户可能发起了普通 turn，与它并发自驱
+        会重复执行工具 —— 让位，其 post-turn 评估接管续轮。"""
+        if self._session_turn_active(session_id):
+            return
+        cont = mgr.next_continuation_prompt()
+        if not cont:
+            return
+        st = mgr.state
+        proj = self.projection(session_id, mgr=mgr)
+        proj["state"] = "running"
+        proj["round"] = self._cumulative_round(session_id, st.turns_used) + 1
+        proj["summary"] = "wait barrier cleared; continuing"
+        self.report(session_id, proj, continuation=cont)
 
     def _schedule_barrier_wakeup(self, session_id: str) -> None:
         """Arm a timer that re-checks a parked goal's barrier. Time barriers
@@ -672,7 +719,14 @@ class ZetGoalDriver:
 
         mgr = GoalManager(session_id)
         st = mgr.state
-        if st is None or st.status != "active" or not mgr.is_waiting():
+        if st is None or st.status != "active":
+            return
+        if not mgr.is_waiting():
+            # Barrier 在设置与排定时器之间就满足了（被等的 pid 秒退等）：
+            # is_waiting() 已顺手清掉 barrier —— 静默 return 会让 goal 卡在
+            # active 无人续跑直到重启 reconcile（codex P1），走 wakeup 同款
+            # 续跑路径。
+            self._kick_after_barrier(session_id, mgr)
             return
         delay = _BARRIER_POLL_S
         if st.waiting_until and st.waiting_until > time.time():
@@ -685,9 +739,10 @@ class ZetGoalDriver:
         ctx = contextvars.copy_context()
         timer = threading.Timer(delay, lambda: ctx.run(self._barrier_wakeup, session_id))
         timer.daemon = True
+        key = self._scope_key(session_id)
         with self._lock:
-            old = self._barrier_timers.pop(session_id, None)
-            self._barrier_timers[session_id] = timer
+            old = self._barrier_timers.pop(key, None)
+            self._barrier_timers[key] = timer
         if old is not None:
             try:
                 old.cancel()
@@ -699,7 +754,7 @@ class ZetGoalDriver:
         from hermes_cli.goals import GoalManager
 
         with self._lock:
-            self._barrier_timers.pop(session_id, None)
+            self._barrier_timers.pop(self._scope_key(session_id), None)
         try:
             with self._session_lock(session_id):
                 try:
@@ -713,14 +768,7 @@ class ZetGoalDriver:
                     # Barrier still holding (pid/session) — keep polling.
                     self._schedule_barrier_wakeup(session_id)
                     return
-                cont = mgr.next_continuation_prompt()
-                if not cont:
-                    return
-                proj = self.projection(session_id, mgr=mgr)
-                proj["state"] = "running"
-                proj["round"] = self._cumulative_round(session_id, st.turns_used) + 1
-                proj["summary"] = "wait barrier cleared; continuing"
-                self.report(session_id, proj, continuation=cont)
+                self._kick_after_barrier(session_id, mgr)
         except Exception:
             logger.warning("[zet_goal] barrier wakeup failed", exc_info=True)
 
@@ -778,6 +826,35 @@ class ZetGoalDriver:
         except Exception:
             pass
         return session_id
+
+    def _session_turn_active(self, session_id: str) -> bool:
+        """Whether this process has an in-flight turn belonging to the goal's
+        session. Three-way match: the active table is keyed by the REQUEST-
+        time App sid while compaction rotates ``agent.session_id`` and the
+        goal index moves to the new sid immediately — any single-key lookup
+        misses one direction (codex P1)."""
+        active = {}
+        try:
+            with self.adapter._session_run_lock:
+                active = dict(self.adapter._active_session_agents)
+        except Exception:
+            return False
+        keys = {session_id}
+        try:
+            app_sid = str(self._load_sidecar(session_id).get("app_session_id") or "").strip()
+            if app_sid:
+                keys.add(app_sid)
+        except Exception:
+            pass
+        if keys & set(active):
+            return True
+        for ref in active.values():
+            try:
+                if str(getattr(ref[0], "session_id", "") or "") == session_id:
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _interaction_flag_set(self, session_id: str) -> bool:
         return bool(self._load_sidecar(session_id).get(self._INTERACTION_FLAG))
@@ -937,34 +1014,10 @@ class ZetGoalDriver:
             if st.status == "active" and not mgr.is_waiting():
                 # A live loop was cut mid-flight (crash / OOM respawn).
                 # Skip if this process already has an active turn for the
-                # session — the loop is running, no kick needed.
-                #
-                # 活跃表按「请求时的 App sid」注册，而压缩即时迁移会把 index
-                # 提前切到新 sid（codex P1）：只查 sid 会漏掉「已压缩但尚未
-                # 结束」的在途轮，并发重踢同一 goal。补查 sidecar 的
-                # app_session_id（注册键）以及各活跃 agent 轮转后的当前
-                # session_id。
-                active = {}
-                try:
-                    with self.adapter._session_run_lock:
-                        active = dict(self.adapter._active_session_agents)
-                except Exception:
-                    pass
-                keys = {sid}
-                try:
-                    app_sid = str(self._load_sidecar(sid).get("app_session_id") or "").strip()
-                    if app_sid:
-                        keys.add(app_sid)
-                except Exception:
-                    pass
-                if keys & set(active):
+                # session — the loop is running, no kick needed（三路比对
+                # 见 _session_turn_active，codex P1）。
+                if self._session_turn_active(sid):
                     return
-                for ref in active.values():
-                    try:
-                        if str(getattr(ref[0], "session_id", "") or "") == sid:
-                            return
-                    except Exception:
-                        continue
                 cont = mgr.next_continuation_prompt()
                 if cont:
                     proj["state"] = "running"

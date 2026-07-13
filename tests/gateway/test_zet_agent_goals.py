@@ -10,6 +10,7 @@ compaction sidecar migration. The judge is always mocked — no LLM calls.
 from __future__ import annotations
 
 import threading
+import time
 from unittest.mock import patch
 
 import pytest
@@ -530,6 +531,89 @@ class TestRotationAwareInteractions:
 
         driver._reconcile_sync()
         assert all(r.get("continuation") is None for r in reports), "在途轮（旧 sid 注册）不得被并发重踢"
+
+
+class TestBarrierEdgeCases:
+    def test_barrier_already_cleared_kicks_immediately(self, driver, reports, monkeypatch):
+        """WAIT verdict 设完 barrier 后被等的 pid 秒退：排定时器时 is_waiting()
+        已清掉 barrier —— 不能静默 return 卡死，必须走 wakeup 同款续跑
+        （codex P1）。"""
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+        mgr = GoalManager(SID)
+        st = mgr.state
+        st.turns_used = 1
+        # 用已过期的时间 barrier 模拟「设置后立刻满足」：is_waiting() 对过期
+        # deadline 返回 False 并清 barrier。
+        st.waiting_until = time.time() - 1.0
+        st.waiting_reason = "waiting for build"
+        from hermes_cli.goals import save_goal
+
+        save_goal(SID, st)
+
+        driver._schedule_barrier_wakeup(SID)
+        assert reports, "barrier 已满足必须立即下发续轮"
+        assert reports[-1]["proj"]["state"] == "running"
+        assert reports[-1]["continuation"] and "[Continuing toward" in reports[-1]["continuation"]
+
+    def test_barrier_kick_yields_to_active_turn(self, driver, reports):
+        """barrier 清除时用户 turn 在途：不得并发自驱（codex P1），让位给
+        该 turn 的 post-turn 评估。"""
+        import types
+
+        from hermes_cli.goals import GoalManager, save_goal
+
+        _create(driver)
+        st = GoalManager(SID).state
+        st.turns_used = 1
+        st.waiting_until = time.time() - 1.0
+        save_goal(SID, st)
+        driver.adapter._active_session_agents[SID] = [types.SimpleNamespace(session_id=SID)]
+
+        driver._schedule_barrier_wakeup(SID)
+        assert all(r.get("continuation") is None for r in reports), "在途 turn 存在时不得下发续轮"
+
+
+class TestResumeIdempotency:
+    def test_resume_retry_with_active_turn_skips_continuation(self, driver, reports):
+        """resume 重试撞上已在途的续轮（上一条 resume 已起轮）：不得再发
+        continuation 并发起第二轮（codex P1）。"""
+        import types
+
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+        GoalManager(SID).pause("user paused")
+        driver.adapter._active_session_agents[SID] = [types.SimpleNamespace(session_id=SID)]
+
+        proj = driver._apply_action_sync(SID, "resume", {})
+        assert proj["state"] in ("running", "waiting")
+        assert all(r.get("continuation") is None for r in reports), "在途 turn 存在时 resume 不下发续轮"
+
+    def test_resume_on_idle_session_still_kicks(self, driver, reports):
+        """会话空闲时的 resume（LS error 重踢的正常场景）照常下发续轮。"""
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+        GoalManager(SID).pause("user paused")
+        driver._apply_action_sync(SID, "resume", {})
+        assert reports and reports[-1]["continuation"], "空闲会话的 resume 必须重踢续轮"
+
+
+class TestScopedKeys:
+    def test_cancel_marks_isolated_per_profile_home(self, driver, monkeypatch):
+        """mux 下 driver 是单例、profile 只切 runtime scope：同名 session_id
+        的 cancel mark / barrier timer 不得跨 profile 互踩（codex P1）。"""
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+        driver._mark_user_cancel(SID)
+        token = set_hermes_home_override("/tmp/other-profile-home")
+        try:
+            assert not driver._consume_user_cancel(SID), "别的 profile 不得消费本 profile 的 mark"
+        finally:
+            reset_hermes_home_override(token)
+        assert driver._consume_user_cancel(SID), "回到原 scope 后 mark 仍在"
 
 
 class TestJudgeBackgroundProcesses:
