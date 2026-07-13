@@ -112,6 +112,11 @@ class ZetGoalDriver:
         # the judge is already evaluating still wins. TTL'd so a stale mark
         # can never pause a future goal round.
         self._cancel_marks: Dict[str, float] = {}
+        # resolved profile home → epoch，unload 时递增：排队中尚未建锁/代际
+        # 键的后置任务（CLI 建的 goal 首次经本进程跑等）也要能被 unload 失效
+        # —— 只翻已存在的 session 键盖不到它们（codex P1）。
+        self._home_epochs: Dict[str, int] = {}
+        self._home_resolve_cache: Dict[str, str] = {}
         # scope key → generation counter, bumped on clear/done prune and on
         # create-over-existing. A post-turn hook that was QUEUED on the old
         # session lock while the user cleared + recreated the goal acquires
@@ -146,9 +151,31 @@ class ZetGoalDriver:
                 self._session_locks[key] = lk
             return lk
 
-    def _lock_generation(self, session_id: str) -> int:
+    def _resolved_home(self, home: str) -> str:
+        if not home:
+            return ""
+        cached = self._home_resolve_cache.get(home)
+        if cached is not None:
+            return cached
+        try:
+            from pathlib import Path
+
+            resolved = str(Path(home).resolve())
+        except Exception:
+            resolved = home
+        # home 数量 = profile 数，天然有界；GIL 下 str 赋值原子。
+        self._home_resolve_cache[home] = resolved
+        return resolved
+
+    def _lock_generation(self, session_id: str):
+        """失效代际 = (session 代际, home epoch)。home epoch 由 profile
+        unload 递增（codex P1）：覆盖「排队中尚未建 session 键」的后置任务
+        —— 它们捕获的 epoch 在 unload 后必然过期。"""
+        key = self._scope_key(session_id)
+        home = key.split("|", 1)[0] if "|" in key else ""
+        rhome = self._resolved_home(home)
         with self._lock:
-            return self._lock_gens.get(self._scope_key(session_id), 0)
+            return (self._lock_gens.get(key, 0), self._home_epochs.get(rhome, 0))
 
     def _bump_lock_generation_locked_key(self, key: str) -> None:
         """Caller holds self._lock."""
@@ -493,6 +520,13 @@ class ZetGoalDriver:
                     # active（codex P1）——local-server 的重试/过期 resume 一到，
                     # 用户已终结的 goal 就重新自驱。终态只回投影，不动状态。
                     return self.projection(session_id, mgr=mgr)
+                if st0.status == "active" and self._barrier_holding(st0):
+                    # WAIT barrier 仍成立的 active goal：过期/重试的 resume
+                    # 不得清 barrier（上游 resume() 会抹掉 waiting_on_*）再
+                    # 立即续轮 —— 那会绕过 judge 设下的等待、重复触发长任务
+                    # （codex P1）。幂等处理：只确保 wakeup timer 在，回投影。
+                    self._schedule_barrier_wakeup(session_id)
+                    return self.projection(session_id, mgr=mgr)
                 # 显式恢复 = 宣告此前的 stop 作废：丢弃残留 cancel mark（stop
                 # 中断的轮次不跑 post-turn hook，标记不会被正常消费），否则
                 # 恢复后第一轮结束时旧标记会把 goal 又暂停回去（codex P1）。
@@ -554,7 +588,7 @@ class ZetGoalDriver:
                 # stale-anchor 兜底毫秒级窗口。
                 if not self._session_turn_active(session_id):
                     cont = mgr.next_continuation_prompt()
-                    if cont:
+                    if cont and not self._consume_user_cancel(session_id):
                         proj = dict(proj)
                         proj["round"] = self._cumulative_round(session_id, mgr.state.turns_used) + 1
                         self.report(session_id, proj, continuation=cont, cause="resume")
@@ -580,6 +614,10 @@ class ZetGoalDriver:
         ``conversation_compression``; the sidecar must follow)."""
         if not session_id:
             return
+        # 代际在「排队时」而不是「executor 调度后」捕获（codex P1）：排队
+        # 延迟内 clear+create 会让 hook 里读到新代际、复核形同虚设 —— 旧轮
+        # 的 final_response 被拿去评估新 goal。
+        scheduled_gen = self._lock_generation(session_id)
         try:
             task = asyncio.create_task(
                 asyncio.to_thread(
@@ -588,6 +626,7 @@ class ZetGoalDriver:
                     user_message or "",
                     final_response or "",
                     effective_session_id or "",
+                    scheduled_gen,
                 )
             )
             tasks = getattr(self.adapter, "_background_tasks", None)
@@ -599,7 +638,7 @@ class ZetGoalDriver:
                     pass
         except RuntimeError:
             # No running loop (unit tests calling the sync path) — run inline.
-            self._after_turn_sync(session_id, user_message or "", final_response or "", effective_session_id or "")
+            self._after_turn_sync(session_id, user_message or "", final_response or "", effective_session_id or "", scheduled_gen)
 
     def note_compaction_rotation(self, old_sid: str, new_sid: str) -> None:
         """Migrate the sidecar/index AT compaction time (codex P1). The goal
@@ -660,14 +699,22 @@ class ZetGoalDriver:
         user_message: str,
         final_response: str,
         effective_session_id: str = "",
+        scheduled_gen: Any = None,
     ) -> None:
         from hermes_cli.goals import GoalManager
 
-        if effective_session_id and effective_session_id != session_id:
+        rotated = bool(effective_session_id and effective_session_id != session_id)
+        if rotated:
             self._migrate_sidecar(session_id, effective_session_id)
             session_id = effective_session_id
         try:
-            gen0 = self._lock_generation(session_id)
+            # 未轮转（绝大多数轮）：用排队时捕获的代际，堵住排队窗口的
+            # clear+create（codex P1）；轮转轮的代际键随 sid 变，退回进锁前
+            # 快照（双低概率叠加，接受）。
+            if scheduled_gen is not None and not rotated:
+                gen0 = scheduled_gen
+            else:
+                gen0 = self._lock_generation(session_id)
             with self._session_lock(session_id):
                 if self._lock_generation(session_id) != gen0:
                     # 排队等锁期间 goal 被 clear（可能又 create 了新 goal）：
@@ -753,6 +800,14 @@ class ZetGoalDriver:
                 verdict = str(decision.get("verdict") or "")
                 proj = self.projection(session_id, mgr=mgr)
                 if decision.get("should_continue") and decision.get("continuation_prompt"):
+                    # report 是网络调用且在锁内 —— stop 的 pause 线程会被本锁
+                    # 挡住，continuation 却已发出（codex P1）。发送前最后一刻
+                    # 再让 cancel mark 获胜（_mark_user_cancel 不等锁，同步可见）。
+                    if self._consume_user_cancel(session_id):
+                        mgr.pause("user stopped the running turn")
+                        self._cancel_barrier_timer(session_id)
+                        self.report(session_id, self.projection(session_id, mgr=mgr))
+                        return
                     proj["state"] = "running"
                     proj["round"] = self._cumulative_round(session_id, mgr.state.turns_used) + 1
                     proj["summary"] = str(decision.get("reason") or "")
@@ -820,6 +875,9 @@ class ZetGoalDriver:
         except Exception:
             target = str(profile_home)
         with self._lock:
+            # home epoch 先行：连「还没建 session 键」的排队任务也一并失效
+            # （codex P1）；显式逐键翻转保留（同 home 的既有键立即过期）。
+            self._home_epochs[target] = self._home_epochs.get(target, 0) + 1
             for key in set(self._lock_gens) | set(self._session_locks):
                 home = key.split("|", 1)[0] if "|" in key else ""
                 try:
@@ -867,6 +925,12 @@ class ZetGoalDriver:
             return
         cont = mgr.next_continuation_prompt()
         if not cont:
+            return
+        # 发送前最后一刻让 cancel mark 获胜（codex P1，同 post-turn continue
+        # 分支）。
+        if self._consume_user_cancel(session_id):
+            mgr.pause("user stopped the running turn")
+            self.report(session_id, self.projection(session_id, mgr=mgr))
             return
         st = mgr.state
         proj = self.projection(session_id, mgr=mgr)

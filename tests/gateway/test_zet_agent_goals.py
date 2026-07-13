@@ -754,7 +754,10 @@ class TestStaleInteractionCallback:
 
         def stale_first(sid):
             calls["n"] += 1
-            return real(sid) - 1 if calls["n"] == 1 else real(sid)
+            if calls["n"] == 1:
+                gen, epoch = real(sid)
+                return (gen - 1, epoch)
+            return real(sid)
 
         with patch.object(driver, "_lock_generation", side_effect=stale_first):
             driver.on_interaction_pending(SID)
@@ -778,6 +781,82 @@ class TestUnloadInvalidatesInflightJudge:
         with patch("hermes_cli.goals.judge_goal", side_effect=judge_then_unload):
             driver._after_turn_sync(SID, "user msg", "产出")
         assert reports == [], "unload 后完成的 judge 不得上报 continuation"
+
+
+class TestResumeKeepsWaitBarrier:
+    def test_resume_on_waiting_goal_is_idempotent(self, driver, reports):
+        """过期/重试的 resume 打到 WAIT 中的 active goal：不得清 barrier 并
+        立即续轮（绕过 judge 设下的等待、重复触发长任务，codex P1）。"""
+        from hermes_cli.goals import GoalManager, save_goal
+
+        _create(driver)
+        st = GoalManager(SID).state
+        st.waiting_until = time.time() + 3600.0
+        st.waiting_reason = "waiting for build"
+        save_goal(SID, st)
+        reports.clear()
+
+        proj = driver._apply_action_sync(SID, "resume", {})
+        assert proj["state"] == "waiting", "投影保持 waiting"
+        st2 = GoalManager(SID).state
+        assert st2.waiting_until, "barrier 不得被 resume 清除"
+        assert all(r.get("continuation") is None for r in reports), "不得下发续轮"
+        assert driver._barrier_timers, "wakeup timer 保持在位"
+
+
+class TestCancelMarkWinsBeforeReport:
+    def test_stop_during_judge_window_blocks_continuation(self, driver, reports):
+        """第二次 mark 检查之后、report 发出之前的 stop（judge 后的窄窗）：
+        发送前最后一刻的消费必须获胜，不下发 continuation（codex P1）。"""
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+
+        def judge_then_stop(*args, **kwargs):
+            # judge 返回 continue 的同时用户按下 stop（mark 同步写入）。
+            driver._mark_user_cancel(SID)
+            return ("continue", "还没完", False, None)
+
+        with patch("hermes_cli.goals.judge_goal", side_effect=judge_then_stop):
+            driver._after_turn_sync(SID, "user msg", "产出")
+        assert GoalManager(SID).state.status == "paused"
+        assert all(r.get("continuation") is None for r in reports), "stop 后不得下发续轮"
+
+
+class TestScheduledGeneration:
+    def test_hook_with_stale_scheduled_gen_is_noop(self, driver, reports):
+        """代际必须在排队时捕获（codex P1）：排队延迟内 clear+create 的场景
+        等价于 hook 带着旧 scheduled_gen 执行 —— 必须整体失效。"""
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+        stale = driver._lock_generation(SID)
+        driver._apply_action_sync(SID, "clear", {})
+        _create(driver, goal_id="g_new", text="新目标 直到完成")
+        reports.clear()
+
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "go", False, None)) as jg:
+            driver._after_turn_sync(SID, "旧轮消息", "旧轮产出", "", stale)
+        assert not jg.called, "旧轮 hook 不得评估新 goal"
+        assert reports == []
+        assert GoalManager(SID).state.status == "active"
+
+    def test_home_epoch_invalidates_tasks_without_session_keys(self, driver, reports, hermes_home):
+        """unload 的 home epoch 覆盖「尚未建 session 键」的排队任务
+        （codex P1）：即使 _lock_gens/_session_locks 里没有该会话的键，
+        unload 后旧 scheduled_gen 也必须过期。"""
+        _create(driver)
+        scheduled = driver._lock_generation(SID)
+        # 清掉 session 键，模拟「任务排队时键尚未建立」。
+        driver._session_locks.clear()
+        driver._lock_gens.clear()
+        driver.bump_lock_generations_for_home(str(hermes_home))
+        reports.clear()
+
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "go", False, None)) as jg:
+            driver._after_turn_sync(SID, "user msg", "产出", "", scheduled)
+        assert not jg.called, "unload 后排队任务必须失效"
+        assert reports == []
 
 
 class TestActiveTurnProfileIsolation:
@@ -833,7 +912,8 @@ class TestLockGeneration:
         def stale_first_read(sid):
             calls["n"] += 1
             if calls["n"] == 1:
-                return real(sid) - 1  # hook 在 clear/create 之前捕获的旧代际
+                gen, epoch = real(sid)
+                return (gen - 1, epoch)  # hook 在 clear/create 之前捕获的旧代际
             return real(sid)
 
         with patch.object(driver, "_lock_generation", side_effect=stale_first_read):
@@ -845,12 +925,12 @@ class TestLockGeneration:
 
     def test_prune_and_create_bump_generation(self, driver):
         _create(driver)
-        g0 = driver._lock_generation(SID)
+        g0, e0 = driver._lock_generation(SID)
         driver._prune_session_lock(SID)
-        g1 = driver._lock_generation(SID)
-        assert g1 == g0 + 1
+        g1, e1 = driver._lock_generation(SID)
+        assert (g1, e1) == (g0 + 1, e0)
         driver.bump_lock_generation(SID)
-        assert driver._lock_generation(SID) == g1 + 1
+        assert driver._lock_generation(SID) == (g1 + 1, e0)
 
 
 class TestReconcileLiveInteraction:
