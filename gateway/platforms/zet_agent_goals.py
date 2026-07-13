@@ -458,6 +458,17 @@ class ZetGoalDriver:
                 # 翻代：还在旧锁上排队的旧轮 post-turn hook 不得评估新 goal
                 # （codex P1）。
                 self.bump_lock_generation(session_id)
+                # 覆盖已有 active goal 时先把旧状态置为不可自驱（codex P1）：
+                # 下面「sidecar/index 先行、mgr.set() 最后」的崩溃顺序在覆盖
+                # 场景有反例 —— 新 goal_id sidecar 已写、set() 未跑时崩溃，
+                # 重启 reconcile 会拿旧 active GoalState 配新 goal_id 继续
+                # 自驱旧目标。先 pause：中间态崩溃后旧 goal 是可见的 paused
+                # （不自驱、可手动处理），set() 完成即被新 goal 整体覆盖。
+                try:
+                    if mgr.is_active():
+                        mgr.pause("superseded by a new goal")
+                except Exception:
+                    logger.debug("[zet_goal] pre-create pause failed", exc_info=True)
                 # Crash-ordering: sidecar + index FIRST, activation LAST — a
                 # crash mid-create must leave "goal not yet active", never
                 # "active but untracked" (an orphan reconcile can't see).
@@ -725,6 +736,12 @@ class ZetGoalDriver:
                 except Exception:
                     logger.warning("[zet_goal] evaluate_after_turn failed", exc_info=True)
                     return
+                # judge 是本函数里唯一的长阻塞（LLM 调用，几十秒量级）——
+                # 期间 profile 可能被 unload（bump_lock_generations_for_home
+                # 翻代）：带着旧 profile context 上报 continuation 会重新驱动
+                # 用户刚删掉的 agent（codex P1）。report 前复核一次代际。
+                if self._lock_generation(session_id) != gen0:
+                    return
                 # A stop pressed WHILE the judge was evaluating: evaluate's own
                 # save just wrote status=active over the (racing) pause — the
                 # cancel mark is the tiebreaker that stops the crawl-back.
@@ -788,6 +805,29 @@ class ZetGoalDriver:
                 t.cancel()
             except Exception:
                 pass
+
+    def bump_lock_generations_for_home(self, profile_home: Any) -> None:
+        """Profile-unload hook (codex P1): a post-turn judge task queued in
+        ``_background_tasks`` outlives the profile's active-run count — after
+        unload it would still evaluate and report a continuation with the
+        stale profile context, re-driving the removed agent. Bumping every
+        generation under the profile's home makes those tasks fail the
+        re-check they run before reporting."""
+        from pathlib import Path
+
+        try:
+            target = str(Path(str(profile_home)).resolve())
+        except Exception:
+            target = str(profile_home)
+        with self._lock:
+            for key in set(self._lock_gens) | set(self._session_locks):
+                home = key.split("|", 1)[0] if "|" in key else ""
+                try:
+                    matched = bool(home) and str(Path(home).resolve()) == target
+                except Exception:
+                    matched = home == str(profile_home)
+                if matched:
+                    self._bump_lock_generation_locked_key(key)
 
     def cancel_barrier_timers_for_home(self, profile_home: Any) -> None:
         """Profile-unload hook (codex P1): a WAIT barrier's daemon Timer
@@ -943,8 +983,9 @@ class ZetGoalDriver:
         writing waiting flags/pauses under the stale id would park them on a
         tombstoned sidecar reconcile never scans (codex P1)."""
         try:
+            key = self._scope_key(session_id)
             with self.adapter._session_run_lock:
-                ref = self.adapter._active_session_agents.get(session_id)
+                ref = self.adapter._active_session_agents.get(key) or self.adapter._active_session_agents.get(session_id)
             rotated = str(getattr(ref[0], "session_id", "") or "") if ref else ""
             if rotated and rotated != session_id:
                 return rotated
@@ -959,18 +1000,16 @@ class ZetGoalDriver:
         goal index moves to the new sid immediately — any single-key lookup
         misses one direction (codex P1).
 
-        Profile-filtered (codex P1): the active table itself is adapter-
-        global with bare sids — under the multiplexer another profile's
-        same-named session must not read as "this goal is already running"
-        (it would starve the goal's continuation forever). Registrations
-        are stamped with their profile home; unstamped entries (legacy /
-        single-profile) stay permissive."""
+        Profile-filtered (codex P1 两轮收敛): the active table is keyed
+        ``{hermes_home}|{sid}`` (adapter._active_turn_key — same shape as our
+        _scope_key), so two profiles running SAME-NAMED sessions concurrently
+        hold separate entries and neither overwrites the other. Entries from
+        another profile's home never count as this goal's in-flight turn;
+        bare-sid entries (legacy / single-profile) stay permissive."""
         active = {}
-        homes = {}
         try:
             with self.adapter._session_run_lock:
                 active = dict(self.adapter._active_session_agents)
-                homes = dict(getattr(self.adapter, "_active_session_homes", {}) or {})
         except Exception:
             return False
         current_home = ""
@@ -981,10 +1020,6 @@ class ZetGoalDriver:
         except Exception:
             pass
 
-        def _same_profile(key: str) -> bool:
-            entry_home = str(homes.get(key, "") or "")
-            return not entry_home or not current_home or entry_home == current_home
-
         keys = {session_id}
         try:
             app_sid = str(self._load_sidecar(session_id).get("app_session_id") or "").strip()
@@ -992,12 +1027,17 @@ class ZetGoalDriver:
                 keys.add(app_sid)
         except Exception:
             pass
-        for key in keys & set(active):
-            if _same_profile(key):
-                return True
         for key, ref in active.items():
+            if "|" in key:
+                entry_home, entry_sid = key.split("|", 1)
+            else:
+                entry_home, entry_sid = "", key
+            if entry_home and current_home and entry_home != current_home:
+                continue  # 另一 profile 的同名会话（codex P1）
+            if entry_sid in keys:
+                return True
             try:
-                if str(getattr(ref[0], "session_id", "") or "") == session_id and _same_profile(key):
+                if str(getattr(ref[0], "session_id", "") or "") == session_id:
                     return True
             except Exception:
                 continue
@@ -1028,21 +1068,31 @@ class ZetGoalDriver:
         # 行/sidecar 都在新 sid 下（旧行 cleared、旧 sidecar tombstone），
         # 不解析的话 is_active() 直接 False，等待态既不投影也不落盘。
         session_id = self._live_session_id(session_id)
-        try:
-            mgr = GoalManager(session_id)
-        except Exception:
-            return
-        if not mgr.is_active():
-            return
+        # 判定 + flag 写入 + 投影构造全部在 session lock 内、状态锁内新载
+        # （codex P1）：锁外判定 active 与锁内写 flag 之间 clear/create 可能
+        # 换代 —— 旧回调会把等待标记写到新 goal 的 sidecar 并用旧投影上报
+        # waiting，随后 reconcile/resume 把新目标无故 park。代际校验与
+        # post-turn hook 同款。产品链路上 create 接管被 one-turn-per-session
+        # 挡在旧 turn 结束之后，这里主要兜 clear 竞态与 CLI 旁路。
+        gen0 = self._lock_generation(session_id)
         try:
             with self._session_lock(session_id):
+                if self._lock_generation(session_id) != gen0:
+                    return
+                try:
+                    mgr = GoalManager(session_id)
+                except Exception:
+                    return
+                if not mgr.is_active():
+                    return
                 side = self._load_sidecar(session_id)
                 if not side.get(self._INTERACTION_FLAG):
                     side[self._INTERACTION_FLAG] = time.time()
                     self._save_sidecar(session_id, side)
+                proj = self.projection(session_id, mgr=mgr)
         except Exception:
             logger.debug("[zet_goal] persist interaction flag failed", exc_info=True)
-        proj = self.projection(session_id, mgr=mgr)
+            return
         proj["state"] = "waiting"
         proj["summary"] = "waiting for user confirmation"
         self.report_in_thread(session_id, proj)

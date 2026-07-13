@@ -725,22 +725,83 @@ class TestMigrationCrashRecovery:
         assert reports[-1]["session_id"] == new_sid
 
 
+class TestCreateOverActiveGoal:
+    def test_create_over_active_pauses_old_before_set(self, driver):
+        """覆盖已有 active goal 时必须先把旧状态置为不可自驱（codex P1）：
+        新 sidecar 已写、mgr.set() 未跑的中间态崩溃后，重启 reconcile 看到
+        的必须是 paused 旧 goal，而不是带新 goal_id 继续自驱的旧目标。"""
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+        with patch.object(GoalManager, "set", side_effect=RuntimeError("crash before set")):
+            with pytest.raises(RuntimeError):
+                driver._apply_action_sync(SID, "create", {
+                    "goal_id": "g_new", "text": "新目标 直到完成", "app_session_id": SID,
+                })
+        st = GoalManager(SID).state
+        assert st is not None and st.status == "paused", "set 前崩溃时旧 goal 必须已 paused"
+
+
+class TestStaleInteractionCallback:
+    def test_stale_interaction_callback_is_noop(self, driver, reports):
+        """clear/create 换代后迟到的 approval 回调不得把等待标记写到新 goal
+        的 sidecar、也不得用旧投影上报 waiting（codex P1）。"""
+        _create(driver)
+        reports.clear()
+
+        real = driver._lock_generation
+        calls = {"n": 0}
+
+        def stale_first(sid):
+            calls["n"] += 1
+            return real(sid) - 1 if calls["n"] == 1 else real(sid)
+
+        with patch.object(driver, "_lock_generation", side_effect=stale_first):
+            driver.on_interaction_pending(SID)
+        assert reports == [], "失效回调不得上报 waiting"
+        assert not driver._interaction_flag_set(SID), "失效回调不得写等待标记"
+
+
+class TestUnloadInvalidatesInflightJudge:
+    def test_judge_running_across_unload_does_not_report(self, driver, reports, hermes_home):
+        """post-turn judge 任务可跑几十秒，profile unload 时 active-run 计数
+        已归零拦不住它（codex P1）——unload 按 home 翻代后，judge 完成时的
+        report 前复核必须让它静默退出，不得再驱动已卸载的 agent。"""
+        _create(driver)
+        reports.clear()
+
+        def judge_then_unload(*args, **kwargs):
+            # 模拟 judge 进行期间 profile 被 unload。
+            driver.bump_lock_generations_for_home(str(hermes_home))
+            return ("continue", "go on", False, None)
+
+        with patch("hermes_cli.goals.judge_goal", side_effect=judge_then_unload):
+            driver._after_turn_sync(SID, "user msg", "产出")
+        assert reports == [], "unload 后完成的 judge 不得上报 continuation"
+
+
 class TestActiveTurnProfileIsolation:
     def test_other_profile_turn_does_not_block_goal(self, driver, reports):
-        """mux 下 active 表是 adapter 级裸 sid：另一 profile 的同名会话在跑
-        不得让本 profile 的 goal 误判「已在途」而饿死续轮（codex P1）。"""
+        """mux 下 active 表按 {home}|{sid} 键控（codex P1 两轮收敛）：另一
+        profile 的同名会话在跑，既不覆盖本 profile 的注册，也不得让本
+        profile 的 goal 误判「已在途」而饿死续轮。"""
         import types
 
         _create(driver)
-        driver.adapter._active_session_agents[SID] = [types.SimpleNamespace(session_id=SID)]
-        driver.adapter._active_session_homes = {SID: "/some/other/profile-home"}
+        # 另一 profile 的同名会话（scoped key 隔离，互不覆盖）。
+        driver.adapter._active_session_agents[f"/some/other/profile-home|{SID}"] = [
+            types.SimpleNamespace(session_id=SID)
+        ]
         assert not driver._session_turn_active(SID), "别的 profile 的 turn 不算本 goal 在途"
 
-        driver.adapter._active_session_homes = {SID: str(driver_home_of(driver))}
+        # 本 profile 的同名会话并存注册 —— 两条各自可见。
+        driver.adapter._active_session_agents[f"{driver_home_of(driver)}|{SID}"] = [
+            types.SimpleNamespace(session_id=SID)
+        ]
         assert driver._session_turn_active(SID), "本 profile 的 turn 照常算在途"
 
     def test_unstamped_registration_stays_permissive(self, driver):
-        """未打 home 戳的注册（legacy/单 profile）保持宽松命中，行为不变。"""
+        """裸 sid 键的注册（legacy/单 profile）保持宽松命中，行为不变。"""
         import types
 
         _create(driver)

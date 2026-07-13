@@ -625,37 +625,52 @@ class ZetAgentAdapter(APIServerAdapter):
         so the interrupt picks up the agent the moment it appears."""
         if not session_id:
             return
-        # Stamp the registration with its profile home (contextvar scope is
-        # live here — the chat request entered via /p/{profile}): the goal
-        # driver's active-turn checks must not treat ANOTHER profile's
-        # same-named session as this goal's in-flight turn (codex P1).
-        home = ""
+        # Key by profile home + sid (codex P1): under the multiplexer two
+        # profiles can run same-named sessions CONCURRENTLY — a bare-sid key
+        # would let the later registration overwrite the earlier one, whose
+        # goal driver then can't see its own in-flight turn and double-drives
+        # the loop (reconcile/resume/barrier wakeup). The contextvar scope is
+        # live here (the chat request entered via /p/{profile}).
+        key = self._active_turn_key(session_id)
+        with self._session_run_lock:
+            self._active_session_agents[key] = agent_ref
+            self._active_session_tasks[key] = agent_task
+
+    def _active_turn_key(self, session_id: str) -> str:
+        """Scoped registry key: {hermes_home}|{session_id} — same shape as
+        the goal driver's _scope_key so both sides resolve identically."""
         try:
             from hermes_constants import get_hermes_home
 
-            home = str(get_hermes_home())
+            return f"{get_hermes_home()}|{session_id}"
         except Exception:
-            pass
-        with self._session_run_lock:
-            self._active_session_agents[session_id] = agent_ref
-            self._active_session_tasks[session_id] = agent_task
-            if not hasattr(self, "_active_session_homes"):
-                self._active_session_homes = {}
-            self._active_session_homes[session_id] = home
+            return session_id
 
     def _clear_active_session_turn(self, session_id: Optional[str], agent_ref: list, agent_task: Any) -> None:
         """Drop the registration ONLY if it still points at the turn we
         registered. Guards against late-clearing a fresher turn that
-        the same session has already started."""
+        the same session has already started. Identity-scan fallback: if the
+        clear runs outside the registration's profile scope the scoped key
+        won't reconstruct — a leaked entry would read as a forever-live turn,
+        so hunt the exact agent_ref down."""
         if not session_id:
             return
+        key = self._active_turn_key(session_id)
         with self._session_run_lock:
-            if self._active_session_agents.get(session_id) is agent_ref:
-                self._active_session_agents.pop(session_id, None)
-                if hasattr(self, "_active_session_homes"):
-                    self._active_session_homes.pop(session_id, None)
-            if self._active_session_tasks.get(session_id) is agent_task:
-                self._active_session_tasks.pop(session_id, None)
+            if self._active_session_agents.get(key) is agent_ref:
+                self._active_session_agents.pop(key, None)
+            else:
+                for k, v in list(self._active_session_agents.items()):
+                    if v is agent_ref:
+                        self._active_session_agents.pop(k, None)
+                        break
+            if self._active_session_tasks.get(key) is agent_task:
+                self._active_session_tasks.pop(key, None)
+            else:
+                for k, v in list(self._active_session_tasks.items()):
+                    if v is agent_task:
+                        self._active_session_tasks.pop(k, None)
+                        break
 
     # ------------------------------------------------------------------
     # Agent factory override
@@ -1337,9 +1352,11 @@ class ZetAgentAdapter(APIServerAdapter):
                     interrupt_reason = str(body.get("reason", "") or "")
         except Exception:
             interrupt_reason = ""
+        # Scoped key first（注册键含 profile home），裸键回退兼容 legacy 注册。
+        turn_key = self._active_turn_key(session_id)
         with self._session_run_lock:
-            agent_ref = self._active_session_agents.get(session_id)
-            task = self._active_session_tasks.get(session_id)
+            agent_ref = self._active_session_agents.get(turn_key) or self._active_session_agents.get(session_id)
+            task = self._active_session_tasks.get(turn_key) or self._active_session_tasks.get(session_id)
 
         if interrupt_reason == "user_cancel":
             # Mid-turn context compaction rotates the session id and migrates
@@ -2147,12 +2164,15 @@ class ZetAgentAdapter(APIServerAdapter):
                 closed_session_db = True
             # 该 profile 的 goal barrier timers 一并取消（codex P1）：daemon
             # Timer 携带旧 profile 的 runtime scope，卸载后触发会用内存旧
-            # scope 读 goal 并重新自驱一个用户刚删掉的 agent。getattr：
-            # teardown 期间绝不懒创建 driver。
+            # scope 读 goal 并重新自驱一个用户刚删掉的 agent。同时按 home
+            # 翻代，让还在跑的 post-turn judge 任务在 report 前的复核中失效
+            # （active-run 计数在 turn 结束时已归零，拦不住这些后置任务）。
+            # getattr：teardown 期间绝不懒创建 driver。
             drv = getattr(self, "_zet_goal_driver", None)
             if drv is not None:
                 try:
                     drv.cancel_barrier_timers_for_home(profile_home)
+                    drv.bump_lock_generations_for_home(profile_home)
                 except Exception:
                     logger.warning(
                         "[zet_agent] profile-unload: goal timer cleanup failed",
