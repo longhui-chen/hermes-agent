@@ -754,6 +754,88 @@ def driver_home_of(driver):
     return get_hermes_home()
 
 
+class TestLockGeneration:
+    def test_stale_hook_exits_without_touching_new_goal(self, driver, reports):
+        """排队等旧锁的 post-turn hook 在 clear+create 之后拿到锁：代际已翻，
+        必须失效退出 —— 绝不用旧轮 final_response 评估新 goal（codex P1）。
+        通过让第一次代际读取（hook 的捕获）返回翻代前的值来模拟排队时序。"""
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+        driver._apply_action_sync(SID, "clear", {})
+        _create(driver, goal_id="g_new", text="新目标 直到完成")
+        reports.clear()
+
+        real = driver._lock_generation
+        calls = {"n": 0}
+
+        def stale_first_read(sid):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return real(sid) - 1  # hook 在 clear/create 之前捕获的旧代际
+            return real(sid)
+
+        with patch.object(driver, "_lock_generation", side_effect=stale_first_read):
+            with patch("hermes_cli.goals.judge_goal", return_value=("continue", "go", False, None)) as jg:
+                driver._after_turn_sync(SID, "user msg", "旧轮的产出")
+        assert not jg.called, "失效 hook 不得评估新 goal"
+        assert reports == [], "失效 hook 不得上报/续轮"
+        assert GoalManager(SID).state.status == "active", "新 goal 不受影响"
+
+    def test_prune_and_create_bump_generation(self, driver):
+        _create(driver)
+        g0 = driver._lock_generation(SID)
+        driver._prune_session_lock(SID)
+        g1 = driver._lock_generation(SID)
+        assert g1 == g0 + 1
+        driver.bump_lock_generation(SID)
+        assert driver._lock_generation(SID) == g1 + 1
+
+
+class TestReconcileLiveInteraction:
+    def test_reconcile_skips_live_waiting_turn(self, driver, reports):
+        """启动 5s 内本 goal 的确认轮还活着（卡 approval）：reconcile 不得
+        把它当「重启丢失的卡片」park —— 用户确认后循环会无故卡死
+        （codex P1）。"""
+        import types
+
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+        driver.on_interaction_pending(SID)
+        assert driver._interaction_flag_set(SID)
+        reports.clear()
+        # 确认轮仍在途（activeSession 有本 goal 的注册）。
+        driver.adapter._active_session_agents[SID] = [types.SimpleNamespace(session_id=SID)]
+
+        driver._reconcile_sync()
+
+        assert GoalManager(SID).state.status == "active", "在途确认轮不得被 park"
+        assert driver._interaction_flag_set(SID), "flag 保留给真正的交互钩子处理"
+        assert reports == [], "不上报、不 kick，一切交给在途轮"
+
+
+class TestProfileUnloadTimers:
+    def test_cancel_barrier_timers_for_home(self, driver, hermes_home):
+        """profile 卸载必须取消其 barrier timers（codex P1）——旧 timer 携带
+        已卸载 profile 的 scope，触发会重新自驱刚删掉的 agent。"""
+        from hermes_cli.goals import GoalManager, save_goal
+
+        _create(driver)
+        st = GoalManager(SID).state
+        st.waiting_until = time.time() + 3600.0
+        save_goal(SID, st)
+        driver._schedule_barrier_wakeup(SID)
+        assert driver._barrier_timers
+
+        # 别的 home 的卸载不影响本 profile 的 timer。
+        driver.cancel_barrier_timers_for_home("/tmp/unrelated-profile")
+        assert driver._barrier_timers
+
+        driver.cancel_barrier_timers_for_home(str(hermes_home))
+        assert not driver._barrier_timers
+
+
 class TestJudgeBackgroundProcesses:
     def test_evaluate_passes_background_snapshot(self, driver, reports):
         """judge 的 WAIT 判定依赖后台进程快照（CI/build/watch）——必须像其它

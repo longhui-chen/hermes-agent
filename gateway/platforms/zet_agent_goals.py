@@ -112,8 +112,16 @@ class ZetGoalDriver:
         # the judge is already evaluating still wins. TTL'd so a stale mark
         # can never pause a future goal round.
         self._cancel_marks: Dict[str, float] = {}
+        # scope key → generation counter, bumped on clear/done prune and on
+        # create-over-existing. A post-turn hook that was QUEUED on the old
+        # session lock while the user cleared + recreated the goal acquires
+        # a lock that no longer guards anything — the generation check makes
+        # it exit instead of evaluating the NEW goal with the OLD turn's
+        # final_response (codex P1). Bounded at _LOCK_GEN_CAP.
+        self._lock_gens: Dict[str, int] = {}
 
     _CANCEL_MARK_TTL_S = 180.0
+    _LOCK_GEN_CAP = 1024
 
     def _scope_key(self, session_id: str) -> str:
         """Key the in-memory per-session state (locks / cancel marks / barrier
@@ -138,11 +146,28 @@ class ZetGoalDriver:
                 self._session_locks[key] = lk
             return lk
 
+    def _lock_generation(self, session_id: str) -> int:
+        with self._lock:
+            return self._lock_gens.get(self._scope_key(session_id), 0)
+
+    def _bump_lock_generation_locked_key(self, key: str) -> None:
+        """Caller holds self._lock."""
+        self._lock_gens[key] = self._lock_gens.get(key, 0) + 1
+        while len(self._lock_gens) > self._LOCK_GEN_CAP:
+            self._lock_gens.pop(next(iter(self._lock_gens)))
+
+    def bump_lock_generation(self, session_id: str) -> None:
+        with self._lock:
+            self._bump_lock_generation_locked_key(self._scope_key(session_id))
+
     def _prune_session_lock(self, session_id: str) -> None:
         key = self._scope_key(session_id)
         with self._lock:
             self._session_locks.pop(key, None)
             self._cancel_marks.pop(key, None)
+            # 翻代：正排队等旧锁对象的 post-turn hook 拿到锁后必须失效退出
+            # —— 旧锁已不在表里，它与后续新锁持有者不再互斥（codex P1）。
+            self._bump_lock_generation_locked_key(key)
 
     def _mark_user_cancel(self, session_id: str) -> None:
         with self._lock:
@@ -424,6 +449,9 @@ class ZetGoalDriver:
                 # WAIT 时被 create 覆盖，残留 timer 之后触发会加载到新 goal
                 # （已无 barrier）并下发 continuation，与新 goal 并发起轮。
                 self._cancel_barrier_timer(session_id)
+                # 翻代：还在旧锁上排队的旧轮 post-turn hook 不得评估新 goal
+                # （codex P1）。
+                self.bump_lock_generation(session_id)
                 # Crash-ordering: sidecar + index FIRST, activation LAST — a
                 # crash mid-create must leave "goal not yet active", never
                 # "active but untracked" (an orphan reconcile can't see).
@@ -622,7 +650,14 @@ class ZetGoalDriver:
             self._migrate_sidecar(session_id, effective_session_id)
             session_id = effective_session_id
         try:
+            gen0 = self._lock_generation(session_id)
             with self._session_lock(session_id):
+                if self._lock_generation(session_id) != gen0:
+                    # 排队等锁期间 goal 被 clear（可能又 create 了新 goal）：
+                    # 本 hook 所属的旧轮世界已不存在，且此刻拿到的旧锁对象
+                    # 已被摘除、与新锁持有者不再互斥 —— 只读代际后立刻退出，
+                    # 绝不用旧轮的 final_response 评估新 goal（codex P1）。
+                    return
                 # Any pending-interaction flag died with the turn that raised
                 # it (approved / denied / timed out inline) — clear it so it
                 # can't park a later legitimate resume.
@@ -743,6 +778,35 @@ class ZetGoalDriver:
             timers = list(self._barrier_timers.values())
             self._barrier_timers.clear()
         for t in timers:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+    def cancel_barrier_timers_for_home(self, profile_home: Any) -> None:
+        """Profile-unload hook (codex P1): a WAIT barrier's daemon Timer
+        captured the profile's runtime scope — after the profile is unloaded
+        (and its directory deleted) the timer would still fire, read the
+        goal via the stale in-memory scope and re-drive an agent the user
+        just removed. Keys are ``{hermes_home}|{sid}`` — cancel the ones
+        whose home resolves to the unloaded profile."""
+        from pathlib import Path
+
+        try:
+            target = str(Path(str(profile_home)).resolve())
+        except Exception:
+            target = str(profile_home)
+        victims = []
+        with self._lock:
+            for key in list(self._barrier_timers):
+                home = key.split("|", 1)[0] if "|" in key else ""
+                try:
+                    matched = bool(home) and str(Path(home).resolve()) == target
+                except Exception:
+                    matched = home == str(profile_home)
+                if matched:
+                    victims.append(self._barrier_timers.pop(key))
+        for t in victims:
             try:
                 t.cancel()
             except Exception:
@@ -1100,6 +1164,12 @@ class ZetGoalDriver:
                 self._index_remove(sid)
                 return dest
             if st.status == "active" and self._interaction_flag_set(sid):
+                if self._session_turn_active(sid):
+                    # 确认轮还活着（进程启动后 5s 内已有本 goal 的轮在跑并卡
+                    # 在 approval/clarify）：卡片就在内存里等用户，不是重启
+                    # 丢失的 —— park 会让用户确认后 post-turn 只见 paused、
+                    # 循环无故卡住（codex P1）。什么都不动，交给交互钩子。
+                    return
                 # The gateway died while an approval/clarify card was blocking
                 # a round — the card died with the turn. Blindly continuing
                 # would self-drive past a confirmation the user never gave

@@ -2145,6 +2145,19 @@ class ZetAgentAdapter(APIServerAdapter):
                             exc_info=True,
                         )
                 closed_session_db = True
+            # 该 profile 的 goal barrier timers 一并取消（codex P1）：daemon
+            # Timer 携带旧 profile 的 runtime scope，卸载后触发会用内存旧
+            # scope 读 goal 并重新自驱一个用户刚删掉的 agent。getattr：
+            # teardown 期间绝不懒创建 driver。
+            drv = getattr(self, "_zet_goal_driver", None)
+            if drv is not None:
+                try:
+                    drv.cancel_barrier_timers_for_home(profile_home)
+                except Exception:
+                    logger.warning(
+                        "[zet_agent] profile-unload: goal timer cleanup failed",
+                        exc_info=True,
+                    )
 
         return web.json_response({
             "unloaded": True,
