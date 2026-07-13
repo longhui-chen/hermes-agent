@@ -1,0 +1,357 @@
+"""Tests for gateway/platforms/zet_agent_goals.py — the zet_agent goal-loop
+driver (5th host driver for hermes_cli.goals).
+
+Covers: sidecar/index round-trip, projection mapping, action dispatch
+(create/pause/resume/clear), the post-turn evaluation flow (continue / done /
+paused verdicts → advance report), user-interrupt pause semantics, and the
+compaction sidecar migration. The judge is always mocked — no LLM calls.
+"""
+
+from __future__ import annotations
+
+import threading
+from unittest.mock import patch
+
+import pytest
+
+
+@pytest.fixture
+def hermes_home(tmp_path, monkeypatch):
+    """Isolated HERMES_HOME (mirrors tests/hermes_cli/test_goals.py)."""
+    from pathlib import Path
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    # DEFAULT_DB_PATH 在 hermes_state 模块导入时固化（get_hermes_home() 的
+    # import-time 求值），仅改 env 不会让 SessionDB() 落到本测试的 home ——
+    # 不 patch 的话所有测试共享第一次导入时的 state.db，互相污染。
+    import hermes_state
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", home / "state.db")
+
+    from hermes_cli import goals
+
+    goals._DB_CACHE.clear()
+    yield home
+    goals._DB_CACHE.clear()
+
+
+class FakeAdapter:
+    """Minimal stand-in for ZetAgentAdapter: just the attributes the driver touches."""
+
+    def __init__(self):
+        self._background_tasks = set()
+        self._session_run_lock = threading.Lock()
+        self._active_session_agents = {}
+
+    def _check_auth(self, request):
+        return None
+
+
+@pytest.fixture
+def driver(hermes_home):
+    from gateway.platforms.zet_agent_goals import ZetGoalDriver
+
+    return ZetGoalDriver(FakeAdapter())
+
+
+@pytest.fixture
+def reports(driver, monkeypatch):
+    """Capture advance reports instead of POSTing (fail-open path untested here)."""
+    captured = []
+
+    def fake_report(session_id, proj, *, continuation=None):
+        captured.append({"session_id": session_id, "proj": dict(proj), "continuation": continuation})
+
+    monkeypatch.setattr(driver, "report", fake_report)
+    # report_in_thread 直接同步执行，测试不依赖线程时序。
+    monkeypatch.setattr(driver, "report_in_thread", fake_report)
+    return captured
+
+
+SID = "zettlab:u1:agent-a:s1"
+
+
+def _create(driver, sid=SID, text="整理下载目录 直到没有散落文件", goal_id="g_test", max_rounds=8):
+    return driver._apply_action_sync(sid, "create", {
+        "goal_id": goal_id,
+        "text": text,
+        "max_rounds": max_rounds,
+        "app_session_id": sid,
+    })
+
+
+class TestSidecarAndIndex:
+    def test_create_persists_sidecar_and_index(self, driver):
+        proj = _create(driver)
+        assert proj["goal_id"] == "g_test"
+        assert proj["state"] == "running"
+        assert proj["max_rounds"] == 8
+        side = driver._load_sidecar(SID)
+        assert side["goal_id"] == "g_test"
+        assert side["app_session_id"] == SID
+        assert SID in driver._index()
+
+    def test_clear_removes_from_index(self, driver):
+        _create(driver)
+        proj = driver._apply_action_sync(SID, "clear", {})
+        assert proj["state"] == "cleared"
+        assert SID not in driver._index()
+
+    def test_migrate_sidecar_follows_compaction(self, driver):
+        _create(driver)
+        new_sid = "zettlab:u1:agent-a:s1--rotated"
+        driver._migrate_sidecar(SID, new_sid)
+        assert driver._load_sidecar(new_sid)["goal_id"] == "g_test"
+        assert new_sid in driver._index()
+        assert SID not in driver._index()
+        # 迁移后 wire session id 仍是稳定的 app session id。
+        assert driver._wire_session_id(new_sid) == SID
+
+
+class TestProjection:
+    def test_states_map_to_wire_values(self, driver):
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+        assert driver.projection(SID)["state"] == "running"
+
+        GoalManager(SID).pause("stop it")
+        assert driver.projection(SID)["state"] == "paused"
+
+        GoalManager(SID).resume()
+        assert driver.projection(SID)["state"] == "running"
+
+        GoalManager(SID).mark_done("all good")
+        proj = driver.projection(SID)
+        assert proj["state"] == "done"
+        assert proj["summary"] == "all good"
+
+    def test_no_goal_projects_cleared(self, driver):
+        proj = driver.projection("zettlab:u1:agent-a:never-had-goal")
+        assert proj["state"] == "cleared"
+
+
+class TestResumeRoundContinuity:
+    def test_user_resume_keeps_round_counter(self, driver, reports):
+        """第 3 轮暂停后点继续，必须从第 4 轮接着数 —— 上游 resume() 默认
+        重置 turns_used 会让 App 轮次显示跳回第 1 轮。"""
+        from hermes_cli.goals import GoalManager, save_goal
+
+        _create(driver)
+        mgr = GoalManager(SID)
+        st = mgr.state
+        st.turns_used = 3
+        save_goal(SID, st)
+        driver._apply_action_sync(SID, "pause", {"reason": "user"})
+
+        proj = driver._apply_action_sync(SID, "resume", {})
+
+        assert GoalManager(SID).state.turns_used == 3, "非预算暂停的 resume 不得重置轮数"
+        # resume 重踢的续轮上报应是「下一轮」= 4。
+        assert proj["round"] == 4
+        assert reports and reports[-1]["proj"]["round"] == 4
+        assert reports[-1]["continuation"]
+
+    def test_soft_pause_counts_finished_continuation_round(self, driver, reports):
+        """第 2 轮跑着时按暂停（软暂停不打断本轮）：本轮跑完必须计轮，
+        resume 后从第 3 轮继续 —— 不计的话轮次号原地重复。"""
+        from gateway.platforms.zet_agent_goals import CONTINUATION_MARKER
+        from hermes_cli.goals import GoalManager, save_goal
+
+        _create(driver)
+        mgr = GoalManager(SID)
+        st = mgr.state
+        st.turns_used = 1  # 第 1 轮已计，第 2 轮在跑
+        save_goal(SID, st)
+        driver._apply_action_sync(SID, "pause", {"reason": "user"})
+
+        # 第 2 轮（continuation 驱动）跑完，post-turn hook 落在 paused 上：
+        driver._after_turn_sync(SID, CONTINUATION_MARKER + " your standing goal]\nGoal: x", "第二段内容")
+
+        assert GoalManager(SID).state.turns_used == 2, "软暂停期间跑完的 continuation 轮必须计数"
+        assert reports and reports[-1]["proj"]["round"] == 2, "暂停投影应同步到第 2 轮"
+
+        proj = driver._apply_action_sync(SID, "resume", {})
+        assert proj["round"] == 3, "继续后应从第 3 轮开始"
+
+    def test_soft_pause_does_not_count_user_interjection(self, driver, reports):
+        """暂停期间的用户插话（无 continuation marker）不计轮。"""
+        from hermes_cli.goals import GoalManager, save_goal
+
+        _create(driver)
+        mgr = GoalManager(SID)
+        st = mgr.state
+        st.turns_used = 2
+        save_goal(SID, st)
+        driver._apply_action_sync(SID, "pause", {"reason": "user"})
+
+        driver._after_turn_sync(SID, "顺便帮我看看天气", "今天晴")
+
+        assert GoalManager(SID).state.turns_used == 2
+
+    def test_budget_resume_resets_with_monotonic_round(self, driver, reports):
+        """预算耗尽的暂停 resume 时必须重置预算（否则立刻再触发预算暂停），
+        但 App 侧轮次要靠 sidecar 偏移保持单调 —— 第 5 轮耗尽后继续应显示第 6 轮。"""
+        from hermes_cli.goals import GoalManager, save_goal
+
+        _create(driver, max_rounds=5)
+        mgr = GoalManager(SID)
+        st = mgr.state
+        st.turns_used = 5
+        st.status = "paused"
+        st.paused_reason = "turn budget exhausted (5/5)"
+        save_goal(SID, st)
+
+        proj = driver._apply_action_sync(SID, "resume", {})
+
+        assert GoalManager(SID).state.turns_used == 0, "预算暂停的 resume 必须重置预算"
+        assert driver._load_sidecar(SID)["rounds_offset"] == 5
+        assert proj["round"] == 6, "轮次显示必须单调：5 轮偏移 + 新预算第 1 轮"
+
+
+class TestAfterTurn:
+    def test_continue_verdict_reports_continuation(self, driver, reports):
+        _create(driver)
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "还有散落文件", False, None)):
+            driver._after_turn_sync(SID, "整理下载目录", "本轮移动了 3 个文件")
+        assert len(reports) == 1
+        r = reports[0]
+        assert r["proj"]["state"] == "running"
+        assert r["proj"]["round"] == 2  # turns_used=1 + 下一轮
+        assert r["continuation"] and "[Continuing toward" in r["continuation"]
+        assert r["session_id"] == SID
+
+    def test_done_verdict_reports_done_and_drops_index(self, driver, reports):
+        _create(driver)
+        with patch("hermes_cli.goals.judge_goal", return_value=("done", "全部归位", False, None)):
+            driver._after_turn_sync(SID, "user msg", "最终产出")
+        assert reports[-1]["proj"]["state"] == "done"
+        assert reports[-1]["continuation"] is None
+        assert SID not in driver._index()
+
+    def test_budget_exhausted_reports_paused(self, driver, reports):
+        _create(driver, max_rounds=1)
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "还没完", False, None)):
+            driver._after_turn_sync(SID, "user msg", "产出")
+        assert reports[-1]["proj"]["state"] == "paused"
+        assert reports[-1]["continuation"] is None
+
+    def test_no_goal_is_noop(self, driver, reports):
+        driver._after_turn_sync("zettlab:u1:agent-a:no-goal", "hi", "hello")
+        assert reports == []
+
+    def test_continuation_marker_marks_not_user_initiated(self, driver, reports):
+        _create(driver)
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "again", False, None)) as jg:
+            driver._after_turn_sync(SID, "[Continuing toward your standing goal]\nGoal: x", "产出")
+        assert jg.called
+        assert len(reports) == 1
+
+    def test_compaction_rotation_migrates_before_evaluate(self, driver, reports):
+        from hermes_cli.goals import migrate_goal_to_session
+
+        _create(driver)
+        new_sid = SID + "--c2"
+        migrate_goal_to_session(SID, new_sid, reason="compression")
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "go on", False, None)):
+            driver._after_turn_sync(SID, "user msg", "产出", effective_session_id=new_sid)
+        assert len(reports) == 1
+        # 驱动内部按迁移后的 sid 继续循环（fixture 捕获的是 report 入参）……
+        assert reports[0]["session_id"] == new_sid
+        assert driver._load_sidecar(new_sid)["goal_id"] == "g_test"
+        # ……而真实 report() 会经 _wire_session_id 换回 app 级稳定 id 上报。
+        assert driver._wire_session_id(new_sid) == SID
+
+
+def _wait_until(cond, timeout=3.0):
+    import time as _t
+
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        if cond():
+            return True
+        _t.sleep(0.02)
+    return cond()
+
+
+class TestInterruptAndInteractions:
+    def test_user_interrupt_pauses_goal(self, driver, reports):
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+        driver.on_user_interrupt(SID)
+        # pause 在 context 保持的后台线程里落库（不阻塞 interrupt HTTP 响应）。
+        assert _wait_until(lambda: GoalManager(SID).state.status == "paused")
+        assert _wait_until(lambda: bool(reports) and reports[-1]["proj"]["state"] == "paused")
+        # 暂停后 post-turn hook 不再续轮（evaluate 返回 inactive）。
+        n = len(reports)
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "x", False, None)):
+            driver._after_turn_sync(SID, "user msg", "产出")
+        assert len(reports) == n, "paused goal 不得自动爬起续轮"
+
+    def test_cancel_mark_beats_racing_evaluate(self, driver, reports):
+        """停止落在 judge 评估期间：evaluate 自己的 save 会把 active 写回去，
+        cancel 标记是最后的裁决 —— 绝不能上报 continuation。"""
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+        # 模拟"评估还没开始/正在进行时用户按了停止"：只打标记，不跑后台 pause
+        # 线程（绕过 _spawn 的时序不确定性，聚焦标记裁决本身）。
+        driver._mark_user_cancel(SID)
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "还没完", False, None)):
+            driver._after_turn_sync(SID, "user msg", "产出")
+        assert GoalManager(SID).state.status == "paused", "cancel 标记必须压过 continue 判定"
+        assert reports[-1]["proj"]["state"] == "paused"
+        assert all(r["continuation"] is None for r in reports), "不得下发续轮 continuation"
+
+    def test_interrupt_without_goal_is_noop(self, driver, reports):
+        driver.on_user_interrupt("zettlab:u1:agent-a:no-goal")
+        import time as _t
+
+        _t.sleep(0.1)  # 后台 pause 线程跑完（no-goal 路径无写入无上报）
+        assert reports == []
+
+    def test_interaction_pending_projects_waiting(self, driver, reports):
+        _create(driver)
+        driver.on_interaction_pending(SID)
+        assert reports[-1]["proj"]["state"] == "waiting"
+        driver.on_interaction_resolved(SID)
+        assert reports[-1]["proj"]["state"] == "running"
+
+
+class TestReconcile:
+    def test_reconcile_rekicks_active_goal(self, driver, reports):
+        _create(driver)
+        driver._reconcile_sync()
+        assert len(reports) == 1
+        assert reports[0]["proj"]["state"] == "running"
+        assert reports[0]["continuation"] and "[Continuing toward" in reports[0]["continuation"]
+
+    def test_reconcile_skips_session_with_active_turn(self, driver, reports):
+        _create(driver)
+        driver.adapter._active_session_agents[SID] = [object()]
+        driver._reconcile_sync()
+        assert reports == [], "已有活跃 turn 的会话不得重复 kick"
+
+    def test_reconcile_prunes_done_goal(self, driver, reports):
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+        GoalManager(SID).mark_done("done")
+        driver._reconcile_sync()
+        assert SID not in driver._index()
+        assert reports == []
+
+    def test_reconcile_reports_paused_without_kick(self, driver, reports):
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+        GoalManager(SID).pause("user paused")
+        driver._reconcile_sync()
+        assert len(reports) == 1
+        assert reports[0]["proj"]["state"] == "paused"
+        assert reports[0]["continuation"] is None
