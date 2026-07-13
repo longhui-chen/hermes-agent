@@ -625,9 +625,23 @@ class ZetAgentAdapter(APIServerAdapter):
         so the interrupt picks up the agent the moment it appears."""
         if not session_id:
             return
+        # Stamp the registration with its profile home (contextvar scope is
+        # live here — the chat request entered via /p/{profile}): the goal
+        # driver's active-turn checks must not treat ANOTHER profile's
+        # same-named session as this goal's in-flight turn (codex P1).
+        home = ""
+        try:
+            from hermes_constants import get_hermes_home
+
+            home = str(get_hermes_home())
+        except Exception:
+            pass
         with self._session_run_lock:
             self._active_session_agents[session_id] = agent_ref
             self._active_session_tasks[session_id] = agent_task
+            if not hasattr(self, "_active_session_homes"):
+                self._active_session_homes = {}
+            self._active_session_homes[session_id] = home
 
     def _clear_active_session_turn(self, session_id: Optional[str], agent_ref: list, agent_task: Any) -> None:
         """Drop the registration ONLY if it still points at the turn we
@@ -638,6 +652,8 @@ class ZetAgentAdapter(APIServerAdapter):
         with self._session_run_lock:
             if self._active_session_agents.get(session_id) is agent_ref:
                 self._active_session_agents.pop(session_id, None)
+                if hasattr(self, "_active_session_homes"):
+                    self._active_session_homes.pop(session_id, None)
             if self._active_session_tasks.get(session_id) is agent_task:
                 self._active_session_tasks.pop(session_id, None)
 
@@ -2430,6 +2446,18 @@ class ZetAgentAdapter(APIServerAdapter):
     async def disconnect(self) -> None:
         """Tear down the aiohttp server and unregister approval callbacks
         for any sessions we registered."""
+        # Goal barrier timers are daemon threading.Timers OUTSIDE
+        # _background_tasks — cancel them here or a reloaded/replaced
+        # adapter's stale timers keep firing wakeups and double-drive the
+        # goal alongside the new adapter's reconcile (codex P1). getattr:
+        # never lazily CREATE the driver during teardown.
+        drv = getattr(self, "_zet_goal_driver", None)
+        if drv is not None:
+            try:
+                drv.cancel_all_barrier_timers()
+            except Exception:
+                pass
+
         # Drop approval notify callbacks so blocked agent threads (if
         # any leak past process shutdown) don't fire into a dead loop.
         try:

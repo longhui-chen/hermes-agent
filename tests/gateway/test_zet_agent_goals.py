@@ -616,6 +616,144 @@ class TestScopedKeys:
         assert driver._consume_user_cancel(SID), "回到原 scope 后 mark 仍在"
 
 
+class TestTerminalPauseRejected:
+    def test_pause_on_done_goal_stays_done(self, driver, reports):
+        """与 resume 对称（codex P1）：过期 pause 不得把终态行改成 paused，
+        否则后续合法 resume 会复活已终结的 goal。"""
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+        GoalManager(SID).mark_done("done")
+        proj = driver._apply_action_sync(SID, "pause", {"reason": "stale"})
+        assert proj["state"] == "done"
+        assert GoalManager(SID).state.status == "done"
+
+    def test_pause_on_cleared_goal_stays_cleared(self, driver, reports):
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+        driver._apply_action_sync(SID, "clear", {})
+        proj = driver._apply_action_sync(SID, "pause", {"reason": "stale"})
+        assert proj["state"] == "cleared"
+        st = GoalManager(SID).state
+        assert st is None or st.status == "cleared"
+
+
+class TestBarrierTimerLifecycle:
+    def _arm_timer(self, driver):
+        from hermes_cli.goals import GoalManager, save_goal
+
+        st = GoalManager(SID).state
+        st.waiting_until = time.time() + 3600.0
+        save_goal(SID, st)
+        driver._schedule_barrier_wakeup(SID)
+        assert driver._barrier_timers, "前置：timer 已排上"
+
+    def test_create_cancels_stale_barrier_timer(self, driver, reports):
+        """旧 goal 在 WAIT 时被 create 覆盖：残留 timer 触发会加载新 goal
+        （无 barrier）并下发 continuation，与新 goal 并发起轮（codex P1）。"""
+        _create(driver)
+        self._arm_timer(driver)
+        _create(driver, goal_id="g_new", text="新目标 直到完成")
+        assert not driver._barrier_timers, "create 覆盖必须取消旧 barrier timer"
+
+    def test_disconnect_cancels_all_timers(self, driver, reports):
+        """adapter teardown：daemon Timer 不在 _background_tasks，不清会在
+        断开后触发 wakeup 与新 adapter 并发自驱（codex P1）。"""
+        _create(driver)
+        self._arm_timer(driver)
+        driver.cancel_all_barrier_timers()
+        assert not driver._barrier_timers
+
+
+class TestProjectionReadOnly:
+    def test_projection_does_not_clear_satisfied_barrier(self, driver, reports):
+        """GET/status 的 projection 无锁运行：is_waiting() 的 lazy auto-clear
+        会把旧快照写回 DB、与并发 pause/clear 竞态（codex P1）——投影必须
+        只读。barrier 已满足时投影显示 running，但 barrier 字段留给持锁的
+        推进路径去清。"""
+        from hermes_cli.goals import GoalManager, save_goal
+
+        _create(driver)
+        st = GoalManager(SID).state
+        st.waiting_until = time.time() - 1.0  # 已满足的时间 barrier
+        save_goal(SID, st)
+
+        proj = driver.projection(SID)
+        assert proj["state"] == "running", "满足的 barrier 不再算 waiting"
+        st2 = GoalManager(SID).state
+        assert st2.waiting_until, "projection 不得顺手清 barrier（写副作用）"
+
+    def test_projection_shows_waiting_while_barrier_holds(self, driver, reports):
+        from hermes_cli.goals import GoalManager, save_goal
+
+        _create(driver)
+        st = GoalManager(SID).state
+        st.waiting_until = time.time() + 3600.0
+        st.waiting_reason = "waiting for build"
+        save_goal(SID, st)
+
+        proj = driver.projection(SID)
+        assert proj["state"] == "waiting"
+        assert proj["summary"] == "waiting for build"
+
+
+class TestMigrationCrashRecovery:
+    def test_reconcile_follows_migration_pointer(self, driver, reports):
+        """迁移半途崩溃（pointer 已写、new 未入 index）：reconcile 必须沿
+        migrated_to 恢复新 sid 的 index/sidecar（app_session_id 跟过去，
+        上报不漂移）而不是只删旧索引（codex P1）。"""
+        from hermes_cli.goals import GoalManager, migrate_goal_to_session
+
+        _create(driver)
+        new_sid = SID + "--c2"
+        migrate_goal_to_session(SID, new_sid, reason="compression")
+        # 模拟崩溃点：只完成了「old sidecar 打 forward pointer」这一步。
+        side = driver._load_sidecar(SID)
+        driver._save_sidecar(SID, {**side, "migrated_to": new_sid})
+        assert SID in driver._index() and new_sid not in driver._index()
+
+        driver._reconcile_sync()
+
+        assert new_sid in driver._index(), "沿指针恢复新 sid 索引"
+        assert SID not in driver._index(), "旧索引照常摘除"
+        restored = driver._load_sidecar(new_sid)
+        assert restored.get("app_session_id") == SID, "app_session_id 必须恢复，上报不得漂移"
+        assert GoalManager(new_sid).state.status == "active"
+        # 恢复后的 goal 被照常重踢（active 无在途 turn）。
+        assert reports and reports[-1]["continuation"]
+        assert reports[-1]["session_id"] == new_sid
+
+
+class TestActiveTurnProfileIsolation:
+    def test_other_profile_turn_does_not_block_goal(self, driver, reports):
+        """mux 下 active 表是 adapter 级裸 sid：另一 profile 的同名会话在跑
+        不得让本 profile 的 goal 误判「已在途」而饿死续轮（codex P1）。"""
+        import types
+
+        _create(driver)
+        driver.adapter._active_session_agents[SID] = [types.SimpleNamespace(session_id=SID)]
+        driver.adapter._active_session_homes = {SID: "/some/other/profile-home"}
+        assert not driver._session_turn_active(SID), "别的 profile 的 turn 不算本 goal 在途"
+
+        driver.adapter._active_session_homes = {SID: str(driver_home_of(driver))}
+        assert driver._session_turn_active(SID), "本 profile 的 turn 照常算在途"
+
+    def test_unstamped_registration_stays_permissive(self, driver):
+        """未打 home 戳的注册（legacy/单 profile）保持宽松命中，行为不变。"""
+        import types
+
+        _create(driver)
+        driver.adapter._active_session_agents[SID] = [types.SimpleNamespace(session_id=SID)]
+        assert driver._session_turn_active(SID)
+
+
+def driver_home_of(driver):
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home()
+
+
 class TestJudgeBackgroundProcesses:
     def test_evaluate_passes_background_snapshot(self, driver, reports):
         """judge 的 WAIT 判定依赖后台进程快照（CI/build/watch）——必须像其它

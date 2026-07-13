@@ -244,6 +244,32 @@ class ZetGoalDriver:
         except Exception:
             return offset
 
+    def _barrier_holding(self, st: Any) -> bool:
+        """Read-only twin of ``GoalManager.is_waiting()``: judges whether the
+        wait barrier still holds WITHOUT the lazy auto-clear side effect
+        (``stop_waiting()`` writes state back to the DB). ``projection()``
+        runs on lock-free paths (GET /goal status, interaction hooks) — a
+        write there races a concurrent pause/clear and can clobber the fresh
+        state with a stale active snapshot (codex P1). Barrier clearing only
+        happens on the lock-held driving paths (_kick_after_barrier /
+        _barrier_wakeup / evaluate_after_turn)."""
+        if st is None:
+            return False
+        try:
+            from hermes_cli.goals import _pid_alive, _session_waiting
+
+            if st.waiting_on_session is not None:
+                return bool(_session_waiting(st.waiting_on_session))
+            if st.waiting_on_pid is not None:
+                return bool(_pid_alive(st.waiting_on_pid))
+            if st.waiting_until:
+                return time.time() < st.waiting_until
+            return False
+        except Exception:
+            # 上游私有 helper 改名等极端情况：退化为「有 barrier 字段即视为
+            # waiting」——保守显示，不写库。
+            return bool(st.waiting_on_session or st.waiting_on_pid or st.waiting_until)
+
     def projection(self, session_id: str, mgr: Any = None) -> Dict[str, Any]:
         from hermes_cli.goals import GoalManager
         if mgr is None:
@@ -260,14 +286,15 @@ class ZetGoalDriver:
                 "session_id": session_id,
                 "state": "cleared",
             }
+        barrier_holding = self._barrier_holding(st) if st.status == "active" else False
         if st.status == "active":
-            state = "waiting" if mgr.is_waiting() else "running"
+            state = "waiting" if barrier_holding else "running"
         elif st.status in ("paused", "done", "cleared"):
             state = st.status
         else:
             state = st.status
         summary = st.last_reason or st.paused_reason or ""
-        if st.status == "active" and mgr.is_waiting():
+        if barrier_holding:
             summary = st.waiting_reason or summary
         return {
             "goal_id": goal_id,
@@ -393,6 +420,10 @@ class ZetGoalDriver:
                 # 上按过的停止 / 旧 goal 清除前的停止，TTL 180s 内仍在）——
                 # 否则新 goal 第一轮 post-turn 就会消费旧标记误暂停（codex P1）。
                 self._consume_user_cancel(session_id)
+                # 同理不承接旧 goal 的 barrier timer（codex P1）：旧 goal 在
+                # WAIT 时被 create 覆盖，残留 timer 之后触发会加载到新 goal
+                # （已无 barrier）并下发 continuation，与新 goal 并发起轮。
+                self._cancel_barrier_timer(session_id)
                 # Crash-ordering: sidecar + index FIRST, activation LAST — a
                 # crash mid-create must leave "goal not yet active", never
                 # "active but untracked" (an orphan reconcile can't see).
@@ -401,6 +432,12 @@ class ZetGoalDriver:
                 headline, contract = parse_contract(text)
                 mgr.set(headline or text, max_turns=max_rounds, contract=contract)
             elif action == "pause":
+                st0 = mgr.state
+                if st0 is None or st0.status in ("cleared", "done"):
+                    # 与 resume 对称（codex P1）：上游 pause() 不校验状态，会把
+                    # 终态行改成 paused —— 过期的 pause 一到，已终结的 goal 就
+                    # 能被后续合法 resume 复活自驱。终态只回投影，不动 DB。
+                    return self.projection(session_id, mgr=mgr)
                 reason = str(body.get("reason", "") or "").strip() or "user-paused"
                 mgr.pause(reason)
                 self._cancel_barrier_timer(session_id)
@@ -549,19 +586,22 @@ class ZetGoalDriver:
         the old row is tombstoned so a stale copy can't clobber fresh
         new-sid state.
 
-        Crash-ordering (codex P1): the NEW sid enters the index FIRST — a
-        crash at any later step leaves at worst both sids indexed, and
-        reconcile prunes the old (cleared) one harmlessly. The old order
-        (remove old → add new last) had a window where neither the old nor
-        the new sid could lead reconcile to the live goal."""
-        self._index_add(new_sid)
+        Crash-ordering (codex P1 两轮收敛)：第 1 步先在旧 sidecar 上打
+        ``migrated_to`` forward pointer（保留全部原字段）——此后任意点崩溃，
+        reconcile 都能沿指针恢复新 sid 的 index/sidecar（app_session_id 不
+        丢，上报不漂移）；新 sid 尽早入索引；tombstone 只留指针（防旧快照
+        回盖新数据）；最后才摘旧索引。"""
         side = self._load_sidecar(old_sid)
-        if side:
+        payload = {k: v for k, v in side.items() if k != "migrated_to"}
+        if payload:
+            self._save_sidecar(old_sid, {**payload, "migrated_to": new_sid})
             existing = self._load_sidecar(new_sid)
-            merged = {**side, **existing}
+            merged = {**payload, **{k: v for k, v in existing.items() if k != "migrated_to"}}
             if merged != existing:
                 self._save_sidecar(new_sid, merged)
-            self._save_sidecar(old_sid, {})
+        self._index_add(new_sid)
+        if payload:
+            self._save_sidecar(old_sid, {"migrated_to": new_sid})
         self._index_remove(old_sid)
         old_key, new_key = self._scope_key(old_sid), self._scope_key(new_sid)
         with self._lock:
@@ -688,6 +728,21 @@ class ZetGoalDriver:
         with self._lock:
             t = self._barrier_timers.pop(self._scope_key(session_id), None)
         if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+    def cancel_all_barrier_timers(self) -> None:
+        """Adapter teardown hook (codex P1): daemon Timers live outside
+        ``_background_tasks``, so ``disconnect()``/reload would otherwise
+        leave the OLD adapter's timers armed — they'd fire after teardown
+        and issue continuations concurrently with the replacement adapter's
+        reconcile, double-driving the same goal."""
+        with self._lock:
+            timers = list(self._barrier_timers.values())
+            self._barrier_timers.clear()
+        for t in timers:
             try:
                 t.cancel()
             except Exception:
@@ -832,13 +887,34 @@ class ZetGoalDriver:
         session. Three-way match: the active table is keyed by the REQUEST-
         time App sid while compaction rotates ``agent.session_id`` and the
         goal index moves to the new sid immediately — any single-key lookup
-        misses one direction (codex P1)."""
+        misses one direction (codex P1).
+
+        Profile-filtered (codex P1): the active table itself is adapter-
+        global with bare sids — under the multiplexer another profile's
+        same-named session must not read as "this goal is already running"
+        (it would starve the goal's continuation forever). Registrations
+        are stamped with their profile home; unstamped entries (legacy /
+        single-profile) stay permissive."""
         active = {}
+        homes = {}
         try:
             with self.adapter._session_run_lock:
                 active = dict(self.adapter._active_session_agents)
+                homes = dict(getattr(self.adapter, "_active_session_homes", {}) or {})
         except Exception:
             return False
+        current_home = ""
+        try:
+            from hermes_constants import get_hermes_home
+
+            current_home = str(get_hermes_home())
+        except Exception:
+            pass
+
+        def _same_profile(key: str) -> bool:
+            entry_home = str(homes.get(key, "") or "")
+            return not entry_home or not current_home or entry_home == current_home
+
         keys = {session_id}
         try:
             app_sid = str(self._load_sidecar(session_id).get("app_session_id") or "").strip()
@@ -846,11 +922,12 @@ class ZetGoalDriver:
                 keys.add(app_sid)
         except Exception:
             pass
-        if keys & set(active):
-            return True
-        for ref in active.values():
+        for key in keys & set(active):
+            if _same_profile(key):
+                return True
+        for key, ref in active.items():
             try:
-                if str(getattr(ref[0], "session_id", "") or "") == session_id:
+                if str(getattr(ref[0], "session_id", "") or "") == session_id and _same_profile(key):
                     return True
             except Exception:
                 continue
@@ -980,24 +1057,48 @@ class ZetGoalDriver:
             except Exception:
                 logger.debug("[zet_goal] reconcile failed for %s", sid, exc_info=True)
 
-    def _reconcile_one(self, sid: str) -> None:
+    def _reconcile_one(self, sid: str, _depth: int = 0) -> None:
         """Reconcile a single indexed goal. The verdict AND the report happen
         under the same session lock with freshly loaded state (codex P1):
         the 5s startup reconcile can race a user pause/clear or the post-turn
         hook — a lock-free snapshot taken before the race would re-kick a
         goal the user just stopped. Mirrors _after_turn_sync, whose report
         also runs inside the lock."""
+        followup = self._reconcile_one_locked(sid, _depth)
+        if followup and followup != sid and _depth < 4:
+            # 轮转迁移中途崩溃的恢复（codex P1）：旧行的 migrated_to 指针
+            # 把我们带到新 sid —— 在旧 sid 的锁外接着 reconcile 它（指针链
+            # 每次压缩加一层，深度上限防御环）。
+            self._reconcile_one(followup, _depth + 1)
+
+    def _reconcile_one_locked(self, sid: str, _depth: int = 0) -> str:
         from hermes_cli.goals import GoalManager
 
         with self._session_lock(sid):
             try:
                 mgr = GoalManager(sid)
             except Exception:
-                return
+                return ""
             st = mgr.state
             if st is None or st.status in ("cleared", "done"):
+                dest = ""
+                try:
+                    side_old = self._load_sidecar(sid)
+                    dest = str(side_old.get("migrated_to") or "").strip()
+                    if dest and dest != sid:
+                        # 迁移在半途崩溃：先把新 sid 恢复进 index，缺 sidecar
+                        # 时用旧行保留的字段补齐（app_session_id 必须跟过去，
+                        # 否则上报漂移到轮转后的 hermes sid，App 稳定会话收
+                        # 不到下一轮 —— codex P1）。
+                        self._index_add(dest)
+                        if not self._load_sidecar(dest):
+                            restored = {k: v for k, v in side_old.items() if k != "migrated_to"}
+                            if restored:
+                                self._save_sidecar(dest, restored)
+                except Exception:
+                    logger.debug("[zet_goal] migration pointer follow failed", exc_info=True)
                 self._index_remove(sid)
-                return
+                return dest
             if st.status == "active" and self._interaction_flag_set(sid):
                 # The gateway died while an approval/clarify card was blocking
                 # a round — the card died with the turn. Blindly continuing
