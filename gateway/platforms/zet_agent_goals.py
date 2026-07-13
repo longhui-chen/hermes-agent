@@ -385,12 +385,31 @@ class ZetGoalDriver:
                 mgr.pause(reason)
                 self._cancel_barrier_timer(session_id)
             elif action == "resume":
+                st0 = mgr.state
+                side0 = self._load_sidecar(session_id)
+                if side0.get(self._INTERACTION_FLAG):
+                    if st0 is not None and st0.status == "active":
+                        # 自动 resume（local-server 的 error 重踢）撞上「approval/
+                        # clarify 等待中 gateway 挂掉」：确认卡片已随 turn 消亡，
+                        # 继续自驱等于替用户跳过确认（HR#3）—— park 成 paused，
+                        # 留给用户显式恢复。用户手动 resume 作用于 paused 态，
+                        # 不进此分支。
+                        side0.pop(self._INTERACTION_FLAG, None)
+                        self._save_sidecar(session_id, side0)
+                        mgr.pause(
+                            "waiting for your confirmation when the round was cut — resume to retry"
+                        )
+                        self._cancel_barrier_timer(session_id)
+                        return self.projection(session_id, mgr=mgr)
+                    # paused 态上的残留 flag（等待确认期间用户按了停止）：
+                    # 用户显式 resume 即视为放弃那次确认，清掉再正常恢复。
+                    side0.pop(self._INTERACTION_FLAG, None)
+                    self._save_sidecar(session_id, side0)
                 # 用户在第 N 轮暂停后点继续，必须从第 N+1 轮接着数 —— 上游
                 # resume() 默认重置轮数预算（turns_used=0），会让 App 轮次
                 # 显示跳回第 1 轮。只有"预算耗尽"的暂停才真正需要重置预算
                 # （否则 resume 后立刻再次触发预算暂停），重置前把已用轮数
                 # 累进 sidecar 偏移，App 侧轮次保持单调递增。
-                st0 = mgr.state
                 budget_paused = bool(
                     st0 is not None
                     and st0.status == "paused"
@@ -467,12 +486,19 @@ class ZetGoalDriver:
     def _migrate_sidecar(self, old_sid: str, new_sid: str) -> None:
         """Follow a compaction-driven session rotation: the goal row was
         already moved by ``migrate_goal_to_session``; move our sidecar +
-        index entry alongside so goal_id / app_session_id survive."""
+        index entry alongside so goal_id / app_session_id survive. A cancel
+        mark dropped on the pre-rotation id (local-server keeps addressing
+        it) must follow too, or the post-turn hook only consults the new id
+        and a user stop gets silently outraced (codex P1)."""
         side = self._load_sidecar(old_sid)
         if side:
             self._save_sidecar(new_sid, side)
         self._index_remove(old_sid)
         self._index_add(new_sid)
+        with self._lock:
+            at = self._cancel_marks.pop(old_sid, None)
+            if at is not None and at > self._cancel_marks.get(new_sid, 0.0):
+                self._cancel_marks[new_sid] = at
 
     def _after_turn_sync(
         self,
@@ -488,6 +514,10 @@ class ZetGoalDriver:
             session_id = effective_session_id
         try:
             with self._session_lock(session_id):
+                # Any pending-interaction flag died with the turn that raised
+                # it (approved / denied / timed out inline) — clear it so it
+                # can't park a later legitimate resume.
+                self._clear_interaction_flag_locked(session_id)
                 # Consume a stop pressed BEFORE this hook ran: the pause may
                 # have already landed (status!=active → early return below),
                 # or we're first — either way the goal must not continue.
@@ -525,8 +555,23 @@ class ZetGoalDriver:
                     self.report(session_id, self.projection(session_id, mgr=mgr))
                     return
                 user_initiated = not user_message.startswith(CONTINUATION_MARKER)
+                # Judge visibility into live background processes (CI/build/
+                # watch launched by this turn): the WAIT verdict keys off the
+                # snapshot — omitting it makes the judge continue immediately
+                # and re-launch long tasks (codex P1). Same no-arg gather as
+                # gateway/run.py's goal driver.
                 try:
-                    decision = mgr.evaluate_after_turn(final_response, user_initiated=user_initiated)
+                    from hermes_cli.goals import gather_background_processes
+
+                    bg_procs = gather_background_processes()
+                except Exception:
+                    bg_procs = None
+                try:
+                    decision = mgr.evaluate_after_turn(
+                        final_response,
+                        user_initiated=user_initiated,
+                        background_processes=bg_procs,
+                    )
                 except Exception:
                     logger.warning("[zet_goal] evaluate_after_turn failed", exc_info=True)
                     return
@@ -675,10 +720,27 @@ class ZetGoalDriver:
         except Exception:
             logger.debug("[zet_goal] pause after interrupt failed", exc_info=True)
 
+    _INTERACTION_FLAG = "interaction_pending"
+
+    def _interaction_flag_set(self, session_id: str) -> bool:
+        return bool(self._load_sidecar(session_id).get(self._INTERACTION_FLAG))
+
+    def _clear_interaction_flag_locked(self, session_id: str) -> None:
+        """Drop the pending-interaction flag. Caller holds the session lock."""
+        try:
+            side = self._load_sidecar(session_id)
+            if side.pop(self._INTERACTION_FLAG, None) is not None:
+                self._save_sidecar(session_id, side)
+        except Exception:
+            logger.debug("[zet_goal] clear interaction flag failed", exc_info=True)
+
     def on_interaction_pending(self, session_id: str) -> None:
         """An approval/clarify card is blocking the turn: project 'waiting'
         so the App banner explains the stall. GoalManager state itself is
-        untouched — the turn is still running from the loop's viewpoint."""
+        untouched — the turn is still running from the loop's viewpoint.
+        The flag IS persisted to the sidecar: if the gateway dies before the
+        user confirms, reconcile/resume must park the goal instead of
+        self-driving past a confirmation nobody gave (codex P1, HR#3)."""
         from hermes_cli.goals import GoalManager
 
         try:
@@ -687,6 +749,14 @@ class ZetGoalDriver:
             return
         if not mgr.is_active():
             return
+        try:
+            with self._session_lock(session_id):
+                side = self._load_sidecar(session_id)
+                if not side.get(self._INTERACTION_FLAG):
+                    side[self._INTERACTION_FLAG] = time.time()
+                    self._save_sidecar(session_id, side)
+        except Exception:
+            logger.debug("[zet_goal] persist interaction flag failed", exc_info=True)
         proj = self.projection(session_id, mgr=mgr)
         proj["state"] = "waiting"
         proj["summary"] = "waiting for user confirmation"
@@ -699,6 +769,8 @@ class ZetGoalDriver:
             mgr = GoalManager(session_id)
         except Exception:
             return
+        with self._session_lock(session_id):
+            self._clear_interaction_flag_locked(session_id)
         if not mgr.is_active():
             return
         self.report_in_thread(session_id, self.projection(session_id, mgr=mgr))
@@ -710,11 +782,55 @@ class ZetGoalDriver:
     async def reconcile_on_start(self) -> None:
         try:
             await asyncio.sleep(_RECONCILE_STARTUP_DELAY_S)
-            await asyncio.to_thread(self._reconcile_sync)
+            await asyncio.to_thread(self._reconcile_all_scopes)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.warning("[zet_goal] reconcile-on-start failed", exc_info=True)
+
+    def _reconcile_all_scopes(self) -> None:
+        """Run the reconcile pass in every runtime scope that owns goal state.
+
+        Under the multiplex gateway each profile keeps its goal rows /
+        sidecars / index in its own HERMES_HOME state.db (SessionDB caches
+        per home), and reports resolve ZET_GOAL_ADVANCE_URL through the
+        profile's ``.env`` (``_scoped_env`` fails closed without a scope) —
+        a single default-scope pass would neither see profile goals nor be
+        able to report them, so profile goals never self-heal after an OOM
+        respawn (codex P1). Single-profile processes keep the plain pass."""
+        mux = False
+        try:
+            from agent.secret_scope import is_multiplex_active
+
+            mux = is_multiplex_active()
+        except Exception:
+            mux = False
+        if not mux:
+            self._reconcile_sync()
+            return
+        try:
+            from pathlib import Path
+
+            from gateway.run import _profile_runtime_scope
+
+            homes = self.adapter._multiplex_profile_homes()
+        except Exception:
+            logger.warning("[zet_goal] multiplex reconcile scaffolding unavailable", exc_info=True)
+            return
+        seen: set = set()
+        for name, home in homes.items():
+            try:
+                key = str(Path(home).resolve())
+            except Exception:
+                key = str(home)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                with _profile_runtime_scope(Path(home)):
+                    self._reconcile_sync()
+            except Exception:
+                logger.warning("[zet_goal] reconcile failed for profile %s", name, exc_info=True)
 
     def _reconcile_sync(self) -> None:
         from hermes_cli.goals import GoalManager
@@ -727,6 +843,20 @@ class ZetGoalDriver:
             st = mgr.state
             if st is None or st.status in ("cleared", "done"):
                 self._index_remove(sid)
+                continue
+            if st.status == "active" and self._interaction_flag_set(sid):
+                # The gateway died while an approval/clarify card was blocking
+                # a round — the card died with the turn. Blindly continuing
+                # would self-drive past a confirmation the user never gave
+                # (codex P1, HR#3): park it and let the user resume explicitly.
+                with self._session_lock(sid):
+                    self._clear_interaction_flag_locked(sid)
+                    mgr2 = GoalManager(sid)
+                    if mgr2.is_active():
+                        mgr2.pause(
+                            "gateway restarted while waiting for your confirmation — resume to retry"
+                        )
+                self.report(sid, self.projection(sid))
                 continue
             proj = self.projection(sid, mgr=mgr)
             if st.status == "active" and not mgr.is_waiting():

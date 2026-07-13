@@ -323,6 +323,147 @@ class TestInterruptAndInteractions:
         assert reports[-1]["proj"]["state"] == "running"
 
 
+class TestCancelMarkMigration:
+    def test_migrate_sidecar_moves_cancel_mark(self, driver):
+        _create(driver)
+        driver._mark_user_cancel(SID)
+        new_sid = SID + "--c2"
+        driver._migrate_sidecar(SID, new_sid)
+        assert driver._consume_user_cancel(new_sid), "cancel 标记必须随轮转迁移"
+        assert not driver._consume_user_cancel(SID), "旧 id 的标记应已被搬走"
+
+    def test_stop_after_compaction_rotation_still_pauses(self, driver, reports):
+        """压缩轮转后用户按停止：标记落在旧 App sid（local-server 只认它），
+        post-turn hook 迁移 sidecar 时必须连带迁移标记，否则 continue 判定
+        会压过用户的停止（codex P1）。"""
+        from hermes_cli.goals import GoalManager, migrate_goal_to_session
+
+        _create(driver)
+        new_sid = SID + "--c2"
+        migrate_goal_to_session(SID, new_sid, reason="compression")
+        # 停止落在旧 id：goal 行已迁走，_pause_after_interrupt(old) 扑空，
+        # 只剩这个标记承载用户意图。
+        driver._mark_user_cancel(SID)
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "还没完", False, None)):
+            driver._after_turn_sync(SID, "user msg", "产出", effective_session_id=new_sid)
+        assert GoalManager(new_sid).state.status == "paused"
+        assert all(r["continuation"] is None for r in reports), "停止之后不得下发续轮"
+
+
+class TestInteractionPersistence:
+    def test_pending_flag_persists_and_reconcile_parks(self, driver, reports):
+        """approval 等待中 gateway 挂掉：重启 reconcile 不得自驱续轮（HR#3），
+        必须 park 成 paused 留给用户显式恢复。"""
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+        driver.on_interaction_pending(SID)
+        assert driver._interaction_flag_set(SID), "等待态必须落盘才能撑过重启"
+        reports.clear()
+
+        driver._reconcile_sync()
+        assert GoalManager(SID).state.status == "paused"
+        assert len(reports) == 1
+        assert reports[0]["proj"]["state"] == "paused"
+        assert reports[0]["continuation"] is None, "reconcile 不得替用户跳过确认"
+        assert not driver._interaction_flag_set(SID)
+
+    def test_flag_cleared_after_clean_turn(self, driver, reports):
+        """approval 在轮内被处理（同意/拒绝/超时）后轮次正常结束：flag 必须
+        随之清掉，循环照常推进。"""
+        _create(driver)
+        driver.on_interaction_pending(SID)
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "继续", False, None)):
+            driver._after_turn_sync(SID, "user msg", "产出")
+        assert not driver._interaction_flag_set(SID)
+        assert reports[-1]["proj"]["state"] == "running"
+        assert reports[-1]["continuation"], "已处理完确认的轮次照常续轮"
+
+    def test_auto_resume_with_pending_interaction_parks(self, driver, reports):
+        """LS 的 error 重踢（resume）抢在 reconcile 之前落到 active + flag 的
+        goal 上：park 而不是续轮。"""
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+        driver.on_interaction_pending(SID)
+        proj = driver._apply_action_sync(SID, "resume", {})
+        assert proj["state"] == "paused"
+        assert GoalManager(SID).state.status == "paused"
+        assert not driver._interaction_flag_set(SID)
+
+    def test_user_resume_clears_stale_flag(self, driver, reports):
+        """等待确认期间用户按停止（paused + flag 残留）后手动继续：正常恢复，
+        flag 视为放弃那次确认被清掉。"""
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+        driver.on_interaction_pending(SID)
+        GoalManager(SID).pause("user stopped the running turn")
+        proj = driver._apply_action_sync(SID, "resume", {})
+        assert proj["state"] in ("running", "waiting")
+        assert GoalManager(SID).state.status == "active"
+        assert not driver._interaction_flag_set(SID)
+
+
+class TestJudgeBackgroundProcesses:
+    def test_evaluate_passes_background_snapshot(self, driver, reports):
+        """judge 的 WAIT 判定依赖后台进程快照（CI/build/watch）——必须像其它
+        宿主驱动一样透传 gather_background_processes()（codex P1）。"""
+        procs = [{"pid": 4242, "command": "npm run build", "running": True}]
+        _create(driver)
+        with patch("hermes_cli.goals.gather_background_processes", return_value=procs), \
+             patch("hermes_cli.goals.judge_goal", return_value=("continue", "build 还在跑", False, None)) as jg:
+            driver._after_turn_sync(SID, "user msg", "产出")
+        assert jg.called
+        assert jg.call_args.kwargs.get("background_processes") == procs
+
+
+class TestMultiplexReconcile:
+    def test_non_mux_runs_single_pass(self, driver, monkeypatch):
+        calls = []
+        monkeypatch.setattr(driver, "_reconcile_sync", lambda: calls.append("default"))
+        monkeypatch.setattr("agent.secret_scope.is_multiplex_active", lambda: False)
+        driver._reconcile_all_scopes()
+        assert calls == ["default"]
+
+    def test_mux_reconciles_each_profile_home_once(self, driver, monkeypatch, tmp_path):
+        """multiplex 下每个 profile home 的 goal index 各自独立，且 report 依赖
+        profile scope 才能解析 ZET_GOAL_ADVANCE_URL —— reconcile 必须逐 profile
+        进 scope 跑（codex P1）；default/main 同 home 去重。"""
+        import sys
+        import types
+        from contextlib import contextmanager
+        from pathlib import Path
+
+        home_a = tmp_path / "prof-a"
+        home_b = tmp_path / "prof-b"
+        home_a.mkdir()
+        home_b.mkdir()
+
+        entered = []
+
+        @contextmanager
+        def fake_scope(home):
+            entered.append(str(Path(home)))
+            yield
+
+        fake_run = types.ModuleType("gateway.run")
+        fake_run._profile_runtime_scope = fake_scope
+        monkeypatch.setitem(sys.modules, "gateway.run", fake_run)
+        monkeypatch.setattr("agent.secret_scope.is_multiplex_active", lambda: True)
+        monkeypatch.setattr(
+            driver.adapter,
+            "_multiplex_profile_homes",
+            lambda: {"default": home_a, "main": home_a, "beta": home_b},
+            raising=False,
+        )
+        passes = []
+        monkeypatch.setattr(driver, "_reconcile_sync", lambda: passes.append(entered[-1]))
+
+        driver._reconcile_all_scopes()
+        assert sorted(passes) == sorted([str(home_a), str(home_b)]), "同 home 去重、每 profile 各跑一遍"
+
+
 class TestReconcile:
     def test_reconcile_rekicks_active_goal(self, driver, reports):
         _create(driver)

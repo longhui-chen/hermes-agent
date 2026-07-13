@@ -1284,15 +1284,29 @@ class ZetAgentAdapter(APIServerAdapter):
                     interrupt_reason = str(body.get("reason", "") or "")
         except Exception:
             interrupt_reason = ""
-        if interrupt_reason == "user_cancel":
-            try:
-                await asyncio.to_thread(self._goals().on_user_interrupt, session_id)
-            except Exception:
-                logger.debug("[zet_agent] goal pause on interrupt failed", exc_info=True)
-
         with self._session_run_lock:
             agent_ref = self._active_session_agents.get(session_id)
             task = self._active_session_tasks.get(session_id)
+
+        if interrupt_reason == "user_cancel":
+            # Mid-turn context compaction rotates the session id and migrates
+            # the goal row with it (conversation_compression →
+            # migrate_goal_to_session), while local-server keeps addressing
+            # the pre-rotation id. Pause under BOTH ids, or a stop pressed
+            # after a rotation never lands on the goal and the loop keeps
+            # self-driving (codex P1).
+            interrupt_sids = [session_id]
+            try:
+                rotated = str(getattr(agent_ref[0], "session_id", "") or "") if agent_ref else ""
+                if rotated and rotated != session_id:
+                    interrupt_sids.append(rotated)
+            except Exception:
+                pass
+            for sid in interrupt_sids:
+                try:
+                    await asyncio.to_thread(self._goals().on_user_interrupt, sid)
+                except Exception:
+                    logger.debug("[zet_agent] goal pause on interrupt failed", exc_info=True)
 
         agent = agent_ref[0] if agent_ref else None
 
