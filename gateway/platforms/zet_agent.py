@@ -73,6 +73,7 @@ Cheapest viable: cache the first user message per session and emit a
 on session reset. No LLM call — pure deterministic snippet.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -93,6 +94,7 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     DEFAULT_HOST,
     MAX_REQUEST_BYTES,
+    _chat_finish_reason_from_result,
     _coerce_port,
     _openai_error,
 )
@@ -393,8 +395,7 @@ class ZetAgentAdapter(APIServerAdapter):
         except Exception:
             logger.debug("[zet_agent] title push failed", exc_info=True)
 
-    @staticmethod
-    def _make_status_cb(stream_q: Any, previous: Any = None):
+    def _make_status_cb(self, stream_q: Any, previous: Any = None):
         """Forward structured AIAgent status events onto the SSE extension lane."""
         # AIAgent instances are currently created per turn. If a future change
         # reuses them, unwrap our prior wrapper instead of chaining closures that
@@ -412,6 +413,19 @@ class ZetAgentAdapter(APIServerAdapter):
                     logger.debug("[zet_agent] previous status_callback failed", exc_info=True)
             if not is_compaction:
                 return
+            # Goal sidecar/index 必须在压缩轮转的当下同步迁移（codex P1）：
+            # goal 行此刻已被 conversation_compression 迁到新 sid（旧行标
+            # cleared），只等 post-turn hook 搬 sidecar 的话，压缩后、turn
+            # 结束前 gateway 挂掉会让 reconcile 沿旧 index 找到 cleared 行并
+            # 删索引 —— 新 sid 下的 active goal 从此对自愈不可见。
+            if str(payload.get("state") or "") == "succeeded":
+                old_sid = str(payload.get("old_session_id") or "")
+                new_sid = str(payload.get("new_session_id") or "")
+                if old_sid and new_sid and old_sid != new_sid:
+                    try:
+                        self._goals().note_compaction_rotation(old_sid, new_sid)
+                    except Exception:
+                        logger.debug("[zet_agent] goal compaction migration failed", exc_info=True)
             event = dict(payload)
             event["type"] = "context.compaction"
             try:
@@ -469,6 +483,13 @@ class ZetAgentAdapter(APIServerAdapter):
                 stream_q.put(("__tool_progress__", payload))
             except Exception:
                 logger.debug("[zet_agent] approval notify push failed", exc_info=True)
+            # Goal projection: a blocked approval means the loop is waiting
+            # on the user — surface it on the App's goal banner (HR#3: goal
+            # rounds never auto-approve). No-op for non-goal sessions.
+            try:
+                self._goals().on_interaction_pending(session_id)
+            except Exception:
+                logger.debug("[zet_agent] goal waiting projection failed", exc_info=True)
 
         return _notify
 
@@ -511,6 +532,12 @@ class ZetAgentAdapter(APIServerAdapter):
                 logger.debug("[zet_agent] clarify push failed", exc_info=True)
                 self._discard_clarify_entry(session_id, entry)
                 return ""
+            # Goal projection: clarify blocks the turn on user input — mirror
+            # the approval hook (waiting banner; no GoalManager mutation).
+            try:
+                self._goals().on_interaction_pending(session_id)
+            except Exception:
+                logger.debug("[zet_agent] goal waiting projection failed", exc_info=True)
 
             resolved = entry.event.wait(timeout=CLARIFY_RESPONSE_TIMEOUT)
             if not resolved:
@@ -598,21 +625,52 @@ class ZetAgentAdapter(APIServerAdapter):
         so the interrupt picks up the agent the moment it appears."""
         if not session_id:
             return
+        # Key by profile home + sid (codex P1): under the multiplexer two
+        # profiles can run same-named sessions CONCURRENTLY — a bare-sid key
+        # would let the later registration overwrite the earlier one, whose
+        # goal driver then can't see its own in-flight turn and double-drives
+        # the loop (reconcile/resume/barrier wakeup). The contextvar scope is
+        # live here (the chat request entered via /p/{profile}).
+        key = self._active_turn_key(session_id)
         with self._session_run_lock:
-            self._active_session_agents[session_id] = agent_ref
-            self._active_session_tasks[session_id] = agent_task
+            self._active_session_agents[key] = agent_ref
+            self._active_session_tasks[key] = agent_task
+
+    def _active_turn_key(self, session_id: str) -> str:
+        """Scoped registry key: {hermes_home}|{session_id} — same shape as
+        the goal driver's _scope_key so both sides resolve identically."""
+        try:
+            from hermes_constants import get_hermes_home
+
+            return f"{get_hermes_home()}|{session_id}"
+        except Exception:
+            return session_id
 
     def _clear_active_session_turn(self, session_id: Optional[str], agent_ref: list, agent_task: Any) -> None:
         """Drop the registration ONLY if it still points at the turn we
         registered. Guards against late-clearing a fresher turn that
-        the same session has already started."""
+        the same session has already started. Identity-scan fallback: if the
+        clear runs outside the registration's profile scope the scoped key
+        won't reconstruct — a leaked entry would read as a forever-live turn,
+        so hunt the exact agent_ref down."""
         if not session_id:
             return
+        key = self._active_turn_key(session_id)
         with self._session_run_lock:
-            if self._active_session_agents.get(session_id) is agent_ref:
-                self._active_session_agents.pop(session_id, None)
-            if self._active_session_tasks.get(session_id) is agent_task:
-                self._active_session_tasks.pop(session_id, None)
+            if self._active_session_agents.get(key) is agent_ref:
+                self._active_session_agents.pop(key, None)
+            else:
+                for k, v in list(self._active_session_agents.items()):
+                    if v is agent_ref:
+                        self._active_session_agents.pop(k, None)
+                        break
+            if self._active_session_tasks.get(key) is agent_task:
+                self._active_session_tasks.pop(key, None)
+            else:
+                for k, v in list(self._active_session_tasks.items()):
+                    if v is agent_task:
+                        self._active_session_tasks.pop(k, None)
+                        break
 
     # ------------------------------------------------------------------
     # Agent factory override
@@ -918,7 +976,7 @@ class ZetAgentAdapter(APIServerAdapter):
         os.environ.setdefault("HERMES_EXEC_ASK", "1")
 
         try:
-            return await super()._run_agent(
+            result = await super()._run_agent(
                 user_message=user_message,
                 conversation_history=conversation_history,
                 ephemeral_system_prompt=ephemeral_system_prompt,
@@ -933,6 +991,45 @@ class ZetAgentAdapter(APIServerAdapter):
                 turn_id=turn_id,
                 request_overrides=request_overrides,
             )
+            # Goal loop post-turn hook (ZET goal driver): if this session has
+            # an active persistent goal, evaluate the finished turn off the
+            # event loop and report the verdict (+ continuation) to
+            # local-server's advance endpoint. Fire-and-forget — a hook
+            # failure must never fail the turn itself.
+            try:
+                final_response = ""
+                effective_sid = ""
+                run_ok = True
+                if isinstance(result, tuple) and result and isinstance(result[0], dict):
+                    r0 = result[0]
+                    final_response = str(r0.get("final_response") or "")
+                    effective_sid = str(r0.get("session_id") or "")
+                    # 硬失败轮（provider 401/限额等，failed=True 或 completed
+                    # =False 带 error）不进 judge（codex P1）：final_response
+                    # 是错误文本，judge 会把 "billing exhausted" 误判成 done/
+                    # blocked 终结 goal，或故障期间自驱烧轮。用 SSE 同一套
+                    # 分类器保证两侧闭环互补：判为 "error" 的轮，SSE 侧必然
+                    # 发 __hermes_error__ + 非 stop finish → local-server 的
+                    # turn watcher 走有界重踢/park；截断（length）照常评估。
+                    try:
+                        run_ok = _chat_finish_reason_from_result(r0) != "error"
+                    except Exception:
+                        run_ok = not bool(r0.get("failed"))
+                if run_ok:
+                    self._goals().schedule_after_turn(
+                        session_id or "",
+                        user_message,
+                        final_response,
+                        effective_session_id=effective_sid,
+                    )
+                else:
+                    logger.info(
+                        "[zet_agent] goal post-turn hook skipped for failed turn session=%s",
+                        session_id,
+                    )
+            except Exception:
+                logger.debug("[zet_agent] goal post-turn hook failed", exc_info=True)
+            return result
         finally:
             if old_session_key is None:
                 os.environ.pop("HERMES_SESSION_KEY", None)
@@ -1100,6 +1197,17 @@ class ZetAgentAdapter(APIServerAdapter):
         resolved = resolve_gateway_approval(session_id, choice)
         with self._pending_lock:
             self._pending_approval.pop(session_id, None)
+        # Goal projection: the loop is no longer blocked on the user — flip
+        # the App banner back from "waiting". No-op for non-goal sessions.
+        # 仅在真的解析了 approval（resolved > 0）时才清等待标记（codex P1）：
+        # gateway 重启后内存 queue 已丢、App 对旧卡片的 POST 返回 resolved=0，
+        # 此时清掉 sidecar 上的 interaction_pending 会让 reconcile/自动 resume
+        # 把本该等确认的 goal 继续自驱（用户点的可能还是 deny）。
+        if resolved:
+            try:
+                await asyncio.to_thread(self._goals().on_interaction_resolved, session_id)
+            except Exception:
+                logger.debug("[zet_agent] goal resolved projection failed", exc_info=True)
         return web.json_response({"resolved": resolved})
 
     async def _handle_clarify_respond(self, request: "web.Request") -> "web.Response":
@@ -1141,6 +1249,11 @@ class ZetAgentAdapter(APIServerAdapter):
         entry.event.set()
         with self._pending_lock:
             self._pending_clarify.pop(session_id, None)
+        # Goal projection: mirror the approval respond hook.
+        try:
+            await asyncio.to_thread(self._goals().on_interaction_resolved, session_id)
+        except Exception:
+            logger.debug("[zet_agent] goal resolved projection failed", exc_info=True)
         return web.json_response({"resolved": 1})
 
     async def _handle_pending(self, request: "web.Request") -> "web.Response":
@@ -1167,6 +1280,26 @@ class ZetAgentAdapter(APIServerAdapter):
             "approval": ap,
             "clarify": cl,
         })
+
+    # ------------------------------------------------------------------
+    # Goal loop (persistent /goal) — driver accessor + HTTP surface
+    # ------------------------------------------------------------------
+
+    def _goals(self):
+        """Lazily construct this adapter's goal-loop driver (see
+        gateway/platforms/zet_agent_goals.py for the architecture)."""
+        drv = getattr(self, "_zet_goal_driver", None)
+        if drv is None:
+            from gateway.platforms.zet_agent_goals import ZetGoalDriver
+            drv = ZetGoalDriver(self)
+            self._zet_goal_driver = drv
+        return drv
+
+    async def _handle_session_goal(self, request: "web.Request") -> "web.Response":
+        """POST/GET /v1/sessions/{session_id}/goal — create / pause / resume /
+        clear / status for the session's persistent goal. Called by
+        zettlab-local-server (chat.send goal trigger + App control proxy)."""
+        return await self._goals().handle_goal_route(request)
 
     async def _handle_session_interrupt(self, request: "web.Request") -> "web.Response":
         """POST /v1/sessions/{session_id}/interrupt — stop the active
@@ -1203,9 +1336,47 @@ class ZetAgentAdapter(APIServerAdapter):
             return auth_err
 
         session_id = request.match_info.get("session_id", "")
+
+        # Optional reason body (HR#4: additive — legacy callers send none).
+        # reason=user_cancel means the USER pressed stop: pause any active
+        # goal loop BEFORE interrupting the agent, so the interrupted turn's
+        # post-turn goal hook sees status=paused and never fires another
+        # round — a goal must not crawl back up after an explicit stop.
+        # Timeout/disconnect interruptions never POST here, so they leave
+        # the loop free to continue (judge treats the cut turn as unfinished).
+        interrupt_reason = ""
+        try:
+            if request.can_read_body:
+                body = await request.json()
+                if isinstance(body, dict):
+                    interrupt_reason = str(body.get("reason", "") or "")
+        except Exception:
+            interrupt_reason = ""
+        # Scoped key first（注册键含 profile home），裸键回退兼容 legacy 注册。
+        turn_key = self._active_turn_key(session_id)
         with self._session_run_lock:
-            agent_ref = self._active_session_agents.get(session_id)
-            task = self._active_session_tasks.get(session_id)
+            agent_ref = self._active_session_agents.get(turn_key) or self._active_session_agents.get(session_id)
+            task = self._active_session_tasks.get(turn_key) or self._active_session_tasks.get(session_id)
+
+        if interrupt_reason == "user_cancel":
+            # Mid-turn context compaction rotates the session id and migrates
+            # the goal row with it (conversation_compression →
+            # migrate_goal_to_session), while local-server keeps addressing
+            # the pre-rotation id. Pause under BOTH ids, or a stop pressed
+            # after a rotation never lands on the goal and the loop keeps
+            # self-driving (codex P1).
+            interrupt_sids = [session_id]
+            try:
+                rotated = str(getattr(agent_ref[0], "session_id", "") or "") if agent_ref else ""
+                if rotated and rotated != session_id:
+                    interrupt_sids.append(rotated)
+            except Exception:
+                pass
+            for sid in interrupt_sids:
+                try:
+                    await asyncio.to_thread(self._goals().on_user_interrupt, sid)
+                except Exception:
+                    logger.debug("[zet_agent] goal pause on interrupt failed", exc_info=True)
 
         agent = agent_ref[0] if agent_ref else None
 
@@ -1991,6 +2162,27 @@ class ZetAgentAdapter(APIServerAdapter):
                             exc_info=True,
                         )
                 closed_session_db = True
+            # 该 profile 的 goal barrier timers 一并取消（codex P1）：daemon
+            # Timer 携带旧 profile 的 runtime scope，卸载后触发会用内存旧
+            # scope 读 goal 并重新自驱一个用户刚删掉的 agent。同时按 home
+            # 翻代，让还在跑的 post-turn judge 任务在 report 前的复核中失效
+            # （active-run 计数在 turn 结束时已归零，拦不住这些后置任务）。
+            # getattr：teardown 期间绝不懒创建 driver。
+            drv = getattr(self, "_zet_goal_driver", None)
+            if drv is not None:
+                try:
+                    drv.cancel_barrier_timers_for_home(profile_home)
+                    drv.bump_lock_generations_for_home(profile_home)
+                    # goal sidecar 走 hermes_cli.goals._DB_CACHE（按 home 缓存
+                    # SessionDB），上面只关了 adapter 自己的 _session_dbs ——
+                    # 不关它的话 profile 删除/重建后 goal 读写仍打在旧 inode
+                    # 上（codex P1）。
+                    drv.close_goal_db_for_home(profile_home)
+                except Exception:
+                    logger.warning(
+                        "[zet_agent] profile-unload: goal timer cleanup failed",
+                        exc_info=True,
+                    )
 
         return web.json_response({
             "unloaded": True,
@@ -2108,6 +2300,16 @@ class ZetAgentAdapter(APIServerAdapter):
                 "/v1/sessions/{session_id}/interrupt",
                 self._handle_session_interrupt,
             )
+            # Persistent goal loop control surface (create/pause/resume/clear
+            # /status) — consumed by zettlab-local-server only.
+            self._app.router.add_post(
+                "/v1/sessions/{session_id}/goal",
+                self._handle_session_goal,
+            )
+            self._app.router.add_get(
+                "/v1/sessions/{session_id}/goal",
+                self._handle_session_goal,
+            )
             self._app.router.add_post(
                 "/v1/model/switch",
                 self._handle_model_switch,
@@ -2202,6 +2404,14 @@ class ZetAgentAdapter(APIServerAdapter):
                 "/p/{profile}/v1/sessions/{session_id}/interrupt",
                 self._profile_handler(self._handle_session_interrupt),
             )
+            self._app.router.add_post(
+                "/p/{profile}/v1/sessions/{session_id}/goal",
+                self._profile_handler(self._handle_session_goal),
+            )
+            self._app.router.add_get(
+                "/p/{profile}/v1/sessions/{session_id}/goal",
+                self._profile_handler(self._handle_session_goal),
+            )
 
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
             try:
@@ -2251,6 +2461,21 @@ class ZetAgentAdapter(APIServerAdapter):
                 "[%s] listening on http://%s:%d (interaction endpoints enabled)",
                 self.name, self._host, self._port,
             )
+
+            # Goal reconcile-on-start: after a crash/OOM respawn (local-server
+            # goal keepalive re-spawns us), re-report every indexed goal and
+            # re-kick loops that were cut mid-flight (HR#2 self-heal pair).
+            # 必须在 API key / 端口检查和 site.start() 全部成功之后才创建
+            # （codex P1）：启动失败的副本（端口被占等）若也自驱 goal，会和
+            # 真正监听的进程并发重踢同一循环。
+            goal_task = asyncio.create_task(self._goals().reconcile_on_start())
+            try:
+                self._background_tasks.add(goal_task)
+            except TypeError:
+                pass
+            if hasattr(goal_task, "add_done_callback"):
+                goal_task.add_done_callback(self._background_tasks.discard)
+
             return True
         except Exception:
             logger.exception("[%s] failed to start", self.name)
@@ -2259,6 +2484,27 @@ class ZetAgentAdapter(APIServerAdapter):
     async def disconnect(self) -> None:
         """Tear down the aiohttp server and unregister approval callbacks
         for any sessions we registered."""
+        # Goal barrier timers are daemon threading.Timers OUTSIDE
+        # _background_tasks — cancel them here or a reloaded/replaced
+        # adapter's stale timers keep firing wakeups and double-drive the
+        # goal alongside the new adapter's reconcile (codex P1). getattr:
+        # never lazily CREATE the driver during teardown.
+        drv = getattr(self, "_zet_goal_driver", None)
+        if drv is not None:
+            try:
+                drv.cancel_all_barrier_timers()
+            except Exception:
+                pass
+            # 已进 executor 的 post-turn judge 线程躲得过
+            # cancel_background_tasks（取消的只是 asyncio wrapper）——
+            # 全量翻代让它们在 report 前的复核中失效，否则会与替换者
+            # （新 adapter reconcile / keepalive 拉起的新进程）并发
+            # 自驱同一 goal（codex P1）。
+            try:
+                drv.invalidate_all_generations()
+            except Exception:
+                pass
+
         # Drop approval notify callbacks so blocked agent threads (if
         # any leak past process shutdown) don't fire into a dead loop.
         try:
