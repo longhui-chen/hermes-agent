@@ -478,6 +478,7 @@ class TestAdapterInit:
                     {"type": "function", "function": {"name": "todo"}},
                 ]
                 self.valid_tool_names = {"present_plan", "todo"}
+                self._skip_mcp_refresh = False
 
         monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
         monkeypatch.setattr(
@@ -514,6 +515,7 @@ class TestAdapterInit:
 
         assert agent.tools == []
         assert agent.valid_tool_names == set()
+        assert agent._skip_mcp_refresh is True
         assert captured["request_overrides"] == {
             "response_format": {"type": "json_object"},
         }

@@ -1594,6 +1594,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # without an OpenAI-compatible tool_choice parameter) behave the same.
             agent.tools = []
             agent.valid_tool_names = set()
+            agent._skip_mcp_refresh = True
         return agent
 
     def _response_format_transport_error(

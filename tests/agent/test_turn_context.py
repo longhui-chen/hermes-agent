@@ -297,6 +297,58 @@ def test_between_turns_refresh_skipped_when_skip_flag_set():
     gtd.assert_not_called()
 
 
+def test_api_server_tool_choice_none_skips_registered_mcp_refresh(monkeypatch):
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+
+    class FakeAgent(_FakeAgent):
+        def __init__(self, **_kwargs):
+            super().__init__()
+            self.platform = "api_server"
+            self.tools = [
+                {"type": "function", "function": {"name": "present_plan"}},
+                {"type": "function", "function": {"name": "todo"}},
+            ]
+            self.valid_tool_names = {"present_plan", "todo"}
+
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openai",
+            "base_url": "https://example.test/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5")
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._load_reasoning_config",
+        staticmethod(lambda: {}),
+    )
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._load_fallback_model",
+        staticmethod(lambda: None),
+    )
+    monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 90)
+    monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+    agent = adapter._create_agent(
+        session_id="meeting-summary",
+        request_overrides={"tool_choice": "none"},
+    )
+
+    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=True), \
+         patch("tools.mcp_tool.refresh_agent_mcp_tools") as refresh:
+        _build(agent)
+
+    refresh.assert_not_called()
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()
+
+
 def test_between_turns_refresh_no_churn_when_unchanged():
     """R2: an unchanged tool set leaves the snapshot object identity intact
     (no needless swap → nothing for the next request prefix to diff against)."""
