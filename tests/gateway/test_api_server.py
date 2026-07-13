@@ -467,6 +467,57 @@ class TestAdapterInit:
         assert isinstance(agent, FakeAgent)
         assert captured["max_iterations"] == 200
 
+    def test_create_agent_disables_tools_for_tool_choice_none(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.tools = [
+                    {"type": "function", "function": {"name": "present_plan"}},
+                    {"type": "function", "function": {"name": "todo"}},
+                ]
+                self.valid_tool_names = {"present_plan", "todo"}
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openai",
+                "base_url": "https://example.test/v1",
+                "api_mode": "chat_completions",
+            },
+        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5")
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_reasoning_config",
+            staticmethod(lambda: {}),
+        )
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_fallback_model",
+            staticmethod(lambda: None),
+        )
+        monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 90)
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        agent = adapter._create_agent(
+            session_id="meeting-summary",
+            request_overrides={
+                "tool_choice": "none",
+                "response_format": {"type": "json_object"},
+            },
+        )
+
+        assert agent.tools == []
+        assert agent.valid_tool_names == set()
+        assert captured["request_overrides"] == {
+            "response_format": {"type": "json_object"},
+        }
+
     def test_create_agent_handles_fallback_model_kwarg_collision(self, monkeypatch):
         """When the primary provider auth-fails, _resolve_runtime_agent_kwargs()
         returns a runtime dict that carries its own ``model`` key. _create_agent
@@ -1205,6 +1256,43 @@ class TestChatCompletionsEndpoint:
 
             assert resp.status == 200
             assert mock_run.await_args.kwargs["request_overrides"] == {
+                "response_format": {"type": "json_object"},
+            }
+
+    @pytest.mark.asyncio
+    async def test_meeting_summary_tool_choice_none_integration_flow_disables_agent_tools(self, adapter):
+        mock_result = {
+            "final_response": '{"title":"产品计划会","overall":"讨论发布计划"}',
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": "发布计划先给大家看，确认后再执行。",
+                            }
+                        ],
+                        "stream": False,
+                        "tool_choice": "none",
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+
+            assert resp.status == 200
+            assert mock_run.await_args.kwargs["request_overrides"] == {
+                "tool_choice": "none",
                 "response_format": {"type": "json_object"},
             }
 
