@@ -64,8 +64,8 @@ def reports(driver, monkeypatch):
     """Capture advance reports instead of POSTing (fail-open path untested here)."""
     captured = []
 
-    def fake_report(session_id, proj, *, continuation=None):
-        captured.append({"session_id": session_id, "proj": dict(proj), "continuation": continuation})
+    def fake_report(session_id, proj, *, continuation=None, cause=""):
+        captured.append({"session_id": session_id, "proj": dict(proj), "continuation": continuation, "cause": cause})
 
     monkeypatch.setattr(driver, "report", fake_report)
     # report_in_thread 直接同步执行，测试不依赖线程时序。

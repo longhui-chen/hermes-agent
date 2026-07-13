@@ -350,6 +350,7 @@ class ZetGoalDriver:
         proj: Dict[str, Any],
         *,
         continuation: Optional[str] = None,
+        cause: str = "",
     ) -> None:
         url = _scoped_env("ZET_GOAL_ADVANCE_URL").strip()
         if not url:
@@ -358,6 +359,11 @@ class ZetGoalDriver:
         payload = dict(proj)
         payload["agent_id"] = _scoped_env("ZET_AGENT_ID").strip()
         payload["session_id"] = self._wire_session_id(session_id)
+        if cause:
+            # additive 可选字段（HR#4）：local-server 用它区分「用户 resume
+            # 触发的 running」与「pause 前旧判定迟到的 running」——后者不得
+            # 撤销用户的暂停（codex P2）。
+            payload["cause"] = cause
         if continuation:
             payload["continuation"] = continuation
         try:
@@ -540,7 +546,7 @@ class ZetGoalDriver:
                     if cont:
                         proj = dict(proj)
                         proj["round"] = self._cumulative_round(session_id, mgr.state.turns_used) + 1
-                        self.report(session_id, proj, continuation=cont)
+                        self.report(session_id, proj, continuation=cont, cause="resume")
             return proj
 
     # ------------------------------------------------------------------
