@@ -299,7 +299,7 @@ _EXTRA_ENV_KEYS = frozenset({
 import yaml
 
 from hermes_cli.colors import Colors, color
-from hermes_cli.default_soul import DEFAULT_SOUL_MD, is_legacy_template_soul
+from hermes_cli.default_soul import default_soul_md
 
 
 # =============================================================================
@@ -819,23 +819,21 @@ def _secure_file(path):
 
 
 def _ensure_default_soul_md(home: Path) -> None:
-    """Seed a default SOUL.md into HERMES_HOME, upgrading legacy empty templates.
+    """Seed a neutral SOUL.md only when the active profile has none.
 
-    First run: write DEFAULT_SOUL_MD. Existing installs whose SOUL.md is still
-    the old comment-only scaffold (seeded by older install.sh / install.ps1 /
-    docker images, which shadowed the runtime default) get upgraded in place to
-    DEFAULT_SOUL_MD. A SOUL.md the user actually customized is never touched.
+    Existing files are owned by the user, local-server, or the package that
+    materialized the profile. Hermes must never migrate or reinterpret them;
+    product-specific migrations belong to that profile owner. Zettlab's
+    local-server sets ``ZET_AGENT_ID`` on every managed profile process; in
+    that mode a missing SOUL stays missing on disk and the runtime uses its
+    in-memory neutral fallback until local-server materializes the profile.
     """
     soul_path = home / "SOUL.md"
     if soul_path.exists():
-        try:
-            existing = soul_path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            return
-        if not is_legacy_template_soul(existing):
-            return
-        # Legacy empty template -> upgrade to the real default in place.
-    soul_path.write_text(DEFAULT_SOUL_MD, encoding="utf-8")
+        return
+    if os.environ.get("ZET_AGENT_ID", "").strip():
+        return
+    soul_path.write_text(default_soul_md(), encoding="utf-8")
     _secure_file(soul_path)
 
 

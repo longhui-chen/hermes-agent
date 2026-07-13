@@ -127,7 +127,7 @@ class ResponsesApiTransport(ProviderTransport):
             _responses_tools,
         )
 
-        from run_agent import DEFAULT_AGENT_IDENTITY
+        from agent.prompt_builder import default_agent_identity
 
         instructions = params.get("instructions", "")
         payload_messages = messages
@@ -136,7 +136,7 @@ class ResponsesApiTransport(ProviderTransport):
                 instructions = str(messages[0].get("content") or "").strip()
                 payload_messages = messages[1:]
         if not instructions:
-            instructions = DEFAULT_AGENT_IDENTITY
+            instructions = default_agent_identity()
 
         is_github_responses = params.get("is_github_responses", False)
         is_codex_backend = params.get("is_codex_backend", False)

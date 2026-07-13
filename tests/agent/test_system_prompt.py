@@ -99,3 +99,38 @@ class TestCodingContextBlock:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         agent = _make_agent(valid_tool_names=[], platform="cli")
         assert "coding agent" not in _stable_prompt(agent)
+
+
+class TestZettlabPromptKernel:
+    def test_xml_kernel_wraps_neutral_identity_for_named_profile(self, monkeypatch):
+        monkeypatch.setenv("ZETTLAB_AGENT_LANG", "zh")
+        monkeypatch.setenv("HERMES_AGENT_LANG", "zh")
+        monkeypatch.setenv("ZET_AGENT_ID", "writer")
+
+        stable = _stable_prompt(_make_agent())
+
+        root_index = stable.index('<zettlab_agent_base_prompt version="0.3" lang="zh">')
+        soul_index = stable.index("<profile_soul", root_index)
+        protocol_index = stable.index("<conversation_protocol", soul_index)
+        voice_index = stable.index("<voice>", protocol_index)
+        style_index = stable.index("<style_and_formatting>", voice_index)
+        facts_index = stable.index("<product_facts>", style_index)
+        setup_skill_index = stable.index("zettlab-memo-setup", facts_index)
+
+        assert "不要默认自己是任何具名专家" in stable
+        assert "你是 Zettlab Memo" not in stable
+        assert root_index < soul_index < protocol_index < voice_index < style_index < facts_index < setup_skill_index
+        assert "# 对话协议" not in stable
+        assert "# 语气与风格" not in stable
+
+    def test_xml_kernel_does_not_infer_memo_from_main_profile(self, monkeypatch):
+        monkeypatch.setenv("ZETTLAB_AGENT_LANG", "zh")
+        monkeypatch.setenv("HERMES_AGENT_LANG", "zh")
+        monkeypatch.setenv("ZET_AGENT_ID", "main")
+
+        stable = _stable_prompt(_make_agent())
+
+        assert "<profile_soul source=\"SOUL.md\">" in stable
+        assert "<agent_persona id=\"zettlab-memo\"" not in stable
+        assert "你是 Zettlab Memo" not in stable
+        assert "不要默认自己是任何具名专家" in stable
