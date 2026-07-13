@@ -491,6 +491,47 @@ class TestCompactionTimeMigration:
         assert driver._load_sidecar(new_sid)["goal_id"] == "g_test"
 
 
+class TestRotationAwareInteractions:
+    def test_interaction_pending_follows_rotation(self, driver, reports):
+        """approval 回调捕获的是 _create_agent 时的旧 sid；本轮已压缩轮转时
+        等待标记必须写到新 sid 的 sidecar（codex P1）——写旧 sid 的话
+        reconcile 只扫新 index，重启后看不到等待态照样自驱。"""
+        import types
+
+        from hermes_cli.goals import migrate_goal_to_session
+
+        _create(driver)
+        new_sid = SID + "--c2"
+        migrate_goal_to_session(SID, new_sid, reason="compression")
+        driver.note_compaction_rotation(SID, new_sid)
+        # 活跃 agent 仍按请求时的旧 sid 注册，但 agent.session_id 已轮转。
+        driver.adapter._active_session_agents[SID] = [types.SimpleNamespace(session_id=new_sid)]
+
+        driver.on_interaction_pending(SID)
+        assert driver._interaction_flag_set(new_sid), "等待标记必须落在轮转后的 sidecar"
+        assert not driver._interaction_flag_set(SID)
+        assert reports[-1]["proj"]["state"] == "waiting"
+
+        driver.on_interaction_resolved(SID)
+        assert not driver._interaction_flag_set(new_sid), "resolved 也要按轮转后的 sid 清"
+
+    def test_reconcile_skips_rotated_active_turn(self, driver, reports):
+        """压缩即时迁移把 index 提前切到新 sid，而在途 turn 仍按旧 App sid
+        注册（codex P1）：reconcile 只查新 sid 会误判空闲、并发重踢。"""
+        import types
+
+        from hermes_cli.goals import migrate_goal_to_session
+
+        _create(driver)
+        new_sid = SID + "--c2"
+        migrate_goal_to_session(SID, new_sid, reason="compression")
+        driver.note_compaction_rotation(SID, new_sid)
+        driver.adapter._active_session_agents[SID] = [types.SimpleNamespace(session_id=new_sid)]
+
+        driver._reconcile_sync()
+        assert all(r.get("continuation") is None for r in reports), "在途轮（旧 sid 注册）不得被并发重踢"
+
+
 class TestJudgeBackgroundProcesses:
     def test_evaluate_passes_background_snapshot(self, driver, reports):
         """judge 的 WAIT 判定依赖后台进程快照（CI/build/watch）——必须像其它

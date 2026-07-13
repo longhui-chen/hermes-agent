@@ -94,6 +94,7 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     DEFAULT_HOST,
     MAX_REQUEST_BYTES,
+    _chat_finish_reason_from_result,
     _coerce_port,
     _openai_error,
 )
@@ -967,15 +968,34 @@ class ZetAgentAdapter(APIServerAdapter):
             try:
                 final_response = ""
                 effective_sid = ""
+                run_ok = True
                 if isinstance(result, tuple) and result and isinstance(result[0], dict):
-                    final_response = str(result[0].get("final_response") or "")
-                    effective_sid = str(result[0].get("session_id") or "")
-                self._goals().schedule_after_turn(
-                    session_id or "",
-                    user_message,
-                    final_response,
-                    effective_session_id=effective_sid,
-                )
+                    r0 = result[0]
+                    final_response = str(r0.get("final_response") or "")
+                    effective_sid = str(r0.get("session_id") or "")
+                    # 硬失败轮（provider 401/限额等，failed=True 或 completed
+                    # =False 带 error）不进 judge（codex P1）：final_response
+                    # 是错误文本，judge 会把 "billing exhausted" 误判成 done/
+                    # blocked 终结 goal，或故障期间自驱烧轮。用 SSE 同一套
+                    # 分类器保证两侧闭环互补：判为 "error" 的轮，SSE 侧必然
+                    # 发 __hermes_error__ + 非 stop finish → local-server 的
+                    # turn watcher 走有界重踢/park；截断（length）照常评估。
+                    try:
+                        run_ok = _chat_finish_reason_from_result(r0) != "error"
+                    except Exception:
+                        run_ok = not bool(r0.get("failed"))
+                if run_ok:
+                    self._goals().schedule_after_turn(
+                        session_id or "",
+                        user_message,
+                        final_response,
+                        effective_session_id=effective_sid,
+                    )
+                else:
+                    logger.info(
+                        "[zet_agent] goal post-turn hook skipped for failed turn session=%s",
+                        session_id,
+                    )
             except Exception:
                 logger.debug("[zet_agent] goal post-turn hook failed", exc_info=True)
             return result

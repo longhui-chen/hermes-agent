@@ -761,6 +761,24 @@ class ZetGoalDriver:
 
     _INTERACTION_FLAG = "interaction_pending"
 
+    def _live_session_id(self, session_id: str) -> str:
+        """Resolve the CURRENT hermes sid for a live turn's request-time sid.
+
+        Mid-turn compaction rotates ``agent.session_id`` (goal row + sidecar
+        follow immediately via note_compaction_rotation), while approval/
+        clarify callbacks keep the sid captured at ``_create_agent`` time —
+        writing waiting flags/pauses under the stale id would park them on a
+        tombstoned sidecar reconcile never scans (codex P1)."""
+        try:
+            with self.adapter._session_run_lock:
+                ref = self.adapter._active_session_agents.get(session_id)
+            rotated = str(getattr(ref[0], "session_id", "") or "") if ref else ""
+            if rotated and rotated != session_id:
+                return rotated
+        except Exception:
+            pass
+        return session_id
+
     def _interaction_flag_set(self, session_id: str) -> bool:
         return bool(self._load_sidecar(session_id).get(self._INTERACTION_FLAG))
 
@@ -782,6 +800,10 @@ class ZetGoalDriver:
         self-driving past a confirmation nobody gave (codex P1, HR#3)."""
         from hermes_cli.goals import GoalManager
 
+        # 回调闭包捕获的是 _create_agent 时的 sid —— 本轮若已压缩轮转，goal
+        # 行/sidecar 都在新 sid 下（旧行 cleared、旧 sidecar tombstone），
+        # 不解析的话 is_active() 直接 False，等待态既不投影也不落盘。
+        session_id = self._live_session_id(session_id)
         try:
             mgr = GoalManager(session_id)
         except Exception:
@@ -804,6 +826,9 @@ class ZetGoalDriver:
     def on_interaction_resolved(self, session_id: str) -> None:
         from hermes_cli.goals import GoalManager
 
+        # 与 on_interaction_pending 同款轮转解析：flag 写在哪个 sid 就得从
+        # 哪个 sid 清。
+        session_id = self._live_session_id(session_id)
         try:
             mgr = GoalManager(session_id)
         except Exception:
@@ -913,14 +938,33 @@ class ZetGoalDriver:
                 # A live loop was cut mid-flight (crash / OOM respawn).
                 # Skip if this process already has an active turn for the
                 # session — the loop is running, no kick needed.
+                #
+                # 活跃表按「请求时的 App sid」注册，而压缩即时迁移会把 index
+                # 提前切到新 sid（codex P1）：只查 sid 会漏掉「已压缩但尚未
+                # 结束」的在途轮，并发重踢同一 goal。补查 sidecar 的
+                # app_session_id（注册键）以及各活跃 agent 轮转后的当前
+                # session_id。
                 active = {}
                 try:
                     with self.adapter._session_run_lock:
                         active = dict(self.adapter._active_session_agents)
                 except Exception:
                     pass
-                if sid in active:
+                keys = {sid}
+                try:
+                    app_sid = str(self._load_sidecar(sid).get("app_session_id") or "").strip()
+                    if app_sid:
+                        keys.add(app_sid)
+                except Exception:
+                    pass
+                if keys & set(active):
                     return
+                for ref in active.values():
+                    try:
+                        if str(getattr(ref[0], "session_id", "") or "") == sid:
+                            return
+                    except Exception:
+                        continue
                 cont = mgr.next_continuation_prompt()
                 if cont:
                     proj["state"] = "running"
