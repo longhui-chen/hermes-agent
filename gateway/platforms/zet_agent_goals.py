@@ -116,6 +116,12 @@ class ZetGoalDriver:
         # 键的后置任务（CLI 建的 goal 首次经本进程跑等）也要能被 unload 失效
         # —— 只翻已存在的 session 键盖不到它们（codex P1）。
         self._home_epochs: Dict[str, int] = {}
+        # adapter 级 epoch，disconnect（gateway 重启/adapter 替换）时递增：
+        # 已进 executor 的 judge 线程躲得过 cancel_background_tasks（取消的
+        # 只是 asyncio wrapper），若不失效，旧后置任务会在新进程 reconcile
+        # 接管后并发 report continuation 双驱同一 goal（codex P1）。并入
+        # _lock_generation 的 epoch 分量（只增不减，和求和后 != 判定兼容）。
+        self._adapter_epoch: int = 0
         self._home_resolve_cache: Dict[str, str] = {}
         # scope key → generation counter, bumped on clear/done prune and on
         # create-over-existing. A post-turn hook that was QUEUED on the old
@@ -168,14 +174,28 @@ class ZetGoalDriver:
         return resolved
 
     def _lock_generation(self, session_id: str):
-        """失效代际 = (session 代际, home epoch)。home epoch 由 profile
-        unload 递增（codex P1）：覆盖「排队中尚未建 session 键」的后置任务
-        —— 它们捕获的 epoch 在 unload 后必然过期。"""
+        """失效代际 = (session 代际, home epoch + adapter epoch)。home epoch
+        由 profile unload 递增（codex P1）：覆盖「排队中尚未建 session 键」
+        的后置任务 —— 它们捕获的 epoch 在 unload 后必然过期。adapter epoch
+        由 disconnect 递增（codex P1）：整个 adapter 被替换/关停时全量失效。
+        两者都只增，求和后任何一次翻转都让 != 复核失效。"""
         key = self._scope_key(session_id)
         home = key.split("|", 1)[0] if "|" in key else ""
         rhome = self._resolved_home(home)
         with self._lock:
-            return (self._lock_gens.get(key, 0), self._home_epochs.get(rhome, 0))
+            return (
+                self._lock_gens.get(key, 0),
+                self._home_epochs.get(rhome, 0) + self._adapter_epoch,
+            )
+
+    def invalidate_all_generations(self) -> None:
+        """Adapter teardown hook（codex P1）：disconnect 时让本 driver 名下
+        所有已排队/在途的 goal 后置任务在 report 前的代际复核中失效 ——
+        cancel_background_tasks 只能取消 asyncio wrapper，进了 executor 的
+        judge 线程会继续跑完并上报，与替换者（新 adapter reconcile / 新进程）
+        并发自驱同一 goal。"""
+        with self._lock:
+            self._adapter_epoch += 1
 
     def _bump_lock_generation_locked_key(self, key: str) -> None:
         """Caller holds self._lock."""
@@ -428,7 +448,7 @@ class ZetGoalDriver:
             return web.json_response({"error": "session_id required"}, status=400)
 
         if request.method == "GET":
-            proj = await asyncio.to_thread(self.projection, session_id)
+            proj = await asyncio.to_thread(self._projection_at_tip, session_id)
             return web.json_response(proj)
 
         try:
@@ -451,9 +471,34 @@ class ZetGoalDriver:
             return web.json_response({"error": f"goal {action} failed: {e}"}, status=500)
         return web.json_response(proj)
 
+    def _follow_migration(self, session_id: str) -> str:
+        """沿 sidecar 的 ``migrated_to`` 指针解析到 goal 当前所在的 sid。
+
+        压缩轮转后旧 sidecar 只剩指针、goal 行是 cleared tombstone ——
+        local-server 仍可能拿 pre-rotation id 发控制请求（interrupt 分支
+        同款时序），不解析的话 pause/clear/status 会打在 tombstone 上
+        「成功」返回，新 sid 下真正 active 的 goal 继续被自驱（codex P1）。
+        深度上限与 reconcile 的指针恢复一致，防指针环。"""
+        sid = session_id
+        for _ in range(4):
+            try:
+                dest = str(self._load_sidecar(sid).get("migrated_to") or "").strip()
+            except Exception:
+                return sid
+            if not dest or dest == sid:
+                return sid
+            sid = dest
+        return sid
+
+    def _projection_at_tip(self, session_id: str) -> Dict[str, Any]:
+        return self.projection(self._follow_migration(session_id))
+
     def _apply_action_sync(self, session_id: str, action: str, body: Dict[str, Any]) -> Dict[str, Any]:
         from hermes_cli.goals import GoalManager, parse_contract
 
+        # 控制动作一律先解析到迁移后的 sid（codex P1）。create 也解析：
+        # 轮转后旧 hermes sid 已无会话内容，goal 建在那里会立刻失联。
+        session_id = self._follow_migration(session_id)
         with self._session_lock(session_id):
             mgr = GoalManager(session_id)
             if action == "create":
@@ -887,6 +932,42 @@ class ZetGoalDriver:
                 if matched:
                     self._bump_lock_generation_locked_key(key)
 
+    def close_goal_db_for_home(self, profile_home: Any) -> None:
+        """Profile-unload hook（codex P1）：goal sidecar 读写复用
+        ``hermes_cli.goals._DB_CACHE``（按 hermes_home 缓存 SessionDB），
+        adapter 只关自己的 ``_session_dbs`` 盖不到它 —— profile 删除/重建后
+        旧连接仍指向已删 inode，reconcile/control 读到旧 goal 状态继续自驱，
+        新 profile 的 goal 又不可见。按 home pop 并 close。"""
+        from pathlib import Path
+
+        try:
+            from hermes_cli import goals as _goals_mod
+
+            cache = getattr(_goals_mod, "_DB_CACHE", None)
+        except Exception:
+            return
+        if not isinstance(cache, dict):
+            return
+        try:
+            target = str(Path(str(profile_home)).resolve())
+        except Exception:
+            target = str(profile_home)
+        victims = []
+        for home in list(cache.keys()):
+            try:
+                matched = str(Path(home).resolve()) == target
+            except Exception:
+                matched = home == str(profile_home)
+            if matched:
+                victims.append(cache.pop(home, None))
+        for db in victims:
+            close = getattr(db, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
     def cancel_barrier_timers_for_home(self, profile_home: Any) -> None:
         """Profile-unload hook (codex P1): a WAIT barrier's daemon Timer
         captured the profile's runtime scope — after the profile is unloaded
@@ -1161,21 +1242,63 @@ class ZetGoalDriver:
         proj["summary"] = "waiting for user confirmation"
         self.report_in_thread(session_id, proj)
 
+    def _interaction_still_pending(self, *sids: str) -> bool:
+        """本 session 是否还有未回应的 approval/clarify 卡片。approval/
+        clarify 都是 per-session FIFO、没有 request_id —— respond 只解掉
+        最老的一张，剩下的卡片仍在阻塞 turn，此时不能清等待标记。"""
+        seen = set()
+        for sid in sids:
+            if not sid or sid in seen:
+                continue
+            seen.add(sid)
+            try:
+                from tools.approval import has_blocking_approval
+
+                if has_blocking_approval(sid):
+                    return True
+            except Exception:
+                pass
+            try:
+                with self.adapter._clarify_state_lock:
+                    if self.adapter._clarify_queues.get(sid):
+                        return True
+            except Exception:
+                pass
+        return False
+
     def on_interaction_resolved(self, session_id: str) -> None:
         from hermes_cli.goals import GoalManager
 
         # 与 on_interaction_pending 同款轮转解析：flag 写在哪个 sid 就得从
-        # 哪个 sid 清。
+        # 哪个 sid 清。pending 队列键的是回调原始 sid，两个都查。
+        req_sid = session_id
         session_id = self._live_session_id(session_id)
+        # 旧卡的响应不代表 turn 不再阻塞（codex P1）：clear+create 换代后
+        # 新 goal 自己的卡片可能还挂着 —— per-session FIFO 会先解旧卡，
+        # 此时清掉 sidecar 标记会让 gateway 重启后的 reconcile 跳过一个
+        # 用户从未给出的确认（HR#3）。还有卡片在等就保留标记。
+        if self._interaction_still_pending(req_sid, session_id):
+            return
+        # 判定 + 清 flag + 投影全部锁内、带代际（codex P1，与
+        # on_interaction_pending 对称）：锁外窗口内 clear/create 换代时，
+        # 旧回调不得动新 goal 的 sidecar。
+        gen0 = self._lock_generation(session_id)
         try:
-            mgr = GoalManager(session_id)
+            with self._session_lock(session_id):
+                if self._lock_generation(session_id) != gen0:
+                    return
+                try:
+                    mgr = GoalManager(session_id)
+                except Exception:
+                    return
+                self._clear_interaction_flag_locked(session_id)
+                if not mgr.is_active():
+                    return
+                proj = self.projection(session_id, mgr=mgr)
         except Exception:
+            logger.debug("[zet_goal] interaction resolved handling failed", exc_info=True)
             return
-        with self._session_lock(session_id):
-            self._clear_interaction_flag_locked(session_id)
-        if not mgr.is_active():
-            return
-        self.report_in_thread(session_id, self.projection(session_id, mgr=mgr))
+        self.report_in_thread(session_id, proj)
 
     # ------------------------------------------------------------------
     # Reconcile-on-start (HR#2 pair of local-server's goal keepalive)

@@ -2173,6 +2173,11 @@ class ZetAgentAdapter(APIServerAdapter):
                 try:
                     drv.cancel_barrier_timers_for_home(profile_home)
                     drv.bump_lock_generations_for_home(profile_home)
+                    # goal sidecar 走 hermes_cli.goals._DB_CACHE（按 home 缓存
+                    # SessionDB），上面只关了 adapter 自己的 _session_dbs ——
+                    # 不关它的话 profile 删除/重建后 goal 读写仍打在旧 inode
+                    # 上（codex P1）。
+                    drv.close_goal_db_for_home(profile_home)
                 except Exception:
                     logger.warning(
                         "[zet_agent] profile-unload: goal timer cleanup failed",
@@ -2488,6 +2493,15 @@ class ZetAgentAdapter(APIServerAdapter):
         if drv is not None:
             try:
                 drv.cancel_all_barrier_timers()
+            except Exception:
+                pass
+            # 已进 executor 的 post-turn judge 线程躲得过
+            # cancel_background_tasks（取消的只是 asyncio wrapper）——
+            # 全量翻代让它们在 report 前的复核中失效，否则会与替换者
+            # （新 adapter reconcile / keepalive 拉起的新进程）并发
+            # 自驱同一 goal（codex P1）。
+            try:
+                drv.invalidate_all_generations()
             except Exception:
                 pass
 

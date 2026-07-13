@@ -47,6 +47,8 @@ class FakeAdapter:
         self._background_tasks = set()
         self._session_run_lock = threading.Lock()
         self._active_session_agents = {}
+        self._clarify_state_lock = threading.Lock()
+        self._clarify_queues = {}
 
     def _check_auth(self, request):
         return None
@@ -1068,3 +1070,131 @@ class TestReconcile:
         assert len(reports) == 1
         assert reports[0]["proj"]["state"] == "paused"
         assert reports[0]["continuation"] is None
+
+
+class TestDisconnectInvalidation:
+    def test_judge_running_across_disconnect_does_not_report(self, driver, reports):
+        """disconnect 只能取消 asyncio wrapper，已进 executor 的 judge 线程
+        会继续跑完（codex P1）——disconnect 的全量翻代必须让它在 report 前
+        的复核中失效，否则与替换 adapter/新进程的 reconcile 双驱同一 goal。"""
+        _create(driver)
+        reports.clear()
+
+        def judge_then_disconnect(*args, **kwargs):
+            # 模拟 judge 进行期间 adapter 被 disconnect。
+            driver.invalidate_all_generations()
+            return ("continue", "go on", False, None)
+
+        with patch("hermes_cli.goals.judge_goal", side_effect=judge_then_disconnect):
+            driver._after_turn_sync(SID, "user msg", "产出")
+        assert reports == [], "disconnect 后完成的 judge 不得上报 continuation"
+
+
+class TestUnloadClosesGoalDB:
+    def test_close_goal_db_for_home_pops_and_closes(self, driver, hermes_home):
+        """profile unload 必须连带关闭 hermes_cli.goals._DB_CACHE 里同 home
+        的 SessionDB（codex P1）：adapter 只关自己的 _session_dbs，残留连接
+        指向已删 inode，profile 重建后 goal 状态读写全部错位。"""
+        from hermes_cli import goals
+
+        class FakeDB:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        mine, other = FakeDB(), FakeDB()
+        goals._DB_CACHE[str(hermes_home)] = mine
+        goals._DB_CACHE["/somewhere/else"] = other
+
+        driver.close_goal_db_for_home(str(hermes_home))
+
+        assert str(hermes_home) not in goals._DB_CACHE, "同 home 缓存必须被移除"
+        assert mine.closed, "被移除的连接必须 close"
+        assert goals._DB_CACHE.get("/somewhere/else") is other and not other.closed, \
+            "其它 home 的缓存不受影响"
+
+
+class TestInteractionResolvedGuards:
+    def test_resolved_keeps_flag_while_another_card_pending(self, driver, reports):
+        """per-session FIFO 没有 request_id：旧卡被回应时新 goal 自己的卡片
+        可能还挂着（codex P1）——此时清 sidecar 等待标记会让重启后的
+        reconcile 跳过一个用户从未给出的确认（HR#3）。"""
+        _create(driver)
+        driver.on_interaction_pending(SID)
+        assert driver._interaction_flag_set(SID)
+        reports.clear()
+
+        # 会话里还有一张 clarify 卡片在等。
+        driver.adapter._clarify_queues[SID] = [object()]
+        driver.on_interaction_resolved(SID)
+
+        assert driver._interaction_flag_set(SID), "还有卡片挂着时不得清等待标记"
+        assert reports == [], "标记未清时不得上报"
+
+    def test_resolved_clears_flag_when_nothing_pending(self, driver, reports):
+        _create(driver)
+        driver.on_interaction_pending(SID)
+        reports.clear()
+
+        driver.on_interaction_resolved(SID)
+
+        assert not driver._interaction_flag_set(SID)
+        assert len(reports) == 1 and reports[0]["proj"]["state"] == "running"
+
+    def test_stale_resolved_callback_is_noop(self, driver, reports):
+        """clear/create 换代窗口内迟到的 resolved 回调不得动新 goal 的
+        sidecar（codex P1，与 on_interaction_pending 的失效判定对称）。"""
+        _create(driver)
+        driver.on_interaction_pending(SID)
+        reports.clear()
+
+        real = driver._lock_generation
+        calls = {"n": 0}
+
+        def stale_first(sid):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                gen, epoch = real(sid)
+                return (gen - 1, epoch)
+            return real(sid)
+
+        with patch.object(driver, "_lock_generation", side_effect=stale_first):
+            driver.on_interaction_resolved(SID)
+        assert driver._interaction_flag_set(SID), "失效回调不得清等待标记"
+        assert reports == []
+
+
+class TestControlFollowsMigration:
+    NEW_SID = SID + "--rotated"
+
+    def _rotated_goal(self, driver):
+        """构造压缩轮转后的形状：goal 活在新 sid，旧 sidecar 只剩指针。"""
+        _create(driver, sid=self.NEW_SID)
+        driver._save_sidecar(SID, {"migrated_to": self.NEW_SID})
+
+    def test_pause_on_pre_rotation_sid_hits_migrated_goal(self, driver):
+        """轮转后 local-server 仍可能拿 pre-rotation id 发控制请求
+        （codex P1）：不跟 migrated_to 指针的话 pause 会打在 tombstone 上
+        「成功」返回，新 sid 下的 active goal 继续自驱。"""
+        from hermes_cli.goals import GoalManager
+
+        self._rotated_goal(driver)
+        proj = driver._apply_action_sync(SID, "pause", {})
+        assert proj["goal_id"] == "g_test"
+        assert proj["state"] == "paused"
+        st = GoalManager(self.NEW_SID).state
+        assert st is not None and st.status == "paused", "真正的 goal 必须被暂停"
+
+    def test_clear_on_pre_rotation_sid_clears_migrated_goal(self, driver):
+        self._rotated_goal(driver)
+        proj = driver._apply_action_sync(SID, "clear", {})
+        assert proj["state"] == "cleared"
+        assert self.NEW_SID not in driver._index(), "新 sid 必须摘出索引"
+
+    def test_status_get_follows_pointer(self, driver):
+        self._rotated_goal(driver)
+        proj = driver._projection_at_tip(SID)
+        assert proj["goal_id"] == "g_test"
+        assert proj["state"] == "running"
