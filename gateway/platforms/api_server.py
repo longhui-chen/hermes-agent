@@ -1565,6 +1565,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # same fallback behaviour as Telegram/Discord/Slack (fixes #4954).
         fallback_model = GatewayRunner._load_fallback_model()
 
+        agent_request_overrides = dict(request_overrides or {})
+        disable_tools = agent_request_overrides.pop("tool_choice", None) == "none"
+
         agent = AIAgent(
             model=model,
             **runtime_kwargs,
@@ -1583,8 +1586,15 @@ class APIServerAdapter(BasePlatformAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
-            request_overrides=request_overrides,
+            request_overrides=agent_request_overrides or None,
         )
+        if disable_tools:
+            # ``tool_choice=none`` is an API-level safety boundary.  Remove every
+            # advertised tool for this request so all transports (including ones
+            # without an OpenAI-compatible tool_choice parameter) behave the same.
+            agent.tools = []
+            agent.valid_tool_names = set()
+            agent._skip_mcp_refresh = True
         return agent
 
     def _response_format_transport_error(
@@ -2456,6 +2466,8 @@ class APIServerAdapter(BasePlatformAdapter):
         model_name = body.get("model", self._model_name)
         created = int(time.time())
         request_overrides: Dict[str, Any] = {}
+        if body.get("tool_choice") == "none":
+            request_overrides["tool_choice"] = "none"
         response_format = body.get("response_format")
         if response_format is not None:
             response_format_error = _validate_chat_response_format(response_format)
