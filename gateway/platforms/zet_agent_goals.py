@@ -373,6 +373,10 @@ class ZetGoalDriver:
                     # 缺 app_session_id 意味着 compaction 轮转后上报会漂移到
                     # 新 hermes sid，local-server 侧对不上 registry/transcript。
                     logger.warning("[zet_goal] create without app_session_id for %s", session_id)
+                # 新 goal 不承接历史 stop：丢弃残留 cancel mark（无 goal 会话
+                # 上按过的停止 / 旧 goal 清除前的停止，TTL 180s 内仍在）——
+                # 否则新 goal 第一轮 post-turn 就会消费旧标记误暂停（codex P1）。
+                self._consume_user_cancel(session_id)
                 # Crash-ordering: sidecar + index FIRST, activation LAST — a
                 # crash mid-create must leave "goal not yet active", never
                 # "active but untracked" (an orphan reconcile can't see).
@@ -386,6 +390,15 @@ class ZetGoalDriver:
                 self._cancel_barrier_timer(session_id)
             elif action == "resume":
                 st0 = mgr.state
+                if st0 is None or st0.status in ("cleared", "done"):
+                    # 上游 resume() 不校验状态，会把 cleared/done 直接置回
+                    # active（codex P1）——local-server 的重试/过期 resume 一到，
+                    # 用户已终结的 goal 就重新自驱。终态只回投影，不动状态。
+                    return self.projection(session_id, mgr=mgr)
+                # 显式恢复 = 宣告此前的 stop 作废：丢弃残留 cancel mark（stop
+                # 中断的轮次不跑 post-turn hook，标记不会被正常消费），否则
+                # 恢复后第一轮结束时旧标记会把 goal 又暂停回去（codex P1）。
+                self._consume_user_cancel(session_id)
                 side0 = self._load_sidecar(session_id)
                 if side0.get(self._INTERACTION_FLAG):
                     if st0 is not None and st0.status == "active":
@@ -483,16 +496,42 @@ class ZetGoalDriver:
             # No running loop (unit tests calling the sync path) — run inline.
             self._after_turn_sync(session_id, user_message or "", final_response or "", effective_session_id or "")
 
+    def note_compaction_rotation(self, old_sid: str, new_sid: str) -> None:
+        """Migrate the sidecar/index AT compaction time (codex P1). The goal
+        row itself is moved by ``migrate_goal_to_session`` the moment the
+        rotation happens (the old row is archived as cleared); waiting for
+        the post-turn hook leaves a crash window — gateway dies between
+        compaction and turn end → reconcile follows the old index entry to a
+        cleared row, prunes it, and the active goal under the new sid is
+        invisible to self-heal forever."""
+        if not old_sid or not new_sid or old_sid == new_sid:
+            return
+        try:
+            self._migrate_sidecar(old_sid, new_sid)
+        except Exception:
+            logger.debug("[zet_goal] compaction sidecar migration failed", exc_info=True)
+
     def _migrate_sidecar(self, old_sid: str, new_sid: str) -> None:
         """Follow a compaction-driven session rotation: the goal row was
         already moved by ``migrate_goal_to_session``; move our sidecar +
         index entry alongside so goal_id / app_session_id survive. A cancel
         mark dropped on the pre-rotation id (local-server keeps addressing
         it) must follow too, or the post-turn hook only consults the new id
-        and a user stop gets silently outraced (codex P1)."""
+        and a user stop gets silently outraced (codex P1).
+
+        Idempotent by design: both the compaction-time migration
+        (note_compaction_rotation) and the post-turn fallback call this.
+        The first caller moves the data; later calls only fill gaps — the
+        merge never overwrites keys already present under the new sid, and
+        the old row is tombstoned so a stale copy can't clobber fresh
+        new-sid state."""
         side = self._load_sidecar(old_sid)
         if side:
-            self._save_sidecar(new_sid, side)
+            existing = self._load_sidecar(new_sid)
+            merged = {**side, **existing}
+            if merged != existing:
+                self._save_sidecar(new_sid, merged)
+            self._save_sidecar(old_sid, {})
         self._index_remove(old_sid)
         self._index_add(new_sid)
         with self._lock:
@@ -833,31 +872,42 @@ class ZetGoalDriver:
                 logger.warning("[zet_goal] reconcile failed for profile %s", name, exc_info=True)
 
     def _reconcile_sync(self) -> None:
+        for sid in self._index():
+            try:
+                self._reconcile_one(sid)
+            except Exception:
+                logger.debug("[zet_goal] reconcile failed for %s", sid, exc_info=True)
+
+    def _reconcile_one(self, sid: str) -> None:
+        """Reconcile a single indexed goal. The verdict AND the report happen
+        under the same session lock with freshly loaded state (codex P1):
+        the 5s startup reconcile can race a user pause/clear or the post-turn
+        hook — a lock-free snapshot taken before the race would re-kick a
+        goal the user just stopped. Mirrors _after_turn_sync, whose report
+        also runs inside the lock."""
         from hermes_cli.goals import GoalManager
 
-        for sid in self._index():
+        with self._session_lock(sid):
             try:
                 mgr = GoalManager(sid)
             except Exception:
-                continue
+                return
             st = mgr.state
             if st is None or st.status in ("cleared", "done"):
                 self._index_remove(sid)
-                continue
+                return
             if st.status == "active" and self._interaction_flag_set(sid):
                 # The gateway died while an approval/clarify card was blocking
                 # a round — the card died with the turn. Blindly continuing
                 # would self-drive past a confirmation the user never gave
                 # (codex P1, HR#3): park it and let the user resume explicitly.
-                with self._session_lock(sid):
-                    self._clear_interaction_flag_locked(sid)
-                    mgr2 = GoalManager(sid)
-                    if mgr2.is_active():
-                        mgr2.pause(
-                            "gateway restarted while waiting for your confirmation — resume to retry"
-                        )
+                self._clear_interaction_flag_locked(sid)
+                if mgr.is_active():
+                    mgr.pause(
+                        "gateway restarted while waiting for your confirmation — resume to retry"
+                    )
                 self.report(sid, self.projection(sid))
-                continue
+                return
             proj = self.projection(sid, mgr=mgr)
             if st.status == "active" and not mgr.is_waiting():
                 # A live loop was cut mid-flight (crash / OOM respawn).
@@ -870,14 +920,14 @@ class ZetGoalDriver:
                 except Exception:
                     pass
                 if sid in active:
-                    continue
+                    return
                 cont = mgr.next_continuation_prompt()
                 if cont:
                     proj["state"] = "running"
                     proj["round"] = int(st.turns_used) + 1
                     proj["summary"] = "resumed after gateway restart"
                     self.report(sid, proj, continuation=cont)
-                    continue
+                    return
             if st.status == "active" and mgr.is_waiting():
                 self._schedule_barrier_wakeup(sid)
             self.report(sid, proj)

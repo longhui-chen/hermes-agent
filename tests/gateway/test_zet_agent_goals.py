@@ -405,6 +405,92 @@ class TestInteractionPersistence:
         assert not driver._interaction_flag_set(SID)
 
 
+class TestTerminalResumeRejected:
+    def test_resume_on_cleared_goal_stays_cleared(self, driver, reports):
+        """上游 resume() 不校验状态会把 cleared 复活成 active（codex P1）——
+        LS 的重试/过期 resume 不得让已终结的 goal 重新自驱。"""
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+        driver._apply_action_sync(SID, "clear", {})
+        proj = driver._apply_action_sync(SID, "resume", {})
+        assert proj["state"] == "cleared"
+        st = GoalManager(SID).state
+        assert st is None or st.status == "cleared"
+        assert all(r.get("continuation") is None for r in reports), "终态 resume 不得下发续轮"
+
+    def test_resume_on_done_goal_stays_done(self, driver, reports):
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+        GoalManager(SID).mark_done("done")
+        proj = driver._apply_action_sync(SID, "resume", {})
+        assert proj["state"] == "done"
+        assert GoalManager(SID).state.status == "done"
+
+
+class TestStaleCancelMark:
+    def test_create_discards_stale_cancel_mark(self, driver, reports):
+        """无 goal 会话上按过的停止（mark TTL 180s）不得误暂停之后新建的
+        goal（codex P1）：create 时丢弃残留标记。"""
+        from hermes_cli.goals import GoalManager
+
+        driver._mark_user_cancel(SID)
+        _create(driver)
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "继续", False, None)):
+            driver._after_turn_sync(SID, "user msg", "产出")
+        assert GoalManager(SID).state.status == "active", "旧 stop 不得暂停新 goal"
+        assert reports[-1]["continuation"], "第一轮照常续轮"
+
+    def test_resume_discards_stale_cancel_mark(self, driver, reports):
+        """stop 中断的轮次不跑 post-turn hook，mark 不被消费；用户显式恢复
+        即宣告该 stop 作废 —— 否则恢复后第一轮结束又被旧标记暂停回去。"""
+        from hermes_cli.goals import GoalManager
+
+        _create(driver)
+        driver._mark_user_cancel(SID)
+        GoalManager(SID).pause("user stopped the running turn")
+        driver._apply_action_sync(SID, "resume", {})
+        assert GoalManager(SID).state.status == "active"
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "继续", False, None)):
+            driver._after_turn_sync(SID, "[Continuing toward your standing goal]\nGoal: x", "产出")
+        assert GoalManager(SID).state.status == "active", "作废的 stop 不得再次暂停"
+
+
+class TestCompactionTimeMigration:
+    def test_note_compaction_rotation_migrates_index_immediately(self, driver):
+        """压缩当下即时迁移（codex P1）：goal 行已被 migrate_goal_to_session
+        迁走（旧行 cleared），若 index 还留在旧 sid，压缩后 turn 结束前挂掉
+        的 gateway 重启 reconcile 只会删旧索引，新 sid 的 active goal 永失。"""
+        from hermes_cli.goals import GoalManager, migrate_goal_to_session
+
+        _create(driver)
+        new_sid = SID + "--c2"
+        migrate_goal_to_session(SID, new_sid, reason="compression")
+        driver.note_compaction_rotation(SID, new_sid)
+
+        assert new_sid in driver._index()
+        assert SID not in driver._index()
+        assert driver._load_sidecar(new_sid)["goal_id"] == "g_test"
+        # 模拟压缩后立即崩溃重启：reconcile 必须能沿新 index 找到 active goal。
+        assert GoalManager(new_sid).state.status == "active"
+
+    def test_double_migration_is_idempotent_and_preserves_new_side(self, driver):
+        """即时迁移后 post-turn hook 还会再调一次 _migrate_sidecar：旧行已
+        tombstone，重复迁移不得用旧快照回盖新 sid 上的后续写入。"""
+        _create(driver)
+        new_sid = SID + "--c2"
+        driver.note_compaction_rotation(SID, new_sid)
+        # 新 sid 上发生了后续写入（如 rounds_offset）。
+        side = driver._load_sidecar(new_sid)
+        side["rounds_offset"] = 5
+        driver._save_sidecar(new_sid, side)
+
+        driver._migrate_sidecar(SID, new_sid)  # post-turn 兜底重复迁移
+        assert driver._load_sidecar(new_sid)["rounds_offset"] == 5
+        assert driver._load_sidecar(new_sid)["goal_id"] == "g_test"
+
+
 class TestJudgeBackgroundProcesses:
     def test_evaluate_passes_background_snapshot(self, driver, reports):
         """judge 的 WAIT 判定依赖后台进程快照（CI/build/watch）——必须像其它

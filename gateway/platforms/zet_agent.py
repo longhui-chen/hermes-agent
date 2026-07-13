@@ -394,8 +394,7 @@ class ZetAgentAdapter(APIServerAdapter):
         except Exception:
             logger.debug("[zet_agent] title push failed", exc_info=True)
 
-    @staticmethod
-    def _make_status_cb(stream_q: Any, previous: Any = None):
+    def _make_status_cb(self, stream_q: Any, previous: Any = None):
         """Forward structured AIAgent status events onto the SSE extension lane."""
         # AIAgent instances are currently created per turn. If a future change
         # reuses them, unwrap our prior wrapper instead of chaining closures that
@@ -413,6 +412,19 @@ class ZetAgentAdapter(APIServerAdapter):
                     logger.debug("[zet_agent] previous status_callback failed", exc_info=True)
             if not is_compaction:
                 return
+            # Goal sidecar/index 必须在压缩轮转的当下同步迁移（codex P1）：
+            # goal 行此刻已被 conversation_compression 迁到新 sid（旧行标
+            # cleared），只等 post-turn hook 搬 sidecar 的话，压缩后、turn
+            # 结束前 gateway 挂掉会让 reconcile 沿旧 index 找到 cleared 行并
+            # 删索引 —— 新 sid 下的 active goal 从此对自愈不可见。
+            if str(payload.get("state") or "") == "succeeded":
+                old_sid = str(payload.get("old_session_id") or "")
+                new_sid = str(payload.get("new_session_id") or "")
+                if old_sid and new_sid and old_sid != new_sid:
+                    try:
+                        self._goals().note_compaction_rotation(old_sid, new_sid)
+                    except Exception:
+                        logger.debug("[zet_agent] goal compaction migration failed", exc_info=True)
             event = dict(payload)
             event["type"] = "context.compaction"
             try:
@@ -1136,10 +1148,15 @@ class ZetAgentAdapter(APIServerAdapter):
             self._pending_approval.pop(session_id, None)
         # Goal projection: the loop is no longer blocked on the user — flip
         # the App banner back from "waiting". No-op for non-goal sessions.
-        try:
-            await asyncio.to_thread(self._goals().on_interaction_resolved, session_id)
-        except Exception:
-            logger.debug("[zet_agent] goal resolved projection failed", exc_info=True)
+        # 仅在真的解析了 approval（resolved > 0）时才清等待标记（codex P1）：
+        # gateway 重启后内存 queue 已丢、App 对旧卡片的 POST 返回 resolved=0，
+        # 此时清掉 sidecar 上的 interaction_pending 会让 reconcile/自动 resume
+        # 把本该等确认的 goal 继续自驱（用户点的可能还是 deny）。
+        if resolved:
+            try:
+                await asyncio.to_thread(self._goals().on_interaction_resolved, session_id)
+            except Exception:
+                logger.debug("[zet_agent] goal resolved projection failed", exc_info=True)
         return web.json_response({"resolved": resolved})
 
     async def _handle_clarify_respond(self, request: "web.Request") -> "web.Response":
@@ -2330,17 +2347,6 @@ class ZetAgentAdapter(APIServerAdapter):
             if hasattr(sweep_task, "add_done_callback"):
                 sweep_task.add_done_callback(self._background_tasks.discard)
 
-            # Goal reconcile-on-start: after a crash/OOM respawn (local-server
-            # goal keepalive re-spawns us), re-report every indexed goal and
-            # re-kick loops that were cut mid-flight (HR#2 self-heal pair).
-            goal_task = asyncio.create_task(self._goals().reconcile_on_start())
-            try:
-                self._background_tasks.add(goal_task)
-            except TypeError:
-                pass
-            if hasattr(goal_task, "add_done_callback"):
-                goal_task.add_done_callback(self._background_tasks.discard)
-
             if is_network_accessible(self._host) and not self._api_key:
                 logger.error(
                     "[%s] Refusing to start: binding to %s requires ZET_AGENT_KEY/API_SERVER_KEY.",
@@ -2381,6 +2387,21 @@ class ZetAgentAdapter(APIServerAdapter):
                 "[%s] listening on http://%s:%d (interaction endpoints enabled)",
                 self.name, self._host, self._port,
             )
+
+            # Goal reconcile-on-start: after a crash/OOM respawn (local-server
+            # goal keepalive re-spawns us), re-report every indexed goal and
+            # re-kick loops that were cut mid-flight (HR#2 self-heal pair).
+            # 必须在 API key / 端口检查和 site.start() 全部成功之后才创建
+            # （codex P1）：启动失败的副本（端口被占等）若也自驱 goal，会和
+            # 真正监听的进程并发重踢同一循环。
+            goal_task = asyncio.create_task(self._goals().reconcile_on_start())
+            try:
+                self._background_tasks.add(goal_task)
+            except TypeError:
+                pass
+            if hasattr(goal_task, "add_done_callback"):
+                goal_task.add_done_callback(self._background_tasks.discard)
+
             return True
         except Exception:
             logger.exception("[%s] failed to start", self.name)
