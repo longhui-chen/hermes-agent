@@ -4787,6 +4787,8 @@ class AIAgent:
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
+        if self._should_suppress_plan_stream_text():
+            return
         cb = self.reasoning_callback
         if cb is not None:
             try:
@@ -5512,7 +5514,20 @@ class AIAgent:
     def _build_assistant_message(self, assistant_message, finish_reason: str) -> dict:
         """Forwarder — see ``agent.chat_completion_helpers.build_assistant_message``."""
         from agent.chat_completion_helpers import build_assistant_message
-        return build_assistant_message(self, assistant_message, finish_reason)
+        message = build_assistant_message(self, assistant_message, finish_reason)
+        if (
+            self._should_suppress_plan_stream_text()
+            and (getattr(assistant_message, "tool_calls", None) or [])
+        ):
+            # Tool-call responses can carry sibling content/reasoning on weak
+            # OpenAI-compatible providers. It is provisional Plan output, not
+            # transcript content. Preserve a non-empty reasoning_content pad for
+            # DeepSeek/Kimi replay validation without retaining the visible draft.
+            message["content"] = ""
+            message["reasoning"] = None
+            if "reasoning_content" in message:
+                message["reasoning_content"] = " "
+        return message
 
     def _needs_thinking_reasoning_pad(self) -> bool:
         """Return True when the active provider enforces reasoning_content echo-back.

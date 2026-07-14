@@ -62,6 +62,28 @@ def _empty_response() -> SimpleNamespace:
     )
 
 
+def _plan_tool_response(*, content: str, reasoning: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(
+                content=content,
+                tool_calls=[SimpleNamespace(
+                    id="call-plan",
+                    type="function",
+                    function=SimpleNamespace(
+                        name="present_plan",
+                        arguments='{"title":"减脂计划","groups":[]}',
+                    ),
+                )],
+                reasoning_content=reasoning,
+            ),
+            finish_reason="tool_calls",
+        )],
+        usage=None,
+        model="test-model",
+    )
+
+
 def test_plan_flow_requires_clarify_before_present_plan_and_hides_side_effects():
     agent = SimpleNamespace(
         platform="zet_agent",
@@ -314,6 +336,91 @@ def test_plan_mode_suppresses_provisional_plain_text_streaming():
     AIAgent._fire_stream_delta(agent, "这段纯文本计划不能提前进入 SSE")
 
     assert streamed == []
+
+
+def test_plan_mode_suppresses_provisional_reasoning_streaming():
+    streamed = []
+    agent = SimpleNamespace(
+        platform="zet_agent",
+        _zet_agent_plan_mode_active=True,
+        _zet_agent_plan_presented=False,
+        reasoning_callback=streamed.append,
+    )
+    agent._should_suppress_plan_stream_text = lambda: AIAgent._should_suppress_plan_stream_text(agent)
+
+    AIAgent._fire_reasoning_delta(agent, "这段 reasoning 草案不能提前进入 SSE")
+
+    assert streamed == []
+
+
+def test_plan_mode_sanitizes_tool_response_history_at_the_shared_builder():
+    agent = _plan_agent(("clarify", "present_plan"))
+    agent._zet_agent_plan_mode_active = True
+    agent._zet_agent_plan_presented = False
+    assistant = SimpleNamespace(
+        content="未经审核的草案",
+        tool_calls=[SimpleNamespace(
+            id="call-unknown",
+            type="function",
+            function=SimpleNamespace(name="unknown_tool", arguments="{}"),
+        )],
+        reasoning_content="先构造完整计划",
+    )
+
+    message = agent._build_assistant_message(assistant, "tool_calls")
+
+    assert message["content"] == ""
+    assert message["reasoning"] is None
+    assert message["reasoning_content"] == " "
+
+
+def test_plan_tool_flow_drops_sibling_content_and_visible_reasoning_before_history():
+    agent = _plan_agent(("clarify", "present_plan"))
+    response = _plan_tool_response(
+        content="这是未经确认的纯文本计划",
+        reasoning="先草拟一份完整计划再调用工具",
+    )
+    flushed = []
+
+    def execute_plan(_assistant_message, messages, *_args):
+        agent._zet_agent_plan_presented = True
+        messages.append({
+            "role": "tool",
+            "name": "present_plan",
+            "tool_call_id": "call-plan",
+            "content": '{"success":true}',
+        })
+
+    with (
+        patch.object(agent, "_interruptible_api_call", return_value=response),
+        patch.object(agent, "_execute_tool_calls", side_effect=execute_plan),
+        patch.object(
+            agent,
+            "_flush_messages_to_session_db",
+            side_effect=lambda messages, _history=None: flushed.append(
+                [message.copy() for message in messages]
+            ),
+        ),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("帮我制定减脂计划")
+
+    assistant = next(
+        message for message in result["messages"]
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    )
+    assert assistant["content"] == ""
+    assert assistant["reasoning"] is None
+    assert assistant["reasoning_content"] == " "
+    assert flushed
+    assert all(
+        "未经确认" not in str(message)
+        and "草拟一份完整计划" not in str(message)
+        for snapshot in flushed
+        for message in snapshot
+    )
 
 
 def test_plan_mode_requires_interactive_callbacks():

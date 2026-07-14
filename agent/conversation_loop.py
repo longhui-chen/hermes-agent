@@ -4569,6 +4569,16 @@ def run_conversation(
                     assistant_message.content = str(raw)
 
             _enforce_single_plan_interaction_tool_call(agent, assistant_message)
+            _plan_mode_tool_response = bool(
+                getattr(agent, "_zet_agent_plan_mode_active", False)
+                and (getattr(assistant_message, "tool_calls", None) or [])
+            )
+            if _plan_mode_tool_response:
+                # OpenAI-compatible providers may return ordinary assistant
+                # content alongside a tool call. In Plan mode that text is an
+                # unreviewed plan draft: clear it before hooks, history, and
+                # incremental persistence can observe it.
+                assistant_message.content = ""
 
             try:
                 from hermes_cli.plugins import (
