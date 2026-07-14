@@ -1041,12 +1041,26 @@ class ZetAgentAdapter(APIServerAdapter):
                         run_ok = _chat_finish_reason_from_result(r0) != "error"
                     except Exception:
                         run_ok = not bool(r0.get("failed"))
-                if run_ok:
+                # Unconsumed /steer wins over goal continuation: the text is
+                # about to be surfaced as steer_dropped below and re-queued by
+                # the client as the next turn. Scheduling the judge now races
+                # its continuation kick against the user's redirect — the
+                # autopilot could out-run the correction. Skip this round; the
+                # re-queued message's own post-turn hook re-enters the loop.
+                has_pending_steer = False
+                if isinstance(result, tuple) and result and isinstance(result[0], dict):
+                    has_pending_steer = bool(result[0].get("pending_steer"))
+                if run_ok and not has_pending_steer:
                     self._goals().schedule_after_turn(
                         session_id or "",
                         user_message,
                         final_response,
                         effective_session_id=effective_sid,
+                    )
+                elif run_ok:
+                    logger.info(
+                        "[zet_agent] goal post-turn hook deferred: unconsumed steer pending session=%s",
+                        session_id,
                     )
                 else:
                     logger.info(
@@ -1479,9 +1493,21 @@ class ZetAgentAdapter(APIServerAdapter):
         turn_key = self._active_turn_key(session_id)
         with self._session_run_lock:
             agent_ref = self._active_session_agents.get(turn_key) or self._active_session_agents.get(session_id)
+            task = self._active_session_tasks.get(turn_key) or self._active_session_tasks.get(session_id)
         agent = agent_ref[0] if agent_ref else None
 
-        if agent is None:
+        # Task liveness gate (mirrors the interrupt handler's dual lookup):
+        # the registration outlives agent_task by the SSE close window, and
+        # run_conversation's finalizer + _push_steer_dropped_if_any have
+        # already run by then — a steer stashed now would neither reach the
+        # model nor produce a steer_dropped receipt (silently lost). Report
+        # not_running so the caller re-queues the text as the next turn.
+        task_done = False
+        try:
+            task_done = task is None or bool(task.done())
+        except Exception:
+            task_done = task is None
+        if agent is None or task_done:
             return web.json_response(
                 {"session_id": session_id, "status": "not_running", "accepted": False}
             )

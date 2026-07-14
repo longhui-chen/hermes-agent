@@ -43,6 +43,16 @@ class _FakeWeb:
         return _FakeResponse(payload, status)
 
 
+class _FakeTask:
+    """Live agent_task stand-in — steer's task-liveness gate reads done()."""
+
+    def __init__(self, done=False):
+        self._done = done
+
+    def done(self):
+        return self._done
+
+
 class _FakeAgent:
     def __init__(self, accept=True):
         self.accept = accept
@@ -65,7 +75,7 @@ async def test_steer_hits_active_agent_via_scoped_key(monkeypatch):
     # （2026-07-13 dev rig 实测踩过：裸 sid 查 scoped 表 → steer.dropped 连发）。
     adapter = _adapter(monkeypatch)
     agent = _FakeAgent()
-    adapter._register_active_session_turn("s1", [agent], None)
+    adapter._register_active_session_turn("s1", [agent], _FakeTask())
 
     resp = await adapter._handle_session_steer(
         _FakeRequest({"text": "把 PDF 也算上"}, match_info={"session_id": "s1"})
@@ -81,6 +91,7 @@ async def test_steer_hits_active_agent_via_bare_sid_fallback(monkeypatch):
     adapter = _adapter(monkeypatch)
     agent = _FakeAgent()
     adapter._active_session_agents["s1"] = [agent]
+    adapter._active_session_tasks["s1"] = _FakeTask()
 
     resp = await adapter._handle_session_steer(
         _FakeRequest({"text": "把 PDF 也算上"}, match_info={"session_id": "s1"})
@@ -89,6 +100,42 @@ async def test_steer_hits_active_agent_via_bare_sid_fallback(monkeypatch):
     assert resp.status == 200
     assert resp.payload == {"session_id": "s1", "status": "steering", "accepted": True}
     assert agent.steered == ["把 PDF 也算上"]
+
+
+@pytest.mark.asyncio
+async def test_steer_refused_when_task_done(monkeypatch):
+    """SSE 收尾窗口：agent_task 已结束但注册尚未清理。此时 finalizer 与
+    _push_steer_dropped_if_any 已跑完，再 stash 的 steer 既进不了模型也不会
+    有 dropped 回执（静默丢失）——必须回 not_running 让调用方转排队。"""
+    adapter = _adapter(monkeypatch)
+    agent = _FakeAgent()
+    adapter._active_session_agents["s1"] = [agent]
+    adapter._active_session_tasks["s1"] = _FakeTask(done=True)
+
+    resp = await adapter._handle_session_steer(
+        _FakeRequest({"text": "hello"}, match_info={"session_id": "s1"})
+    )
+
+    assert resp.status == 200
+    assert resp.payload == {"session_id": "s1", "status": "not_running", "accepted": False}
+    assert agent.steered == []
+
+
+@pytest.mark.asyncio
+async def test_steer_refused_when_task_missing(monkeypatch):
+    """有 agent 注册却没有对应 task 的状态不可信（生产注册点恒成对写入）
+    —— 按 not_running 处理，宁可转排队也不冒静默丢话的风险。"""
+    adapter = _adapter(monkeypatch)
+    agent = _FakeAgent()
+    adapter._active_session_agents["s1"] = [agent]
+
+    resp = await adapter._handle_session_steer(
+        _FakeRequest({"text": "hello"}, match_info={"session_id": "s1"})
+    )
+
+    assert resp.status == 200
+    assert resp.payload == {"session_id": "s1", "status": "not_running", "accepted": False}
+    assert agent.steered == []
 
 
 @pytest.mark.asyncio
@@ -166,6 +213,7 @@ async def test_steer_agent_exception_reports_rejected(monkeypatch):
             raise RuntimeError("boom")
 
     adapter._active_session_agents["s1"] = [_Boom()]
+    adapter._active_session_tasks["s1"] = _FakeTask()
 
     resp = await adapter._handle_session_steer(
         _FakeRequest({"text": "hi"}, match_info={"session_id": "s1"})
@@ -213,3 +261,55 @@ def test_push_steer_dropped_tolerates_missing_queue():
     ZetAgentAdapter._push_steer_dropped_if_any(
         None, ({"pending_steer": "text"}, None)
     )
+
+
+# ---------------------------------------------------------------------------
+# goal post-turn hook vs pending steer (_run_agent override)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingGoals:
+    def __init__(self):
+        self.calls = []
+
+    def schedule_after_turn(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+
+
+def _patch_base_run_agent(monkeypatch, result):
+    async def fake_run_agent(self, **kwargs):
+        return result
+
+    monkeypatch.setattr(zet_agent.APIServerAdapter, "_run_agent", fake_run_agent)
+
+
+@pytest.mark.asyncio
+async def test_goal_schedule_deferred_when_pending_steer(monkeypatch):
+    """轮末未消费的 /steer 即将由客户端转排队为下一轮 —— 本轮不得触发
+    goal judge/continuation，否则自动续跑会与用户的改向说明抢跑。"""
+    adapter = _adapter(monkeypatch)
+    goals = _RecordingGoals()
+    monkeypatch.setattr(adapter, "_goals", lambda: goals)
+    _patch_base_run_agent(
+        monkeypatch,
+        ({"final_response": "ok", "session_id": "s1", "pending_steer": "改个方向"},),
+    )
+
+    await adapter._run_agent(user_message="跑任务", session_id="s1")
+
+    assert goals.calls == []
+
+
+@pytest.mark.asyncio
+async def test_goal_schedule_runs_without_pending_steer(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    goals = _RecordingGoals()
+    monkeypatch.setattr(adapter, "_goals", lambda: goals)
+    _patch_base_run_agent(
+        monkeypatch,
+        ({"final_response": "ok", "session_id": "s1"},),
+    )
+
+    await adapter._run_agent(user_message="跑任务", session_id="s1")
+
+    assert len(goals.calls) == 1
