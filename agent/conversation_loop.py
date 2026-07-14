@@ -922,6 +922,11 @@ def run_conversation(
             agent._steer_closed = False
     else:
         agent._steer_closed = False
+    # Consumed-steer marker for the goal hook: a steer the model already
+    # saw this turn means the user intervened — the post-turn goal judge
+    # must evaluate it as user-initiated, not as an untouched auto-
+    # continuation round.
+    agent._turn_last_steer_text = None
 
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user

@@ -1601,6 +1601,14 @@ class HermesACPAgent(acp.Agent):
         # — same recovery as CLI/gateway, otherwise an accepted steer that
         # missed the last model call is silently lost on this surface.
         leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
+        if not leftover_steer:
+            # Early-return paths bypass finalize_turn — salvage the slot
+            # (close+drain; no-op after a normal finalize) so an accepted
+            # steer doesn't leak into the next prompt's pre-API drain.
+            try:
+                leftover_steer = state.agent._drain_pending_steer(close=True)
+            except Exception:
+                leftover_steer = None
         if leftover_steer:
             with state.runtime_lock:
                 state.queued_prompts.append(leftover_steer)

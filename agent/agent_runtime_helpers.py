@@ -2894,6 +2894,10 @@ def drain_steer_for_next_api_call(agent, messages: list) -> None:
             merged = True
         else:
             messages.append(steer_msg)
+        # Consumed-steer marker for the goal hook (every delivery shape):
+        # the model sees this text on the next call, so the post-turn goal
+        # judge must treat the round as user-initiated.
+        agent._turn_last_steer_text = steer_text
         # Crash-resilience persistence stamps the turn-opening user row
         # BEFORE this merge and _persist_session (append-only) skips
         # stamped messages — the merged steer would exist in memory but
@@ -2905,6 +2909,7 @@ def drain_steer_for_next_api_call(agent, messages: list) -> None:
             _persist_merged_steer_row(agent, steer_msg["content"])
     else:
         messages.append(steer_msg)
+        agent._turn_last_steer_text = steer_text
     _ra().logger.info(
         "Delivered /steer before next API call (%d chars): %s",
         len(steer_text),
@@ -2951,9 +2956,13 @@ def reclaim_tail_steer(agent, messages: list) -> None:
     ``pending_steer`` (→ steer_dropped → client re-queue), and a reused
     CLI agent re-injects it on the next turn's pre-API drain.
 
-    The merged-into-existing-user shapes (first-iteration str/list merge)
-    are not reclaimable — there the steer is part of that turn's opening
-    user message, which the caller retries wholesale on failure paths.
+    Merged shapes are reclaimed too: a steer that arrived before the
+    first API call was folded into the opening user message (str concat /
+    list text-block append). The STEER_USER_PREFIX makes the folded
+    suffix identifiable, so it is split back out — nothing else auto-
+    retries a failed turn on the zet path (the App's steered bubble never
+    re-sends itself), so leaving it merged would both lose the redirect
+    and persist it inside a failed turn's history.
     """
     if not messages:
         return
@@ -2961,10 +2970,41 @@ def reclaim_tail_steer(agent, messages: list) -> None:
     if not (isinstance(tail, dict) and tail.get("role") == "user"):
         return
     content = tail.get("content")
-    if not isinstance(content, str) or not content.startswith(STEER_USER_PREFIX):
+    reclaimed: list = []
+    if isinstance(content, str):
+        if content.startswith(STEER_USER_PREFIX):
+            # Standalone steer message (or a merge into an empty opener —
+            # same shape, and an empty opener carries nothing else worth
+            # keeping): pop the whole message.
+            messages.pop()
+            reclaimed.append(content[len(STEER_USER_PREFIX):])
+        else:
+            # Folded suffixes: "<original>\n\n<prefix><steer>" — possibly
+            # several if multiple drains hit the same opener. Split them
+            # back out, restoring the original content.
+            sep = "\n\n" + STEER_USER_PREFIX
+            idx = content.rfind(sep)
+            while idx >= 0:
+                reclaimed.insert(0, content[idx + len(sep):])
+                content = content[:idx]
+                idx = content.rfind(sep)
+            if reclaimed:
+                tail["content"] = content
+    elif isinstance(content, list):
+        while content:
+            last = content[-1]
+            if (
+                isinstance(last, dict)
+                and last.get("type") == "text"
+                and isinstance(last.get("text"), str)
+                and last["text"].startswith(STEER_USER_PREFIX)
+            ):
+                reclaimed.insert(0, content.pop()["text"][len(STEER_USER_PREFIX):])
+            else:
+                break
+    if not reclaimed:
         return
-    messages.pop()
-    text = content[len(STEER_USER_PREFIX):]
+    text = "\n".join(reclaimed)
     _lock = getattr(agent, "_pending_steer_lock", None)
     if _lock is not None:
         with _lock:

@@ -1078,9 +1078,21 @@ class ZetAgentAdapter(APIServerAdapter):
                 if isinstance(result, tuple) and result and isinstance(result[0], dict):
                     has_pending_steer = bool(result[0].get("pending_steer"))
                 if run_ok and not has_pending_steer:
+                    # Consumed mid-turn steer = the user intervened in this
+                    # round. The goal judge keys user_initiated off the
+                    # message NOT starting with CONTINUATION_MARKER — pass
+                    # the steer text so an auto-continuation round the user
+                    # redirected is evaluated as user-initiated instead of
+                    # the autopilot overriding the correction.
+                    _consumed_steer = None
+                    try:
+                        _agent_for_steer = agent_ref[0] if agent_ref else None
+                        _consumed_steer = getattr(_agent_for_steer, "_turn_last_steer_text", None)
+                    except Exception:
+                        _consumed_steer = None
                     self._goals().schedule_after_turn(
                         session_id or "",
-                        user_message,
+                        _consumed_steer or user_message,
                         final_response,
                         effective_session_id=effective_sid,
                     )

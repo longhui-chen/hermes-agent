@@ -516,3 +516,71 @@ class TestMergedSteerPersistence:
         messages2 = [{"role": "user", "content": "首轮", "_db_persisted": True}]
         agent2._drain_steer_for_next_api_call(messages2)
         assert db2.appended == []
+
+
+class TestReclaimMergedShapes:
+    """第九轮 review：合并进首轮 user 的 steer 也要能拆回——zet 链路上
+    没有任何机制会整条重试失败轮（App 的 steered 气泡不会自动重发），
+    留在合并形态里既丢改向又把它持久化进失败轮历史。"""
+
+    def test_reclaims_folded_str_suffix(self):
+        from agent.agent_runtime_helpers import reclaim_tail_steer
+        agent = _bare_agent()
+        agent.steer("改个方向")
+        messages = [{"role": "user", "content": "首轮问题"}]
+        agent._drain_steer_for_next_api_call(messages)
+        assert f"{STEER_USER_PREFIX}改个方向" in messages[0]["content"]
+
+        reclaim_tail_steer(agent, messages)
+
+        assert messages[0]["content"] == "首轮问题"  # 原文恢复
+        assert agent._pending_steer == "改个方向"
+
+    def test_reclaims_multimodal_text_block(self):
+        from agent.agent_runtime_helpers import reclaim_tail_steer
+        agent = _bare_agent()
+        agent.steer("看看颜色")
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "图里有什么"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}},
+            ],
+        }]
+        agent._drain_steer_for_next_api_call(messages)
+        assert len(messages[0]["content"]) == 3
+
+        reclaim_tail_steer(agent, messages)
+
+        assert len(messages[0]["content"]) == 2  # steer block 已拆出
+        assert agent._pending_steer == "看看颜色"
+
+    def test_plain_user_without_steer_untouched(self):
+        from agent.agent_runtime_helpers import reclaim_tail_steer
+        agent = _bare_agent()
+        messages = [{"role": "user", "content": "普通首轮（无 steer）"}]
+        reclaim_tail_steer(agent, messages)
+        assert messages[0]["content"] == "普通首轮（无 steer）"
+        assert agent._pending_steer is None
+
+
+class TestConsumedSteerMarker:
+    """已消费 steer 的轮必须让 goal judge 按 user-initiated 评估——
+    _turn_last_steer_text 由 drain 置位、新轮入口复位。"""
+
+    def test_drain_records_last_steer_text(self):
+        agent = _bare_agent()
+        agent.steer("暂停一下")
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "a"}]},
+            {"role": "tool", "content": "out", "tool_call_id": "a"},
+        ]
+        agent._drain_steer_for_next_api_call(messages)
+        assert agent._turn_last_steer_text == "暂停一下"
+
+    def test_merged_drain_also_records(self):
+        agent = _bare_agent()
+        agent.steer("补充要求")
+        messages = [{"role": "user", "content": "首轮"}]
+        agent._drain_steer_for_next_api_call(messages)
+        assert agent._turn_last_steer_text == "补充要求"

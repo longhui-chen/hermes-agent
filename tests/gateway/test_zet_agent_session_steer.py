@@ -395,3 +395,30 @@ async def test_steer_closed_slot_reports_not_running(monkeypatch):
 
     assert resp.status == 200
     assert resp.payload == {"session_id": "s1", "status": "not_running", "accepted": False}
+
+
+@pytest.mark.asyncio
+async def test_goal_schedule_passes_consumed_steer_as_user_message(monkeypatch):
+    """已在 pre-API drain 被模型消费的 steer：goal judge 必须按
+    user-initiated 评估（user_message 不以 CONTINUATION_MARKER 开头），
+    否则自动续跑会抢掉用户刚生效的改向。"""
+    adapter = _adapter(monkeypatch)
+    goals = _RecordingGoals()
+    monkeypatch.setattr(adapter, "_goals", lambda: goals)
+    _patch_base_run_agent(
+        monkeypatch,
+        ({"final_response": "已按新方向调整", "session_id": "s1"},),
+    )
+    agent = _FakeAgent()
+    agent._turn_last_steer_text = "换个方向"
+
+    await adapter._run_agent(
+        user_message="[goal-continuation] round 3",
+        session_id="s1",
+        agent_ref=[agent],
+    )
+
+    assert len(goals.calls) == 1
+    args, _ = goals.calls[0]
+    # user_message 位是消费的 steer 文本（非 marker 开头 → user_initiated）。
+    assert args[1] == "换个方向"

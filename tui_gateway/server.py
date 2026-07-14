@@ -8898,6 +8898,17 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
         except UnboundLocalError:
             _leftover_steer = None
+        if not _leftover_steer:
+            # Early-return paths (invalid-response / provider error) bypass
+            # finalize_turn: a steer accepted in that window is still
+            # sitting in the slot with nothing to drain it — it would leak
+            # into the NEXT prompt's pre-API drain and execute a stale
+            # redirect out of order. Close+drain here (no-op on the normal
+            # path: the finalizer already drained and closed).
+            try:
+                _leftover_steer = agent._drain_pending_steer(close=True)
+            except Exception:
+                _leftover_steer = None
         if _leftover_steer:
             _enqueue_prompt(session, _leftover_steer, session.get("transport"))
 
