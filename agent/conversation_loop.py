@@ -260,6 +260,50 @@ def _should_end_after_present_plan(agent: Any) -> bool:
     )
 
 
+def _plan_mode_interaction_error(agent: Any) -> Optional[str]:
+    """Return a recoverable error when Plan mode has no interactive callbacks."""
+    if not getattr(agent, "_zet_agent_plan_mode_active", False):
+        return None
+    if callable(getattr(agent, "clarify_callback", None)) and callable(
+        getattr(agent, "plan_emit_callback", None)
+    ):
+        return None
+    return (
+        "Plan mode requires an interactive streaming client. "
+        "Retry the turn with stream=true."
+    )
+
+
+def _enforce_single_plan_interaction_tool_call(
+    agent: Any, assistant_message: Any
+) -> bool:
+    """Keep one Plan interaction call, preferring clarify over a stale plan."""
+    if not getattr(agent, "_zet_agent_plan_mode_active", False):
+        return False
+    tool_calls = getattr(assistant_message, "tool_calls", None)
+    if not isinstance(tool_calls, list) or len(tool_calls) <= 1:
+        return False
+
+    def _name(tool_call: Any) -> str:
+        function = getattr(tool_call, "function", None)
+        if function is not None:
+            return getattr(function, "name", "") or ""
+        if isinstance(tool_call, dict):
+            function = tool_call.get("function")
+            if isinstance(function, dict):
+                return function.get("name", "") or ""
+        return ""
+
+    selected = next((call for call in tool_calls if _name(call) == "clarify"), tool_calls[0])
+    assistant_message.tool_calls = [selected]
+    logger.warning(
+        "zet_agent plan mode: provider returned parallel interaction tools; "
+        "keeping only %s",
+        _name(selected) or "first call",
+    )
+    return True
+
+
 _ZET_AGENT_PLAN_MODE_PROTOCOL = (
     "Zettlab App Plan mode protocol (this system instruction takes precedence "
     "over any app- or user-supplied instruction to call present_plan):\n"
@@ -870,6 +914,17 @@ def run_conversation(
     agent._zet_agent_plan_text_fallback = False
     agent._zet_agent_plan_presented = False
     agent._zet_agent_plan_protocol_retries = 0
+    plan_mode_error = _plan_mode_interaction_error(agent)
+    if plan_mode_error:
+        agent._persist_session(messages, conversation_history)
+        return {
+            "final_response": plan_mode_error,
+            "messages": messages,
+            "api_calls": 0,
+            "completed": False,
+            "failed": True,
+            "error": plan_mode_error,
+        }
     api_call_count = 0
     final_response = None
     interrupted = False
@@ -4456,6 +4511,8 @@ def run_conversation(
                     assistant_message.content = "\n".join(parts)
                 else:
                     assistant_message.content = str(raw)
+
+            _enforce_single_plan_interaction_tool_call(agent, assistant_message)
 
             try:
                 from hermes_cli.plugins import (

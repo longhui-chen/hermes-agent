@@ -2154,7 +2154,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # reasoning display.  Non-reasoning text is harmlessly
                 # suppressed by the CLI's _stream_delta when the stream
                 # box is already closed (tool boundary flush).
-                elif agent.stream_delta_callback:
+                elif (
+                    agent.stream_delta_callback
+                    and not getattr(
+                        agent, "_should_suppress_plan_stream_text", lambda: False
+                    )()
+                ):
                     try:
                         agent.stream_delta_callback(delta.content)
                         agent._record_streamed_assistant_text(delta.content)

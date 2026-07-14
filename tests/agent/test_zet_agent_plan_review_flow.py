@@ -3,9 +3,12 @@ from types import SimpleNamespace
 from agent.conversation_loop import (
     _apply_forced_present_plan_tool_choice,
     _drop_trailing_plan_protocol_messages,
+    _enforce_single_plan_interaction_tool_call,
+    _plan_mode_interaction_error,
     _should_force_present_plan_tool_choice,
 )
 from agent.tool_executor import _zet_agent_plan_mode_block_message
+from run_agent import AIAgent
 
 
 def _tool(name: str) -> dict:
@@ -207,3 +210,56 @@ def test_text_only_plan_request_stays_regular_without_response_mode():
         "todo",
         "terminal",
     ]
+
+
+def test_plan_mode_suppresses_provisional_plain_text_streaming():
+    streamed = []
+    agent = SimpleNamespace(
+        platform="zet_agent",
+        _zet_agent_plan_mode_active=True,
+        _zet_agent_plan_presented=False,
+        stream_delta_callback=streamed.append,
+        _stream_callback=None,
+    )
+    agent._should_suppress_plan_stream_text = lambda: AIAgent._should_suppress_plan_stream_text(agent)
+
+    AIAgent._fire_stream_delta(agent, "这段纯文本计划不能提前进入 SSE")
+
+    assert streamed == []
+
+
+def test_plan_mode_requires_interactive_callbacks():
+    missing = SimpleNamespace(
+        _zet_agent_plan_mode_active=True,
+        clarify_callback=None,
+        plan_emit_callback=None,
+    )
+    ready = SimpleNamespace(
+        _zet_agent_plan_mode_active=True,
+        clarify_callback=lambda *_: None,
+        plan_emit_callback=lambda *_: None,
+    )
+
+    assert "stream=true" in _plan_mode_interaction_error(missing)
+    assert _plan_mode_interaction_error(ready) is None
+
+
+def test_parallel_plan_calls_prefer_clarify_and_drop_stale_present_plan():
+    assistant = SimpleNamespace(tool_calls=[
+        SimpleNamespace(function=SimpleNamespace(name="present_plan")),
+        SimpleNamespace(function=SimpleNamespace(name="clarify")),
+    ])
+    agent = SimpleNamespace(_zet_agent_plan_mode_active=True)
+
+    assert _enforce_single_plan_interaction_tool_call(agent, assistant)
+    assert [call.function.name for call in assistant.tool_calls] == ["clarify"]
+
+
+def test_parallel_present_plan_calls_keep_only_the_first_call():
+    first = SimpleNamespace(function=SimpleNamespace(name="present_plan"), id="first")
+    second = SimpleNamespace(function=SimpleNamespace(name="present_plan"), id="second")
+    assistant = SimpleNamespace(tool_calls=[first, second])
+    agent = SimpleNamespace(_zet_agent_plan_mode_active=True)
+
+    assert _enforce_single_plan_interaction_tool_call(agent, assistant)
+    assert assistant.tool_calls == [first]

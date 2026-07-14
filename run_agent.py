@@ -4721,8 +4721,18 @@ class AIAgent:
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
 
+    def _should_suppress_plan_stream_text(self) -> bool:
+        """Keep provisional plain text out of Plan Review SSE responses."""
+        return (
+            (getattr(self, "platform", "") or "") == "zet_agent"
+            and bool(getattr(self, "_zet_agent_plan_mode_active", False))
+            and not bool(getattr(self, "_zet_agent_plan_presented", False))
+        )
+
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
+        if self._should_suppress_plan_stream_text():
+            return
         # If a tool iteration set the break flag, prepend a single paragraph
         # break before the first real text delta.  This prevents the original
         # problem (text concatenation across tool boundaries) without stacking
