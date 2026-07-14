@@ -380,3 +380,53 @@ class TestSteerInterruptRace:
         agent._drain_steer_for_next_api_call(messages)
         assert messages[-1]["role"] == "user"
         assert "go on" in messages[-1]["content"]
+
+
+class TestReclaimTailSteer:
+    """pre-API drain 与成功模型响应之间的早退（rate-guard / thinking-budget
+    exhaustion）：注入的 steer 必须撤回 restash，不得持久化成未回答 user
+    消息并入下一轮。"""
+
+    def test_reclaims_injected_steer_and_restashes(self):
+        from agent.agent_runtime_helpers import reclaim_tail_steer
+        agent = _bare_agent()
+        agent.steer("换个方向")
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "a"}]},
+            {"role": "tool", "content": "out", "tool_call_id": "a"},
+        ]
+        agent._drain_steer_for_next_api_call(messages)
+        assert messages[-1]["role"] == "user"
+
+        reclaim_tail_steer(agent, messages)
+
+        assert len(messages) == 2  # steer 消息已弹出
+        assert messages[-1]["role"] == "tool"
+        assert agent._pending_steer == "换个方向"
+
+    def test_no_op_when_tail_is_not_a_steer(self):
+        from agent.agent_runtime_helpers import reclaim_tail_steer
+        agent = _bare_agent()
+        messages = [
+            {"role": "user", "content": "普通用户消息"},
+            {"role": "assistant", "content": "回答"},
+        ]
+        reclaim_tail_steer(agent, messages)
+        assert len(messages) == 2
+        assert agent._pending_steer is None
+
+    def test_plain_user_tail_untouched(self):
+        from agent.agent_runtime_helpers import reclaim_tail_steer
+        agent = _bare_agent()
+        messages = [{"role": "user", "content": "首轮问题（非 steer）"}]
+        reclaim_tail_steer(agent, messages)
+        assert len(messages) == 1
+        assert agent._pending_steer is None
+
+    def test_merges_in_front_of_existing_pending(self):
+        from agent.agent_runtime_helpers import reclaim_tail_steer
+        agent = _bare_agent()
+        messages = [format_steer_user_message("先到的")]
+        agent.steer("后到的")
+        reclaim_tail_steer(agent, messages)
+        assert agent._pending_steer == "先到的\n后到的"

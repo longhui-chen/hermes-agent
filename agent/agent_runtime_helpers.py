@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout
-from agent.prompt_builder import format_steer_user_message
+from agent.prompt_builder import STEER_USER_PREFIX, format_steer_user_message
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED
@@ -2901,6 +2901,47 @@ def drain_steer_for_next_api_call(agent, messages: list) -> None:
 
 
 
+def reclaim_tail_steer(agent, messages: list) -> None:
+    """Pop an un-answered steer user message off the tail and restash it.
+
+    Early-return paths between the pre-API drain and a successful model
+    response (Nous rate-guard, thinking-budget exhaustion) persist
+    ``messages`` and return without another model call — the injected
+    steer would survive as an unanswered user message that merges into
+    the NEXT turn's input, while bypassing the finalizer's pending_steer
+    hand-back. Restashing puts the text back where the recovery paths
+    can see it: zet_agent's early-return salvage drains it into
+    ``pending_steer`` (→ steer_dropped → client re-queue), and a reused
+    CLI agent re-injects it on the next turn's pre-API drain.
+
+    The merged-into-existing-user shapes (first-iteration str/list merge)
+    are not reclaimable — there the steer is part of that turn's opening
+    user message, which the caller retries wholesale on failure paths.
+    """
+    if not messages:
+        return
+    tail = messages[-1]
+    if not (isinstance(tail, dict) and tail.get("role") == "user"):
+        return
+    content = tail.get("content")
+    if not isinstance(content, str) or not content.startswith(STEER_USER_PREFIX):
+        return
+    messages.pop()
+    text = content[len(STEER_USER_PREFIX):]
+    _lock = getattr(agent, "_pending_steer_lock", None)
+    if _lock is not None:
+        with _lock:
+            existing = agent._pending_steer
+            agent._pending_steer = (text + "\n" + existing) if existing else text
+    else:
+        existing = getattr(agent, "_pending_steer", None)
+        agent._pending_steer = (text + "\n" + existing) if existing else text
+    _ra().logger.info(
+        "Reclaimed un-answered /steer from early-return turn (%d chars)",
+        len(text),
+    )
+
+
 def force_close_tcp_sockets(client: Any) -> int:
     """Abort in-flight TCP I/O by shutting down sockets WITHOUT closing FDs.
 
@@ -2977,6 +3018,7 @@ __all__ = [
     "cleanup_dead_connections",
     "extract_api_error_context",
     "drain_steer_for_next_api_call",
+    "reclaim_tail_steer",
     "_iter_pool_sockets",
     "force_close_tcp_sockets",
 ]

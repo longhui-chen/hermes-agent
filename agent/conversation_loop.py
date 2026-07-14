@@ -1374,6 +1374,12 @@ def run_conversation(
                         # No fallback available — surface buffered context
                         # so user sees the rate-limit message that led here.
                         agent._flush_status_buffer()
+                        # 撤回本迭代 pre-API drain 注入、模型从未见到的
+                        # steer：留在 messages 里会被持久化成未回答 user
+                        # 消息并入下一轮（restash 后由 salvage/下一轮 drain
+                        # 正常投递）。
+                        from agent.agent_runtime_helpers import reclaim_tail_steer
+                        reclaim_tail_steer(agent, messages)
                         agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": (
@@ -2059,6 +2065,11 @@ def run_conversation(
                             "→ Or switch to a larger/non-reasoning model with `/model`"
                         )
                         agent._cleanup_task_resources(effective_task_id)
+                        # 模型输出全花在 reasoning、没有任何回应就终局——
+                        # 本轮注入的 steer 等于未被消费，撤回转排队而不是
+                        # 持久化成未回答 user 消息。
+                        from agent.agent_runtime_helpers import reclaim_tail_steer
+                        reclaim_tail_steer(agent, messages)
                         agent._persist_session(messages, conversation_history)
                         return {
                             "final_response": _exhaust_response,

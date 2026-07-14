@@ -8103,10 +8103,14 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5000, f"steer failed: {exc}")
     if not accepted and text.strip():
         # Slot closed by the turn finalizer (turn finishing) — requeue the
-        # text as the next turn so it isn't dropped. `requeued` is a new
-        # OPTIONAL field; old clients ignore it and still see "rejected".
+        # text as the next turn so it isn't dropped. Report "queued": the
+        # text WILL run next turn, and existing clients (ui-tui
+        # useSubmission / desktop use-composer-submit) fall back to their
+        # own client-side queue on any non-queued status — reporting
+        # "rejected" here would double-queue and re-run the same steer
+        # twice. `requeued` disambiguates for clients that care.
         _enqueue_prompt(session, text, session.get("transport"))
-        return _ok(rid, {"status": "rejected", "text": text, "requeued": True})
+        return _ok(rid, {"status": "queued", "text": text, "requeued": True})
     return _ok(rid, {"status": "queued" if accepted else "rejected", "text": text})
 
 
@@ -8881,7 +8885,13 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         # prompt — same as CLI/gateway — instead of silently dropping text
         # the user was told was accepted. _enqueue_prompt merges losslessly
         # with any prompt already queued mid-turn.
-        _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
+        # result 只在 try 内赋值：run_conversation 之前抛异常（图像预处理/
+        # agent 构建后失败）时走 except→finally 到这里，直接读会
+        # UnboundLocalError 把错误恢复路径二次炸掉、跳过下方排队/通知收尾。
+        try:
+            _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
+        except UnboundLocalError:
+            _leftover_steer = None
         if _leftover_steer:
             _enqueue_prompt(session, _leftover_steer, session.get("transport"))
 
