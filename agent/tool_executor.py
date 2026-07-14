@@ -171,6 +171,16 @@ def _zet_agent_plan_mode_block_message(agent, function_name: str, function_args:
     if (getattr(agent, "platform", "") or "") != "zet_agent":
         return None
 
+    if (
+        bool(getattr(agent, "_zet_agent_plan_mode_active", False))
+        and function_name not in {"clarify", "present_plan"}
+    ):
+        return (
+            "This Zettlab App turn is in Plan mode. Only `clarify` and "
+            "`present_plan` are allowed until the user reviews the plan. "
+            f"Do not call `{function_name}` or perform side effects."
+        )
+
     if function_name == "skill_view":
         name = str(function_args.get("name") or "").strip().lower()
         file_path = str(function_args.get("file_path") or "").strip()

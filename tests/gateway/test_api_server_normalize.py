@@ -1,7 +1,37 @@
 """Tests for _normalize_chat_content in the API server adapter."""
 
 from gateway.platforms import api_server
-from gateway.platforms.api_server import _extract_turn_id, _normalize_chat_content
+from gateway.platforms.api_server import (
+    _extract_plan_ack,
+    _extract_turn_id,
+    _normalize_chat_content,
+)
+
+
+class TestExtractPlanAck:
+    def test_snake_case_cancelled_ack(self):
+        assert _extract_plan_ack({
+            "metadata": {
+                "plan_ack": {
+                    "status": "cancelled",
+                    "revision_requested": False,
+                },
+            },
+        }) == {"status": "cancelled", "revision_requested": False}
+
+    def test_camel_case_revision_ack(self):
+        assert _extract_plan_ack({
+            "metadata": {
+                "planAck": {
+                    "status": "cancelled",
+                    "revisionRequested": True,
+                },
+            },
+        }) == {"status": "cancelled", "revision_requested": True}
+
+    def test_unknown_or_malformed_ack_is_ignored(self):
+        assert _extract_plan_ack({"metadata": {"plan_ack": "cancelled"}}) == {}
+        assert _extract_plan_ack({"metadata": {"plan_ack": {"status": "other"}}}) == {}
 
 
 class TestExtractTurnId:
