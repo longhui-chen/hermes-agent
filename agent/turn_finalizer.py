@@ -442,7 +442,11 @@ def finalize_turn(
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.
-    _leftover_steer = agent._drain_pending_steer()
+    # close=True: this is the LAST drain of the turn — a steer arriving
+    # after it has no consumer (the SSE task may linger past this point,
+    # so endpoint-side task.done() checks can't cover the window) and
+    # must be refused by steer() so the caller re-queues the text.
+    _leftover_steer = agent._drain_pending_steer(close=True)
     if _leftover_steer:
         result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False

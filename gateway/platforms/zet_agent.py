@@ -1446,6 +1446,29 @@ class ZetAgentAdapter(APIServerAdapter):
         status = "stopping" if (agent is not None or task is not None) else "not_running"
         return web.json_response({"session_id": session_id, "status": status})
 
+    async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
+        """Extend the base capability surface with zet_agent-only endpoints.
+
+        local-server does NOT gate chat.steer on this (it always advertises
+        capabilities.steer=true on the WS and degrades via the 404 →
+        steer_dropped path against an old hermes), but the endpoint contract
+        is that /v1/capabilities lists the callable surface truthfully —
+        external orchestrators discover features here.
+        """
+        resp = await super()._handle_capabilities(request)
+        if getattr(resp, "status", 200) != 200:
+            return resp
+        try:
+            payload = json.loads(resp.body)
+        except Exception:
+            return resp
+        payload.setdefault("features", {})["session_steer"] = True
+        payload.setdefault("endpoints", {})["session_steer"] = {
+            "method": "POST",
+            "path": "/v1/sessions/{session_id}/steer",
+        }
+        return web.json_response(payload)
+
     async def _handle_session_steer(self, request: "web.Request") -> "web.Response":
         """POST /v1/sessions/{session_id}/steer — inject user text into the
         active chat-completions turn WITHOUT interrupting it.

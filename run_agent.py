@@ -2835,30 +2835,51 @@ class AIAgent:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
             # Fall back to direct attribute set; no concurrent callers expected
             # in those stubs.
+            if getattr(self, "_steer_closed", False):
+                return False
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
             return True
         with _lock:
+            # After the turn finalizer's closing drain there is no consumer
+            # left for this slot (the SSE task may linger for a moment, so
+            # task.done() alone can't catch this window) — refuse so the
+            # caller re-delivers the text as a normal next-turn message
+            # instead of it vanishing.
+            if getattr(self, "_steer_closed", False):
+                return False
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
         return True
 
-    def _drain_pending_steer(self) -> Optional[str]:
+    def _drain_pending_steer(self, close: bool = False) -> Optional[str]:
         """Return the pending steer text (if any) and clear the slot.
 
         Safe to call from the agent execution thread after appending tool
         results. Returns None when no steer is pending.
+
+        Args:
+            close: When True (the turn finalizer's last drain), atomically
+                mark the slot closed so a steer racing the SSE-teardown
+                window is refused by ``steer()`` (and re-queued by the
+                caller) instead of being stashed with no consumer left.
+                ``run_conversation`` reopens the slot at the next turn's
+                start.
         """
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             text = getattr(self, "_pending_steer", None)
             self._pending_steer = None
+            if close:
+                self._steer_closed = True
             return text
         with _lock:
             text = self._pending_steer
             self._pending_steer = None
+            if close:
+                self._steer_closed = True
         return text
 
     def _record_file_mutation_result(

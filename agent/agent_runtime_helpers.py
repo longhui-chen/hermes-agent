@@ -2850,7 +2850,27 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
     """
     if num_tool_msgs <= 0 or not messages:
         return
-    steer_text = agent._drain_pending_steer()
+    # Atomic drain-unless-interrupted: a hard interrupt supersedes any
+    # pending steer (interrupt() drops the slot by design). Racing that —
+    # checking the flag outside the lock, or draining first — could write
+    # the steer into ``messages`` as an unanswered user turn that merges
+    # into the NEXT turn's input and resurrects an instruction the user
+    # already cancelled. Under the lock, either the interrupt flag is
+    # visible here (leave the slot for interrupt()/the finalizer to
+    # surface as steer_dropped) or the drain happened strictly before
+    # the interrupt (a legal pre-stop injection).
+    _lock = getattr(agent, "_pending_steer_lock", None)
+    if _lock is not None:
+        with _lock:
+            if getattr(agent, "_interrupt_requested", False):
+                return
+            steer_text = agent._pending_steer
+            agent._pending_steer = None
+    else:
+        if getattr(agent, "_interrupt_requested", False):
+            return
+        steer_text = getattr(agent, "_pending_steer", None)
+        agent._pending_steer = None
     if not steer_text:
         return
     # Verify the recent tail really contains a tool result. Skipping

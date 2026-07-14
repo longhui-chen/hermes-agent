@@ -350,3 +350,61 @@ class TestSteerCommandRegistry:
 
 if __name__ == "__main__":  # pragma: no cover
     pytest.main([__file__, "-v"])
+
+
+class TestSteerClosedWindow:
+    """Finalizer 收尾后的 SSE 拆除窗口：steer 槽位已无消费者，必须拒收
+    （调用方转排队），而不是 stash 后静默丢失。"""
+
+    def test_closing_drain_refuses_later_steer(self):
+        agent = _bare_agent()
+        agent.steer("early")
+        assert agent._drain_pending_steer(close=True) == "early"
+        # 关闭后拒收 —— 端点据此回 rejected/not_running，LS 转 dropped。
+        assert agent.steer("late") is False
+        assert agent._pending_steer is None
+
+    def test_plain_drain_keeps_slot_open(self):
+        agent = _bare_agent()
+        agent.steer("first")
+        assert agent._drain_pending_steer() == "first"
+        assert agent.steer("second") is True
+        assert agent._pending_steer == "second"
+
+    def test_new_turn_reopens_slot(self):
+        agent = _bare_agent()
+        agent._drain_pending_steer(close=True)
+        assert agent.steer("x") is False
+        # run_conversation 入口的复位语义。
+        agent._steer_closed = False
+        assert agent.steer("x") is True
+
+
+class TestSteerInterruptRace:
+    """/steer 后紧接 /stop：interrupt 旗标可见时绝不能把 pending steer
+    注入 messages（会作为未回答 user 消息并入下一轮，复活已取消的指令）。"""
+
+    def test_no_injection_when_interrupt_requested(self):
+        agent = _bare_agent()
+        agent._interrupt_requested = True
+        agent.steer("change direction")
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "a"}]},
+            {"role": "tool", "content": "out", "tool_call_id": "a"},
+        ]
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+        # 不注入；槽位保留给 interrupt() 丢弃或 finalizer 转 dropped。
+        assert len(messages) == 2
+        assert agent._pending_steer == "change direction"
+
+    def test_injection_proceeds_without_interrupt(self):
+        agent = _bare_agent()
+        agent._interrupt_requested = False
+        agent.steer("go on")
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "a"}]},
+            {"role": "tool", "content": "out", "tool_call_id": "a"},
+        ]
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+        assert messages[-1]["role"] == "user"
+        assert "go on" in messages[-1]["content"]

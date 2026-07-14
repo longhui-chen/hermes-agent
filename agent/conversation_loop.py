@@ -913,6 +913,16 @@ def run_conversation(
         except Exception:
             pass
 
+    # Reopen the steer slot: the previous turn's finalizer closed it after
+    # its last drain (see _drain_pending_steer(close=True)); a cached agent
+    # starting a new turn must accept /steer again.
+    _steer_lock = getattr(agent, "_pending_steer_lock", None)
+    if _steer_lock is not None:
+        with _steer_lock:
+            agent._steer_closed = False
+    else:
+        agent._steer_closed = False
+
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
     # message sanitization, todo/nudge hydration, system-prompt restore-or-

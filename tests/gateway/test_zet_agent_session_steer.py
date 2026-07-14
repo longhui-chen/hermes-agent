@@ -313,3 +313,29 @@ async def test_goal_schedule_runs_without_pending_steer(monkeypatch):
     await adapter._run_agent(user_message="跑任务", session_id="s1")
 
     assert len(goals.calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# /v1/capabilities steer declaration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_capabilities_declares_session_steer(monkeypatch):
+    """zet_agent 的能力面必须如实声明 steer 端点（LS 不据此 gate——WS 上
+    恒宣告 + 404 降级——但外部编排方靠这里发现 API 面）。"""
+    adapter = _adapter(monkeypatch)
+
+    resp = await adapter._handle_capabilities(
+        _FakeRequest({}, match_info={})
+    )
+
+    assert resp.status == 200
+    payload = resp.payload
+    assert payload["features"]["session_steer"] is True
+    assert payload["endpoints"]["session_steer"] == {
+        "method": "POST",
+        "path": "/v1/sessions/{session_id}/steer",
+    }
+    # 基类清单不被覆写破坏。
+    assert payload["features"]["chat_completions"] is True
