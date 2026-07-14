@@ -213,11 +213,11 @@ from agent.tool_dispatch_helpers import (
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
 
 
-# Internal flags that mark a message as ephemeral empty-response/prefill
-# recovery scaffolding: the synthetic assistant "(empty)" turn and user nudge
-# injected after an empty response, the terminal "(empty)" sentinel, and the
-# thinking-only prefill placeholder. These exist only to drive the next API
-# retry; the in-memory loop pops them before appending the real response.
+# Internal flags that mark ephemeral recovery/protocol scaffolding: the
+# synthetic assistant "(empty)" turn and user nudge injected after an empty
+# response, the terminal "(empty)" sentinel, the thinking-only prefill
+# placeholder, and Plan mode protocol retries. These exist only to drive the
+# next API retry; the in-memory loop pops them before appending the real response.
 # Persistence must mirror that, otherwise an append-only flush can commit them
 # to the session store and a resumed session replays synthetic "(empty)"/nudge
 # turns as if they were genuine context.
@@ -226,6 +226,7 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_empty_terminal_sentinel",
     "_length_continuation_synthetic",
     "_thinking_prefill",
+    "_plan_protocol_synthetic",
     # verify-on-stop and pre_verify nudges append a synthetic assistant
     # "done" plus a synthetic user nudge to keep the agent going one more
     # turn before it can claim completion. Those messages exist only to
@@ -4721,8 +4722,18 @@ class AIAgent:
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
 
+    def _should_suppress_plan_stream_text(self) -> bool:
+        """Keep provisional plain text out of Plan Review SSE responses."""
+        return (
+            (getattr(self, "platform", "") or "") == "zet_agent"
+            and bool(getattr(self, "_zet_agent_plan_mode_active", False))
+            and not bool(getattr(self, "_zet_agent_plan_presented", False))
+        )
+
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
+        if self._should_suppress_plan_stream_text():
+            return
         # If a tool iteration set the break flag, prepend a single paragraph
         # break before the first real text delta.  This prevents the original
         # problem (text concatenation across tool boundaries) without stacking
@@ -4776,6 +4787,8 @@ class AIAgent:
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
+        if self._should_suppress_plan_stream_text():
+            return
         cb = self.reasoning_callback
         if cb is not None:
             try:
@@ -5501,7 +5514,20 @@ class AIAgent:
     def _build_assistant_message(self, assistant_message, finish_reason: str) -> dict:
         """Forwarder — see ``agent.chat_completion_helpers.build_assistant_message``."""
         from agent.chat_completion_helpers import build_assistant_message
-        return build_assistant_message(self, assistant_message, finish_reason)
+        message = build_assistant_message(self, assistant_message, finish_reason)
+        if (
+            self._should_suppress_plan_stream_text()
+            and (getattr(assistant_message, "tool_calls", None) or [])
+        ):
+            # Tool-call responses can carry sibling content/reasoning on weak
+            # OpenAI-compatible providers. It is provisional Plan output, not
+            # transcript content. Preserve a non-empty reasoning_content pad for
+            # DeepSeek/Kimi replay validation without retaining the visible draft.
+            message["content"] = ""
+            message["reasoning"] = None
+            if "reasoning_content" in message:
+                message["reasoning_content"] = " "
+        return message
 
     def _needs_thinking_reasoning_pad(self) -> bool:
         """Return True when the active provider enforces reasoning_content echo-back.

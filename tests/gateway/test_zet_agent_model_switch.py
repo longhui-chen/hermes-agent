@@ -270,6 +270,22 @@ async def test_run_agent_no_note_when_model_unchanged(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_run_agent_forwards_structured_plan_ack(monkeypatch):
+    adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
+    plan_ack = {"status": "cancelled", "revision_requested": False}
+
+    captured = await _capture_run_agent(
+        monkeypatch,
+        adapter,
+        user_message="cancel",
+        session_id="plan-session",
+        plan_ack=plan_ack,
+    )
+
+    assert captured["plan_ack"] == plan_ack
+
+
+@pytest.mark.asyncio
 async def test_run_agent_new_session_records_baseline_no_note(monkeypatch):
     adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
     captured = await _capture_run_agent(monkeypatch, adapter, user_message="hi", session_id="new-sess")

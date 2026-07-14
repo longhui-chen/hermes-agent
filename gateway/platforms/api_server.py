@@ -142,6 +142,27 @@ def _extract_response_mode(body: Dict[str, Any]) -> str:
     return "plan" if mode == "plan" else ""
 
 
+def _extract_plan_ack(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract the App's structured Plan Review action from metadata."""
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return {}
+    raw = metadata.get("plan_ack", metadata.get("planAck"))
+    if not isinstance(raw, dict):
+        return {}
+    status = str(raw.get("status", "") or "").strip().lower()
+    if status not in {"confirmed", "cancelled"}:
+        return {}
+    revision_requested = _coerce_request_bool(
+        raw.get("revision_requested", raw.get("revisionRequested")),
+        default=False,
+    )
+    return {
+        "status": status,
+        "revision_requested": revision_requested,
+    }
+
+
 def _extract_turn_id(body: Dict[str, Any]) -> str:
     """Extract metadata.turn_id (zettlab local-server's per-turn correlation
     token) so the NAS agent-search fallback can echo it back as the
@@ -2357,6 +2378,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
         response_mode = _extract_response_mode(body)
+        plan_ack = _extract_plan_ack(body)
         turn_id = _extract_turn_id(body)
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
@@ -2576,6 +2598,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 response_mode=response_mode,
+                plan_ack=plan_ack,
                 turn_id=turn_id,
                 request_overrides=request_overrides or None,
             ))
@@ -2605,6 +2628,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     gateway_session_key=gateway_session_key,
                     response_mode=response_mode,
+                    plan_ack=plan_ack,
                     turn_id=turn_id,
                     request_overrides=request_overrides or None,
                 )
@@ -4466,6 +4490,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_ref: Optional[list] = None,
         gateway_session_key: Optional[str] = None,
         response_mode: Optional[str] = None,
+        plan_ack: Optional[Dict[str, Any]] = None,
         turn_id: Optional[str] = None,
         request_overrides: Optional[Dict[str, Any]] = None,
     ) -> tuple:
@@ -4508,8 +4533,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
                 if agent_ref is not None:
                     agent_ref[0] = agent
-                if response_mode:
-                    agent._zet_agent_response_mode = response_mode
+                agent._zet_agent_response_mode = response_mode or ""
+                agent._zet_agent_plan_ack = dict(plan_ack or {})
                 effective_task_id = session_id or str(uuid.uuid4())
                 result = agent.run_conversation(
                     user_message=user_message,

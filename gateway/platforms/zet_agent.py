@@ -992,6 +992,7 @@ class ZetAgentAdapter(APIServerAdapter):
         agent_ref=None,
         gateway_session_key: Optional[str] = None,
         response_mode: Optional[str] = None,
+        plan_ack: Optional[Dict[str, Any]] = None,
         turn_id: Optional[str] = None,
         request_overrides: Optional[Dict[str, Any]] = None,
     ):
@@ -1064,6 +1065,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
                 response_mode=response_mode,
+                plan_ack=plan_ack,
                 turn_id=turn_id,
                 request_overrides=request_overrides,
             )
