@@ -974,11 +974,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             stage=f"tool result {name}",
         )
 
-        # ── Per-tool /steer drain ───────────────────────────────────
-        # Same as the sequential path: drain between each collected
-        # result so the steer lands as early as possible.
-        agent._apply_pending_steer_to_tool_results(messages, 1)
-
     # ── Per-turn aggregate budget enforcement ─────────────────────────
     num_tools = len(parsed_calls)
     if num_tools > 0:
@@ -986,9 +981,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id), config=_tool_budget)
 
     # ── /steer injection ──────────────────────────────────────────────
-    # Append any pending user steer text to the last tool result so the
-    # agent sees it on its next iteration. Runs AFTER budget enforcement
-    # so the steer marker is never truncated. See steer() for details.
+    # Deliver any pending user steer as a role:"user" message ONLY after
+    # the whole tool batch is written. Injecting between results of one
+    # assistant(tool_calls) batch splits it (…tool a → user → tool b);
+    # repair_message_sequence resets known tool ids on a user turn and
+    # drops the later results as orphans. Runs AFTER budget enforcement
+    # so the steer text is never truncated. See steer() for details.
     if num_tools > 0:
         agent._apply_pending_steer_to_tool_results(messages, num_tools)
 
@@ -1648,12 +1646,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             messages,
             stage=f"tool result {function_name}",
         )
-
-        # ── Per-tool /steer drain ───────────────────────────────────
-        # Drain pending steer BETWEEN individual tool calls so the
-        # injection lands as soon as a tool finishes — not after the
-        # entire batch.  The model sees it on the next API iteration.
-        agent._apply_pending_steer_to_tool_results(messages, 1)
 
         if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
             if agent.verbose_logging:

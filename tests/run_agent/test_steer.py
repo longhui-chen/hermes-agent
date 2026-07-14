@@ -12,6 +12,7 @@ import threading
 
 import pytest
 
+from agent.agent_runtime_helpers import repair_message_sequence
 from agent.prompt_builder import STEER_USER_PREFIX, format_steer_user_message
 from run_agent import AIAgent
 
@@ -140,6 +141,45 @@ class TestSteerInjection:
         assert messages[0]["content"] == original_blocks
         assert messages[-1]["role"] == "user"
         assert "extra note" in messages[-1]["content"]
+
+    def test_batch_end_injection_survives_repair_intact(self):
+        """Flow: steer delivered at the END of a multi-tool batch must keep
+        every tool result after repair_message_sequence. This is why
+        tool_executor only drains at the batch boundary — injecting a user
+        message BETWEEN results of one assistant(tool_calls) batch makes
+        repair treat the later results as orphans and drop them (PR #173
+        review finding)."""
+        agent = _bare_agent()
+        agent.steer("also check auth.log")
+        messages = [
+            {"role": "user", "content": "inspect logs"},
+            {"role": "assistant", "tool_calls": [{"id": "a"}, {"id": "b"}]},
+            {"role": "tool", "content": "out A", "tool_call_id": "a"},
+            {"role": "tool", "content": "out B", "tool_call_id": "b"},
+        ]
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=2)
+        repairs = repair_message_sequence(agent, messages)
+        assert repairs == 0
+        roles = [m["role"] for m in messages]
+        assert roles == ["user", "assistant", "tool", "tool", "user"]
+
+    def test_mid_batch_user_injection_would_drop_tool_results(self):
+        """Documents the failure mode the batch-boundary rule guards
+        against: a user message spliced between the results of one batch
+        makes repair drop the later tool result. If this behavior ever
+        changes, the batch-boundary constraint can be revisited."""
+        agent = _bare_agent()
+        messages = [
+            {"role": "user", "content": "inspect logs"},
+            {"role": "assistant", "tool_calls": [{"id": "a"}, {"id": "b"}]},
+            {"role": "tool", "content": "out A", "tool_call_id": "a"},
+            format_steer_user_message("mid-batch"),
+            {"role": "tool", "content": "out B", "tool_call_id": "b"},
+        ]
+        repairs = repair_message_sequence(agent, messages)
+        assert repairs > 0
+        # tool b got dropped — exactly the data loss we avoid.
+        assert all(m.get("tool_call_id") != "b" for m in messages)
 
     def test_restashed_when_no_tool_result_in_batch(self):
         """If the 'batch' contains no tool-role messages (e.g. all skipped
