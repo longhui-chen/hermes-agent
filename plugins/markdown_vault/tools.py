@@ -141,6 +141,96 @@ def _post_sse(path: str, body: Dict[str, Any], cap: int) -> List[Dict[str, Any]]
 
 
 # ---------------------------------------------------------------------------
+# Write surface (vault_write / vault_delete) — separate toolset markdown_vault_write
+# ---------------------------------------------------------------------------
+#
+# Writes go through the SAME loopback file API as reads, so the HR3 path
+# allowlist / traversal checks still apply server-side, and _resolve_in_vault
+# confines every target to the vault before any call. Destructive ops keep a
+# recoverable backup in <vault>/.zettlab-trash/ (a dot-folder Obsidian hides)
+# before mutating, so an over-eager or injected edit can be undone. These tools
+# are ALSO expected to run under the agent's approval mode (user confirms each
+# write) — the backup is defence in depth, not the only guard.
+
+UPLOAD_META_HEADER = "X-Zettos-Meta"
+_MOD_OVERWRITE = 4  # SameNameMod.ModOverwrite (server-side upload strategy)
+TRASH_DIRNAME = ".zettlab-trash"
+
+
+def _stamp() -> str:
+    """A filename-safe timestamp for backup copies. import time here (not at
+    module top) keeps the read-only import surface unchanged."""
+    import time
+    return time.strftime("%Y%m%d-%H%M%S", time.localtime())
+
+
+def _upload(dir_abs: str, filename: str, content: bytes) -> Any:
+    """Create or overwrite <dir_abs>/<filename> with content via the streaming
+    upload endpoint (metadata in header, raw body = bytes, mod=overwrite)."""
+    meta = {"path": dir_abs, "filename": filename, "mod": _MOD_OVERWRITE}
+    req = urllib.request.Request(
+        _api_base() + "/file/upload", data=content, method="POST",
+        headers={UPLOAD_META_HEADER: json.dumps(meta),
+                 "Content-Type": "application/octet-stream"},
+    )
+    with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _mkfolder(parent_abs: str, name: str) -> None:
+    """Create parent_abs/name (idempotent server-side MkdirAll)."""
+    try:
+        _post_json("/file/folder", {"path": parent_abs, "name": name})
+    except urllib.error.URLError:
+        raise
+    except Exception:
+        # A non-URL error (e.g. already-exists envelope) is non-fatal — the
+        # folder is what we needed and MkdirAll no-ops on an existing dir.
+        pass
+
+
+def _delete_abs(abs_path: str) -> Any:
+    body = json.dumps({"paths": [abs_path]}).encode("utf-8")
+    req = urllib.request.Request(
+        _api_base() + "/file/delete", data=body, method="DELETE",
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def _read_or_none(abs_path: str) -> Optional[str]:
+    """Return the file's current text, or None if it does not exist / is
+    unreadable. Used to decide create-vs-overwrite and to back up before a
+    destructive change."""
+    try:
+        resp = _get("/file/content", {"path": abs_path})
+    except urllib.error.URLError:
+        return None
+    except Exception:
+        return None
+    data = (resp or {}).get("data")
+    if isinstance(data, dict):
+        return data.get("content")
+    if isinstance(data, str):
+        return data
+    return None
+
+
+def _backup(rel_note: str, content: str) -> str:
+    """Copy content into <vault>/.zettlab-trash/<flattened>.<stamp>.bak and
+    return the backup's vault-relative path. Raises on failure so callers can
+    abort a destructive op rather than lose the only copy."""
+    root = _vault_root()
+    trash_abs = os.path.join(root, TRASH_DIRNAME)
+    _mkfolder(root, TRASH_DIRNAME)
+    flat = rel_note.replace("/", "__").replace(os.sep, "__")
+    backup_name = f"{flat}.{_stamp()}.bak"
+    _upload(trash_abs, backup_name, content.encode("utf-8"))
+    return posixpath.join(TRASH_DIRNAME, backup_name)
+
+
+# ---------------------------------------------------------------------------
 # Tool schemas
 # ---------------------------------------------------------------------------
 
@@ -212,8 +302,11 @@ def _wrap(payload: str) -> str:
     return f"{_UNTRUSTED_BANNER}\n<<<VAULT\n{payload}\nVAULT>>>"
 
 
-def handle_vault_list(**kwargs) -> str:
-    folder = kwargs.get("folder", "") or ""
+def handle_vault_list(args=None, **kwargs) -> str:
+    # hermes dispatches tools as handler(args_dict, **ctx); the unit tests call
+    # with kwargs. Accept both so the tool works in the real gateway and in tests.
+    args = args if isinstance(args, dict) else kwargs
+    folder = args.get("folder", "") or ""
     try:
         abs_path = _resolve_in_vault(folder)
         resp = _post_json("/file/list", {"path": abs_path, "page_index": 1, "page_size": 500})
@@ -234,8 +327,9 @@ def handle_vault_list(**kwargs) -> str:
     return _wrap(f"folder: {rel}\n{body}")
 
 
-def handle_vault_read(**kwargs) -> str:
-    note = kwargs.get("note", "")
+def handle_vault_read(args=None, **kwargs) -> str:
+    args = args if isinstance(args, dict) else kwargs
+    note = args.get("note", "")
     if not note:
         return "error: 'note' is required"
     try:
@@ -255,12 +349,13 @@ def handle_vault_read(**kwargs) -> str:
     return _wrap(f"note: {note}\n---\n{content}")
 
 
-def handle_vault_search(**kwargs) -> str:
-    query = kwargs.get("query", "")
+def handle_vault_search(args=None, **kwargs) -> str:
+    args = args if isinstance(args, dict) else kwargs
+    query = args.get("query", "")
     if not query:
         return "error: 'query' is required"
-    content = bool(kwargs.get("content", False))
-    limit = int(kwargs.get("limit", 30) or 30)
+    content = bool(args.get("content", False))
+    limit = int(args.get("limit", 30) or 30)
     limit = max(1, min(limit, 200))
     sources = ["name", "doc"] if content else ["name"]
     try:
@@ -282,3 +377,111 @@ def handle_vault_search(**kwargs) -> str:
     body = "\n".join(out) if out else "(no matches)"
     scope = "filename+content" if content else "filename"
     return _wrap(f"search: {query!r} ({scope})\n{body}")
+
+
+# ---------------------------------------------------------------------------
+# Write tool schemas (toolset markdown_vault_write)
+# ---------------------------------------------------------------------------
+
+VAULT_WRITE_SCHEMA: Dict[str, Any] = {
+    "name": "vault_write",
+    "description": (
+        "Create a new note or overwrite an existing one in the user's vault. "
+        "'note' is a vault-relative path such as 'Ideas.md' or "
+        "'Daily/2026-07-14.md'; 'content' is the full new markdown text (this "
+        "REPLACES the whole file, it does not append). If the note already "
+        "exists its previous version is backed up to .zettlab-trash first. "
+        "Confined to the vault — cannot write outside it."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "note": {"type": "string", "description": "Vault-relative note path to create/overwrite."},
+            "content": {"type": "string", "description": "Full new markdown content (replaces the file)."},
+        },
+        "required": ["note", "content"],
+        "additionalProperties": False,
+    },
+}
+
+VAULT_DELETE_SCHEMA: Dict[str, Any] = {
+    "name": "vault_delete",
+    "description": (
+        "Delete a note from the user's vault. The note is first backed up to "
+        ".zettlab-trash (recoverable) and then removed. 'note' is a "
+        "vault-relative path. Confined to the vault."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "note": {"type": "string", "description": "Vault-relative note path to delete."},
+        },
+        "required": ["note"],
+        "additionalProperties": False,
+    },
+}
+
+
+# ---------------------------------------------------------------------------
+# Write tool handlers
+# ---------------------------------------------------------------------------
+
+def handle_vault_write(args=None, **kwargs) -> str:
+    args = args if isinstance(args, dict) else kwargs
+    note = (args.get("note") or "").strip()
+    if not note:
+        return "error: 'note' is required"
+    content = args.get("content")
+    if content is None:
+        return "error: 'content' is required"
+    if not isinstance(content, str):
+        content = str(content)
+    try:
+        abs_path = _resolve_in_vault(note)
+    except VaultError as e:
+        return f"error: {e}"
+    if abs_path == _vault_root():
+        return "error: 'note' must be a file inside the vault, not the vault root"
+    dir_abs = os.path.dirname(abs_path)
+    filename = os.path.basename(abs_path)
+    try:
+        existing = _read_or_none(abs_path)
+        backup_rel = None
+        if existing is not None:
+            # Overwrite: preserve the old version before replacing it. If the
+            # backup fails we abort rather than destroy the only copy.
+            backup_rel = _backup(note, existing)
+        _upload(dir_abs, filename, content.encode("utf-8"))
+    except urllib.error.URLError as e:
+        return f"error: vault file API unreachable ({e})"
+    except Exception as e:  # noqa: BLE001 — surface any write failure to the model
+        return f"error: write failed ({e})"
+    if existing is None:
+        return f"ok: created {note}"
+    return f"ok: updated {note} (previous version backed up to {backup_rel})"
+
+
+def handle_vault_delete(args=None, **kwargs) -> str:
+    args = args if isinstance(args, dict) else kwargs
+    note = (args.get("note") or "").strip()
+    if not note:
+        return "error: 'note' is required"
+    try:
+        abs_path = _resolve_in_vault(note)
+    except VaultError as e:
+        return f"error: {e}"
+    if abs_path == _vault_root():
+        return "error: refusing to delete the vault root"
+    try:
+        existing = _read_or_none(abs_path)
+        if existing is None:
+            return f"error: note not found ({note})"
+        # Soft-delete: back up to .zettlab-trash, then remove. Abort if the
+        # backup fails so the note stays recoverable.
+        backup_rel = _backup(note, existing)
+        _delete_abs(abs_path)
+    except urllib.error.URLError as e:
+        return f"error: vault file API unreachable ({e})"
+    except Exception as e:  # noqa: BLE001
+        return f"error: delete failed ({e})"
+    return f"ok: deleted {note} (backed up to {backup_rel})"

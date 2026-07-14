@@ -109,10 +109,87 @@ def test_list_rejects_escape(monkeypatch):
     assert calls["n"] == 0
 
 
-# --- read-only surface guarantee (D9) ---
+# --- read/write toolset split (permission-model-v2 §5) ---
 
-def test_tool_surface_is_read_only():
-    handlers = {n for n in dir(tools) if n.startswith("handle_")}
-    assert handlers == {"handle_vault_list", "handle_vault_read", "handle_vault_search"}
-    for verb in ("write", "delete", "patch", "move", "create", "rename", "put", "upload"):
-        assert not any(verb in n.lower() for n in handlers), f"read-only: no {verb} handler allowed"
+def test_read_toolset_has_no_write_tool():
+    """The READ tools registered under toolset 'markdown_vault' must not include
+    any mutating handler — write lives in the separate markdown_vault_write
+    toolset, gated independently by the profile."""
+    from plugins.markdown_vault import _READ_TOOLS, _WRITE_TOOLS
+    read_names = {name for name, *_ in _READ_TOOLS}
+    write_names = {name for name, *_ in _WRITE_TOOLS}
+    assert read_names == {"vault_list", "vault_read", "vault_search"}
+    assert write_names == {"vault_write", "vault_delete"}
+    # no overlap — a read grant can never expose a write tool
+    assert read_names.isdisjoint(write_names)
+
+
+# --- write: create / overwrite-with-backup / confinement ---
+
+def test_write_creates_new_note_no_backup(monkeypatch):
+    monkeypatch.setattr(tools, "_read_or_none", lambda p: None)  # doesn't exist
+    up = {}
+    monkeypatch.setattr(tools, "_upload", lambda d, f, c: up.update(dir=d, file=f, content=c) or {})
+    backups = {"n": 0}
+    monkeypatch.setattr(tools, "_backup", lambda note, content: backups.__setitem__("n", backups["n"] + 1) or "x")
+    out = tools.handle_vault_write(note="Ideas.md", content="hello")
+    assert out.startswith("ok: created")
+    assert up["file"] == "Ideas.md" and up["content"] == b"hello"
+    assert backups["n"] == 0, "creating a new note must not back up"
+
+
+def test_write_overwrite_backs_up_first(monkeypatch):
+    order = []
+    monkeypatch.setattr(tools, "_read_or_none", lambda p: "OLD CONTENT")
+    monkeypatch.setattr(tools, "_backup", lambda note, content: order.append(("backup", content)) or ".zettlab-trash/Ideas.md.bak")
+    monkeypatch.setattr(tools, "_upload", lambda d, f, c: order.append(("upload", c)))
+    out = tools.handle_vault_write(note="Ideas.md", content="NEW")
+    assert order == [("backup", "OLD CONTENT"), ("upload", b"NEW")], "must back up old BEFORE writing new"
+    assert "backed up" in out
+
+
+def test_write_rejects_escape_before_api(monkeypatch):
+    calls = {"n": 0}
+    monkeypatch.setattr(tools, "_upload", lambda *a: calls.__setitem__("n", calls["n"] + 1))
+    monkeypatch.setattr(tools, "_read_or_none", lambda p: calls.__setitem__("n", calls["n"] + 1))
+    out = tools.handle_vault_write(note="../../etc/cron.d/evil", content="x")
+    assert "outside the vault" in out
+    assert calls["n"] == 0, "must reject traversal before any API call"
+
+
+def test_write_dispatch_positional_args(monkeypatch):
+    """Regression: hermes dispatches handler(args_dict, **ctx) POSITIONALLY.
+    The write handler must accept that, not only kwargs."""
+    monkeypatch.setattr(tools, "_read_or_none", lambda p: None)
+    monkeypatch.setattr(tools, "_upload", lambda d, f, c: {})
+    out = tools.handle_vault_write({"note": "P.md", "content": "body"})
+    assert out.startswith("ok: created")
+
+
+# --- delete: soft-delete (backup then remove) ---
+
+def test_delete_backs_up_then_removes(monkeypatch):
+    order = []
+    monkeypatch.setattr(tools, "_read_or_none", lambda p: "DOOMED")
+    monkeypatch.setattr(tools, "_backup", lambda note, content: order.append(("backup", content)) or ".zettlab-trash/x")
+    monkeypatch.setattr(tools, "_delete_abs", lambda p: order.append(("delete", p)))
+    out = tools.handle_vault_delete(note="Old.md")
+    assert order[0][0] == "backup" and order[1][0] == "delete", "must back up BEFORE deleting"
+    assert out.startswith("ok: deleted")
+
+
+def test_delete_missing_note_is_error_no_delete(monkeypatch):
+    monkeypatch.setattr(tools, "_read_or_none", lambda p: None)  # not found
+    calls = {"n": 0}
+    monkeypatch.setattr(tools, "_delete_abs", lambda p: calls.__setitem__("n", calls["n"] + 1))
+    out = tools.handle_vault_delete(note="ghost.md")
+    assert "not found" in out
+    assert calls["n"] == 0, "must not call delete for a missing note"
+
+
+def test_delete_rejects_escape(monkeypatch):
+    calls = {"n": 0}
+    monkeypatch.setattr(tools, "_delete_abs", lambda p: calls.__setitem__("n", calls["n"] + 1))
+    out = tools.handle_vault_delete(note="/etc/passwd")
+    assert "outside the vault" in out
+    assert calls["n"] == 0
