@@ -3142,10 +3142,10 @@ class AIAgent:
         # which already surfaces its own message) — don't second-guess.
         return ""
 
-    def _apply_pending_steer_to_tool_results(self, messages: list, num_tool_msgs: int) -> None:
-        """Forwarder — see ``agent.agent_runtime_helpers.apply_pending_steer_to_tool_results``."""
-        from agent.agent_runtime_helpers import apply_pending_steer_to_tool_results
-        return apply_pending_steer_to_tool_results(self, messages, num_tool_msgs)
+    def _drain_steer_for_next_api_call(self, messages: list) -> None:
+        """Forwarder — see ``agent.agent_runtime_helpers.drain_steer_for_next_api_call``."""
+        from agent.agent_runtime_helpers import drain_steer_for_next_api_call
+        return drain_steer_for_next_api_call(self, messages)
 
     def _touch_activity(self, desc: str) -> None:
         """Update the last-activity timestamp and description (thread-safe).

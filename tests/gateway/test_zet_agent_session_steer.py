@@ -339,3 +339,41 @@ async def test_capabilities_declares_session_steer(monkeypatch):
     }
     # 基类清单不被覆写破坏。
     assert payload["features"]["chat_completions"] is True
+
+
+@pytest.mark.asyncio
+async def test_early_return_turn_salvages_pending_steer(monkeypatch):
+    """conversation_loop 的 retry/error 提前 return 绕过 finalize_turn，
+    槽位既不关闭也不 drain——覆写层必须补救：drain(close=True) 塞回
+    result["pending_steer"]，让下方的 dropped 回执把文本转排队。"""
+    import threading as _threading
+
+    adapter = _adapter(monkeypatch)
+    goals = _RecordingGoals()
+    monkeypatch.setattr(adapter, "_goals", lambda: goals)
+    # 提前 return 的 result：无 pending_steer 字段。
+    _patch_base_run_agent(
+        monkeypatch,
+        ({"final_response": "", "session_id": "s1", "failed": True},),
+    )
+    agent = _FakeAgent()
+    agent._pending_steer = "被卡在错误轮里的引导"
+    agent._pending_steer_lock = _threading.Lock()
+    agent._steer_closed = False
+
+    def _drain(close=False):
+        with agent._pending_steer_lock:
+            text = agent._pending_steer
+            agent._pending_steer = None
+            if close:
+                agent._steer_closed = True
+        return text
+
+    agent._drain_pending_steer = _drain
+
+    result = await adapter._run_agent(user_message="跑任务", session_id="s1", agent_ref=[agent])
+
+    assert result[0]["pending_steer"] == "被卡在错误轮里的引导"
+    assert agent._steer_closed is True
+    # 失败轮不触发 goal schedule（既有语义不受 salvage 影响）。
+    assert goals.calls == []

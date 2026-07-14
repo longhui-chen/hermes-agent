@@ -1063,24 +1063,17 @@ def run_conversation(
                 and "skill_manage" in agent.valid_tool_names):
             agent._iters_since_skill += 1
         
-        # ── Pre-API-call /steer drain ──────────────────────────────────
-        # If a /steer arrived during the previous API call (while the model
-        # was thinking), drain it now — before we build api_messages — so
-        # the model sees the steer text on THIS iteration.  Without this,
-        # steers sent during an API call only land after the NEXT tool batch,
-        # which may never come if the model returns a final response.
-        #
-        # Delivered as a real user message (native instruction authority —
-        # see prompt_builder's steering module note). Appending after a
-        # completed tool batch is the legal "ongoing dialog" sequence; on
-        # the first-iteration edge (last message already user) the repair
-        # pass merges the two adjacent user messages, so role alternation
-        # holds either way.
-        _pre_api_steer = agent._drain_pending_steer()
-        if _pre_api_steer:
-            from agent.prompt_builder import format_steer_user_message
-            messages.append(format_steer_user_message(_pre_api_steer))
-            logger.debug("Pre-API-call steer drain: appended mid-turn user message")
+        # ── Pre-API-call /steer drain (the ONLY injection point) ──────
+        # Drain right before the request is built so the model sees the
+        # steer text on THIS iteration, and only when a next model call is
+        # certain — tool batches that break out of the loop (present-plan /
+        # guardrail / budget) leave the slot pending for the finalizer to
+        # surface as steer_dropped instead of persisting an unanswered user
+        # message. The helper handles delivery shape (adjacent-user merge
+        # for the first-iteration/multimodal edge, plain append otherwise)
+        # and the interrupt-race guard.
+        from agent.agent_runtime_helpers import drain_steer_for_next_api_call
+        drain_steer_for_next_api_call(agent, messages)
 
         # Prepare messages for API call
         # If we have an ephemeral system prompt, prepend it to the messages

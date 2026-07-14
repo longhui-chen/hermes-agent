@@ -2832,23 +2832,30 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
 
 
 
-def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
-    """Deliver any pending /steer as a real user message after this tool batch.
+def drain_steer_for_next_api_call(agent, messages: list) -> None:
+    """Deliver any pending /steer as a user turn, right before an API call.
 
-    Called at the end of a tool-call batch, before the next API call.
-    The steer is appended as a ``role:"user"`` message so it carries
-    native user authority — tool→user→assistant is a legal sequence
-    (see repair_message_sequence's "ongoing dialog" note; the Anthropic
-    adapter merges it into the tool_result user turn). An earlier
-    revision appended a marker to the last tool result instead; models
-    weight tool-channel text low and weak models ignored the steer.
+    This is the ONLY injection point (the earlier per-batch hook in
+    tool_executor was removed): draining here means the very next model
+    request is guaranteed to carry the text. Draining at the end of a tool
+    batch instead could inject into a turn that immediately breaks out of
+    the loop (present-plan / guardrail halt / budget exhausted) — the steer
+    would persist as an unanswered user message, merge into the NEXT turn's
+    input, and resurrect a stale redirect with no dropped receipt. On break
+    paths the slot stays pending and the finalizer surfaces steer_dropped.
 
-    Args:
-        messages: The running messages list.
-        num_tool_msgs: Number of tool results appended in this batch;
-            used to verify the batch really produced results.
+    Delivery shape depends on the current tail:
+      - tail is a user message with str content → concatenate (strict
+        providers reject adjacent user turns; repair's Pass 2 would merge
+        str+str anyway, but doing it here keeps the request well-formed
+        even when repair is skipped)
+      - tail is a user message with list (multimodal) content → append a
+        text block (repair deliberately skips list merges, so adjacent
+        user(list)+user(str) would otherwise reach strict providers)
+      - anything else (the normal tool-batch tail) → append a new
+        ``role:"user"`` message (the legal "ongoing dialog" sequence)
     """
-    if num_tool_msgs <= 0 or not messages:
+    if not messages:
         return
     # Atomic drain-unless-interrupted: a hard interrupt supersedes any
     # pending steer (interrupt() drops the slot by design). Racing that —
@@ -2873,33 +2880,21 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         agent._pending_steer = None
     if not steer_text:
         return
-    # Verify the recent tail really contains a tool result. Skipping
-    # non-tool messages defends against future code appending
-    # something else at the boundary.
-    has_tool_result = False
-    for j in range(len(messages) - 1, max(len(messages) - num_tool_msgs - 1, -1), -1):
-        msg = messages[j]
-        if isinstance(msg, dict) and msg.get("role") == "tool":
-            has_tool_result = True
-            break
-    if not has_tool_result:
-        # No tool result in this batch (e.g. all skipped by interrupt);
-        # put the steer back so the caller's fallback path can deliver
-        # it as a normal next-turn user message.
-        _lock = getattr(agent, "_pending_steer_lock", None)
-        if _lock is not None:
-            with _lock:
-                if agent._pending_steer:
-                    agent._pending_steer = agent._pending_steer + "\n" + steer_text
-                else:
-                    agent._pending_steer = steer_text
+    steer_msg = format_steer_user_message(steer_text)
+    tail = messages[-1] if isinstance(messages[-1], dict) else None
+    if tail is not None and tail.get("role") == "user":
+        tail_content = tail.get("content")
+        if isinstance(tail_content, str):
+            joined = (tail_content + "\n\n" + steer_msg["content"]) if tail_content else steer_msg["content"]
+            tail["content"] = joined
+        elif isinstance(tail_content, list):
+            tail_content.append({"type": "text", "text": steer_msg["content"]})
         else:
-            existing = getattr(agent, "_pending_steer", None)
-            agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
-        return
-    messages.append(format_steer_user_message(steer_text))
+            messages.append(steer_msg)
+    else:
+        messages.append(steer_msg)
     _ra().logger.info(
-        "Delivered /steer to agent after tool batch (%d chars): %s",
+        "Delivered /steer before next API call (%d chars): %s",
         len(steer_text),
         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
     )
@@ -2981,7 +2976,7 @@ __all__ = [
     "copy_reasoning_content_for_api",
     "cleanup_dead_connections",
     "extract_api_error_context",
-    "apply_pending_steer_to_tool_results",
+    "drain_steer_for_next_api_call",
     "_iter_pool_sockets",
     "force_close_tcp_sockets",
 ]

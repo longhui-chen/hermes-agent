@@ -75,6 +75,9 @@ class TestSteerDrain:
 
 
 class TestSteerInjection:
+    """drain_steer_for_next_api_call — the single injection point, called
+    right before each API request is built."""
+
     def test_appends_user_message_after_tool_batch(self):
         agent = _bare_agent()
         agent.steer("please also check auth.log")
@@ -84,14 +87,13 @@ class TestSteerInjection:
             {"role": "tool", "content": "ls output A", "tool_call_id": "a"},
             {"role": "tool", "content": "ls output B", "tool_call_id": "b"},
         ]
-        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=2)
+        agent._drain_steer_for_next_api_call(messages)
         # Tool results are untouched — the steer is a NEW user message.
         assert messages[2]["content"] == "ls output A"
         assert messages[3]["content"] == "ls output B"
         assert len(messages) == 5
         assert messages[4]["role"] == "user"
         assert messages[4]["content"] == f"{STEER_USER_PREFIX}please also check auth.log"
-        # And pending_steer is consumed.
         assert agent._pending_steer is None
 
     def test_no_op_when_no_steer_pending(self):
@@ -100,55 +102,67 @@ class TestSteerInjection:
             {"role": "assistant", "tool_calls": [{"id": "a"}]},
             {"role": "tool", "content": "output", "tool_call_id": "a"},
         ]
-        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+        agent._drain_steer_for_next_api_call(messages)
         assert len(messages) == 2  # unchanged
         assert messages[-1]["content"] == "output"
 
-    def test_no_op_when_num_tool_msgs_zero(self):
+    def test_empty_messages_keeps_steer_pending(self):
         agent = _bare_agent()
         agent.steer("steer")
-        messages = [{"role": "user", "content": "hi"}]
-        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=0)
-        # Steer should remain pending (nothing to drain into)
+        messages: list = []
+        agent._drain_steer_for_next_api_call(messages)
+        assert messages == []
         assert agent._pending_steer == "steer"
 
+    def test_adjacent_str_user_is_merged_not_appended(self):
+        """First-iteration edge: the tail is already a user turn. Strict
+        providers reject adjacent user messages, so the steer is folded
+        into the existing content rather than appended."""
+        agent = _bare_agent()
+        agent.steer("early steer")
+        messages = [{"role": "user", "content": "hello"}]
+        agent._drain_steer_for_next_api_call(messages)
+        assert len(messages) == 1
+        assert messages[0]["role"] == "user"
+        assert "hello" in messages[0]["content"]
+        assert f"{STEER_USER_PREFIX}early steer" in messages[0]["content"]
+
+    def test_multimodal_user_gets_text_block_appended(self):
+        """Multimodal first turn (list content): repair deliberately skips
+        list merges, so the steer must be folded in as a text block here —
+        adjacent user(list)+user(str) would 400 on strict providers."""
+        agent = _bare_agent()
+        agent.steer("also describe the colors")
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is in this image?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,xxx"}},
+            ],
+        }]
+        agent._drain_steer_for_next_api_call(messages)
+        assert len(messages) == 1
+        blocks = messages[0]["content"]
+        assert blocks[-1] == {"type": "text", "text": f"{STEER_USER_PREFIX}also describe the colors"}
+        # Original blocks untouched.
+        assert blocks[0]["text"] == "what is in this image?"
+        assert blocks[1]["type"] == "image_url"
+
     def test_steer_carries_user_role_with_mid_task_prefix(self):
-        """The steer must land as a real user message (native instruction
-        authority — tool-channel text gets ignored by weak models) with the
-        mid-task prefix so the model and turn-boundary scans can tell it
-        apart from the turn-starting user message.
-        """
         agent = _bare_agent()
         agent.steer("stop after next step")
         messages = [{"role": "tool", "content": "x", "tool_call_id": "1"}]
-        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+        agent._drain_steer_for_next_api_call(messages)
         assert messages[-1]["role"] == "user"
         assert messages[-1]["content"].startswith(STEER_USER_PREFIX)
         assert "stop after next step" in messages[-1]["content"]
-        # Tool content untouched.
         assert messages[0]["content"] == "x"
 
-    def test_multimodal_tool_content_untouched(self):
-        """Anthropic-style list content on the tool result must stay intact —
-        the steer no longer rewrites tool content at all."""
-        agent = _bare_agent()
-        agent.steer("extra note")
-        original_blocks = [{"type": "text", "text": "existing output"}]
-        messages = [
-            {"role": "tool", "content": list(original_blocks), "tool_call_id": "1"}
-        ]
-        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
-        assert messages[0]["content"] == original_blocks
-        assert messages[-1]["role"] == "user"
-        assert "extra note" in messages[-1]["content"]
-
     def test_batch_end_injection_survives_repair_intact(self):
-        """Flow: steer delivered at the END of a multi-tool batch must keep
-        every tool result after repair_message_sequence. This is why
-        tool_executor only drains at the batch boundary — injecting a user
-        message BETWEEN results of one assistant(tool_calls) batch makes
-        repair treat the later results as orphans and drop them (PR #173
-        review finding)."""
+        """Flow: injecting AFTER the whole tool batch keeps every tool
+        result through repair_message_sequence — injecting between results
+        of one assistant(tool_calls) batch would make repair drop the later
+        ones as orphans (PR #173 review finding)."""
         agent = _bare_agent()
         agent.steer("also check auth.log")
         messages = [
@@ -157,17 +171,16 @@ class TestSteerInjection:
             {"role": "tool", "content": "out A", "tool_call_id": "a"},
             {"role": "tool", "content": "out B", "tool_call_id": "b"},
         ]
-        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=2)
+        agent._drain_steer_for_next_api_call(messages)
         repairs = repair_message_sequence(agent, messages)
         assert repairs == 0
         roles = [m["role"] for m in messages]
         assert roles == ["user", "assistant", "tool", "tool", "user"]
 
     def test_mid_batch_user_injection_would_drop_tool_results(self):
-        """Documents the failure mode the batch-boundary rule guards
+        """Documents the failure mode the single-injection-point rule guards
         against: a user message spliced between the results of one batch
-        makes repair drop the later tool result. If this behavior ever
-        changes, the batch-boundary constraint can be revisited."""
+        makes repair drop the later tool result."""
         agent = _bare_agent()
         messages = [
             {"role": "user", "content": "inspect logs"},
@@ -178,26 +191,7 @@ class TestSteerInjection:
         ]
         repairs = repair_message_sequence(agent, messages)
         assert repairs > 0
-        # tool b got dropped — exactly the data loss we avoid.
         assert all(m.get("tool_call_id") != "b" for m in messages)
-
-    def test_restashed_when_no_tool_result_in_batch(self):
-        """If the 'batch' contains no tool-role messages (e.g. all skipped
-        after an interrupt), the steer should be put back into the pending
-        slot so the caller's fallback path can deliver it."""
-        agent = _bare_agent()
-        agent.steer("ping")
-        messages = [
-            {"role": "user", "content": "x"},
-            {"role": "assistant", "content": "y"},
-        ]
-        # Claim there were N tool msgs, but the tail has none — simulates
-        # the interrupt-cancelled case.
-        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=2)
-        # Messages untouched
-        assert messages[-1]["content"] == "y"
-        # And the steer is back in pending so the fallback can grab it
-        assert agent._pending_steer == "ping"
 
 
 class TestSteerThreadSafety:
@@ -244,17 +238,13 @@ class TestSteerClearedOnInterrupt:
 
 
 class TestPreApiCallSteerDrain:
-    """Test that steers arriving during an API call are drained before the
-    next API call — not deferred until the next tool batch.  This is the
-    fix for the scenario where /steer sent during model thinking only lands
-    after the agent is completely done."""
+    """Steers arriving during an API call are drained before the NEXT API
+    call — and only there (the per-batch hook was removed so that turns
+    which break out of the loop leave the slot pending for the finalizer's
+    steer_dropped instead of persisting an unanswered user message)."""
 
     def test_pre_api_drain_appends_user_message(self):
-        """If a steer is pending when the main loop starts building
-        api_messages, it should be appended as a mid-turn user message
-        (mirrors the pre-API drain in run_conversation)."""
         agent = _bare_agent()
-        # Simulate messages after a tool batch completed
         messages = [
             {"role": "user", "content": "do something"},
             {"role": "assistant", "content": "ok", "tool_calls": [
@@ -262,43 +252,25 @@ class TestPreApiCallSteerDrain:
             ]},
             {"role": "tool", "content": "output here", "tool_call_id": "tc1"},
         ]
-        # Steer arrives during API call (set after tool execution)
         agent.steer("focus on error handling")
-        # Simulate what the pre-API-call drain does:
-        _pre_api_steer = agent._drain_pending_steer()
-        assert _pre_api_steer == "focus on error handling"
-        messages.append(format_steer_user_message(_pre_api_steer))
+        agent._drain_steer_for_next_api_call(messages)
         assert messages[-1]["role"] == "user"
         assert messages[-1]["content"] == f"{STEER_USER_PREFIX}focus on error handling"
-        # Tool result untouched.
         assert messages[2]["content"] == "output here"
         assert agent._pending_steer is None
 
-    def test_pre_api_drain_first_iteration_appends_adjacent_user(self):
-        """First-iteration edge: no tool batch yet, the steer still lands as
-        a user message right after the turn-starting one — the repair pass
-        (repair_message_sequence Pass 2) merges adjacent user messages, so
-        role alternation holds."""
+    def test_pending_steer_survives_loop_break_for_finalizer(self):
+        """When no next API call happens (present-plan / guardrail / budget
+        break), nothing drains the slot mid-loop — the finalizer's closing
+        drain hands it back as pending_steer so the caller emits
+        steer_dropped and the client re-queues the text."""
         agent = _bare_agent()
-        messages = [
-            {"role": "user", "content": "hello"},
-        ]
-        agent.steer("early steer")
-        _pre_api_steer = agent._drain_pending_steer()
-        assert _pre_api_steer == "early steer"
-        messages.append(format_steer_user_message(_pre_api_steer))
-
-        from agent.agent_runtime_helpers import repair_message_sequence
-
-        class _RepairAgent:
-            session_id = "test"
-
-        repairs = repair_message_sequence(_RepairAgent(), messages)
-        assert repairs == 1
-        assert len(messages) == 1
-        assert messages[0]["role"] == "user"
-        assert "hello" in messages[0]["content"]
-        assert "early steer" in messages[0]["content"]
+        agent.steer("redirect that never lands")
+        # No drain call happens on break paths; finalizer drains with close.
+        leftover = agent._drain_pending_steer(close=True)
+        assert leftover == "redirect that never lands"
+        # And the slot is closed against the SSE-teardown window.
+        assert agent.steer("too late") is False
 
 
 class TestSteerMessageContract:
@@ -392,7 +364,7 @@ class TestSteerInterruptRace:
             {"role": "assistant", "tool_calls": [{"id": "a"}]},
             {"role": "tool", "content": "out", "tool_call_id": "a"},
         ]
-        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+        agent._drain_steer_for_next_api_call(messages)
         # 不注入；槽位保留给 interrupt() 丢弃或 finalizer 转 dropped。
         assert len(messages) == 2
         assert agent._pending_steer == "change direction"
@@ -405,6 +377,6 @@ class TestSteerInterruptRace:
             {"role": "assistant", "tool_calls": [{"id": "a"}]},
             {"role": "tool", "content": "out", "tool_call_id": "a"},
         ]
-        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+        agent._drain_steer_for_next_api_call(messages)
         assert messages[-1]["role"] == "user"
         assert "go on" in messages[-1]["content"]

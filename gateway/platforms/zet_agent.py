@@ -1017,6 +1017,33 @@ class ZetAgentAdapter(APIServerAdapter):
                 turn_id=turn_id,
                 request_overrides=request_overrides,
             )
+            # Early-return steer salvage: many conversation_loop retry/error
+            # paths return without running finalize_turn, so the closing
+            # drain never happens — a steer accepted in those windows would
+            # have no consumer and no dropped receipt (silently lost with the
+            # turn). If the result carries no pending_steer but the slot
+            # still holds text, drain it here (close=True so later steers
+            # are refused) and let the receipt push below re-queue it. On
+            # the normal finalize path this is a no-op (slot already drained
+            # and closed).
+            try:
+                _salvage_agent = agent_ref[0] if agent_ref else None
+                if (
+                    _salvage_agent is not None
+                    and isinstance(result, tuple)
+                    and result
+                    and isinstance(result[0], dict)
+                    and not result[0].get("pending_steer")
+                ):
+                    _leftover = _salvage_agent._drain_pending_steer(close=True)
+                    if _leftover:
+                        result[0]["pending_steer"] = _leftover
+                        logger.info(
+                            "[zet_agent] salvaged steer from early-return turn session=%s",
+                            session_id,
+                        )
+            except Exception:
+                logger.debug("[zet_agent] early-return steer salvage failed", exc_info=True)
             # Goal loop post-turn hook (ZET goal driver): if this session has
             # an active persistent goal, evaluate the finished turn off the
             # event loop and report the verdict (+ continuation) to
