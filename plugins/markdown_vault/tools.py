@@ -118,6 +118,16 @@ def _resolve_in_vault(rel_or_abs: str) -> str:
         candidate = os.path.normpath(os.path.join(root, raw))
     if candidate != root and not candidate.startswith(root + os.sep):
         raise VaultError(f"path {rel_or_abs!r} is outside the vault")
+    # Symlink confinement (defence in depth): the lexical check above passes a
+    # symlink that SITS inside the vault but POINTS outward (e.g. <vault>/shared ->
+    # /home/user). realpath resolves symlinks in the existing path prefix (the leaf
+    # may not exist yet for a new note); re-check the resolved path is still under
+    # the resolved root. The server file API remains the authoritative boundary, but
+    # this closes the obvious in-plugin hole rather than relying on it alone.
+    real_root = os.path.realpath(root)
+    real = os.path.realpath(candidate)
+    if real != real_root and not real.startswith(real_root + os.sep):
+        raise VaultError(f"path {rel_or_abs!r} escapes the vault via a symlink")
     # Defence in depth (D9/T7): keep the tool surface to user notes only.
     # Reject any hidden path segment so the agent can never list/read/write
     # Obsidian app state (.obsidian), our own soft-delete backups
@@ -151,7 +161,13 @@ def _get(path: str, params: Dict[str, str]) -> Any:
 
 
 def _post_sse(path: str, body: Dict[str, Any], cap: int) -> List[Dict[str, Any]]:
-    """POST an SSE endpoint and collect up to *cap* `data:` JSON events."""
+    """POST an SSE endpoint and collect up to *cap* `hit` frames.
+
+    /file/search streams typed frames (`hit` / `done` / `error` / `ping`), and it
+    ALWAYS ends with a `done` frame carrying totals — NOT a result item. Collecting
+    every `data:` line blindly (ignoring `event:`) appends that done frame as a
+    phantom hit and swallows `error` frames as fake successes. So we track the
+    event type: keep only `hit` payloads, raise on `error`, ignore the rest."""
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         _api_base() + path, data=data, method="POST",
@@ -159,13 +175,24 @@ def _post_sse(path: str, body: Dict[str, Any], cap: int) -> List[Dict[str, Any]]
     )
     hits: List[Dict[str, Any]] = []
     with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
+        event: Optional[str] = None
         for raw in resp:
             line = raw.decode("utf-8", "replace").strip()
+            if not line:
+                event = None  # blank line ends a frame (SSE dispatch)
+                continue
+            if line.startswith("event:"):
+                event = line[len("event:"):].strip()
+                continue
             if not line.startswith("data:"):
                 continue
             payload = line[len("data:"):].strip()
             if not payload:
                 continue
+            if event == "error":
+                raise VaultError(f"search failed: {payload}")
+            if event not in (None, "hit"):
+                continue  # done/ping/progress frames carry no result item
             try:
                 hits.append(json.loads(payload))
             except json.JSONDecodeError:
@@ -405,7 +432,10 @@ def _wrap(payload: str) -> str:
     return f"{_UNTRUSTED_BANNER}\n{_FENCE_OPEN}\n{safe}\n{_FENCE_CLOSE}"
 
 
-_LIST_PAGE_SIZE = 500
+# Server /file/list caps size at maxPageSize=200 (internal/file/service/list.go);
+# a larger value is silently clamped, which would break the "short page ⇒ done"
+# stop condition (a full 200-entry page would look short vs 500). Keep it ≤ 200.
+_LIST_PAGE_SIZE = 200
 # Cap total entries per listing to bound memory (HR1: 2GB device). A single
 # Obsidian folder above this is pathological; we truncate and say so rather
 # than either OOM or silently drop the tail.
@@ -426,7 +456,11 @@ def handle_vault_list(args=None, **kwargs) -> str:
         while True:
             resp = _post_json(
                 "/file/list",
-                {"path": abs_path, "page_index": page, "page_size": _LIST_PAGE_SIZE},
+                # Server PageInfo reads `index`/`size` (1-based). The old
+                # `page_index`/`page_size` names were ignored → every request fell
+                # back to defaultPageSize=20 page 1, so only the first 20 entries of
+                # any folder were ever returned. Match the real contract.
+                {"path": abs_path, "index": page, "size": _LIST_PAGE_SIZE},
             )
             # CommonListResp: {total, content: [FileListItem], index, size}
             data = (resp or {}).get("data") or {}
@@ -509,6 +543,10 @@ def handle_vault_search(args=None, **kwargs) -> str:
              "sources": sources, "size": limit},
             cap=limit,
         )
+    except VaultError as e:
+        # A server `error` frame (bad glob, permission, …) — surface it as a tool
+        # error the agent can act on, not "(no matches)".
+        return _err(str(e))
     except urllib.error.URLError as e:
         return _err(f"vault file API unreachable ({e})")
     root = _vault_root()
@@ -585,6 +623,14 @@ def handle_vault_write(args=None, **kwargs) -> str:
         return _err("'content' is required")
     if not isinstance(content, str):
         content = str(content)
+    # HR1 (2GB device): bound the write. An injected/over-eager "write this huge
+    # note" must be refused, not streamed into the device. Encode once and reuse.
+    content_bytes = content.encode("utf-8")
+    if len(content_bytes) > MAX_CONTENT_BYTES:
+        return _err(
+            f"content is {len(content_bytes)} bytes, over the "
+            f"{MAX_CONTENT_BYTES}-byte limit for a single note"
+        )
     try:
         abs_path = _resolve_in_vault(note)
     except VaultError as e:
@@ -606,7 +652,7 @@ def handle_vault_write(args=None, **kwargs) -> str:
             # Overwrite: preserve the old version before replacing it. If the
             # backup fails we abort rather than destroy the only copy.
             backup_rel = _backup(note, existing)
-        _upload(dir_abs, filename, content.encode("utf-8"))
+        _upload(dir_abs, filename, content_bytes)
     except urllib.error.URLError as e:
         return _err(f"vault file API unreachable ({e})")
     except Exception as e:  # noqa: BLE001 — surface any write failure to the model

@@ -325,9 +325,12 @@ def test_backup_names_are_unique(monkeypatch):
 
 def test_list_paginates_collects_all_pages(monkeypatch):
     def fake_list(path, body):
-        page = body["page_index"]
-        size = body["page_size"]
-        total = 1200  # spans 3 pages of 500
+        # Server PageInfo reads `index`/`size` — the plugin MUST send those exact
+        # names (the old page_index/page_size were ignored → only page 1 returned).
+        page = body["index"]
+        size = body["size"]
+        assert "page_index" not in body and "page_size" not in body
+        total = 1200  # spans multiple pages
         start = (page - 1) * size
         end = min(start + size, total)
         content = [{"filename": f"n{i}.md", "is_dir": False} for i in range(start, end)]
@@ -341,8 +344,8 @@ def test_list_paginates_collects_all_pages(monkeypatch):
 def test_list_caps_entries_for_memory(monkeypatch):
     # An unbounded folder must be capped (HR1) and reported as truncated.
     def fake_list(path, body):
-        page = body["page_index"]
-        size = body["page_size"]
+        page = body["index"]
+        size = body["size"]
         content = [{"filename": f"p{page}_{i}.md", "is_dir": False} for i in range(size)]
         return {"data": {"total": 999999, "content": content}}
     monkeypatch.setattr(tools, "_post_json", lambda p, b: fake_list(p, b))
@@ -400,3 +403,96 @@ def test_read_dispatch_positional_args(monkeypatch):
     monkeypatch.setattr(tools, "_get", lambda p, params: {"data": {"content": "hello"}})
     out = tools.handle_vault_read({"note": "P.md"})
     assert "hello" in out and "VAULT DATA" in out
+
+
+# --- R3: mutation MUST abort if the backup itself fails (no destroy-only-copy) ---
+
+def test_write_aborts_when_backup_fails(monkeypatch):
+    calls = {"upload": 0}
+    monkeypatch.setattr(tools, "_read_note", lambda p: "OLD")  # existing → needs backup
+    def boom(note, content):
+        raise tools.VaultError("backup disk full")
+    monkeypatch.setattr(tools, "_backup", boom)
+    monkeypatch.setattr(tools, "_upload", lambda d, f, c: calls.__setitem__("upload", calls["upload"] + 1))
+    out = tools.handle_vault_write(note="Ideas.md", content="NEW")
+    assert calls["upload"] == 0, "must NOT overwrite when the backup failed"
+    assert '"status": "error"' in out or "error" in out.lower()
+
+
+def test_delete_aborts_when_backup_fails(monkeypatch):
+    calls = {"delete": 0}
+    monkeypatch.setattr(tools, "_read_note", lambda p: "DOOMED")
+    def boom(note, content):
+        raise tools.VaultError("backup disk full")
+    monkeypatch.setattr(tools, "_backup", boom)
+    monkeypatch.setattr(tools, "_delete_abs", lambda p: calls.__setitem__("delete", calls["delete"] + 1))
+    out = tools.handle_vault_delete(note="Old.md")
+    assert calls["delete"] == 0, "must NOT delete when the backup failed"
+    assert "error" in out.lower()
+
+
+# --- R3: HR1 — an oversized write is refused, not streamed to the device ---
+
+def test_write_rejects_oversized_content(monkeypatch):
+    calls = {"read": 0, "upload": 0}
+    monkeypatch.setattr(tools, "_read_note", lambda p: calls.__setitem__("read", calls["read"] + 1))
+    monkeypatch.setattr(tools, "_upload", lambda d, f, c: calls.__setitem__("upload", calls["upload"] + 1))
+    big = "x" * (tools.MAX_CONTENT_BYTES + 1)
+    out = tools.handle_vault_write(note="Huge.md", content=big)
+    assert "limit" in out.lower()
+    assert calls["upload"] == 0 and calls["read"] == 0, "reject before any API call"
+
+
+# --- R3: symlink confinement (lexical check alone would let a symlink escape) ---
+
+def test_resolve_rejects_symlink_escape(tmp_path, monkeypatch):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("secret")
+    (vault / "shared").symlink_to(outside)  # in-vault symlink pointing out
+    monkeypatch.setenv("MARKDOWN_VAULT_PATH", str(vault))
+    with pytest.raises(tools.VaultError):
+        tools._resolve_in_vault("shared/secret.md")
+
+
+# --- R3: search SSE must be event-typed (done frame ≠ hit; error frame surfaces) ---
+
+class _FakeResp:
+    def __init__(self, lines):
+        self._lines = lines
+    def __enter__(self):
+        return iter(self._lines)
+    def __exit__(self, *a):
+        return False
+
+
+def _mock_sse(monkeypatch, lines):
+    monkeypatch.setattr(tools.urllib.request, "urlopen", lambda req, timeout=None: _FakeResp(lines))
+
+
+def test_post_sse_ignores_done_frame(monkeypatch):
+    # A hit then the always-present done frame — only the hit is collected.
+    lines = [b"event: hit\n", b'data: {"item": {"path": "/v/a.md"}}\n', b"\n",
+             b"event: done\n", b'data: {"total": 1, "elapsed_ms": 3}\n', b"\n"]
+    _mock_sse(monkeypatch, lines)
+    hits = tools._post_sse("/file/search", {}, cap=30)
+    assert hits == [{"item": {"path": "/v/a.md"}}], "done frame must not become a phantom hit"
+
+
+def test_search_error_frame_surfaces_error(monkeypatch):
+    lines = [b"event: error\n", b'data: {"code": 64004, "message": "bad glob"}\n', b"\n"]
+    _mock_sse(monkeypatch, lines)
+    out = tools.handle_vault_search(query="[")
+    assert "error" in out.lower() and "no matches" not in out.lower()
+
+
+# --- R3: the write toolset must be OFF by default (read-only profiles stay read-only) ---
+
+def test_write_toolset_is_default_off():
+    from hermes_cli.tools_config import _DEFAULT_OFF_TOOLSETS
+    assert "markdown_vault_write" in _DEFAULT_OFF_TOOLSETS, \
+        "write/delete must be opt-in; a read-only profile must not silently get them"
+    assert "markdown_vault" not in _DEFAULT_OFF_TOOLSETS, \
+        "the read toolset should remain available by default"
