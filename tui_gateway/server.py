@@ -4782,7 +4782,7 @@ def _clear_inflight_turn(session: dict) -> None:
     session["inflight_turn"] = None
 
 
-def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
+def _enqueue_prompt(session: dict, text: Any, transport: Any, prepend: bool = False) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
     Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). A single
@@ -4790,6 +4790,12 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
     consecutive-user merge in ``repair_message_sequence``) so nothing the user
     typed is dropped. ``transport`` is pinned so the drained turn streams back to
     the client that sent it even if the session transport is rebound meanwhile.
+
+    ``prepend`` merges *text* in FRONT of an already-queued prompt instead of
+    after it — used for the leftover /steer requeue: the steer was accepted
+    while the ended turn ran, so a prompt queued later in that window must not
+    execute (or read, once merged) ahead of the redirect. The existing entry's
+    transport is kept in that case — it is the later arrival.
     """
     existing = session.get("queued_prompt")
     if (
@@ -4798,7 +4804,11 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
         and isinstance(text, str)
     ):
         prev = existing["text"]
-        text = f"{prev}\n\n{text}" if prev and text else (prev or text)
+        if prepend:
+            text = f"{text}\n\n{prev}" if prev and text else (prev or text)
+            transport = existing.get("transport") or transport
+        else:
+            text = f"{prev}\n\n{text}" if prev and text else (prev or text)
     session["queued_prompt"] = {"text": text, "transport": transport}
 
 
@@ -8925,7 +8935,10 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             except Exception:
                 _leftover_steer = None
         if _leftover_steer:
-            _enqueue_prompt(session, _leftover_steer, session.get("transport"))
+            # prepend=True：steer 在已结束的 turn 内被接受，先于 turn 中
+            # 排队的后续 prompt 到达——合并进单槽时必须排在它前面，否则
+            # 后到的普通 prompt 抢在改向前执行/被读取。
+            _enqueue_prompt(session, _leftover_steer, session.get("transport"), prepend=True)
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;

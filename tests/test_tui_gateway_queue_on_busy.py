@@ -46,6 +46,24 @@ def test_enqueue_merges_second_arrival_losslessly():
     assert session["queued_prompt"]["transport"] == "ws-2"
 
 
+def test_enqueue_prepend_puts_leftover_steer_first():
+    # 第十一轮 review：leftover /steer 在 turn 内被接受、先于 turn 中排队
+    # 的普通 prompt 到达——requeue 合并进单槽必须排在它前面，否则后到的
+    # prompt 抢在改向前被读取。
+    session = _session()
+    server._enqueue_prompt(session, "后到的普通 prompt", "ws-1")
+    server._enqueue_prompt(session, "先到的 steer", "ws-2", prepend=True)
+    assert session["queued_prompt"]["text"] == "先到的 steer\n\n后到的普通 prompt"
+    # 已排队条目才是更晚到达的客户端，transport 保留。
+    assert session["queued_prompt"]["transport"] == "ws-1"
+
+
+def test_enqueue_prepend_on_empty_queue_is_plain_enqueue():
+    session = _session()
+    server._enqueue_prompt(session, "steer", "ws-1", prepend=True)
+    assert session["queued_prompt"] == {"text": "steer", "transport": "ws-1"}
+
+
 # ── _handle_busy_submit (policy) ───────────────────────────────────────────
 
 def test_busy_interrupt_mode_interrupts_and_queues(monkeypatch):

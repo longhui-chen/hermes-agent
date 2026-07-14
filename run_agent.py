@@ -2825,7 +2825,10 @@ class AIAgent:
             text: The user text to inject. Empty strings are ignored.
 
         Returns:
-            True if the steer was accepted, False if the text was empty.
+            True if the steer was accepted. False when the text is empty,
+            the slot is closed (turn finalizing), or a hard interrupt is
+            winding the turn down — callers re-queue the text as a normal
+            next-turn message on False.
         """
         if not text or not text.strip():
             return False
@@ -2837,6 +2840,8 @@ class AIAgent:
             # in those stubs.
             if getattr(self, "_steer_closed", False):
                 return False
+            if getattr(self, "_interrupt_requested", False):
+                return False
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
             return True
@@ -2847,6 +2852,13 @@ class AIAgent:
             # caller re-delivers the text as a normal next-turn message
             # instead of it vanishing.
             if getattr(self, "_steer_closed", False):
+                return False
+            # A hard interrupt is winding the turn down: the pre-API drain
+            # refuses to inject while the flag is up, and the finalizer's
+            # interrupted branch discards leftovers WITHOUT a steer_dropped
+            # receipt (stop supersedes steer by design) — text accepted in
+            # this window would vanish silently. Refuse so callers re-queue.
+            if getattr(self, "_interrupt_requested", False):
                 return False
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned

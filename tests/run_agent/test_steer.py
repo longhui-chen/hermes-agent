@@ -223,15 +223,17 @@ class TestSteerClearedOnInterrupt:
         would be surprising."""
         agent = _bare_agent()
         # Minimal surface needed by clear_interrupt()
-        agent._interrupt_requested = True
         agent._interrupt_message = None
         agent._interrupt_thread_signal_pending = False
         agent._execution_thread_id = None
         agent._tool_worker_threads = None
         agent._tool_worker_threads_lock = None
 
+        # 真实时序：steer 先被接受，用户随后 /stop（flag 置位后 steer()
+        # 直接拒收，见 test_steer_refused_while_interrupt_pending）。
         agent.steer("will be dropped")
         assert agent._pending_steer == "will be dropped"
+        agent._interrupt_requested = True
 
         agent.clear_interrupt()
         assert agent._pending_steer is None
@@ -357,9 +359,11 @@ class TestSteerInterruptRace:
     注入 messages（会作为未回答 user 消息并入下一轮，复活已取消的指令）。"""
 
     def test_no_injection_when_interrupt_requested(self):
+        # 真实时序：steer 先被接受，interrupt 后到（flag 置位后 steer()
+        # 直接拒收）——drain 在锁内看到 flag，不注入、槽位留给 finalizer。
         agent = _bare_agent()
-        agent._interrupt_requested = True
         agent.steer("change direction")
+        agent._interrupt_requested = True
         messages = [
             {"role": "assistant", "tool_calls": [{"id": "a"}]},
             {"role": "tool", "content": "out", "tool_call_id": "a"},
@@ -368,6 +372,25 @@ class TestSteerInterruptRace:
         # 不注入；槽位保留给 interrupt() 丢弃或 finalizer 转 dropped。
         assert len(messages) == 2
         assert agent._pending_steer == "change direction"
+
+    def test_steer_refused_while_interrupt_pending(self):
+        # 第十一轮 review：/interrupt 之后、agent_task 结束前的停止窗口，
+        # steer() 不得再接受——finalizer 的 interrupted 分支丢弃 leftover
+        # 且无 steer_dropped 回执，接受等于静默吞话。拒收让 zet 端点回
+        # not_running、调用方转排队。
+        agent = _bare_agent()
+        agent._interrupt_requested = True
+
+        assert agent.steer("stop 窗口的改向") is False
+        assert agent._pending_steer is None
+
+    def test_steer_accepts_again_after_interrupt_cleared(self):
+        agent = _bare_agent()
+        agent._interrupt_requested = True
+        assert agent.steer("x") is False
+        agent._interrupt_requested = False
+        assert agent.steer("新一轮改向") is True
+        assert agent._pending_steer == "新一轮改向"
 
     def test_injection_proceeds_without_interrupt(self):
         agent = _bare_agent()

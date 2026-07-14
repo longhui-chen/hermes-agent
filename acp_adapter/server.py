@@ -1611,7 +1611,12 @@ class HermesACPAgent(acp.Agent):
                 leftover_steer = None
         if leftover_steer:
             with state.runtime_lock:
-                state.queued_prompts.append(leftover_steer)
+                # Front of the queue, not the tail: the steer redirects the
+                # turn that JUST ended and was accepted while it ran, so any
+                # prompt sitting in the queue arrived later in that window.
+                # An append would run those later prompts before the
+                # redirect, inverting the user's input order.
+                state.queued_prompts.insert(0, leftover_steer)
 
         final_response = result.get("final_response", "")
         cancelled = bool(state.cancel_event and state.cancel_event.is_set())

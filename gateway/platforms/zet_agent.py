@@ -1577,10 +1577,13 @@ class ZetAgentAdapter(APIServerAdapter):
         try:
             accepted = bool(agent.steer(text))
             # text is non-empty (validated above), so a normal False here
-            # means the turn finalizer already closed the slot — the turn
-            # is effectively over. Report not_running (the contract's
-            # re-queue signal), not "rejected": callers only fall back to
-            # next-turn queueing on a re-queueable status.
+            # means the turn finalizer already closed the slot OR a hard
+            # interrupt is winding the turn down (steer() refuses in the
+            # stop window — an accepted steer there would be discarded by
+            # the finalizer's interrupted branch with no receipt). Either
+            # way the turn is effectively over: report not_running (the
+            # contract's re-queue signal), not "rejected" — callers only
+            # fall back to next-turn queueing on a re-queueable status.
             status = "steering" if accepted else "not_running"
         except Exception:
             logger.debug("[zet_agent] session steer: agent.steer failed", exc_info=True)

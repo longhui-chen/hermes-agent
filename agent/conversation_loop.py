@@ -1301,6 +1301,12 @@ def run_conversation(
             final_response = _runtime_context_error
             failed = True
             _turn_exit_reason = "ollama_runtime_context_too_small"
+            # 本迭代 pre-API drain 已注入、模型从未看到的 steer：未发任何
+            # 请求就 break，先撤回 restash——finalize_turn 的关槽 drain 会把
+            # 它带进 result["pending_steer"] 走正常回执链。必须在 append
+            # assistant 错误行之前做（reclaim 只认 tail）。
+            from agent.agent_runtime_helpers import reclaim_tail_steer
+            reclaim_tail_steer(agent, messages)
             messages.append({"role": "assistant", "content": final_response})
             agent._emit_status("❌ Ollama runtime context is too small for Hermes tool use")
             api_call_count -= 1
