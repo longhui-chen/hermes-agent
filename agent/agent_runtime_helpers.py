@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout
-from agent.prompt_builder import format_steer_marker
+from agent.prompt_builder import format_steer_user_message
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED
@@ -2833,34 +2833,36 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
 
 
 def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
-    """Append any pending /steer text to the last tool result in this turn.
+    """Deliver any pending /steer as a real user message after this tool batch.
 
     Called at the end of a tool-call batch, before the next API call.
-    The steer is appended to the last ``role:"tool"`` message's content
-    with a clear marker so the model understands it came from the user
-    and NOT from the tool itself. Role alternation is preserved —
-    nothing new is inserted, we only modify existing content.
+    The steer is appended as a ``role:"user"`` message so it carries
+    native user authority — tool→user→assistant is a legal sequence
+    (see repair_message_sequence's "ongoing dialog" note; the Anthropic
+    adapter merges it into the tool_result user turn). An earlier
+    revision appended a marker to the last tool result instead; models
+    weight tool-channel text low and weak models ignored the steer.
 
     Args:
         messages: The running messages list.
         num_tool_msgs: Number of tool results appended in this batch;
-            used to locate the tail slice safely.
+            used to verify the batch really produced results.
     """
     if num_tool_msgs <= 0 or not messages:
         return
     steer_text = agent._drain_pending_steer()
     if not steer_text:
         return
-    # Find the last tool-role message in the recent tail. Skipping
+    # Verify the recent tail really contains a tool result. Skipping
     # non-tool messages defends against future code appending
     # something else at the boundary.
-    target_idx = None
+    has_tool_result = False
     for j in range(len(messages) - 1, max(len(messages) - num_tool_msgs - 1, -1), -1):
         msg = messages[j]
         if isinstance(msg, dict) and msg.get("role") == "tool":
-            target_idx = j
+            has_tool_result = True
             break
-    if target_idx is None:
+    if not has_tool_result:
         # No tool result in this batch (e.g. all skipped by interrupt);
         # put the steer back so the caller's fallback path can deliver
         # it as a normal next-turn user message.
@@ -2875,20 +2877,7 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
             existing = getattr(agent, "_pending_steer", None)
             agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
         return
-    marker = format_steer_marker(steer_text)
-    existing_content = messages[target_idx].get("content", "")
-    if not isinstance(existing_content, str):
-        # Anthropic multimodal content blocks — preserve them and append
-        # a text block at the end.
-        try:
-            blocks = list(existing_content) if existing_content else []
-            blocks.append({"type": "text", "text": marker.lstrip()})
-            messages[target_idx]["content"] = blocks
-        except Exception:
-            # Fall back to string replacement if content shape is unexpected.
-            messages[target_idx]["content"] = f"{existing_content}{marker}"
-    else:
-        messages[target_idx]["content"] = existing_content + marker
+    messages.append(format_steer_user_message(steer_text))
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars): %s",
         len(steer_text),

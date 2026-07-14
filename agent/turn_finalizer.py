@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.prompt_builder import STEER_USER_PREFIX
 
 
 def finalize_turn(
@@ -391,6 +392,11 @@ def finalize_turn(
     last_reasoning = None
     for msg in reversed(messages):
         if msg.get("role") == "user":
+            # Mid-turn /steer user messages live INSIDE the turn — they are
+            # not the turn-starting boundary; keep walking past them.
+            _c = msg.get("content")
+            if isinstance(_c, str) and _c.startswith(STEER_USER_PREFIX):
+                continue
             break  # turn boundary — don't cross into prior turns
         if msg.get("role") == "assistant" and msg.get("reasoning"):
             last_reasoning = msg["reasoning"]

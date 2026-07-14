@@ -395,6 +395,32 @@ class ZetAgentAdapter(APIServerAdapter):
         except Exception:
             logger.debug("[zet_agent] title push failed", exc_info=True)
 
+    @staticmethod
+    def _push_steer_dropped_if_any(stream_q: Any, run_result: Any) -> None:
+        """Surface an unconsumed /steer as a ``steer_dropped`` progress event.
+
+        ``run_result`` is base ``_run_agent``'s ``(result_dict, usage)``
+        tuple; the finalizer puts leftover steer text under
+        ``result_dict["pending_steer"]``. Read-only — the dict is returned
+        to the caller untouched. Best-effort: a push failure must never
+        fail the turn that just completed.
+        """
+        if stream_q is None:
+            return
+        try:
+            result_dict = run_result[0] if isinstance(run_result, tuple) else run_result
+            if not isinstance(result_dict, dict):
+                return
+            leftover = result_dict.get("pending_steer")
+            if not leftover or not str(leftover).strip():
+                return
+            stream_q.put((
+                "__tool_progress__",
+                {"type": "steer_dropped", "text": str(leftover)},
+            ))
+        except Exception:
+            logger.debug("[zet_agent] steer_dropped push failed", exc_info=True)
+
     def _make_status_cb(self, stream_q: Any, previous: Any = None):
         """Forward structured AIAgent status events onto the SSE extension lane."""
         # AIAgent instances are currently created per turn. If a future change
@@ -1029,6 +1055,15 @@ class ZetAgentAdapter(APIServerAdapter):
                     )
             except Exception:
                 logger.debug("[zet_agent] goal post-turn hook failed", exc_info=True)
+            # A /steer that landed after the final tool boundary was drained
+            # into result["pending_steer"] by run_conversation's finalizer.
+            # CLI/gateway re-deliver it as the next user turn; the stateless
+            # chat-completions path instead surfaces a steer_dropped progress
+            # event so local-server/App can re-queue the text. This MUST run
+            # here — before this coroutine returns — because the SSE writer's
+            # close sentinel is enqueued by agent_task's done callback, and
+            # anything put on stream_q after that may never be drained.
+            self._push_steer_dropped_if_any(stream_q, result)
             return result
         finally:
             if old_session_key is None:
@@ -1396,6 +1431,71 @@ class ZetAgentAdapter(APIServerAdapter):
 
         status = "stopping" if (agent is not None or task is not None) else "not_running"
         return web.json_response({"session_id": session_id, "status": status})
+
+    async def _handle_session_steer(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions/{session_id}/steer — inject user text into the
+        active chat-completions turn WITHOUT interrupting it.
+
+        Companion to ``_handle_session_interrupt``: same registry lookup,
+        but instead of stopping the agent it calls ``AIAgent.steer(text)``,
+        which stashes the text for the conversation loop's pre-API drain
+        (agent/conversation_loop.py) so the model sees it appended to the
+        latest tool result on its next iteration. A steer that is never
+        consumed (turn ends on a plain text response with no further tool
+        boundary) is surfaced as a ``steer_dropped`` progress event by
+        ``_run_agent`` so the caller can re-deliver the text as a normal
+        message instead of it being silently lost.
+
+        Body: ``{"text": "..."}`` — required, non-empty after strip.
+
+        Returns 200 ``{accepted: true, status: "steering"}`` when the text
+        was stashed onto a live agent; ``{accepted: false, status:
+        "not_running"}`` when no turn is in flight for the session (caller
+        should fall back to queueing the text as the next turn).
+        ``agent.steer`` only takes a short self-owned lock, so calling it
+        synchronously from the event loop is safe (same pattern as
+        ``agent.interrupt`` above).
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        text = body.get("text") if isinstance(body, dict) else None
+        if not isinstance(text, str) or not text.strip():
+            return web.json_response(
+                _openai_error("steer requires a non-empty 'text' field"),
+                status=400,
+            )
+
+        session_id = request.match_info.get("session_id", "")
+        # Scoped-key lookup mirrors _handle_session_interrupt: registrations
+        # are keyed by _active_turn_key ({hermes_home}|{sid}, codex P1 for
+        # concurrent same-named sessions under the multiplexer); the bare-sid
+        # fallback covers entries registered outside a profile scope.
+        turn_key = self._active_turn_key(session_id)
+        with self._session_run_lock:
+            agent_ref = self._active_session_agents.get(turn_key) or self._active_session_agents.get(session_id)
+        agent = agent_ref[0] if agent_ref else None
+
+        if agent is None:
+            return web.json_response(
+                {"session_id": session_id, "status": "not_running", "accepted": False}
+            )
+
+        try:
+            accepted = bool(agent.steer(text))
+        except Exception:
+            logger.debug("[zet_agent] session steer: agent.steer failed", exc_info=True)
+            accepted = False
+
+        status = "steering" if accepted else "rejected"
+        return web.json_response(
+            {"session_id": session_id, "status": status, "accepted": accepted}
+        )
 
     def _interrupt_pending_interactions(self, session_id: str) -> None:
         """Best-effort cleanup of agent-thread blockers for ``session_id``.
@@ -2311,6 +2411,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 self._handle_session_goal,
             )
             self._app.router.add_post(
+                "/v1/sessions/{session_id}/steer",
+                self._handle_session_steer,
+            )
+            self._app.router.add_post(
                 "/v1/model/switch",
                 self._handle_model_switch,
             )
@@ -2411,6 +2515,10 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_get(
                 "/p/{profile}/v1/sessions/{session_id}/goal",
                 self._profile_handler(self._handle_session_goal),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/sessions/{session_id}/steer",
+                self._profile_handler(self._handle_session_steer),
             )
 
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())
