@@ -1596,6 +1596,15 @@ class HermesACPAgent(acp.Agent):
                     exc_info=True,
                 )
 
+        # Leftover /steer handed back by the turn finalizer: requeue as the
+        # next prompt (the post-turn while-loop below drains queued_prompts)
+        # — same recovery as CLI/gateway, otherwise an accepted steer that
+        # missed the last model call is silently lost on this surface.
+        leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
+        if leftover_steer:
+            with state.runtime_lock:
+                state.queued_prompts.append(leftover_steer)
+
         final_response = result.get("final_response", "")
         cancelled = bool(state.cancel_event and state.cancel_event.is_set())
         interrupted = bool(result.get("interrupted")) or cancelled

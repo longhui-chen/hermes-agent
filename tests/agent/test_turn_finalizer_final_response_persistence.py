@@ -59,7 +59,7 @@ class FakeAgent:
     def _turn_completion_explainer_enabled(self):
         return False
 
-    def _drain_pending_steer(self):
+    def _drain_pending_steer(self, close=False):
         return None
 
     def clear_interrupt(self):

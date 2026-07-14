@@ -8101,6 +8101,12 @@ def _(rid, params: dict) -> dict:
         accepted = agent.steer(text)
     except Exception as exc:
         return _err(rid, 5000, f"steer failed: {exc}")
+    if not accepted and text.strip():
+        # Slot closed by the turn finalizer (turn finishing) — requeue the
+        # text as the next turn so it isn't dropped. `requeued` is a new
+        # OPTIONAL field; old clients ignore it and still see "rejected".
+        _enqueue_prompt(session, text, session.get("transport"))
+        return _ok(rid, {"status": "rejected", "text": text, "requeued": True})
     return _ok(rid, {"status": "queued" if accepted else "rejected", "text": text})
 
 
@@ -8869,6 +8875,15 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 session["last_active"] = time.time()
                 _clear_inflight_turn(session)
             _emit("session.info", sid, _session_info(agent, session))
+
+        # Leftover /steer handed back by the turn finalizer (the turn ended
+        # before another model call could absorb it): requeue as the next
+        # prompt — same as CLI/gateway — instead of silently dropping text
+        # the user was told was accepted. _enqueue_prompt merges losslessly
+        # with any prompt already queued mid-turn.
+        _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
+        if _leftover_steer:
+            _enqueue_prompt(session, _leftover_steer, session.get("transport"))
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;

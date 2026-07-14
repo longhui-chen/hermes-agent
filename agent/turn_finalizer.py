@@ -446,9 +446,21 @@ def finalize_turn(
     # after it has no consumer (the SSE task may linger past this point,
     # so endpoint-side task.done() checks can't cover the window) and
     # must be refused by steer() so the caller re-queues the text.
+    #
+    # Interrupted turns DROP the leftover instead: a hard interrupt
+    # supersedes any pending steer (interrupt() empties the slot itself,
+    # but a steer landing in the interrupt→finalize window re-fills it).
+    # Handing it back would make CLI/gateway re-deliver it as the next
+    # user turn — auto-executing a redirect the user just cancelled.
     _leftover_steer = agent._drain_pending_steer(close=True)
     if _leftover_steer:
-        result["pending_steer"] = _leftover_steer
+        if interrupted:
+            logger.info(
+                "Dropping pending /steer superseded by interrupt (%d chars)",
+                len(_leftover_steer),
+            )
+        else:
+            result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False
 
     # Include interrupt message if one triggered the interrupt
