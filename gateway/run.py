@@ -8997,7 +8997,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
                     )
-                    adapter._pending_messages[_quick_key] = queued_event
+                    # Route through the shared FIFO/merge helper — a direct
+                    # single-slot assignment would silently overwrite any
+                    # message/media already pending for this session (#28503
+                    # semantics apply to the steer fallback too).
+                    self._queue_or_replace_pending_event(_quick_key, queued_event)
                 return "No active agent — /steer queued for the next turn."
 
             # /model must not be used while the agent is running.

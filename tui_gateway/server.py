@@ -8102,6 +8102,12 @@ def _(rid, params: dict) -> dict:
     except Exception as exc:
         return _err(rid, 5000, f"steer failed: {exc}")
     if not accepted and text.strip():
+        if not session.get("running"):
+            # Session already idle: _drain_queued_prompt only fires at a
+            # turn's tail — a server-side enqueue now would sit until some
+            # future turn ends and then run out of order. Report rejected
+            # so the client falls back to its own queue/submit path.
+            return _ok(rid, {"status": "rejected", "text": text})
         # Slot closed by the turn finalizer (turn finishing) — requeue the
         # text as the next turn so it isn't dropped. Report "queued": the
         # text WILL run next turn, and existing clients (ui-tui

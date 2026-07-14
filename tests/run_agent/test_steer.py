@@ -489,3 +489,30 @@ class TestMergedSteerPersistence:
 
         assert len(db.appended) == 1
         assert db.appended[0]["content"] == f"{STEER_USER_PREFIX}看看颜色"
+
+    def test_persisted_merge_respects_redaction_and_persist_guard(self):
+        # 补写独立行必须走与 flush chokepoint 相同的防护：
+        # _redact_message_content 脱敏（steer 里可能粘了 API key）+
+        # _persist_disabled 硬停（harness 轮禁写用户会话历史）。
+        from agent.prompt_builder import STEER_USER_PREFIX as _P
+        agent = _bare_agent()
+        db = self._DbStub()
+        agent._session_db = db
+        agent.session_id = "sess-1"
+        agent._redact_message_content = lambda c: c.replace("sk-secret", "[REDACTED]")
+        agent.steer("用 sk-secret 这个 key")
+        messages = [{"role": "user", "content": "首轮", "_db_persisted": True}]
+        agent._drain_steer_for_next_api_call(messages)
+        assert db.appended[0]["content"] == f"{_P}用 [REDACTED] 这个 key"
+        # 内存里的注入内容不脱敏（模型需要原文），只有落库行脱敏。
+        assert "sk-secret" in messages[0]["content"]
+
+        agent2 = _bare_agent()
+        db2 = self._DbStub()
+        agent2._session_db = db2
+        agent2.session_id = "sess-2"
+        agent2._persist_disabled = True
+        agent2.steer("harness 轮的引导")
+        messages2 = [{"role": "user", "content": "首轮", "_db_persisted": True}]
+        agent2._drain_steer_for_next_api_call(messages2)
+        assert db2.appended == []

@@ -2917,13 +2917,23 @@ def _persist_merged_steer_row(agent, steer_content: str) -> None:
     """Best-effort durable row for a steer merged into an already-persisted
     user message (see drain_steer_for_next_api_call). Failure is logged and
     swallowed — persistence must never break the turn (same contract as
-    _persist_session)."""
+    _persist_session).
+
+    Mirrors the flush chokepoint's guards: honors ``_persist_disabled``
+    (harness turns must never write the user's session history) and runs
+    the content through ``_redact_message_content`` — a mid-turn steer can
+    contain pasted API keys/tokens, and bypassing redaction here would
+    persist them in plaintext while every other row is scrubbed."""
+    if getattr(agent, "_persist_disabled", False):
+        return
     db = getattr(agent, "_session_db", None)
     sid = getattr(agent, "session_id", None)
     if db is None or not sid:
         return
     try:
-        db.append_message(session_id=sid, role="user", content=steer_content)
+        redact = getattr(agent, "_redact_message_content", None)
+        content = redact(steer_content) if callable(redact) else steer_content
+        db.append_message(session_id=sid, role="user", content=content)
     except Exception:
         _ra().logger.debug("steer merge: session DB append failed", exc_info=True)
 
