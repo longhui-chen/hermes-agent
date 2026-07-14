@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from agent.conversation_loop import (
     _apply_forced_present_plan_tool_choice,
@@ -12,7 +13,53 @@ from run_agent import AIAgent
 
 
 def _tool(name: str) -> dict:
-    return {"type": "function", "function": {"name": name}}
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": f"{name} tool",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+
+def _plan_agent(tool_names: tuple[str, ...]) -> AIAgent:
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[_tool(name) for name in tool_names]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            provider="openai",
+            model="test-model",
+            platform="zet_agent",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            clarify_callback=lambda *_: None,
+        )
+    agent.client = MagicMock()
+    agent.plan_emit_callback = lambda *_: None
+    agent._zet_agent_response_mode = "plan"
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.tool_delay = 0
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    return agent
+
+
+def _empty_response() -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[SimpleNamespace(
+            message=SimpleNamespace(content=None, tool_calls=None),
+            finish_reason="stop",
+        )],
+        usage=None,
+        model="test-model",
+    )
 
 
 def test_plan_flow_requires_clarify_before_present_plan_and_hides_side_effects():
@@ -99,6 +146,47 @@ def test_plan_mode_filters_side_effects_even_when_present_plan_is_misconfigured(
     assert not _apply_forced_present_plan_tool_choice(agent, request)
     assert [tool["function"]["name"] for tool in request["tools"]] == ["clarify"]
     assert request["parallel_tool_calls"] is False
+
+
+def test_plan_mode_rejects_missing_clarify_instead_of_forcing_present_plan():
+    agent = SimpleNamespace(
+        _zet_agent_plan_mode_active=True,
+        clarify_callback=lambda *_: None,
+        plan_emit_callback=lambda *_: None,
+        valid_tool_names={"present_plan"},
+    )
+
+    error = _plan_mode_interaction_error(agent)
+
+    assert error is not None
+    assert "clarify" in error
+
+    request = {"tools": [_tool("present_plan"), _tool("todo")]}
+    configured_agent = SimpleNamespace(
+        platform="zet_agent",
+        api_mode="chat_completions",
+        _zet_agent_plan_mode_active=True,
+        _zet_agent_plan_presented=False,
+        _zet_agent_force_present_plan_disable_thinking=False,
+        _zet_agent_plan_omit_thinking_disable=False,
+    )
+    assert not _apply_forced_present_plan_tool_choice(configured_agent, request)
+    assert [tool["function"]["name"] for tool in request["tools"]] == [
+        "present_plan",
+    ]
+    assert "tool_choice" not in request
+
+
+def test_plan_mode_missing_clarify_fails_before_the_model_call():
+    agent = _plan_agent(("present_plan",))
+
+    with patch.object(agent, "_persist_session"):
+        result = agent.run_conversation("帮我制定减脂计划")
+
+    assert result["failed"] is True
+    assert result["api_calls"] == 0
+    assert "clarify" in result["error"]
+    agent.client.chat.completions.create.assert_not_called()
 
 
 def test_plan_mode_filters_side_effects_before_rejecting_unsupported_api_mode():
@@ -238,10 +326,40 @@ def test_plan_mode_requires_interactive_callbacks():
         _zet_agent_plan_mode_active=True,
         clarify_callback=lambda *_: None,
         plan_emit_callback=lambda *_: None,
+        valid_tool_names={"clarify", "present_plan"},
     )
 
     assert "stream=true" in _plan_mode_interaction_error(missing)
     assert _plan_mode_interaction_error(ready) is None
+
+
+def test_empty_plan_responses_retry_twice_then_return_protocol_error():
+    agent = _plan_agent(("clarify", "present_plan"))
+    empty = _empty_response()
+
+    with (
+        patch.object(agent, "_interruptible_api_call", side_effect=[empty, empty, empty]),
+        patch.object(agent, "_persist_session") as persist_session,
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("帮我制定减脂计划")
+
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["api_calls"] == 3
+    assert "Plan mode protocol error" in result["error"]
+    assert all(
+        not message.get("_plan_protocol_synthetic")
+        for message in result["messages"]
+    )
+    assert persist_session.call_count >= 1
+    for call in persist_session.call_args_list:
+        persisted_messages = call.args[0]
+        assert all(
+            not message.get("_plan_protocol_synthetic")
+            for message in persisted_messages
+        )
 
 
 def test_parallel_plan_calls_prefer_clarify_and_drop_stale_present_plan():

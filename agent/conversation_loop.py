@@ -261,17 +261,26 @@ def _should_end_after_present_plan(agent: Any) -> bool:
 
 
 def _plan_mode_interaction_error(agent: Any) -> Optional[str]:
-    """Return a recoverable error when Plan mode has no interactive callbacks."""
+    """Return a recoverable error when Plan mode cannot satisfy its protocol."""
     if not getattr(agent, "_zet_agent_plan_mode_active", False):
         return None
-    if callable(getattr(agent, "clarify_callback", None)) and callable(
-        getattr(agent, "plan_emit_callback", None)
+    if not (
+        callable(getattr(agent, "clarify_callback", None))
+        and callable(getattr(agent, "plan_emit_callback", None))
     ):
-        return None
-    return (
-        "Plan mode requires an interactive streaming client. "
-        "Retry the turn with stream=true."
-    )
+        return (
+            "Plan mode requires an interactive streaming client. "
+            "Retry the turn with stream=true."
+        )
+
+    valid_tool_names = set(getattr(agent, "valid_tool_names", set()) or set())
+    missing = sorted({"clarify", "present_plan"} - valid_tool_names)
+    if missing:
+        return (
+            "Plan mode requires both clarify and present_plan tools. "
+            f"Enable the missing tool(s): {', '.join(missing)}, then retry the turn."
+        )
+    return None
 
 
 def _enforce_single_plan_interaction_tool_call(
@@ -375,6 +384,50 @@ def _drop_trailing_plan_protocol_messages(messages: List[Dict[str, Any]]) -> Non
         messages.pop()
 
 
+_PLAN_MODE_PROTOCOL_RETRY_PROMPT = (
+    "[System: Plan mode requires a tool call. Call clarify if essential "
+    "information is missing; otherwise call present_plan. Do not answer "
+    "with a plain-text plan.]"
+)
+_PLAN_MODE_PROTOCOL_ERROR = (
+    "Plan mode protocol error: the model did not call clarify or "
+    "present_plan after 2 retries. Please retry the turn."
+)
+
+
+def _record_plan_mode_protocol_violation(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    assistant_message: Any,
+    violation: str,
+) -> Optional[str]:
+    """Append one private protocol retry, or return the terminal error."""
+    protocol_retries = int(
+        getattr(agent, "_zet_agent_plan_protocol_retries", 0)
+    )
+    if protocol_retries >= 2:
+        _drop_trailing_plan_protocol_messages(messages)
+        return _PLAN_MODE_PROTOCOL_ERROR
+
+    agent._zet_agent_plan_protocol_retries = protocol_retries + 1
+    logger.warning(
+        "zet_agent plan mode: model returned %s without clarify/present_plan; "
+        "retrying protocol (%d/2)",
+        violation,
+        protocol_retries + 1,
+    )
+    interim_msg = agent._build_assistant_message(assistant_message, "incomplete")
+    interim_msg["_plan_protocol_synthetic"] = True
+    messages.append(interim_msg)
+    messages.append({
+        "role": "user",
+        "content": _PLAN_MODE_PROTOCOL_RETRY_PROMPT,
+        "_plan_protocol_synthetic": True,
+    })
+    agent._session_messages = messages
+    return None
+
+
 def _apply_forced_present_plan_tool_choice(agent: Any, api_kwargs: Dict[str, Any]) -> bool:
     """Restrict every active Zettlab plan-mode request to interaction tools."""
     if not getattr(agent, "_zet_agent_plan_mode_active", False):
@@ -408,13 +461,16 @@ def _apply_forced_present_plan_tool_choice(agent: Any, api_kwargs: Dict[str, Any
         )
         return False
 
-    if not any(
-        isinstance(tool.get("function"), dict)
-        and tool["function"].get("name") == "present_plan"
+    allowed_names = {
+        tool["function"].get("name")
         for tool in allowed_tools
-    ):
+        if isinstance(tool.get("function"), dict)
+    }
+    missing_names = {"clarify", "present_plan"} - allowed_names
+    if missing_names:
         logger.warning(
-            "zet_agent plan mode requested but present_plan is missing from API tools"
+            "zet_agent plan mode requested but interaction tools are missing: %s",
+            ", ".join(sorted(missing_names)),
         )
         return False
 
@@ -5108,6 +5164,29 @@ def run_conversation(
                 
                 # Check if response only has think block with no actual content after it
                 if not agent._has_content_after_think_block(final_response):
+                    if (
+                        getattr(agent, "_zet_agent_plan_mode_active", False)
+                        and not getattr(agent, "_zet_agent_plan_presented", False)
+                    ):
+                        error_message = _record_plan_mode_protocol_violation(
+                            agent,
+                            messages,
+                            assistant_message,
+                            "an empty or reasoning-only response",
+                        )
+                        if error_message is None:
+                            continue
+                        agent._cleanup_task_resources(effective_task_id)
+                        agent._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": error_message,
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "failed": True,
+                            "error": error_message,
+                        }
+
                     # ── Partial stream recovery ─────────────────────
                     # If content was already streamed to the user before
                     # the connection died, use it as the final response
@@ -5439,38 +5518,14 @@ def run_conversation(
                     getattr(agent, "_zet_agent_plan_mode_active", False)
                     and not getattr(agent, "_zet_agent_plan_presented", False)
                 ):
-                    protocol_retries = int(
-                        getattr(agent, "_zet_agent_plan_protocol_retries", 0)
+                    error_message = _record_plan_mode_protocol_violation(
+                        agent,
+                        messages,
+                        assistant_message,
+                        "plain text",
                     )
-                    if protocol_retries < 2:
-                        agent._zet_agent_plan_protocol_retries = protocol_retries + 1
-                        logger.warning(
-                            "zet_agent plan mode: model returned text without clarify/"
-                            "present_plan; retrying protocol (%d/2)",
-                            protocol_retries + 1,
-                        )
-                        interim_msg = agent._build_assistant_message(
-                            assistant_message, "incomplete"
-                        )
-                        interim_msg["_plan_protocol_synthetic"] = True
-                        messages.append(interim_msg)
-                        messages.append({
-                            "role": "user",
-                            "content": (
-                                "[System: Plan mode requires a tool call. Call clarify "
-                                "if essential information is missing; otherwise call "
-                                "present_plan. Do not answer with a plain-text plan.]"
-                            ),
-                            "_plan_protocol_synthetic": True,
-                        })
-                        agent._session_messages = messages
+                    if error_message is None:
                         continue
-
-                    _drop_trailing_plan_protocol_messages(messages)
-                    error_message = (
-                        "Plan mode protocol error: the model did not call clarify "
-                        "or present_plan after 2 retries. Please retry the turn."
-                    )
                     agent._cleanup_task_resources(effective_task_id)
                     agent._persist_session(messages, conversation_history)
                     return {

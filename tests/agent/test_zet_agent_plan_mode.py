@@ -153,6 +153,7 @@ def test_forced_present_plan_disables_thinking_mode_and_preserves_extra_body():
     )
     api_kwargs = {
         "tools": [
+            {"type": "function", "function": {"name": "clarify"}},
             {"type": "function", "function": {"name": "present_plan"}},
         ],
         "extra_body": {"metadata": {"source": "test"}},
@@ -177,6 +178,7 @@ def test_forced_present_plan_disables_thinking_for_zettlab_ai_proxy():
     )
     api_kwargs = {
         "tools": [
+            {"type": "function", "function": {"name": "clarify"}},
             {"type": "function", "function": {"name": "present_plan"}},
         ],
         "extra_body": {"metadata": {"source": "test"}},
@@ -202,6 +204,7 @@ def test_forced_present_plan_reactive_disable_flag_covers_custom_models():
     )
     api_kwargs = {
         "tools": [
+            {"type": "function", "function": {"name": "clarify"}},
             {"type": "function", "function": {"name": "present_plan"}},
         ],
         "reasoning_effort": "medium",

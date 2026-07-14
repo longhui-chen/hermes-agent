@@ -213,11 +213,11 @@ from agent.tool_dispatch_helpers import (
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
 
 
-# Internal flags that mark a message as ephemeral empty-response/prefill
-# recovery scaffolding: the synthetic assistant "(empty)" turn and user nudge
-# injected after an empty response, the terminal "(empty)" sentinel, and the
-# thinking-only prefill placeholder. These exist only to drive the next API
-# retry; the in-memory loop pops them before appending the real response.
+# Internal flags that mark ephemeral recovery/protocol scaffolding: the
+# synthetic assistant "(empty)" turn and user nudge injected after an empty
+# response, the terminal "(empty)" sentinel, the thinking-only prefill
+# placeholder, and Plan mode protocol retries. These exist only to drive the
+# next API retry; the in-memory loop pops them before appending the real response.
 # Persistence must mirror that, otherwise an append-only flush can commit them
 # to the session store and a resumed session replays synthetic "(empty)"/nudge
 # turns as if they were genuine context.
@@ -226,6 +226,7 @@ _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_empty_terminal_sentinel",
     "_length_continuation_synthetic",
     "_thinking_prefill",
+    "_plan_protocol_synthetic",
     # verify-on-stop and pre_verify nudges append a synthetic assistant
     # "done" plus a synthetic user nudge to keep the agent going one more
     # turn before it can claim completion. Those messages exist only to

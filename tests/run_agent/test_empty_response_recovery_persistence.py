@@ -176,6 +176,29 @@ def test_flush_skips_thinking_prefill_scaffolding():
     assert [r["content"] for r in agent._session_db.rows] == ["hi", "Hello!"]
 
 
+def test_flush_never_writes_plan_protocol_scaffolding():
+    agent = _agent_with_capturing_db()
+    messages = [
+        {"role": "user", "content": "帮我制定计划"},
+        {
+            "role": "assistant",
+            "content": "未审核的纯文本计划",
+            "_plan_protocol_synthetic": True,
+        },
+        {
+            "role": "user",
+            "content": "[System: Plan mode requires a tool call.]",
+            "_plan_protocol_synthetic": True,
+        },
+    ]
+
+    agent._flush_messages_to_session_db(messages, conversation_history=[])
+
+    assert agent._session_db.rows == [
+        {"role": "user", "content": "帮我制定计划"},
+    ]
+
+
 def test_persist_session_strips_trailing_length_continuation_prompt():
     agent = _agent_with_stubbed_persistence()
     messages = [
