@@ -974,23 +974,18 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             stage=f"tool result {name}",
         )
 
-        # ── Per-tool /steer drain ───────────────────────────────────
-        # Same as the sequential path: drain between each collected
-        # result so the steer lands as early as possible.
-        agent._apply_pending_steer_to_tool_results(messages, 1)
-
     # ── Per-turn aggregate budget enforcement ─────────────────────────
     num_tools = len(parsed_calls)
     if num_tools > 0:
         turn_tool_msgs = messages[-num_tools:]
         enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id), config=_tool_budget)
 
-    # ── /steer injection ──────────────────────────────────────────────
-    # Append any pending user steer text to the last tool result so the
-    # agent sees it on its next iteration. Runs AFTER budget enforcement
-    # so the steer marker is never truncated. See steer() for details.
-    if num_tools > 0:
-        agent._apply_pending_steer_to_tool_results(messages, num_tools)
+    # NOTE: no /steer injection here. Draining at the batch boundary could
+    # inject into a turn that immediately breaks out of the loop (present-
+    # plan / guardrail / budget paths) — the steer would persist as an
+    # unanswered user message with no dropped receipt. The conversation
+    # loop's pre-API drain (drain_steer_for_next_api_call) is the single
+    # injection point: it only fires when a next model call is certain.
 
 
 
@@ -1649,12 +1644,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             stage=f"tool result {function_name}",
         )
 
-        # ── Per-tool /steer drain ───────────────────────────────────
-        # Drain pending steer BETWEEN individual tool calls so the
-        # injection lands as soon as a tool finishes — not after the
-        # entire batch.  The model sees it on the next API iteration.
-        agent._apply_pending_steer_to_tool_results(messages, 1)
-
         if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
             if agent.verbose_logging:
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
@@ -1689,11 +1678,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     if num_tools_seq > 0:
         enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id), config=_tool_budget)
 
-    # ── /steer injection ──────────────────────────────────────────────
-    # See _execute_tool_calls_parallel for the rationale. Same hook,
-    # applied to sequential execution as well.
-    if num_tools_seq > 0:
-        agent._apply_pending_steer_to_tool_results(messages, num_tools_seq)
+    # NOTE: no /steer injection here — see the parallel path's note; the
+    # conversation loop's pre-API drain is the single injection point.
 
 
 

@@ -2825,7 +2825,10 @@ class AIAgent:
             text: The user text to inject. Empty strings are ignored.
 
         Returns:
-            True if the steer was accepted, False if the text was empty.
+            True if the steer was accepted. False when the text is empty,
+            the slot is closed (turn finalizing), or a hard interrupt is
+            winding the turn down — callers re-queue the text as a normal
+            next-turn message on False.
         """
         if not text or not text.strip():
             return False
@@ -2835,30 +2838,60 @@ class AIAgent:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
             # Fall back to direct attribute set; no concurrent callers expected
             # in those stubs.
+            if getattr(self, "_steer_closed", False):
+                return False
+            if getattr(self, "_interrupt_requested", False):
+                return False
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
             return True
         with _lock:
+            # After the turn finalizer's closing drain there is no consumer
+            # left for this slot (the SSE task may linger for a moment, so
+            # task.done() alone can't catch this window) — refuse so the
+            # caller re-delivers the text as a normal next-turn message
+            # instead of it vanishing.
+            if getattr(self, "_steer_closed", False):
+                return False
+            # A hard interrupt is winding the turn down: the pre-API drain
+            # refuses to inject while the flag is up, and the finalizer's
+            # interrupted branch discards leftovers WITHOUT a steer_dropped
+            # receipt (stop supersedes steer by design) — text accepted in
+            # this window would vanish silently. Refuse so callers re-queue.
+            if getattr(self, "_interrupt_requested", False):
+                return False
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
         return True
 
-    def _drain_pending_steer(self) -> Optional[str]:
+    def _drain_pending_steer(self, close: bool = False) -> Optional[str]:
         """Return the pending steer text (if any) and clear the slot.
 
         Safe to call from the agent execution thread after appending tool
         results. Returns None when no steer is pending.
+
+        Args:
+            close: When True (the turn finalizer's last drain), atomically
+                mark the slot closed so a steer racing the SSE-teardown
+                window is refused by ``steer()`` (and re-queued by the
+                caller) instead of being stashed with no consumer left.
+                ``run_conversation`` reopens the slot at the next turn's
+                start.
         """
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             text = getattr(self, "_pending_steer", None)
             self._pending_steer = None
+            if close:
+                self._steer_closed = True
             return text
         with _lock:
             text = self._pending_steer
             self._pending_steer = None
+            if close:
+                self._steer_closed = True
         return text
 
     def _record_file_mutation_result(
@@ -3121,10 +3154,10 @@ class AIAgent:
         # which already surfaces its own message) — don't second-guess.
         return ""
 
-    def _apply_pending_steer_to_tool_results(self, messages: list, num_tool_msgs: int) -> None:
-        """Forwarder — see ``agent.agent_runtime_helpers.apply_pending_steer_to_tool_results``."""
-        from agent.agent_runtime_helpers import apply_pending_steer_to_tool_results
-        return apply_pending_steer_to_tool_results(self, messages, num_tool_msgs)
+    def _drain_steer_for_next_api_call(self, messages: list) -> None:
+        """Forwarder — see ``agent.agent_runtime_helpers.drain_steer_for_next_api_call``."""
+        from agent.agent_runtime_helpers import drain_steer_for_next_api_call
+        return drain_steer_for_next_api_call(self, messages)
 
     def _touch_activity(self, desc: str) -> None:
         """Update the last-activity timestamp and description (thread-safe).

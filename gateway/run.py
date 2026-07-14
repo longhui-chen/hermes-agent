@@ -8982,8 +8982,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if accepted:
                         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
                         return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
-                    return "Steer rejected (empty payload)."
-                # Running agent is missing or lacks steer() — fall back to queue.
+                    # steer() also returns False when the finalizer already
+                    # closed the slot (turn finishing) — steer_text is
+                    # non-empty here, so fall through to the queue fallback
+                    # below instead of dropping the text.
+                # Running agent is missing / lacks steer() / slot closed —
+                # fall back to queue.
                 adapter = self.adapters.get(source.platform)
                 if adapter:
                     queued_event = MessageEvent(
@@ -8993,7 +8997,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
                     )
-                    adapter._pending_messages[_quick_key] = queued_event
+                    # Route through the shared FIFO/merge helper — a direct
+                    # single-slot assignment would silently overwrite any
+                    # message/media already pending for this session (#28503
+                    # semantics apply to the steer fallback too).
+                    self._queue_or_replace_pending_event(_quick_key, queued_event)
                 return "No active agent — /steer queued for the next turn."
 
             # /model must not be used while the agent is running.

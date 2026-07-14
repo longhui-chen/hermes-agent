@@ -395,6 +395,32 @@ class ZetAgentAdapter(APIServerAdapter):
         except Exception:
             logger.debug("[zet_agent] title push failed", exc_info=True)
 
+    @staticmethod
+    def _push_steer_dropped_if_any(stream_q: Any, run_result: Any) -> None:
+        """Surface an unconsumed /steer as a ``steer_dropped`` progress event.
+
+        ``run_result`` is base ``_run_agent``'s ``(result_dict, usage)``
+        tuple; the finalizer puts leftover steer text under
+        ``result_dict["pending_steer"]``. Read-only — the dict is returned
+        to the caller untouched. Best-effort: a push failure must never
+        fail the turn that just completed.
+        """
+        if stream_q is None:
+            return
+        try:
+            result_dict = run_result[0] if isinstance(run_result, tuple) else run_result
+            if not isinstance(result_dict, dict):
+                return
+            leftover = result_dict.get("pending_steer")
+            if not leftover or not str(leftover).strip():
+                return
+            stream_q.put((
+                "__tool_progress__",
+                {"type": "steer_dropped", "text": str(leftover)},
+            ))
+        except Exception:
+            logger.debug("[zet_agent] steer_dropped push failed", exc_info=True)
+
     def _make_status_cb(self, stream_q: Any, previous: Any = None):
         """Forward structured AIAgent status events onto the SSE extension lane."""
         # AIAgent instances are currently created per turn. If a future change
@@ -991,6 +1017,33 @@ class ZetAgentAdapter(APIServerAdapter):
                 turn_id=turn_id,
                 request_overrides=request_overrides,
             )
+            # Early-return steer salvage: many conversation_loop retry/error
+            # paths return without running finalize_turn, so the closing
+            # drain never happens — a steer accepted in those windows would
+            # have no consumer and no dropped receipt (silently lost with the
+            # turn). If the result carries no pending_steer but the slot
+            # still holds text, drain it here (close=True so later steers
+            # are refused) and let the receipt push below re-queue it. On
+            # the normal finalize path this is a no-op (slot already drained
+            # and closed).
+            try:
+                _salvage_agent = agent_ref[0] if agent_ref else None
+                if (
+                    _salvage_agent is not None
+                    and isinstance(result, tuple)
+                    and result
+                    and isinstance(result[0], dict)
+                    and not result[0].get("pending_steer")
+                ):
+                    _leftover = _salvage_agent._drain_pending_steer(close=True)
+                    if _leftover:
+                        result[0]["pending_steer"] = _leftover
+                        logger.info(
+                            "[zet_agent] salvaged steer from early-return turn session=%s",
+                            session_id,
+                        )
+            except Exception:
+                logger.debug("[zet_agent] early-return steer salvage failed", exc_info=True)
             # Goal loop post-turn hook (ZET goal driver): if this session has
             # an active persistent goal, evaluate the finished turn off the
             # event loop and report the verdict (+ continuation) to
@@ -1015,12 +1068,38 @@ class ZetAgentAdapter(APIServerAdapter):
                         run_ok = _chat_finish_reason_from_result(r0) != "error"
                     except Exception:
                         run_ok = not bool(r0.get("failed"))
-                if run_ok:
+                # Unconsumed /steer wins over goal continuation: the text is
+                # about to be surfaced as steer_dropped below and re-queued by
+                # the client as the next turn. Scheduling the judge now races
+                # its continuation kick against the user's redirect — the
+                # autopilot could out-run the correction. Skip this round; the
+                # re-queued message's own post-turn hook re-enters the loop.
+                has_pending_steer = False
+                if isinstance(result, tuple) and result and isinstance(result[0], dict):
+                    has_pending_steer = bool(result[0].get("pending_steer"))
+                if run_ok and not has_pending_steer:
+                    # Consumed mid-turn steer = the user intervened in this
+                    # round. The goal judge keys user_initiated off the
+                    # message NOT starting with CONTINUATION_MARKER — pass
+                    # the steer text so an auto-continuation round the user
+                    # redirected is evaluated as user-initiated instead of
+                    # the autopilot overriding the correction.
+                    _consumed_steer = None
+                    try:
+                        _agent_for_steer = agent_ref[0] if agent_ref else None
+                        _consumed_steer = getattr(_agent_for_steer, "_turn_last_steer_text", None)
+                    except Exception:
+                        _consumed_steer = None
                     self._goals().schedule_after_turn(
                         session_id or "",
-                        user_message,
+                        _consumed_steer or user_message,
                         final_response,
                         effective_session_id=effective_sid,
+                    )
+                elif run_ok:
+                    logger.info(
+                        "[zet_agent] goal post-turn hook deferred: unconsumed steer pending session=%s",
+                        session_id,
                     )
                 else:
                     logger.info(
@@ -1029,6 +1108,15 @@ class ZetAgentAdapter(APIServerAdapter):
                     )
             except Exception:
                 logger.debug("[zet_agent] goal post-turn hook failed", exc_info=True)
+            # A /steer that landed after the final tool boundary was drained
+            # into result["pending_steer"] by run_conversation's finalizer.
+            # CLI/gateway re-deliver it as the next user turn; the stateless
+            # chat-completions path instead surfaces a steer_dropped progress
+            # event so local-server/App can re-queue the text. This MUST run
+            # here — before this coroutine returns — because the SSE writer's
+            # close sentinel is enqueued by agent_task's done callback, and
+            # anything put on stream_q after that may never be drained.
+            self._push_steer_dropped_if_any(stream_q, result)
             return result
         finally:
             if old_session_key is None:
@@ -1396,6 +1484,115 @@ class ZetAgentAdapter(APIServerAdapter):
 
         status = "stopping" if (agent is not None or task is not None) else "not_running"
         return web.json_response({"session_id": session_id, "status": status})
+
+    async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
+        """Extend the base capability surface with zet_agent-only endpoints.
+
+        local-server does NOT gate chat.steer on this (it always advertises
+        capabilities.steer=true on the WS and degrades via the 404 →
+        steer_dropped path against an old hermes), but the endpoint contract
+        is that /v1/capabilities lists the callable surface truthfully —
+        external orchestrators discover features here.
+        """
+        resp = await super()._handle_capabilities(request)
+        if getattr(resp, "status", 200) != 200:
+            return resp
+        try:
+            payload = json.loads(resp.body)
+        except Exception:
+            return resp
+        payload.setdefault("features", {})["session_steer"] = True
+        payload.setdefault("endpoints", {})["session_steer"] = {
+            "method": "POST",
+            "path": "/v1/sessions/{session_id}/steer",
+        }
+        return web.json_response(payload)
+
+    async def _handle_session_steer(self, request: "web.Request") -> "web.Response":
+        """POST /v1/sessions/{session_id}/steer — inject user text into the
+        active chat-completions turn WITHOUT interrupting it.
+
+        Companion to ``_handle_session_interrupt``: same registry lookup,
+        but instead of stopping the agent it calls ``AIAgent.steer(text)``,
+        which stashes the text for the conversation loop's pre-API drain
+        (agent/conversation_loop.py) so the model sees it appended to the
+        latest tool result on its next iteration. A steer that is never
+        consumed (turn ends on a plain text response with no further tool
+        boundary) is surfaced as a ``steer_dropped`` progress event by
+        ``_run_agent`` so the caller can re-deliver the text as a normal
+        message instead of it being silently lost.
+
+        Body: ``{"text": "..."}`` — required, non-empty after strip.
+
+        Returns 200 ``{accepted: true, status: "steering"}`` when the text
+        was stashed onto a live agent; ``{accepted: false, status:
+        "not_running"}`` when no turn is in flight for the session (caller
+        should fall back to queueing the text as the next turn).
+        ``agent.steer`` only takes a short self-owned lock, so calling it
+        synchronously from the event loop is safe (same pattern as
+        ``agent.interrupt`` above).
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        text = body.get("text") if isinstance(body, dict) else None
+        if not isinstance(text, str) or not text.strip():
+            return web.json_response(
+                _openai_error("steer requires a non-empty 'text' field"),
+                status=400,
+            )
+
+        session_id = request.match_info.get("session_id", "")
+        # Scoped-key lookup mirrors _handle_session_interrupt: registrations
+        # are keyed by _active_turn_key ({hermes_home}|{sid}, codex P1 for
+        # concurrent same-named sessions under the multiplexer); the bare-sid
+        # fallback covers entries registered outside a profile scope.
+        turn_key = self._active_turn_key(session_id)
+        with self._session_run_lock:
+            agent_ref = self._active_session_agents.get(turn_key) or self._active_session_agents.get(session_id)
+            task = self._active_session_tasks.get(turn_key) or self._active_session_tasks.get(session_id)
+        agent = agent_ref[0] if agent_ref else None
+
+        # Task liveness gate (mirrors the interrupt handler's dual lookup):
+        # the registration outlives agent_task by the SSE close window, and
+        # run_conversation's finalizer + _push_steer_dropped_if_any have
+        # already run by then — a steer stashed now would neither reach the
+        # model nor produce a steer_dropped receipt (silently lost). Report
+        # not_running so the caller re-queues the text as the next turn.
+        task_done = False
+        try:
+            task_done = task is None or bool(task.done())
+        except Exception:
+            task_done = task is None
+        if agent is None or task_done:
+            return web.json_response(
+                {"session_id": session_id, "status": "not_running", "accepted": False}
+            )
+
+        try:
+            accepted = bool(agent.steer(text))
+            # text is non-empty (validated above), so a normal False here
+            # means the turn finalizer already closed the slot OR a hard
+            # interrupt is winding the turn down (steer() refuses in the
+            # stop window — an accepted steer there would be discarded by
+            # the finalizer's interrupted branch with no receipt). Either
+            # way the turn is effectively over: report not_running (the
+            # contract's re-queue signal), not "rejected" — callers only
+            # fall back to next-turn queueing on a re-queueable status.
+            status = "steering" if accepted else "not_running"
+        except Exception:
+            logger.debug("[zet_agent] session steer: agent.steer failed", exc_info=True)
+            accepted = False
+            status = "rejected"
+
+        return web.json_response(
+            {"session_id": session_id, "status": status, "accepted": accepted}
+        )
 
     def _interrupt_pending_interactions(self, session_id: str) -> None:
         """Best-effort cleanup of agent-thread blockers for ``session_id``.
@@ -2311,6 +2508,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 self._handle_session_goal,
             )
             self._app.router.add_post(
+                "/v1/sessions/{session_id}/steer",
+                self._handle_session_steer,
+            )
+            self._app.router.add_post(
                 "/v1/model/switch",
                 self._handle_model_switch,
             )
@@ -2411,6 +2612,10 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_get(
                 "/p/{profile}/v1/sessions/{session_id}/goal",
                 self._profile_handler(self._handle_session_goal),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/sessions/{session_id}/steer",
+                self._profile_handler(self._handle_session_steer),
             )
 
             sweep_task = asyncio.create_task(self._sweep_orphaned_runs())

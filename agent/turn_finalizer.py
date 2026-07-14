@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.prompt_builder import STEER_USER_PREFIX
 
 
 def finalize_turn(
@@ -391,6 +392,11 @@ def finalize_turn(
     last_reasoning = None
     for msg in reversed(messages):
         if msg.get("role") == "user":
+            # Mid-turn /steer user messages live INSIDE the turn — they are
+            # not the turn-starting boundary; keep walking past them.
+            _c = msg.get("content")
+            if isinstance(_c, str) and _c.startswith(STEER_USER_PREFIX):
+                continue
             break  # turn boundary — don't cross into prior turns
         if msg.get("role") == "assistant" and msg.get("reasoning"):
             last_reasoning = msg["reasoning"]
@@ -436,9 +442,25 @@ def finalize_turn(
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.
-    _leftover_steer = agent._drain_pending_steer()
+    # close=True: this is the LAST drain of the turn — a steer arriving
+    # after it has no consumer (the SSE task may linger past this point,
+    # so endpoint-side task.done() checks can't cover the window) and
+    # must be refused by steer() so the caller re-queues the text.
+    #
+    # Interrupted turns DROP the leftover instead: a hard interrupt
+    # supersedes any pending steer (interrupt() empties the slot itself,
+    # but a steer landing in the interrupt→finalize window re-fills it).
+    # Handing it back would make CLI/gateway re-deliver it as the next
+    # user turn — auto-executing a redirect the user just cancelled.
+    _leftover_steer = agent._drain_pending_steer(close=True)
     if _leftover_steer:
-        result["pending_steer"] = _leftover_steer
+        if interrupted:
+            logger.info(
+                "Dropping pending /steer superseded by interrupt (%d chars)",
+                len(_leftover_steer),
+            )
+        else:
+            result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False
 
     # Include interrupt message if one triggered the interrupt

@@ -467,6 +467,10 @@ def init_agent(
     # existing tool message rather than inserting a new user turn).
     agent._pending_steer: Optional[str] = None
     agent._pending_steer_lock = threading.Lock()
+    # Closed by the turn finalizer's last drain (steer() refuses while set);
+    # reopened at the next run_conversation start. Guards the SSE-teardown
+    # window where a stashed steer would have no consumer left.
+    agent._steer_closed = False
 
     # Concurrent-tool worker thread tracking.  `_execute_tool_calls_concurrent`
     # runs each tool on its own ThreadPoolExecutor worker — those worker

@@ -706,6 +706,30 @@ class TestMessageStorage:
         session = db.get_session("s1")
         assert session["message_count"] == 2
 
+    def test_delete_message_removes_single_row(self, db):
+        # steer reclaim 撤回补写行的支撑：按 (session_id, row_id) 精确删除，
+        # 计数同步递减，重复删除幂等返回 False。
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="Hello")
+        phantom_id = db.append_message("s1", role="user", content="mid-task steer")
+
+        assert db.delete_message("s1", phantom_id) is True
+        messages = db.get_messages("s1")
+        assert len(messages) == 1
+        assert messages[0]["content"] == "Hello"
+        assert db.get_session("s1")["message_count"] == 1
+
+        assert db.delete_message("s1", phantom_id) is False
+        assert db.get_session("s1")["message_count"] == 1
+
+    def test_delete_message_scoped_to_session(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.create_session(session_id="s2", source="cli")
+        mid = db.append_message("s1", role="user", content="Hello")
+
+        assert db.delete_message("s2", mid) is False
+        assert len(db.get_messages("s1")) == 1
+
     def test_observed_flag_round_trips_for_gateway_replay(self, db):
         db.create_session(session_id="s1", source="telegram:-100")
         db.append_message(

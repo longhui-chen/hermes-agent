@@ -913,6 +913,25 @@ def run_conversation(
         except Exception:
             pass
 
+    # Reopen the steer slot: the previous turn's finalizer closed it after
+    # its last drain (see _drain_pending_steer(close=True)); a cached agent
+    # starting a new turn must accept /steer again.
+    _steer_lock = getattr(agent, "_pending_steer_lock", None)
+    if _steer_lock is not None:
+        with _steer_lock:
+            agent._steer_closed = False
+    else:
+        agent._steer_closed = False
+    # Consumed-steer marker for the goal hook: a steer the model already
+    # saw this turn means the user intervened — the post-turn goal judge
+    # must evaluate it as user-initiated, not as an untouched auto-
+    # continuation round.
+    agent._turn_last_steer_text = None
+    # Per-turn ledger of crash-resilience rows written for merged steers
+    # (see _persist_merged_steer_row / reclaim_tail_steer). Stale entries
+    # from a finished turn must never be deletable by a later reclaim.
+    agent._steer_merged_db_rows = []
+
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
     # message sanitization, todo/nudge hydration, system-prompt restore-or-
@@ -1053,56 +1072,17 @@ def run_conversation(
                 and "skill_manage" in agent.valid_tool_names):
             agent._iters_since_skill += 1
         
-        # ── Pre-API-call /steer drain ──────────────────────────────────
-        # If a /steer arrived during the previous API call (while the model
-        # was thinking), drain it now — before we build api_messages — so
-        # the model sees the steer text on THIS iteration.  Without this,
-        # steers sent during an API call only land after the NEXT tool batch,
-        # which may never come if the model returns a final response.
-        #
-        # We scan backwards for the last tool-role message in the messages
-        # list.  If found, the steer is appended there.  If not (first
-        # iteration, no tools yet), the steer stays pending for the next
-        # tool batch — injecting into a user message would break role
-        # alternation, and there's no tool output to piggyback on.
-        _pre_api_steer = agent._drain_pending_steer()
-        if _pre_api_steer:
-            _injected = False
-            for _si in range(len(messages) - 1, -1, -1):
-                _sm = messages[_si]
-                if isinstance(_sm, dict) and _sm.get("role") == "tool":
-                    from agent.prompt_builder import format_steer_marker
-                    marker = format_steer_marker(_pre_api_steer)
-                    existing = _sm.get("content", "")
-                    if isinstance(existing, str):
-                        _sm["content"] = existing + marker
-                    else:
-                        # Multimodal content blocks — append text block
-                        try:
-                            blocks = list(existing) if existing else []
-                            blocks.append({"type": "text", "text": marker})
-                            _sm["content"] = blocks
-                        except Exception:
-                            pass
-                    _injected = True
-                    logger.debug(
-                        "Pre-API-call steer drain: injected into tool msg at index %d",
-                        _si,
-                    )
-                    break
-            if not _injected:
-                # No tool message to inject into — put it back so
-                # the post-tool-execution drain picks it up later.
-                _lock = getattr(agent, "_pending_steer_lock", None)
-                if _lock is not None:
-                    with _lock:
-                        if agent._pending_steer:
-                            agent._pending_steer = agent._pending_steer + "\n" + _pre_api_steer
-                        else:
-                            agent._pending_steer = _pre_api_steer
-                else:
-                    existing = getattr(agent, "_pending_steer", None)
-                    agent._pending_steer = (existing + "\n" + _pre_api_steer) if existing else _pre_api_steer
+        # ── Pre-API-call /steer drain (the ONLY injection point) ──────
+        # Drain right before the request is built so the model sees the
+        # steer text on THIS iteration, and only when a next model call is
+        # certain — tool batches that break out of the loop (present-plan /
+        # guardrail / budget) leave the slot pending for the finalizer to
+        # surface as steer_dropped instead of persisting an unanswered user
+        # message. The helper handles delivery shape (adjacent-user merge
+        # for the first-iteration/multimodal edge, plain append otherwise)
+        # and the interrupt-race guard.
+        from agent.agent_runtime_helpers import drain_steer_for_next_api_call
+        drain_steer_for_next_api_call(agent, messages)
 
         # Prepare messages for API call
         # If we have an ephemeral system prompt, prepend it to the messages
@@ -1321,6 +1301,12 @@ def run_conversation(
             final_response = _runtime_context_error
             failed = True
             _turn_exit_reason = "ollama_runtime_context_too_small"
+            # 本迭代 pre-API drain 已注入、模型从未看到的 steer：未发任何
+            # 请求就 break，先撤回 restash——finalize_turn 的关槽 drain 会把
+            # 它带进 result["pending_steer"] 走正常回执链。必须在 append
+            # assistant 错误行之前做（reclaim 只认 tail）。
+            from agent.agent_runtime_helpers import reclaim_tail_steer
+            reclaim_tail_steer(agent, messages)
             messages.append({"role": "assistant", "content": final_response})
             agent._emit_status("❌ Ollama runtime context is too small for Hermes tool use")
             api_call_count -= 1
@@ -1403,8 +1389,16 @@ def run_conversation(
                         # No fallback available — surface buffered context
                         # so user sees the rate-limit message that led here.
                         agent._flush_status_buffer()
+                        # 撤回本迭代 pre-API drain 注入、模型从未见到的
+                        # steer，并以 pending_steer 带回结果——早退绕过
+                        # finalizer 的 close+drain，classic CLI / messaging
+                        # gateway 只认 result["pending_steer"]（无槽位
+                        # salvage），裸 restash 会滞留到下一条无关 prompt
+                        # 才乱序注入。
+                        from agent.agent_runtime_helpers import reclaim_and_handback_steer
+                        _reclaimed_steer = reclaim_and_handback_steer(agent, messages)
                         agent._persist_session(messages, conversation_history)
-                        return {
+                        _rate_guard_result = {
                             "final_response": (
                                 f"⏳ {_nous_msg}\n\n"
                                 "No fallback provider available. "
@@ -1417,6 +1411,9 @@ def run_conversation(
                             "failed": True,
                             "error": _nous_msg,
                         }
+                        if _reclaimed_steer:
+                            _rate_guard_result["pending_steer"] = _reclaimed_steer
+                        return _rate_guard_result
                 except ImportError:
                     pass
                 except Exception:
@@ -2088,8 +2085,15 @@ def run_conversation(
                             "→ Or switch to a larger/non-reasoning model with `/model`"
                         )
                         agent._cleanup_task_resources(effective_task_id)
+                        # 模型输出全花在 reasoning、没有任何回应就终局——
+                        # 本轮注入的 steer 等于未被消费，撤回并以
+                        # pending_steer 带回结果（早退绕过 finalizer 的
+                        # close+drain，无槽位 salvage 的 surface 只认
+                        # result["pending_steer"]）。
+                        from agent.agent_runtime_helpers import reclaim_and_handback_steer
+                        _reclaimed_steer = reclaim_and_handback_steer(agent, messages)
                         agent._persist_session(messages, conversation_history)
-                        return {
+                        _exhaust_result = {
                             "final_response": _exhaust_response,
                             "messages": messages,
                             "api_calls": api_call_count,
@@ -2097,6 +2101,9 @@ def run_conversation(
                             "partial": True,
                             "error": _exhaust_error,
                         }
+                        if _reclaimed_steer:
+                            _exhaust_result["pending_steer"] = _reclaimed_steer
+                        return _exhaust_result
 
                     if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
                         assistant_message = _trunc_msg
