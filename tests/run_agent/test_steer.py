@@ -430,3 +430,62 @@ class TestReclaimTailSteer:
         agent.steer("后到的")
         reclaim_tail_steer(agent, messages)
         assert agent._pending_steer == "先到的\n后到的"
+
+
+class TestMergedSteerPersistence:
+    """steer 合并进已被 crash-resilience 持久化的首轮 user 消息时，必须补写
+    独立 db 行——_persist_session 是 append-only 且跳过已标记消息，否则
+    模型看到了 steer 但 SQLite 历史缺失，重启/resume/压缩后丢上下文。"""
+
+    class _DbStub:
+        def __init__(self):
+            self.appended = []
+
+        def append_message(self, **kwargs):
+            self.appended.append(kwargs)
+
+    def test_merge_into_persisted_user_appends_db_row(self):
+        agent = _bare_agent()
+        db = self._DbStub()
+        agent._session_db = db
+        agent.session_id = "sess-1"
+        agent.steer("换个方向")
+        messages = [{"role": "user", "content": "首轮问题", "_db_persisted": True}]
+
+        agent._drain_steer_for_next_api_call(messages)
+
+        assert len(messages) == 1  # 内存里仍是合并形态
+        assert f"{STEER_USER_PREFIX}换个方向" in messages[0]["content"]
+        assert len(db.appended) == 1
+        assert db.appended[0]["role"] == "user"
+        assert db.appended[0]["content"] == f"{STEER_USER_PREFIX}换个方向"
+
+    def test_merge_into_unpersisted_user_skips_db_append(self):
+        # 未持久化的 user：flush 会带着合并后的内容整行写入，无需补行。
+        agent = _bare_agent()
+        db = self._DbStub()
+        agent._session_db = db
+        agent.session_id = "sess-1"
+        agent.steer("补充")
+        messages = [{"role": "user", "content": "首轮问题"}]
+
+        agent._drain_steer_for_next_api_call(messages)
+
+        assert db.appended == []
+
+    def test_multimodal_persisted_merge_appends_db_row(self):
+        agent = _bare_agent()
+        db = self._DbStub()
+        agent._session_db = db
+        agent.session_id = "sess-1"
+        agent.steer("看看颜色")
+        messages = [{
+            "role": "user",
+            "content": [{"type": "text", "text": "图里有什么"}],
+            "_db_persisted": True,
+        }]
+
+        agent._drain_steer_for_next_api_call(messages)
+
+        assert len(db.appended) == 1
+        assert db.appended[0]["content"] == f"{STEER_USER_PREFIX}看看颜色"

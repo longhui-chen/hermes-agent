@@ -377,3 +377,21 @@ async def test_early_return_turn_salvages_pending_steer(monkeypatch):
     assert agent._steer_closed is True
     # 失败轮不触发 goal schedule（既有语义不受 salvage 影响）。
     assert goals.calls == []
+
+
+@pytest.mark.asyncio
+async def test_steer_closed_slot_reports_not_running(monkeypatch):
+    """finalizer 已关槽但 task 未 done 的收尾窗口：steer() 返回 False（文本
+    非空），端点必须回 not_running（可重排状态）而不是 rejected——调用方
+    只在可重排状态下把文本转下一轮队列。"""
+    adapter = _adapter(monkeypatch)
+    agent = _FakeAgent(accept=False)  # 模拟 _steer_closed 拒收
+    adapter._active_session_agents["s1"] = [agent]
+    adapter._active_session_tasks["s1"] = _FakeTask()
+
+    resp = await adapter._handle_session_steer(
+        _FakeRequest({"text": "收尾窗口的引导"}, match_info={"session_id": "s1"})
+    )
+
+    assert resp.status == 200
+    assert resp.payload == {"session_id": "s1", "status": "not_running", "accepted": False}

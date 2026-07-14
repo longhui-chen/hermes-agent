@@ -2884,13 +2884,25 @@ def drain_steer_for_next_api_call(agent, messages: list) -> None:
     tail = messages[-1] if isinstance(messages[-1], dict) else None
     if tail is not None and tail.get("role") == "user":
         tail_content = tail.get("content")
+        merged = False
         if isinstance(tail_content, str):
             joined = (tail_content + "\n\n" + steer_msg["content"]) if tail_content else steer_msg["content"]
             tail["content"] = joined
+            merged = True
         elif isinstance(tail_content, list):
             tail_content.append({"type": "text", "text": steer_msg["content"]})
+            merged = True
         else:
             messages.append(steer_msg)
+        # Crash-resilience persistence stamps the turn-opening user row
+        # BEFORE this merge and _persist_session (append-only) skips
+        # stamped messages — the merged steer would exist in memory but
+        # never reach the session DB (lost on restart/resume/compaction).
+        # Append it as its own durable user row instead; on reload the
+        # adjacent user rows re-merge via repair's Pass 2, so the replayed
+        # shape matches what the model saw.
+        if merged and tail.get(_ra()._DB_PERSISTED_MARKER):
+            _persist_merged_steer_row(agent, steer_msg["content"])
     else:
         messages.append(steer_msg)
     _ra().logger.info(
@@ -2899,6 +2911,21 @@ def drain_steer_for_next_api_call(agent, messages: list) -> None:
         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
     )
 
+
+
+def _persist_merged_steer_row(agent, steer_content: str) -> None:
+    """Best-effort durable row for a steer merged into an already-persisted
+    user message (see drain_steer_for_next_api_call). Failure is logged and
+    swallowed — persistence must never break the turn (same contract as
+    _persist_session)."""
+    db = getattr(agent, "_session_db", None)
+    sid = getattr(agent, "session_id", None)
+    if db is None or not sid:
+        return
+    try:
+        db.append_message(session_id=sid, role="user", content=steer_content)
+    except Exception:
+        _ra().logger.debug("steer merge: session DB append failed", exc_info=True)
 
 
 def reclaim_tail_steer(agent, messages: list) -> None:
