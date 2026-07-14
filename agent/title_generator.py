@@ -22,6 +22,9 @@ TitleCallback = Callable[[str], None]
 _TITLE_PROMPT = (
     "Generate a short, descriptive title (3-7 words) for a conversation that starts with the "
     "following exchange. The title should capture the main topic or intent. "
+    "Label what the user is asking or trying to do; never answer the user, address them, or continue "
+    "the dialogue. Prefer a concise noun phrase. For example, title '她有什么缺点？' as "
+    "'询问她的缺点', never as '她的缺点是……'. "
     "Write the title in the same language the user is writing in. "
     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
 )
@@ -29,9 +32,32 @@ _TITLE_PROMPT = (
 _TITLE_PROMPT_PINNED_LANGUAGE = (
     "Generate a short, descriptive title (3-7 words) for a conversation that starts with the "
     "following exchange. The title should capture the main topic or intent. "
+    "Label what the user is asking or trying to do; never answer the user, address them, or continue "
+    "the dialogue. Prefer a concise noun phrase. For example, title '她有什么缺点？' as "
+    "'询问她的缺点', never as '她的缺点是……'. "
     "Write the title in {language}. "
     "Return ONLY the title text, nothing else. No quotes, no punctuation at the end, no prefixes."
 )
+
+
+def _clean_generated_title(content: str) -> Optional[str]:
+    """Normalize model output to one safe, concise title line."""
+    from agent.agent_runtime_helpers import strip_think_blocks
+
+    text = strip_think_blocks(None, content or "").strip()
+    if not text:
+        return None
+
+    text = next((line.strip() for line in text.splitlines() if line.strip()), "")
+    text = text.strip('"\'“”‘’「」『』')
+    for prefix in ("Title:", "title:", "标题：", "标题:"):
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
+    text = " ".join(text.strip('"\'“”‘’「」『』').split())
+    if len(text) > 80:
+        text = text[:77] + "..."
+    return text or None
 
 
 def _title_language() -> str:
@@ -88,22 +114,7 @@ def generate_title(
             main_runtime=main_runtime,
         )
         content = response.choices[0].message.content or ""
-        # Strip thinking/reasoning blocks that think-enabled models
-        # (MiniMax M2.7, DeepSeek, etc.) emit even for simple prompts like
-        # title generation. Without this the raw <think>...</think> XML
-        # leaks into session titles. Reuses the canonical scrubber so all
-        # tag variants (unterminated blocks, orphan closes, mixed case)
-        # are handled, not just a single literal <think> pair.
-        from agent.agent_runtime_helpers import strip_think_blocks
-        title = strip_think_blocks(None, content).strip()
-        # Clean up: remove quotes, trailing punctuation, prefixes like "Title: "
-        title = title.strip('"\'')
-        if title.lower().startswith("title:"):
-            title = title[6:].strip()
-        # Enforce reasonable length
-        if len(title) > 80:
-            title = title[:77] + "..."
-        return title if title else None
+        return _clean_generated_title(content)
     except Exception as e:
         # Log at WARNING so this shows up in agent.log without debug mode.
         # Full detail at debug level for operators who need the stack.
@@ -152,7 +163,18 @@ def auto_title_session(
         return
 
     try:
-        session_db.set_session_title(session_id, title)
+        atomic_setter = getattr(type(session_db), "set_session_title_if_empty", None)
+        if callable(atomic_setter):
+            updated = atomic_setter(session_db, session_id, title)
+        else:
+            # Compatibility for third-party SessionDB implementations. Hermes'
+            # own SessionDB uses the atomic branch above so a manual rename
+            # made while the LLM call is running always wins.
+            if session_db.get_session_title(session_id):
+                return
+            updated = session_db.set_session_title(session_id, title)
+        if updated is False:
+            return
         logger.debug("Auto-generated session title: %s", title)
         if title_callback is not None:
             try:
@@ -172,12 +194,17 @@ def maybe_auto_title(
     failure_callback: Optional[FailureCallback] = None,
     main_runtime: dict = None,
     title_callback: Optional[TitleCallback] = None,
+    background: bool = True,
 ) -> None:
-    """Fire-and-forget title generation after the first exchange.
+    """Start title generation after the first exchange.
 
     Only generates a title when:
     - This appears to be the first user→assistant exchange
     - No title is already set
+
+    The default remains fire-and-forget. In-band transports can set
+    background to false while already running off their event loop, ensuring
+    a title callback is delivered before that transport closes its stream.
     """
     if not session_db or not session_id or not user_message or not assistant_response:
         return
@@ -190,14 +217,25 @@ def maybe_auto_title(
     if user_msg_count > 2:
         return
 
+    worker_kwargs = {
+        "failure_callback": failure_callback,
+        "main_runtime": main_runtime,
+        "title_callback": title_callback,
+    }
+    if not background:
+        auto_title_session(
+            session_db,
+            session_id,
+            user_message,
+            assistant_response,
+            **worker_kwargs,
+        )
+        return
+
     thread = threading.Thread(
         target=auto_title_session,
         args=(session_db, session_id, user_message, assistant_response),
-        kwargs={
-            "failure_callback": failure_callback,
-            "main_runtime": main_runtime,
-            "title_callback": title_callback,
-        },
+        kwargs=worker_kwargs,
         daemon=True,
         name="auto-title",
     )

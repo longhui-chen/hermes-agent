@@ -2276,6 +2276,14 @@ class TestSessionTitle:
         session = db.get_session("s1")
         assert session["title"] == "Updated Title"
 
+    def test_auto_title_only_sets_an_empty_title(self, db):
+        db.create_session(session_id="s1", source="cli")
+
+        assert db.set_session_title_if_empty("s1", "Generated Title") is True
+        db.set_session_title("s1", "Manual Rename")
+        assert db.set_session_title_if_empty("s1", "Late Generated Title") is False
+        assert db.get_session_title("s1") == "Manual Rename"
+
     def test_title_in_search_sessions(self, db):
         db.create_session(session_id="s1", source="cli")
         db.set_session_title("s1", "Debugging Auth")

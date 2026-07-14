@@ -68,9 +68,9 @@ directly with a ``threading.Event``-based wait we own.
 
 Auto-title
 ----------
-Cheapest viable: cache the first user message per session and emit a
-``conversation.title`` event the first time we observe it. Re-emit
-on session reset. No LLM call — pure deterministic snippet.
+After the first successful exchange, reuse Hermes' native
+``agent.title_generator`` LLM worker and emit its result as a
+``conversation.title`` event before the request SSE closes.
 """
 
 import asyncio
@@ -161,10 +161,6 @@ def _approval_timeout_seconds() -> float:
         ))
     except Exception:
         return DEFAULT_APPROVAL_TIMEOUT_SECONDS
-
-# Cap the auto-title at a length the APP can render in a single line
-# without truncation. Beyond that, the APP can elide.
-TITLE_MAX_LEN = 60
 
 # Name of the single MCP server that carries Zettlab connector tools
 # (linear.*, etc). local-server injects this server into each agent's
@@ -303,11 +299,10 @@ class ZetAgentAdapter(APIServerAdapter):
         self._active_session_agents: Dict[str, Any] = {}
         self._active_session_tasks: Dict[str, Any] = {}
 
-        # Per-session sticky data: title plus the set of session_ids
-        # for which we've already pushed a title (avoid duplicates).
+        # Sessions with registered approval callbacks. Kept separately from
+        # title generation so titles remain fully owned by Hermes SessionDB.
         self._session_lock = threading.Lock()
-        self._session_titles: Dict[str, str] = {}
-        self._titles_pushed: set[str] = set()
+        self._approval_session_ids: set[str] = set()
 
     # ------------------------------------------------------------------
     # _stream_q closure sniffing
@@ -348,52 +343,120 @@ class ZetAgentAdapter(APIServerAdapter):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _truncate_title(text: str) -> str:
-        text = (text or "").strip().replace("\n", " ").replace("\r", " ")
-        if len(text) <= TITLE_MAX_LEN:
-            return text
-        return text[: TITLE_MAX_LEN - 1].rstrip() + "…"
-
-    def _maybe_update_title(self, session_id: Optional[str], user_message: str) -> Optional[str]:
-        """Cache and return a new title when the session sees its first
-        non-empty user message. Returns None if no update needed.
-
-        Zettlab system markers (e.g. [ZETTLAB:BOOTSTRAP_KICKOFF],
-        [ZETTLAB:SKIP_TRIGGER], [ZETTLAB:RESUME_TRIGGER]) are skipped
-        so they don't pollute the conversation.title SSE event. These
-        markers are local-server-issued synthetic user messages used by
-        the bootstrap interview flow; see Phase 11 design doc.
-        """
-        if not session_id or not user_message:
-            return None
-        if user_message.startswith("[ZETTLAB:"):
-            return None
-        candidate = self._truncate_title(user_message)
-        if not candidate:
-            return None
-        with self._session_lock:
-            if session_id in self._session_titles:
-                return None
-            self._session_titles[session_id] = candidate
-        return candidate
-
-    def _push_title_if_new(self, stream_q: Any, session_id: Optional[str], title: Optional[str]) -> None:
-        if not session_id or not title or stream_q is None:
+    def _push_title(stream_q: Any, title: Optional[str]) -> None:
+        if not title or stream_q is None:
             return
-        with self._session_lock:
-            if session_id in self._titles_pushed:
-                return
-            self._titles_pushed.add(session_id)
         try:
-            # Plan-E rev4: only `title` on the wire — the WS connection
-            # is already per-session so the APP doesn't need session_id
-            # echoed back; local-server's translate.go drops it anyway.
+            # Hermes keeps the upstream payload minimal; local-server adds
+            # the canonical session_id while translating the SSE event.
             stream_q.put((
                 "__tool_progress__",
                 {"type": "conversation.title", "title": title},
             ))
         except Exception:
             logger.debug("[zet_agent] title push failed", exc_info=True)
+
+    @staticmethod
+    def _title_user_message(user_message: str) -> str:
+        """Remove local-server routing instructions from the title input."""
+        text = str(user_message or "").lstrip()
+        marker = "\n[User request]\n"
+        if text.startswith("[Zettlab internal routing directive]") and marker in text:
+            return text.rsplit(marker, 1)[1].strip()
+        return text
+
+    async def _emit_native_session_title(
+        self,
+        *,
+        result: Any,
+        user_message: str,
+        conversation_history: Optional[List[Dict[str, Any]]],
+        session_id: Optional[str],
+        stream_q: Any,
+        agent_ref: Any,
+        gateway_session_key: Optional[str],
+    ) -> None:
+        """Run Hermes' native title worker before the request stream closes."""
+        if not isinstance(result, tuple) or not result or not isinstance(result[0], dict):
+            return
+        run_result = result[0]
+        if _chat_finish_reason_from_result(run_result) == "error":
+            return
+        assistant_response = str(run_result.get("final_response") or "").strip()
+        effective_session_id = str(run_result.get("session_id") or session_id or "").strip()
+        if not user_message or not assistant_response or not effective_session_id:
+            return
+
+        agent = agent_ref[0] if isinstance(agent_ref, list) and agent_ref else None
+        session_db = getattr(agent, "_session_db", None)
+        if session_db is None:
+            session_db = self._ensure_session_db()
+        if session_db is None:
+            return
+
+        all_messages = run_result.get("messages")
+        if not isinstance(all_messages, list) or not all_messages:
+            all_messages = list(conversation_history or []) + [
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": assistant_response},
+            ]
+
+        def _title_failure_cb(task: str, exc: BaseException) -> None:
+            logger.debug("[zet_agent] native %s failed: %s", task, exc)
+
+        main_runtime = None
+        runtime_getter = getattr(agent, "_current_main_runtime", None)
+        if callable(runtime_getter):
+            try:
+                main_runtime = runtime_getter()
+            except Exception:
+                logger.debug("[zet_agent] failed to read current main runtime", exc_info=True)
+        if not isinstance(main_runtime, dict) and agent is not None:
+            main_runtime = {
+                "model": getattr(agent, "model", None),
+                "provider": getattr(agent, "provider", None),
+                "base_url": getattr(agent, "base_url", None),
+                "api_key": getattr(agent, "api_key", None),
+                "api_mode": getattr(agent, "api_mode", None),
+            }
+
+        from agent.title_generator import maybe_auto_title
+
+        def _run_title_worker() -> None:
+            from gateway.session_context import clear_session_vars
+
+            tokens = self._bind_api_server_session(
+                chat_id=effective_session_id,
+                session_key=gateway_session_key or effective_session_id,
+                session_id=effective_session_id,
+            )
+            try:
+                maybe_auto_title(
+                    session_db,
+                    effective_session_id,
+                    user_message,
+                    assistant_response,
+                    all_messages,
+                    failure_callback=_title_failure_cb,
+                    main_runtime=main_runtime,
+                    title_callback=(
+                        (lambda title: self._push_title(stream_q, title))
+                        if stream_q is not None
+                        else None
+                    ),
+                    background=False,
+                )
+            finally:
+                clear_session_vars(tokens)
+
+        if stream_q is None:
+            threading.Thread(
+                target=_run_title_worker,
+                daemon=True,
+                name="zet-agent-auto-title",
+            ).start()
+            return
+        await asyncio.to_thread(_run_title_worker)
 
     @staticmethod
     def _push_steer_dropped_if_any(stream_q: Any, run_result: Any) -> None:
@@ -906,13 +969,12 @@ class ZetAgentAdapter(APIServerAdapter):
             try:
                 from tools.approval import register_gateway_notify
                 register_gateway_notify(session_id, self._make_approval_cb(stream_q, session_id))
+                with self._session_lock:
+                    self._approval_session_ids.add(session_id)
             except Exception:
                 logger.warning("[zet_agent] failed to register approval notify", exc_info=True)
 
-        # 5. Auto-title is emitted in _run_agent() instead — the
-        # user_message arrives there as a kwarg, but at this point in
-        # _create_agent it has not been threaded through yet
-        # (base _run_agent passes user_message only to run_conversation).
+        # 5. Auto-title runs after the first successful assistant reply.
 
         return agent
 
@@ -933,8 +995,7 @@ class ZetAgentAdapter(APIServerAdapter):
         turn_id: Optional[str] = None,
         request_overrides: Optional[Dict[str, Any]] = None,
     ):
-        """Wrap base ``_run_agent`` to (1) push the auto-title before
-        kicking off the agent thread and (2) bind the session-scoped env
+        """Wrap base ``_run_agent`` to bind the session-scoped env
         vars hermes' approval/clarify gate reads at runtime.
 
         ``HERMES_SESSION_KEY`` keys the per-session approval queue so
@@ -950,18 +1011,7 @@ class ZetAgentAdapter(APIServerAdapter):
         contention window is short enough in practice.
         """
         stream_q = self._sniff_stream_q(tool_start_callback, stream_delta_callback)
-        # conversation_history 守卫：_session_titles 是进程内 cache，子进程
-        # 重启（lifecycle.OnUpdate / OOM / supervisor 拉起）会清零，老会话
-        # 下一条 user msg 在 cache cold 时会被误判成首句重推 title，让 App
-        # 把会话列表里的首句标题换成当前这条新消息。OpenAI 兼容 API 下
-        # caller 每次都传完整 history，真新会话 history 必为空 —— 只在那
-        # 一刻才允许触发首句去重逻辑。App 侧另有 first-write-wins 兜底。
-        if stream_q is not None and not conversation_history:
-            try:
-                title = self._maybe_update_title(session_id, user_message)
-                self._push_title_if_new(stream_q, session_id, title)
-            except Exception:
-                logger.debug("[zet_agent] auto-title hook failed", exc_info=True)
+        title_user_message = self._title_user_message(user_message)
 
         # Open-time check: if this session's effective model (override, else
         # config default) differs from the persisted last-seen value, inject a
@@ -1117,6 +1167,19 @@ class ZetAgentAdapter(APIServerAdapter):
             # close sentinel is enqueued by agent_task's done callback, and
             # anything put on stream_q after that may never be drained.
             self._push_steer_dropped_if_any(stream_q, result)
+            if not title_user_message.startswith("[ZETTLAB:"):
+                try:
+                    await self._emit_native_session_title(
+                        result=result,
+                        user_message=title_user_message,
+                        conversation_history=conversation_history,
+                        session_id=session_id,
+                        stream_q=stream_q,
+                        agent_ref=agent_ref,
+                        gateway_session_key=gateway_session_key,
+                    )
+                except Exception:
+                    logger.debug("[zet_agent] native auto-title hook failed", exc_info=True)
             return result
         finally:
             if old_session_key is None:
@@ -2715,7 +2778,8 @@ class ZetAgentAdapter(APIServerAdapter):
         try:
             from tools.approval import unregister_gateway_notify
             with self._session_lock:
-                sids = list(self._session_titles.keys())
+                sids = list(self._approval_session_ids)
+                self._approval_session_ids.clear()
             for sid in sids:
                 try:
                     unregister_gateway_notify(sid)
