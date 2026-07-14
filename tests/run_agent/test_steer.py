@@ -431,6 +431,25 @@ class TestReclaimTailSteer:
         reclaim_tail_steer(agent, messages)
         assert agent._pending_steer == "先到的\n后到的"
 
+    def test_interrupt_discards_instead_of_restash(self):
+        # 第十轮 review：注入后用户 /stop（interrupt 清槽置旗标），随后同轮
+        # 早退触发 reclaim——消息手术照做（撤出未回答 user 消息），但不得
+        # restash 复活已取消的改向。与 drain 的锁内 interrupt 检查对称。
+        from agent.agent_runtime_helpers import reclaim_tail_steer
+        agent = _bare_agent()
+        agent.steer("换个方向")
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "a"}]},
+            {"role": "tool", "content": "out", "tool_call_id": "a"},
+        ]
+        agent._drain_steer_for_next_api_call(messages)
+        agent._interrupt_requested = True
+
+        reclaim_tail_steer(agent, messages)
+
+        assert messages[-1]["role"] == "tool"  # 注入已撤出
+        assert agent._pending_steer is None    # 但不复活
+
 
 class TestMergedSteerPersistence:
     """steer 合并进已被 crash-resilience 持久化的首轮 user 消息时，必须补写
@@ -584,3 +603,152 @@ class TestConsumedSteerMarker:
         messages = [{"role": "user", "content": "首轮"}]
         agent._drain_steer_for_next_api_call(messages)
         assert agent._turn_last_steer_text == "补充要求"
+
+
+class TestReclaimUndoesMergedDbRow:
+    """第十轮 review：合并进已持久化 user 的 steer 会即时补写 db 行；同轮
+    早退 reclaim 撤回后必须删掉该行——否则失败轮历史留下模型从未消费的
+    幽灵 steer 行，客户端重排后下一轮再写一份（/resume 双份）。"""
+
+    class _DbStub:
+        def __init__(self):
+            self.appended = []
+            self.deleted = []
+
+        def append_message(self, **kwargs):
+            self.appended.append(kwargs)
+            return len(self.appended)
+
+        def delete_message(self, session_id, message_id):
+            self.deleted.append((session_id, message_id))
+            return True
+
+    def _merged_setup(self):
+        agent = _bare_agent()
+        db = self._DbStub()
+        agent._session_db = db
+        agent.session_id = "sess-1"
+        agent.steer("换个方向")
+        messages = [{"role": "user", "content": "首轮", "_db_persisted": True}]
+        agent._drain_steer_for_next_api_call(messages)
+        assert len(db.appended) == 1
+        return agent, db, messages
+
+    def test_reclaim_deletes_phantom_row(self):
+        from agent.agent_runtime_helpers import reclaim_tail_steer
+        agent, db, messages = self._merged_setup()
+
+        reclaim_tail_steer(agent, messages)
+
+        assert db.deleted == [("sess-1", 1)]
+        assert agent._steer_merged_db_rows == []
+        assert agent._pending_steer == "换个方向"
+
+    def test_consumed_merge_row_survives(self):
+        # 模型已消费（tail 变 assistant）→ reclaim 不触碰，行保留。
+        from agent.agent_runtime_helpers import reclaim_tail_steer
+        agent, db, messages = self._merged_setup()
+        messages.append({"role": "assistant", "content": "答"})
+
+        reclaim_tail_steer(agent, messages)
+
+        assert db.deleted == []
+        assert len(db.appended) == 1
+
+    def test_standalone_reclaim_no_delete(self):
+        # 独立注入（无补写行）→ reclaim 不做任何删除。
+        from agent.agent_runtime_helpers import reclaim_tail_steer
+        agent = _bare_agent()
+        db = self._DbStub()
+        agent._session_db = db
+        agent.session_id = "sess-1"
+        agent.steer("补充")
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "a"}]},
+            {"role": "tool", "content": "out", "tool_call_id": "a"},
+        ]
+        agent._drain_steer_for_next_api_call(messages)
+
+        reclaim_tail_steer(agent, messages)
+
+        assert db.deleted == []
+
+    def test_double_merge_deletes_both_rows(self):
+        from agent.agent_runtime_helpers import reclaim_tail_steer
+        agent, db, messages = self._merged_setup()
+        agent.steer("再补一句")
+        agent._drain_steer_for_next_api_call(messages)
+        assert len(db.appended) == 2
+
+        reclaim_tail_steer(agent, messages)
+
+        assert sorted(db.deleted) == [("sess-1", 1), ("sess-1", 2)]
+        assert messages[0]["content"] == "首轮"
+
+    def test_interrupt_discard_still_deletes_phantom_row(self):
+        # interrupt 丢弃 restash 时，幽灵行同样要删——文本已离开 messages，
+        # DB 必须跟内存一致。
+        from agent.agent_runtime_helpers import reclaim_tail_steer
+        agent, db, messages = self._merged_setup()
+        agent._interrupt_requested = True
+
+        reclaim_tail_steer(agent, messages)
+
+        assert db.deleted == [("sess-1", 1)]
+        assert agent._pending_steer is None
+
+
+class TestReclaimAndHandback:
+    """早退 return 用的组合 helper：撤回注入 + 关槽 drain，把文本以
+    pending_steer 交还调用方——classic CLI / messaging gateway 只认
+    result["pending_steer"]（无槽位 salvage），不交还会滞留缓存 agent、
+    下一条无关 prompt 才被 pre-API drain 乱序注入。"""
+
+    def test_returns_reclaimed_text_and_closes_slot(self):
+        from agent.agent_runtime_helpers import reclaim_and_handback_steer
+        agent = _bare_agent()
+        agent.steer("换个方向")
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "a"}]},
+            {"role": "tool", "content": "out", "tool_call_id": "a"},
+        ]
+        agent._drain_steer_for_next_api_call(messages)
+
+        handed = reclaim_and_handback_steer(agent, messages)
+
+        assert handed == "换个方向"
+        assert agent._pending_steer is None
+        assert messages[-1]["role"] == "tool"
+        # 槽位已关（与 finalizer 同契约）：turn 已终局，晚到 steer 拒收，
+        # 由调用方转排队。
+        assert agent.steer("晚到") is False
+
+    def test_salvages_slot_only_steer(self):
+        # steer 在 drain 窗口之后到达（未注入 messages）：也一并交还。
+        from agent.agent_runtime_helpers import reclaim_and_handback_steer
+        agent = _bare_agent()
+        agent.steer("晚到的")
+        messages = [{"role": "assistant", "content": "答"}]
+
+        assert reclaim_and_handback_steer(agent, messages) == "晚到的"
+
+    def test_returns_none_when_nothing_pending(self):
+        from agent.agent_runtime_helpers import reclaim_and_handback_steer
+        agent = _bare_agent()
+        messages = [{"role": "assistant", "content": "答"}]
+        assert reclaim_and_handback_steer(agent, messages) is None
+
+    def test_interrupt_yields_no_handback(self):
+        # interrupt 场景：reclaim 丢弃、槽位也已被 interrupt 清空 → 无交还，
+        # 不给已取消的改向任何复活通道。
+        from agent.agent_runtime_helpers import reclaim_and_handback_steer
+        agent = _bare_agent()
+        agent.steer("换个方向")
+        messages = [
+            {"role": "assistant", "tool_calls": [{"id": "a"}]},
+            {"role": "tool", "content": "out", "tool_call_id": "a"},
+        ]
+        agent._drain_steer_for_next_api_call(messages)
+        agent._interrupt_requested = True
+
+        assert reclaim_and_handback_steer(agent, messages) is None

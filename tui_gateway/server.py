@@ -8486,6 +8486,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
+        _leftover_steer = None  # un-consumed /steer handed back by the turn
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -8732,6 +8733,20 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 _clear_inflight_turn(session)
             _emit("message.complete", sid, payload)
 
+            # Pull the leftover /steer BEFORE the goal hook: a steer that
+            # arrived after the last API call means the user redirected
+            # this turn — evaluating the goal on a final_response that
+            # ignores the redirect would burn a turn of budget (and could
+            # record a done/paused verdict) before the steer even runs.
+            # Mirrors zet_agent's pending-steer goal-hook skip. The slot
+            # close+drain is the same salvage the tail block used to do.
+            _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
+            if not _leftover_steer:
+                try:
+                    _leftover_steer = agent._drain_pending_steer(close=True)
+                except Exception:
+                    _leftover_steer = None
+
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
             # whether the goal is done and — if not and we're still under
@@ -8740,7 +8755,10 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # ("✓ Goal achieved" / "⏸ budget exhausted") is surfaced as
             # a system line so the user sees progress regardless of
             # outcome. Mirrors gateway/run._post_turn_goal_continuation.
-            if status == "complete" and isinstance(raw, str) and raw.strip():
+            # Skipped when a leftover steer is about to requeue — that
+            # steer becomes the next prompt and the judge re-evaluates at
+            # the end of THAT turn.
+            if status == "complete" and not _leftover_steer and isinstance(raw, str) and raw.strip():
                 try:
                     from hermes_cli.goals import GoalManager
 
@@ -8890,21 +8908,18 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         # before another model call could absorb it): requeue as the next
         # prompt — same as CLI/gateway — instead of silently dropping text
         # the user was told was accepted. _enqueue_prompt merges losslessly
-        # with any prompt already queued mid-turn.
-        # result 只在 try 内赋值：run_conversation 之前抛异常（图像预处理/
-        # agent 构建后失败）时走 except→finally 到这里，直接读会
-        # UnboundLocalError 把错误恢复路径二次炸掉、跳过下方排队/通知收尾。
-        try:
-            _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
-        except UnboundLocalError:
-            _leftover_steer = None
+        # with any prompt already queued mid-turn. The extraction itself
+        # runs inside the try (before the goal hook, which it gates); this
+        # tail only covers turns that died before reaching it.
         if not _leftover_steer:
-            # Early-return paths (invalid-response / provider error) bypass
-            # finalize_turn: a steer accepted in that window is still
-            # sitting in the slot with nothing to drain it — it would leak
-            # into the NEXT prompt's pre-API drain and execute a stale
-            # redirect out of order. Close+drain here (no-op on the normal
-            # path: the finalizer already drained and closed).
+            # Exception paths (image preprocessing / run_conversation
+            # raising) skip the in-try extraction, and early-return paths
+            # (invalid-response / provider error) bypass finalize_turn: a
+            # steer accepted in that window is still sitting in the slot
+            # with nothing to drain it — it would leak into the NEXT
+            # prompt's pre-API drain and execute a stale redirect out of
+            # order. Close+drain here (no-op when the in-try extraction
+            # already ran: the slot is drained and closed).
             try:
                 _leftover_steer = agent._drain_pending_steer(close=True)
             except Exception:

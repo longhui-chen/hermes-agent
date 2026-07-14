@@ -3304,6 +3304,31 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+    def delete_message(self, session_id: str, message_id: int) -> bool:
+        """Delete a single message row, scoped to *session_id*.
+
+        Used to undo a crash-resilience row whose in-memory message was
+        retracted before any model call consumed it (steer reclaim on
+        early-return turns) — leaving the row would replay a phantom user
+        message on /resume. The FTS DELETE triggers keep the search
+        indexes consistent. Returns True if a row was deleted.
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                "DELETE FROM messages WHERE id = ? AND session_id = ?",
+                (message_id, session_id),
+            )
+            if cursor.rowcount > 0:
+                conn.execute(
+                    """UPDATE sessions SET message_count =
+                       CASE WHEN message_count > 0 THEN message_count - 1 ELSE 0 END
+                       WHERE id = ?""",
+                    (session_id,),
+                )
+            return cursor.rowcount > 0
+
+        return bool(self._execute_write(_do))
+
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
 

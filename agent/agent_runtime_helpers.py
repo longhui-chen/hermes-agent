@@ -2928,7 +2928,13 @@ def _persist_merged_steer_row(agent, steer_content: str) -> None:
     (harness turns must never write the user's session history) and runs
     the content through ``_redact_message_content`` — a mid-turn steer can
     contain pasted API keys/tokens, and bypassing redaction here would
-    persist them in plaintext while every other row is scrubbed."""
+    persist them in plaintext while every other row is scrubbed.
+
+    The written row id is recorded on ``agent._steer_merged_db_rows`` so
+    ``reclaim_tail_steer`` can undo the row if the same turn retracts the
+    merge before any model call consumed it — otherwise a failed turn's
+    history keeps a phantom steer row AND the client's re-queue delivers
+    the text again next turn (double row on /resume)."""
     if getattr(agent, "_persist_disabled", False):
         return
     db = getattr(agent, "_session_db", None)
@@ -2938,7 +2944,13 @@ def _persist_merged_steer_row(agent, steer_content: str) -> None:
     try:
         redact = getattr(agent, "_redact_message_content", None)
         content = redact(steer_content) if callable(redact) else steer_content
-        db.append_message(session_id=sid, role="user", content=content)
+        row_id = db.append_message(session_id=sid, role="user", content=content)
+        if isinstance(row_id, int):
+            rows = getattr(agent, "_steer_merged_db_rows", None)
+            if not isinstance(rows, list):
+                rows = []
+                agent._steer_merged_db_rows = rows
+            rows.append((steer_content, row_id))
     except Exception:
         _ra().logger.debug("steer merge: session DB append failed", exc_info=True)
 
@@ -3004,19 +3016,80 @@ def reclaim_tail_steer(agent, messages: list) -> None:
                 break
     if not reclaimed:
         return
+    # Undo the crash-resilience rows _persist_merged_steer_row wrote for
+    # these exact merges: the text just left ``messages``, so a surviving
+    # DB row would replay a phantom steer on /resume — and the re-queued
+    # delivery next turn would then persist it a second time. Matched by
+    # recorded row id (LIFO on identical text), never by content scan.
+    rows = getattr(agent, "_steer_merged_db_rows", None)
+    if isinstance(rows, list) and rows:
+        db = getattr(agent, "_session_db", None)
+        sid = getattr(agent, "session_id", None)
+        delete = getattr(db, "delete_message", None) if db is not None else None
+        for _text in reclaimed:
+            _full = STEER_USER_PREFIX + _text
+            for _i in range(len(rows) - 1, -1, -1):
+                if rows[_i][0] == _full:
+                    _row_id = rows.pop(_i)[1]
+                    if callable(delete) and sid:
+                        try:
+                            delete(sid, _row_id)
+                        except Exception:
+                            _ra().logger.debug(
+                                "steer reclaim: phantom row delete failed",
+                                exc_info=True,
+                            )
+                    break
     text = "\n".join(reclaimed)
+    # Restash-unless-interrupted, mirroring the drain's atomic guard: a
+    # hard interrupt supersedes the steer (interrupt() drops the slot by
+    # design), and these early-return paths bypass finalize_turn's
+    # interrupted-leftover discard — an unconditional restash would
+    # resurrect an instruction the user already cancelled.
+    def _restash_unless_interrupted() -> bool:
+        if getattr(agent, "_interrupt_requested", False):
+            return False
+        existing = getattr(agent, "_pending_steer", None)
+        agent._pending_steer = (text + "\n" + existing) if existing else text
+        return True
+
     _lock = getattr(agent, "_pending_steer_lock", None)
     if _lock is not None:
         with _lock:
-            existing = agent._pending_steer
-            agent._pending_steer = (text + "\n" + existing) if existing else text
+            restashed = _restash_unless_interrupted()
     else:
-        existing = getattr(agent, "_pending_steer", None)
-        agent._pending_steer = (text + "\n" + existing) if existing else text
-    _ra().logger.info(
-        "Reclaimed un-answered /steer from early-return turn (%d chars)",
-        len(text),
-    )
+        restashed = _restash_unless_interrupted()
+    if restashed:
+        _ra().logger.info(
+            "Reclaimed un-answered /steer from early-return turn (%d chars)",
+            len(text),
+        )
+    else:
+        _ra().logger.info(
+            "Discarding reclaimed /steer — interrupt supersedes it (%d chars)",
+            len(text),
+        )
+
+
+def reclaim_and_handback_steer(agent, messages: list):
+    """``reclaim_tail_steer`` + the finalizer's closing drain, for the
+    early-return paths in ``run_conversation``.
+
+    Those returns bypass ``finalize_turn`` entirely: only zet_agent / TUI
+    / ACP wrap a slot salvage around the call, while classic CLI and the
+    messaging gateway consume steer exclusively from
+    ``result["pending_steer"]``. Handing the text back here — and closing
+    the slot, same as the finalizer — keeps every surface on that
+    contract; a bare restash would otherwise sit in the cached agent
+    until a later unrelated prompt's pre-API drain executes the stale
+    redirect out of order. Returns the drained text (or None)."""
+    reclaim_tail_steer(agent, messages)
+    try:
+        drain = getattr(agent, "_drain_pending_steer", None)
+        return drain(close=True) if callable(drain) else None
+    except Exception:
+        _ra().logger.debug("steer handback drain failed", exc_info=True)
+        return None
 
 
 def force_close_tcp_sockets(client: Any) -> int:
@@ -3096,6 +3169,7 @@ __all__ = [
     "extract_api_error_context",
     "drain_steer_for_next_api_call",
     "reclaim_tail_steer",
+    "reclaim_and_handback_steer",
     "_iter_pool_sockets",
     "force_close_tcp_sockets",
 ]

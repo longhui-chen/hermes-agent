@@ -927,6 +927,10 @@ def run_conversation(
     # must evaluate it as user-initiated, not as an untouched auto-
     # continuation round.
     agent._turn_last_steer_text = None
+    # Per-turn ledger of crash-resilience rows written for merged steers
+    # (see _persist_merged_steer_row / reclaim_tail_steer). Stale entries
+    # from a finished turn must never be deletable by a later reclaim.
+    agent._steer_merged_db_rows = []
 
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
@@ -1380,13 +1384,15 @@ def run_conversation(
                         # so user sees the rate-limit message that led here.
                         agent._flush_status_buffer()
                         # 撤回本迭代 pre-API drain 注入、模型从未见到的
-                        # steer：留在 messages 里会被持久化成未回答 user
-                        # 消息并入下一轮（restash 后由 salvage/下一轮 drain
-                        # 正常投递）。
-                        from agent.agent_runtime_helpers import reclaim_tail_steer
-                        reclaim_tail_steer(agent, messages)
+                        # steer，并以 pending_steer 带回结果——早退绕过
+                        # finalizer 的 close+drain，classic CLI / messaging
+                        # gateway 只认 result["pending_steer"]（无槽位
+                        # salvage），裸 restash 会滞留到下一条无关 prompt
+                        # 才乱序注入。
+                        from agent.agent_runtime_helpers import reclaim_and_handback_steer
+                        _reclaimed_steer = reclaim_and_handback_steer(agent, messages)
                         agent._persist_session(messages, conversation_history)
-                        return {
+                        _rate_guard_result = {
                             "final_response": (
                                 f"⏳ {_nous_msg}\n\n"
                                 "No fallback provider available. "
@@ -1399,6 +1405,9 @@ def run_conversation(
                             "failed": True,
                             "error": _nous_msg,
                         }
+                        if _reclaimed_steer:
+                            _rate_guard_result["pending_steer"] = _reclaimed_steer
+                        return _rate_guard_result
                 except ImportError:
                     pass
                 except Exception:
@@ -2071,12 +2080,14 @@ def run_conversation(
                         )
                         agent._cleanup_task_resources(effective_task_id)
                         # 模型输出全花在 reasoning、没有任何回应就终局——
-                        # 本轮注入的 steer 等于未被消费，撤回转排队而不是
-                        # 持久化成未回答 user 消息。
-                        from agent.agent_runtime_helpers import reclaim_tail_steer
-                        reclaim_tail_steer(agent, messages)
+                        # 本轮注入的 steer 等于未被消费，撤回并以
+                        # pending_steer 带回结果（早退绕过 finalizer 的
+                        # close+drain，无槽位 salvage 的 surface 只认
+                        # result["pending_steer"]）。
+                        from agent.agent_runtime_helpers import reclaim_and_handback_steer
+                        _reclaimed_steer = reclaim_and_handback_steer(agent, messages)
                         agent._persist_session(messages, conversation_history)
-                        return {
+                        _exhaust_result = {
                             "final_response": _exhaust_response,
                             "messages": messages,
                             "api_calls": api_call_count,
@@ -2084,6 +2095,9 @@ def run_conversation(
                             "partial": True,
                             "error": _exhaust_error,
                         }
+                        if _reclaimed_steer:
+                            _exhaust_result["pending_steer"] = _reclaimed_steer
+                        return _exhaust_result
 
                     if agent.api_mode in {"chat_completions", "bedrock_converse", "anthropic_messages"}:
                         assistant_message = _trunc_msg
