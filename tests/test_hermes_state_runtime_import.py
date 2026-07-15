@@ -1,5 +1,6 @@
 import hashlib
 import json
+import sqlite3
 import time
 
 import pytest
@@ -118,6 +119,22 @@ def test_incomplete_or_conflicting_import_never_changes_target(tmp_path):
         with pytest.raises(RuntimeImportConflict):
             _stage(db, messages=changed)
         assert db.get_session("imported-session") is None
+    finally:
+        db.close()
+
+
+def test_runtime_import_rejects_existing_target_before_staging(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        db.create_session("imported-session", "api")
+        with pytest.raises(RuntimeImportConflict, match="target_session_id already exists"):
+            _stage(db)
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM runtime_imports WHERE import_id = 'imp-1'"
+        ).fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM runtime_import_chunks WHERE import_id = 'imp-1'"
+        ).fetchone()[0] == 0
     finally:
         db.close()
 
@@ -249,6 +266,30 @@ def test_expired_runtime_import_staging_is_cleaned_on_db_open(tmp_path):
         ).fetchone()[0] == 0
     finally:
         reopened.close()
+
+
+def test_db_open_tolerates_runtime_import_cleanup_failure(tmp_path, monkeypatch):
+    def _locked(_self):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(SessionDB, "cleanup_stale_runtime_imports", _locked)
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        assert db.get_session("missing") is None
+    finally:
+        db.close()
+
+
+def test_profile_unload_cleanup_discards_all_unpublished_staging(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        _stage(db, import_id="fresh", expected=1)
+        assert db.discard_runtime_import_staging() == 1
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM runtime_imports WHERE status = 'staging'"
+        ).fetchone()[0] == 0
+    finally:
+        db.close()
 
 
 def test_runtime_import_cleanup_is_bounded(tmp_path):

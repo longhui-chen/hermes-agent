@@ -1038,7 +1038,19 @@ class SessionDB:
             # Expired staging rows can contain complete source transcripts.
             # Sweep a bounded batch whenever the profile DB opens so abandoned
             # imports converge even when no later import request arrives.
-            self.cleanup_stale_runtime_imports()
+            try:
+                self.cleanup_stale_runtime_imports()
+            except sqlite3.OperationalError as exc:
+                if not any(token in str(exc).lower() for token in ("locked", "busy")):
+                    raise
+                # Expired import cleanup is privacy hygiene, but it must not
+                # make the primary session database unavailable when another
+                # process temporarily owns SQLite's write lock. The gateway
+                # sweeper will retry after the profile is open.
+                logger.warning(
+                    "state.db runtime import staging cleanup failed during open",
+                    exc_info=True,
+                )
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
             # session DB is unavailable instead of a bare "Session database
@@ -3649,6 +3661,14 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+    def discard_runtime_import_staging(self) -> int:
+        """Delete all unpublished transcript staging before profile unload."""
+        return self._execute_write(
+            lambda conn: conn.execute(
+                "DELETE FROM runtime_imports WHERE status = 'staging'"
+            ).rowcount
+        )
+
     def stage_completed_transcript_import(
         self,
         *,
@@ -3710,6 +3730,10 @@ class SessionDB:
             if row is None:
                 if chunk_index != 0:
                     raise RuntimeImportConflict("first chunk_index must be 0")
+                if conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?", (target_session_id,)
+                ).fetchone():
+                    raise RuntimeImportConflict("target_session_id already exists")
                 conn.execute(
                     """INSERT INTO runtime_imports
                        (import_id, source, source_session_id, target_session_id, title,
@@ -3747,6 +3771,10 @@ class SessionDB:
                     "staged_message_count": row["staged_message_count"],
                     "replayed": True,
                 }
+            if conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (target_session_id,)
+            ).fetchone():
+                raise RuntimeImportConflict("target_session_id already exists")
             if tuple(row[k] for k in (
                 "source", "source_session_id", "target_session_id",
                 "payload_sha256", "expected_message_count"

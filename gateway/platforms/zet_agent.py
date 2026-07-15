@@ -2575,6 +2575,18 @@ class ZetAgentAdapter(APIServerAdapter):
         if profile_home:
             db = self._session_dbs.pop(self._profile_home_key(profile_home), None)
             if db is not None:
+                discard_staging = getattr(db, "discard_runtime_import_staging", None)
+                if callable(discard_staging):
+                    try:
+                        await asyncio.to_thread(discard_staging)
+                    except Exception:
+                        # Unload remains best-effort, but always attempt to
+                        # remove unpublished external transcripts before the
+                        # DB leaves the background sweeper's cache.
+                        logger.warning(
+                            "[zet_agent] profile-unload: runtime import staging cleanup failed",
+                            exc_info=True,
+                        )
                 close = getattr(db, "close", None)
                 if callable(close):
                     try:
