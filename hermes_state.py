@@ -145,6 +145,21 @@ class RuntimeImportConflict(ValueError):
 class RuntimeImportIncomplete(ValueError):
     """A transcript import cannot commit until every declared message exists."""
 
+
+def _validate_runtime_import_identifier(field: str, value: Any) -> str:
+    """Validate IDs that can later reach session-derived filesystem paths."""
+    from gateway.session import _is_path_unsafe
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 128
+        or any(ord(char) < 0x20 for char in value)
+        or _is_path_unsafe(value)
+    ):
+        raise ValueError(f"{field} must be a path-safe 1..128 character identifier")
+    return value
+
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
 # ---------------------------------------------------------------------------
@@ -3620,8 +3635,7 @@ class SessionDB:
         for field, value in (("import_id", import_id), ("source", source),
                              ("source_session_id", source_session_id),
                              ("target_session_id", target_session_id)):
-            if not isinstance(value, str) or not value or len(value) > 128:
-                raise ValueError(f"{field} must be 1..128 characters")
+            _validate_runtime_import_identifier(field, value)
         if title is not None and not isinstance(title, str):
             raise ValueError("title must be text when provided")
         if not re.fullmatch(r"[0-9a-fA-F]{64}", payload_sha256 or ""):
@@ -3738,6 +3752,8 @@ class SessionDB:
 
     def commit_completed_transcript_import(self, import_id: str) -> Dict[str, Any]:
         """Atomically publish every staged chunk as one new completed session."""
+        _validate_runtime_import_identifier("import_id", import_id)
+
         def _do(conn):
             row = conn.execute(
                 "SELECT * FROM runtime_imports WHERE import_id = ?", (import_id,)
@@ -3785,13 +3801,9 @@ class SessionDB:
             )
             digest = hashlib.sha256()
             total = 0
-            chunks = conn.execute(
-                "SELECT messages_json FROM runtime_import_chunks "
-                "WHERE import_id = ? ORDER BY chunk_index", (import_id,),
-            ).fetchall()
-            if len(chunks) != row["next_chunk_index"]:
-                raise RuntimeImportIncomplete("one or more staged chunks are missing")
-            for chunk in chunks:
+            chunk_count = 0
+            for chunk in self._iter_runtime_import_chunks(conn, import_id):
+                chunk_count += 1
                 raw = chunk["messages_json"]
                 encoded = raw.encode("utf-8")
                 digest.update(len(encoded).to_bytes(8, "big"))
@@ -3801,6 +3813,8 @@ class SessionDB:
                     conn, row["target_session_id"], messages
                 )
                 total += inserted
+            if chunk_count != row["next_chunk_index"]:
+                raise RuntimeImportIncomplete("one or more staged chunks are missing")
             normalized_sha = digest.hexdigest()
             conn.execute(
                 "UPDATE sessions SET message_count = ? WHERE id = ?",
@@ -3812,6 +3826,15 @@ class SessionDB:
                    WHERE import_id = ?""",
                 (normalized_sha, time.time(), time.time(), import_id),
             )
+            # The completed receipt above is sufficient for idempotent replay.
+            # Remove full staged transcript bodies and source message IDs in the
+            # SAME transaction so session deletion cannot reveal a second copy.
+            conn.execute(
+                "DELETE FROM runtime_import_chunks WHERE import_id = ?", (import_id,)
+            )
+            conn.execute(
+                "DELETE FROM runtime_import_message_ids WHERE import_id = ?", (import_id,)
+            )
             return {
                 "import_id": import_id, "status": "completed",
                 "session_id": row["target_session_id"], "message_count": total,
@@ -3820,7 +3843,22 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+    @staticmethod
+    def _iter_runtime_import_chunks(conn, import_id: str):
+        """Yield one staged chunk at a time; never materialize the 32 MiB bound."""
+        cursor = conn.execute(
+            "SELECT messages_json FROM runtime_import_chunks "
+            "WHERE import_id = ? ORDER BY chunk_index", (import_id,),
+        )
+        while True:
+            row = cursor.fetchone()
+            if row is None:
+                return
+            yield row
+
     def abort_completed_transcript_import(self, import_id: str) -> Dict[str, Any]:
+        _validate_runtime_import_identifier("import_id", import_id)
+
         def _do(conn):
             row = conn.execute(
                 "SELECT status FROM runtime_imports WHERE import_id = ?", (import_id,)
@@ -5192,6 +5230,13 @@ class SessionDB:
         filesystem hiccup never blocks a DB operation.
         """
         if sessions_dir is None:
+            return
+        try:
+            _validate_runtime_import_identifier("session_id", session_id)
+        except ValueError:
+            logger.warning(
+                "Refusing filesystem cleanup for unsafe session id: %r", session_id
+            )
             return
         for suffix in (".json", ".jsonl"):
             p = sessions_dir / f"{session_id}{suffix}"

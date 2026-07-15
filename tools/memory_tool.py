@@ -676,7 +676,10 @@ class MemoryStore:
         )
         with self._file_lock(path):
             if receipt_path.exists():
-                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                try:
+                    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as exc:
+                    raise MemoryImportConflict(f"memory import receipt is unreadable: {exc}") from exc
                 expected = (import_id, target, payload_sha256.lower(), content_sha)
                 actual = (receipt.get("import_id"), receipt.get("target"),
                           receipt.get("payload_sha256"), receipt.get("content_sha256"))
@@ -685,10 +688,23 @@ class MemoryStore:
                 live_sha = hashlib.sha256(
                     ENTRY_DELIMITER.join(self._read_file(path)).encode("utf-8")
                 ).hexdigest()
-                if live_sha != receipt.get("content_sha256"):
+                state = receipt.get("state")
+                if state == "prepared":
+                    previous_sha = receipt.get("previous_content_sha256")
+                    if live_sha == previous_sha:
+                        self._write_file(path, normalized)
+                    elif live_sha != content_sha:
+                        raise MemoryImportConflict(
+                            "memory changed after import prepare; refusing to overwrite user edits"
+                        )
+                    receipt["state"] = "completed"
+                    receipt["completed_at"] = time.time()
+                    self._write_import_receipt(receipt_path, receipt)
+                elif state != "completed" or live_sha != receipt.get("content_sha256"):
                     raise MemoryImportConflict(
                         "memory changed after import; refusing to overwrite user edits"
                     )
+                self._set_entries(target, normalized)
                 return {"import_id": import_id, "status": "completed", "target": target,
                         "char_count": char_count, "replayed": True,
                         "effective_from": "next_session"}
@@ -698,37 +714,53 @@ class MemoryStore:
                 raise MemoryImportConflict(_drift_error(path, backup)["error"])
             original = list(self._entries_for(target))
             receipt_path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                self._write_file(path, normalized)
-                fd, tmp_path = tempfile.mkstemp(
-                    dir=str(receipt_path.parent), suffix=".tmp", prefix=".receipt_"
-                )
-                try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                        json.dump({"import_id": import_id, "target": target,
-                                   "payload_sha256": payload_sha256.lower(),
-                                   "content_sha256": content_sha}, handle,
-                                  sort_keys=True, separators=(",", ":"))
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    atomic_replace(tmp_path, receipt_path)
-                except BaseException:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
-                    raise
-            except BaseException:
-                self._write_file(path, original)
-                try:
-                    receipt_path.unlink()
-                except OSError:
-                    pass
-                raise
+            previous_sha = hashlib.sha256(
+                ENTRY_DELIMITER.join(original).encode("utf-8")
+            ).hexdigest()
+            receipt = {
+                "state": "prepared", "import_id": import_id, "target": target,
+                "payload_sha256": payload_sha256.lower(),
+                "content_sha256": content_sha,
+                "previous_content_sha256": previous_sha,
+                "prepared_at": time.time(),
+            }
+            # Durable prepare MUST precede the target rename. A crash can then
+            # be recovered without guessing whether a later edit is user data.
+            self._write_import_receipt(receipt_path, receipt)
+            self._write_file(path, normalized)
+            receipt["state"] = "completed"
+            receipt["completed_at"] = time.time()
+            self._write_import_receipt(receipt_path, receipt)
             self._set_entries(target, normalized)
         return {"import_id": import_id, "status": "completed", "target": target,
                 "char_count": char_count, "replayed": False,
                 "effective_from": "next_session"}
+
+    @staticmethod
+    def _write_import_receipt(path: Path, receipt: Dict[str, Any]) -> None:
+        """Atomically persist and fsync a memory-import prepare/receipt."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), suffix=".tmp", prefix=".receipt_"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(receipt, handle, sort_keys=True, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            atomic_replace(tmp_path, path)
+            if os.name != "nt":
+                dir_fd = os.open(path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def _batch_error(self, target: str, message: str) -> Dict[str, Any]:
         """Build a batch-abort error that reports live (uncommitted) state."""

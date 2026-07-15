@@ -52,6 +52,23 @@ def test_completed_transcript_import_is_chunk_and_commit_idempotent(tmp_path):
         session = db.get_session("imported-session")
         assert session["source"] == "import:workbuddy"
         assert session["message_count"] == 2
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM runtime_import_chunks WHERE import_id = 'imp-1'"
+        ).fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM runtime_import_message_ids WHERE import_id = 'imp-1'"
+        ).fetchone()[0] == 0
+
+        assert db.delete_session("imported-session") is True
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE session_id = 'imported-session'"
+        ).fetchone()[0] == 0
+        # Only the non-sensitive idempotency receipt metadata remains.
+        receipt = db._conn.execute(
+            "SELECT status, normalized_sha256 FROM runtime_imports WHERE import_id = 'imp-1'"
+        ).fetchone()
+        assert receipt["status"] == "completed"
+        assert receipt["normalized_sha256"]
     finally:
         db.close()
 
@@ -101,3 +118,57 @@ def test_runtime_import_rejects_duplicate_source_id_across_chunks(tmp_path):
         assert db.get_session("imported-session") is None
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("field", ["import_id", "source", "source_session_id", "target_session_id"])
+@pytest.mark.parametrize("unsafe", ["../auth", "nested/session", "win\\session", ".."])
+def test_runtime_import_rejects_path_unsafe_ids(tmp_path, field, unsafe):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        values = {
+            "import_id": "safe-import", "source": "workbuddy",
+            "source_session_id": "source-session", "target_session_id": "target-session",
+        }
+        values[field] = unsafe
+        with pytest.raises(ValueError, match="path-safe"):
+            db.stage_completed_transcript_import(
+                **values,
+                title=None, payload_sha256=hashlib.sha256(b"x").hexdigest(),
+                expected_message_count=1, chunk_index=0,
+                messages=[{"role": "user", "content": "hi", "created_at": 1}],
+            )
+    finally:
+        db.close()
+
+
+def test_delete_legacy_unsafe_session_id_cannot_traverse_sessions_dir(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    outside = tmp_path / "auth.json"
+    outside.write_text("must survive", encoding="utf-8")
+    try:
+        db.create_session("../auth", "legacy")
+        assert db.delete_session("../auth", sessions_dir=sessions_dir) is True
+        assert outside.read_text(encoding="utf-8") == "must survive"
+    finally:
+        db.close()
+
+
+def test_runtime_import_chunk_iterator_never_calls_fetchall():
+    rows = iter([{"messages_json": "[]"}, None])
+
+    class Cursor:
+        def fetchone(self):
+            return next(rows)
+
+        def fetchall(self):
+            raise AssertionError("streaming iterator must not call fetchall")
+
+    class Conn:
+        def execute(self, *_args):
+            return Cursor()
+
+    assert list(SessionDB._iter_runtime_import_chunks(Conn(), "import")) == [
+        {"messages_json": "[]"}
+    ]
