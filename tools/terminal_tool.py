@@ -45,6 +45,7 @@ import threading
 import atexit
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -960,6 +961,23 @@ import sys
 _CONNECTOR_RUNTIME_SCRIPT = "connector_runtime.py"
 _CONNECTOR_RUNTIME_SHELL_PUNCTUATION = set(";&|<>")
 _CONNECTOR_RUNTIME_TRUST_CUTOFF = time.time()
+
+
+@dataclass(frozen=True)
+class _ConnectorRuntimeRootAnchor:
+    configured_root: Path
+    resolved_root: Path
+    identity: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class _ConnectorRuntimeCommand:
+    argv: list[str]
+    root_identity: tuple[int, int]
+    script_identity: tuple[int, int]
+
+
+_CONNECTOR_RUNTIME_ROOT_ANCHOR: Optional[_ConnectorRuntimeRootAnchor] = None
 _CONNECTOR_RUNTIME_STDIN_WRAPPER = r"""
 import json
 import os
@@ -990,11 +1008,15 @@ def _is_python_executable_token(token: str) -> bool:
     )
 
 
-def _path_writable_by_current_user(path: Path) -> bool:
+def _path_trust_rejection_reason(
+    path: Path,
+    *,
+    enforce_cutoff: bool = True,
+) -> Optional[str]:
     try:
         st = path.stat()
     except OSError:
-        return True
+        return "path_unavailable"
     euid = os.geteuid() if hasattr(os, "geteuid") else None
     mode = stat.S_IMODE(st.st_mode)
     if euid == 0:
@@ -1002,14 +1024,19 @@ def _path_writable_by_current_user(path: Path) -> bool:
         # bits look read-only. Trust only the packaged tree that was already in
         # place before this module was loaded; anything changed afterward may
         # have been swapped by a model-controlled root terminal.
-        return (
-            st.st_uid != 0
-            or bool(mode & (stat.S_IWGRP | stat.S_IWOTH))
-            or st.st_mtime > _CONNECTOR_RUNTIME_TRUST_CUTOFF
-            or st.st_ctime > _CONNECTOR_RUNTIME_TRUST_CUTOFF
-        )
+        if st.st_uid != 0:
+            return "uid_not_root"
+        if mode & stat.S_IWGRP:
+            return "group_writable"
+        if mode & stat.S_IWOTH:
+            return "world_writable"
+        if enforce_cutoff and st.st_mtime > _CONNECTOR_RUNTIME_TRUST_CUTOFF:
+            return "mtime_after_cutoff"
+        if enforce_cutoff and st.st_ctime > _CONNECTOR_RUNTIME_TRUST_CUTOFF:
+            return "ctime_after_cutoff"
+        return None
     if euid is not None and st.st_uid == euid:
-        return True
+        return "owned_by_terminal_user"
     try:
         groups = set(os.getgroups())
         egid = os.getegid()
@@ -1017,72 +1044,226 @@ def _path_writable_by_current_user(path: Path) -> bool:
     except Exception:
         groups = set()
     if st.st_gid in groups and mode & stat.S_IWGRP:
-        return True
-    return bool(mode & stat.S_IWOTH)
+        return "group_writable"
+    if mode & stat.S_IWOTH:
+        return "world_writable"
+    return None
 
 
-def _connector_runtime_path_is_trusted(path: Path, presets_root: Path) -> bool:
-    """Return True only for official presets paths the terminal user cannot edit."""
+def _path_writable_by_current_user(path: Path, *, enforce_cutoff: bool = True) -> bool:
+    return _path_trust_rejection_reason(
+        path,
+        enforce_cutoff=enforce_cutoff,
+    ) is not None
+
+
+def _path_identity(path: Path) -> tuple[int, int]:
+    st = path.stat()
+    return st.st_dev, st.st_ino
+
+
+def _log_connector_runtime_rejection(reason: str, relative_path: str = "") -> None:
+    logger.warning(
+        "Connector runtime direct runner rejected: reason=%s relative_path=%s",
+        reason,
+        relative_path or "<unknown>",
+    )
+
+
+def _capture_connector_runtime_root() -> Optional[_ConnectorRuntimeRootAnchor]:
+    global _CONNECTOR_RUNTIME_ROOT_ANCHOR
+
+    presets_dir = os.environ.get("ZETTLAB_PRESETS_DIR", "")
+    if not presets_dir:
+        _log_connector_runtime_rejection("presets_dir_missing")
+        return None
+    configured_root = Path(
+        os.path.expandvars(os.path.expanduser(presets_dir))
+    ).absolute()
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    if anchor is not None:
+        if configured_root != anchor.configured_root:
+            _log_connector_runtime_rejection("presets_root_changed")
+            return None
+        return anchor
+
     try:
+        resolved_root = configured_root.resolve(strict=True)
+        identity = _path_identity(resolved_root)
+    except OSError:
+        _log_connector_runtime_rejection("presets_root_unavailable")
+        return None
+
+    anchor = _ConnectorRuntimeRootAnchor(
+        configured_root=configured_root,
+        resolved_root=resolved_root,
+        identity=identity,
+    )
+    _CONNECTOR_RUNTIME_ROOT_ANCHOR = anchor
+    return anchor
+
+
+# Production gateways receive ZETTLAB_PRESETS_DIR before importing this module.
+# Capture the concrete version directory before any model-authored terminal call.
+if os.environ.get("ZETTLAB_PRESETS_DIR"):
+    _capture_connector_runtime_root()
+
+
+def _connector_runtime_path_is_trusted(
+    path: Path,
+    presets_root: Path,
+    *,
+    expected_root_identity: Optional[tuple[int, int]] = None,
+) -> bool:
+    """Return True only for the pinned, immutable official presets tree."""
+    try:
+        lexical_relative = path.relative_to(presets_root)
         resolved_path = path.resolve(strict=True)
         resolved_root = presets_root.resolve(strict=True)
         relative = resolved_path.relative_to(resolved_root)
+        if expected_root_identity is not None:
+            if _path_identity(resolved_root) != expected_root_identity:
+                return False
     except (OSError, ValueError):
         return False
 
-    # Symlinks are resolved above; now check every concrete parent from the
-    # filesystem root through the runner. If the Hermes service user can write
-    # or replace any component, model-controlled terminal commands can swap the
-    # trusted tree before the connector runner starts.
+    # Shared mount ancestors may legitimately change after Hermes starts (for
+    # example, creation of /volume1/subvol/.recycle). They still must have safe
+    # ownership/mode, but their unrelated mtime/ctime is outside the trust
+    # boundary. The pinned version root and everything below it keep the strict
+    # temporal check and reject symlinks.
     root_ancestors = list(resolved_root.parents)
+    if any(
+        _path_writable_by_current_user(component, enforce_cutoff=False)
+        for component in root_ancestors
+    ):
+        return False
+
     current = resolved_root
-    components = [*root_ancestors, resolved_root]
-    for part in relative.parts:
+    components = [resolved_root]
+    for part in lexical_relative.parts:
         current = current / part
         components.append(current)
-    return not any(_path_writable_by_current_user(component) for component in components)
+    try:
+        if any(stat.S_ISLNK(component.lstat().st_mode) for component in components):
+            return False
+    except OSError:
+        return False
+    return not any(
+        _path_writable_by_current_user(component, enforce_cutoff=True)
+        for component in components
+    )
+
+
+def _connector_runtime_trust_rejection_reason(
+    path: Path,
+    presets_root: Path,
+    *,
+    expected_root_identity: Optional[tuple[int, int]] = None,
+) -> Optional[str]:
+    """Return a non-sensitive reason for a failed trust decision."""
+    try:
+        lexical_relative = path.relative_to(presets_root)
+        resolved_path = path.resolve(strict=True)
+        resolved_root = presets_root.resolve(strict=True)
+        resolved_path.relative_to(resolved_root)
+        if expected_root_identity is not None:
+            if _path_identity(resolved_root) != expected_root_identity:
+                return "trust_anchor_changed"
+    except OSError:
+        return "path_unavailable"
+    except ValueError:
+        return "path_escape"
+
+    for component in resolved_root.parents:
+        reason = _path_trust_rejection_reason(component, enforce_cutoff=False)
+        if reason is not None:
+            return f"shared_ancestor_{reason}"
+
+    current = resolved_root
+    components = [resolved_root]
+    for part in lexical_relative.parts:
+        current = current / part
+        components.append(current)
+    try:
+        if any(stat.S_ISLNK(component.lstat().st_mode) for component in components):
+            return "symlink_or_special_file"
+    except OSError:
+        return "path_unavailable"
+    for component in components:
+        reason = _path_trust_rejection_reason(component, enforce_cutoff=True)
+        if reason is not None:
+            return reason
+    return None
 
 
 def _resolve_connector_runtime_script(raw_path: str) -> Optional[Path]:
-    presets_dir = os.environ.get("ZETTLAB_PRESETS_DIR", "")
-    if not presets_dir:
+    anchor = _capture_connector_runtime_root()
+    if anchor is None:
         return None
-    path_text = raw_path
+    relative_text: Optional[str] = None
     for prefix in ("$ZETTLAB_PRESETS_DIR/", "${ZETTLAB_PRESETS_DIR}/"):
         if raw_path.startswith(prefix):
-            path_text = os.path.join(presets_dir, raw_path[len(prefix):])
+            relative_text = raw_path[len(prefix):]
             break
     else:
         normalized_raw = raw_path[2:] if raw_path.startswith("./") else raw_path
         if normalized_raw.startswith("skills/"):
-            path_text = os.path.join(presets_dir, normalized_raw)
+            relative_text = normalized_raw
+        else:
+            expanded_path = Path(
+                os.path.expandvars(os.path.expanduser(normalized_raw))
+            ).absolute()
+            for allowed_root in (anchor.configured_root, anchor.resolved_root):
+                try:
+                    relative_text = str(expanded_path.relative_to(allowed_root))
+                    break
+                except ValueError:
+                    continue
+            if relative_text is None:
+                _log_connector_runtime_rejection("path_outside_pinned_root")
+                return None
 
     try:
-        presets_root = Path(os.path.expandvars(os.path.expanduser(presets_dir))).resolve()
-        path = Path(os.path.expandvars(os.path.expanduser(path_text))).resolve()
-    except Exception:
-        return None
-
-    try:
-        path.relative_to(presets_root)
-    except ValueError:
+        candidate_path = anchor.resolved_root / str(relative_text)
+        path = candidate_path.resolve(strict=True)
+        relative = path.relative_to(anchor.resolved_root)
+    except (OSError, ValueError):
+        _log_connector_runtime_rejection(
+            "path_unavailable_or_escaped",
+            relative_text or "",
+        )
         return None
 
     parts = path.parts
     if len(parts) < 4:
+        _log_connector_runtime_rejection("invalid_layout", str(relative))
         return None
     if parts[-1] != _CONNECTOR_RUNTIME_SCRIPT:
+        _log_connector_runtime_rejection("invalid_script_name", str(relative))
         return None
     if parts[-2] != "scripts" or parts[-4] != "skills":
+        _log_connector_runtime_rejection("invalid_layout", str(relative))
         return None
     if not path.is_file():
+        _log_connector_runtime_rejection("runner_not_regular_file", str(relative))
         return None
-    if not _connector_runtime_path_is_trusted(path, presets_root):
+    if not _connector_runtime_path_is_trusted(
+        candidate_path,
+        anchor.resolved_root,
+        expected_root_identity=anchor.identity,
+    ):
+        reason = _connector_runtime_trust_rejection_reason(
+            candidate_path,
+            anchor.resolved_root,
+            expected_root_identity=anchor.identity,
+        )
+        _log_connector_runtime_rejection(reason or "trust_check_failed", str(relative))
         return None
     return path
 
 
-def _parse_connector_runtime_command(command: str) -> Optional[list[str]]:
+def _parse_connector_runtime_command(command: str) -> Optional[_ConnectorRuntimeCommand]:
     """Return argv for the dedicated connector runner, or None if not exact.
 
     The allowlist intentionally accepts only a direct Python invocation of a
@@ -1103,10 +1284,25 @@ def _parse_connector_runtime_command(command: str) -> Optional[list[str]]:
         if token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION:
             return None
 
+    if Path(tokens[1]).name != _CONNECTOR_RUNTIME_SCRIPT:
+        return None
+
     script = _resolve_connector_runtime_script(tokens[1])
     if script is None:
         return None
-    return [sys.executable, str(script), *tokens[2:]]
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    if anchor is None:
+        return None
+    try:
+        script_identity = _path_identity(script)
+    except OSError:
+        _log_connector_runtime_rejection("runner_identity_unavailable")
+        return None
+    return _ConnectorRuntimeCommand(
+        argv=[sys.executable, str(script), *tokens[2:]],
+        root_identity=anchor.identity,
+        script_identity=script_identity,
+    )
 
 
 def _connector_runtime_result_json(
@@ -1205,8 +1401,35 @@ def _run_connector_runtime_command_if_allowed(
     cwd: str,
     timeout: int,
 ) -> Optional[str]:
-    argv = _parse_connector_runtime_command(command)
-    if argv is None:
+    parsed = _parse_connector_runtime_command(command)
+    if parsed is None:
+        return None
+    argv = parsed.argv
+
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    script = Path(argv[1])
+    try:
+        identities_match = (
+            anchor is not None
+            and _path_identity(anchor.resolved_root) == parsed.root_identity
+            and _path_identity(script) == parsed.script_identity
+            and _connector_runtime_path_is_trusted(
+                script,
+                anchor.resolved_root,
+                expected_root_identity=parsed.root_identity,
+            )
+        )
+    except OSError:
+        identities_match = False
+    if not identities_match:
+        reason = None
+        if anchor is not None:
+            reason = _connector_runtime_trust_rejection_reason(
+                script,
+                anchor.resolved_root,
+                expected_root_identity=parsed.root_identity,
+            )
+        _log_connector_runtime_rejection(reason or "identity_changed_before_exec")
         return None
 
     secret_values: list[str] = []

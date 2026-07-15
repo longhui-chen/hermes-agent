@@ -4,7 +4,18 @@ import sys
 import textwrap
 from io import StringIO
 
+import pytest
+
 from tools import terminal_tool as terminal_tool_module
+
+
+@pytest.fixture(autouse=True)
+def _reset_connector_runtime_root_anchor(monkeypatch):
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_CONNECTOR_RUNTIME_ROOT_ANCHOR",
+        None,
+    )
 
 
 def _write_connector_runtime(tmp_path):
@@ -79,7 +90,7 @@ def test_connector_runtime_direct_runner_flow_receives_profile_scoped_env(monkey
     monkeypatch.setattr(
         terminal_tool_module,
         "_connector_runtime_path_is_trusted",
-        lambda path, presets_root: True,
+        lambda path, presets_root, **kwargs: True,
     )
     ss.set_multiplex_active(False)
 
@@ -103,7 +114,7 @@ def test_connector_runtime_direct_runner_keeps_token_out_of_popen_env(monkeypatc
     monkeypatch.setattr(
         terminal_tool_module,
         "_connector_runtime_path_is_trusted",
-        lambda path, presets_root: True,
+        lambda path, presets_root, **kwargs: True,
     )
     captured = {}
 
@@ -138,7 +149,7 @@ def test_connector_runtime_direct_runner_preserves_parent_process_globals(monkey
     monkeypatch.setattr(
         terminal_tool_module,
         "_connector_runtime_path_is_trusted",
-        lambda path, presets_root: True,
+        lambda path, presets_root, **kwargs: True,
     )
     original_cwd = os.getcwd()
     original_path = list(sys.path)
@@ -163,6 +174,7 @@ def test_connector_runtime_direct_runner_preserves_parent_process_globals(monkey
     assert captured_parent_stdout == ""
 
 
+@pytest.mark.live_system_guard_bypass
 def test_connector_runtime_direct_runner_timeout_restores_control(monkeypatch, tmp_path):
     _write_connector_runtime_sleep(tmp_path)
     monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
@@ -170,7 +182,7 @@ def test_connector_runtime_direct_runner_timeout_restores_control(monkeypatch, t
     monkeypatch.setattr(
         terminal_tool_module,
         "_connector_runtime_path_is_trusted",
-        lambda path, presets_root: True,
+        lambda path, presets_root, **kwargs: True,
     )
 
     result = json.loads(terminal_tool_module._run_connector_runtime_command_if_allowed(
@@ -180,7 +192,7 @@ def test_connector_runtime_direct_runner_timeout_restores_control(monkeypatch, t
     ))
 
     assert result["connector_runtime_direct"] is True
-    assert result["exit_code"] == 124
+    assert result["exit_code"] == 124, result
     assert "timed out" in result["error"]
     assert "should not finish" not in result["output"]
 
@@ -220,7 +232,7 @@ def test_connector_runtime_direct_runner_isolates_pythonpath(monkeypatch, tmp_pa
     monkeypatch.setattr(
         terminal_tool_module,
         "_connector_runtime_path_is_trusted",
-        lambda path, presets_root: True,
+        lambda path, presets_root, **kwargs: True,
     )
     monkeypatch.syspath_prepend(str(safe_dep))
 
@@ -252,7 +264,7 @@ def test_connector_runtime_direct_runner_redacts_before_truncating(monkeypatch, 
     monkeypatch.setattr(
         terminal_tool_module,
         "_connector_runtime_path_is_trusted",
-        lambda path, presets_root: True,
+        lambda path, presets_root, **kwargs: True,
     )
     from tools import tool_output_limits
 
@@ -283,7 +295,7 @@ def test_compound_connector_runtime_command_does_not_receive_token(monkeypatch, 
     monkeypatch.setattr(
         terminal_tool_module,
         "_connector_runtime_path_is_trusted",
-        lambda path, presets_root: True,
+        lambda path, presets_root, **kwargs: True,
     )
     ss.set_multiplex_active(False)
 
@@ -308,7 +320,7 @@ def test_parser_rejects_non_presets_or_compound_connector_runtime(monkeypatch, t
     monkeypatch.setattr(
         terminal_tool_module,
         "_connector_runtime_path_is_trusted",
-        lambda path, presets_root: True,
+        lambda path, presets_root, **kwargs: True,
     )
 
     direct = terminal_tool_module._parse_connector_runtime_command(
@@ -316,6 +328,9 @@ def test_parser_rejects_non_presets_or_compound_connector_runtime(monkeypatch, t
     )
     relative = terminal_tool_module._parse_connector_runtime_command(
         "python3 skills/linear/scripts/connector_runtime.py list-tools"
+    )
+    absolute = terminal_tool_module._parse_connector_runtime_command(
+        f"python3 {script} list-tools"
     )
     compound = terminal_tool_module._parse_connector_runtime_command(
         'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py"; env'
@@ -326,6 +341,7 @@ def test_parser_rejects_non_presets_or_compound_connector_runtime(monkeypatch, t
 
     assert direct is not None
     assert relative is not None
+    assert absolute is not None
     assert compound is None
     assert non_presets is None
 
@@ -400,13 +416,30 @@ def test_connector_runtime_trust_rejects_root_tree_ctime_bump(monkeypatch, tmp_p
     assert terminal_tool_module._path_writable_by_current_user(script) is True
 
 
-def test_connector_runtime_trust_checks_presets_parent_directories(monkeypatch, tmp_path):
+def test_connector_runtime_trust_rejects_version_tree_modified_after_start(monkeypatch, tmp_path):
+    script = _write_connector_runtime(tmp_path)
+    monkeypatch.setattr(terminal_tool_module.os, "geteuid", lambda: 0, raising=False)
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_CONNECTOR_RUNTIME_TRUST_CUTOFF",
+        terminal_tool_module.time.time(),
+    )
+    future = terminal_tool_module._CONNECTOR_RUNTIME_TRUST_CUTOFF + 10
+    os.utime(script, (future, future))
+
+    assert terminal_tool_module._connector_runtime_path_is_trusted(
+        script,
+        tmp_path / "presets",
+    ) is False
+
+
+def test_connector_runtime_trust_ignores_shared_ancestor_timestamp_changes(monkeypatch, tmp_path):
     script = _write_connector_runtime(tmp_path)
     presets_root = tmp_path / "presets"
     writable_parent = tmp_path
 
-    def fake_writable(path):
-        return path == writable_parent
+    def fake_writable(path, *, enforce_cutoff=True):
+        return path == writable_parent and enforce_cutoff
 
     monkeypatch.setattr(
         terminal_tool_module,
@@ -417,7 +450,93 @@ def test_connector_runtime_trust_checks_presets_parent_directories(monkeypatch, 
     assert terminal_tool_module._connector_runtime_path_is_trusted(
         script,
         presets_root,
+    ) is True
+
+
+def test_connector_runtime_trust_rejects_symlink_inside_version_tree(monkeypatch, tmp_path):
+    script = _write_connector_runtime(tmp_path)
+    real_script = script.with_name("real_connector_runtime.py")
+    script.rename(real_script)
+    script.symlink_to(real_script.name)
+    monkeypatch.setattr(terminal_tool_module.os, "geteuid", lambda: 424242, raising=False)
+    monkeypatch.setattr(terminal_tool_module.os, "getegid", lambda: 424242, raising=False)
+    monkeypatch.setattr(terminal_tool_module.os, "getgroups", lambda: [])
+
+    assert terminal_tool_module._connector_runtime_path_is_trusted(
+        script,
+        tmp_path / "presets",
     ) is False
+
+
+def test_connector_runtime_pins_original_version_when_current_symlink_moves(monkeypatch, tmp_path):
+    v1 = tmp_path / "v1"
+    v2 = tmp_path / "v2"
+    _write_connector_runtime(v1)
+    _write_connector_runtime(v2)
+    current = tmp_path / "current"
+    current.symlink_to(v1 / "presets", target_is_directory=True)
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(current))
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+
+    first = terminal_tool_module._parse_connector_runtime_command(
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py"'
+    )
+    current.unlink()
+    current.symlink_to(v2 / "presets", target_is_directory=True)
+    second = terminal_tool_module._parse_connector_runtime_command(
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py"'
+    )
+
+    assert first is not None
+    assert second is not None
+    assert first.argv[1] == second.argv[1]
+    assert str(v1 / "presets") in first.argv[1]
+
+
+def test_connector_runtime_rejects_version_root_identity_replacement(monkeypatch, tmp_path):
+    _write_connector_runtime(tmp_path)
+    presets = tmp_path / "presets"
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets))
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+    parsed = terminal_tool_module._parse_connector_runtime_command(
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py"'
+    )
+    assert parsed is not None
+
+    original = presets.with_name("presets-old")
+    presets.rename(original)
+    presets.mkdir()
+
+    result = terminal_tool_module._run_connector_runtime_command_if_allowed(
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py"',
+        cwd=str(tmp_path),
+        timeout=5,
+    )
+
+    assert result is None
+
+
+def test_connector_runtime_rejection_log_never_contains_token(monkeypatch, tmp_path, caplog):
+    _write_connector_runtime(tmp_path)
+    token = "canary-connector-token-must-not-appear"
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", token)
+
+    parsed = terminal_tool_module._parse_connector_runtime_command(
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py"'
+    )
+
+    assert parsed is None
+    assert "owned_by_terminal_user" in caplog.text
+    assert token not in caplog.text
 
 
 def test_connector_runtime_output_force_redacts_actual_secret_values():
