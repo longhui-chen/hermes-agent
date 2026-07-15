@@ -160,6 +160,11 @@ def _validate_runtime_import_identifier(field: str, value: Any) -> str:
         raise ValueError(f"{field} must be a path-safe 1..128 character identifier")
     return value
 
+
+def _runtime_import_receipt_source_id(source_session_id: str) -> str:
+    """Return a non-reversible binding for completed-import idempotency."""
+    return hashlib.sha256(source_session_id.encode("utf-8")).hexdigest()
+
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
 # ---------------------------------------------------------------------------
@@ -3680,19 +3685,37 @@ class SessionDB:
                 row = conn.execute(
                     "SELECT * FROM runtime_imports WHERE import_id = ?", (import_id,)
                 ).fetchone()
-            elif tuple(row[k] for k in (
-                "source", "source_session_id", "target_session_id",
-                "payload_sha256", "expected_message_count"
-            )) != metadata:
-                raise RuntimeImportConflict("import_id is already bound to different metadata")
-
             if row["status"] == "completed":
+                # Completed receipts retain only a one-way source-session
+                # binding. Accept raw legacy rows for compatibility, while
+                # still rejecting a reused import_id with different metadata.
+                stored_source_session_id = row["source_session_id"]
+                source_session_matches = stored_source_session_id in {
+                    source_session_id,
+                    _runtime_import_receipt_source_id(source_session_id),
+                }
+                completed_metadata_matches = (
+                    row["source"] == source
+                    and source_session_matches
+                    and row["target_session_id"] == target_session_id
+                    and row["payload_sha256"] == payload_sha256.lower()
+                    and row["expected_message_count"] == expected_message_count
+                )
+                if not completed_metadata_matches:
+                    raise RuntimeImportConflict(
+                        "import_id is already bound to different metadata"
+                    )
                 return {
                     "import_id": import_id, "status": "completed",
                     "next_chunk_index": row["next_chunk_index"],
                     "staged_message_count": row["staged_message_count"],
                     "replayed": True,
                 }
+            if tuple(row[k] for k in (
+                "source", "source_session_id", "target_session_id",
+                "payload_sha256", "expected_message_count"
+            )) != metadata:
+                raise RuntimeImportConflict("import_id is already bound to different metadata")
             existing = conn.execute(
                 "SELECT chunk_sha256 FROM runtime_import_chunks "
                 "WHERE import_id = ? AND chunk_index = ?", (import_id, chunk_index),
@@ -3822,9 +3845,12 @@ class SessionDB:
             )
             conn.execute(
                 """UPDATE runtime_imports SET status = 'completed',
-                   normalized_sha256 = ?, completed_at = ?, updated_at = ?
+                   normalized_sha256 = ?, source_session_id = ?, title = NULL,
+                   completed_at = ?, updated_at = ?
                    WHERE import_id = ?""",
-                (normalized_sha, time.time(), time.time(), import_id),
+                (normalized_sha,
+                 _runtime_import_receipt_source_id(row["source_session_id"]),
+                 time.time(), time.time(), import_id),
             )
             # The completed receipt above is sufficient for idempotent replay.
             # Remove full staged transcript bodies and source message IDs in the

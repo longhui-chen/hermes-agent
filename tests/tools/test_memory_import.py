@@ -113,3 +113,34 @@ def test_memory_import_recovers_crash_after_target_rename(tmp_path, monkeypatch)
         payload_sha256=digest,
     )
     assert result["replayed"] is True
+
+
+def test_memory_import_recovers_prepare_crash_with_legacy_duplicate_entries(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    memory_path = home / "memories" / "MEMORY.md"
+    memory_path.parent.mkdir(parents=True)
+    memory_path.write_text("old fact\n§\nold fact", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=100, user_char_limit=100)
+    digest = hashlib.sha256(b"duplicate-crash-export").hexdigest()
+
+    original_write = store._write_file
+    monkeypatch.setattr(
+        store,
+        "_write_file",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("crash before target")),
+    )
+    with pytest.raises(RuntimeError, match="crash before target"):
+        store.import_replace(
+            target="memory", entries=["imported fact"], import_id="duplicate-crash",
+            payload_sha256=digest,
+        )
+    assert memory_path.read_text(encoding="utf-8") == "old fact\n§\nold fact"
+
+    monkeypatch.setattr(store, "_write_file", original_write)
+    result = store.import_replace(
+        target="memory", entries=["imported fact"], import_id="duplicate-crash",
+        payload_sha256=digest,
+    )
+    assert result["replayed"] is True
+    assert memory_path.read_text(encoding="utf-8") == "imported fact"

@@ -709,13 +709,17 @@ class MemoryStore:
                         "char_count": char_count, "replayed": True,
                         "effective_from": "next_session"}
 
+            # Capture the same parsed on-disk representation used by crash
+            # recovery before _reload_target deduplicates the live entries.
+            # Otherwise a legacy file containing duplicate entries produces a
+            # prepared receipt whose previous SHA can never match that file.
+            previous_entries = self._read_file(path)
             backup = self._reload_target(target)
             if backup:
                 raise MemoryImportConflict(_drift_error(path, backup)["error"])
-            original = list(self._entries_for(target))
             receipt_path.parent.mkdir(parents=True, exist_ok=True)
             previous_sha = hashlib.sha256(
-                ENTRY_DELIMITER.join(original).encode("utf-8")
+                ENTRY_DELIMITER.join(previous_entries).encode("utf-8")
             ).hexdigest()
             receipt = {
                 "state": "prepared", "import_id": import_id, "target": target,

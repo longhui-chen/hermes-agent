@@ -65,10 +65,30 @@ def test_completed_transcript_import_is_chunk_and_commit_idempotent(tmp_path):
         ).fetchone()[0] == 0
         # Only the non-sensitive idempotency receipt metadata remains.
         receipt = db._conn.execute(
-            "SELECT status, normalized_sha256 FROM runtime_imports WHERE import_id = 'imp-1'"
+            "SELECT status, normalized_sha256, source_session_id, title "
+            "FROM runtime_imports WHERE import_id = 'imp-1'"
         ).fetchone()
         assert receipt["status"] == "completed"
         assert receipt["normalized_sha256"]
+        assert receipt["source_session_id"] != "source-session"
+        assert len(receipt["source_session_id"]) == 64
+        assert receipt["title"] is None
+
+        # A lost stage response can still replay after commit without retaining
+        # the raw source session identifier, while a different binding fails.
+        assert _stage(db)["status"] == "completed"
+        with pytest.raises(RuntimeImportConflict):
+            db.stage_completed_transcript_import(
+                import_id="imp-1", source="workbuddy",
+                source_session_id="different-source-session",
+                target_session_id="imported-session", title="Imported chat",
+                payload_sha256=hashlib.sha256(b"source-payload").hexdigest(),
+                expected_message_count=2, chunk_index=0,
+                messages=[{
+                    "source_id": "m-0", "role": "user", "content": "hello",
+                    "created_at": 1_700_000_000,
+                }],
+            )
     finally:
         db.close()
 
