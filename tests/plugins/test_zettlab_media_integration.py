@@ -24,9 +24,8 @@ def test_image_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
     image_gen_registry.register_provider(ZettlabImageGenProvider())
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
     monkeypatch.setattr(image_tool, "_read_configured_image_provider", lambda: "zettlab")
-    monkeypatch.setattr(image_tool, "_read_configured_image_model", lambda: "seedream-v4")
+    monkeypatch.setattr(image_tool, "_read_configured_image_model", lambda: None)
     monkeypatch.setattr("hermes_cli.plugins._ensure_plugins_discovered", lambda *args, **kwargs: None)
-    monkeypatch.setattr(client, "default_model", lambda media_type: "seedream-v4")
 
     captured = {}
 
@@ -38,6 +37,13 @@ def test_image_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
             "assets": [{"url": "https://cdn.example/image.png"}],
         })
 
+    monkeypatch.setattr(client.requests, "get", lambda url, timeout: _Resp({
+        "image": {
+            "enabled": True,
+            "default_model": "seedream-v4",
+            "models": [{"id": "seedream-v4"}],
+        },
+    }))
     monkeypatch.setattr(client.requests, "post", fake_post)
 
     raw = image_tool._handle_image_generate({
@@ -62,7 +68,7 @@ def test_video_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
     video_gen_registry.register_provider(ZettlabVideoGenProvider())
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
     monkeypatch.setattr(video_tool, "_read_configured_video_provider", lambda: "zettlab")
-    monkeypatch.setattr(video_tool, "_read_configured_video_model", lambda: "seedance-v1")
+    monkeypatch.setattr(video_tool, "_read_configured_video_model", lambda: None)
     monkeypatch.setattr("hermes_cli.plugins._ensure_plugins_discovered", lambda *args, **kwargs: None)
 
     captured = {}
@@ -75,11 +81,17 @@ def test_video_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
             "assets": [{"url": "https://cdn.example/video.mp4"}],
         })
 
+    monkeypatch.setattr(client.requests, "get", lambda url, timeout: _Resp({
+        "video": {
+            "enabled": True,
+            "default_model": "seedance-v1",
+            "models": [{"id": "seedance-v1"}],
+        },
+    }))
     monkeypatch.setattr(client.requests, "post", fake_post)
 
     raw = video_tool._handle_video_generate({
         "prompt": "make a clip",
-        "model": "seedance-v1",
         "duration": 5,
         "aspect_ratio": "16:9",
     })

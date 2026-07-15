@@ -44,6 +44,56 @@ def test_zettlab_image_provider_reads_capabilities(monkeypatch):
     assert provider.capabilities()["max_reference_images"] == 3
 
 
+def test_zettlab_provider_uses_gateway_default_model(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setattr(client, "type_capability", lambda media_type: {
+        "enabled": True,
+        "default_model": "seedream-pro",
+        "models": [{"id": "seedream-fast"}, {"id": "seedream-pro"}],
+    })
+
+    assert client.default_model("image") == "seedream-pro"
+
+
+def test_zettlab_provider_default_model_uses_one_capability_snapshot(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    calls = 0
+
+    def capability(media_type):
+        nonlocal calls
+        calls += 1
+        return {"enabled": True, "models": [{"id": "legacy-first"}]}
+
+    monkeypatch.setattr(client, "type_capability", capability)
+    assert client.default_model("image") == "legacy-first"
+    assert calls == 1
+
+
+def test_zettlab_provider_rejects_disabled_or_empty_capability(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setattr(client, "type_capability", lambda media_type: {"enabled": False, "models": [{"id": "hidden"}]})
+    assert client.default_model("image") is None
+    monkeypatch.setattr(client, "type_capability", lambda media_type: {"enabled": True, "default_model": "missing", "models": []})
+    assert client.default_model("image") is None
+    monkeypatch.setattr(client, "type_capability", lambda media_type: {
+        "enabled": True,
+        "default_model": "missing",
+        "models": [{"id": "catalog-first"}],
+    })
+    assert client.default_model("image") is None
+
+
+def test_zettlab_provider_keeps_local_model_override_priority(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setattr(client, "_config_section", lambda media_type: {"model": "local-override"})
+    monkeypatch.setattr(client, "type_capability", lambda media_type: (_ for _ in ()).throw(AssertionError("capability should not be read")))
+    assert client.default_model("image") == "local-override"
+
+
 def test_zettlab_image_generate_creates_media_job(monkeypatch):
     from plugins import zettlab_media_client as client
 
@@ -100,6 +150,27 @@ def test_zettlab_image_generate_creates_media_job(monkeypatch):
         {"url": "https://example.com/source.png", "role": "source"},
         {"url": "https://example.com/ref.png", "role": "reference"},
     ]
+
+
+def test_zettlab_image_generate_uses_gateway_default_when_model_is_omitted(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
+    captured = {}
+    monkeypatch.setattr(client, "type_capability", lambda media_type: {
+        "enabled": True,
+        "default_model": "seedream-default",
+        "models": [{"id": "seedream-default"}],
+    })
+
+    def fake_post(url, json, headers, timeout):
+        captured.update(json)
+        return _Resp({"job_id": "job-default", "status": "done", "assets": [{"url": "https://cdn.example/default.png"}]})
+
+    monkeypatch.setattr(client.requests, "post", fake_post)
+    got = ZettlabImageGenProvider().generate("make image")
+    assert got["success"] is True
+    assert captured["model"] == "seedream-default"
 
 
 def test_zettlab_image_rejects_non_https_remote_input(monkeypatch):

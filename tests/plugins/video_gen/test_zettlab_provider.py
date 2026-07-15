@@ -103,6 +103,27 @@ def test_zettlab_video_generate_creates_media_job(monkeypatch):
     ]
 
 
+def test_zettlab_video_generate_uses_gateway_default_when_model_is_omitted(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
+    captured = {}
+    monkeypatch.setattr(client, "type_capability", lambda media_type: {
+        "enabled": True,
+        "default_model": "seedance-default",
+        "models": [{"id": "seedance-default"}],
+    })
+
+    def fake_post(url, json, headers, timeout):
+        captured.update(json)
+        return _Resp({"job_id": "job-video-default", "status": "done", "assets": [{"url": "https://cdn.example/default.mp4"}]})
+
+    monkeypatch.setattr(client.requests, "post", fake_post)
+    got = ZettlabVideoGenProvider().generate("make video")
+    assert got["success"] is True
+    assert captured["model"] == "seedance-default"
+
+
 def test_zettlab_video_rejects_non_https_remote_input(monkeypatch):
     from plugins import zettlab_media_client as client
 

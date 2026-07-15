@@ -88,9 +88,28 @@ def default_model(media_type: str) -> Optional[str]:
     configured = _config_section(media_type).get("model")
     if isinstance(configured, str) and configured.strip():
         return configured.strip()
-    models = list_models(media_type)
-    if models:
-        return str(models[0]["id"])
+    section = type_capability(media_type)
+    if section.get("enabled") is False:
+        return None
+    gateway_default = section.get("default_model")
+    models = section.get("models")
+    if isinstance(models, list):
+        model_ids = [
+            model.get("id").strip()
+            for model in models
+            if isinstance(model, dict)
+            and isinstance(model.get("id"), str)
+            and model.get("id").strip()
+        ]
+        if "default_model" in section:
+            if isinstance(gateway_default, str) and gateway_default.strip() in model_ids:
+                return gateway_default.strip()
+            return None
+        # Compatibility with gateways that predate the explicit default_model
+        # field. Reuse this same capability snapshot so a transient second GET
+        # cannot invalidate an otherwise usable response.
+        if model_ids:
+            return model_ids[0]
     return None
 
 
