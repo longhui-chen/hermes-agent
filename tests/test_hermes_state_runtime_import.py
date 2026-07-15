@@ -86,3 +86,18 @@ def test_runtime_import_rejects_non_completed_runtime_messages(tmp_path):
         assert db.get_session("imported-session") is None
     finally:
         db.close()
+
+
+def test_runtime_import_rejects_duplicate_source_id_across_chunks(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        _stage(db)
+        duplicate = [{
+            "source_id": "m-0", "role": "assistant", "content": "duplicate",
+            "created_at": 1_700_000_001,
+        }]
+        with pytest.raises(RuntimeImportConflict, match="across chunks"):
+            _stage(db, chunk_index=1, messages=duplicate)
+        assert db.get_session("imported-session") is None
+    finally:
+        db.close()

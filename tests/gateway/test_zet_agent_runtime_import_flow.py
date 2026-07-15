@@ -17,6 +17,7 @@ async def test_completed_transcript_http_flow_requires_auth_and_commits_atomical
     adapter._ensure_session_db = lambda: db
     app = web.Application()
     app.router.add_post("/api/sessions/import", adapter._handle_session_import)
+    app.router.add_post("/api/memory/import", adapter._handle_memory_import)
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     payload = {
         "import_id": "flow-import", "operation": "stage", "source": "marvis",
@@ -42,6 +43,15 @@ async def test_completed_transcript_http_flow_requires_auth_and_commits_atomical
             assert (await committed.json())["message_count"] == 1
             caps = await cli.get("/v1/capabilities", headers=headers)
             assert (await caps.json())["features"]["completed_transcript_import"] is True
+            memory = await cli.post(
+                "/api/memory/import",
+                json={"import_id": "memory-flow", "mode": "replace", "target": "memory",
+                      "payload_sha256": hashlib.sha256(b"memory").hexdigest(),
+                      "entries": ["用户喜欢简洁回答"]},
+                headers=headers,
+            )
+            assert memory.status == 200
+            assert (await memory.json())["effective_from"] == "next_session"
         assert db.get_messages_as_conversation("hermes-1")[0]["content"] == "你好"
     finally:
         db.close()

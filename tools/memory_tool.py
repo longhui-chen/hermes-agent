@@ -23,6 +23,7 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -58,6 +59,10 @@ def get_memory_dir() -> Path:
     return get_hermes_home() / "memories"
 
 ENTRY_DELIMITER = "\n§\n"
+
+
+class MemoryImportConflict(ValueError):
+    """An import id or receipt conflicts with the live curated memory."""
 
 
 # ---------------------------------------------------------------------------
@@ -637,6 +642,94 @@ class MemoryStore:
 
         return self._success_response(target, f"Applied {len(operations)} operation(s).")
 
+    def import_replace(
+        self, *, target: str, entries: List[str], import_id: str, payload_sha256: str
+    ) -> Dict[str, Any]:
+        """Atomically replace one curated-memory file with an idempotent receipt."""
+        if target not in {"memory", "user"}:
+            raise ValueError("target must be memory or user")
+        if not isinstance(import_id, str) or not import_id or len(import_id) > 128:
+            raise ValueError("import_id must be 1..128 characters")
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", payload_sha256 or ""):
+            raise ValueError("payload_sha256 must be 64 hexadecimal characters")
+        if not isinstance(entries, list) or len(entries) > 128:
+            raise ValueError("entries must be a list with at most 128 items")
+        normalized: List[str] = []
+        for index, raw in enumerate(entries):
+            if not isinstance(raw, str) or not raw.strip():
+                raise ValueError(f"entries[{index}] must be non-empty text")
+            entry = raw.strip()
+            error = _scan_memory_content(entry) or _validate_user_profile_language(target, entry)
+            if error:
+                raise ValueError(f"entries[{index}]: {error}")
+            if entry not in normalized:
+                normalized.append(entry)
+        char_count = len(ENTRY_DELIMITER.join(normalized)) if normalized else 0
+        if char_count > self._char_limit(target):
+            raise ValueError(f"imported {target} exceeds {self._char_limit(target)} character limit")
+
+        content = ENTRY_DELIMITER.join(normalized)
+        content_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        path = self._path_for(target)
+        receipt_path = get_memory_dir() / ".imports" / (
+            hashlib.sha256(import_id.encode("utf-8")).hexdigest() + ".json"
+        )
+        with self._file_lock(path):
+            if receipt_path.exists():
+                receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                expected = (import_id, target, payload_sha256.lower(), content_sha)
+                actual = (receipt.get("import_id"), receipt.get("target"),
+                          receipt.get("payload_sha256"), receipt.get("content_sha256"))
+                if actual != expected:
+                    raise MemoryImportConflict("import_id is already bound to different memory data")
+                live_sha = hashlib.sha256(
+                    ENTRY_DELIMITER.join(self._read_file(path)).encode("utf-8")
+                ).hexdigest()
+                if live_sha != receipt.get("content_sha256"):
+                    raise MemoryImportConflict(
+                        "memory changed after import; refusing to overwrite user edits"
+                    )
+                return {"import_id": import_id, "status": "completed", "target": target,
+                        "char_count": char_count, "replayed": True,
+                        "effective_from": "next_session"}
+
+            backup = self._reload_target(target)
+            if backup:
+                raise MemoryImportConflict(_drift_error(path, backup)["error"])
+            original = list(self._entries_for(target))
+            receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                self._write_file(path, normalized)
+                fd, tmp_path = tempfile.mkstemp(
+                    dir=str(receipt_path.parent), suffix=".tmp", prefix=".receipt_"
+                )
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                        json.dump({"import_id": import_id, "target": target,
+                                   "payload_sha256": payload_sha256.lower(),
+                                   "content_sha256": content_sha}, handle,
+                                  sort_keys=True, separators=(",", ":"))
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    atomic_replace(tmp_path, receipt_path)
+                except BaseException:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    raise
+            except BaseException:
+                self._write_file(path, original)
+                try:
+                    receipt_path.unlink()
+                except OSError:
+                    pass
+                raise
+            self._set_entries(target, normalized)
+        return {"import_id": import_id, "status": "completed", "target": target,
+                "char_count": char_count, "replayed": False,
+                "effective_from": "next_session"}
+
     def _batch_error(self, target: str, message: str) -> Dict[str, Any]:
         """Build a batch-abort error that reports live (uncommitted) state."""
         current = self._char_count(target)
@@ -1177,5 +1270,3 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
-

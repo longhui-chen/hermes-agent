@@ -813,6 +813,12 @@ CREATE TABLE IF NOT EXISTS runtime_import_chunks (
     PRIMARY KEY (import_id, chunk_index)
 );
 
+CREATE TABLE IF NOT EXISTS runtime_import_message_ids (
+    import_id TEXT NOT NULL REFERENCES runtime_imports(import_id) ON DELETE CASCADE,
+    source_id TEXT NOT NULL,
+    PRIMARY KEY (import_id, source_id)
+);
+
 CREATE TABLE IF NOT EXISTS compression_locks (
     session_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
@@ -3604,12 +3610,20 @@ class SessionDB:
         chunk_index: int,
         messages: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """Stage one bounded chunk without mutating the canonical transcript."""
+        """Stage one bounded chunk without mutating the canonical transcript.
+
+        ``payload_sha256`` binds the idempotency key to the caller's complete
+        source artifact. It is intentionally opaque because source exporters
+        have different canonical encodings. ``commit`` returns a separate
+        server-computed ``normalized_sha256`` for the Hermes-normalized rows.
+        """
         for field, value in (("import_id", import_id), ("source", source),
                              ("source_session_id", source_session_id),
                              ("target_session_id", target_session_id)):
             if not isinstance(value, str) or not value or len(value) > 128:
                 raise ValueError(f"{field} must be 1..128 characters")
+        if title is not None and not isinstance(title, str):
+            raise ValueError("title must be text when provided")
         if not re.fullmatch(r"[0-9a-fA-F]{64}", payload_sha256 or ""):
             raise ValueError("payload_sha256 must be 64 hexadecimal characters")
         if not isinstance(expected_message_count, int) or isinstance(expected_message_count, bool):
@@ -3688,11 +3702,25 @@ class SessionDB:
                 raise ValueError("staged messages exceed expected_message_count")
             if new_bytes > RUNTIME_IMPORT_MAX_STAGED_BYTES:
                 raise ValueError("staged transcript exceeds 32 MiB")
+            source_ids = [m.get("platform_message_id") for m in normalized
+                          if m.get("platform_message_id")]
+            for source_id in source_ids:
+                if conn.execute(
+                    "SELECT 1 FROM runtime_import_message_ids "
+                    "WHERE import_id = ? AND source_id = ?", (import_id, source_id),
+                ).fetchone():
+                    raise RuntimeImportConflict(
+                        f"duplicate source_id across chunks: {source_id}"
+                    )
             conn.execute(
                 """INSERT INTO runtime_import_chunks
                    (import_id, chunk_index, chunk_sha256, messages_json,
                     message_count, byte_count) VALUES (?, ?, ?, ?, ?, ?)""",
                 (import_id, chunk_index, chunk_sha, canonical, len(normalized), byte_count),
+            )
+            conn.executemany(
+                "INSERT INTO runtime_import_message_ids (import_id, source_id) VALUES (?, ?)",
+                [(import_id, source_id) for source_id in source_ids],
             )
             conn.execute(
                 """UPDATE runtime_imports SET next_chunk_index = next_chunk_index + 1,

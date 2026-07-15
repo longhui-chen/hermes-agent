@@ -1568,6 +1568,7 @@ class ZetAgentAdapter(APIServerAdapter):
             return resp
         payload.setdefault("features", {})["session_steer"] = True
         payload["features"]["completed_transcript_import"] = True
+        payload["features"]["curated_memory_import"] = True
         payload.setdefault("endpoints", {})["session_steer"] = {
             "method": "POST",
             "path": "/v1/sessions/{session_id}/steer",
@@ -1576,6 +1577,9 @@ class ZetAgentAdapter(APIServerAdapter):
             "method": "POST",
             "path": "/api/sessions/import",
             "operations": ["stage", "commit", "abort"],
+        }
+        payload["endpoints"]["curated_memory_import"] = {
+            "method": "POST", "path": "/api/memory/import",
         }
         return web.json_response(payload)
 
@@ -1638,11 +1642,46 @@ class ZetAgentAdapter(APIServerAdapter):
                 status=status,
             )
 
+    async def _handle_memory_import(self, request: "web.Request") -> "web.Response":
+        """Replace one bounded curated-memory file; effective next session."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+            if not isinstance(body, dict) or body.get("mode") != "replace":
+                raise ValueError("mode must be replace")
+            from tools.memory_tool import load_on_disk_store
+            result = await asyncio.to_thread(
+                load_on_disk_store().import_replace,
+                target=body.get("target"), entries=body.get("entries"),
+                import_id=body.get("import_id"),
+                payload_sha256=body.get("payload_sha256"),
+            )
+            return web.json_response(result)
+        except Exception as exc:
+            from tools.memory_tool import MemoryImportConflict
+            if isinstance(exc, MemoryImportConflict):
+                status, code = 409, "memory_import_conflict"
+            elif isinstance(exc, (ValueError, TypeError)):
+                status, code = 400, "invalid_memory_import"
+            else:
+                logger.exception("[zet_agent] curated memory import failed")
+                status, code = 500, "memory_import_failed"
+            return web.json_response(
+                {"error": {"message": str(exc), "type": "invalid_request_error", "code": code}},
+                status=status,
+            )
+
     def _register_profile_api_routes(self, router, *, chat_handler=None) -> None:
         super()._register_profile_api_routes(router, chat_handler=chat_handler)
         router.add_post(
             "/p/{profile}/api/sessions/import",
             self._profile_handler(self._handle_session_import),
+        )
+        router.add_post(
+            "/p/{profile}/api/memory/import",
+            self._profile_handler(self._handle_memory_import),
         )
 
     async def _handle_session_steer(self, request: "web.Request") -> "web.Response":
@@ -2612,6 +2651,9 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
             self._app.router.add_post(
                 "/api/sessions/import", self._handle_session_import,
+            )
+            self._app.router.add_post(
+                "/api/memory/import", self._handle_memory_import,
             )
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
