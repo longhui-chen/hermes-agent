@@ -15,8 +15,10 @@ Key design decisions:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
+import math
 import random
 import re
 import sqlite3
@@ -128,6 +130,20 @@ SCHEMA_VERSION = 17
 # Search queries do not need to be arbitrarily large, and bounding them keeps
 # sanitizer/runtime behavior predictable under adversarial input.
 MAX_FTS5_QUERY_CHARS = 2_048
+
+RUNTIME_IMPORT_MAX_CHUNK_MESSAGES = 200
+RUNTIME_IMPORT_MAX_MESSAGES = 10_000
+RUNTIME_IMPORT_MAX_CONTENT_CHARS = 65_536
+RUNTIME_IMPORT_MAX_STAGED_BYTES = 32 * 1024 * 1024
+RUNTIME_IMPORT_STAGING_TTL_SECONDS = 24 * 60 * 60
+
+
+class RuntimeImportConflict(ValueError):
+    """The idempotency key or target is already bound to different data."""
+
+
+class RuntimeImportIncomplete(ValueError):
+    """A transcript import cannot commit until every declared message exists."""
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -769,6 +785,34 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+CREATE TABLE IF NOT EXISTS runtime_imports (
+    import_id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    source_session_id TEXT NOT NULL,
+    target_session_id TEXT NOT NULL,
+    title TEXT,
+    payload_sha256 TEXT NOT NULL,
+    expected_message_count INTEGER NOT NULL,
+    next_chunk_index INTEGER NOT NULL DEFAULT 0,
+    staged_message_count INTEGER NOT NULL DEFAULT 0,
+    staged_bytes INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'staging',
+    normalized_sha256 TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS runtime_import_chunks (
+    import_id TEXT NOT NULL REFERENCES runtime_imports(import_id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL,
+    chunk_sha256 TEXT NOT NULL,
+    messages_json TEXT NOT NULL,
+    message_count INTEGER NOT NULL,
+    byte_count INTEGER NOT NULL,
+    PRIMARY KEY (import_id, chunk_index)
+);
+
 CREATE TABLE IF NOT EXISTS compression_locks (
     session_id TEXT PRIMARY KEY,
     holder TEXT NOT NULL,
@@ -781,6 +825,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_runtime_imports_updated ON runtime_imports(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 """
 
@@ -3497,6 +3542,269 @@ class SessionDB:
             )
 
         self._execute_write(_do)
+
+    @staticmethod
+    def _normalize_import_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("messages must be a non-empty list")
+        if len(messages) > RUNTIME_IMPORT_MAX_CHUNK_MESSAGES:
+            raise ValueError(
+                f"chunk exceeds {RUNTIME_IMPORT_MAX_CHUNK_MESSAGES} messages"
+            )
+        normalized: List[Dict[str, Any]] = []
+        seen_source_ids: set[str] = set()
+        for index, raw in enumerate(messages):
+            if not isinstance(raw, dict):
+                raise ValueError(f"messages[{index}] must be an object")
+            role = raw.get("role")
+            if role not in {"user", "assistant"}:
+                raise ValueError(
+                    f"messages[{index}].role must be user or assistant; "
+                    "system/tool/in-flight state is not importable"
+                )
+            content = raw.get("content")
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError(f"messages[{index}].content must be non-empty text")
+            if len(content) > RUNTIME_IMPORT_MAX_CONTENT_CHARS:
+                raise ValueError(
+                    f"messages[{index}].content exceeds "
+                    f"{RUNTIME_IMPORT_MAX_CONTENT_CHARS} characters"
+                )
+            created_at = raw.get("created_at")
+            if not isinstance(created_at, (int, float)) or isinstance(created_at, bool):
+                raise ValueError(f"messages[{index}].created_at must be unix seconds")
+            created_at = float(created_at)
+            if not math.isfinite(created_at) or created_at < 0:
+                raise ValueError(f"messages[{index}].created_at is invalid")
+            source_id = raw.get("source_id")
+            if source_id is not None:
+                if not isinstance(source_id, str) or not source_id or len(source_id) > 256:
+                    raise ValueError(f"messages[{index}].source_id is invalid")
+                if source_id in seen_source_ids:
+                    raise ValueError(f"duplicate source_id in chunk: {source_id}")
+                seen_source_ids.add(source_id)
+            normalized.append({
+                "role": role,
+                "content": content,
+                "timestamp": created_at,
+                "platform_message_id": source_id,
+            })
+        return normalized
+
+    def stage_completed_transcript_import(
+        self,
+        *,
+        import_id: str,
+        source: str,
+        source_session_id: str,
+        target_session_id: str,
+        title: Optional[str],
+        payload_sha256: str,
+        expected_message_count: int,
+        chunk_index: int,
+        messages: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Stage one bounded chunk without mutating the canonical transcript."""
+        for field, value in (("import_id", import_id), ("source", source),
+                             ("source_session_id", source_session_id),
+                             ("target_session_id", target_session_id)):
+            if not isinstance(value, str) or not value or len(value) > 128:
+                raise ValueError(f"{field} must be 1..128 characters")
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", payload_sha256 or ""):
+            raise ValueError("payload_sha256 must be 64 hexadecimal characters")
+        if not isinstance(expected_message_count, int) or isinstance(expected_message_count, bool):
+            raise ValueError("expected_message_count must be an integer")
+        if not 1 <= expected_message_count <= RUNTIME_IMPORT_MAX_MESSAGES:
+            raise ValueError(
+                f"expected_message_count must be 1..{RUNTIME_IMPORT_MAX_MESSAGES}"
+            )
+        if not isinstance(chunk_index, int) or isinstance(chunk_index, bool) or chunk_index < 0:
+            raise ValueError("chunk_index must be a non-negative integer")
+        normalized = self._normalize_import_messages(messages)
+        canonical = json.dumps(
+            normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        byte_count = len(canonical.encode("utf-8"))
+        chunk_sha = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        now = time.time()
+
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM runtime_imports WHERE status = 'staging' AND updated_at < ?",
+                (now - RUNTIME_IMPORT_STAGING_TTL_SECONDS,),
+            )
+            row = conn.execute(
+                "SELECT * FROM runtime_imports WHERE import_id = ?", (import_id,)
+            ).fetchone()
+            metadata = (source, source_session_id, target_session_id,
+                        payload_sha256.lower(), expected_message_count)
+            if row is None:
+                if chunk_index != 0:
+                    raise RuntimeImportConflict("first chunk_index must be 0")
+                conn.execute(
+                    """INSERT INTO runtime_imports
+                       (import_id, source, source_session_id, target_session_id, title,
+                        payload_sha256, expected_message_count, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (import_id, source, source_session_id, target_session_id, title,
+                     payload_sha256.lower(), expected_message_count, now, now),
+                )
+                row = conn.execute(
+                    "SELECT * FROM runtime_imports WHERE import_id = ?", (import_id,)
+                ).fetchone()
+            elif tuple(row[k] for k in (
+                "source", "source_session_id", "target_session_id",
+                "payload_sha256", "expected_message_count"
+            )) != metadata:
+                raise RuntimeImportConflict("import_id is already bound to different metadata")
+
+            if row["status"] == "completed":
+                return {
+                    "import_id": import_id, "status": "completed",
+                    "next_chunk_index": row["next_chunk_index"],
+                    "staged_message_count": row["staged_message_count"],
+                    "replayed": True,
+                }
+            existing = conn.execute(
+                "SELECT chunk_sha256 FROM runtime_import_chunks "
+                "WHERE import_id = ? AND chunk_index = ?", (import_id, chunk_index),
+            ).fetchone()
+            if existing:
+                if existing["chunk_sha256"] != chunk_sha:
+                    raise RuntimeImportConflict("chunk_index was already staged with different data")
+                return {
+                    "import_id": import_id, "status": "staged",
+                    "next_chunk_index": row["next_chunk_index"],
+                    "staged_message_count": row["staged_message_count"],
+                    "replayed": True,
+                }
+            if chunk_index != row["next_chunk_index"]:
+                raise RuntimeImportConflict(
+                    f"expected chunk_index {row['next_chunk_index']}"
+                )
+            new_count = row["staged_message_count"] + len(normalized)
+            new_bytes = row["staged_bytes"] + byte_count
+            if new_count > expected_message_count:
+                raise ValueError("staged messages exceed expected_message_count")
+            if new_bytes > RUNTIME_IMPORT_MAX_STAGED_BYTES:
+                raise ValueError("staged transcript exceeds 32 MiB")
+            conn.execute(
+                """INSERT INTO runtime_import_chunks
+                   (import_id, chunk_index, chunk_sha256, messages_json,
+                    message_count, byte_count) VALUES (?, ?, ?, ?, ?, ?)""",
+                (import_id, chunk_index, chunk_sha, canonical, len(normalized), byte_count),
+            )
+            conn.execute(
+                """UPDATE runtime_imports SET next_chunk_index = next_chunk_index + 1,
+                   staged_message_count = ?, staged_bytes = ?, updated_at = ?
+                   WHERE import_id = ?""",
+                (new_count, new_bytes, now, import_id),
+            )
+            return {
+                "import_id": import_id, "status": "staged",
+                "next_chunk_index": chunk_index + 1,
+                "staged_message_count": new_count, "replayed": False,
+            }
+
+        return self._execute_write(_do)
+
+    def commit_completed_transcript_import(self, import_id: str) -> Dict[str, Any]:
+        """Atomically publish every staged chunk as one new completed session."""
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM runtime_imports WHERE import_id = ?", (import_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("unknown import_id")
+            if row["status"] == "completed":
+                return {
+                    "import_id": import_id, "status": "completed",
+                    "session_id": row["target_session_id"],
+                    "message_count": row["staged_message_count"],
+                    "normalized_sha256": row["normalized_sha256"], "replayed": True,
+                }
+            if row["staged_message_count"] != row["expected_message_count"]:
+                raise RuntimeImportIncomplete(
+                    f"staged {row['staged_message_count']} of "
+                    f"{row['expected_message_count']} messages"
+                )
+            if conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (row["target_session_id"],)
+            ).fetchone():
+                raise RuntimeImportConflict("target_session_id already exists")
+
+            title = self.sanitize_title(row["title"])
+            if title and conn.execute(
+                "SELECT 1 FROM sessions WHERE title = ?", (title,)
+            ).fetchone():
+                suffix = f" #{hashlib.sha256(import_id.encode()).hexdigest()[:8]}"
+                title = title[: self.MAX_TITLE_LENGTH - len(suffix)] + suffix
+            started_at = time.time()
+            model_config = json.dumps({
+                "_runtime_import": {
+                    "import_id": import_id,
+                    "source": row["source"],
+                    "source_session_id": row["source_session_id"],
+                    "payload_sha256": row["payload_sha256"],
+                }
+            })
+            conn.execute(
+                """INSERT INTO sessions
+                   (id, source, model_config, started_at, title)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (row["target_session_id"], f"import:{row['source']}",
+                 model_config, started_at, title),
+            )
+            digest = hashlib.sha256()
+            total = 0
+            chunks = conn.execute(
+                "SELECT messages_json FROM runtime_import_chunks "
+                "WHERE import_id = ? ORDER BY chunk_index", (import_id,),
+            ).fetchall()
+            if len(chunks) != row["next_chunk_index"]:
+                raise RuntimeImportIncomplete("one or more staged chunks are missing")
+            for chunk in chunks:
+                raw = chunk["messages_json"]
+                encoded = raw.encode("utf-8")
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+                messages = json.loads(raw)
+                inserted, _ = self._insert_message_rows(
+                    conn, row["target_session_id"], messages
+                )
+                total += inserted
+            normalized_sha = digest.hexdigest()
+            conn.execute(
+                "UPDATE sessions SET message_count = ? WHERE id = ?",
+                (total, row["target_session_id"]),
+            )
+            conn.execute(
+                """UPDATE runtime_imports SET status = 'completed',
+                   normalized_sha256 = ?, completed_at = ?, updated_at = ?
+                   WHERE import_id = ?""",
+                (normalized_sha, time.time(), time.time(), import_id),
+            )
+            return {
+                "import_id": import_id, "status": "completed",
+                "session_id": row["target_session_id"], "message_count": total,
+                "normalized_sha256": normalized_sha, "replayed": False,
+            }
+
+        return self._execute_write(_do)
+
+    def abort_completed_transcript_import(self, import_id: str) -> Dict[str, Any]:
+        def _do(conn):
+            row = conn.execute(
+                "SELECT status FROM runtime_imports WHERE import_id = ?", (import_id,)
+            ).fetchone()
+            if row and row["status"] == "completed":
+                raise RuntimeImportConflict("completed imports cannot be aborted")
+            deleted = conn.execute(
+                "DELETE FROM runtime_imports WHERE import_id = ?", (import_id,)
+            ).rowcount
+            return {"import_id": import_id, "status": "aborted", "replayed": not bool(deleted)}
+
+        return self._execute_write(_do)
 
     def has_archived_messages(self, session_id: str) -> bool:
         """Return True if the session has any soft-archived (``active = 0``) rows.

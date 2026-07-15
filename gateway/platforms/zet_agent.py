@@ -1567,11 +1567,83 @@ class ZetAgentAdapter(APIServerAdapter):
         except Exception:
             return resp
         payload.setdefault("features", {})["session_steer"] = True
+        payload["features"]["completed_transcript_import"] = True
         payload.setdefault("endpoints", {})["session_steer"] = {
             "method": "POST",
             "path": "/v1/sessions/{session_id}/steer",
         }
+        payload["endpoints"]["completed_transcript_import"] = {
+            "method": "POST",
+            "path": "/api/sessions/import",
+            "operations": ["stage", "commit", "abort"],
+        }
         return web.json_response(payload)
+
+    async def _handle_session_import(self, request: "web.Request") -> "web.Response":
+        """Stage and atomically publish completed external transcripts.
+
+        This endpoint intentionally accepts only completed user/assistant text.
+        It never restores system prompts, tool calls, approvals, credentials, or
+        any other in-flight runtime state.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("request body must be an object")
+            operation = body.get("operation")
+            import_id = body.get("import_id")
+            session_db = self._ensure_session_db()
+            if session_db is None:
+                raise RuntimeError("session db unavailable")
+            if operation == "stage":
+                result = await asyncio.to_thread(
+                    session_db.stage_completed_transcript_import,
+                    import_id=import_id,
+                    source=body.get("source"),
+                    source_session_id=body.get("source_session_id"),
+                    target_session_id=body.get("target_session_id"),
+                    title=body.get("title"),
+                    payload_sha256=body.get("payload_sha256"),
+                    expected_message_count=body.get("expected_message_count"),
+                    chunk_index=body.get("chunk_index"),
+                    messages=body.get("messages"),
+                )
+            elif operation == "commit":
+                result = await asyncio.to_thread(
+                    session_db.commit_completed_transcript_import, import_id
+                )
+            elif operation == "abort":
+                result = await asyncio.to_thread(
+                    session_db.abort_completed_transcript_import, import_id
+                )
+            else:
+                raise ValueError("operation must be stage, commit, or abort")
+            return web.json_response(result)
+        except Exception as exc:
+            from hermes_state import RuntimeImportConflict, RuntimeImportIncomplete
+            if isinstance(exc, RuntimeImportConflict):
+                status, code = 409, "runtime_import_conflict"
+            elif isinstance(exc, RuntimeImportIncomplete):
+                status, code = 409, "runtime_import_incomplete"
+            elif isinstance(exc, (ValueError, TypeError)):
+                status, code = 400, "invalid_runtime_import"
+            else:
+                logger.exception("[zet_agent] completed transcript import failed")
+                status, code = 500, "runtime_import_failed"
+            return web.json_response(
+                {"error": {"message": str(exc), "type": "invalid_request_error", "code": code}},
+                status=status,
+            )
+
+    def _register_profile_api_routes(self, router, *, chat_handler=None) -> None:
+        super()._register_profile_api_routes(router, chat_handler=chat_handler)
+        router.add_post(
+            "/p/{profile}/api/sessions/import",
+            self._profile_handler(self._handle_session_import),
+        )
 
     async def _handle_session_steer(self, request: "web.Request") -> "web.Response":
         """POST /v1/sessions/{session_id}/steer — inject user text into the
@@ -2538,6 +2610,9 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
             self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+            self._app.router.add_post(
+                "/api/sessions/import", self._handle_session_import,
+            )
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             if hasattr(self, "_handle_get_run"):
