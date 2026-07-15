@@ -125,6 +125,29 @@ def test_runtime_import_rejects_non_completed_runtime_messages(tmp_path):
         db.close()
 
 
+def test_runtime_import_accepts_unknown_source_timestamp_sentinel(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        _stage(
+            db,
+            expected=1,
+            messages=[{
+                "source_id": "unknown-time",
+                "role": "user",
+                "content": "timestamp was not exported",
+                "created_at": 0,
+            }],
+        )
+        assert db.commit_completed_transcript_import("imp-1")["status"] == "completed"
+        timestamp = db._conn.execute(
+            "SELECT timestamp FROM messages WHERE session_id = ?",
+            ("imported-session",),
+        ).fetchone()[0]
+        assert timestamp == 0
+    finally:
+        db.close()
+
+
 def test_runtime_import_rejects_duplicate_source_id_across_chunks(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     try:
