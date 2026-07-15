@@ -139,6 +139,11 @@ ZET_AGENT_DEFAULT_PORT = 7900
 # default 300s) so we don't duplicate it here.
 CLARIFY_RESPONSE_TIMEOUT = 300.0
 
+# Expired runtime-import staging may contain complete source transcripts.
+# Sweep periodically even when no later import request arrives; each database
+# call deletes one bounded batch to avoid long write-lock holds on device.
+RUNTIME_IMPORT_CLEANUP_INTERVAL_SECONDS = 15 * 60
+
 # Default approval gateway timeout in seconds — must mirror the literal
 # default in tools/approval.py:1110. We read this independently so the
 # expires_at_ms we publish to clients matches what the agent thread will
@@ -1673,6 +1678,31 @@ class ZetAgentAdapter(APIServerAdapter):
                 status=status,
             )
 
+    async def _cleanup_stale_runtime_imports_once(self) -> int:
+        session_db = self._ensure_session_db()
+        if session_db is None:
+            return 0
+        return await asyncio.to_thread(session_db.cleanup_stale_runtime_imports)
+
+    async def _sweep_stale_runtime_imports(self) -> None:
+        while True:
+            try:
+                deleted = await self._cleanup_stale_runtime_imports_once()
+                if deleted:
+                    logger.info(
+                        "[zet_agent] removed %d expired runtime import staging row(s)",
+                        deleted,
+                    )
+                await asyncio.sleep(RUNTIME_IMPORT_CLEANUP_INTERVAL_SECONDS)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "[zet_agent] runtime import staging cleanup failed",
+                    exc_info=True,
+                )
+                await asyncio.sleep(RUNTIME_IMPORT_CLEANUP_INTERVAL_SECONDS)
+
     def _register_profile_api_routes(self, router, *, chat_handler=None) -> None:
         super()._register_profile_api_routes(router, chat_handler=chat_handler)
         router.add_post(
@@ -2848,6 +2878,12 @@ class ZetAgentAdapter(APIServerAdapter):
                 "[%s] listening on http://%s:%d (interaction endpoints enabled)",
                 self.name, self._host, self._port,
             )
+
+            import_cleanup_task = asyncio.create_task(
+                self._sweep_stale_runtime_imports()
+            )
+            self._background_tasks.add(import_cleanup_task)
+            import_cleanup_task.add_done_callback(self._background_tasks.discard)
 
             # Goal reconcile-on-start: after a crash/OOM respawn (local-server
             # goal keepalive re-spawns us), re-report every indexed goal and

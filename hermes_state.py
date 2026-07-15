@@ -136,6 +136,7 @@ RUNTIME_IMPORT_MAX_MESSAGES = 10_000
 RUNTIME_IMPORT_MAX_CONTENT_CHARS = 65_536
 RUNTIME_IMPORT_MAX_STAGED_BYTES = 32 * 1024 * 1024
 RUNTIME_IMPORT_STAGING_TTL_SECONDS = 24 * 60 * 60
+RUNTIME_IMPORT_CLEANUP_BATCH_SIZE = 64
 
 
 class RuntimeImportConflict(ValueError):
@@ -1034,6 +1035,10 @@ class SessionDB:
                 if not report.get("repaired"):
                     raise
                 _connect_and_init()
+            # Expired staging rows can contain complete source transcripts.
+            # Sweep a bounded batch whenever the profile DB opens so abandoned
+            # imports converge even when no later import request arrives.
+            self.cleanup_stale_runtime_imports()
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
             # session DB is unavailable instead of a bare "Session database
@@ -3613,9 +3618,36 @@ class SessionDB:
                 "role": role,
                 "content": content,
                 "timestamp": created_at,
-                "platform_message_id": source_id,
+                # Source IDs are staging-only idempotency metadata. They must
+                # never become canonical platform_message_id values because
+                # conversation replay forwards message_id to some providers.
+                "_source_id": source_id,
             })
         return normalized
+
+    def cleanup_stale_runtime_imports(
+        self,
+        *,
+        now: Optional[float] = None,
+        limit: int = RUNTIME_IMPORT_CLEANUP_BATCH_SIZE,
+    ) -> int:
+        """Delete one bounded batch of expired transcript staging rows."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
+            raise ValueError("limit must be an integer in 1..1000")
+        cutoff = (time.time() if now is None else float(now)) - RUNTIME_IMPORT_STAGING_TTL_SECONDS
+        if not math.isfinite(cutoff):
+            raise ValueError("now must be finite")
+
+        def _do(conn):
+            return conn.execute(
+                "DELETE FROM runtime_imports WHERE import_id IN ("
+                "SELECT import_id FROM runtime_imports "
+                "WHERE status = 'staging' AND updated_at < ? "
+                "ORDER BY updated_at, import_id LIMIT ?)",
+                (cutoff, limit),
+            ).rowcount
+
+        return self._execute_write(_do)
 
     def stage_completed_transcript_import(
         self,
@@ -3663,8 +3695,12 @@ class SessionDB:
 
         def _do(conn):
             conn.execute(
-                "DELETE FROM runtime_imports WHERE status = 'staging' AND updated_at < ?",
-                (now - RUNTIME_IMPORT_STAGING_TTL_SECONDS,),
+                "DELETE FROM runtime_imports WHERE import_id IN ("
+                "SELECT import_id FROM runtime_imports "
+                "WHERE status = 'staging' AND updated_at < ? "
+                "ORDER BY updated_at, import_id LIMIT ?)",
+                (now - RUNTIME_IMPORT_STAGING_TTL_SECONDS,
+                 RUNTIME_IMPORT_CLEANUP_BATCH_SIZE),
             )
             row = conn.execute(
                 "SELECT * FROM runtime_imports WHERE import_id = ?", (import_id,)
@@ -3739,8 +3775,8 @@ class SessionDB:
                 raise ValueError("staged messages exceed expected_message_count")
             if new_bytes > RUNTIME_IMPORT_MAX_STAGED_BYTES:
                 raise ValueError("staged transcript exceeds 32 MiB")
-            source_ids = [m.get("platform_message_id") for m in normalized
-                          if m.get("platform_message_id")]
+            source_ids = [m.get("_source_id") for m in normalized
+                          if m.get("_source_id")]
             for source_id in source_ids:
                 if conn.execute(
                     "SELECT 1 FROM runtime_import_message_ids "
@@ -3811,7 +3847,9 @@ class SessionDB:
                 "_runtime_import": {
                     "import_id": import_id,
                     "source": row["source"],
-                    "source_session_id": row["source_session_id"],
+                    "source_session_id_sha256": _runtime_import_receipt_source_id(
+                        row["source_session_id"]
+                    ),
                     "payload_sha256": row["payload_sha256"],
                 }
             })
@@ -3832,6 +3870,8 @@ class SessionDB:
                 digest.update(len(encoded).to_bytes(8, "big"))
                 digest.update(encoded)
                 messages = json.loads(raw)
+                for message in messages:
+                    message.pop("_source_id", None)
                 inserted, _ = self._insert_message_rows(
                     conn, row["target_session_id"], messages
                 )

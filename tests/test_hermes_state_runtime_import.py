@@ -1,4 +1,6 @@
 import hashlib
+import json
+import time
 
 import pytest
 
@@ -52,6 +54,14 @@ def test_completed_transcript_import_is_chunk_and_commit_idempotent(tmp_path):
         session = db.get_session("imported-session")
         assert session["source"] == "import:workbuddy"
         assert session["message_count"] == 2
+        runtime_meta = json.loads(session["model_config"])["_runtime_import"]
+        assert "source_session_id" not in runtime_meta
+        assert runtime_meta["source_session_id_sha256"] == hashlib.sha256(
+            b"source-session"
+        ).hexdigest()
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE platform_message_id IS NOT NULL"
+        ).fetchone()[0] == 0
         assert db._conn.execute(
             "SELECT COUNT(*) FROM runtime_import_chunks WHERE import_id = 'imp-1'"
         ).fetchone()[0] == 0
@@ -215,3 +225,45 @@ def test_runtime_import_chunk_iterator_never_calls_fetchall():
     assert list(SessionDB._iter_runtime_import_chunks(Conn(), "import")) == [
         {"messages_json": "[]"}
     ]
+
+
+def test_expired_runtime_import_staging_is_cleaned_on_db_open(tmp_path):
+    path = tmp_path / "state.db"
+    db = SessionDB(path)
+    try:
+        _stage(db, import_id="abandoned", expected=1)
+        db._conn.execute(
+            "UPDATE runtime_imports SET updated_at = ? WHERE import_id = ?",
+            (time.time() - 25 * 60 * 60, "abandoned"),
+        )
+    finally:
+        db.close()
+
+    reopened = SessionDB(path)
+    try:
+        assert reopened._conn.execute(
+            "SELECT COUNT(*) FROM runtime_imports WHERE import_id = 'abandoned'"
+        ).fetchone()[0] == 0
+        assert reopened._conn.execute(
+            "SELECT COUNT(*) FROM runtime_import_chunks WHERE import_id = 'abandoned'"
+        ).fetchone()[0] == 0
+    finally:
+        reopened.close()
+
+
+def test_runtime_import_cleanup_is_bounded(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        for index in range(3):
+            _stage(db, import_id=f"abandoned-{index}", expected=1)
+        db._conn.execute(
+            "UPDATE runtime_imports SET updated_at = ?",
+            (time.time() - 25 * 60 * 60,),
+        )
+        assert db.cleanup_stale_runtime_imports(limit=2) == 2
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM runtime_imports WHERE status = 'staging'"
+        ).fetchone()[0] == 1
+        assert db.cleanup_stale_runtime_imports(limit=2) == 1
+    finally:
+        db.close()

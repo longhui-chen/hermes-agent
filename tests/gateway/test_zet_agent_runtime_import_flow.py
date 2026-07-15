@@ -1,4 +1,5 @@
 import hashlib
+import time
 
 import pytest
 from aiohttp import web
@@ -53,5 +54,32 @@ async def test_completed_transcript_http_flow_requires_auth_and_commits_atomical
             assert memory.status == 200
             assert (await memory.json())["effective_from"] == "next_session"
         assert db.get_messages_as_conversation("hermes-1")[0]["content"] == "你好"
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_runtime_import_cleanup_converges_without_new_import(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    db.stage_completed_transcript_import(
+        import_id="abandoned", source="marvis", source_session_id="source",
+        target_session_id="target", title=None,
+        payload_sha256=hashlib.sha256(b"abandoned").hexdigest(),
+        expected_message_count=1, chunk_index=0,
+        messages=[{"source_id": "m1", "role": "user", "content": "private",
+                   "created_at": 0}],
+    )
+    db._conn.execute(
+        "UPDATE runtime_imports SET updated_at = ? WHERE import_id = ?",
+        (time.time() - 25 * 60 * 60, "abandoned"),
+    )
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    adapter._session_db = db
+    adapter._ensure_session_db = lambda: db
+    try:
+        assert await adapter._cleanup_stale_runtime_imports_once() == 1
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM runtime_imports WHERE import_id = 'abandoned'"
+        ).fetchone()[0] == 0
     finally:
         db.close()
