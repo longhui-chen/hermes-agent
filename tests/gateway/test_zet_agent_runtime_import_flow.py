@@ -83,3 +83,70 @@ async def test_gateway_runtime_import_cleanup_converges_without_new_import(tmp_p
         ).fetchone()[0] == 0
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_runtime_import_cleanup_sweeps_every_cached_profile(tmp_path):
+    first = SessionDB(tmp_path / "first" / "state.db")
+    second = SessionDB(tmp_path / "second" / "state.db")
+    for index, db in enumerate((first, second), start=1):
+        db.stage_completed_transcript_import(
+            import_id=f"abandoned-{index}", source="marvis",
+            source_session_id=f"source-{index}",
+            target_session_id=f"target-{index}", title=None,
+            payload_sha256=hashlib.sha256(str(index).encode()).hexdigest(),
+            expected_message_count=1, chunk_index=0,
+            messages=[{
+                "source_id": f"m-{index}", "role": "user",
+                "content": "private", "created_at": 0,
+            }],
+        )
+        db._conn.execute(
+            "UPDATE runtime_imports SET updated_at = ? WHERE import_id = ?",
+            (time.time() - 25 * 60 * 60, f"abandoned-{index}"),
+        )
+
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    adapter._session_db = first
+    adapter._session_dbs = {"first": first, "second": second}
+    adapter._ensure_session_db = lambda: first
+    try:
+        assert await adapter._cleanup_stale_runtime_imports_once() == 2
+        for index, db in enumerate((first, second), start=1):
+            assert db._conn.execute(
+                "SELECT COUNT(*) FROM runtime_imports WHERE import_id = ?",
+                (f"abandoned-{index}",),
+            ).fetchone()[0] == 0
+    finally:
+        first.close()
+        second.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_runtime_import_cleanup_continues_after_profile_failure():
+    class _DB:
+        def __init__(self, result=0, error=None):
+            self.result = result
+            self.error = error
+            self.calls = 0
+
+        def cleanup_stale_runtime_imports(self):
+            self.calls += 1
+            if self.error is not None:
+                raise self.error
+            return self.result
+
+    failed = _DB(error=RuntimeError("closed"))
+    healthy = _DB(result=3)
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    adapter._session_db = failed
+    adapter._session_dbs = {"failed": failed, "healthy": healthy}
+    adapter._ensure_session_db = lambda: failed
+
+    assert await adapter._cleanup_stale_runtime_imports_once() == 3
+    assert failed.calls == 1
+    assert healthy.calls == 1

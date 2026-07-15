@@ -1679,10 +1679,30 @@ class ZetAgentAdapter(APIServerAdapter):
             )
 
     async def _cleanup_stale_runtime_imports_once(self) -> int:
-        session_db = self._ensure_session_db()
-        if session_db is None:
-            return 0
-        return await asyncio.to_thread(session_db.cleanup_stale_runtime_imports)
+        default_db = self._ensure_session_db()
+        candidates = [default_db, *tuple(self._session_dbs.values())]
+        session_dbs = []
+        seen = set()
+        for session_db in candidates:
+            if session_db is None or id(session_db) in seen:
+                continue
+            seen.add(id(session_db))
+            session_dbs.append(session_db)
+
+        deleted = 0
+        for session_db in session_dbs:
+            try:
+                deleted += await asyncio.to_thread(
+                    session_db.cleanup_stale_runtime_imports
+                )
+            except Exception:
+                # A profile can be unloaded while the sweep is running.  Its
+                # closed DB must not prevent other profile homes from cleanup.
+                logger.warning(
+                    "[zet_agent] runtime import staging cleanup failed for one profile",
+                    exc_info=True,
+                )
+        return deleted
 
     async def _sweep_stale_runtime_imports(self) -> None:
         while True:
