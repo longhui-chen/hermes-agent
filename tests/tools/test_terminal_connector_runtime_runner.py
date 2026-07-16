@@ -283,8 +283,8 @@ def test_connector_runtime_direct_runner_redacts_before_truncating(monkeypatch, 
     assert "xxxxxxxx" not in result["output"]
 
 
-def test_compound_connector_runtime_command_does_not_receive_token(monkeypatch, tmp_path):
-    """A command with shell punctuation falls back to generic terminal env."""
+def test_compound_connector_runtime_command_flow_is_blocked_and_retried_singly(monkeypatch, tmp_path):
+    """A compound runtime command never falls through to generic terminal."""
     from agent import secret_scope as ss
 
     _write_connector_runtime(tmp_path)
@@ -308,9 +308,13 @@ def test_compound_connector_runtime_command_does_not_receive_token(monkeypatch, 
         task_id="connector-runtime-compound-test",
     ))
 
-    assert result.get("connector_runtime_direct") is not True
-    assert result["exit_code"] == 0
-    assert "connector token ok: False" in result["output"]
+    assert result["connector_runtime_direct"] is False
+    assert result["connector_runtime_blocked"] is True
+    assert result["exit_code"] == 2
+    assert result["errorCode"] == "connector_runtime_compound_command"
+    assert result["connector_error"]["nextAction"] == {"type": "retry_single_command"}
+    assert "separate terminal tool call" in result["error"]
+    assert "connector token ok" not in result["output"]
     assert "runner-token" not in result["output"]
 
 
@@ -335,6 +339,14 @@ def test_parser_rejects_non_presets_or_compound_connector_runtime(monkeypatch, t
     compound = terminal_tool_module._parse_connector_runtime_command(
         'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py"; env'
     )
+    newline_compound = terminal_tool_module._parse_connector_runtime_command(
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py" list-tools\n'
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py" call linear.list_issues'
+    )
+    quoted_punctuation = terminal_tool_module._parse_connector_runtime_command(
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py" '
+        "call linear.list_issues --args-json '{\"query\":\"a;b\"}'"
+    )
     non_presets = terminal_tool_module._parse_connector_runtime_command(
         f"python3 {script.parent.parent / 'connector_runtime.py'}"
     )
@@ -343,6 +355,8 @@ def test_parser_rejects_non_presets_or_compound_connector_runtime(monkeypatch, t
     assert relative is not None
     assert absolute is not None
     assert compound is None
+    assert newline_compound is None
+    assert quoted_punctuation is not None
     assert non_presets is None
 
 

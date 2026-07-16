@@ -959,7 +959,7 @@ import sys
 
 
 _CONNECTOR_RUNTIME_SCRIPT = "connector_runtime.py"
-_CONNECTOR_RUNTIME_SHELL_PUNCTUATION = set(";&|<>")
+_CONNECTOR_RUNTIME_SHELL_PUNCTUATION = set(";&|<>\n")
 _CONNECTOR_RUNTIME_TRUST_CUTOFF = time.time()
 
 
@@ -1271,7 +1271,14 @@ def _parse_connector_runtime_command(command: str) -> Optional[_ConnectorRuntime
     compound commands such as `connector_runtime.py ... ; env`, so injected
     connector env can never be observed by a following shell fragment.
     """
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer = shlex.shlex(
+        command.strip(),
+        posix=True,
+        punctuation_chars=";&|<>\n",
+    )
+    # Keep unquoted newlines visible as shell separators. Quoted newlines stay
+    # inside their argument token, just like punctuation inside --args-json.
+    lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     try:
         tokens = list(lexer)
@@ -1303,6 +1310,73 @@ def _parse_connector_runtime_command(command: str) -> Optional[_ConnectorRuntime
         root_identity=anchor.identity,
         script_identity=script_identity,
     )
+
+
+def _connector_runtime_shell_guard_result(command: str) -> Optional[str]:
+    """Block shell-wrapped official connector runtime invocations.
+
+    The dedicated runner intentionally accepts only one direct Python command.
+    When an otherwise trusted runtime invocation is combined with another shell
+    fragment, falling through to the generic terminal strips Connector context
+    and produces a misleading authorization error. Fail closed instead and tell
+    the agent to retry each runtime command in its own tool call.
+    """
+    lexer = shlex.shlex(
+        command.strip(),
+        posix=True,
+        punctuation_chars=";&|<>\n",
+    )
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+
+    if not any(
+        token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION
+        for token in tokens
+    ):
+        return None
+
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION:
+            segments.append([])
+            continue
+        segments[-1].append(token)
+
+    contains_trusted_runtime = any(
+        len(segment) >= 2
+        and _is_python_executable_token(segment[0])
+        and Path(segment[1]).name == _CONNECTOR_RUNTIME_SCRIPT
+        and _resolve_connector_runtime_script(segment[1]) is not None
+        for segment in segments
+    )
+    if not contains_trusted_runtime:
+        return None
+
+    code = "connector_runtime_compound_command"
+    message = (
+        "Connector Runtime commands must run one at a time without shell "
+        "operators. Retry each connector_runtime.py command in a separate "
+        "terminal tool call."
+    )
+    return json.dumps({
+        "output": "",
+        "exit_code": 2,
+        "error": message,
+        "errorCode": code,
+        "status": "error",
+        "connector_runtime_direct": False,
+        "connector_runtime_blocked": True,
+        "connector_error": {
+            "code": code,
+            "errorCode": code,
+            "message": message,
+            "nextAction": {"type": "retry_single_command"},
+        },
+    }, ensure_ascii=False)
 
 
 def _connector_runtime_result_json(
@@ -1403,7 +1477,7 @@ def _run_connector_runtime_command_if_allowed(
 ) -> Optional[str]:
     parsed = _parse_connector_runtime_command(command)
     if parsed is None:
-        return None
+        return _connector_runtime_shell_guard_result(command)
     argv = parsed.argv
 
     anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
