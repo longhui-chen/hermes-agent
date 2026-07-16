@@ -17,6 +17,19 @@ from tools.memory_tool import (
 )
 
 
+def _link_targets_path(target, kwargs, expected: Path) -> bool:
+    target_path = Path(target)
+    directory_fd = kwargs.get("dst_dir_fd")
+    if target_path.is_absolute() or directory_fd is None:
+        return target_path == expected
+    opened = os.fstat(directory_fd)
+    parent = os.stat(expected.parent)
+    return (
+        target_path.name == expected.name
+        and (opened.st_dev, opened.st_ino) == (parent.st_dev, parent.st_ino)
+    )
+
+
 def test_memory_import_replace_is_bounded_atomic_and_idempotent(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -47,6 +60,91 @@ def test_memory_import_replace_is_bounded_atomic_and_idempotent(tmp_path, monkey
             import_id="memory-1", payload_sha256=digest,
         )
     assert (home / "memories" / "MEMORY.md").read_text() == "user changed this"
+
+
+def test_memory_import_receipt_replay_never_falls_back_to_legacy_path_reader(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=100, user_char_limit=100)
+    digest = hashlib.sha256(b"single-snapshot-replay").hexdigest()
+    store.import_replace(
+        target="memory",
+        entries=["safe fact"],
+        import_id="single-snapshot-replay",
+        payload_sha256=digest,
+    )
+
+    def legacy_reader_must_not_run(_path):
+        raise AssertionError("receipt replay used the legacy path reader")
+
+    monkeypatch.setattr(store, "_read_file", legacy_reader_must_not_run)
+    replay = store.import_replace(
+        target="memory",
+        entries=["safe fact"],
+        import_id="single-snapshot-replay",
+        payload_sha256=digest,
+    )
+    assert replay["replayed"] is True
+
+
+@pytest.mark.parametrize(
+    ("temp_prefix", "managed_component"),
+    [
+        (".backup_", "backups"),
+        (".receipt_", "imports"),
+        (".mem_", "memories"),
+    ],
+)
+def test_memory_import_directory_swap_cannot_redirect_plaintext(
+    tmp_path, monkeypatch, temp_prefix, managed_component
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    (memories / "MEMORY.md").write_text("old fact", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "sentinel").write_text("unchanged", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=100, user_char_limit=100)
+    original_create_temp = memory_tool._ImportDirectoryHandles._create_temp
+    swapped = False
+
+    def swap_component_before_temp(directory_fd, prefix):
+        nonlocal swapped
+        if prefix == temp_prefix and not swapped:
+            swapped = True
+            if managed_component == "backups":
+                victim = memories / ".imports" / "backups"
+            elif managed_component == "imports":
+                victim = memories / ".imports"
+            else:
+                victim = memories
+            detached = victim.with_name(victim.name + "-detached")
+            victim.rename(detached)
+            victim.symlink_to(outside, target_is_directory=True)
+        return original_create_temp(directory_fd, prefix)
+
+    monkeypatch.setattr(
+        memory_tool._ImportDirectoryHandles,
+        "_create_temp",
+        staticmethod(swap_component_before_temp),
+    )
+    with pytest.raises(MemoryImportConflict, match="changed during import"):
+        store.import_replace(
+            target="memory",
+            entries=["imported private fact"],
+            import_id=f"swap-{managed_component}",
+            payload_sha256=hashlib.sha256(
+                f"swap-{managed_component}".encode()
+            ).hexdigest(),
+        )
+
+    assert swapped is True
+    assert sorted(path.name for path in outside.iterdir()) == ["sentinel"]
+    assert (outside / "sentinel").read_text(encoding="utf-8") == "unchanged"
 
 
 def test_memory_import_rejects_poison_and_overflow_without_writing(tmp_path, monkeypatch):
@@ -314,18 +412,18 @@ def test_memory_import_fsyncs_target_directory_before_completed_receipt(
     monkeypatch.setenv("HERMES_HOME", str(home))
     store = MemoryStore(memory_char_limit=100, user_char_limit=100)
     events = []
-    original_fsync_directory = memory_tool._fsync_directory
+    original_fsync_directory = memory_tool._fsync_directory_fd
     original_write_receipt = store._write_import_receipt
 
-    def track_fsync_directory(path):
+    def track_fsync_directory(directory_fd, path):
         events.append(("fsync", Path(path).name))
-        return original_fsync_directory(path)
+        return original_fsync_directory(directory_fd, path)
 
     def track_receipt(path, receipt):
         events.append(("receipt", receipt["state"]))
         return original_write_receipt(path, receipt)
 
-    monkeypatch.setattr(memory_tool, "_fsync_directory", track_fsync_directory)
+    monkeypatch.setattr(memory_tool, "_fsync_directory_fd", track_fsync_directory)
     monkeypatch.setattr(store, "_write_import_receipt", track_receipt)
     store.import_replace(
         target="memory", entries=["safe fact"], import_id="durable",
@@ -482,7 +580,7 @@ def test_memory_import_no_clobber_preserves_edit_after_final_validation(
 
     def edit_immediately_before_publish(source, target, *args, **kwargs):
         nonlocal raced
-        if not raced and Path(target) == memory_path:
+        if not raced and _link_targets_path(target, kwargs, memory_path):
             raced = True
             memory_path.write_text("concurrent external edit", encoding="utf-8")
         return original_link(source, target, *args, **kwargs)
@@ -519,7 +617,7 @@ def test_memory_import_link_failure_restores_displaced_with_exclusive_copy(
     original_link = memory_tool.os.link
 
     def reject_canonical_hardlinks(source, target, *args, **kwargs):
-        if Path(target) == memory_path:
+        if _link_targets_path(target, kwargs, memory_path):
             raise OSError(link_errno, "hard links unavailable")
         return original_link(source, target, *args, **kwargs)
 
@@ -557,7 +655,7 @@ def test_memory_import_link_failure_does_not_overwrite_concurrent_winner(
 
     def install_winner_then_fail_publish(source, target, *args, **kwargs):
         nonlocal raced
-        if not raced and Path(target) == memory_path:
+        if not raced and _link_targets_path(target, kwargs, memory_path):
             raced = True
             memory_path.write_text("concurrent winner", encoding="utf-8")
             raise OSError(errno.EPERM, "hard links unavailable")
@@ -596,7 +694,7 @@ def test_memory_import_prepared_recovery_flow_after_displacement(tmp_path, monke
     original_link = memory_tool.os.link
 
     def crash_before_publish(source, target, *args, **kwargs):
-        if Path(target) == memory_path:
+        if _link_targets_path(target, kwargs, memory_path):
             raise RuntimeError("crash before publish")
         return original_link(source, target, *args, **kwargs)
 

@@ -29,9 +29,11 @@ import json
 import logging
 import os
 import re
+import secrets
 import stat
 import tempfile
 import time
+from contextvars import ContextVar
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -74,6 +76,22 @@ def _fsync_directory(path: Path) -> None:
             return
         raise
 
+
+def _fsync_directory_fd(directory_fd: int, path: Path) -> None:
+    """Persist an already-open directory without reopening a mutable path."""
+    try:
+        os.fsync(directory_fd)
+    except OSError as exc:
+        unsupported = {
+            errno.EINVAL,
+            getattr(errno, "ENOTSUP", errno.EINVAL),
+            getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+        }
+        if exc.errno in unsupported:
+            logger.debug("directory fsync unsupported for %s: %s", path, exc)
+            return
+        raise
+
 # Where memory files live — resolved dynamically so profile overrides
 # (HERMES_HOME env var changes) are always respected.  The old module-level
 # constant was cached at import time and could go stale if a profile switch
@@ -92,6 +110,395 @@ _MEMORY_TRANSACTION_LOCK = ".curated-memory-transaction"
 
 class MemoryImportConflict(ValueError):
     """An import id or receipt conflicts with the live curated memory."""
+
+
+class _ImportDirectoryHandles:
+    """Stable POSIX directory handles for one curated-memory import."""
+
+    def __init__(self, mem_dir: Path):
+        self.home_dir = mem_dir.parent
+        self.mem_dir = mem_dir
+        self.imports_dir = mem_dir / ".imports"
+        self.backup_dir = self.imports_dir / "backups"
+        self.home_fd = -1
+        self.mem_fd = -1
+        self.imports_fd = -1
+        self.backup_fd = -1
+
+    @staticmethod
+    def _directory_flags() -> int:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        return flags
+
+    @staticmethod
+    def _open_child_directory(parent_fd: int, name: str) -> int:
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        try:
+            fd = os.open(
+                name,
+                _ImportDirectoryHandles._directory_flags(),
+                dir_fd=parent_fd,
+            )
+        except OSError as exc:
+            raise MemoryImportConflict(
+                f"managed memory directory {name} is unsafe: {exc}"
+            ) from exc
+        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise MemoryImportConflict(
+                f"managed memory directory {name} must be a real directory"
+            )
+        return fd
+
+    def __enter__(self):
+        if os.name == "nt" or os.open not in os.supports_dir_fd:
+            raise MemoryImportConflict(
+                "secure memory import requires directory-relative file operations"
+            )
+        try:
+            self.home_fd = os.open(self.home_dir, self._directory_flags())
+            self.mem_fd = os.open(
+                self.mem_dir.name,
+                self._directory_flags(),
+                dir_fd=self.home_fd,
+            )
+            self.imports_fd = self._open_child_directory(self.mem_fd, ".imports")
+            self.backup_fd = self._open_child_directory(self.imports_fd, "backups")
+            self.verify_attached()
+            return self
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        for attribute in ("backup_fd", "imports_fd", "mem_fd", "home_fd"):
+            fd = getattr(self, attribute)
+            if fd >= 0:
+                os.close(fd)
+                setattr(self, attribute, -1)
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        self.close()
+
+    @staticmethod
+    def _same_open_directory(path: Path, fd: int) -> bool:
+        try:
+            current = os.lstat(path)
+            opened = os.fstat(fd)
+        except OSError:
+            return False
+        return (
+            stat.S_ISDIR(current.st_mode)
+            and stat.S_ISDIR(opened.st_mode)
+            and (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino)
+        )
+
+    def verify_attached(self) -> None:
+        for path, fd in (
+            (self.home_dir, self.home_fd),
+            (self.mem_dir, self.mem_fd),
+            (self.imports_dir, self.imports_fd),
+            (self.backup_dir, self.backup_fd),
+        ):
+            if not self._same_open_directory(path, fd):
+                raise MemoryImportConflict(
+                    f"managed memory directory changed during import: {path.name}"
+                )
+
+    @staticmethod
+    def read_bytes(directory_fd: int, name: str) -> Optional[bytes]:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_NONBLOCK"):
+            flags |= os.O_NONBLOCK
+        try:
+            fd = os.open(name, flags, dir_fd=directory_fd)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise MemoryImportConflict(f"cannot safely open {name}: {exc}") from exc
+        try:
+            opened = os.fstat(fd)
+            if not stat.S_ISREG(opened.st_mode):
+                raise MemoryImportConflict(f"{name} must be a regular file")
+            if opened.st_size > MAX_CURATED_MEMORY_FILE_BYTES:
+                raise MemoryImportConflict(f"{name} exceeds the memory file size limit")
+            chunks = []
+            total = 0
+            while True:
+                chunk = os.read(
+                    fd, min(64 << 10, MAX_CURATED_MEMORY_FILE_BYTES + 1 - total)
+                )
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > MAX_CURATED_MEMORY_FILE_BYTES:
+                    raise MemoryImportConflict(
+                        f"{name} exceeds the memory file size limit"
+                    )
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def read_text(directory_fd: int, name: str) -> Optional[str]:
+        raw = _ImportDirectoryHandles.read_bytes(directory_fd, name)
+        if raw is None:
+            return None
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise MemoryImportConflict(f"{name} is not valid UTF-8") from exc
+
+    @staticmethod
+    def _create_temp(directory_fd: int, prefix: str) -> tuple[int, str]:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        for _ in range(128):
+            name = f"{prefix}{secrets.token_hex(16)}.tmp"
+            try:
+                return os.open(name, flags, 0o600, dir_fd=directory_fd), name
+            except FileExistsError:
+                continue
+        raise MemoryImportConflict("cannot allocate a unique memory import temp file")
+
+    def atomic_write(
+        self, directory_fd: int, name: str, content: bytes, *, prefix: str
+    ) -> None:
+        fd, temp_name = self._create_temp(directory_fd, prefix)
+        identity = None
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                fd = -1
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+                opened = os.fstat(handle.fileno())
+                identity = (opened.st_dev, opened.st_ino)
+            current = os.stat(temp_name, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISREG(current.st_mode) or (
+                current.st_dev,
+                current.st_ino,
+            ) != identity:
+                raise MemoryImportConflict("memory import temp file changed before publish")
+            self.verify_attached()
+            os.replace(
+                temp_name,
+                name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            temp_name = ""
+            directory_path = (
+                self.mem_dir
+                if directory_fd == self.mem_fd
+                else self.imports_dir
+                if directory_fd == self.imports_fd
+                else self.backup_dir
+            )
+            _fsync_directory_fd(directory_fd, directory_path)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if temp_name:
+                try:
+                    os.unlink(temp_name, dir_fd=directory_fd)
+                except OSError:
+                    pass
+
+    def _restore_displaced_no_replace(
+        self, displaced_name: str, canonical_name: str
+    ) -> None:
+        source = self.read_bytes(self.mem_fd, displaced_name)
+        if source is None:
+            raise MemoryImportConflict("displaced memory recovery file is missing")
+        source_stat = os.stat(
+            displaced_name, dir_fd=self.mem_fd, follow_symlinks=False
+        )
+        source_mode = stat.S_IMODE(source_stat.st_mode) or 0o600
+        self.verify_attached()
+        try:
+            os.link(
+                displaced_name,
+                canonical_name,
+                src_dir_fd=self.mem_fd,
+                dst_dir_fd=self.mem_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            return
+        except OSError:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                fd = os.open(
+                    canonical_name, flags, source_mode, dir_fd=self.mem_fd
+                )
+            except FileExistsError:
+                return
+            identity = None
+            try:
+                opened = os.fstat(fd)
+                identity = (opened.st_dev, opened.st_ino)
+                view = memoryview(source)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError("short write while restoring displaced memory")
+                    view = view[written:]
+                os.fsync(fd)
+            except BaseException:
+                if identity is not None:
+                    try:
+                        current = os.stat(
+                            canonical_name,
+                            dir_fd=self.mem_fd,
+                            follow_symlinks=False,
+                        )
+                        if (current.st_dev, current.st_ino) == identity:
+                            os.unlink(canonical_name, dir_fd=self.mem_fd)
+                    except OSError:
+                        pass
+                raise
+            finally:
+                os.close(fd)
+        _fsync_directory_fd(self.mem_fd, self.mem_dir)
+
+    def write_canonical_cas(
+        self,
+        canonical_name: str,
+        displaced_name: str,
+        content: bytes,
+        expected_sha256: str,
+    ) -> None:
+        fd, temp_name = self._create_temp(self.mem_fd, ".mem_")
+        identity = None
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                fd = -1
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+                opened = os.fstat(handle.fileno())
+                identity = (opened.st_dev, opened.st_ino)
+            current_temp = os.stat(
+                temp_name, dir_fd=self.mem_fd, follow_symlinks=False
+            )
+            if not stat.S_ISREG(current_temp.st_mode) or (
+                current_temp.st_dev,
+                current_temp.st_ino,
+            ) != identity:
+                raise MemoryImportConflict("memory import temp file changed before publish")
+
+            displaced = self.read_bytes(self.mem_fd, displaced_name)
+            canonical = self.read_bytes(self.mem_fd, canonical_name)
+            if displaced is not None:
+                if hashlib.sha256(displaced).hexdigest() != expected_sha256:
+                    if canonical is None:
+                        self._restore_displaced_no_replace(
+                            displaced_name, canonical_name
+                        )
+                    raise MemoryImportConflict(
+                        "memory changed after import prepare; refusing to overwrite user edits"
+                    )
+                if canonical is not None:
+                    raise MemoryImportConflict(
+                        "memory changed after import prepare; refusing to overwrite user edits"
+                    )
+            elif expected_sha256 == _MISSING_MEMORY_FILE_SHA256:
+                if canonical is not None:
+                    raise MemoryImportConflict(
+                        "memory changed after import prepare; refusing to overwrite user edits"
+                    )
+            else:
+                self.verify_attached()
+                try:
+                    os.replace(
+                        canonical_name,
+                        displaced_name,
+                        src_dir_fd=self.mem_fd,
+                        dst_dir_fd=self.mem_fd,
+                    )
+                except FileNotFoundError as exc:
+                    raise MemoryImportConflict(
+                        "memory changed after import prepare; refusing to overwrite user edits"
+                    ) from exc
+                _fsync_directory_fd(self.mem_fd, self.mem_dir)
+                displaced = self.read_bytes(self.mem_fd, displaced_name)
+                if (
+                    displaced is None
+                    or hashlib.sha256(displaced).hexdigest() != expected_sha256
+                ):
+                    if self.read_bytes(self.mem_fd, canonical_name) is None:
+                        self._restore_displaced_no_replace(
+                            displaced_name, canonical_name
+                        )
+                    raise MemoryImportConflict(
+                        "memory changed after import prepare; refusing to overwrite user edits"
+                    )
+
+            self.verify_attached()
+            try:
+                os.link(
+                    temp_name,
+                    canonical_name,
+                    src_dir_fd=self.mem_fd,
+                    dst_dir_fd=self.mem_fd,
+                    follow_symlinks=False,
+                )
+            except FileExistsError as exc:
+                raise MemoryImportConflict(
+                    "memory changed after import prepare; refusing to overwrite user edits"
+                ) from exc
+            except OSError as publish_error:
+                if self.read_bytes(self.mem_fd, displaced_name) is not None:
+                    try:
+                        self._restore_displaced_no_replace(
+                            displaced_name, canonical_name
+                        )
+                    except BaseException as restore_error:
+                        raise RuntimeError(
+                            "memory publish failed and displaced recovery also failed: "
+                            f"{restore_error}"
+                        ) from publish_error
+                raise
+            os.unlink(temp_name, dir_fd=self.mem_fd)
+            temp_name = ""
+            _fsync_directory_fd(self.mem_fd, self.mem_dir)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if temp_name:
+                try:
+                    os.unlink(temp_name, dir_fd=self.mem_fd)
+                except OSError:
+                    pass
+
+
+_ACTIVE_MEMORY_IMPORT_DIRS: ContextVar[Optional[_ImportDirectoryHandles]] = (
+    ContextVar("active_memory_import_dirs", default=None)
+)
+
+
+@contextmanager
+def _anchored_import_directories(mem_dir: Path):
+    with _ImportDirectoryHandles(mem_dir) as handles:
+        token = _ACTIVE_MEMORY_IMPORT_DIRS.set(handles)
+        try:
+            yield handles
+        finally:
+            _ACTIVE_MEMORY_IMPORT_DIRS.reset(token)
 
 
 def _require_real_directory(path: Path, *, label: str, create: bool) -> None:
@@ -678,7 +1085,17 @@ class MemoryStore:
             flags = os.O_RDWR | os.O_CREAT
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
-            if os.name != "nt" and os.open in os.supports_dir_fd:
+            import_dirs = _ACTIVE_MEMORY_IMPORT_DIRS.get()
+            if import_dirs is not None and lock_path.parent == import_dirs.mem_dir:
+                raw_fd = os.open(
+                    lock_path.name, flags, 0o600, dir_fd=import_dirs.mem_fd
+                )
+                current = os.stat(
+                    lock_path.name,
+                    dir_fd=import_dirs.mem_fd,
+                    follow_symlinks=False,
+                )
+            elif os.name != "nt" and os.open in os.supports_dir_fd:
                 parent_flags = os.O_RDONLY
                 if hasattr(os, "O_DIRECTORY"):
                     parent_flags |= os.O_DIRECTORY
@@ -686,10 +1103,11 @@ class MemoryStore:
                     parent_flags |= os.O_NOFOLLOW
                 parent_fd = os.open(lock_path.parent, parent_flags)
                 raw_fd = os.open(lock_path.name, flags, 0o600, dir_fd=parent_fd)
+                current = os.lstat(lock_path)
             else:
                 raw_fd = os.open(lock_path, flags, 0o600)
+                current = os.lstat(lock_path)
             opened = os.fstat(raw_fd)
-            current = os.lstat(lock_path)
             if (
                 not stat.S_ISREG(opened.st_mode)
                 or not stat.S_ISREG(current.st_mode)
@@ -1101,32 +1519,27 @@ class MemoryStore:
         transaction_path = mem_dir / _MEMORY_TRANSACTION_LOCK
         for lock_target in (transaction_path, path):
             _validate_reset_lock(lock_target)
-        imports_dir = _require_managed_memory_directory(
-            mem_dir / ".imports", create=True
-        )
-        backup_dir = _require_managed_memory_directory(
-            imports_dir / "backups", create=True
-        )
+        imports_dir = mem_dir / ".imports"
+        backup_dir = imports_dir / "backups"
         receipt_path = imports_dir / (
             hashlib.sha256(import_id.encode("utf-8")).hexdigest() + ".json"
         )
         import_hash = hashlib.sha256(import_id.encode("utf-8")).hexdigest()
         backup_candidate = backup_dir / f"{target}-{import_hash}.bak"
         displaced_candidate = self._import_displaced_path(path, receipt_path)
-        for candidate in (receipt_path, backup_candidate, displaced_candidate):
-            _read_bounded_regular_file_bytes(candidate)
-        with self._file_lock(
+        with _anchored_import_directories(mem_dir) as import_dirs, self._file_lock(
             transaction_path, create_parent=False
         ), self._file_lock(path, create_parent=False):
-            # Directory entries can be replaced while waiting for the locks.
-            # Re-anchor every managed path before reading or creating files.
-            _require_profile_memory_directory(create=False)
-            _require_managed_memory_directory(imports_dir, create=False)
-            _require_managed_memory_directory(backup_dir, create=False)
-            _read_bounded_regular_file_bytes(path)
-            receipt_text = _read_bounded_regular_file_text(receipt_path)
-            _read_bounded_regular_file_bytes(backup_candidate)
-            _read_bounded_regular_file_bytes(displaced_candidate)
+            # Every read and write below is relative to directory descriptors
+            # opened before lock acquisition. Path swaps can abort the import,
+            # but cannot redirect plaintext into an attacker-controlled tree.
+            import_dirs.verify_attached()
+            canonical_raw = import_dirs.read_bytes(import_dirs.mem_fd, path.name)
+            receipt_text = import_dirs.read_text(
+                import_dirs.imports_fd, receipt_path.name
+            )
+            import_dirs.read_bytes(import_dirs.backup_fd, backup_candidate.name)
+            import_dirs.read_bytes(import_dirs.mem_fd, displaced_candidate.name)
             if receipt_text is not None:
                 try:
                     receipt = json.loads(receipt_text)
@@ -1137,10 +1550,27 @@ class MemoryStore:
                           receipt.get("payload_sha256"), receipt.get("content_sha256"))
                 if actual != expected:
                     raise MemoryImportConflict("import_id is already bound to different memory data")
+                if canonical_raw is None:
+                    live_entries = []
+                    live_file_sha = _MISSING_MEMORY_FILE_SHA256
+                else:
+                    try:
+                        live_text = canonical_raw.decode("utf-8")
+                    except UnicodeDecodeError as exc:
+                        raise MemoryImportConflict(
+                            f"{path.name} is not valid UTF-8"
+                        ) from exc
+                    live_entries = [
+                        item
+                        for item in (
+                            part.strip() for part in live_text.split(ENTRY_DELIMITER)
+                        )
+                        if item
+                    ]
+                    live_file_sha = hashlib.sha256(canonical_raw).hexdigest()
                 live_sha = hashlib.sha256(
-                    ENTRY_DELIMITER.join(self._read_file(path)).encode("utf-8")
+                    ENTRY_DELIMITER.join(live_entries).encode("utf-8")
                 ).hexdigest()
-                live_file_sha = self._live_file_sha256(path)
                 state = receipt.get("state")
                 if state == "prepared":
                     previous_sha = receipt.get("previous_content_sha256")
@@ -1187,7 +1617,8 @@ class MemoryStore:
                         )
                     # Also covers recovery of a legacy prepared receipt where
                     # the target rename landed before process death.
-                    _fsync_directory(path.parent)
+                    import_dirs.verify_attached()
+                    _fsync_directory_fd(import_dirs.mem_fd, import_dirs.mem_dir)
                     receipt["state"] = "completed"
                     receipt["completed_at"] = time.time()
                     if (
@@ -1216,7 +1647,9 @@ class MemoryStore:
                                 "memory import receipt has an invalid displaced path"
                             )
                         if (
-                            _read_bounded_regular_file_bytes(Path(displaced_path)) is not None
+                            import_dirs.read_bytes(
+                                import_dirs.mem_fd, Path(displaced_path).name
+                            ) is not None
                             and receipt.get("displaced_retention") != "manual"
                         ):
                             receipt["displaced_retention"] = "manual"
@@ -1230,7 +1663,9 @@ class MemoryStore:
                 displaced_path = receipt.get("displaced_path")
                 if (
                     displaced_path is not None
-                    and _read_bounded_regular_file_bytes(Path(displaced_path)) is not None
+                    and import_dirs.read_bytes(
+                        import_dirs.mem_fd, Path(displaced_path).name
+                    ) is not None
                 ):
                     result["recovery_path"] = displaced_path
                     result["recovery_retention"] = "manual"
@@ -1240,11 +1675,30 @@ class MemoryStore:
             # recovery before _reload_target deduplicates the live entries.
             # Otherwise a legacy file containing duplicate entries produces a
             # prepared receipt whose previous SHA can never match that file.
-            previous_file_sha = self._live_file_sha256(path)
-            previous_entries = self._read_import_file(path)
-            backup = self._reload_target(target, bounded=True)
+            if canonical_raw is None:
+                previous_file_sha = _MISSING_MEMORY_FILE_SHA256
+                previous_text = ""
+            else:
+                previous_file_sha = hashlib.sha256(canonical_raw).hexdigest()
+                try:
+                    previous_text = canonical_raw.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise MemoryImportConflict(
+                        f"{path.name} is not valid UTF-8"
+                    ) from exc
+            previous_entries = [
+                item
+                for item in (
+                    part.strip() for part in previous_text.split(ENTRY_DELIMITER)
+                )
+                if item
+            ]
+            backup = self._detect_external_drift(
+                target, bounded=True, raw_text=previous_text
+            )
             if backup:
                 raise MemoryImportConflict(_drift_error(path, backup)["error"])
+            self._set_entries(target, list(dict.fromkeys(previous_entries)))
             backup_path = self._write_import_backup(
                 path=path, target=target, import_id=import_id
             )
@@ -1286,7 +1740,11 @@ class MemoryStore:
     @staticmethod
     def _write_import_backup(*, path: Path, target: str, import_id: str) -> Optional[str]:
         """Atomically retain the previous curated-memory bytes before replace."""
-        previous = _read_bounded_regular_file_bytes(path)
+        import_dirs = _ACTIVE_MEMORY_IMPORT_DIRS.get()
+        if import_dirs is not None and path.parent == import_dirs.mem_dir:
+            previous = import_dirs.read_bytes(import_dirs.mem_fd, path.name)
+        else:
+            previous = _read_bounded_regular_file_bytes(path)
         if previous is None:
             return None
 
@@ -1294,6 +1752,31 @@ class MemoryStore:
         _require_managed_memory_directory(backup_dir, create=False)
         import_hash = hashlib.sha256(import_id.encode("utf-8")).hexdigest()
         backup_path = backup_dir / f"{target}-{import_hash}.bak"
+        if import_dirs is not None and backup_dir == import_dirs.backup_dir:
+            import_dirs.atomic_write(
+                import_dirs.backup_fd,
+                backup_path.name,
+                previous,
+                prefix=".backup_",
+            )
+            retained = []
+            for name in os.listdir(import_dirs.backup_fd):
+                if not name.startswith(f"{target}-") or not name.endswith(".bak"):
+                    continue
+                candidate_stat = os.stat(
+                    name, dir_fd=import_dirs.backup_fd, follow_symlinks=False
+                )
+                if not stat.S_ISREG(candidate_stat.st_mode):
+                    raise MemoryImportConflict(
+                        f"managed memory backup {name} must be a regular file"
+                    )
+                retained.append((name, candidate_stat.st_mtime_ns))
+            retained.sort(key=lambda item: (item[1], item[0]), reverse=True)
+            for name, _mtime_ns in retained[MEMORY_IMPORT_BACKUP_LIMIT:]:
+                os.unlink(name, dir_fd=import_dirs.backup_fd)
+            import_dirs.verify_attached()
+            _fsync_directory_fd(import_dirs.backup_fd, import_dirs.backup_dir)
+            return str(backup_path)
         fd, tmp_path = tempfile.mkstemp(
             dir=str(backup_dir), suffix=".tmp", prefix=".backup_"
         )
@@ -1336,6 +1819,18 @@ class MemoryStore:
     @staticmethod
     def _write_import_receipt(path: Path, receipt: Dict[str, Any]) -> None:
         """Atomically persist and fsync a memory-import prepare/receipt."""
+        import_dirs = _ACTIVE_MEMORY_IMPORT_DIRS.get()
+        if import_dirs is not None and path.parent == import_dirs.imports_dir:
+            encoded = json.dumps(
+                receipt, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            import_dirs.atomic_write(
+                import_dirs.imports_fd,
+                path.name,
+                encoded,
+                prefix=".receipt_",
+            )
+            return
         _require_managed_memory_directory(path.parent, create=False)
         fd, tmp_path = tempfile.mkstemp(
             dir=str(path.parent), suffix=".tmp", prefix=".receipt_"
@@ -1464,7 +1959,11 @@ class MemoryStore:
         return [e for e in entries if e]
 
     def _detect_external_drift(
-        self, target: str, *, bounded: bool = False
+        self,
+        target: str,
+        *,
+        bounded: bool = False,
+        raw_text: Optional[str] = None,
     ) -> Optional[str]:
         """Return a backup-path string if on-disk content shows external drift.
 
@@ -1490,7 +1989,9 @@ class MemoryStore:
         per-target char_limit for signal #2.
         """
         path = self._path_for(target)
-        if bounded:
+        if raw_text is not None:
+            raw = raw_text
+        elif bounded:
             raw = _read_bounded_regular_file_text(path)
             if raw is None:
                 return None
@@ -1520,6 +2021,18 @@ class MemoryStore:
         ts = int(time.time())
         bak_path = path.with_suffix(path.suffix + f".bak.{ts}")
         if bounded:
+            import_dirs = _ACTIVE_MEMORY_IMPORT_DIRS.get()
+            if import_dirs is not None and path.parent == import_dirs.mem_dir:
+                try:
+                    import_dirs.atomic_write(
+                        import_dirs.mem_fd,
+                        bak_path.name,
+                        raw.encode("utf-8"),
+                        prefix=".drift_",
+                    )
+                except OSError:
+                    return str(bak_path) + " (BACKUP FAILED — file unchanged on disk)"
+                return str(bak_path)
             fd = None
             tmp_path = None
             try:
@@ -1560,6 +2073,9 @@ class MemoryStore:
 
     @staticmethod
     def _import_displaced_path(path: Path, receipt_path: Path) -> Path:
+        import_dirs = _ACTIVE_MEMORY_IMPORT_DIRS.get()
+        if import_dirs is not None and path.parent == import_dirs.mem_dir:
+            return import_dirs.mem_dir / f".{path.name}.{receipt_path.stem}.displaced"
         if path.is_symlink():
             raise MemoryImportConflict(
                 f"refusing to import through symlinked {path.name}"
@@ -1643,6 +2159,28 @@ class MemoryStore:
         recovery path manually only after quiescing external writers.
         """
         content = ENTRY_DELIMITER.join(entries) if entries else ""
+        import_dirs = _ACTIVE_MEMORY_IMPORT_DIRS.get()
+        if (
+            import_dirs is not None
+            and path.parent == import_dirs.mem_dir
+            and expected_live_sha256 is not None
+        ):
+            if displaced_path is None or displaced_path.parent != import_dirs.mem_dir:
+                raise MemoryImportConflict(
+                    "memory import is missing a valid displaced path"
+                )
+            try:
+                import_dirs.write_canonical_cas(
+                    path.name,
+                    displaced_path.name,
+                    content.encode("utf-8"),
+                    expected_live_sha256,
+                )
+            except MemoryImportConflict:
+                raise
+            except (OSError, IOError) as exc:
+                raise RuntimeError(f"Failed to write memory file {path}: {exc}") from exc
+            return
         if path.is_symlink():
             raise MemoryImportConflict(
                 f"refusing to import through symlinked {path.name}"
