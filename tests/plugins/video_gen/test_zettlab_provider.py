@@ -52,6 +52,26 @@ def test_zettlab_video_provider_reads_capabilities(monkeypatch):
     assert caps["max_duration"] == 10
 
 
+def test_zettlab_video_capabilities_use_only_selected_model(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setattr(client, "type_capability", lambda media_type: {
+        "enabled": True,
+        "default_model": "selected",
+        "models": [
+            {"id": "selected", "modalities": ["text"], "aspect_ratios": ["16:9"], "resolutions": ["720p"], "durations": [5]},
+            {"id": "other", "modalities": ["image"], "aspect_ratios": ["9:16"], "resolutions": ["1080p"], "durations": [10]},
+        ],
+        "limits": {"max_remote_media_inputs": 1},
+    })
+
+    caps = ZettlabVideoGenProvider().capabilities()
+    assert caps["modalities"] == ["text"]
+    assert caps["aspect_ratios"] == ["16:9"]
+    assert caps["resolutions"] == ["720p"]
+    assert caps["min_duration"] == caps["max_duration"] == 5
+
+
 def test_zettlab_video_generate_creates_media_job(monkeypatch):
     from plugins import zettlab_media_client as client
 
@@ -127,7 +147,7 @@ def test_zettlab_video_generate_uses_gateway_default_when_model_is_omitted(monke
 def test_zettlab_video_rejects_non_https_remote_input(monkeypatch):
     from plugins import zettlab_media_client as client
 
-    monkeypatch.setattr(client, "default_model", lambda media_type: "seedance-v1")
+    monkeypatch.setattr(client, "resolve_model", lambda media_type, requested=None: "seedance-v1")
     got = ZettlabVideoGenProvider().generate("make video", image_url="/tmp/source.png")
     assert got["success"] is False
     assert got["error_type"] == "ZettlabMediaError"

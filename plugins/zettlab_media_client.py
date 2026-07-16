@@ -7,16 +7,19 @@ zettlab-ai-gateway.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 import requests
+from tools.interrupt import is_interrupted
 
 DEFAULT_BASE_URL = "http://127.0.0.1:9090/api/v1/ai-proxy/v1"
 CAPABILITY_TIMEOUT = 5.0
 REQUEST_TIMEOUT = 30.0
+POLL_RETRY_LIMIT = 3
 ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
 
 
@@ -45,7 +48,28 @@ def _config_section(media_type: str) -> Dict[str, Any]:
 def base_url(media_type: str) -> str:
     configured = os.environ.get("ZETTLAB_AI_PROXY_BASE_URL") or _config_section(media_type).get("base_url")
     raw = str(configured or DEFAULT_BASE_URL).strip().rstrip("/")
-    return raw or DEFAULT_BASE_URL
+    raw = raw or DEFAULT_BASE_URL
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    try:
+        port = parsed.port
+    except ValueError:
+        port = -1
+    try:
+        loopback = host == "localhost" or ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        loopback = host == "localhost"
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not loopback
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or port == -1
+    ):
+        raise ZettlabMediaError("Zettlab ai-proxy base_url must be a plain loopback HTTP(S) URL")
+    return raw
 
 
 def get_capabilities(media_type: Optional[str] = None) -> Dict[str, Any]:
@@ -85,10 +109,31 @@ def list_models(media_type: str) -> List[Dict[str, Any]]:
 
 
 def default_model(media_type: str) -> Optional[str]:
-    configured = _config_section(media_type).get("model")
-    if isinstance(configured, str) and configured.strip():
-        return configured.strip()
     section = type_capability(media_type)
+    return _resolve_model_from_section(media_type, section)
+
+
+def resolve_model(media_type: str, requested: Optional[str] = None) -> Optional[str]:
+    section = type_capability(media_type)
+    return _resolve_model_from_section(media_type, section, requested)
+
+
+def selected_model_capability(media_type: str) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    section = type_capability(media_type)
+    model_id = _resolve_model_from_section(media_type, section)
+    models = section.get("models")
+    if model_id and isinstance(models, list):
+        for model in models:
+            if isinstance(model, dict) and str(model.get("id") or "").strip() == model_id:
+                return section, model
+    return section, None
+
+
+def _resolve_model_from_section(
+    media_type: str,
+    section: Dict[str, Any],
+    requested: Optional[str] = None,
+) -> Optional[str]:
     if section.get("enabled") is False:
         return None
     gateway_default = section.get("default_model")
@@ -101,6 +146,13 @@ def default_model(media_type: str) -> Optional[str]:
             and isinstance(model.get("id"), str)
             and model.get("id").strip()
         ]
+        explicit = str(requested or "").strip()
+        if explicit:
+            return explicit if explicit in model_ids else None
+        configured = _config_section(media_type).get("model")
+        if isinstance(configured, str) and configured.strip():
+            configured_id = configured.strip()
+            return configured_id if configured_id in model_ids else None
         if "default_model" in section:
             if isinstance(gateway_default, str) and gateway_default.strip() in model_ids:
                 return gateway_default.strip()
@@ -128,7 +180,27 @@ def validate_remote_url(value: Optional[str], *, label: str) -> Optional[str]:
     if not raw:
         return None
     parsed = urlparse(raw)
-    if parsed.scheme != "https" or not parsed.netloc or parsed.username or parsed.password:
+    host = (parsed.hostname or "").lower().rstrip(".")
+    try:
+        port = parsed.port
+    except ValueError:
+        port = -1
+    try:
+        is_ip_literal = bool(host) and ipaddress.ip_address(host) is not None
+    except ValueError:
+        is_ip_literal = False
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+        or port not in {None, 443}
+        or not host
+        or host == "localhost"
+        or host.endswith(".localhost")
+        or is_ip_literal
+    ):
         raise ZettlabMediaError(f"{label} must be an https URL for Zettlab media generation")
     return raw
 
@@ -187,24 +259,55 @@ def create_and_wait(
         raise ZettlabMediaError("media generation job response did not include job_id")
 
     deadline = time.monotonic() + float(timeout_seconds or _timeout_from_capability(media_type))
+    poll_failures = 0
+    try:
+        while time.monotonic() < deadline:
+            _interruptible_sleep(max(0.2, poll_interval))
+            try:
+                resp = requests.get(
+                    f"{base_url(media_type)}/media/generation-jobs/{job_id}",
+                    headers=headers,
+                    timeout=REQUEST_TIMEOUT,
+                )
+                resp.raise_for_status()
+                job = resp.json()
+            except requests.RequestException:
+                poll_failures += 1
+                if poll_failures > POLL_RETRY_LIMIT:
+                    raise
+                continue
+            poll_failures = 0
+            if not isinstance(job, dict):
+                raise ZettlabMediaError("media generation poll response is not a JSON object")
+            status = str(job.get("status") or "")
+            if status == "done":
+                return job
+            if status in {"failed", "cancelled"}:
+                msg = str(job.get("error_message") or job.get("error_code") or status)
+                raise ZettlabMediaError(f"media generation job {status}: {msg}")
+        raise ZettlabMediaError("media generation timed out")
+    except BaseException:
+        _delete_job(media_type, job_id, headers)
+        raise
+
+
+def _interruptible_sleep(delay: float) -> None:
+    deadline = time.monotonic() + delay
     while time.monotonic() < deadline:
-        time.sleep(max(0.2, poll_interval))
-        resp = requests.get(
+        if is_interrupted():
+            raise ZettlabMediaError("media generation interrupted")
+        time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
+
+
+def _delete_job(media_type: str, job_id: str, headers: Dict[str, str]) -> None:
+    try:
+        requests.delete(
             f"{base_url(media_type)}/media/generation-jobs/{job_id}",
             headers=headers,
             timeout=REQUEST_TIMEOUT,
-        )
-        resp.raise_for_status()
-        job = resp.json()
-        if not isinstance(job, dict):
-            raise ZettlabMediaError("media generation poll response is not a JSON object")
-        status = str(job.get("status") or "")
-        if status == "done":
-            return job
-        if status in {"failed", "cancelled"}:
-            msg = str(job.get("error_message") or job.get("error_code") or status)
-            raise ZettlabMediaError(f"media generation job {status}: {msg}")
-    raise ZettlabMediaError("media generation timed out")
+        ).raise_for_status()
+    except Exception:
+        pass
 
 
 def first_asset_url(job: Dict[str, Any]) -> str:

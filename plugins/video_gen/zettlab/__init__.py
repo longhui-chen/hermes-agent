@@ -52,30 +52,26 @@ class ZettlabVideoGenProvider(VideoGenProvider):
 
     def capabilities(self) -> Dict[str, Any]:
         try:
-            cap = media_client.type_capability("video")
+            cap, model = media_client.selected_model_capability("video")
         except Exception:
             return super().capabilities()
-        models = cap.get("models") if isinstance(cap, dict) else None
         modalities: List[str] = ["text"]
         aspect_ratios: List[str] = []
         resolutions: List[str] = []
         durations: List[int] = []
-        if isinstance(models, list):
-            for model in models:
-                if not isinstance(model, dict):
-                    continue
-                for value in model.get("modalities") or []:
-                    if isinstance(value, str) and value not in modalities:
-                        modalities.append(value)
-                for value in model.get("aspect_ratios") or []:
-                    if isinstance(value, str) and value not in aspect_ratios:
-                        aspect_ratios.append(value)
-                for value in model.get("resolutions") or []:
-                    if isinstance(value, str) and value not in resolutions:
-                        resolutions.append(value)
-                for value in model.get("durations") or []:
-                    if isinstance(value, int) and value not in durations:
-                        durations.append(value)
+        if isinstance(model, dict):
+            for value in model.get("modalities") or []:
+                if isinstance(value, str) and value not in modalities:
+                    modalities.append(value)
+            for value in model.get("aspect_ratios") or []:
+                if isinstance(value, str) and value not in aspect_ratios:
+                    aspect_ratios.append(value)
+            for value in model.get("resolutions") or []:
+                if isinstance(value, str) and value not in resolutions:
+                    resolutions.append(value)
+            for value in model.get("durations") or []:
+                if isinstance(value, int) and value not in durations:
+                    durations.append(value)
         limits = cap.get("limits") if isinstance(cap, dict) else {}
         max_refs = 0
         if isinstance(limits, dict):
@@ -117,7 +113,7 @@ class ZettlabVideoGenProvider(VideoGenProvider):
                 aspect_ratio=aspect_ratio,
             )
 
-        resolved_model = str(model or media_client.default_model("video") or "").strip()
+        resolved_model = str(media_client.resolve_model("video", model) or "").strip()
         if not resolved_model:
             return error_response(
                 error="No Zettlab video generation model is available from ai-gateway capabilities",

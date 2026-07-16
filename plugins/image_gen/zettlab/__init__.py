@@ -52,17 +52,14 @@ class ZettlabImageGenProvider(ImageGenProvider):
 
     def capabilities(self) -> Dict[str, Any]:
         try:
-            cap = media_client.type_capability("image")
+            cap, model = media_client.selected_model_capability("image")
         except Exception:
             return {"modalities": ["text"], "max_reference_images": 0}
-        models = cap.get("models") if isinstance(cap, dict) else None
         modalities: List[str] = ["text"]
-        if isinstance(models, list):
-            for model in models:
-                if isinstance(model, dict):
-                    for value in model.get("modalities") or []:
-                        if isinstance(value, str) and value not in modalities:
-                            modalities.append(value)
+        if isinstance(model, dict):
+            for value in model.get("modalities") or []:
+                if isinstance(value, str) and value not in modalities:
+                    modalities.append(value)
         limits = cap.get("limits") if isinstance(cap, dict) else {}
         max_refs = 0
         if isinstance(limits, dict):
@@ -88,7 +85,7 @@ class ZettlabImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        model = str(kwargs.get("model") or media_client.default_model("image") or "").strip()
+        model = str(media_client.resolve_model("image", kwargs.get("model")) or "").strip()
         if not model:
             return error_response(
                 error="No Zettlab image generation model is available from ai-gateway capabilities",
