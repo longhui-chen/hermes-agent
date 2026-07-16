@@ -709,14 +709,44 @@ class MemoryStore:
                 state = receipt.get("state")
                 if state == "prepared":
                     previous_sha = receipt.get("previous_content_sha256")
-                    if live_sha == previous_sha:
+                    displaced_path = receipt.get("displaced_path")
+                    expected_displaced = str(
+                        self._import_displaced_path(path, receipt_path)
+                    )
+                    if displaced_path is not None and displaced_path != expected_displaced:
+                        raise MemoryImportConflict(
+                            "memory import receipt has an invalid displaced path"
+                        )
+                    if live_sha == content_sha and live_file_sha == content_sha:
+                        pass
+                    elif displaced_path is not None:
+                        previous_file_sha = receipt.get("previous_file_sha256")
+                        if previous_file_sha is None:
+                            raise MemoryImportConflict(
+                                "memory import receipt is missing the previous file hash"
+                            )
+                        self._write_file(
+                            path,
+                            normalized,
+                            previous_file_sha,
+                            Path(displaced_path),
+                        )
+                    elif live_sha == previous_sha:
                         previous_file_sha = receipt.get("previous_file_sha256")
                         if previous_file_sha is not None and live_file_sha != previous_file_sha:
                             raise MemoryImportConflict(
                                 "memory changed after import prepare; refusing to overwrite user edits"
                             )
-                        self._write_file(path, normalized, live_file_sha)
-                    elif live_sha != content_sha:
+                        displaced_path = expected_displaced
+                        receipt["displaced_path"] = displaced_path
+                        self._write_import_receipt(receipt_path, receipt)
+                        self._write_file(
+                            path,
+                            normalized,
+                            live_file_sha,
+                            Path(displaced_path),
+                        )
+                    else:
                         raise MemoryImportConflict(
                             "memory changed after import prepare; refusing to overwrite user edits"
                         )
@@ -726,10 +756,27 @@ class MemoryStore:
                     receipt["state"] = "completed"
                     receipt["completed_at"] = time.time()
                     self._write_import_receipt(receipt_path, receipt)
-                elif state != "completed" or live_sha != receipt.get("content_sha256"):
+                    if displaced_path is not None:
+                        self._cleanup_import_displaced(Path(displaced_path))
+                elif (
+                    state != "completed"
+                    or live_sha != receipt.get("content_sha256")
+                    or live_file_sha != receipt.get("content_sha256")
+                ):
                     raise MemoryImportConflict(
                         "memory changed after import; refusing to overwrite user edits"
                     )
+                else:
+                    displaced_path = receipt.get("displaced_path")
+                    if displaced_path is not None:
+                        expected_displaced = str(
+                            self._import_displaced_path(path, receipt_path)
+                        )
+                        if displaced_path != expected_displaced:
+                            raise MemoryImportConflict(
+                                "memory import receipt has an invalid displaced path"
+                            )
+                        self._cleanup_import_displaced(Path(displaced_path))
                 self._set_entries(target, normalized)
                 result = {"import_id": import_id, "status": "completed", "target": target,
                           "char_count": char_count, "replayed": True,
@@ -754,12 +801,14 @@ class MemoryStore:
             previous_sha = hashlib.sha256(
                 ENTRY_DELIMITER.join(previous_entries).encode("utf-8")
             ).hexdigest()
+            displaced_path = self._import_displaced_path(path, receipt_path)
             receipt = {
                 "state": "prepared", "import_id": import_id, "target": target,
                 "payload_sha256": payload_sha256.lower(),
                 "content_sha256": content_sha,
                 "previous_content_sha256": previous_sha,
                 "previous_file_sha256": previous_file_sha,
+                "displaced_path": str(displaced_path),
                 "prepared_at": time.time(),
             }
             if backup_path:
@@ -767,10 +816,11 @@ class MemoryStore:
             # Durable prepare MUST precede the target rename. A crash can then
             # be recovered without guessing whether a later edit is user data.
             self._write_import_receipt(receipt_path, receipt)
-            self._write_file(path, normalized, previous_file_sha)
+            self._write_file(path, normalized, previous_file_sha, displaced_path)
             receipt["state"] = "completed"
             receipt["completed_at"] = time.time()
             self._write_import_receipt(receipt_path, receipt)
+            self._cleanup_import_displaced(displaced_path)
             self._set_entries(target, normalized)
         result = {"import_id": import_id, "status": "completed", "target": target,
                   "char_count": char_count, "replayed": False,
@@ -1018,36 +1068,113 @@ class MemoryStore:
         return hashlib.sha256(content).hexdigest()
 
     @staticmethod
+    def _import_displaced_path(path: Path, receipt_path: Path) -> Path:
+        effective_path = Path(os.path.realpath(path)) if path.is_symlink() else path
+        return effective_path.parent / (
+            f".{effective_path.name}.{receipt_path.stem}.displaced"
+        )
+
+    @staticmethod
+    def _cleanup_import_displaced(displaced_path: Path) -> None:
+        try:
+            displaced_path.unlink()
+        except FileNotFoundError:
+            return
+        _fsync_directory(displaced_path.parent)
+
+    @staticmethod
+    def _restore_displaced_no_replace(displaced_path: Path, path: Path) -> None:
+        try:
+            os.link(displaced_path, path)
+        except FileExistsError:
+            return
+        _fsync_directory(path.parent)
+
+    @staticmethod
     def _write_file(
-        path: Path, entries: List[str], expected_live_sha256: Optional[str] = None
+        path: Path,
+        entries: List[str],
+        expected_live_sha256: Optional[str] = None,
+        displaced_path: Optional[Path] = None,
     ):
-        """Write entries to a memory file using atomic temp-file + rename.
+        """Write entries atomically, with no-clobber CAS for imports.
 
         Previous implementation used open("w") + flock, but "w" truncates the
         file *before* the lock is acquired, creating a race window where
         concurrent readers see an empty file. Atomic rename avoids this:
         readers always see either the old complete file or the new one.
+
+        Import writes with an expected SHA use a stricter state machine: move
+        the old target to ``displaced_path``, verify those exact bytes, then
+        hard-link the prepared file into the unoccupied canonical name. This
+        deliberately creates a short missing-name window so an external writer
+        can win with create-if-absent instead of ever being overwritten.
         """
         content = ENTRY_DELIMITER.join(entries) if entries else ""
+        effective_path = Path(os.path.realpath(path)) if path.is_symlink() else path
         try:
             # Write to temp file in same directory (same filesystem for atomic rename)
             fd, tmp_path = tempfile.mkstemp(
-                dir=str(path.parent), suffix=".tmp", prefix=".mem_"
+                dir=str(effective_path.parent), suffix=".tmp", prefix=".mem_"
             )
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(content)
                     f.flush()
                     os.fsync(f.fileno())
-                if (
-                    expected_live_sha256 is not None
-                    and MemoryStore._live_file_sha256(path) != expected_live_sha256
-                ):
+                if expected_live_sha256 is None:
+                    atomic_replace(tmp_path, path)
+                    _fsync_directory(effective_path.parent)
+                    return
+                if displaced_path is None or displaced_path.parent != effective_path.parent:
+                    raise MemoryImportConflict(
+                        "memory import is missing a valid displaced path"
+                    )
+
+                if displaced_path.exists():
+                    displaced_sha = MemoryStore._live_file_sha256(displaced_path)
+                    if displaced_sha != expected_live_sha256:
+                        if MemoryStore._live_file_sha256(effective_path) == _MISSING_MEMORY_FILE_SHA256:
+                            MemoryStore._restore_displaced_no_replace(
+                                displaced_path, effective_path
+                            )
+                        raise MemoryImportConflict(
+                            "memory changed after import prepare; refusing to overwrite user edits"
+                        )
+                    if MemoryStore._live_file_sha256(effective_path) != _MISSING_MEMORY_FILE_SHA256:
+                        raise MemoryImportConflict(
+                            "memory changed after import prepare; refusing to overwrite user edits"
+                        )
+                elif expected_live_sha256 == _MISSING_MEMORY_FILE_SHA256:
+                    if MemoryStore._live_file_sha256(effective_path) != _MISSING_MEMORY_FILE_SHA256:
+                        raise MemoryImportConflict(
+                            "memory changed after import prepare; refusing to overwrite user edits"
+                        )
+                else:
+                    try:
+                        os.replace(effective_path, displaced_path)
+                    except FileNotFoundError as exc:
+                        raise MemoryImportConflict(
+                            "memory changed after import prepare; refusing to overwrite user edits"
+                        ) from exc
+                    _fsync_directory(effective_path.parent)
+                    if MemoryStore._live_file_sha256(displaced_path) != expected_live_sha256:
+                        if MemoryStore._live_file_sha256(effective_path) == _MISSING_MEMORY_FILE_SHA256:
+                            MemoryStore._restore_displaced_no_replace(
+                                displaced_path, effective_path
+                            )
+                        raise MemoryImportConflict(
+                            "memory changed after import prepare; refusing to overwrite user edits"
+                        )
+
+                try:
+                    os.link(tmp_path, effective_path)
+                except FileExistsError as exc:
                     raise MemoryImportConflict(
                         "memory changed after import prepare; refusing to overwrite user edits"
-                    )
-                atomic_replace(tmp_path, path)
-                _fsync_directory(path.parent)
+                    ) from exc
+                os.unlink(tmp_path)
+                _fsync_directory(effective_path.parent)
             except BaseException:
                 # Clean up temp file on any failure
                 try:

@@ -27,6 +27,32 @@ def test_portable_credential_scanner_rejects_assignment_and_escape_forms(value):
 @pytest.mark.parametrize(
     "value",
     [
+        "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7REAL",
+        '{"AZURE_STORAGE_ACCOUNT_KEY":"abcdefghijklmnop"}',
+        "AZURE_SUBSCRIPTION_KEY: abcdefghijklmnop",
+    ],
+    ids=["aws-access-key-id", "azure-storage-account-key", "azure-subscription-key"],
+)
+def test_portable_credential_scanner_rejects_vendor_assignment_vocabulary(value):
+    assert portable_credential_finding(value) is not None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "public_key=abcdefghijklmnop",
+        "account_id=1234567890123456",
+        "subscription_key_hint=rotate-quarterly",
+    ],
+    ids=["public-key", "account-id", "subscription-key-hint"],
+)
+def test_portable_credential_scanner_allows_non_secret_assignment_neighbors(value):
+    assert portable_credential_finding(value) is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
         "xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwxyzABCD",
         "xapp-1-123456789012-abcdefghijklmnopqrstuvwxyzABCD",
         "AIza" + "A" * 35,

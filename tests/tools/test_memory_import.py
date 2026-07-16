@@ -231,6 +231,91 @@ def test_memory_import_cas_preserves_edit_after_prepared_receipt(tmp_path, monke
     assert Path(receipt["backup_path"]).read_text(encoding="utf-8") == "old fact"
 
 
+def test_memory_import_no_clobber_preserves_edit_after_final_validation(
+    tmp_path, monkeypatch
+):
+    import tools.memory_tool as memory_tool
+
+    home = tmp_path / ".hermes"
+    memory_path = home / "memories" / "MEMORY.md"
+    memory_path.parent.mkdir(parents=True)
+    memory_path.write_text("old fact", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=100, user_char_limit=100)
+    original_link = memory_tool.os.link
+    raced = False
+
+    def edit_immediately_before_publish(source, target, *args, **kwargs):
+        nonlocal raced
+        if not raced and Path(target) == memory_path:
+            raced = True
+            memory_path.write_text("concurrent external edit", encoding="utf-8")
+        return original_link(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(memory_tool.os, "link", edit_immediately_before_publish)
+
+    with pytest.raises(MemoryImportConflict, match="after import prepare"):
+        store.import_replace(
+            target="memory",
+            entries=["imported fact"],
+            import_id="publish-race",
+            payload_sha256=hashlib.sha256(b"publish-race").hexdigest(),
+        )
+
+    assert raced is True
+    assert memory_path.read_text(encoding="utf-8") == "concurrent external edit"
+    receipt_path = next((home / "memories" / ".imports").glob("*.json"))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["state"] == "prepared"
+    displaced_path = Path(receipt["displaced_path"])
+    assert displaced_path.read_text(encoding="utf-8") == "old fact"
+
+
+def test_memory_import_prepared_recovery_flow_after_displacement(tmp_path, monkeypatch):
+    import tools.memory_tool as memory_tool
+
+    home = tmp_path / ".hermes"
+    memory_path = home / "memories" / "MEMORY.md"
+    memory_path.parent.mkdir(parents=True)
+    memory_path.write_text("old fact", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=100, user_char_limit=100)
+    original_link = memory_tool.os.link
+
+    def crash_before_publish(source, target, *args, **kwargs):
+        if Path(target) == memory_path:
+            raise RuntimeError("crash before publish")
+        return original_link(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(memory_tool.os, "link", crash_before_publish)
+    digest = hashlib.sha256(b"displaced-recovery").hexdigest()
+    with pytest.raises(RuntimeError, match="crash before publish"):
+        store.import_replace(
+            target="memory",
+            entries=["imported fact"],
+            import_id="displaced-recovery",
+            payload_sha256=digest,
+        )
+
+    receipt_path = next((home / "memories" / ".imports").glob("*.json"))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    displaced_path = Path(receipt["displaced_path"])
+    assert receipt["state"] == "prepared"
+    assert not memory_path.exists()
+    assert displaced_path.read_text(encoding="utf-8") == "old fact"
+
+    monkeypatch.setattr(memory_tool.os, "link", original_link)
+    result = store.import_replace(
+        target="memory",
+        entries=["imported fact"],
+        import_id="displaced-recovery",
+        payload_sha256=digest,
+    )
+    assert result["replayed"] is True
+    assert memory_path.read_text(encoding="utf-8") == "imported fact"
+    assert not displaced_path.exists()
+
+
 def test_memory_import_retains_only_five_recoverable_backups(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     memory_path = home / "memories" / "MEMORY.md"
@@ -307,6 +392,11 @@ def test_memory_import_recovers_prepare_crash_with_legacy_duplicate_entries(tmp_
             payload_sha256=digest,
         )
     assert memory_path.read_text(encoding="utf-8") == "old fact\n§\nold fact"
+
+    receipt_path = next((home / "memories" / ".imports").glob("*.json"))
+    legacy_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    legacy_receipt.pop("displaced_path")
+    receipt_path.write_text(json.dumps(legacy_receipt), encoding="utf-8")
 
     monkeypatch.setattr(store, "_write_file", original_write)
     result = store.import_replace(
