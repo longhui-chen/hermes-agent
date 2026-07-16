@@ -22,7 +22,9 @@ VAULT = "/tmp/mdvault-test"
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
     monkeypatch.setenv("MARKDOWN_VAULT_PATH", VAULT)
+    monkeypatch.setenv("MARKDOWN_VAULT_WRITE", "1")
     monkeypatch.setenv("ZETTLAB_FILE_API_URL", "http://127.0.0.1:9090/api/v1")
+    _mock_health(monkeypatch, ok=True)
 
 
 # --- path confinement (T3-style, at the tool layer) ---
@@ -703,13 +705,23 @@ def test_write_toolset_is_default_off():
 # vault surface stays off even for callers that expand every toolset — closing the
 # gap where model_tools' "start with everything" path bypasses tools_config.
 
-def _mock_health(monkeypatch, ok=True):
+def _mock_health(
+    monkeypatch,
+    ok=True,
+    capabilities=(tools._CONDITIONAL_MUTATION_CAPABILITY,),
+):
+    payload = {"status": "ok" if ok else "unavailable"}
+    if capabilities is not None:
+        payload["capabilities"] = list(capabilities)
+
     class _Resp:
         status = 200 if ok else 503
         def __enter__(self):
             return self
         def __exit__(self, *a):
             return False
+        def read(self, _limit=-1):
+            return json.dumps(payload).encode("utf-8")
     monkeypatch.setattr(tools.urllib.request, "urlopen", lambda *a, **k: _Resp())
 
 
@@ -768,8 +780,93 @@ def test_write_gate_on_with_grant_path_health(monkeypatch):
     assert tools.check_vault_write_requirements() is True
 
 
+def test_write_gate_off_when_server_lacks_conditional_mutation_capability(monkeypatch):
+    monkeypatch.setenv("MARKDOWN_VAULT_PATH", VAULT)
+    monkeypatch.setenv("MARKDOWN_VAULT_WRITE", "1")
+    _mock_health(monkeypatch, ok=True, capabilities=None)
+    assert tools.check_vault_write_requirements() is False
+
+
 def test_write_gate_off_without_path_even_with_grant(monkeypatch):
     # A write grant without a provisioned vault path is still off (read gate fails).
     monkeypatch.delenv("MARKDOWN_VAULT_PATH", raising=False)
     monkeypatch.setenv("MARKDOWN_VAULT_WRITE", "1")
     assert tools.check_vault_write_requirements() is False
+
+
+@pytest.mark.parametrize(
+    ("handler", "args"),
+    [
+        (tools.handle_vault_write, {"note": "revoked.md", "content": "new"}),
+        (tools.handle_vault_delete, {"note": "revoked.md"}),
+    ],
+)
+def test_mutation_flow_rechecks_profile_env_after_cached_gate(
+    monkeypatch,
+    tmp_path,
+    handler,
+    args,
+):
+    """A turn's secret-scope snapshot may still say write=1 after revocation.
+
+    The handler must re-read the active profile .env immediately before any
+    mutation instead of trusting the registry's cached check_fn verdict.
+    """
+    from agent import secret_scope
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        f"MARKDOWN_VAULT_PATH={VAULT}\nMARKDOWN_VAULT_WRITE=1\n",
+        encoding="utf-8",
+    )
+    previous_multiplex = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    home_token = set_hermes_home_override(str(tmp_path))
+    scope_token = secret_scope.set_secret_scope(
+        secret_scope.build_profile_secret_scope(tmp_path)
+    )
+    try:
+        assert tools.check_vault_write_requirements() is True
+        # Revoke on disk while the installed turn scope remains stale/writeable.
+        env_path.write_text(f"MARKDOWN_VAULT_PATH={VAULT}\n", encoding="utf-8")
+        monkeypatch.setattr(
+            tools,
+            "_read_note",
+            lambda *_a, **_k: (_ for _ in ()).throw(
+                AssertionError("revoked handler touched vault data")
+            ),
+        )
+        out = json.loads(handler(args))
+        assert "write access is not granted" in out["error"]
+    finally:
+        secret_scope.reset_secret_scope(scope_token)
+        reset_hermes_home_override(home_token)
+        secret_scope.set_multiplex_active(previous_multiplex)
+
+
+@pytest.mark.parametrize(
+    ("handler", "args"),
+    [
+        (tools.handle_vault_write, {"note": "legacy.md", "content": "new"}),
+        (tools.handle_vault_delete, {"note": "legacy.md"}),
+    ],
+)
+def test_mutation_flow_rejects_legacy_server_before_touching_data(
+    monkeypatch,
+    handler,
+    args,
+):
+    _mock_health(monkeypatch, ok=True, capabilities=None)
+    monkeypatch.setattr(
+        tools,
+        "_read_note",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("legacy server handler touched vault data")
+        ),
+    )
+    out = json.loads(handler(args))
+    assert "conditional-mutation capability" in out["error"]
