@@ -124,6 +124,137 @@ def test_memory_import_rejects_canonical_symlink_without_external_write(
     assert not (memories / ".imports").exists()
 
 
+@pytest.mark.parametrize("target", ["memory", "user"])
+def test_memory_import_rejects_symlinked_memory_parent_before_any_write(
+    tmp_path, monkeypatch, target
+):
+    home = tmp_path / ".hermes"
+    outside = tmp_path / "outside"
+    home.mkdir()
+    outside.mkdir()
+    (home / "memories").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    with pytest.raises(MemoryImportConflict, match="memories"):
+        MemoryStore(memory_char_limit=1000, user_char_limit=1000).import_replace(
+            target=target,
+            entries=["imported content"],
+            import_id=f"parent-symlink-{target}",
+            payload_sha256=hashlib.sha256(target.encode()).hexdigest(),
+        )
+
+    assert list(outside.iterdir()) == []
+
+
+@pytest.mark.parametrize("managed_name", [".imports", ".imports/backups"])
+def test_memory_import_rejects_symlinked_managed_directory(
+    tmp_path, monkeypatch, managed_name
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    outside = tmp_path / "outside"
+    memories.mkdir(parents=True)
+    outside.mkdir()
+    managed = memories / managed_name
+    managed.parent.mkdir(parents=True, exist_ok=True)
+    managed.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    with pytest.raises(MemoryImportConflict, match="managed memory directory"):
+        MemoryStore(memory_char_limit=1000, user_char_limit=1000).import_replace(
+            target="memory",
+            entries=["imported content"],
+            import_id=f"managed-symlink-{managed.name}",
+            payload_sha256=hashlib.sha256(managed_name.encode()).hexdigest(),
+        )
+
+    assert list(outside.iterdir()) == []
+    assert not (memories / "MEMORY.md").exists()
+
+
+@pytest.mark.parametrize(
+    "lock_name", [".curated-memory-transaction.lock", "MEMORY.md.lock"]
+)
+def test_memory_import_rejects_symlinked_lock_without_external_write(
+    tmp_path, monkeypatch, lock_name
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    outside = tmp_path / "outside-lock"
+    outside.write_text("external lock content", encoding="utf-8")
+    (memories / lock_name).symlink_to(outside)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    with pytest.raises(MemoryImportConflict, match="unsafe reset lock"):
+        MemoryStore(memory_char_limit=1000, user_char_limit=1000).import_replace(
+            target="memory",
+            entries=["imported content"],
+            import_id=f"unsafe-lock-{lock_name}",
+            payload_sha256=hashlib.sha256(lock_name.encode()).hexdigest(),
+        )
+
+    assert outside.read_text(encoding="utf-8") == "external lock content"
+    assert not (memories / "MEMORY.md").exists()
+
+
+def test_bounded_regular_reader_rejects_fifo_without_opening_it(tmp_path):
+    fifo = tmp_path / "MEMORY.md"
+    os.mkfifo(fifo)
+
+    with pytest.raises(MemoryImportConflict, match="regular file"):
+        memory_tool._read_bounded_regular_file_bytes(fifo)
+
+
+def test_bounded_regular_reader_rejects_file_over_hard_limit(tmp_path):
+    path = tmp_path / "MEMORY.md"
+    path.write_bytes(b"x" * (memory_tool.MAX_CURATED_MEMORY_FILE_BYTES + 1))
+
+    with pytest.raises(MemoryImportConflict, match="size limit"):
+        memory_tool._read_bounded_regular_file_bytes(path)
+
+
+@pytest.mark.parametrize("unsafe_kind", ["fifo", "oversize"])
+@pytest.mark.parametrize("location", ["live", "receipt", "backup"])
+def test_memory_import_rejects_unsafe_read_inputs_without_publishing(
+    tmp_path, monkeypatch, unsafe_kind, location
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    imports = memories / ".imports"
+    backups = imports / "backups"
+    backups.mkdir(parents=True)
+    import_id = f"unsafe-{location}-{unsafe_kind}"
+    import_hash = hashlib.sha256(import_id.encode()).hexdigest()
+    paths = {
+        "live": memories / "MEMORY.md",
+        "receipt": imports / f"{import_hash}.json",
+        "backup": backups / f"memory-{import_hash}.bak",
+    }
+    unsafe = paths[location]
+    if unsafe_kind == "fifo":
+        os.mkfifo(unsafe)
+    else:
+        unsafe.write_bytes(b"x" * (memory_tool.MAX_CURATED_MEMORY_FILE_BYTES + 1))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    with pytest.raises(MemoryImportConflict, match="regular file|size limit"):
+        MemoryStore(memory_char_limit=1000, user_char_limit=1000).import_replace(
+            target="memory",
+            entries=["imported content"],
+            import_id=import_id,
+            payload_sha256=hashlib.sha256(import_id.encode()).hexdigest(),
+        )
+
+    if location == "live":
+        if unsafe_kind == "fifo":
+            assert stat.S_ISFIFO(os.lstat(unsafe).st_mode)
+        else:
+            assert unsafe.stat().st_size == memory_tool.MAX_CURATED_MEMORY_FILE_BYTES + 1
+    else:
+        assert not (memories / "MEMORY.md").exists()
+
+
 @pytest.mark.parametrize(
     "import_id",
     [

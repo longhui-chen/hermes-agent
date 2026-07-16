@@ -84,6 +84,7 @@ def get_memory_dir() -> Path:
 
 ENTRY_DELIMITER = "\n§\n"
 MEMORY_IMPORT_BACKUP_LIMIT = 5
+MAX_CURATED_MEMORY_FILE_BYTES = 1 << 20
 _MISSING_MEMORY_FILE_SHA256 = "missing"
 _MEMORY_TARGET_FILES = {"memory": "MEMORY.md", "user": "USER.md"}
 _MEMORY_TRANSACTION_LOCK = ".curated-memory-transaction"
@@ -91,6 +92,124 @@ _MEMORY_TRANSACTION_LOCK = ".curated-memory-transaction"
 
 class MemoryImportConflict(ValueError):
     """An import id or receipt conflicts with the live curated memory."""
+
+
+def _require_real_directory(path: Path, *, label: str, create: bool) -> None:
+    if create:
+        try:
+            os.mkdir(path, 0o700)
+        except FileExistsError:
+            pass
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError as exc:
+        raise MemoryImportConflict(f"{label} does not exist") from exc
+    if not stat.S_ISDIR(mode):
+        raise MemoryImportConflict(f"{label} must be a real directory, not a symlink")
+
+
+def _require_profile_memory_directory(*, create: bool) -> Path:
+    """Return the profile memory root without traversing a symlinked child."""
+    home = get_hermes_home()
+    if create:
+        home.mkdir(parents=True, exist_ok=True)
+    try:
+        resolved_home = home.resolve(strict=True)
+    except OSError as exc:
+        raise MemoryImportConflict(f"cannot resolve HERMES_HOME: {exc}") from exc
+    mem_dir = home / "memories"
+    _require_real_directory(
+        mem_dir, label="profile memories directory", create=create
+    )
+    try:
+        resolved_memory = mem_dir.resolve(strict=True)
+    except OSError as exc:
+        raise MemoryImportConflict(
+            f"cannot resolve profile memories directory: {exc}"
+        ) from exc
+    if resolved_memory != resolved_home / "memories":
+        raise MemoryImportConflict("profile memories directory escapes HERMES_HOME")
+    return mem_dir
+
+
+def _require_managed_memory_directory(path: Path, *, create: bool) -> Path:
+    """Validate every managed directory component below the memory root."""
+    mem_dir = _require_profile_memory_directory(create=create)
+    try:
+        relative = path.relative_to(mem_dir)
+    except ValueError as exc:
+        raise MemoryImportConflict("managed memory directory escapes HERMES_HOME") from exc
+    current = mem_dir
+    for part in relative.parts:
+        current /= part
+        _require_real_directory(
+            current,
+            label=f"managed memory directory {current.name}",
+            create=create,
+        )
+    expected = mem_dir.resolve(strict=True) / relative
+    if path.resolve(strict=True) != expected:
+        raise MemoryImportConflict("managed memory directory escapes HERMES_HOME")
+    return path
+
+
+def _read_bounded_regular_file_bytes(path: Path) -> Optional[bytes]:
+    """Read one bounded regular file without following its leaf entry."""
+    try:
+        before = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(before.st_mode):
+        raise MemoryImportConflict(f"{path.name} must be a regular file")
+    if before.st_size > MAX_CURATED_MEMORY_FILE_BYTES:
+        raise MemoryImportConflict(f"{path.name} exceeds the memory file size limit")
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise MemoryImportConflict(f"cannot safely open {path.name}: {exc}") from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise MemoryImportConflict(f"{path.name} must be a regular file")
+        if (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino):
+            raise MemoryImportConflict(f"{path.name} changed while it was opened")
+        if opened.st_size > MAX_CURATED_MEMORY_FILE_BYTES:
+            raise MemoryImportConflict(f"{path.name} exceeds the memory file size limit")
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(
+                fd, min(64 << 10, MAX_CURATED_MEMORY_FILE_BYTES + 1 - total)
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > MAX_CURATED_MEMORY_FILE_BYTES:
+                raise MemoryImportConflict(
+                    f"{path.name} exceeds the memory file size limit"
+                )
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _read_bounded_regular_file_text(path: Path) -> Optional[str]:
+    raw = _read_bounded_regular_file_bytes(path)
+    if raw is None:
+        return None
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise MemoryImportConflict(f"{path.name} is not valid UTF-8") from exc
 
 
 def _is_real_directory(path: Path) -> bool:
@@ -458,7 +577,7 @@ class MemoryStore:
             ),
         }
 
-    def load_from_disk(self):
+    def load_from_disk(self, *, bounded: bool = False):
         """Load entries from MEMORY.md and USER.md, capture system prompt snapshot.
 
         The frozen snapshot is what enters the system prompt. We scan each
@@ -475,11 +594,15 @@ class MemoryStore:
         Scanning is deterministic from disk bytes, so the snapshot remains
         stable for the entire session (prefix-cache invariant holds).
         """
-        mem_dir = get_memory_dir()
-        mem_dir.mkdir(parents=True, exist_ok=True)
-
-        self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
+        if bounded:
+            mem_dir = _require_profile_memory_directory(create=True)
+            self.memory_entries = self._read_import_file(mem_dir / "MEMORY.md")
+            self.user_entries = self._read_import_file(mem_dir / "USER.md")
+        else:
+            mem_dir = get_memory_dir()
+            mem_dir.mkdir(parents=True, exist_ok=True)
+            self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
+            self.user_entries = self._read_file(mem_dir / "USER.md")
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
@@ -535,20 +658,53 @@ class MemoryStore:
 
     @staticmethod
     @contextmanager
-    def _file_lock(path: Path):
+    def _file_lock(path: Path, *, create_parent: bool = True):
         """Acquire an exclusive file lock for read-modify-write safety.
 
         Uses a separate .lock file so the memory file itself can still be
         atomically replaced via os.replace().
         """
         lock_path = path.with_suffix(path.suffix + ".lock")
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if create_parent:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
 
         if fcntl is None and msvcrt is None:
             yield
             return
 
-        fd = open(lock_path, "a+", encoding="utf-8")
+        raw_fd = None
+        parent_fd = None
+        try:
+            flags = os.O_RDWR | os.O_CREAT
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            if os.name != "nt" and os.open in os.supports_dir_fd:
+                parent_flags = os.O_RDONLY
+                if hasattr(os, "O_DIRECTORY"):
+                    parent_flags |= os.O_DIRECTORY
+                if hasattr(os, "O_NOFOLLOW"):
+                    parent_flags |= os.O_NOFOLLOW
+                parent_fd = os.open(lock_path.parent, parent_flags)
+                raw_fd = os.open(lock_path.name, flags, 0o600, dir_fd=parent_fd)
+            else:
+                raw_fd = os.open(lock_path, flags, 0o600)
+            opened = os.fstat(raw_fd)
+            current = os.lstat(lock_path)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+            ):
+                raise MemoryImportConflict(f"refusing to follow unsafe lock {lock_path}")
+            fd = os.fdopen(raw_fd, "a+", encoding="utf-8")
+            raw_fd = None
+        except OSError as exc:
+            raise MemoryImportConflict(f"cannot safely open lock {lock_path}: {exc}") from exc
+        finally:
+            if raw_fd is not None:
+                os.close(raw_fd)
+            if parent_fd is not None:
+                os.close(parent_fd)
         try:
             if fcntl:
                 fcntl.flock(fd, fcntl.LOCK_EX)
@@ -577,7 +733,9 @@ class MemoryStore:
             return mem_dir / "USER.md"
         return mem_dir / "MEMORY.md"
 
-    def _reload_target(self, target: str, *, skip_drift: bool = False) -> Optional[str]:
+    def _reload_target(
+        self, target: str, *, skip_drift: bool = False, bounded: bool = False
+    ) -> Optional[str]:
         """Re-read entries from disk into in-memory state.
 
         Called under file lock to get the latest state before mutating.
@@ -593,8 +751,8 @@ class MemoryStore:
         rewriting, so existing content is never clobbered.
         """
         path = self._path_for(target)
-        bak = None if skip_drift else self._detect_external_drift(target)
-        fresh = self._read_file(path)
+        bak = None if skip_drift else self._detect_external_drift(target, bounded=bounded)
+        fresh = self._read_import_file(path) if bounded else self._read_file(path)
         fresh = list(dict.fromkeys(fresh))  # deduplicate
         self._set_entries(target, fresh)
         return bak
@@ -932,24 +1090,47 @@ class MemoryStore:
 
         content = ENTRY_DELIMITER.join(normalized)
         content_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        path = self._path_for(target)
+        mem_dir = _require_profile_memory_directory(create=True)
+        path = mem_dir / _MEMORY_TARGET_FILES[target]
+        # Reject an unsafe canonical leaf before creating managed import state.
         if path.is_symlink():
             raise MemoryImportConflict(
                 f"refusing to import through symlinked {path.name}"
             )
-        receipt_path = get_memory_dir() / ".imports" / (
+        _read_bounded_regular_file_bytes(path)
+        transaction_path = mem_dir / _MEMORY_TRANSACTION_LOCK
+        for lock_target in (transaction_path, path):
+            _validate_reset_lock(lock_target)
+        imports_dir = _require_managed_memory_directory(
+            mem_dir / ".imports", create=True
+        )
+        backup_dir = _require_managed_memory_directory(
+            imports_dir / "backups", create=True
+        )
+        receipt_path = imports_dir / (
             hashlib.sha256(import_id.encode("utf-8")).hexdigest() + ".json"
         )
-        transaction_path = get_memory_dir() / _MEMORY_TRANSACTION_LOCK
-        with self._file_lock(transaction_path), self._file_lock(path):
-            if path.is_symlink():
-                raise MemoryImportConflict(
-                    f"refusing to import through symlinked {path.name}"
-                )
-            if receipt_path.exists():
+        import_hash = hashlib.sha256(import_id.encode("utf-8")).hexdigest()
+        backup_candidate = backup_dir / f"{target}-{import_hash}.bak"
+        displaced_candidate = self._import_displaced_path(path, receipt_path)
+        for candidate in (receipt_path, backup_candidate, displaced_candidate):
+            _read_bounded_regular_file_bytes(candidate)
+        with self._file_lock(
+            transaction_path, create_parent=False
+        ), self._file_lock(path, create_parent=False):
+            # Directory entries can be replaced while waiting for the locks.
+            # Re-anchor every managed path before reading or creating files.
+            _require_profile_memory_directory(create=False)
+            _require_managed_memory_directory(imports_dir, create=False)
+            _require_managed_memory_directory(backup_dir, create=False)
+            _read_bounded_regular_file_bytes(path)
+            receipt_text = _read_bounded_regular_file_text(receipt_path)
+            _read_bounded_regular_file_bytes(backup_candidate)
+            _read_bounded_regular_file_bytes(displaced_candidate)
+            if receipt_text is not None:
                 try:
-                    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError) as exc:
+                    receipt = json.loads(receipt_text)
+                except json.JSONDecodeError as exc:
                     raise MemoryImportConflict(f"memory import receipt is unreadable: {exc}") from exc
                 expected = (import_id, target, payload_sha256.lower(), content_sha)
                 actual = (receipt.get("import_id"), receipt.get("target"),
@@ -1035,7 +1216,7 @@ class MemoryStore:
                                 "memory import receipt has an invalid displaced path"
                             )
                         if (
-                            Path(displaced_path).exists()
+                            _read_bounded_regular_file_bytes(Path(displaced_path)) is not None
                             and receipt.get("displaced_retention") != "manual"
                         ):
                             receipt["displaced_retention"] = "manual"
@@ -1047,7 +1228,10 @@ class MemoryStore:
                 if receipt.get("backup_path"):
                     result["backup_path"] = receipt["backup_path"]
                 displaced_path = receipt.get("displaced_path")
-                if displaced_path is not None and Path(displaced_path).exists():
+                if (
+                    displaced_path is not None
+                    and _read_bounded_regular_file_bytes(Path(displaced_path)) is not None
+                ):
                     result["recovery_path"] = displaced_path
                     result["recovery_retention"] = "manual"
                 return result
@@ -1057,11 +1241,10 @@ class MemoryStore:
             # Otherwise a legacy file containing duplicate entries produces a
             # prepared receipt whose previous SHA can never match that file.
             previous_file_sha = self._live_file_sha256(path)
-            previous_entries = self._read_file(path)
-            backup = self._reload_target(target)
+            previous_entries = self._read_import_file(path)
+            backup = self._reload_target(target, bounded=True)
             if backup:
                 raise MemoryImportConflict(_drift_error(path, backup)["error"])
-            receipt_path.parent.mkdir(parents=True, exist_ok=True)
             backup_path = self._write_import_backup(
                 path=path, target=target, import_id=import_id
             )
@@ -1095,7 +1278,7 @@ class MemoryStore:
                   "effective_from": "next_session"}
         if backup_path:
             result["backup_path"] = backup_path
-        if displaced_path.exists():
+        if _read_bounded_regular_file_bytes(displaced_path) is not None:
             result["recovery_path"] = str(displaced_path)
             result["recovery_retention"] = "manual"
         return result
@@ -1103,17 +1286,12 @@ class MemoryStore:
     @staticmethod
     def _write_import_backup(*, path: Path, target: str, import_id: str) -> Optional[str]:
         """Atomically retain the previous curated-memory bytes before replace."""
-        if not path.exists():
+        previous = _read_bounded_regular_file_bytes(path)
+        if previous is None:
             return None
-        try:
-            previous = path.read_bytes()
-        except OSError as exc:
-            raise MemoryImportConflict(
-                f"cannot back up existing {path.name}: {exc}"
-            ) from exc
 
         backup_dir = path.parent / ".imports" / "backups"
-        backup_dir.mkdir(parents=True, exist_ok=True)
+        _require_managed_memory_directory(backup_dir, create=False)
         import_hash = hashlib.sha256(import_id.encode("utf-8")).hexdigest()
         backup_path = backup_dir / f"{target}-{import_hash}.bak"
         fd, tmp_path = tempfile.mkstemp(
@@ -1135,17 +1313,22 @@ class MemoryStore:
 
         retained = []
         for candidate in backup_dir.iterdir():
-            if (
-                candidate.is_file()
-                and candidate.name.startswith(f"{target}-")
+            candidate_stat = candidate.stat(follow_symlinks=False)
+            if not (
+                candidate.name.startswith(f"{target}-")
                 and candidate.name.endswith(".bak")
             ):
-                retained.append(candidate)
+                continue
+            if not stat.S_ISREG(candidate_stat.st_mode):
+                raise MemoryImportConflict(
+                    f"managed memory backup {candidate.name} must be a regular file"
+                )
+            retained.append((candidate, candidate_stat.st_mtime_ns))
         retained.sort(
-            key=lambda candidate: (candidate.stat().st_mtime_ns, candidate.name),
+            key=lambda item: (item[1], item[0].name),
             reverse=True,
         )
-        for candidate in retained[MEMORY_IMPORT_BACKUP_LIMIT:]:
+        for candidate, _mtime_ns in retained[MEMORY_IMPORT_BACKUP_LIMIT:]:
             candidate.unlink()
         _fsync_directory(backup_dir)
         return str(backup_path)
@@ -1153,7 +1336,7 @@ class MemoryStore:
     @staticmethod
     def _write_import_receipt(path: Path, receipt: Dict[str, Any]) -> None:
         """Atomically persist and fsync a memory-import prepare/receipt."""
-        path.parent.mkdir(parents=True, exist_ok=True)
+        _require_managed_memory_directory(path.parent, create=False)
         fd, tmp_path = tempfile.mkstemp(
             dir=str(path.parent), suffix=".tmp", prefix=".receipt_"
         )
@@ -1271,7 +1454,18 @@ class MemoryStore:
         entries = [e.strip() for e in raw.split(ENTRY_DELIMITER)]
         return [e for e in entries if e]
 
-    def _detect_external_drift(self, target: str) -> Optional[str]:
+    @staticmethod
+    def _read_import_file(path: Path) -> List[str]:
+        """Read an import target through the bounded no-follow reader."""
+        raw = _read_bounded_regular_file_text(path)
+        if raw is None or not raw.strip():
+            return []
+        entries = [e.strip() for e in raw.split(ENTRY_DELIMITER)]
+        return [e for e in entries if e]
+
+    def _detect_external_drift(
+        self, target: str, *, bounded: bool = False
+    ) -> Optional[str]:
         """Return a backup-path string if on-disk content shows external drift.
 
         The memory file is supposed to be a list of small entries the tool
@@ -1296,12 +1490,17 @@ class MemoryStore:
         per-target char_limit for signal #2.
         """
         path = self._path_for(target)
-        if not path.exists():
-            return None
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except (OSError, IOError):
-            return None
+        if bounded:
+            raw = _read_bounded_regular_file_text(path)
+            if raw is None:
+                return None
+        else:
+            if not path.exists():
+                return None
+            try:
+                raw = path.read_text(encoding="utf-8")
+            except (OSError, IOError):
+                return None
         if not raw.strip():
             return None
 
@@ -1320,6 +1519,32 @@ class MemoryStore:
         # the caller can refuse the mutation.
         ts = int(time.time())
         bak_path = path.with_suffix(path.suffix + f".bak.{ts}")
+        if bounded:
+            fd = None
+            tmp_path = None
+            try:
+                fd, tmp_path = tempfile.mkstemp(
+                    dir=str(path.parent), suffix=".tmp", prefix=".drift_"
+                )
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    fd = None
+                    handle.write(raw)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                atomic_replace(tmp_path, bak_path)
+                tmp_path = None
+                _fsync_directory(path.parent)
+            except OSError:
+                return str(bak_path) + " (BACKUP FAILED — file unchanged on disk)"
+            finally:
+                if fd is not None:
+                    os.close(fd)
+                if tmp_path is not None:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+            return str(bak_path)
         try:
             bak_path.write_text(raw, encoding="utf-8")
         except (OSError, IOError):
@@ -1328,14 +1553,9 @@ class MemoryStore:
 
     @staticmethod
     def _live_file_sha256(path: Path) -> str:
-        try:
-            content = path.read_bytes()
-        except FileNotFoundError:
+        content = _read_bounded_regular_file_bytes(path)
+        if content is None:
             return _MISSING_MEMORY_FILE_SHA256
-        except OSError as exc:
-            raise MemoryImportConflict(
-                f"cannot verify existing {path.name}: {exc}"
-            ) from exc
         return hashlib.sha256(content).hexdigest()
 
     @staticmethod
@@ -1350,29 +1570,28 @@ class MemoryStore:
 
     @staticmethod
     def _restore_displaced_no_replace(displaced_path: Path, path: Path) -> None:
+        source_content = _read_bounded_regular_file_bytes(displaced_path)
+        if source_content is None:
+            raise MemoryImportConflict("displaced memory recovery file is missing")
+        source_mode = stat.S_IMODE(os.lstat(displaced_path).st_mode) or 0o600
         try:
-            os.link(displaced_path, path)
+            os.link(displaced_path, path, follow_symlinks=False)
         except FileExistsError:
             return
         except OSError:
             # Hard links are unavailable on some supported profile filesystems.
             # Fall back to an O_EXCL copy so a concurrent external winner is
             # never overwritten. The displaced recovery inode remains retained.
-            source_fd = None
             target_fd = None
             target_identity = None
             try:
-                source_fd = os.open(displaced_path, os.O_RDONLY)
-                source_mode = stat.S_IMODE(os.fstat(source_fd).st_mode) or 0o600
                 target_fd = os.open(
                     path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, source_mode
                 )
                 target_stat = os.fstat(target_fd)
                 target_identity = (target_stat.st_dev, target_stat.st_ino)
-                while True:
-                    chunk = os.read(source_fd, 1 << 20)
-                    if not chunk:
-                        break
+                for offset in range(0, len(source_content), 1 << 20):
+                    chunk = source_content[offset:offset + (1 << 20)]
                     view = memoryview(chunk)
                     while view:
                         written = os.write(target_fd, view)
@@ -1394,8 +1613,6 @@ class MemoryStore:
             finally:
                 if target_fd is not None:
                     os.close(target_fd)
-                if source_fd is not None:
-                    os.close(source_fd)
         _fsync_directory(path.parent)
 
     @staticmethod
@@ -1450,7 +1667,7 @@ class MemoryStore:
                         "memory import is missing a valid displaced path"
                     )
 
-                if displaced_path.exists():
+                if os.path.lexists(displaced_path):
                     displaced_sha = MemoryStore._live_file_sha256(displaced_path)
                     if displaced_sha != expected_live_sha256:
                         if MemoryStore._live_file_sha256(effective_path) == _MISSING_MEMORY_FILE_SHA256:
@@ -1516,7 +1733,7 @@ class MemoryStore:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 
 
-def load_on_disk_store() -> "MemoryStore":
+def load_on_disk_store(*, bounded: bool = False) -> "MemoryStore":
     """Build a fresh on-disk :class:`MemoryStore`, honoring configured char limits.
 
     Use this from any context that has no live agent (the messaging gateway, the
@@ -1544,7 +1761,7 @@ def load_on_disk_store() -> "MemoryStore":
         memory_char_limit=memory_char_limit,
         user_char_limit=user_char_limit,
     )
-    store.load_from_disk()
+    store.load_from_disk(bounded=bounded)
     return store
 
 

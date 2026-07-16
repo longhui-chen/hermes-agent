@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import shutil
 import threading
 import time
@@ -150,7 +151,7 @@ async def test_memory_import_http_flow_returns_conflict_for_live_cas_edit(
             memory_path.write_text("external edit wins", encoding="utf-8")
 
     monkeypatch.setattr(store, "_write_import_receipt", edit_after_prepare)
-    monkeypatch.setattr(memory_tool, "load_on_disk_store", lambda: store)
+    monkeypatch.setattr(memory_tool, "load_on_disk_store", lambda **_kwargs: store)
     adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
     app = web.Application()
     app.router.add_post("/api/memory/import", adapter._handle_memory_import)
@@ -320,7 +321,7 @@ async def test_memory_import_flow_blocks_unload_until_worker_finishes(monkeypatc
             assert release.wait(2)
             return {"status": "completed"}
 
-    monkeypatch.setattr(memory_tool, "load_on_disk_store", lambda: _Store())
+    monkeypatch.setattr(memory_tool, "load_on_disk_store", lambda **_kwargs: _Store())
     adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
     app = web.Application()
     app.router.add_post("/api/memory/import", adapter._handle_memory_import)
@@ -399,6 +400,116 @@ class _DirectImportRequest(dict):
 
 
 @pytest.mark.asyncio
+async def test_memory_import_constructs_store_inside_worker_thread(monkeypatch):
+    import tools.memory_tool as memory_tool
+
+    event_loop_thread = threading.get_ident()
+    constructor_threads = []
+
+    class _Store:
+        def import_replace(self, **_kwargs):
+            return {"status": "completed"}
+
+    def load_store(**_kwargs):
+        constructor_threads.append(threading.get_ident())
+        return _Store()
+
+    monkeypatch.setattr(memory_tool, "load_on_disk_store", load_store)
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    response = await adapter._handle_memory_import(_DirectImportRequest({
+        "import_id": "worker-construction",
+        "mode": "replace",
+        "target": "memory",
+        "payload_sha256": hashlib.sha256(b"worker-construction").hexdigest(),
+        "entries": ["safe fact"],
+    }))
+
+    assert response.status == 200
+    assert constructor_threads
+    assert constructor_threads[0] != event_loop_thread
+
+
+@pytest.mark.parametrize("unsafe_kind", ["fifo", "oversize"])
+@pytest.mark.asyncio
+async def test_memory_import_constructor_rejects_unsafe_live_file_without_blocking_loop(
+    tmp_path, monkeypatch, unsafe_kind
+):
+    home = tmp_path / ".hermes"
+    memory_path = home / "memories" / "MEMORY.md"
+    memory_path.parent.mkdir(parents=True)
+    if unsafe_kind == "fifo":
+        os.mkfifo(memory_path)
+    else:
+        import tools.memory_tool as memory_tool
+
+        memory_path.write_bytes(
+            b"x" * (memory_tool.MAX_CURATED_MEMORY_FILE_BYTES + 1)
+        )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    request = _DirectImportRequest({
+        "import_id": f"constructor-{unsafe_kind}",
+        "mode": "replace",
+        "target": "memory",
+        "payload_sha256": hashlib.sha256(unsafe_kind.encode()).hexdigest(),
+        "entries": ["safe fact"],
+    })
+    heartbeat = asyncio.create_task(asyncio.sleep(0))
+    response = await asyncio.wait_for(adapter._handle_memory_import(request), 1)
+    await heartbeat
+
+    assert response.status == 409
+    assert json.loads(response.text)["error"]["code"] == "memory_import_conflict"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_memory_import_holds_barrier_during_store_construction(
+    monkeypatch,
+):
+    import tools.memory_tool as memory_tool
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class _Store:
+        def import_replace(self, **_kwargs):
+            return {"status": "completed"}
+
+    def load_store(**_kwargs):
+        started.set()
+        assert release.wait(2)
+        return _Store()
+
+    monkeypatch.setattr(memory_tool, "load_on_disk_store", load_store)
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    request = _DirectImportRequest({
+        "import_id": "cancel-construction",
+        "mode": "replace",
+        "target": "memory",
+        "payload_sha256": hashlib.sha256(b"cancel-construction").hexdigest(),
+        "entries": ["safe fact"],
+    })
+    task = asyncio.create_task(adapter._handle_memory_import(request))
+    assert await asyncio.to_thread(started.wait, 1)
+    task.cancel()
+    await asyncio.sleep(0)
+
+    assert not task.done()
+    blocked = await adapter._handle_profile_unload(_DirectImportRequest(None))
+    assert blocked.status == 409
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert (await adapter._handle_profile_unload(_DirectImportRequest(None))).status == 200
+
+
+@pytest.mark.asyncio
 async def test_cancelled_memory_import_holds_unload_barrier_until_worker_exits(
     monkeypatch,
 ):
@@ -413,7 +524,7 @@ async def test_cancelled_memory_import_holds_unload_barrier_until_worker_exits(
             assert release.wait(2)
             return {"status": "completed"}
 
-    monkeypatch.setattr(memory_tool, "load_on_disk_store", lambda: _Store())
+    monkeypatch.setattr(memory_tool, "load_on_disk_store", lambda **_kwargs: _Store())
     adapter = ZetAgentAdapter(
         PlatformConfig(enabled=True, extra={"key": "test-key"})
     )

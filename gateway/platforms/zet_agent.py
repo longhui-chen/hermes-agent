@@ -1852,11 +1852,16 @@ class ZetAgentAdapter(APIServerAdapter):
             if not isinstance(body, dict) or body.get("mode") != "replace":
                 raise ValueError("mode must be replace")
             from tools.memory_tool import load_on_disk_store
+
+            def _import_memory():
+                return load_on_disk_store(bounded=True).import_replace(
+                    target=body.get("target"), entries=body.get("entries"),
+                    import_id=body.get("import_id"),
+                    payload_sha256=body.get("payload_sha256"),
+                )
+
             result = await _to_thread_with_completion_barrier(
-                load_on_disk_store().import_replace,
-                target=body.get("target"), entries=body.get("entries"),
-                import_id=body.get("import_id"),
-                payload_sha256=body.get("payload_sha256"),
+                _import_memory,
             )
             return web.json_response(result)
         except Exception as exc:

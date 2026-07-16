@@ -2888,7 +2888,7 @@ class SessionDB:
                         ELSE 2
                       END,
                       COALESCE(
-                        (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = child.id),
+                        (SELECT MAX(NULLIF(m.timestamp, 0)) FROM messages m WHERE m.session_id = child.id),
                         child.started_at
                       ) DESC,
                       child.started_at DESC,
@@ -3079,7 +3079,7 @@ class SessionDB:
                     SELECT
                         root_id,
                         MAX(COALESCE(
-                            (SELECT MAX(m.timestamp) FROM messages m WHERE m.session_id = cur_id),
+                            (SELECT MAX(NULLIF(m.timestamp, 0)) FROM messages m WHERE m.session_id = cur_id),
                             (SELECT started_at FROM sessions ss WHERE ss.id = cur_id)
                         )) AS effective_last_active
                     FROM chain
@@ -3090,11 +3090,11 @@ class SessionDB:
                         (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
                          FROM messages m
                          WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
-                         ORDER BY m.timestamp, m.id LIMIT 1),
+                         ORDER BY m.id LIMIT 1),
                         ''
                     ) AS _preview_raw,
                     COALESCE(
-                        (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
+                        (SELECT MAX(NULLIF(m2.timestamp, 0)) FROM messages m2 WHERE m2.session_id = s.id),
                         s.started_at
                     ) AS last_active,
                     COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
@@ -3114,11 +3114,11 @@ class SessionDB:
                         (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
                          FROM messages m
                          WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
-                         ORDER BY m.timestamp, m.id LIMIT 1),
+                         ORDER BY m.id LIMIT 1),
                         ''
                     ) AS _preview_raw,
                     COALESCE(
-                        (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
+                        (SELECT MAX(NULLIF(m2.timestamp, 0)) FROM messages m2 WHERE m2.session_id = s.id),
                         s.started_at
                     ) AS last_active
                 FROM sessions s
@@ -3218,11 +3218,11 @@ class SessionDB:
                     (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
                      FROM messages m
                      WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
-                     ORDER BY m.timestamp, m.id LIMIT 1),
+                     ORDER BY m.id LIMIT 1),
                     ''
                 ) AS _preview_raw,
                 COALESCE(
-                    (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
+                    (SELECT MAX(NULLIF(m2.timestamp, 0)) FROM messages m2 WHERE m2.session_id = s.id),
                     s.started_at
                 ) AS last_active
             FROM sessions s
@@ -3257,11 +3257,11 @@ class SessionDB:
                     (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
                      FROM messages m
                      WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
-                     ORDER BY m.timestamp, m.id LIMIT 1),
+                     ORDER BY m.id LIMIT 1),
                     ''
                 ) AS _preview_raw,
                 COALESCE(
-                    (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
+                    (SELECT MAX(NULLIF(m2.timestamp, 0)) FROM messages m2 WHERE m2.session_id = s.id),
                     s.started_at
                 ) AS last_active
             FROM sessions s
@@ -5266,7 +5266,7 @@ class SessionDB:
             "SELECT s.*, COALESCE(m.last_active, s.started_at) AS last_active "
             "FROM sessions s "
             "LEFT JOIN ("
-            "SELECT session_id, MAX(timestamp) AS last_active "
+            "SELECT session_id, MAX(NULLIF(timestamp, 0)) AS last_active "
             "FROM messages GROUP BY session_id"
             ") m ON m.session_id = s.id "
         )
@@ -6233,11 +6233,11 @@ class SessionDB:
                             (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
                              FROM messages m
                              WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
-                             ORDER BY m.timestamp, m.id LIMIT 1),
+                             ORDER BY m.id LIMIT 1),
                             ''
                         ) AS _preview_raw,
                         COALESCE(
-                            (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
+                            (SELECT MAX(NULLIF(m2.timestamp, 0)) FROM messages m2 WHERE m2.session_id = s.id),
                             s.started_at
                         ) AS last_active
                     FROM sessions s
@@ -6262,11 +6262,11 @@ class SessionDB:
                             (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
                              FROM messages m
                              WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
-                             ORDER BY m.timestamp, m.id LIMIT 1),
+                             ORDER BY m.id LIMIT 1),
                             ''
                         ) AS _preview_raw,
                         COALESCE(
-                            (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
+                            (SELECT MAX(NULLIF(m2.timestamp, 0)) FROM messages m2 WHERE m2.session_id = s.id),
                             s.started_at
                         ) AS last_active
                     FROM sessions s

@@ -478,6 +478,114 @@ def test_runtime_import_accepts_unknown_source_timestamp_sentinel(tmp_path):
         db.close()
 
 
+def test_unknown_import_timestamp_falls_back_for_recency_but_stays_raw(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        now = time.time()
+        for index in range(50):
+            session_id = f"normal-{index:02d}"
+            db.create_session(session_id, "cli")
+            db.append_message(session_id, "user", f"normal {index}")
+            db._conn.execute(
+                "UPDATE messages SET timestamp = ? WHERE session_id = ?",
+                (now - 100 + index, session_id),
+            )
+
+        _stage(
+            db,
+            expected=1,
+            messages=[{
+                "source_id": "unknown-time",
+                "role": "user",
+                "content": "timestamp was not exported",
+                "created_at": 0,
+            }],
+        )
+        db.commit_completed_transcript_import("imp-1")
+
+        page = db.list_sessions_rich(limit=50, order_by_last_active=True)
+        imported = db._get_session_rich_row("imported-session")
+        session = db.get_session("imported-session")
+        raw_timestamp = db._conn.execute(
+            "SELECT timestamp FROM messages WHERE session_id = ?",
+            ("imported-session",),
+        ).fetchone()[0]
+
+        assert page[0]["id"] == "imported-session"
+        assert imported["last_active"] == session["started_at"]
+        assert db.search_sessions(limit=1)[0]["id"] == "imported-session"
+        assert raw_timestamp == 0
+    finally:
+        db.close()
+
+
+def test_import_preview_uses_canonical_message_order_when_timestamp_is_unknown(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        _stage(
+            db,
+            expected=2,
+            messages=[
+                {
+                    "source_id": "first",
+                    "role": "user",
+                    "content": "first in the exported transcript",
+                    "created_at": 100,
+                },
+                {
+                    "source_id": "second",
+                    "role": "user",
+                    "content": "later message with unknown time",
+                    "created_at": 0,
+                },
+            ],
+        )
+        db.commit_completed_transcript_import("imp-1")
+
+        listed = db.list_sessions_rich(limit=1, order_by_last_active=True)[0]
+        assert listed["preview"] == "first in the exported transcript"
+    finally:
+        db.close()
+
+
+def test_unknown_import_timestamp_keeps_compression_tip_and_chain_recent(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        db.create_session("root", "cli")
+        db.end_session("root", end_reason="compression")
+        db.create_session("stale-child", "cli", parent_session_id="root")
+        db.append_message("stale-child", "user", "stale sibling")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = 1, ended_at = 2 WHERE id = 'stale-child'"
+        )
+        db._conn.execute(
+            "UPDATE messages SET timestamp = 1 WHERE session_id = 'stale-child'"
+        )
+
+        _stage(
+            db,
+            expected=1,
+            messages=[{
+                "source_id": "unknown-time",
+                "role": "user",
+                "content": "recent imported continuation",
+                "created_at": 0,
+            }],
+        )
+        db.commit_completed_transcript_import("imp-1")
+        db._conn.execute(
+            "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
+            ("root", "imported-session"),
+        )
+
+        assert db.get_compression_tip("root") == "imported-session"
+        listed = db.list_sessions_rich(limit=1, order_by_last_active=True)
+        assert listed[0]["id"] == "imported-session"
+        assert listed[0]["preview"] == "recent imported continuation"
+    finally:
+        db.close()
+
+
 def test_runtime_import_rejects_duplicate_source_id_across_chunks(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     try:
