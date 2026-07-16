@@ -309,6 +309,68 @@ class ZetAgentAdapter(APIServerAdapter):
         self._session_lock = threading.Lock()
         self._approval_session_ids: set[str] = set()
 
+        # Portable imports mutate profile-owned state outside the chat-run
+        # path. Track them explicitly so a successful profile unload cannot
+        # race a worker that later recreates the deleted profile directory.
+        self._runtime_import_operation_lock = threading.Lock()
+        self._runtime_import_operations: Dict[str, int] = {}
+        self._runtime_import_unloaded_homes: Dict[str, Optional[tuple[int, int]]] = {}
+
+    @staticmethod
+    def _profile_directory_identity(key: str) -> Optional[tuple[int, int]]:
+        try:
+            stat = Path(key).stat()
+            return int(stat.st_dev), int(stat.st_ino)
+        except OSError:
+            return None
+
+    def _begin_runtime_import_operation(self, profile_home: Optional[Any]) -> Optional[str]:
+        key = self._profile_home_key(profile_home)
+        with self._runtime_import_operation_lock:
+            if key in self._runtime_import_unloaded_homes:
+                previous = self._runtime_import_unloaded_homes[key]
+                current = self._profile_directory_identity(key)
+                # A newly-created directory is a new profile generation. An
+                # absent directory is not: allowing it would let this request
+                # itself resurrect the just-deleted profile.
+                if current is None or current == previous:
+                    return None
+                self._runtime_import_unloaded_homes.pop(key, None)
+            self._runtime_import_operations[key] = (
+                self._runtime_import_operations.get(key, 0) + 1
+            )
+        return key
+
+    def _end_runtime_import_operation(self, key: Optional[str]) -> None:
+        if not key:
+            return
+        with self._runtime_import_operation_lock:
+            remaining = self._runtime_import_operations.get(key, 0) - 1
+            if remaining > 0:
+                self._runtime_import_operations[key] = remaining
+            else:
+                self._runtime_import_operations.pop(key, None)
+
+    def _block_runtime_import_profile(self, profile_home: Optional[Any]) -> int:
+        key = self._profile_home_key(profile_home)
+        with self._runtime_import_operation_lock:
+            active = int(self._runtime_import_operations.get(key, 0) or 0)
+            if not active:
+                self._runtime_import_unloaded_homes[key] = (
+                    self._profile_directory_identity(key)
+                )
+            return active
+
+    def _unblock_runtime_import_profile(self, profile_home: Optional[Any]) -> None:
+        key = self._profile_home_key(profile_home)
+        with self._runtime_import_operation_lock:
+            self._runtime_import_unloaded_homes.pop(key, None)
+
+    def _runtime_import_profile_is_blocked(self, profile_home: Optional[Any]) -> bool:
+        key = self._profile_home_key(profile_home)
+        with self._runtime_import_operation_lock:
+            return key in self._runtime_import_unloaded_homes
+
     # ------------------------------------------------------------------
     # _stream_q closure sniffing
     # ------------------------------------------------------------------
@@ -1598,6 +1660,15 @@ class ZetAgentAdapter(APIServerAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        operation_key = self._begin_runtime_import_operation(
+            _request_value(request, "hermes_profile_home")
+        )
+        if operation_key is None:
+            return web.json_response(
+                {"error": {"message": "profile is unloaded", "type": "invalid_request_error",
+                           "code": "runtime_import_profile_unloaded"}},
+                status=409,
+            )
         try:
             body = await request.json()
             if not isinstance(body, dict):
@@ -1637,7 +1708,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 status, code = 409, "runtime_import_conflict"
             elif isinstance(exc, RuntimeImportIncomplete):
                 status, code = 409, "runtime_import_incomplete"
-            elif isinstance(exc, (ValueError, TypeError)):
+            elif isinstance(exc, (ValueError, TypeError, RecursionError)):
                 status, code = 400, "invalid_runtime_import"
             else:
                 logger.exception("[zet_agent] completed transcript import failed")
@@ -1646,12 +1717,23 @@ class ZetAgentAdapter(APIServerAdapter):
                 {"error": {"message": str(exc), "type": "invalid_request_error", "code": code}},
                 status=status,
             )
+        finally:
+            self._end_runtime_import_operation(operation_key)
 
     async def _handle_memory_import(self, request: "web.Request") -> "web.Response":
         """Replace one bounded curated-memory file; effective next session."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        operation_key = self._begin_runtime_import_operation(
+            _request_value(request, "hermes_profile_home")
+        )
+        if operation_key is None:
+            return web.json_response(
+                {"error": {"message": "profile is unloaded", "type": "invalid_request_error",
+                           "code": "memory_import_profile_unloaded"}},
+                status=409,
+            )
         try:
             body = await request.json()
             if not isinstance(body, dict) or body.get("mode") != "replace":
@@ -1668,7 +1750,7 @@ class ZetAgentAdapter(APIServerAdapter):
             from tools.memory_tool import MemoryImportConflict
             if isinstance(exc, MemoryImportConflict):
                 status, code = 409, "memory_import_conflict"
-            elif isinstance(exc, (ValueError, TypeError)):
+            elif isinstance(exc, (ValueError, TypeError, RecursionError)):
                 status, code = 400, "invalid_memory_import"
             else:
                 logger.exception("[zet_agent] curated memory import failed")
@@ -1677,20 +1759,70 @@ class ZetAgentAdapter(APIServerAdapter):
                 {"error": {"message": str(exc), "type": "invalid_request_error", "code": code}},
                 status=status,
             )
+        finally:
+            self._end_runtime_import_operation(operation_key)
 
     async def _cleanup_stale_runtime_imports_once(self) -> int:
-        default_db = self._ensure_session_db()
-        candidates = [default_db, *tuple(self._session_dbs.values())]
+        default_key = self._profile_home_key()
+        default_db = None
+        if not self._runtime_import_profile_is_blocked(default_key):
+            default_db = self._ensure_session_db()
+        candidates = [(default_key, default_db, False)]
+        candidates.extend((key, db, False) for key, db in tuple(self._session_dbs.items()))
+
+        # After a gateway restart the per-profile DB cache is empty. Discover
+        # every served profile with an existing state.db so expired private
+        # transcript staging still converges without a foreground request.
+        cached_keys = {key for key, _db, _close in candidates}
+        try:
+            from hermes_state import SessionDB
+            profile_homes = tuple(self._multiplex_profile_homes().values())
+        except Exception:
+            logger.warning(
+                "[zet_agent] runtime import profile discovery failed",
+                exc_info=True,
+            )
+            profile_homes = ()
+        for profile_home in profile_homes:
+            key = self._profile_home_key(profile_home)
+            state_db = Path(profile_home) / "state.db"
+            if (
+                key in cached_keys
+                or self._runtime_import_profile_is_blocked(key)
+                or not state_db.is_file()
+            ):
+                continue
+            try:
+                session_db = await asyncio.to_thread(SessionDB, state_db)
+            except Exception:
+                logger.warning(
+                    "[zet_agent] runtime import profile DB open failed",
+                    exc_info=True,
+                )
+                continue
+            candidates.append((key, session_db, True))
+            cached_keys.add(key)
+
         session_dbs = []
         seen = set()
-        for session_db in candidates:
+        for key, session_db, close_after in candidates:
             if session_db is None or id(session_db) in seen:
                 continue
+            if self._runtime_import_profile_is_blocked(key):
+                if close_after:
+                    try:
+                        session_db.close()
+                    except Exception:
+                        logger.warning(
+                            "[zet_agent] blocked runtime import cleanup DB close failed",
+                            exc_info=True,
+                        )
+                continue
             seen.add(id(session_db))
-            session_dbs.append(session_db)
+            session_dbs.append((session_db, close_after))
 
         deleted = 0
-        for session_db in session_dbs:
+        for session_db, close_after in session_dbs:
             try:
                 deleted += await asyncio.to_thread(
                     session_db.cleanup_stale_runtime_imports
@@ -1702,6 +1834,15 @@ class ZetAgentAdapter(APIServerAdapter):
                     "[zet_agent] runtime import staging cleanup failed for one profile",
                     exc_info=True,
                 )
+            finally:
+                if close_after:
+                    try:
+                        session_db.close()
+                    except Exception:
+                        logger.warning(
+                            "[zet_agent] runtime import cleanup DB close failed",
+                            exc_info=True,
+                        )
         return deleted
 
     async def _sweep_stale_runtime_imports(self) -> None:
@@ -2495,6 +2636,9 @@ class ZetAgentAdapter(APIServerAdapter):
             "%d DB row(s) cleared",
             invalidated, db_rows_cleared,
         )
+        self._unblock_runtime_import_profile(
+            _request_value(request, "hermes_profile_home")
+        )
         return web.json_response({
             "reloaded": True,
             "invalidated_sessions": invalidated,
@@ -2534,6 +2678,17 @@ class ZetAgentAdapter(APIServerAdapter):
                 },
                 status=409,
             )
+        active_imports = self._block_runtime_import_profile(profile_home)
+        if active_imports:
+            return web.json_response(
+                {
+                    "unloaded": False,
+                    "error": "profile has active imports",
+                    "active_sessions": active_imports,
+                    "active_imports": active_imports,
+                },
+                status=409,
+            )
 
         runtime_unload = {}
         gw = getattr(self, "gateway_runner", None)
@@ -2549,6 +2704,7 @@ class ZetAgentAdapter(APIServerAdapter):
                         "disconnected_adapters": 0,
                     }
             except Exception:
+                self._unblock_runtime_import_profile(profile_home)
                 logger.warning(
                     "[zet_agent] profile-unload: runtime unload failed",
                     exc_info=True,
@@ -2562,6 +2718,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 )
 
         if runtime_unload.get("blocked"):
+            self._unblock_runtime_import_profile(profile_home)
             return web.json_response(
                 {
                     "unloaded": False,
@@ -2575,6 +2732,8 @@ class ZetAgentAdapter(APIServerAdapter):
         if profile_home:
             db = self._session_dbs.pop(self._profile_home_key(profile_home), None)
             if db is not None:
+                if db is self._session_db:
+                    self._session_db = None
                 discard_staging = getattr(db, "discard_runtime_import_staging", None)
                 if callable(discard_staging):
                     try:

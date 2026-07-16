@@ -135,8 +135,10 @@ RUNTIME_IMPORT_MAX_CHUNK_MESSAGES = 200
 RUNTIME_IMPORT_MAX_MESSAGES = 10_000
 RUNTIME_IMPORT_MAX_CONTENT_CHARS = 65_536
 RUNTIME_IMPORT_MAX_STAGED_BYTES = 32 * 1024 * 1024
+RUNTIME_IMPORT_MAX_TOTAL_STAGED_BYTES = 64 * 1024 * 1024
 RUNTIME_IMPORT_STAGING_TTL_SECONDS = 24 * 60 * 60
-RUNTIME_IMPORT_CLEANUP_BATCH_SIZE = 64
+RUNTIME_IMPORT_CLEANUP_BATCH_SIZE = 8
+RUNTIME_IMPORT_CLEANUP_MAX_BYTES = 64 * 1024 * 1024
 
 
 class RuntimeImportConflict(ValueError):
@@ -3588,6 +3590,8 @@ class SessionDB:
 
     @staticmethod
     def _normalize_import_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        from portable_import_security import reject_portable_credentials
+
         if not isinstance(messages, list) or not messages:
             raise ValueError("messages must be a non-empty list")
         if len(messages) > RUNTIME_IMPORT_MAX_CHUNK_MESSAGES:
@@ -3613,6 +3617,7 @@ class SessionDB:
                     f"messages[{index}].content exceeds "
                     f"{RUNTIME_IMPORT_MAX_CONTENT_CHARS} characters"
                 )
+            reject_portable_credentials(content, field=f"messages[{index}].content")
             created_at = raw.get("created_at")
             if not isinstance(created_at, (int, float)) or isinstance(created_at, bool):
                 raise ValueError(f"messages[{index}].created_at must be unix seconds")
@@ -3623,6 +3628,9 @@ class SessionDB:
             if source_id is not None:
                 if not isinstance(source_id, str) or not source_id or len(source_id) > 256:
                     raise ValueError(f"messages[{index}].source_id is invalid")
+                reject_portable_credentials(
+                    source_id, field=f"messages[{index}].source_id"
+                )
                 if source_id in seen_source_ids:
                     raise ValueError(f"duplicate source_id in chunk: {source_id}")
                 seen_source_ids.add(source_id)
@@ -3642,24 +3650,71 @@ class SessionDB:
         *,
         now: Optional[float] = None,
         limit: int = RUNTIME_IMPORT_CLEANUP_BATCH_SIZE,
+        max_bytes: int = RUNTIME_IMPORT_CLEANUP_MAX_BYTES,
     ) -> int:
         """Delete one bounded batch of expired transcript staging rows."""
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
             raise ValueError("limit must be an integer in 1..1000")
+        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 1:
+            raise ValueError("max_bytes must be a positive integer")
         cutoff = (time.time() if now is None else float(now)) - RUNTIME_IMPORT_STAGING_TTL_SECONDS
         if not math.isfinite(cutoff):
             raise ValueError("now must be finite")
 
         def _do(conn):
-            return conn.execute(
-                "DELETE FROM runtime_imports WHERE import_id IN ("
-                "SELECT import_id FROM runtime_imports "
-                "WHERE status = 'staging' AND updated_at < ? "
-                "ORDER BY updated_at, import_id LIMIT ?)",
-                (cutoff, limit),
-            ).rowcount
+            return self._delete_stale_runtime_imports(
+                conn, cutoff=cutoff, limit=limit, max_bytes=max_bytes
+            )
 
         return self._execute_write(_do)
+
+    @staticmethod
+    def _delete_stale_runtime_imports(conn, *, cutoff: float, limit: int,
+                                      max_bytes: int) -> int:
+        """Delete a count- and byte-bounded batch inside an existing transaction."""
+        rows = conn.execute(
+            "SELECT import_id, staged_bytes FROM runtime_imports "
+            "WHERE status = 'staging' AND updated_at < ? "
+            "ORDER BY updated_at, import_id LIMIT ?",
+            (cutoff, limit),
+        ).fetchall()
+        selected: List[str] = []
+        selected_bytes = 0
+        for row in rows:
+            staged_bytes = max(0, int(row["staged_bytes"] or 0))
+            if selected and selected_bytes + staged_bytes > max_bytes:
+                break
+            selected.append(row["import_id"])
+            selected_bytes += staged_bytes
+        if not selected:
+            return 0
+        placeholders = ",".join("?" for _ in selected)
+        return conn.execute(
+            f"DELETE FROM runtime_imports WHERE import_id IN ({placeholders})",
+            selected,
+        ).rowcount
+
+    @staticmethod
+    def _completed_runtime_import_target_matches(conn, row) -> bool:
+        target = conn.execute(
+            "SELECT model_config FROM sessions WHERE id = ?",
+            (row["target_session_id"],),
+        ).fetchone()
+        if target is None:
+            return False
+        try:
+            model_config = json.loads(target["model_config"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if not isinstance(model_config, dict):
+            return False
+        metadata = model_config.get("_runtime_import", {})
+        if not isinstance(metadata, dict):
+            return False
+        return (
+            metadata.get("import_id") == row["import_id"]
+            and metadata.get("payload_sha256") == row["payload_sha256"]
+        )
 
     def discard_runtime_import_staging(self) -> int:
         """Delete all unpublished transcript staging before profile unload."""
@@ -3695,6 +3750,10 @@ class SessionDB:
             _validate_runtime_import_identifier(field, value)
         if title is not None and not isinstance(title, str):
             raise ValueError("title must be text when provided")
+        title = self.sanitize_title(title)
+        if title:
+            from portable_import_security import reject_portable_credentials
+            reject_portable_credentials(title, field="title")
         if not re.fullmatch(r"[0-9a-fA-F]{64}", payload_sha256 or ""):
             raise ValueError("payload_sha256 must be 64 hexadecimal characters")
         if not isinstance(expected_message_count, int) or isinstance(expected_message_count, bool):
@@ -3714,13 +3773,11 @@ class SessionDB:
         now = time.time()
 
         def _do(conn):
-            conn.execute(
-                "DELETE FROM runtime_imports WHERE import_id IN ("
-                "SELECT import_id FROM runtime_imports "
-                "WHERE status = 'staging' AND updated_at < ? "
-                "ORDER BY updated_at, import_id LIMIT ?)",
-                (now - RUNTIME_IMPORT_STAGING_TTL_SECONDS,
-                 RUNTIME_IMPORT_CLEANUP_BATCH_SIZE),
+            self._delete_stale_runtime_imports(
+                conn,
+                cutoff=now - RUNTIME_IMPORT_STAGING_TTL_SECONDS,
+                limit=RUNTIME_IMPORT_CLEANUP_BATCH_SIZE,
+                max_bytes=RUNTIME_IMPORT_CLEANUP_MAX_BYTES,
             )
             row = conn.execute(
                 "SELECT * FROM runtime_imports WHERE import_id = ?", (import_id,)
@@ -3734,6 +3791,15 @@ class SessionDB:
                     "SELECT 1 FROM sessions WHERE id = ?", (target_session_id,)
                 ).fetchone():
                     raise RuntimeImportConflict("target_session_id already exists")
+                reserved = conn.execute(
+                    "SELECT import_id FROM runtime_imports "
+                    "WHERE status = 'staging' AND target_session_id = ? LIMIT 1",
+                    (target_session_id,),
+                ).fetchone()
+                if reserved is not None:
+                    raise RuntimeImportConflict(
+                        "target_session_id is reserved by another staged import"
+                    )
                 conn.execute(
                     """INSERT INTO runtime_imports
                        (import_id, source, source_session_id, target_session_id, title,
@@ -3764,6 +3830,10 @@ class SessionDB:
                 if not completed_metadata_matches:
                     raise RuntimeImportConflict(
                         "import_id is already bound to different metadata"
+                    )
+                if not self._completed_runtime_import_target_matches(conn, row):
+                    raise RuntimeImportConflict(
+                        "completed import target session is missing or replaced"
                     )
                 return {
                     "import_id": import_id, "status": "completed",
@@ -3803,6 +3873,12 @@ class SessionDB:
                 raise ValueError("staged messages exceed expected_message_count")
             if new_bytes > RUNTIME_IMPORT_MAX_STAGED_BYTES:
                 raise ValueError("staged transcript exceeds 32 MiB")
+            total_staged_bytes = conn.execute(
+                "SELECT COALESCE(SUM(staged_bytes), 0) FROM runtime_imports "
+                "WHERE status = 'staging'"
+            ).fetchone()[0]
+            if total_staged_bytes + byte_count > RUNTIME_IMPORT_MAX_TOTAL_STAGED_BYTES:
+                raise ValueError("profile staged transcripts exceed 64 MiB")
             source_ids = [m.get("_source_id") for m in normalized
                           if m.get("_source_id")]
             for source_id in source_ids:
@@ -3848,6 +3924,10 @@ class SessionDB:
             if row is None:
                 raise ValueError("unknown import_id")
             if row["status"] == "completed":
+                if not self._completed_runtime_import_target_matches(conn, row):
+                    raise RuntimeImportConflict(
+                        "completed import target session is missing or replaced"
+                    )
                 return {
                     "import_id": import_id, "status": "completed",
                     "session_id": row["target_session_id"],

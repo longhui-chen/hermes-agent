@@ -50,6 +50,17 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+
+def _fsync_directory(path: Path) -> None:
+    """Persist directory metadata after an atomic rename on POSIX."""
+    if os.name == "nt":
+        return
+    dir_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
 # Where memory files live — resolved dynamically so profile overrides
 # (HERMES_HOME env var changes) are always respected.  The old module-level
 # constant was cached at import time and could go stale if a profile switch
@@ -646,6 +657,8 @@ class MemoryStore:
         self, *, target: str, entries: List[str], import_id: str, payload_sha256: str
     ) -> Dict[str, Any]:
         """Atomically replace one curated-memory file with an idempotent receipt."""
+        from portable_import_security import reject_portable_credentials
+
         if target not in {"memory", "user"}:
             raise ValueError("target must be memory or user")
         if not isinstance(import_id, str) or not import_id or len(import_id) > 128:
@@ -659,6 +672,7 @@ class MemoryStore:
             if not isinstance(raw, str) or not raw.strip():
                 raise ValueError(f"entries[{index}] must be non-empty text")
             entry = raw.strip()
+            reject_portable_credentials(entry, field=f"entries[{index}]")
             error = _scan_memory_content(entry) or _validate_user_profile_language(target, entry)
             if error:
                 raise ValueError(f"entries[{index}]: {error}")
@@ -697,6 +711,9 @@ class MemoryStore:
                         raise MemoryImportConflict(
                             "memory changed after import prepare; refusing to overwrite user edits"
                         )
+                    # Also covers recovery of a legacy prepared receipt where
+                    # the target rename landed before process death.
+                    _fsync_directory(path.parent)
                     receipt["state"] = "completed"
                     receipt["completed_at"] = time.time()
                     self._write_import_receipt(receipt_path, receipt)
@@ -753,12 +770,7 @@ class MemoryStore:
                 handle.flush()
                 os.fsync(handle.fileno())
             atomic_replace(tmp_path, path)
-            if os.name != "nt":
-                dir_fd = os.open(path.parent, os.O_RDONLY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
+            _fsync_directory(path.parent)
         except BaseException:
             try:
                 os.unlink(tmp_path)
@@ -942,6 +954,7 @@ class MemoryStore:
                     f.flush()
                     os.fsync(f.fileno())
                 atomic_replace(tmp_path, path)
+                _fsync_directory(path.parent)
             except BaseException:
                 # Clean up temp file on any failure
                 try:

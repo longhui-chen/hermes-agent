@@ -5,6 +5,8 @@ import time
 
 import pytest
 
+import hermes_state
+
 from hermes_state import (
     RuntimeImportConflict,
     RuntimeImportIncomplete,
@@ -12,12 +14,13 @@ from hermes_state import (
 )
 
 
-def _stage(db, *, import_id="imp-1", chunk_index=0, messages=None, expected=2):
+def _stage(db, *, import_id="imp-1", chunk_index=0, messages=None, expected=2,
+           target_session_id="imported-session"):
     return db.stage_completed_transcript_import(
         import_id=import_id,
         source="workbuddy",
         source_session_id="source-session",
-        target_session_id="imported-session",
+        target_session_id=target_session_id,
         title="Imported chat",
         payload_sha256=hashlib.sha256(b"source-payload").hexdigest(),
         expected_message_count=expected,
@@ -85,9 +88,12 @@ def test_completed_transcript_import_is_chunk_and_commit_idempotent(tmp_path):
         assert len(receipt["source_session_id"]) == 64
         assert receipt["title"] is None
 
-        # A lost stage response can still replay after commit without retaining
-        # the raw source session identifier, while a different binding fails.
-        assert _stage(db)["status"] == "completed"
+        # Completed replay is valid only while the imported target still
+        # exists; deletion is a tombstone conflict, never a false success.
+        with pytest.raises(RuntimeImportConflict, match="missing or replaced"):
+            db.commit_completed_transcript_import("imp-1")
+        with pytest.raises(RuntimeImportConflict, match="missing or replaced"):
+            _stage(db)
         with pytest.raises(RuntimeImportConflict):
             db.stage_completed_transcript_import(
                 import_id="imp-1", source="workbuddy",
@@ -148,6 +154,130 @@ def test_runtime_import_rejects_non_completed_runtime_messages(tmp_path):
                 "created_at": 1_700_000_000,
             }])
         assert db.get_session("imported-session") is None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("message", [
+    {"source_id": "m", "role": "user", "content": "Authorization: Bearer abcdefghijklmnop", "created_at": 1},
+    {"source_id": "m", "role": "user", "content": "api_key = sk-abcdefghijklmnop", "created_at": 1},
+    {"source_id": "m", "role": "user", "content": "-----BEGIN RSA PRIVATE KEY-----", "created_at": 1},
+    {"source_id": "m", "role": "user", "content": "ghp_abcdefghijklmnopqrst", "created_at": 1},
+    {"source_id": "Authorization: Bearer abcdefghijklmnop", "role": "user",
+     "content": "safe", "created_at": 1},
+])
+def test_runtime_import_rejects_every_credential_free_policy_category(tmp_path, message):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        with pytest.raises(ValueError, match="forbidden"):
+            _stage(db, expected=1, messages=[message])
+        assert db.get_session("imported-session") is None
+    finally:
+        db.close()
+
+
+def test_runtime_import_ignores_deep_unknown_fields_without_recursion(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    unknown = {}
+    cursor = unknown
+    for _ in range(2000):
+        child = {}
+        cursor["unknown"] = child
+        cursor = child
+    message = {"source_id": "m", "role": "user", "content": "safe",
+               "created_at": 1, "extension": unknown}
+    try:
+        assert _stage(db, expected=1, messages=[message])["status"] == "staged"
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("content", [
+    "token: <redacted>",
+    "api_key=${OPENAI_API_KEY}",
+    "password=changeme",
+    "sk-example",
+    "Authorization: Bearer redacted",
+    '{"credentials": {}}',
+])
+def test_runtime_import_allows_non_secret_examples_and_placeholders(tmp_path, content):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        result = _stage(
+            db, expected=1,
+            messages=[{"source_id": "m", "role": "user", "content": content,
+                       "created_at": 1}],
+        )
+        assert result["status"] == "staged"
+    finally:
+        db.close()
+
+
+def test_runtime_import_rejects_long_title_before_staging(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        with pytest.raises(ValueError, match="Title too long"):
+            db.stage_completed_transcript_import(
+                import_id="long-title", source="workbuddy", source_session_id="source",
+                target_session_id="target", title="x" * 101,
+                payload_sha256=hashlib.sha256(b"payload").hexdigest(),
+                expected_message_count=1, chunk_index=0,
+                messages=[{"role": "user", "content": "safe", "created_at": 1}],
+            )
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM runtime_imports"
+        ).fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_runtime_import_rejects_credential_in_title_before_staging(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        with pytest.raises(ValueError, match="forbidden"):
+            db.stage_completed_transcript_import(
+                import_id="credential-title", source="workbuddy",
+                source_session_id="source", target_session_id="target",
+                title="Authorization: Bearer abcdefghijklmnop",
+                payload_sha256=hashlib.sha256(b"payload").hexdigest(),
+                expected_message_count=1, chunk_index=0,
+                messages=[{"role": "user", "content": "safe", "created_at": 1}],
+            )
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM runtime_imports"
+        ).fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+def test_runtime_import_reserves_target_across_database_connections(tmp_path):
+    path = tmp_path / "state.db"
+    first = SessionDB(path)
+    second = SessionDB(path)
+    try:
+        _stage(first, import_id="first", expected=1)
+        with pytest.raises(RuntimeImportConflict, match="reserved"):
+            _stage(second, import_id="second", expected=1)
+    finally:
+        first.close()
+        second.close()
+
+
+def test_runtime_import_enforces_profile_aggregate_staging_quota(tmp_path, monkeypatch):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        _stage(db, import_id="first", expected=1, target_session_id="target-1")
+        staged_bytes = db._conn.execute(
+            "SELECT staged_bytes FROM runtime_imports WHERE import_id = 'first'"
+        ).fetchone()[0]
+        monkeypatch.setattr(
+            hermes_state, "RUNTIME_IMPORT_MAX_TOTAL_STAGED_BYTES", staged_bytes
+        )
+        with pytest.raises(ValueError, match="profile staged transcripts"):
+            _stage(db, import_id="second", expected=1, target_session_id="target-2")
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM runtime_imports WHERE staged_bytes > 0"
+        ).fetchone()[0] == 1
     finally:
         db.close()
 
@@ -296,7 +426,10 @@ def test_runtime_import_cleanup_is_bounded(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     try:
         for index in range(3):
-            _stage(db, import_id=f"abandoned-{index}", expected=1)
+            _stage(
+                db, import_id=f"abandoned-{index}", expected=1,
+                target_session_id=f"target-{index}",
+            )
         db._conn.execute(
             "UPDATE runtime_imports SET updated_at = ?",
             (time.time() - 25 * 60 * 60,),
@@ -306,5 +439,30 @@ def test_runtime_import_cleanup_is_bounded(tmp_path):
             "SELECT COUNT(*) FROM runtime_imports WHERE status = 'staging'"
         ).fetchone()[0] == 1
         assert db.cleanup_stale_runtime_imports(limit=2) == 1
+    finally:
+        db.close()
+
+
+def test_runtime_import_cleanup_is_also_byte_bounded(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        for index in range(3):
+            _stage(
+                db, import_id=f"abandoned-{index}", expected=1,
+                target_session_id=f"target-{index}",
+            )
+        db._conn.execute(
+            "UPDATE runtime_imports SET updated_at = ?",
+            (time.time() - 25 * 60 * 60,),
+        )
+        one_import_bytes = db._conn.execute(
+            "SELECT staged_bytes FROM runtime_imports LIMIT 1"
+        ).fetchone()[0]
+        assert db.cleanup_stale_runtime_imports(
+            limit=8, max_bytes=one_import_bytes
+        ) == 1
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM runtime_imports WHERE status = 'staging'"
+        ).fetchone()[0] == 2
     finally:
         db.close()

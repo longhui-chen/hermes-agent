@@ -1,5 +1,6 @@
 import hashlib
 import json
+from pathlib import Path
 
 import pytest
 
@@ -49,6 +50,74 @@ def test_memory_import_rejects_poison_and_overflow_without_writing(tmp_path, mon
             import_id="bad", payload_sha256=digest,
         )
     assert not (home / "memories" / "MEMORY.md").exists()
+
+
+@pytest.mark.parametrize("entry", [
+    "Authorization: Bearer abcdefghijklmnop",
+    "api_key = sk-abcdefghijklmnop",
+    "-----BEGIN OPENSSH PRIVATE KEY-----",
+    "github_pat_abcdefghijklmnopqrst",
+])
+def test_memory_import_rejects_credentials_without_writing(tmp_path, monkeypatch, entry):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=1000, user_char_limit=1000)
+    with pytest.raises(ValueError, match="forbidden"):
+        store.import_replace(
+            target="memory", entries=[entry], import_id="credential",
+            payload_sha256=hashlib.sha256(b"credential").hexdigest(),
+        )
+    assert not (home / "memories" / "MEMORY.md").exists()
+
+
+def test_memory_import_allows_non_secret_examples_and_placeholders(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=1000, user_char_limit=1000)
+    entries = [
+        "token: <redacted>",
+        "api_key=${OPENAI_API_KEY}",
+        "password=changeme",
+        "sk-example",
+        "Authorization: Bearer redacted",
+        '{"credentials": {}}',
+    ]
+    result = store.import_replace(
+        target="memory", entries=entries, import_id="safe-examples",
+        payload_sha256=hashlib.sha256(b"safe-examples").hexdigest(),
+    )
+    assert result["status"] == "completed"
+
+
+def test_memory_import_fsyncs_target_directory_before_completed_receipt(
+    tmp_path, monkeypatch
+):
+    import tools.memory_tool as memory_tool
+
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=100, user_char_limit=100)
+    events = []
+    original_fsync_directory = memory_tool._fsync_directory
+    original_write_receipt = store._write_import_receipt
+
+    def track_fsync_directory(path):
+        events.append(("fsync", Path(path).name))
+        return original_fsync_directory(path)
+
+    def track_receipt(path, receipt):
+        events.append(("receipt", receipt["state"]))
+        return original_write_receipt(path, receipt)
+
+    monkeypatch.setattr(memory_tool, "_fsync_directory", track_fsync_directory)
+    monkeypatch.setattr(store, "_write_import_receipt", track_receipt)
+    store.import_replace(
+        target="memory", entries=["safe fact"], import_id="durable",
+        payload_sha256=hashlib.sha256(b"durable").hexdigest(),
+    )
+
+    completed_index = events.index(("receipt", "completed"))
+    assert ("fsync", "memories") in events[:completed_index]
 
 
 def test_memory_import_prepare_blocks_user_edit_after_crash(tmp_path, monkeypatch):

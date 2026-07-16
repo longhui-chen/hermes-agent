@@ -1,4 +1,7 @@
+import asyncio
 import hashlib
+import shutil
+import threading
 import time
 
 import pytest
@@ -56,6 +59,171 @@ async def test_completed_transcript_http_flow_requires_auth_and_commits_atomical
         assert db.get_messages_as_conversation("hermes-1")[0]["content"] == "你好"
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_import_flow_rejects_credentials_at_final_consumer(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    adapter._session_db = db
+    adapter._ensure_session_db = lambda: db
+    app = web.Application()
+    app.router.add_post("/api/sessions/import", adapter._handle_session_import)
+    app.router.add_post("/api/memory/import", adapter._handle_memory_import)
+    headers = {"Authorization": "Bearer test-key"}
+    payload = {
+        "import_id": "credential-flow", "operation": "stage", "source": "marvis",
+        "source_session_id": "source", "target_session_id": "target",
+        "title": None, "expected_message_count": 1, "chunk_index": 0,
+        "payload_sha256": hashlib.sha256(b"credential").hexdigest(),
+        "messages": [{"role": "user", "content": "api_key = sk-abcdefghijklmnop",
+                      "created_at": 1}],
+    }
+    try:
+        async with TestClient(TestServer(app)) as cli:
+            transcript = await cli.post(
+                "/api/sessions/import", json=payload, headers=headers
+            )
+            assert transcript.status == 400
+            assert (await transcript.json())["error"]["code"] == "invalid_runtime_import"
+            memory = await cli.post(
+                "/api/memory/import",
+                json={"import_id": "credential-memory", "mode": "replace",
+                      "target": "memory",
+                      "payload_sha256": hashlib.sha256(b"memory").hexdigest(),
+                      "entries": ["Authorization: Bearer abcdefghijklmnop"]},
+                headers=headers,
+            )
+            assert memory.status == 400
+            assert (await memory.json())["error"]["code"] == "invalid_memory_import"
+        assert db.get_session("target") is None
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_import_flow_blocks_unload_until_worker_finishes(monkeypatch):
+    import tools.memory_tool as memory_tool
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class _Store:
+        def import_replace(self, **_kwargs):
+            started.set()
+            assert release.wait(2)
+            return {"status": "completed"}
+
+    monkeypatch.setattr(memory_tool, "load_on_disk_store", lambda: _Store())
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    app = web.Application()
+    app.router.add_post("/api/memory/import", adapter._handle_memory_import)
+    app.router.add_post("/v1/profile/unload", adapter._handle_profile_unload)
+    headers = {"Authorization": "Bearer test-key"}
+    body = {"import_id": "blocking", "mode": "replace", "target": "memory",
+            "payload_sha256": hashlib.sha256(b"blocking").hexdigest(),
+            "entries": ["safe fact"]}
+
+    async with TestClient(TestServer(app)) as cli:
+        import_task = asyncio.create_task(
+            cli.post("/api/memory/import", json=body, headers=headers)
+        )
+        assert await asyncio.to_thread(started.wait, 1)
+        blocked = await cli.post("/v1/profile/unload", headers=headers)
+        assert blocked.status == 409
+        assert (await blocked.json())["active_imports"] == 1
+        release.set()
+        assert (await import_task).status == 200
+
+        unloaded = await cli.post("/v1/profile/unload", headers=headers)
+        assert unloaded.status == 200
+        after_unload = await cli.post(
+            "/api/memory/import", json=body, headers=headers
+        )
+        assert after_unload.status == 409
+
+
+@pytest.mark.asyncio
+async def test_session_import_flow_blocks_unload_until_stage_finishes():
+    started = threading.Event()
+    release = threading.Event()
+
+    class _DB:
+        def stage_completed_transcript_import(self, **_kwargs):
+            started.set()
+            assert release.wait(2)
+            return {"status": "staged"}
+
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    adapter._ensure_session_db = lambda: _DB()
+    app = web.Application()
+    app.router.add_post("/api/sessions/import", adapter._handle_session_import)
+    app.router.add_post("/v1/profile/unload", adapter._handle_profile_unload)
+    headers = {"Authorization": "Bearer test-key"}
+    body = {"import_id": "blocking-session", "operation": "stage",
+            "source": "workbuddy", "source_session_id": "source",
+            "target_session_id": "target", "title": None,
+            "payload_sha256": hashlib.sha256(b"blocking").hexdigest(),
+            "expected_message_count": 1, "chunk_index": 0,
+            "messages": [{"role": "user", "content": "safe", "created_at": 1}]}
+
+    async with TestClient(TestServer(app)) as cli:
+        import_task = asyncio.create_task(
+            cli.post("/api/sessions/import", json=body, headers=headers)
+        )
+        assert await asyncio.to_thread(started.wait, 1)
+        blocked = await cli.post("/v1/profile/unload", headers=headers)
+        assert blocked.status == 409
+        release.set()
+        assert (await import_task).status == 200
+
+
+def test_runtime_import_barrier_allows_only_a_recreated_profile_generation(tmp_path):
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+
+    assert adapter._block_runtime_import_profile(profile_home) == 0
+    assert adapter._begin_runtime_import_operation(profile_home) is None
+    profile_home.rmdir()
+    assert adapter._begin_runtime_import_operation(profile_home) is None
+    profile_home.mkdir()
+    key = adapter._begin_runtime_import_operation(profile_home)
+    assert key == adapter._profile_home_key(profile_home)
+    adapter._end_runtime_import_operation(key)
+
+
+@pytest.mark.asyncio
+async def test_unload_then_sweep_does_not_recreate_deleted_profile(
+    tmp_path, monkeypatch
+):
+    profile_home = tmp_path / "profiles" / "coder"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    db = SessionDB(profile_home / "state.db")
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    key = adapter._profile_home_key(profile_home)
+    adapter._session_db = db
+    adapter._session_dbs = {key: db}
+    monkeypatch.setattr(adapter, "_multiplex_profile_homes", lambda: {})
+
+    class _Request(dict):
+        def __init__(self):
+            super().__init__(
+                hermes_profile="coder", hermes_profile_home=str(profile_home)
+            )
+            self.headers = {"Authorization": "Bearer test-key"}
+            self.method = "POST"
+            self.path_qs = "/p/coder/v1/profile/unload"
+            self.remote = "127.0.0.1"
+            self.transport = None
+
+    response = await adapter._handle_profile_unload(_Request())
+    assert response.status == 200
+    assert adapter._session_db is None
+    shutil.rmtree(profile_home)
+
+    assert await adapter._cleanup_stale_runtime_imports_once() == 0
+    assert not profile_home.exists()
 
 
 @pytest.mark.asyncio
@@ -122,6 +290,88 @@ async def test_gateway_runtime_import_cleanup_sweeps_every_cached_profile(tmp_pa
     finally:
         first.close()
         second.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_runtime_import_cleanup_discovers_uncached_served_profile(
+    tmp_path, monkeypatch
+):
+    profile_home = tmp_path / "profiles" / "coder"
+    db = SessionDB(profile_home / "state.db")
+    db.stage_completed_transcript_import(
+        import_id="uncached", source="marvis", source_session_id="source",
+        target_session_id="target", title=None,
+        payload_sha256=hashlib.sha256(b"uncached").hexdigest(),
+        expected_message_count=1, chunk_index=0,
+        messages=[{"role": "user", "content": "private", "created_at": 0}],
+    )
+    db._conn.execute(
+        "UPDATE runtime_imports SET updated_at = ?",
+        (time.time() - 25 * 60 * 60,),
+    )
+    db.close()
+
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    adapter._session_db = None
+    adapter._session_dbs = {}
+    adapter._ensure_session_db = lambda: None
+    monkeypatch.setattr(
+        adapter, "_multiplex_profile_homes", lambda: {"coder": profile_home}
+    )
+
+    await adapter._cleanup_stale_runtime_imports_once()
+    reopened = SessionDB(profile_home / "state.db")
+    try:
+        assert reopened._conn.execute(
+            "SELECT COUNT(*) FROM runtime_imports WHERE import_id = 'uncached'"
+        ).fetchone()[0] == 0
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_uncached_profile_open_failure_does_not_block_other_profile_cleanup(
+    tmp_path, monkeypatch
+):
+    broken_home = tmp_path / "profiles" / "broken"
+    broken_home.mkdir(parents=True)
+    (broken_home / "state.db").write_bytes(b"not sqlite")
+    healthy_home = tmp_path / "profiles" / "healthy"
+    db = SessionDB(healthy_home / "state.db")
+    db.stage_completed_transcript_import(
+        import_id="healthy-stale", source="marvis", source_session_id="source",
+        target_session_id="target", title=None,
+        payload_sha256=hashlib.sha256(b"healthy").hexdigest(),
+        expected_message_count=1, chunk_index=0,
+        messages=[{"role": "user", "content": "private", "created_at": 0}],
+    )
+    db._conn.execute(
+        "UPDATE runtime_imports SET updated_at = ?",
+        (time.time() - 25 * 60 * 60,),
+    )
+    db.close()
+
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    adapter._session_db = None
+    adapter._session_dbs = {}
+    adapter._ensure_session_db = lambda: None
+    monkeypatch.setattr(
+        adapter, "_multiplex_profile_homes",
+        lambda: {"broken": broken_home, "healthy": healthy_home},
+    )
+
+    await adapter._cleanup_stale_runtime_imports_once()
+    reopened = SessionDB(healthy_home / "state.db")
+    try:
+        assert reopened._conn.execute(
+            "SELECT COUNT(*) FROM runtime_imports WHERE import_id = 'healthy-stale'"
+        ).fetchone()[0] == 0
+    finally:
+        reopened.close()
 
 
 @pytest.mark.asyncio
