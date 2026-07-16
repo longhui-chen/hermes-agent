@@ -115,11 +115,13 @@ class MemoryImportConflict(ValueError):
 class _ImportDirectoryHandles:
     """Stable POSIX directory handles for one curated-memory import."""
 
-    def __init__(self, mem_dir: Path):
+    def __init__(self, mem_dir: Path, *, create_managed: bool = True):
         self.home_dir = mem_dir.parent
         self.mem_dir = mem_dir
         self.imports_dir = mem_dir / ".imports"
         self.backup_dir = self.imports_dir / "backups"
+        self.create_managed = create_managed
+        self._unopened_identities: Dict[Path, Optional[tuple[int, int, int]]] = {}
         self.home_fd = -1
         self.mem_fd = -1
         self.imports_fd = -1
@@ -135,18 +137,25 @@ class _ImportDirectoryHandles:
         return flags
 
     @staticmethod
-    def _open_child_directory(parent_fd: int, name: str) -> int:
-        try:
-            os.mkdir(name, 0o700, dir_fd=parent_fd)
-        except FileExistsError:
-            pass
+    def _open_child_directory(parent_fd: int, name: str, *, create: bool) -> int:
+        if create:
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
         try:
             fd = os.open(
                 name,
                 _ImportDirectoryHandles._directory_flags(),
                 dir_fd=parent_fd,
             )
+        except FileNotFoundError:
+            if not create:
+                return -1
+            raise
         except OSError as exc:
+            if not create:
+                return -1
             raise MemoryImportConflict(
                 f"managed memory directory {name} is unsafe: {exc}"
             ) from exc
@@ -169,8 +178,17 @@ class _ImportDirectoryHandles:
                 self._directory_flags(),
                 dir_fd=self.home_fd,
             )
-            self.imports_fd = self._open_child_directory(self.mem_fd, ".imports")
-            self.backup_fd = self._open_child_directory(self.imports_fd, "backups")
+            self.imports_fd = self._open_child_directory(
+                self.mem_fd, ".imports", create=self.create_managed
+            )
+            if self.imports_fd < 0:
+                self._remember_unopened(self.imports_dir)
+            if self.imports_fd >= 0:
+                self.backup_fd = self._open_child_directory(
+                    self.imports_fd, "backups", create=self.create_managed
+                )
+                if self.backup_fd < 0:
+                    self._remember_unopened(self.backup_dir)
             self.verify_attached()
             return self
         except BaseException:
@@ -200,6 +218,18 @@ class _ImportDirectoryHandles:
             and (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino)
         )
 
+    def _remember_unopened(self, path: Path) -> None:
+        try:
+            current = os.lstat(path)
+        except FileNotFoundError:
+            self._unopened_identities[path] = None
+            return
+        self._unopened_identities[path] = (
+            current.st_dev,
+            current.st_ino,
+            current.st_mode,
+        )
+
     def verify_attached(self) -> None:
         for path, fd in (
             (self.home_dir, self.home_fd),
@@ -207,10 +237,35 @@ class _ImportDirectoryHandles:
             (self.imports_dir, self.imports_fd),
             (self.backup_dir, self.backup_fd),
         ):
+            if fd < 0:
+                try:
+                    current = os.lstat(path)
+                    identity = (current.st_dev, current.st_ino, current.st_mode)
+                except FileNotFoundError:
+                    identity = None
+                if identity != self._unopened_identities.get(path):
+                    raise MemoryImportConflict(
+                        f"managed memory directory changed during import: {path.name}"
+                    )
+                continue
             if not self._same_open_directory(path, fd):
                 raise MemoryImportConflict(
                     f"managed memory directory changed during import: {path.name}"
                 )
+
+    def ensure_managed(self) -> None:
+        """Create/open managed children only after the transaction lock."""
+        if self.imports_fd < 0:
+            self.imports_fd = self._open_child_directory(
+                self.mem_fd, ".imports", create=True
+            )
+            self._unopened_identities.pop(self.imports_dir, None)
+        if self.backup_fd < 0:
+            self.backup_fd = self._open_child_directory(
+                self.imports_fd, "backups", create=True
+            )
+            self._unopened_identities.pop(self.backup_dir, None)
+        self.verify_attached()
 
     @staticmethod
     def read_bytes(directory_fd: int, name: str) -> Optional[bytes]:
@@ -258,6 +313,32 @@ class _ImportDirectoryHandles:
             return raw.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise MemoryImportConflict(f"{name} is not valid UTF-8") from exc
+
+    def unlink_non_directory(self, directory_fd: int, name: str) -> bool:
+        self.verify_attached()
+        try:
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if stat.S_ISDIR(current.st_mode):
+            return False
+        os.unlink(name, dir_fd=directory_fd)
+        self.verify_attached()
+        return True
+
+    @staticmethod
+    def read_receipt(directory_fd: int, name: str) -> Optional[Dict[str, Any]]:
+        try:
+            raw = _ImportDirectoryHandles.read_bytes(directory_fd, name)
+        except MemoryImportConflict:
+            return None
+        if raw is None:
+            return None
+        try:
+            value = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        return value if isinstance(value, dict) else None
 
     @staticmethod
     def _create_temp(directory_fd: int, prefix: str) -> tuple[int, str]:
@@ -307,6 +388,7 @@ class _ImportDirectoryHandles:
                 else self.backup_dir
             )
             _fsync_directory_fd(directory_fd, directory_path)
+            self.verify_attached()
         finally:
             if fd >= 0:
                 os.close(fd)
@@ -485,6 +567,27 @@ class _ImportDirectoryHandles:
                 except OSError:
                     pass
 
+    def confirm_completed(
+        self, canonical_name: str, receipt_name: str, content_sha256: str
+    ) -> None:
+        """Confirm the visible anchored state immediately before success."""
+        self.verify_attached()
+        canonical = self.read_bytes(self.mem_fd, canonical_name)
+        receipt = self.read_receipt(self.imports_fd, receipt_name)
+        if (
+            canonical is None
+            or hashlib.sha256(canonical).hexdigest() != content_sha256
+            or receipt is None
+            or receipt.get("state") != "completed"
+            or receipt.get("content_sha256") != content_sha256
+        ):
+            raise MemoryImportConflict(
+                "memory import durable state changed before completion"
+            )
+        _fsync_directory_fd(self.mem_fd, self.mem_dir)
+        _fsync_directory_fd(self.imports_fd, self.imports_dir)
+        self.verify_attached()
+
 
 _ACTIVE_MEMORY_IMPORT_DIRS: ContextVar[Optional[_ImportDirectoryHandles]] = (
     ContextVar("active_memory_import_dirs", default=None)
@@ -492,11 +595,17 @@ _ACTIVE_MEMORY_IMPORT_DIRS: ContextVar[Optional[_ImportDirectoryHandles]] = (
 
 
 @contextmanager
-def _anchored_import_directories(mem_dir: Path):
-    with _ImportDirectoryHandles(mem_dir) as handles:
+def _anchored_import_directories(mem_dir: Path, *, create_managed: bool = True):
+    with _ImportDirectoryHandles(
+        mem_dir, create_managed=create_managed
+    ) as handles:
         token = _ACTIVE_MEMORY_IMPORT_DIRS.set(handles)
         try:
             yield handles
+        except BaseException:
+            raise
+        else:
+            handles.verify_attached()
         finally:
             _ACTIVE_MEMORY_IMPORT_DIRS.reset(token)
 
@@ -625,18 +734,6 @@ def _is_real_directory(path: Path) -> bool:
         return stat.S_ISDIR(os.lstat(path).st_mode)
     except FileNotFoundError:
         return False
-
-
-def _unlink_file_entry(path: Path) -> bool:
-    """Unlink one non-directory entry without following a symlink leaf."""
-    try:
-        mode = os.lstat(path).st_mode
-    except FileNotFoundError:
-        return False
-    if stat.S_ISDIR(mode):
-        return False
-    os.unlink(path)
-    return True
 
 
 def _read_import_receipt_no_follow(path: Path) -> Optional[Dict[str, Any]]:
@@ -768,83 +865,95 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
 
     targets = ("memory", "user") if target == "all" else (target,)
     deleted: List[str] = []
-    imports_dir = mem_dir / ".imports"
-    backup_dir = imports_dir / "backups"
 
     transaction_path = mem_dir / _MEMORY_TRANSACTION_LOCK
     target_paths = [mem_dir / _MEMORY_TARGET_FILES[item] for item in ("memory", "user")]
     for lock_target in [transaction_path, *target_paths]:
         _validate_reset_lock(lock_target)
 
-    # Import/reset use the transaction lock. Holding both target locks as well
-    # serializes reset with ordinary memory writes and makes removal of generic
-    # crash-temporary files safe for either reset scope.
-    with ExitStack() as stack:
-        stack.enter_context(MemoryStore._file_lock(transaction_path))
+    # Import/reset use the transaction lock. All enumeration, reads, unlinks,
+    # and fsyncs remain relative to the same no-follow directory descriptors.
+    # Swapping any visible directory can make reset fail, but cannot redirect a
+    # deletion into the replacement tree.
+    with _anchored_import_directories(
+        mem_dir, create_managed=False
+    ) as reset_dirs, ExitStack() as stack:
+        stack.enter_context(
+            MemoryStore._file_lock(transaction_path, create_parent=False)
+        )
         for path in target_paths:
-            stack.enter_context(MemoryStore._file_lock(path))
+            stack.enter_context(MemoryStore._file_lock(path, create_parent=False))
 
+        reset_dirs.verify_attached()
         for item in targets:
             filename = _MEMORY_TARGET_FILES[item]
-            path = mem_dir / filename
-            if _unlink_file_entry(path):
+            if reset_dirs.unlink_non_directory(reset_dirs.mem_fd, filename):
                 deleted.append(filename)
 
             displaced_prefix = f".{filename}."
-            with os.scandir(mem_dir) as entries:
-                for entry in entries:
-                    if (
-                        entry.name.startswith(displaced_prefix)
-                        and entry.name.endswith(".displaced")
-                        and _unlink_file_entry(Path(entry.path))
-                    ):
-                        deleted.append(entry.name)
+            for name in os.listdir(reset_dirs.mem_fd):
+                if (
+                    name.startswith(displaced_prefix)
+                    and name.endswith(".displaced")
+                    and reset_dirs.unlink_non_directory(reset_dirs.mem_fd, name)
+                ):
+                    deleted.append(name)
 
-            if _is_real_directory(backup_dir):
+            if reset_dirs.backup_fd >= 0:
                 backup_prefix = f"{item}-"
-                with os.scandir(backup_dir) as entries:
-                    for entry in entries:
-                        if (
-                            entry.name.startswith(backup_prefix)
-                            and entry.name.endswith(".bak")
-                            and _unlink_file_entry(Path(entry.path))
-                        ):
-                            deleted.append(str(Path(".imports") / "backups" / entry.name))
+                for name in os.listdir(reset_dirs.backup_fd):
+                    if (
+                        name.startswith(backup_prefix)
+                        and name.endswith(".bak")
+                        and reset_dirs.unlink_non_directory(
+                            reset_dirs.backup_fd, name
+                        )
+                    ):
+                        deleted.append(
+                            str(Path(".imports") / "backups" / name)
+                        )
 
-            if _is_real_directory(imports_dir):
-                with os.scandir(imports_dir) as entries:
-                    for entry in entries:
-                        if not entry.name.endswith(".json"):
-                            continue
-                        receipt_path = Path(entry.path)
-                        receipt = _read_import_receipt_no_follow(receipt_path)
-                        if receipt is None or receipt.get("target") != item:
-                            continue
-                        if _unlink_file_entry(receipt_path):
-                            deleted.append(str(Path(".imports") / entry.name))
+            if reset_dirs.imports_fd >= 0:
+                for name in os.listdir(reset_dirs.imports_fd):
+                    if not name.endswith(".json"):
+                        continue
+                    receipt = reset_dirs.read_receipt(
+                        reset_dirs.imports_fd, name
+                    )
+                    if receipt is None or receipt.get("target") != item:
+                        continue
+                    if reset_dirs.unlink_non_directory(
+                        reset_dirs.imports_fd, name
+                    ):
+                        deleted.append(str(Path(".imports") / name))
 
         temp_locations = (
-            (mem_dir, ".mem_", Path(".")),
-            (imports_dir, ".receipt_", Path(".imports")),
-            (backup_dir, ".backup_", Path(".imports") / "backups"),
+            (reset_dirs.mem_fd, ".mem_", Path(".")),
+            (reset_dirs.imports_fd, ".receipt_", Path(".imports")),
+            (
+                reset_dirs.backup_fd,
+                ".backup_",
+                Path(".imports") / "backups",
+            ),
         )
-        for directory, prefix, relative_dir in temp_locations:
-            if not _is_real_directory(directory):
+        for directory_fd, prefix, relative_dir in temp_locations:
+            if directory_fd < 0:
                 continue
-            with os.scandir(directory) as entries:
-                for entry in entries:
-                    if (
-                        entry.name.startswith(prefix)
-                        and entry.name.endswith(".tmp")
-                        and _unlink_file_entry(Path(entry.path))
-                    ):
-                        deleted.append(str(relative_dir / entry.name))
+            for name in os.listdir(directory_fd):
+                if (
+                    name.startswith(prefix)
+                    and name.endswith(".tmp")
+                    and reset_dirs.unlink_non_directory(directory_fd, name)
+                ):
+                    deleted.append(str(relative_dir / name))
 
-        _fsync_directory(mem_dir)
-        if _is_real_directory(imports_dir):
-            _fsync_directory(imports_dir)
-        if _is_real_directory(backup_dir):
-            _fsync_directory(backup_dir)
+        reset_dirs.verify_attached()
+        _fsync_directory_fd(reset_dirs.mem_fd, reset_dirs.mem_dir)
+        if reset_dirs.imports_fd >= 0:
+            _fsync_directory_fd(reset_dirs.imports_fd, reset_dirs.imports_dir)
+        if reset_dirs.backup_fd >= 0:
+            _fsync_directory_fd(reset_dirs.backup_fd, reset_dirs.backup_dir)
+        reset_dirs.verify_attached()
 
     return {"deleted": deleted, "targets": list(targets)}
 
@@ -1527,13 +1636,15 @@ class MemoryStore:
         import_hash = hashlib.sha256(import_id.encode("utf-8")).hexdigest()
         backup_candidate = backup_dir / f"{target}-{import_hash}.bak"
         displaced_candidate = self._import_displaced_path(path, receipt_path)
-        with _anchored_import_directories(mem_dir) as import_dirs, self._file_lock(
+        with _anchored_import_directories(
+            mem_dir, create_managed=False
+        ) as import_dirs, self._file_lock(
             transaction_path, create_parent=False
         ), self._file_lock(path, create_parent=False):
             # Every read and write below is relative to directory descriptors
             # opened before lock acquisition. Path swaps can abort the import,
             # but cannot redirect plaintext into an attacker-controlled tree.
-            import_dirs.verify_attached()
+            import_dirs.ensure_managed()
             canonical_raw = import_dirs.read_bytes(import_dirs.mem_fd, path.name)
             receipt_text = import_dirs.read_text(
                 import_dirs.imports_fd, receipt_path.name
@@ -1669,6 +1780,9 @@ class MemoryStore:
                 ):
                     result["recovery_path"] = displaced_path
                     result["recovery_retention"] = "manual"
+                import_dirs.confirm_completed(
+                    path.name, receipt_path.name, content_sha
+                )
                 return result
 
             # Capture the same parsed on-disk representation used by crash
@@ -1726,16 +1840,27 @@ class MemoryStore:
             receipt["state"] = "completed"
             receipt["completed_at"] = time.time()
             self._write_import_receipt(receipt_path, receipt)
+            import_dirs.confirm_completed(
+                path.name, receipt_path.name, content_sha
+            )
             self._set_entries(target, normalized)
-        result = {"import_id": import_id, "status": "completed", "target": target,
-                  "char_count": char_count, "replayed": False,
-                  "effective_from": "next_session"}
-        if backup_path:
-            result["backup_path"] = backup_path
-        if _read_bounded_regular_file_bytes(displaced_path) is not None:
-            result["recovery_path"] = str(displaced_path)
-            result["recovery_retention"] = "manual"
-        return result
+            result = {
+                "import_id": import_id,
+                "status": "completed",
+                "target": target,
+                "char_count": char_count,
+                "replayed": False,
+                "effective_from": "next_session",
+            }
+            if backup_path:
+                result["backup_path"] = backup_path
+            if import_dirs.read_bytes(
+                import_dirs.mem_fd, displaced_path.name
+            ) is not None:
+                result["recovery_path"] = str(displaced_path)
+                result["recovery_retention"] = "manual"
+            import_dirs.verify_attached()
+            return result
 
     @staticmethod
     def _write_import_backup(*, path: Path, target: str, import_id: str) -> Optional[str]:

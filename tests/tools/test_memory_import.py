@@ -147,6 +147,94 @@ def test_memory_import_directory_swap_cannot_redirect_plaintext(
     assert (outside / "sentinel").read_text(encoding="utf-8") == "unchanged"
 
 
+def test_memory_import_second_receipt_publish_swap_cannot_report_completed(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    (memories / "MEMORY.md").write_text("old fact", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=100, user_char_limit=100)
+    original_replace = memory_tool.os.replace
+    receipt_publishes = 0
+    detached = memories.with_name("memories-detached")
+
+    def swap_after_completed_receipt(source, target, *args, **kwargs):
+        nonlocal receipt_publishes
+        result = original_replace(source, target, *args, **kwargs)
+        if str(target).endswith(".json"):
+            receipt_publishes += 1
+            if receipt_publishes == 2:
+                memories.rename(detached)
+                memories.symlink_to(outside, target_is_directory=True)
+        return result
+
+    monkeypatch.setattr(memory_tool.os, "replace", swap_after_completed_receipt)
+    with pytest.raises(MemoryImportConflict, match="changed during import"):
+        store.import_replace(
+            target="memory",
+            entries=["imported fact"],
+            import_id="swap-after-completed-receipt",
+            payload_sha256=hashlib.sha256(
+                b"swap-after-completed-receipt"
+            ).hexdigest(),
+        )
+
+    assert receipt_publishes == 2
+    assert not (outside / "MEMORY.md").exists()
+    assert not list(outside.glob("*.json"))
+    assert (detached / "MEMORY.md").read_text(encoding="utf-8") == "imported fact"
+    receipt = json.loads(next((detached / ".imports").glob("*.json")).read_text())
+    assert receipt["state"] == "completed"
+
+
+def test_memory_reset_directory_swap_is_fail_closed_and_deletes_nothing(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    imports = memories / ".imports"
+    backups = imports / "backups"
+    backups.mkdir(parents=True)
+    (memories / "MEMORY.md").write_text("detached memory", encoding="utf-8")
+    (backups / "memory-safe.bak").write_text("detached backup", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "MEMORY.md").write_text("outside memory", encoding="utf-8")
+    (outside / "memory-safe.bak").write_text("outside backup", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original_unlink = memory_tool._ImportDirectoryHandles.unlink_non_directory
+    detached = memories.with_name("memories-detached")
+    swapped = False
+
+    def swap_before_first_unlink(handles, directory_fd, name):
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            memories.rename(detached)
+            memories.symlink_to(outside, target_is_directory=True)
+        return original_unlink(handles, directory_fd, name)
+
+    monkeypatch.setattr(
+        memory_tool._ImportDirectoryHandles,
+        "unlink_non_directory",
+        swap_before_first_unlink,
+    )
+    with pytest.raises(MemoryImportConflict, match="changed during import"):
+        reset_curated_memory("memory")
+
+    assert swapped is True
+    assert (outside / "MEMORY.md").read_text(encoding="utf-8") == "outside memory"
+    assert (outside / "memory-safe.bak").read_text(encoding="utf-8") == "outside backup"
+    assert (detached / "MEMORY.md").read_text(encoding="utf-8") == "detached memory"
+    assert (
+        detached / ".imports" / "backups" / "memory-safe.bak"
+    ).read_text(encoding="utf-8") == "detached backup"
+
+
 def test_memory_import_rejects_poison_and_overflow_without_writing(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -917,16 +1005,20 @@ def test_memory_reset_and_import_are_serialized_by_profile_transaction(
     allow_reset_to_finish = threading.Event()
     import_started = threading.Event()
     import_finished = threading.Event()
-    original_unlink = memory_tool._unlink_file_entry
+    original_unlink = memory_tool._ImportDirectoryHandles.unlink_non_directory
 
-    def pause_after_canonical_unlink(path):
-        removed = original_unlink(path)
-        if path == memory_path and removed:
+    def pause_after_canonical_unlink(handles, directory_fd, name):
+        removed = original_unlink(handles, directory_fd, name)
+        if directory_fd == handles.mem_fd and name == memory_path.name and removed:
             reset_inside_transaction.set()
             assert allow_reset_to_finish.wait(timeout=5)
         return removed
 
-    monkeypatch.setattr(memory_tool, "_unlink_file_entry", pause_after_canonical_unlink)
+    monkeypatch.setattr(
+        memory_tool._ImportDirectoryHandles,
+        "unlink_non_directory",
+        pause_after_canonical_unlink,
+    )
     reset_thread = threading.Thread(target=reset_curated_memory, args=("all",))
     reset_thread.start()
     assert reset_inside_transaction.wait(timeout=5)
