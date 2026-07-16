@@ -113,7 +113,8 @@ class ZettlabVideoGenProvider(VideoGenProvider):
                 aspect_ratio=aspect_ratio,
             )
 
-        resolved_model = str(media_client.resolve_model("video", model) or "").strip()
+        resolved_model_value, model_capability = media_client.resolve_model_with_capability("video", model)
+        resolved_model = str(resolved_model_value or "").strip()
         if not resolved_model:
             return error_response(
                 error="No Zettlab video generation model is available from ai-gateway capabilities",
@@ -124,6 +125,12 @@ class ZettlabVideoGenProvider(VideoGenProvider):
             )
 
         try:
+            effective_duration = int(duration or 0)
+            if effective_duration <= 0 and isinstance(model_capability, dict):
+                for candidate in model_capability.get("durations") or []:
+                    if isinstance(candidate, int) and candidate > 0:
+                        effective_duration = candidate
+                        break
             inputs = media_client.remote_inputs(image_url, reference_image_urls)
             parameters: Dict[str, Any] = {}
             if negative_prompt:
@@ -140,7 +147,7 @@ class ZettlabVideoGenProvider(VideoGenProvider):
                     "output_count": 1,
                     "aspect_ratio": aspect_ratio,
                     "resolution": resolution,
-                    "duration": int(duration or 0),
+                    "duration": effective_duration,
                     "remote_media_inputs": inputs,
                     "parameters": parameters,
                 },
@@ -162,7 +169,7 @@ class ZettlabVideoGenProvider(VideoGenProvider):
             prompt=prompt,
             modality="image" if image_url or reference_image_urls else "text",
             aspect_ratio=aspect_ratio,
-            duration=int(duration or 0),
+            duration=effective_duration,
             provider="zettlab",
             extra={
                 "job_id": job.get("job_id"),

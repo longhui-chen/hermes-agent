@@ -87,14 +87,13 @@ def test_video_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
         "video": {
             "enabled": True,
             "default_model": "seedance-v1",
-            "models": [{"id": "seedance-v1"}],
+            "models": [{"id": "seedance-v1", "durations": [5, 10]}],
         },
     }))
     monkeypatch.setattr(client._SESSION, "post", fake_post)
 
     raw = video_tool._handle_video_generate({
         "prompt": "make a clip",
-        "duration": 5,
         "aspect_ratio": "16:9",
     })
     got = json.loads(raw)
@@ -103,3 +102,4 @@ def test_video_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
     assert got["video"] == "https://cdn.example/video.mp4"
     assert captured["json"]["media_type"] == "video"
     assert captured["json"]["model"] == "seedance-v1"
+    assert captured["json"]["duration"] == 5

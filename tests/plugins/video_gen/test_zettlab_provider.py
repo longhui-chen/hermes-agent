@@ -129,11 +129,18 @@ def test_zettlab_video_generate_uses_gateway_default_when_model_is_omitted(monke
 
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
     captured = {}
-    monkeypatch.setattr(client, "type_capability", lambda media_type: {
-        "enabled": True,
-        "default_model": "seedance-default",
-        "models": [{"id": "seedance-default"}],
-    })
+    capability_calls = 0
+
+    def fake_capability(media_type):
+        nonlocal capability_calls
+        capability_calls += 1
+        return {
+            "enabled": True,
+            "default_model": "seedance-default",
+            "models": [{"id": "seedance-default", "durations": [5, 10]}],
+        }
+
+    monkeypatch.setattr(client, "type_capability", fake_capability)
 
     def fake_post(url, json, headers, timeout, allow_redirects):
         assert allow_redirects is False
@@ -144,16 +151,31 @@ def test_zettlab_video_generate_uses_gateway_default_when_model_is_omitted(monke
     got = ZettlabVideoGenProvider().generate("make video")
     assert got["success"] is True
     assert captured["model"] == "seedance-default"
+    assert captured["duration"] == 5
+    assert got["duration"] == 5
+    assert capability_calls == 1
 
 
 def test_zettlab_video_rejects_non_https_remote_input(monkeypatch):
     from plugins import zettlab_media_client as client
 
-    monkeypatch.setattr(client, "resolve_model", lambda media_type, requested=None: "seedance-v1")
+    monkeypatch.setattr(
+        client,
+        "resolve_model_with_capability",
+        lambda media_type, requested=None: ("seedance-v1", {"id": "seedance-v1", "durations": [5]}),
+    )
     got = ZettlabVideoGenProvider().generate("make video", image_url="/tmp/source.png")
     assert got["success"] is False
     assert got["error_type"] == "ZettlabMediaError"
     assert "https URL" in got["error"]
+
+
+def test_first_asset_url_accepts_legacy_top_level_shortcut_without_assets():
+    from plugins import zettlab_media_client as client
+
+    assert client.first_asset_url({"status": "done", "video": "https://cdn.example/legacy.mp4"}) == (
+        "https://cdn.example/legacy.mp4"
+    )
 
 
 def test_register_calls_video_provider_registry():

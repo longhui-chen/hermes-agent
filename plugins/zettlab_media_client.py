@@ -118,8 +118,22 @@ def default_model(media_type: str) -> Optional[str]:
 
 
 def resolve_model(media_type: str, requested: Optional[str] = None) -> Optional[str]:
+    model_id, _ = resolve_model_with_capability(media_type, requested)
+    return model_id
+
+
+def resolve_model_with_capability(
+    media_type: str,
+    requested: Optional[str] = None,
+) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
     section = type_capability(media_type)
-    return _resolve_model_from_section(media_type, section, requested)
+    model_id = _resolve_model_from_section(media_type, section, requested)
+    models = section.get("models")
+    if model_id and isinstance(models, list):
+        for model in models:
+            if isinstance(model, dict) and str(model.get("id") or "").strip() == model_id:
+                return model_id, model
+    return model_id, None
 
 
 def selected_model_capability(media_type: str) -> tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
@@ -319,17 +333,17 @@ def _delete_job(media_type: str, job_id: str, headers: Dict[str, str]) -> None:
 
 def first_asset_url(job: Dict[str, Any]) -> str:
     assets = job.get("assets")
-    if not isinstance(assets, list) or not assets:
-        raise ZettlabMediaError("media generation completed without assets")
-    first = assets[0]
-    if not isinstance(first, dict):
-        raise ZettlabMediaError("media generation asset has invalid shape")
-    url = first.get("url")
-    if isinstance(url, str) and url.strip():
-        return url.strip()
+    if isinstance(assets, list) and assets and isinstance(assets[0], dict):
+        url = assets[0].get("url")
+        if isinstance(url, str) and url.strip():
+            return url.strip()
     shortcut = job.get("image") or job.get("video")
     if isinstance(shortcut, str) and shortcut.strip():
         return shortcut.strip()
+    if not isinstance(assets, list) or not assets:
+        raise ZettlabMediaError("media generation completed without assets")
+    if not isinstance(assets[0], dict):
+        raise ZettlabMediaError("media generation asset has invalid shape")
     raise ZettlabMediaError("media generation asset has no retrievable URL")
 
 
