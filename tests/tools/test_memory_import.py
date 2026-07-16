@@ -440,6 +440,259 @@ def test_memory_reset_phase_fsync_failure_keeps_isolated_transaction_for_retry(
     assert curated_memory_has_state("memory") is False
 
 
+@pytest.mark.parametrize("scope", ["memory", "imports", "backups"])
+def test_reset_move_and_restore_fsync_the_new_name_before_unlink(
+    tmp_path, monkeypatch, scope
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    imports = memories / ".imports"
+    backups = imports / "backups"
+    backups.mkdir(parents=True)
+    scope_path = {
+        "memory": memories,
+        "imports": imports,
+        "backups": backups,
+    }[scope]
+    source_name = f"source-{scope}"
+    stage_name = f"{memory_tool._RESET_STAGE_PREFIX}ordering-{scope}"
+    (scope_path / source_name).write_text("private", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    with memory_tool._anchored_import_directories(
+        memories, create_managed=False
+    ) as handles:
+        original_link = memory_tool.os.link
+        original_unlink = memory_tool.os.unlink
+        original_fsync = memory_tool._fsync_directory_fd
+        events = []
+
+        def record_link(*args, **kwargs):
+            events.append("link")
+            return original_link(*args, **kwargs)
+
+        def record_unlink(*args, **kwargs):
+            events.append("unlink")
+            return original_unlink(*args, **kwargs)
+
+        def record_fsync(directory_fd, path):
+            events.append(f"fsync:{path.name}")
+            return original_fsync(directory_fd, path)
+
+        monkeypatch.setattr(memory_tool.os, "link", record_link)
+        monkeypatch.setattr(memory_tool.os, "unlink", record_unlink)
+        monkeypatch.setattr(memory_tool, "_fsync_directory_fd", record_fsync)
+
+        memory_tool._reset_move_no_replace(
+            handles, scope, source_name, stage_name
+        )
+        assert events == [
+            "link",
+            "fsync:memories",
+            "unlink",
+            f"fsync:{scope_path.name}",
+        ]
+
+        events.clear()
+        memory_tool._reset_restore_plan(handles, [{
+            "scope": scope,
+            "name": source_name,
+            "stage": stage_name,
+            "label": source_name,
+        }])
+        assert events == [
+            "link",
+            f"fsync:{scope_path.name}",
+            "unlink",
+            "fsync:memories",
+        ]
+
+
+def _restore_only_fsynced_reset_dentries(
+    source_path: Path,
+    stage_path: Path,
+    durable: dict[Path, set[str]],
+) -> None:
+    """Emulate a crash by retaining only directory entries from fsync snapshots."""
+    locations = ((source_path.parent, source_path), (stage_path.parent, stage_path))
+    desired = {
+        path
+        for directory, path in locations
+        if path.name in durable[directory]
+    }
+    assert desired, "reset ordering left no durable name for the private inode"
+    current = [path for _directory, path in locations if os.path.lexists(path)]
+    assert current, "fault injection lost the live inode before crash simulation"
+    anchor = current[0]
+    for path in desired:
+        if not os.path.lexists(path):
+            os.link(anchor, path, follow_symlinks=False)
+    for _directory, path in locations:
+        if path not in desired and os.path.lexists(path):
+            os.unlink(path)
+
+
+@pytest.mark.parametrize("scope", ["memory", "imports", "backups"])
+@pytest.mark.parametrize("fail_fsync", [1, 2])
+def test_reset_move_power_loss_preserves_a_staging_recovery_name(
+    tmp_path, monkeypatch, scope, fail_fsync
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    imports = memories / ".imports"
+    backups = imports / "backups"
+    backups.mkdir(parents=True)
+    scope_path = {
+        "memory": memories,
+        "imports": imports,
+        "backups": backups,
+    }[scope]
+    source_name = f"source-{scope}"
+    stage_name = f"{memory_tool._RESET_STAGE_PREFIX}power-move-{scope}"
+    source_path = scope_path / source_name
+    stage_path = memories / stage_name
+    source_path.write_text("private", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    receipt_name = f"{memory_tool._RESET_RECEIPT_PREFIX}power-move-{scope}.json"
+    plan = [{
+        "scope": scope,
+        "name": source_name,
+        "stage": stage_name,
+        "label": source_name,
+    }]
+
+    with memory_tool._anchored_import_directories(
+        memories, create_managed=False
+    ) as handles:
+        memory_tool._write_reset_receipt(
+            handles,
+            receipt_name,
+            {"version": 1, "state": "staging", "plan": plan},
+        )
+        original_fsync = memory_tool._fsync_directory_fd
+        relevant_paths = {scope_path, memories}
+        durable = {
+            path: {
+                candidate.name
+                for candidate in (source_path, stage_path)
+                if candidate.parent == path and os.path.lexists(candidate)
+            }
+            for path in relevant_paths
+        }
+        fsync_calls = 0
+
+        def fail_one_fsync(directory_fd, path):
+            nonlocal fsync_calls
+            if path in relevant_paths:
+                fsync_calls += 1
+                if fsync_calls == fail_fsync:
+                    raise OSError(errno.EIO, "simulated reset power loss")
+                durable[path] = {
+                    candidate.name
+                    for candidate in (source_path, stage_path)
+                    if candidate.parent == path and os.path.lexists(candidate)
+                }
+            return original_fsync(directory_fd, path)
+
+        monkeypatch.setattr(memory_tool, "_fsync_directory_fd", fail_one_fsync)
+        with pytest.raises(OSError, match="simulated reset power loss"):
+            memory_tool._reset_move_no_replace(
+                handles, scope, source_name, stage_name
+            )
+
+        _restore_only_fsynced_reset_dentries(source_path, stage_path, durable)
+        monkeypatch.setattr(memory_tool, "_fsync_directory_fd", original_fsync)
+        assert memory_tool._recover_reset_transactions(
+            handles, os.listdir(handles.mem_fd)
+        ) is False
+
+    assert source_path.read_text(encoding="utf-8") == "private"
+    assert not stage_path.exists()
+    assert not (memories / receipt_name).exists()
+
+
+@pytest.mark.parametrize("scope", ["memory", "imports", "backups"])
+@pytest.mark.parametrize("fail_fsync", [1, 2])
+def test_reset_rollback_power_loss_remains_recoverable(
+    tmp_path, monkeypatch, scope, fail_fsync
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    imports = memories / ".imports"
+    backups = imports / "backups"
+    backups.mkdir(parents=True)
+    scope_path = {
+        "memory": memories,
+        "imports": imports,
+        "backups": backups,
+    }[scope]
+    source_name = f"source-{scope}"
+    stage_name = f"{memory_tool._RESET_STAGE_PREFIX}power-restore-{scope}"
+    source_path = scope_path / source_name
+    stage_path = memories / stage_name
+    source_path.write_text("private", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    plan = [{
+        "scope": scope,
+        "name": source_name,
+        "stage": stage_name,
+        "label": source_name,
+    }]
+    receipt_name = (
+        f"{memory_tool._RESET_RECEIPT_PREFIX}power-restore-{scope}.json"
+    )
+
+    with memory_tool._anchored_import_directories(
+        memories, create_managed=False
+    ) as handles:
+        memory_tool._write_reset_receipt(
+            handles,
+            receipt_name,
+            {"version": 1, "state": "staging", "plan": plan},
+        )
+        memory_tool._reset_move_no_replace(
+            handles, scope, source_name, stage_name
+        )
+        original_fsync = memory_tool._fsync_directory_fd
+        relevant_paths = {scope_path, memories}
+        durable = {
+            path: {
+                candidate.name
+                for candidate in (source_path, stage_path)
+                if candidate.parent == path and os.path.lexists(candidate)
+            }
+            for path in relevant_paths
+        }
+        fsync_calls = 0
+
+        def fail_one_fsync(directory_fd, path):
+            nonlocal fsync_calls
+            if path in relevant_paths:
+                fsync_calls += 1
+                if fsync_calls == fail_fsync:
+                    raise OSError(errno.EIO, "simulated rollback power loss")
+                durable[path] = {
+                    candidate.name
+                    for candidate in (source_path, stage_path)
+                    if candidate.parent == path and os.path.lexists(candidate)
+                }
+            return original_fsync(directory_fd, path)
+
+        monkeypatch.setattr(memory_tool, "_fsync_directory_fd", fail_one_fsync)
+        with pytest.raises(OSError, match="simulated rollback power loss"):
+            memory_tool._reset_restore_plan(handles, plan)
+
+        _restore_only_fsynced_reset_dentries(source_path, stage_path, durable)
+        monkeypatch.setattr(memory_tool, "_fsync_directory_fd", original_fsync)
+        assert memory_tool._recover_reset_transactions(
+            handles, os.listdir(handles.mem_fd)
+        ) is False
+
+    assert source_path.read_text(encoding="utf-8") == "private"
+    assert not stage_path.exists()
+    assert not (memories / receipt_name).exists()
+
+
 def test_memory_reset_cleanup_failure_is_explicit_and_retryable(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     memories = home / "memories"

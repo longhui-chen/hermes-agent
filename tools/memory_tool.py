@@ -1028,16 +1028,13 @@ def _reset_move_no_replace(
         dst_dir_fd=handles.mem_fd,
         follow_symlinks=False,
     )
-    try:
-        os.unlink(source_name, dir_fd=source_fd)
-    except BaseException:
-        try:
-            os.unlink(stage_name, dir_fd=handles.mem_fd)
-        except OSError:
-            pass
-        raise
-    _reset_fsync_scope(handles, source_scope)
+    # The staged dentry must be durable before the source dentry can be
+    # durably removed.  This ordering matters when source and stage live in
+    # different directories: fsyncing the source first can lose both names on
+    # power failure even though link(2) succeeded in memory.
     _fsync_directory_fd(handles.mem_fd, handles.mem_dir)
+    os.unlink(source_name, dir_fd=source_fd)
+    _reset_fsync_scope(handles, source_scope)
     handles.verify_attached()
 
 
@@ -1049,13 +1046,16 @@ def _reset_restore_plan(
         source = _reset_entry_stat(source_fd, entry["name"])
         stage = _reset_entry_stat(handles.mem_fd, entry["stage"])
         if stage is None:
+            if source is None:
+                raise MemoryImportConflict(
+                    f"reset recovery lost both source and stage: {entry['name']}"
+                )
             continue
         if source is not None:
             if (source.st_dev, source.st_ino) != (stage.st_dev, stage.st_ino):
                 raise MemoryImportConflict(
                     f"cannot restore reset source occupied by another file: {entry['name']}"
                 )
-            os.unlink(entry["stage"], dir_fd=handles.mem_fd)
         else:
             os.link(
                 entry["stage"],
@@ -1064,8 +1064,11 @@ def _reset_restore_plan(
                 dst_dir_fd=source_fd,
                 follow_symlinks=False,
             )
-            os.unlink(entry["stage"], dir_fd=handles.mem_fd)
+        # Confirm the restored source name before deleting the only durable
+        # staged name.  If either fsync fails, the staging receipt and at least
+        # one linked name remain for the next recovery attempt.
         _reset_fsync_scope(handles, entry["scope"])
+        os.unlink(entry["stage"], dir_fd=handles.mem_fd)
         _fsync_directory_fd(handles.mem_fd, handles.mem_dir)
     handles.verify_attached()
 
