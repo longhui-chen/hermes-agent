@@ -14,7 +14,7 @@ _AUTHORIZATION_BEARER_RE = re.compile(
 )
 _CREDENTIAL_ASSIGNMENT_RE = re.compile(
     r"(?:^|[\s{,])[\"']?"
-    r"((?:[a-z0-9]+[._ -])*(?:api[._ -]?key|client[._ -]?secret|"
+    r"((?:[a-z0-9]+[._-])*(?:api[._ -]?key|client[._ -]?secret|"
     r"secret[._ -]?access[._ -]?key|access[._ -]?token|refresh[._ -]?token|"
     r"auth[._ -]?token|authorization|credentials?|secret|token|password|"
     r"passwd|cookie|private[._ -]?key))"
