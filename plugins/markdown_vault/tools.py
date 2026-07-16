@@ -481,6 +481,16 @@ def handle_vault_list(args=None, **kwargs) -> str:
                 # any folder were ever returned. Match the real contract.
                 {"path": abs_path, "index": page, "size": _LIST_PAGE_SIZE},
             )
+            # The file API answers HTTP 200 with the status in `code`; a missing/
+            # denied folder (or listing a file) returns a non-OK code + data:null,
+            # which without this check becomes an empty listing the agent can't tell
+            # from a genuinely empty folder. Surface it as an error (like vault_read).
+            if isinstance(resp, dict):
+                code = resp.get("code")
+                if code in _NOT_FOUND_CODES:
+                    return _err(f"folder not found ({folder or 'vault root'})")
+                if code is not None and code != _OK_CODE:
+                    return _err(f"cannot list folder '{folder or 'vault root'}' (code {code})")
             # CommonListResp: {total, content: [FileListItem], index, size}
             data = (resp or {}).get("data") or {}
             batch = data.get("content") or []
@@ -546,13 +556,26 @@ def _is_hidden_rel(rel: str) -> bool:
     return any(seg.startswith(".") for seg in rel.split(os.sep) if seg)
 
 
+def _as_bool(v) -> bool:
+    """Coerce a tool arg to bool. `bool("false")` is True (non-empty string), so a
+    model passing the string "false"/"0" must not silently enable content search."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "yes", "on")
+    return bool(v)
+
+
 def handle_vault_search(args=None, **kwargs) -> str:
     args = args if isinstance(args, dict) else kwargs
     query = args.get("query", "")
     if not query:
         return _err("'query' is required")
-    content = bool(args.get("content", False))
-    limit = int(args.get("limit", 30) or 30)
+    content = _as_bool(args.get("content", False))
+    try:
+        limit = int(args.get("limit", 30) or 30)
+    except (TypeError, ValueError):
+        limit = 30
     limit = max(1, min(limit, 200))
     sources = ["name", "doc"] if content else ["name"]
     try:
@@ -681,6 +704,27 @@ def handle_vault_write(args=None, **kwargs) -> str:
     return f"ok: updated {note} (previous version backed up to {backup_rel})"
 
 
+def _is_dir_in_vault(abs_path: str) -> bool:
+    """Best-effort: is abs_path a directory? Lists the parent and matches the
+    entry's is_dir flag. Lets delete EXPLICITLY refuse a directory rather than
+    relying on /file/content happening to error on dirs. Returns False when it
+    can't tell (the caller's content-read guard remains the backstop)."""
+    parent = os.path.dirname(abs_path.rstrip(os.sep))
+    name = os.path.basename(abs_path.rstrip(os.sep))
+    if not name:
+        return False
+    try:
+        resp = _post_json("/file/list", {"path": parent, "index": 1, "size": _LIST_PAGE_SIZE})
+    except Exception:  # noqa: BLE001 — indeterminate → defer to the read guard
+        return False
+    if isinstance(resp, dict) and resp.get("code") not in (None, _OK_CODE):
+        return False
+    for it in ((resp or {}).get("data") or {}).get("content") or []:
+        if it.get("name") == name:
+            return bool(it.get("is_dir"))
+    return False
+
+
 def handle_vault_delete(args=None, **kwargs) -> str:
     args = args if isinstance(args, dict) else kwargs
     note = (args.get("note") or "").strip()
@@ -692,6 +736,12 @@ def handle_vault_delete(args=None, **kwargs) -> str:
         return _err(str(e))
     if abs_path == _vault_root():
         return _err("refusing to delete the vault root")
+    # Explicitly refuse to delete a DIRECTORY — the server delete is os.RemoveAll
+    # (recursive), so a mistakenly-targeted folder would wipe every note under it
+    # with only a useless empty backup. Check the entry type via the parent listing
+    # instead of inferring file-ness from a content-read side effect.
+    if _is_dir_in_vault(abs_path):
+        return _err(f"refusing to delete a directory ({note}); this tool deletes note files only")
     # A read failure must abort the delete (we can't back up what we can't read,
     # and treating unreadable as absent would drop the backup guarantee).
     try:

@@ -192,6 +192,7 @@ def test_write_reports_failure_when_upload_rejected(monkeypatch):
 
 def test_delete_backs_up_then_removes(monkeypatch):
     order = []
+    monkeypatch.setattr(tools, "_is_dir_in_vault", lambda p: False)
     monkeypatch.setattr(tools, "_read_note", lambda p: "DOOMED")
     monkeypatch.setattr(tools, "_backup", lambda note, content: order.append(("backup", content)) or ".zettlab-trash/x")
     monkeypatch.setattr(tools, "_delete_abs", lambda p: order.append(("delete", p)))
@@ -201,12 +202,36 @@ def test_delete_backs_up_then_removes(monkeypatch):
 
 
 def test_delete_missing_note_is_error_no_delete(monkeypatch):
+    monkeypatch.setattr(tools, "_is_dir_in_vault", lambda p: False)
     monkeypatch.setattr(tools, "_read_note", lambda p: None)  # not found
     calls = {"n": 0}
     monkeypatch.setattr(tools, "_delete_abs", lambda p: calls.__setitem__("n", calls["n"] + 1))
     out = tools.handle_vault_delete(note="ghost.md")
     assert "not found" in out
     assert calls["n"] == 0, "must not call delete for a missing note"
+
+
+def test_delete_refuses_directory(monkeypatch):
+    """Explicit directory guard: a folder must not be deleted (server delete is
+    recursive RemoveAll) — regression against a latent recursive wipe."""
+    monkeypatch.setattr(tools, "_is_dir_in_vault", lambda p: True)  # target is a dir
+    calls = {"n": 0}
+    monkeypatch.setattr(tools, "_read_note", lambda p: calls.__setitem__("n", calls["n"] + 1))
+    monkeypatch.setattr(tools, "_delete_abs", lambda p: calls.__setitem__("n", calls["n"] + 1))
+    out = tools.handle_vault_delete(note="Projects")
+    assert "directory" in out.lower()
+    assert calls["n"] == 0, "must not read/delete when the target is a directory"
+
+
+def test_search_content_arg_string_false_is_false(monkeypatch):
+    """`bool("false")` is True; the coercion must treat the string "false" as False
+    so a model can't accidentally enable content search."""
+    captured = {}
+    monkeypatch.setattr(tools, "_post_sse", lambda path, body, cap: captured.update(body) or [])
+    tools.handle_vault_search(query="x", content="false")
+    assert captured["sources"] == ["name"], "content='false' must not enable doc search"
+    tools.handle_vault_search(query="x", content="true")
+    assert "doc" in captured["sources"]
 
 
 def test_delete_rejects_escape(monkeypatch):
