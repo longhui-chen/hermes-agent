@@ -593,6 +593,12 @@ def test_parser_rejects_non_presets_or_compound_connector_runtime(monkeypatch, t
     direct = terminal_tool_module._parse_connector_runtime_command(
         'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py" list-tools'
     )
+    unquoted_braced = terminal_tool_module._parse_connector_runtime_command(
+        "python3 ${ZETTLAB_PRESETS_DIR}/skills/linear/scripts/connector_runtime.py list-tools"
+    )
+    quoted_braced = terminal_tool_module._parse_connector_runtime_command(
+        'python3 "${ZETTLAB_PRESETS_DIR}/skills/linear/scripts/connector_runtime.py" list-tools'
+    )
     relative = terminal_tool_module._parse_connector_runtime_command(
         "python3 skills/linear/scripts/connector_runtime.py list-tools"
     )
@@ -615,12 +621,50 @@ def test_parser_rejects_non_presets_or_compound_connector_runtime(monkeypatch, t
     )
 
     assert direct is not None
+    assert unquoted_braced is not None
+    assert quoted_braced is not None
     assert relative is not None
     assert absolute is not None
     assert compound is None
     assert newline_compound is None
     assert quoted_punctuation is not None
     assert non_presets is None
+
+
+def test_shell_guard_blocks_wrapped_unquoted_braced_presets_path(monkeypatch, tmp_path):
+    _write_connector_runtime(tmp_path)
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+
+    result = terminal_tool_module._connector_runtime_shell_guard_result(
+        "timeout 30 python3 ${ZETTLAB_PRESETS_DIR}/skills/linear/scripts/connector_runtime.py "
+        "list-tools; true"
+    )
+
+    assert result is not None
+    assert json.loads(result)["connector_runtime_blocked"] is True
+
+
+def test_shell_guard_still_blocks_brace_grouped_runtime(monkeypatch, tmp_path):
+    _write_connector_runtime(tmp_path)
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+
+    result = terminal_tool_module._connector_runtime_shell_guard_result(
+        '{ python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py" '
+        "list-tools; true; }"
+    )
+
+    assert result is not None
+    assert json.loads(result)["connector_runtime_blocked"] is True
 
 
 def test_parser_rejects_writable_presets_runner_by_default(monkeypatch, tmp_path):
