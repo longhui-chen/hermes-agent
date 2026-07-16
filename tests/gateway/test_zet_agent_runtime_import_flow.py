@@ -62,7 +62,11 @@ async def test_completed_transcript_http_flow_requires_auth_and_commits_atomical
 
 
 @pytest.mark.asyncio
-async def test_runtime_import_flow_rejects_credentials_at_final_consumer(tmp_path):
+async def test_runtime_import_flow_rejects_credentials_at_final_consumer(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
     db = SessionDB(tmp_path / "state.db")
     adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
     adapter._session_db = db
@@ -96,7 +100,38 @@ async def test_runtime_import_flow_rejects_credentials_at_final_consumer(tmp_pat
             )
             assert memory.status == 400
             assert (await memory.json())["error"]["code"] == "invalid_memory_import"
+            credential_id = "sk-1234567890abcdefghij"
+            metadata = await cli.post(
+                "/api/sessions/import",
+                json={
+                    **payload,
+                    "import_id": credential_id,
+                    "messages": [
+                        {"role": "user", "content": "safe", "created_at": 1}
+                    ],
+                },
+                headers=headers,
+            )
+            assert metadata.status == 400
+            assert (await metadata.json())["error"]["code"] == "invalid_runtime_import"
+            memory_metadata = await cli.post(
+                "/api/memory/import",
+                json={
+                    "import_id": credential_id,
+                    "mode": "replace",
+                    "target": "memory",
+                    "payload_sha256": hashlib.sha256(b"memory-id").hexdigest(),
+                    "entries": ["safe fact"],
+                },
+                headers=headers,
+            )
+            assert memory_metadata.status == 400
+            assert (await memory_metadata.json())["error"]["code"] == "invalid_memory_import"
         assert db.get_session("target") is None
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM runtime_imports"
+        ).fetchone()[0] == 0
+        assert not (home / "memories" / ".imports").exists()
     finally:
         db.close()
 

@@ -70,6 +70,30 @@ def test_memory_import_rejects_credentials_without_writing(tmp_path, monkeypatch
     assert not (home / "memories" / "MEMORY.md").exists()
 
 
+@pytest.mark.parametrize(
+    "import_id",
+    [
+        "sk-1234567890abcdefghij",
+        "github_pat_abcdefghijklmnopqrstuvwxyz1234",
+    ],
+)
+def test_memory_import_rejects_credential_import_id_without_writing(
+    tmp_path, monkeypatch, import_id
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=1000, user_char_limit=1000)
+    with pytest.raises(ValueError, match="import_id contains forbidden"):
+        store.import_replace(
+            target="memory",
+            entries=["safe fact"],
+            import_id=import_id,
+            payload_sha256=hashlib.sha256(b"credential-id").hexdigest(),
+        )
+    assert not (home / "memories" / "MEMORY.md").exists()
+    assert not (home / "memories" / ".imports").exists()
+
+
 def test_memory_import_allows_non_secret_examples_and_placeholders(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -83,7 +107,7 @@ def test_memory_import_allows_non_secret_examples_and_placeholders(tmp_path, mon
         '{"credentials": {}}',
     ]
     result = store.import_replace(
-        target="memory", entries=entries, import_id="safe-examples",
+        target="memory", entries=entries, import_id="sk-example",
         payload_sha256=hashlib.sha256(b"safe-examples").hexdigest(),
     )
     assert result["status"] == "completed"

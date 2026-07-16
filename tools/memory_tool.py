@@ -663,6 +663,7 @@ class MemoryStore:
             raise ValueError("target must be memory or user")
         if not isinstance(import_id, str) or not import_id or len(import_id) > 128:
             raise ValueError("import_id must be 1..128 characters")
+        reject_portable_credentials(import_id, field="import_id")
         if not re.fullmatch(r"[0-9a-fA-F]{64}", payload_sha256 or ""):
             raise ValueError("payload_sha256 must be 64 hexadecimal characters")
         if not isinstance(entries, list) or len(entries) > 128:

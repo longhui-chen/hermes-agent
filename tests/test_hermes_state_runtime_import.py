@@ -250,6 +250,55 @@ def test_runtime_import_rejects_credential_in_title_before_staging(tmp_path):
         db.close()
 
 
+@pytest.mark.parametrize(
+    ("field", "credential"),
+    [
+        (field, credential)
+        for field in ("import_id", "source", "source_session_id", "target_session_id")
+        for credential in (
+            "sk-1234567890abcdefghij",
+            "github_pat_abcdefghijklmnopqrstuvwxyz1234",
+        )
+    ],
+)
+def test_runtime_import_rejects_credential_metadata_before_staging(
+    tmp_path, field, credential
+):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        values = {
+            "import_id": "safe-import",
+            "source": "workbuddy",
+            "source_session_id": "source-session",
+            "target_session_id": "target-session",
+        }
+        values[field] = credential
+        with pytest.raises(ValueError, match=f"{field} contains forbidden"):
+            db.stage_completed_transcript_import(
+                **values,
+                title=None,
+                payload_sha256=hashlib.sha256(b"payload").hexdigest(),
+                expected_message_count=1,
+                chunk_index=0,
+                messages=[{"role": "user", "content": "safe", "created_at": 1}],
+            )
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM runtime_imports"
+        ).fetchone()[0] == 0
+        assert db.get_session(values["target_session_id"]) is None
+    finally:
+        db.close()
+
+
+def test_runtime_import_allows_placeholder_import_id(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        result = _stage(db, import_id="sk-example", expected=1)
+        assert result["status"] == "staged"
+    finally:
+        db.close()
+
+
 def test_runtime_import_reserves_target_across_database_connections(tmp_path):
     path = tmp_path / "state.db"
     first = SessionDB(path)

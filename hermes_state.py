@@ -3748,11 +3748,15 @@ class SessionDB:
                              ("source_session_id", source_session_id),
                              ("target_session_id", target_session_id)):
             _validate_runtime_import_identifier(field, value)
+        from portable_import_security import reject_portable_credentials
+        for field, value in (("import_id", import_id), ("source", source),
+                             ("source_session_id", source_session_id),
+                             ("target_session_id", target_session_id)):
+            reject_portable_credentials(value, field=field)
         if title is not None and not isinstance(title, str):
             raise ValueError("title must be text when provided")
         title = self.sanitize_title(title)
         if title:
-            from portable_import_security import reject_portable_credentials
             reject_portable_credentials(title, field="title")
         if not re.fullmatch(r"[0-9a-fA-F]{64}", payload_sha256 or ""):
             raise ValueError("payload_sha256 must be 64 hexadecimal characters")
