@@ -12304,6 +12304,7 @@ def cmd_memory(args):
         print("  Saved to config.yaml\n")
     elif sub == "reset":
         from hermes_constants import get_hermes_home, display_hermes_home
+        from tools.memory_tool import curated_memory_has_state, reset_curated_memory
 
         mem_dir = get_hermes_home() / "memories"
         target = getattr(args, "target", "all")
@@ -12314,9 +12315,11 @@ def cmd_memory(args):
             files_to_reset.append(("USER.md", "user profile"))
 
         # Check what exists
-        existing = [
-            (f, desc) for f, desc in files_to_reset if (mem_dir / f).exists()
-        ]
+        existing = []
+        for f, desc in files_to_reset:
+            item = "memory" if f == "MEMORY.md" else "user"
+            if curated_memory_has_state(item):
+                existing.append((f, desc))
         if not existing:
             print(
                 f"\n  Nothing to reset — no memory files found in {display_hermes_home()}/memories/\n"
@@ -12326,8 +12329,11 @@ def cmd_memory(args):
         print(f"\n  This will permanently erase the following memory files:")
         for f, desc in existing:
             path = mem_dir / f
-            size = path.stat().st_size
-            print(f"    ◆ {f} ({desc}) — {size:,} bytes")
+            if os.path.lexists(path):
+                size = path.lstat().st_size
+                print(f"    ◆ {f} ({desc}) — {size:,} bytes")
+            else:
+                print(f"    ◆ {f} ({desc}) — import recovery state")
 
         if not getattr(args, "yes", False):
             try:
@@ -12339,8 +12345,8 @@ def cmd_memory(args):
                 print("  Cancelled.\n")
                 return
 
+        reset_curated_memory(target)
         for f, desc in existing:
-            (mem_dir / f).unlink()
             print(f"  ✓ Deleted {f} ({desc})")
 
         print(

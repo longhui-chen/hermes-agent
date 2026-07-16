@@ -197,6 +197,34 @@ class TestMemoryEndpoints:
             "/api/memory/reset", json={"target": "bogus"}
         ).status_code == 400
 
+    def test_reset_removes_memory_import_recovery_state(self):
+        import hashlib
+        from pathlib import Path
+
+        from hermes_constants import get_hermes_home
+        from tools.memory_tool import MemoryStore
+
+        mem = get_hermes_home() / "memories"
+        (mem / "MEMORY.md").write_text("private old memory", encoding="utf-8")
+        result = MemoryStore(memory_char_limit=100, user_char_limit=100).import_replace(
+            target="memory",
+            entries=["imported memory"],
+            import_id="dashboard-reset-import",
+            payload_sha256=hashlib.sha256(b"dashboard-reset-import").hexdigest(),
+        )
+        recovery_path = Path(result["recovery_path"])
+        backup_path = Path(result["backup_path"])
+        receipt_path = next((mem / ".imports").glob("*.json"))
+
+        response = self.client.post("/api/memory/reset", json={"target": "memory"})
+
+        assert response.status_code == 200
+        assert "MEMORY.md" in response.json()["deleted"]
+        assert not (mem / "MEMORY.md").exists()
+        assert not recovery_path.exists()
+        assert not backup_path.exists()
+        assert not receipt_path.exists()
+
 
 class TestPairingEndpoints:
     @pytest.fixture(autouse=True)

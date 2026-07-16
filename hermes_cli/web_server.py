@@ -9743,22 +9743,13 @@ async def reset_memory(body: MemoryReset):
     if target not in {"all", "memory", "user"}:
         raise HTTPException(status_code=400, detail="target must be all, memory, or user")
 
-    mem_dir = get_hermes_home() / "memories"
-    deleted = []
-    targets = []
-    if target in {"all", "memory"}:
-        targets.append("MEMORY.md")
-    if target in {"all", "user"}:
-        targets.append("USER.md")
-    for fname in targets:
-        path = mem_dir / fname
-        if path.exists():
-            try:
-                path.unlink()
-                deleted.append(fname)
-            except OSError as exc:
-                raise HTTPException(status_code=500, detail=f"Could not delete {fname}: {exc}")
-    return {"ok": True, "deleted": deleted}
+    from tools.memory_tool import MemoryImportConflict, reset_curated_memory
+
+    try:
+        result = await asyncio.to_thread(reset_curated_memory, target)
+    except (OSError, MemoryImportConflict) as exc:
+        raise HTTPException(status_code=500, detail=f"Could not reset memory: {exc}")
+    return {"ok": True, "deleted": result["deleted"]}
 
 
 # ---------------------------------------------------------------------------

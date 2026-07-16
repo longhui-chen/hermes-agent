@@ -28,6 +28,7 @@ import json
 import logging
 import os
 import re
+import stat
 import tempfile
 import time
 from contextlib import contextmanager
@@ -72,10 +73,187 @@ def get_memory_dir() -> Path:
 ENTRY_DELIMITER = "\n§\n"
 MEMORY_IMPORT_BACKUP_LIMIT = 5
 _MISSING_MEMORY_FILE_SHA256 = "missing"
+_MEMORY_TARGET_FILES = {"memory": "MEMORY.md", "user": "USER.md"}
 
 
 class MemoryImportConflict(ValueError):
     """An import id or receipt conflicts with the live curated memory."""
+
+
+def _is_real_directory(path: Path) -> bool:
+    """Return True only for a directory entry that is not a symlink."""
+    try:
+        return stat.S_ISDIR(os.lstat(path).st_mode)
+    except FileNotFoundError:
+        return False
+
+
+def _unlink_file_entry(path: Path) -> bool:
+    """Unlink one non-directory entry without following a symlink leaf."""
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return False
+    if stat.S_ISDIR(mode):
+        return False
+    os.unlink(path)
+    return True
+
+
+def _read_import_receipt_no_follow(path: Path) -> Optional[Dict[str, Any]]:
+    """Read one regular receipt without following a symlink receipt."""
+    try:
+        before = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(before.st_mode):
+        return None
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        after = os.fstat(fd)
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or before.st_dev != after.st_dev
+            or before.st_ino != after.st_ino
+        ):
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            value = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return value if isinstance(value, dict) else None
+
+
+def _target_has_import_state(mem_dir: Path, target: str) -> bool:
+    filename = _MEMORY_TARGET_FILES[target]
+    backup_prefix = f"{target}-"
+    displaced_prefix = f".{filename}."
+    imports_dir = mem_dir / ".imports"
+    backup_dir = imports_dir / "backups"
+
+    if _is_real_directory(mem_dir):
+        with os.scandir(mem_dir) as entries:
+            if any(
+                entry.name.startswith(displaced_prefix)
+                and entry.name.endswith(".displaced")
+                for entry in entries
+            ):
+                return True
+    if _is_real_directory(backup_dir):
+        with os.scandir(backup_dir) as entries:
+            if any(
+                entry.name.startswith(backup_prefix) and entry.name.endswith(".bak")
+                for entry in entries
+            ):
+                return True
+    if _is_real_directory(imports_dir):
+        with os.scandir(imports_dir) as entries:
+            for entry in entries:
+                if not entry.name.endswith(".json"):
+                    continue
+                receipt = _read_import_receipt_no_follow(Path(entry.path))
+                if receipt is not None and receipt.get("target") == target:
+                    return True
+    return False
+
+
+def curated_memory_has_state(target: str) -> bool:
+    """Return whether a reset target has canonical or managed import state."""
+    if target not in {"all", "memory", "user"}:
+        raise ValueError("target must be all, memory, or user")
+    mem_dir = get_memory_dir()
+    if not _is_real_directory(mem_dir):
+        return False
+    targets = ("memory", "user") if target == "all" else (target,)
+    for item in targets:
+        if os.path.lexists(mem_dir / _MEMORY_TARGET_FILES[item]):
+            return True
+        if _target_has_import_state(mem_dir, item):
+            return True
+    return False
+
+
+def reset_curated_memory(target: str) -> Dict[str, Any]:
+    """Permanently unlink canonical and profile-local import state for a target.
+
+    Receipt-provided paths are deliberately ignored. Managed backup and
+    displaced names are discovered only in fixed profile-local directories,
+    and directory symlinks are never traversed. A canonical symlink is unlinked
+    as a directory entry; its external target is not touched.
+    """
+    if target not in {"all", "memory", "user"}:
+        raise ValueError("target must be all, memory, or user")
+    mem_dir = get_memory_dir()
+    if not _is_real_directory(mem_dir):
+        return {"deleted": [], "targets": []}
+
+    targets = ("memory", "user") if target == "all" else (target,)
+    deleted: List[str] = []
+    imports_dir = mem_dir / ".imports"
+    backup_dir = imports_dir / "backups"
+
+    for item in targets:
+        filename = _MEMORY_TARGET_FILES[item]
+        path = mem_dir / filename
+        lock_path = path.with_suffix(path.suffix + ".lock")
+        if os.path.lexists(lock_path) and not stat.S_ISREG(os.lstat(lock_path).st_mode):
+            raise MemoryImportConflict(f"refusing to follow unsafe reset lock {lock_path}")
+
+        with MemoryStore._file_lock(path):
+            if _unlink_file_entry(path):
+                deleted.append(filename)
+
+            displaced_prefix = f".{filename}."
+            with os.scandir(mem_dir) as entries:
+                for entry in entries:
+                    if (
+                        entry.name.startswith(displaced_prefix)
+                        and entry.name.endswith(".displaced")
+                        and _unlink_file_entry(Path(entry.path))
+                    ):
+                        deleted.append(entry.name)
+
+            if _is_real_directory(backup_dir):
+                backup_prefix = f"{item}-"
+                with os.scandir(backup_dir) as entries:
+                    for entry in entries:
+                        if (
+                            entry.name.startswith(backup_prefix)
+                            and entry.name.endswith(".bak")
+                            and _unlink_file_entry(Path(entry.path))
+                        ):
+                            deleted.append(str(Path(".imports") / "backups" / entry.name))
+
+            if _is_real_directory(imports_dir):
+                with os.scandir(imports_dir) as entries:
+                    for entry in entries:
+                        if not entry.name.endswith(".json"):
+                            continue
+                        receipt_path = Path(entry.path)
+                        receipt = _read_import_receipt_no_follow(receipt_path)
+                        if receipt is None or receipt.get("target") != item:
+                            continue
+                        if _unlink_file_entry(receipt_path):
+                            deleted.append(str(Path(".imports") / entry.name))
+
+            _fsync_directory(mem_dir)
+            if _is_real_directory(imports_dir):
+                _fsync_directory(imports_dir)
+            if _is_real_directory(backup_dir):
+                _fsync_directory(backup_dir)
+
+    return {"deleted": deleted, "targets": list(targets)}
 
 
 # ---------------------------------------------------------------------------

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from tools.memory_tool import MemoryImportConflict, MemoryStore
+from tools.memory_tool import MemoryImportConflict, MemoryStore, reset_curated_memory
 
 
 def test_memory_import_replace_is_bounded_atomic_and_idempotent(tmp_path, monkeypatch):
@@ -365,6 +365,104 @@ def test_memory_import_retains_late_writes_from_preexisting_open_fd(
     assert replay["replayed"] is True
     assert replay["recovery_path"] == str(recovery_path)
     assert recovery_path.read_text(encoding="utf-8") == "late writer data"
+
+
+def test_memory_import_reset_removes_only_target_state(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    (memories / "MEMORY.md").write_text("previous memory", encoding="utf-8")
+    (memories / "USER.md").write_text("previous user", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=100, user_char_limit=100)
+
+    memory_result = store.import_replace(
+        target="memory",
+        entries=["old agent fact"],
+        import_id="reset-memory",
+        payload_sha256=hashlib.sha256(b"reset-memory").hexdigest(),
+    )
+    user_result = store.import_replace(
+        target="user",
+        entries=["old user fact"],
+        import_id="reset-user",
+        payload_sha256=hashlib.sha256(b"reset-user").hexdigest(),
+    )
+    memory_paths = {
+        Path(memory_result["backup_path"]),
+        Path(memory_result["recovery_path"]),
+    }
+    user_paths = {
+        Path(user_result["backup_path"]),
+        Path(user_result["recovery_path"]),
+    }
+
+    result = reset_curated_memory("memory")
+
+    assert "MEMORY.md" in result["deleted"]
+    assert not (home / "memories" / "MEMORY.md").exists()
+    assert not any(path.exists() for path in memory_paths)
+    remaining_receipts = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (home / "memories" / ".imports").glob("*.json")
+    ]
+    assert [receipt["target"] for receipt in remaining_receipts] == ["user"]
+    assert (home / "memories" / "USER.md").read_text(encoding="utf-8") == "old user fact"
+    assert all(path.exists() for path in user_paths)
+
+
+def test_memory_reset_does_not_follow_symlinks_or_receipt_paths(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    imports = memories / ".imports"
+    backups = imports / "backups"
+    backups.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    outside_memory = tmp_path / "outside-memory.md"
+    outside_memory.write_text("outside memory", encoding="utf-8")
+    (memories / "MEMORY.md").symlink_to(outside_memory)
+
+    outside_backup = tmp_path / "outside-backup.md"
+    outside_backup.write_text("outside backup", encoding="utf-8")
+    (backups / "memory-malicious.bak").symlink_to(outside_backup)
+
+    outside_displaced = tmp_path / "outside-displaced.md"
+    outside_displaced.write_text("outside displaced", encoding="utf-8")
+    receipt_path = imports / ("a" * 64 + ".json")
+    receipt_path.write_text(json.dumps({
+        "target": "memory",
+        "backup_path": str(outside_backup),
+        "displaced_path": str(outside_displaced),
+    }), encoding="utf-8")
+
+    reset_curated_memory("memory")
+
+    assert not os.path.lexists(memories / "MEMORY.md")
+    assert not os.path.lexists(backups / "memory-malicious.bak")
+    assert not receipt_path.exists()
+    assert outside_memory.read_text(encoding="utf-8") == "outside memory"
+    assert outside_backup.read_text(encoding="utf-8") == "outside backup"
+    assert outside_displaced.read_text(encoding="utf-8") == "outside displaced"
+
+
+def test_memory_reset_does_not_traverse_symlinked_backup_directory(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    imports = memories / ".imports"
+    imports.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    (memories / "MEMORY.md").write_text("memory", encoding="utf-8")
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_backup = outside / "memory-victim.bak"
+    outside_backup.write_text("must survive", encoding="utf-8")
+    (imports / "backups").symlink_to(outside, target_is_directory=True)
+
+    reset_curated_memory("memory")
+
+    assert outside_backup.read_text(encoding="utf-8") == "must survive"
 
 
 def test_memory_import_retains_only_five_recoverable_backups(tmp_path, monkeypatch):

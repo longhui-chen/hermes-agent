@@ -8,6 +8,8 @@ Covers:
 - Profile-scoped reset (uses HERMES_HOME)
 """
 
+from pathlib import Path
+
 import pytest
 
 
@@ -37,6 +39,7 @@ def _run_memory_reset(target="all", yes=False, monkeypatch=None, confirm_input="
     Simulates what happens when `hermes memory reset` is run.
     """
     from hermes_constants import get_hermes_home
+    from tools.memory_tool import curated_memory_has_state, reset_curated_memory
 
     mem_dir = get_hermes_home() / "memories"
     files_to_reset = []
@@ -45,7 +48,11 @@ def _run_memory_reset(target="all", yes=False, monkeypatch=None, confirm_input="
     if target in {"all", "user"}:
         files_to_reset.append(("USER.md", "user profile"))
 
-    existing = [(f, desc) for f, desc in files_to_reset if (mem_dir / f).exists()]
+    existing = []
+    for f, desc in files_to_reset:
+        item = "memory" if f == "MEMORY.md" else "user"
+        if curated_memory_has_state(item):
+            existing.append((f, desc))
     if not existing:
         return "nothing"
 
@@ -53,8 +60,7 @@ def _run_memory_reset(target="all", yes=False, monkeypatch=None, confirm_input="
         if confirm_input != "yes":
             return "cancelled"
 
-    for f, desc in existing:
-        (mem_dir / f).unlink()
+    reset_curated_memory(target)
 
     return "deleted"
 
@@ -141,6 +147,33 @@ class TestMemoryReset:
         result = _run_memory_reset(target="all", yes=True)
         assert result == "deleted"
         assert not (memories / "MEMORY.md").exists()
+
+    def test_reset_cleans_import_recovery_when_canonical_is_missing(
+        self, tmp_path, monkeypatch
+    ):
+        import hashlib
+
+        from tools.memory_tool import MemoryStore
+
+        home = tmp_path / ".hermes"
+        memories = home / "memories"
+        memories.mkdir(parents=True)
+        (memories / "MEMORY.md").write_text("private old memory", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        result = MemoryStore(memory_char_limit=100, user_char_limit=100).import_replace(
+            target="memory",
+            entries=["imported memory"],
+            import_id="cli-reset-import",
+            payload_sha256=hashlib.sha256(b"cli-reset-import").hexdigest(),
+        )
+        (memories / "MEMORY.md").unlink()
+
+        reset = _run_memory_reset(target="memory", yes=True)
+
+        assert reset == "deleted"
+        assert not Path(result["backup_path"]).exists()
+        assert not Path(result["recovery_path"]).exists()
+        assert not list((memories / ".imports").glob("*.json"))
 
     def test_reset_empty_memories_dir(self, tmp_path, monkeypatch):
         """No memories dir at all should report nothing."""
