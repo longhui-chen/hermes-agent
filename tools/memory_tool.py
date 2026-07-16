@@ -755,9 +755,13 @@ class MemoryStore:
                     _fsync_directory(path.parent)
                     receipt["state"] = "completed"
                     receipt["completed_at"] = time.time()
+                    if (
+                        displaced_path is not None
+                        and receipt.get("previous_file_sha256")
+                        != _MISSING_MEMORY_FILE_SHA256
+                    ):
+                        receipt["displaced_retention"] = "manual"
                     self._write_import_receipt(receipt_path, receipt)
-                    if displaced_path is not None:
-                        self._cleanup_import_displaced(Path(displaced_path))
                 elif (
                     state != "completed"
                     or live_sha != receipt.get("content_sha256")
@@ -776,13 +780,22 @@ class MemoryStore:
                             raise MemoryImportConflict(
                                 "memory import receipt has an invalid displaced path"
                             )
-                        self._cleanup_import_displaced(Path(displaced_path))
+                        if (
+                            Path(displaced_path).exists()
+                            and receipt.get("displaced_retention") != "manual"
+                        ):
+                            receipt["displaced_retention"] = "manual"
+                            self._write_import_receipt(receipt_path, receipt)
                 self._set_entries(target, normalized)
                 result = {"import_id": import_id, "status": "completed", "target": target,
                           "char_count": char_count, "replayed": True,
                           "effective_from": "next_session"}
                 if receipt.get("backup_path"):
                     result["backup_path"] = receipt["backup_path"]
+                displaced_path = receipt.get("displaced_path")
+                if displaced_path is not None and Path(displaced_path).exists():
+                    result["recovery_path"] = displaced_path
+                    result["recovery_retention"] = "manual"
                 return result
 
             # Capture the same parsed on-disk representation used by crash
@@ -811,6 +824,8 @@ class MemoryStore:
                 "displaced_path": str(displaced_path),
                 "prepared_at": time.time(),
             }
+            if previous_file_sha != _MISSING_MEMORY_FILE_SHA256:
+                receipt["displaced_retention"] = "manual"
             if backup_path:
                 receipt["backup_path"] = backup_path
             # Durable prepare MUST precede the target rename. A crash can then
@@ -820,13 +835,15 @@ class MemoryStore:
             receipt["state"] = "completed"
             receipt["completed_at"] = time.time()
             self._write_import_receipt(receipt_path, receipt)
-            self._cleanup_import_displaced(displaced_path)
             self._set_entries(target, normalized)
         result = {"import_id": import_id, "status": "completed", "target": target,
                   "char_count": char_count, "replayed": False,
                   "effective_from": "next_session"}
         if backup_path:
             result["backup_path"] = backup_path
+        if displaced_path.exists():
+            result["recovery_path"] = str(displaced_path)
+            result["recovery_retention"] = "manual"
         return result
 
     @staticmethod
@@ -1075,14 +1092,6 @@ class MemoryStore:
         )
 
     @staticmethod
-    def _cleanup_import_displaced(displaced_path: Path) -> None:
-        try:
-            displaced_path.unlink()
-        except FileNotFoundError:
-            return
-        _fsync_directory(displaced_path.parent)
-
-    @staticmethod
     def _restore_displaced_no_replace(displaced_path: Path, path: Path) -> None:
         try:
             os.link(displaced_path, path)
@@ -1109,6 +1118,13 @@ class MemoryStore:
         hard-link the prepared file into the unoccupied canonical name. This
         deliberately creates a short missing-name window so an external writer
         can win with create-if-absent instead of ever being overwritten.
+
+        The displaced inode is retained at its receipt-recorded path after a
+        successful import. A different process may still hold an open file
+        descriptor for that inode and write after completion; POSIX provides no
+        safe way to prove all such descriptors are closed. Automatic cleanup
+        would therefore risk losing those late writes. Operators may remove the
+        recovery path manually only after quiescing external writers.
         """
         content = ENTRY_DELIMITER.join(entries) if entries else ""
         effective_path = Path(os.path.realpath(path)) if path.is_symlink() else path

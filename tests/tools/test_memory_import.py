@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -313,7 +314,57 @@ def test_memory_import_prepared_recovery_flow_after_displacement(tmp_path, monke
     )
     assert result["replayed"] is True
     assert memory_path.read_text(encoding="utf-8") == "imported fact"
-    assert not displaced_path.exists()
+    assert result["recovery_path"] == str(displaced_path)
+    assert result["recovery_retention"] == "manual"
+    assert displaced_path.read_text(encoding="utf-8") == "old fact"
+
+
+def test_memory_import_retains_late_writes_from_preexisting_open_fd(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memory_path = home / "memories" / "MEMORY.md"
+    memory_path.parent.mkdir(parents=True)
+    memory_path.write_text("old fact", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=100, user_char_limit=100)
+    digest = hashlib.sha256(b"open-fd").hexdigest()
+
+    old_fd = os.open(memory_path, os.O_WRONLY)
+    try:
+        result = store.import_replace(
+            target="memory",
+            entries=["imported fact"],
+            import_id="open-fd",
+            payload_sha256=digest,
+        )
+        recovery_path = Path(result["recovery_path"])
+        receipt_path = next((home / "memories" / ".imports").glob("*.json"))
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+
+        assert memory_path.read_text(encoding="utf-8") == "imported fact"
+        assert receipt["displaced_path"] == str(recovery_path)
+        assert receipt["displaced_retention"] == "manual"
+        assert result["recovery_retention"] == "manual"
+
+        os.ftruncate(old_fd, 0)
+        os.write(old_fd, b"late writer data")
+        os.fsync(old_fd)
+    finally:
+        os.close(old_fd)
+
+    assert memory_path.read_text(encoding="utf-8") == "imported fact"
+    assert recovery_path.read_text(encoding="utf-8") == "late writer data"
+
+    replay = store.import_replace(
+        target="memory",
+        entries=["imported fact"],
+        import_id="open-fd",
+        payload_sha256=digest,
+    )
+    assert replay["replayed"] is True
+    assert replay["recovery_path"] == str(recovery_path)
+    assert recovery_path.read_text(encoding="utf-8") == "late writer data"
 
 
 def test_memory_import_retains_only_five_recoverable_backups(tmp_path, monkeypatch):
@@ -396,6 +447,7 @@ def test_memory_import_recovers_prepare_crash_with_legacy_duplicate_entries(tmp_
     receipt_path = next((home / "memories" / ".imports").glob("*.json"))
     legacy_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     legacy_receipt.pop("displaced_path")
+    legacy_receipt.pop("displaced_retention")
     receipt_path.write_text(json.dumps(legacy_receipt), encoding="utf-8")
 
     monkeypatch.setattr(store, "_write_file", original_write)
@@ -405,3 +457,9 @@ def test_memory_import_recovers_prepare_crash_with_legacy_duplicate_entries(tmp_
     )
     assert result["replayed"] is True
     assert memory_path.read_text(encoding="utf-8") == "imported fact"
+    recovery_path = Path(result["recovery_path"])
+    completed_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert completed_receipt["displaced_path"] == str(recovery_path)
+    assert completed_receipt["displaced_retention"] == "manual"
+    assert result["recovery_retention"] == "manual"
+    assert recovery_path.read_text(encoding="utf-8") == "old fact\n§\nold fact"
