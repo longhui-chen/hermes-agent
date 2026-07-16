@@ -55,13 +55,13 @@ class ZettlabVideoGenProvider(VideoGenProvider):
             cap, model = media_client.selected_model_capability("video")
         except Exception:
             return super().capabilities()
-        modalities: List[str] = ["text"]
+        modalities: List[str] = []
         aspect_ratios: List[str] = []
         resolutions: List[str] = []
         durations: List[int] = []
         if isinstance(model, dict):
             for value in model.get("modalities") or []:
-                if isinstance(value, str) and value not in modalities:
+                if isinstance(value, str) and value.strip() and value not in modalities:
                     modalities.append(value)
             for value in model.get("aspect_ratios") or []:
                 if isinstance(value, str) and value not in aspect_ratios:
@@ -77,7 +77,7 @@ class ZettlabVideoGenProvider(VideoGenProvider):
         if isinstance(limits, dict):
             max_refs = int(limits.get("max_remote_media_inputs") or 0)
         return {
-            "modalities": modalities,
+            "modalities": modalities or ["text"],
             "aspect_ratios": aspect_ratios or [DEFAULT_ASPECT_RATIO],
             "resolutions": resolutions or [DEFAULT_RESOLUTION],
             "max_duration": max(durations) if durations else 10,
@@ -126,12 +126,39 @@ class ZettlabVideoGenProvider(VideoGenProvider):
 
         try:
             effective_duration = int(duration or 0)
-            if effective_duration <= 0 and isinstance(model_capability, dict):
+            allowed_durations: List[int] = []
+            if isinstance(model_capability, dict):
                 for candidate in model_capability.get("durations") or []:
-                    if isinstance(candidate, int) and candidate > 0:
-                        effective_duration = candidate
-                        break
+                    if isinstance(candidate, int) and candidate > 0 and candidate not in allowed_durations:
+                        allowed_durations.append(candidate)
+            if allowed_durations:
+                if effective_duration <= 0:
+                    effective_duration = allowed_durations[0]
+                elif effective_duration not in allowed_durations:
+                    effective_duration = min(
+                        allowed_durations,
+                        key=lambda candidate: (abs(candidate - effective_duration), candidate),
+                    )
             inputs = media_client.remote_inputs(image_url, reference_image_urls)
+            configured_modalities = (
+                model_capability.get("modalities")
+                if isinstance(model_capability, dict)
+                else None
+            )
+            if (
+                isinstance(configured_modalities, list)
+                and "image" in configured_modalities
+                and "text" not in configured_modalities
+                and not inputs
+            ):
+                return error_response(
+                    error="An image input is required for this Zettlab video generation model.",
+                    error_type="missing_image",
+                    provider="zettlab",
+                    model=resolved_model,
+                    prompt=prompt,
+                    aspect_ratio=aspect_ratio,
+                )
             parameters: Dict[str, Any] = {}
             if negative_prompt:
                 parameters["negative_prompt"] = negative_prompt

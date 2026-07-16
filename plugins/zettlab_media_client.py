@@ -8,12 +8,12 @@ zettlab-ai-gateway.
 from __future__ import annotations
 
 import ipaddress
-import os
 import time
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import requests
+from agent.secret_scope import get_secret
 from tools.interrupt import is_interrupted
 
 _SESSION = requests.Session()
@@ -49,8 +49,24 @@ def _config_section(media_type: str) -> Dict[str, Any]:
 
 
 def base_url(media_type: str) -> str:
-    configured = os.environ.get("ZETTLAB_AI_PROXY_BASE_URL") or _config_section(media_type).get("base_url")
-    raw = str(configured or DEFAULT_BASE_URL).strip().rstrip("/")
+    explicit = str(get_secret("ZETTLAB_AI_PROXY_BASE_URL", "") or "").strip()
+    configured = explicit or _config_section(media_type).get("base_url")
+    if configured:
+        raw = str(configured).strip().rstrip("/")
+    else:
+        append_url = str(get_secret("ZET_CHAT_APPEND_URL", "") or "").strip()
+        if append_url:
+            parsed_append = urlparse(append_url)
+            raw = urlunparse((
+                parsed_append.scheme,
+                parsed_append.netloc,
+                "/api/v1/ai-proxy/v1",
+                "",
+                "",
+                "",
+            ))
+        else:
+            raw = DEFAULT_BASE_URL
     raw = raw or DEFAULT_BASE_URL
     parsed = urlparse(raw)
     host = (parsed.hostname or "").lower().rstrip(".")
@@ -90,7 +106,7 @@ def get_capabilities(media_type: Optional[str] = None) -> Dict[str, Any]:
 
 
 def action_headers() -> Dict[str, str]:
-    token = os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN", "").strip()
+    token = str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip()
     if not token:
         raise ZettlabMediaError("ZETTLAB_AGENT_ACTION_TOKEN is required for media generation")
     return {ACTION_TOKEN_HEADER: token}

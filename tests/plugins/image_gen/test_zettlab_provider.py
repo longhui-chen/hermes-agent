@@ -222,6 +222,47 @@ def test_zettlab_ai_proxy_rejects_non_loopback_base_url(monkeypatch):
         client.base_url("image")
 
 
+def test_zettlab_media_client_uses_profile_scoped_proxy_origin_and_action_token(monkeypatch):
+    from agent import secret_scope
+    from plugins import zettlab_media_client as client
+
+    previous_multiplex = secret_scope.is_multiplex_active()
+    monkeypatch.setattr(client, "_config_section", lambda media_type: {})
+    monkeypatch.setenv("ZET_CHAT_APPEND_URL", "http://127.0.0.1:9999/other-profile")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "other-token")
+    secret_scope.set_multiplex_active(True)
+    token = secret_scope.set_secret_scope({
+        "ZET_CHAT_APPEND_URL": "http://127.0.0.1:9420/api/v1/internal/chat/append",
+        "ZETTLAB_AGENT_ACTION_TOKEN": "profile-token",
+    })
+    try:
+        assert client.base_url("image") == "http://127.0.0.1:9420/api/v1/ai-proxy/v1"
+        assert client.action_headers() == {
+            "X-Zettlab-Agent-Action-Token": "profile-token",
+        }
+    finally:
+        secret_scope.reset_secret_scope(token)
+        secret_scope.set_multiplex_active(previous_multiplex)
+
+
+def test_zettlab_media_client_explicit_profile_proxy_base_wins(monkeypatch):
+    from agent import secret_scope
+    from plugins import zettlab_media_client as client
+
+    previous_multiplex = secret_scope.is_multiplex_active()
+    monkeypatch.setattr(client, "_config_section", lambda media_type: {})
+    secret_scope.set_multiplex_active(True)
+    token = secret_scope.set_secret_scope({
+        "ZETTLAB_AI_PROXY_BASE_URL": "http://127.0.0.1:9430/custom/ai-proxy/v1",
+        "ZET_CHAT_APPEND_URL": "http://127.0.0.1:9420/api/v1/internal/chat/append",
+    })
+    try:
+        assert client.base_url("video") == "http://127.0.0.1:9430/custom/ai-proxy/v1"
+    finally:
+        secret_scope.reset_secret_scope(token)
+        secret_scope.set_multiplex_active(previous_multiplex)
+
+
 def test_zettlab_ai_proxy_ignores_environment_proxies(monkeypatch):
     from plugins import zettlab_media_client as client
 

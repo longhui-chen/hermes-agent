@@ -72,6 +72,20 @@ def test_zettlab_video_capabilities_use_only_selected_model(monkeypatch):
     assert caps["min_duration"] == caps["max_duration"] == 5
 
 
+def test_zettlab_video_capabilities_preserve_image_only_modality(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setattr(client, "selected_model_capability", lambda media_type: ({
+        "limits": {"max_remote_media_inputs": 1},
+    }, {
+        "id": "image-only",
+        "modalities": ["image"],
+        "durations": [5],
+    }))
+
+    assert ZettlabVideoGenProvider().capabilities()["modalities"] == ["image"]
+
+
 def test_zettlab_video_generate_creates_media_job(monkeypatch):
     from plugins import zettlab_media_client as client
 
@@ -154,6 +168,57 @@ def test_zettlab_video_generate_uses_gateway_default_when_model_is_omitted(monke
     assert captured["duration"] == 5
     assert got["duration"] == 5
     assert capability_calls == 1
+
+
+def test_zettlab_video_generate_normalizes_duration_to_nearest_supported_value(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setattr(
+        client,
+        "resolve_model_with_capability",
+        lambda media_type, requested=None: ("seedance-v1", {
+            "id": "seedance-v1",
+            "modalities": ["text"],
+            "durations": [5, 10],
+        }),
+    )
+    captured = {}
+
+    def fake_create_and_wait(**kwargs):
+        captured.update(kwargs["payload"])
+        return {"job_id": "job-nearest", "status": "done", "assets": [{"url": "https://cdn.example/nearest.mp4"}]}
+
+    monkeypatch.setattr(client, "create_and_wait", fake_create_and_wait)
+
+    got = ZettlabVideoGenProvider().generate("make video", duration=8)
+
+    assert got["success"] is True
+    assert captured["duration"] == 10
+    assert got["duration"] == 10
+
+
+def test_zettlab_video_image_only_model_requires_image_input(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setattr(
+        client,
+        "resolve_model_with_capability",
+        lambda media_type, requested=None: ("image-only", {
+            "id": "image-only",
+            "modalities": ["image"],
+            "durations": [5],
+        }),
+    )
+    monkeypatch.setattr(
+        client,
+        "create_and_wait",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("request should not be sent")),
+    )
+
+    got = ZettlabVideoGenProvider().generate("animate this")
+
+    assert got["success"] is False
+    assert got["error_type"] == "missing_image"
 
 
 def test_zettlab_video_rejects_non_https_remote_input(monkeypatch):
