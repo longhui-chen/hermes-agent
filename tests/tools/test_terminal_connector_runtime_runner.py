@@ -1,5 +1,6 @@
 import json
 import os
+import shlex
 import sys
 import textwrap
 from io import StringIO
@@ -18,8 +19,8 @@ def _reset_connector_runtime_root_anchor(monkeypatch):
     )
 
 
-def _write_connector_runtime(tmp_path):
-    script = tmp_path / "presets" / "skills" / "linear" / "scripts" / "connector_runtime.py"
+def _write_connector_runtime(tmp_path, skill_id="linear"):
+    script = tmp_path / "presets" / "skills" / skill_id / "scripts" / "connector_runtime.py"
     script.parent.mkdir(parents=True)
     script.write_text(textwrap.dedent(
         """
@@ -316,6 +317,268 @@ def test_compound_connector_runtime_command_flow_is_blocked_and_retried_singly(m
     assert "separate terminal tool call" in result["error"]
     assert "connector token ok" not in result["output"]
     assert "runner-token" not in result["output"]
+
+
+@pytest.mark.parametrize(
+    ("connector_kind", "skill_id", "runtime_args"),
+    [
+        ("first_party", "github", "list-tools --prefix github."),
+        ("custom_mcp", "custom-connectors", "call custom_connector.list_tools --args-json '{}'"),
+        ("custom_api", "custom-connectors", "call custom_connector.list_tools --args-json '{}'"),
+    ],
+)
+@pytest.mark.parametrize(
+    "command_template",
+    [
+        "timeout 30 {runtime}; true",
+        "env FOO=1 {runtime} && true",
+        "sudo -n {runtime} || true",
+        "command {runtime}; true",
+    ],
+)
+def test_wrapped_connector_runtime_flow_is_blocked_for_all_connector_kinds(
+    monkeypatch,
+    tmp_path,
+    connector_kind,
+    skill_id,
+    runtime_args,
+    command_template,
+):
+    """Every connector kind keeps runtime context out of wrapper shells."""
+    from agent import secret_scope as ss
+
+    _write_connector_runtime(tmp_path, skill_id)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "runner-token")
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+    ss.set_multiplex_active(False)
+    runtime = (
+        f'python3 "$ZETTLAB_PRESETS_DIR/skills/{skill_id}/scripts/connector_runtime.py" '
+        f"{runtime_args}"
+    )
+
+    result = json.loads(terminal_tool_module.terminal_tool(
+        command_template.format(runtime=runtime),
+        task_id=f"connector-runtime-wrapper-{connector_kind}",
+    ))
+
+    assert result["connector_runtime_blocked"] is True
+    assert result["errorCode"] == "connector_runtime_compound_command"
+    assert result["connector_error"]["nextAction"] == {"type": "retry_single_command"}
+    assert "runner-token" not in json.dumps(result)
+
+
+def test_single_wrapped_connector_runtime_command_is_blocked(monkeypatch, tmp_path):
+    _write_connector_runtime(tmp_path)
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+
+    result = json.loads(terminal_tool_module._run_connector_runtime_command_if_allowed(
+        'timeout 30 python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py" list-tools',
+        cwd=str(tmp_path),
+        timeout=5,
+    ))
+
+    assert result["connector_runtime_blocked"] is True
+    assert result["errorCode"] == "connector_runtime_compound_command"
+
+
+@pytest.mark.parametrize(
+    "command_template",
+    [
+        "FOO=1 {runtime}; true",
+        "exec {runtime}; true",
+        "nice -n 10 {runtime}; true",
+        "nohup {runtime}; true",
+        "setsid {runtime}; true",
+        "stdbuf -o L {runtime}; true",
+        "time {runtime}; true",
+        "builtin {runtime}; true",
+        "( {runtime} ); true",
+        "python3 -u {script} list-tools; true",
+    ],
+)
+def test_connector_runtime_shell_guard_blocks_similar_non_direct_shapes(
+    monkeypatch,
+    tmp_path,
+    command_template,
+):
+    script = _write_connector_runtime(tmp_path)
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+    runtime = (
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py" '
+        "list-tools"
+    )
+
+    result = terminal_tool_module._connector_runtime_shell_guard_result(
+        command_template.format(runtime=runtime, script=script)
+    )
+
+    assert result is not None
+    assert json.loads(result)["connector_runtime_blocked"] is True
+
+
+@pytest.mark.parametrize(
+    ("connector_kind", "skill_id"),
+    [
+        ("first_party_linear", "linear"),
+        ("first_party_github", "github"),
+        ("custom_mcp", "custom-connectors"),
+        ("custom_api", "custom-connectors"),
+    ],
+)
+@pytest.mark.parametrize("shell_command", ["sh -c", "bash -lc"])
+def test_nested_shell_connector_runtime_flow_is_blocked_for_all_connector_kinds(
+    monkeypatch,
+    tmp_path,
+    connector_kind,
+    skill_id,
+    shell_command,
+):
+    _write_connector_runtime(tmp_path, skill_id)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "runner-token")
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+    nested = (
+        f'python3 "$ZETTLAB_PRESETS_DIR/skills/{skill_id}/scripts/connector_runtime.py" '
+        "list-tools; true"
+    )
+
+    result = json.loads(terminal_tool_module.terminal_tool(
+        f"{shell_command} {shlex.quote(nested)}",
+        task_id=f"nested-shell-{connector_kind}",
+    ))
+
+    assert result["connector_runtime_blocked"] is True
+    assert result["errorCode"] == "connector_runtime_compound_command"
+    assert "runner-token" not in json.dumps(result)
+
+
+def test_nested_shell_guard_ignores_runtime_path_used_as_command_data(monkeypatch):
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_resolve_connector_runtime_script",
+        lambda path: pytest.fail(f"data-only runtime path was resolved: {path}"),
+    )
+    nested = (
+        'echo python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py"; '
+        "true"
+    )
+
+    result = terminal_tool_module._connector_runtime_shell_guard_result(
+        f"bash -lc {shlex.quote(nested)}"
+    )
+
+    assert result is None
+
+
+def test_nested_shell_guard_stops_parsing_options_after_double_dash(monkeypatch):
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_resolve_connector_runtime_script",
+        lambda path: pytest.fail(f"non-command runtime path was resolved: {path}"),
+    )
+    nested = (
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py"; '
+        "true"
+    )
+
+    result = terminal_tool_module._connector_runtime_shell_guard_result(
+        f"bash -- -c {shlex.quote(nested)}"
+    )
+
+    assert result is None
+
+
+def test_connector_runtime_flow_blocks_three_nested_command_shells(monkeypatch, tmp_path):
+    _write_connector_runtime(tmp_path)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+    command = (
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py" '
+        "list-tools; true"
+    )
+    for shell_command in ("bash -lc", "sh -c", "dash -c"):
+        command = f"{shell_command} {shlex.quote(command)}"
+
+    result = json.loads(terminal_tool_module.terminal_tool(
+        command,
+        task_id="connector-runtime-three-nested-shells",
+    ))
+
+    assert result["connector_runtime_blocked"] is True
+    assert result["errorCode"] == "connector_runtime_compound_command"
+
+
+@pytest.mark.parametrize(
+    ("background", "pty"),
+    [(True, False), (False, True)],
+)
+def test_connector_runtime_flow_blocks_unsupported_execution_modes(
+    monkeypatch,
+    tmp_path,
+    background,
+    pty,
+):
+    _write_connector_runtime(tmp_path)
+    monkeypatch.setenv("TERMINAL_ENV", "local")
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "runner-token")
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+
+    result = json.loads(terminal_tool_module.terminal_tool(
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py" list-tools',
+        background=background,
+        pty=pty,
+        task_id="connector-runtime-unsupported-mode",
+    ))
+
+    assert result["connector_runtime_blocked"] is True
+    assert result["errorCode"] == "connector_runtime_compound_command"
+    assert "foreground non-PTY" in result["error"]
+    assert "runner-token" not in json.dumps(result)
+
+
+def test_connector_runtime_shell_guard_ignores_runtime_path_used_as_command_data(monkeypatch):
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_resolve_connector_runtime_script",
+        lambda path: pytest.fail(f"data-only runtime path was resolved: {path}"),
+    )
+
+    result = terminal_tool_module._connector_runtime_shell_guard_result(
+        'echo python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py"; true'
+    )
+
+    assert result is None
 
 
 def test_parser_rejects_non_presets_or_compound_connector_runtime(monkeypatch, tmp_path):
