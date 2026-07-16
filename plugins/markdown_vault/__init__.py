@@ -1,14 +1,20 @@
-"""markdown_vault plugin — read-only agent access to the user's Obsidian/markdown vault.
+"""markdown_vault plugin — agent access to the user's Obsidian/markdown vault.
 
-Provides three tools (vault_list / vault_read / vault_search) that retrieve
-notes through the local-server loopback file API. There is deliberately no
-write/move/delete surface — read-only is a property of the tool set, not of
-instructions (spec 2026-07-08 local-data-access §4.6, D9/T7).
+Read tools (vault_list / vault_read / vault_search) live in toolset
+"markdown_vault"; write tools (vault_write / vault_delete) live in a SEPARATE
+toolset "markdown_vault_write" that is default-off and only granted when the
+user explicitly enables write access for the agent. All go through the
+local-server loopback file API (spec 2026-07-08 local-data-access §4.6, D9/T7;
+permission-model-v2 2026-07-13).
 
-The profile that mounts this plugin should NOT also expose terminal /
-write_file / execute_code / delegate_task etc.; withholding those at the
-profile/toolset layer is what makes the whole surface read-only (skills and
-skills_guard cannot enforce that at runtime). See SKILL.md.
+Read-vs-write is a property of the TOOL SET, not of instructions: the write
+surface is withheld by not enabling the write toolset AND, at the runtime layer,
+by check_vault_write_requirements — which needs the device's explicit
+MARKDOWN_VAULT_WRITE grant — never by prompt text. A profile that mounts this
+plugin for read-only should NOT also expose terminal / write_file /
+execute_code / delegate_task etc.; withholding those at the profile/toolset
+layer is what keeps a read grant read-only (skills / skills_guard cannot enforce
+that at runtime). See SKILL.md.
 """
 
 from __future__ import annotations
@@ -23,6 +29,7 @@ from plugins.markdown_vault.tools import (
     VAULT_SEARCH_SCHEMA,
     VAULT_WRITE_SCHEMA,
     check_vault_requirements,
+    check_vault_write_requirements,
     handle_vault_delete,
     handle_vault_list,
     handle_vault_read,
@@ -67,7 +74,11 @@ def register(ctx) -> None:
             toolset="markdown_vault_write",
             schema=schema,
             handler=handler,
-            check_fn=check_vault_requirements,
+            # Write tools use the STRICTER gate: read requirements PLUS an explicit
+            # per-agent write grant (MARKDOWN_VAULT_WRITE) the device sets only when
+            # the profile grants write. Keeps write default-off at the runtime layer,
+            # not just in tools_config (PR #185 P1-1).
+            check_fn=check_vault_write_requirements,
             emoji=emoji,
         )
     # Register the bundled SKILL.md so the read-only / prompt-injection guidance

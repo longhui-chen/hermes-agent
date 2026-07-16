@@ -77,6 +77,11 @@ actually need to answer the question.
   capability (`vault_write`/`vault_delete`); if those tools aren't present,
   tell the user note editing isn't enabled for this agent rather than pretending
   to do it.
+- These tools only exist when the DEVICE has provisioned vault access for this
+  agent: it injects the vault location (`MARKDOWN_VAULT_PATH`) for read, plus an
+  explicit write grant (`MARKDOWN_VAULT_WRITE`) for write. Without them the tools
+  don't appear at all — there is no default location to fall back to. So "no vault
+  tools" means "this agent wasn't granted vault access", not a transient glitch.
 - Tag search is best-effort: `#tag` is matched as literal text inside note
   bodies (`content=true`), since there is no dedicated tag index yet.
 - Content search depends on the device's file index; on some builds only
