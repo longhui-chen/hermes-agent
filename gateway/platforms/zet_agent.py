@@ -127,6 +127,10 @@ async def _to_thread_with_completion_barrier(func, /, *args, **kwargs):
             except asyncio.CancelledError:
                 # A second cancellation request must not reopen the same race.
                 continue
+            except BaseException:
+                # The cancelled request must keep cancellation as its public
+                # outcome even when the worker finishes with an exception.
+                break
         try:
             worker.result()
         except BaseException:

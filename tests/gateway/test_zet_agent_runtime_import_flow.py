@@ -11,7 +11,10 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
-from gateway.platforms.zet_agent import ZetAgentAdapter
+from gateway.platforms.zet_agent import (
+    ZetAgentAdapter,
+    _to_thread_with_completion_barrier,
+)
 from hermes_state import SessionDB
 
 
@@ -468,6 +471,29 @@ async def test_cancelled_session_import_holds_unload_barrier_until_worker_exits(
     with pytest.raises(asyncio.CancelledError):
         await task
     assert (await adapter._handle_profile_unload(_DirectImportRequest(None))).status == 200
+
+
+@pytest.mark.asyncio
+async def test_cancelled_import_keeps_cancellation_when_worker_fails():
+    started = threading.Event()
+    release = threading.Event()
+
+    def fail_after_release():
+        started.set()
+        assert release.wait(2)
+        raise RuntimeError("worker failed")
+
+    task = asyncio.create_task(
+        _to_thread_with_completion_barrier(fail_after_release)
+    )
+    assert await asyncio.to_thread(started.wait, 1)
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 def test_runtime_import_barrier_allows_only_a_recreated_profile_generation(tmp_path):
