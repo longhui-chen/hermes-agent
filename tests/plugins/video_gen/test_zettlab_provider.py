@@ -40,7 +40,7 @@ def _capabilities():
 def test_zettlab_video_provider_reads_capabilities(monkeypatch):
     from plugins import zettlab_media_client as client
 
-    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout: _Resp(_capabilities()))
+    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout, allow_redirects: _Resp(_capabilities()))
 
     provider = ZettlabVideoGenProvider()
     assert provider.is_available() is True
@@ -79,7 +79,8 @@ def test_zettlab_video_generate_creates_media_job(monkeypatch):
     captured = {}
     monkeypatch.setattr(client._SESSION, "get", lambda url, **kwargs: _Resp(_capabilities()))
 
-    def fake_post(url, json, headers, timeout):
+    def fake_post(url, json, headers, timeout, allow_redirects):
+        assert allow_redirects is False
         captured["url"] = url
         captured["json"] = json
         captured["headers"] = headers
@@ -134,7 +135,8 @@ def test_zettlab_video_generate_uses_gateway_default_when_model_is_omitted(monke
         "models": [{"id": "seedance-default"}],
     })
 
-    def fake_post(url, json, headers, timeout):
+    def fake_post(url, json, headers, timeout, allow_redirects):
+        assert allow_redirects is False
         captured.update(json)
         return _Resp({"job_id": "job-video-default", "status": "done", "assets": [{"url": "https://cdn.example/default.mp4"}]})
 

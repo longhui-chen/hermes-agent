@@ -80,6 +80,7 @@ def get_capabilities(media_type: Optional[str] = None) -> Dict[str, Any]:
     resp = _SESSION.get(
         f"{base_url(mt)}/media/generation-capabilities",
         timeout=CAPABILITY_TIMEOUT,
+        allow_redirects=False,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -249,6 +250,7 @@ def create_and_wait(
         json=body,
         headers=headers,
         timeout=REQUEST_TIMEOUT,
+        allow_redirects=False,
     )
     resp.raise_for_status()
     job = resp.json()
@@ -271,6 +273,7 @@ def create_and_wait(
                     f"{base_url(media_type)}/media/generation-jobs/{job_id}",
                     headers=headers,
                     timeout=REQUEST_TIMEOUT,
+                    allow_redirects=False,
                 )
                 resp.raise_for_status()
                 job = resp.json()
@@ -308,6 +311,7 @@ def _delete_job(media_type: str, job_id: str, headers: Dict[str, str]) -> None:
             f"{base_url(media_type)}/media/generation-jobs/{job_id}",
             headers=headers,
             timeout=REQUEST_TIMEOUT,
+            allow_redirects=False,
         ).raise_for_status()
     except Exception:
         pass

@@ -29,7 +29,8 @@ def test_image_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
 
     captured = {}
 
-    def fake_post(url, json, headers, timeout):
+    def fake_post(url, json, headers, timeout, allow_redirects):
+        assert allow_redirects is False
         captured["json"] = json
         return _Resp({
             "job_id": "job-image",
@@ -37,7 +38,7 @@ def test_image_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
             "assets": [{"url": "https://cdn.example/image.png"}],
         })
 
-    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout: _Resp({
+    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout, allow_redirects: _Resp({
         "image": {
             "enabled": True,
             "default_model": "seedream-v4",
@@ -73,7 +74,8 @@ def test_video_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
 
     captured = {}
 
-    def fake_post(url, json, headers, timeout):
+    def fake_post(url, json, headers, timeout, allow_redirects):
+        assert allow_redirects is False
         captured["json"] = json
         return _Resp({
             "job_id": "job-video",
@@ -81,7 +83,7 @@ def test_video_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
             "assets": [{"url": "https://cdn.example/video.mp4"}],
         })
 
-    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout: _Resp({
+    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout, allow_redirects: _Resp({
         "video": {
             "enabled": True,
             "default_model": "seedance-v1",

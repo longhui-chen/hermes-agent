@@ -22,9 +22,10 @@ class _Resp:
 def test_zettlab_image_provider_reads_capabilities(monkeypatch):
     from plugins import zettlab_media_client as client
 
-    def fake_get(url, timeout):
+    def fake_get(url, timeout, allow_redirects):
         assert url == "http://127.0.0.1:9090/api/v1/ai-proxy/v1/media/generation-capabilities"
         assert timeout == client.CAPABILITY_TIMEOUT
+        assert allow_redirects is False
         return _Resp({
             "image": {
                 "enabled": True,
@@ -123,11 +124,12 @@ def test_zettlab_image_generate_creates_media_job(monkeypatch):
             },
         })
 
-    def fake_post(url, json, headers, timeout):
+    def fake_post(url, json, headers, timeout, allow_redirects):
         captured["url"] = url
         captured["json"] = json
         captured["headers"] = headers
         captured["timeout"] = timeout
+        captured["allow_redirects"] = allow_redirects
         return _Resp({
             "job_id": "job-1",
             "status": "done",
@@ -157,6 +159,7 @@ def test_zettlab_image_generate_creates_media_job(monkeypatch):
     assert captured["url"].endswith("/media/generation-jobs")
     assert captured["headers"]["X-Scene-Type"] == "media_generation"
     assert captured["headers"]["X-Zettlab-Agent-Action-Token"] == "media-token"
+    assert captured["allow_redirects"] is False
     assert captured["json"]["media_type"] == "image"
     assert captured["json"]["model"] == "seedream-v4"
     assert captured["json"]["output_count"] == 2
@@ -177,7 +180,8 @@ def test_zettlab_image_generate_uses_gateway_default_when_model_is_omitted(monke
         "models": [{"id": "seedream-default"}],
     })
 
-    def fake_post(url, json, headers, timeout):
+    def fake_post(url, json, headers, timeout, allow_redirects):
+        assert allow_redirects is False
         captured.update(json)
         return _Resp({"job_id": "job-default", "status": "done", "assets": [{"url": "https://cdn.example/default.png"}]})
 
@@ -244,6 +248,7 @@ def test_zettlab_poll_retries_transient_error_without_cleanup(monkeypatch):
     polls = iter([requests.ConnectionError("temporary"), _Resp({"job_id": "job-retry", "status": "done", "assets": [{"url": "https://cdn.example/done.png"}]})])
 
     def fake_get(*args, **kwargs):
+        assert kwargs["allow_redirects"] is False
         result = next(polls)
         if isinstance(result, Exception):
             raise result
@@ -263,7 +268,13 @@ def test_zettlab_poll_interrupt_deletes_job(monkeypatch):
     monkeypatch.setattr(client._SESSION, "post", lambda *args, **kwargs: _Resp({"job_id": "job-interrupt", "status": "running"}))
     monkeypatch.setattr(client, "is_interrupted", lambda: True)
     deleted = []
-    monkeypatch.setattr(client._SESSION, "delete", lambda url, **kwargs: deleted.append(url) or _Resp({}))
+
+    def fake_delete(url, **kwargs):
+        assert kwargs["allow_redirects"] is False
+        deleted.append(url)
+        return _Resp({})
+
+    monkeypatch.setattr(client._SESSION, "delete", fake_delete)
 
     with pytest.raises(client.ZettlabMediaError, match="interrupted"):
         client.create_and_wait(media_type="image", model="seedream-v4", prompt="stop", payload={}, timeout_seconds=10)
@@ -278,7 +289,13 @@ def test_zettlab_poll_exhaustion_deletes_job(monkeypatch):
     monkeypatch.setattr(client._SESSION, "post", lambda *args, **kwargs: _Resp({"job_id": "job-error", "status": "running"}))
     monkeypatch.setattr(client._SESSION, "get", lambda *args, **kwargs: (_ for _ in ()).throw(requests.ConnectionError("offline")))
     deleted = []
-    monkeypatch.setattr(client._SESSION, "delete", lambda url, **kwargs: deleted.append(url) or _Resp({}))
+
+    def fake_delete(url, **kwargs):
+        assert kwargs["allow_redirects"] is False
+        deleted.append(url)
+        return _Resp({})
+
+    monkeypatch.setattr(client._SESSION, "delete", fake_delete)
 
     with pytest.raises(requests.ConnectionError):
         client.create_and_wait(media_type="image", model="seedream-v4", prompt="fail", payload={}, timeout_seconds=10)
