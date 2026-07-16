@@ -720,7 +720,10 @@ def _is_dir_in_vault(abs_path: str) -> bool:
     if isinstance(resp, dict) and resp.get("code") not in (None, _OK_CODE):
         return False
     for it in ((resp or {}).get("data") or {}).get("content") or []:
-        if it.get("name") == name:
+        # The file API's FileListItem serialises the name as `filename` (not
+        # `name`); match both so the guard actually fires (handle_vault_list uses
+        # the same `filename or name` fallback).
+        if (it.get("filename") or it.get("name")) == name:
             return bool(it.get("is_dir"))
     return False
 

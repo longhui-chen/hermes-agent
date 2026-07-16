@@ -223,6 +223,20 @@ def test_delete_refuses_directory(monkeypatch):
     assert calls["n"] == 0, "must not read/delete when the target is a directory"
 
 
+def test_is_dir_in_vault_matches_filename_field(monkeypatch):
+    """Regression: FileListItem serialises the entry name as `filename`, not
+    `name` — the guard must read `filename` or it silently returns False for every
+    path (making the delete directory-guard dead code)."""
+    resp = {"code": 200, "data": {"content": [
+        {"filename": "Projects", "is_dir": True},
+        {"filename": "notes.md", "is_dir": False},
+    ]}}
+    monkeypatch.setattr(tools, "_post_json", lambda path, body: resp)
+    assert tools._is_dir_in_vault("/vault/Projects") is True
+    assert tools._is_dir_in_vault("/vault/notes.md") is False
+    assert tools._is_dir_in_vault("/vault/absent") is False
+
+
 def test_search_content_arg_string_false_is_false(monkeypatch):
     """`bool("false")` is True; the coercion must treat the string "false" as False
     so a model can't accidentally enable content search."""
