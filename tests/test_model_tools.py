@@ -9,6 +9,7 @@ from model_tools import (
     get_tool_definitions,
     get_all_tool_names,
     get_toolset_for_tool,
+    _resolve_active_context_length,
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
     TOOL_TO_TOOLSET_MAP,
@@ -204,6 +205,234 @@ class TestHandleFunctionCall:
 
 
 # =========================================================================
+# Tool-search context length resolution
+# =========================================================================
+
+class TestToolSearchContextLength:
+    def test_prefers_configured_model_context_length_without_metadata_probe(self, monkeypatch):
+        """Configured model.context_length should be authoritative for the
+        tool-search gate. This prevents cold-start metadata probing when
+        local-server has already written the context window into config.yaml.
+        """
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {
+                "model": {
+                    "default": "lite",
+                    "provider": "custom",
+                    "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+                    "api_key": "local-ai-proxy",
+                    "context_length": 200_000,
+                }
+            },
+        )
+
+        def fail_metadata_probe(*args, **kwargs):
+            raise AssertionError(
+                "metadata resolver should not run when model.context_length is set"
+            )
+
+        monkeypatch.setattr(
+            "agent.model_metadata.get_model_context_length",
+            fail_metadata_probe,
+        )
+
+        assert _resolve_active_context_length() == 200_000
+
+    def test_ai_proxy_context_resolution_flow_passes_runtime_to_resolver(self, monkeypatch):
+        """When context_length is absent, pass the ai-proxy provider bundle to
+        the resolver instead of looking up bare model='lite'. Bare lookups can
+        fall through to OpenRouter metadata; the provider bundle keeps the
+        probe on the local /v1/models endpoint.
+        """
+        cfg = {
+            "model": {
+                "default": "lite",
+                "provider": "custom",
+                "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+                "api_key": "local-ai-proxy",
+            },
+            "custom_providers": [
+                {
+                    "name": "zettlab-ai-proxy",
+                    "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+                    "models": {"lite": {"context_length": 200_000}},
+                }
+            ],
+        }
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+        captured = {}
+
+        def fake_get_model_context_length(model, **kwargs):
+            captured["model"] = model
+            captured["kwargs"] = kwargs
+            return 200_000
+
+        monkeypatch.setattr(
+            "agent.model_metadata.get_model_context_length",
+            fake_get_model_context_length,
+        )
+
+        assert _resolve_active_context_length() == 200_000
+        assert captured["model"] == "lite"
+        assert (
+            captured["kwargs"]["base_url"]
+            == "http://127.0.0.1:9090/api/v1/ai-proxy/v1"
+        )
+        assert captured["kwargs"]["api_key"] == "local-ai-proxy"
+        assert captured["kwargs"]["provider"] == "custom"
+        assert captured["kwargs"]["custom_providers"] == cfg["custom_providers"]
+
+    def test_named_provider_context_resolution_flow_uses_provider_base_url(
+        self,
+        monkeypatch,
+    ):
+        """Hermes v12 providers can name the active provider while keeping the
+        endpoint under providers.<key>. Tool-search context resolution must
+        pass that endpoint through so per-model context_length can match.
+        """
+        cfg = {
+            "model": {
+                "default": "lite",
+                "provider": "zettlab-ai-proxy",
+            },
+            "providers": {
+                "zettlab-ai-proxy": {
+                    "name": "Zettlab AI Proxy",
+                    "api": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+                    "api_key": "local-ai-proxy",
+                    "models": {"lite": {"context_length": 200_000}},
+                }
+            },
+        }
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+        captured = {}
+
+        def fake_get_model_context_length(model, **kwargs):
+            captured["model"] = model
+            captured["kwargs"] = kwargs
+            return 200_000
+
+        monkeypatch.setattr(
+            "agent.model_metadata.get_model_context_length",
+            fake_get_model_context_length,
+        )
+
+        assert _resolve_active_context_length() == 200_000
+        assert captured["model"] == "lite"
+        assert (
+            captured["kwargs"]["base_url"]
+            == "http://127.0.0.1:9090/api/v1/ai-proxy/v1"
+        )
+        assert captured["kwargs"]["api_key"] == "local-ai-proxy"
+        assert captured["kwargs"]["provider"] == "zettlab-ai-proxy"
+        assert captured["kwargs"]["custom_providers"][0]["provider_key"] == (
+            "zettlab-ai-proxy"
+        )
+
+    def test_named_provider_context_resolution_uses_key_env(
+        self,
+        monkeypatch,
+    ):
+        cfg = {
+            "model": {
+                "default": "lite",
+                "provider": "zettlab-ai-proxy",
+            },
+            "providers": {
+                "zettlab-ai-proxy": {
+                    "api": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+                    "key_env": "LOCAL_AI_PROXY_KEY",
+                    "models": {"lite": {"context_length": 200_000}},
+                }
+            },
+        }
+        monkeypatch.setenv("LOCAL_AI_PROXY_KEY", "local-ai-proxy")
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+        captured = {}
+
+        def fake_get_model_context_length(model, **kwargs):
+            captured["model"] = model
+            captured["kwargs"] = kwargs
+            return 200_000
+
+        monkeypatch.setattr(
+            "agent.model_metadata.get_model_context_length",
+            fake_get_model_context_length,
+        )
+
+        assert _resolve_active_context_length() == 200_000
+        assert captured["model"] == "lite"
+        assert (
+            captured["kwargs"]["base_url"]
+            == "http://127.0.0.1:9090/api/v1/ai-proxy/v1"
+        )
+        assert captured["kwargs"]["api_key"] == "local-ai-proxy"
+        assert captured["kwargs"]["provider"] == "zettlab-ai-proxy"
+
+    def test_ai_proxy_endpoint_context_resolution_does_not_call_openrouter(
+        self,
+        monkeypatch,
+    ):
+        """If config lacks context_length but has the ai-proxy endpoint, the
+        resolver should stop at local /v1/models metadata and never hit the
+        OpenRouter catalog fallback.
+        """
+        cfg = {
+            "model": {
+                "default": "lite",
+                "provider": "custom",
+                "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+                "api_key": "local-ai-proxy",
+            },
+        }
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+        monkeypatch.setattr(
+            "agent.model_metadata.get_cached_context_length",
+            lambda *args, **kwargs: None,
+        )
+        monkeypatch.setattr(
+            "agent.model_metadata.fetch_endpoint_model_metadata",
+            lambda base_url, api_key="": {
+                "lite": {
+                    "id": "lite",
+                    "context_length": 200_000,
+                }
+            },
+        )
+
+        def fail_openrouter_fetch(*args, **kwargs):
+            raise AssertionError("OpenRouter metadata fallback should not run")
+
+        monkeypatch.setattr(
+            "agent.model_metadata.fetch_model_metadata",
+            fail_openrouter_fetch,
+        )
+
+        assert _resolve_active_context_length() == 200_000
+
+    def test_invalid_configured_context_length_falls_back_to_resolver(
+        self,
+        monkeypatch,
+    ):
+        cfg = {
+            "model": {
+                "default": "lite",
+                "provider": "custom",
+                "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+                "context_length": True,
+            }
+        }
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: cfg)
+        monkeypatch.setattr(
+            "agent.model_metadata.get_model_context_length",
+            lambda *args, **kwargs: 200_000,
+        )
+
+        assert _resolve_active_context_length() == 200_000
+
+
+# =========================================================================
 # Agent loop tools
 # =========================================================================
 
@@ -384,7 +613,7 @@ class TestPreToolCallBlocking:
 class TestLegacyToolsetMap:
     def test_expected_legacy_names(self):
         expected = [
-            "web_tools", "terminal_tools", "vision_tools", "moa_tools",
+            "web_tools", "terminal_tools", "vision_tools",
             "image_tools", "skills_tools", "browser_tools", "cronjob_tools",
             "file_tools", "tts_tools",
         ]
@@ -466,3 +695,82 @@ class TestCoerceNumberInfNan:
         assert _coerce_number("42") == 42
         assert _coerce_number("3.14") == 3.14
         assert _coerce_number("1e3") == 1000
+
+class TestDisabledToolsetsPlatformBundle:
+    """Regression test for #33924: disabling a platform bundle (hermes-*)
+    must not remove core tools from other enabled toolsets."""
+
+    def test_disabling_platform_bundle_preserves_core_tools(self):
+        """Disabling hermes-yuanbao should not strip core tools from hermes-telegram."""
+        from model_tools import get_tool_definitions
+
+        tools_telegram = get_tool_definitions(
+            enabled_toolsets=["hermes-telegram"],
+            quiet_mode=True,
+        )
+        tools_telegram_no_yuanbao = get_tool_definitions(
+            enabled_toolsets=["hermes-telegram"],
+            disabled_toolsets=["hermes-yuanbao"],
+            quiet_mode=True,
+        )
+        names_telegram = {t["function"]["name"] for t in tools_telegram}
+        names_no_yuanbao = {t["function"]["name"] for t in tools_telegram_no_yuanbao}
+
+        # Disabling a *different* platform bundle must not remove any tools
+        assert names_telegram == names_no_yuanbao, (
+            f"Tools lost after disabling hermes-yuanbao: "
+            f"{names_telegram - names_no_yuanbao}"
+        )
+
+    def test_disabling_platform_bundle_removes_own_tools(self):
+        """Disabling hermes-discord should remove discord-specific tools."""
+        from model_tools import get_tool_definitions
+
+        tools = get_tool_definitions(
+            enabled_toolsets=["hermes-discord"],
+            disabled_toolsets=["hermes-discord"],
+            quiet_mode=True,
+        )
+        names = {t["function"]["name"] for t in tools}
+        assert "discord" not in names
+
+    def test_disabling_non_platform_toolset_still_works(self):
+        """Disabling a regular (non-hermes-) toolset still subtracts all tools."""
+        from model_tools import get_tool_definitions
+
+        tools_normal = get_tool_definitions(
+            enabled_toolsets=["hermes-telegram"],
+            quiet_mode=True,
+        )
+        tools_no_web = get_tool_definitions(
+            enabled_toolsets=["hermes-telegram"],
+            disabled_toolsets=["web"],
+            quiet_mode=True,
+        )
+        names_normal = {t["function"]["name"] for t in tools_normal}
+        names_no_web = {t["function"]["name"] for t in tools_no_web}
+
+        web_tools = {"web_search", "web_extract"}
+        removed = names_normal - names_no_web
+        # web tools should be removed (if they were present)
+        present_web = web_tools & names_normal
+        assert present_web <= removed, (
+            f"Web tools not removed: {present_web - removed}"
+        )
+
+
+    def test_disabling_bundle_removes_platform_tools_but_keeps_core(self):
+        """Disabling hermes-discord (when enabled) removes discord/discord_admin
+        from the resolved delta but keeps core tools — via bundle_non_core_tools."""
+        from toolsets import bundle_non_core_tools, _HERMES_CORE_TOOLS
+
+        delta = bundle_non_core_tools("hermes-yuanbao")
+        # The delta is the bundle's platform-specific tools, NOT core.
+        assert "yb_send_dm" in delta
+        assert not (delta & set(_HERMES_CORE_TOOLS)), "core tools must not be in the removal delta"
+
+    def test_bundle_non_core_tools_unknown_falls_back(self):
+        """An unknown/garbage bundle name falls back to full resolution (best effort)."""
+        from toolsets import bundle_non_core_tools
+        # A non-existent bundle resolves to an empty set (no tools), not a crash.
+        assert bundle_non_core_tools("hermes-does-not-exist") == set()

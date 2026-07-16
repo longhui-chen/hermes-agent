@@ -87,6 +87,39 @@ _CRON_ATTACHMENT_TEMP_DIRS = frozenset({
 _ABSOLUTE_PATH_RE = re.compile(r"(?<![\w./-])/{1,3}[^\s\"'<>`|)]{2,}")
 
 
+def _scoped_env(name: str, default: str = "") -> str:
+    """Read an env value through the cron profile secret scope when available.
+
+    Under the multiplex gateway there is no per-agent child process:
+    ZET_CHAT_APPEND_URL / ZET_AGENT_ID / ZETTLAB_AGENT_ACTION_TOKEN live in
+    the profile's ``.env`` (written by zettlab-local-server), NOT in
+    ``os.environ``. ``cron.scheduler._cron_env`` resolves through the active
+    profile secret scope — including a fresh ``.env`` re-read for values
+    written after gateway startup — and falls back to ``os.environ`` in
+    legacy per-profile processes.
+
+    On resolution failure (missing scope / upstream helper renamed) the
+    fallback is mode-dependent: legacy processes read ``os.environ`` (their
+    values were injected per-process, so it is safe), but under an ACTIVE
+    multiplexer we return the default instead — gateway startup loads the
+    active profile's ``.env`` into the process environment, so reading
+    ``os.environ`` here could deliver this cron's result with ANOTHER
+    profile's ZET_CHAT_APPEND_URL / action token. A skipped report beats a
+    cross-profile delivery.
+    """
+    try:
+        from cron.scheduler import _cron_env
+        return _cron_env(name, default)
+    except Exception:
+        try:
+            from agent.secret_scope import is_multiplex_active
+            if is_multiplex_active():
+                return default
+        except Exception:
+            pass
+        return os.environ.get(name, default)
+
+
 def _is_zet_agent_platform(platform: Any) -> bool:
     return str(platform or "").lower() in {"zet_agent", "zettlab"}
 
@@ -140,7 +173,7 @@ def _split_channel_targets(deliver):
 
 def _resolve_channel_send_url():
     """Derive local-server's channel-send endpoint from ZET_CHAT_APPEND_URL."""
-    raw = os.environ.get("ZET_CHAT_APPEND_URL", "").strip()
+    raw = _scoped_env("ZET_CHAT_APPEND_URL").strip()
     if not raw:
         return None
     from urllib.parse import urlsplit, urlunsplit
@@ -195,7 +228,7 @@ def _send_to_channel(kind: str, content: str, job_id: str):
     url = _resolve_channel_send_url()
     if not url:
         return "channel delivery: ZET_CHAT_APPEND_URL unset"
-    token = os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN", "").strip()
+    token = _scoped_env("ZETTLAB_AGENT_ACTION_TOKEN").strip()
     if not token:
         return "channel delivery: action token unavailable"
     from tools.channel_text import chunk_channel_text
@@ -276,6 +309,12 @@ def _handoff_session_id(old_id: str) -> Optional[str]:
     if len(parts) != 4 or parts[0] != "zettlab":
         return None
     return f"zettlab:{parts[1]}:{parts[2]}:{uuid.uuid4().hex[:12]}"
+
+
+def _is_calendar_reminders_session(session_id: str) -> bool:
+    """APP/local-server use this fixed synthetic chat for imported calendar reminders."""
+    parts = session_id.split(":", 3)
+    return len(parts) == 4 and parts[0] == "zettlab" and parts[3] == "calendar-reminders"
 
 
 def _fence_safe(text: str) -> str:
@@ -911,10 +950,10 @@ _shutdown = threading.Event()
 atexit.register(_shutdown.set)
 
 # The two literal fragments _redact_channel_failure depends on — the job name
-# sits between them ("⚠️ Cron job '<name>' failed:\n" is the upstream template).
+# sits between them ("⚠️ Cron '<name>' failed:\n" is the upstream template).
 # BOTH must survive an upstream sync, or the redaction silently stops matching
 # and raw errors leak through channel delivery.
-_CHANNEL_FAILURE_FRAGMENTS = ("⚠️ Cron job '", "' failed:")
+_CHANNEL_FAILURE_FRAGMENTS = ("⚠️ Cron '", "' failed:")
 
 
 def _warn_if_failure_template_drifted(scheduler_source: str) -> bool:
@@ -1029,7 +1068,7 @@ def _redact_channel_failure(job: dict, content: Optional[str]):
     pass anything else through unchanged.
 
     Detects the template by reconstructing the EXACT prefix upstream builds
-    (``⚠️ Cron job '<name>' failed:\\n``, name = ``job.get('name', job['id'])``)
+    (``⚠️ Cron '<name>' failed:\\n``, name = ``job.get('name', job['id'])``)
     from this job's own name/id and slicing by its length — NOT a regex. Job
     names are stored verbatim (cron/jobs.py only end-strips), so an interior
     newline in the name would defeat a ``.*?`` regex and leak the raw error to
@@ -1037,10 +1076,13 @@ def _redact_channel_failure(job: dict, content: Optional[str]):
     if not content:
         return content
     template_name = job.get("name", job.get("id", ""))
-    prefix = f"⚠️ Cron job '{template_name}' failed:\n"
-    if not content.startswith(prefix):
-        return content
-    return _friendly_failure(job.get("name", ""), content[len(prefix):])
+    for prefix in (
+        f"⚠️ Cron '{template_name}' failed:\n",
+        f"⚠️ Cron job '{template_name}' failed:\n",
+    ):
+        if content.startswith(prefix):
+            return _friendly_failure(job.get("name", ""), content[len(prefix):])
+    return content
 
 
 def _is_retryable_failure_result(result) -> bool:
@@ -1176,8 +1218,13 @@ def _try_persist_to_session(
         target_id = origin_chat_id
         origin_recreated = False
         if db.get_session(origin_chat_id) is None:
-            new_id = _handoff_session_id(origin_chat_id)
-            if new_id:
+            if _is_calendar_reminders_session(origin_chat_id):
+                db.create_session(origin_chat_id, source="zet_agent", user_id=_user_id_from(origin_chat_id))
+                _dbg(f"_try_persist: created synthetic calendar reminder session {origin_chat_id}")
+            else:
+                new_id = _handoff_session_id(origin_chat_id)
+                if not new_id:
+                    raise RuntimeError(f"cannot derive handoff session for missing origin {origin_chat_id!r}")
                 # source 与正常 App 会话一致（run_agent 用 platform 名），让承接会话
                 # 跟用户手建的对话同档，避免别处按 source 的隐性差异。
                 db.create_session(new_id, source="zet_agent", user_id=_user_id_from(origin_chat_id))
@@ -1215,11 +1262,11 @@ def _try_persist_to_session(
 
 
 def _try_notify_chat_append(session_id: str, msg_id: int, content: str) -> None:
-    url = os.environ.get("ZET_CHAT_APPEND_URL", "").strip()
+    url = _scoped_env("ZET_CHAT_APPEND_URL").strip()
     if not url:
         _dbg("_try_notify_chat_append: ZET_CHAT_APPEND_URL unset, skip")
         return
-    agent_id = os.environ.get("ZET_AGENT_ID", "").strip()
+    agent_id = _scoped_env("ZET_AGENT_ID").strip()
     payload = {
         "agent_id": agent_id,
         "session_id": session_id,
@@ -1294,6 +1341,24 @@ def _build_typed_message_content(
         "last_run_result": "success" if success else "failed",
         "scheduled_at": _now_iso(),
     }
+    if job.get("source") == "calendar":
+        metadata["source"] = "calendar"
+        for _key in (
+            "calendar_source_type",
+            "calendar_source_instance_id",
+            "calendar_source_platform",
+            "calendar_provider",
+            "calendar_connection_id",
+            "calendar_id",
+            "calendar_event_id",
+            "calendar_series_id",
+            "calendar_original_start",
+            "calendar_etag",
+            "content",
+        ):
+            _value = job.get(_key)
+            if _value:
+                metadata[_key] = _value
     # next_run_at 是绝对时刻（带 offset），App 据此把循环任务的展示时间换算到设备
     # 本地时区——绕开"cron 表达式按哪个时区写的"歧义（旧 job 存 UTC 表达式 +
     # timezone=None，按字面显示会差 8 小时）。timezone 一并带上：App 用它区分
@@ -1319,7 +1384,9 @@ def _build_typed_message_content(
     if attachments:
         metadata["attachments"] = attachments
 
-    if success:
+    if success and job.get("source") == "calendar":
+        body = str(job.get("content") or job.get("name") or "").strip()
+    elif success:
         body = _extract_response_body(_LATEST_OUTPUT.get(job_id, ""))
     else:
         # Friendly fallback; raw FAILED doc stays in the run .md.
@@ -1474,7 +1541,7 @@ def _collect_produced_files(job_id: str, job: Optional[dict] = None) -> List[Dic
 
 def _cron_agent_ids(job: Optional[dict]) -> set[str]:
     ids: set[str] = set()
-    env_agent_id = os.environ.get("ZET_AGENT_ID", "").strip()
+    env_agent_id = _scoped_env("ZET_AGENT_ID").strip()
     if env_agent_id:
         ids.add(env_agent_id)
     origin = (job or {}).get("origin") if isinstance(job, dict) else None

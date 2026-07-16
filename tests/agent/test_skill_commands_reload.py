@@ -12,6 +12,7 @@ dicts. Descriptions are truncated to 60 chars.
 
 import shutil
 import tempfile
+import threading
 import textwrap
 from pathlib import Path
 
@@ -39,10 +40,9 @@ def _write_skill(skills_dir: Path, name: str, description: str = "") -> Path:
 def hermes_home(monkeypatch):
     """Isolate HERMES_HOME for ``reload_skills`` tests.
 
-    Rather than popping cache-bearing modules from ``sys.modules`` (which
-    races against pytest-xdist's parallel workers), we monkeypatch the
-    module-level ``HERMES_HOME`` / ``SKILLS_DIR`` constants in place so the
-    isolation is local to this fixture's scope.
+    Rather than popping cache-bearing modules from ``sys.modules``,
+    we monkeypatch the module-level ``HERMES_HOME`` / ``SKILLS_DIR``
+    constants in place so the isolation is local to this fixture's scope.
     """
     td = tempfile.mkdtemp(prefix="hermes-reload-skills-")
     monkeypatch.setenv("HERMES_HOME", td)
@@ -58,6 +58,10 @@ def hermes_home(monkeypatch):
     monkeypatch.setattr(_st, "SKILLS_DIR", home / "skills", raising=False)
     # Reset the in-process slash-command cache so each test starts from zero.
     monkeypatch.setattr(_sc, "_skill_commands", {}, raising=False)
+    monkeypatch.setattr(_sc, "_skill_commands_platform", None, raising=False)
+    monkeypatch.setattr(_sc, "_skill_commands_skills_dir_key", None, raising=False)
+    monkeypatch.setattr(_sc, "_skill_commands_cache", {}, raising=False)
+    monkeypatch.setattr(_sc, "_skill_commands_generations", {}, raising=False)
 
     yield home
 
@@ -136,6 +140,181 @@ class TestReloadSkillsHelper:
         assert "alpha" in result["unchanged"]
         assert result["added"] == []
         assert result["removed"] == []
+
+    def test_reload_invalidates_other_platform_scopes_for_same_profile(
+        self, hermes_home, monkeypatch
+    ):
+        from agent.skill_commands import get_skill_commands, reload_skills
+
+        _write_skill(hermes_home / "skills", "old")
+
+        assert set(get_skill_commands()) == {"/old"}
+
+        monkeypatch.setenv("HERMES_PLATFORM", "telegram")
+        assert set(get_skill_commands()) == {"/old"}
+
+        _write_skill(hermes_home / "skills", "new")
+        result = reload_skills()
+
+        assert result["added"] == [{"name": "new", "description": "new skill"}]
+        assert set(get_skill_commands()) == {"/old", "/new"}
+
+        monkeypatch.delenv("HERMES_PLATFORM")
+        assert set(get_skill_commands()) == {"/old", "/new"}
+
+    def test_reload_blocks_inflight_stale_scan_from_repopulating_other_scope(
+        self, hermes_home, monkeypatch
+    ):
+        import agent.skill_utils as skill_utils
+        from agent.skill_commands import get_skill_commands, reload_skills
+
+        skills_dir = hermes_home / "skills"
+        _write_skill(skills_dir, "old")
+
+        monkeypatch.setenv("HERMES_PLATFORM", "telegram")
+        assert set(get_skill_commands()) == {"/old"}
+        monkeypatch.delenv("HERMES_PLATFORM")
+
+        real_iter = skill_utils.iter_skill_index_files
+        bare_thread_id = {}
+        bare_yielded_old = threading.Event()
+        release_bare_scan = threading.Event()
+
+        def interleaved_iter_skill_index_files(scan_dir, filename):
+            if (
+                threading.get_ident() == bare_thread_id.get("id")
+                and Path(scan_dir) == skills_dir
+            ):
+                for item in real_iter(scan_dir, filename):
+                    if item.parent.name == "old":
+                        yield item
+                        bare_yielded_old.set()
+                        assert release_bare_scan.wait(5)
+                        return
+                return
+            yield from real_iter(scan_dir, filename)
+
+        monkeypatch.setattr(
+            skill_utils,
+            "iter_skill_index_files",
+            interleaved_iter_skill_index_files,
+        )
+
+        bare_result = {}
+        errors = []
+
+        def run_bare_scan():
+            bare_thread_id["id"] = threading.get_ident()
+            try:
+                bare_result["commands"] = dict(get_skill_commands())
+            except Exception as exc:
+                errors.append(exc)
+
+        bare_thread = threading.Thread(target=run_bare_scan)
+        bare_thread.start()
+        assert bare_yielded_old.wait(5)
+
+        _write_skill(skills_dir, "new")
+        monkeypatch.setenv("HERMES_PLATFORM", "telegram")
+        result = reload_skills()
+
+        assert result["added"] == [{"name": "new", "description": "new skill"}]
+        assert set(get_skill_commands()) == {"/old", "/new"}
+
+        release_bare_scan.set()
+        bare_thread.join(5)
+        assert not bare_thread.is_alive()
+        assert errors == []
+        assert set(bare_result["commands"]) == {"/old"}
+
+        monkeypatch.delenv("HERMES_PLATFORM")
+        assert set(get_skill_commands()) == {"/old", "/new"}
+
+    def test_concurrent_reload_returns_after_current_scope_cache_is_published(
+        self, hermes_home, monkeypatch
+    ):
+        import agent.skill_commands as sc_mod
+        import agent.skill_utils as skill_utils
+        from agent.skill_commands import get_skill_commands, reload_skills
+
+        skills_dir = hermes_home / "skills"
+        _write_skill(skills_dir, "old")
+        assert set(get_skill_commands()) == {"/old"}
+        _write_skill(skills_dir, "new")
+
+        real_iter = skill_utils.iter_skill_index_files
+        real_bump = sc_mod._bump_skill_command_generation
+        a_thread_id = {}
+        b_thread_id = {}
+        a_scanned = threading.Event()
+        release_a = threading.Event()
+        b_bumped = threading.Event()
+        release_b = threading.Event()
+
+        def interleaved_iter_skill_index_files(scan_dir, filename):
+            current_id = threading.get_ident()
+            if current_id == a_thread_id.get("id") and Path(scan_dir) == skills_dir:
+                yield from real_iter(scan_dir, filename)
+                a_scanned.set()
+                assert release_a.wait(5)
+                return
+            if current_id == b_thread_id.get("id") and Path(scan_dir) == skills_dir:
+                yield from real_iter(scan_dir, filename)
+                assert release_b.wait(5)
+                return
+            yield from real_iter(scan_dir, filename)
+
+        def bump_generation(skills_dir_key):
+            real_bump(skills_dir_key)
+            if threading.get_ident() == b_thread_id.get("id"):
+                b_bumped.set()
+
+        monkeypatch.setattr(
+            skill_utils,
+            "iter_skill_index_files",
+            interleaved_iter_skill_index_files,
+        )
+        monkeypatch.setattr(sc_mod, "_bump_skill_command_generation", bump_generation)
+
+        a_result = {}
+        b_result = {}
+        errors = []
+
+        def run_a_reload():
+            a_thread_id["id"] = threading.get_ident()
+            try:
+                a_result["result"] = reload_skills()
+            except Exception as exc:
+                errors.append(exc)
+
+        def run_b_reload():
+            b_thread_id["id"] = threading.get_ident()
+            try:
+                b_result["result"] = reload_skills()
+            except Exception as exc:
+                errors.append(exc)
+
+        a_thread = threading.Thread(target=run_a_reload)
+        b_thread = threading.Thread(target=run_b_reload)
+        a_thread.start()
+        assert a_scanned.wait(5)
+
+        b_thread.start()
+        b_bumped.wait(0.5)
+
+        release_a.set()
+        a_thread.join(5)
+        assert not a_thread.is_alive()
+        assert errors == []
+        assert a_result["result"]["added"] == [
+            {"name": "new", "description": "new skill"}
+        ]
+        assert set(get_skill_commands()) == {"/old", "/new"}
+
+        release_b.set()
+        b_thread.join(5)
+        assert not b_thread.is_alive()
+        assert errors == []
 
     def test_does_not_invalidate_prompt_cache_snapshot(self, hermes_home):
         """reload_skills must NOT delete the skills prompt-cache snapshot.

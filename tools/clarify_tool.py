@@ -138,6 +138,8 @@ CLARIFY_SCHEMA = {
         "Right: question='Which deployment target?', choices=['staging', "
         "'prod']. Wrong: question='Which target? 1) staging 2) prod', choices=[].\n\n"
         "Use this tool when:\n"
+        "- Plan mode is active and essential information is missing; call "
+        "this before `present_plan`, then reassess after the response\n"
         "- The task is ambiguous and you need the user to choose an approach\n"
         "- You want post-task feedback ('How did that work out?')\n"
         "- You want to offer to save a skill or update memory\n"

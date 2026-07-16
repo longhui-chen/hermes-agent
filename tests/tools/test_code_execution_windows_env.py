@@ -177,6 +177,74 @@ class TestScrubChildEnvWindows:
         assert "APPDATA" in scrubbed
 
 
+class TestScrubKeepsHomeFallbackMarker:
+    """The scrubber must not drop HERMES_HOME_FALLBACK.
+
+    execute_code spawns a sandbox child with a scrubbed env, then applies
+    the subprocess HOME policy. If the marker is stripped, a grandchild
+    (execute_code inside a nested hermes) sees ``HOME == profile home``
+    with no marker, "repairs" it back to the pwd-guessed real home (/root),
+    and re-breaks ZET-1938 on the second hop. The marker is a non-secret
+    runtime-location flag — same class as HERMES_HOME — so it belongs in
+    the operational allowlist.
+    """
+
+    def test_marker_survives_scrub_posix(self):
+        from tools.code_execution_tool import _HERMES_CHILD_ALLOWED
+        assert "HERMES_HOME_FALLBACK" in _HERMES_CHILD_ALLOWED
+
+    def test_scrub_keeps_marker_value(self):
+        env = {
+            "HERMES_HOME": "/data/.hermes",
+            "HERMES_HOME_FALLBACK": "/data/.hermes/home",
+            "HOME": "/data/.hermes/home",
+            "PATH": "/usr/bin",
+        }
+        scrubbed = _scrub_child_env(env,
+                                    is_passthrough=_no_passthrough,
+                                    is_windows=False)
+        assert scrubbed["HERMES_HOME_FALLBACK"] == "/data/.hermes/home"
+        assert scrubbed["HERMES_HOME"] == "/data/.hermes"
+        assert scrubbed["HOME"] == "/data/.hermes/home"
+
+    def test_scrubbed_env_survives_nested_apply(self, tmp_path, monkeypatch):
+        """End-to-end: parent env (HOME=profile home, marked) is scrubbed for
+        the sandbox child, then the child's apply_subprocess_home_env keeps
+        HOME at the profile home rather than flipping it to the real-HOME
+        guess. This is the exact second-hop that P1-1 fixes."""
+        import hermes_constants
+        monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+        monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+        monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+
+        hermes_home = tmp_path / ".hermes"
+        profile_home = hermes_home / "home"
+        profile_home.mkdir(parents=True)
+
+        # A real OS-account HOME the buggy repair would flip back to.
+        real_home = tmp_path / "real-home"
+        real_home.mkdir()
+        monkeypatch.setenv("HERMES_REAL_HOME", str(real_home))
+
+        parent_env = {
+            "HERMES_HOME": str(hermes_home),
+            "HERMES_HOME_FALLBACK": str(profile_home),
+            "HOME": str(profile_home),
+            "PATH": "/usr/bin",
+        }
+        scrubbed = _scrub_child_env(parent_env,
+                                    is_passthrough=_no_passthrough,
+                                    is_windows=False)
+        # Marker preserved through the scrub.
+        assert scrubbed["HERMES_HOME_FALLBACK"] == str(profile_home)
+
+        from hermes_constants import apply_subprocess_home_env
+        apply_subprocess_home_env(scrubbed)
+
+        # Grandchild HOME stays at the profile home — no flip to real_home.
+        assert scrubbed["HOME"] == str(profile_home)
+
+
 class TestScrubChildEnvPassthroughInteraction:
     """The passthrough hook runs *before* the secret block, so a skill
     can legitimately forward a third-party API key.  The Windows
@@ -259,9 +327,12 @@ def _legacy_posix_scrubber(source_env, is_passthrough):
 
     Deliberately updated for #27303 (the broad ``HERMES_`` prefix was dropped
     in favor of an explicit operational allowlist, and DSN/WEBHOOK were added
-    to the secret substrings).  The original docstring said: if POSIX behavior
-    legitimately needs to evolve, adjust this oracle on purpose so the churn is
-    visible in review — that is what this change is.
+    to the secret substrings) and for the ZET-1938 nested-fallback fix
+    (HERMES_HOME_FALLBACK added to the operational allowlist so the second
+    hop of a nested hermes chain keeps its profile HOME).  The original
+    docstring said: if POSIX behavior legitimately needs to evolve, adjust
+    this oracle on purpose so the churn is visible in review — that is what
+    this change is.
     """
     _SAFE_ENV_PREFIXES = ("PATH", "HOME", "USER", "LANG", "LC_", "TERM",
                           "TMPDIR", "TMP", "TEMP", "SHELL", "LOGNAME",
@@ -270,6 +341,7 @@ def _legacy_posix_scrubber(source_env, is_passthrough):
                           "PASSWD", "AUTH", "DSN", "WEBHOOK")
     _HERMES_CHILD_ALLOWED = frozenset({
         "HERMES_HOME", "HERMES_PROFILE", "HERMES_CONFIG", "HERMES_ENV",
+        "HERMES_HOME_FALLBACK",
     })
     out = {}
     for k, v in source_env.items():
@@ -319,6 +391,7 @@ class TestPosixEquivalence:
         # every other HERMES_* is dropped (the broad prefix was removed).
         "HERMES_HOME": "/home/alice/.hermes",        # allowlisted → kept
         "HERMES_PROFILE": "default",                 # allowlisted → kept
+        "HERMES_HOME_FALLBACK": "/home/alice/.hermes/home",  # allowlisted → kept
         "HERMES_INTERACTIVE": "1",                   # not allowlisted → dropped
         "HERMES_BASE_URL": "https://api.internal",   # not allowlisted → dropped
         "HERMES_KANBAN_DB": "postgres://u:p@h/db",   # not allowlisted → dropped

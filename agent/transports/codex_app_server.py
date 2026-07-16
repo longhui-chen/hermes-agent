@@ -25,6 +25,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from tools.environments.local import hermes_subprocess_env
+
 # Default minimum codex version we test against. The PR sets this from the
 # `codex --version` parsed at install time; bumping is a one-line change here.
 MIN_CODEX_VERSION = (0, 125, 0)
@@ -74,7 +76,18 @@ class CodexAppServerClient:
         env: Optional[dict[str, str]] = None,
     ) -> None:
         self._codex_bin = codex_bin
-        spawn_env = os.environ.copy()
+        # codex app-server is a model-driving CLI executor: it runs a
+        # model-chosen agentic loop that executes shell commands, so it
+        # legitimately needs LLM provider credentials (inherit_credentials=True)
+        # to authenticate against the model endpoint. But the previous
+        # `os.environ.copy()` also handed it every Tier-1 Hermes secret — gateway
+        # bot tokens, GitHub auth, Modal/Daytona infra tokens, the dashboard
+        # session token, AUXILIARY_* side-LLM keys, GATEWAY_RELAY_* auth — none
+        # of which a coding subprocess has any use for. Route through the
+        # centralized helper so Tier-1 + dynamic-internal secrets are always
+        # stripped while provider creds still flow, matching copilot_acp_client
+        # (#29157 sibling spawn-site gap).
+        spawn_env = hermes_subprocess_env(inherit_credentials=True)
         if env:
             spawn_env.update(env)
         if codex_home:
@@ -113,6 +126,24 @@ class CodexAppServerClient:
         cmd = [codex_bin, "app-server"] + app_server_args
         # Codex emits tracing to stderr; default WARN keeps it quiet for users.
         spawn_env.setdefault("RUST_LOG", "warn")
+
+        # Bridge the context-local Hermes home override into the child's
+        # HERMES_HOME before the HOME contract runs. ContextVars don't cross
+        # process boundaries and the contract resolves HOME from the override,
+        # so without this the child's HERMES_HOME (stale process-global) and its
+        # HOME (override's profile home) would split. Mirrors the terminal spawn
+        # paths (_inject_context_hermes_home in tools/environments/local.py).
+        from hermes_constants import apply_subprocess_home_env, get_hermes_home_override
+        _override = get_hermes_home_override()
+        if _override:
+            spawn_env["HERMES_HOME"] = _override
+        # Route through the shared subprocess HOME contract. On a host with a
+        # real HOME this is a no-op (auto mode keeps it), so codex's shell tool
+        # subprocesses — gh/git/npm/aws — still find the user's real ~/.config,
+        # ~/.ssh. On a systemd/cron host with no HOME (ZET-1938) it falls HOME
+        # back to {HERMES_HOME}/home so those children can address ~ at all.
+        # CODEX_HOME (codex's own state) is a separate axis and is untouched.
+        apply_subprocess_home_env(spawn_env)
 
         self._proc = subprocess.Popen(
             cmd,

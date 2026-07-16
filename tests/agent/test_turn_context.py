@@ -9,11 +9,13 @@ confirm the prologue produces the right ``TurnContext`` and applies the
 from __future__ import annotations
 
 import types
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.context_compressor import ContextCompressor
 from agent.turn_context import TurnContext, build_turn_context
+from hermes_state import SessionDB
 
 
 class _FakeTodoStore:
@@ -71,10 +73,13 @@ class _FakeAgent:
         self._invalid_tool_retries = -1
         self._vision_supported = None
         self._persist_calls = 0
+        # Records _cached_system_prompt at the moment _ensure_db_session()
+        # is called (regression guard for #45499 turn-setup ordering).
+        self._ensure_db_prompt_at_call = "<unset>"
 
     # --- methods the prologue calls ---
     def _ensure_db_session(self):
-        pass
+        self._ensure_db_prompt_at_call = self._cached_system_prompt
 
     def _restore_primary_runtime(self):
         pass
@@ -96,6 +101,33 @@ class _FakeAgent:
 
     def _persist_session(self, *_a, **_k):
         self._persist_calls += 1
+
+
+def _make_agent_with_cooldown(db_path, session_id, *, cooldown_until=None):
+    agent = _FakeAgent()
+    agent.compression_enabled = True
+    agent._emit_status = MagicMock()
+    agent._compress_context = MagicMock(
+        side_effect=lambda messages, *_a, **_k: (messages, "SYSTEM")
+    )
+
+    db = SessionDB(db_path=db_path)
+    db.create_session(session_id, source="cli")
+    if cooldown_until is not None:
+        db.record_compression_failure_cooldown(session_id, cooldown_until, "timeout")
+
+    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        compressor = ContextCompressor(
+            model="test/model",
+            threshold_percent=0.85,
+            protect_first_n=2,
+            protect_last_n=2,
+            quiet_mode=True,
+        )
+    compressor.bind_session_state(db, session_id)
+    agent.context_compressor = compressor
+    agent._session_db = db
+    return agent
 
 
 @pytest.fixture(autouse=True)
@@ -191,6 +223,29 @@ def test_no_review_when_memory_disabled():
     assert ctx.should_review_memory is False
 
 
+def test_ensure_db_session_runs_after_system_prompt_restore():
+    """Regression for #45499.
+
+    On a fresh API/gateway agent (``_cached_system_prompt is None``) the DB
+    session row must be created AFTER the system prompt is restored/built, so
+    the persisted snapshot is written non-NULL. If ``_ensure_db_session()``
+    ran first it would insert ``system_prompt=NULL`` and trip the misleading
+    "stored system prompt is null; rebuilding" warning plus a first-turn
+    prefix cache miss.
+    """
+    agent = _FakeAgent()
+    agent._cached_system_prompt = None  # fresh agent, no cached prompt yet
+
+    def _restore(_agent, _system_message, _history):
+        _agent._cached_system_prompt = "REBUILT-SYSTEM"
+
+    _build(agent, restore_or_build_system_prompt=_restore)
+
+    # The prompt was populated before the DB row was created.
+    assert agent._ensure_db_prompt_at_call == "REBUILT-SYSTEM"
+    assert agent._cached_system_prompt == "REBUILT-SYSTEM"
+
+
 # ── Between-turns MCP refresh (cache-safe late-binding) ──────────────────────
 #
 # A slow MCP server that connects after the agent's build-time tool snapshot
@@ -242,6 +297,58 @@ def test_between_turns_refresh_skipped_when_skip_flag_set():
     gtd.assert_not_called()
 
 
+def test_api_server_tool_choice_none_skips_registered_mcp_refresh(monkeypatch):
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+
+    class FakeAgent(_FakeAgent):
+        def __init__(self, **_kwargs):
+            super().__init__()
+            self.platform = "api_server"
+            self.tools = [
+                {"type": "function", "function": {"name": "present_plan"}},
+                {"type": "function", "function": {"name": "todo"}},
+            ]
+            self.valid_tool_names = {"present_plan", "todo"}
+
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openai",
+            "base_url": "https://example.test/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5")
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._load_reasoning_config",
+        staticmethod(lambda: {}),
+    )
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._load_fallback_model",
+        staticmethod(lambda: None),
+    )
+    monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 90)
+    monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+    agent = adapter._create_agent(
+        session_id="meeting-summary",
+        request_overrides={"tool_choice": "none"},
+    )
+
+    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=True), \
+         patch("tools.mcp_tool.refresh_agent_mcp_tools") as refresh:
+        _build(agent)
+
+    refresh.assert_not_called()
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()
+
+
 def test_between_turns_refresh_no_churn_when_unchanged():
     """R2: an unchanged tool set leaves the snapshot object identity intact
     (no needless swap → nothing for the next request prefix to diff against)."""
@@ -259,3 +366,53 @@ def test_between_turns_refresh_no_churn_when_unchanged():
         _build(agent)
 
     assert agent.tools is same  # not replaced → no churn
+
+
+def test_preflight_skips_when_persisted_cooldown_survives_restart(tmp_path):
+    agent = _make_agent_with_cooldown(
+        tmp_path / "state.db",
+        "sess-1",
+        cooldown_until=4_000_000_000.0,
+    )
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
+        ctx = _build(agent)
+
+    assert isinstance(ctx, TurnContext)
+    agent._emit_status.assert_not_called()
+    agent._compress_context.assert_not_called()
+
+
+def test_preflight_still_runs_for_other_session_with_same_db(tmp_path):
+    db_path = tmp_path / "state.db"
+    _make_agent_with_cooldown(
+        db_path,
+        "sess-1",
+        cooldown_until=4_000_000_000.0,
+    )
+    agent = _make_agent_with_cooldown(db_path, "sess-2")
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
+        ctx = _build(agent)
+
+    assert isinstance(ctx, TurnContext)
+    agent._emit_status.assert_called_once()
+    agent._compress_context.assert_called()
+
+
+def test_expired_cooldown_allows_preflight(tmp_path):
+    agent = _make_agent_with_cooldown(
+        tmp_path / "state.db",
+        "sess-1",
+        cooldown_until=1.0,
+    )
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
+        ctx = _build(agent)
+
+    assert isinstance(ctx, TurnContext)
+    agent._emit_status.assert_called_once()
+    agent._compress_context.assert_called()

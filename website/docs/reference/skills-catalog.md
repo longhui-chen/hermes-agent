@@ -62,8 +62,7 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 
 | Skill | Description | Path |
 |-------|-------------|------|
-| [`kanban-orchestrator`](/docs/user-guide/skills/bundled/devops/devops-kanban-orchestrator) | Decomposition playbook + anti-temptation rules for an orchestrator profile routing work through Kanban. The "don't do the work yourself" rule and the basic lifecycle are auto-injected into every kanban worker's system prompt; this skill... | `devops/kanban-orchestrator` |
-| [`kanban-worker`](/docs/user-guide/skills/bundled/devops/devops-kanban-worker) | Pitfalls, examples, and edge cases for Hermes Kanban workers. The lifecycle itself is auto-injected into every worker's system prompt as KANBAN_GUIDANCE (from agent/prompt_builder.py); this skill is what you load when you want deeper det... | `devops/kanban-worker` |
+
 
 ## dogfood
 
@@ -111,6 +110,7 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 | [`maps`](/docs/user-guide/skills/bundled/productivity/productivity-maps) | Geocode, POIs, routes, timezones via OpenStreetMap/OSRM. | `productivity/maps` |
 | [`nano-pdf`](/docs/user-guide/skills/bundled/productivity/productivity-nano-pdf) | Edit PDF text/typos/titles via nano-pdf CLI (NL prompts). | `productivity/nano-pdf` |
 | [`ocr-and-documents`](/docs/user-guide/skills/bundled/productivity/productivity-ocr-and-documents) | Extract text from PDFs/scans (pymupdf, marker-pdf). | `productivity/ocr-and-documents` |
+| [`petdex`](/docs/user-guide/skills/bundled/productivity/productivity-petdex) | Install and select animated petdex mascots for Hermes. | `productivity/petdex` |
 | [`powerpoint`](/docs/user-guide/skills/bundled/productivity/productivity-powerpoint) | Create, read, edit .pptx decks, slides, notes, templates. | `productivity/powerpoint` |
 
 ## research

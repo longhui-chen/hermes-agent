@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-from utils import atomic_replace
+from utils import atomic_replace, fast_safe_load
 
 
 # Env var name suffixes that indicate credential values.  These are the
@@ -59,7 +59,10 @@ _ORIGINAL_PROCESS_ENV: frozenset[str] | None = None
 # snapshot the operator VALUE and re-assert it after every .env load.  Keep this
 # list tiny and non-secret — snapshotting secret values into a process-lifetime
 # global is exactly what _ORIGINAL_PROCESS_ENV (key-set only) avoids.
-_LIVE_RESOLVED_ENV_KEYS: frozenset[str] = frozenset({"HERMES_TIMEZONE"})
+_LIVE_RESOLVED_ENV_KEYS: frozenset[str] = frozenset({
+    "HERMES_TIMEZONE",
+    "ZETTLAB_PRESETS_DIR",
+})
 _ORIGINAL_OPERATOR_VALUES: dict[str, str] | None = None
 
 
@@ -433,7 +436,7 @@ def _load_secrets_config(home_path: Path) -> dict:
         return {}
     try:
         with open(config_path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
+            data = fast_safe_load(f) or {}
     except Exception:  # noqa: BLE001
         return {}
     return data.get("secrets") or {}

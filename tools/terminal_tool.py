@@ -37,11 +37,15 @@ import logging
 import os
 import platform
 import re
+import shlex
+import stat
+import sysconfig
 import time
 import threading
 import atexit
 import shutil
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -257,10 +261,33 @@ from tools.approval import (
 )
 
 
-def _check_all_guards(command: str, env_type: str) -> dict:
+def _docker_volume_uses_host_path(volume_spec: str) -> bool:
+    """Return True when a docker volume spec bind-mounts a host path."""
+    if not isinstance(volume_spec, str):
+        return False
+
+    vol = volume_spec.strip()
+    return bool(vol) and (
+        vol.startswith(("/", "~", "./", "../")) or
+        (len(vol) >= 3 and vol[1] == ":" and vol[2] in ("/", "\\"))
+    )
+
+
+def _docker_has_host_access(config: Dict[str, Any]) -> bool:
+    """Return True when a Docker sandbox exposes host paths through bind mounts."""
+    if config.get("env_type") != "docker":
+        return False
+    if config.get("host_cwd") and config.get("docker_mount_cwd_to_workspace"):
+        return True
+    return any(_docker_volume_uses_host_path(vol) for vol in config.get("docker_volumes", []))
+
+
+def _check_all_guards(command: str, env_type: str,
+                      has_host_access: bool = False) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback."""
     return _check_all_guards_impl(command, env_type,
-                                  approval_callback=_get_approval_callback())
+                                  approval_callback=_get_approval_callback(),
+                                  has_host_access=has_host_access)
 
 
 # Allowlist: characters that can legitimately appear in directory paths.
@@ -316,6 +343,43 @@ def _handle_sudo_failure(output: str, env_type: str) -> str:
             return output + f"\n\n💡 Tip: To enable sudo over messaging, add SUDO_PASSWORD to {_dhh()}/.env on the agent machine."
     
     return output
+
+
+# sudo -S rejects a bad cached/interactive password with these messages.
+_SUDO_WRONG_PASSWORD_MARKERS = (
+    "sudo: authentication failed",
+    "sudo: incorrect password attempt",
+    "sudo: maximum 3 incorrect authentication attempts",
+    "sudo: 3 incorrect password attempts",
+)
+
+
+def _sudo_wrong_password_failure(output: str) -> bool:
+    """Return True when sudo rejected a piped password."""
+    if not output:
+        return False
+    lowered = output.lower()
+    return any(marker in lowered for marker in _SUDO_WRONG_PASSWORD_MARKERS)
+
+
+def _invalidate_cached_sudo_on_auth_failure(
+    command: str | None, output: str
+) -> bool:
+    """Drop a session-cached sudo password after sudo rejects it.
+
+    Env-configured ``SUDO_PASSWORD`` is left alone — that is an explicit
+    operator choice, not an interactive cache entry.
+    """
+    if "SUDO_PASSWORD" in os.environ:
+        return False
+    if not _sudo_wrong_password_failure(output):
+        return False
+    if _count_real_sudo_invocations(command or "") == 0:
+        return False
+    if not _get_cached_sudo_password():
+        return False
+    _set_cached_sudo_password("")
+    return True
 
 
 def _prompt_for_sudo_password(timeout_seconds: int = 45) -> str:
@@ -497,13 +561,16 @@ def _read_shell_token(command: str, start: int) -> tuple[str, int]:
     return command[start:i], i
 
 
-def _rewrite_real_sudo_invocations(command: str) -> tuple[str, bool]:
-    """Rewrite only real unquoted sudo command words, not plain text mentions."""
+def _rewrite_real_sudo_invocations(command: str) -> tuple[str, int]:
+    """Rewrite only real unquoted sudo command words, not plain text mentions.
+
+    Returns the rewritten command and the number of sudo invocations rewritten.
+    """
     out: list[str] = []
     i = 0
     n = len(command)
     command_start = True
-    found = False
+    sudo_count = 0
 
     while i < n:
         ch = command[i]
@@ -545,7 +612,7 @@ def _rewrite_real_sudo_invocations(command: str) -> tuple[str, bool]:
         token, next_i = _read_shell_token(command, i)
         if command_start and token == "sudo":
             out.append("sudo -S -p ''")
-            found = True
+            sudo_count += 1
         else:
             out.append(token)
 
@@ -555,7 +622,63 @@ def _rewrite_real_sudo_invocations(command: str) -> tuple[str, bool]:
             command_start = False
         i = next_i
 
-    return "".join(out), found
+    return "".join(out), sudo_count
+
+
+def _count_real_sudo_invocations(command: str) -> int:
+    """Return how many real sudo command words appear in *command*.
+
+    Lightweight scan that reuses the same tokeniser as
+    ``_rewrite_real_sudo_invocations`` but skips the string-building, so it
+    is cheap to call from the result-processing path.
+    """
+    count = 0
+    i = 0
+    n = len(command)
+    command_start = True
+
+    while i < n:
+        ch = command[i]
+
+        if ch.isspace():
+            if ch == "\n":
+                command_start = True
+            i += 1
+            continue
+
+        if ch == "#" and command_start:
+            comment_end = command.find("\n", i)
+            if comment_end == -1:
+                break
+            i = comment_end
+            continue
+
+        if command.startswith("&&", i) or command.startswith("||", i) or command.startswith(";;", i):
+            i += 2
+            command_start = True
+            continue
+
+        if ch in ";|&(":
+            i += 1
+            command_start = True
+            continue
+
+        if ch == ")":
+            i += 1
+            command_start = False
+            continue
+
+        token, next_i = _read_shell_token(command, i)
+        if command_start and token == "sudo":
+            count += 1
+
+        if command_start and _looks_like_env_assignment(token):
+            command_start = True
+        else:
+            command_start = False
+        i = next_i
+
+    return count
 
 
 def _sudo_nopasswd_works() -> bool:
@@ -786,8 +909,8 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
     """
     if command is None:
         return None, None
-    transformed, has_real_sudo = _rewrite_real_sudo_invocations(command)
-    if not has_real_sudo:
+    transformed, sudo_count = _rewrite_real_sudo_invocations(command)
+    if sudo_count == 0:
         return command, None
 
     has_configured_password = "SUDO_PASSWORD" in os.environ
@@ -816,8 +939,10 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
             _set_cached_sudo_password(sudo_password)
 
     if has_configured_password or sudo_password:
-        # Trailing newline is required: sudo -S reads one line for the password.
-        return transformed, sudo_password + "\n"
+        # Trailing newline is required: sudo -S reads one line per invocation.
+        # Compound commands (`sudo a && sudo b`) need one password line each.
+        password_line = sudo_password + "\n"
+        return transformed, password_line * sudo_count
 
     return command, None
 
@@ -831,6 +956,542 @@ from tools.environments.modal import ModalEnvironment as _ModalEnvironment
 from tools.environments.managed_modal import ManagedModalEnvironment as _ManagedModalEnvironment
 from tools.managed_tool_gateway import is_managed_tool_gateway_ready
 import sys
+
+
+_CONNECTOR_RUNTIME_SCRIPT = "connector_runtime.py"
+_CONNECTOR_RUNTIME_SHELL_PUNCTUATION = set(";&|<>")
+_CONNECTOR_RUNTIME_TRUST_CUTOFF = time.time()
+
+
+@dataclass(frozen=True)
+class _ConnectorRuntimeRootAnchor:
+    configured_root: Path
+    resolved_root: Path
+    identity: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class _ConnectorRuntimeCommand:
+    argv: list[str]
+    root_identity: tuple[int, int]
+    script_identity: tuple[int, int]
+
+
+_CONNECTOR_RUNTIME_ROOT_ANCHOR: Optional[_ConnectorRuntimeRootAnchor] = None
+_CONNECTOR_RUNTIME_STDIN_WRAPPER = r"""
+import json
+import os
+import runpy
+import sys
+
+payload = json.loads(sys.stdin.read() or "{}")
+env = payload.get("env") or {}
+script = payload["script"]
+argv = payload.get("argv") or [script]
+pythonpath = payload.get("pythonpath")
+if isinstance(pythonpath, list):
+    sys.path = [str(item) for item in pythonpath if item]
+for key, value in env.items():
+    if value is not None:
+        os.environ[str(key)] = str(value)
+os.environ.pop("PYTHONPATH", None)
+sys.argv = [script, *[str(arg) for arg in argv[1:]]]
+runpy.run_path(script, run_name="__main__")
+"""
+
+
+def _is_python_executable_token(token: str) -> bool:
+    name = Path(token).name.lower()
+    return (
+        name in {"python", "python3", "python.exe", "python3.exe"}
+        or re.fullmatch(r"python3\.\d+(?:\.exe)?", name) is not None
+    )
+
+
+def _path_trust_rejection_reason(
+    path: Path,
+    *,
+    enforce_cutoff: bool = True,
+) -> Optional[str]:
+    try:
+        st = path.stat()
+    except OSError:
+        return "path_unavailable"
+    euid = os.geteuid() if hasattr(os, "geteuid") else None
+    mode = stat.S_IMODE(st.st_mode)
+    if euid == 0:
+        # A root-running terminal can rewrite root-owned files even when mode
+        # bits look read-only. Trust only the packaged tree that was already in
+        # place before this module was loaded; anything changed afterward may
+        # have been swapped by a model-controlled root terminal.
+        if st.st_uid != 0:
+            return "uid_not_root"
+        if mode & stat.S_IWGRP:
+            return "group_writable"
+        if mode & stat.S_IWOTH:
+            return "world_writable"
+        if enforce_cutoff and st.st_mtime > _CONNECTOR_RUNTIME_TRUST_CUTOFF:
+            return "mtime_after_cutoff"
+        if enforce_cutoff and st.st_ctime > _CONNECTOR_RUNTIME_TRUST_CUTOFF:
+            return "ctime_after_cutoff"
+        return None
+    if euid is not None and st.st_uid == euid:
+        return "owned_by_terminal_user"
+    try:
+        groups = set(os.getgroups())
+        egid = os.getegid()
+        groups.add(egid)
+    except Exception:
+        groups = set()
+    if st.st_gid in groups and mode & stat.S_IWGRP:
+        return "group_writable"
+    if mode & stat.S_IWOTH:
+        return "world_writable"
+    return None
+
+
+def _path_writable_by_current_user(path: Path, *, enforce_cutoff: bool = True) -> bool:
+    return _path_trust_rejection_reason(
+        path,
+        enforce_cutoff=enforce_cutoff,
+    ) is not None
+
+
+def _path_identity(path: Path) -> tuple[int, int]:
+    st = path.stat()
+    return st.st_dev, st.st_ino
+
+
+def _log_connector_runtime_rejection(reason: str, relative_path: str = "") -> None:
+    logger.warning(
+        "Connector runtime direct runner rejected: reason=%s relative_path=%s",
+        reason,
+        relative_path or "<unknown>",
+    )
+
+
+def _capture_connector_runtime_root() -> Optional[_ConnectorRuntimeRootAnchor]:
+    global _CONNECTOR_RUNTIME_ROOT_ANCHOR
+
+    presets_dir = os.environ.get("ZETTLAB_PRESETS_DIR", "")
+    if not presets_dir:
+        _log_connector_runtime_rejection("presets_dir_missing")
+        return None
+    configured_root = Path(
+        os.path.expandvars(os.path.expanduser(presets_dir))
+    ).absolute()
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    if anchor is not None:
+        if configured_root != anchor.configured_root:
+            _log_connector_runtime_rejection("presets_root_changed")
+            return None
+        return anchor
+
+    try:
+        resolved_root = configured_root.resolve(strict=True)
+        identity = _path_identity(resolved_root)
+    except OSError:
+        _log_connector_runtime_rejection("presets_root_unavailable")
+        return None
+
+    anchor = _ConnectorRuntimeRootAnchor(
+        configured_root=configured_root,
+        resolved_root=resolved_root,
+        identity=identity,
+    )
+    _CONNECTOR_RUNTIME_ROOT_ANCHOR = anchor
+    return anchor
+
+
+# Production gateways receive ZETTLAB_PRESETS_DIR before importing this module.
+# Capture the concrete version directory before any model-authored terminal call.
+if os.environ.get("ZETTLAB_PRESETS_DIR"):
+    _capture_connector_runtime_root()
+
+
+def _connector_runtime_path_is_trusted(
+    path: Path,
+    presets_root: Path,
+    *,
+    expected_root_identity: Optional[tuple[int, int]] = None,
+) -> bool:
+    """Return True only for the pinned, immutable official presets tree."""
+    try:
+        lexical_relative = path.relative_to(presets_root)
+        resolved_path = path.resolve(strict=True)
+        resolved_root = presets_root.resolve(strict=True)
+        relative = resolved_path.relative_to(resolved_root)
+        if expected_root_identity is not None:
+            if _path_identity(resolved_root) != expected_root_identity:
+                return False
+    except (OSError, ValueError):
+        return False
+
+    # Shared mount ancestors may legitimately change after Hermes starts (for
+    # example, creation of /volume1/subvol/.recycle). They still must have safe
+    # ownership/mode, but their unrelated mtime/ctime is outside the trust
+    # boundary. The pinned version root and everything below it keep the strict
+    # temporal check and reject symlinks.
+    root_ancestors = list(resolved_root.parents)
+    if any(
+        _path_writable_by_current_user(component, enforce_cutoff=False)
+        for component in root_ancestors
+    ):
+        return False
+
+    current = resolved_root
+    components = [resolved_root]
+    for part in lexical_relative.parts:
+        current = current / part
+        components.append(current)
+    try:
+        if any(stat.S_ISLNK(component.lstat().st_mode) for component in components):
+            return False
+    except OSError:
+        return False
+    return not any(
+        _path_writable_by_current_user(component, enforce_cutoff=True)
+        for component in components
+    )
+
+
+def _connector_runtime_trust_rejection_reason(
+    path: Path,
+    presets_root: Path,
+    *,
+    expected_root_identity: Optional[tuple[int, int]] = None,
+) -> Optional[str]:
+    """Return a non-sensitive reason for a failed trust decision."""
+    try:
+        lexical_relative = path.relative_to(presets_root)
+        resolved_path = path.resolve(strict=True)
+        resolved_root = presets_root.resolve(strict=True)
+        resolved_path.relative_to(resolved_root)
+        if expected_root_identity is not None:
+            if _path_identity(resolved_root) != expected_root_identity:
+                return "trust_anchor_changed"
+    except OSError:
+        return "path_unavailable"
+    except ValueError:
+        return "path_escape"
+
+    for component in resolved_root.parents:
+        reason = _path_trust_rejection_reason(component, enforce_cutoff=False)
+        if reason is not None:
+            return f"shared_ancestor_{reason}"
+
+    current = resolved_root
+    components = [resolved_root]
+    for part in lexical_relative.parts:
+        current = current / part
+        components.append(current)
+    try:
+        if any(stat.S_ISLNK(component.lstat().st_mode) for component in components):
+            return "symlink_or_special_file"
+    except OSError:
+        return "path_unavailable"
+    for component in components:
+        reason = _path_trust_rejection_reason(component, enforce_cutoff=True)
+        if reason is not None:
+            return reason
+    return None
+
+
+def _resolve_connector_runtime_script(raw_path: str) -> Optional[Path]:
+    anchor = _capture_connector_runtime_root()
+    if anchor is None:
+        return None
+    relative_text: Optional[str] = None
+    for prefix in ("$ZETTLAB_PRESETS_DIR/", "${ZETTLAB_PRESETS_DIR}/"):
+        if raw_path.startswith(prefix):
+            relative_text = raw_path[len(prefix):]
+            break
+    else:
+        normalized_raw = raw_path[2:] if raw_path.startswith("./") else raw_path
+        if normalized_raw.startswith("skills/"):
+            relative_text = normalized_raw
+        else:
+            expanded_path = Path(
+                os.path.expandvars(os.path.expanduser(normalized_raw))
+            ).absolute()
+            for allowed_root in (anchor.configured_root, anchor.resolved_root):
+                try:
+                    relative_text = str(expanded_path.relative_to(allowed_root))
+                    break
+                except ValueError:
+                    continue
+            if relative_text is None:
+                _log_connector_runtime_rejection("path_outside_pinned_root")
+                return None
+
+    try:
+        candidate_path = anchor.resolved_root / str(relative_text)
+        path = candidate_path.resolve(strict=True)
+        relative = path.relative_to(anchor.resolved_root)
+    except (OSError, ValueError):
+        _log_connector_runtime_rejection(
+            "path_unavailable_or_escaped",
+            relative_text or "",
+        )
+        return None
+
+    parts = path.parts
+    if len(parts) < 4:
+        _log_connector_runtime_rejection("invalid_layout", str(relative))
+        return None
+    if parts[-1] != _CONNECTOR_RUNTIME_SCRIPT:
+        _log_connector_runtime_rejection("invalid_script_name", str(relative))
+        return None
+    if parts[-2] != "scripts" or parts[-4] != "skills":
+        _log_connector_runtime_rejection("invalid_layout", str(relative))
+        return None
+    if not path.is_file():
+        _log_connector_runtime_rejection("runner_not_regular_file", str(relative))
+        return None
+    if not _connector_runtime_path_is_trusted(
+        candidate_path,
+        anchor.resolved_root,
+        expected_root_identity=anchor.identity,
+    ):
+        reason = _connector_runtime_trust_rejection_reason(
+            candidate_path,
+            anchor.resolved_root,
+            expected_root_identity=anchor.identity,
+        )
+        _log_connector_runtime_rejection(reason or "trust_check_failed", str(relative))
+        return None
+    return path
+
+
+def _parse_connector_runtime_command(command: str) -> Optional[_ConnectorRuntimeCommand]:
+    """Return argv for the dedicated connector runner, or None if not exact.
+
+    The allowlist intentionally accepts only a direct Python invocation of a
+    presets skill's scripts/connector_runtime.py. Shell punctuation rejects
+    compound commands such as `connector_runtime.py ... ; env`, so injected
+    connector env can never be observed by a following shell fragment.
+    """
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+
+    if len(tokens) < 2 or not _is_python_executable_token(tokens[0]):
+        return None
+    for token in tokens:
+        if token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION:
+            return None
+
+    if Path(tokens[1]).name != _CONNECTOR_RUNTIME_SCRIPT:
+        return None
+
+    script = _resolve_connector_runtime_script(tokens[1])
+    if script is None:
+        return None
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    if anchor is None:
+        return None
+    try:
+        script_identity = _path_identity(script)
+    except OSError:
+        _log_connector_runtime_rejection("runner_identity_unavailable")
+        return None
+    return _ConnectorRuntimeCommand(
+        argv=[sys.executable, str(script), *tokens[2:]],
+        root_identity=anchor.identity,
+        script_identity=script_identity,
+    )
+
+
+def _connector_runtime_result_json(
+    *,
+    command: str,
+    output: str,
+    returncode: int,
+    secret_values: list[str] | None = None,
+    timed_out: bool = False,
+) -> str:
+    from tools.ansi_strip import strip_ansi
+    from agent.redact import redact_sensitive_text
+
+    output = strip_ansi(output)
+    for secret in secret_values or []:
+        if secret:
+            output = output.replace(secret, "[REDACTED]")
+    try:
+        from tools.tool_output_limits import get_max_bytes
+
+        max_output_chars = get_max_bytes()
+    except Exception:
+        max_output_chars = 20000
+    if len(output) > max_output_chars:
+        head_chars = int(max_output_chars * 0.4)
+        tail_chars = max_output_chars - head_chars
+        omitted = len(output) - head_chars - tail_chars
+        output = (
+            output[:head_chars]
+            + f"\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted "
+            + f"out of {len(output)} total] ...\n\n"
+            + output[-tail_chars:]
+        )
+    output = redact_sensitive_text(
+        output.strip(),
+        force=True,
+        code_file=False,
+    ) if output else ""
+    return json.dumps({
+        "output": output,
+        "exit_code": 124 if timed_out else returncode,
+        "error": (
+            f"Command timed out while running connector runtime"
+            if timed_out else None
+        ),
+        "connector_runtime_direct": True,
+    }, ensure_ascii=False)
+
+
+def _connector_runtime_isolated_sys_path(*, script: Path, cwd: Path) -> list[str]:
+    """Build a Python import path that excludes model-writable command context."""
+    blocked_exact: set[Path] = set()
+    blocked_roots: set[Path] = set()
+    for raw in ("", ".", str(cwd), os.getcwd()):
+        try:
+            blocked_exact.add(Path(raw or ".").resolve())
+        except OSError:
+            pass
+    for raw in os.environ.get("PYTHONPATH", "").split(os.pathsep):
+        if not raw:
+            continue
+        try:
+            blocked_roots.add(Path(raw).resolve())
+        except OSError:
+            pass
+
+    allowed: list[str] = []
+    candidate_paths = list(sys.path)
+    for key in ("stdlib", "platstdlib", "purelib", "platlib"):
+        value = sysconfig.get_paths().get(key)
+        if value:
+            candidate_paths.append(value)
+
+    seen: set[str] = set()
+    for raw in candidate_paths:
+        if not raw:
+            continue
+        try:
+            resolved = Path(raw).resolve()
+        except OSError:
+            continue
+        if resolved in blocked_exact:
+            continue
+        if any(resolved == root or root in resolved.parents for root in blocked_roots):
+            continue
+        text = str(resolved)
+        if text not in seen:
+            seen.add(text)
+            allowed.append(text)
+    return allowed
+
+
+def _run_connector_runtime_command_if_allowed(
+    command: str,
+    *,
+    cwd: str,
+    timeout: int,
+) -> Optional[str]:
+    parsed = _parse_connector_runtime_command(command)
+    if parsed is None:
+        return None
+    argv = parsed.argv
+
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    script = Path(argv[1])
+    try:
+        identities_match = (
+            anchor is not None
+            and _path_identity(anchor.resolved_root) == parsed.root_identity
+            and _path_identity(script) == parsed.script_identity
+            and _connector_runtime_path_is_trusted(
+                script,
+                anchor.resolved_root,
+                expected_root_identity=parsed.root_identity,
+            )
+        )
+    except OSError:
+        identities_match = False
+    if not identities_match:
+        reason = None
+        if anchor is not None:
+            reason = _connector_runtime_trust_rejection_reason(
+                script,
+                anchor.resolved_root,
+                expected_root_identity=parsed.root_identity,
+            )
+        _log_connector_runtime_rejection(reason or "identity_changed_before_exec")
+        return None
+
+    secret_values: list[str] = []
+    try:
+        from tools.environments.local import build_connector_runtime_env
+
+        connector_env = build_connector_runtime_env()
+        from tools.environments.local import _sanitize_subprocess_env
+
+        run_env = _sanitize_subprocess_env(os.environ)
+        run_env.pop("PYTHONPATH", None)
+        secret_values = [
+            connector_env.get("ZETTLAB_CONNECTORS_AUTH_TOKEN", ""),
+            connector_env.get("ZETTLAB_CONNECTORS_URL", ""),
+        ]
+        run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
+        isolated_path = _connector_runtime_isolated_sys_path(
+            script=Path(argv[1]),
+            cwd=Path(run_cwd),
+        )
+        payload = json.dumps({
+            "script": argv[1],
+            "argv": argv[1:],
+            "env": connector_env,
+            "pythonpath": isolated_path,
+        })
+        completed = subprocess.run(
+            [sys.executable, "-c", _CONNECTOR_RUNTIME_STDIN_WRAPPER],
+            cwd=run_cwd,
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            input=payload,
+        )
+        return _connector_runtime_result_json(
+            command=command,
+            output=(completed.stdout or "") + (completed.stderr or ""),
+            returncode=completed.returncode,
+            secret_values=secret_values,
+        )
+    except subprocess.TimeoutExpired as e:
+        stdout = e.stdout or ""
+        stderr = e.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode(errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        return _connector_runtime_result_json(
+            command=command,
+            output=stdout + stderr,
+            returncode=124,
+            secret_values=secret_values,
+            timed_out=True,
+        )
+    except Exception as e:
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": f"Connector runtime execution failed: {type(e).__name__}: {e}",
+            "connector_runtime_direct": True,
+        }, ensure_ascii=False)
 
 
 # Tool description for LLM
@@ -1086,6 +1747,36 @@ def _safe_getcwd() -> str:
         return os.getenv("TERMINAL_CWD") or os.path.expanduser("~")
 
 
+# Path prefixes that identify a *host* working directory which cannot exist
+# inside a container sandbox. Covers POSIX user dirs and Windows drive paths
+# (``C:\Users\...`` / ``C:/Users/...``) — the latter is how a Windows host's
+# cwd looks when it leaks toward a Linux container's ``-w`` flag.
+_HOST_CWD_PREFIXES = ("/Users/", "/home/", "C:\\", "C:/")
+
+_CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona"})
+
+
+def _is_unusable_container_cwd(cwd: str) -> bool:
+    """Return True if *cwd* is a host/relative path that won't work as the
+    working directory inside a container sandbox.
+
+    A container's cwd must be an absolute path that exists *inside* the
+    sandbox (e.g. ``/workspace`` or ``/root``). A host path (``/home/user``,
+    ``C:\\Users\\me``) or a relative path (``.``, ``src/``) is meaningless to
+    ``docker run -w`` and makes the container fail to start (exit 125).
+    """
+    if not cwd:
+        return False
+    if any(cwd.startswith(p) for p in _HOST_CWD_PREFIXES):
+        return True
+    # Relative paths (".", "src/") can't be a container workdir either. Windows
+    # drive paths are absolute on Windows but os.path.isabs() is False on a
+    # POSIX host, so they're already caught by the prefix check above.
+    if not os.path.isabs(cwd):
+        return True
+    return False
+
+
 def _get_env_config() -> Dict[str, Any]:
     """Get terminal environment configuration from environment variables."""
     # Default image with Python and Node.js for maximum compatibility
@@ -1138,21 +1829,18 @@ def _get_env_config() -> Dict[str, Any]:
     if cwd:
         cwd = os.path.expanduser(cwd)
     host_cwd = None
-    host_prefixes = ("/Users/", "/home/", "C:\\", "C:/")
     if env_type == "docker" and mount_docker_cwd:
         docker_cwd_source = os.getenv("TERMINAL_CWD") or _safe_getcwd()
         candidate = os.path.abspath(os.path.expanduser(docker_cwd_source))
         if (
-            any(candidate.startswith(p) for p in host_prefixes)
+            any(candidate.startswith(p) for p in _HOST_CWD_PREFIXES)
             or (os.path.isabs(candidate) and os.path.isdir(candidate) and not candidate.startswith(("/workspace", "/root")))
         ):
             host_cwd = candidate
             cwd = "/workspace"
-    elif env_type in {"modal", "docker", "singularity", "daytona"} and cwd:
+    elif env_type in _CONTAINER_BACKENDS and cwd:
         # Host paths and relative paths that won't work inside containers
-        is_host_path = any(cwd.startswith(p) for p in host_prefixes)
-        is_relative = not os.path.isabs(cwd)  # e.g. "." or "src/"
-        if (is_host_path or is_relative) and cwd != default_cwd:
+        if _is_unusable_container_cwd(cwd) and cwd != default_cwd:
             logger.info("Ignoring TERMINAL_CWD=%r for %s backend "
                         "(host/relative path won't work in sandbox). Using %r instead.",
                         cwd, env_type, default_cwd)
@@ -1845,6 +2533,7 @@ def terminal_tool(
     background: bool = False,
     timeout: Optional[int] = None,
     task_id: Optional[str] = None,
+    session_id: Optional[str] = None,
     force: bool = False,
     workdir: Optional[str] = None,
     pty: bool = False,
@@ -1859,6 +2548,7 @@ def terminal_tool(
         background: Whether to run in background (default: False)
         timeout: Command timeout in seconds (default: from config)
         task_id: Unique identifier for environment isolation (optional)
+        session_id: Conversation/session identifier for durable observability
         force: If True, skip dangerous command check (use after user confirms)
         workdir: Working directory for this command (optional, uses session cwd if not set)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
@@ -1925,6 +2615,25 @@ def terminal_tool(
             image = ""
 
         cwd = overrides.get("cwd") or config["cwd"]
+        # A per-task cwd override (registered by the gateway/TUI for workspace
+        # tracking, or by RL/benchmark envs) wins over config["cwd"] — but
+        # config["cwd"] was already sanitized for container backends in
+        # _get_env_config() while the override is raw. On a container backend a
+        # raw host path (e.g. a Windows desktop session's C:\Users\<user>, or a
+        # POSIX /home/<user>) reaches `docker run -w <host-path>` and the
+        # container fails to start (exit 125). Re-apply the same host/relative
+        # path guard to the *resolved* cwd so the override can't bypass it.
+        # Valid in-container override paths (RL/benchmark sandboxes that set
+        # cwd to /workspace, /root, etc.) are absolute non-host paths and pass
+        # through untouched.
+        if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
+            if cwd != config["cwd"]:
+                logger.info(
+                    "Ignoring host/relative cwd override %r for %s backend "
+                    "(won't exist in sandbox). Using %r instead.",
+                    cwd, env_type, config["cwd"],
+                )
+            cwd = config["cwd"]
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
@@ -1950,6 +2659,27 @@ def terminal_tool(
                     "error": guidance,
                     "status": "error",
                 }, ensure_ascii=False)
+
+        if workdir:
+            workdir_error = _validate_workdir(workdir)
+            if workdir_error:
+                logger.warning("Blocked dangerous workdir: %s (command: %s)",
+                               workdir[:200], _safe_command_preview(command))
+                return json.dumps({
+                    "output": "",
+                    "exit_code": -1,
+                    "error": workdir_error,
+                    "status": "blocked"
+                }, ensure_ascii=False)
+
+        if not background and not pty:
+            connector_runtime_result = _run_connector_runtime_command_if_allowed(
+                command,
+                cwd=workdir or cwd,
+                timeout=effective_timeout,
+            )
+            if connector_runtime_result is not None:
+                return connector_runtime_result
 
         # Start cleanup thread
         _start_cleanup_thread()
@@ -2085,7 +2815,10 @@ def terminal_tool(
         # Skip check if force=True (user has confirmed they want to run it)
         approval_note = None
         if not force:
-            approval = _check_all_guards(command, env_type)
+            approval = _check_all_guards(
+                command, env_type,
+                has_host_access=_docker_has_host_access(config),
+            )
             if not approval["approved"]:
                 # Check if this is an approval_required (gateway ask mode)
                 if approval.get("status") == "pending_approval":
@@ -2144,14 +2877,27 @@ def terminal_tool(
                 "EOF."
             )
 
+        # Claim the (shared "default") terminal env for the session driving this
+        # command. File tools read env.cwd_owner to decide whether the env's live
+        # cwd is THIS session's `cd` or a different worktree session's — without
+        # it, two open worktree sessions sharing the env route each other's edits
+        # to the wrong checkout. get_current_session_key()'s contextvar doesn't
+        # cross tool-worker threads, so fall back to the raw task_id (which IS the
+        # session_key for the top-level agent) — a stable, thread-safe anchor.
+        from tools.approval import get_current_session_key
+
+        session_key = get_current_session_key(default="") or (task_id or "")
+        try:
+            env.cwd_owner = session_key
+        except Exception:
+            pass
+
         if background:
             # Spawn a tracked background process via the process registry.
             # For local backends: uses subprocess.Popen with output buffering.
             # For non-local backends: runs inside the sandbox via env.execute().
-            from tools.approval import get_current_session_key
             from tools.process_registry import process_registry
 
-            session_key = get_current_session_key(default="")
             effective_cwd = _resolve_command_cwd(
                 workdir=workdir,
                 env=env,
@@ -2297,20 +3043,47 @@ def terminal_tool(
                 # watch-pattern and completion notifications can be
                 # routed back to the correct chat/thread.
                 if background and (notify_on_complete or watch_patterns):
-                    from gateway.session_context import get_session_env as _gse
-                    _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
-                    if _gw_platform:
-                        _gw_chat_id = _gse("HERMES_SESSION_CHAT_ID", "")
-                        _gw_thread_id = _gse("HERMES_SESSION_THREAD_ID", "")
-                        _gw_user_id = _gse("HERMES_SESSION_USER_ID", "")
-                        _gw_user_name = _gse("HERMES_SESSION_USER_NAME", "")
-                        _gw_message_id = _gse("HERMES_SESSION_MESSAGE_ID", "")
-                        proc_session.watcher_platform = _gw_platform
-                        proc_session.watcher_chat_id = _gw_chat_id
-                        proc_session.watcher_user_id = _gw_user_id
-                        proc_session.watcher_user_name = _gw_user_name
-                        proc_session.watcher_thread_id = _gw_thread_id
-                        proc_session.watcher_message_id = _gw_message_id
+                    from gateway.session_context import (
+                        async_delivery_supported as _async_ok,
+                        get_session_env as _gse,
+                    )
+
+                    # Stateless request/response sessions (the API server /
+                    # WebUI path) cannot route a completion back to the agent
+                    # after the turn ends — there is no persistent channel and
+                    # send() is a no-op. Registering a watcher there silently
+                    # no-ops (issue #10760). Refuse the promise instead: drop
+                    # the flags and tell the agent to poll.
+                    if not _async_ok():
+                        notify_on_complete = False
+                        watch_patterns = None
+                        result_data["notify_on_complete"] = False
+                        result_data["notify_unsupported"] = (
+                            "notify_on_complete / watch_patterns are not available on "
+                            "this endpoint (stateless HTTP API — no channel to deliver "
+                            "an async completion after the turn ends). The process is "
+                            "running in the background; retrieve its result with "
+                            "process(action='poll') or process(action='wait')."
+                        )
+                        logger.info(
+                            "background proc %s: async delivery unsupported on this "
+                            "session; notify_on_complete/watch_patterns disabled",
+                            proc_session.id,
+                        )
+                    else:
+                        _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
+                        if _gw_platform:
+                            _gw_chat_id = _gse("HERMES_SESSION_CHAT_ID", "")
+                            _gw_thread_id = _gse("HERMES_SESSION_THREAD_ID", "")
+                            _gw_user_id = _gse("HERMES_SESSION_USER_ID", "")
+                            _gw_user_name = _gse("HERMES_SESSION_USER_NAME", "")
+                            _gw_message_id = _gse("HERMES_SESSION_MESSAGE_ID", "")
+                            proc_session.watcher_platform = _gw_platform
+                            proc_session.watcher_chat_id = _gw_chat_id
+                            proc_session.watcher_user_id = _gw_user_id
+                            proc_session.watcher_user_name = _gw_user_name
+                            proc_session.watcher_thread_id = _gw_thread_id
+                            proc_session.watcher_message_id = _gw_message_id
 
                 # Mutual exclusion: if both notify_on_complete and watch_patterns
                 # are set, drop watch_patterns. The combination produces duplicate
@@ -2368,16 +3141,18 @@ def terminal_tool(
             max_retries = 3
             retry_count = 0
             result = None
+            command_cwd = None
             
             while retry_count <= max_retries:
                 try:
+                    command_cwd = _resolve_command_cwd(
+                        workdir=workdir,
+                        env=env,
+                        default_cwd=cwd,
+                    )
                     execute_kwargs = {
                         "timeout": effective_timeout,
-                        "cwd": _resolve_command_cwd(
-                            workdir=workdir,
-                            env=env,
-                            default_cwd=cwd,
-                        ),
+                        "cwd": command_cwd,
                     }
                     result = env.execute(command, **execute_kwargs)
                 except Exception as e:
@@ -2415,6 +3190,19 @@ def terminal_tool(
 
             # Add helpful message for sudo failures in messaging context
             output = _handle_sudo_failure(output, env_type)
+
+            sudo_auth_failed = _sudo_wrong_password_failure(output)
+            sudo_cache_cleared = _invalidate_cached_sudo_on_auth_failure(
+                command, output
+            )
+            if sudo_cache_cleared:
+                has_sudo_prompt_callback = _get_sudo_password_callback() is not None
+                if has_sudo_prompt_callback or env_var_enabled("HERMES_INTERACTIVE"):
+                    output += (
+                        "\n\n⚠️ Sudo authentication failed — cached password "
+                        "cleared. You will be prompted again on the next sudo "
+                        "command."
+                    )
 
             # Foreground terminal output canonicalization seam: plugins receive
             # the full output string before default truncation and may only
@@ -2455,9 +3243,17 @@ def terminal_tool(
             from tools.ansi_strip import strip_ansi
             output = strip_ansi(output)
 
-            # Redact secrets from command output (catches env/printenv leaking keys)
-            from agent.redact import redact_sensitive_text
-            output = redact_sensitive_text(output.strip()) if output else ""
+            # Redact secrets from command output. For source/config dumps
+            # (MAX_TOKENS=100, "apiKey": "x" fixtures, postgresql:// f-string
+            # templates) the ENV/JSON/template passes are skipped to avoid
+            # false positives (code_file=True). But for env-dump commands
+            # (env/printenv/set/export/declare) the output IS a KEY=value
+            # credential dump, so redact_terminal_output runs the ENV pass
+            # (code_file=False) to mask opaque tokens with no vendor prefix.
+            # Real prefixes, auth headers, JWTs, private keys are masked in
+            # both modes. See issue #43025.
+            from agent.redact import redact_terminal_output
+            output = redact_terminal_output(output.strip(), command) if output else ""
 
             # Interpret non-zero exit codes that aren't real errors
             # (e.g. grep=1 means "no matches", diff=1 means "files differ")
@@ -2468,10 +3264,33 @@ def terminal_tool(
                 "exit_code": returncode,
                 "error": None,
             }
+            try:
+                from agent.verification_evidence import record_terminal_result
+
+                evidence = record_terminal_result(
+                    command=command,
+                    cwd=command_cwd,
+                    session_id=session_id or task_id or effective_task_id or "default",
+                    exit_code=returncode,
+                    output=output,
+                )
+                if evidence:
+                    result_dict["verification_evidence"] = {
+                        "status": evidence.get("status"),
+                        "kind": evidence.get("kind"),
+                        "scope": evidence.get("scope"),
+                        "canonical_command": evidence.get("canonical_command"),
+                    }
+            except Exception:
+                logger.debug("verification evidence recording failed", exc_info=True)
             if approval_note:
                 result_dict["approval"] = approval_note
             if exit_note:
                 result_dict["exit_code_meaning"] = exit_note
+            if sudo_auth_failed:
+                result_dict["sudo_auth_failed"] = True
+            if sudo_cache_cleared:
+                result_dict["sudo_cache_cleared"] = True
 
             return json.dumps(result_dict, ensure_ascii=False)
 
@@ -2701,6 +3520,7 @@ def _handle_terminal(args, **kw):
         background=args.get("background", False),
         timeout=args.get("timeout"),
         task_id=kw.get("task_id"),
+        session_id=kw.get("session_id"),
         workdir=args.get("workdir"),
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),

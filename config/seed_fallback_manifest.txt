@@ -6,8 +6,6 @@ skills/creative/excalidraw
 skills/creative/humanizer
 skills/creative/popular-web-designs
 skills/creative/songwriting-and-ai-music
-skills/devops/kanban-orchestrator
-skills/devops/kanban-worker
 skills/email/himalaya
 skills/media/gif-search
 skills/media/youtube-content

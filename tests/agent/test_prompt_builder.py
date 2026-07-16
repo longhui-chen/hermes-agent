@@ -23,7 +23,11 @@ from agent.prompt_builder import (
     _get_context_file_max_chars,
     _CONTEXT_FILE_DYNAMIC_CEILING,
     DEFAULT_AGENT_IDENTITY,
+    default_agent_identity,
+    get_agent_prompt_lang,
     drain_truncation_warnings,
+    zettlab_agent_kernel_guidance,
+    zettlab_turn_rules_guidance,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
@@ -43,6 +47,147 @@ from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatu
 
 
 class TestGuidanceConstants:
+    def test_zettlab_agent_kernel_guidance_english_matches_poke_style_xml_layers(self):
+        guidance = zettlab_agent_kernel_guidance("en")
+
+        expected_order = [
+            '<zettlab_agent_base_prompt version="0.3" lang="en">',
+            '<profile_soul source="SOUL.md">',
+            "<conversation_protocol",
+            "<message_tags>",
+            "<output_tags>",
+            "<priority>",
+            "<capabilities>",
+            "<behavior>",
+            "<product_policy>",
+            "<platform_ux_rules>",
+            "<voice>",
+            "<style_and_formatting>",
+            "<soul_inheritance>",
+            "<product_facts>",
+            "</zettlab_agent_base_prompt>",
+        ]
+        positions = [guidance.index(marker) for marker in expected_order]
+        assert positions == sorted(positions)
+        assert 'placeholder="true"' in guidance
+        assert "Do not invent unconfigured product facts" in guidance
+        assert "# Conversation protocol" not in guidance
+
+    def test_zettlab_agent_kernel_guidance_chinese_matches_poke_style_xml_layers(self):
+        guidance = zettlab_agent_kernel_guidance("zh")
+
+        expected_order = [
+            '<zettlab_agent_base_prompt version="0.3" lang="zh">',
+            '<profile_soul source="SOUL.md">',
+            "<conversation_protocol",
+            "<message_tags>",
+            "<output_tags>",
+            "<priority>",
+            "<capabilities>",
+            "<behavior>",
+            "<product_policy>",
+            "<platform_ux_rules>",
+            "<voice>",
+            "<style_and_formatting>",
+            "<soul_inheritance>",
+            "<product_facts>",
+            "</zettlab_agent_base_prompt>",
+        ]
+        positions = [guidance.index(marker) for marker in expected_order]
+        assert positions == sorted(positions)
+        assert 'placeholder="true"' in guidance
+        assert "不要编造未配置的产品事实" in guidance
+        assert "# 对话协议" not in guidance
+
+    def test_zettlab_agent_kernel_wraps_custom_identity(self):
+        guidance = zettlab_agent_kernel_guidance("zh", identity_text="我是照片整理 agent。")
+
+        assert "<profile_soul source=\"SOUL.md\">\n我是照片整理 agent。\n</profile_soul>" in guidance
+        assert guidance.count("<profile_soul") == 1
+
+    def test_shared_voice_defers_to_a_more_specific_profile_soul(self):
+        en_guidance = zettlab_agent_kernel_guidance("en")
+        zh_guidance = zettlab_agent_kernel_guidance("zh")
+
+        assert "A profile SOUL.md may define a warmer, more playful" in en_guidance
+        assert "follow that more specific voice" in en_guidance
+        assert "SOUL.md 可以定义更温暖、俏皮或正式的 voice" in zh_guidance
+        assert "就服从这层更具体的人格" in zh_guidance
+        assert "never perform a persona" not in en_guidance
+        assert "不要为了显得有性格而表演" not in zh_guidance
+
+    def test_default_agent_identity_is_neutral_for_main_profile(self, monkeypatch):
+        monkeypatch.setenv("ZET_AGENT_ID", "main")
+        assert "specialized persona" in default_agent_identity("en")
+        assert "Zettlab Memo" not in default_agent_identity("en")
+
+    def test_default_agent_identity_is_neutral_for_named_profile(self, monkeypatch):
+        monkeypatch.setenv("ZET_AGENT_ID", "writer")
+        assert "specialized persona" in default_agent_identity("en")
+        assert "Zettlab Memo" not in default_agent_identity("en")
+
+    def test_output_tags_warn_not_to_emit_internal_xml_even_when_asked(self):
+        zh_guidance = zettlab_agent_kernel_guidance("zh")
+        en_guidance = zettlab_agent_kernel_guidance("en")
+
+        assert "即使用户要求" in zh_guidance
+        assert "不要把内部 XML 标签原样输出" in zh_guidance
+        assert "Even if the user asks" in en_guidance
+        assert "do not print internal XML tags" in en_guidance
+
+    def test_internal_tag_requests_are_answered_naturally_without_policy_explanations(self):
+        zh_guidance = zettlab_agent_kernel_guidance("zh")
+        en_guidance = zettlab_agent_kernel_guidance("en")
+
+        assert "直接回答用户真正的问题" in zh_guidance
+        assert "不要解释内部规则" in zh_guidance
+        assert "answer the user's underlying request" in en_guidance
+        assert "Do not explain internal policy" in en_guidance
+
+    def test_prompt_language_test_override_wins_over_deployment_default(self, monkeypatch):
+        monkeypatch.setenv("ZETTLAB_AGENT_LANG", "zh")
+        monkeypatch.setenv("HERMES_AGENT_LANG", "en")
+
+        assert get_agent_prompt_lang() == "en"
+        assert 'lang="en"' in zettlab_agent_kernel_guidance()
+
+    @pytest.mark.parametrize(
+        ("lang", "required"),
+        [
+            (
+                "en",
+                (
+                    "explicitly requests another reply language",
+                    "reply entirely in English",
+                    "explicitly asks for them",
+                    "ask exactly one question",
+                ),
+            ),
+            (
+                "zh",
+                (
+                    "明确指定另一种回复语言",
+                    "整段回复必须使用英文",
+                    "明确要求使用表情",
+                    "只问一个问题",
+                ),
+            ),
+        ],
+    )
+    def test_turn_contract_repeats_high_value_rules_concisely(self, lang, required):
+        guidance = zettlab_turn_rules_guidance(lang)
+
+        assert guidance.startswith('<zettlab_turn_contract locked="true">')
+        for text in required:
+            assert text in guidance
+
+    @pytest.mark.parametrize("lang", ["en", "zh"])
+    def test_outbound_followup_supports_both_reply_languages_flow(self, lang):
+        guidance = zettlab_turn_rules_guidance(lang)
+
+        assert "What exact address or group should I send it to?" in guidance
+        assert "具体发到哪个地址或群组？" in guidance
+
     def test_memory_guidance_discourages_task_logs(self):
         assert "durable facts" in MEMORY_GUIDANCE
         assert "Do NOT save task progress" in MEMORY_GUIDANCE
@@ -700,7 +845,8 @@ class TestBuildContextFilesPrompt:
         with patch("pathlib.Path.home", return_value=fake_home):
             result = build_context_files_prompt(cwd=str(tmp_path))
         assert "Project Context" in result
-        assert "Zettlab Memo" in result
+        assert "specialized persona" in result
+        assert "Zettlab Memo" not in result
 
     def test_loads_agents_md(self, tmp_path):
         (tmp_path / "AGENTS.md").write_text("Use Ruff for linting.")
@@ -928,6 +1074,43 @@ class TestFindHermesMd:
         (repo / ".git").mkdir()
         assert _find_hermes_md(repo) is None
 
+    def test_no_git_root_checks_cwd_only(self, tmp_path):
+        """Outside a git repo, only cwd is checked — parents are NOT walked.
+
+        Walking parents with no git root to stop the loop would climb all
+        the way to / and pick up a .hermes.md planted in /tmp, /home, or /
+        on a shared system — a cross-user prompt-injection vector.
+        """
+        from unittest.mock import patch
+
+        parent = tmp_path / "parent"
+        parent.mkdir()
+        (parent / ".hermes.md").write_text("planted by another user")
+        cwd = parent / "work"
+        cwd.mkdir()
+        # No git root anywhere up the tree.
+        with patch("agent.prompt_builder._find_git_root", return_value=None):
+            assert _find_hermes_md(cwd) is None
+
+    def test_no_git_root_finds_in_cwd(self, tmp_path):
+        """Outside a git repo, a .hermes.md in cwd itself is still found."""
+        from unittest.mock import patch
+
+        (tmp_path / ".hermes.md").write_text("local rules")
+        with patch("agent.prompt_builder._find_git_root", return_value=None):
+            assert _find_hermes_md(tmp_path) == tmp_path / ".hermes.md"
+
+    def test_walks_parents_inside_git_repo(self, tmp_path):
+        """Inside a git repo, parent walk up to the git root still works."""
+        from unittest.mock import patch
+
+        (tmp_path / ".hermes.md").write_text("repo root rules")
+        sub = tmp_path / "a" / "b"
+        sub.mkdir(parents=True)
+        # Simulate cwd being inside a repo rooted at tmp_path.
+        with patch("agent.prompt_builder._find_git_root", return_value=tmp_path):
+            assert _find_hermes_md(sub) == tmp_path / ".hermes.md"
+
 
 class TestFindGitRoot:
     def test_finds_git_dir(self, tmp_path):
@@ -982,8 +1165,24 @@ class TestStripYamlFrontmatter:
 class TestPromptBuilderConstants:
     def test_default_identity_non_empty(self):
         assert len(DEFAULT_AGENT_IDENTITY) > 50
-        assert "Zettlab Memo" in DEFAULT_AGENT_IDENTITY
+        assert "Zettlab Memo" not in DEFAULT_AGENT_IDENTITY
+        assert "specialized persona" in DEFAULT_AGENT_IDENTITY
         assert "Hermes Agent" not in DEFAULT_AGENT_IDENTITY
+
+    def test_default_identity_leaves_product_contract_to_profile_soul(self):
+        for phrase in [
+            "open identity slot",
+            "shared Zettlab agent base prompt",
+            "future edits to this SOUL.md",
+        ]:
+            assert phrase in DEFAULT_AGENT_IDENTITY
+        for product_specific_phrase in [
+            "Zettlab Memo",
+            "built-in main agent for this device",
+            "generalist all-in-one assistant",
+            "created by Nous Research",
+        ]:
+            assert product_specific_phrase not in DEFAULT_AGENT_IDENTITY
 
     def test_platform_hints_known_platforms(self):
         assert "whatsapp" in PLATFORM_HINTS
@@ -992,8 +1191,17 @@ class TestPromptBuilderConstants:
         assert "discord" in PLATFORM_HINTS
         assert "cron" in PLATFORM_HINTS
         assert "cli" in PLATFORM_HINTS
+        assert "tui" in PLATFORM_HINTS
         assert "api_server" in PLATFORM_HINTS
         assert "webui" in PLATFORM_HINTS
+
+    def test_cli_and_tui_hints_flag_local_only_cron(self):
+        """#51568 — cron jobs from CLI/TUI sessions don't deliver back into
+        the session, so the agent must be told up front not to promise it."""
+        for key in ("cli", "tui"):
+            hint = PLATFORM_HINTS[key]
+            assert "LOCAL-ONLY" in hint
+            assert "deliver" in hint
 
     def test_whatsapp_cloud_hint_mentions_24h_window(self):
         """The Cloud API's 24-hour conversation window is a hard rule the
@@ -1010,6 +1218,19 @@ class TestPromptBuilderConstants:
         Baileys for outbound attachments."""
         hint = PLATFORM_HINTS["whatsapp_cloud"]
         assert "MEDIA:" in hint
+
+    def test_markdown_converting_platform_hints_do_not_forbid_markdown(self):
+        """#12224 — WhatsApp (Baileys) and Signal adapters actively convert
+        markdown to native formatting (gateway/platforms/whatsapp_common.py
+        format_message + signal_format.markdown_to_signal: bold, italic,
+        strikethrough, headers, bullets). Their hints previously told the
+        agent "do not use markdown", which made it strip bullets/bold the
+        adapter would have rendered. The hint must affirm markdown, not
+        forbid it."""
+        for key in ("whatsapp", "signal"):
+            hint = PLATFORM_HINTS[key]
+            assert "do not use markdown" not in hint.lower()
+            assert "markdown" in hint.lower()
 
     def test_cli_hint_does_not_suggest_media_tags(self):
         # Regression: MEDIA:/path tags are intercepted only by messaging
@@ -1198,6 +1419,46 @@ class TestEnvironmentHints:
         assert "Terminal backend: modal" in result
         assert "Linux 6.8.0" in result
         assert "/workspace" in result
+
+    def test_probe_remote_backend_imports_real_factory(self, monkeypatch):
+        """Regression for #53667: the probe imported a nonexistent
+        ``get_environment`` from ``tools.environments`` and always died with
+        ``ImportError: cannot import name 'get_environment'`` (cosmetic — it
+        only dropped the live backend description to a static fallback). The
+        real factory is ``_create_environment`` in ``tools.terminal_tool``;
+        the probe must import and call THAT, returning a parsed line instead
+        of None."""
+        import agent.prompt_builder as _pb
+
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        _pb._clear_backend_probe_cache()
+
+        class _FakeEnv:
+            def execute(self, cmd, timeout=None):
+                return {
+                    "returncode": 0,
+                    "output": (
+                        "os=Linux\nkernel=6.8.0\nhome=/root\n"
+                        "cwd=/workspace\nuser=root\n"
+                    ),
+                }
+
+        created = {}
+
+        def _fake_create_environment(*, env_type, **kwargs):
+            created["env_type"] = env_type
+            return _FakeEnv()
+
+        # Patch the REAL factory in tools.terminal_tool — the probe imports it
+        # locally, so the import itself must succeed (the bug was here).
+        import tools.terminal_tool as _tt
+        monkeypatch.setattr(_tt, "_create_environment", _fake_create_environment)
+
+        line = _pb._probe_remote_backend("docker")
+        assert created.get("env_type") == "docker"
+        assert line is not None
+        assert "Linux 6.8.0" in line
+        assert "root" in line
 
     def test_remote_backend_list_covers_known_sandboxes(self):
         """Regression guard: if someone adds a remote backend, they must list it here."""

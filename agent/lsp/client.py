@@ -257,12 +257,34 @@ class LSPClient:
         env = dict(os.environ)
         if self._env:
             env.update(self._env)
+        # Bridge the context-local Hermes home override into the child's
+        # HERMES_HOME before the HOME contract runs. ContextVars don't cross
+        # process boundaries and the contract resolves HOME from the override,
+        # so without this the child's HERMES_HOME (stale process-global) and its
+        # HOME (override's profile home) would split. Mirrors the terminal spawn
+        # paths (_inject_context_hermes_home in tools/environments/local.py).
+        from hermes_constants import apply_subprocess_home_env, get_hermes_home_override
+        _override = get_hermes_home_override()
+        if _override:
+            env["HERMES_HOME"] = _override
+        # Route through the shared subprocess HOME contract: a no-op on hosts
+        # with a real HOME, but on a systemd/cron host with no HOME (ZET-1938)
+        # it falls the server's HOME back to {HERMES_HOME}/home so it (and
+        # anything it shells out to) can address ~-stored config.
+        apply_subprocess_home_env(env)
 
         cmd = self._command
         if sys.platform == "win32":
             cmd = self._win_wrap_cmd(cmd)
 
         try:
+            # start_new_session=True detaches the LSP server into its own
+            # process group / session. Without this, the LSP server inherits
+            # the gateway's pgid (= TUI parent PID). When mcp_tool's
+            # _kill_orphaned_mcp_children races with LSP spawn and sweeps the
+            # gateway's child set, it captures the LSP PID, records the
+            # inherited pgid, and killpg() then kills the TUI parent itself.
+            # See tui_gateway_crash.log "killpg → SIGTERM received" stacks.
             self._proc = await asyncio.create_subprocess_exec(
                 cmd[0],
                 *cmd[1:],
@@ -271,6 +293,7 @@ class LSPClient:
                 stderr=asyncio.subprocess.PIPE,
                 env=env,
                 cwd=self._cwd,
+                start_new_session=True,
             )
         except FileNotFoundError as e:
             raise LSPProtocolError(

@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.prompt_builder import STEER_USER_PREFIX
 
 
 def finalize_turn(
@@ -122,25 +123,92 @@ def finalize_turn(
                 )
 
     # Determine if conversation completed successfully
+    normal_text_response = str(_turn_exit_reason).startswith("text_response(")
     completed = (
         final_response is not None
-        and api_call_count < agent.max_iterations
         and not failed
+        and (
+            api_call_count < agent.max_iterations
+            or normal_text_response
+        )
     )
+
+    # Post-loop cleanup must never lose the response.  Trajectory save,
+    # resource teardown, and session persistence all touch fallible
+    # surfaces — file I/O / JSON serialization (_save_trajectory), remote
+    # VM/browser teardown over the network (_cleanup_task_resources), and
+    # SQLite writes (_persist_session).  A raise from any of them used to
+    # propagate straight out of run_conversation, discarding the partial
+    # final_response the caller is waiting for (subprocess wrappers saw an
+    # empty stdout with no traceback — #8049).  Each step is now guarded
+    # independently so one failure can't skip the others, and any errors
+    # are surfaced on the result dict via ``cleanup_errors`` rather than
+    # killing the turn.
+    _cleanup_errors = []
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
-    agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
+    try:
+        agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
+    except Exception as _save_err:
+        _cleanup_errors.append(f"save_trajectory: {_save_err}")
+        logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
 
     # Clean up VM and browser for this task after conversation completes
-    agent._cleanup_task_resources(effective_task_id)
+    try:
+        agent._cleanup_task_resources(effective_task_id)
+    except Exception as _cleanup_err:
+        _cleanup_errors.append(f"cleanup_task_resources: {_cleanup_err}")
+        logger.error("finalize_turn: _cleanup_task_resources failed: %s", _cleanup_err, exc_info=True)
 
     # Persist session to both JSON log and SQLite only after private retry
     # scaffolding has been removed. Otherwise a later user "continue" turn
     # can replay assistant("(empty)") / recovery nudges and fall into the
     # same empty-response loop again.
-    agent._drop_trailing_empty_response_scaffolding(messages)
-    agent._persist_session(messages, conversation_history)
+    try:
+        agent._drop_trailing_empty_response_scaffolding(messages)
+
+        # When the turn was interrupted and the last message is a tool
+        # result, append a synthetic assistant message to close the
+        # tool-call sequence. Without this, the session persists a
+        # ``tool → user`` alternation that strict providers (Gemini,
+        # Claude) reject, causing them to hallucinate a continuation of
+        # the user's message on the next turn (#48879).
+        #
+        # ``_drop_trailing_empty_response_scaffolding`` only rewinds the
+        # tool tail when an empty-response scaffolding flag is present; a
+        # clean ``/stop`` interrupt after a successful tool sets no such
+        # flag, so the tool result survives as the tail and we close it
+        # here instead. On an interrupt ``final_response`` is typically
+        # empty, so fall back to an explicit placeholder rather than
+        # persisting an empty-content assistant turn.
+        if interrupted:
+            from agent.message_sanitization import close_interrupted_tool_sequence
+            close_interrupted_tool_sequence(messages, final_response)
+
+        # Some recovery/fallback paths return a real final_response without
+        # adding a closing assistant message to the transcript (e.g. the
+        # partial-stream and prior-turn-content recovery ``break`` sites in
+        # ``conversation_loop``). If persisted as-is, the durable session can
+        # end at a tool/user message even though the caller — and the gateway
+        # platform — already saw a completed assistant response. The next turn
+        # then replays a user-only backlog and the model re-answers every
+        # "unanswered" message. Close the durable turn at the source, at the
+        # single chokepoint every recovery ``break`` flows through, so the
+        # invariant "delivered final_response ⇒ assistant row in transcript"
+        # holds regardless of which path produced it. (#43849 / #44100)
+        if final_response and not interrupted:
+            try:
+                _tail_role = messages[-1].get("role") if messages else None
+            except Exception:
+                _tail_role = None
+            if _tail_role != "assistant":
+                messages.append({"role": "assistant", "content": final_response})
+
+        agent._persist_session(messages, conversation_history)
+    except Exception as _persist_err:
+        _cleanup_errors.append(f"persist_session: {_persist_err}")
+        logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
 
     # ── Turn-exit diagnostic log ─────────────────────────────────────
     # Always logged at INFO so agent.log captures WHY every turn ended.
@@ -241,7 +309,14 @@ def finalize_turn(
                     and len(_stripped) <= 24
                     and _stripped[-1:] not in {".", "!", "?", "。", "！", "？", "`", ")"}
                 )
-                if _is_empty_terminal or _is_partial_fragment:
+                _is_partial_stream_recovery = (
+                    str(_turn_exit_reason) == "partial_stream_recovery"
+                )
+                if (
+                    _is_empty_terminal
+                    or _is_partial_fragment
+                    or _is_partial_stream_recovery
+                ):
                     _explanation = agent._format_turn_completion_explanation(
                         _turn_exit_reason
                     )
@@ -317,6 +392,11 @@ def finalize_turn(
     last_reasoning = None
     for msg in reversed(messages):
         if msg.get("role") == "user":
+            # Mid-turn /steer user messages live INSIDE the turn — they are
+            # not the turn-starting boundary; keep walking past them.
+            _c = msg.get("content")
+            if isinstance(_c, str) and _c.startswith(STEER_USER_PREFIX):
+                continue
             break  # turn boundary — don't cross into prior turns
         if msg.get("role") == "assistant" and msg.get("reasoning"):
             last_reasoning = msg["reasoning"]
@@ -354,12 +434,33 @@ def finalize_turn(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+    # Surface any post-loop cleanup failures so the caller can distinguish a
+    # clean turn from one whose trajectory/session/resource teardown raised
+    # (the response is still returned either way — #8049).
+    if _cleanup_errors:
+        result["cleanup_errors"] = _cleanup_errors
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.
-    _leftover_steer = agent._drain_pending_steer()
+    # close=True: this is the LAST drain of the turn — a steer arriving
+    # after it has no consumer (the SSE task may linger past this point,
+    # so endpoint-side task.done() checks can't cover the window) and
+    # must be refused by steer() so the caller re-queues the text.
+    #
+    # Interrupted turns DROP the leftover instead: a hard interrupt
+    # supersedes any pending steer (interrupt() empties the slot itself,
+    # but a steer landing in the interrupt→finalize window re-fills it).
+    # Handing it back would make CLI/gateway re-deliver it as the next
+    # user turn — auto-executing a redirect the user just cancelled.
+    _leftover_steer = agent._drain_pending_steer(close=True)
     if _leftover_steer:
-        result["pending_steer"] = _leftover_steer
+        if interrupted:
+            logger.info(
+                "Dropping pending /steer superseded by interrupt (%d chars)",
+                len(_leftover_steer),
+            )
+        else:
+            result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False
 
     # Include interrupt message if one triggered the interrupt
