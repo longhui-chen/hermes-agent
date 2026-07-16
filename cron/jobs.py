@@ -51,6 +51,29 @@ except ImportError:
     HAS_CRONITER = False
 
 
+_MAX_TIMEZONE_NAME_LENGTH = 255
+_MAX_CRON_NEXT_RUN_ATTEMPTS = 8
+
+
+def _normalized_iana_timezone_name(name: Any) -> Optional[str]:
+    """Return a bounded valid IANA timezone name, or ``None``.
+
+    Persisted jobs may predate timezone validation or may have been edited by
+    hand.  Treat that field as untrusted: reject non-strings and oversized
+    values before asking ``ZoneInfo`` to resolve them.
+    """
+    if not isinstance(name, str):
+        return None
+    text = name.strip()
+    if not text or len(text) > _MAX_TIMEZONE_NAME_LENGTH:
+        return None
+    try:
+        ZoneInfo(text)
+    except (OSError, ZoneInfoNotFoundError, TypeError, ValueError):
+        return None
+    return text
+
+
 def _validate_tz_name(name: Optional[str]) -> Optional[str]:
     """Validate IANA timezone name; return canonical string or None.
 
@@ -59,14 +82,16 @@ def _validate_tz_name(name: Optional[str]) -> Optional[str]:
     """
     if name is None:
         return None
-    text = str(name).strip()
+    if not isinstance(name, str):
+        raise ValueError("Invalid timezone: expected an IANA timezone name")
+    text = name.strip()
     if not text:
         return None
-    try:
-        ZoneInfo(text)
-    except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise ValueError(f"Invalid timezone {text!r}: {exc}")
-    return text
+    normalized = _normalized_iana_timezone_name(text)
+    if normalized is None:
+        display = text[:128] + ("..." if len(text) > 128 else "")
+        raise ValueError(f"Invalid timezone {display!r}")
+    return normalized
 
 # =============================================================================
 # Configuration
@@ -623,14 +648,19 @@ def compute_next_run(
         # Resolve the timezone to evaluate the cron expression in.
         # Per-job tz wins; otherwise inherit the hermes instance's tz.
         job_tz = None
-        if tz_name:
-            try:
-                job_tz = ZoneInfo(tz_name)
-            except (ZoneInfoNotFoundError, ValueError):
-                logger.warning(
-                    "Invalid per-job timezone %r; falling back to hermes default.",
-                    tz_name,
-                )
+        normalized_tz_name = _normalized_iana_timezone_name(tz_name)
+        if normalized_tz_name is not None:
+            job_tz = ZoneInfo(normalized_tz_name)
+        elif tz_name not in (None, ""):
+            invalid_tz = (
+                tz_name[:128] + ("..." if len(tz_name) > 128 else "")
+                if isinstance(tz_name, str)
+                else f"<{type(tz_name).__name__}>"
+            )
+            logger.warning(
+                "Invalid per-job timezone %r; falling back to hermes default.",
+                invalid_tz,
+            )
 
         # Use last_run_at as the croniter base when available, consistent
         # with interval jobs.  This ensures that after a crash/restart,
@@ -644,8 +674,38 @@ def compute_next_run(
             base_time = base_time.astimezone(job_tz)
 
         cron = croniter(schedule["expr"], base_time)
-        next_run = cron.get_next(datetime)
-        return next_run.isoformat()
+        base_timestamp = base_time.timestamp()
+        for _ in range(_MAX_CRON_NEXT_RUN_ATTEMPTS):
+            next_run = cron.get_next(datetime)
+            if next_run.timestamp() > base_timestamp:
+                return next_run.isoformat()
+
+            # During a DST fall-back, croniter can return the first occurrence
+            # of an ambiguous wall time (fold=0) even when the base is already
+            # in the repeated hour (fold=1).  The wall time looks later, but its
+            # absolute timestamp is in the past.  Prefer the second occurrence
+            # when it is both genuinely ambiguous and strictly after the base.
+            folded_next_run = next_run.replace(fold=1)
+            if (
+                folded_next_run.utcoffset() != next_run.utcoffset()
+                and folded_next_run.timestamp() > base_timestamp
+            ):
+                return folded_next_run.isoformat()
+
+        cron_expr = schedule.get("expr")
+        cron_expr_display = (
+            cron_expr[:128] + ("..." if len(cron_expr) > 128 else "")
+            if isinstance(cron_expr, str)
+            else f"<{type(cron_expr).__name__}>"
+        )
+        logger.error(
+            "Cron schedule %r did not produce a next run strictly after %s "
+            "within %d attempts.",
+            cron_expr_display,
+            base_time.isoformat(),
+            _MAX_CRON_NEXT_RUN_ATTEMPTS,
+        )
+        return None
 
     return None
 
@@ -1696,6 +1756,9 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         kind = schedule.get("kind")
 
         next_run_dt = _ensure_aware(raw_next_run_dt)
+        has_fixed_job_timezone = (
+            _normalized_iana_timezone_name(job.get("timezone")) is not None
+        )
         # Migration repair: a cron job persists next_run_at as an absolute
         # instant, but the cron expr describes local wall-clock intent. If the
         # configured/system timezone changed after persistence, the stored
@@ -1704,15 +1767,13 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         # clock* is still in the future, recompute from the schedule so we fire
         # at the intended local time instead of early-then-again.
         #
-        # TRADE-OFF: this cannot distinguish a config/host TZ migration from a
-        # legitimate DST offset change. A DST boundary that satisfies all four
-        # conditions will recompute (and thus SKIP the pending occurrence, no
-        # catch-up) rather than fire it. Accepted: in the pure-migration case
-        # the recompute lands on the same wall-clock time later the same period,
-        # and DST-boundary collisions with a still-future stored wall clock are
-        # rare relative to the double-fire bug this prevents (#28934).
+        # This heuristic applies only to legacy/malformed jobs without a valid
+        # pinned IANA timezone. A pinned timezone owns its offset (including
+        # normal differences from the Hermes runtime), so its persisted aware
+        # timestamp must be judged by absolute time instead.
         if (
             kind == "cron"
+            and not has_fixed_job_timezone
             and next_run_dt <= now
             and _timezone_offset_mismatch(raw_next_run_dt, now)
             and _stored_wall_clock_is_future(raw_next_run_dt, now)
