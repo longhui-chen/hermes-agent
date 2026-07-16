@@ -53,6 +53,7 @@ except ImportError:
         pass
 
 logger = logging.getLogger(__name__)
+_OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 
 
 def _fsync_directory(path: Path) -> None:
@@ -155,7 +156,19 @@ class _ImportDirectoryHandles:
             raise
         except OSError as exc:
             if not create:
-                return -1
+                try:
+                    current = os.stat(
+                        name, dir_fd=parent_fd, follow_symlinks=False
+                    )
+                except FileNotFoundError:
+                    return -1
+                except OSError as inspect_error:
+                    raise MemoryImportConflict(
+                        f"cannot inspect managed memory directory {name}: "
+                        f"{inspect_error}"
+                    ) from exc
+                if not stat.S_ISDIR(current.st_mode):
+                    return -1
             raise MemoryImportConflict(
                 f"managed memory directory {name} is unsafe: {exc}"
             ) from exc
@@ -167,7 +180,7 @@ class _ImportDirectoryHandles:
         return fd
 
     def __enter__(self):
-        if os.name == "nt" or os.open not in os.supports_dir_fd:
+        if os.name == "nt" or not _OPEN_SUPPORTS_DIR_FD:
             raise MemoryImportConflict(
                 "secure memory import requires directory-relative file operations"
             )
@@ -331,7 +344,15 @@ class _ImportDirectoryHandles:
         try:
             raw = _ImportDirectoryHandles.read_bytes(directory_fd, name)
         except MemoryImportConflict:
-            return None
+            try:
+                current = os.stat(
+                    name, dir_fd=directory_fd, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                return None
+            if not stat.S_ISREG(current.st_mode):
+                return None
+            raise
         if raw is None:
             return None
         try:
@@ -339,6 +360,39 @@ class _ImportDirectoryHandles:
         except (UnicodeDecodeError, json.JSONDecodeError):
             return None
         return value if isinstance(value, dict) else None
+
+    def preflight_reset(
+        self,
+    ) -> tuple[List[str], List[str], List[str], Dict[str, Optional[Dict[str, Any]]]]:
+        """Snapshot all reset inputs before allowing the first unlink."""
+        try:
+            memory_names = os.listdir(self.mem_fd)
+            imports_names = (
+                os.listdir(self.imports_fd) if self.imports_fd >= 0 else []
+            )
+            backup_names = (
+                os.listdir(self.backup_fd) if self.backup_fd >= 0 else []
+            )
+            for directory_fd, names in (
+                (self.mem_fd, memory_names),
+                (self.imports_fd, imports_names),
+                (self.backup_fd, backup_names),
+            ):
+                if directory_fd < 0:
+                    continue
+                for name in names:
+                    os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            receipt_targets = {
+                name: self.read_receipt(self.imports_fd, name)
+                for name in imports_names
+                if name.endswith(".json")
+            }
+        except OSError as exc:
+            raise MemoryImportConflict(
+                f"cannot preflight curated memory reset: {exc}"
+            ) from exc
+        self.verify_attached()
+        return memory_names, imports_names, backup_names, receipt_targets
 
     @staticmethod
     def _create_temp(directory_fd: int, prefix: str) -> tuple[int, str]:
@@ -885,13 +939,23 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
             stack.enter_context(MemoryStore._file_lock(path, create_parent=False))
 
         reset_dirs.verify_attached()
+        # Preflight every directory and receipt needed to decide this reset
+        # before the first unlink. A real managed directory that exists but is
+        # unreadable must fail the whole reset, never look like an empty one.
+        (
+            memory_names,
+            imports_names,
+            backup_names,
+            receipt_targets,
+        ) = reset_dirs.preflight_reset()
+
         for item in targets:
             filename = _MEMORY_TARGET_FILES[item]
             if reset_dirs.unlink_non_directory(reset_dirs.mem_fd, filename):
                 deleted.append(filename)
 
             displaced_prefix = f".{filename}."
-            for name in os.listdir(reset_dirs.mem_fd):
+            for name in memory_names:
                 if (
                     name.startswith(displaced_prefix)
                     and name.endswith(".displaced")
@@ -901,7 +965,7 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
 
             if reset_dirs.backup_fd >= 0:
                 backup_prefix = f"{item}-"
-                for name in os.listdir(reset_dirs.backup_fd):
+                for name in backup_names:
                     if (
                         name.startswith(backup_prefix)
                         and name.endswith(".bak")
@@ -914,12 +978,10 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
                         )
 
             if reset_dirs.imports_fd >= 0:
-                for name in os.listdir(reset_dirs.imports_fd):
+                for name in imports_names:
                     if not name.endswith(".json"):
                         continue
-                    receipt = reset_dirs.read_receipt(
-                        reset_dirs.imports_fd, name
-                    )
+                    receipt = receipt_targets[name]
                     if receipt is None or receipt.get("target") != item:
                         continue
                     if reset_dirs.unlink_non_directory(
@@ -939,7 +1001,14 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
         for directory_fd, prefix, relative_dir in temp_locations:
             if directory_fd < 0:
                 continue
-            for name in os.listdir(directory_fd):
+            names = (
+                memory_names
+                if directory_fd == reset_dirs.mem_fd
+                else imports_names
+                if directory_fd == reset_dirs.imports_fd
+                else backup_names
+            )
+            for name in names:
                 if (
                     name.startswith(prefix)
                     and name.endswith(".tmp")
@@ -1204,7 +1273,7 @@ class MemoryStore:
                     dir_fd=import_dirs.mem_fd,
                     follow_symlinks=False,
                 )
-            elif os.name != "nt" and os.open in os.supports_dir_fd:
+            elif os.name != "nt" and _OPEN_SUPPORTS_DIR_FD:
                 parent_flags = os.O_RDONLY
                 if hasattr(os, "O_DIRECTORY"):
                     parent_flags |= os.O_DIRECTORY

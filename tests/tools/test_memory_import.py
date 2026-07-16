@@ -235,6 +235,107 @@ def test_memory_reset_directory_swap_is_fail_closed_and_deletes_nothing(
     ).read_text(encoding="utf-8") == "detached backup"
 
 
+@pytest.mark.parametrize("open_errno", [errno.EACCES, errno.EIO, errno.EMFILE])
+def test_memory_reset_real_backup_open_error_is_fail_closed_without_partial_delete(
+    tmp_path, monkeypatch, open_errno
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    imports = memories / ".imports"
+    backups = imports / "backups"
+    backups.mkdir(parents=True)
+    canonical = memories / "MEMORY.md"
+    receipt = imports / "receipt.json"
+    backup = backups / "memory-safe.bak"
+    canonical.write_text("canonical", encoding="utf-8")
+    receipt.write_text(json.dumps({"target": "memory"}), encoding="utf-8")
+    backup.write_text("backup", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original_open = memory_tool.os.open
+
+    def fail_real_backup_open(path, flags, *args, **kwargs):
+        if path == "backups" and kwargs.get("dir_fd") is not None:
+            raise OSError(open_errno, "simulated managed directory open failure")
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(memory_tool.os, "open", fail_real_backup_open)
+    with pytest.raises(MemoryImportConflict, match="backups"):
+        reset_curated_memory("memory")
+
+    assert canonical.read_text(encoding="utf-8") == "canonical"
+    assert json.loads(receipt.read_text(encoding="utf-8"))["target"] == "memory"
+    assert backup.read_text(encoding="utf-8") == "backup"
+
+
+def test_memory_reset_unreadable_backup_directory_does_not_partially_delete(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    imports = memories / ".imports"
+    backups = imports / "backups"
+    backups.mkdir(parents=True)
+    canonical = memories / "MEMORY.md"
+    receipt = imports / "receipt.json"
+    backup = backups / "memory-safe.bak"
+    canonical.write_text("canonical", encoding="utf-8")
+    receipt.write_text(json.dumps({"target": "memory"}), encoding="utf-8")
+    backup.write_text("backup", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    backups.chmod(0)
+    try:
+        try:
+            os.listdir(backups)
+        except PermissionError:
+            pass
+        else:
+            pytest.skip("platform identity can enumerate chmod 000 directories")
+        with pytest.raises(MemoryImportConflict, match="backups"):
+            reset_curated_memory("memory")
+        assert canonical.read_text(encoding="utf-8") == "canonical"
+        assert json.loads(receipt.read_text(encoding="utf-8"))["target"] == "memory"
+    finally:
+        backups.chmod(0o700)
+    assert backup.read_text(encoding="utf-8") == "backup"
+
+
+def test_memory_reset_backup_preflight_error_happens_before_any_unlink(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    imports = memories / ".imports"
+    backups = imports / "backups"
+    backups.mkdir(parents=True)
+    canonical = memories / "MEMORY.md"
+    receipt = imports / "receipt.json"
+    backup = backups / "memory-safe.bak"
+    canonical.write_text("canonical", encoding="utf-8")
+    receipt.write_text(json.dumps({"target": "memory"}), encoding="utf-8")
+    backup.write_text("backup", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original_listdir = memory_tool.os.listdir
+    backup_identity = os.stat(backups)
+
+    def fail_backup_listdir(path):
+        if isinstance(path, int):
+            opened = os.fstat(path)
+            if (opened.st_dev, opened.st_ino) == (
+                backup_identity.st_dev,
+                backup_identity.st_ino,
+            ):
+                raise OSError(errno.EIO, "simulated backup enumeration failure")
+        return original_listdir(path)
+
+    monkeypatch.setattr(memory_tool.os, "listdir", fail_backup_listdir)
+    with pytest.raises(MemoryImportConflict, match="preflight"):
+        reset_curated_memory("memory")
+
+    assert canonical.read_text(encoding="utf-8") == "canonical"
+    assert json.loads(receipt.read_text(encoding="utf-8"))["target"] == "memory"
+    assert backup.read_text(encoding="utf-8") == "backup"
+
+
 def test_memory_import_rejects_poison_and_overflow_without_writing(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     monkeypatch.setenv("HERMES_HOME", str(home))
