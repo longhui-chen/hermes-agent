@@ -24,7 +24,16 @@ _CREDENTIAL_ASSIGNMENT_RE = re.compile(
 )
 _HIGH_CONFIDENCE_BARE_TOKEN_RE = re.compile(
     r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
-    r"sk-(?:proj-)?[A-Za-z0-9_-]{20,})\b"
+    r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}|"
+    r"xox[baprs]-[A-Za-z0-9-]{10,}|"
+    r"AIza[A-Za-z0-9_-]{35}|"
+    r"eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b"
+)
+_URL_QUERY_CREDENTIAL_RE = re.compile(
+    r"[?&](?:api[._-]?key|access[._-]?token|refresh[._-]?token|"
+    r"auth[._-]?token|authorization|client[._-]?secret|secret|token|"
+    r"password|passwd|cookie|credentials?)=([^&#\s]+)",
+    re.IGNORECASE,
 )
 _PLACEHOLDER_VALUE_RE = re.compile(
     r"(?:\$(?:\{[A-Z_][A-Z0-9_]*\}?|[A-Z_][A-Z0-9_]*)|<[^<>\r\n]+>|"
@@ -75,6 +84,9 @@ def portable_credential_finding(value: str) -> Optional[str]:
         return "private key"
     if _HIGH_CONFIDENCE_BARE_TOKEN_RE.search(value):
         return "credential material"
+    for match in _URL_QUERY_CREDENTIAL_RE.finditer(value):
+        if _credential_value_looks_real(match.group(1)):
+            return "URL query credential"
     for match in _AUTHORIZATION_BEARER_RE.finditer(value):
         if _credential_value_looks_real(match.group(1)):
             return "bearer credential"

@@ -1,8 +1,10 @@
 import asyncio
 import hashlib
+import json
 import shutil
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from aiohttp import web
@@ -35,6 +37,12 @@ async def test_completed_transcript_http_flow_requires_auth_and_commits_atomical
         async with TestClient(TestServer(app)) as cli:
             assert (await cli.post("/api/sessions/import", json=payload)).status == 401
             headers = {"Authorization": "Bearer test-key"}
+            unsafe = await cli.post(
+                "/api/sessions/import",
+                json={**payload, "import_id": "glob-flow", "target_session_id": "*"},
+                headers=headers,
+            )
+            assert unsafe.status == 400
             staged = await cli.post("/api/sessions/import", json=payload, headers=headers)
             assert staged.status == 200
             assert db.get_session("hermes-1") is None
@@ -59,6 +67,32 @@ async def test_completed_transcript_http_flow_requires_auth_and_commits_atomical
         assert db.get_messages_as_conversation("hermes-1")[0]["content"] == "你好"
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_memory_import_http_flow_returns_recoverable_backup(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    memory_path = home / "memories" / "MEMORY.md"
+    memory_path.parent.mkdir(parents=True)
+    memory_path.write_text("existing curated fact", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    app = web.Application()
+    app.router.add_post("/api/memory/import", adapter._handle_memory_import)
+
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            "/api/memory/import",
+            json={
+                "import_id": "backup-flow", "mode": "replace", "target": "memory",
+                "payload_sha256": hashlib.sha256(b"backup-flow").hexdigest(),
+                "entries": ["replacement fact"],
+            },
+            headers={"Authorization": "Bearer test-key"},
+        )
+        assert response.status == 200
+        result = await response.json()
+        assert Path(result["backup_path"]).read_text(encoding="utf-8") == "existing curated fact"
 
 
 @pytest.mark.asyncio
@@ -270,6 +304,56 @@ async def test_unload_then_sweep_does_not_recreate_deleted_profile(
 
     assert await adapter._cleanup_stale_runtime_imports_once() == 0
     assert not profile_home.exists()
+
+
+@pytest.mark.asyncio
+async def test_uncached_profile_cleanup_db_open_blocks_profile_unload(
+    tmp_path, monkeypatch
+):
+    profile_home = tmp_path / "profiles" / "coder"
+    db = SessionDB(profile_home / "state.db")
+    db.close()
+
+    started = threading.Event()
+    release = threading.Event()
+    real_session_db = SessionDB
+
+    def slow_open(path):
+        started.set()
+        assert release.wait(2)
+        return real_session_db(path)
+
+    monkeypatch.setattr("hermes_state.SessionDB", slow_open)
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    adapter._session_db = None
+    adapter._session_dbs = {}
+    adapter._ensure_session_db = lambda: None
+    monkeypatch.setattr(
+        adapter, "_multiplex_profile_homes", lambda: {"coder": profile_home}
+    )
+
+    class _Request(dict):
+        def __init__(self):
+            super().__init__(
+                hermes_profile="coder", hermes_profile_home=str(profile_home)
+            )
+            self.headers = {"Authorization": "Bearer test-key"}
+            self.method = "POST"
+            self.path_qs = "/p/coder/v1/profile/unload"
+            self.remote = "127.0.0.1"
+            self.transport = None
+
+    cleanup_task = asyncio.create_task(adapter._cleanup_stale_runtime_imports_once())
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        response = await adapter._handle_profile_unload(_Request())
+        assert response.status == 409
+        assert json.loads(response.body)["active_imports"] == 1
+    finally:
+        release.set()
+        await cleanup_task
 
 
 @pytest.mark.asyncio

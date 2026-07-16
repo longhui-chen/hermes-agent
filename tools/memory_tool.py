@@ -70,6 +70,7 @@ def get_memory_dir() -> Path:
     return get_hermes_home() / "memories"
 
 ENTRY_DELIMITER = "\n§\n"
+MEMORY_IMPORT_BACKUP_LIMIT = 5
 
 
 class MemoryImportConflict(ValueError):
@@ -723,9 +724,12 @@ class MemoryStore:
                         "memory changed after import; refusing to overwrite user edits"
                     )
                 self._set_entries(target, normalized)
-                return {"import_id": import_id, "status": "completed", "target": target,
-                        "char_count": char_count, "replayed": True,
-                        "effective_from": "next_session"}
+                result = {"import_id": import_id, "status": "completed", "target": target,
+                          "char_count": char_count, "replayed": True,
+                          "effective_from": "next_session"}
+                if receipt.get("backup_path"):
+                    result["backup_path"] = receipt["backup_path"]
+                return result
 
             # Capture the same parsed on-disk representation used by crash
             # recovery before _reload_target deduplicates the live entries.
@@ -736,6 +740,9 @@ class MemoryStore:
             if backup:
                 raise MemoryImportConflict(_drift_error(path, backup)["error"])
             receipt_path.parent.mkdir(parents=True, exist_ok=True)
+            backup_path = self._write_import_backup(
+                path=path, target=target, import_id=import_id
+            )
             previous_sha = hashlib.sha256(
                 ENTRY_DELIMITER.join(previous_entries).encode("utf-8")
             ).hexdigest()
@@ -746,6 +753,8 @@ class MemoryStore:
                 "previous_content_sha256": previous_sha,
                 "prepared_at": time.time(),
             }
+            if backup_path:
+                receipt["backup_path"] = backup_path
             # Durable prepare MUST precede the target rename. A crash can then
             # be recovered without guessing whether a later edit is user data.
             self._write_import_receipt(receipt_path, receipt)
@@ -754,9 +763,62 @@ class MemoryStore:
             receipt["completed_at"] = time.time()
             self._write_import_receipt(receipt_path, receipt)
             self._set_entries(target, normalized)
-        return {"import_id": import_id, "status": "completed", "target": target,
-                "char_count": char_count, "replayed": False,
-                "effective_from": "next_session"}
+        result = {"import_id": import_id, "status": "completed", "target": target,
+                  "char_count": char_count, "replayed": False,
+                  "effective_from": "next_session"}
+        if backup_path:
+            result["backup_path"] = backup_path
+        return result
+
+    @staticmethod
+    def _write_import_backup(*, path: Path, target: str, import_id: str) -> Optional[str]:
+        """Atomically retain the previous curated-memory bytes before replace."""
+        if not path.exists():
+            return None
+        try:
+            previous = path.read_bytes()
+        except OSError as exc:
+            raise MemoryImportConflict(
+                f"cannot back up existing {path.name}: {exc}"
+            ) from exc
+
+        backup_dir = path.parent / ".imports" / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        import_hash = hashlib.sha256(import_id.encode("utf-8")).hexdigest()
+        backup_path = backup_dir / f"{target}-{import_hash}.bak"
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(backup_dir), suffix=".tmp", prefix=".backup_"
+        )
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(previous)
+                handle.flush()
+                os.fsync(handle.fileno())
+            atomic_replace(tmp_path, backup_path)
+            _fsync_directory(backup_dir)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+        retained = []
+        for candidate in backup_dir.iterdir():
+            if (
+                candidate.is_file()
+                and candidate.name.startswith(f"{target}-")
+                and candidate.name.endswith(".bak")
+            ):
+                retained.append(candidate)
+        retained.sort(
+            key=lambda candidate: (candidate.stat().st_mtime_ns, candidate.name),
+            reverse=True,
+        )
+        for candidate in retained[MEMORY_IMPORT_BACKUP_LIMIT:]:
+            candidate.unlink()
+        _fsync_directory(backup_dir)
+        return str(backup_path)
 
     @staticmethod
     def _write_import_receipt(path: Path, receipt: Dict[str, Any]) -> None:

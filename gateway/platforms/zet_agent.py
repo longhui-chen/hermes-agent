@@ -1764,16 +1764,38 @@ class ZetAgentAdapter(APIServerAdapter):
 
     async def _cleanup_stale_runtime_imports_once(self) -> int:
         default_key = self._profile_home_key()
-        default_db = None
-        if not self._runtime_import_profile_is_blocked(default_key):
-            default_db = self._ensure_session_db()
-        candidates = [(default_key, default_db, False)]
-        candidates.extend((key, db, False) for key, db in tuple(self._session_dbs.items()))
+        cached_candidates = [(default_key, None)]
+        cached_candidates.extend(tuple(self._session_dbs.items()))
+        cached_keys = {key for key, _db in cached_candidates}
+        seen = set()
+        deleted = 0
+
+        for key, cached_db in cached_candidates:
+            operation_key = self._begin_runtime_import_operation(key)
+            if operation_key is None:
+                continue
+            try:
+                session_db = cached_db
+                if key == default_key and session_db is None:
+                    session_db = self._ensure_session_db()
+                if session_db is None or id(session_db) in seen:
+                    continue
+                seen.add(id(session_db))
+                try:
+                    deleted += await asyncio.to_thread(
+                        session_db.cleanup_stale_runtime_imports
+                    )
+                except Exception:
+                    logger.warning(
+                        "[zet_agent] runtime import staging cleanup failed for one profile",
+                        exc_info=True,
+                    )
+            finally:
+                self._end_runtime_import_operation(operation_key)
 
         # After a gateway restart the per-profile DB cache is empty. Discover
         # every served profile with an existing state.db so expired private
         # transcript staging still converges without a foreground request.
-        cached_keys = {key for key, _db, _close in candidates}
         try:
             from hermes_state import SessionDB
             profile_homes = tuple(self._multiplex_profile_homes().values())
@@ -1786,56 +1808,32 @@ class ZetAgentAdapter(APIServerAdapter):
         for profile_home in profile_homes:
             key = self._profile_home_key(profile_home)
             state_db = Path(profile_home) / "state.db"
-            if (
-                key in cached_keys
-                or self._runtime_import_profile_is_blocked(key)
-                or not state_db.is_file()
-            ):
+            if key in cached_keys:
                 continue
+            operation_key = self._begin_runtime_import_operation(key)
+            if operation_key is None:
+                continue
+            session_db = None
+            generation = self._profile_directory_identity(key)
             try:
+                if generation is None or not state_db.is_file():
+                    continue
                 session_db = await asyncio.to_thread(SessionDB, state_db)
-            except Exception:
-                logger.warning(
-                    "[zet_agent] runtime import profile DB open failed",
-                    exc_info=True,
-                )
-                continue
-            candidates.append((key, session_db, True))
-            cached_keys.add(key)
-
-        session_dbs = []
-        seen = set()
-        for key, session_db, close_after in candidates:
-            if session_db is None or id(session_db) in seen:
-                continue
-            if self._runtime_import_profile_is_blocked(key):
-                if close_after:
-                    try:
-                        session_db.close()
-                    except Exception:
-                        logger.warning(
-                            "[zet_agent] blocked runtime import cleanup DB close failed",
-                            exc_info=True,
-                        )
-                continue
-            seen.add(id(session_db))
-            session_dbs.append((session_db, close_after))
-
-        deleted = 0
-        for session_db, close_after in session_dbs:
-            try:
+                if self._profile_directory_identity(key) != generation:
+                    logger.warning(
+                        "[zet_agent] runtime import profile changed while DB opened; skipping cleanup"
+                    )
+                    continue
                 deleted += await asyncio.to_thread(
                     session_db.cleanup_stale_runtime_imports
                 )
             except Exception:
-                # A profile can be unloaded while the sweep is running.  Its
-                # closed DB must not prevent other profile homes from cleanup.
                 logger.warning(
                     "[zet_agent] runtime import staging cleanup failed for one profile",
                     exc_info=True,
                 )
             finally:
-                if close_after:
+                if session_db is not None:
                     try:
                         session_db.close()
                     except Exception:
@@ -1843,6 +1841,7 @@ class ZetAgentAdapter(APIServerAdapter):
                             "[zet_agent] runtime import cleanup DB close failed",
                             exc_info=True,
                         )
+                self._end_runtime_import_operation(operation_key)
         return deleted
 
     async def _sweep_stale_runtime_imports(self) -> None:

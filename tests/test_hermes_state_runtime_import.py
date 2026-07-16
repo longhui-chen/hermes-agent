@@ -179,6 +179,13 @@ def test_runtime_import_rejects_non_completed_runtime_messages(tmp_path):
     {"source_id": "m", "role": "user", "content": "api_key = sk-abcdefghijklmnop", "created_at": 1},
     {"source_id": "m", "role": "user", "content": "-----BEGIN RSA PRIVATE KEY-----", "created_at": 1},
     {"source_id": "m", "role": "user", "content": "ghp_abcdefghijklmnopqrst", "created_at": 1},
+    {"source_id": "m", "role": "user", "content":
+     "xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwxyzABCD", "created_at": 1},
+    {"source_id": "m", "role": "user", "content": "AIza" + "A" * 35, "created_at": 1},
+    {"source_id": "m", "role": "user", "content":
+     "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlX3ZhbHVl", "created_at": 1},
+    {"source_id": "m", "role": "user", "content":
+     "https://api.example.test/v1/items?access_token=abcdefghijklmnop", "created_at": 1},
     {"source_id": "Authorization: Bearer abcdefghijklmnop", "role": "user",
      "content": "safe", "created_at": 1},
 ])
@@ -229,6 +236,8 @@ def test_runtime_import_ignores_deep_unknown_fields_without_recursion(tmp_path):
     '{"Authorization": "Bearer redacted"}',
     "{'Authorization': 'Bearer ${ACCESS_TOKEN}'}",
     '{"credentials": {}}',
+    "https://api.example.test/v1/items?access_token=${ACCESS_TOKEN}",
+    "https://api.example.test/v1/items?api_key=redacted",
 ])
 def test_runtime_import_allows_non_secret_examples_and_placeholders(tmp_path, content):
     db = SessionDB(tmp_path / "state.db")
@@ -400,7 +409,10 @@ def test_runtime_import_rejects_duplicate_source_id_across_chunks(tmp_path):
 
 
 @pytest.mark.parametrize("field", ["import_id", "source", "source_session_id", "target_session_id"])
-@pytest.mark.parametrize("unsafe", ["../auth", "nested/session", "win\\session", ".."])
+@pytest.mark.parametrize(
+    "unsafe",
+    ["../auth", "nested/session", "win\\session", "..", "*", "?", "[session]"],
+)
 def test_runtime_import_rejects_path_unsafe_ids(tmp_path, field, unsafe):
     db = SessionDB(tmp_path / "state.db")
     try:
@@ -430,6 +442,20 @@ def test_delete_legacy_unsafe_session_id_cannot_traverse_sessions_dir(tmp_path):
         db.create_session("../auth", "legacy")
         assert db.delete_session("../auth", sessions_dir=sessions_dir) is True
         assert outside.read_text(encoding="utf-8") == "must survive"
+    finally:
+        db.close()
+
+
+def test_delete_legacy_glob_session_id_cannot_remove_other_request_dumps(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    other_dump = sessions_dir / "request_dump_other_001.json"
+    other_dump.write_text("must survive", encoding="utf-8")
+    try:
+        db.create_session("*", "legacy")
+        assert db.delete_session("*", sessions_dir=sessions_dir) is True
+        assert other_dump.read_text(encoding="utf-8") == "must survive"
     finally:
         db.close()
 

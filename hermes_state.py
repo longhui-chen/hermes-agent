@@ -158,6 +158,7 @@ def _validate_runtime_import_identifier(field: str, value: Any) -> str:
         or not value
         or len(value) > 128
         or any(ord(char) < 0x20 for char in value)
+        or any(char in "*?[]" for char in value)
         or _is_path_unsafe(value)
     ):
         raise ValueError(f"{field} must be a path-safe 1..128 character identifier")

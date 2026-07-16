@@ -65,6 +65,10 @@ def test_memory_import_rejects_poison_and_overflow_without_writing(tmp_path, mon
     "api_key = sk-abcdefghijklmnop",
     "-----BEGIN OPENSSH PRIVATE KEY-----",
     "github_pat_abcdefghijklmnopqrst",
+    "xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwxyzABCD",
+    "AIza" + "A" * 35,
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlX3ZhbHVl",
+    "https://api.example.test/v1/items?access_token=abcdefghijklmnop",
 ])
 def test_memory_import_rejects_credentials_without_writing(tmp_path, monkeypatch, entry):
     home = tmp_path / ".hermes"
@@ -120,6 +124,8 @@ def test_memory_import_allows_non_secret_examples_and_placeholders(tmp_path, mon
         '{"Authorization": "Bearer redacted"}',
         "{'Authorization': 'Bearer ${ACCESS_TOKEN}'}",
         '{"credentials": {}}',
+        "https://api.example.test/v1/items?access_token=${ACCESS_TOKEN}",
+        "https://api.example.test/v1/items?api_key=redacted",
     ]
     result = store.import_replace(
         target="memory", entries=entries, import_id="sk-example",
@@ -178,6 +184,11 @@ def test_memory_import_prepare_blocks_user_edit_after_crash(tmp_path, monkeypatc
     receipt_path = next((home / "memories" / ".imports").glob("*.json"))
     assert json.loads(receipt_path.read_text())["state"] == "prepared"
     assert memory_path.read_text() == "old fact"
+    backups = list((home / "memories" / ".imports" / "backups").glob("memory-*.bak"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "old fact"
+    receipt = json.loads(receipt_path.read_text())
+    assert Path(receipt["backup_path"]) == backups[0]
 
     monkeypatch.setattr(store, "_write_file", original_write)
     memory_path.write_text("user edit after crash", encoding="utf-8")
@@ -187,6 +198,27 @@ def test_memory_import_prepare_blocks_user_edit_after_crash(tmp_path, monkeypatc
             payload_sha256=digest,
         )
     assert memory_path.read_text() == "user edit after crash"
+
+
+def test_memory_import_retains_only_five_recoverable_backups(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    memory_path = home / "memories" / "MEMORY.md"
+    memory_path.parent.mkdir(parents=True)
+    memory_path.write_text("original", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=100, user_char_limit=100)
+
+    for index in range(7):
+        result = store.import_replace(
+            target="memory",
+            entries=[f"imported {index}"],
+            import_id=f"retained-{index}",
+            payload_sha256=hashlib.sha256(f"payload-{index}".encode()).hexdigest(),
+        )
+        assert Path(result["backup_path"]).is_file()
+
+    backups = list((home / "memories" / ".imports" / "backups").glob("memory-*.bak"))
+    assert len(backups) == 5
 
 
 def test_memory_import_recovers_crash_after_target_rename(tmp_path, monkeypatch):
