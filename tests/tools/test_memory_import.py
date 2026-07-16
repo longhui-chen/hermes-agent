@@ -200,6 +200,37 @@ def test_memory_import_prepare_blocks_user_edit_after_crash(tmp_path, monkeypatc
     assert memory_path.read_text() == "user edit after crash"
 
 
+def test_memory_import_cas_preserves_edit_after_prepared_receipt(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    memory_path = home / "memories" / "MEMORY.md"
+    memory_path.parent.mkdir(parents=True)
+    memory_path.write_text("old fact", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=100, user_char_limit=100)
+    original_write_receipt = store._write_import_receipt
+
+    def edit_after_prepare(path, receipt):
+        original_write_receipt(path, receipt)
+        if receipt["state"] == "prepared":
+            memory_path.write_text("concurrent external edit", encoding="utf-8")
+
+    monkeypatch.setattr(store, "_write_import_receipt", edit_after_prepare)
+
+    with pytest.raises(MemoryImportConflict, match="after import prepare"):
+        store.import_replace(
+            target="memory",
+            entries=["imported fact"],
+            import_id="cas-conflict",
+            payload_sha256=hashlib.sha256(b"cas-conflict").hexdigest(),
+        )
+
+    assert memory_path.read_text(encoding="utf-8") == "concurrent external edit"
+    receipt_path = next((home / "memories" / ".imports").glob("*.json"))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["state"] == "prepared"
+    assert Path(receipt["backup_path"]).read_text(encoding="utf-8") == "old fact"
+
+
 def test_memory_import_retains_only_five_recoverable_backups(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     memory_path = home / "memories" / "MEMORY.md"

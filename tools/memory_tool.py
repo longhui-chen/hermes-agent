@@ -71,6 +71,7 @@ def get_memory_dir() -> Path:
 
 ENTRY_DELIMITER = "\n§\n"
 MEMORY_IMPORT_BACKUP_LIMIT = 5
+_MISSING_MEMORY_FILE_SHA256 = "missing"
 
 
 class MemoryImportConflict(ValueError):
@@ -704,11 +705,17 @@ class MemoryStore:
                 live_sha = hashlib.sha256(
                     ENTRY_DELIMITER.join(self._read_file(path)).encode("utf-8")
                 ).hexdigest()
+                live_file_sha = self._live_file_sha256(path)
                 state = receipt.get("state")
                 if state == "prepared":
                     previous_sha = receipt.get("previous_content_sha256")
                     if live_sha == previous_sha:
-                        self._write_file(path, normalized)
+                        previous_file_sha = receipt.get("previous_file_sha256")
+                        if previous_file_sha is not None and live_file_sha != previous_file_sha:
+                            raise MemoryImportConflict(
+                                "memory changed after import prepare; refusing to overwrite user edits"
+                            )
+                        self._write_file(path, normalized, live_file_sha)
                     elif live_sha != content_sha:
                         raise MemoryImportConflict(
                             "memory changed after import prepare; refusing to overwrite user edits"
@@ -735,6 +742,7 @@ class MemoryStore:
             # recovery before _reload_target deduplicates the live entries.
             # Otherwise a legacy file containing duplicate entries produces a
             # prepared receipt whose previous SHA can never match that file.
+            previous_file_sha = self._live_file_sha256(path)
             previous_entries = self._read_file(path)
             backup = self._reload_target(target)
             if backup:
@@ -751,6 +759,7 @@ class MemoryStore:
                 "payload_sha256": payload_sha256.lower(),
                 "content_sha256": content_sha,
                 "previous_content_sha256": previous_sha,
+                "previous_file_sha256": previous_file_sha,
                 "prepared_at": time.time(),
             }
             if backup_path:
@@ -758,7 +767,7 @@ class MemoryStore:
             # Durable prepare MUST precede the target rename. A crash can then
             # be recovered without guessing whether a later edit is user data.
             self._write_import_receipt(receipt_path, receipt)
-            self._write_file(path, normalized)
+            self._write_file(path, normalized, previous_file_sha)
             receipt["state"] = "completed"
             receipt["completed_at"] = time.time()
             self._write_import_receipt(receipt_path, receipt)
@@ -997,7 +1006,21 @@ class MemoryStore:
         return str(bak_path)
 
     @staticmethod
-    def _write_file(path: Path, entries: List[str]):
+    def _live_file_sha256(path: Path) -> str:
+        try:
+            content = path.read_bytes()
+        except FileNotFoundError:
+            return _MISSING_MEMORY_FILE_SHA256
+        except OSError as exc:
+            raise MemoryImportConflict(
+                f"cannot verify existing {path.name}: {exc}"
+            ) from exc
+        return hashlib.sha256(content).hexdigest()
+
+    @staticmethod
+    def _write_file(
+        path: Path, entries: List[str], expected_live_sha256: Optional[str] = None
+    ):
         """Write entries to a memory file using atomic temp-file + rename.
 
         Previous implementation used open("w") + flock, but "w" truncates the
@@ -1016,6 +1039,13 @@ class MemoryStore:
                     f.write(content)
                     f.flush()
                     os.fsync(f.fileno())
+                if (
+                    expected_live_sha256 is not None
+                    and MemoryStore._live_file_sha256(path) != expected_live_sha256
+                ):
+                    raise MemoryImportConflict(
+                        "memory changed after import prepare; refusing to overwrite user edits"
+                    )
                 atomic_replace(tmp_path, path)
                 _fsync_directory(path.parent)
             except BaseException:

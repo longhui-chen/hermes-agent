@@ -96,6 +96,46 @@ async def test_memory_import_http_flow_returns_recoverable_backup(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_memory_import_http_flow_returns_conflict_for_live_cas_edit(
+    tmp_path, monkeypatch
+):
+    import tools.memory_tool as memory_tool
+
+    home = tmp_path / ".hermes"
+    memory_path = home / "memories" / "MEMORY.md"
+    memory_path.parent.mkdir(parents=True)
+    memory_path.write_text("existing curated fact", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = memory_tool.MemoryStore(memory_char_limit=100, user_char_limit=100)
+    original_write_receipt = store._write_import_receipt
+
+    def edit_after_prepare(path, receipt):
+        original_write_receipt(path, receipt)
+        if receipt["state"] == "prepared":
+            memory_path.write_text("external edit wins", encoding="utf-8")
+
+    monkeypatch.setattr(store, "_write_import_receipt", edit_after_prepare)
+    monkeypatch.setattr(memory_tool, "load_on_disk_store", lambda: store)
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    app = web.Application()
+    app.router.add_post("/api/memory/import", adapter._handle_memory_import)
+
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            "/api/memory/import",
+            json={
+                "import_id": "cas-http-flow", "mode": "replace", "target": "memory",
+                "payload_sha256": hashlib.sha256(b"cas-http-flow").hexdigest(),
+                "entries": ["replacement fact"],
+            },
+            headers={"Authorization": "Bearer test-key"},
+        )
+        assert response.status == 409
+        assert (await response.json())["error"]["code"] == "memory_import_conflict"
+    assert memory_path.read_text(encoding="utf-8") == "external edit wins"
+
+
+@pytest.mark.asyncio
 async def test_runtime_import_flow_rejects_credentials_at_final_consumer(
     tmp_path, monkeypatch
 ):
@@ -135,6 +175,31 @@ async def test_runtime_import_flow_rejects_credentials_at_final_consumer(
             )
             assert memory.status == 400
             assert (await memory.json())["error"]["code"] == "invalid_memory_import"
+            aws_query = await cli.post(
+                "/api/sessions/import",
+                json={
+                    **payload,
+                    "import_id": "aws-query-credential",
+                    "messages": [{
+                        "role": "user",
+                        "content": "https://bucket.s3.amazonaws.com/item?X-Amz-Signature=" + "a" * 64,
+                        "created_at": 1,
+                    }],
+                },
+                headers=headers,
+            )
+            assert aws_query.status == 400
+            slack_app = await cli.post(
+                "/api/memory/import",
+                json={
+                    "import_id": "slack-app-credential", "mode": "replace",
+                    "target": "memory",
+                    "payload_sha256": hashlib.sha256(b"slack-app").hexdigest(),
+                    "entries": ["xapp-1-123456789012-abcdefghijklmnopqrstuvwxyzABCD"],
+                },
+                headers=headers,
+            )
+            assert slack_app.status == 400
             credential_id = "sk-1234567890abcdefghij"
             metadata = await cli.post(
                 "/api/sessions/import",
@@ -263,7 +328,9 @@ def test_runtime_import_barrier_allows_only_a_recreated_profile_generation(tmp_p
     profile_home.mkdir(parents=True)
     adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
 
-    assert adapter._block_runtime_import_profile(profile_home) == 0
+    active, owner = adapter._block_runtime_import_profile(profile_home)
+    assert active == 0
+    adapter._complete_runtime_import_profile_unload(profile_home, owner)
     assert adapter._begin_runtime_import_operation(profile_home) is None
     profile_home.rmdir()
     assert adapter._begin_runtime_import_operation(profile_home) is None
@@ -354,6 +421,146 @@ async def test_uncached_profile_cleanup_db_open_blocks_profile_unload(
     finally:
         release.set()
         await cleanup_task
+
+
+@pytest.mark.asyncio
+async def test_failed_reload_and_unload_do_not_release_a_successful_unload_barrier(
+    tmp_path,
+):
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+
+    class _Request(dict):
+        def __init__(self, *, body=None, path="/p/coder/v1/profile/unload"):
+            super().__init__(
+                hermes_profile="coder", hermes_profile_home=str(profile_home)
+            )
+            self._body = body
+            self.headers = {"Authorization": "Bearer test-key"}
+            self.method = "POST"
+            self.path_qs = path
+            self.remote = "127.0.0.1"
+            self.transport = None
+
+        async def json(self):
+            return self._body
+
+    first = await adapter._handle_profile_unload(_Request())
+    assert first.status == 200
+
+    class _FailingRunner:
+        async def unload_profile_runtime(self, _profile):
+            raise RuntimeError("unload failed")
+
+        def invalidate_cached_agents_for_profile(self, _profile):
+            return 0
+
+    class _FailingDB:
+        def clear_all_system_prompts(self):
+            raise RuntimeError("reload failed")
+
+    adapter.gateway_runner = _FailingRunner()
+    adapter._ensure_session_db = lambda: _FailingDB()
+    failed_reload = await adapter._handle_profile_reload(
+        _Request(path="/p/coder/v1/profile/reload")
+    )
+    assert failed_reload.status == 500
+    failed = await adapter._handle_profile_unload(_Request())
+    assert failed.status == 500
+
+    blocked = await adapter._handle_memory_import(
+        _Request(
+            path="/p/coder/api/memory/import",
+            body={
+                "import_id": "after-failed-unload",
+                "mode": "replace",
+                "target": "memory",
+                "payload_sha256": hashlib.sha256(b"after-failed-unload").hexdigest(),
+                "entries": ["safe fact"],
+            },
+        )
+    )
+    assert blocked.status == 409
+
+
+@pytest.mark.asyncio
+async def test_reload_cannot_release_a_concurrent_successful_unload_barrier(tmp_path):
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+
+    class _Request(dict):
+        def __init__(self, *, body=None, path="/p/coder/v1/profile/unload"):
+            super().__init__(
+                hermes_profile="coder", hermes_profile_home=str(profile_home)
+            )
+            self._body = body
+            self.headers = {"Authorization": "Bearer test-key"}
+            self.method = "POST"
+            self.path_qs = path
+            self.remote = "127.0.0.1"
+            self.transport = None
+
+        async def json(self):
+            return self._body
+
+    class _Runner:
+        async def unload_profile_runtime(self, _profile):
+            return {"evicted_sessions": 0, "disconnected_adapters": 0}
+
+        def invalidate_cached_agents_for_profile(self, _profile):
+            return 0
+
+    adapter.gateway_runner = _Runner()
+    assert (await adapter._handle_profile_unload(_Request())).status == 200
+
+    reload_started = threading.Event()
+    allow_reload = threading.Event()
+
+    class _BlockingDB:
+        def clear_all_system_prompts(self):
+            reload_started.set()
+            assert allow_reload.wait(2)
+            return 0
+
+    adapter._ensure_session_db = lambda: _BlockingDB()
+    concurrent_unload = []
+
+    def unload_while_reload_is_in_progress():
+        assert reload_started.wait(2)
+        concurrent_unload.append(
+            asyncio.run(adapter._handle_profile_unload(_Request())).status
+        )
+        allow_reload.set()
+
+    thread = threading.Thread(target=unload_while_reload_is_in_progress)
+    thread.start()
+    reloaded = await adapter._handle_profile_reload(
+        _Request(path="/p/coder/v1/profile/reload")
+    )
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert reloaded.status == 200
+    assert concurrent_unload == [200]
+
+    blocked = await adapter._handle_memory_import(
+        _Request(
+            path="/p/coder/api/memory/import",
+            body={
+                "import_id": "after-concurrent-unload",
+                "mode": "replace",
+                "target": "memory",
+                "payload_sha256": hashlib.sha256(b"after-concurrent-unload").hexdigest(),
+                "entries": ["safe fact"],
+            },
+        )
+    )
+    assert blocked.status == 409
 
 
 @pytest.mark.asyncio

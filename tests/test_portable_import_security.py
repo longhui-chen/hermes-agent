@@ -28,11 +28,14 @@ def test_portable_credential_scanner_rejects_assignment_and_escape_forms(value):
     "value",
     [
         "xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwxyzABCD",
+        "xapp-1-123456789012-abcdefghijklmnopqrstuvwxyzABCD",
         "AIza" + "A" * 35,
         "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.c2lnbmF0dXJlX3ZhbHVl",
         "https://api.example.test/v1/items?access_token=abcdefghijklmnop",
+        "https://bucket.s3.amazonaws.com/item?X-Amz-Signature=" + "a" * 64,
+        "https://bucket.s3.amazonaws.com/item?X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20260717%2Fus-east-1%2Fs3%2Faws4_request",
     ],
-    ids=["slack", "google-api", "jwt", "url-query"],
+    ids=["slack-bot", "slack-app", "google-api", "jwt", "url-query", "aws-signature", "aws-credential"],
 )
 def test_portable_credential_scanner_rejects_high_confidence_bare_and_query_forms(value):
     assert portable_credential_finding(value) is not None
@@ -44,8 +47,12 @@ def test_portable_credential_scanner_rejects_high_confidence_bare_and_query_form
         "Authorization=Bearer redacted",
         "api key = ${OPENAI_API_KEY}",
         r"{\"Authorization\":\u0020\"Bearer\u0020${ACCESS_TOKEN}\"}",
+        "xapp-your-app-token-here",
+        "xapp-1-<SLACK_APP_TOKEN>",
         "https://api.example.test/v1/items?access_token=${ACCESS_TOKEN}",
         "https://api.example.test/v1/items?api_key=redacted",
+        "https://bucket.s3.amazonaws.com/item?X-Amz-Signature=${AWS_SIGNATURE}",
+        "https://bucket.s3.amazonaws.com/item?X-Amz-Credential=<AWS_CREDENTIAL>",
     ],
 )
 def test_portable_credential_scanner_keeps_placeholders(value):

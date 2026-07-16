@@ -25,6 +25,7 @@ _CREDENTIAL_ASSIGNMENT_RE = re.compile(
 _HIGH_CONFIDENCE_BARE_TOKEN_RE = re.compile(
     r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
     r"sk-(?:proj-)?[A-Za-z0-9_-]{20,}|"
+    r"xapp-\d+-[A-Za-z0-9-]{10,}|"
     r"xox[baprs]-[A-Za-z0-9-]{10,}|"
     r"AIza[A-Za-z0-9_-]{35}|"
     r"eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b"
@@ -32,7 +33,8 @@ _HIGH_CONFIDENCE_BARE_TOKEN_RE = re.compile(
 _URL_QUERY_CREDENTIAL_RE = re.compile(
     r"[?&](?:api[._-]?key|access[._-]?token|refresh[._-]?token|"
     r"auth[._-]?token|authorization|client[._-]?secret|secret|token|"
-    r"password|passwd|cookie|credentials?)=([^&#\s]+)",
+    r"password|passwd|cookie|credentials?|x-amz-signature|"
+    r"x-amz-credential)=([^&#\s]+)",
     re.IGNORECASE,
 )
 _PLACEHOLDER_VALUE_RE = re.compile(

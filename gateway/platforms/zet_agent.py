@@ -314,7 +314,10 @@ class ZetAgentAdapter(APIServerAdapter):
         # race a worker that later recreates the deleted profile directory.
         self._runtime_import_operation_lock = threading.Lock()
         self._runtime_import_operations: Dict[str, int] = {}
-        self._runtime_import_unloaded_homes: Dict[str, Optional[tuple[int, int]]] = {}
+        self._runtime_import_unload_barriers: Dict[
+            str, Dict[int, tuple[Optional[tuple[int, int]], bool]]
+        ] = {}
+        self._runtime_import_barrier_generation = 0
 
     @staticmethod
     def _profile_directory_identity(key: str) -> Optional[tuple[int, int]]:
@@ -327,15 +330,8 @@ class ZetAgentAdapter(APIServerAdapter):
     def _begin_runtime_import_operation(self, profile_home: Optional[Any]) -> Optional[str]:
         key = self._profile_home_key(profile_home)
         with self._runtime_import_operation_lock:
-            if key in self._runtime_import_unloaded_homes:
-                previous = self._runtime_import_unloaded_homes[key]
-                current = self._profile_directory_identity(key)
-                # A newly-created directory is a new profile generation. An
-                # absent directory is not: allowing it would let this request
-                # itself resurrect the just-deleted profile.
-                if current is None or current == previous:
-                    return None
-                self._runtime_import_unloaded_homes.pop(key, None)
+            if self._runtime_import_barriers_locked(key):
+                return None
             self._runtime_import_operations[key] = (
                 self._runtime_import_operations.get(key, 0) + 1
             )
@@ -351,25 +347,111 @@ class ZetAgentAdapter(APIServerAdapter):
             else:
                 self._runtime_import_operations.pop(key, None)
 
-    def _block_runtime_import_profile(self, profile_home: Optional[Any]) -> int:
+    def _runtime_import_barriers_locked(
+        self, key: str
+    ) -> Dict[int, tuple[Optional[tuple[int, int]], bool]]:
+        barriers = self._runtime_import_unload_barriers.get(key)
+        if not barriers:
+            return {}
+        current = self._profile_directory_identity(key)
+        # An absent directory remains blocked: otherwise an import request can
+        # recreate the profile it is meant to protect. A different live inode
+        # is a new profile generation, so only owners acquired for that exact
+        # generation continue to apply.
+        if current is None:
+            return barriers
+        retained = {
+            owner: state
+            for owner, state in barriers.items()
+            if state[0] == current
+        }
+        if retained:
+            self._runtime_import_unload_barriers[key] = retained
+        else:
+            self._runtime_import_unload_barriers.pop(key, None)
+        return retained
+
+    def _block_runtime_import_profile(
+        self, profile_home: Optional[Any]
+    ) -> tuple[int, Optional[int]]:
         key = self._profile_home_key(profile_home)
         with self._runtime_import_operation_lock:
             active = int(self._runtime_import_operations.get(key, 0) or 0)
-            if not active:
-                self._runtime_import_unloaded_homes[key] = (
-                    self._profile_directory_identity(key)
-                )
-            return active
+            if active:
+                return active, None
+            self._runtime_import_barriers_locked(key)
+            self._runtime_import_barrier_generation += 1
+            owner = self._runtime_import_barrier_generation
+            self._runtime_import_unload_barriers.setdefault(key, {})[owner] = (
+                self._profile_directory_identity(key), False
+            )
+            return 0, owner
 
-    def _unblock_runtime_import_profile(self, profile_home: Optional[Any]) -> None:
+    def _complete_runtime_import_profile_unload(
+        self, profile_home: Optional[Any], owner: Optional[int]
+    ) -> None:
+        if owner is None:
+            return
         key = self._profile_home_key(profile_home)
         with self._runtime_import_operation_lock:
-            self._runtime_import_unloaded_homes.pop(key, None)
+            barriers = self._runtime_import_unload_barriers.get(key)
+            if barriers is None or owner not in barriers:
+                return
+            identity, _pending = barriers[owner]
+            # Completed owners collapse to the newest generation. Pending
+            # owners remain individually reference-counted so one failed
+            # request can release only itself without growing the durable
+            # successful barrier set on repeated unload calls.
+            for previous_owner, (_previous_identity, completed) in tuple(
+                barriers.items()
+            ):
+                if completed:
+                    barriers.pop(previous_owner, None)
+            barriers[owner] = (identity, True)
+
+    def _unblock_runtime_import_profile(
+        self, profile_home: Optional[Any], owner: Optional[int]
+    ) -> None:
+        if owner is None:
+            return
+        key = self._profile_home_key(profile_home)
+        with self._runtime_import_operation_lock:
+            barriers = self._runtime_import_unload_barriers.get(key)
+            if barriers is None:
+                return
+            barriers.pop(owner, None)
+            if not barriers:
+                self._runtime_import_unload_barriers.pop(key, None)
+
+    def _snapshot_runtime_import_reload_barriers(
+        self, profile_home: Optional[Any]
+    ) -> tuple[str, frozenset[int]]:
+        key = self._profile_home_key(profile_home)
+        with self._runtime_import_operation_lock:
+            barriers = self._runtime_import_barriers_locked(key)
+            return key, frozenset(
+                owner for owner, (_identity, completed) in barriers.items()
+                if completed
+            )
+
+    def _release_runtime_import_reload_barriers(
+        self, key: str, owners: frozenset[int]
+    ) -> None:
+        if not owners:
+            return
+        with self._runtime_import_operation_lock:
+            barriers = self._runtime_import_unload_barriers.get(key)
+            if barriers is None:
+                return
+            for owner in owners:
+                barriers.pop(owner, None)
+            if not barriers:
+                self._runtime_import_unload_barriers.pop(key, None)
 
     def _runtime_import_profile_is_blocked(self, profile_home: Optional[Any]) -> bool:
         key = self._profile_home_key(profile_home)
         with self._runtime_import_operation_lock:
-            return key in self._runtime_import_unloaded_homes
+            return bool(self._runtime_import_barriers_locked(key))
 
     # ------------------------------------------------------------------
     # _stream_q closure sniffing
@@ -2565,6 +2647,11 @@ class ZetAgentAdapter(APIServerAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        reload_barrier_key, reload_barrier_owners = (
+            self._snapshot_runtime_import_reload_barriers(
+                _request_value(request, "hermes_profile_home")
+            )
+        )
 
         gw = getattr(self, "gateway_runner", None)
         if gw is None:
@@ -2635,8 +2722,8 @@ class ZetAgentAdapter(APIServerAdapter):
             "%d DB row(s) cleared",
             invalidated, db_rows_cleared,
         )
-        self._unblock_runtime_import_profile(
-            _request_value(request, "hermes_profile_home")
+        self._release_runtime_import_reload_barriers(
+            reload_barrier_key, reload_barrier_owners
         )
         return web.json_response({
             "reloaded": True,
@@ -2677,7 +2764,9 @@ class ZetAgentAdapter(APIServerAdapter):
                 },
                 status=409,
             )
-        active_imports = self._block_runtime_import_profile(profile_home)
+        active_imports, unload_barrier_owner = self._block_runtime_import_profile(
+            profile_home
+        )
         if active_imports:
             return web.json_response(
                 {
@@ -2702,8 +2791,15 @@ class ZetAgentAdapter(APIServerAdapter):
                         "evicted_sessions": gw.invalidate_all_cached_agents(),
                         "disconnected_adapters": 0,
                     }
+            except asyncio.CancelledError:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                raise
             except Exception:
-                self._unblock_runtime_import_profile(profile_home)
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
                 logger.warning(
                     "[zet_agent] profile-unload: runtime unload failed",
                     exc_info=True,
@@ -2717,7 +2813,9 @@ class ZetAgentAdapter(APIServerAdapter):
                 )
 
         if runtime_unload.get("blocked"):
-            self._unblock_runtime_import_profile(profile_home)
+            self._unblock_runtime_import_profile(
+                profile_home, unload_barrier_owner
+            )
             return web.json_response(
                 {
                     "unloaded": False,
@@ -2737,6 +2835,11 @@ class ZetAgentAdapter(APIServerAdapter):
                 if callable(discard_staging):
                     try:
                         await asyncio.to_thread(discard_staging)
+                    except asyncio.CancelledError:
+                        self._unblock_runtime_import_profile(
+                            profile_home, unload_barrier_owner
+                        )
+                        raise
                     except Exception:
                         # Unload remains best-effort, but always attempt to
                         # remove unpublished external transcripts before the
@@ -2777,6 +2880,9 @@ class ZetAgentAdapter(APIServerAdapter):
                         exc_info=True,
                     )
 
+        self._complete_runtime_import_profile_unload(
+            profile_home, unload_barrier_owner
+        )
         return web.json_response({
             "unloaded": True,
             "closed_session_db": closed_session_db,
