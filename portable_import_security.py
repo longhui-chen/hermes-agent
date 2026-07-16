@@ -34,8 +34,10 @@ _PLACEHOLDER_VALUE_RE = re.compile(
     r"redacted|changeme|sk-example|[x*_-]+)",
     re.IGNORECASE,
 )
-_ASCII_UNICODE_ESCAPE_RE = re.compile(r"\\+u00([0-7][0-9a-f])", re.IGNORECASE)
-_ESCAPED_QUOTE_RE = re.compile(r"\\+([\"'])")
+_ASCII_UNICODE_ESCAPE_RE = re.compile(
+    r"(?<!\\)\\+u00([0-7][0-9a-f])", re.IGNORECASE
+)
+_ESCAPED_QUOTE_RE = re.compile(r"(?<!\\)\\+([\"'])")
 
 
 def _credential_scan_text(value: str) -> str:

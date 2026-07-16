@@ -45,3 +45,14 @@ def test_portable_credential_scanner_bounds_long_non_matching_prose():
 
     assert finding is None
     assert elapsed < 2.0, f"credential scan took {elapsed:.3f}s"
+
+
+def test_portable_credential_scanner_bounds_long_escape_run():
+    value = "\\" * 65_536
+
+    started_at = time.perf_counter()
+    finding = portable_credential_finding(value)
+    elapsed = time.perf_counter() - started_at
+
+    assert finding is None
+    assert elapsed < 2.0, f"credential scan took {elapsed:.3f}s"
