@@ -62,6 +62,9 @@ dependencies = [
   "prompt_toolkit==3.0.52",
   # Cron scheduler (built-in feature — scheduled cron/interval jobs use croniter).
   "croniter==6.0.0",
+  # IANA-backed BCP 47 validation for persisted cron output-language tags.
+  # Imported lazily so profiles without localized jobs pay no startup/RSS cost.
+  "langcodes==3.5.1",
   # ``packaging`` is imported directly on three production paths but was never
   # declared, so it only reached users transitively (pip/uv pull it for other
   # tools). The slim official Docker image ships without it, where the

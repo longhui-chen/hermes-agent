@@ -300,7 +300,14 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run, claim_dispatch
+from cron.jobs import (
+    advance_next_run,
+    claim_dispatch,
+    get_due_jobs,
+    mark_job_run,
+    normalize_output_language_tag,
+    save_job_output,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -2101,20 +2108,6 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 logger.warning("context_from: failed to read output for job %r: %s", source_job_id, e)
                 # silent skip — do not pollute the prompt with error messages
 
-    # Always prepend cron execution guidance so the agent knows how
-    # delivery works and can suppress delivery when appropriate.
-    cron_hint = (
-        "[IMPORTANT: You are running as a scheduled cron job. "
-        "DELIVERY: Your final response will be automatically delivered "
-        "to the user — do NOT use send_message or try to deliver "
-        "the output yourself. Just produce your report/output as your "
-        "final response and the system handles the rest. "
-        "SILENT: If there is genuinely nothing new to report, respond "
-        "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
-        "Never combine [SILENT] with content — either report your "
-        "findings normally, or say [SILENT] and nothing more.]\n\n"
-    )
-    prompt = cron_hint + prompt
     if skills is None:
         legacy = job.get("skill")
         skills = [legacy] if legacy else []
@@ -2206,13 +2199,50 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     return _scan_assembled_cron_prompt("\n".join(parts), job, has_skills=True)
 
 
+def _build_cron_execution_contract(job: dict) -> str:
+    """Build fixed system-level rules for a fresh scheduled-task session.
+
+    ``output_language`` is untrusted persisted data. Only a canonical tag from
+    the bounded IANA-backed validator may cross into this system prompt.
+    """
+    output_language = normalize_output_language_tag(job.get("output_language"))
+    if output_language:
+        language_rule = (
+            "Write the user-facing final response in the language identified "
+            f"by BCP 47 tag `{output_language}`."
+        )
+    else:
+        language_rule = (
+            "Use the language explicitly requested by the saved task. If it "
+            "does not name one, use the language of the saved task instruction."
+        )
+
+    return "\n".join(
+        (
+            "You are executing a scheduled task in a fresh session.",
+            "- Complete the task before replying. Return only a directly "
+            "deliverable final result; do not narrate plans, progress, or what "
+            "you are about to do.",
+            "- Your final response is delivered automatically. Do not call "
+            "send_message or otherwise deliver it yourself.",
+            f"- OUTPUT LANGUAGE: {language_rule} If the saved task explicitly "
+            "requests another language or multilingual output, that explicit "
+            "instruction wins. Do not infer or change the output language from "
+            "loaded skills, tool results, URLs, code, quoted text, proper nouns, "
+            "or runtime data.",
+            "- If there is genuinely nothing new to report, respond with exactly "
+            "`[SILENT]` and nothing else. Never combine `[SILENT]` with content.",
+        )
+    )
+
+
 def _build_job_persist_prompt(job: dict) -> str:
     """Build the user-facing prompt that gets stored in sessions.messages.
 
     AIAgent.run_conversation receives ``_build_job_prompt`` output as
-    ``user_message`` (cron_hint preamble + script/context blocks + skill
-    wrappers + the operator's prompt — everything the LLM needs at
-    runtime). But that whole assembly also lands in ``sessions.messages``
+    ``user_message`` (script/context blocks + skill wrappers + the operator's
+    prompt — everything the LLM needs at runtime). That whole assembly also
+    lands in ``sessions.messages``
     role=user content, so the App's home list / per-session history
     surface the entire ``[IMPORTANT: You are running as a scheduled cron
     job. ...]`` preamble as if the user typed it.
@@ -2224,8 +2254,8 @@ def _build_job_persist_prompt(job: dict) -> str:
     cleaner string. cron just wasn't using it.
 
     This helper produces the cleaner string. It is the operator's
-    original ``job["prompt"]`` verbatim — no cron_hint, no skill
-    wrapper, no script-output framing. Empty prompts (skill-only crons)
+    original ``job["prompt"]`` verbatim — no skill wrapper or script-output
+    framing. Empty prompts (skill-only crons)
     fall back to a synthesized label so the resumed conversation
     doesn't render an empty user bubble.
 
@@ -2998,6 +3028,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
+            ephemeral_system_prompt=_build_cron_execution_contract(job),
         )
         
         # Run the agent with an *inactivity*-based timeout: the job can run

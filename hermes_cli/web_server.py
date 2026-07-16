@@ -8353,6 +8353,7 @@ class CronJobCreate(BaseModel):
     enabled_toolsets: Optional[List[str]] = None
     workdir: Optional[str] = None
     no_agent: bool = False
+    output_language: Optional[str] = None
 
 
 class CronJobUpdate(BaseModel):
@@ -8669,6 +8670,7 @@ async def create_cron_job(body: CronJobCreate, profile: str = "default"):
             enabled_toolsets=_cron_string_list(body.enabled_toolsets),
             workdir=_cron_optional_text(body.workdir),
             no_agent=no_agent,
+            output_language=body.output_language,
         )
     except HTTPException:
         raise

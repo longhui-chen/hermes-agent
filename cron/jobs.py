@@ -52,7 +52,57 @@ except ImportError:
 
 
 _MAX_TIMEZONE_NAME_LENGTH = 255
+_MAX_OUTPUT_LANGUAGE_TAG_LENGTH = 63
 _MAX_CRON_NEXT_RUN_ATTEMPTS = 8
+
+
+def normalize_output_language_tag(value: Any) -> Optional[str]:
+    """Return a canonical, bounded BCP 47 tag, or ``None`` if invalid.
+
+    This is the fail-closed reader for an untrusted persisted field.  It never
+    raises, so a hand-edited legacy job cannot break the scheduler, and it
+    imports the IANA-backed validator only when a non-empty value is present.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if (
+        not text
+        or len(text) > _MAX_OUTPUT_LANGUAGE_TAG_LENGTH
+        or not text.isascii()
+        or not re.fullmatch(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*", text)
+    ):
+        return None
+
+    try:
+        from langcodes import standardize_tag, tag_is_valid
+
+        if not tag_is_valid(text):
+            return None
+        normalized = standardize_tag(text)
+    except (ImportError, LookupError, TypeError, ValueError):
+        return None
+
+    # These ISO 639 codes deliberately describe an unknown, multiple, or
+    # non-linguistic language and therefore cannot establish an output
+    # language. Pure private-use tags have the same ambiguity.
+    primary = normalized.split("-", 1)[0].lower()
+    if primary in {"und", "mul", "zxx", "x"}:
+        return None
+    return normalized
+
+
+def validate_output_language_tag(value: Any) -> Optional[str]:
+    """Validate a create/update value, raising a bounded generic error."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    normalized = normalize_output_language_tag(value)
+    if normalized is None:
+        raise ValueError(
+            "output_language must be a valid BCP 47 tag of at most 63 ASCII "
+            "characters (for example 'zh-CN', 'ja', 'ar', or 'sr-Latn-RS')"
+        )
+    return normalized
 
 
 def _normalized_iana_timezone_name(name: Any) -> Optional[str]:
@@ -319,6 +369,20 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     if not state:
         state = "scheduled" if normalized.get("enabled", True) else "paused"
     normalized["state"] = state
+
+    raw_output_language = normalized.get("output_language")
+    output_language = normalize_output_language_tag(raw_output_language)
+    if output_language is not None:
+        normalized["output_language"] = output_language
+    else:
+        # Missing and invalid values both mean "legacy fallback". In
+        # particular, never pass hand-edited arbitrary text to a system prompt.
+        normalized.pop("output_language", None)
+        if raw_output_language is not None and raw_output_language != "":
+            logger.warning(
+                "Ignoring invalid output_language on cron job %r",
+                normalized.get("id"),
+            )
 
     return normalized
 
@@ -1016,6 +1080,7 @@ def create_job(
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
     timezone: Optional[str] = None,
+    output_language: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1060,6 +1125,9 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        output_language: Optional canonical BCP 47 language tag captured when
+                         an LLM creates an agent job. Direct/legacy callers may
+                         omit it; script-only jobs ignore it.
 
     Returns:
         The created job dict
@@ -1106,6 +1174,11 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_output_language = (
+        None
+        if normalized_no_agent
+        else validate_output_language_tag(output_language)
+    )
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1188,6 +1261,8 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    if normalized_output_language is not None:
+        job["output_language"] = normalized_output_language
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1283,6 +1358,10 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
             # and falls back to the hermes instance's configured tz.
             if "timezone" in updates:
                 updates["timezone"] = _validate_tz_name(updates["timezone"])
+            if "output_language" in updates:
+                updates["output_language"] = validate_output_language_tag(
+                    updates["output_language"]
+                )
 
             updated = _apply_skill_fields({**job, **updates})
             schedule_changed = "schedule" in updates

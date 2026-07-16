@@ -1587,6 +1587,7 @@ dependencies = [
     { name = "fire" },
     { name = "httpx", extra = ["socks"] },
     { name = "jinja2" },
+    { name = "langcodes" },
     { name = "markdown" },
     { name = "openai" },
     { name = "packaging" },
@@ -1860,6 +1861,7 @@ requires-dist = [
     { name = "honcho-ai", marker = "extra == 'honcho'", specifier = "==2.0.1" },
     { name = "httpx", extras = ["socks"], specifier = "==0.28.1" },
     { name = "jinja2", specifier = "==3.1.6" },
+    { name = "langcodes", specifier = "==3.5.1" },
     { name = "langfuse", marker = "extra == 'langfuse'", specifier = "==4.7.1" },
     { name = "lark-oapi", marker = "extra == 'feishu'", specifier = "==1.5.3" },
     { name = "markdown", specifier = "==3.10.2" },
@@ -2248,6 +2250,15 @@ dependencies = [
 sdist = { url = "https://mirrors.hust.edu.cn/pypi/web/packages/19/74/a633ee74eb36c44aa6d1095e7cc5569bebf04342ee146178e2d36600708b/jsonschema_specifications-2025.9.1.tar.gz", hash = "sha256:b540987f239e745613c7a9176f3edb72b832a4ac465cf02712288397832b5e8d" }
 wheels = [
     { url = "https://mirrors.hust.edu.cn/pypi/web/packages/41/45/1a4ed80516f02155c51f51e8cedb3c1902296743db0bbc66608a0db2814f/jsonschema_specifications-2025.9.1-py3-none-any.whl", hash = "sha256:98802fee3a11ee76ecaca44429fda8a41bff98b00a0f2838151b113f210cc6fe" },
+]
+
+[[package]]
+name = "langcodes"
+version = "3.5.1"
+source = { registry = "https://mirrors.hust.edu.cn/pypi/web/simple" }
+sdist = { url = "https://mirrors.hust.edu.cn/pypi/web/packages/a9/75/f9edc5d72945019312f359e69ded9f82392a81d49c5051ed3209b100c0d2/langcodes-3.5.1.tar.gz", hash = "sha256:40bff315e01b01d11c2ae3928dd4f5cbd74dd38f9bd912c12b9a3606c143f731" }
+wheels = [
+    { url = "https://mirrors.hust.edu.cn/pypi/web/packages/dd/c1/d10b371bcba7abce05e2b33910e39c33cfa496a53f13640b7b8e10bb4d2b/langcodes-3.5.1-py3-none-any.whl", hash = "sha256:b6a9c25c603804e2d169165091d0cdb23934610524a21d226e4f463e8e958a72" },
 ]
 
 [[package]]

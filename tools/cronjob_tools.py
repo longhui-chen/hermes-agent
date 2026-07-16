@@ -26,6 +26,7 @@ from cron.jobs import (
     get_job,
     list_jobs,
     mark_job_run,
+    normalize_output_language_tag,
     parse_schedule,
     pause_job,
     remove_job,
@@ -579,6 +580,9 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["enabled_toolsets"] = job["enabled_toolsets"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
+    output_language = normalize_output_language_tag(job.get("output_language"))
+    if output_language:
+        result["output_language"] = output_language
     return result
 
 
@@ -649,6 +653,7 @@ def cronjob(
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
     timezone: Optional[str] = None,
+    output_language: Optional[str] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -723,6 +728,7 @@ def cronjob(
                 no_agent=_no_agent,
                 attach_to_session=attach_to_session,
                 timezone=_normalize_optional_job_value(timezone),
+                output_language=output_language,
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -918,6 +924,10 @@ def cronjob(
                 # Empty string clears the per-job tz (falls back to hermes
                 # instance tz); otherwise normalize and let update_job validate.
                 updates["timezone"] = _normalize_optional_job_value(timezone)
+            if output_language is not None:
+                # update_job performs canonical BCP 47 validation. Empty
+                # string clears the field for direct/legacy callers.
+                updates["output_language"] = output_language
             if repeat is not None:
                 # Normalize: treat 0 or negative as None (infinite)
                 normalized_repeat = None if repeat <= 0 else repeat
@@ -955,6 +965,10 @@ Use action='update', 'pause', 'resume', 'remove', or 'run' to manage an existing
 To stop a job the user no longer wants: first action='list' to find the job_id, then action='remove' with that job_id. Never guess job IDs — always list first.
 
 Jobs run in a fresh session with no current-chat context, so prompts must be self-contained.
+For an agent-driven create, output_language is required. Pass the BCP 47 tag
+for the language you would use in the current user-facing response, unless the
+saved task explicitly requests another output language. URLs, code, quoted
+text, proper nouns, skills, and tool data do not determine this field.
 If skills are provided on create, the future cron run loads those skills in order, then follows the prompt as the task instruction.
 On update, passing skills=[] clears attached skills.
 
@@ -1118,6 +1132,21 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                     "(e.g. 'UTC 02:30'). On update, pass empty string to clear."
                 ),
             },
+            "output_language": {
+                "type": "string",
+                "description": (
+                    "Required for action='create' unless no_agent=True. A "
+                    "canonicalizable BCP 47 tag (for example zh-CN, zh-TW, "
+                    "en, ja, ko, de, fr, es, it, ar, or sr-Latn-RS). Infer "
+                    "it from the language you would use to answer the user "
+                    "in the creation conversation. An explicit requested "
+                    "output language wins. Ignore URLs, code, quoted text, "
+                    "proper nouns, loaded skills, and tool output. For a "
+                    "multilingual task, store the default narrative language; "
+                    "the prompt may still request multilingual sections. On "
+                    "update, pass an empty string to clear."
+                ),
+            },
         },
         "required": ["action"]
     }
@@ -1149,11 +1178,28 @@ def check_cronjob_requirements() -> bool:
 # --- Registry ---
 from tools.registry import registry, tool_error
 
-registry.register(
-    name="cronjob",
-    toolset="cronjob",
-    schema=CRONJOB_SCHEMA,
-    handler=lambda args, **kw: (lambda _mo=_resolve_model_override(args.get("model")): cronjob(
+
+def _cronjob_registry_handler(args: Dict[str, Any], **kwargs) -> str:
+    """Dispatch the LLM-facing tool with conversation-only requirements.
+
+    Direct ``cronjob``/``create_job`` callers remain backward compatible. The
+    registered LLM tool is the only create path guaranteed to see the source
+    conversation, so it must capture the language before that context is lost.
+    """
+    action = str(args.get("action") or "").strip().lower()
+    if (
+        action == "create"
+        and not bool(args.get("no_agent"))
+        and not str(args.get("output_language") or "").strip()
+    ):
+        return tool_error(
+            "output_language is required for an agent-driven create; pass a "
+            "BCP 47 tag such as 'zh-CN', 'ja', 'ar', or 'sr-Latn-RS'",
+            success=False,
+        )
+
+    model_provider, model_name = _resolve_model_override(args.get("model"))
+    return cronjob(
         action=args.get("action", ""),
         job_id=args.get("job_id"),
         prompt=args.get("prompt"),
@@ -1164,8 +1210,8 @@ registry.register(
         include_disabled=args.get("include_disabled", True),
         skill=args.get("skill"),
         skills=args.get("skills"),
-        model=_mo[1],
-        provider=_mo[0] or args.get("provider"),
+        model=model_name,
+        provider=model_provider or args.get("provider"),
         base_url=args.get("base_url"),
         reason=args.get("reason"),
         script=args.get("script"),
@@ -1174,8 +1220,15 @@ registry.register(
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
         timezone=args.get("timezone"),
-        task_id=kw.get("task_id"),
-    ))(),
+        output_language=args.get("output_language"),
+        task_id=kwargs.get("task_id"),
+    )
+
+registry.register(
+    name="cronjob",
+    toolset="cronjob",
+    schema=CRONJOB_SCHEMA,
+    handler=_cronjob_registry_handler,
     check_fn=check_cronjob_requirements,
     emoji="⏰",
 )

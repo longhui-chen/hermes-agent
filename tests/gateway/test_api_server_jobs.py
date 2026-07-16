@@ -169,6 +169,31 @@ class TestCreateJob:
                 assert call_kwargs["origin"]["user_agent"] == "cron-client"
 
     @pytest.mark.asyncio
+    async def test_create_job_output_language_flow(self, adapter):
+        """REST/local-server proxy may pass the optional persisted tag."""
+        app = _create_app(adapter)
+        expected = {**SAMPLE_JOB, "output_language": "zh-CN"}
+        mock_create = MagicMock(return_value=expected)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post(
+                    "/api/jobs",
+                    json={
+                        "name": "localized",
+                        "schedule": "every 1h",
+                        "prompt": "https://example.com/report",
+                        "output_language": "zh-CN",
+                    },
+                )
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data["job"]["output_language"] == "zh-CN"
+        assert mock_create.call_args.kwargs["output_language"] == "zh-CN"
+
+    @pytest.mark.asyncio
     async def test_create_job_missing_name(self, adapter):
         """POST /api/jobs without name returns 400."""
         app = _create_app(adapter)
