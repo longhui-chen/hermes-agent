@@ -30,13 +30,13 @@ import re
 import json
 import urllib.request
 from urllib.parse import urlsplit, urlunsplit
-from contextvars import ContextVar
 import difflib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, ClassVar
 from pathlib import Path
 from tools.binary_extensions import BINARY_EXTENSIONS
+from gateway.session_context import set_zettlab_turn_id, zettlab_turn_id
 
 from agent.file_safety import (
     build_write_denied_paths,
@@ -766,27 +766,6 @@ def _maybe_warn_line_oriented_newline_pattern(result: SearchResult, pattern: str
         "lines, or escape as `\\\\n` when searching for a literal backslash+n."
     )
     return result
-
-
-# Per-turn correlation token (zettlab local-server's request-body metadata.turn_id),
-# echoed back as the X-Zettlab-Turn-Id header on NAS agent-search fallbacks so
-# local-server pins the result card to THIS turn (ByTurnIDForAgent) instead of
-# guessing the agent's newest turn (ActiveByAgent). Scoped to this feature — one
-# writer (the api_server handler, via set_zettlab_turn_id) and one reader
-# (_zettlab_nas_fallback) — so it stays here rather than becoming a first-class
-# session var. Context-local: an os.environ copy would be process-global and
-# reintroduce the very concurrent-same-agent-turn race the turn pinning fixes.
-_ZETTLAB_TURN_ID: ContextVar = ContextVar("zettlab_nas_turn_id", default="")
-
-
-def set_zettlab_turn_id(turn_id: str) -> None:
-    """Set (or clear, with "") the current turn's NAS correlation token.
-
-    Called by the api_server handler inside its run-in-executor thread, and
-    cleared to "" in the same finally as the other session context — so a
-    reused pool thread never leaks a prior turn's id into a turn that had none.
-    """
-    _ZETTLAB_TURN_ID.set(turn_id or "")
 
 
 class ShellFileOperations(FileOperations):
@@ -2030,7 +2009,7 @@ class ShellFileOperations(FileOperations):
     def _zettlab_turn_id() -> str:
         """Current turn's correlation token (set via set_zettlab_turn_id from the
         api_server handler's metadata.turn_id). "" when local-server sent none."""
-        return _ZETTLAB_TURN_ID.get().strip()
+        return zettlab_turn_id()
 
     def _zettlab_nas_fallback(self, pattern: str, limit: int) -> Optional[SearchResult]:
         """Query local-server NAS agent-search; returns None on any error.
