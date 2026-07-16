@@ -465,6 +465,7 @@ def test_heartbeat_roundtrip_and_age(tmp_path, monkeypatch):
     import cron.jobs as jobs
 
     cron_dir = tmp_path / "cron"
+    monkeypatch.setattr(jobs, "get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
     monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
     monkeypatch.setattr(jobs, "TICKER_HEARTBEAT_FILE", cron_dir / "ticker_heartbeat")
