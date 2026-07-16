@@ -31,7 +31,7 @@ import re
 import stat
 import tempfile
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional
@@ -74,6 +74,7 @@ ENTRY_DELIMITER = "\n§\n"
 MEMORY_IMPORT_BACKUP_LIMIT = 5
 _MISSING_MEMORY_FILE_SHA256 = "missing"
 _MEMORY_TARGET_FILES = {"memory": "MEMORY.md", "user": "USER.md"}
+_MEMORY_TRANSACTION_LOCK = ".curated-memory-transaction"
 
 
 class MemoryImportConflict(ValueError):
@@ -168,6 +169,33 @@ def _target_has_import_state(mem_dir: Path, target: str) -> bool:
     return False
 
 
+def _has_import_temp_state(mem_dir: Path) -> bool:
+    """Return whether a crash may have left profile-local import plaintext."""
+    imports_dir = mem_dir / ".imports"
+    backup_dir = imports_dir / "backups"
+    locations = (
+        (mem_dir, ".mem_"),
+        (imports_dir, ".receipt_"),
+        (backup_dir, ".backup_"),
+    )
+    for directory, prefix in locations:
+        if not _is_real_directory(directory):
+            continue
+        with os.scandir(directory) as entries:
+            if any(
+                entry.name.startswith(prefix) and entry.name.endswith(".tmp")
+                for entry in entries
+            ):
+                return True
+    return False
+
+
+def _validate_reset_lock(path: Path) -> None:
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    if os.path.lexists(lock_path) and not stat.S_ISREG(os.lstat(lock_path).st_mode):
+        raise MemoryImportConflict(f"refusing to follow unsafe reset lock {lock_path}")
+
+
 def curated_memory_has_state(target: str) -> bool:
     """Return whether a reset target has canonical or managed import state."""
     if target not in {"all", "memory", "user"}:
@@ -175,6 +203,8 @@ def curated_memory_has_state(target: str) -> bool:
     mem_dir = get_memory_dir()
     if not _is_real_directory(mem_dir):
         return False
+    if _has_import_temp_state(mem_dir):
+        return True
     targets = ("memory", "user") if target == "all" else (target,)
     for item in targets:
         if os.path.lexists(mem_dir / _MEMORY_TARGET_FILES[item]):
@@ -203,14 +233,22 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
     imports_dir = mem_dir / ".imports"
     backup_dir = imports_dir / "backups"
 
-    for item in targets:
-        filename = _MEMORY_TARGET_FILES[item]
-        path = mem_dir / filename
-        lock_path = path.with_suffix(path.suffix + ".lock")
-        if os.path.lexists(lock_path) and not stat.S_ISREG(os.lstat(lock_path).st_mode):
-            raise MemoryImportConflict(f"refusing to follow unsafe reset lock {lock_path}")
+    transaction_path = mem_dir / _MEMORY_TRANSACTION_LOCK
+    target_paths = [mem_dir / _MEMORY_TARGET_FILES[item] for item in ("memory", "user")]
+    for lock_target in [transaction_path, *target_paths]:
+        _validate_reset_lock(lock_target)
 
-        with MemoryStore._file_lock(path):
+    # Import/reset use the transaction lock. Holding both target locks as well
+    # serializes reset with ordinary memory writes and makes removal of generic
+    # crash-temporary files safe for either reset scope.
+    with ExitStack() as stack:
+        stack.enter_context(MemoryStore._file_lock(transaction_path))
+        for path in target_paths:
+            stack.enter_context(MemoryStore._file_lock(path))
+
+        for item in targets:
+            filename = _MEMORY_TARGET_FILES[item]
+            path = mem_dir / filename
             if _unlink_file_entry(path):
                 deleted.append(filename)
 
@@ -247,11 +285,28 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
                         if _unlink_file_entry(receipt_path):
                             deleted.append(str(Path(".imports") / entry.name))
 
-            _fsync_directory(mem_dir)
-            if _is_real_directory(imports_dir):
-                _fsync_directory(imports_dir)
-            if _is_real_directory(backup_dir):
-                _fsync_directory(backup_dir)
+        temp_locations = (
+            (mem_dir, ".mem_", Path(".")),
+            (imports_dir, ".receipt_", Path(".imports")),
+            (backup_dir, ".backup_", Path(".imports") / "backups"),
+        )
+        for directory, prefix, relative_dir in temp_locations:
+            if not _is_real_directory(directory):
+                continue
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if (
+                        entry.name.startswith(prefix)
+                        and entry.name.endswith(".tmp")
+                        and _unlink_file_entry(Path(entry.path))
+                    ):
+                        deleted.append(str(relative_dir / entry.name))
+
+        _fsync_directory(mem_dir)
+        if _is_real_directory(imports_dir):
+            _fsync_directory(imports_dir)
+        if _is_real_directory(backup_dir):
+            _fsync_directory(backup_dir)
 
     return {"deleted": deleted, "targets": list(targets)}
 
@@ -869,7 +924,8 @@ class MemoryStore:
         receipt_path = get_memory_dir() / ".imports" / (
             hashlib.sha256(import_id.encode("utf-8")).hexdigest() + ".json"
         )
-        with self._file_lock(path):
+        transaction_path = get_memory_dir() / _MEMORY_TRANSACTION_LOCK
+        with self._file_lock(transaction_path), self._file_lock(path):
             if receipt_path.exists():
                 try:
                     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))

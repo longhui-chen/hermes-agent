@@ -1,11 +1,18 @@
 import hashlib
 import json
 import os
+import threading
 from pathlib import Path
 
 import pytest
 
-from tools.memory_tool import MemoryImportConflict, MemoryStore, reset_curated_memory
+import tools.memory_tool as memory_tool
+from tools.memory_tool import (
+    MemoryImportConflict,
+    MemoryStore,
+    curated_memory_has_state,
+    reset_curated_memory,
+)
 
 
 def test_memory_import_replace_is_bounded_atomic_and_idempotent(tmp_path, monkeypatch):
@@ -463,6 +470,85 @@ def test_memory_reset_does_not_traverse_symlinked_backup_directory(tmp_path, mon
     reset_curated_memory("memory")
 
     assert outside_backup.read_text(encoding="utf-8") == "must survive"
+
+
+def test_memory_reset_detects_and_removes_crash_temporary_plaintext(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    imports = memories / ".imports"
+    backups = imports / "backups"
+    backups.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    temporary_paths = [
+        memories / ".mem_crash.tmp",
+        imports / ".receipt_crash.tmp",
+        backups / ".backup_crash.tmp",
+    ]
+    for path in temporary_paths:
+        path.write_text("private crash residue", encoding="utf-8")
+
+    assert curated_memory_has_state("all") is True
+    result = reset_curated_memory("all")
+
+    assert not any(os.path.lexists(path) for path in temporary_paths)
+    assert {Path(path).name for path in result["deleted"]} >= {
+        ".mem_crash.tmp",
+        ".receipt_crash.tmp",
+        ".backup_crash.tmp",
+    }
+    assert curated_memory_has_state("all") is False
+
+
+def test_memory_reset_and_import_are_serialized_by_profile_transaction(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memory_path = home / "memories" / "MEMORY.md"
+    memory_path.parent.mkdir(parents=True)
+    memory_path.write_text("old fact", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=100, user_char_limit=100)
+
+    reset_inside_transaction = threading.Event()
+    allow_reset_to_finish = threading.Event()
+    import_started = threading.Event()
+    import_finished = threading.Event()
+    original_unlink = memory_tool._unlink_file_entry
+
+    def pause_after_canonical_unlink(path):
+        removed = original_unlink(path)
+        if path == memory_path and removed:
+            reset_inside_transaction.set()
+            assert allow_reset_to_finish.wait(timeout=5)
+        return removed
+
+    monkeypatch.setattr(memory_tool, "_unlink_file_entry", pause_after_canonical_unlink)
+    reset_thread = threading.Thread(target=reset_curated_memory, args=("all",))
+    reset_thread.start()
+    assert reset_inside_transaction.wait(timeout=5)
+
+    def run_import():
+        import_started.set()
+        store.import_replace(
+            target="memory",
+            entries=["new fact"],
+            import_id="concurrent-after-reset",
+            payload_sha256=hashlib.sha256(b"concurrent-after-reset").hexdigest(),
+        )
+        import_finished.set()
+
+    import_thread = threading.Thread(target=run_import)
+    import_thread.start()
+    assert import_started.wait(timeout=5)
+    assert import_finished.is_set() is False
+
+    allow_reset_to_finish.set()
+    reset_thread.join(timeout=5)
+    import_thread.join(timeout=5)
+    assert reset_thread.is_alive() is False
+    assert import_thread.is_alive() is False
+    assert memory_path.read_text(encoding="utf-8") == "new fact"
 
 
 def test_memory_import_retains_only_five_recoverable_backups(tmp_path, monkeypatch):
