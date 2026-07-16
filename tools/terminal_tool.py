@@ -959,7 +959,43 @@ import sys
 
 
 _CONNECTOR_RUNTIME_SCRIPT = "connector_runtime.py"
-_CONNECTOR_RUNTIME_SHELL_PUNCTUATION = set(";&|<>")
+_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT = ";&|<>\n()"
+_CONNECTOR_RUNTIME_SHELL_PUNCTUATION = set(_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT)
+_CONNECTOR_RUNTIME_SHELL_GROUP_START = "{"
+_CONNECTOR_RUNTIME_WRAPPERS = {
+    "sudo",
+    "env",
+    "timeout",
+    "exec",
+    "nice",
+    "nohup",
+    "setsid",
+    "stdbuf",
+    "time",
+    "command",
+    "builtin",
+}
+_CONNECTOR_RUNTIME_WRAPPER_OPTIONS_WITH_ARG = {
+    "sudo": {"-c", "--close-from", "-g", "--group", "-h", "--host", "-p", "--prompt", "-u", "--user"},
+    "env": {"-a", "--argv0", "-C", "--chdir", "-S", "--split-string", "-u", "--unset"},
+    "timeout": {"-k", "--kill-after", "-s", "--signal"},
+    "exec": {"-a"},
+    "nice": {"-n", "--adjustment"},
+    "stdbuf": {"-e", "--error", "-i", "--input", "-o", "--output"},
+    "time": {"-f", "--format", "-o", "--output"},
+}
+_CONNECTOR_RUNTIME_COMMAND_SHELLS = {"bash", "dash", "sh", "zsh"}
+_CONNECTOR_RUNTIME_SHELL_OPTIONS_WITH_ARG = {
+    "+O",
+    "+o",
+    "-O",
+    "-o",
+    "--init-file",
+    "--rcfile",
+}
+_CONNECTOR_RUNTIME_NESTED_SHELL_DEPTH = 8
+_CONNECTOR_RUNTIME_ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+_CONNECTOR_RUNTIME_TIMEOUT_RE = re.compile(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[smhd])?")
 _CONNECTOR_RUNTIME_TRUST_CUTOFF = time.time()
 
 
@@ -1271,7 +1307,14 @@ def _parse_connector_runtime_command(command: str) -> Optional[_ConnectorRuntime
     compound commands such as `connector_runtime.py ... ; env`, so injected
     connector env can never be observed by a following shell fragment.
     """
-    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer = shlex.shlex(
+        command.strip(),
+        posix=True,
+        punctuation_chars=_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT,
+    )
+    # Keep unquoted newlines visible as shell separators. Quoted newlines stay
+    # inside their argument token, just like punctuation inside --args-json.
+    lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     try:
         tokens = list(lexer)
@@ -1303,6 +1346,232 @@ def _parse_connector_runtime_command(command: str) -> Optional[_ConnectorRuntime
         root_identity=anchor.identity,
         script_identity=script_identity,
     )
+
+
+def _connector_runtime_shell_guard_result(
+    command: str,
+    *,
+    _nested_shell_depth: int = 0,
+) -> Optional[str]:
+    """Block shell-wrapped official connector runtime invocations.
+
+    The dedicated runner intentionally accepts only one direct Python command.
+    When an otherwise trusted runtime invocation is combined with another shell
+    fragment, falling through to the generic terminal strips Connector context
+    and produces a misleading authorization error. Fail closed instead and tell
+    the agent to retry each runtime command in its own tool call.
+    """
+    lexer = shlex.shlex(
+        command.strip(),
+        posix=True,
+        punctuation_chars=_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT,
+    )
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION:
+            segments.append([])
+            continue
+        segments[-1].append(token)
+
+    contains_trusted_runtime = any(
+        _connector_runtime_segment_contains_trusted_invocation(segment)
+        for segment in segments
+    )
+    if not contains_trusted_runtime and _nested_shell_depth < _CONNECTOR_RUNTIME_NESTED_SHELL_DEPTH:
+        contains_trusted_runtime = any(
+            _connector_runtime_segment_contains_nested_shell_invocation(
+                segment,
+                nested_shell_depth=_nested_shell_depth,
+            )
+            for segment in segments
+        )
+    if not contains_trusted_runtime:
+        return None
+
+    code = "connector_runtime_compound_command"
+    message = (
+        "Connector Runtime commands must run as one direct Python invocation "
+        "in a foreground non-PTY terminal tool call, without command wrappers "
+        "or shell operators. Retry each connector_runtime.py command in a "
+        "separate terminal tool call."
+    )
+    return json.dumps({
+        "output": "",
+        "exit_code": 2,
+        "error": message,
+        "errorCode": code,
+        "status": "error",
+        "connector_runtime_direct": False,
+        "connector_runtime_blocked": True,
+        "connector_error": {
+            "code": code,
+            "errorCode": code,
+            "message": message,
+            "nextAction": {"type": "retry_single_command"},
+        },
+    }, ensure_ascii=False)
+
+
+def _connector_runtime_segment_contains_trusted_invocation(segment: list[str]) -> bool:
+    """Recognize direct or explicitly wrapped runtime command positions."""
+    for index in range(len(segment) - 1):
+        if not _is_python_executable_token(segment[index]):
+            continue
+        script_index = _connector_runtime_python_script_index(segment, index)
+        if script_index is None:
+            continue
+        if index > 0 and not _connector_runtime_command_prefix_is_supported(segment[:index]):
+            continue
+        if _resolve_connector_runtime_script(segment[script_index]) is not None:
+            return True
+    return False
+
+
+def _connector_runtime_segment_contains_nested_shell_invocation(
+    segment: list[str],
+    *,
+    nested_shell_depth: int,
+) -> bool:
+    """Inspect only supported ``shell -c`` command-string positions."""
+    for index, token in enumerate(segment):
+        if Path(token).name.lower() not in _CONNECTOR_RUNTIME_COMMAND_SHELLS:
+            continue
+        if index > 0 and not _connector_runtime_command_prefix_is_supported(segment[:index]):
+            continue
+        nested_command = _connector_runtime_shell_command_argument(segment[index + 1:])
+        if nested_command is None:
+            continue
+        if _connector_runtime_shell_guard_result(
+            nested_command,
+            _nested_shell_depth=nested_shell_depth + 1,
+        ) is not None:
+            return True
+    return False
+
+
+def _connector_runtime_shell_command_argument(arguments: list[str]) -> Optional[str]:
+    """Return the command string passed to a supported shell's ``-c`` flag."""
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        if token == "--":
+            return None
+        if not token.startswith(("-", "+")) or token in {"-", "+"}:
+            return None
+        option_name = token.split("=", 1)[0]
+        if option_name in _CONNECTOR_RUNTIME_SHELL_OPTIONS_WITH_ARG:
+            index += 1
+            if "=" not in token:
+                if index >= len(arguments):
+                    return None
+                index += 1
+            continue
+        short_options = token[1:]
+        if token.startswith("--") or "c" not in short_options:
+            index += 1
+            continue
+        command_index = index + 1
+        if command_index >= len(arguments):
+            return None
+        return arguments[command_index]
+    return None
+
+
+def _connector_runtime_python_script_index(
+    segment: list[str],
+    python_index: int,
+) -> Optional[int]:
+    """Find a script after Python flags without interpreting ``-c``/``-m``."""
+    position = python_index + 1
+    while position < len(segment):
+        token = segment[position]
+        if token == "--":
+            position += 1
+            break
+        if not token.startswith("-"):
+            break
+        option_name = token.split("=", 1)[0]
+        if option_name in {"-c", "-m"}:
+            return None
+        position += 1
+        if "=" not in token and option_name in {"-W", "-X"}:
+            if position >= len(segment):
+                return None
+            position += 1
+    if (
+        position >= len(segment)
+        or Path(segment[position]).name != _CONNECTOR_RUNTIME_SCRIPT
+    ):
+        return None
+    return position
+
+
+def _connector_runtime_command_prefix_is_supported(prefix: list[str]) -> bool:
+    """Accept standalone shell group openers before known wrappers."""
+    position = 0
+    while position < len(prefix) and prefix[position] == _CONNECTOR_RUNTIME_SHELL_GROUP_START:
+        position += 1
+    if position == len(prefix):
+        return position > 0
+    return _connector_runtime_wrapper_prefix_is_supported(prefix[position:])
+
+
+def _connector_runtime_wrapper_prefix_is_supported(prefix: list[str]) -> bool:
+    """Return True when prefix is only a known command-wrapper chain.
+
+    This parser is intentionally smaller than shell parsing: it recognizes the
+    wrapper vocabulary already handled by Hermes command guards plus timeout,
+    and rejects unknown prefix words so data such as ``echo python3 ...`` does
+    not become a Connector-runtime false positive.
+    """
+    position = 0
+    saw_wrapper = False
+    while position < len(prefix):
+        if _CONNECTOR_RUNTIME_ENV_ASSIGNMENT_RE.fullmatch(prefix[position]) is not None:
+            saw_wrapper = True
+            position += 1
+            continue
+        wrapper = Path(prefix[position]).name.lower()
+        if wrapper not in _CONNECTOR_RUNTIME_WRAPPERS:
+            return False
+        saw_wrapper = True
+        position += 1
+
+        options_with_arg = _CONNECTOR_RUNTIME_WRAPPER_OPTIONS_WITH_ARG.get(wrapper, set())
+        while position < len(prefix) and prefix[position].startswith("-"):
+            option = prefix[position]
+            position += 1
+            if option == "--":
+                break
+            option_name = option.split("=", 1)[0]
+            if "=" not in option and option_name in options_with_arg:
+                if position >= len(prefix):
+                    return False
+                position += 1
+
+        if wrapper == "timeout":
+            if (
+                position >= len(prefix)
+                or _CONNECTOR_RUNTIME_TIMEOUT_RE.fullmatch(prefix[position]) is None
+            ):
+                return False
+            position += 1
+
+        if wrapper in {"env", "sudo"}:
+            while (
+                position < len(prefix)
+                and _CONNECTOR_RUNTIME_ENV_ASSIGNMENT_RE.fullmatch(prefix[position]) is not None
+            ):
+                position += 1
+
+    return saw_wrapper
 
 
 def _connector_runtime_result_json(
@@ -1403,7 +1672,7 @@ def _run_connector_runtime_command_if_allowed(
 ) -> Optional[str]:
     parsed = _parse_connector_runtime_command(command)
     if parsed is None:
-        return None
+        return _connector_runtime_shell_guard_result(command)
     argv = parsed.argv
 
     anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
@@ -2678,6 +2947,10 @@ def terminal_tool(
                 cwd=workdir or cwd,
                 timeout=effective_timeout,
             )
+            if connector_runtime_result is not None:
+                return connector_runtime_result
+        else:
+            connector_runtime_result = _connector_runtime_shell_guard_result(command)
             if connector_runtime_result is not None:
                 return connector_runtime_result
 

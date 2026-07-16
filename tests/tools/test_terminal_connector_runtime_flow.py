@@ -1,11 +1,25 @@
 import json
 import textwrap
 
+import pytest
+
 from agent import secret_scope
 from tools import terminal_tool as terminal_tool_module
 
 
-def test_terminal_flow_keeps_direct_runner_after_shared_ancestor_changes(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "runtime_path",
+    [
+        '"$ZETTLAB_PRESETS_DIR/skills/gmail/scripts/connector_runtime.py"',
+        "${ZETTLAB_PRESETS_DIR}/skills/gmail/scripts/connector_runtime.py",
+    ],
+    ids=["quoted_plain", "unquoted_braced"],
+)
+def test_terminal_flow_keeps_direct_runner_after_shared_ancestor_changes(
+    monkeypatch,
+    tmp_path,
+    runtime_path,
+):
     """Exercise terminal_tool -> direct subprocess with the real trust checks."""
     script = (
         tmp_path
@@ -56,7 +70,7 @@ def test_terminal_flow_keeps_direct_runner_after_shared_ancestor_changes(monkeyp
     (tmp_path / "shared" / ".recycle").mkdir()
 
     result = json.loads(terminal_tool_module.terminal_tool(
-        'python3 "$ZETTLAB_PRESETS_DIR/skills/gmail/scripts/connector_runtime.py" list-tools',
+        f"python3 {runtime_path} list-tools",
         task_id="connector-runtime-shared-ancestor-flow",
     ))
 

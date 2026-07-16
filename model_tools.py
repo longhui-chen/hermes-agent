@@ -269,6 +269,20 @@ _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
 _TOOL_DEFS_CACHE_MAX = 8
 
 
+def _quiet_tool_defs_cache_enabled() -> bool:
+    """Keep quiet-mode schemas local to one profile in multiplex mode.
+
+    Tool availability can depend on the profile secret scope and its live
+    .env grants. A process-wide cache cannot safely represent those values.
+    """
+    try:
+        from agent.secret_scope import is_multiplex_active
+        return not is_multiplex_active()
+    except Exception:
+        # Standalone/minimal callers retain the existing cache behavior.
+        return True
+
+
 def _clear_tool_defs_cache() -> None:
     """Drop memoized get_tool_definitions() results. Called when dynamic
     schema dependencies change (e.g. discord capability cache reset,
@@ -308,7 +322,8 @@ def get_tool_definitions(
     # user-visible config edits that affect dynamic schemas (execute_code
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
-    if quiet_mode:
+    cache_enabled = quiet_mode and _quiet_tool_defs_cache_enabled()
+    if cache_enabled:
         try:
             from hermes_cli.config import get_config_path
             cfg_path = get_config_path()
@@ -336,7 +351,7 @@ def get_tool_definitions(
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                        skip_tool_search_assembly=skip_tool_search_assembly)
-    if quiet_mode:
+    if cache_enabled:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
         # schemas to self.tools) don't poison the cache. Without this, a

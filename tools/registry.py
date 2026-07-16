@@ -142,6 +142,17 @@ _check_fn_last_good: Dict[Callable, float] = {}
 _check_fn_cache_lock = threading.Lock()
 
 
+def _must_recheck_profile_scope(fn: Callable) -> bool:
+    """Whether *fn* reads profile-local authorization in a shared gateway."""
+    if not getattr(fn, "_profile_scope_sensitive", False):
+        return False
+    try:
+        from agent.secret_scope import is_multiplex_active
+        return is_multiplex_active()
+    except Exception:
+        return False
+
+
 def _check_fn_cached(fn: Callable) -> bool:
     """Return bool(fn()), TTL-cached across calls.
 
@@ -151,6 +162,20 @@ def _check_fn_cached(fn: Callable) -> bool:
     re-probes) to keep flaky external checks (Docker daemon busy, socket
     contention, probe timeout) from silently stripping tools mid-session.
     """
+    if _must_recheck_profile_scope(fn):
+        # A function-global TTL/last-good cache is unsafe here: profile A's
+        # grant can otherwise expose a tool for profile B, or outlive revoke.
+        # Keep the normal per-definitions-pass de-duplication in callers, but
+        # re-evaluate across multiplexed profile scopes.
+        try:
+            return bool(fn())
+        except Exception:
+            logger.warning(
+                "profile-scoped check_fn %s raised; dependent tools are unavailable this turn",
+                getattr(fn, "__qualname__", fn),
+            )
+            return False
+
     now = time.monotonic()
     with _check_fn_cache_lock:
         cached = _check_fn_cache.get(fn)
