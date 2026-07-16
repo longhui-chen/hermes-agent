@@ -12,12 +12,14 @@ from portable_import_security import portable_credential_finding
         "api key = abcdefghijklmnop",
         "Authorization:\u0020Bearer\u0020abcdefghijklmnop",
         r"{\"Authorization\":\u0020\"Bearer\u0020abcdefghijklmnop\"}",
+        "-----BEGIN PGP PRIVATE KEY BLOCK-----",
     ],
     ids=[
         "authorization-equals",
         "spaced-api-key",
         "decoded-unicode-space",
         "literal-json-escapes",
+        "pgp-private-key-block",
     ],
 )
 def test_portable_credential_scanner_rejects_assignment_and_escape_forms(value):

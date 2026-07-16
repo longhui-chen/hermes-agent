@@ -921,11 +921,19 @@ class MemoryStore:
         content = ENTRY_DELIMITER.join(normalized)
         content_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
         path = self._path_for(target)
+        if path.is_symlink():
+            raise MemoryImportConflict(
+                f"refusing to import through symlinked {path.name}"
+            )
         receipt_path = get_memory_dir() / ".imports" / (
             hashlib.sha256(import_id.encode("utf-8")).hexdigest() + ".json"
         )
         transaction_path = get_memory_dir() / _MEMORY_TRANSACTION_LOCK
         with self._file_lock(transaction_path), self._file_lock(path):
+            if path.is_symlink():
+                raise MemoryImportConflict(
+                    f"refusing to import through symlinked {path.name}"
+                )
             if receipt_path.exists():
                 try:
                     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
@@ -1320,9 +1328,12 @@ class MemoryStore:
 
     @staticmethod
     def _import_displaced_path(path: Path, receipt_path: Path) -> Path:
-        effective_path = Path(os.path.realpath(path)) if path.is_symlink() else path
-        return effective_path.parent / (
-            f".{effective_path.name}.{receipt_path.stem}.displaced"
+        if path.is_symlink():
+            raise MemoryImportConflict(
+                f"refusing to import through symlinked {path.name}"
+            )
+        return path.parent / (
+            f".{path.name}.{receipt_path.stem}.displaced"
         )
 
     @staticmethod
@@ -1361,7 +1372,11 @@ class MemoryStore:
         recovery path manually only after quiescing external writers.
         """
         content = ENTRY_DELIMITER.join(entries) if entries else ""
-        effective_path = Path(os.path.realpath(path)) if path.is_symlink() else path
+        if path.is_symlink():
+            raise MemoryImportConflict(
+                f"refusing to import through symlinked {path.name}"
+            )
+        effective_path = path
         try:
             # Write to temp file in same directory (same filesystem for atomic rename)
             fd, tmp_path = tempfile.mkstemp(

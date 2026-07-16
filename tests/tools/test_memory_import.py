@@ -72,6 +72,7 @@ def test_memory_import_rejects_poison_and_overflow_without_writing(tmp_path, mon
     "Authorization: Bearer abcdefghexamplehijklmnop",
     "api_key = sk-abcdefghijklmnop",
     "-----BEGIN OPENSSH PRIVATE KEY-----",
+    "-----BEGIN PGP PRIVATE KEY BLOCK-----",
     "github_pat_abcdefghijklmnopqrst",
     "xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwxyzABCD",
     "AIza" + "A" * 35,
@@ -90,6 +91,35 @@ def test_memory_import_rejects_credentials_without_writing(tmp_path, monkeypatch
     assert not (home / "memories" / "MEMORY.md").exists()
     assert not (home / "memories" / "USER.md").exists()
     assert not (home / "memories" / ".imports").exists()
+
+
+@pytest.mark.parametrize(
+    ("target", "filename"),
+    [("memory", "MEMORY.md"), ("user", "USER.md")],
+)
+def test_memory_import_rejects_canonical_symlink_without_external_write(
+    tmp_path, monkeypatch, target, filename
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    outside = tmp_path / f"outside-{filename}"
+    outside.write_text("external content must survive", encoding="utf-8")
+    canonical = memories / filename
+    canonical.symlink_to(outside)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    with pytest.raises(MemoryImportConflict, match="symlinked"):
+        MemoryStore(memory_char_limit=1000, user_char_limit=1000).import_replace(
+            target=target,
+            entries=["imported content"],
+            import_id=f"symlink-{target}",
+            payload_sha256=hashlib.sha256(target.encode()).hexdigest(),
+        )
+
+    assert canonical.is_symlink()
+    assert outside.read_text(encoding="utf-8") == "external content must survive"
+    assert not (memories / ".imports").exists()
 
 
 @pytest.mark.parametrize(

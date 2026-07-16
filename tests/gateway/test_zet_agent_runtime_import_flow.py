@@ -96,6 +96,38 @@ async def test_memory_import_http_flow_returns_recoverable_backup(tmp_path, monk
 
 
 @pytest.mark.asyncio
+async def test_memory_import_http_flow_rejects_canonical_symlink(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    memory_path = home / "memories" / "MEMORY.md"
+    memory_path.parent.mkdir(parents=True)
+    outside = tmp_path / "outside-memory.md"
+    outside.write_text("external content must survive", encoding="utf-8")
+    memory_path.symlink_to(outside)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    app = web.Application()
+    app.router.add_post("/api/memory/import", adapter._handle_memory_import)
+
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            "/api/memory/import",
+            json={
+                "import_id": "symlink-flow",
+                "mode": "replace",
+                "target": "memory",
+                "payload_sha256": hashlib.sha256(b"symlink-flow").hexdigest(),
+                "entries": ["replacement fact"],
+            },
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert response.status == 409
+    assert memory_path.is_symlink()
+    assert outside.read_text(encoding="utf-8") == "external content must survive"
+    assert not (home / "memories" / ".imports").exists()
+
+
+@pytest.mark.asyncio
 async def test_memory_import_http_flow_returns_conflict_for_live_cas_edit(
     tmp_path, monkeypatch
 ):
@@ -200,6 +232,32 @@ async def test_runtime_import_flow_rejects_credentials_at_final_consumer(
                 headers=headers,
             )
             assert slack_app.status == 400
+            pgp_transcript = await cli.post(
+                "/api/sessions/import",
+                json={
+                    **payload,
+                    "import_id": "pgp-transcript-credential",
+                    "messages": [{
+                        "role": "user",
+                        "content": "-----BEGIN PGP PRIVATE KEY BLOCK-----",
+                        "created_at": 1,
+                    }],
+                },
+                headers=headers,
+            )
+            assert pgp_transcript.status == 400
+            pgp_memory = await cli.post(
+                "/api/memory/import",
+                json={
+                    "import_id": "pgp-memory-credential",
+                    "mode": "replace",
+                    "target": "memory",
+                    "payload_sha256": hashlib.sha256(b"pgp-memory").hexdigest(),
+                    "entries": ["-----BEGIN PGP PRIVATE KEY BLOCK-----"],
+                },
+                headers=headers,
+            )
+            assert pgp_memory.status == 400
             credential_id = "sk-1234567890abcdefghij"
             metadata = await cli.post(
                 "/api/sessions/import",

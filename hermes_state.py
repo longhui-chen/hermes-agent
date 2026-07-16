@@ -3973,24 +3973,36 @@ class SessionDB:
                 (row["target_session_id"], f"import:{row['source']}",
                  model_config, started_at, title),
             )
+            # Hash the exact normalized message sequence that becomes canonical
+            # state. Staging-only source IDs and transport chunk boundaries must
+            # not affect this server-computed receipt digest.
             digest = hashlib.sha256()
+            digest.update(b"[")
+            first_digest_message = True
             total = 0
             chunk_count = 0
             for chunk in self._iter_runtime_import_chunks(conn, import_id):
                 chunk_count += 1
                 raw = chunk["messages_json"]
-                encoded = raw.encode("utf-8")
-                digest.update(len(encoded).to_bytes(8, "big"))
-                digest.update(encoded)
                 messages = json.loads(raw)
                 for message in messages:
                     message.pop("_source_id", None)
+                    if not first_digest_message:
+                        digest.update(b",")
+                    digest.update(json.dumps(
+                        message,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8"))
+                    first_digest_message = False
                 inserted, _ = self._insert_message_rows(
                     conn, row["target_session_id"], messages
                 )
                 total += inserted
             if chunk_count != row["next_chunk_index"]:
                 raise RuntimeImportIncomplete("one or more staged chunks are missing")
+            digest.update(b"]")
             normalized_sha = digest.hexdigest()
             conn.execute(
                 "UPDATE sessions SET message_count = ? WHERE id = ?",

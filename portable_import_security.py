@@ -5,7 +5,8 @@ from typing import Optional
 
 
 _PRIVATE_KEY_RE = re.compile(
-    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE | re.MULTILINE
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: [A-Z0-9][A-Z0-9 ]*)?-----",
+    re.IGNORECASE | re.MULTILINE,
 )
 _AUTHORIZATION_BEARER_RE = re.compile(
     r"(?<![A-Za-z0-9_-])authorization(?:\s*\\?[\"'])?\s*[:=]\s*"

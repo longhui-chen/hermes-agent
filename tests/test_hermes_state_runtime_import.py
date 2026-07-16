@@ -110,6 +110,61 @@ def test_completed_transcript_import_is_chunk_and_commit_idempotent(tmp_path):
         db.close()
 
 
+def test_normalized_sha_is_independent_of_chunks_and_source_ids(tmp_path):
+    messages = [
+        {"source_id": "one-a", "role": "user", "content": "hello", "created_at": 1},
+        {"source_id": "one-b", "role": "assistant", "content": "hi", "created_at": 2},
+    ]
+    canonical = [
+        {"role": "user", "content": "hello", "timestamp": 1.0},
+        {"role": "assistant", "content": "hi", "timestamp": 2.0},
+    ]
+    expected_digest = hashlib.sha256(json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        db.stage_completed_transcript_import(
+            import_id="one-chunk",
+            source="workbuddy",
+            source_session_id="source-one",
+            target_session_id="target-one",
+            title=None,
+            payload_sha256=hashlib.sha256(b"one-chunk").hexdigest(),
+            expected_message_count=2,
+            chunk_index=0,
+            messages=messages,
+        )
+        one_chunk = db.commit_completed_transcript_import("one-chunk")
+
+        for chunk_index, message in enumerate(messages):
+            equivalent = dict(message)
+            equivalent["source_id"] = f"different-{chunk_index}"
+            db.stage_completed_transcript_import(
+                import_id="two-chunks",
+                source="workbuddy",
+                source_session_id="source-two",
+                target_session_id="target-two",
+                title=None,
+                payload_sha256=hashlib.sha256(b"two-chunks").hexdigest(),
+                expected_message_count=2,
+                chunk_index=chunk_index,
+                messages=[equivalent],
+            )
+        two_chunks = db.commit_completed_transcript_import("two-chunks")
+
+        assert one_chunk["normalized_sha256"] == expected_digest
+        assert two_chunks["normalized_sha256"] == expected_digest
+        assert db.get_messages_as_conversation("target-one") == (
+            db.get_messages_as_conversation("target-two")
+        )
+    finally:
+        db.close()
+
+
 def test_incomplete_or_conflicting_import_never_changes_target(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     try:
@@ -178,6 +233,7 @@ def test_runtime_import_rejects_non_completed_runtime_messages(tmp_path):
      "content": "Authorization: Bearer abcdefghexamplehijklmnop", "created_at": 1},
     {"source_id": "m", "role": "user", "content": "api_key = sk-abcdefghijklmnop", "created_at": 1},
     {"source_id": "m", "role": "user", "content": "-----BEGIN RSA PRIVATE KEY-----", "created_at": 1},
+    {"source_id": "m-pgp", "role": "user", "content": "-----BEGIN PGP PRIVATE KEY BLOCK-----", "created_at": 1},
     {"source_id": "m", "role": "user", "content": "ghp_abcdefghijklmnopqrst", "created_at": 1},
     {"source_id": "m", "role": "user", "content":
      "xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwxyzABCD", "created_at": 1},
