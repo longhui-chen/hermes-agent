@@ -25,22 +25,19 @@ _HIGH_CONFIDENCE_BARE_TOKEN_RE = re.compile(
     r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|"
     r"sk-(?:proj-)?[A-Za-z0-9_-]{20,})\b"
 )
+_PLACEHOLDER_VALUE_RE = re.compile(
+    r"(?:\$(?:\{[A-Z_][A-Z0-9_]*\}?|[A-Z_][A-Z0-9_]*)|<[^<>\r\n]+>|"
+    r"env\.[A-Z_][A-Z0-9_]*|process\.env\.[A-Z_][A-Z0-9_]*|"
+    r"your[-_](?:api[-_]?key|token|secret|password)(?:[-_]here)?|"
+    r"example(?:[-_](?:token|key|secret|value))*|"
+    r"redacted|changeme|sk-example|[x*_-]+)",
+    re.IGNORECASE,
+)
 
 
 def _credential_value_looks_real(raw: str) -> bool:
     value = raw.strip().strip("\"'")
-    lower = value.lower()
-    return (
-        len(value) >= 6
-        and not value.startswith(("$", "<"))
-        and not lower.startswith(("env.", "process.env"))
-        and "your_" not in lower
-        and "your-" not in lower
-        and "example" not in lower
-        and "redacted" not in lower
-        and "changeme" not in lower
-        and lower.strip("x*-_") != ""
-    )
+    return len(value) >= 6 and _PLACEHOLDER_VALUE_RE.fullmatch(value) is None
 
 
 def portable_credential_finding(value: str) -> Optional[str]:

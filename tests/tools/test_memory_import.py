@@ -57,6 +57,7 @@ def test_memory_import_rejects_poison_and_overflow_without_writing(tmp_path, mon
     '{"Authorization": "Bearer abcdefghijklmnop"}',
     "{'Authorization': 'Bearer abcdefghijklmnop'}",
     r'{\"Authorization\": \"Bearer abcdefghijklmnop\"}',
+    "Authorization: Bearer abcdefghexamplehijklmnop",
     "api_key = sk-abcdefghijklmnop",
     "-----BEGIN OPENSSH PRIVATE KEY-----",
     "github_pat_abcdefghijklmnopqrst",

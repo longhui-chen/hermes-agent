@@ -81,7 +81,7 @@ async def test_runtime_import_flow_rejects_credentials_at_final_consumer(
         "title": None, "expected_message_count": 1, "chunk_index": 0,
         "payload_sha256": hashlib.sha256(b"credential").hexdigest(),
         "messages": [{"role": "user",
-                      "content": '{"Authorization": "Bearer abcdefghijklmnop"}',
+                      "content": '{"Authorization": "Bearer abcdefghexamplehijklmnop"}',
                       "created_at": 1}],
     }
     try:
@@ -96,7 +96,7 @@ async def test_runtime_import_flow_rejects_credentials_at_final_consumer(
                 json={"import_id": "credential-memory", "mode": "replace",
                       "target": "memory",
                       "payload_sha256": hashlib.sha256(b"memory").hexdigest(),
-                      "entries": ["{'Authorization': 'Bearer abcdefghijklmnop'}"]},
+                      "entries": ["{'Authorization': 'Bearer abcdefghexamplehijklmnop'}"]},
                 headers=headers,
             )
             assert memory.status == 400

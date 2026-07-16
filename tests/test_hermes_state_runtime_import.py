@@ -166,6 +166,8 @@ def test_runtime_import_rejects_non_completed_runtime_messages(tmp_path):
      "content": "{'Authorization': 'Bearer abcdefghijklmnop'}", "created_at": 1},
     {"source_id": "m-escaped", "role": "user",
      "content": r'{\"Authorization\": \"Bearer abcdefghijklmnop\"}', "created_at": 1},
+    {"source_id": "m-placeholder-substring", "role": "user",
+     "content": "Authorization: Bearer abcdefghexamplehijklmnop", "created_at": 1},
     {"source_id": "m", "role": "user", "content": "api_key = sk-abcdefghijklmnop", "created_at": 1},
     {"source_id": "m", "role": "user", "content": "-----BEGIN RSA PRIVATE KEY-----", "created_at": 1},
     {"source_id": "m", "role": "user", "content": "ghp_abcdefghijklmnopqrst", "created_at": 1},
