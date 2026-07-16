@@ -3956,6 +3956,7 @@ class SessionDB:
                 suffix = f" #{hashlib.sha256(import_id.encode()).hexdigest()[:8]}"
                 title = title[: self.MAX_TITLE_LENGTH - len(suffix)] + suffix
             started_at = time.time()
+            completed_at = started_at
             model_config = json.dumps({
                 "_runtime_import": {
                     "import_id": import_id,
@@ -3968,10 +3969,11 @@ class SessionDB:
             })
             conn.execute(
                 """INSERT INTO sessions
-                   (id, source, model_config, started_at, title)
-                   VALUES (?, ?, ?, ?, ?)""",
+                   (id, source, model_config, started_at, ended_at, end_reason, title)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (row["target_session_id"], f"import:{row['source']}",
-                 model_config, started_at, title),
+                 model_config, started_at, completed_at,
+                 "import_completed", title),
             )
             # Hash the exact normalized message sequence that becomes canonical
             # state. Staging-only source IDs and transport chunk boundaries must
@@ -4015,7 +4017,7 @@ class SessionDB:
                    WHERE import_id = ?""",
                 (normalized_sha,
                  _runtime_import_receipt_source_id(row["source_session_id"]),
-                 time.time(), time.time(), import_id),
+                 completed_at, completed_at, import_id),
             )
             # The completed receipt above is sufficient for idempotent replay.
             # Remove full staged transcript bodies and source message IDs in the

@@ -381,6 +381,95 @@ async def test_session_import_flow_blocks_unload_until_stage_finishes():
         assert (await import_task).status == 200
 
 
+class _DirectImportRequest(dict):
+    def __init__(self, body):
+        super().__init__()
+        self._body = body
+        self.headers = {"Authorization": "Bearer test-key"}
+        self.method = "POST"
+        self.path_qs = "/api/import"
+        self.remote = "127.0.0.1"
+        self.transport = None
+
+    async def json(self):
+        return self._body
+
+
+@pytest.mark.asyncio
+async def test_cancelled_memory_import_holds_unload_barrier_until_worker_exits(
+    monkeypatch,
+):
+    import tools.memory_tool as memory_tool
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class _Store:
+        def import_replace(self, **_kwargs):
+            started.set()
+            assert release.wait(2)
+            return {"status": "completed"}
+
+    monkeypatch.setattr(memory_tool, "load_on_disk_store", lambda: _Store())
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    request = _DirectImportRequest({
+        "import_id": "cancel-memory", "mode": "replace", "target": "memory",
+        "payload_sha256": hashlib.sha256(b"cancel-memory").hexdigest(),
+        "entries": ["safe fact"],
+    })
+    task = asyncio.create_task(adapter._handle_memory_import(request))
+    assert await asyncio.to_thread(started.wait, 1)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    blocked = await adapter._handle_profile_unload(_DirectImportRequest(None))
+    assert blocked.status == 409
+    assert json.loads(blocked.text)["active_imports"] == 1
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert (await adapter._handle_profile_unload(_DirectImportRequest(None))).status == 200
+
+
+@pytest.mark.asyncio
+async def test_cancelled_session_import_holds_unload_barrier_until_worker_exits():
+    started = threading.Event()
+    release = threading.Event()
+
+    class _DB:
+        def stage_completed_transcript_import(self, **_kwargs):
+            started.set()
+            assert release.wait(2)
+            return {"status": "staged"}
+
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    adapter._ensure_session_db = lambda: _DB()
+    request = _DirectImportRequest({
+        "import_id": "cancel-session", "operation": "stage",
+        "source": "workbuddy", "source_session_id": "source",
+        "target_session_id": "target", "title": None,
+        "payload_sha256": hashlib.sha256(b"cancel-session").hexdigest(),
+        "expected_message_count": 1, "chunk_index": 0,
+        "messages": [{"role": "user", "content": "safe", "created_at": 1}],
+    })
+    task = asyncio.create_task(adapter._handle_session_import(request))
+    assert await asyncio.to_thread(started.wait, 1)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    blocked = await adapter._handle_profile_unload(_DirectImportRequest(None))
+    assert blocked.status == 409
+    assert json.loads(blocked.text)["active_imports"] == 1
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert (await adapter._handle_profile_unload(_DirectImportRequest(None))).status == 200
+
+
 def test_runtime_import_barrier_allows_only_a_recreated_profile_generation(tmp_path):
     profile_home = tmp_path / "profiles" / "coder"
     profile_home.mkdir(parents=True)

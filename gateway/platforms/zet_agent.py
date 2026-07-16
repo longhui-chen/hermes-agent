@@ -109,6 +109,33 @@ _zet_agent_cron.install()
 logger = logging.getLogger(__name__)
 
 
+async def _to_thread_with_completion_barrier(func, /, *args, **kwargs):
+    """Keep a cancelled request alive until its non-cancellable worker exits.
+
+    ``asyncio.to_thread`` cancellation only cancels the asyncio wrapper. The
+    underlying thread keeps mutating profile state, so callers must not release
+    an unload barrier until that worker has actually finished. Cancellation is
+    still re-raised after the worker result/exception has been observed.
+    """
+    worker = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError as cancelled:
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # A second cancellation request must not reopen the same race.
+                continue
+        try:
+            worker.result()
+        except BaseException:
+            # Cancellation remains the externally visible outcome, but consume
+            # the worker exception so asyncio does not report it as unhandled.
+            pass
+        raise cancelled
+
+
 def _request_value(request: Any, key: str, default: Any = None) -> Any:
     """Read aiohttp request mapping values while tolerating simple test fakes."""
     getter = getattr(request, "get", None)
@@ -1761,7 +1788,7 @@ class ZetAgentAdapter(APIServerAdapter):
             if session_db is None:
                 raise RuntimeError("session db unavailable")
             if operation == "stage":
-                result = await asyncio.to_thread(
+                result = await _to_thread_with_completion_barrier(
                     session_db.stage_completed_transcript_import,
                     import_id=import_id,
                     source=body.get("source"),
@@ -1774,11 +1801,11 @@ class ZetAgentAdapter(APIServerAdapter):
                     messages=body.get("messages"),
                 )
             elif operation == "commit":
-                result = await asyncio.to_thread(
+                result = await _to_thread_with_completion_barrier(
                     session_db.commit_completed_transcript_import, import_id
                 )
             elif operation == "abort":
-                result = await asyncio.to_thread(
+                result = await _to_thread_with_completion_barrier(
                     session_db.abort_completed_transcript_import, import_id
                 )
             else:
@@ -1821,7 +1848,7 @@ class ZetAgentAdapter(APIServerAdapter):
             if not isinstance(body, dict) or body.get("mode") != "replace":
                 raise ValueError("mode must be replace")
             from tools.memory_tool import load_on_disk_store
-            result = await asyncio.to_thread(
+            result = await _to_thread_with_completion_barrier(
                 load_on_disk_store().import_replace,
                 target=body.get("target"), entries=body.get("entries"),
                 import_id=body.get("import_id"),

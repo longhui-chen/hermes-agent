@@ -1,6 +1,8 @@
+import errno
 import hashlib
 import json
 import os
+import stat
 import threading
 from pathlib import Path
 
@@ -203,6 +205,70 @@ def test_memory_import_fsyncs_target_directory_before_completed_receipt(
     assert ("fsync", "memories") in events[:completed_index]
 
 
+@pytest.mark.parametrize(
+    "unsupported_errno",
+    [errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP],
+)
+def test_directory_fsync_ignores_only_explicitly_unsupported_errno(
+    tmp_path, monkeypatch, unsupported_errno
+):
+    original_fsync = memory_tool.os.fsync
+
+    def unsupported_for_directory(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(unsupported_errno, "directory fsync unsupported")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(memory_tool.os, "fsync", unsupported_for_directory)
+    memory_tool._fsync_directory(tmp_path)
+
+
+def test_directory_fsync_still_reports_real_io_failure(tmp_path, monkeypatch):
+    original_fsync = memory_tool.os.fsync
+
+    def fail_directory(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EIO, "directory metadata write failed")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(memory_tool.os, "fsync", fail_directory)
+    with pytest.raises(OSError) as raised:
+        memory_tool._fsync_directory(tmp_path)
+    assert raised.value.errno == errno.EIO
+
+
+@pytest.mark.parametrize("operation", ["ordinary", "import", "reset"])
+def test_memory_flows_tolerate_unsupported_directory_fsync(
+    tmp_path, monkeypatch, operation
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original_fsync = memory_tool.os.fsync
+
+    def unsupported_for_directory(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "directory fsync unsupported")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(memory_tool.os, "fsync", unsupported_for_directory)
+    store = MemoryStore(memory_char_limit=100, user_char_limit=100)
+    if operation == "ordinary":
+        assert store.add("memory", "safe fact")["success"] is True
+        assert (home / "memories" / "MEMORY.md").read_text() == "safe fact"
+    elif operation == "import":
+        result = store.import_replace(
+            target="memory", entries=["safe fact"], import_id="unsupported-fsync",
+            payload_sha256=hashlib.sha256(b"unsupported-fsync").hexdigest(),
+        )
+        assert result["status"] == "completed"
+        assert (home / "memories" / "MEMORY.md").read_text() == "safe fact"
+    else:
+        assert store.add("memory", "safe fact")["success"] is True
+        result = reset_curated_memory("memory")
+        assert result["targets"] == ["memory"]
+        assert not (home / "memories" / "MEMORY.md").exists()
+
+
 def test_memory_import_prepare_blocks_user_edit_after_crash(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     memory_path = home / "memories" / "MEMORY.md"
@@ -306,6 +372,84 @@ def test_memory_import_no_clobber_preserves_edit_after_final_validation(
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["state"] == "prepared"
     displaced_path = Path(receipt["displaced_path"])
+    assert displaced_path.read_text(encoding="utf-8") == "old fact"
+
+
+@pytest.mark.parametrize("link_errno", [errno.EPERM, errno.ENOTSUP])
+def test_memory_import_link_failure_restores_displaced_with_exclusive_copy(
+    tmp_path, monkeypatch, link_errno
+):
+    home = tmp_path / ".hermes"
+    memory_path = home / "memories" / "MEMORY.md"
+    memory_path.parent.mkdir(parents=True)
+    memory_path.write_text("old fact", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=100, user_char_limit=100)
+    original_link = memory_tool.os.link
+
+    def reject_canonical_hardlinks(source, target, *args, **kwargs):
+        if Path(target) == memory_path:
+            raise OSError(link_errno, "hard links unavailable")
+        return original_link(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(memory_tool.os, "link", reject_canonical_hardlinks)
+
+    with pytest.raises(RuntimeError, match="Failed to write memory file"):
+        store.import_replace(
+            target="memory",
+            entries=["imported fact"],
+            import_id=f"link-unsupported-{link_errno}",
+            payload_sha256=hashlib.sha256(
+                f"link-unsupported-{link_errno}".encode()
+            ).hexdigest(),
+        )
+
+    assert memory_path.read_text(encoding="utf-8") == "old fact"
+    receipt_path = next((home / "memories" / ".imports").glob("*.json"))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    displaced_path = Path(receipt["displaced_path"])
+    assert receipt["state"] == "prepared"
+    assert displaced_path.read_text(encoding="utf-8") == "old fact"
+
+
+def test_memory_import_link_failure_does_not_overwrite_concurrent_winner(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memory_path = home / "memories" / "MEMORY.md"
+    memory_path.parent.mkdir(parents=True)
+    memory_path.write_text("old fact", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=100, user_char_limit=100)
+    original_link = memory_tool.os.link
+    raced = False
+
+    def install_winner_then_fail_publish(source, target, *args, **kwargs):
+        nonlocal raced
+        if not raced and Path(target) == memory_path:
+            raced = True
+            memory_path.write_text("concurrent winner", encoding="utf-8")
+            raise OSError(errno.EPERM, "hard links unavailable")
+        return original_link(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(
+        memory_tool.os, "link", install_winner_then_fail_publish
+    )
+
+    with pytest.raises(RuntimeError, match="Failed to write memory file"):
+        store.import_replace(
+            target="memory",
+            entries=["imported fact"],
+            import_id="link-concurrent-winner",
+            payload_sha256=hashlib.sha256(b"link-concurrent-winner").hexdigest(),
+        )
+
+    assert raced is True
+    assert memory_path.read_text(encoding="utf-8") == "concurrent winner"
+    receipt_path = next((home / "memories" / ".imports").glob("*.json"))
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    displaced_path = Path(receipt["displaced_path"])
+    assert receipt["state"] == "prepared"
     assert displaced_path.read_text(encoding="utf-8") == "old fact"
 
 

@@ -58,6 +58,8 @@ def test_completed_transcript_import_is_chunk_and_commit_idempotent(tmp_path):
         session = db.get_session("imported-session")
         assert session["source"] == "import:workbuddy"
         assert session["message_count"] == 2
+        assert session["ended_at"] is not None
+        assert session["end_reason"] == "import_completed"
         runtime_meta = json.loads(session["model_config"])["_runtime_import"]
         assert "source_session_id" not in runtime_meta
         assert runtime_meta["source_session_id_sha256"] == hashlib.sha256(
@@ -106,6 +108,33 @@ def test_completed_transcript_import_is_chunk_and_commit_idempotent(tmp_path):
                     "created_at": 1_700_000_000,
                 }],
             )
+    finally:
+        db.close()
+
+
+def test_completed_transcript_can_reopen_and_remains_retention_eligible(tmp_path):
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        _stage(db)
+        _stage(db, chunk_index=1)
+        db.commit_completed_transcript_import("imp-1")
+        imported = db.get_session("imported-session")
+        assert imported["ended_at"] is not None
+        assert imported["end_reason"] == "import_completed"
+
+        db.reopen_session("imported-session")
+        reopened = db.get_session("imported-session")
+        assert reopened["ended_at"] is None
+        assert reopened["end_reason"] is None
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (time.time() - 100 * 86400, "imported-session"),
+        )
+        assert db.prune_sessions(older_than_days=90) == 0
+
+        db.end_session("imported-session", "resumed_after_import")
+        assert db.prune_sessions(older_than_days=90) == 1
+        assert db.get_session("imported-session") is None
     finally:
         db.close()
 

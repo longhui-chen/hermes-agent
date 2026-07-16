@@ -23,6 +23,7 @@ Design:
 - Frozen snapshot pattern: system prompt is stable, tool responses show live state
 """
 
+import errno
 import hashlib
 import json
 import logging
@@ -56,11 +57,22 @@ def _fsync_directory(path: Path) -> None:
     """Persist directory metadata after an atomic rename on POSIX."""
     if os.name == "nt":
         return
-    dir_fd = os.open(path, os.O_RDONLY)
     try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+        dir_fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError as exc:
+        unsupported = {
+            errno.EINVAL,
+            getattr(errno, "ENOTSUP", errno.EINVAL),
+            getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+        }
+        if exc.errno in unsupported:
+            logger.debug("directory fsync unsupported for %s: %s", path, exc)
+            return
+        raise
 
 # Where memory files live — resolved dynamically so profile overrides
 # (HERMES_HOME env var changes) are always respected.  The old module-level
@@ -1342,6 +1354,48 @@ class MemoryStore:
             os.link(displaced_path, path)
         except FileExistsError:
             return
+        except OSError:
+            # Hard links are unavailable on some supported profile filesystems.
+            # Fall back to an O_EXCL copy so a concurrent external winner is
+            # never overwritten. The displaced recovery inode remains retained.
+            source_fd = None
+            target_fd = None
+            target_identity = None
+            try:
+                source_fd = os.open(displaced_path, os.O_RDONLY)
+                source_mode = stat.S_IMODE(os.fstat(source_fd).st_mode) or 0o600
+                target_fd = os.open(
+                    path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, source_mode
+                )
+                target_stat = os.fstat(target_fd)
+                target_identity = (target_stat.st_dev, target_stat.st_ino)
+                while True:
+                    chunk = os.read(source_fd, 1 << 20)
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(target_fd, view)
+                        if written <= 0:
+                            raise OSError("short write while restoring displaced memory")
+                        view = view[written:]
+                os.fsync(target_fd)
+            except FileExistsError:
+                return
+            except BaseException:
+                if target_fd is not None and target_identity is not None:
+                    try:
+                        current = os.lstat(path)
+                        if (current.st_dev, current.st_ino) == target_identity:
+                            os.unlink(path)
+                    except OSError:
+                        pass
+                raise
+            finally:
+                if target_fd is not None:
+                    os.close(target_fd)
+                if source_fd is not None:
+                    os.close(source_fd)
         _fsync_directory(path.parent)
 
     @staticmethod
@@ -1438,6 +1492,17 @@ class MemoryStore:
                     raise MemoryImportConflict(
                         "memory changed after import prepare; refusing to overwrite user edits"
                     ) from exc
+                except OSError as publish_error:
+                    try:
+                        MemoryStore._restore_displaced_no_replace(
+                            displaced_path, effective_path
+                        )
+                    except BaseException as restore_error:
+                        raise RuntimeError(
+                            "memory publish failed and displaced recovery also failed: "
+                            f"{restore_error}"
+                        ) from publish_error
+                    raise
                 os.unlink(tmp_path)
                 _fsync_directory(effective_path.parent)
             except BaseException:
