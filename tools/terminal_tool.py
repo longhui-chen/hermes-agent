@@ -959,8 +959,9 @@ import sys
 
 
 _CONNECTOR_RUNTIME_SCRIPT = "connector_runtime.py"
-_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT = ";&|<>\n(){}"
+_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT = ";&|<>\n()"
 _CONNECTOR_RUNTIME_SHELL_PUNCTUATION = set(_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT)
+_CONNECTOR_RUNTIME_SHELL_GROUP_START = "{"
 _CONNECTOR_RUNTIME_WRAPPERS = {
     "sudo",
     "env",
@@ -1426,7 +1427,7 @@ def _connector_runtime_segment_contains_trusted_invocation(segment: list[str]) -
         script_index = _connector_runtime_python_script_index(segment, index)
         if script_index is None:
             continue
-        if index > 0 and not _connector_runtime_wrapper_prefix_is_supported(segment[:index]):
+        if index > 0 and not _connector_runtime_command_prefix_is_supported(segment[:index]):
             continue
         if _resolve_connector_runtime_script(segment[script_index]) is not None:
             return True
@@ -1442,7 +1443,7 @@ def _connector_runtime_segment_contains_nested_shell_invocation(
     for index, token in enumerate(segment):
         if Path(token).name.lower() not in _CONNECTOR_RUNTIME_COMMAND_SHELLS:
             continue
-        if index > 0 and not _connector_runtime_wrapper_prefix_is_supported(segment[:index]):
+        if index > 0 and not _connector_runtime_command_prefix_is_supported(segment[:index]):
             continue
         nested_command = _connector_runtime_shell_command_argument(segment[index + 1:])
         if nested_command is None:
@@ -1510,6 +1511,16 @@ def _connector_runtime_python_script_index(
     ):
         return None
     return position
+
+
+def _connector_runtime_command_prefix_is_supported(prefix: list[str]) -> bool:
+    """Accept standalone shell group openers before known wrappers."""
+    position = 0
+    while position < len(prefix) and prefix[position] == _CONNECTOR_RUNTIME_SHELL_GROUP_START:
+        position += 1
+    if position == len(prefix):
+        return position > 0
+    return _connector_runtime_wrapper_prefix_is_supported(prefix[position:])
 
 
 def _connector_runtime_wrapper_prefix_is_supported(prefix: list[str]) -> bool:
