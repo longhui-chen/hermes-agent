@@ -1253,26 +1253,32 @@ class TestGetDueJobs:
         repaired = datetime.fromisoformat(get_job("cron-tz-migrate")["next_run_at"])
         assert repaired == datetime(2026, 5, 19, 21, 0, 0, tzinfo=current_tz)
 
-    def test_cron_offset_migration_recompute_preserves_per_job_timezone(self, tmp_cron_dir, monkeypatch):
+    def test_behavior_matrix_fixed_timezone_due_bypasses_host_migration(
+        self, tmp_cron_dir, monkeypatch
+    ):
         pytest.importorskip("croniter")
-        now = datetime(2026, 5, 8, 16, 0, 0, tzinfo=timezone.utc)
+        now = datetime(2026, 7, 8, 9, 0, 0, tzinfo=timezone.utc)
         monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
 
         save_jobs(
             [{
-                "id": "cron-per-job-tz-migrate",
-                "name": "Per-job timezone migrate",
+                "id": "cron-per-job-tz-due",
+                "name": "工作日喝水提醒",
                 "prompt": "...",
-                "schedule": {"kind": "cron", "expr": "6 23 * * *", "display": "6 23 * * *"},
-                "schedule_display": "6 23 * * *",
+                "schedule": {
+                    "kind": "cron",
+                    "expr": "0 9-18 * * 1-5",
+                    "display": "0 9-18 * * 1-5",
+                },
+                "schedule_display": "0 9-18 * * 1-5",
                 "repeat": {"times": None, "completed": 0},
                 "enabled": True,
                 "state": "scheduled",
                 "paused_at": None,
                 "paused_reason": None,
-                "created_at": "2026-05-07T23:06:00+08:00",
-                "next_run_at": "2026-05-08T23:06:00+08:00",
-                "last_run_at": "2026-05-07T23:06:00+08:00",
+                "created_at": "2026-07-08T16:50:52+08:00",
+                "next_run_at": "2026-07-08T17:00:00+08:00",
+                "last_run_at": None,
                 "last_status": "ok",
                 "last_error": None,
                 "deliver": "local",
@@ -1281,11 +1287,94 @@ class TestGetDueJobs:
             }]
         )
 
+        assert [job["id"] for job in get_due_jobs()] == ["cron-per-job-tz-due"]
+        assert (
+            get_job("cron-per-job-tz-due")["next_run_at"]
+            == "2026-07-08T17:00:00+08:00"
+        )
+
+    def test_behavior_matrix_fixed_timezone_due_flow_advances_once(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        pytest.importorskip("croniter")
+        now = datetime(2026, 7, 8, 9, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        save_jobs(
+            [{
+                "id": "cron-per-job-tz-flow",
+                "name": "工作日喝水提醒",
+                "prompt": "...",
+                "schedule": {
+                    "kind": "cron",
+                    "expr": "0 9-18 * * 1-5",
+                    "display": "0 9-18 * * 1-5",
+                },
+                "schedule_display": "0 9-18 * * 1-5",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "created_at": "2026-07-08T16:50:52+08:00",
+                "next_run_at": "2026-07-08T17:00:00+08:00",
+                "last_run_at": None,
+                "last_status": None,
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+                "timezone": "Asia/Shanghai",
+            }]
+        )
+
+        assert [job["id"] for job in get_due_jobs()] == ["cron-per-job-tz-flow"]
+        assert advance_next_run("cron-per-job-tz-flow") is True
+        assert (
+            get_job("cron-per-job-tz-flow")["next_run_at"]
+            == "2026-07-08T18:00:00+08:00"
+        )
         assert get_due_jobs() == []
-        repaired = datetime.fromisoformat(
-            get_job("cron-per-job-tz-migrate")["next_run_at"]
-        ).astimezone(timezone.utc)
-        assert repaired == datetime(2026, 5, 9, 15, 6, 0, tzinfo=timezone.utc)
+
+    @pytest.mark.parametrize(
+        "invalid_timezone",
+        [123, "Mars/Olympus_Mons", "../../etc/passwd", "A" * 10_000],
+        ids=["non-string", "unknown-zone", "path-traversal", "oversized"],
+    )
+    def test_suppression_matrix_invalid_timezone_does_not_poison_due_scan(
+        self, tmp_cron_dir, monkeypatch, invalid_timezone
+    ):
+        now = datetime(2026, 7, 8, 9, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        def due_job(job_id, timezone_value, next_run_at):
+            return {
+                "id": job_id,
+                "name": job_id,
+                "prompt": "...",
+                "schedule": {
+                    "kind": "cron",
+                    "expr": "0 9-18 * * 1-5",
+                    "display": "0 9-18 * * 1-5",
+                },
+                "schedule_display": "0 9-18 * * 1-5",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "created_at": "2026-07-08T16:50:52+08:00",
+                "next_run_at": next_run_at,
+                "last_run_at": None,
+                "last_status": None,
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+                "timezone": timezone_value,
+            }
+
+        save_jobs(
+            [
+                due_job("poisoned", invalid_timezone, "2026-07-08T17:00:00+08:00"),
+                due_job("healthy", "UTC", "2026-07-08T09:00:00+00:00"),
+            ]
+        )
+
+        assert [job["id"] for job in get_due_jobs()] == ["healthy"]
 
     def test_cron_offset_migration_does_not_repair_already_passed_wall_time(self, tmp_cron_dir, monkeypatch):
         current_tz = timezone(timedelta(hours=2))
