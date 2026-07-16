@@ -12345,7 +12345,13 @@ def cmd_memory(args):
                 print("  Cancelled.\n")
                 return
 
-        reset_curated_memory(target)
+        result = reset_curated_memory(target)
+        if result.get("status") != "completed":
+            print(
+                "\n  ! Memory files were isolated, but secure cleanup is still pending."
+            )
+            print("  Run the same reset command again to finish cleanup.\n")
+            raise SystemExit(1)
         for f, desc in existing:
             print(f"  ✓ Deleted {f} ({desc})")
 

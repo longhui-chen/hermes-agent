@@ -2,6 +2,7 @@ import errno
 import hashlib
 import json
 import os
+import secrets
 import stat
 import threading
 from pathlib import Path
@@ -206,23 +207,19 @@ def test_memory_reset_directory_swap_is_fail_closed_and_deletes_nothing(
     (outside / "MEMORY.md").write_text("outside memory", encoding="utf-8")
     (outside / "memory-safe.bak").write_text("outside backup", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
-    original_unlink = memory_tool._ImportDirectoryHandles.unlink_non_directory
+    original_move = memory_tool._reset_move_no_replace
     detached = memories.with_name("memories-detached")
     swapped = False
 
-    def swap_before_first_unlink(handles, directory_fd, name):
+    def swap_before_first_move(handles, scope, name, stage):
         nonlocal swapped
         if not swapped:
             swapped = True
             memories.rename(detached)
             memories.symlink_to(outside, target_is_directory=True)
-        return original_unlink(handles, directory_fd, name)
+        return original_move(handles, scope, name, stage)
 
-    monkeypatch.setattr(
-        memory_tool._ImportDirectoryHandles,
-        "unlink_non_directory",
-        swap_before_first_unlink,
-    )
+    monkeypatch.setattr(memory_tool, "_reset_move_no_replace", swap_before_first_move)
     with pytest.raises(MemoryImportConflict, match="changed during import"):
         reset_curated_memory("memory")
 
@@ -334,6 +331,368 @@ def test_memory_reset_backup_preflight_error_happens_before_any_unlink(
     assert canonical.read_text(encoding="utf-8") == "canonical"
     assert json.loads(receipt.read_text(encoding="utf-8"))["target"] == "memory"
     assert backup.read_text(encoding="utf-8") == "backup"
+
+
+@pytest.mark.parametrize(("fail_index", "after_move"), [(0, False), (1, True), (3, True)])
+def test_memory_reset_move_failure_rolls_back_every_source(
+    tmp_path, monkeypatch, fail_index, after_move
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    imports = memories / ".imports"
+    backups = imports / "backups"
+    backups.mkdir(parents=True)
+    canonical = memories / "MEMORY.md"
+    drift = memories / "MEMORY.md.bak.1"
+    receipt = imports / "receipt.json"
+    backup = backups / "memory-safe.bak"
+    canonical.write_text("canonical", encoding="utf-8")
+    drift.write_text("drift", encoding="utf-8")
+    receipt.write_text(json.dumps({"target": "memory"}), encoding="utf-8")
+    backup.write_text("backup", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original_move = memory_tool._reset_move_no_replace
+    calls = 0
+
+    def fail_one_move(handles, scope, name, stage):
+        nonlocal calls
+        index = calls
+        calls += 1
+        if index == fail_index and not after_move:
+            raise OSError(errno.EIO, "simulated reset move failure")
+        original_move(handles, scope, name, stage)
+        if index == fail_index:
+            raise OSError(errno.EIO, "simulated reset move failure")
+
+    monkeypatch.setattr(memory_tool, "_reset_move_no_replace", fail_one_move)
+    with pytest.raises(OSError, match="simulated reset move failure"):
+        reset_curated_memory("memory")
+
+    assert canonical.read_text(encoding="utf-8") == "canonical"
+    assert drift.read_text(encoding="utf-8") == "drift"
+    assert json.loads(receipt.read_text(encoding="utf-8"))["target"] == "memory"
+    assert backup.read_text(encoding="utf-8") == "backup"
+    assert not list(memories.glob(f"{memory_tool._RESET_STAGE_PREFIX}*"))
+    assert not list(memories.glob(f"{memory_tool._RESET_RECEIPT_PREFIX}*"))
+
+
+def test_memory_reset_does_not_rollback_after_isolated_receipt_is_published(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    canonical = memories / "MEMORY.md"
+    canonical.write_text("private", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original_write = memory_tool._write_reset_receipt
+
+    def fail_after_publish(handles, receipt_name, receipt):
+        original_write(handles, receipt_name, receipt)
+        if receipt["state"] == "isolated":
+            raise OSError(errno.EIO, "simulated post-publish failure")
+
+    monkeypatch.setattr(memory_tool, "_write_reset_receipt", fail_after_publish)
+    result = reset_curated_memory("memory")
+
+    assert result["status"] == "completed"
+    assert not canonical.exists()
+    assert curated_memory_has_state("memory") is False
+
+
+def test_memory_reset_phase_fsync_failure_keeps_isolated_transaction_for_retry(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    canonical = memories / "MEMORY.md"
+    canonical.write_text("private", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original_fsync = memory_tool._fsync_directory_fd
+    failures_remaining = 2
+
+    def fail_isolated_phase(directory_fd, path):
+        nonlocal failures_remaining
+        receipts = list(
+            memories.glob(f"{memory_tool._RESET_RECEIPT_PREFIX}*.json")
+        )
+        if (
+            failures_remaining
+            and path == memories
+            and receipts
+            and json.loads(receipts[0].read_text(encoding="utf-8"))["state"]
+            == "isolated"
+            and list(memories.glob(f"{memory_tool._RESET_STAGE_PREFIX}*"))
+        ):
+            failures_remaining -= 1
+            raise OSError(errno.EIO, "simulated phase fsync failure")
+        return original_fsync(directory_fd, path)
+
+    monkeypatch.setattr(memory_tool, "_fsync_directory_fd", fail_isolated_phase)
+    result = reset_curated_memory("memory")
+
+    assert result["status"] == "cleanup_pending"
+    assert not canonical.exists()
+    assert curated_memory_has_state("memory") is True
+    monkeypatch.setattr(memory_tool, "_fsync_directory_fd", original_fsync)
+    assert reset_curated_memory("memory")["status"] == "completed"
+    assert curated_memory_has_state("memory") is False
+
+
+def test_memory_reset_cleanup_failure_is_explicit_and_retryable(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    (memories / "MEMORY.md").write_text("private", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original_unlink = memory_tool.os.unlink
+    failed = False
+
+    def fail_first_stage_cleanup(path, *args, **kwargs):
+        nonlocal failed
+        if str(path).startswith(memory_tool._RESET_STAGE_PREFIX) and not failed:
+            failed = True
+            raise OSError(errno.EIO, "simulated cleanup failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(memory_tool.os, "unlink", fail_first_stage_cleanup)
+    result = reset_curated_memory("memory")
+    assert result["status"] == "cleanup_pending"
+    assert not (memories / "MEMORY.md").exists()
+    assert curated_memory_has_state("memory") is True
+
+    monkeypatch.setattr(memory_tool.os, "unlink", original_unlink)
+    retry = reset_curated_memory("memory")
+    assert retry["status"] == "completed"
+    assert curated_memory_has_state("memory") is False
+
+
+def test_memory_reset_cleanup_fsync_failure_keeps_retry_marker(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    (memories / "MEMORY.md").write_text("private", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original_fsync = memory_tool._fsync_directory_fd
+    failed = False
+
+    def fail_after_stage_unlink(directory_fd, path):
+        nonlocal failed
+        receipts = list(
+            memories.glob(f"{memory_tool._RESET_RECEIPT_PREFIX}*.json")
+        )
+        if (
+            not failed
+            and path == memories
+            and receipts
+            and json.loads(receipts[0].read_text(encoding="utf-8"))["state"]
+            == "isolated"
+            and not list(memories.glob(f"{memory_tool._RESET_STAGE_PREFIX}*"))
+        ):
+            failed = True
+            raise OSError(errno.EIO, "simulated cleanup fsync failure")
+        return original_fsync(directory_fd, path)
+
+    monkeypatch.setattr(memory_tool, "_fsync_directory_fd", fail_after_stage_unlink)
+    result = reset_curated_memory("memory")
+
+    assert result["status"] == "cleanup_pending"
+    assert curated_memory_has_state("memory") is True
+    monkeypatch.setattr(memory_tool, "_fsync_directory_fd", original_fsync)
+    assert reset_curated_memory("memory")["status"] == "completed"
+    assert curated_memory_has_state("memory") is False
+
+
+def test_memory_reset_recovers_staging_receipt_before_new_transaction(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    imports = memories / ".imports"
+    (imports / "backups").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    stage = f"{memory_tool._RESET_STAGE_PREFIX}crash_0"
+    receipt_name = f"{memory_tool._RESET_RECEIPT_PREFIX}crash.json"
+    (memories / stage).write_text("private", encoding="utf-8")
+    (memories / receipt_name).write_text(json.dumps({
+        "state": "staging",
+        "plan": [{
+            "scope": "memory", "name": "MEMORY.md", "stage": stage,
+            "label": "MEMORY.md",
+        }],
+    }), encoding="utf-8")
+
+    def stop_after_recovery(*_args, **_kwargs):
+        raise OSError(errno.EIO, "stop after recovery")
+
+    monkeypatch.setattr(memory_tool, "_write_reset_receipt", stop_after_recovery)
+    with pytest.raises(OSError, match="stop after recovery"):
+        reset_curated_memory("memory")
+    assert (memories / "MEMORY.md").read_text(encoding="utf-8") == "private"
+    assert not (memories / stage).exists()
+    assert not (memories / receipt_name).exists()
+
+
+def test_memory_reset_supports_tmp_symlink_ancestor(tmp_path, monkeypatch):
+    logical_root = Path("/tmp") / f"hermes-reset-{secrets.token_hex(8)}"
+    try:
+        memories = logical_root / ".hermes" / "memories"
+        memories.mkdir(parents=True)
+        (memories / "MEMORY.md").write_text("private", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(logical_root / ".hermes"))
+        result = reset_curated_memory("memory")
+        assert result["status"] == "completed"
+        assert not (memories / "MEMORY.md").exists()
+    finally:
+        import shutil
+
+        shutil.rmtree(logical_root, ignore_errors=True)
+
+
+@pytest.mark.parametrize("replaced_leaf", ["home", "memories"])
+def test_memory_reset_rejects_profile_leaf_replacement_before_secure_open(
+    tmp_path, monkeypatch, replaced_leaf
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    canonical = memories / "MEMORY.md"
+    canonical.write_text("original private data", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original_open = memory_tool._open_resolved_directory_chain
+    replacement = tmp_path / f"old-{replaced_leaf}"
+    replacement_victim = memories / "MEMORY.md"
+    swapped = False
+
+    def replace_before_open(path, flags):
+        nonlocal swapped, replacement_victim
+        if not swapped:
+            swapped = True
+            if replaced_leaf == "home":
+                home.rename(replacement)
+                replacement_victim = home / "memories" / "MEMORY.md"
+                replacement_victim.parent.mkdir(parents=True)
+            else:
+                memories.rename(replacement)
+                replacement_victim = memories / "MEMORY.md"
+                memories.mkdir()
+            replacement_victim.write_text("replacement must survive", encoding="utf-8")
+        return original_open(path, flags)
+
+    monkeypatch.setattr(
+        memory_tool, "_open_resolved_directory_chain", replace_before_open
+    )
+    with pytest.raises(MemoryImportConflict, match="changed before secure open"):
+        reset_curated_memory("memory")
+
+    assert replacement_victim.read_text(encoding="utf-8") == "replacement must survive"
+    original_canonical = (
+        replacement / "memories" / "MEMORY.md"
+        if replaced_leaf == "home"
+        else replacement / "MEMORY.md"
+    )
+    assert original_canonical.read_text(encoding="utf-8") == "original private data"
+
+
+@pytest.mark.parametrize("replaced_leaf", ["home", "memories"])
+def test_memory_import_rejects_profile_leaf_replacement_before_secure_open(
+    tmp_path, monkeypatch, replaced_leaf
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    canonical = memories / "MEMORY.md"
+    canonical.write_text("original private data", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=100, user_char_limit=100)
+    original_open = memory_tool._open_resolved_directory_chain
+    replacement = tmp_path / f"import-old-{replaced_leaf}"
+    replacement_victim = memories / "MEMORY.md"
+    swapped = False
+
+    def replace_before_open(path, flags):
+        nonlocal swapped, replacement_victim
+        if not swapped:
+            swapped = True
+            if replaced_leaf == "home":
+                home.rename(replacement)
+                replacement_victim = home / "memories" / "MEMORY.md"
+                replacement_victim.parent.mkdir(parents=True)
+            else:
+                memories.rename(replacement)
+                replacement_victim = memories / "MEMORY.md"
+                memories.mkdir()
+            replacement_victim.write_text("replacement must survive", encoding="utf-8")
+        return original_open(path, flags)
+
+    monkeypatch.setattr(
+        memory_tool, "_open_resolved_directory_chain", replace_before_open
+    )
+    with pytest.raises(MemoryImportConflict, match="changed before secure open"):
+        store.import_replace(
+            target="memory",
+            entries=["imported private fact"],
+            import_id=f"profile-swap-{replaced_leaf}",
+            payload_sha256=hashlib.sha256(replaced_leaf.encode()).hexdigest(),
+        )
+
+    assert replacement_victim.read_text(encoding="utf-8") == "replacement must survive"
+    original_canonical = (
+        replacement / "memories" / "MEMORY.md"
+        if replaced_leaf == "home"
+        else replacement / "MEMORY.md"
+    )
+    assert original_canonical.read_text(encoding="utf-8") == "original private data"
+    assert not (replacement_victim.parent / ".imports").exists()
+
+
+def test_memory_reset_discovers_and_removes_legacy_and_transaction_residue(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    residue = [
+        memories / "MEMORY.md.bak.1700000000",
+        memories / ".drift_crash.tmp",
+        memories / ".reset_receipt_crash.tmp",
+        memories / f"{memory_tool._RESET_STAGE_PREFIX}orphan",
+        memories / f"{memory_tool._RESET_RECEIPT_PREFIX}orphan.tmp",
+    ]
+    for path in residue:
+        path.write_text("private residue", encoding="utf-8")
+
+    assert curated_memory_has_state("memory") is True
+    result = reset_curated_memory("memory")
+
+    assert result["status"] == "completed"
+    assert not any(os.path.lexists(path) for path in residue)
+    assert curated_memory_has_state("memory") is False
+
+
+def test_legacy_windows_reset_remains_available_and_cleans_v25_residue(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    residue = [
+        memories / "MEMORY.md",
+        memories / "MEMORY.md.bak.1700000000",
+        memories / ".drift_crash.tmp",
+        memories / f"{memory_tool._RESET_STAGE_PREFIX}orphan",
+        memories / f"{memory_tool._RESET_RECEIPT_PREFIX}orphan.json",
+    ]
+    for path in residue:
+        path.write_text("private residue", encoding="utf-8")
+
+    result = memory_tool._reset_curated_memory_legacy_windows("memory")
+
+    assert result["status"] == "completed"
+    assert not any(os.path.lexists(path) for path in residue)
 
 
 def test_memory_import_rejects_poison_and_overflow_without_writing(tmp_path, monkeypatch):
@@ -1106,20 +1465,15 @@ def test_memory_reset_and_import_are_serialized_by_profile_transaction(
     allow_reset_to_finish = threading.Event()
     import_started = threading.Event()
     import_finished = threading.Event()
-    original_unlink = memory_tool._ImportDirectoryHandles.unlink_non_directory
+    original_move = memory_tool._reset_move_no_replace
 
-    def pause_after_canonical_unlink(handles, directory_fd, name):
-        removed = original_unlink(handles, directory_fd, name)
-        if directory_fd == handles.mem_fd and name == memory_path.name and removed:
+    def pause_after_canonical_move(handles, scope, name, stage):
+        original_move(handles, scope, name, stage)
+        if scope == "memory" and name == memory_path.name:
             reset_inside_transaction.set()
             assert allow_reset_to_finish.wait(timeout=5)
-        return removed
 
-    monkeypatch.setattr(
-        memory_tool._ImportDirectoryHandles,
-        "unlink_non_directory",
-        pause_after_canonical_unlink,
-    )
+    monkeypatch.setattr(memory_tool, "_reset_move_no_replace", pause_after_canonical_move)
     reset_thread = threading.Thread(target=reset_curated_memory, args=("all",))
     reset_thread.start()
     assert reset_inside_transaction.wait(timeout=5)

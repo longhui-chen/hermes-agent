@@ -225,6 +225,24 @@ class TestMemoryEndpoints:
         assert not backup_path.exists()
         assert not receipt_path.exists()
 
+    def test_reset_cleanup_pending_is_not_reported_as_success(self, monkeypatch):
+        import tools.memory_tool as memory_tool
+
+        monkeypatch.setattr(
+            memory_tool,
+            "reset_curated_memory",
+            lambda _target: {
+                "deleted": ["MEMORY.md"],
+                "targets": ["memory"],
+                "status": "cleanup_pending",
+            },
+        )
+
+        response = self.client.post("/api/memory/reset", json={"target": "memory"})
+
+        assert response.status_code == 503
+        assert response.json()["detail"]["code"] == "memory_reset_cleanup_pending"
+
 
 class TestPairingEndpoints:
     @pytest.fixture(autouse=True)

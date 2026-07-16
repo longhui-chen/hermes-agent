@@ -56,6 +56,26 @@ logger = logging.getLogger(__name__)
 _OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
 
 
+def _path_identity(path: Path) -> tuple[int, int]:
+    current = os.stat(path, follow_symlinks=False)
+    return current.st_dev, current.st_ino
+
+
+def _open_resolved_directory_chain(path: Path, flags: int) -> int:
+    """Open a realpath from `/` one no-follow component at a time."""
+    resolved = Path(os.path.realpath(path))
+    current_fd = os.open(resolved.anchor or "/", flags)
+    try:
+        for part in resolved.parts[1:]:
+            next_fd = os.open(part, flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
 def _fsync_directory(path: Path) -> None:
     """Persist directory metadata after an atomic rename on POSIX."""
     if os.name == "nt":
@@ -101,12 +121,19 @@ def get_memory_dir() -> Path:
     """Return the profile-scoped memories directory."""
     return get_hermes_home() / "memories"
 
+
+def portable_memory_import_supported() -> bool:
+    """Whether this platform can enforce V2.5 directory-relative safety."""
+    return os.name != "nt" and _OPEN_SUPPORTS_DIR_FD
+
 ENTRY_DELIMITER = "\n§\n"
 MEMORY_IMPORT_BACKUP_LIMIT = 5
 MAX_CURATED_MEMORY_FILE_BYTES = 1 << 20
 _MISSING_MEMORY_FILE_SHA256 = "missing"
 _MEMORY_TARGET_FILES = {"memory": "MEMORY.md", "user": "USER.md"}
 _MEMORY_TRANSACTION_LOCK = ".curated-memory-transaction"
+_RESET_RECEIPT_PREFIX = ".reset_tx_"
+_RESET_STAGE_PREFIX = ".reset_stage_"
 
 
 class MemoryImportConflict(ValueError):
@@ -116,12 +143,25 @@ class MemoryImportConflict(ValueError):
 class _ImportDirectoryHandles:
     """Stable POSIX directory handles for one curated-memory import."""
 
-    def __init__(self, mem_dir: Path, *, create_managed: bool = True):
+    def __init__(
+        self,
+        mem_dir: Path,
+        *,
+        create_managed: bool = True,
+        expected_home_identity: Optional[tuple[int, int]] = None,
+        expected_mem_identity: Optional[tuple[int, int]] = None,
+    ):
         self.home_dir = mem_dir.parent
         self.mem_dir = mem_dir
         self.imports_dir = mem_dir / ".imports"
         self.backup_dir = self.imports_dir / "backups"
         self.create_managed = create_managed
+        self.expected_home_identity = (
+            expected_home_identity or _path_identity(self.home_dir)
+        )
+        self.expected_mem_identity = (
+            expected_mem_identity or _path_identity(self.mem_dir)
+        )
         self._unopened_identities: Dict[Path, Optional[tuple[int, int, int]]] = {}
         self.home_fd = -1
         self.mem_fd = -1
@@ -185,12 +225,26 @@ class _ImportDirectoryHandles:
                 "secure memory import requires directory-relative file operations"
             )
         try:
-            self.home_fd = os.open(self.home_dir, self._directory_flags())
+            self.home_fd = _open_resolved_directory_chain(
+                self.home_dir, self._directory_flags()
+            )
+            if (
+                os.fstat(self.home_fd).st_dev,
+                os.fstat(self.home_fd).st_ino,
+            ) != self.expected_home_identity:
+                raise MemoryImportConflict("HERMES_HOME changed before secure open")
             self.mem_fd = os.open(
                 self.mem_dir.name,
                 self._directory_flags(),
                 dir_fd=self.home_fd,
             )
+            if (
+                os.fstat(self.mem_fd).st_dev,
+                os.fstat(self.mem_fd).st_ino,
+            ) != self.expected_mem_identity:
+                raise MemoryImportConflict(
+                    "profile memories directory changed before secure open"
+                )
             self.imports_fd = self._open_child_directory(
                 self.mem_fd, ".imports", create=self.create_managed
             )
@@ -649,9 +703,18 @@ _ACTIVE_MEMORY_IMPORT_DIRS: ContextVar[Optional[_ImportDirectoryHandles]] = (
 
 
 @contextmanager
-def _anchored_import_directories(mem_dir: Path, *, create_managed: bool = True):
+def _anchored_import_directories(
+    mem_dir: Path,
+    *,
+    create_managed: bool = True,
+    expected_home_identity: Optional[tuple[int, int]] = None,
+    expected_mem_identity: Optional[tuple[int, int]] = None,
+):
     with _ImportDirectoryHandles(
-        mem_dir, create_managed=create_managed
+        mem_dir,
+        create_managed=create_managed,
+        expected_home_identity=expected_home_identity,
+        expected_mem_identity=expected_mem_identity,
     ) as handles:
         token = _ACTIVE_MEMORY_IMPORT_DIRS.set(handles)
         try:
@@ -678,11 +741,14 @@ def _require_real_directory(path: Path, *, label: str, create: bool) -> None:
         raise MemoryImportConflict(f"{label} must be a real directory, not a symlink")
 
 
-def _require_profile_memory_directory(*, create: bool) -> Path:
-    """Return the profile memory root without traversing a symlinked child."""
+def _require_profile_memory_snapshot(
+    *, create: bool
+) -> tuple[Path, tuple[int, int], tuple[int, int]]:
+    """Validate the profile root and capture identities for its secure open."""
     home = get_hermes_home()
     if create:
         home.mkdir(parents=True, exist_ok=True)
+    _require_real_directory(home, label="HERMES_HOME", create=False)
     try:
         resolved_home = home.resolve(strict=True)
     except OSError as exc:
@@ -699,7 +765,29 @@ def _require_profile_memory_directory(*, create: bool) -> Path:
         ) from exc
     if resolved_memory != resolved_home / "memories":
         raise MemoryImportConflict("profile memories directory escapes HERMES_HOME")
-    return mem_dir
+    try:
+        home_identity = _path_identity(home)
+        mem_identity = _path_identity(mem_dir)
+        # Resolve and identity checks must describe one snapshot.  A leaf swap
+        # during validation is a conflict, not a new profile root to trust.
+        changed = (
+            home.resolve(strict=True) != resolved_home
+            or mem_dir.resolve(strict=True) != resolved_memory
+            or _path_identity(home) != home_identity
+            or _path_identity(mem_dir) != mem_identity
+        )
+    except OSError as exc:
+        raise MemoryImportConflict(
+            f"profile memory root changed during validation: {exc}"
+        ) from exc
+    if changed:
+        raise MemoryImportConflict("profile memory root changed during validation")
+    return mem_dir, home_identity, mem_identity
+
+
+def _require_profile_memory_directory(*, create: bool) -> Path:
+    """Return the profile memory root without traversing a symlinked child."""
+    return _require_profile_memory_snapshot(create=create)[0]
 
 
 def _require_managed_memory_directory(path: Path, *, create: bool) -> Path:
@@ -835,8 +923,11 @@ def _target_has_import_state(mem_dir: Path, target: str) -> bool:
     if _is_real_directory(mem_dir):
         with os.scandir(mem_dir) as entries:
             if any(
-                entry.name.startswith(displaced_prefix)
-                and entry.name.endswith(".displaced")
+                (
+                    entry.name.startswith(displaced_prefix)
+                    and entry.name.endswith(".displaced")
+                )
+                or entry.name.startswith(f"{filename}.bak.")
                 for entry in entries
             ):
                 return True
@@ -863,16 +954,20 @@ def _has_import_temp_state(mem_dir: Path) -> bool:
     imports_dir = mem_dir / ".imports"
     backup_dir = imports_dir / "backups"
     locations = (
-        (mem_dir, ".mem_"),
-        (imports_dir, ".receipt_"),
-        (backup_dir, ".backup_"),
+        (mem_dir, ".mem_", ".tmp"),
+        (mem_dir, ".drift_", ".tmp"),
+        (mem_dir, ".reset_receipt_", ".tmp"),
+        (mem_dir, _RESET_RECEIPT_PREFIX, ""),
+        (mem_dir, _RESET_STAGE_PREFIX, ""),
+        (imports_dir, ".receipt_", ".tmp"),
+        (backup_dir, ".backup_", ".tmp"),
     )
-    for directory, prefix in locations:
+    for directory, prefix, suffix in locations:
         if not _is_real_directory(directory):
             continue
         with os.scandir(directory) as entries:
             if any(
-                entry.name.startswith(prefix) and entry.name.endswith(".tmp")
+                entry.name.startswith(prefix) and entry.name.endswith(suffix)
                 for entry in entries
             ):
                 return True
@@ -883,6 +978,198 @@ def _validate_reset_lock(path: Path) -> None:
     lock_path = path.with_suffix(path.suffix + ".lock")
     if os.path.lexists(lock_path) and not stat.S_ISREG(os.lstat(lock_path).st_mode):
         raise MemoryImportConflict(f"refusing to follow unsafe reset lock {lock_path}")
+
+
+def _reset_scope_fd(handles: _ImportDirectoryHandles, scope: str) -> int:
+    mapping = {
+        "memory": handles.mem_fd,
+        "imports": handles.imports_fd,
+        "backups": handles.backup_fd,
+    }
+    fd = mapping.get(scope, -1)
+    if fd < 0:
+        raise MemoryImportConflict(f"reset source directory is unavailable: {scope}")
+    return fd
+
+
+def _reset_entry_stat(directory_fd: int, name: str):
+    try:
+        return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def _reset_fsync_scope(handles: _ImportDirectoryHandles, scope: str) -> None:
+    fd = _reset_scope_fd(handles, scope)
+    path = (
+        handles.mem_dir
+        if scope == "memory"
+        else handles.imports_dir
+        if scope == "imports"
+        else handles.backup_dir
+    )
+    _fsync_directory_fd(fd, path)
+
+
+def _reset_move_no_replace(
+    handles: _ImportDirectoryHandles,
+    source_scope: str,
+    source_name: str,
+    stage_name: str,
+) -> None:
+    source_fd = _reset_scope_fd(handles, source_scope)
+    if _reset_entry_stat(handles.mem_fd, stage_name) is not None:
+        raise MemoryImportConflict(f"reset stage already exists: {stage_name}")
+    handles.verify_attached()
+    os.link(
+        source_name,
+        stage_name,
+        src_dir_fd=source_fd,
+        dst_dir_fd=handles.mem_fd,
+        follow_symlinks=False,
+    )
+    try:
+        os.unlink(source_name, dir_fd=source_fd)
+    except BaseException:
+        try:
+            os.unlink(stage_name, dir_fd=handles.mem_fd)
+        except OSError:
+            pass
+        raise
+    _reset_fsync_scope(handles, source_scope)
+    _fsync_directory_fd(handles.mem_fd, handles.mem_dir)
+    handles.verify_attached()
+
+
+def _reset_restore_plan(
+    handles: _ImportDirectoryHandles, plan: List[Dict[str, str]]
+) -> None:
+    for entry in reversed(plan):
+        source_fd = _reset_scope_fd(handles, entry["scope"])
+        source = _reset_entry_stat(source_fd, entry["name"])
+        stage = _reset_entry_stat(handles.mem_fd, entry["stage"])
+        if stage is None:
+            continue
+        if source is not None:
+            if (source.st_dev, source.st_ino) != (stage.st_dev, stage.st_ino):
+                raise MemoryImportConflict(
+                    f"cannot restore reset source occupied by another file: {entry['name']}"
+                )
+            os.unlink(entry["stage"], dir_fd=handles.mem_fd)
+        else:
+            os.link(
+                entry["stage"],
+                entry["name"],
+                src_dir_fd=handles.mem_fd,
+                dst_dir_fd=source_fd,
+                follow_symlinks=False,
+            )
+            os.unlink(entry["stage"], dir_fd=handles.mem_fd)
+        _reset_fsync_scope(handles, entry["scope"])
+        _fsync_directory_fd(handles.mem_fd, handles.mem_dir)
+    handles.verify_attached()
+
+
+def _write_reset_receipt(
+    handles: _ImportDirectoryHandles, receipt_name: str, receipt: Dict[str, Any]
+) -> None:
+    handles.atomic_write(
+        handles.mem_fd,
+        receipt_name,
+        json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        prefix=".reset_receipt_",
+    )
+
+
+def _cleanup_isolated_reset(
+    handles: _ImportDirectoryHandles,
+    receipt_name: str,
+    plan: List[Dict[str, str]],
+) -> bool:
+    cleanup_pending = False
+    for entry in plan:
+        try:
+            if _reset_entry_stat(handles.mem_fd, entry["stage"]) is not None:
+                os.unlink(entry["stage"], dir_fd=handles.mem_fd)
+        except OSError:
+            cleanup_pending = True
+    try:
+        _fsync_directory_fd(handles.mem_fd, handles.mem_dir)
+    except OSError:
+        # Keep the isolated receipt so a later reset retries the purge.
+        return True
+    if cleanup_pending:
+        return True
+    try:
+        os.unlink(receipt_name, dir_fd=handles.mem_fd)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return True
+    try:
+        _fsync_directory_fd(handles.mem_fd, handles.mem_dir)
+    except OSError:
+        # The receipt removal was not durably confirmed. Recreate a marker so
+        # callers can observe cleanup_pending and a retry has work to recover.
+        try:
+            _write_reset_receipt(
+                handles,
+                receipt_name,
+                {"version": 1, "state": "isolated", "plan": plan},
+            )
+        except (OSError, MemoryImportConflict):
+            pass
+        return True
+    handles.verify_attached()
+    return False
+
+
+def _validate_reset_receipt(value: Any) -> tuple[str, List[Dict[str, str]]]:
+    if not isinstance(value, dict) or value.get("state") not in {"staging", "isolated"}:
+        raise MemoryImportConflict("memory reset receipt is invalid")
+    raw_plan = value.get("plan")
+    if not isinstance(raw_plan, list):
+        raise MemoryImportConflict("memory reset receipt plan is invalid")
+    plan = []
+    for raw in raw_plan:
+        if not isinstance(raw, dict):
+            raise MemoryImportConflict("memory reset receipt entry is invalid")
+        scope, name, stage, label = (
+            raw.get("scope"), raw.get("name"), raw.get("stage"), raw.get("label")
+        )
+        if (
+            scope not in {"memory", "imports", "backups"}
+            or not all(isinstance(item, str) and item and "/" not in item and "\\" not in item
+                       for item in (name, stage))
+            or not isinstance(label, str)
+            or not stage.startswith(_RESET_STAGE_PREFIX)
+        ):
+            raise MemoryImportConflict("memory reset receipt entry is unsafe")
+        plan.append({"scope": scope, "name": name, "stage": stage, "label": label})
+    return value["state"], plan
+
+
+def _recover_reset_transactions(
+    handles: _ImportDirectoryHandles, memory_names: List[str]
+) -> bool:
+    cleanup_pending = False
+    receipt_names = [
+        name
+        for name in memory_names
+        if name.startswith(_RESET_RECEIPT_PREFIX) and name.endswith(".json")
+    ]
+    for receipt_name in receipt_names:
+        receipt = handles.read_receipt(handles.mem_fd, receipt_name)
+        state, plan = _validate_reset_receipt(receipt)
+        if state == "staging":
+            _reset_restore_plan(handles, plan)
+            os.unlink(receipt_name, dir_fd=handles.mem_fd)
+            _fsync_directory_fd(handles.mem_fd, handles.mem_dir)
+        else:
+            cleanup_pending |= _cleanup_isolated_reset(
+                handles, receipt_name, plan
+            )
+    return cleanup_pending
 
 
 def curated_memory_has_state(target: str) -> bool:
@@ -903,6 +1190,82 @@ def curated_memory_has_state(target: str) -> bool:
     return False
 
 
+def _reset_curated_memory_legacy_windows(target: str) -> Dict[str, Any]:
+    """Preserve the pre-V2.5 reset path where POSIX dirfd APIs do not exist."""
+    mem_dir = get_memory_dir()
+    if not _is_real_directory(mem_dir):
+        return {"deleted": [], "targets": [], "status": "completed"}
+    targets = ("memory", "user") if target == "all" else (target,)
+    imports_dir = mem_dir / ".imports"
+    backup_dir = imports_dir / "backups"
+    deleted = []
+    for item in targets:
+        filename = _MEMORY_TARGET_FILES[item]
+        canonical = mem_dir / filename
+        if (
+            os.path.lexists(canonical)
+            and not stat.S_ISDIR(os.lstat(canonical).st_mode)
+        ):
+            canonical.unlink()
+            deleted.append(filename)
+        with os.scandir(mem_dir) as entries:
+            for entry in entries:
+                if (
+                    (
+                        entry.name.startswith(f".{filename}.")
+                        and entry.name.endswith(".displaced")
+                    )
+                    or entry.name.startswith(f"{filename}.bak.")
+                ) and not entry.is_dir(follow_symlinks=False):
+                    os.unlink(entry.path)
+                    deleted.append(entry.name)
+        if _is_real_directory(backup_dir):
+            with os.scandir(backup_dir) as entries:
+                for entry in entries:
+                    if (
+                        entry.name.startswith(f"{item}-")
+                        and entry.name.endswith(".bak")
+                        and not entry.is_dir(follow_symlinks=False)
+                    ):
+                        os.unlink(entry.path)
+                        deleted.append(str(Path(".imports") / "backups" / entry.name))
+        if _is_real_directory(imports_dir):
+            with os.scandir(imports_dir) as entries:
+                for entry in entries:
+                    if not entry.name.endswith(".json"):
+                        continue
+                    receipt = _read_import_receipt_no_follow(Path(entry.path))
+                    if receipt is not None and receipt.get("target") == item:
+                        os.unlink(entry.path)
+                        deleted.append(str(Path(".imports") / entry.name))
+    for directory, prefixes, relative in (
+        (mem_dir, (".mem_", ".drift_", ".reset_receipt_"), Path(".")),
+        (imports_dir, (".receipt_",), Path(".imports")),
+        (backup_dir, (".backup_",), Path(".imports") / "backups"),
+    ):
+        if not _is_real_directory(directory):
+            continue
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if (
+                    any(entry.name.startswith(prefix) for prefix in prefixes)
+                    and entry.name.endswith(".tmp")
+                    and not entry.is_dir(follow_symlinks=False)
+                ):
+                    os.unlink(entry.path)
+                    deleted.append(str(relative / entry.name))
+    if _is_real_directory(mem_dir):
+        with os.scandir(mem_dir) as entries:
+            for entry in entries:
+                if (
+                    entry.name.startswith((_RESET_RECEIPT_PREFIX, _RESET_STAGE_PREFIX))
+                    and not entry.is_dir(follow_symlinks=False)
+                ):
+                    os.unlink(entry.path)
+                    deleted.append(entry.name)
+    return {"deleted": deleted, "targets": list(targets), "status": "completed"}
+
+
 def reset_curated_memory(target: str) -> Dict[str, Any]:
     """Permanently unlink canonical and profile-local import state for a target.
 
@@ -913,9 +1276,14 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
     """
     if target not in {"all", "memory", "user"}:
         raise ValueError("target must be all, memory, or user")
+    if os.name == "nt":
+        return _reset_curated_memory_legacy_windows(target)
     mem_dir = get_memory_dir()
     if not _is_real_directory(mem_dir):
-        return {"deleted": [], "targets": []}
+        return {"deleted": [], "targets": [], "status": "completed"}
+    mem_dir, home_identity, mem_identity = _require_profile_memory_snapshot(
+        create=False
+    )
 
     targets = ("memory", "user") if target == "all" else (target,)
     deleted: List[str] = []
@@ -930,7 +1298,10 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
     # Swapping any visible directory can make reset fail, but cannot redirect a
     # deletion into the replacement tree.
     with _anchored_import_directories(
-        mem_dir, create_managed=False
+        mem_dir,
+        create_managed=False,
+        expected_home_identity=home_identity,
+        expected_mem_identity=mem_identity,
     ) as reset_dirs, ExitStack() as stack:
         stack.enter_context(
             MemoryStore._file_lock(transaction_path, create_parent=False)
@@ -948,83 +1319,167 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
             backup_names,
             receipt_targets,
         ) = reset_dirs.preflight_reset()
+        if _recover_reset_transactions(reset_dirs, memory_names):
+            return {
+                "deleted": [],
+                "targets": list(targets),
+                "status": "cleanup_pending",
+            }
+        (
+            memory_names,
+            imports_names,
+            backup_names,
+            receipt_targets,
+        ) = reset_dirs.preflight_reset()
+
+        transaction_id = secrets.token_hex(16)
+        plan: List[Dict[str, str]] = []
+        planned = set()
+
+        def add_plan(scope: str, name: str, label: str) -> None:
+            key = (scope, name)
+            if key in planned:
+                return
+            directory_fd = _reset_scope_fd(reset_dirs, scope)
+            current = _reset_entry_stat(directory_fd, name)
+            if current is None or stat.S_ISDIR(current.st_mode):
+                return
+            planned.add(key)
+            plan.append({
+                "scope": scope,
+                "name": name,
+                "stage": f"{_RESET_STAGE_PREFIX}{transaction_id}_{len(plan)}",
+                "label": label,
+            })
 
         for item in targets:
             filename = _MEMORY_TARGET_FILES[item]
-            if reset_dirs.unlink_non_directory(reset_dirs.mem_fd, filename):
-                deleted.append(filename)
-
+            add_plan("memory", filename, filename)
             displaced_prefix = f".{filename}."
             for name in memory_names:
                 if (
                     name.startswith(displaced_prefix)
                     and name.endswith(".displaced")
-                    and reset_dirs.unlink_non_directory(reset_dirs.mem_fd, name)
-                ):
-                    deleted.append(name)
+                ) or name.startswith(f"{filename}.bak."):
+                    add_plan("memory", name, name)
+            for name in backup_names:
+                if name.startswith(f"{item}-") and name.endswith(".bak"):
+                    add_plan(
+                        "backups", name, str(Path(".imports") / "backups" / name)
+                    )
+            for name, receipt in receipt_targets.items():
+                if receipt is not None and receipt.get("target") == item:
+                    add_plan("imports", name, str(Path(".imports") / name))
 
-            if reset_dirs.backup_fd >= 0:
-                backup_prefix = f"{item}-"
-                for name in backup_names:
-                    if (
-                        name.startswith(backup_prefix)
-                        and name.endswith(".bak")
-                        and reset_dirs.unlink_non_directory(
-                            reset_dirs.backup_fd, name
-                        )
-                    ):
-                        deleted.append(
-                            str(Path(".imports") / "backups" / name)
-                        )
-
-            if reset_dirs.imports_fd >= 0:
-                for name in imports_names:
-                    if not name.endswith(".json"):
-                        continue
-                    receipt = receipt_targets[name]
-                    if receipt is None or receipt.get("target") != item:
-                        continue
-                    if reset_dirs.unlink_non_directory(
-                        reset_dirs.imports_fd, name
-                    ):
-                        deleted.append(str(Path(".imports") / name))
-
-        temp_locations = (
-            (reset_dirs.mem_fd, ".mem_", Path(".")),
-            (reset_dirs.imports_fd, ".receipt_", Path(".imports")),
+        for scope, names, prefix, relative_dir in (
+            ("memory", memory_names, ".mem_", Path(".")),
+            ("memory", memory_names, ".drift_", Path(".")),
+            ("memory", memory_names, ".reset_receipt_", Path(".")),
+            ("imports", imports_names, ".receipt_", Path(".imports")),
             (
-                reset_dirs.backup_fd,
-                ".backup_",
+                "backups", backup_names, ".backup_",
                 Path(".imports") / "backups",
             ),
-        )
-        for directory_fd, prefix, relative_dir in temp_locations:
-            if directory_fd < 0:
-                continue
-            names = (
-                memory_names
-                if directory_fd == reset_dirs.mem_fd
-                else imports_names
-                if directory_fd == reset_dirs.imports_fd
-                else backup_names
-            )
+        ):
             for name in names:
-                if (
-                    name.startswith(prefix)
-                    and name.endswith(".tmp")
-                    and reset_dirs.unlink_non_directory(directory_fd, name)
-                ):
-                    deleted.append(str(relative_dir / name))
+                if name.startswith(prefix) and name.endswith(".tmp"):
+                    add_plan(scope, name, str(relative_dir / name))
+        for name in memory_names:
+            if name.startswith(_RESET_STAGE_PREFIX):
+                add_plan("memory", name, name)
+            elif name.startswith(_RESET_RECEIPT_PREFIX) and not name.endswith(
+                ".json"
+            ):
+                add_plan("memory", name, name)
 
-        reset_dirs.verify_attached()
-        _fsync_directory_fd(reset_dirs.mem_fd, reset_dirs.mem_dir)
-        if reset_dirs.imports_fd >= 0:
-            _fsync_directory_fd(reset_dirs.imports_fd, reset_dirs.imports_dir)
-        if reset_dirs.backup_fd >= 0:
-            _fsync_directory_fd(reset_dirs.backup_fd, reset_dirs.backup_dir)
-        reset_dirs.verify_attached()
+        receipt_name = f"{_RESET_RECEIPT_PREFIX}{transaction_id}.json"
+        receipt = {
+            "version": 1,
+            "state": "staging",
+            "targets": list(targets),
+            "plan": plan,
+            "created_at": time.time(),
+        }
+        _write_reset_receipt(reset_dirs, receipt_name, receipt)
+        try:
+            for entry in plan:
+                _reset_move_no_replace(
+                    reset_dirs,
+                    entry["scope"],
+                    entry["name"],
+                    entry["stage"],
+                )
+            reset_dirs.verify_attached()
+            for scope in {entry["scope"] for entry in plan} | {"memory"}:
+                _reset_fsync_scope(reset_dirs, scope)
+            receipt["state"] = "isolated"
+            receipt["isolated_at"] = time.time()
+            _write_reset_receipt(reset_dirs, receipt_name, receipt)
+            reset_dirs.verify_attached()
+        except BaseException as reset_error:
+            # atomic_write may have published the isolated receipt before a
+            # directory fsync reported failure.  Once that state is visible,
+            # never start a rollback under an `isolated` receipt: a crash in
+            # that rollback would recover as a commit and leave partial state.
+            current_receipt = reset_dirs.read_receipt(
+                reset_dirs.mem_fd, receipt_name
+            )
+            if (
+                isinstance(current_receipt, dict)
+                and current_receipt.get("state") == "isolated"
+            ):
+                reset_dirs.verify_attached()
+                try:
+                    _fsync_directory_fd(reset_dirs.mem_fd, reset_dirs.mem_dir)
+                except OSError:
+                    return {
+                        "deleted": [entry["label"] for entry in plan],
+                        "targets": list(targets),
+                        "status": "cleanup_pending",
+                    }
+                cleanup_pending = _cleanup_isolated_reset(
+                    reset_dirs, receipt_name, plan
+                )
+                return {
+                    "deleted": [entry["label"] for entry in plan],
+                    "targets": list(targets),
+                    "status": (
+                        "cleanup_pending" if cleanup_pending else "completed"
+                    ),
+                }
+            if not any(
+                _reset_entry_stat(reset_dirs.mem_fd, entry["stage"]) is not None
+                for entry in plan
+            ):
+                try:
+                    reset_dirs.verify_attached()
+                    os.unlink(receipt_name, dir_fd=reset_dirs.mem_fd)
+                    _fsync_directory_fd(reset_dirs.mem_fd, reset_dirs.mem_dir)
+                except (OSError, MemoryImportConflict):
+                    pass
+                raise
+            try:
+                _reset_restore_plan(reset_dirs, plan)
+                try:
+                    os.unlink(receipt_name, dir_fd=reset_dirs.mem_fd)
+                    _fsync_directory_fd(reset_dirs.mem_fd, reset_dirs.mem_dir)
+                except FileNotFoundError:
+                    pass
+            except BaseException as restore_error:
+                raise RuntimeError(
+                    "memory reset failed and recovery remains pending: "
+                    f"{restore_error}"
+                ) from reset_error
+            raise
 
-    return {"deleted": deleted, "targets": list(targets)}
+        deleted = [entry["label"] for entry in plan]
+        cleanup_pending = _cleanup_isolated_reset(reset_dirs, receipt_name, plan)
+        reset_dirs.verify_attached()
+        return {
+            "deleted": deleted,
+            "targets": list(targets),
+            "status": "cleanup_pending" if cleanup_pending else "completed",
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -1686,7 +2141,9 @@ class MemoryStore:
 
         content = ENTRY_DELIMITER.join(normalized)
         content_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        mem_dir = _require_profile_memory_directory(create=True)
+        mem_dir, home_identity, mem_identity = _require_profile_memory_snapshot(
+            create=True
+        )
         path = mem_dir / _MEMORY_TARGET_FILES[target]
         # Reject an unsafe canonical leaf before creating managed import state.
         if path.is_symlink():
@@ -1706,7 +2163,10 @@ class MemoryStore:
         backup_candidate = backup_dir / f"{target}-{import_hash}.bak"
         displaced_candidate = self._import_displaced_path(path, receipt_path)
         with _anchored_import_directories(
-            mem_dir, create_managed=False
+            mem_dir,
+            create_managed=False,
+            expected_home_identity=home_identity,
+            expected_mem_identity=mem_identity,
         ) as import_dirs, self._file_lock(
             transaction_path, create_parent=False
         ), self._file_lock(path, create_parent=False):

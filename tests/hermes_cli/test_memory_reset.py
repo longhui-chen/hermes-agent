@@ -9,6 +9,7 @@ Covers:
 """
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -96,6 +97,32 @@ class TestMemoryReset:
         assert result == "deleted"
         assert (memories / "MEMORY.md").exists()
         assert not (memories / "USER.md").exists()
+
+    def test_cleanup_pending_exits_nonzero_without_success_message(
+        self, memory_env, monkeypatch, capsys
+    ):
+        import tools.memory_tool as memory_tool
+        from hermes_cli.main import cmd_memory
+
+        monkeypatch.setattr(
+            memory_tool,
+            "reset_curated_memory",
+            lambda _target: {
+                "deleted": ["MEMORY.md"],
+                "targets": ["memory"],
+                "status": "cleanup_pending",
+            },
+        )
+
+        with pytest.raises(SystemExit) as raised:
+            cmd_memory(
+                SimpleNamespace(memory_command="reset", target="memory", yes=True)
+            )
+
+        assert raised.value.code == 1
+        output = capsys.readouterr().out
+        assert "cleanup is still pending" in output
+        assert "Memory reset complete" not in output
 
     def test_reset_no_files_exist(self, tmp_path, monkeypatch):
         """Should return 'nothing' when no memory files exist."""

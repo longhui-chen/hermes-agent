@@ -20,6 +20,38 @@ from hermes_state import SessionDB
 
 
 @pytest.mark.asyncio
+async def test_unsupported_platform_disables_v25_memory_import(monkeypatch):
+    import tools.memory_tool as memory_tool
+
+    monkeypatch.setattr(
+        memory_tool, "portable_memory_import_supported", lambda: False
+    )
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    app = web.Application()
+    app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    app.router.add_post("/api/memory/import", adapter._handle_memory_import)
+    headers = {"Authorization": "Bearer test-key"}
+
+    async with TestClient(TestServer(app)) as cli:
+        capabilities = await cli.get("/v1/capabilities", headers=headers)
+        payload = await capabilities.json()
+        assert payload["features"]["curated_memory_import"] is False
+        assert payload["endpoints"]["curated_memory_import"]["enabled"] is False
+
+        unauthenticated = await cli.post("/api/memory/import", json={})
+        assert unauthenticated.status == 401
+        unsupported = await cli.post(
+            "/api/memory/import", json={}, headers=headers
+        )
+        assert unsupported.status == 501
+        assert (await unsupported.json())["error"]["code"] == (
+            "memory_import_unsupported"
+        )
+
+
+@pytest.mark.asyncio
 async def test_completed_transcript_http_flow_requires_auth_and_commits_atomically(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))

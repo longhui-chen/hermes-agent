@@ -1746,9 +1746,12 @@ class ZetAgentAdapter(APIServerAdapter):
             payload = json.loads(resp.body)
         except Exception:
             return resp
+        from tools.memory_tool import portable_memory_import_supported
+
+        memory_import_supported = portable_memory_import_supported()
         payload.setdefault("features", {})["session_steer"] = True
         payload["features"]["completed_transcript_import"] = True
-        payload["features"]["curated_memory_import"] = True
+        payload["features"]["curated_memory_import"] = memory_import_supported
         payload.setdefault("endpoints", {})["session_steer"] = {
             "method": "POST",
             "path": "/v1/sessions/{session_id}/steer",
@@ -1760,6 +1763,7 @@ class ZetAgentAdapter(APIServerAdapter):
         }
         payload["endpoints"]["curated_memory_import"] = {
             "method": "POST", "path": "/api/memory/import",
+            "enabled": memory_import_supported,
         }
         return web.json_response(payload)
 
@@ -1838,6 +1842,17 @@ class ZetAgentAdapter(APIServerAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        from tools.memory_tool import portable_memory_import_supported
+
+        if not portable_memory_import_supported():
+            return web.json_response(
+                {"error": {
+                    "message": "curated memory import is unavailable on this platform",
+                    "type": "invalid_request_error",
+                    "code": "memory_import_unsupported",
+                }},
+                status=501,
+            )
         operation_key = self._begin_runtime_import_operation(
             _request_value(request, "hermes_profile_home")
         )

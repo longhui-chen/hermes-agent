@@ -9749,7 +9749,16 @@ async def reset_memory(body: MemoryReset):
         result = await asyncio.to_thread(reset_curated_memory, target)
     except (OSError, MemoryImportConflict) as exc:
         raise HTTPException(status_code=500, detail=f"Could not reset memory: {exc}")
-    return {"ok": True, "deleted": result["deleted"]}
+    if result.get("status") != "completed":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "memory_reset_cleanup_pending",
+                "message": "Memory cleanup is pending; retry reset to finish securely.",
+                "deleted": result["deleted"],
+            },
+        )
+    return {"ok": True, "deleted": result["deleted"], "status": "completed"}
 
 
 # ---------------------------------------------------------------------------
