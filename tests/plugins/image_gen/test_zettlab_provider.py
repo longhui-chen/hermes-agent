@@ -38,7 +38,7 @@ def test_zettlab_image_provider_reads_capabilities(monkeypatch):
             "video": {"enabled": False, "models": []},
         })
 
-    monkeypatch.setattr(client.requests, "get", fake_get)
+    monkeypatch.setattr(client._SESSION, "get", fake_get)
 
     provider = ZettlabImageGenProvider()
     assert provider.is_available() is True
@@ -138,8 +138,8 @@ def test_zettlab_image_generate_creates_media_job(monkeypatch):
             }],
         })
 
-    monkeypatch.setattr(client.requests, "get", fake_get)
-    monkeypatch.setattr(client.requests, "post", fake_post)
+    monkeypatch.setattr(client._SESSION, "get", fake_get)
+    monkeypatch.setattr(client._SESSION, "post", fake_post)
 
     got = ZettlabImageGenProvider().generate(
         "make a product shot",
@@ -181,7 +181,7 @@ def test_zettlab_image_generate_uses_gateway_default_when_model_is_omitted(monke
         captured.update(json)
         return _Resp({"job_id": "job-default", "status": "done", "assets": [{"url": "https://cdn.example/default.png"}]})
 
-    monkeypatch.setattr(client.requests, "post", fake_post)
+    monkeypatch.setattr(client._SESSION, "post", fake_post)
     got = ZettlabImageGenProvider().generate("make image")
     assert got["success"] is True
     assert captured["model"] == "seedream-default"
@@ -218,12 +218,29 @@ def test_zettlab_ai_proxy_rejects_non_loopback_base_url(monkeypatch):
         client.base_url("image")
 
 
+def test_zettlab_ai_proxy_ignores_environment_proxies(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setenv("HTTP_PROXY", "http://proxy.example:8080")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example:8080")
+    settings = client._SESSION.merge_environment_settings(
+        client.DEFAULT_BASE_URL,
+        {},
+        None,
+        None,
+        None,
+    )
+
+    assert client._SESSION.trust_env is False
+    assert settings["proxies"] == {}
+
+
 def test_zettlab_poll_retries_transient_error_without_cleanup(monkeypatch):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
     monkeypatch.setattr(client, "_interruptible_sleep", lambda delay: None)
-    monkeypatch.setattr(client.requests, "post", lambda *args, **kwargs: _Resp({"job_id": "job-retry", "status": "running"}))
+    monkeypatch.setattr(client._SESSION, "post", lambda *args, **kwargs: _Resp({"job_id": "job-retry", "status": "running"}))
     polls = iter([requests.ConnectionError("temporary"), _Resp({"job_id": "job-retry", "status": "done", "assets": [{"url": "https://cdn.example/done.png"}]})])
 
     def fake_get(*args, **kwargs):
@@ -232,8 +249,8 @@ def test_zettlab_poll_retries_transient_error_without_cleanup(monkeypatch):
             raise result
         return result
 
-    monkeypatch.setattr(client.requests, "get", fake_get)
-    monkeypatch.setattr(client.requests, "delete", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("cleanup should not run")))
+    monkeypatch.setattr(client._SESSION, "get", fake_get)
+    monkeypatch.setattr(client._SESSION, "delete", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("cleanup should not run")))
 
     job = client.create_and_wait(media_type="image", model="seedream-v4", prompt="retry", payload={}, timeout_seconds=10)
     assert job["status"] == "done"
@@ -243,10 +260,10 @@ def test_zettlab_poll_interrupt_deletes_job(monkeypatch):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
-    monkeypatch.setattr(client.requests, "post", lambda *args, **kwargs: _Resp({"job_id": "job-interrupt", "status": "running"}))
+    monkeypatch.setattr(client._SESSION, "post", lambda *args, **kwargs: _Resp({"job_id": "job-interrupt", "status": "running"}))
     monkeypatch.setattr(client, "is_interrupted", lambda: True)
     deleted = []
-    monkeypatch.setattr(client.requests, "delete", lambda url, **kwargs: deleted.append(url) or _Resp({}))
+    monkeypatch.setattr(client._SESSION, "delete", lambda url, **kwargs: deleted.append(url) or _Resp({}))
 
     with pytest.raises(client.ZettlabMediaError, match="interrupted"):
         client.create_and_wait(media_type="image", model="seedream-v4", prompt="stop", payload={}, timeout_seconds=10)
@@ -258,10 +275,10 @@ def test_zettlab_poll_exhaustion_deletes_job(monkeypatch):
 
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
     monkeypatch.setattr(client, "_interruptible_sleep", lambda delay: None)
-    monkeypatch.setattr(client.requests, "post", lambda *args, **kwargs: _Resp({"job_id": "job-error", "status": "running"}))
-    monkeypatch.setattr(client.requests, "get", lambda *args, **kwargs: (_ for _ in ()).throw(requests.ConnectionError("offline")))
+    monkeypatch.setattr(client._SESSION, "post", lambda *args, **kwargs: _Resp({"job_id": "job-error", "status": "running"}))
+    monkeypatch.setattr(client._SESSION, "get", lambda *args, **kwargs: (_ for _ in ()).throw(requests.ConnectionError("offline")))
     deleted = []
-    monkeypatch.setattr(client.requests, "delete", lambda url, **kwargs: deleted.append(url) or _Resp({}))
+    monkeypatch.setattr(client._SESSION, "delete", lambda url, **kwargs: deleted.append(url) or _Resp({}))
 
     with pytest.raises(requests.ConnectionError):
         client.create_and_wait(media_type="image", model="seedream-v4", prompt="fail", payload={}, timeout_seconds=10)

@@ -37,14 +37,14 @@ def test_image_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
             "assets": [{"url": "https://cdn.example/image.png"}],
         })
 
-    monkeypatch.setattr(client.requests, "get", lambda url, timeout: _Resp({
+    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout: _Resp({
         "image": {
             "enabled": True,
             "default_model": "seedream-v4",
             "models": [{"id": "seedream-v4"}],
         },
     }))
-    monkeypatch.setattr(client.requests, "post", fake_post)
+    monkeypatch.setattr(client._SESSION, "post", fake_post)
 
     raw = image_tool._handle_image_generate({
         "prompt": "make a product shot",
@@ -81,14 +81,14 @@ def test_video_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
             "assets": [{"url": "https://cdn.example/video.mp4"}],
         })
 
-    monkeypatch.setattr(client.requests, "get", lambda url, timeout: _Resp({
+    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout: _Resp({
         "video": {
             "enabled": True,
             "default_model": "seedance-v1",
             "models": [{"id": "seedance-v1"}],
         },
     }))
-    monkeypatch.setattr(client.requests, "post", fake_post)
+    monkeypatch.setattr(client._SESSION, "post", fake_post)
 
     raw = video_tool._handle_video_generate({
         "prompt": "make a clip",

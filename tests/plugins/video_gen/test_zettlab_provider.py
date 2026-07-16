@@ -40,7 +40,7 @@ def _capabilities():
 def test_zettlab_video_provider_reads_capabilities(monkeypatch):
     from plugins import zettlab_media_client as client
 
-    monkeypatch.setattr(client.requests, "get", lambda url, timeout: _Resp(_capabilities()))
+    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout: _Resp(_capabilities()))
 
     provider = ZettlabVideoGenProvider()
     assert provider.is_available() is True
@@ -77,7 +77,7 @@ def test_zettlab_video_generate_creates_media_job(monkeypatch):
 
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
     captured = {}
-    monkeypatch.setattr(client.requests, "get", lambda url, **kwargs: _Resp(_capabilities()))
+    monkeypatch.setattr(client._SESSION, "get", lambda url, **kwargs: _Resp(_capabilities()))
 
     def fake_post(url, json, headers, timeout):
         captured["url"] = url
@@ -94,7 +94,7 @@ def test_zettlab_video_generate_creates_media_job(monkeypatch):
             }],
         })
 
-    monkeypatch.setattr(client.requests, "post", fake_post)
+    monkeypatch.setattr(client._SESSION, "post", fake_post)
 
     got = ZettlabVideoGenProvider().generate(
         "make a short clip",
@@ -138,7 +138,7 @@ def test_zettlab_video_generate_uses_gateway_default_when_model_is_omitted(monke
         captured.update(json)
         return _Resp({"job_id": "job-video-default", "status": "done", "assets": [{"url": "https://cdn.example/default.mp4"}]})
 
-    monkeypatch.setattr(client.requests, "post", fake_post)
+    monkeypatch.setattr(client._SESSION, "post", fake_post)
     got = ZettlabVideoGenProvider().generate("make video")
     assert got["success"] is True
     assert captured["model"] == "seedance-default"

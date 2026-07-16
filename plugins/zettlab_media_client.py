@@ -16,6 +16,9 @@ from urllib.parse import urlparse
 import requests
 from tools.interrupt import is_interrupted
 
+_SESSION = requests.Session()
+_SESSION.trust_env = False
+
 DEFAULT_BASE_URL = "http://127.0.0.1:9090/api/v1/ai-proxy/v1"
 CAPABILITY_TIMEOUT = 5.0
 REQUEST_TIMEOUT = 30.0
@@ -74,7 +77,7 @@ def base_url(media_type: str) -> str:
 
 def get_capabilities(media_type: Optional[str] = None) -> Dict[str, Any]:
     mt = media_type or "image"
-    resp = requests.get(
+    resp = _SESSION.get(
         f"{base_url(mt)}/media/generation-capabilities",
         timeout=CAPABILITY_TIMEOUT,
     )
@@ -241,7 +244,7 @@ def create_and_wait(
         "X-Step-Title": "media_generation",
         **action_headers(),
     }
-    resp = requests.post(
+    resp = _SESSION.post(
         f"{base_url(media_type)}/media/generation-jobs",
         json=body,
         headers=headers,
@@ -264,7 +267,7 @@ def create_and_wait(
         while time.monotonic() < deadline:
             _interruptible_sleep(max(0.2, poll_interval))
             try:
-                resp = requests.get(
+                resp = _SESSION.get(
                     f"{base_url(media_type)}/media/generation-jobs/{job_id}",
                     headers=headers,
                     timeout=REQUEST_TIMEOUT,
@@ -301,7 +304,7 @@ def _interruptible_sleep(delay: float) -> None:
 
 def _delete_job(media_type: str, job_id: str, headers: Dict[str, str]) -> None:
     try:
-        requests.delete(
+        _SESSION.delete(
             f"{base_url(media_type)}/media/generation-jobs/{job_id}",
             headers=headers,
             timeout=REQUEST_TIMEOUT,
