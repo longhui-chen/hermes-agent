@@ -29,7 +29,8 @@ ZPK_GLOBAL_EXCLUDES := \
 	--exclude=.mypy_cache \
 	--exclude='*.egg-info'
 
-# These are repository-root build and development paths. Keep the ./ prefix:
+# These are repository-root paths deliberately omitted from the product payload.
+# Keep the ./ prefix:
 # an unanchored tar exclude also removes same-named runtime directories inside
 # plugins/ and venv/ (for example plugins/web and botocore/data).
 ZPK_ROOT_EXCLUDES := \
@@ -47,6 +48,7 @@ ZPK_ROOT_EXCLUDES := \
 	--exclude=./nix \
 	--exclude=./environments \
 	--exclude=./packaging \
+	--exclude=./plugins/hermes-achievements \
 	--exclude=./wandb \
 	--exclude=./testlogs \
 	--exclude=./venv/.zpk-venv.stamp \

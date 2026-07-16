@@ -25,4 +25,5 @@ Checks the staged `hermes-agent` tree after the Makefile copies it into
 `zpk/lib/hermes-agent`. It compares regular files under the source `plugins/`
 and `venv/` runtime trees with the staged copies and fails when tar exclusions
 remove nested runtime content. Deliberately excluded caches, bytecode,
-development environments, egg metadata, ZPK stamps, and symlinks are ignored.
+development environments, egg metadata, ZPK stamps, symlinks, and the
+non-product `plugins/hermes-achievements/` plugin are ignored.
