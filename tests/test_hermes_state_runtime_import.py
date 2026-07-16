@@ -160,6 +160,12 @@ def test_runtime_import_rejects_non_completed_runtime_messages(tmp_path):
 
 @pytest.mark.parametrize("message", [
     {"source_id": "m", "role": "user", "content": "Authorization: Bearer abcdefghijklmnop", "created_at": 1},
+    {"source_id": "m-json", "role": "user",
+     "content": '{"Authorization": "Bearer abcdefghijklmnop"}', "created_at": 1},
+    {"source_id": "m-js", "role": "user",
+     "content": "{'Authorization': 'Bearer abcdefghijklmnop'}", "created_at": 1},
+    {"source_id": "m-escaped", "role": "user",
+     "content": r'{\"Authorization\": \"Bearer abcdefghijklmnop\"}', "created_at": 1},
     {"source_id": "m", "role": "user", "content": "api_key = sk-abcdefghijklmnop", "created_at": 1},
     {"source_id": "m", "role": "user", "content": "-----BEGIN RSA PRIVATE KEY-----", "created_at": 1},
     {"source_id": "m", "role": "user", "content": "ghp_abcdefghijklmnopqrst", "created_at": 1},
@@ -172,6 +178,15 @@ def test_runtime_import_rejects_every_credential_free_policy_category(tmp_path, 
         with pytest.raises(ValueError, match="forbidden"):
             _stage(db, expected=1, messages=[message])
         assert db.get_session("imported-session") is None
+        assert db._conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+        assert db._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
+        assert db._conn.execute("SELECT COUNT(*) FROM runtime_imports").fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM runtime_import_chunks"
+        ).fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM runtime_import_message_ids"
+        ).fetchone()[0] == 0
     finally:
         db.close()
 
@@ -198,6 +213,8 @@ def test_runtime_import_ignores_deep_unknown_fields_without_recursion(tmp_path):
     "password=changeme",
     "sk-example",
     "Authorization: Bearer redacted",
+    '{"Authorization": "Bearer redacted"}',
+    "{'Authorization': 'Bearer ${ACCESS_TOKEN}'}",
     '{"credentials": {}}',
 ])
 def test_runtime_import_allows_non_secret_examples_and_placeholders(tmp_path, content):

@@ -80,7 +80,8 @@ async def test_runtime_import_flow_rejects_credentials_at_final_consumer(
         "source_session_id": "source", "target_session_id": "target",
         "title": None, "expected_message_count": 1, "chunk_index": 0,
         "payload_sha256": hashlib.sha256(b"credential").hexdigest(),
-        "messages": [{"role": "user", "content": "api_key = sk-abcdefghijklmnop",
+        "messages": [{"role": "user",
+                      "content": '{"Authorization": "Bearer abcdefghijklmnop"}',
                       "created_at": 1}],
     }
     try:
@@ -95,7 +96,7 @@ async def test_runtime_import_flow_rejects_credentials_at_final_consumer(
                 json={"import_id": "credential-memory", "mode": "replace",
                       "target": "memory",
                       "payload_sha256": hashlib.sha256(b"memory").hexdigest(),
-                      "entries": ["Authorization: Bearer abcdefghijklmnop"]},
+                      "entries": ["{'Authorization': 'Bearer abcdefghijklmnop'}"]},
                 headers=headers,
             )
             assert memory.status == 400
@@ -131,6 +132,16 @@ async def test_runtime_import_flow_rejects_credentials_at_final_consumer(
         assert db._conn.execute(
             "SELECT COUNT(*) FROM runtime_imports"
         ).fetchone()[0] == 0
+        assert db._conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0] == 0
+        assert db._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM runtime_import_chunks"
+        ).fetchone()[0] == 0
+        assert db._conn.execute(
+            "SELECT COUNT(*) FROM runtime_import_message_ids"
+        ).fetchone()[0] == 0
+        assert not (home / "memories" / "MEMORY.md").exists()
+        assert not (home / "memories" / "USER.md").exists()
         assert not (home / "memories" / ".imports").exists()
     finally:
         db.close()

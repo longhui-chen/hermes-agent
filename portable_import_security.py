@@ -8,7 +8,8 @@ _PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----", re.IGNORECASE | re.MULTILINE
 )
 _AUTHORIZATION_BEARER_RE = re.compile(
-    r"\bauthorization\s*:\s*bearer\s+([A-Za-z0-9._~+/=-]{8,})",
+    r"(?<![A-Za-z0-9_-])authorization(?:\s*\\?[\"'])?\s*:\s*"
+    r"(?:\\?[\"']\s*)?bearer\s+([A-Za-z0-9._~+/=-]{8,})",
     re.IGNORECASE | re.MULTILINE,
 )
 _CREDENTIAL_ASSIGNMENT_RE = re.compile(

@@ -54,6 +54,9 @@ def test_memory_import_rejects_poison_and_overflow_without_writing(tmp_path, mon
 
 @pytest.mark.parametrize("entry", [
     "Authorization: Bearer abcdefghijklmnop",
+    '{"Authorization": "Bearer abcdefghijklmnop"}',
+    "{'Authorization': 'Bearer abcdefghijklmnop'}",
+    r'{\"Authorization\": \"Bearer abcdefghijklmnop\"}',
     "api_key = sk-abcdefghijklmnop",
     "-----BEGIN OPENSSH PRIVATE KEY-----",
     "github_pat_abcdefghijklmnopqrst",
@@ -68,6 +71,8 @@ def test_memory_import_rejects_credentials_without_writing(tmp_path, monkeypatch
             payload_sha256=hashlib.sha256(b"credential").hexdigest(),
         )
     assert not (home / "memories" / "MEMORY.md").exists()
+    assert not (home / "memories" / "USER.md").exists()
+    assert not (home / "memories" / ".imports").exists()
 
 
 @pytest.mark.parametrize(
@@ -104,6 +109,8 @@ def test_memory_import_allows_non_secret_examples_and_placeholders(tmp_path, mon
         "password=changeme",
         "sk-example",
         "Authorization: Bearer redacted",
+        '{"Authorization": "Bearer redacted"}',
+        "{'Authorization': 'Bearer ${ACCESS_TOKEN}'}",
         '{"credentials": {}}',
     ]
     result = store.import_replace(
