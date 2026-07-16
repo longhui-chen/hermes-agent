@@ -168,6 +168,26 @@ def test_write_dispatch_positional_args(monkeypatch):
     assert out.startswith("ok: created")
 
 
+def test_require_ok_raises_on_business_error_code():
+    """The file API answers HTTP 200 with the real status in `code`; a non-OK
+    code on a write must raise, not be mistaken for success (regression: an
+    overwrite that reports 'ok' on a rejected upload silently drops the old
+    version)."""
+    with pytest.raises(tools.VaultError):
+        tools._require_ok({"code": 62003, "msg": "dir not exist"}, "upload")
+    assert tools._require_ok({"code": tools._OK_CODE, "data": {}}, "upload")["code"] == tools._OK_CODE
+
+
+def test_write_reports_failure_when_upload_rejected(monkeypatch):
+    """A server-side rejection surfaces from _upload as VaultError; vault_write
+    must report failure, NOT a false 'ok: created' (else the model tells the
+    user the note was saved when it wasn't)."""
+    monkeypatch.setattr(tools, "_read_note", lambda p: None)  # treat as create
+    monkeypatch.setattr(tools, "_upload", lambda d, f, c: (_ for _ in ()).throw(tools.VaultError("upload failed (code 62003)")))
+    out = tools.handle_vault_write(note="Projects/x.md", content="hi")
+    assert not out.startswith("ok:"), "must not falsely report success on a rejected upload"
+
+
 # --- delete: soft-delete (backup then remove) ---
 
 def test_delete_backs_up_then_removes(monkeypatch):

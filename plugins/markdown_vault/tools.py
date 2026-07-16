@@ -236,12 +236,31 @@ def _stamp() -> str:
     return time.strftime("%Y%m%d-%H%M%S", time.localtime()) + "-" + _os.urandom(4).hex()
 
 
+def _require_ok(resp: Any, op: str) -> Any:
+    """Raise VaultError when a write/mutate envelope reports a non-OK business
+    code. The file API answers HTTP 200 with the real status in `code`, so a
+    transport-only check mistakes a server-side rejection (missing parent dir,
+    quota, permission, disk full) for success — and for an overwrite write that
+    means the old version is destroyed while reporting 'ok'. The destructive
+    path (backup-before-overwrite) relies on this raising so it aborts instead
+    of losing the only copy."""
+    if not isinstance(resp, dict):
+        raise VaultError(f"{op}: unexpected file API response")
+    code = resp.get("code")
+    if code is not None and code != _OK_CODE:
+        detail = resp.get("msg") or resp.get("message") or ""
+        raise VaultError(f"{op} failed (code {code}) {detail}".strip())
+    return resp
+
+
 def _upload(dir_abs: str, filename: str, content: bytes) -> Any:
     """Create or overwrite <dir_abs>/<filename> with content via the streaming
     upload endpoint (metadata in header, raw body = bytes, mod=overwrite).
 
     The file API expects X-Zettos-Meta as base64url(JSON) — sending raw JSON is
-    rejected as a param error (the header is base64-decoded server-side)."""
+    rejected as a param error (the header is base64-decoded server-side).
+    Verifies the business `code` so a server-side rejection surfaces as an
+    exception (not a silent 'ok' that would drop data on overwrite)."""
     import base64
     meta = {"path": dir_abs, "filename": filename, "mod": _MOD_OVERWRITE}
     meta_b64 = base64.urlsafe_b64encode(
@@ -253,7 +272,7 @@ def _upload(dir_abs: str, filename: str, content: bytes) -> Any:
                  "Content-Type": "application/octet-stream"},
     )
     with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        return _require_ok(json.loads(resp.read().decode("utf-8")), "upload")
 
 
 def _mkfolder(parent_abs: str, name: str) -> None:
@@ -507,18 +526,18 @@ def handle_vault_read(args=None, **kwargs) -> str:
         return _err("'note' is required")
     try:
         abs_path = _resolve_in_vault(note)
-        resp = _get("/file/content", {"path": abs_path})
+        # Reuse _read_note so a business-code error (not-found / oversized >5MB /
+        # permission) is distinguished from a genuinely empty note, instead of
+        # silently returning empty content that reads as "the note is empty".
+        content = _read_note(abs_path)
     except VaultError as e:
         return _err(str(e))
+    except VaultReadError as e:
+        return _err(f"cannot read note ({e})")
     except urllib.error.URLError as e:
         return _err(f"vault file API unreachable ({e})")
-    data = (resp or {}).get("data")
-    if isinstance(data, dict):
-        content = data.get("content", "")
-    elif isinstance(data, str):
-        content = data
-    else:
-        return _err(f"note not found or unreadable ({note})")
+    if content is None:
+        return _err(f"note not found ({note})")
     return _wrap(f"note: {note}\n---\n{content}")
 
 
