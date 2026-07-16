@@ -1332,6 +1332,48 @@ class TestGetDueJobs:
         )
         assert get_due_jobs() == []
 
+    def test_behavior_matrix_fixed_timezone_dst_fold_advances_absolutely(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        pytest.importorskip("croniter")
+        now = datetime(2026, 10, 25, 1, 15, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        save_jobs(
+            [{
+                "id": "berlin-daily",
+                "name": "Berlin daily reminder",
+                "prompt": "...",
+                "schedule": {
+                    "kind": "cron",
+                    "expr": "30 2 * * *",
+                    "display": "30 2 * * *",
+                },
+                "schedule_display": "30 2 * * *",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "created_at": "2026-10-24T02:30:00+02:00",
+                "next_run_at": "2026-10-25T02:30:00+02:00",
+                "last_run_at": None,
+                "last_status": None,
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+                "timezone": "Europe/Berlin",
+            }]
+        )
+
+        assert [job["id"] for job in get_due_jobs()] == ["berlin-daily"]
+        assert advance_next_run("berlin-daily") is True
+        advanced = get_job("berlin-daily")["next_run_at"]
+        assert advanced == "2026-10-25T02:30:00+01:00"
+        assert datetime.fromisoformat(advanced).timestamp() > now.timestamp()
+
+        mark_job_run("berlin-daily", True)
+
+        assert get_job("berlin-daily")["next_run_at"] == advanced
+        assert get_due_jobs() == []
+
     @pytest.mark.parametrize(
         "invalid_timezone",
         [123, "Mars/Olympus_Mons", "../../etc/passwd", "A" * 10_000],

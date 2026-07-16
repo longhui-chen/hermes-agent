@@ -52,6 +52,7 @@ except ImportError:
 
 
 _MAX_TIMEZONE_NAME_LENGTH = 255
+_MAX_CRON_NEXT_RUN_ATTEMPTS = 8
 
 
 def _normalized_iana_timezone_name(name: Any) -> Optional[str]:
@@ -673,8 +674,38 @@ def compute_next_run(
             base_time = base_time.astimezone(job_tz)
 
         cron = croniter(schedule["expr"], base_time)
-        next_run = cron.get_next(datetime)
-        return next_run.isoformat()
+        base_timestamp = base_time.timestamp()
+        for _ in range(_MAX_CRON_NEXT_RUN_ATTEMPTS):
+            next_run = cron.get_next(datetime)
+            if next_run.timestamp() > base_timestamp:
+                return next_run.isoformat()
+
+            # During a DST fall-back, croniter can return the first occurrence
+            # of an ambiguous wall time (fold=0) even when the base is already
+            # in the repeated hour (fold=1).  The wall time looks later, but its
+            # absolute timestamp is in the past.  Prefer the second occurrence
+            # when it is both genuinely ambiguous and strictly after the base.
+            folded_next_run = next_run.replace(fold=1)
+            if (
+                folded_next_run.utcoffset() != next_run.utcoffset()
+                and folded_next_run.timestamp() > base_timestamp
+            ):
+                return folded_next_run.isoformat()
+
+        cron_expr = schedule.get("expr")
+        cron_expr_display = (
+            cron_expr[:128] + ("..." if len(cron_expr) > 128 else "")
+            if isinstance(cron_expr, str)
+            else f"<{type(cron_expr).__name__}>"
+        )
+        logger.error(
+            "Cron schedule %r did not produce a next run strictly after %s "
+            "within %d attempts.",
+            cron_expr_display,
+            base_time.isoformat(),
+            _MAX_CRON_NEXT_RUN_ATTEMPTS,
+        )
+        return None
 
     return None
 
