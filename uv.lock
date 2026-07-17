@@ -1861,7 +1861,7 @@ requires-dist = [
     { name = "honcho-ai", marker = "extra == 'honcho'", specifier = "==2.0.1" },
     { name = "httpx", extras = ["socks"], specifier = "==0.28.1" },
     { name = "jinja2", specifier = "==3.1.6" },
-    { name = "langcodes", specifier = "==3.5.1" },
+    { name = "langcodes", specifier = ">=3.5.1,<4" },
     { name = "langfuse", marker = "extra == 'langfuse'", specifier = "==4.7.1" },
     { name = "lark-oapi", marker = "extra == 'feishu'", specifier = "==1.5.3" },
     { name = "markdown", specifier = "==3.10.2" },
