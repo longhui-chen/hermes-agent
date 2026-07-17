@@ -3869,7 +3869,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
     # Allowed fields for update — prevents clients injecting arbitrary keys
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled", "timezone"}
+    _UPDATE_ALLOWED_FIELDS = {
+        "name", "schedule", "prompt", "deliver", "skills", "skill",
+        "repeat", "enabled", "timezone", "output_language",
+    }
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
 
@@ -4022,6 +4025,7 @@ class APIServerAdapter(BasePlatformAdapter):
             skills = body.get("skills")
             repeat = body.get("repeat")
             timezone = body.get("timezone")
+            output_language = body.get("output_language")
             origin = body.get("origin")
 
             if not name:
@@ -4062,6 +4066,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["repeat"] = repeat
             if timezone is not None:
                 kwargs["timezone"] = timezone
+            if output_language is not None:
+                kwargs["output_language"] = output_language
             if origin is not None:
                 kwargs["origin"] = origin
 
