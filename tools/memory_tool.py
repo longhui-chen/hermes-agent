@@ -1914,6 +1914,42 @@ def _reset_all_receipt_entries(
     return entries
 
 
+def _reset_receipt_targets(receipt: Any) -> tuple[str, ...]:
+    if not isinstance(receipt, dict):
+        raise MemoryImportConflict("memory reset receipt is invalid")
+    raw_targets = receipt.get("targets")
+    if (
+        not isinstance(raw_targets, list)
+        or not raw_targets
+        or any(
+            not isinstance(item, str) or item not in {"memory", "user"}
+            for item in raw_targets
+        )
+        or len(raw_targets) != len(set(raw_targets))
+    ):
+        raise MemoryImportConflict("memory reset receipt targets are invalid")
+    return tuple(raw_targets)
+
+
+def _reset_receipts_require_forward_all(
+    handles: _ImportDirectoryHandles, memory_names: List[str]
+) -> bool:
+    """Return the durable direction of any unfinished reset-all transaction."""
+    forward_all = False
+    for receipt_name in memory_names:
+        if not (
+            receipt_name.startswith(_RESET_RECEIPT_PREFIX)
+            and receipt_name.endswith(".json")
+        ):
+            continue
+        receipt = handles.read_receipt(handles.mem_fd, receipt_name)
+        _validate_reset_receipt(receipt)
+        original_targets = _reset_receipt_targets(receipt)
+        if set(original_targets) == {"memory", "user"}:
+            forward_all = True
+    return forward_all
+
+
 def _recover_reset_transactions(
     handles: _ImportDirectoryHandles,
     memory_names: List[str],
@@ -1933,6 +1969,7 @@ def _recover_reset_transactions(
     for receipt_name in receipt_names:
         receipt = handles.read_receipt(handles.mem_fd, receipt_name)
         state, plan = _validate_reset_receipt(receipt)
+        _reset_receipt_targets(receipt)
         if state == "staging":
             _reset_restore_plan(handles, plan)
             os.unlink(receipt_name, dir_fd=handles.mem_fd)
@@ -2103,7 +2140,6 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
         expected_mem_identity=expected_mem_identity,
     )
 
-    targets = ("memory", "user") if target == "all" else (target,)
     deleted: List[str] = []
 
     transaction_path = mem_dir / _MEMORY_TRANSACTION_LOCK
@@ -2127,19 +2163,36 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
             initial_backup_names,
             initial_receipt_targets,
         ) = reset_dirs.preflight_reset(
-            parse_import_receipts=target != "all"
+            parse_import_receipts=False
         )
+        effective_target = target
+        if target != "all" and _reset_receipts_require_forward_all(
+            reset_dirs, initial_memory_names
+        ):
+            effective_target = "all"
+        targets = (
+            ("memory", "user")
+            if effective_target == "all"
+            else (effective_target,)
+        )
+        if effective_target != "all":
+            (
+                initial_memory_names,
+                initial_imports_names,
+                initial_backup_names,
+                initial_receipt_targets,
+            ) = reset_dirs.preflight_reset(parse_import_receipts=True)
         _validate_reset_candidate_types(
             reset_dirs,
-            target,
+            effective_target,
             initial_memory_names,
             initial_imports_names,
             initial_backup_names,
         )
         _validate_reset_receipts(
-            target, initial_imports_names, initial_receipt_targets
+            effective_target, initial_imports_names, initial_receipt_targets
         )
-        if target == "all":
+        if effective_target == "all":
             # Reject an unenumerable reset receipt before lock files or a new
             # transaction can be created. The same bounded parse is repeated
             # under the transaction locks below to bind the deletion plan.
@@ -2160,14 +2213,28 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
             backup_names,
             receipt_targets,
         ) = reset_dirs.preflight_reset(
-            parse_import_receipts=target != "all"
+            parse_import_receipts=effective_target != "all"
         )
+        if effective_target != "all" and _reset_receipts_require_forward_all(
+            reset_dirs, memory_names
+        ):
+            effective_target = "all"
+            targets = ("memory", "user")
+            receipt_targets = {}
         _validate_reset_candidate_types(
-            reset_dirs, target, memory_names, imports_names, backup_names
+            reset_dirs,
+            effective_target,
+            memory_names,
+            imports_names,
+            backup_names,
         )
-        _validate_reset_receipts(target, imports_names, receipt_targets)
+        _validate_reset_receipts(
+            effective_target, imports_names, receipt_targets
+        )
         if _recover_reset_transactions(
-            reset_dirs, memory_names, purge_all=target == "all"
+            reset_dirs,
+            memory_names,
+            purge_all=effective_target == "all",
         ):
             return {
                 "deleted": [],
@@ -2180,11 +2247,11 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
             backup_names,
             receipt_targets,
         ) = reset_dirs.preflight_reset(
-            parse_import_receipts=target != "all"
+            parse_import_receipts=effective_target != "all"
         )
         reset_all_entries = (
             _reset_all_receipt_entries(reset_dirs, memory_names)
-            if target == "all"
+            if effective_target == "all"
             else []
         )
 
@@ -2237,7 +2304,7 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
                 if receipt is not None and receipt.get("target") == item:
                     add_plan("imports", name, str(Path(".imports") / name))
 
-        if target == "all":
+        if effective_target == "all":
             for name in imports_names:
                 if name != "backups":
                     add_plan("imports", name, str(Path(".imports") / name))
@@ -2269,7 +2336,7 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
             if name.startswith(_RESET_STAGE_PREFIX):
                 add_plan("memory", name, name)
             elif name.startswith(_RESET_RECEIPT_PREFIX) and (
-                target == "all" or not name.endswith(".json")
+                effective_target == "all" or not name.endswith(".json")
             ):
                 add_plan("memory", name, name)
         for scope, names in (

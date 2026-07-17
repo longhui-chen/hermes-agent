@@ -1164,10 +1164,11 @@ def test_memory_reset_recovers_staging_receipt_before_new_transaction(
     (memories / stage).write_text("private", encoding="utf-8")
     (memories / receipt_name).write_text(json.dumps({
         "state": "staging",
-            "plan": [{
-                "scope": "memory", "stage_scope": "memory",
-                "name": "MEMORY.md", "stage": stage,
-                "label": "MEMORY.md",
+        "targets": ["memory"],
+        "plan": [{
+            "scope": "memory", "stage_scope": "memory",
+            "name": "MEMORY.md", "stage": stage,
+            "label": "MEMORY.md",
         }],
     }), encoding="utf-8")
 
@@ -1180,6 +1181,102 @@ def test_memory_reset_recovers_staging_receipt_before_new_transaction(
     assert (memories / "MEMORY.md").read_text(encoding="utf-8") == "private"
     assert not (memories / stage).exists()
     assert not (memories / receipt_name).exists()
+
+
+@pytest.mark.parametrize(
+    ("requested_target", "unfinished_name"),
+    [("memory", "USER.md"), ("user", "MEMORY.md")],
+)
+def test_single_target_finishes_crashed_reset_all_forward(
+    tmp_path, monkeypatch, requested_target, unfinished_name
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    backups = memories / ".imports" / "backups"
+    backups.mkdir(parents=True)
+    unfinished = memories / unfinished_name
+    unfinished.write_text("not yet staged", encoding="utf-8")
+    opaque_name = "opaque-private-snapshot.bin"
+    opaque_stage_name = f"{memory_tool._RESET_STAGE_PREFIX}opaque-all"
+    opaque_stage = backups / opaque_stage_name
+    opaque_stage.write_text("already staged private data", encoding="utf-8")
+    unfinished_stage_name = f"{memory_tool._RESET_STAGE_PREFIX}unfinished-all"
+    receipt = memories / f"{memory_tool._RESET_RECEIPT_PREFIX}crashed-all.json"
+    receipt.write_text(json.dumps({
+        "version": 1,
+        "state": "staging",
+        "targets": ["memory", "user"],
+        "plan": [
+            {
+                "scope": "backups",
+                "stage_scope": "backups",
+                "name": opaque_name,
+                "stage": opaque_stage_name,
+                "label": opaque_name,
+            },
+            {
+                "scope": "memory",
+                "stage_scope": "memory",
+                "name": unfinished_name,
+                "stage": unfinished_stage_name,
+                "label": unfinished_name,
+            },
+        ],
+    }), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    result = reset_curated_memory(requested_target)
+
+    assert result["status"] == "completed"
+    assert result["targets"] == ["memory", "user"]
+    assert not unfinished.exists()
+    assert not (backups / opaque_name).exists()
+    assert not opaque_stage.exists()
+    assert not receipt.exists()
+    assert curated_memory_has_state("all") is False
+
+
+@pytest.mark.parametrize(
+    "receipt_value",
+    [
+        {
+            "version": 1,
+            "state": "staging",
+            "plan": [],
+        },
+        {
+            "version": 1,
+            "state": "staging",
+            "targets": ["bogus"],
+            "plan": [],
+        },
+        None,
+    ],
+    ids=["legacy-missing-targets", "corrupt-targets", "corrupt-json"],
+)
+def test_single_target_does_not_guess_reset_receipt_direction(
+    tmp_path, monkeypatch, receipt_value
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    (memories / ".imports" / "backups").mkdir(parents=True)
+    stage = memories / f"{memory_tool._RESET_STAGE_PREFIX}unknown-direction"
+    receipt = memories / f"{memory_tool._RESET_RECEIPT_PREFIX}unknown.json"
+    stage.write_text("private staged data", encoding="utf-8")
+    receipt.write_text(
+        "{" if receipt_value is None else json.dumps(receipt_value),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    before = sorted(os.listdir(memories))
+
+    with pytest.raises(MemoryImportConflict):
+        reset_curated_memory("memory")
+
+    assert sorted(os.listdir(memories)) == before
+    assert stage.read_text(encoding="utf-8") == "private staged data"
+    assert receipt.exists()
+    assert curated_memory_has_state("all") is True
 
 
 def test_memory_reset_supports_tmp_symlink_ancestor(tmp_path, monkeypatch):
@@ -2643,6 +2740,7 @@ def test_reset_all_purges_contradictory_same_scope_transaction(tmp_path, monkeyp
     receipt.write_text(json.dumps({
         "version": 1,
         "state": "staging",
+        "targets": ["memory"],
         "plan": [{
             "scope": "memory",
             "stage_scope": "memory",
@@ -2860,6 +2958,7 @@ def test_reset_retries_same_scope_atomic_stage_without_copying(
     receipt.write_text(json.dumps({
         "version": 1,
         "state": "staging",
+        "targets": ["memory"],
         "plan": [{
             "scope": "memory",
             "stage_scope": "memory",
