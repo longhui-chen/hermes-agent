@@ -533,6 +533,16 @@ def _restore_only_fsynced_reset_dentries(
             os.unlink(path)
 
 
+def _recover_legacy_receipt_for_protocol_test(handles, receipt_name):
+    receipt = handles.read_receipt(handles.mem_fd, receipt_name)
+    _state, plan = memory_tool._validate_reset_receipt(
+        receipt, allow_legacy=True
+    )
+    memory_tool._reset_restore_plan(handles, plan)
+    os.unlink(receipt_name, dir_fd=handles.mem_fd)
+    memory_tool._fsync_directory_fd(handles.mem_fd, handles.mem_dir)
+
+
 @pytest.mark.parametrize("scope", ["memory", "imports", "backups"])
 @pytest.mark.parametrize("fail_fsync", [1, 2])
 def test_reset_move_power_loss_preserves_a_staging_recovery_name(
@@ -603,9 +613,7 @@ def test_reset_move_power_loss_preserves_a_staging_recovery_name(
 
         _restore_only_fsynced_reset_dentries(source_path, stage_path, durable)
         monkeypatch.setattr(memory_tool, "_fsync_directory_fd", original_fsync)
-        assert memory_tool._recover_reset_transactions(
-            handles, os.listdir(handles.mem_fd)
-        ) is False
+        _recover_legacy_receipt_for_protocol_test(handles, receipt_name)
 
     assert source_path.read_text(encoding="utf-8") == "private"
     assert not stage_path.exists()
@@ -685,9 +693,7 @@ def test_reset_rollback_power_loss_remains_recoverable(
 
         _restore_only_fsynced_reset_dentries(source_path, stage_path, durable)
         monkeypatch.setattr(memory_tool, "_fsync_directory_fd", original_fsync)
-        assert memory_tool._recover_reset_transactions(
-            handles, os.listdir(handles.mem_fd)
-        ) is False
+        _recover_legacy_receipt_for_protocol_test(handles, receipt_name)
 
     assert source_path.read_text(encoding="utf-8") == "private"
     assert not stage_path.exists()
@@ -974,7 +980,7 @@ def test_reset_copy_rollback_preserves_original_file_mode(tmp_path, monkeypatch)
 
 
 @pytest.mark.parametrize("partial_side", ["stage", "source"])
-def test_staging_receipt_recovers_interrupted_copy_prefix(
+def test_staging_receipt_legacy_copy_prefix_is_fail_closed(
     tmp_path, monkeypatch, partial_side
 ):
     memories = tmp_path / ".hermes" / "memories"
@@ -1003,31 +1009,22 @@ def test_staging_receipt_recovers_interrupted_copy_prefix(
     }), encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
 
-    def hardlinks_unsupported(*_args, **_kwargs):
-        raise OSError(errno.ENOTSUP, "hardlinks unsupported")
-
     with memory_tool._anchored_import_directories(
         memories, create_managed=False
     ) as handles:
-        monkeypatch.setattr(memory_tool.os, "link", hardlinks_unsupported)
-        if partial_side == "source":
-            with pytest.raises(MemoryImportConflict, match="prefix"):
-                memory_tool._recover_reset_transactions(
-                    handles, os.listdir(handles.mem_fd)
-                )
-        else:
-            assert memory_tool._recover_reset_transactions(
+        with pytest.raises(MemoryImportConflict, match="unsafe"):
+            memory_tool._recover_reset_transactions(
                 handles, os.listdir(handles.mem_fd)
-            ) is False
+            )
 
     if partial_side == "source":
         assert source.read_bytes() == full[: 32 << 10]
-        assert stage.read_bytes() == full
-        assert (memories / receipt_name).exists()
     else:
         assert source.read_bytes() == full
-        assert not stage.exists()
-        assert not (memories / receipt_name).exists()
+    assert stage.read_bytes() == (
+        full if partial_side == "source" else full[: 32 << 10]
+    )
+    assert (memories / receipt_name).exists()
 
 
 def test_staging_recovery_never_deletes_new_user_file_that_is_stage_prefix(
@@ -1057,7 +1054,7 @@ def test_staging_recovery_never_deletes_new_user_file_that_is_stage_prefix(
     with memory_tool._anchored_import_directories(
         memories, create_managed=False
     ) as handles:
-        with pytest.raises(MemoryImportConflict, match="prefix"):
+        with pytest.raises(MemoryImportConflict, match="unsafe"):
             memory_tool._recover_reset_transactions(
                 handles, os.listdir(handles.mem_fd)
             )
@@ -1167,9 +1164,10 @@ def test_memory_reset_recovers_staging_receipt_before_new_transaction(
     (memories / stage).write_text("private", encoding="utf-8")
     (memories / receipt_name).write_text(json.dumps({
         "state": "staging",
-        "plan": [{
-            "scope": "memory", "name": "MEMORY.md", "stage": stage,
-            "label": "MEMORY.md",
+            "plan": [{
+                "scope": "memory", "stage_scope": "memory",
+                "name": "MEMORY.md", "stage": stage,
+                "label": "MEMORY.md",
         }],
     }), encoding="utf-8")
 
@@ -2617,6 +2615,121 @@ def test_reset_all_purges_contradictory_same_scope_transaction(tmp_path, monkeyp
     assert not source.exists()
     assert not stage.exists()
     assert not receipt.exists()
+
+
+def test_reset_all_enumerates_opaque_same_scope_source_from_receipt(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    backups = memories / ".imports" / "backups"
+    backups.mkdir(parents=True)
+    source = backups / "opaque-private-snapshot.bin"
+    stage_name = f"{memory_tool._RESET_STAGE_PREFIX}opaque"
+    stage = backups / stage_name
+    receipt = memories / f"{memory_tool._RESET_RECEIPT_PREFIX}opaque.json"
+    source.write_text("new private snapshot", encoding="utf-8")
+    stage.write_text("staged private snapshot", encoding="utf-8")
+    receipt.write_text(json.dumps({
+        "version": 1,
+        "state": "staging",
+        "plan": [{
+            "scope": "backups",
+            "stage_scope": "backups",
+            "name": source.name,
+            "stage": stage_name,
+            "label": source.name,
+        }],
+    }), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert curated_memory_has_state("all") is True
+    assert reset_curated_memory("all")["status"] == "completed"
+
+    assert not source.exists()
+    assert not stage.exists()
+    assert not receipt.exists()
+    assert curated_memory_has_state("all") is False
+
+
+def test_reset_all_fails_before_orphaning_source_from_unsafe_plan(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    backups = memories / ".imports" / "backups"
+    backups.mkdir(parents=True)
+    source = backups / "opaque-private-snapshot.bin"
+    receipt = memories / f"{memory_tool._RESET_RECEIPT_PREFIX}unsafe-plan.json"
+    source.write_text("private snapshot", encoding="utf-8")
+    receipt.write_text(json.dumps({
+        "version": 1,
+        "state": "staging",
+        "plan": [{
+            "scope": "backups",
+            "stage_scope": "backups",
+            "name": source.name,
+            "stage": "../unsafe-stage",
+            "label": source.name,
+        }],
+    }), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    with pytest.raises(MemoryImportConflict, match="cannot safely enumerate"):
+        reset_curated_memory("all")
+
+    assert source.exists()
+    assert receipt.exists()
+    assert curated_memory_has_state("all") is True
+
+
+def test_legacy_cross_scope_sparse_receipt_is_never_copied(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    backups = memories / ".imports" / "backups"
+    backups.mkdir(parents=True)
+    source = backups / "opaque-private-sparse.bin"
+    stage_name = f"{memory_tool._RESET_STAGE_PREFIX}legacy-sparse"
+    stage = memories / stage_name
+    for path in (source, stage):
+        with path.open("wb") as handle:
+            handle.seek((65 << 20) - 1)
+            handle.write(b"x")
+    receipt = memories / f"{memory_tool._RESET_RECEIPT_PREFIX}legacy-sparse.json"
+    receipt.write_text(json.dumps({
+        "version": 1,
+        "state": "staging",
+        "plan": [{
+            "scope": "backups",
+            "name": source.name,
+            "stage": stage_name,
+            "label": source.name,
+        }],
+    }), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    def cross_device(*_args, **_kwargs):
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    def reject_copy(*_args, **_kwargs):
+        raise AssertionError("legacy reset recovery must never copy sparse data")
+
+    monkeypatch.setattr(memory_tool.os, "link", cross_device)
+    monkeypatch.setattr(memory_tool, "_reset_copy_regular_no_follow", reject_copy)
+
+    with pytest.raises(MemoryImportConflict, match="unsafe"):
+        reset_curated_memory("memory")
+    assert source.exists()
+    assert stage.exists()
+    assert receipt.exists()
+
+    assert reset_curated_memory("all")["status"] == "completed"
+    assert not source.exists()
+    assert not stage.exists()
+    assert not receipt.exists()
+    assert curated_memory_has_state("all") is False
 
 
 def test_explicit_cross_scope_reset_stage_is_rejected_or_purged(

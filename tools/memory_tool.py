@@ -1804,7 +1804,12 @@ def _cleanup_isolated_reset(
     return False
 
 
-def _validate_reset_receipt(value: Any) -> tuple[str, List[Dict[str, str]]]:
+def _validate_reset_receipt(
+    value: Any,
+    *,
+    allow_legacy: bool = False,
+    allow_cross_scope: bool = False,
+) -> tuple[str, List[Dict[str, str]]]:
     if not isinstance(value, dict) or value.get("state") not in {"staging", "isolated"}:
         raise MemoryImportConflict("memory reset receipt is invalid")
     raw_plan = value.get("plan")
@@ -1821,14 +1826,29 @@ def _validate_reset_receipt(value: Any) -> tuple[str, List[Dict[str, str]]]:
             raw.get("stage"),
             raw.get("label"),
         )
+        has_stage_scope = "stage_scope" in raw
         if (
             scope not in {"memory", "imports", "backups"}
             or stage_scope not in {"memory", "imports", "backups"}
-            or ("stage_scope" in raw and stage_scope != scope)
-            or not all(isinstance(item, str) and item and "/" not in item and "\\" not in item
+            or (not has_stage_scope and not allow_legacy)
+            or (
+                has_stage_scope
+                and stage_scope != scope
+                and not allow_cross_scope
+            )
+            or not all(isinstance(item, str) and item not in {"", ".", ".."}
+                       and "/" not in item and "\\" not in item
                        for item in (name, stage))
             or not isinstance(label, str)
             or not stage.startswith(_RESET_STAGE_PREFIX)
+            or (
+                scope == "memory"
+                and name in {
+                    f"{_MEMORY_TRANSACTION_LOCK}.lock",
+                    "MEMORY.md.lock",
+                    "USER.md.lock",
+                }
+            )
         ):
             raise MemoryImportConflict("memory reset receipt entry is unsafe")
         entry = {
@@ -1837,10 +1857,49 @@ def _validate_reset_receipt(value: Any) -> tuple[str, List[Dict[str, str]]]:
             "stage": stage,
             "label": label,
         }
-        if "stage_scope" in raw:
+        if has_stage_scope:
             entry["stage_scope"] = stage_scope
         plan.append(entry)
     return value["state"], plan
+
+
+def _reset_all_receipt_entries(
+    handles: _ImportDirectoryHandles, memory_names: List[str]
+) -> List[Dict[str, str]]:
+    """Safely enumerate receipt-owned leaves without replaying recovery."""
+    entries: List[Dict[str, str]] = []
+    for receipt_name in memory_names:
+        if not (
+            receipt_name.startswith(_RESET_RECEIPT_PREFIX)
+            and receipt_name.endswith(".json")
+        ):
+            continue
+        try:
+            receipt = handles.read_receipt(handles.mem_fd, receipt_name)
+        except MemoryImportConflict:
+            # Unreadable receipt bytes cannot safely authorize arbitrary source
+            # names. Their own fixed name and fixed-prefix stages are still
+            # collected by reset-all's ordinary residue scan.
+            continue
+        if not isinstance(receipt, dict) or not isinstance(
+            receipt.get("plan"), list
+        ):
+            continue
+        try:
+            _state, plan = _validate_reset_receipt(
+                receipt,
+                allow_legacy=True,
+                allow_cross_scope=True,
+            )
+        except MemoryImportConflict as exc:
+            # Once a receipt exposes a plan, silently discarding only the
+            # receipt could orphan a private opaque source and falsely report
+            # an empty profile. Preserve everything and fail explicitly.
+            raise MemoryImportConflict(
+                f"cannot safely enumerate reset-all receipt {receipt_name}"
+            ) from exc
+        entries.extend(plan)
+    return entries
 
 
 def _recover_reset_transactions(
@@ -1849,11 +1908,8 @@ def _recover_reset_transactions(
     *,
     purge_all: bool = False,
 ) -> bool:
-    # Reset-all is a forward-only privacy purge. Do not parse or roll back a
-    # previous reset transaction: its receipt, sources, and fixed-prefix stage
-    # names are all discovered by the fresh deletion plan. Besides making a
-    # malformed or contradictory receipt non-blocking, this guarantees that
-    # reset-all never enters legacy cross-directory copy recovery.
+    # Reset-all is a forward-only privacy purge. Receipt-owned leaves are
+    # enumerated separately for the fresh deletion plan; never roll back here.
     if purge_all:
         return False
     cleanup_pending = False
@@ -2104,6 +2160,11 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
         ) = reset_dirs.preflight_reset(
             parse_import_receipts=target != "all"
         )
+        reset_all_entries = (
+            _reset_all_receipt_entries(reset_dirs, memory_names)
+            if target == "all"
+            else []
+        )
 
         transaction_id = secrets.token_hex(16)
         plan: List[Dict[str, str]] = []
@@ -2129,6 +2190,11 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
                 "stage": f"{_RESET_STAGE_PREFIX}{transaction_id}_{len(plan)}",
                 "label": label,
             })
+
+        for entry in reset_all_entries:
+            add_plan(entry["scope"], entry["name"], entry["label"])
+            stage_scope = _reset_stage_scope(entry)
+            add_plan(stage_scope, entry["stage"], entry["stage"])
 
         for item in targets:
             filename = _MEMORY_TARGET_FILES[item]
