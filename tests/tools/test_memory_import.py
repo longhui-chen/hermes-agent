@@ -2403,7 +2403,14 @@ def test_memory_reset_rejects_symlink_state_without_following_receipt_paths(
 
 @pytest.mark.parametrize(
     "receipt_text",
-    ["{", "[]", "{}", json.dumps({"target": "bogus"})],
+    [
+        "{",
+        "[]",
+        "{}",
+        json.dumps({"target": "bogus"}),
+        "[" * 2_000 + "]" * 2_000,
+    ],
+    ids=["truncated", "list", "missing-target", "bogus-target", "too-deep"],
 )
 def test_reset_all_removes_unclassified_receipt_but_single_target_fails_closed(
     tmp_path, monkeypatch, receipt_text
@@ -2459,6 +2466,43 @@ def test_reset_all_deletes_unreadable_regular_receipt_without_parsing(
 
     assert reset_curated_memory("all")["status"] == "completed"
     assert not receipt.exists()
+
+
+@pytest.mark.parametrize("storage", ["sparse", "materialized"])
+def test_oversize_receipt_reader_is_bounded_and_reset_all_still_deletes(
+    tmp_path, monkeypatch, storage
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    imports = memories / ".imports"
+    imports.mkdir(parents=True)
+    receipt = imports / "oversize.json"
+    if storage == "sparse":
+        with receipt.open("wb") as handle:
+            handle.truncate(65 << 20)
+    else:
+        receipt.write_bytes(
+            b"x" * (memory_tool.MAX_CURATED_MEMORY_FILE_BYTES + 1)
+        )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original_read = memory_tool.os.read
+    read_calls = []
+
+    def record_read(fd, size):
+        read_calls.append(size)
+        return original_read(fd, size)
+
+    monkeypatch.setattr(memory_tool.os, "read", record_read)
+
+    assert curated_memory_has_state("all") is True
+    with pytest.raises(MemoryImportConflict, match="valid target"):
+        curated_memory_has_state("memory")
+    assert read_calls == []
+    assert not (memories / ".curated-memory-transaction.lock").exists()
+
+    assert reset_curated_memory("all")["status"] == "completed"
+    assert not receipt.exists()
+    assert read_calls == []
 
 
 @pytest.mark.parametrize("same_inode", [True, False], ids=["hardlinked", "independent"])

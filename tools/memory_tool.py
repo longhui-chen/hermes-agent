@@ -523,7 +523,7 @@ class _ImportDirectoryHandles:
             return None
         try:
             value = json.loads(raw)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
             return None
         return value if isinstance(value, dict) else None
 
@@ -1124,6 +1124,19 @@ def _read_bounded_regular_file_bytes(path: Path) -> Optional[bytes]:
                 raise MemoryImportConflict(
                     f"{path.name} exceeds the memory file size limit"
                 )
+        after = os.fstat(fd)
+        if (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
+        ):
+            raise MemoryImportConflict(f"{path.name} changed while it was read")
         return b"".join(chunks)
     finally:
         os.close(fd)
@@ -1176,35 +1189,15 @@ def _validate_optional_managed_memory_directories(mem_dir: Path) -> None:
 def _read_import_receipt_no_follow(path: Path) -> Optional[Dict[str, Any]]:
     """Read one regular receipt without following a symlink receipt."""
     try:
-        before = os.lstat(path)
-    except FileNotFoundError:
+        raw = _read_bounded_regular_file_bytes(path)
+    except (OSError, MemoryImportConflict):
         return None
-    if not stat.S_ISREG(before.st_mode):
-        return None
-
-    flags = os.O_RDONLY
-    if hasattr(os, "O_NOFOLLOW"):
-        flags |= os.O_NOFOLLOW
-    try:
-        fd = os.open(path, flags)
-    except OSError:
+    if raw is None:
         return None
     try:
-        after = os.fstat(fd)
-        if (
-            not stat.S_ISREG(after.st_mode)
-            or before.st_dev != after.st_dev
-            or before.st_ino != after.st_ino
-        ):
-            return None
-        with os.fdopen(fd, "r", encoding="utf-8") as handle:
-            fd = -1
-            value = json.load(handle)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
         return None
-    finally:
-        if fd >= 0:
-            os.close(fd)
     return value if isinstance(value, dict) else None
 
 

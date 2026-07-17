@@ -275,3 +275,32 @@ class TestMemoryReset:
         assert "managed import recovery state" in output
         assert "Deleted MEMORY.md" not in output
         assert "Deleted USER.md" not in output
+
+    def test_cli_reset_all_does_not_read_sparse_oversize_receipt(
+        self, tmp_path, monkeypatch
+    ):
+        import tools.memory_tool as memory_tool
+        from hermes_cli.main import cmd_memory
+
+        home = tmp_path / ".hermes"
+        imports = home / "memories" / ".imports"
+        imports.mkdir(parents=True)
+        receipt = imports / "oversize.json"
+        with receipt.open("wb") as handle:
+            handle.truncate(65 << 20)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        original_read = memory_tool.os.read
+        reads = []
+
+        def record_read(fd, size):
+            reads.append(size)
+            return original_read(fd, size)
+
+        monkeypatch.setattr(memory_tool.os, "read", record_read)
+
+        cmd_memory(SimpleNamespace(
+            memory_command="reset", target="all", yes=True
+        ))
+
+        assert not receipt.exists()
+        assert reads == []
