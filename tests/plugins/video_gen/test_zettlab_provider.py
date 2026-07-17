@@ -197,6 +197,36 @@ def test_zettlab_video_generate_normalizes_duration_to_nearest_supported_value(m
     assert got["duration"] == 10
 
 
+def test_zettlab_video_omits_unspecified_duration_and_normalizes_model_options(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setattr(
+        client,
+        "resolve_model_with_capability",
+        lambda media_type, requested=None: ("restricted-video", {
+            "id": "restricted-video",
+            "modalities": ["text"],
+            "aspect_ratios": ["9:16"],
+            "resolutions": ["1080p"],
+        }),
+    )
+    captured = {}
+
+    def fake_create_and_wait(**kwargs):
+        captured.update(kwargs["payload"])
+        return {"job_id": "job-restricted", "status": "done", "assets": [{"url": "https://cdn.example/restricted.mp4"}]}
+
+    monkeypatch.setattr(client, "create_and_wait", fake_create_and_wait)
+
+    got = ZettlabVideoGenProvider().generate("make vertical video")
+
+    assert got["success"] is True
+    assert "duration" not in captured
+    assert captured["aspect_ratio"] == "9:16"
+    assert captured["resolution"] == "1080p"
+    assert got["aspect_ratio"] == "9:16"
+
+
 def test_zettlab_video_image_only_model_requires_image_input(monkeypatch):
     from plugins import zettlab_media_client as client
 

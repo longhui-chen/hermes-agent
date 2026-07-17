@@ -48,6 +48,19 @@ def test_zettlab_image_provider_reads_capabilities(monkeypatch):
     assert provider.capabilities()["max_reference_images"] == 3
 
 
+def test_zettlab_image_capabilities_preserve_image_only_modality(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setattr(client, "selected_model_capability", lambda media_type: ({
+        "limits": {"max_remote_media_inputs": 1},
+    }, {
+        "id": "image-only",
+        "modalities": ["image"],
+    }))
+
+    assert ZettlabImageGenProvider().capabilities()["modalities"] == ["image"]
+
+
 def test_zettlab_provider_uses_gateway_default_model(monkeypatch):
     from plugins import zettlab_media_client as client
 
@@ -194,11 +207,35 @@ def test_zettlab_image_generate_uses_gateway_default_when_model_is_omitted(monke
 def test_zettlab_image_rejects_non_https_remote_input(monkeypatch):
     from plugins import zettlab_media_client as client
 
-    monkeypatch.setattr(client, "resolve_model", lambda media_type, requested=None: "seedream-v4")
+    monkeypatch.setattr(
+        client,
+        "resolve_model_with_capability",
+        lambda media_type, requested=None: ("seedream-v4", {"id": "seedream-v4", "modalities": ["text", "image"]}),
+    )
     got = ZettlabImageGenProvider().generate("make image", image_url="http://example.com/a.png")
     assert got["success"] is False
     assert got["error_type"] == "ZettlabMediaError"
     assert "https URL" in got["error"]
+
+
+def test_zettlab_image_only_model_requires_image_input(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setattr(
+        client,
+        "resolve_model_with_capability",
+        lambda media_type, requested=None: ("image-only", {"id": "image-only", "modalities": ["image"]}),
+    )
+    monkeypatch.setattr(
+        client,
+        "create_and_wait",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("request should not be sent")),
+    )
+
+    got = ZettlabImageGenProvider().generate("edit this image")
+
+    assert got["success"] is False
+    assert got["error_type"] == "missing_image"
 
 
 @pytest.mark.parametrize("value", [

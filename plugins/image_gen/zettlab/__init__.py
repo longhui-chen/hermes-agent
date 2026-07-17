@@ -55,16 +55,16 @@ class ZettlabImageGenProvider(ImageGenProvider):
             cap, model = media_client.selected_model_capability("image")
         except Exception:
             return {"modalities": ["text"], "max_reference_images": 0}
-        modalities: List[str] = ["text"]
+        modalities: List[str] = []
         if isinstance(model, dict):
             for value in model.get("modalities") or []:
-                if isinstance(value, str) and value not in modalities:
-                    modalities.append(value)
+                if isinstance(value, str) and value.strip() and value.strip() not in modalities:
+                    modalities.append(value.strip())
         limits = cap.get("limits") if isinstance(cap, dict) else {}
         max_refs = 0
         if isinstance(limits, dict):
             max_refs = int(limits.get("max_remote_media_inputs") or 0)
-        return {"modalities": modalities, "max_reference_images": max(0, max_refs - 1)}
+        return {"modalities": modalities or ["text"], "max_reference_images": max(0, max_refs - 1)}
 
     def generate(
         self,
@@ -85,7 +85,8 @@ class ZettlabImageGenProvider(ImageGenProvider):
                 aspect_ratio=aspect,
             )
 
-        model = str(media_client.resolve_model("image", kwargs.get("model")) or "").strip()
+        model_value, model_capability = media_client.resolve_model_with_capability("image", kwargs.get("model"))
+        model = str(model_value or "").strip()
         if not model:
             return error_response(
                 error="No Zettlab image generation model is available from ai-gateway capabilities",
@@ -98,6 +99,25 @@ class ZettlabImageGenProvider(ImageGenProvider):
         try:
             refs = normalize_reference_images(reference_image_urls)
             inputs = media_client.remote_inputs(image_url, refs)
+            configured_modalities = (
+                model_capability.get("modalities")
+                if isinstance(model_capability, dict)
+                else None
+            )
+            if (
+                isinstance(configured_modalities, list)
+                and "image" in configured_modalities
+                and "text" not in configured_modalities
+                and not inputs
+            ):
+                return error_response(
+                    error="An image input is required for this Zettlab image generation model.",
+                    error_type="missing_image",
+                    provider="zettlab",
+                    model=model,
+                    prompt=prompt,
+                    aspect_ratio=aspect,
+                )
             output_count = int(kwargs.get("num_images") or kwargs.get("output_count") or 1)
             job = media_client.create_and_wait(
                 media_type="image",

@@ -124,15 +124,33 @@ class ZettlabVideoGenProvider(VideoGenProvider):
                 aspect_ratio=aspect_ratio,
             )
 
+        effective_aspect_ratio = aspect_ratio
+        effective_resolution = resolution
+        effective_duration: Optional[int] = None
         try:
-            effective_duration = int(duration or 0)
+            if duration is not None:
+                effective_duration = int(duration)
             allowed_durations: List[int] = []
             if isinstance(model_capability, dict):
                 for candidate in model_capability.get("durations") or []:
                     if isinstance(candidate, int) and candidate > 0 and candidate not in allowed_durations:
                         allowed_durations.append(candidate)
+                allowed_aspect_ratios = [
+                    value.strip()
+                    for value in model_capability.get("aspect_ratios") or []
+                    if isinstance(value, str) and value.strip()
+                ]
+                if allowed_aspect_ratios and effective_aspect_ratio not in allowed_aspect_ratios:
+                    effective_aspect_ratio = allowed_aspect_ratios[0]
+                allowed_resolutions = [
+                    value.strip()
+                    for value in model_capability.get("resolutions") or []
+                    if isinstance(value, str) and value.strip()
+                ]
+                if allowed_resolutions and effective_resolution not in allowed_resolutions:
+                    effective_resolution = allowed_resolutions[0]
             if allowed_durations:
-                if effective_duration <= 0:
+                if effective_duration is None or effective_duration <= 0:
                     effective_duration = allowed_durations[0]
                 elif effective_duration not in allowed_durations:
                     effective_duration = min(
@@ -157,7 +175,7 @@ class ZettlabVideoGenProvider(VideoGenProvider):
                     provider="zettlab",
                     model=resolved_model,
                     prompt=prompt,
-                    aspect_ratio=aspect_ratio,
+                    aspect_ratio=effective_aspect_ratio,
                 )
             parameters: Dict[str, Any] = {}
             if negative_prompt:
@@ -166,18 +184,20 @@ class ZettlabVideoGenProvider(VideoGenProvider):
                 parameters["audio"] = bool(audio)
             if seed is not None:
                 parameters["seed"] = seed
+            payload: Dict[str, Any] = {
+                "output_count": 1,
+                "aspect_ratio": effective_aspect_ratio,
+                "resolution": effective_resolution,
+                "remote_media_inputs": inputs,
+                "parameters": parameters,
+            }
+            if effective_duration is not None:
+                payload["duration"] = effective_duration
             job = media_client.create_and_wait(
                 media_type="video",
                 model=resolved_model,
                 prompt=prompt,
-                payload={
-                    "output_count": 1,
-                    "aspect_ratio": aspect_ratio,
-                    "resolution": resolution,
-                    "duration": effective_duration,
-                    "remote_media_inputs": inputs,
-                    "parameters": parameters,
-                },
+                payload=payload,
             )
             video = media_client.first_asset_url(job)
         except Exception as exc:
@@ -187,7 +207,7 @@ class ZettlabVideoGenProvider(VideoGenProvider):
                 provider="zettlab",
                 model=resolved_model,
                 prompt=prompt,
-                aspect_ratio=aspect_ratio,
+                aspect_ratio=effective_aspect_ratio,
             )
 
         return success_response(
@@ -195,8 +215,8 @@ class ZettlabVideoGenProvider(VideoGenProvider):
             model=resolved_model,
             prompt=prompt,
             modality="image" if image_url or reference_image_urls else "text",
-            aspect_ratio=aspect_ratio,
-            duration=effective_duration,
+            aspect_ratio=effective_aspect_ratio,
+            duration=effective_duration or 0,
             provider="zettlab",
             extra={
                 "job_id": job.get("job_id"),

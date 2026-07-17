@@ -59,6 +59,36 @@ def test_image_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
     assert captured["json"]["model"] == "seedream-v4"
 
 
+def test_image_only_model_requires_input_through_generation_tool(monkeypatch):
+    from agent import image_gen_registry
+    from plugins import zettlab_media_client as client
+    from plugins.image_gen.zettlab import ZettlabImageGenProvider
+    from tools import image_generation_tool as image_tool
+
+    image_gen_registry._reset_for_tests()
+    image_gen_registry.register_provider(ZettlabImageGenProvider())
+    monkeypatch.setattr(image_tool, "_read_configured_image_provider", lambda: "zettlab")
+    monkeypatch.setattr(image_tool, "_read_configured_image_model", lambda: None)
+    monkeypatch.setattr("hermes_cli.plugins._ensure_plugins_discovered", lambda *args, **kwargs: None)
+    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout, allow_redirects: _Resp({
+        "image": {
+            "enabled": True,
+            "default_model": "image-only",
+            "models": [{"id": "image-only", "modalities": ["image"]}],
+        },
+    }))
+    monkeypatch.setattr(
+        client._SESSION,
+        "post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("request should not be sent")),
+    )
+
+    got = json.loads(image_tool._handle_image_generate({"prompt": "edit this image"}))
+
+    assert got["success"] is False
+    assert got["error_type"] == "missing_image"
+
+
 def test_video_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
     from agent import video_gen_registry
     from plugins import zettlab_media_client as client
@@ -87,7 +117,11 @@ def test_video_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
         "video": {
             "enabled": True,
             "default_model": "seedance-v1",
-            "models": [{"id": "seedance-v1", "durations": [5, 10]}],
+            "models": [{
+                "id": "seedance-v1",
+                "aspect_ratios": ["9:16"],
+                "resolutions": ["1080p"],
+            }],
         },
     }))
     monkeypatch.setattr(client._SESSION, "post", fake_post)
@@ -102,4 +136,6 @@ def test_video_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
     assert got["video"] == "https://cdn.example/video.mp4"
     assert captured["json"]["media_type"] == "video"
     assert captured["json"]["model"] == "seedance-v1"
-    assert captured["json"]["duration"] == 5
+    assert captured["json"]["aspect_ratio"] == "9:16"
+    assert captured["json"]["resolution"] == "1080p"
+    assert "duration" not in captured["json"]
