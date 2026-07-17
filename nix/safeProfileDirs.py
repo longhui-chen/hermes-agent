@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import os
 import stat
 from pathlib import Path
+
+_RECURSIVE_IDENTITY_RETRIES = 3
 
 
 def _directory_flags() -> int:
@@ -67,9 +70,20 @@ def _open_or_create_child(parent_fd: int, name: str) -> int:
         raise
 
 
-def _normalize_child(parent_fd: int, name: str, uid: int, gid: int, mode: int) -> int:
+def _normalize_child(
+    parent_fd: int,
+    name: str,
+    uid: int,
+    gid: int,
+    mode: int,
+    *,
+    expected_device: int | None = None,
+) -> int:
     child_fd = _open_or_create_child(parent_fd, name)
     try:
+        opened = os.fstat(child_fd)
+        if expected_device is not None and opened.st_dev != expected_device:
+            raise OSError(errno.EXDEV, f"managed profile directory crosses device: {name}")
         os.fchown(child_fd, uid, gid)
         os.fchmod(child_fd, mode)
         _require_visible_identity(parent_fd, name, child_fd)
@@ -88,29 +102,85 @@ def _normalize_regular_file(
     chown: bool,
     group_write: bool,
     expected: os.stat_result,
-) -> None:
+    root_device: int,
+) -> bool:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     if hasattr(os, "O_NONBLOCK"):
         flags |= os.O_NONBLOCK
-    fd = os.open(name, flags, dir_fd=parent_fd)
-    try:
-        visible = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        opened = os.fstat(fd)
-        if (
-            not stat.S_ISREG(visible.st_mode)
-            or not stat.S_ISREG(opened.st_mode)
-            or (expected.st_dev, expected.st_ino) != (opened.st_dev, opened.st_ino)
-            or (visible.st_dev, visible.st_ino) != (opened.st_dev, opened.st_ino)
-        ):
-            raise RuntimeError(f"managed profile file changed during open: {name}")
-        if chown:
-            os.fchown(fd, uid, gid)
-        if group_write:
-            os.fchmod(fd, stat.S_IMODE(opened.st_mode) | stat.S_IRGRP | stat.S_IWGRP)
-    finally:
-        os.close(fd)
+    for attempt in range(_RECURSIVE_IDENTITY_RETRIES):
+        try:
+            fd = os.open(name, flags, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return False
+        try:
+            try:
+                visible = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return False
+            opened = os.fstat(fd)
+            stable = (
+                stat.S_ISREG(visible.st_mode)
+                and stat.S_ISREG(opened.st_mode)
+                and (expected.st_dev, expected.st_ino)
+                == (opened.st_dev, opened.st_ino)
+                and (visible.st_dev, visible.st_ino)
+                == (opened.st_dev, opened.st_ino)
+            )
+            if stable:
+                if opened.st_dev != root_device:
+                    return False
+                if chown:
+                    os.fchown(fd, uid, gid)
+                if group_write:
+                    os.fchmod(
+                        fd,
+                        stat.S_IMODE(opened.st_mode) | stat.S_IRGRP | stat.S_IWGRP,
+                    )
+                return True
+        finally:
+            os.close(fd)
+        if attempt + 1 == _RECURSIVE_IDENTITY_RETRIES:
+            raise RuntimeError(f"managed profile file kept changing: {name}")
+        try:
+            expected = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(expected.st_mode):
+            return False
+    return False
+
+
+def _open_recursive_directory(
+    parent_fd: int, name: str, expected: os.stat_result
+) -> tuple[int, os.stat_result] | None:
+    retry_errnos = {errno.ENOENT, errno.ENOTDIR, getattr(errno, "ELOOP", errno.ENOTDIR)}
+    for attempt in range(_RECURSIVE_IDENTITY_RETRIES):
+        try:
+            child_fd = os.open(name, _directory_flags(), dir_fd=parent_fd)
+        except OSError as exc:
+            if exc.errno not in retry_errnos:
+                raise
+            child_fd = -1
+        if child_fd >= 0:
+            try:
+                opened = _require_visible_identity(parent_fd, name, child_fd, expected)
+                return child_fd, opened
+            except FileNotFoundError:
+                os.close(child_fd)
+                return None
+            except RuntimeError:
+                os.close(child_fd)
+        if attempt + 1 == _RECURSIVE_IDENTITY_RETRIES:
+            raise RuntimeError(f"managed profile directory kept changing: {name}")
+        try:
+            expected = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISDIR(expected.st_mode):
+            return None
+    return None
 
 
 def _normalize_tree(
@@ -125,15 +195,20 @@ def _normalize_tree(
     top_level: bool = False,
 ) -> None:
     for name in os.listdir(directory_fd):
-        visible = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        try:
+            visible = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
         if visible.st_dev != root_device:
             continue
         if stat.S_ISDIR(visible.st_mode):
-            child_fd = os.open(name, _directory_flags(), dir_fd=directory_fd)
+            opened_child = _open_recursive_directory(directory_fd, name, visible)
+            if opened_child is None:
+                continue
+            child_fd, opened = opened_child
             try:
-                opened = _require_visible_identity(
-                    directory_fd, name, child_fd, visible
-                )
+                if opened.st_dev != root_device:
+                    continue
                 if chown:
                     os.fchown(child_fd, uid, gid)
                 _normalize_tree(
@@ -164,6 +239,7 @@ def _normalize_tree(
                 chown=chown,
                 group_write=shared_file_modes and (group_write_tree or root_shared),
                 expected=visible,
+                root_device=root_device,
             )
 
 
@@ -181,17 +257,28 @@ def ensure_transaction_directories(
     state_fds: list[int] = []
     try:
         home_fd = _normalize_child(parent_fd, home.name, uid, gid, 0o2770)
+        root_device = os.fstat(home_fd).st_dev
         for name in ("cron", "sessions", "logs", "plugins"):
-            state_fds.append(_normalize_child(home_fd, name, uid, gid, 0o2770))
-        memories_fd = _normalize_child(home_fd, "memories", uid, gid, 0o2770)
-        imports_fd = _normalize_child(memories_fd, ".imports", uid, gid, 0o2770)
-        backups_fd = _normalize_child(imports_fd, "backups", uid, gid, 0o2770)
+            state_fds.append(
+                _normalize_child(
+                    home_fd, name, uid, gid, 0o2770, expected_device=root_device
+                )
+            )
+        memories_fd = _normalize_child(
+            home_fd, "memories", uid, gid, 0o2770, expected_device=root_device
+        )
+        imports_fd = _normalize_child(
+            memories_fd, ".imports", uid, gid, 0o2770, expected_device=root_device
+        )
+        backups_fd = _normalize_child(
+            imports_fd, "backups", uid, gid, 0o2770, expected_device=root_device
+        )
         if recursive_ownership or shared_file_modes:
             _normalize_tree(
                 home_fd,
                 uid,
                 gid,
-                os.fstat(home_fd).st_dev,
+                root_device,
                 chown=recursive_ownership,
                 shared_file_modes=shared_file_modes,
                 top_level=True,

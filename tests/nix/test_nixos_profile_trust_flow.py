@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import stat
+import sys
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,9 @@ def test_safe_profile_directory_flow_creates_exact_managed_chain(tmp_path):
         opened = path.stat(follow_symlinks=False)
         assert opened.st_uid == current.st_uid
         assert opened.st_gid == current.st_gid
-        assert opened.st_mode & 0o7777 == 0o2770
+        assert opened.st_mode & 0o0770 == 0o0770
+        if sys.platform.startswith("linux"):
+            assert opened.st_mode & stat.S_ISGID
 
 
 @pytest.mark.parametrize("leaf", ["home", "memories", ".imports", "backups"])
@@ -144,6 +147,153 @@ def test_safe_profile_directory_flow_normalizes_only_opened_inodes(
         assert (opened.st_dev, opened.st_ino) in normalized
 
 
+def test_exact_managed_child_rejects_foreign_device_before_mutation(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    current = home.stat()
+    parent_fd = os.open(home, safe_profile_dirs._directory_flags())
+    child_fd = os.open(memories, safe_profile_dirs._directory_flags())
+    child_identity = os.fstat(child_fd)
+    original_fstat = safe_profile_dirs.os.fstat
+
+    def foreign_fstat(fd):
+        opened = original_fstat(fd)
+        if (opened.st_dev, opened.st_ino) == (
+            child_identity.st_dev,
+            child_identity.st_ino,
+        ):
+            values = list(opened)
+            values[2] = opened.st_dev + 1
+            return os.stat_result(values)
+        return opened
+
+    monkeypatch.setattr(
+        safe_profile_dirs,
+        "_open_or_create_child",
+        lambda _parent_fd, _name: os.dup(child_fd),
+    )
+    monkeypatch.setattr(safe_profile_dirs.os, "fstat", foreign_fstat)
+    monkeypatch.setattr(
+        safe_profile_dirs.os,
+        "fchown",
+        lambda *_args: pytest.fail("foreign child was chowned before device gate"),
+    )
+    monkeypatch.setattr(
+        safe_profile_dirs.os,
+        "fchmod",
+        lambda *_args: pytest.fail("foreign child was chmodded before device gate"),
+    )
+    try:
+        with pytest.raises(OSError) as raised:
+            safe_profile_dirs._normalize_child(
+                parent_fd,
+                "memories",
+                current.st_uid,
+                current.st_gid,
+                0o2770,
+                expected_device=current.st_dev,
+            )
+        assert raised.value.errno == safe_profile_dirs.errno.EXDEV
+    finally:
+        os.close(child_fd)
+        os.close(parent_fd)
+
+
+@pytest.mark.parametrize("operation", ["recursive_ownership", "shared_file_modes"])
+def test_recursive_profile_scan_skips_normal_enoent_churn(
+    tmp_path, monkeypatch, operation
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    current = home.stat()
+    safe_profile_dirs.ensure_transaction_directories(
+        home, current.st_uid, current.st_gid
+    )
+    churn = home / "sessions" / "churn.txt"
+    churn.write_text("gone")
+    original_stat = safe_profile_dirs.os.stat
+
+    def missing_during_scan(path, *args, **kwargs):
+        if path == churn.name and kwargs.get("dir_fd") is not None:
+            raise FileNotFoundError(path)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(safe_profile_dirs.os, "stat", missing_during_scan)
+    safe_profile_dirs.ensure_transaction_directories(
+        home,
+        current.st_uid,
+        current.st_gid,
+        **{operation: True},
+    )
+
+
+@pytest.mark.parametrize("operation", ["recursive_ownership", "shared_file_modes"])
+def test_recursive_profile_scan_bounds_persistent_identity_churn(
+    tmp_path, monkeypatch, operation
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    current = home.stat()
+    safe_profile_dirs.ensure_transaction_directories(
+        home, current.st_uid, current.st_gid
+    )
+    (home / "sessions" / "racy").mkdir()
+    original_check = safe_profile_dirs._require_visible_identity
+    attempts = 0
+
+    def always_changes(parent_fd, name, child_fd, expected=None):
+        nonlocal attempts
+        if name == "racy":
+            attempts += 1
+            raise RuntimeError("changed")
+        return original_check(parent_fd, name, child_fd, expected)
+
+    monkeypatch.setattr(
+        safe_profile_dirs, "_require_visible_identity", always_changes
+    )
+    with pytest.raises(RuntimeError, match="kept changing"):
+        safe_profile_dirs.ensure_transaction_directories(
+            home,
+            current.st_uid,
+            current.st_gid,
+            **{operation: True},
+        )
+    assert attempts == safe_profile_dirs._RECURSIVE_IDENTITY_RETRIES
+
+
+def test_recursive_profile_scan_recovers_from_transient_identity_churn(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    current = home.stat()
+    safe_profile_dirs.ensure_transaction_directories(
+        home, current.st_uid, current.st_gid
+    )
+    (home / "sessions" / "racy").mkdir()
+    original_check = safe_profile_dirs._require_visible_identity
+    attempts = 0
+
+    def changes_once(parent_fd, name, child_fd, expected=None):
+        nonlocal attempts
+        if name == "racy" and attempts == 0:
+            attempts += 1
+            raise RuntimeError("changed")
+        return original_check(parent_fd, name, child_fd, expected)
+
+    monkeypatch.setattr(safe_profile_dirs, "_require_visible_identity", changes_once)
+    safe_profile_dirs.ensure_transaction_directories(
+        home,
+        current.st_uid,
+        current.st_gid,
+        recursive_ownership=True,
+    )
+    assert attempts == 1
+
+
 def test_nixos_module_uses_nofollow_helper_for_transaction_directories():
     source = (Path(__file__).parents[2] / "nix" / "nixosModules.nix").read_text()
 
@@ -156,3 +306,13 @@ def test_nixos_module_uses_nofollow_helper_for_transaction_directories():
     assert "--recursive-ownership" in source
     assert "--shared-file-modes" in source
     assert 'find "$HERMES_HOME"' not in source
+
+
+def test_container_gid_uses_configured_group_for_host_users():
+    source = (Path(__file__).parents[2] / "nix" / "nixosModules.nix").read_text()
+
+    configured_gid = "getent group ${lib.escapeShellArg cfg.group}"
+    assert source.count(configured_gid) >= 2
+    assert "id -g ${cfg.user}" not in source
+    assert "users.users = lib.genAttrs cfg.container.hostUsers" in source
+    assert "schema = 5" in source

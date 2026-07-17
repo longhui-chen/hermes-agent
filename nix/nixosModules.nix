@@ -209,7 +209,7 @@
     # Package and entrypoint use stable symlinks (current-package, current-entrypoint)
     # so they can update without recreation. Env vars go through $HERMES_HOME/.env.
     containerIdentity = builtins.hashString "sha256" (builtins.toJSON {
-      schema = 4; # bump when identity inputs change (4: Node 18→22 via NodeSource)
+      schema = 5; # 5: container group identity follows cfg.group, not user's primary group
       image = cfg.container.image;
       extraVolumes = cfg.container.extraVolumes;
       extraOptions = cfg.container.extraOptions;
@@ -981,8 +981,8 @@
 
             if [ "$NEED_CREATE" = "true" ]; then
               # Resolve numeric UID/GID — passed to entrypoint for in-container user setup
-              HERMES_UID=$(${pkgs.coreutils}/bin/id -u ${cfg.user})
-              HERMES_GID=$(${pkgs.coreutils}/bin/id -g ${cfg.user})
+              HERMES_UID=$(${pkgs.coreutils}/bin/id -u ${lib.escapeShellArg cfg.user})
+              HERMES_GID=$(${pkgs.glibc.bin}/bin/getent group ${lib.escapeShellArg cfg.group} | ${pkgs.coreutils}/bin/cut -d: -f3)
 
               echo "Creating container..."
               ${containerBin} create \
