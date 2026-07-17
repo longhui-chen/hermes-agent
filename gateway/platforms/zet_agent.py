@@ -275,7 +275,10 @@ class ZetAgentAdapter(APIServerAdapter):
         # One-shot warn flag for closure-sniff failures.
         self._sniff_warned: bool = False
 
-        # Pending clarify prompts: session_id -> list[_ClarifyEntry] (FIFO).
+        # Pending clarify prompts: {profile-home}|{session_id} ->
+        # list[_ClarifyEntry] (FIFO). A bare session id is not a gateway
+        # identity in multiplex mode: /p/main and /p/coder may legitimately
+        # run one same-named session at the same time.
         # Plan-E rev4 wire model is "single oldest pending wins on respond";
         # the queue holds entries created concurrently within one session,
         # though in practice clarify_callback blocks the agent thread so
@@ -287,8 +290,8 @@ class ZetAgentAdapter(APIServerAdapter):
         self._clarify_queues: Dict[str, List[_ClarifyEntry]] = {}
 
         # Mirror of the most recently pushed (and not yet resolved) prompt
-        # payload per session. Used by GET /v1/sessions/{sid}/pending so a
-        # reconnecting client (chat.resume path) can re-render the modal
+        # payload per scoped session. Used by GET /v1/sessions/{sid}/pending
+        # so a reconnecting client (chat.resume path) can re-render the modal
         # for any interaction the agent thread is still blocked on.
         self._pending_lock = threading.Lock()
         self._pending_clarify: Dict[str, Dict[str, Any]] = {}
@@ -604,6 +607,11 @@ class ZetAgentAdapter(APIServerAdapter):
         identity when the client provides it; legacy clients that do not yet
         send the field retain the historical FIFO response behavior.
         """
+        # Capture profile identity while the callback is attached. The agent
+        # invokes it later from its worker thread, where the request's profile
+        # contextvar need not be active any more.
+        scoped_session_key = self._active_turn_key(session_id)
+
         def _ask(question: str, choices: Optional[List[str]]) -> str:
             # Stamp the deadline using the same constant the agent
             # thread waits on a few lines below. Clients see the wall-
@@ -619,7 +627,7 @@ class ZetAgentAdapter(APIServerAdapter):
             }
             entry = _ClarifyEntry(clarify_id, payload)
             with self._clarify_state_lock:
-                queue = self._clarify_queues.setdefault(session_id, [])
+                queue = self._clarify_queues.setdefault(scoped_session_key, [])
                 queue.append(entry)
                 # /pending is the projection of the entry legacy clients
                 # would answer next.  Keep that projection on FIFO's head
@@ -627,12 +635,12 @@ class ZetAgentAdapter(APIServerAdapter):
                 is_pending_head = len(queue) == 1
             with self._pending_lock:
                 if is_pending_head:
-                    self._pending_clarify[session_id] = payload
+                    self._pending_clarify[scoped_session_key] = payload
             try:
                 stream_q.put(("__tool_progress__", payload))
             except Exception:
                 logger.debug("[zet_agent] clarify push failed", exc_info=True)
-                self._discard_clarify_entry(session_id, entry)
+                self._discard_clarify_entry(scoped_session_key, entry)
                 return ""
             # Goal projection: clarify blocks the turn on user input — mirror
             # the approval hook (waiting banner; no GoalManager mutation).
@@ -647,7 +655,7 @@ class ZetAgentAdapter(APIServerAdapter):
                     "[zet_agent] clarify timeout after %ss session=%s",
                     CLARIFY_RESPONSE_TIMEOUT, session_id,
                 )
-                self._discard_clarify_entry(session_id, entry)
+                self._discard_clarify_entry(scoped_session_key, entry)
                 return ""
             return entry.response or ""
 
@@ -706,29 +714,29 @@ class ZetAgentAdapter(APIServerAdapter):
 
         return _emit
 
-    def _discard_clarify_entry(self, session_id: str, entry: _ClarifyEntry) -> None:
+    def _discard_clarify_entry(self, scoped_session_key: str, entry: _ClarifyEntry) -> None:
         """Remove an unresolved entry (push failure or timeout). The
         respond handler removes via popleft on success; this path
         handles error rollback so the queue doesn't accumulate."""
         next_payload: Optional[Dict[str, Any]] = None
         with self._clarify_state_lock:
-            queue = self._clarify_queues.get(session_id)
+            queue = self._clarify_queues.get(scoped_session_key)
             if queue and entry in queue:
                 queue.remove(entry)
             if queue is not None and not queue:
-                self._clarify_queues.pop(session_id, None)
+                self._clarify_queues.pop(scoped_session_key, None)
             elif queue:
                 # The pending projection always represents the entry at the
                 # front of the legacy FIFO. This also keeps reconnect correct
                 # should a future producer create more than one entry.
                 next_payload = queue[0].payload
         with self._pending_lock:
-            current = self._pending_clarify.get(session_id)
+            current = self._pending_clarify.get(scoped_session_key)
             if current and current.get("clarify_id") == entry.clarify_id:
                 if next_payload is None:
-                    self._pending_clarify.pop(session_id, None)
+                    self._pending_clarify.pop(scoped_session_key, None)
                 else:
-                    self._pending_clarify[session_id] = next_payload
+                    self._pending_clarify[scoped_session_key] = next_payload
 
     def _register_active_session_turn(self, session_id: Optional[str], agent_ref: list, agent_task: Any) -> None:
         """Stash the in-flight chat-completions turn so the session
@@ -1402,6 +1410,7 @@ class ZetAgentAdapter(APIServerAdapter):
             return auth_err
 
         session_id = request.match_info.get("session_id", "")
+        scoped_session_key = self._active_turn_key(session_id)
         try:
             body = await request.json()
         except Exception:
@@ -1412,7 +1421,7 @@ class ZetAgentAdapter(APIServerAdapter):
 
         next_payload: Optional[Dict[str, Any]] = None
         with self._clarify_state_lock:
-            queue = self._clarify_queues.get(session_id)
+            queue = self._clarify_queues.get(scoped_session_key)
             entry: Optional[_ClarifyEntry] = None
             if queue:
                 if clarify_id:
@@ -1423,7 +1432,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 else:
                     entry = queue.pop(0)
             if queue is not None and not queue:
-                self._clarify_queues.pop(session_id, None)
+                self._clarify_queues.pop(scoped_session_key, None)
             elif queue:
                 next_payload = queue[0].payload
         if entry is None:
@@ -1438,12 +1447,12 @@ class ZetAgentAdapter(APIServerAdapter):
         entry.response = response_text
         entry.event.set()
         with self._pending_lock:
-            current = self._pending_clarify.get(session_id)
+            current = self._pending_clarify.get(scoped_session_key)
             if current and current.get("clarify_id") == entry.clarify_id:
                 if next_payload is None:
-                    self._pending_clarify.pop(session_id, None)
+                    self._pending_clarify.pop(scoped_session_key, None)
                 else:
-                    self._pending_clarify[session_id] = next_payload
+                    self._pending_clarify[scoped_session_key] = next_payload
         # Goal projection: mirror the approval respond hook.
         try:
             await asyncio.to_thread(self._goals().on_interaction_resolved, session_id)
@@ -1468,9 +1477,10 @@ class ZetAgentAdapter(APIServerAdapter):
         if auth_err:
             return auth_err
         session_id = request.match_info.get("session_id", "")
+        scoped_session_key = self._active_turn_key(session_id)
         with self._pending_lock:
             ap = self._pending_approval.get(session_id)
-            cl = self._pending_clarify.get(session_id)
+            cl = self._pending_clarify.get(scoped_session_key)
         return web.json_response({
             "approval": ap,
             "clarify": cl,
@@ -1581,7 +1591,7 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception:
                 logger.debug("[zet_agent] session interrupt: agent.interrupt failed", exc_info=True)
 
-        self._interrupt_pending_interactions(session_id)
+        self._interrupt_pending_interactions(session_id, turn_key)
 
         if task is not None and not task.done():
             try:
@@ -1701,7 +1711,7 @@ class ZetAgentAdapter(APIServerAdapter):
             {"session_id": session_id, "status": status, "accepted": accepted}
         )
 
-    def _interrupt_pending_interactions(self, session_id: str) -> None:
+    def _interrupt_pending_interactions(self, session_id: str, scoped_session_key: Optional[str] = None) -> None:
         """Best-effort cleanup of agent-thread blockers for ``session_id``.
 
         Without this, ``agent.interrupt()`` flips the flag but the
@@ -1717,8 +1727,10 @@ class ZetAgentAdapter(APIServerAdapter):
         """
         # Clarify queue: drain pending entries and signal their events
         # with empty response so the ask_user callback unblocks.
+        if scoped_session_key is None:
+            scoped_session_key = self._active_turn_key(session_id)
         with self._clarify_state_lock:
-            clarify_queue = list(self._clarify_queues.pop(session_id, []) or [])
+            clarify_queue = list(self._clarify_queues.pop(scoped_session_key, []) or [])
         for entry in clarify_queue:
             try:
                 entry.response = ""
@@ -1749,7 +1761,7 @@ class ZetAgentAdapter(APIServerAdapter):
             logger.debug("[zet_agent] session interrupt: terminal cleanup failed", exc_info=True)
 
         with self._pending_lock:
-            self._pending_clarify.pop(session_id, None)
+            self._pending_clarify.pop(scoped_session_key, None)
             self._pending_approval.pop(session_id, None)
 
     # ------------------------------------------------------------------

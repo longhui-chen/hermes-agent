@@ -187,6 +187,79 @@ async def test_exact_clarify_response_keeps_pending_projection_on_fifo_head():
     }
 
 
+@pytest.mark.asyncio
+async def test_prefixed_profiles_isolate_same_named_clarify_session(profile_homes):
+    """A profile-local card cannot be read, answered, or interrupted by another profile."""
+    adapter = _make_adapter()
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+    same_session = "same-session-id"
+    main_stream: queue.Queue = queue.Queue()
+    coder_stream: queue.Queue = queue.Queue()
+    main_answers = []
+    coder_answers = []
+
+    # This is the same attachment-time scope used by the real chat-completion
+    # path. The callback later runs on a worker thread, so it proves we
+    # captured profile identity instead of consulting a thread-local value.
+    with adapter._profile_api_scope("main"):
+        ask_main = adapter._make_clarify_cb(main_stream, same_session)
+    with adapter._profile_api_scope("coder"):
+        ask_coder = adapter._make_clarify_cb(coder_stream, same_session)
+
+    main_thread = threading.Thread(target=lambda: main_answers.append(ask_main("main card", None)), daemon=True)
+    coder_thread = threading.Thread(target=lambda: coder_answers.append(ask_coder("coder card", None)), daemon=True)
+    main_thread.start()
+    coder_thread.start()
+    _, main_payload = main_stream.get(timeout=1)
+    _, coder_payload = coder_stream.get(timeout=1)
+    assert main_payload["clarify_id"] != coder_payload["clarify_id"]
+
+    headers = {"Authorization": "Bearer test-key"}
+    async with TestClient(TestServer(app)) as cli:
+        main_pending = await cli.get(f"/p/main/v1/sessions/{same_session}/pending", headers=headers)
+        coder_pending = await cli.get(f"/p/coder/v1/sessions/{same_session}/pending", headers=headers)
+        assert (await main_pending.json())["clarify"]["question"] == "main card"
+        assert (await coder_pending.json())["clarify"]["question"] == "coder card"
+
+        # A coder response carrying main's id must not cross the profile
+        # boundary or wake either callback.
+        crossed = await cli.post(
+            f"/p/coder/v1/sessions/{same_session}/clarify/respond",
+            json={"clarify_id": main_payload["clarify_id"], "response": "wrong profile"},
+            headers=headers,
+        )
+        assert crossed.status == 404
+        assert main_thread.is_alive() and coder_thread.is_alive()
+
+        # Interrupt uses the same scoped key as pending/respond. It may
+        # unblock coder's clarify but must leave main's same-named session
+        # untouched; timeout/push-failure cleanup reuses this exact discard
+        # helper and key shape.
+        coder_interrupt = await cli.post(
+            f"/p/coder/v1/sessions/{same_session}/interrupt",
+            headers=headers,
+        )
+        assert coder_interrupt.status == 200
+        coder_thread.join(timeout=1)
+        assert not coder_thread.is_alive()
+        assert coder_answers == [""]
+        main_still_pending = await cli.get(f"/p/main/v1/sessions/{same_session}/pending", headers=headers)
+        assert (await main_still_pending.json())["clarify"]["clarify_id"] == main_payload["clarify_id"]
+
+        main_reply = await cli.post(
+            f"/p/main/v1/sessions/{same_session}/clarify/respond",
+            json={"clarify_id": main_payload["clarify_id"], "response": "main answer"},
+            headers=headers,
+        )
+        assert main_reply.status == 200
+
+    main_thread.join(timeout=1)
+    assert not main_thread.is_alive() and not coder_thread.is_alive()
+    assert main_answers == ["main answer"]
+    assert coder_answers == [""]
+
+
 @pytest.fixture
 def profile_homes(tmp_path, monkeypatch):
     root = tmp_path / ".hermes"
