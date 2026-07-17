@@ -24,14 +24,11 @@ IGNORED_RELATIVE_PATHS = {
     Path("venv/.zpk-install-spec"),
     Path("venv/.zpk-venv.stamp"),
 }
-IGNORED_RELATIVE_PREFIXES = (Path("plugins/hermes-achievements"),)
 MAX_REPORTED_PATHS = 50
 
 
 def _is_intentionally_excluded(relative_path: Path) -> bool:
     if relative_path in IGNORED_RELATIVE_PATHS:
-        return True
-    if any(relative_path.is_relative_to(prefix) for prefix in IGNORED_RELATIVE_PREFIXES):
         return True
     if relative_path.suffix == ".pyc":
         return True

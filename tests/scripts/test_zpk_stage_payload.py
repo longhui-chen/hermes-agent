@@ -62,7 +62,7 @@ def _is_gnu_tar() -> bool:
     return "GNU tar" in result.stdout
 
 
-def test_zpk_stage_flow_excludes_non_product_plugins_and_root_build_inputs(
+def test_zpk_stage_flow_preserves_bundled_plugins_and_excludes_root_build_inputs(
     tmp_path: Path,
 ) -> None:
     if not _is_gnu_tar():
@@ -105,11 +105,13 @@ def test_zpk_stage_flow_excludes_non_product_plugins_and_root_build_inputs(
     ):
         assert not (staged / root_only_path).exists()
 
-    assert not (staged / "plugins/hermes-achievements").exists()
-
     for runtime_path in (
         "plugins/web/exa/provider.py",
         "plugins/kanban/dashboard/dist/index.js",
+        "plugins/hermes-achievements/README.md",
+        "plugins/hermes-achievements/dashboard/dist/index.js",
+        "plugins/hermes-achievements/docs/runtime-note.md",
+        "plugins/hermes-achievements/tests/test_runtime_contract.py",
         "venv/lib/python3.11/site-packages/botocore/data/endpoints.json",
         "venv/lib/python3.11/site-packages/slack_sdk/web/client.py",
     ):
@@ -124,15 +126,18 @@ def test_find_missing_runtime_paths_reports_files_removed_from_protected_trees(
     kept_path = "plugins/web/exa/provider.py"
     missing_path = "venv/lib/python3.11/site-packages/botocore/data/endpoints.json"
     ignored_path = "venv/lib/python3.11/site-packages/demo/__pycache__/module.pyc"
-    excluded_plugin_path = "plugins/hermes-achievements/dashboard/dist/index.js"
+    missing_plugin_path = "plugins/hermes-achievements/dashboard/dist/index.js"
 
-    for relative_path in (kept_path, missing_path, ignored_path, excluded_plugin_path):
+    for relative_path in (kept_path, missing_path, ignored_path, missing_plugin_path):
         _write_file(source, relative_path)
     _write_file(staged, kept_path)
 
     module = _load_check_module()
 
-    assert module.find_missing_runtime_paths(source, staged) == [Path(missing_path)]
+    assert module.find_missing_runtime_paths(source, staged) == [
+        Path(missing_plugin_path),
+        Path(missing_path),
+    ]
 
 
 def test_zpk_stage_payload_check_flow_fails_when_runtime_content_is_missing(

@@ -48,7 +48,6 @@ ZPK_ROOT_EXCLUDES := \
 	--exclude=./nix \
 	--exclude=./environments \
 	--exclude=./packaging \
-	--exclude=./plugins/hermes-achievements \
 	--exclude=./wandb \
 	--exclude=./testlogs \
 	--exclude=./venv/.zpk-venv.stamp \
