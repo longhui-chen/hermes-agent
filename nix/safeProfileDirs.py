@@ -16,6 +16,7 @@ _RECURSIVE_IDENTITY_RETRIES = 3
 _MAX_RECURSIVE_DEPTH = 64
 _MANAGED_ROOT_LEAVES = {"config.yaml", ".managed", ".container-mode", "auth.json", ".env"}
 _MAX_MANAGED_LEAF_BYTES = 16 << 20
+_MAX_FDINFO_BYTES = 64 << 10
 
 
 def _directory_flags() -> int:
@@ -25,6 +26,44 @@ def _directory_flags() -> int:
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     return flags
+
+
+def _mount_id(fd: int) -> int | None:
+    """Return the Linux mount identity for fd; other kernels use st_dev."""
+    if not sys.platform.startswith("linux"):
+        return None
+    flags = os.O_RDONLY
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        info_fd = os.open(f"/proc/self/fdinfo/{fd}", flags)
+    except OSError as exc:
+        raise OSError(
+            errno.ENOTSUP, f"cannot determine managed profile mount identity: {exc}"
+        ) from exc
+    try:
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(info_fd, min(4096, _MAX_FDINFO_BYTES + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > _MAX_FDINFO_BYTES:
+                raise OSError(errno.EFBIG, "managed profile fdinfo is too large")
+    finally:
+        os.close(info_fd)
+    for line in b"".join(chunks).splitlines():
+        key, separator, value = line.partition(b":")
+        if separator and key == b"mnt_id":
+            try:
+                return int(value.strip())
+            except ValueError as exc:
+                raise OSError(
+                    errno.ENOTSUP, "invalid managed profile mount identity"
+                ) from exc
+    raise OSError(errno.ENOTSUP, "managed profile mount identity is unavailable")
 
 
 def _open_absolute_directory(path: Path) -> int:
@@ -84,12 +123,15 @@ def _normalize_child(
     mode: int,
     *,
     expected_device: int | None = None,
+    expected_mount_id: int | None = None,
 ) -> int:
     child_fd = _open_or_create_child(parent_fd, name)
     try:
         opened = os.fstat(child_fd)
         if expected_device is not None and opened.st_dev != expected_device:
             raise OSError(errno.EXDEV, f"managed profile directory crosses device: {name}")
+        if expected_mount_id is not None and _mount_id(child_fd) != expected_mount_id:
+            raise OSError(errno.EXDEV, f"managed profile directory crosses mount: {name}")
         os.fchown(child_fd, uid, gid)
         os.fchmod(child_fd, mode)
         _require_visible_identity(parent_fd, name, child_fd)
@@ -109,6 +151,7 @@ def _normalize_regular_file(
     group_write: bool,
     expected: os.stat_result,
     root_device: int,
+    root_mount_id: int | None,
 ) -> bool:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
@@ -136,6 +179,8 @@ def _normalize_regular_file(
             )
             if stable:
                 if opened.st_dev != root_device:
+                    return False
+                if root_mount_id is not None and _mount_id(fd) != root_mount_id:
                     return False
                 if chown:
                     os.fchown(fd, uid, gid)
@@ -323,8 +368,12 @@ def _sync_plugin_links(
     plugins_fd = os.open("plugins", _directory_flags(), dir_fd=home_fd)
     try:
         opened = _require_visible_identity(home_fd, "plugins", plugins_fd, before)
-        if opened.st_dev != os.fstat(home_fd).st_dev:
-            raise OSError(errno.EXDEV, "managed plugins directory crosses device")
+        home_stat = os.fstat(home_fd)
+        home_mount_id = _mount_id(home_fd)
+        if opened.st_dev != home_stat.st_dev or (
+            home_mount_id is not None and _mount_id(plugins_fd) != home_mount_id
+        ):
+            raise OSError(errno.EXDEV, "managed plugins directory crosses device or mount")
         desired: list[tuple[str, str]] = []
         for entry in manifest:
             if not isinstance(entry, dict) or set(entry) != {"name", "target"}:
@@ -422,6 +471,7 @@ def _normalize_tree(
     uid: int,
     gid: int,
     root_device: int,
+    root_mount_id: int | None,
     *,
     chown: bool,
     shared_file_modes: bool,
@@ -451,6 +501,8 @@ def _normalize_tree(
             try:
                 if opened.st_dev != root_device:
                     continue
+                if root_mount_id is not None and _mount_id(child_fd) != root_mount_id:
+                    continue
                 if chown:
                     os.fchown(child_fd, uid, gid)
                 _normalize_tree(
@@ -458,6 +510,7 @@ def _normalize_tree(
                     uid,
                     gid,
                     root_device,
+                    root_mount_id,
                     chown=chown,
                     shared_file_modes=shared_file_modes,
                     group_write_tree=(
@@ -483,6 +536,7 @@ def _normalize_tree(
                 group_write=shared_file_modes and (group_write_tree or root_shared),
                 expected=visible,
                 root_device=root_device,
+                root_mount_id=root_mount_id,
             )
 
 
@@ -502,20 +556,45 @@ def ensure_transaction_directories(
     try:
         home_fd = _normalize_child(parent_fd, home.name, uid, gid, 0o2770)
         root_device = os.fstat(home_fd).st_dev
+        root_mount_id = _mount_id(home_fd)
         for name in ("cron", "sessions", "logs", "plugins"):
             state_fds.append(
                 _normalize_child(
-                    home_fd, name, uid, gid, 0o2770, expected_device=root_device
+                    home_fd,
+                    name,
+                    uid,
+                    gid,
+                    0o2770,
+                    expected_device=root_device,
+                    expected_mount_id=root_mount_id,
                 )
             )
         memories_fd = _normalize_child(
-            home_fd, "memories", uid, gid, 0o2770, expected_device=root_device
+            home_fd,
+            "memories",
+            uid,
+            gid,
+            0o2770,
+            expected_device=root_device,
+            expected_mount_id=root_mount_id,
         )
         imports_fd = _normalize_child(
-            memories_fd, ".imports", uid, gid, 0o2770, expected_device=root_device
+            memories_fd,
+            ".imports",
+            uid,
+            gid,
+            0o2770,
+            expected_device=root_device,
+            expected_mount_id=root_mount_id,
         )
         backups_fd = _normalize_child(
-            imports_fd, "backups", uid, gid, 0o2770, expected_device=root_device
+            imports_fd,
+            "backups",
+            uid,
+            gid,
+            0o2770,
+            expected_device=root_device,
+            expected_mount_id=root_mount_id,
         )
         _reject_unsafe_managed_leaves(home_fd)
         opened_home = os.fstat(home_fd)
@@ -527,6 +606,7 @@ def ensure_transaction_directories(
                 uid,
                 gid,
                 root_device,
+                root_mount_id,
                 chown=recursive_ownership,
                 shared_file_modes=shared_file_modes,
                 top_level=True,

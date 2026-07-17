@@ -204,6 +204,97 @@ def test_exact_managed_child_rejects_foreign_device_before_mutation(
         os.close(parent_fd)
 
 
+def test_exact_managed_child_rejects_same_device_foreign_mount_before_mutation(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    child = home / "plugins"
+    child.mkdir(parents=True)
+    current = home.stat()
+    parent_fd = os.open(home, safe_profile_dirs._directory_flags())
+    child_fd = os.open(child, safe_profile_dirs._directory_flags())
+    child_identity = os.fstat(child_fd)
+
+    def injected_mount_id(fd):
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) == (
+            child_identity.st_dev,
+            child_identity.st_ino,
+        ):
+            return 200
+        return 100
+
+    monkeypatch.setattr(
+        safe_profile_dirs,
+        "_open_or_create_child",
+        lambda _parent_fd, _name: os.dup(child_fd),
+    )
+    monkeypatch.setattr(safe_profile_dirs, "_mount_id", injected_mount_id)
+    monkeypatch.setattr(
+        safe_profile_dirs.os,
+        "fchown",
+        lambda *_args: pytest.fail("foreign mount was chowned before mount gate"),
+    )
+    monkeypatch.setattr(
+        safe_profile_dirs.os,
+        "fchmod",
+        lambda *_args: pytest.fail("foreign mount was chmodded before mount gate"),
+    )
+    try:
+        with pytest.raises(OSError) as raised:
+            safe_profile_dirs._normalize_child(
+                parent_fd,
+                "plugins",
+                current.st_uid,
+                current.st_gid,
+                0o2770,
+                expected_device=current.st_dev,
+                expected_mount_id=100,
+            )
+        assert raised.value.errno == safe_profile_dirs.errno.EXDEV
+    finally:
+        os.close(child_fd)
+        os.close(parent_fd)
+
+
+def test_recursive_profile_scan_skips_same_device_foreign_mount(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    current = home.stat()
+    safe_profile_dirs.ensure_transaction_directories(
+        home, current.st_uid, current.st_gid
+    )
+    mounted = home / "sessions" / "mounted"
+    mounted.mkdir()
+    private = mounted / "private.txt"
+    private.write_text("private")
+    private.chmod(0o600)
+    mounted_identity = mounted.stat()
+
+    def injected_mount_id(fd):
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) == (
+            mounted_identity.st_dev,
+            mounted_identity.st_ino,
+        ):
+            return 200
+        return 100
+
+    monkeypatch.setattr(safe_profile_dirs, "_mount_id", injected_mount_id)
+    safe_profile_dirs.ensure_transaction_directories(
+        home,
+        current.st_uid,
+        current.st_gid,
+        recursive_ownership=True,
+        shared_file_modes=True,
+    )
+
+    assert private.read_text() == "private"
+    assert stat.S_IMODE(private.stat().st_mode) == 0o600
+
+
 @pytest.mark.parametrize("operation", ["recursive_ownership", "shared_file_modes"])
 def test_recursive_profile_scan_skips_normal_enoent_churn(
     tmp_path, monkeypatch, operation
@@ -538,6 +629,45 @@ def test_managed_plugin_sync_rejects_replaced_plugins_directory(tmp_path):
             safe_profile_dirs._sync_plugin_links(
                 home_fd, manifest, current.st_uid, current.st_gid
             )
+    finally:
+        os.close(home_fd)
+
+    assert marker.is_symlink()
+
+
+def test_managed_plugin_sync_rejects_same_device_foreign_mount(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    current = home.stat()
+    identity = safe_profile_dirs.ensure_transaction_directories(
+        home, current.st_uid, current.st_gid
+    )
+    plugins = home / "plugins"
+    plugins_identity = plugins.stat()
+    marker = plugins / "nix-managed-keep"
+    marker.symlink_to(tmp_path / "keep-target")
+    manifest = tmp_path / "plugins.json"
+    manifest.write_text("[]")
+
+    def injected_mount_id(fd):
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) == (
+            plugins_identity.st_dev,
+            plugins_identity.st_ino,
+        ):
+            return 200
+        return 100
+
+    monkeypatch.setattr(safe_profile_dirs, "_mount_id", injected_mount_id)
+    home_fd = safe_profile_dirs._open_verified_home(home, identity)
+    try:
+        with pytest.raises(OSError) as raised:
+            safe_profile_dirs._sync_plugin_links(
+                home_fd, manifest, current.st_uid, current.st_gid
+            )
+        assert raised.value.errno == safe_profile_dirs.errno.EXDEV
     finally:
         os.close(home_fd)
 
