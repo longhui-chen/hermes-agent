@@ -1947,10 +1947,17 @@ def _reset_receipts_require_forward_all(
         ):
             continue
         receipt = handles.read_receipt(handles.mem_fd, receipt_name)
-        state, _plan = _validate_reset_receipt(receipt)
         original_targets = _reset_receipt_targets(receipt)
+        state = receipt.get("state") if isinstance(receipt, dict) else None
         if state == "staging" and set(original_targets) == {"memory", "user"}:
+            _validate_reset_receipt(
+                receipt,
+                allow_legacy=True,
+                allow_cross_scope=True,
+            )
             forward_all = True
+        else:
+            _validate_reset_receipt(receipt)
     return forward_all
 
 
@@ -2216,15 +2223,27 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
             imports_names,
             backup_names,
             receipt_targets,
-        ) = reset_dirs.preflight_reset(
-            parse_import_receipts=effective_target != "all"
-        )
-        if effective_target != "all" and _reset_receipts_require_forward_all(
+        ) = reset_dirs.preflight_reset(parse_import_receipts=False)
+        # The lock-free preflight above can only reject unsafe input early.
+        # Recompute direction from the original request and the locked receipt
+        # snapshot: a reset-all may have completed before we acquired the lock.
+        effective_target = target
+        if target != "all" and _reset_receipts_require_forward_all(
             reset_dirs, memory_names
         ):
             effective_target = "all"
-            targets = ("memory", "user")
-            receipt_targets = {}
+        targets = (
+            ("memory", "user")
+            if effective_target == "all"
+            else (effective_target,)
+        )
+        if effective_target != "all":
+            (
+                memory_names,
+                imports_names,
+                backup_names,
+                receipt_targets,
+            ) = reset_dirs.preflight_reset(parse_import_receipts=True)
         _validate_reset_candidate_types(
             reset_dirs,
             effective_target,

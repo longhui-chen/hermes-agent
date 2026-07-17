@@ -5,6 +5,7 @@ import os
 import secrets
 import stat
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -1267,6 +1268,92 @@ def test_single_target_does_not_reopen_isolated_reset_all(
         "created after reset-all committed"
     )
     assert not receipt.exists()
+
+
+@pytest.mark.parametrize(
+    ("requested_target", "new_other_name"),
+    [("memory", "USER.md"), ("user", "MEMORY.md")],
+)
+def test_locked_snapshot_can_downgrade_completed_reset_all(
+    tmp_path, monkeypatch, requested_target, new_other_name
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    (memories / ".imports" / "backups").mkdir(parents=True)
+    receipt = memories / f"{memory_tool._RESET_RECEIPT_PREFIX}finishing-all.json"
+    receipt.write_text(json.dumps({
+        "version": 1,
+        "state": "staging",
+        "targets": ["memory", "user"],
+        "plan": [],
+    }), encoding="utf-8")
+    new_other = memories / new_other_name
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original_lock = MemoryStore._file_lock
+    completed = False
+
+    @contextmanager
+    def finish_before_transaction_lock(path, *, create_parent=True):
+        nonlocal completed
+        if path.name == memory_tool._MEMORY_TRANSACTION_LOCK and not completed:
+            completed = True
+            receipt.unlink()
+            new_other.write_text(
+                "published after reset-all completed", encoding="utf-8"
+            )
+        with original_lock(path, create_parent=create_parent):
+            yield
+
+    monkeypatch.setattr(
+        MemoryStore,
+        "_file_lock",
+        staticmethod(finish_before_transaction_lock),
+    )
+
+    result = reset_curated_memory(requested_target)
+
+    assert completed is True
+    assert result["targets"] == [requested_target]
+    assert new_other.read_text(encoding="utf-8") == (
+        "published after reset-all completed"
+    )
+
+
+@pytest.mark.parametrize("requested_target", ["memory", "user"])
+def test_single_target_forwards_legacy_staging_reset_all(
+    tmp_path, monkeypatch, requested_target
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    backups = memories / ".imports" / "backups"
+    backups.mkdir(parents=True)
+    other_name = "USER.md" if requested_target == "memory" else "MEMORY.md"
+    other = memories / other_name
+    other.write_text("not yet staged", encoding="utf-8")
+    stage_name = f"{memory_tool._RESET_STAGE_PREFIX}legacy-all"
+    stage = memories / stage_name
+    stage.write_text("legacy cross-scope staged backup", encoding="utf-8")
+    receipt = memories / f"{memory_tool._RESET_RECEIPT_PREFIX}legacy-all.json"
+    receipt.write_text(json.dumps({
+        "version": 1,
+        "state": "staging",
+        "targets": ["memory", "user"],
+        "plan": [{
+            "scope": "backups",
+            "name": "opaque-private-snapshot.bin",
+            "stage": stage_name,
+            "label": "opaque-private-snapshot.bin",
+        }],
+    }), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    result = reset_curated_memory(requested_target)
+
+    assert result["targets"] == ["memory", "user"]
+    assert not other.exists()
+    assert not stage.exists()
+    assert not receipt.exists()
+    assert curated_memory_has_state("all") is False
 
 
 @pytest.mark.parametrize(
@@ -2978,7 +3065,7 @@ def test_legacy_cross_scope_sparse_receipt_is_never_copied(
     monkeypatch.setattr(memory_tool.os, "link", cross_device)
     monkeypatch.setattr(memory_tool, "_reset_copy_regular_no_follow", reject_copy)
 
-    with pytest.raises(MemoryImportConflict, match="unsafe"):
+    with pytest.raises(MemoryImportConflict, match="targets"):
         reset_curated_memory("memory")
     assert source.exists()
     assert stage.exists()
@@ -3017,7 +3104,7 @@ def test_explicit_cross_scope_reset_stage_is_rejected_or_purged(
     }), encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
 
-    with pytest.raises(MemoryImportConflict, match="unsafe"):
+    with pytest.raises(MemoryImportConflict, match="targets"):
         reset_curated_memory("memory")
     assert source.exists()
     assert stage.exists()
