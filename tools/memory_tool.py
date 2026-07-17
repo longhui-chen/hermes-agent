@@ -130,7 +130,23 @@ def get_memory_dir() -> Path:
 
 
 def portable_memory_import_supported() -> bool:
-    """Whether the current profile filesystem can enforce V2.5 durability."""
+    """Report API availability without mutating the selected profile."""
+    try:
+        home_identity, mem_identity = _require_durable_profile_filesystem()
+    except (MemoryImportConflict, MemoryImportUnsupported, OSError):
+        return False
+    if home_identity is not None and mem_identity is not None:
+        try:
+            key = _import_hardlink_cache_key(home_identity, mem_identity)
+        except OSError:
+            return False
+        if key in _IMPORT_HARDLINK_NEGATIVE_CACHE:
+            return False
+    return True
+
+
+def portable_memory_reset_supported() -> bool:
+    """Whether reset can enforce durable directory transaction semantics."""
     try:
         _require_durable_profile_filesystem()
     except (MemoryImportConflict, MemoryImportUnsupported, OSError):
@@ -145,6 +161,10 @@ _MEMORY_TARGET_FILES = {"memory": "MEMORY.md", "user": "USER.md"}
 _MEMORY_TRANSACTION_LOCK = ".curated-memory-transaction"
 _RESET_RECEIPT_PREFIX = ".reset_tx_"
 _RESET_STAGE_PREFIX = ".reset_stage_"
+_IMPORT_LINK_PROBE_PREFIX = ".import_link_probe_"
+_IMPORT_HARDLINK_NEGATIVE_CACHE: set[
+    tuple[str, tuple[int, int], tuple[int, int], int]
+] = set()
 
 
 class MemoryImportConflict(ValueError):
@@ -364,6 +384,68 @@ class _ImportDirectoryHandles:
                 _fsync_directory_fd(directory_fd, path)
         self.verify_attached()
 
+    def _remove_import_link_probe_residue(self, names: List[str]) -> None:
+        """Remove only zero-byte regular files reserved for the link probe."""
+        changed = False
+        try:
+            for name in names:
+                try:
+                    current = os.stat(
+                        name, dir_fd=self.mem_fd, follow_symlinks=False
+                    )
+                except FileNotFoundError:
+                    continue
+                if not stat.S_ISREG(current.st_mode) or current.st_size != 0:
+                    raise MemoryImportConflict(
+                        f"memory import link probe residue {name} is unsafe"
+                    )
+                os.unlink(name, dir_fd=self.mem_fd)
+                changed = True
+        finally:
+            if changed:
+                _fsync_directory_fd(self.mem_fd, self.mem_dir)
+        self.verify_attached()
+
+    def require_import_hardlink_support(self) -> None:
+        """Prove hard-link publish support without writing imported content."""
+        self.verify_attached()
+        fd, source_name = self._create_temp(
+            self.mem_fd, _IMPORT_LINK_PROBE_PREFIX
+        )
+        link_name = f"{source_name}.link"
+        try:
+            os.fsync(fd)
+            os.close(fd)
+            fd = -1
+            try:
+                os.link(
+                    source_name,
+                    link_name,
+                    src_dir_fd=self.mem_fd,
+                    dst_dir_fd=self.mem_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                if exc.errno in _LINK_COPY_FALLBACK_ERRNOS:
+                    _IMPORT_HARDLINK_NEGATIVE_CACHE.add(
+                        _import_hardlink_cache_key(
+                            self.expected_home_identity,
+                            self.expected_mem_identity,
+                        )
+                    )
+                    raise MemoryImportUnsupported(
+                        "curated memory import requires hard-link support on "
+                        f"{self.mem_dir}"
+                    ) from exc
+                raise
+            _fsync_directory_fd(self.mem_fd, self.mem_dir)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            self._remove_import_link_probe_residue(
+                [link_name, source_name]
+            )
+
     @staticmethod
     def read_bytes(directory_fd: int, name: str) -> Optional[bytes]:
         flags = os.O_RDONLY
@@ -539,13 +621,8 @@ class _ImportDirectoryHandles:
     def _restore_displaced_no_replace(
         self, displaced_name: str, canonical_name: str
     ) -> None:
-        source = self.read_bytes(self.mem_fd, displaced_name)
-        if source is None:
+        if self.read_bytes(self.mem_fd, displaced_name) is None:
             raise MemoryImportConflict("displaced memory recovery file is missing")
-        source_stat = os.stat(
-            displaced_name, dir_fd=self.mem_fd, follow_symlinks=False
-        )
-        source_mode = stat.S_IMODE(source_stat.st_mode) or 0o600
         self.verify_attached()
         try:
             os.link(
@@ -557,42 +634,6 @@ class _ImportDirectoryHandles:
             )
         except FileExistsError:
             return
-        except OSError:
-            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            try:
-                fd = os.open(
-                    canonical_name, flags, source_mode, dir_fd=self.mem_fd
-                )
-            except FileExistsError:
-                return
-            identity = None
-            try:
-                opened = os.fstat(fd)
-                identity = (opened.st_dev, opened.st_ino)
-                view = memoryview(source)
-                while view:
-                    written = os.write(fd, view)
-                    if written <= 0:
-                        raise OSError("short write while restoring displaced memory")
-                    view = view[written:]
-                os.fsync(fd)
-            except BaseException:
-                if identity is not None:
-                    try:
-                        current = os.stat(
-                            canonical_name,
-                            dir_fd=self.mem_fd,
-                            follow_symlinks=False,
-                        )
-                        if (current.st_dev, current.st_ino) == identity:
-                            os.unlink(canonical_name, dir_fd=self.mem_fd)
-                    except OSError:
-                        pass
-                raise
-            finally:
-                os.close(fd)
         _fsync_directory_fd(self.mem_fd, self.mem_dir)
 
     def write_canonical_cas(
@@ -693,6 +734,9 @@ class _ImportDirectoryHandles:
                             f"{restore_error}"
                         ) from publish_error
                 raise
+            # Persist the new canonical name before removing the already
+            # durable temp source.
+            _fsync_directory_fd(self.mem_fd, self.mem_dir)
             os.unlink(temp_name, dir_fd=self.mem_fd)
             temp_name = ""
             _fsync_directory_fd(self.mem_fd, self.mem_dir)
@@ -860,6 +904,95 @@ def _require_durable_profile_filesystem(
     return home_identity, mem_identity
 
 
+def _import_hardlink_cache_key(
+    home_identity: tuple[int, int],
+    mem_identity: tuple[int, int],
+) -> tuple[str, tuple[int, int], tuple[int, int], int]:
+    mem_dir = get_memory_dir()
+    return (
+        str(mem_dir),
+        home_identity,
+        mem_identity,
+        os.stat(mem_dir, follow_symlinks=False).st_dev,
+    )
+
+
+def _durably_create_directory_chain(path: Path) -> None:
+    """Create a missing absolute directory chain with durable parent entries."""
+    if not path.is_absolute() or any(part in {".", ".."} for part in path.parts):
+        raise MemoryImportConflict(
+            "profile directory creation requires an absolute path without dot components"
+        )
+    missing = []
+    ancestor = path
+    while not os.path.lexists(ancestor):
+        missing.append(ancestor.name)
+        parent = ancestor.parent
+        if parent == ancestor:
+            raise MemoryImportConflict(
+                f"cannot find an existing parent for {path}"
+            )
+        ancestor = parent
+    try:
+        resolved_ancestor = ancestor.resolve(strict=True)
+    except OSError as exc:
+        raise MemoryImportConflict(
+            f"cannot resolve profile parent directory: {exc}"
+        ) from exc
+    if not stat.S_ISDIR(os.lstat(resolved_ancestor).st_mode):
+        raise MemoryImportConflict(
+            f"profile parent {ancestor} must be a real directory"
+        )
+
+    parent_fd = _open_resolved_directory_chain(
+        resolved_ancestor, _ImportDirectoryHandles._directory_flags()
+    )
+    current_path = resolved_ancestor
+    try:
+        ancestor_parent = resolved_ancestor.parent
+        ancestor_parent_fd = _open_resolved_directory_chain(
+            ancestor_parent, _ImportDirectoryHandles._directory_flags()
+        )
+        try:
+            _fsync_directory_fd(ancestor_parent_fd, ancestor_parent)
+            _fsync_directory_fd(parent_fd, resolved_ancestor)
+        finally:
+            os.close(ancestor_parent_fd)
+        for name in reversed(missing):
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            try:
+                child_fd = os.open(
+                    name,
+                    _ImportDirectoryHandles._directory_flags(),
+                    dir_fd=parent_fd,
+                )
+            except OSError as exc:
+                raise MemoryImportConflict(
+                    f"profile directory component {name} is unsafe: {exc}"
+                ) from exc
+            child_path = current_path / name
+            try:
+                if not stat.S_ISDIR(os.fstat(child_fd).st_mode):
+                    raise MemoryImportConflict(
+                        f"profile directory component {name} is not a directory"
+                    )
+                # A FileExists race may be another creator or residue from a
+                # previous failed fsync. Re-run both barriers unconditionally.
+                _fsync_directory_fd(parent_fd, current_path)
+                _fsync_directory_fd(child_fd, child_path)
+            except BaseException:
+                os.close(child_fd)
+                raise
+            os.close(parent_fd)
+            parent_fd = child_fd
+            current_path = child_path
+    finally:
+        os.close(parent_fd)
+
+
 def _require_profile_memory_snapshot(
     *,
     create: bool,
@@ -869,15 +1002,17 @@ def _require_profile_memory_snapshot(
     """Validate the profile root and capture identities for its secure open."""
     home = get_hermes_home()
     if create:
-        home.mkdir(parents=True, exist_ok=True)
+        _durably_create_directory_chain(home)
     _require_real_directory(home, label="HERMES_HOME", create=False)
     try:
         resolved_home = home.resolve(strict=True)
     except OSError as exc:
         raise MemoryImportConflict(f"cannot resolve HERMES_HOME: {exc}") from exc
     mem_dir = home / "memories"
+    if create:
+        _durably_create_directory_chain(mem_dir)
     _require_real_directory(
-        mem_dir, label="profile memories directory", create=create
+        mem_dir, label="profile memories directory", create=False
     )
     try:
         resolved_memory = mem_dir.resolve(strict=True)
@@ -1099,10 +1234,41 @@ def _target_has_import_state(mem_dir: Path, target: str) -> bool:
             for entry in entries:
                 if not entry.name.endswith(".json"):
                     continue
+                if not stat.S_ISREG(
+                    entry.stat(follow_symlinks=False).st_mode
+                ):
+                    raise MemoryImportConflict(
+                        f"managed memory receipt {entry.name} must be a regular file"
+                    )
                 receipt = _read_import_receipt_no_follow(Path(entry.path))
-                if receipt is not None and receipt.get("target") == target:
+                if (
+                    not isinstance(receipt, dict)
+                    or receipt.get("target") not in {"memory", "user"}
+                ):
+                    raise MemoryImportConflict(
+                        f"managed memory receipt {entry.name} has no valid target"
+                    )
+                if receipt.get("target") == target:
                     return True
     return False
+
+
+def _has_any_import_receipt_state(mem_dir: Path) -> bool:
+    """Treat every regular receipt as reset-all state, even when corrupt."""
+    imports_dir = mem_dir / ".imports"
+    if not _is_real_directory(imports_dir):
+        return False
+    found = False
+    with os.scandir(imports_dir) as entries:
+        for entry in entries:
+            if not entry.name.endswith(".json"):
+                continue
+            if not stat.S_ISREG(entry.stat(follow_symlinks=False).st_mode):
+                raise MemoryImportConflict(
+                    f"managed memory receipt {entry.name} must be a regular file"
+                )
+            found = True
+    return found
 
 
 def _has_import_temp_state(mem_dir: Path) -> bool:
@@ -1110,6 +1276,7 @@ def _has_import_temp_state(mem_dir: Path) -> bool:
     imports_dir = mem_dir / ".imports"
     backup_dir = imports_dir / "backups"
     locations = (
+        (mem_dir, _IMPORT_LINK_PROBE_PREFIX, ""),
         (mem_dir, ".mem_", ".tmp"),
         (mem_dir, ".drift_", ".tmp"),
         (mem_dir, ".reset_receipt_", ".tmp"),
@@ -1556,6 +1723,73 @@ def _recover_reset_transactions(
     return cleanup_pending
 
 
+def _validate_reset_candidate_types(
+    handles: _ImportDirectoryHandles,
+    target: str,
+    memory_names: List[str],
+    imports_names: List[str],
+    backup_names: List[str],
+) -> None:
+    """Reject unsafe managed leaves before reset creates lock/receipt files."""
+    targets = ("memory", "user") if target == "all" else (target,)
+    candidates = set()
+    for item in targets:
+        filename = _MEMORY_TARGET_FILES[item]
+        candidates.add(("memory", filename))
+        for name in memory_names:
+            if (
+                name.startswith(f".{filename}.")
+                and name.endswith(".displaced")
+            ) or name.startswith(f"{filename}.bak."):
+                candidates.add(("memory", name))
+        for name in backup_names:
+            if name.startswith(f"{item}-") and name.endswith(".bak"):
+                candidates.add(("backups", name))
+    for name in memory_names:
+        if (
+            (name.startswith((".mem_", ".drift_", ".reset_receipt_"))
+             and name.endswith(".tmp"))
+            or name.startswith(_IMPORT_LINK_PROBE_PREFIX)
+            or name.startswith((_RESET_STAGE_PREFIX, _RESET_RECEIPT_PREFIX))
+        ):
+            candidates.add(("memory", name))
+    for name in imports_names:
+        if name.endswith(".json") or (
+            name.startswith(".receipt_") and name.endswith(".tmp")
+        ):
+            candidates.add(("imports", name))
+    for name in backup_names:
+        if name.startswith(".backup_") and name.endswith(".tmp"):
+            candidates.add(("backups", name))
+    for scope, name in candidates:
+        current = _reset_entry_stat(_reset_scope_fd(handles, scope), name)
+        if current is not None and not stat.S_ISREG(current.st_mode):
+            raise MemoryImportConflict(
+                f"reset state {name} must be a regular file"
+            )
+
+
+def _validate_reset_receipts(
+    target: str,
+    imports_names: List[str],
+    receipt_targets: Dict[str, Optional[Dict[str, Any]]],
+) -> None:
+    """Fail closed when a single-target reset cannot classify a receipt."""
+    if target == "all":
+        return
+    for name in imports_names:
+        if not name.endswith(".json"):
+            continue
+        receipt = receipt_targets.get(name)
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("target") not in {"memory", "user"}
+        ):
+            raise MemoryImportConflict(
+                f"managed memory receipt {name} has no valid target"
+            )
+
+
 def curated_memory_has_state(target: str) -> bool:
     """Return whether a reset target has canonical or managed import state."""
     if target not in {"all", "memory", "user"}:
@@ -1587,6 +1821,8 @@ def curated_memory_has_state(target: str) -> bool:
     _validate_optional_managed_memory_directories(mem_dir)
     if _has_import_temp_state(mem_dir):
         return True
+    if target == "all" and _has_any_import_receipt_state(mem_dir):
+        return True
     targets = ("memory", "user") if target == "all" else (target,)
     for item in targets:
         if os.path.lexists(mem_dir / _MEMORY_TARGET_FILES[item]):
@@ -1601,8 +1837,9 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
 
     Receipt-provided paths are deliberately ignored. Managed backup and
     displaced names are discovered only in fixed profile-local directories,
-    and directory symlinks are never traversed. A canonical symlink is unlinked
-    as a directory entry; its external target is not touched.
+    and directory symlinks are never traversed. Managed leaves must be regular
+    files; directories, symlinks, and special files fail closed before receipt
+    creation so reset can never report success while unsafe state remains.
     """
     if target not in {"all", "memory", "user"}:
         raise ValueError("target must be all, memory, or user")
@@ -1656,6 +1893,22 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
         expected_home_identity=home_identity,
         expected_mem_identity=mem_identity,
     ) as reset_dirs, ExitStack() as stack:
+        (
+            initial_memory_names,
+            initial_imports_names,
+            initial_backup_names,
+            initial_receipt_targets,
+        ) = reset_dirs.preflight_reset()
+        _validate_reset_candidate_types(
+            reset_dirs,
+            target,
+            initial_memory_names,
+            initial_imports_names,
+            initial_backup_names,
+        )
+        _validate_reset_receipts(
+            target, initial_imports_names, initial_receipt_targets
+        )
         stack.enter_context(
             MemoryStore._file_lock(transaction_path, create_parent=False)
         )
@@ -1672,6 +1925,10 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
             backup_names,
             receipt_targets,
         ) = reset_dirs.preflight_reset()
+        _validate_reset_candidate_types(
+            reset_dirs, target, memory_names, imports_names, backup_names
+        )
+        _validate_reset_receipts(target, imports_names, receipt_targets)
         if _recover_reset_transactions(reset_dirs, memory_names):
             return {
                 "deleted": [],
@@ -1695,8 +1952,12 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
                 return
             directory_fd = _reset_scope_fd(reset_dirs, scope)
             current = _reset_entry_stat(directory_fd, name)
-            if current is None or stat.S_ISDIR(current.st_mode):
+            if current is None:
                 return
+            if not stat.S_ISREG(current.st_mode):
+                raise MemoryImportConflict(
+                    f"reset state {label} must be a regular file"
+                )
             planned.add(key)
             plan.append({
                 "scope": scope,
@@ -1724,7 +1985,13 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
                 if receipt is not None and receipt.get("target") == item:
                     add_plan("imports", name, str(Path(".imports") / name))
 
+        if target == "all":
+            for name in imports_names:
+                if name.endswith(".json"):
+                    add_plan("imports", name, str(Path(".imports") / name))
+
         for scope, names, prefix, relative_dir in (
+            ("memory", memory_names, _IMPORT_LINK_PROBE_PREFIX, Path(".")),
             ("memory", memory_names, ".mem_", Path(".")),
             ("memory", memory_names, ".drift_", Path(".")),
             ("memory", memory_names, ".reset_receipt_", Path(".")),
@@ -1988,9 +2255,27 @@ class MemoryStore:
         stable for the entire session (prefix-cache invariant holds).
         """
         if bounded:
-            mem_dir = _require_profile_memory_directory(create=True)
-            self.memory_entries = self._read_import_file(mem_dir / "MEMORY.md")
-            self.user_entries = self._read_import_file(mem_dir / "USER.md")
+            home = get_hermes_home()
+            if not _require_optional_real_directory(
+                home, label="HERMES_HOME"
+            ):
+                self.memory_entries = []
+                self.user_entries = []
+            else:
+                candidate = home / "memories"
+                if not _require_optional_real_directory(
+                    candidate, label="profile memories directory"
+                ):
+                    self.memory_entries = []
+                    self.user_entries = []
+                else:
+                    mem_dir = _require_profile_memory_directory(create=False)
+                    self.memory_entries = self._read_import_file(
+                        mem_dir / "MEMORY.md"
+                    )
+                    self.user_entries = self._read_import_file(
+                        mem_dir / "USER.md"
+                    )
         else:
             mem_dir = get_memory_dir()
             mem_dir.mkdir(parents=True, exist_ok=True)
@@ -2528,6 +2813,11 @@ class MemoryStore:
         ) as import_dirs, self._file_lock(
             transaction_path, create_parent=False
         ), self._file_lock(path, create_parent=False):
+            # The CAS publish and recovery protocol is hard-link based. Probe
+            # the exact anchored directory under the shared transaction lock.
+            # Lock leaves may exist, but no receipt, backup, displacement, or
+            # imported content can be created before this succeeds.
+            import_dirs.require_import_hardlink_support()
             # Every read and write below is relative to directory descriptors
             # opened before lock acquisition. Path swaps can abort the import,
             # but cannot redirect plaintext into an attacker-controlled tree.

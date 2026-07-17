@@ -50,10 +50,13 @@ def _run_memory_reset(target="all", yes=False, monkeypatch=None, confirm_input="
         files_to_reset.append(("USER.md", "user profile"))
 
     existing = []
-    for f, desc in files_to_reset:
-        item = "memory" if f == "MEMORY.md" else "user"
-        if curated_memory_has_state(item):
-            existing.append((f, desc))
+    if target == "all" and curated_memory_has_state("all"):
+        existing = files_to_reset
+    else:
+        for f, desc in files_to_reset:
+            item = "memory" if f == "MEMORY.md" else "user"
+            if curated_memory_has_state(item):
+                existing.append((f, desc))
     if not existing:
         return "nothing"
 
@@ -137,7 +140,7 @@ class TestMemoryReset:
             reset_called = True
 
         monkeypatch.setattr(
-            memory_tool, "portable_memory_import_supported", lambda: False
+            memory_tool, "portable_memory_reset_supported", lambda: False
         )
         monkeypatch.setattr(memory_tool, "reset_curated_memory", unexpected_reset)
 
@@ -241,3 +244,34 @@ class TestMemoryReset:
         # The memories dir won't exist; get_hermes_home() / "memories" won't have files
         result = _run_memory_reset(target="all", yes=True)
         assert result == "nothing"
+
+    def test_reset_all_cleans_unclassified_receipt(self, tmp_path, monkeypatch):
+        home = tmp_path / ".hermes"
+        imports = home / "memories" / ".imports"
+        imports.mkdir(parents=True)
+        receipt = imports / "corrupt.json"
+        receipt.write_text("{", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        assert _run_memory_reset(target="all", yes=True) == "deleted"
+        assert not receipt.exists()
+
+    def test_cli_reset_all_labels_only_unclassified_recovery_state(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from hermes_cli.main import cmd_memory
+
+        home = tmp_path / ".hermes"
+        imports = home / "memories" / ".imports"
+        imports.mkdir(parents=True)
+        (imports / "corrupt.json").write_text("{", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        cmd_memory(SimpleNamespace(
+            memory_command="reset", target="all", yes=True
+        ))
+
+        output = capsys.readouterr().out
+        assert "managed import recovery state" in output
+        assert "Deleted MEMORY.md" not in output
+        assert "Deleted USER.md" not in output

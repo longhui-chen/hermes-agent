@@ -1736,8 +1736,9 @@ class ZetAgentAdapter(APIServerAdapter):
         local-server does NOT gate chat.steer on this (it always advertises
         capabilities.steer=true on the WS and degrades via the 404 →
         steer_dropped path against an old hermes), but the endpoint contract
-        is that /v1/capabilities lists the callable surface truthfully —
-        external orchestrators discover features here.
+        is that /v1/capabilities lists platform/API availability for external
+        orchestrators. When a profile does not exist yet, target-filesystem
+        publish support is finalized before the first import state mutation.
         """
         resp = await super()._handle_capabilities(request)
         if getattr(resp, "status", 200) != 200:

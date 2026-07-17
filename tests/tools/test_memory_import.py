@@ -1348,6 +1348,110 @@ def test_durability_capability_probe_does_not_create_profile(tmp_path, monkeypat
     assert not home.exists()
 
 
+def test_bounded_store_load_does_not_create_missing_profile(tmp_path, monkeypatch):
+    home = tmp_path / "missing" / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=100, user_char_limit=100)
+
+    store.load_from_disk(bounded=True)
+
+    assert store.memory_entries == []
+    assert store.user_entries == []
+    assert not home.exists()
+
+
+def test_durable_profile_creation_retries_parent_barrier_after_failed_attempt(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "missing" / "deep" / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original_fsync = memory_tool._fsync_directory_fd
+    failed = False
+
+    def fail_first_new_child(directory_fd, path):
+        nonlocal failed
+        if path == tmp_path / "missing" and not failed:
+            failed = True
+            raise OSError(errno.EIO, "simulated parent chain fsync failure")
+        return original_fsync(directory_fd, path)
+
+    monkeypatch.setattr(
+        memory_tool, "_fsync_directory_fd", fail_first_new_child
+    )
+    store = MemoryStore(memory_char_limit=100, user_char_limit=100)
+    with pytest.raises(OSError, match="simulated parent chain"):
+        store.import_replace(
+            target="memory",
+            entries=["safe fact"],
+            import_id="durable-create-retry",
+            payload_sha256=hashlib.sha256(b"durable-create-retry").hexdigest(),
+        )
+    assert (tmp_path / "missing").is_dir()
+
+    barriers = []
+
+    def record_retry(directory_fd, path):
+        barriers.append(path)
+        return original_fsync(directory_fd, path)
+
+    monkeypatch.setattr(memory_tool, "_fsync_directory_fd", record_retry)
+    result = store.import_replace(
+        target="memory",
+        entries=["safe fact"],
+        import_id="durable-create-retry",
+        payload_sha256=hashlib.sha256(b"durable-create-retry").hexdigest(),
+    )
+
+    assert result["status"] == "completed"
+    assert tmp_path in barriers
+    assert tmp_path / "missing" in barriers
+
+
+def test_durable_directory_creation_rebarriers_fileexists_race(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "raced" / "child"
+    original_mkdir = memory_tool.os.mkdir
+    original_fsync = memory_tool._fsync_directory_fd
+    raced = False
+    barriers = []
+
+    def race_mkdir(name, mode=0o777, *, dir_fd=None):
+        nonlocal raced
+        if name == "raced" and not raced:
+            raced = True
+            original_mkdir(name, mode, dir_fd=dir_fd)
+            raise FileExistsError(errno.EEXIST, "concurrent creator")
+        return original_mkdir(name, mode, dir_fd=dir_fd)
+
+    def record_fsync(directory_fd, path):
+        barriers.append(path)
+        return original_fsync(directory_fd, path)
+
+    monkeypatch.setattr(memory_tool.os, "mkdir", race_mkdir)
+    monkeypatch.setattr(memory_tool, "_fsync_directory_fd", record_fsync)
+
+    memory_tool._durably_create_directory_chain(target)
+
+    assert raced is True
+    assert target.is_dir()
+    assert tmp_path in barriers
+    assert tmp_path / "raced" in barriers
+    assert target in barriers
+
+
+def test_durable_directory_creation_rejects_dotdot_components(
+    tmp_path, monkeypatch
+):
+    unsafe = Path(str(tmp_path / "orphan") + "/../target")
+
+    with pytest.raises(MemoryImportConflict, match="dot components"):
+        memory_tool._durably_create_directory_chain(unsafe)
+
+    assert not (tmp_path / "orphan").exists()
+    assert not (tmp_path / "target").exists()
+
+
 def test_durability_capability_is_false_when_directory_fsync_is_unsupported(
     tmp_path, monkeypatch
 ):
@@ -1931,8 +2035,11 @@ def test_memory_import_no_clobber_preserves_edit_after_final_validation(
     assert displaced_path.read_text(encoding="utf-8") == "old fact"
 
 
-@pytest.mark.parametrize("link_errno", [errno.EPERM, errno.ENOTSUP])
-def test_memory_import_link_failure_restores_displaced_with_exclusive_copy(
+@pytest.mark.parametrize(
+    "link_errno",
+    [errno.EPERM, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EXDEV],
+)
+def test_memory_import_hardlink_probe_fails_before_semantic_state(
     tmp_path, monkeypatch, link_errno
 ):
     home = tmp_path / ".hermes"
@@ -1943,14 +2050,14 @@ def test_memory_import_link_failure_restores_displaced_with_exclusive_copy(
     store = MemoryStore(memory_char_limit=100, user_char_limit=100)
     original_link = memory_tool.os.link
 
-    def reject_canonical_hardlinks(source, target, *args, **kwargs):
-        if _link_targets_path(target, kwargs, memory_path):
+    def reject_probe_hardlinks(source, target, *args, **kwargs):
+        if str(source).startswith(memory_tool._IMPORT_LINK_PROBE_PREFIX):
             raise OSError(link_errno, "hard links unavailable")
         return original_link(source, target, *args, **kwargs)
 
-    monkeypatch.setattr(memory_tool.os, "link", reject_canonical_hardlinks)
+    monkeypatch.setattr(memory_tool.os, "link", reject_probe_hardlinks)
 
-    with pytest.raises(RuntimeError, match="Failed to write memory file"):
+    with pytest.raises(MemoryImportUnsupported, match="hard-link support"):
         store.import_replace(
             target="memory",
             entries=["imported fact"],
@@ -1961,11 +2068,108 @@ def test_memory_import_link_failure_restores_displaced_with_exclusive_copy(
         )
 
     assert memory_path.read_text(encoding="utf-8") == "old fact"
-    receipt_path = next((home / "memories" / ".imports").glob("*.json"))
-    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    displaced_path = Path(receipt["displaced_path"])
-    assert receipt["state"] == "prepared"
-    assert displaced_path.read_text(encoding="utf-8") == "old fact"
+    assert not (memory_path.parent / ".imports").exists()
+    assert not list(memory_path.parent.glob("*.displaced"))
+    assert not list(
+        memory_path.parent.glob(f"{memory_tool._IMPORT_LINK_PROBE_PREFIX}*")
+    )
+    assert memory_tool.portable_memory_import_supported() is False
+
+
+def test_memory_import_hardlink_probe_does_not_classify_access_denied_as_unsupported(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memory_path = home / "memories" / "MEMORY.md"
+    memory_path.parent.mkdir(parents=True)
+    memory_path.write_text("old fact", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=100, user_char_limit=100)
+    original_link = memory_tool.os.link
+    def reject_probe_hardlinks(source, target, *args, **kwargs):
+        if str(source).startswith(memory_tool._IMPORT_LINK_PROBE_PREFIX):
+            raise OSError(errno.EACCES, "access denied")
+        return original_link(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(memory_tool.os, "link", reject_probe_hardlinks)
+
+    with pytest.raises(OSError) as raised:
+        store.import_replace(
+            target="memory",
+            entries=["imported fact"],
+            import_id="link-access-denied",
+            payload_sha256=hashlib.sha256(b"link-access-denied").hexdigest(),
+        )
+
+    assert raised.value.errno == errno.EACCES
+    assert memory_path.read_text(encoding="utf-8") == "old fact"
+    assert not (memory_path.parent / ".imports").exists()
+    assert not list(memory_path.parent.glob("*.displaced"))
+    assert not list(
+        memory_path.parent.glob(f"{memory_tool._IMPORT_LINK_PROBE_PREFIX}*")
+    )
+    assert memory_tool.portable_memory_import_supported() is True
+
+
+def test_memory_import_probe_and_reset_are_serialized_by_transaction_lock(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    (memories / "MEMORY.md").write_text("old fact", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    store = MemoryStore(memory_char_limit=100, user_char_limit=100)
+    original_probe = memory_tool._ImportDirectoryHandles.require_import_hardlink_support
+    probe_entered = threading.Event()
+    release_probe = threading.Event()
+    import_result = []
+    reset_result = []
+    reset_errors = []
+
+    def blocking_probe(handles):
+        probe_entered.set()
+        assert release_probe.wait(5)
+        return original_probe(handles)
+
+    monkeypatch.setattr(
+        memory_tool._ImportDirectoryHandles,
+        "require_import_hardlink_support",
+        blocking_probe,
+    )
+
+    importer = threading.Thread(
+        target=lambda: import_result.append(store.import_replace(
+            target="memory",
+            entries=["imported fact"],
+            import_id="serialized-probe",
+            payload_sha256=hashlib.sha256(b"serialized-probe").hexdigest(),
+        ))
+    )
+    def run_reset():
+        try:
+            reset_result.append(reset_curated_memory("memory"))
+        except BaseException as exc:
+            reset_errors.append(exc)
+
+    resetter = threading.Thread(target=run_reset)
+    importer.start()
+    assert probe_entered.wait(5)
+    resetter.start()
+    resetter.join(0.1)
+    assert resetter.is_alive()
+    release_probe.set()
+    importer.join(5)
+    resetter.join(5)
+
+    assert import_result[0]["status"] == "completed"
+    # Reset's pre-lock directory snapshot may deliberately conflict after the
+    # serialized import creates .imports. It must not race through mutation;
+    # a fresh retry sees the completed state and removes it transactionally.
+    assert reset_result == []
+    assert isinstance(reset_errors[0], MemoryImportConflict)
+    assert reset_curated_memory("memory")["status"] == "completed"
+    assert curated_memory_has_state("memory") is False
 
 
 def test_memory_import_link_failure_does_not_overwrite_concurrent_winner(
@@ -2148,7 +2352,9 @@ def test_memory_import_reset_removes_only_target_state(tmp_path, monkeypatch):
     assert all(path.exists() for path in user_paths)
 
 
-def test_memory_reset_does_not_follow_symlinks_or_receipt_paths(tmp_path, monkeypatch):
+def test_memory_reset_rejects_symlink_state_without_following_receipt_paths(
+    tmp_path, monkeypatch
+):
     home = tmp_path / ".hermes"
     memories = home / "memories"
     imports = memories / ".imports"
@@ -2173,14 +2379,96 @@ def test_memory_reset_does_not_follow_symlinks_or_receipt_paths(tmp_path, monkey
         "displaced_path": str(outside_displaced),
     }), encoding="utf-8")
 
-    reset_curated_memory("memory")
+    assert curated_memory_has_state("memory") is True
+    with pytest.raises(MemoryImportConflict, match="regular file"):
+        reset_curated_memory("memory")
 
-    assert not os.path.lexists(memories / "MEMORY.md")
-    assert not os.path.lexists(backups / "memory-malicious.bak")
-    assert not receipt_path.exists()
+    assert os.path.lexists(memories / "MEMORY.md")
+    assert os.path.lexists(backups / "memory-malicious.bak")
+    assert receipt_path.exists()
     assert outside_memory.read_text(encoding="utf-8") == "outside memory"
     assert outside_backup.read_text(encoding="utf-8") == "outside backup"
     assert outside_displaced.read_text(encoding="utf-8") == "outside displaced"
+
+
+@pytest.mark.parametrize(
+    "receipt_text",
+    ["{", "[]", "{}", json.dumps({"target": "bogus"})],
+)
+def test_reset_all_removes_unclassified_receipt_but_single_target_fails_closed(
+    tmp_path, monkeypatch, receipt_text
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    imports = memories / ".imports"
+    imports.mkdir(parents=True)
+    receipt = imports / "corrupt.json"
+    receipt.write_text(receipt_text, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert curated_memory_has_state("all") is True
+    for target in ("memory", "user"):
+        with pytest.raises(MemoryImportConflict, match="valid target"):
+            curated_memory_has_state(target)
+        with pytest.raises(MemoryImportConflict, match="valid target"):
+            reset_curated_memory(target)
+        assert receipt.exists()
+        assert not (memories / ".curated-memory-transaction.lock").exists()
+        assert not list(memories.glob(f"{memory_tool._RESET_RECEIPT_PREFIX}*"))
+        assert not list(memories.glob(f"{memory_tool._RESET_STAGE_PREFIX}*"))
+
+    result = reset_curated_memory("all")
+    assert result["status"] == "completed"
+    assert not receipt.exists()
+
+
+@pytest.mark.parametrize(
+    "artifact", ["canonical", "displaced", "backup", "receipt", "temp"]
+)
+@pytest.mark.parametrize("leaf_kind", ["directory", "symlink", "fifo"])
+def test_reset_rejects_non_regular_managed_artifact_before_any_mutation(
+    tmp_path, monkeypatch, artifact, leaf_kind
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    backups = memories / ".imports" / "backups"
+    backups.mkdir(parents=True)
+    paths = {
+        "canonical": memories / "MEMORY.md",
+        "displaced": memories / ".MEMORY.md.matrix.displaced",
+        "backup": backups / "memory-matrix.bak",
+        "receipt": memories / ".imports" / "matrix.json",
+        "temp": memories / ".mem_matrix.tmp",
+    }
+    managed = paths[artifact]
+    outside = tmp_path / f"outside-{artifact}-{leaf_kind}"
+    outside.write_text("outside survives", encoding="utf-8")
+    if leaf_kind == "directory":
+        managed.mkdir()
+        (managed / "secret").write_text("private", encoding="utf-8")
+    elif leaf_kind == "symlink":
+        managed.symlink_to(outside)
+    else:
+        os.mkfifo(managed)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    if artifact == "receipt":
+        with pytest.raises(MemoryImportConflict, match="regular file"):
+            curated_memory_has_state("memory")
+    else:
+        assert curated_memory_has_state("memory") is True
+    with pytest.raises(MemoryImportConflict, match="regular file"):
+        reset_curated_memory("memory")
+
+    assert os.path.lexists(managed)
+    if leaf_kind == "directory":
+        assert (managed / "secret").read_text(encoding="utf-8") == "private"
+    assert outside.read_text(encoding="utf-8") == "outside survives"
+    assert not (memories / ".curated-memory-transaction.lock").exists()
+    assert not (memories / "MEMORY.md.lock").exists()
+    assert not (memories / "USER.md.lock").exists()
+    assert not list(memories.glob(f"{memory_tool._RESET_RECEIPT_PREFIX}*"))
+    assert not list(memories.glob(f"{memory_tool._RESET_STAGE_PREFIX}*"))
 
 
 def test_memory_reset_does_not_traverse_symlinked_backup_directory(tmp_path, monkeypatch):

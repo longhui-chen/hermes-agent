@@ -87,6 +87,80 @@ async def test_memory_import_durability_race_returns_unsupported(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_capabilities_get_never_runs_mutating_hardlink_probe(
+    tmp_path, monkeypatch
+):
+    import tools.memory_tool as memory_tool
+
+    home = tmp_path / ".hermes"
+    (home / "memories").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    def unexpected_link(*_args, **_kwargs):
+        raise AssertionError("capabilities GET attempted a hardlink probe")
+
+    monkeypatch.setattr(memory_tool.os, "link", unexpected_link)
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    app = web.Application()
+    app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.get(
+            "/v1/capabilities",
+            headers={"Authorization": "Bearer test-key"},
+        )
+
+    assert response.status == 200
+    assert not list(
+        (home / "memories").glob(
+            f"{memory_tool._IMPORT_LINK_PROBE_PREFIX}*"
+        )
+    )
+    assert not list((home / "memories").glob("*.lock"))
+
+
+@pytest.mark.asyncio
+async def test_memory_import_hardlink_probe_failure_returns_501_before_state(
+    tmp_path, monkeypatch
+):
+    import tools.memory_tool as memory_tool
+
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    canonical = memories / "MEMORY.md"
+    canonical.write_text("old fact", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original_link = memory_tool.os.link
+
+    def reject_probe(source, target, *args, **kwargs):
+        if str(source).startswith(memory_tool._IMPORT_LINK_PROBE_PREFIX):
+            raise OSError(memory_tool.errno.ENOTSUP, "hardlinks unavailable")
+        return original_link(source, target, *args, **kwargs)
+
+    monkeypatch.setattr(memory_tool.os, "link", reject_probe)
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    response = await adapter._handle_memory_import(_DirectImportRequest({
+        "import_id": "hardlink-unsupported",
+        "mode": "replace",
+        "target": "memory",
+        "payload_sha256": hashlib.sha256(b"hardlink-unsupported").hexdigest(),
+        "entries": ["safe fact"],
+    }))
+
+    assert response.status == 501
+    assert json.loads(response.text)["error"]["code"] == "memory_import_unsupported"
+    assert canonical.read_text(encoding="utf-8") == "old fact"
+    assert not (memories / ".imports").exists()
+    assert not list(memories.glob("*.displaced"))
+    assert not list(memories.glob(f"{memory_tool._IMPORT_LINK_PROBE_PREFIX}*"))
+
+
+@pytest.mark.asyncio
 async def test_completed_transcript_http_flow_requires_auth_and_commits_atomically(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))

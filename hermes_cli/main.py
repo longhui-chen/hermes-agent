@@ -12305,14 +12305,15 @@ def cmd_memory(args):
     elif sub == "reset":
         from hermes_constants import get_hermes_home, display_hermes_home
         from tools.memory_tool import (
+            MemoryImportConflict,
             curated_memory_has_state,
-            portable_memory_import_supported,
+            portable_memory_reset_supported,
             reset_curated_memory,
         )
 
         mem_dir = get_hermes_home() / "memories"
         target = getattr(args, "target", "all")
-        if not portable_memory_import_supported():
+        if not portable_memory_reset_supported():
             print(
                 "\n  ! Durable memory reset is unsupported on this platform or "
                 "profile filesystem."
@@ -12327,10 +12328,27 @@ def cmd_memory(args):
 
         # Check what exists
         existing = []
+        unclassified_recovery = False
+        has_any = curated_memory_has_state("all") if target == "all" else None
         for f, desc in files_to_reset:
             item = "memory" if f == "MEMORY.md" else "user"
-            if curated_memory_has_state(item):
-                existing.append((f, desc))
+            try:
+                if curated_memory_has_state(item):
+                    existing.append((f, desc))
+            except MemoryImportConflict:
+                if target != "all":
+                    raise
+                unclassified_recovery = True
+        if unclassified_recovery:
+            existing.append((
+                "managed import recovery state",
+                "unclassified import receipt",
+            ))
+        if target == "all" and has_any and not existing:
+            existing.append((
+                "managed import recovery state",
+                "profile-local transaction residue",
+            ))
         if not existing:
             print(
                 f"\n  Nothing to reset — no memory files found in {display_hermes_home()}/memories/\n"
