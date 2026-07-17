@@ -123,6 +123,19 @@
       chown "$HERMES_UID:$HERMES_GID" "$TARGET_HOME"
       chmod 0750 "$TARGET_HOME"
 
+      # Publish the exact shared profile identity from this root entrypoint.
+      # The unprivileged Hermes process cannot replace this trust anchor.
+      install -d -o root -g root -m 0755 /run/hermes-agent
+      (
+        umask 077
+        TRUST_TMP=/run/hermes-agent/.profile-trust.tmp
+        printf 'version=1\nhome=%s\nuid=%s\ngid=%s\n' \
+          "$HERMES_HOME" "$HERMES_UID" "$HERMES_GID" > "$TRUST_TMP"
+        chown root:root "$TRUST_TMP"
+        chmod 0444 "$TRUST_TMP"
+        mv -f "$TRUST_TMP" /run/hermes-agent/profile-trust
+      )
+
       # Ensure HERMES_HOME is owned by the target user.
       # Use find instead of chown -R: chown strips the setgid bit (kernel
       # behavior), destroying the 2770 permissions the NixOS activation
@@ -716,6 +729,8 @@
           "d ${cfg.stateDir}/.hermes/sessions 2770 ${cfg.user} ${cfg.group} - -"
           "d ${cfg.stateDir}/.hermes/logs   2770 ${cfg.user} ${cfg.group} - -"
           "d ${cfg.stateDir}/.hermes/memories 2770 ${cfg.user} ${cfg.group} - -"
+          "d ${cfg.stateDir}/.hermes/memories/.imports 2770 ${cfg.user} ${cfg.group} - -"
+          "d ${cfg.stateDir}/.hermes/memories/.imports/backups 2770 ${cfg.user} ${cfg.group} - -"
           "d ${cfg.stateDir}/.hermes/plugins 2770 ${cfg.user} ${cfg.group} - -"
           "d ${cfg.stateDir}/home           0750 ${cfg.user} ${cfg.group} - -"
           "d ${cfg.workingDirectory}         2770 ${cfg.user} ${cfg.group} - -"
@@ -733,6 +748,23 @@
           chmod 2770 ${cfg.stateDir} ${cfg.stateDir}/.hermes ${cfg.workingDirectory}
           chmod 0750 ${cfg.stateDir}/home
 
+          # Root-owned trust anchor for the intentionally group-writable profile.
+          # It binds the permission exception to this exact HERMES_HOME and the
+          # owner/group assigned above; process-controlled environment variables
+          # are deliberately not trusted for this decision.
+          install -d -o root -g root -m 0755 /run/hermes-agent
+          (
+            umask 077
+            TRUST_TMP=/run/hermes-agent/.profile-trust.tmp
+            printf 'version=1\nhome=%s\nuid=%s\ngid=%s\n' \
+              '${cfg.stateDir}/.hermes' \
+              "$(stat -c %u ${cfg.stateDir}/.hermes)" \
+              "$(stat -c %g ${cfg.stateDir}/.hermes)" > "$TRUST_TMP"
+            chown root:root "$TRUST_TMP"
+            chmod 0444 "$TRUST_TMP"
+            mv -f "$TRUST_TMP" /run/hermes-agent/profile-trust
+          )
+
           # Create subdirs, set setgid + group-writable, migrate existing files.
           # Nix-managed .env/.managed stay 0640/0644; config.yaml uses
           # configYamlMode (0660 under addToSystemPackages, else 0640).
@@ -746,6 +778,13 @@
             find "${cfg.stateDir}/.hermes/$_subdir" -type f \
               -exec chmod g+rw {} + 2>/dev/null || true
           done
+          mkdir -p ${cfg.stateDir}/.hermes/memories/.imports/backups
+          chown ${cfg.user}:${cfg.group} \
+            ${cfg.stateDir}/.hermes/memories/.imports \
+            ${cfg.stateDir}/.hermes/memories/.imports/backups
+          chmod 2770 \
+            ${cfg.stateDir}/.hermes/memories/.imports \
+            ${cfg.stateDir}/.hermes/memories/.imports/backups
 
           # Merge Nix settings into existing config.yaml.
           # Preserves user-added keys (skills, streaming, etc.); Nix keys win.

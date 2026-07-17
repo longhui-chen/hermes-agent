@@ -65,6 +65,88 @@ _LINK_COPY_FALLBACK_ERRNOS = {
     getattr(errno, "ENOTSUP", errno.EPERM),
     getattr(errno, "EOPNOTSUPP", errno.EPERM),
 }
+_MANAGED_PROFILE_TRUST_PATH = Path("/run/hermes-agent/profile-trust")
+_MANAGED_PROFILE_TRUST_MAX_BYTES = 4096
+
+
+def _managed_profile_trust() -> Optional[tuple[Path, int, int]]:
+    """Read the root-owned NixOS trust anchor for a shared profile tree."""
+    if os.name == "nt":
+        return None
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    try:
+        fd = os.open(_MANAGED_PROFILE_TRUST_PATH, flags)
+    except OSError:
+        return None
+    try:
+        opened = os.fstat(fd)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != 0
+            or stat.S_IMODE(opened.st_mode) & 0o022
+            or opened.st_size > _MANAGED_PROFILE_TRUST_MAX_BYTES
+        ):
+            return None
+        raw = os.read(fd, _MANAGED_PROFILE_TRUST_MAX_BYTES + 1)
+        if len(raw) > _MANAGED_PROFILE_TRUST_MAX_BYTES:
+            return None
+    finally:
+        os.close(fd)
+    try:
+        fields = {}
+        for line in raw.decode("utf-8").splitlines():
+            key, value = line.split("=", 1)
+            if key in fields:
+                return None
+            fields[key] = value
+        if set(fields) != {"version", "home", "uid", "gid"}:
+            return None
+        if fields["version"] != "1":
+            return None
+        uid = int(fields["uid"])
+        gid = int(fields["gid"])
+        if uid < 0 or gid < 0 or not fields["home"].startswith("/"):
+            return None
+        trusted_home = Path(os.path.realpath(fields["home"]))
+        if Path(os.path.realpath(get_hermes_home())) != trusted_home:
+            return None
+        return trusted_home, uid, gid
+    except (UnicodeDecodeError, ValueError):
+        return None
+
+
+def _secure_profile_directory_owner(current: os.stat_result) -> bool:
+    """Accept private ownership or one exact root-configured shared identity."""
+    mode = stat.S_IMODE(current.st_mode)
+    if mode & stat.S_IWOTH:
+        return False
+    trusted = _managed_profile_trust()
+    trusted_process = (
+        trusted is not None
+        and (
+            not hasattr(os, "geteuid")
+            or os.geteuid() == trusted[1]
+            or os.getegid() == trusted[2]
+            or trusted[2] in os.getgroups()
+        )
+    )
+    if mode & stat.S_IWGRP:
+        return (
+            trusted_process
+            and current.st_uid == trusted[1]
+            and current.st_gid == trusted[2]
+        )
+    if hasattr(os, "geteuid") and current.st_uid == os.geteuid():
+        return True
+    return (
+        trusted_process
+        and current.st_uid == trusted[1]
+        and current.st_gid == trusted[2]
+    )
 
 
 def _path_identity(path: Path) -> tuple[int, int]:
@@ -255,13 +337,12 @@ class _ImportDirectoryHandles:
             raise MemoryImportConflict(
                 f"managed memory directory {name} must be a real directory"
             )
-        if (
-            hasattr(os, "geteuid") and opened.st_uid != os.geteuid()
-        ) or stat.S_IMODE(opened.st_mode) & 0o022:
+        if not _secure_profile_directory_owner(opened):
             os.close(fd)
             raise MemoryImportConflict(
                 f"managed memory directory {name} must be owned by this user "
-                "and not group/world writable"
+                "and not group/world writable unless it exactly matches the "
+                "root-configured profile owner/group"
             )
         return fd
 
@@ -829,15 +910,10 @@ def _require_real_directory(
         raise MemoryImportConflict(f"{label} does not exist") from exc
     if not stat.S_ISDIR(current.st_mode):
         raise MemoryImportConflict(f"{label} must be a real directory, not a symlink")
-    if secure_owner and (
-        (
-            hasattr(os, "geteuid")
-            and current.st_uid != os.geteuid()
-        )
-        or stat.S_IMODE(current.st_mode) & 0o022
-    ):
+    if secure_owner and not _secure_profile_directory_owner(current):
         raise MemoryImportConflict(
-            f"{label} must be owned by this user and not group/world writable"
+            f"{label} must be owned by this user and not group/world writable "
+            "unless it exactly matches the root-configured profile owner/group"
         )
 
 

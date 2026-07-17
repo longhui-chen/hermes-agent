@@ -1825,6 +1825,141 @@ def test_managed_profile_security_does_not_reject_unmanaged_system_ancestors(
     assert resolved == memories
 
 
+def test_managed_profile_accepts_exact_root_configured_group_write(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    backups = memories / ".imports" / "backups"
+    backups.mkdir(parents=True)
+    for directory in (home, memories, memories / ".imports", backups):
+        directory.chmod(0o2770)
+    current = home.stat()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        memory_tool,
+        "_managed_profile_trust",
+        lambda: (home.resolve(), current.st_uid, current.st_gid),
+    )
+
+    resolved, home_identity, mem_identity = (
+        memory_tool._require_profile_memory_snapshot(create=True)
+    )
+    with memory_tool._ImportDirectoryHandles(
+        resolved,
+        create_managed=False,
+        expected_home_identity=home_identity,
+        expected_mem_identity=mem_identity,
+    ) as handles:
+        assert handles.imports_fd >= 0
+        assert handles.backup_fd >= 0
+
+
+@pytest.mark.parametrize("unsafe_kind", ["arbitrary-group", "world-writable"])
+def test_managed_profile_trust_does_not_accept_arbitrary_write(
+    tmp_path, monkeypatch, unsafe_kind
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    home.chmod(0o2770)
+    memories.chmod(0o2770 if unsafe_kind == "arbitrary-group" else 0o2777)
+    current = home.stat()
+    trusted_gid = current.st_gid + 1 if unsafe_kind == "arbitrary-group" else current.st_gid
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        memory_tool,
+        "_managed_profile_trust",
+        lambda: (home.resolve(), current.st_uid, trusted_gid),
+    )
+
+    with pytest.raises(MemoryImportConflict, match="root-configured"):
+        memory_tool._require_profile_memory_snapshot(create=True)
+
+
+def test_process_environment_cannot_declare_a_trusted_profile_group(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    home.chmod(0o2770)
+    memories.chmod(0o2770)
+    current = home.stat()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_HOME_TRUSTED_UID", str(current.st_uid))
+    monkeypatch.setenv("HERMES_HOME_TRUSTED_GID", str(current.st_gid))
+    monkeypatch.setattr(memory_tool, "_MANAGED_PROFILE_TRUST_PATH", tmp_path / "missing")
+
+    with pytest.raises(MemoryImportConflict, match="root-configured"):
+        memory_tool._require_profile_memory_snapshot(create=True)
+
+
+def test_managed_profile_trust_requires_root_owned_readonly_anchor(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    owner = home.stat()
+    trust = tmp_path / "profile-trust"
+    trust.write_text(
+        f"version=1\nhome={home}\nuid={owner.st_uid}\ngid={owner.st_gid}\n",
+        encoding="utf-8",
+    )
+    trust.chmod(0o444)
+    trust_inode = trust.stat().st_ino
+    original_fstat = memory_tool.os.fstat
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(memory_tool, "_MANAGED_PROFILE_TRUST_PATH", trust)
+
+    def fstat_with_owner(uid):
+        def adjusted(fd):
+            current = original_fstat(fd)
+            if current.st_ino != trust_inode:
+                return current
+            values = list(current)
+            values[4] = uid
+            return os.stat_result(values)
+
+        return adjusted
+
+    monkeypatch.setattr(memory_tool.os, "fstat", fstat_with_owner(1))
+    assert memory_tool._managed_profile_trust() is None
+
+    monkeypatch.setattr(memory_tool.os, "fstat", fstat_with_owner(0))
+    assert memory_tool._managed_profile_trust() == (
+        home.resolve(),
+        owner.st_uid,
+        owner.st_gid,
+    )
+
+    trust.chmod(0o464)
+    assert memory_tool._managed_profile_trust() is None
+
+
+def test_root_configured_profile_trust_rejects_outsider_process(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    home.chmod(0o2770)
+    memories.chmod(0o2770)
+    current = home.stat()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        memory_tool,
+        "_managed_profile_trust",
+        lambda: (home.resolve(), current.st_uid, current.st_gid),
+    )
+    monkeypatch.setattr(memory_tool.os, "geteuid", lambda: current.st_uid + 1)
+    monkeypatch.setattr(memory_tool.os, "getegid", lambda: current.st_gid + 1)
+    monkeypatch.setattr(memory_tool.os, "getgroups", lambda: [])
+
+    with pytest.raises(MemoryImportConflict, match="root-configured"):
+        memory_tool._require_profile_memory_snapshot(create=True)
+
+
 def test_durable_directory_creation_rejects_dotdot_components(
     tmp_path, monkeypatch
 ):
