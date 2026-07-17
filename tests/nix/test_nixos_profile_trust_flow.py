@@ -306,6 +306,10 @@ def test_nixos_module_uses_nofollow_helper_for_transaction_directories():
     assert "--recursive-ownership" in source
     assert "--shared-file-modes" in source
     assert 'find "$HERMES_HOME"' not in source
+    assert '"$PROFILE_UID" \\' in source
+    assert '"$PROFILE_GID" > "$TRUST_TMP"' in source
+    assert "stat -c %u ${profileHomeShell}" not in source
+    assert "stat -c %g ${profileHomeShell}" not in source
 
 
 def test_container_gid_uses_configured_group_for_host_users():
@@ -315,4 +319,9 @@ def test_container_gid_uses_configured_group_for_host_users():
     assert source.count(configured_gid) >= 2
     assert "id -g ${cfg.user}" not in source
     assert "users.users = lib.genAttrs cfg.container.hostUsers" in source
-    assert "schema = 5" in source
+    assert "schema = 6" in source
+    assert "user = cfg.user" in source
+    assert "group = cfg.group" in source
+    assert 'EXPECTED_CONTAINER_IDENTITY="${containerIdentity}:$HERMES_UID:$HERMES_GID"' in source
+    assert '"$(cat ${identityFile})" != "$EXPECTED_CONTAINER_IDENTITY"' in source
+    assert 'echo "$EXPECTED_CONTAINER_IDENTITY" > ${identityFile}' in source

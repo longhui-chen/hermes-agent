@@ -209,10 +209,12 @@
     # Package and entrypoint use stable symlinks (current-package, current-entrypoint)
     # so they can update without recreation. Env vars go through $HERMES_HOME/.env.
     containerIdentity = builtins.hashString "sha256" (builtins.toJSON {
-      schema = 5; # 5: container group identity follows cfg.group, not user's primary group
+      schema = 6; # 6: identity also binds configured and resolved service uid/gid
       image = cfg.container.image;
       extraVolumes = cfg.container.extraVolumes;
       extraOptions = cfg.container.extraOptions;
+      user = cfg.user;
+      group = cfg.group;
     });
 
     identityFile = "${cfg.stateDir}/.container-identity";
@@ -758,8 +760,8 @@
             TRUST_TMP=/run/hermes-agent/.profile-trust.tmp
             printf 'version=1\nhome=%s\nuid=%s\ngid=%s\n' \
               ${profileHomeShell} \
-              "$(stat -c %u ${profileHomeShell})" \
-              "$(stat -c %g ${profileHomeShell})" > "$TRUST_TMP"
+              "$PROFILE_UID" \
+              "$PROFILE_GID" > "$TRUST_TMP"
             chown root:root "$TRUST_TMP"
             chmod 0444 "$TRUST_TMP"
             mv -f "$TRUST_TMP" /run/hermes-agent/profile-trust
@@ -969,21 +971,23 @@
             ${pkgs.nix}/bin/nix-store --add-root ${cfg.stateDir}/.gc-root --indirect -r ${effectivePackage} 2>/dev/null || true
             ${pkgs.nix}/bin/nix-store --add-root ${cfg.stateDir}/.gc-root-entrypoint --indirect -r ${containerEntrypoint} 2>/dev/null || true
 
+            # Numeric mappings can drift even when the configured names stay the
+            # same, so they are part of the persisted container rebuild key.
+            HERMES_UID=$(${pkgs.coreutils}/bin/id -u ${lib.escapeShellArg cfg.user})
+            HERMES_GID=$(${pkgs.glibc.bin}/bin/getent group ${lib.escapeShellArg cfg.group} | ${pkgs.coreutils}/bin/cut -d: -f3)
+            EXPECTED_CONTAINER_IDENTITY="${containerIdentity}:$HERMES_UID:$HERMES_GID"
+
             # Check if container needs (re)creation
             NEED_CREATE=false
             if ! ${containerBin} inspect ${containerName} &>/dev/null; then
               NEED_CREATE=true
-            elif [ ! -f ${identityFile} ] || [ "$(cat ${identityFile})" != "${containerIdentity}" ]; then
+            elif [ ! -f ${identityFile} ] || [ "$(cat ${identityFile})" != "$EXPECTED_CONTAINER_IDENTITY" ]; then
               echo "Container config changed, recreating..."
               ${containerBin} rm -f ${containerName} || true
               NEED_CREATE=true
             fi
 
             if [ "$NEED_CREATE" = "true" ]; then
-              # Resolve numeric UID/GID — passed to entrypoint for in-container user setup
-              HERMES_UID=$(${pkgs.coreutils}/bin/id -u ${lib.escapeShellArg cfg.user})
-              HERMES_GID=$(${pkgs.glibc.bin}/bin/getent group ${lib.escapeShellArg cfg.group} | ${pkgs.coreutils}/bin/cut -d: -f3)
-
               echo "Creating container..."
               ${containerBin} create \
                 --name ${containerName} \
@@ -1003,7 +1007,7 @@
                 ${cfg.container.image} \
                 ${containerDataDir}/current-package/bin/hermes gateway run --replace ${lib.concatStringsSep " " cfg.extraArgs}
 
-              echo "${containerIdentity}" > ${identityFile}
+              echo "$EXPECTED_CONTAINER_IDENTITY" > ${identityFile}
             fi
           '';
 
