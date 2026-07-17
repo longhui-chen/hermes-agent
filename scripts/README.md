@@ -18,3 +18,11 @@ packaging contract only:
 Do not use this script as a replacement for `hermes doctor`. It must not probe
 user config, credentials, external services, system packages, or optional
 provider backends.
+
+## `check_zpk_stage.py`
+
+Checks the staged `hermes-agent` tree after the Makefile copies it into
+`zpk/lib/hermes-agent`. It compares regular files under the source `plugins/`
+and `venv/` runtime trees with the staged copies and fails when tar exclusions
+remove nested runtime content. Deliberately excluded caches, bytecode,
+development environments, egg metadata, ZPK stamps, and symlinks are ignored.
