@@ -1610,7 +1610,27 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
         _require_durable_profile_filesystem()
     )
     mem_dir = get_memory_dir()
-    if not _is_real_directory(mem_dir):
+    memory_exists = _require_optional_real_directory(
+        mem_dir, label="profile memories directory"
+    )
+    if not memory_exists:
+        if expected_mem_identity is not None:
+            raise MemoryImportConflict(
+                "profile memories directory changed after durability probe"
+            )
+        if expected_home_identity is not None:
+            try:
+                home_unchanged = (
+                    _path_identity(get_hermes_home()) == expected_home_identity
+                )
+            except OSError as exc:
+                raise MemoryImportConflict(
+                    f"HERMES_HOME changed after durability probe: {exc}"
+                ) from exc
+            if not home_unchanged:
+                raise MemoryImportConflict(
+                    "HERMES_HOME changed after durability probe"
+                )
         return {"deleted": [], "targets": [], "status": "completed"}
     mem_dir, home_identity, mem_identity = _require_profile_memory_snapshot(
         create=False,

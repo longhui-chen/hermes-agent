@@ -1433,6 +1433,45 @@ def test_missing_profile_is_the_only_false_empty_reset_case(tmp_path, monkeypatc
     assert not home.exists()
 
 
+@pytest.mark.parametrize("replacement_kind", ["symlink", "file"])
+def test_reset_rejects_unsafe_memories_leaf_created_after_probe(
+    tmp_path, monkeypatch, replacement_kind
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    memories = home / "memories"
+    outside = tmp_path / "outside-after-probe"
+    outside.mkdir()
+    victim = outside / "MEMORY.md"
+    victim.write_text("outside survives", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original_probe = memory_tool._require_durable_profile_filesystem
+    injected = False
+
+    def inject_unsafe_leaf_after_probe():
+        nonlocal injected
+        identities = original_probe()
+        if not injected:
+            injected = True
+            if replacement_kind == "symlink":
+                memories.symlink_to(outside, target_is_directory=True)
+            else:
+                memories.write_text("not a directory", encoding="utf-8")
+        return identities
+
+    monkeypatch.setattr(
+        memory_tool,
+        "_require_durable_profile_filesystem",
+        inject_unsafe_leaf_after_probe,
+    )
+
+    with pytest.raises(MemoryImportConflict, match="real directory"):
+        reset_curated_memory("memory")
+
+    assert victim.read_text(encoding="utf-8") == "outside survives"
+    assert injected is True
+
+
 def test_memory_import_rejects_poison_and_overflow_without_writing(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     monkeypatch.setenv("HERMES_HOME", str(home))
