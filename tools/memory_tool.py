@@ -1876,15 +1876,16 @@ def _reset_all_receipt_entries(
             continue
         try:
             receipt = handles.read_receipt(handles.mem_fd, receipt_name)
-        except MemoryImportConflict:
-            # Unreadable receipt bytes cannot safely authorize arbitrary source
-            # names. Their own fixed name and fixed-prefix stages are still
-            # collected by reset-all's ordinary residue scan.
-            continue
+        except MemoryImportConflict as exc:
+            raise MemoryImportConflict(
+                f"cannot safely enumerate reset-all receipt {receipt_name}"
+            ) from exc
         if not isinstance(receipt, dict) or not isinstance(
             receipt.get("plan"), list
         ):
-            continue
+            raise MemoryImportConflict(
+                f"cannot safely enumerate reset-all receipt {receipt_name}"
+            )
         try:
             _state, plan = _validate_reset_receipt(
                 receipt,
@@ -2122,6 +2123,11 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
         _validate_reset_receipts(
             target, initial_imports_names, initial_receipt_targets
         )
+        if target == "all":
+            # Reject an unenumerable reset receipt before lock files or a new
+            # transaction can be created. The same bounded parse is repeated
+            # under the transaction locks below to bind the deletion plan.
+            _reset_all_receipt_entries(reset_dirs, initial_memory_names)
         stack.enter_context(
             MemoryStore._file_lock(transaction_path, create_parent=False)
         )

@@ -2540,7 +2540,7 @@ def test_reset_all_removes_unclassified_receipt_but_single_target_fails_closed(
     assert not receipt.exists()
 
 
-def test_reset_all_removes_corrupt_reset_transaction_and_all_fixed_stages(
+def test_corrupt_reset_transaction_is_fail_closed_with_all_fixed_stages(
     tmp_path, monkeypatch
 ):
     home = tmp_path / ".hermes"
@@ -2573,8 +2573,9 @@ def test_reset_all_removes_corrupt_reset_transaction_and_all_fixed_stages(
         )
     )
 
-    assert reset_curated_memory("all")["status"] == "completed"
-    assert not any(
+    with pytest.raises(MemoryImportConflict, match="cannot safely enumerate"):
+        reset_curated_memory("all")
+    assert all(
         os.path.lexists(path)
         for path in (
             canonical,
@@ -2584,6 +2585,49 @@ def test_reset_all_removes_corrupt_reset_transaction_and_all_fixed_stages(
             backups_stage,
         )
     )
+    assert curated_memory_has_state("all") is True
+
+
+@pytest.mark.parametrize(
+    "receipt_text",
+    [
+        "{",
+        json.dumps({"state": "staging"}),
+        json.dumps({"state": "staging", "plan": {}}),
+    ],
+    ids=["invalid-json", "missing-plan", "non-array-plan"],
+)
+def test_unenumerable_reset_receipt_never_false_clears_opaque_source(
+    tmp_path, monkeypatch, receipt_text
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    imports = memories / ".imports"
+    backups = imports / "backups"
+    backups.mkdir(parents=True)
+    source = backups / "opaque-private-snapshot.bin"
+    stage = memories / f"{memory_tool._RESET_STAGE_PREFIX}opaque-unknown"
+    receipt = memories / f"{memory_tool._RESET_RECEIPT_PREFIX}opaque-unknown.json"
+    source.write_text("opaque private source", encoding="utf-8")
+    stage.write_text("unknown private stage", encoding="utf-8")
+    receipt.write_text(receipt_text, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    before = {
+        path: sorted(os.listdir(path))
+        for path in (memories, imports, backups)
+    }
+
+    with pytest.raises(MemoryImportConflict, match="cannot safely enumerate"):
+        reset_curated_memory("all")
+
+    assert {
+        path: sorted(os.listdir(path))
+        for path in (memories, imports, backups)
+    } == before
+    assert source.read_text(encoding="utf-8") == "opaque private source"
+    assert stage.read_text(encoding="utf-8") == "unknown private stage"
+    assert receipt.read_text(encoding="utf-8") == receipt_text
+    assert curated_memory_has_state("all") is True
 
 
 def test_reset_all_purges_contradictory_same_scope_transaction(tmp_path, monkeypatch):
