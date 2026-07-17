@@ -1314,21 +1314,32 @@ def _target_has_import_state(mem_dir: Path, target: str) -> bool:
     return False
 
 
-def _has_any_import_receipt_state(mem_dir: Path) -> bool:
-    """Treat every regular receipt as reset-all state, even when corrupt."""
+def _has_any_managed_import_leaf_state(mem_dir: Path) -> bool:
+    """Treat every regular leaf in import-owned directories as reset-all state."""
     imports_dir = mem_dir / ".imports"
     if not _is_real_directory(imports_dir):
         return False
     found = False
     with os.scandir(imports_dir) as entries:
         for entry in entries:
-            if not entry.name.endswith(".json"):
+            if entry.name == "backups" and stat.S_ISDIR(
+                entry.stat(follow_symlinks=False).st_mode
+            ):
                 continue
             if not stat.S_ISREG(entry.stat(follow_symlinks=False).st_mode):
                 raise MemoryImportConflict(
-                    f"managed memory receipt {entry.name} must be a regular file"
+                    f"managed memory import leaf {entry.name} must be a regular file"
                 )
             found = True
+    backup_dir = imports_dir / "backups"
+    if _is_real_directory(backup_dir):
+        with os.scandir(backup_dir) as entries:
+            for entry in entries:
+                if not stat.S_ISREG(entry.stat(follow_symlinks=False).st_mode):
+                    raise MemoryImportConflict(
+                        f"managed memory backup leaf {entry.name} must be a regular file"
+                    )
+                found = True
     return found
 
 
@@ -1964,13 +1975,18 @@ def _validate_reset_candidate_types(
         ):
             candidates.add(("memory", name))
     for name in imports_names:
-        if name.startswith(_RESET_STAGE_PREFIX) or name.endswith(".json") or (
-            name.startswith(".receipt_") and name.endswith(".tmp")
+        if (
+            (target == "all" and name != "backups")
+            or name.startswith(_RESET_STAGE_PREFIX)
+            or name.endswith(".json")
+            or (name.startswith(".receipt_") and name.endswith(".tmp"))
         ):
             candidates.add(("imports", name))
     for name in backup_names:
-        if name.startswith(_RESET_STAGE_PREFIX) or (
-            name.startswith(".backup_") and name.endswith(".tmp")
+        if (
+            target == "all"
+            or name.startswith(_RESET_STAGE_PREFIX)
+            or (name.startswith(".backup_") and name.endswith(".tmp"))
         ):
             candidates.add(("backups", name))
     for scope, name in candidates:
@@ -2033,7 +2049,7 @@ def curated_memory_has_state(target: str) -> bool:
     _validate_optional_managed_memory_directories(mem_dir)
     if _has_import_temp_state(mem_dir):
         return True
-    if target == "all" and _has_any_import_receipt_state(mem_dir):
+    if target == "all" and _has_any_managed_import_leaf_state(mem_dir):
         return True
     targets = ("memory", "user") if target == "all" else (target,)
     for item in targets:
@@ -2223,8 +2239,14 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
 
         if target == "all":
             for name in imports_names:
-                if name.endswith(".json"):
+                if name != "backups":
                     add_plan("imports", name, str(Path(".imports") / name))
+            for name in backup_names:
+                add_plan(
+                    "backups",
+                    name,
+                    str(Path(".imports") / "backups" / name),
+                )
 
         for name in memory_names:
             if name.startswith(_IMPORT_LINK_PROBE_PREFIX):

@@ -2696,6 +2696,33 @@ def test_reset_all_enumerates_opaque_same_scope_source_from_receipt(
     assert curated_memory_has_state("all") is False
 
 
+@pytest.mark.parametrize("receipt_mode", ["empty-plan", "missing"])
+def test_reset_all_clears_opaque_import_leaf_without_receipt_ownership(
+    tmp_path, monkeypatch, receipt_mode
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    backups = memories / ".imports" / "backups"
+    backups.mkdir(parents=True)
+    source = backups / "opaque-private-snapshot.bin"
+    source.write_text("unclaimed private snapshot", encoding="utf-8")
+    receipt = memories / f"{memory_tool._RESET_RECEIPT_PREFIX}empty.json"
+    if receipt_mode == "empty-plan":
+        receipt.write_text(json.dumps({
+            "version": 1,
+            "state": "staging",
+            "plan": [],
+        }), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert curated_memory_has_state("all") is True
+    assert reset_curated_memory("all")["status"] == "completed"
+
+    assert not source.exists()
+    assert not receipt.exists()
+    assert curated_memory_has_state("all") is False
+
+
 def test_reset_all_fails_before_orphaning_source_from_unsafe_plan(
     tmp_path, monkeypatch
 ):
