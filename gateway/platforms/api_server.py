@@ -1458,15 +1458,23 @@ class APIServerAdapter(BasePlatformAdapter):
                     current = os.stat(
                         "state.db", dir_fd=directory_fd, follow_symlinks=False
                     )
+                    current_directory = os.stat(profile_home, follow_symlinks=False)
                     if (
                         not stat.S_ISREG(current.st_mode)
                         or current.st_nlink != 1
                         or (current.st_dev, current.st_ino)
                         != (expected.st_dev, expected.st_ino)
+                        or (current_directory.st_dev, current_directory.st_ino)
+                        != (directory_stat.st_dev, directory_stat.st_ino)
                     ):
                         raise RuntimeError(
                             "profile state.db changed during initialization"
                         )
+                    db._profile_home_identity = (
+                        directory_stat.st_dev,
+                        directory_stat.st_ino,
+                    )
+                    db._profile_state_identity = (expected.st_dev, expected.st_ino)
                     return db
                 except BaseException:
                     try:
@@ -1478,6 +1486,44 @@ class APIServerAdapter(BasePlatformAdapter):
                 os.close(leaf_fd)
         finally:
             os.close(directory_fd)
+
+    @staticmethod
+    def _profile_session_db_is_current(profile_home: Path, db: Any) -> bool:
+        """Return whether a cached DB still belongs to this profile generation."""
+        expected_home = getattr(db, "_profile_home_identity", None)
+        expected_state = getattr(db, "_profile_state_identity", None)
+        if expected_home is None or expected_state is None:
+            return False
+
+        directory_flags = os.O_RDONLY
+        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_fd = None
+        leaf_fd = None
+        try:
+            directory_fd = os.open(profile_home, directory_flags)
+            directory_stat = os.fstat(directory_fd)
+            leaf_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            leaf_flags |= getattr(os, "O_NOFOLLOW", 0)
+            leaf_fd = os.open("state.db", leaf_flags, dir_fd=directory_fd)
+            state_stat = os.fstat(leaf_fd)
+            return (
+                stat.S_ISDIR(directory_stat.st_mode)
+                and stat.S_ISREG(state_stat.st_mode)
+                and state_stat.st_nlink == 1
+                and (directory_stat.st_dev, directory_stat.st_ino)
+                == tuple(expected_home)
+                and (state_stat.st_dev, state_stat.st_ino)
+                == tuple(expected_state)
+            )
+        except (OSError, TypeError, ValueError):
+            return False
+        finally:
+            if leaf_fd is not None:
+                os.close(leaf_fd)
+            if directory_fd is not None:
+                os.close(directory_fd)
 
     def _ensure_session_db(self, profile_home: Optional[Any] = None):
         """Lazily initialise and return the shared SessionDB instance.
@@ -1500,7 +1546,20 @@ class APIServerAdapter(BasePlatformAdapter):
             with self._session_db_init_lock:
                 existing = self._session_dbs.get(scoped_home)
                 if existing is not None:
-                    return existing
+                    if self._profile_session_db_is_current(
+                        Path(scoped_home), existing
+                    ):
+                        return existing
+                    self._session_dbs.pop(scoped_home, None)
+                    if self._session_db is existing:
+                        self._session_db = None
+                    try:
+                        existing.close()
+                    except Exception:
+                        logger.warning(
+                            "Invalidated SessionDB close failed",
+                            exc_info=True,
+                        )
                 try:
                     db = self._open_profile_session_db(Path(scoped_home))
                     self._session_dbs[scoped_home] = db

@@ -1577,6 +1577,54 @@ def test_linux_unlinked_procfd_fails_closed_without_touching_replacement(
         check.close()
 
 
+def test_cached_session_db_is_evicted_after_profile_directory_replacement(
+    tmp_path,
+):
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    old_home = tmp_path / "profiles" / "coder-old"
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+
+    first = adapter._ensure_session_db(profile_home)
+    assert first is not None
+    profile_home.rename(old_home)
+    profile_home.mkdir()
+
+    second = adapter._ensure_session_db(profile_home)
+    assert second is not None
+    assert second is not first
+    assert first._conn is None
+    second.stage_completed_transcript_import(
+        import_id="new-generation",
+        source="workbuddy",
+        source_session_id="source",
+        target_session_id="target",
+        title=None,
+        payload_sha256=hashlib.sha256(b"new-generation").hexdigest(),
+        expected_message_count=1,
+        chunk_index=0,
+        messages=[{"role": "user", "content": "new", "created_at": 1}],
+    )
+    second.close()
+
+    old = SessionDB(old_home / "state.db", read_only=True)
+    new = SessionDB(profile_home / "state.db", read_only=True)
+    try:
+        assert old._conn.execute(
+            "SELECT COUNT(*) FROM runtime_imports WHERE import_id = ?",
+            ("new-generation",),
+        ).fetchone()[0] == 0
+        assert new._conn.execute(
+            "SELECT COUNT(*) FROM runtime_imports WHERE import_id = ?",
+            ("new-generation",),
+        ).fetchone()[0] == 1
+    finally:
+        old.close()
+        new.close()
+
+
 @pytest.mark.asyncio
 async def test_uncached_cleanup_rejects_profile_state_db_symlink(
     tmp_path, monkeypatch
@@ -1653,6 +1701,9 @@ async def test_first_session_db_open_is_off_loop_and_published_once(
         PlatformConfig(enabled=True, extra={"key": "test-key"})
     )
     monkeypatch.setattr(adapter, "_open_profile_session_db", slow_open)
+    monkeypatch.setattr(
+        adapter, "_profile_session_db_is_current", lambda *_args: True
+    )
 
     def request(import_id):
         value = _DirectImportRequest({
