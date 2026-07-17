@@ -205,6 +205,11 @@ _LONG_HANDLERS = frozenset(
         "pet.select",
         "pet.thumb",
         "learning.frames",
+        # Journey writes can wait on the cross-process memory transaction lock.
+        # The RPC pool is their completion barrier: the reader thread stays
+        # responsive and the worker is never abandoned mid-mutation.
+        "learning.delete",
+        "learning.edit",
         "plugins.manage",
         "process.list",
         "projects.discover_repos",

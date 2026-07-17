@@ -7,7 +7,48 @@ contract and the CLI-config parity (servers/keys written via the API are
 visible to the CLI data layer), not specific catalog values.
 """
 
+import asyncio
+import threading
+
 import pytest
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["delete", "edit"])
+async def test_learning_mutation_offloads_and_finishes_after_cancellation(
+    monkeypatch, operation
+):
+    import agent.learning_mutations as mutations
+    import hermes_cli.web_server as ws
+
+    event_loop_thread = threading.get_ident()
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def slow_mutation(*_args):
+        assert threading.get_ident() != event_loop_thread
+        started.set()
+        assert release.wait(10)
+        finished.set()
+        return {"ok": True}
+
+    monkeypatch.setattr(mutations, f"{operation}_node", slow_mutation)
+    if operation == "delete":
+        awaitable = ws.delete_learning_node(ws.LearningNodeRef(id="memory:memory:0"))
+    else:
+        awaitable = ws.update_learning_node(
+            ws.LearningNodeEdit(id="memory:memory:0", content="updated")
+        )
+    task = asyncio.create_task(awaitable)
+    assert await asyncio.to_thread(started.wait, 2)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert finished.is_set()
 
 
 def _client():

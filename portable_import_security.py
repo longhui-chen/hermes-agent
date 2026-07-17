@@ -51,9 +51,10 @@ _ASCII_UNICODE_ESCAPE_RE = re.compile(
     r"(?<!\\)\\+u00([0-7][0-9a-f])", re.IGNORECASE
 )
 _ESCAPED_QUOTE_RE = re.compile(r"(?<!\\)\\+([\"'])")
+_MAX_ESCAPE_NORMALIZATION_PASSES = 8
 
 
-def _credential_scan_text(value: str) -> str:
+def _credential_scan_text(value: str) -> tuple[str, bool]:
     """Decode only escaped ASCII syntax needed by the credential scanner.
 
     Imported transcript and memory entries can themselves contain serialized
@@ -62,10 +63,25 @@ def _credential_scan_text(value: str) -> str:
     form exposes credential separators without interpreting arbitrary Unicode
     or executing a general-purpose escape codec.
     """
-    value = _ASCII_UNICODE_ESCAPE_RE.sub(
+    for _ in range(_MAX_ESCAPE_NORMALIZATION_PASSES):
+        normalized = _ASCII_UNICODE_ESCAPE_RE.sub(
+            lambda match: chr(int(match.group(1), 16)), value
+        )
+        normalized = _ESCAPED_QUOTE_RE.sub(
+            lambda match: match.group(1), normalized
+        )
+        if normalized == value:
+            return normalized, True
+        value = normalized
+
+    # One bounded look-ahead distinguishes a value that became stable exactly
+    # at the limit from deeper attacker-controlled nesting. Fail closed on the
+    # latter instead of letting a still-obscured credential reach persistence.
+    normalized = _ASCII_UNICODE_ESCAPE_RE.sub(
         lambda match: chr(int(match.group(1), 16)), value
     )
-    return _ESCAPED_QUOTE_RE.sub(lambda match: match.group(1), value)
+    normalized = _ESCAPED_QUOTE_RE.sub(lambda match: match.group(1), normalized)
+    return value, normalized == value
 
 
 def _credential_value_looks_real(raw: str) -> bool:
@@ -86,7 +102,9 @@ def _authorization_value_looks_real(raw: str) -> bool:
 
 def portable_credential_finding(value: str) -> Optional[str]:
     """Return the first high-confidence credential violation in bounded text."""
-    value = _credential_scan_text(value)
+    value, normalization_complete = _credential_scan_text(value)
+    if not normalization_complete:
+        return "excessively nested escaped text"
     if _PRIVATE_KEY_RE.search(value):
         return "private key"
     if _HIGH_CONFIDENCE_BARE_TOKEN_RE.search(value):

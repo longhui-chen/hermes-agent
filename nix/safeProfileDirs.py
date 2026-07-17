@@ -328,6 +328,10 @@ def _write_managed_leaf(
         os.fsync(fd)
         os.fchown(fd, uid, gid)
         os.fchmod(fd, mode)
+        # Persist the ownership/mode changes too. The earlier fsync only covers
+        # file contents; publishing before this second barrier can leave a
+        # recovered leaf as root:root 0600 after a crash.
+        os.fsync(fd)
         os.close(fd)
         fd = -1
         os.replace(temp_name, name, src_dir_fd=home_fd, dst_dir_fd=home_fd)
@@ -447,6 +451,7 @@ def _write_trust_anchor(
         os.fsync(fd)
         os.fchown(fd, 0, 0)
         os.fchmod(fd, 0o444)
+        os.fsync(fd)
         os.close(fd)
         fd = -1
         os.replace(temp, path)

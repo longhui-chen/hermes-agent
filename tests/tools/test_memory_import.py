@@ -2120,6 +2120,7 @@ def test_memory_import_rejects_poison_and_overflow_without_writing(tmp_path, mon
     "api key = abcdefghijklmnop",
     "Authorization:\u0020Bearer\u0020abcdefghijklmnop",
     r'{\"Authorization\":\u0020\"Bearer\u0020abcdefghijklmnop\"}',
+    r"Authorization\u005cu003a\u005cu0020Bearer\u005cu0020abcdefghijklmnop",
     "Authorization: Bearer abcdefghexamplehijklmnop",
     "api_key = sk-abcdefghijklmnop",
     "-----BEGIN OPENSSH PRIVATE KEY-----",

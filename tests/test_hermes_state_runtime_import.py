@@ -260,6 +260,8 @@ def test_runtime_import_rejects_non_completed_runtime_messages(tmp_path):
      "content": "Authorization:\u0020Bearer\u0020abcdefghijklmnop", "created_at": 1},
     {"source_id": "m-literal-json-escapes", "role": "user",
      "content": r'{\"Authorization\":\u0020\"Bearer\u0020abcdefghijklmnop\"}', "created_at": 1},
+    {"source_id": "m", "role": "user",
+     "content": r"Authorization\u005cu003a\u005cu0020Bearer\u005cu0020abcdefghijklmnop", "created_at": 1},
     {"source_id": "m-placeholder-substring", "role": "user",
      "content": "Authorization: Bearer abcdefghexamplehijklmnop", "created_at": 1},
     {"source_id": "m", "role": "user", "content": "api_key = sk-abcdefghijklmnop", "created_at": 1},

@@ -1,3 +1,4 @@
+import errno
 import importlib.util
 import json
 import os
@@ -519,6 +520,142 @@ def test_profile_trust_anchor_binds_opened_home_identity(tmp_path, monkeypatch):
     assert fields["version"] == "2"
     assert f'{fields["dev"]}:{fields["ino"]}' == identity
     assert fields["home"] == str(home)
+
+
+def test_managed_leaf_fsyncs_metadata_before_publish(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    home_fd = os.open(home, safe_profile_dirs._directory_flags())
+    current = home.stat()
+    events = []
+    original_fsync = safe_profile_dirs.os.fsync
+    original_fchown = safe_profile_dirs.os.fchown
+    original_fchmod = safe_profile_dirs.os.fchmod
+
+    def is_regular(fd):
+        return stat.S_ISREG(os.fstat(fd).st_mode)
+
+    def record_fsync(fd):
+        if is_regular(fd):
+            events.append("fsync")
+        return original_fsync(fd)
+
+    def record_fchown(fd, uid, gid):
+        if is_regular(fd):
+            events.append("fchown")
+        return original_fchown(fd, uid, gid)
+
+    def record_fchmod(fd, mode):
+        if is_regular(fd):
+            events.append("fchmod")
+        return original_fchmod(fd, mode)
+
+    monkeypatch.setattr(safe_profile_dirs.os, "fsync", record_fsync)
+    monkeypatch.setattr(safe_profile_dirs.os, "fchown", record_fchown)
+    monkeypatch.setattr(safe_profile_dirs.os, "fchmod", record_fchmod)
+    try:
+        safe_profile_dirs._write_managed_leaf(
+            home_fd, ".managed", b"managed", current.st_uid, current.st_gid, 0o644
+        )
+    finally:
+        os.close(home_fd)
+
+    assert events == ["fsync", "fchown", "fchmod", "fsync"]
+
+
+def test_managed_leaf_metadata_fsync_failure_prevents_publish(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    home_fd = os.open(home, safe_profile_dirs._directory_flags())
+    current = home.stat()
+    original_fsync = safe_profile_dirs.os.fsync
+    regular_fsyncs = 0
+
+    def fail_second_regular_fsync(fd):
+        nonlocal regular_fsyncs
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            regular_fsyncs += 1
+            if regular_fsyncs == 2:
+                raise OSError(errno.EIO, "metadata fsync failed")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(safe_profile_dirs.os, "fsync", fail_second_regular_fsync)
+    try:
+        with pytest.raises(OSError, match="metadata fsync failed"):
+            safe_profile_dirs._write_managed_leaf(
+                home_fd, ".managed", b"managed", current.st_uid, current.st_gid, 0o644
+            )
+    finally:
+        os.close(home_fd)
+
+    assert not (home / ".managed").exists()
+    assert list(home.glob(".managed-leaf-*.tmp")) == []
+
+
+def test_trust_anchor_fsyncs_metadata_before_publish(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    trust_dir = tmp_path / "run"
+    trust_dir.mkdir()
+    trust = trust_dir / "profile-trust"
+    events = []
+    original_fsync = safe_profile_dirs.os.fsync
+    original_fchmod = safe_profile_dirs.os.fchmod
+
+    def is_regular(fd):
+        return stat.S_ISREG(os.fstat(fd).st_mode)
+
+    def record_fsync(fd):
+        if is_regular(fd):
+            events.append("fsync")
+        return original_fsync(fd)
+
+    def record_fchown(fd, uid, gid):
+        if is_regular(fd):
+            events.append("fchown")
+        assert (uid, gid) == (0, 0)
+
+    def record_fchmod(fd, mode):
+        if is_regular(fd):
+            events.append("fchmod")
+        return original_fchmod(fd, mode)
+
+    monkeypatch.setattr(safe_profile_dirs.os, "fsync", record_fsync)
+    monkeypatch.setattr(safe_profile_dirs.os, "fchown", record_fchown)
+    monkeypatch.setattr(safe_profile_dirs.os, "fchmod", record_fchmod)
+    safe_profile_dirs._write_trust_anchor(
+        trust, home, home.stat().st_uid, home.stat().st_gid, home.stat()
+    )
+
+    assert events == ["fsync", "fchown", "fchmod", "fsync"]
+
+
+def test_trust_anchor_metadata_fsync_failure_prevents_publish(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    trust_dir = tmp_path / "run"
+    trust_dir.mkdir()
+    trust = trust_dir / "profile-trust"
+    original_fsync = safe_profile_dirs.os.fsync
+    regular_fsyncs = 0
+
+    def fail_second_regular_fsync(fd):
+        nonlocal regular_fsyncs
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            regular_fsyncs += 1
+            if regular_fsyncs == 2:
+                raise OSError(errno.EIO, "metadata fsync failed")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(safe_profile_dirs.os, "fsync", fail_second_regular_fsync)
+    monkeypatch.setattr(safe_profile_dirs.os, "fchown", lambda *_args: None)
+    with pytest.raises(OSError, match="metadata fsync failed"):
+        safe_profile_dirs._write_trust_anchor(
+            trust, home, home.stat().st_uid, home.stat().st_gid, home.stat()
+        )
+
+    assert not trust.exists()
+    assert list(trust_dir.glob(".profile-trust.*.tmp")) == []
 
 
 def test_safe_profile_cli_round_trips_anchored_leaf(tmp_path):

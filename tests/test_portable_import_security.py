@@ -15,6 +15,7 @@ from portable_import_security import portable_credential_finding
         "api key = abcdefghijklmnop",
         "Authorization:\u0020Bearer\u0020abcdefghijklmnop",
         r"{\"Authorization\":\u0020\"Bearer\u0020abcdefghijklmnop\"}",
+        r"Authorization\u005cu003a\u005cu0020Bearer\u005cu0020abcdefghijklmnop",
         "-----BEGIN PGP PRIVATE KEY BLOCK-----",
     ],
     ids=[
@@ -25,6 +26,7 @@ from portable_import_security import portable_credential_finding
         "spaced-api-key",
         "decoded-unicode-space",
         "literal-json-escapes",
+        "nested-literal-json-escapes",
         "pgp-private-key-block",
     ],
 )
@@ -125,3 +127,26 @@ def test_portable_credential_scanner_bounds_long_non_credential_query():
 
     assert finding is None
     assert elapsed < 2.0, f"credential scan took {elapsed:.3f}s"
+
+
+def _nested_ascii_escape(value: str, depth: int) -> str:
+    for _ in range(depth - 1):
+        value = value.replace("\\", r"\u005c")
+    return value
+
+
+def test_portable_credential_scanner_detects_at_normalization_depth_limit():
+    value = _nested_ascii_escape(
+        r"Authorization\u003a\u0020Bearer\u0020abcdefghijklmnop", 8
+    )
+    assert portable_credential_finding(value) is not None
+
+
+def test_portable_credential_scanner_fails_closed_beyond_depth_limit():
+    value = _nested_ascii_escape(r"ordinary\u003a text", 9)
+    assert portable_credential_finding(value) == "excessively nested escaped text"
+
+
+def test_portable_credential_scanner_keeps_nested_near_miss():
+    value = _nested_ascii_escape(r"Authorization\u003a\u0020Bearer\u0020redacted", 2)
+    assert portable_credential_finding(value) is None
