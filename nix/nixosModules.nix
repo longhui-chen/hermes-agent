@@ -30,9 +30,6 @@
     cfg = config.services.hermes-agent;
     profileHome = "${cfg.stateDir}/.hermes";
     profileHomeShell = lib.escapeShellArg profileHome;
-    profileImportsShell = lib.escapeShellArg "${profileHome}/memories/.imports";
-    profileBackupsShell = lib.escapeShellArg "${profileHome}/memories/.imports/backups";
-    profileOwnerShell = lib.escapeShellArg "${cfg.user}:${cfg.group}";
     effectivePackage =
       if cfg.extraPythonPackages == [ ] && cfg.extraDependencyGroups == [ ]
       then cfg.package
@@ -53,6 +50,7 @@
     configFile = if cfg.configFile != null then cfg.configFile else generatedConfigFile;
 
     configMergeScript = pkgs.callPackage ./configMergeScript.nix { };
+    safeProfileDirs = ./safeProfileDirs.py;
 
     # config.yaml mode: group-writable (0660) when interactive users share this
     # HERMES_HOME via addToSystemPackages, so they can save settings through the
@@ -147,7 +145,8 @@
       # script sets for group access by hostUsers.  Only touch files with
       # wrong ownership so correctly-owned dirs keep their permission bits.
       if [ -n "''${HERMES_HOME:-}" ] && [ -d "$HERMES_HOME" ]; then
-        find "$HERMES_HOME" \! -user "$HERMES_UID" -exec chown "$HERMES_UID:$HERMES_GID" {} +
+        ${pkgs.python3}/bin/python3 ${safeProfileDirs} \
+          --recursive-ownership "$HERMES_HOME" "$HERMES_UID" "$HERMES_GID"
       fi
 
       # ── Provision apt packages (first boot only, cached in writable layer) ──
@@ -729,14 +728,6 @@
       {
         systemd.tmpfiles.rules = [
           "d ${cfg.stateDir}                2770 ${cfg.user} ${cfg.group} - -"
-          "d ${cfg.stateDir}/.hermes        2770 ${cfg.user} ${cfg.group} - -"
-          "d ${cfg.stateDir}/.hermes/cron   2770 ${cfg.user} ${cfg.group} - -"
-          "d ${cfg.stateDir}/.hermes/sessions 2770 ${cfg.user} ${cfg.group} - -"
-          "d ${cfg.stateDir}/.hermes/logs   2770 ${cfg.user} ${cfg.group} - -"
-          "d ${cfg.stateDir}/.hermes/memories 2770 ${cfg.user} ${cfg.group} - -"
-          "d ${cfg.stateDir}/.hermes/memories/.imports 2770 ${cfg.user} ${cfg.group} - -"
-          "d ${cfg.stateDir}/.hermes/memories/.imports/backups 2770 ${cfg.user} ${cfg.group} - -"
-          "d ${cfg.stateDir}/.hermes/plugins 2770 ${cfg.user} ${cfg.group} - -"
           "d ${cfg.stateDir}/home           0750 ${cfg.user} ${cfg.group} - -"
           "d ${cfg.workingDirectory}         2770 ${cfg.user} ${cfg.group} - -"
         ];
@@ -746,12 +737,16 @@
       {
         system.activationScripts."hermes-agent-setup" = lib.stringAfter ([ "users" ] ++ lib.optional (config.system.activationScripts ? setupSecrets) "setupSecrets") ''
           # Ensure directories exist (activation runs before tmpfiles)
-          mkdir -p ${cfg.stateDir}/.hermes
           mkdir -p ${cfg.stateDir}/home
           mkdir -p ${cfg.workingDirectory}
-          chown ${cfg.user}:${cfg.group} ${cfg.stateDir} ${cfg.stateDir}/.hermes ${cfg.stateDir}/home ${cfg.workingDirectory}
-          chmod 2770 ${cfg.stateDir} ${cfg.stateDir}/.hermes ${cfg.workingDirectory}
+          chown ${cfg.user}:${cfg.group} ${cfg.stateDir} ${cfg.stateDir}/home ${cfg.workingDirectory}
+          chmod 2770 ${cfg.stateDir} ${cfg.workingDirectory}
           chmod 0750 ${cfg.stateDir}/home
+
+          PROFILE_UID="$(${pkgs.coreutils}/bin/id -u ${lib.escapeShellArg cfg.user})"
+          PROFILE_GID="$(${pkgs.glibc.bin}/bin/getent group ${lib.escapeShellArg cfg.group} | ${pkgs.coreutils}/bin/cut -d: -f3)"
+          ${pkgs.python3}/bin/python3 ${safeProfileDirs} \
+            --shared-file-modes ${profileHomeShell} "$PROFILE_UID" "$PROFILE_GID"
 
           # Root-owned trust anchor for the intentionally group-writable profile.
           # It binds the permission exception to this exact HERMES_HOME and the
@@ -769,27 +764,6 @@
             chmod 0444 "$TRUST_TMP"
             mv -f "$TRUST_TMP" /run/hermes-agent/profile-trust
           )
-
-          # Create subdirs, set setgid + group-writable, migrate existing files.
-          # Nix-managed .env/.managed stay 0640/0644; config.yaml uses
-          # configYamlMode (0660 under addToSystemPackages, else 0640).
-          find ${cfg.stateDir}/.hermes -maxdepth 1 \
-            \( -name "*.db" -o -name "*.db-wal" -o -name "*.db-shm" -o -name "SOUL.md" \) \
-            -exec chmod g+rw {} + 2>/dev/null || true
-          for _subdir in cron sessions logs memories plugins; do
-            mkdir -p "${cfg.stateDir}/.hermes/$_subdir"
-            chown ${cfg.user}:${cfg.group} "${cfg.stateDir}/.hermes/$_subdir"
-            chmod 2770 "${cfg.stateDir}/.hermes/$_subdir"
-            find "${cfg.stateDir}/.hermes/$_subdir" -type f \
-              -exec chmod g+rw {} + 2>/dev/null || true
-          done
-          mkdir -p ${profileBackupsShell}
-          chown ${profileOwnerShell} \
-            ${profileImportsShell} \
-            ${profileBackupsShell}
-          chmod 2770 \
-            ${profileImportsShell} \
-            ${profileBackupsShell}
 
           # Merge Nix settings into existing config.yaml.
           # Preserves user-added keys (skills, streaming, etc.); Nix keys win.
