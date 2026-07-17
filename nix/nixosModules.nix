@@ -28,6 +28,11 @@
 
   let
     cfg = config.services.hermes-agent;
+    profileHome = "${cfg.stateDir}/.hermes";
+    profileHomeShell = lib.escapeShellArg profileHome;
+    profileImportsShell = lib.escapeShellArg "${profileHome}/memories/.imports";
+    profileBackupsShell = lib.escapeShellArg "${profileHome}/memories/.imports/backups";
+    profileOwnerShell = lib.escapeShellArg "${cfg.user}:${cfg.group}";
     effectivePackage =
       if cfg.extraPythonPackages == [ ] && cfg.extraDependencyGroups == [ ]
       then cfg.package
@@ -757,9 +762,9 @@
             umask 077
             TRUST_TMP=/run/hermes-agent/.profile-trust.tmp
             printf 'version=1\nhome=%s\nuid=%s\ngid=%s\n' \
-              '${cfg.stateDir}/.hermes' \
-              "$(stat -c %u ${cfg.stateDir}/.hermes)" \
-              "$(stat -c %g ${cfg.stateDir}/.hermes)" > "$TRUST_TMP"
+              ${profileHomeShell} \
+              "$(stat -c %u ${profileHomeShell})" \
+              "$(stat -c %g ${profileHomeShell})" > "$TRUST_TMP"
             chown root:root "$TRUST_TMP"
             chmod 0444 "$TRUST_TMP"
             mv -f "$TRUST_TMP" /run/hermes-agent/profile-trust
@@ -778,13 +783,13 @@
             find "${cfg.stateDir}/.hermes/$_subdir" -type f \
               -exec chmod g+rw {} + 2>/dev/null || true
           done
-          mkdir -p ${cfg.stateDir}/.hermes/memories/.imports/backups
-          chown ${cfg.user}:${cfg.group} \
-            ${cfg.stateDir}/.hermes/memories/.imports \
-            ${cfg.stateDir}/.hermes/memories/.imports/backups
+          mkdir -p ${profileBackupsShell}
+          chown ${profileOwnerShell} \
+            ${profileImportsShell} \
+            ${profileBackupsShell}
           chmod 2770 \
-            ${cfg.stateDir}/.hermes/memories/.imports \
-            ${cfg.stateDir}/.hermes/memories/.imports/backups
+            ${profileImportsShell} \
+            ${profileBackupsShell}
 
           # Merge Nix settings into existing config.yaml.
           # Preserves user-added keys (skills, streaming, etc.); Nix keys win.
