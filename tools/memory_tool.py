@@ -963,10 +963,20 @@ def _durably_create_directory_chain(path: Path) -> None:
         finally:
             os.close(ancestor_parent_fd)
         for name in reversed(missing):
+            created = False
             try:
                 os.mkdir(name, 0o700, dir_fd=parent_fd)
+                created = True
             except FileExistsError:
                 pass
+            try:
+                before_open = os.stat(
+                    name, dir_fd=parent_fd, follow_symlinks=False
+                )
+            except OSError as exc:
+                raise MemoryImportConflict(
+                    f"cannot inspect profile directory component {name}: {exc}"
+                ) from exc
             try:
                 child_fd = os.open(
                     name,
@@ -979,9 +989,33 @@ def _durably_create_directory_chain(path: Path) -> None:
                 ) from exc
             child_path = current_path / name
             try:
-                if not stat.S_ISDIR(os.fstat(child_fd).st_mode):
+                opened = os.fstat(child_fd)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or (before_open.st_dev, before_open.st_ino)
+                    != (opened.st_dev, opened.st_ino)
+                ):
                     raise MemoryImportConflict(
-                        f"profile directory component {name} is not a directory"
+                        f"profile directory component {name} changed before open"
+                    )
+                if (
+                    hasattr(os, "geteuid")
+                    and opened.st_uid != os.geteuid()
+                ) or stat.S_IMODE(opened.st_mode) & 0o077:
+                    origin = "created" if created else "pre-existing"
+                    raise MemoryImportConflict(
+                        f"{origin} profile directory component {name} is not "
+                        "owned privately by this user"
+                    )
+                visible = os.stat(
+                    name, dir_fd=parent_fd, follow_symlinks=False
+                )
+                if (visible.st_dev, visible.st_ino) != (
+                    opened.st_dev,
+                    opened.st_ino,
+                ):
+                    raise MemoryImportConflict(
+                        f"profile directory component {name} changed after open"
                     )
                 # A FileExists race may be another creator or residue from a
                 # previous failed fsync. Re-run both barriers unconditionally.
@@ -1280,7 +1314,9 @@ def _has_import_temp_state(mem_dir: Path) -> bool:
         (mem_dir, _RESET_RECEIPT_PREFIX, ""),
         (mem_dir, _RESET_STAGE_PREFIX, ""),
         (imports_dir, ".receipt_", ".tmp"),
+        (imports_dir, _RESET_STAGE_PREFIX, ""),
         (backup_dir, ".backup_", ".tmp"),
+        (backup_dir, _RESET_STAGE_PREFIX, ""),
     )
     for directory, prefix, suffix in locations:
         if not _is_real_directory(directory):
@@ -1329,6 +1365,10 @@ def _reset_fsync_scope(handles: _ImportDirectoryHandles, scope: str) -> None:
         else handles.backup_dir
     )
     _fsync_directory_fd(fd, path)
+
+
+def _reset_stage_scope(entry: Dict[str, str]) -> str:
+    return entry.get("stage_scope", "memory")
 
 
 def _reset_copy_regular_no_follow(
@@ -1530,23 +1570,58 @@ def _reset_move_no_replace(
     source_scope: str,
     source_name: str,
     stage_name: str,
+    stage_scope: Optional[str] = None,
 ) -> None:
+    atomic_stage = stage_scope is not None
+    if stage_scope is None:
+        # Legacy callers and receipts staged into memories by link/copy.
+        stage_scope = "memory"
     source_fd = _reset_scope_fd(handles, source_scope)
-    if _reset_entry_stat(handles.mem_fd, stage_name) is not None:
+    stage_fd = _reset_scope_fd(handles, stage_scope)
+    if _reset_entry_stat(stage_fd, stage_name) is not None:
         raise MemoryImportConflict(f"reset stage already exists: {stage_name}")
     handles.verify_attached()
+    if atomic_stage and stage_scope == source_scope:
+        expected = _reset_entry_stat(source_fd, source_name)
+        if expected is None or not stat.S_ISREG(expected.st_mode):
+            raise MemoryImportConflict(
+                f"reset source {source_name} must be a regular file"
+            )
+        os.rename(
+            source_name,
+            stage_name,
+            src_dir_fd=source_fd,
+            dst_dir_fd=stage_fd,
+        )
+        staged = _reset_entry_stat(stage_fd, stage_name)
+        if staged is None or (staged.st_dev, staged.st_ino) != (
+            expected.st_dev,
+            expected.st_ino,
+        ):
+            raise MemoryImportConflict(
+                f"reset stage changed during atomic move: {stage_name}"
+            )
+        _reset_fsync_scope(handles, stage_scope)
+        handles.verify_attached()
+        return
     _reset_link_or_copy(
         source_fd,
         source_name,
-        handles.mem_fd,
+        stage_fd,
         stage_name,
-        handles.mem_dir,
+        (
+            handles.mem_dir
+            if stage_scope == "memory"
+            else handles.imports_dir
+            if stage_scope == "imports"
+            else handles.backup_dir
+        ),
     )
     # The staged dentry must be durable before the source dentry can be
     # durably removed.  This ordering matters when source and stage live in
     # different directories: fsyncing the source first can lose both names on
     # power failure even though link(2) succeeded in memory.
-    _fsync_directory_fd(handles.mem_fd, handles.mem_dir)
+    _reset_fsync_scope(handles, stage_scope)
     os.unlink(source_name, dir_fd=source_fd)
     _reset_fsync_scope(handles, source_scope)
     handles.verify_attached()
@@ -1557,20 +1632,44 @@ def _reset_restore_plan(
 ) -> None:
     for entry in reversed(plan):
         source_fd = _reset_scope_fd(handles, entry["scope"])
+        stage_scope = _reset_stage_scope(entry)
+        stage_fd = _reset_scope_fd(handles, stage_scope)
         source = _reset_entry_stat(source_fd, entry["name"])
-        stage = _reset_entry_stat(handles.mem_fd, entry["stage"])
+        stage = _reset_entry_stat(stage_fd, entry["stage"])
         if stage is None:
             if source is None:
                 raise MemoryImportConflict(
                     f"reset recovery lost both source and stage: {entry['name']}"
                 )
             continue
+        if "stage_scope" in entry and stage_scope == entry["scope"]:
+            if source is not None:
+                raise MemoryImportConflict(
+                    "cannot atomically restore reset source occupied by another "
+                    f"entry: {entry['name']}"
+                )
+            os.rename(
+                entry["stage"],
+                entry["name"],
+                src_dir_fd=stage_fd,
+                dst_dir_fd=source_fd,
+            )
+            restored = _reset_entry_stat(source_fd, entry["name"])
+            if restored is None or (restored.st_dev, restored.st_ino) != (
+                stage.st_dev,
+                stage.st_ino,
+            ):
+                raise MemoryImportConflict(
+                    f"reset restore changed during atomic move: {entry['name']}"
+                )
+            _reset_fsync_scope(handles, entry["scope"])
+            continue
         if source is not None:
             if (source.st_dev, source.st_ino) != (stage.st_dev, stage.st_ino):
                 relationship = _reset_compare_regular_files(
                     source_fd,
                     entry["name"],
-                    handles.mem_fd,
+                    stage_fd,
                     entry["stage"],
                 )
                 if relationship == "equal":
@@ -1579,8 +1678,8 @@ def _reset_restore_plan(
                     # A move-side copy was interrupted. The original source is
                     # authoritative; discard only the incomplete stage.
                     _reset_fsync_scope(handles, entry["scope"])
-                    os.unlink(entry["stage"], dir_fd=handles.mem_fd)
-                    _fsync_directory_fd(handles.mem_fd, handles.mem_dir)
+                    os.unlink(entry["stage"], dir_fd=stage_fd)
+                    _reset_fsync_scope(handles, stage_scope)
                     continue
                 elif relationship == "first_prefix":
                     # Prefix shape alone cannot prove this is our interrupted
@@ -1597,7 +1696,7 @@ def _reset_restore_plan(
                     )
         if source is None:
             _reset_link_or_copy(
-                handles.mem_fd,
+                stage_fd,
                 entry["stage"],
                 source_fd,
                 entry["name"],
@@ -1613,8 +1712,8 @@ def _reset_restore_plan(
         # staged name.  If either fsync fails, the staging receipt and at least
         # one linked name remain for the next recovery attempt.
         _reset_fsync_scope(handles, entry["scope"])
-        os.unlink(entry["stage"], dir_fd=handles.mem_fd)
-        _fsync_directory_fd(handles.mem_fd, handles.mem_dir)
+        os.unlink(entry["stage"], dir_fd=stage_fd)
+        _reset_fsync_scope(handles, stage_scope)
     handles.verify_attached()
 
 
@@ -1637,8 +1736,11 @@ def _cleanup_isolated_reset(
     cleanup_pending = False
     for entry in plan:
         try:
-            if _reset_entry_stat(handles.mem_fd, entry["stage"]) is not None:
-                os.unlink(entry["stage"], dir_fd=handles.mem_fd)
+            stage_scope = _reset_stage_scope(entry)
+            stage_fd = _reset_scope_fd(handles, stage_scope)
+            if _reset_entry_stat(stage_fd, entry["stage"]) is not None:
+                os.unlink(entry["stage"], dir_fd=stage_fd)
+                _reset_fsync_scope(handles, stage_scope)
         except OSError:
             cleanup_pending = True
     try:
@@ -1682,23 +1784,39 @@ def _validate_reset_receipt(value: Any) -> tuple[str, List[Dict[str, str]]]:
     for raw in raw_plan:
         if not isinstance(raw, dict):
             raise MemoryImportConflict("memory reset receipt entry is invalid")
-        scope, name, stage, label = (
-            raw.get("scope"), raw.get("name"), raw.get("stage"), raw.get("label")
+        scope, stage_scope, name, stage, label = (
+            raw.get("scope"),
+            raw.get("stage_scope", "memory"),
+            raw.get("name"),
+            raw.get("stage"),
+            raw.get("label"),
         )
         if (
             scope not in {"memory", "imports", "backups"}
+            or stage_scope not in {"memory", "imports", "backups"}
             or not all(isinstance(item, str) and item and "/" not in item and "\\" not in item
                        for item in (name, stage))
             or not isinstance(label, str)
             or not stage.startswith(_RESET_STAGE_PREFIX)
         ):
             raise MemoryImportConflict("memory reset receipt entry is unsafe")
-        plan.append({"scope": scope, "name": name, "stage": stage, "label": label})
+        entry = {
+            "scope": scope,
+            "name": name,
+            "stage": stage,
+            "label": label,
+        }
+        if "stage_scope" in raw:
+            entry["stage_scope"] = stage_scope
+        plan.append(entry)
     return value["state"], plan
 
 
 def _recover_reset_transactions(
-    handles: _ImportDirectoryHandles, memory_names: List[str]
+    handles: _ImportDirectoryHandles,
+    memory_names: List[str],
+    *,
+    allow_invalid: bool = False,
 ) -> bool:
     cleanup_pending = False
     receipt_names = [
@@ -1707,8 +1825,23 @@ def _recover_reset_transactions(
         if name.startswith(_RESET_RECEIPT_PREFIX) and name.endswith(".json")
     ]
     for receipt_name in receipt_names:
-        receipt = handles.read_receipt(handles.mem_fd, receipt_name)
-        state, plan = _validate_reset_receipt(receipt)
+        try:
+            receipt = handles.read_receipt(handles.mem_fd, receipt_name)
+            state, plan = _validate_reset_receipt(receipt)
+        except MemoryImportConflict:
+            if allow_invalid:
+                continue
+            raise
+        # Receipts written before same-directory atomic staging may require a
+        # cross-directory copy to recover. For reset-all, do not replay that
+        # legacy protocol: source, stage, and receipt are all managed deletion
+        # candidates for the fresh transaction below. Targeted reset remains
+        # fail-closed and preserves its legacy rollback behavior.
+        if allow_invalid and any(
+            not isinstance(raw, dict) or "stage_scope" not in raw
+            for raw in receipt.get("plan", [])
+        ):
+            continue
         if state == "staging":
             _reset_restore_plan(handles, plan)
             os.unlink(receipt_name, dir_fd=handles.mem_fd)
@@ -1751,12 +1884,14 @@ def _validate_reset_candidate_types(
         ):
             candidates.add(("memory", name))
     for name in imports_names:
-        if name.endswith(".json") or (
+        if name.startswith(_RESET_STAGE_PREFIX) or name.endswith(".json") or (
             name.startswith(".receipt_") and name.endswith(".tmp")
         ):
             candidates.add(("imports", name))
     for name in backup_names:
-        if name.startswith(".backup_") and name.endswith(".tmp"):
+        if name.startswith(_RESET_STAGE_PREFIX) or (
+            name.startswith(".backup_") and name.endswith(".tmp")
+        ):
             candidates.add(("backups", name))
     for scope, name in candidates:
         current = _reset_entry_stat(_reset_scope_fd(handles, scope), name)
@@ -1930,7 +2065,9 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
             reset_dirs, target, memory_names, imports_names, backup_names
         )
         _validate_reset_receipts(target, imports_names, receipt_targets)
-        if _recover_reset_transactions(reset_dirs, memory_names):
+        if _recover_reset_transactions(
+            reset_dirs, memory_names, allow_invalid=target == "all"
+        ):
             return {
                 "deleted": [],
                 "targets": list(targets),
@@ -1964,6 +2101,7 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
             planned.add(key)
             plan.append({
                 "scope": scope,
+                "stage_scope": scope,
                 "name": name,
                 "stage": f"{_RESET_STAGE_PREFIX}{transaction_id}_{len(plan)}",
                 "label": label,
@@ -2013,10 +2151,17 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
         for name in memory_names:
             if name.startswith(_RESET_STAGE_PREFIX):
                 add_plan("memory", name, name)
-            elif name.startswith(_RESET_RECEIPT_PREFIX) and not name.endswith(
-                ".json"
+            elif name.startswith(_RESET_RECEIPT_PREFIX) and (
+                target == "all" or not name.endswith(".json")
             ):
                 add_plan("memory", name, name)
+        for scope, names in (
+            ("imports", imports_names),
+            ("backups", backup_names),
+        ):
+            for name in names:
+                if name.startswith(_RESET_STAGE_PREFIX):
+                    add_plan(scope, name, name)
 
         receipt_name = f"{_RESET_RECEIPT_PREFIX}{transaction_id}.json"
         receipt = {
@@ -2034,6 +2179,7 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
                     entry["scope"],
                     entry["name"],
                     entry["stage"],
+                    _reset_stage_scope(entry),
                 )
             reset_dirs.verify_attached()
             for scope in {entry["scope"] for entry in plan} | {"memory"}:
@@ -2074,7 +2220,10 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
                     ),
                 }
             if not any(
-                _reset_entry_stat(reset_dirs.mem_fd, entry["stage"]) is not None
+                _reset_entry_stat(
+                    _reset_scope_fd(reset_dirs, _reset_stage_scope(entry)),
+                    entry["stage"],
+                ) is not None
                 for entry in plan
             ):
                 try:

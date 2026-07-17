@@ -212,13 +212,13 @@ def test_memory_reset_directory_swap_is_fail_closed_and_deletes_nothing(
     detached = memories.with_name("memories-detached")
     swapped = False
 
-    def swap_before_first_move(handles, scope, name, stage):
+    def swap_before_first_move(handles, scope, name, stage, stage_scope="memory"):
         nonlocal swapped
         if not swapped:
             swapped = True
             memories.rename(detached)
             memories.symlink_to(outside, target_is_directory=True)
-        return original_move(handles, scope, name, stage)
+        return original_move(handles, scope, name, stage, stage_scope)
 
     monkeypatch.setattr(memory_tool, "_reset_move_no_replace", swap_before_first_move)
     with pytest.raises(MemoryImportConflict, match="changed during import"):
@@ -355,13 +355,13 @@ def test_memory_reset_move_failure_rolls_back_every_source(
     original_move = memory_tool._reset_move_no_replace
     calls = 0
 
-    def fail_one_move(handles, scope, name, stage):
+    def fail_one_move(handles, scope, name, stage, stage_scope="memory"):
         nonlocal calls
         index = calls
         calls += 1
         if index == fail_index and not after_move:
             raise OSError(errno.EIO, "simulated reset move failure")
-        original_move(handles, scope, name, stage)
+        original_move(handles, scope, name, stage, stage_scope)
         if index == fail_index:
             raise OSError(errno.EIO, "simulated reset move failure")
 
@@ -1450,6 +1450,58 @@ def test_durable_directory_creation_rebarriers_fileexists_race(
     assert target in barriers
 
 
+def test_durable_directory_creation_rejects_public_fileexists_race(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "raced" / "child"
+    original_mkdir = memory_tool.os.mkdir
+    raced = False
+
+    def race_mkdir(name, mode=0o777, *, dir_fd=None):
+        nonlocal raced
+        if name == "raced" and not raced:
+            raced = True
+            original_mkdir(name, 0o700, dir_fd=dir_fd)
+            os.chmod(name, 0o777, dir_fd=dir_fd, follow_symlinks=False)
+            raise FileExistsError(errno.EEXIST, "untrusted concurrent creator")
+        return original_mkdir(name, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(memory_tool.os, "mkdir", race_mkdir)
+
+    with pytest.raises(MemoryImportConflict, match="not owned privately"):
+        memory_tool._durably_create_directory_chain(target)
+
+    assert raced is True
+    assert not target.exists()
+
+
+def test_durable_directory_creation_binds_fileexists_identity_before_open(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "raced" / "child"
+    original_open = memory_tool.os.open
+    original_mkdir = memory_tool.os.mkdir
+    swapped = False
+
+    def swap_before_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        if path == "raced" and dir_fd is not None and not swapped:
+            swapped = True
+            os.rename(
+                "raced", "raced-old", src_dir_fd=dir_fd, dst_dir_fd=dir_fd
+            )
+            original_mkdir("raced", 0o700, dir_fd=dir_fd)
+        return original_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(memory_tool.os, "open", swap_before_open)
+
+    with pytest.raises(MemoryImportConflict, match="changed before open"):
+        memory_tool._durably_create_directory_chain(target)
+
+    assert swapped is True
+    assert not target.exists()
+
+
 def test_durable_directory_creation_rejects_dotdot_components(
     tmp_path, monkeypatch
 ):
@@ -2439,6 +2491,113 @@ def test_reset_all_removes_unclassified_receipt_but_single_target_fails_closed(
     assert not receipt.exists()
 
 
+def test_reset_all_removes_corrupt_reset_transaction_and_all_fixed_stages(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    imports = memories / ".imports"
+    backups = imports / "backups"
+    backups.mkdir(parents=True)
+    canonical = memories / "MEMORY.md"
+    reset_receipt = memories / f"{memory_tool._RESET_RECEIPT_PREFIX}corrupt.json"
+    memory_stage = memories / f"{memory_tool._RESET_STAGE_PREFIX}memory"
+    imports_stage = imports / f"{memory_tool._RESET_STAGE_PREFIX}imports"
+    backups_stage = backups / f"{memory_tool._RESET_STAGE_PREFIX}backups"
+    canonical.write_text("private memory", encoding="utf-8")
+    reset_receipt.write_text("{", encoding="utf-8")
+    memory_stage.write_text("private memory stage", encoding="utf-8")
+    imports_stage.write_text("private receipt stage", encoding="utf-8")
+    backups_stage.write_text("private backup stage", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    with pytest.raises(MemoryImportConflict, match="receipt"):
+        reset_curated_memory("memory")
+    assert all(
+        path.exists()
+        for path in (
+            canonical,
+            reset_receipt,
+            memory_stage,
+            imports_stage,
+            backups_stage,
+        )
+    )
+
+    assert reset_curated_memory("all")["status"] == "completed"
+    assert not any(
+        os.path.lexists(path)
+        for path in (
+            canonical,
+            reset_receipt,
+            memory_stage,
+            imports_stage,
+            backups_stage,
+        )
+    )
+
+
+def test_reset_retries_same_scope_atomic_stage_without_copying(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    (memories / ".imports" / "backups").mkdir(parents=True)
+    stage_name = f"{memory_tool._RESET_STAGE_PREFIX}crashed"
+    receipt_name = f"{memory_tool._RESET_RECEIPT_PREFIX}crashed.json"
+    stage = memories / stage_name
+    receipt = memories / receipt_name
+    stage.write_text("complete staged memory", encoding="utf-8")
+    receipt.write_text(json.dumps({
+        "version": 1,
+        "state": "staging",
+        "plan": [{
+            "scope": "memory",
+            "stage_scope": "memory",
+            "name": "MEMORY.md",
+            "stage": stage_name,
+            "label": "MEMORY.md",
+        }],
+    }), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    def reject_copy(*_args, **_kwargs):
+        raise AssertionError("atomic reset recovery must not copy staged data")
+
+    monkeypatch.setattr(memory_tool, "_reset_link_or_copy", reject_copy)
+
+    assert reset_curated_memory("memory")["status"] == "completed"
+    assert not (memories / "MEMORY.md").exists()
+    assert not stage.exists()
+    assert not receipt.exists()
+
+
+def test_public_reset_never_copies_large_sparse_managed_files(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    backups = memories / ".imports" / "backups"
+    backups.mkdir(parents=True)
+    canonical = memories / "MEMORY.md"
+    backup = backups / "memory-sparse.bak"
+    for path in (canonical, backup):
+        with path.open("wb") as handle:
+            handle.seek((65 << 20) - 1)
+            handle.write(b"x")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    def reject_copy(*_args, **_kwargs):
+        raise AssertionError("public reset must not duplicate managed files")
+
+    monkeypatch.setattr(memory_tool, "_reset_link_or_copy", reject_copy)
+
+    result = reset_curated_memory("memory")
+
+    assert result["status"] == "completed"
+    assert not canonical.exists()
+    assert not backup.exists()
+    assert not list(memories.rglob(f"{memory_tool._RESET_STAGE_PREFIX}*"))
+
+
 @pytest.mark.parametrize(
     "receipt_bytes",
     [b"\xff\xfe", b"x" * (memory_tool.MAX_CURATED_MEMORY_FILE_BYTES + 1)],
@@ -2710,8 +2869,10 @@ def test_memory_reset_and_import_are_serialized_by_profile_transaction(
     import_finished = threading.Event()
     original_move = memory_tool._reset_move_no_replace
 
-    def pause_after_canonical_move(handles, scope, name, stage):
-        original_move(handles, scope, name, stage)
+    def pause_after_canonical_move(
+        handles, scope, name, stage, stage_scope="memory"
+    ):
+        original_move(handles, scope, name, stage, stage_scope)
         if scope == "memory" and name == memory_path.name:
             reset_inside_transaction.set()
             assert allow_reset_to_finish.wait(timeout=5)
