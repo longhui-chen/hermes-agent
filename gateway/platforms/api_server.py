@@ -1381,7 +1381,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 return existing
             try:
                 from hermes_state import SessionDB
-                db = SessionDB()
+                db = SessionDB(Path(scoped_home) / "state.db")
                 self._session_dbs[scoped_home] = db
                 if self._session_db is None:
                     self._session_db = db

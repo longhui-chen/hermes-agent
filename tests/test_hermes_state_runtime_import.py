@@ -244,6 +244,8 @@ def test_runtime_import_rejects_non_completed_runtime_messages(tmp_path):
 
 @pytest.mark.parametrize("message", [
     {"source_id": "m", "role": "user", "content": "Authorization: Bearer abcdefghijklmnop", "created_at": 1},
+    {"source_id": "m-basic", "role": "user",
+     "content": "Authorization: Basic dXNlcjpwYXNzd29yZA==", "created_at": 1},
     {"source_id": "m-json", "role": "user",
      "content": '{"Authorization": "Bearer abcdefghijklmnop"}', "created_at": 1},
     {"source_id": "m-js", "role": "user",

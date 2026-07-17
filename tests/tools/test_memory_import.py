@@ -2111,6 +2111,7 @@ def test_memory_import_rejects_poison_and_overflow_without_writing(tmp_path, mon
 
 @pytest.mark.parametrize("entry", [
     "Authorization: Bearer abcdefghijklmnop",
+    "Authorization: Basic dXNlcjpwYXNzd29yZA==",
     '{"Authorization": "Bearer abcdefghijklmnop"}',
     "{'Authorization': 'Bearer abcdefghijklmnop'}",
     r'{\"Authorization\": \"Bearer abcdefghijklmnop\"}',

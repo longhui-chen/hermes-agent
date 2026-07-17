@@ -9,6 +9,9 @@ from portable_import_security import portable_credential_finding
     "value",
     [
         "Authorization=Bearer abcdefghijklmnop",
+        "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+        "Authorization: Basic YTo=",
+        '{"Authorization": "Basic dXNlcjpwYXNzd29yZA=="}',
         "api key = abcdefghijklmnop",
         "Authorization:\u0020Bearer\u0020abcdefghijklmnop",
         r"{\"Authorization\":\u0020\"Bearer\u0020abcdefghijklmnop\"}",
@@ -16,6 +19,9 @@ from portable_import_security import portable_credential_finding
     ],
     ids=[
         "authorization-equals",
+        "authorization-basic",
+        "authorization-basic-short",
+        "authorization-basic-json",
         "spaced-api-key",
         "decoded-unicode-space",
         "literal-json-escapes",
@@ -73,6 +79,7 @@ def test_portable_credential_scanner_rejects_high_confidence_bare_and_query_form
     "value",
     [
         "Authorization=Bearer redacted",
+        "Authorization: Basic ${BASIC_AUTH}",
         "api key = ${OPENAI_API_KEY}",
         r"{\"Authorization\":\u0020\"Bearer\u0020${ACCESS_TOKEN}\"}",
         "xapp-your-app-token-here",

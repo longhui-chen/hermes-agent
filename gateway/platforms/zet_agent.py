@@ -1749,7 +1749,18 @@ class ZetAgentAdapter(APIServerAdapter):
             return resp
         from tools.memory_tool import portable_memory_import_supported
 
-        memory_import_supported = portable_memory_import_supported()
+        operation_key = self._begin_runtime_import_operation(
+            _request_value(request, "hermes_profile_home")
+        )
+        if operation_key is None:
+            memory_import_supported = False
+        else:
+            try:
+                memory_import_supported = await _to_thread_with_completion_barrier(
+                    portable_memory_import_supported
+                )
+            finally:
+                self._end_runtime_import_operation(operation_key)
         payload.setdefault("features", {})["session_steer"] = True
         payload["features"]["completed_transcript_import"] = True
         payload["features"]["curated_memory_import"] = memory_import_supported
@@ -1845,15 +1856,6 @@ class ZetAgentAdapter(APIServerAdapter):
             return auth_err
         from tools.memory_tool import portable_memory_import_supported
 
-        if not portable_memory_import_supported():
-            return web.json_response(
-                {"error": {
-                    "message": "curated memory import is unavailable on this platform",
-                    "type": "invalid_request_error",
-                    "code": "memory_import_unsupported",
-                }},
-                status=501,
-            )
         operation_key = self._begin_runtime_import_operation(
             _request_value(request, "hermes_profile_home")
         )
@@ -1864,6 +1866,17 @@ class ZetAgentAdapter(APIServerAdapter):
                 status=409,
             )
         try:
+            if not await _to_thread_with_completion_barrier(
+                portable_memory_import_supported
+            ):
+                return web.json_response(
+                    {"error": {
+                        "message": "curated memory import is unavailable on this platform",
+                        "type": "invalid_request_error",
+                        "code": "memory_import_unsupported",
+                    }},
+                    status=501,
+                )
             body = await request.json()
             if not isinstance(body, dict) or body.get("mode") != "replace":
                 raise ValueError("mode must be replace")

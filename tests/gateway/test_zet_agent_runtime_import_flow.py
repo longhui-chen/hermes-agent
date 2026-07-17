@@ -492,6 +492,69 @@ async def test_memory_import_flow_blocks_unload_until_worker_finishes(monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint", ["capabilities", "memory-import"])
+async def test_durability_probe_runs_off_loop_and_holds_unload_barrier(
+    monkeypatch, endpoint
+):
+    import tools.memory_tool as memory_tool
+
+    event_loop_thread = threading.get_ident()
+    probe_threads = []
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_probe():
+        probe_threads.append(threading.get_ident())
+        started.set()
+        assert release.wait(2)
+        return True
+
+    class _Store:
+        def import_replace(self, **_kwargs):
+            return {"status": "completed"}
+
+    monkeypatch.setattr(memory_tool, "portable_memory_import_supported", slow_probe)
+    monkeypatch.setattr(memory_tool, "load_on_disk_store", lambda **_kwargs: _Store())
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    app = web.Application()
+    app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
+    app.router.add_post("/api/memory/import", adapter._handle_memory_import)
+    app.router.add_post("/v1/profile/unload", adapter._handle_profile_unload)
+    headers = {"Authorization": "Bearer test-key"}
+
+    async with TestClient(TestServer(app)) as cli:
+        if endpoint == "capabilities":
+            probe_task = asyncio.create_task(
+                cli.get("/v1/capabilities", headers=headers)
+            )
+        else:
+            probe_task = asyncio.create_task(
+                cli.post(
+                    "/api/memory/import",
+                    headers=headers,
+                    json={
+                        "import_id": "slow-probe",
+                        "mode": "replace",
+                        "target": "memory",
+                        "payload_sha256": hashlib.sha256(b"slow-probe").hexdigest(),
+                        "entries": ["safe fact"],
+                    },
+                )
+            )
+        assert await asyncio.to_thread(started.wait, 1)
+        blocked = await cli.post("/v1/profile/unload", headers=headers)
+        assert blocked.status == 409
+        assert (await blocked.json())["active_imports"] == 1
+        release.set()
+        assert (await probe_task).status == 200
+
+    assert probe_threads == [probe_threads[0]]
+    assert probe_threads[0] != event_loop_thread
+
+
+@pytest.mark.asyncio
 async def test_session_import_flow_blocks_unload_until_stage_finishes():
     started = threading.Event()
     release = threading.Event()
@@ -538,6 +601,73 @@ class _DirectImportRequest(dict):
 
     async def json(self):
         return self._body
+
+
+@pytest.mark.asyncio
+async def test_uncached_multiplex_session_imports_use_each_profile_database(
+    tmp_path, monkeypatch
+):
+    import hermes_state
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    default_home = tmp_path / "default"
+    first_home = tmp_path / "profiles" / "first"
+    second_home = tmp_path / "profiles" / "second"
+    first_home.mkdir(parents=True)
+    second_home.mkdir(parents=True)
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", default_home / "state.db")
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+
+    async def import_one(profile_home, suffix):
+        token = set_hermes_home_override(profile_home)
+        try:
+            stage = _DirectImportRequest({
+                "import_id": f"import-{suffix}",
+                "operation": "stage",
+                "source": "workbuddy",
+                "source_session_id": f"source-{suffix}",
+                "target_session_id": f"target-{suffix}",
+                "title": None,
+                "payload_sha256": hashlib.sha256(suffix.encode()).hexdigest(),
+                "expected_message_count": 1,
+                "chunk_index": 0,
+                "messages": [{
+                    "source_id": f"message-{suffix}",
+                    "role": "user",
+                    "content": f"profile {suffix}",
+                    "created_at": 1,
+                }],
+            })
+            stage["hermes_profile_home"] = str(profile_home)
+            assert (await adapter._handle_session_import(stage)).status == 200
+            commit = _DirectImportRequest({
+                "import_id": f"import-{suffix}",
+                "operation": "commit",
+            })
+            commit["hermes_profile_home"] = str(profile_home)
+            assert (await adapter._handle_session_import(commit)).status == 200
+        finally:
+            reset_hermes_home_override(token)
+
+    try:
+        await import_one(first_home, "first")
+        await import_one(second_home, "second")
+        first = SessionDB(first_home / "state.db")
+        second = SessionDB(second_home / "state.db")
+        try:
+            assert first.get_session("target-first") is not None
+            assert first.get_session("target-second") is None
+            assert second.get_session("target-second") is not None
+            assert second.get_session("target-first") is None
+            assert not (default_home / "state.db").exists()
+        finally:
+            first.close()
+            second.close()
+    finally:
+        for db in set(adapter._session_dbs.values()):
+            db.close()
 
 
 @pytest.mark.asyncio

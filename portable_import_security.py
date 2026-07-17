@@ -75,9 +75,12 @@ def _credential_value_looks_real(raw: str) -> bool:
 
 def _authorization_value_looks_real(raw: str) -> bool:
     value = raw.strip().strip("\"'")
-    bearer_match = re.fullmatch(r"bearer\s+(.+)", value, re.IGNORECASE)
-    if bearer_match:
-        return _credential_value_looks_real(bearer_match.group(1))
+    scheme_match = re.fullmatch(
+        r"[A-Za-z][A-Za-z0-9._~-]*\s+(.+)", value, re.IGNORECASE
+    )
+    if scheme_match:
+        parameter = scheme_match.group(1).strip().strip("\"'")
+        return bool(parameter) and _PLACEHOLDER_VALUE_RE.fullmatch(parameter) is None
     return _credential_value_looks_real(value)
 
 
@@ -97,12 +100,15 @@ def portable_credential_finding(value: str) -> Optional[str]:
     for match in _CREDENTIAL_ASSIGNMENT_RE.finditer(value):
         key = re.sub(r"[._ -]", "", match.group(1)).lower()
         raw_value = match.group(2)
-        if key == "authorization" and raw_value.strip("\"'").lower() == "bearer":
-            bearer_value = re.match(
+        authorization_scheme = raw_value.strip("\"'")
+        if key == "authorization" and re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9._~-]*", authorization_scheme
+        ):
+            authorization_value = re.match(
                 r"\s+([^\s,}\]\r\n#]+)", value[match.end() :]
             )
-            if bearer_value:
-                raw_value = f"Bearer {bearer_value.group(1)}"
+            if authorization_value:
+                raw_value = f"{authorization_scheme} {authorization_value.group(1)}"
         value_looks_real = (
             _authorization_value_looks_real(raw_value)
             if key == "authorization"
