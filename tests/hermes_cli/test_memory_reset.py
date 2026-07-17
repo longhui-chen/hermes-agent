@@ -124,6 +124,35 @@ class TestMemoryReset:
         assert "cleanup is still pending" in output
         assert "Memory reset complete" not in output
 
+    def test_unsupported_reset_exits_nonzero_before_any_mutation(
+        self, memory_env, monkeypatch, capsys
+    ):
+        import tools.memory_tool as memory_tool
+        from hermes_cli.main import cmd_memory
+
+        reset_called = False
+
+        def unexpected_reset(_target):
+            nonlocal reset_called
+            reset_called = True
+
+        monkeypatch.setattr(
+            memory_tool, "portable_memory_import_supported", lambda: False
+        )
+        monkeypatch.setattr(memory_tool, "reset_curated_memory", unexpected_reset)
+
+        with pytest.raises(SystemExit) as raised:
+            cmd_memory(
+                SimpleNamespace(memory_command="reset", target="memory", yes=True)
+            )
+
+        assert raised.value.code == 1
+        assert reset_called is False
+        output = capsys.readouterr().out
+        assert "unsupported" in output
+        assert "No memory files were changed" in output
+        assert "Memory reset complete" not in output
+
     def test_reset_no_files_exist(self, tmp_path, monkeypatch):
         """Should return 'nothing' when no memory files exist."""
         hermes_home = tmp_path / ".hermes"

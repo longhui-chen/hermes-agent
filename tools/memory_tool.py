@@ -54,6 +54,17 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 _OPEN_SUPPORTS_DIR_FD = os.open in os.supports_dir_fd
+_DIRECTORY_FSYNC_UNSUPPORTED_ERRNOS = {
+    errno.EINVAL,
+    getattr(errno, "ENOTSUP", errno.EINVAL),
+    getattr(errno, "EOPNOTSUPP", errno.EINVAL),
+}
+_LINK_COPY_FALLBACK_ERRNOS = {
+    errno.EPERM,
+    errno.EXDEV,
+    getattr(errno, "ENOTSUP", errno.EPERM),
+    getattr(errno, "EOPNOTSUPP", errno.EPERM),
+}
 
 
 def _path_identity(path: Path) -> tuple[int, int]:
@@ -99,18 +110,14 @@ def _fsync_directory(path: Path) -> None:
 
 
 def _fsync_directory_fd(directory_fd: int, path: Path) -> None:
-    """Persist an already-open directory without reopening a mutable path."""
+    """Strictly persist an open directory used by import/reset transactions."""
     try:
         os.fsync(directory_fd)
     except OSError as exc:
-        unsupported = {
-            errno.EINVAL,
-            getattr(errno, "ENOTSUP", errno.EINVAL),
-            getattr(errno, "EOPNOTSUPP", errno.EINVAL),
-        }
-        if exc.errno in unsupported:
-            logger.debug("directory fsync unsupported for %s: %s", path, exc)
-            return
+        if exc.errno in _DIRECTORY_FSYNC_UNSUPPORTED_ERRNOS:
+            raise MemoryImportUnsupported(
+                f"durable directory fsync is unsupported for {path}"
+            ) from exc
         raise
 
 # Where memory files live — resolved dynamically so profile overrides
@@ -123,8 +130,12 @@ def get_memory_dir() -> Path:
 
 
 def portable_memory_import_supported() -> bool:
-    """Whether this platform can enforce V2.5 directory-relative safety."""
-    return os.name != "nt" and _OPEN_SUPPORTS_DIR_FD
+    """Whether the current profile filesystem can enforce V2.5 durability."""
+    try:
+        _require_durable_profile_filesystem()
+    except (MemoryImportConflict, MemoryImportUnsupported, OSError):
+        return False
+    return True
 
 ENTRY_DELIMITER = "\n§\n"
 MEMORY_IMPORT_BACKUP_LIMIT = 5
@@ -138,6 +149,10 @@ _RESET_STAGE_PREFIX = ".reset_stage_"
 
 class MemoryImportConflict(ValueError):
     """An import id or receipt conflicts with the live curated memory."""
+
+
+class MemoryImportUnsupported(MemoryImportConflict):
+    """The platform/filesystem cannot provide durable portable memory writes."""
 
 
 class _ImportDirectoryHandles:
@@ -208,7 +223,9 @@ class _ImportDirectoryHandles:
                         f"{inspect_error}"
                     ) from exc
                 if not stat.S_ISDIR(current.st_mode):
-                    return -1
+                    raise MemoryImportConflict(
+                        f"managed memory directory {name} must be a real directory"
+                    ) from exc
             raise MemoryImportConflict(
                 f"managed memory directory {name} is unsafe: {exc}"
             ) from exc
@@ -332,6 +349,19 @@ class _ImportDirectoryHandles:
                 self.imports_fd, "backups", create=True
             )
             self._unopened_identities.pop(self.backup_dir, None)
+        self.verify_attached()
+
+    def require_durable_scopes(self) -> None:
+        """Strictly probe every currently opened transaction directory."""
+        self.verify_attached()
+        for directory_fd, path in (
+            (self.home_fd, self.home_dir),
+            (self.mem_fd, self.mem_dir),
+            (self.imports_fd, self.imports_dir),
+            (self.backup_fd, self.backup_dir),
+        ):
+            if directory_fd >= 0:
+                _fsync_directory_fd(directory_fd, path)
         self.verify_attached()
 
     @staticmethod
@@ -716,6 +746,7 @@ def _anchored_import_directories(
         expected_home_identity=expected_home_identity,
         expected_mem_identity=expected_mem_identity,
     ) as handles:
+        handles.require_durable_scopes()
         token = _ACTIVE_MEMORY_IMPORT_DIRS.set(handles)
         try:
             yield handles
@@ -741,8 +772,99 @@ def _require_real_directory(path: Path, *, label: str, create: bool) -> None:
         raise MemoryImportConflict(f"{label} must be a real directory, not a symlink")
 
 
+def _existing_profile_directory_for_fsync_probe() -> Path:
+    """Return a non-mutating probe directory on the profile's filesystem."""
+    home = get_hermes_home()
+    mem_dir = home / "memories"
+    for path, label in (
+        (home, "HERMES_HOME"),
+        (mem_dir, "profile memories directory"),
+    ):
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError:
+            continue
+        except NotADirectoryError as exc:
+            raise MemoryImportConflict(f"{label} is not a directory") from exc
+        if not stat.S_ISDIR(mode):
+            raise MemoryImportConflict(
+                f"{label} must be a real directory, not a symlink"
+            )
+    if os.path.lexists(mem_dir):
+        return mem_dir
+    if os.path.lexists(home):
+        return home
+    candidate = home.parent
+    while not candidate.exists():
+        parent = candidate.parent
+        if parent == candidate:
+            break
+        candidate = parent
+    if not candidate.is_dir():
+        raise MemoryImportConflict(
+            "cannot find an existing profile parent directory for fsync probe"
+        )
+    return candidate
+
+
+def _require_durable_profile_filesystem(
+) -> tuple[Optional[tuple[int, int]], Optional[tuple[int, int]]]:
+    """Probe directory fsync support before import/reset can mutate the profile."""
+    if os.name == "nt" or not _OPEN_SUPPORTS_DIR_FD:
+        raise MemoryImportUnsupported(
+            "durable curated-memory import/reset is unsupported on this platform"
+        )
+    home = get_hermes_home()
+    mem_dir = home / "memories"
+    home_identity = _path_identity(home) if os.path.lexists(home) else None
+    mem_identity = _path_identity(mem_dir) if os.path.lexists(mem_dir) else None
+    probe_path = _existing_profile_directory_for_fsync_probe()
+    fd = -1
+    try:
+        fd = _open_resolved_directory_chain(
+            probe_path, _ImportDirectoryHandles._directory_flags()
+        )
+        os.fsync(fd)
+    except OSError as exc:
+        if exc.errno in _DIRECTORY_FSYNC_UNSUPPORTED_ERRNOS:
+            raise MemoryImportUnsupported(
+                f"durable directory fsync is unsupported for {probe_path}"
+            ) from exc
+        raise
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    try:
+        if (
+            home_identity is not None
+            and _path_identity(home) != home_identity
+        ) or (
+            mem_identity is not None
+            and _path_identity(mem_dir) != mem_identity
+        ):
+            raise MemoryImportConflict(
+                "profile memory root changed during durability probe"
+            )
+    except OSError as exc:
+        raise MemoryImportConflict(
+            f"profile memory root changed during durability probe: {exc}"
+        ) from exc
+    if mem_identity is not None:
+        with _ImportDirectoryHandles(
+            mem_dir,
+            create_managed=False,
+            expected_home_identity=home_identity,
+            expected_mem_identity=mem_identity,
+        ) as handles:
+            handles.require_durable_scopes()
+    return home_identity, mem_identity
+
+
 def _require_profile_memory_snapshot(
-    *, create: bool
+    *,
+    create: bool,
+    expected_home_identity: Optional[tuple[int, int]] = None,
+    expected_mem_identity: Optional[tuple[int, int]] = None,
 ) -> tuple[Path, tuple[int, int], tuple[int, int]]:
     """Validate the profile root and capture identities for its secure open."""
     home = get_hermes_home()
@@ -782,6 +904,14 @@ def _require_profile_memory_snapshot(
         ) from exc
     if changed:
         raise MemoryImportConflict("profile memory root changed during validation")
+    if (
+        expected_home_identity is not None
+        and home_identity != expected_home_identity
+    ) or (
+        expected_mem_identity is not None
+        and mem_identity != expected_mem_identity
+    ):
+        raise MemoryImportConflict("profile memory root changed before secure open")
     return mem_dir, home_identity, mem_identity
 
 
@@ -876,6 +1006,32 @@ def _is_real_directory(path: Path) -> bool:
         return stat.S_ISDIR(os.lstat(path).st_mode)
     except FileNotFoundError:
         return False
+
+
+def _require_optional_real_directory(path: Path, *, label: str) -> bool:
+    """Return False only for ENOENT; reject every unsafe existing leaf."""
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return False
+    except NotADirectoryError as exc:
+        raise MemoryImportConflict(f"{label} is not a directory") from exc
+    if not stat.S_ISDIR(mode):
+        raise MemoryImportConflict(
+            f"{label} must be a real directory, not a symlink"
+        )
+    return True
+
+
+def _validate_optional_managed_memory_directories(mem_dir: Path) -> None:
+    imports_dir = mem_dir / ".imports"
+    if not _require_optional_real_directory(
+        imports_dir, label="managed memory directory .imports"
+    ):
+        return
+    _require_optional_real_directory(
+        imports_dir / "backups", label="managed memory directory backups"
+    )
 
 
 def _read_import_receipt_no_follow(path: Path) -> Optional[Dict[str, Any]]:
@@ -1011,6 +1167,200 @@ def _reset_fsync_scope(handles: _ImportDirectoryHandles, scope: str) -> None:
     _fsync_directory_fd(fd, path)
 
 
+def _reset_copy_regular_no_follow(
+    source_fd: int,
+    source_name: str,
+    destination_fd: int,
+    destination_name: str,
+    destination_path: Path,
+) -> None:
+    """Create one bounded, durable copy without following either leaf."""
+    try:
+        expected = os.stat(
+            source_name, dir_fd=source_fd, follow_symlinks=False
+        )
+    except OSError as exc:
+        raise MemoryImportConflict(
+            f"cannot inspect reset copy source {source_name}: {exc}"
+        ) from exc
+    if not stat.S_ISREG(expected.st_mode):
+        raise MemoryImportConflict(
+            f"reset copy source {source_name} must be a regular file"
+        )
+    read_flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        read_flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        read_flags |= os.O_NONBLOCK
+    write_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        write_flags |= os.O_NOFOLLOW
+    source_handle = -1
+    destination_handle = -1
+    destination_created = False
+    try:
+        source_handle = os.open(source_name, read_flags, dir_fd=source_fd)
+        opened = os.fstat(source_handle)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or (opened.st_dev, opened.st_ino)
+            != (expected.st_dev, expected.st_ino)
+        ):
+            raise MemoryImportConflict(
+                f"reset copy source {source_name} changed before open"
+            )
+        destination_handle = os.open(
+            destination_name,
+            write_flags,
+            0o600,
+            dir_fd=destination_fd,
+        )
+        destination_created = True
+        source_mode = stat.S_IMODE(expected.st_mode) & 0o777
+        os.fchmod(destination_handle, source_mode or 0o600)
+        total = 0
+        while True:
+            chunk = os.read(source_handle, min(64 << 10, expected.st_size + 1 - total))
+            if not chunk:
+                break
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_handle, view)
+                if written <= 0:
+                    raise OSError("short write during reset copy")
+                view = view[written:]
+            total += len(chunk)
+        after = os.fstat(source_handle)
+        if (
+            total != expected.st_size
+            or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            != (
+                expected.st_dev,
+                expected.st_ino,
+                expected.st_size,
+                expected.st_mtime_ns,
+            )
+        ):
+            raise MemoryImportConflict(
+                f"reset copy source {source_name} changed during copy"
+            )
+        os.fsync(destination_handle)
+    except BaseException:
+        if destination_handle >= 0:
+            os.close(destination_handle)
+            destination_handle = -1
+        if source_handle >= 0:
+            os.close(source_handle)
+            source_handle = -1
+        if destination_created:
+            try:
+                os.unlink(destination_name, dir_fd=destination_fd)
+                _fsync_directory_fd(destination_fd, destination_path)
+            except OSError:
+                pass
+        raise
+    finally:
+        if destination_handle >= 0:
+            os.close(destination_handle)
+        if source_handle >= 0:
+            os.close(source_handle)
+
+
+def _reset_link_or_copy(
+    source_fd: int,
+    source_name: str,
+    destination_fd: int,
+    destination_name: str,
+    destination_path: Path,
+) -> None:
+    try:
+        os.link(
+            source_name,
+            destination_name,
+            src_dir_fd=source_fd,
+            dst_dir_fd=destination_fd,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        if exc.errno not in _LINK_COPY_FALLBACK_ERRNOS:
+            raise
+        _reset_copy_regular_no_follow(
+            source_fd,
+            source_name,
+            destination_fd,
+            destination_name,
+            destination_path,
+        )
+
+
+def _reset_compare_regular_files(
+    first_fd: int, first_name: str, second_fd: int, second_name: str
+) -> str:
+    """Compare bounded regular files without loading reset-sized data in memory."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    handles = []
+    stats = []
+    try:
+        for directory_fd, name in (
+            (first_fd, first_name),
+            (second_fd, second_name),
+        ):
+            expected = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISREG(expected.st_mode):
+                raise MemoryImportConflict(
+                    f"reset copy residue {name} is not a regular file"
+                )
+            handle = os.open(name, flags, dir_fd=directory_fd)
+            opened = os.fstat(handle)
+            if (opened.st_dev, opened.st_ino) != (
+                expected.st_dev,
+                expected.st_ino,
+            ):
+                os.close(handle)
+                raise MemoryImportConflict(
+                    f"reset copy residue {name} changed before open"
+                )
+            handles.append(handle)
+            stats.append(expected)
+        common_size = min(stats[0].st_size, stats[1].st_size)
+        offset = 0
+        while offset < common_size:
+            size = min(64 << 10, common_size - offset)
+            if os.pread(handles[0], size, offset) != os.pread(
+                handles[1], size, offset
+            ):
+                return "different"
+            offset += size
+        for handle, expected in zip(handles, stats):
+            after = os.fstat(handle)
+            if (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ) != (
+                expected.st_dev,
+                expected.st_ino,
+                expected.st_size,
+                expected.st_mtime_ns,
+            ):
+                raise MemoryImportConflict("reset copy residue changed during compare")
+        if stats[0].st_size == stats[1].st_size:
+            return "equal"
+        return (
+            "first_prefix"
+            if stats[0].st_size < stats[1].st_size
+            else "second_prefix"
+        )
+    finally:
+        for handle in handles:
+            os.close(handle)
+
+
 def _reset_move_no_replace(
     handles: _ImportDirectoryHandles,
     source_scope: str,
@@ -1021,12 +1371,12 @@ def _reset_move_no_replace(
     if _reset_entry_stat(handles.mem_fd, stage_name) is not None:
         raise MemoryImportConflict(f"reset stage already exists: {stage_name}")
     handles.verify_attached()
-    os.link(
+    _reset_link_or_copy(
+        source_fd,
         source_name,
+        handles.mem_fd,
         stage_name,
-        src_dir_fd=source_fd,
-        dst_dir_fd=handles.mem_fd,
-        follow_symlinks=False,
+        handles.mem_dir,
     )
     # The staged dentry must be durable before the source dentry can be
     # durably removed.  This ordering matters when source and stage live in
@@ -1053,16 +1403,47 @@ def _reset_restore_plan(
             continue
         if source is not None:
             if (source.st_dev, source.st_ino) != (stage.st_dev, stage.st_ino):
-                raise MemoryImportConflict(
-                    f"cannot restore reset source occupied by another file: {entry['name']}"
+                relationship = _reset_compare_regular_files(
+                    source_fd,
+                    entry["name"],
+                    handles.mem_fd,
+                    entry["stage"],
                 )
-        else:
-            os.link(
+                if relationship == "equal":
+                    pass
+                elif relationship == "second_prefix":
+                    # A move-side copy was interrupted. The original source is
+                    # authoritative; discard only the incomplete stage.
+                    _reset_fsync_scope(handles, entry["scope"])
+                    os.unlink(entry["stage"], dir_fd=handles.mem_fd)
+                    _fsync_directory_fd(handles.mem_fd, handles.mem_dir)
+                    continue
+                elif relationship == "first_prefix":
+                    # Prefix shape alone cannot prove this is our interrupted
+                    # restore: a non-cooperating writer may have created a
+                    # legitimate new source after the crash. Preserve both.
+                    raise MemoryImportConflict(
+                        "cannot restore over a different source that is a prefix "
+                        f"of staged data: {entry['name']}"
+                    )
+                else:
+                    raise MemoryImportConflict(
+                        "cannot restore reset source occupied by different data: "
+                        f"{entry['name']}"
+                    )
+        if source is None:
+            _reset_link_or_copy(
+                handles.mem_fd,
                 entry["stage"],
+                source_fd,
                 entry["name"],
-                src_dir_fd=handles.mem_fd,
-                dst_dir_fd=source_fd,
-                follow_symlinks=False,
+                (
+                    handles.mem_dir
+                    if entry["scope"] == "memory"
+                    else handles.imports_dir
+                    if entry["scope"] == "imports"
+                    else handles.backup_dir
+                ),
             )
         # Confirm the restored source name before deleting the only durable
         # staged name.  If either fsync fails, the staging receipt and at least
@@ -1179,9 +1560,31 @@ def curated_memory_has_state(target: str) -> bool:
     """Return whether a reset target has canonical or managed import state."""
     if target not in {"all", "memory", "user"}:
         raise ValueError("target must be all, memory, or user")
-    mem_dir = get_memory_dir()
-    if not _is_real_directory(mem_dir):
+    home = get_hermes_home()
+    mem_dir = home / "memories"
+    try:
+        home_mode = os.lstat(home).st_mode
+    except FileNotFoundError:
         return False
+    except NotADirectoryError as exc:
+        raise MemoryImportConflict("HERMES_HOME is not a directory") from exc
+    if not stat.S_ISDIR(home_mode):
+        raise MemoryImportConflict(
+            "HERMES_HOME must be a real directory, not a symlink"
+        )
+    try:
+        memory_mode = os.lstat(mem_dir).st_mode
+    except FileNotFoundError:
+        return False
+    except NotADirectoryError as exc:
+        raise MemoryImportConflict(
+            "profile memories directory is not a directory"
+        ) from exc
+    if not stat.S_ISDIR(memory_mode):
+        raise MemoryImportConflict(
+            "profile memories directory must be a real directory, not a symlink"
+        )
+    _validate_optional_managed_memory_directories(mem_dir)
     if _has_import_temp_state(mem_dir):
         return True
     targets = ("memory", "user") if target == "all" else (target,)
@@ -1191,82 +1594,6 @@ def curated_memory_has_state(target: str) -> bool:
         if _target_has_import_state(mem_dir, item):
             return True
     return False
-
-
-def _reset_curated_memory_legacy_windows(target: str) -> Dict[str, Any]:
-    """Preserve the pre-V2.5 reset path where POSIX dirfd APIs do not exist."""
-    mem_dir = get_memory_dir()
-    if not _is_real_directory(mem_dir):
-        return {"deleted": [], "targets": [], "status": "completed"}
-    targets = ("memory", "user") if target == "all" else (target,)
-    imports_dir = mem_dir / ".imports"
-    backup_dir = imports_dir / "backups"
-    deleted = []
-    for item in targets:
-        filename = _MEMORY_TARGET_FILES[item]
-        canonical = mem_dir / filename
-        if (
-            os.path.lexists(canonical)
-            and not stat.S_ISDIR(os.lstat(canonical).st_mode)
-        ):
-            canonical.unlink()
-            deleted.append(filename)
-        with os.scandir(mem_dir) as entries:
-            for entry in entries:
-                if (
-                    (
-                        entry.name.startswith(f".{filename}.")
-                        and entry.name.endswith(".displaced")
-                    )
-                    or entry.name.startswith(f"{filename}.bak.")
-                ) and not entry.is_dir(follow_symlinks=False):
-                    os.unlink(entry.path)
-                    deleted.append(entry.name)
-        if _is_real_directory(backup_dir):
-            with os.scandir(backup_dir) as entries:
-                for entry in entries:
-                    if (
-                        entry.name.startswith(f"{item}-")
-                        and entry.name.endswith(".bak")
-                        and not entry.is_dir(follow_symlinks=False)
-                    ):
-                        os.unlink(entry.path)
-                        deleted.append(str(Path(".imports") / "backups" / entry.name))
-        if _is_real_directory(imports_dir):
-            with os.scandir(imports_dir) as entries:
-                for entry in entries:
-                    if not entry.name.endswith(".json"):
-                        continue
-                    receipt = _read_import_receipt_no_follow(Path(entry.path))
-                    if receipt is not None and receipt.get("target") == item:
-                        os.unlink(entry.path)
-                        deleted.append(str(Path(".imports") / entry.name))
-    for directory, prefixes, relative in (
-        (mem_dir, (".mem_", ".drift_", ".reset_receipt_"), Path(".")),
-        (imports_dir, (".receipt_",), Path(".imports")),
-        (backup_dir, (".backup_",), Path(".imports") / "backups"),
-    ):
-        if not _is_real_directory(directory):
-            continue
-        with os.scandir(directory) as entries:
-            for entry in entries:
-                if (
-                    any(entry.name.startswith(prefix) for prefix in prefixes)
-                    and entry.name.endswith(".tmp")
-                    and not entry.is_dir(follow_symlinks=False)
-                ):
-                    os.unlink(entry.path)
-                    deleted.append(str(relative / entry.name))
-    if _is_real_directory(mem_dir):
-        with os.scandir(mem_dir) as entries:
-            for entry in entries:
-                if (
-                    entry.name.startswith((_RESET_RECEIPT_PREFIX, _RESET_STAGE_PREFIX))
-                    and not entry.is_dir(follow_symlinks=False)
-                ):
-                    os.unlink(entry.path)
-                    deleted.append(entry.name)
-    return {"deleted": deleted, "targets": list(targets), "status": "completed"}
 
 
 def reset_curated_memory(target: str) -> Dict[str, Any]:
@@ -1279,13 +1606,16 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
     """
     if target not in {"all", "memory", "user"}:
         raise ValueError("target must be all, memory, or user")
-    if os.name == "nt":
-        return _reset_curated_memory_legacy_windows(target)
+    expected_home_identity, expected_mem_identity = (
+        _require_durable_profile_filesystem()
+    )
     mem_dir = get_memory_dir()
     if not _is_real_directory(mem_dir):
         return {"deleted": [], "targets": [], "status": "completed"}
     mem_dir, home_identity, mem_identity = _require_profile_memory_snapshot(
-        create=False
+        create=False,
+        expected_home_identity=expected_home_identity,
+        expected_mem_identity=expected_mem_identity,
     )
 
     targets = ("memory", "user") if target == "all" else (target,)
@@ -2144,8 +2474,13 @@ class MemoryStore:
 
         content = ENTRY_DELIMITER.join(normalized)
         content_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        expected_home_identity, expected_mem_identity = (
+            _require_durable_profile_filesystem()
+        )
         mem_dir, home_identity, mem_identity = _require_profile_memory_snapshot(
-            create=True
+            create=True,
+            expected_home_identity=expected_home_identity,
+            expected_mem_identity=expected_mem_identity,
         )
         path = mem_dir / _MEMORY_TARGET_FILES[target]
         # Reject an unsafe canonical leaf before creating managed import state.

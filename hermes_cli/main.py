@@ -12304,10 +12304,21 @@ def cmd_memory(args):
         print("  Saved to config.yaml\n")
     elif sub == "reset":
         from hermes_constants import get_hermes_home, display_hermes_home
-        from tools.memory_tool import curated_memory_has_state, reset_curated_memory
+        from tools.memory_tool import (
+            curated_memory_has_state,
+            portable_memory_import_supported,
+            reset_curated_memory,
+        )
 
         mem_dir = get_hermes_home() / "memories"
         target = getattr(args, "target", "all")
+        if not portable_memory_import_supported():
+            print(
+                "\n  ! Durable memory reset is unsupported on this platform or "
+                "profile filesystem."
+            )
+            print("  No memory files were changed.\n")
+            raise SystemExit(1)
         files_to_reset = []
         if target in {"all", "memory"}:
             files_to_reset.append(("MEMORY.md", "agent notes"))

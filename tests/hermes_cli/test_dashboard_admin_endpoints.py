@@ -243,6 +243,20 @@ class TestMemoryEndpoints:
         assert response.status_code == 503
         assert response.json()["detail"]["code"] == "memory_reset_cleanup_pending"
 
+    def test_reset_unsupported_is_explicit_and_keeps_memory(self, monkeypatch):
+        import tools.memory_tool as memory_tool
+        from hermes_constants import get_hermes_home
+
+        canonical = get_hermes_home() / "memories" / "MEMORY.md"
+        canonical.write_text("private", encoding="utf-8")
+        monkeypatch.setattr(memory_tool, "_OPEN_SUPPORTS_DIR_FD", False)
+
+        response = self.client.post("/api/memory/reset", json={"target": "memory"})
+
+        assert response.status_code == 501
+        assert response.json()["detail"]["code"] == "memory_reset_unsupported"
+        assert canonical.read_text(encoding="utf-8") == "private"
+
 
 class TestPairingEndpoints:
     @pytest.fixture(autouse=True)

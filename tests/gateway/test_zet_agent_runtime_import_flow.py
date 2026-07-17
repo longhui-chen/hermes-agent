@@ -52,6 +52,41 @@ async def test_unsupported_platform_disables_v25_memory_import(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_memory_import_durability_race_returns_unsupported(monkeypatch):
+    import tools.memory_tool as memory_tool
+
+    class _Store:
+        def import_replace(self, **_kwargs):
+            raise memory_tool.MemoryImportUnsupported(
+                "profile filesystem stopped supporting directory fsync"
+            )
+
+    monkeypatch.setattr(
+        memory_tool, "portable_memory_import_supported", lambda: True
+    )
+    monkeypatch.setattr(
+        memory_tool, "load_on_disk_store", lambda **_kwargs: _Store()
+    )
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    request = _DirectImportRequest({
+        "import_id": "durability-race",
+        "mode": "replace",
+        "target": "memory",
+        "payload_sha256": hashlib.sha256(b"durability-race").hexdigest(),
+        "entries": ["safe fact"],
+    })
+
+    response = await adapter._handle_memory_import(request)
+
+    assert response.status == 501
+    assert json.loads(response.text)["error"]["code"] == (
+        "memory_import_unsupported"
+    )
+
+
+@pytest.mark.asyncio
 async def test_completed_transcript_http_flow_requires_auth_and_commits_atomically(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))

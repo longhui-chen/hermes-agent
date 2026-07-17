@@ -1880,8 +1880,13 @@ class ZetAgentAdapter(APIServerAdapter):
             )
             return web.json_response(result)
         except Exception as exc:
-            from tools.memory_tool import MemoryImportConflict
-            if isinstance(exc, MemoryImportConflict):
+            from tools.memory_tool import (
+                MemoryImportConflict,
+                MemoryImportUnsupported,
+            )
+            if isinstance(exc, MemoryImportUnsupported):
+                status, code = 501, "memory_import_unsupported"
+            elif isinstance(exc, MemoryImportConflict):
                 status, code = 409, "memory_import_conflict"
             elif isinstance(exc, (ValueError, TypeError, RecursionError)):
                 status, code = 400, "invalid_memory_import"

@@ -9743,10 +9743,22 @@ async def reset_memory(body: MemoryReset):
     if target not in {"all", "memory", "user"}:
         raise HTTPException(status_code=400, detail="target must be all, memory, or user")
 
-    from tools.memory_tool import MemoryImportConflict, reset_curated_memory
+    from tools.memory_tool import (
+        MemoryImportConflict,
+        MemoryImportUnsupported,
+        reset_curated_memory,
+    )
 
     try:
         result = await asyncio.to_thread(reset_curated_memory, target)
+    except MemoryImportUnsupported as exc:
+        raise HTTPException(
+            status_code=501,
+            detail={
+                "code": "memory_reset_unsupported",
+                "message": str(exc),
+            },
+        )
     except (OSError, MemoryImportConflict) as exc:
         raise HTTPException(status_code=500, detail=f"Could not reset memory: {exc}")
     if result.get("status") != "completed":

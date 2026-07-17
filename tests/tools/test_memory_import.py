@@ -12,6 +12,7 @@ import pytest
 import tools.memory_tool as memory_tool
 from tools.memory_tool import (
     MemoryImportConflict,
+    MemoryImportUnsupported,
     MemoryStore,
     curated_memory_has_state,
     reset_curated_memory,
@@ -693,6 +694,402 @@ def test_reset_rollback_power_loss_remains_recoverable(
     assert not (memories / receipt_name).exists()
 
 
+@pytest.mark.parametrize(
+    "fallback_errno",
+    [
+        errno.EPERM,
+        errno.ENOTSUP,
+        getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+        errno.EXDEV,
+    ],
+)
+@pytest.mark.parametrize("scope", ["memory", "imports", "backups"])
+def test_reset_copy_fallback_moves_and_restores_same_and_cross_scope(
+    tmp_path, monkeypatch, scope, fallback_errno
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    imports = memories / ".imports"
+    backups = imports / "backups"
+    backups.mkdir(parents=True)
+    scope_path = {
+        "memory": memories,
+        "imports": imports,
+        "backups": backups,
+    }[scope]
+    source_name = f"copy-source-{scope}"
+    stage_name = f"{memory_tool._RESET_STAGE_PREFIX}copy-{scope}"
+    source_path = scope_path / source_name
+    stage_path = memories / stage_name
+    source_path.write_bytes((f"private-{scope}".encode()) * 8192)
+    original = source_path.read_bytes()
+    original_mode = stat.S_IMODE(source_path.stat().st_mode)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    def hardlinks_unsupported(*_args, **_kwargs):
+        raise OSError(fallback_errno, "hardlinks unsupported")
+
+    with memory_tool._anchored_import_directories(
+        memories, create_managed=False
+    ) as handles:
+        monkeypatch.setattr(memory_tool.os, "link", hardlinks_unsupported)
+        memory_tool._reset_move_no_replace(
+            handles, scope, source_name, stage_name
+        )
+        assert not source_path.exists()
+        assert stage_path.read_bytes() == original
+        assert stat.S_IMODE(stage_path.stat().st_mode) == original_mode
+
+        memory_tool._reset_restore_plan(handles, [{
+            "scope": scope,
+            "name": source_name,
+            "stage": stage_name,
+            "label": source_name,
+        }])
+
+    assert source_path.read_bytes() == original
+    assert stat.S_IMODE(source_path.stat().st_mode) == original_mode
+    assert not stage_path.exists()
+
+
+def test_reset_copy_fallback_does_not_catch_access_denied(tmp_path, monkeypatch):
+    memories = tmp_path / ".hermes" / "memories"
+    (memories / ".imports" / "backups").mkdir(parents=True)
+    source = memories / "MEMORY.md"
+    stage_name = f"{memory_tool._RESET_STAGE_PREFIX}access"
+    source.write_text("private", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    copied = False
+
+    def access_denied(*_args, **_kwargs):
+        raise OSError(errno.EACCES, "access denied")
+
+    def unexpected_copy(*_args, **_kwargs):
+        nonlocal copied
+        copied = True
+
+    with memory_tool._anchored_import_directories(
+        memories, create_managed=False
+    ) as handles:
+        monkeypatch.setattr(memory_tool.os, "link", access_denied)
+        monkeypatch.setattr(
+            memory_tool, "_reset_copy_regular_no_follow", unexpected_copy
+        )
+        with pytest.raises(OSError) as raised:
+            memory_tool._reset_move_no_replace(
+                handles, "memory", source.name, stage_name
+            )
+
+    assert raised.value.errno == errno.EACCES
+    assert copied is False
+    assert source.read_text(encoding="utf-8") == "private"
+    assert not (memories / stage_name).exists()
+
+
+@pytest.mark.parametrize("scope", ["memory", "imports", "backups"])
+def test_reset_copy_fallback_fsyncs_file_and_new_dir_before_unlink(
+    tmp_path, monkeypatch, scope
+):
+    memories = tmp_path / ".hermes" / "memories"
+    imports = memories / ".imports"
+    backups = imports / "backups"
+    backups.mkdir(parents=True)
+    scope_path = {
+        "memory": memories,
+        "imports": imports,
+        "backups": backups,
+    }[scope]
+    source_name = f"ordered-copy-{scope}"
+    stage_name = f"{memory_tool._RESET_STAGE_PREFIX}ordered-copy-{scope}"
+    (scope_path / source_name).write_bytes(b"private" * 8192)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+    with memory_tool._anchored_import_directories(
+        memories, create_managed=False
+    ) as handles:
+        original_fsync = memory_tool.os.fsync
+        original_dir_fsync = memory_tool._fsync_directory_fd
+        original_unlink = memory_tool.os.unlink
+        events = []
+
+        def hardlinks_unsupported(*_args, **_kwargs):
+            raise OSError(errno.ENOTSUP, "hardlinks unsupported")
+
+        def record_file_fsync(fd):
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                events.append("fsync:file")
+            return original_fsync(fd)
+
+        def record_directory_fsync(directory_fd, path):
+            events.append(f"fsync-dir:{path.name}")
+            return original_dir_fsync(directory_fd, path)
+
+        def record_unlink(*args, **kwargs):
+            events.append("unlink")
+            return original_unlink(*args, **kwargs)
+
+        monkeypatch.setattr(memory_tool.os, "link", hardlinks_unsupported)
+        monkeypatch.setattr(memory_tool.os, "fsync", record_file_fsync)
+        monkeypatch.setattr(
+            memory_tool, "_fsync_directory_fd", record_directory_fsync
+        )
+        monkeypatch.setattr(memory_tool.os, "unlink", record_unlink)
+
+        memory_tool._reset_move_no_replace(
+            handles, scope, source_name, stage_name
+        )
+        assert events == [
+            "fsync:file",
+            "fsync-dir:memories",
+            "unlink",
+            f"fsync-dir:{scope_path.name}",
+        ]
+
+        events.clear()
+        memory_tool._reset_restore_plan(handles, [{
+            "scope": scope,
+            "name": source_name,
+            "stage": stage_name,
+            "label": source_name,
+        }])
+        assert events == [
+            "fsync:file",
+            f"fsync-dir:{scope_path.name}",
+            "unlink",
+            "fsync-dir:memories",
+        ]
+
+
+@pytest.mark.parametrize("mutation", ["grow", "truncate"])
+def test_reset_copy_interruption_cleans_partial_stage_before_source_unlink(
+    tmp_path, monkeypatch, mutation
+):
+    memories = tmp_path / ".hermes" / "memories"
+    (memories / ".imports" / "backups").mkdir(parents=True)
+    source = memories / "MEMORY.md"
+    source.write_bytes(b"a" * (128 << 10))
+    stage_name = f"{memory_tool._RESET_STAGE_PREFIX}{mutation}"
+    stage = memories / stage_name
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    original_link = memory_tool.os.link
+    original_read = memory_tool.os.read
+    reads = 0
+
+    def hardlinks_unsupported(*_args, **_kwargs):
+        raise OSError(errno.EOPNOTSUPP, "hardlinks unsupported")
+
+    def mutate_during_copy(fd, size):
+        nonlocal reads
+        chunk = original_read(fd, size)
+        reads += 1
+        if reads == 1:
+            if mutation == "grow":
+                with source.open("ab") as handle:
+                    handle.write(b"growth")
+            else:
+                with source.open("r+b") as handle:
+                    handle.truncate(1)
+        return chunk
+
+    with memory_tool._anchored_import_directories(
+        memories, create_managed=False
+    ) as handles:
+        monkeypatch.setattr(memory_tool.os, "link", hardlinks_unsupported)
+        monkeypatch.setattr(memory_tool.os, "read", mutate_during_copy)
+        with pytest.raises(MemoryImportConflict, match="changed during copy"):
+            memory_tool._reset_move_no_replace(
+                handles, "memory", source.name, stage_name
+            )
+        monkeypatch.setattr(memory_tool.os, "link", original_link)
+
+    assert source.exists()
+    assert not stage.exists()
+
+
+def test_reset_copy_enospc_keeps_source_and_removes_partial_stage(
+    tmp_path, monkeypatch
+):
+    memories = tmp_path / ".hermes" / "memories"
+    (memories / ".imports" / "backups").mkdir(parents=True)
+    source = memories / "MEMORY.md"
+    source.write_bytes(b"a" * (128 << 10))
+    stage_name = f"{memory_tool._RESET_STAGE_PREFIX}enospc"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    original_write = memory_tool.os.write
+    writes = 0
+
+    def hardlinks_unsupported(*_args, **_kwargs):
+        raise OSError(errno.EXDEV, "hardlinks unavailable")
+
+    def fail_second_write(fd, data):
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise OSError(errno.ENOSPC, "disk full")
+        return original_write(fd, data)
+
+    with memory_tool._anchored_import_directories(
+        memories, create_managed=False
+    ) as handles:
+        monkeypatch.setattr(memory_tool.os, "link", hardlinks_unsupported)
+        monkeypatch.setattr(memory_tool.os, "write", fail_second_write)
+        with pytest.raises(OSError) as raised:
+            memory_tool._reset_move_no_replace(
+                handles, "memory", source.name, stage_name
+            )
+
+    assert raised.value.errno == errno.ENOSPC
+    assert source.exists()
+    assert not (memories / stage_name).exists()
+
+
+def test_reset_copy_rollback_preserves_original_file_mode(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    canonical = memories / "MEMORY.md"
+    canonical.write_text("private", encoding="utf-8")
+    canonical.chmod(0o640)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original_receipt_write = memory_tool._write_reset_receipt
+
+    def hardlinks_unsupported(*_args, **_kwargs):
+        raise OSError(errno.ENOTSUP, "hardlinks unsupported")
+
+    def fail_before_isolated_publish(handles, receipt_name, receipt):
+        if receipt["state"] == "isolated":
+            raise OSError(errno.EIO, "fail before isolated publish")
+        return original_receipt_write(handles, receipt_name, receipt)
+
+    monkeypatch.setattr(memory_tool.os, "link", hardlinks_unsupported)
+    monkeypatch.setattr(
+        memory_tool, "_write_reset_receipt", fail_before_isolated_publish
+    )
+    with pytest.raises(OSError, match="fail before isolated publish"):
+        reset_curated_memory("memory")
+
+    assert canonical.read_text(encoding="utf-8") == "private"
+    assert stat.S_IMODE(canonical.stat().st_mode) == 0o640
+    assert not list(memories.glob(f"{memory_tool._RESET_STAGE_PREFIX}*"))
+
+
+@pytest.mark.parametrize("partial_side", ["stage", "source"])
+def test_staging_receipt_recovers_interrupted_copy_prefix(
+    tmp_path, monkeypatch, partial_side
+):
+    memories = tmp_path / ".hermes" / "memories"
+    imports = memories / ".imports"
+    (imports / "backups").mkdir(parents=True)
+    source_name = "copy-source.json"
+    stage_name = f"{memory_tool._RESET_STAGE_PREFIX}partial-{partial_side}"
+    source = imports / source_name
+    stage = memories / stage_name
+    full = b"private-copy-content" * 4096
+    if partial_side == "stage":
+        source.write_bytes(full)
+        stage.write_bytes(full[: 32 << 10])
+    else:
+        source.write_bytes(full[: 32 << 10])
+        stage.write_bytes(full)
+    receipt_name = f"{memory_tool._RESET_RECEIPT_PREFIX}partial.json"
+    plan = [{
+        "scope": "imports",
+        "name": source_name,
+        "stage": stage_name,
+        "label": source_name,
+    }]
+    (memories / receipt_name).write_text(json.dumps({
+        "version": 1, "state": "staging", "plan": plan,
+    }), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+    def hardlinks_unsupported(*_args, **_kwargs):
+        raise OSError(errno.ENOTSUP, "hardlinks unsupported")
+
+    with memory_tool._anchored_import_directories(
+        memories, create_managed=False
+    ) as handles:
+        monkeypatch.setattr(memory_tool.os, "link", hardlinks_unsupported)
+        if partial_side == "source":
+            with pytest.raises(MemoryImportConflict, match="prefix"):
+                memory_tool._recover_reset_transactions(
+                    handles, os.listdir(handles.mem_fd)
+                )
+        else:
+            assert memory_tool._recover_reset_transactions(
+                handles, os.listdir(handles.mem_fd)
+            ) is False
+
+    if partial_side == "source":
+        assert source.read_bytes() == full[: 32 << 10]
+        assert stage.read_bytes() == full
+        assert (memories / receipt_name).exists()
+    else:
+        assert source.read_bytes() == full
+        assert not stage.exists()
+        assert not (memories / receipt_name).exists()
+
+
+def test_staging_recovery_never_deletes_new_user_file_that_is_stage_prefix(
+    tmp_path, monkeypatch
+):
+    memories = tmp_path / ".hermes" / "memories"
+    imports = memories / ".imports"
+    (imports / "backups").mkdir(parents=True)
+    source = imports / "new-user-file.json"
+    stage_name = f"{memory_tool._RESET_STAGE_PREFIX}user-prefix"
+    stage = memories / stage_name
+    source.write_bytes(b"legitimate new data")
+    stage.write_bytes(b"legitimate new data plus old staged suffix")
+    receipt_name = f"{memory_tool._RESET_RECEIPT_PREFIX}user-prefix.json"
+    (memories / receipt_name).write_text(json.dumps({
+        "version": 1,
+        "state": "staging",
+        "plan": [{
+            "scope": "imports",
+            "name": source.name,
+            "stage": stage_name,
+            "label": source.name,
+        }],
+    }), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+    with memory_tool._anchored_import_directories(
+        memories, create_managed=False
+    ) as handles:
+        with pytest.raises(MemoryImportConflict, match="prefix"):
+            memory_tool._recover_reset_transactions(
+                handles, os.listdir(handles.mem_fd)
+            )
+
+    assert source.read_bytes() == b"legitimate new data"
+    assert stage.exists()
+    assert (memories / receipt_name).exists()
+
+
+@pytest.mark.parametrize("size", [(2 << 20) + 17, (65 << 20) + 1])
+def test_reset_copy_fallback_has_no_import_sized_or_total_copy_cap(
+    tmp_path, monkeypatch, size
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    canonical = memories / "MEMORY.md"
+    with canonical.open("wb") as handle:
+        handle.truncate(size)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    def hardlinks_unsupported(*_args, **_kwargs):
+        raise OSError(errno.ENOTSUP, "hardlinks unsupported")
+
+    monkeypatch.setattr(memory_tool.os, "link", hardlinks_unsupported)
+    result = reset_curated_memory("memory")
+
+    assert result["status"] == "completed"
+    assert not canonical.exists()
+    assert curated_memory_has_state("memory") is False
+
+
 def test_memory_reset_cleanup_failure_is_explicit_and_retryable(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     memories = home / "memories"
@@ -836,7 +1233,7 @@ def test_memory_reset_rejects_profile_leaf_replacement_before_secure_open(
     monkeypatch.setattr(
         memory_tool, "_open_resolved_directory_chain", replace_before_open
     )
-    with pytest.raises(MemoryImportConflict, match="changed before secure open"):
+    with pytest.raises(MemoryImportConflict, match="changed"):
         reset_curated_memory("memory")
 
     assert replacement_victim.read_text(encoding="utf-8") == "replacement must survive"
@@ -882,7 +1279,7 @@ def test_memory_import_rejects_profile_leaf_replacement_before_secure_open(
     monkeypatch.setattr(
         memory_tool, "_open_resolved_directory_chain", replace_before_open
     )
-    with pytest.raises(MemoryImportConflict, match="changed before secure open"):
+    with pytest.raises(MemoryImportConflict, match="changed"):
         store.import_replace(
             target="memory",
             entries=["imported private fact"],
@@ -925,27 +1322,115 @@ def test_memory_reset_discovers_and_removes_legacy_and_transaction_residue(
     assert curated_memory_has_state("memory") is False
 
 
-def test_legacy_windows_reset_remains_available_and_cleans_v25_residue(
+def test_public_reset_is_unsupported_without_durable_directory_operations(
     tmp_path, monkeypatch
 ):
     home = tmp_path / ".hermes"
     memories = home / "memories"
     memories.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
-    residue = [
-        memories / "MEMORY.md",
-        memories / "MEMORY.md.bak.1700000000",
-        memories / ".drift_crash.tmp",
-        memories / f"{memory_tool._RESET_STAGE_PREFIX}orphan",
-        memories / f"{memory_tool._RESET_RECEIPT_PREFIX}orphan.json",
-    ]
-    for path in residue:
-        path.write_text("private residue", encoding="utf-8")
+    canonical = memories / "MEMORY.md"
+    canonical.write_text("private residue", encoding="utf-8")
+    monkeypatch.setattr(memory_tool, "_OPEN_SUPPORTS_DIR_FD", False)
 
-    result = memory_tool._reset_curated_memory_legacy_windows("memory")
+    assert memory_tool.portable_memory_import_supported() is False
+    with pytest.raises(MemoryImportUnsupported, match="unsupported"):
+        reset_curated_memory("memory")
 
-    assert result["status"] == "completed"
-    assert not any(os.path.lexists(path) for path in residue)
+    assert canonical.read_text(encoding="utf-8") == "private residue"
+
+
+def test_durability_capability_probe_does_not_create_profile(tmp_path, monkeypatch):
+    home = tmp_path / "missing" / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert memory_tool.portable_memory_import_supported() is True
+    assert not home.exists()
+
+
+def test_durability_capability_is_false_when_directory_fsync_is_unsupported(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "missing" / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original_fsync = memory_tool.os.fsync
+
+    def reject_directory(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.ENOTSUP, "directory fsync unsupported")
+        return original_fsync(fd)
+
+    monkeypatch.setattr(memory_tool.os, "fsync", reject_directory)
+
+    assert memory_tool.portable_memory_import_supported() is False
+    assert not home.exists()
+
+
+def test_existing_managed_scope_fsync_is_probed_before_reset_receipt_mutation(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    backups = memories / ".imports" / "backups"
+    backups.mkdir(parents=True)
+    canonical = memories / "MEMORY.md"
+    canonical.write_text("private", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original_fsync = memory_tool._fsync_directory_fd
+
+    def reject_backup_scope(directory_fd, path):
+        if path == backups:
+            raise MemoryImportUnsupported("backup scope fsync unsupported")
+        return original_fsync(directory_fd, path)
+
+    monkeypatch.setattr(
+        memory_tool, "_fsync_directory_fd", reject_backup_scope
+    )
+
+    assert memory_tool.portable_memory_import_supported() is False
+    with pytest.raises(MemoryImportUnsupported, match="backup scope"):
+        reset_curated_memory("memory")
+    assert canonical.read_text(encoding="utf-8") == "private"
+    assert not list(memories.glob(f"{memory_tool._RESET_RECEIPT_PREFIX}*"))
+
+
+@pytest.mark.parametrize("leaf", ["home", "memories"])
+@pytest.mark.parametrize("kind", ["symlink", "file"])
+def test_memory_state_and_reset_reject_unsafe_profile_leaf(
+    tmp_path, monkeypatch, leaf, kind
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    victim = outside / "MEMORY.md"
+    victim.write_text("outside survives", encoding="utf-8")
+    target = home if leaf == "home" else memories
+    if leaf == "memories":
+        home.mkdir()
+    if kind == "symlink":
+        target.symlink_to(outside, target_is_directory=True)
+    else:
+        target.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    with pytest.raises(MemoryImportConflict, match="real directory|not a directory"):
+        curated_memory_has_state("memory")
+    with pytest.raises(MemoryImportConflict, match="real directory|not a directory"):
+        reset_curated_memory("memory")
+
+    assert victim.read_text(encoding="utf-8") == "outside survives"
+
+
+def test_missing_profile_is_the_only_false_empty_reset_case(tmp_path, monkeypatch):
+    home = tmp_path / "missing" / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert curated_memory_has_state("all") is False
+    assert reset_curated_memory("all") == {
+        "deleted": [], "targets": [], "status": "completed",
+    }
+    assert not home.exists()
 
 
 def test_memory_import_rejects_poison_and_overflow_without_writing(tmp_path, monkeypatch):
@@ -1268,7 +1753,7 @@ def test_directory_fsync_still_reports_real_io_failure(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("operation", ["ordinary", "import", "reset"])
-def test_memory_flows_tolerate_unsupported_directory_fsync(
+def test_durable_memory_flows_reject_unsupported_directory_fsync_before_mutation(
     tmp_path, monkeypatch, operation
 ):
     home = tmp_path / ".hermes"
@@ -1286,17 +1771,19 @@ def test_memory_flows_tolerate_unsupported_directory_fsync(
         assert store.add("memory", "safe fact")["success"] is True
         assert (home / "memories" / "MEMORY.md").read_text() == "safe fact"
     elif operation == "import":
-        result = store.import_replace(
-            target="memory", entries=["safe fact"], import_id="unsupported-fsync",
-            payload_sha256=hashlib.sha256(b"unsupported-fsync").hexdigest(),
-        )
-        assert result["status"] == "completed"
-        assert (home / "memories" / "MEMORY.md").read_text() == "safe fact"
+        with pytest.raises(MemoryImportUnsupported, match="unsupported"):
+            store.import_replace(
+                target="memory", entries=["safe fact"],
+                import_id="unsupported-fsync",
+                payload_sha256=hashlib.sha256(b"unsupported-fsync").hexdigest(),
+            )
+        assert not home.exists()
     else:
         assert store.add("memory", "safe fact")["success"] is True
-        result = reset_curated_memory("memory")
-        assert result["targets"] == ["memory"]
-        assert not (home / "memories" / "MEMORY.md").exists()
+        canonical = home / "memories" / "MEMORY.md"
+        with pytest.raises(MemoryImportUnsupported, match="unsupported"):
+            reset_curated_memory("memory")
+        assert canonical.read_text(encoding="utf-8") == "safe fact"
 
 
 def test_memory_import_prepare_blocks_user_edit_after_crash(tmp_path, monkeypatch):
@@ -1671,9 +2158,48 @@ def test_memory_reset_does_not_traverse_symlinked_backup_directory(tmp_path, mon
     outside_backup.write_text("must survive", encoding="utf-8")
     (imports / "backups").symlink_to(outside, target_is_directory=True)
 
-    reset_curated_memory("memory")
+    with pytest.raises(MemoryImportConflict, match="backups.*real directory"):
+        curated_memory_has_state("memory")
+    with pytest.raises(MemoryImportConflict, match="backups.*real directory"):
+        reset_curated_memory("memory")
 
     assert outside_backup.read_text(encoding="utf-8") == "must survive"
+    assert (memories / "MEMORY.md").read_text(encoding="utf-8") == "memory"
+
+
+@pytest.mark.parametrize("managed_leaf", ["imports", "backups"])
+@pytest.mark.parametrize("kind", ["symlink", "file"])
+def test_memory_state_and_reset_reject_unsafe_managed_directory_leaf(
+    tmp_path, monkeypatch, managed_leaf, kind
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    canonical = memories / "MEMORY.md"
+    canonical.write_text("private", encoding="utf-8")
+    imports = memories / ".imports"
+    if managed_leaf == "backups":
+        imports.mkdir()
+        target = imports / "backups"
+    else:
+        target = imports
+    outside = tmp_path / "outside-managed"
+    outside.mkdir()
+    victim = outside / "victim"
+    victim.write_text("survives", encoding="utf-8")
+    if kind == "symlink":
+        target.symlink_to(outside, target_is_directory=True)
+    else:
+        target.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    with pytest.raises(MemoryImportConflict, match="managed memory directory"):
+        curated_memory_has_state("memory")
+    with pytest.raises(MemoryImportConflict, match="managed memory directory"):
+        reset_curated_memory("memory")
+
+    assert canonical.read_text(encoding="utf-8") == "private"
+    assert victim.read_text(encoding="utf-8") == "survives"
 
 
 def test_memory_reset_detects_and_removes_crash_temporary_plaintext(tmp_path, monkeypatch):
