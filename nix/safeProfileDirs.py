@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import errno
+import json
 import os
+import secrets
 import stat
 import sys
 from pathlib import Path
@@ -13,6 +15,7 @@ from pathlib import Path
 _RECURSIVE_IDENTITY_RETRIES = 3
 _MAX_RECURSIVE_DEPTH = 64
 _MANAGED_ROOT_LEAVES = {"config.yaml", ".managed", ".container-mode", "auth.json", ".env"}
+_MAX_MANAGED_LEAF_BYTES = 16 << 20
 
 
 def _directory_flags() -> int:
@@ -196,6 +199,224 @@ def _reject_unsafe_managed_leaves(home_fd: int) -> None:
             raise OSError(errno.EINVAL, f"unsafe managed profile leaf: {name}")
 
 
+def _identity_token(opened: os.stat_result) -> str:
+    return f"{opened.st_dev}:{opened.st_ino}"
+
+
+def _open_verified_home(home: Path, expected_identity: str) -> int:
+    home_fd = _open_absolute_directory(home)
+    if _identity_token(os.fstat(home_fd)) != expected_identity:
+        os.close(home_fd)
+        raise RuntimeError("managed profile changed after secure setup")
+    return home_fd
+
+
+def _validate_leaf_name(name: str) -> None:
+    if name not in _MANAGED_ROOT_LEAVES:
+        raise ValueError(f"unsupported managed profile leaf: {name}")
+
+
+def _read_managed_leaf(home_fd: int, name: str) -> bytes:
+    _validate_leaf_name(name)
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    try:
+        fd = os.open(name, flags, dir_fd=home_fd)
+    except FileNotFoundError:
+        return b""
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError(errno.EINVAL, f"unsafe managed profile leaf: {name}")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(64 << 10, _MAX_MANAGED_LEAF_BYTES + 1 - total))
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > _MAX_MANAGED_LEAF_BYTES:
+                raise OSError(errno.EFBIG, f"managed profile leaf is too large: {name}")
+    finally:
+        os.close(fd)
+
+
+def _write_managed_leaf(
+    home_fd: int,
+    name: str,
+    content: bytes,
+    uid: int,
+    gid: int,
+    mode: int,
+    *,
+    if_missing: bool = False,
+) -> None:
+    _validate_leaf_name(name)
+    if len(content) > _MAX_MANAGED_LEAF_BYTES:
+        raise OSError(errno.EFBIG, f"managed profile leaf is too large: {name}")
+    if if_missing:
+        try:
+            existing = os.stat(name, dir_fd=home_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            if not stat.S_ISREG(existing.st_mode):
+                raise OSError(errno.EINVAL, f"unsafe managed profile leaf: {name}")
+            return
+    temp_name = f".managed-leaf-{secrets.token_hex(16)}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(temp_name, flags, 0o600, dir_fd=home_fd)
+    published = False
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError(errno.EIO, f"failed to write managed profile leaf: {name}")
+            view = view[written:]
+        os.fsync(fd)
+        os.fchown(fd, uid, gid)
+        os.fchmod(fd, mode)
+        os.close(fd)
+        fd = -1
+        os.replace(temp_name, name, src_dir_fd=home_fd, dst_dir_fd=home_fd)
+        published = True
+        os.fsync(home_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if not published:
+            try:
+                os.unlink(temp_name, dir_fd=home_fd)
+            except FileNotFoundError:
+                pass
+
+
+def _remove_managed_leaf(home_fd: int, name: str) -> None:
+    _validate_leaf_name(name)
+    try:
+        current = os.stat(name, dir_fd=home_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(current.st_mode):
+        raise OSError(errno.EINVAL, f"unsafe managed profile leaf: {name}")
+    os.unlink(name, dir_fd=home_fd)
+    os.fsync(home_fd)
+
+
+def _sync_plugin_links(
+    home_fd: int, manifest_path: Path, uid: int, gid: int
+) -> None:
+    raw = manifest_path.read_bytes()
+    if len(raw) > _MAX_MANAGED_LEAF_BYTES:
+        raise OSError(errno.EFBIG, "managed plugin manifest is too large")
+    manifest = json.loads(raw)
+    if not isinstance(manifest, list):
+        raise ValueError("managed plugin manifest must be an array")
+    before = os.stat("plugins", dir_fd=home_fd, follow_symlinks=False)
+    plugins_fd = os.open("plugins", _directory_flags(), dir_fd=home_fd)
+    try:
+        opened = _require_visible_identity(home_fd, "plugins", plugins_fd, before)
+        if opened.st_dev != os.fstat(home_fd).st_dev:
+            raise OSError(errno.EXDEV, "managed plugins directory crosses device")
+        desired: list[tuple[str, str]] = []
+        for entry in manifest:
+            if not isinstance(entry, dict) or set(entry) != {"name", "target"}:
+                raise ValueError("invalid managed plugin manifest entry")
+            name = entry["name"]
+            target = entry["target"]
+            if (
+                not isinstance(name, str)
+                or not name
+                or name in {".", ".."}
+                or "/" in name
+                or "\0" in name
+                or not isinstance(target, str)
+                or not target.startswith("/")
+                or "\0" in target
+            ):
+                raise ValueError("unsafe managed plugin manifest entry")
+            desired.append((f"nix-managed-{name}", target))
+        for name in os.listdir(plugins_fd):
+            if not name.startswith("nix-managed-"):
+                continue
+            current = os.stat(name, dir_fd=plugins_fd, follow_symlinks=False)
+            if stat.S_ISLNK(current.st_mode):
+                os.unlink(name, dir_fd=plugins_fd)
+        for name, target in desired:
+            temp_name = f".managed-plugin-{secrets.token_hex(16)}.tmp"
+            os.symlink(target, temp_name, dir_fd=plugins_fd)
+            published = False
+            try:
+                os.chown(
+                    temp_name,
+                    uid,
+                    gid,
+                    dir_fd=plugins_fd,
+                    follow_symlinks=False,
+                )
+                os.replace(temp_name, name, src_dir_fd=plugins_fd, dst_dir_fd=plugins_fd)
+                published = True
+            finally:
+                if not published:
+                    try:
+                        os.unlink(temp_name, dir_fd=plugins_fd)
+                    except FileNotFoundError:
+                        pass
+        os.fsync(plugins_fd)
+        _require_visible_identity(home_fd, "plugins", plugins_fd, opened)
+    finally:
+        os.close(plugins_fd)
+
+
+def _write_trust_anchor(
+    path: Path, home: Path, uid: int, gid: int, opened: os.stat_result
+) -> None:
+    content = (
+        f"version=2\nhome={home}\nuid={uid}\ngid={gid}\n"
+        f"dev={opened.st_dev}\nino={opened.st_ino}\n"
+    ).encode()
+    temp = path.with_name(f".{path.name}.{secrets.token_hex(16)}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(temp, flags, 0o600)
+    published = False
+    try:
+        view = memoryview(content)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError(errno.EIO, "failed to write managed profile trust")
+            view = view[written:]
+        os.fsync(fd)
+        os.fchown(fd, 0, 0)
+        os.fchmod(fd, 0o444)
+        os.close(fd)
+        fd = -1
+        os.replace(temp, path)
+        published = True
+        parent_fd = _open_absolute_directory(path.parent)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if not published:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+
+
 def _normalize_tree(
     directory_fd: int,
     uid: int,
@@ -272,7 +493,8 @@ def ensure_transaction_directories(
     *,
     recursive_ownership: bool = False,
     shared_file_modes: bool = False,
-) -> None:
+    trust_anchor: Path | None = None,
+) -> str:
     """Normalize the managed profile chain without following any symlink."""
     parent_fd = _open_absolute_directory(home.parent)
     home_fd = memories_fd = imports_fd = backups_fd = -1
@@ -296,6 +518,9 @@ def ensure_transaction_directories(
             imports_fd, "backups", uid, gid, 0o2770, expected_device=root_device
         )
         _reject_unsafe_managed_leaves(home_fd)
+        opened_home = os.fstat(home_fd)
+        if trust_anchor is not None:
+            _write_trust_anchor(trust_anchor, home, uid, gid, opened_home)
         if recursive_ownership or shared_file_modes:
             _normalize_tree(
                 home_fd,
@@ -306,6 +531,7 @@ def ensure_transaction_directories(
                 shared_file_modes=shared_file_modes,
                 top_level=True,
             )
+        return _identity_token(opened_home)
     finally:
         for fd in (backups_fd, imports_fd, memories_fd, *state_fds, home_fd, parent_fd):
             if fd >= 0:
@@ -319,14 +545,69 @@ def main() -> None:
     parser.add_argument("gid", type=int)
     parser.add_argument("--recursive-ownership", action="store_true")
     parser.add_argument("--shared-file-modes", action="store_true")
+    parser.add_argument("--trust-anchor", type=Path)
+    parser.add_argument("--expected-identity")
+    parser.add_argument("--read-leaf", choices=sorted(_MANAGED_ROOT_LEAVES))
+    parser.add_argument("--write-leaf", choices=sorted(_MANAGED_ROOT_LEAVES))
+    parser.add_argument("--remove-leaf", choices=sorted(_MANAGED_ROOT_LEAVES))
+    parser.add_argument("--sync-plugins-manifest", type=Path)
+    parser.add_argument("--content-file", type=Path)
+    parser.add_argument("--leaf-mode", type=lambda value: int(value, 8))
+    parser.add_argument("--if-missing", action="store_true")
     args = parser.parse_args()
-    ensure_transaction_directories(
+    leaf_actions = [
+        args.read_leaf,
+        args.write_leaf,
+        args.remove_leaf,
+        args.sync_plugins_manifest,
+    ]
+    if sum(action is not None for action in leaf_actions) > 1:
+        parser.error("choose only one managed leaf action")
+    if any(action is not None for action in leaf_actions):
+        if not args.expected_identity:
+            parser.error("managed leaf actions require --expected-identity")
+        home_fd = _open_verified_home(args.home, args.expected_identity)
+        action_succeeded = False
+        try:
+            if args.read_leaf:
+                sys.stdout.buffer.write(_read_managed_leaf(home_fd, args.read_leaf))
+            elif args.write_leaf:
+                if args.content_file is None or args.leaf_mode is None:
+                    parser.error("--write-leaf requires --content-file and --leaf-mode")
+                _write_managed_leaf(
+                    home_fd,
+                    args.write_leaf,
+                    args.content_file.read_bytes(),
+                    args.uid,
+                    args.gid,
+                    args.leaf_mode,
+                    if_missing=args.if_missing,
+                )
+            elif args.remove_leaf:
+                _remove_managed_leaf(home_fd, args.remove_leaf)
+            else:
+                _sync_plugin_links(
+                    home_fd,
+                    args.sync_plugins_manifest,
+                    args.uid,
+                    args.gid,
+                )
+            action_succeeded = True
+        finally:
+            os.close(home_fd)
+        if action_succeeded:
+            verification_fd = _open_verified_home(args.home, args.expected_identity)
+            os.close(verification_fd)
+        return
+    identity = ensure_transaction_directories(
         args.home,
         args.uid,
         args.gid,
         recursive_ownership=args.recursive_ownership,
         shared_file_modes=args.shared_file_modes,
+        trust_anchor=args.trust_anchor,
     )
+    print(identity)
 
 
 if __name__ == "__main__":

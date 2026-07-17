@@ -1,6 +1,8 @@
 import importlib.util
+import json
 import os
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -357,6 +359,191 @@ def test_safe_profile_directory_flow_rejects_unsafe_managed_leaf(
         assert stat.S_ISFIFO(unsafe.lstat().st_mode)
 
 
+def test_managed_leaf_write_is_anchored_and_replaces_symlink_not_target(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    current = home.stat()
+    identity = safe_profile_dirs.ensure_transaction_directories(
+        home, current.st_uid, current.st_gid
+    )
+    outside = tmp_path / "outside"
+    outside.write_text("do not touch")
+    (home / ".managed").symlink_to(outside)
+    home_fd = safe_profile_dirs._open_verified_home(home, identity)
+    try:
+        safe_profile_dirs._write_managed_leaf(
+            home_fd,
+            ".managed",
+            b"managed",
+            current.st_uid,
+            current.st_gid,
+            0o644,
+        )
+    finally:
+        os.close(home_fd)
+
+    assert outside.read_text() == "do not touch"
+    assert not (home / ".managed").is_symlink()
+    assert (home / ".managed").read_bytes() == b"managed"
+
+
+def test_managed_leaf_action_rejects_replaced_profile_identity(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    current = home.stat()
+    identity = safe_profile_dirs.ensure_transaction_directories(
+        home, current.st_uid, current.st_gid
+    )
+    home.rename(tmp_path / ".hermes-old")
+    home.mkdir()
+
+    with pytest.raises(RuntimeError, match="changed after secure setup"):
+        safe_profile_dirs._open_verified_home(home, identity)
+
+
+def test_profile_trust_anchor_binds_opened_home_identity(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    current = home.stat()
+    trust_dir = tmp_path / "run"
+    trust_dir.mkdir()
+    trust = trust_dir / "profile-trust"
+    original_fchown = safe_profile_dirs.os.fchown
+
+    def allow_synthetic_root_owner(fd, uid, gid):
+        if (uid, gid) == (0, 0):
+            return None
+        return original_fchown(fd, uid, gid)
+
+    monkeypatch.setattr(safe_profile_dirs.os, "fchown", allow_synthetic_root_owner)
+
+    identity = safe_profile_dirs.ensure_transaction_directories(
+        home,
+        current.st_uid,
+        current.st_gid,
+        trust_anchor=trust,
+    )
+
+    fields = dict(line.split("=", 1) for line in trust.read_text().splitlines())
+    assert fields["version"] == "2"
+    assert f'{fields["dev"]}:{fields["ino"]}' == identity
+    assert fields["home"] == str(home)
+
+
+def test_safe_profile_cli_round_trips_anchored_leaf(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    current = home.stat()
+    setup = subprocess.run(
+        [sys.executable, str(_SOURCE), str(home), str(current.st_uid), str(current.st_gid)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    identity = setup.stdout.strip()
+    content = tmp_path / "managed-content"
+    content.write_text("managed")
+    subprocess.run(
+        [
+            sys.executable,
+            str(_SOURCE),
+            "--expected-identity",
+            identity,
+            str(home),
+            str(current.st_uid),
+            str(current.st_gid),
+            "--write-leaf",
+            ".managed",
+            "--content-file",
+            str(content),
+            "--leaf-mode",
+            "0644",
+        ],
+        check=True,
+    )
+    read_back = subprocess.run(
+        [
+            sys.executable,
+            str(_SOURCE),
+            "--expected-identity",
+            identity,
+            str(home),
+            str(current.st_uid),
+            str(current.st_gid),
+            "--read-leaf",
+            ".managed",
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    assert read_back.stdout == b"managed"
+
+
+def test_managed_plugin_sync_replaces_only_managed_symlinks(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    current = home.stat()
+    identity = safe_profile_dirs.ensure_transaction_directories(
+        home, current.st_uid, current.st_gid
+    )
+    plugins = home / "plugins"
+    stale_target = tmp_path / "stale-target"
+    stale_target.mkdir()
+    (plugins / "nix-managed-stale").symlink_to(stale_target)
+    regular = plugins / "nix-managed-regular"
+    regular.write_text("preserve user data")
+    desired_target = tmp_path / "desired-plugin"
+    desired_target.mkdir()
+    manifest = tmp_path / "plugins.json"
+    manifest.write_text(
+        json.dumps([{"name": "desired", "target": str(desired_target)}])
+    )
+
+    home_fd = safe_profile_dirs._open_verified_home(home, identity)
+    try:
+        safe_profile_dirs._sync_plugin_links(
+            home_fd, manifest, current.st_uid, current.st_gid
+        )
+    finally:
+        os.close(home_fd)
+
+    assert not (plugins / "nix-managed-stale").exists()
+    assert regular.read_text() == "preserve user data"
+    desired = plugins / "nix-managed-desired"
+    assert desired.is_symlink()
+    assert os.readlink(desired) == str(desired_target)
+
+
+def test_managed_plugin_sync_rejects_replaced_plugins_directory(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    current = home.stat()
+    identity = safe_profile_dirs.ensure_transaction_directories(
+        home, current.st_uid, current.st_gid
+    )
+    plugins = home / "plugins"
+    plugins.rename(home / "plugins-original")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    marker = outside / "nix-managed-keep"
+    marker.symlink_to(tmp_path / "keep-target")
+    plugins.symlink_to(outside, target_is_directory=True)
+    manifest = tmp_path / "plugins.json"
+    manifest.write_text("[]")
+
+    home_fd = safe_profile_dirs._open_verified_home(home, identity)
+    try:
+        with pytest.raises(OSError):
+            safe_profile_dirs._sync_plugin_links(
+                home_fd, manifest, current.st_uid, current.st_gid
+            )
+    finally:
+        os.close(home_fd)
+
+    assert marker.is_symlink()
+
+
 def test_nixos_module_uses_nofollow_helper_for_transaction_directories():
     source = (Path(__file__).parents[2] / "nix" / "nixosModules.nix").read_text()
 
@@ -369,19 +556,19 @@ def test_nixos_module_uses_nofollow_helper_for_transaction_directories():
     assert "--recursive-ownership" in source
     assert "--shared-file-modes" in source
     assert 'find "$HERMES_HOME"' not in source
-    assert '"$PROFILE_UID" \\' in source
-    assert '"$PROFILE_GID" > "$TRUST_TMP"' in source
     assert "stat -c %u ${profileHomeShell}" not in source
     assert "stat -c %g ${profileHomeShell}" not in source
-    helper_call = source.index("--shared-file-modes ${profileHomeShell}")
-    parent_lock = source.index("chmod 2700 ${cfg.stateDir}")
-    leaf_guard = source.index("for _managed_leaf in config.yaml")
-    parent_restore = source.rindex("_restore_profile_parent_mode")
-    assert parent_lock < helper_call < leaf_guard < parent_restore
-    assert "trap _restore_profile_parent_mode EXIT" in source
-    assert "trap - EXIT" in source
-    assert '[ -L "$_managed_path" ]' in source
-    assert '[ ! -f "$_managed_path" ]' in source
+    assert source.count("--trust-anchor /run/hermes-agent/profile-trust") == 2
+    assert "--expected-identity \"$PROFILE_IDENTITY\"" in source
+    assert "--sync-plugins-manifest ${managedPluginsManifest}" in source
+    assert "find ${cfg.stateDir}/.hermes/plugins" not in source
+    assert "ln -sfn ${plugin}" not in source
+    assert "chown -h ${cfg.user}:${cfg.group} ${cfg.stateDir}/.hermes/plugins" not in source
+    for leaf in ("config.yaml", ".managed", ".container-mode", "auth.json", ".env"):
+        assert f"--write-leaf {leaf}" in source or f"--remove-leaf {leaf}" in source
+    assert "touch ${cfg.stateDir}/.hermes/.managed" not in source
+    assert "cat > ${cfg.stateDir}/.hermes/.container-mode" not in source
+    assert "install -o ${cfg.user} -g ${cfg.group} -m 0600 ${cfg.authFile}" not in source
 
 
 def test_container_gid_uses_configured_group_for_host_users():

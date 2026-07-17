@@ -51,6 +51,12 @@
 
     configMergeScript = pkgs.callPackage ./configMergeScript.nix { };
     safeProfileDirs = ./safeProfileDirs.py;
+    managedPluginsManifest = pkgs.writeText "hermes-managed-plugins.json" (
+      builtins.toJSON (map (plugin: {
+        name = lib.getName plugin;
+        target = toString plugin;
+      }) cfg.extraPlugins)
+    );
 
     # config.yaml mode: group-writable (0660) when interactive users share this
     # HERMES_HOME via addToSystemPackages, so they can save settings through the
@@ -126,28 +132,12 @@
       chown "$HERMES_UID:$HERMES_GID" "$TARGET_HOME"
       chmod 0750 "$TARGET_HOME"
 
-      # Publish the exact shared profile identity from this root entrypoint.
-      # The unprivileged Hermes process cannot replace this trust anchor.
+      # Normalize the mounted profile and publish its exact opened identity.
       install -d -o root -g root -m 0755 /run/hermes-agent
-      (
-        umask 077
-        TRUST_TMP=/run/hermes-agent/.profile-trust.tmp
-        printf 'version=1\nhome=%s\nuid=%s\ngid=%s\n' \
-          "$HERMES_HOME" "$HERMES_UID" "$HERMES_GID" > "$TRUST_TMP"
-        chown root:root "$TRUST_TMP"
-        chmod 0444 "$TRUST_TMP"
-        mv -f "$TRUST_TMP" /run/hermes-agent/profile-trust
-      )
-
-      # Ensure HERMES_HOME is owned by the target user.
-      # Use find instead of chown -R: chown strips the setgid bit (kernel
-      # behavior), destroying the 2770 permissions the NixOS activation
-      # script sets for group access by hostUsers.  Only touch files with
-      # wrong ownership so correctly-owned dirs keep their permission bits.
-      if [ -n "''${HERMES_HOME:-}" ] && [ -d "$HERMES_HOME" ]; then
-        ${pkgs.python3}/bin/python3 ${safeProfileDirs} \
-          --recursive-ownership "$HERMES_HOME" "$HERMES_UID" "$HERMES_GID"
-      fi
+      PROFILE_IDENTITY="$(${pkgs.python3}/bin/python3 ${safeProfileDirs} \
+        --recursive-ownership \
+        --trust-anchor /run/hermes-agent/profile-trust \
+        "$HERMES_HOME" "$HERMES_UID" "$HERMES_GID")"
 
       # ── Provision apt packages (first boot only, cached in writable layer) ──
       # sudo: agent self-modification
@@ -742,51 +732,26 @@
           mkdir -p ${cfg.stateDir}/home
           mkdir -p ${cfg.workingDirectory}
           chown ${cfg.user}:${cfg.group} ${cfg.stateDir} ${cfg.stateDir}/home ${cfg.workingDirectory}
-          # Activation performs several root-owned leaf updates below. Remove
-          # shared-group write from their parent for the whole critical section
-          # so hostUsers cannot swap the verified profile between operations.
-          (
           chmod 2770 ${cfg.workingDirectory}
-          chmod 2700 ${cfg.stateDir}
+          chmod 2770 ${cfg.stateDir}
           chmod 0750 ${cfg.stateDir}/home
-          _restore_profile_parent_mode() {
-            chmod 2770 ${cfg.stateDir}
-          }
-          trap _restore_profile_parent_mode EXIT
 
           PROFILE_UID="$(${pkgs.coreutils}/bin/id -u ${lib.escapeShellArg cfg.user})"
           PROFILE_GID="$(${pkgs.glibc.bin}/bin/getent group ${lib.escapeShellArg cfg.group} | ${pkgs.coreutils}/bin/cut -d: -f3)"
-          ${pkgs.python3}/bin/python3 ${safeProfileDirs} \
-            --shared-file-modes ${profileHomeShell} "$PROFILE_UID" "$PROFILE_GID"
-
-          # The shared group cannot mutate the profile while the parent is
-          # locked down above. Reject pre-existing special leaves before any
-          # subsequent root pathname write can follow or overwrite them.
           PROFILE_HOME=${profileHomeShell}
-          for _managed_leaf in config.yaml .managed .container-mode auth.json .env; do
-            _managed_path="$PROFILE_HOME/$_managed_leaf"
-            if [ -L "$_managed_path" ] || { [ -e "$_managed_path" ] && [ ! -f "$_managed_path" ]; }; then
-              echo "ERROR: unsafe managed profile leaf: $_managed_path" >&2
-              exit 1
-            fi
-          done
-
-          # Root-owned trust anchor for the intentionally group-writable profile.
-          # It binds the permission exception to this exact HERMES_HOME and the
-          # owner/group assigned above; process-controlled environment variables
-          # are deliberately not trusted for this decision.
           install -d -o root -g root -m 0755 /run/hermes-agent
-          (
-            umask 077
-            TRUST_TMP=/run/hermes-agent/.profile-trust.tmp
-            printf 'version=1\nhome=%s\nuid=%s\ngid=%s\n' \
-              ${profileHomeShell} \
-              "$PROFILE_UID" \
-              "$PROFILE_GID" > "$TRUST_TMP"
-            chown root:root "$TRUST_TMP"
-            chmod 0444 "$TRUST_TMP"
-            mv -f "$TRUST_TMP" /run/hermes-agent/profile-trust
-          )
+          ACTIVATION_TMP="$(mktemp -d /run/hermes-agent/activation.XXXXXX)"
+          _cleanup_profile_activation() { rm -rf "$ACTIVATION_TMP"; }
+          trap _cleanup_profile_activation EXIT
+          PROFILE_IDENTITY="$(${pkgs.python3}/bin/python3 ${safeProfileDirs} \
+            --shared-file-modes \
+            --trust-anchor /run/hermes-agent/profile-trust \
+            "$PROFILE_HOME" "$PROFILE_UID" "$PROFILE_GID")"
+          _profile_leaf() {
+            ${pkgs.python3}/bin/python3 ${safeProfileDirs} \
+              --expected-identity "$PROFILE_IDENTITY" \
+              "$PROFILE_HOME" "$PROFILE_UID" "$PROFILE_GID" "$@"
+          }
 
           # Merge Nix settings into existing config.yaml.
           # Preserves user-added keys (skills, streaming, etc.); Nix keys win.
@@ -794,33 +759,33 @@
           # Mode is configYamlMode (0660 under addToSystemPackages so interactive
           # hermes-group users can save settings via the CLI/TUI, else 0640).
           ${if cfg.configFile != null then ''
-            install -o ${cfg.user} -g ${cfg.group} -m ${configYamlMode} -D ${configFile} ${cfg.stateDir}/.hermes/config.yaml
+            _profile_leaf --write-leaf config.yaml \
+              --content-file ${configFile} --leaf-mode ${configYamlMode}
           '' else ''
-            ${configMergeScript} ${generatedConfigFile} ${cfg.stateDir}/.hermes/config.yaml
-            chown ${cfg.user}:${cfg.group} ${cfg.stateDir}/.hermes/config.yaml
-            chmod ${configYamlMode} ${cfg.stateDir}/.hermes/config.yaml
+            _profile_leaf --read-leaf config.yaml > "$ACTIVATION_TMP/config.yaml"
+            ${configMergeScript} ${generatedConfigFile} "$ACTIVATION_TMP/config.yaml"
+            _profile_leaf --write-leaf config.yaml \
+              --content-file "$ACTIVATION_TMP/config.yaml" --leaf-mode ${configYamlMode}
           ''}
 
           # Managed mode marker (so interactive shells also detect NixOS management)
-          touch ${cfg.stateDir}/.hermes/.managed
-          chown ${cfg.user}:${cfg.group} ${cfg.stateDir}/.hermes/.managed
-          chmod 0644 ${cfg.stateDir}/.hermes/.managed
+          _profile_leaf --write-leaf .managed --content-file /dev/null --leaf-mode 0644
 
           # Container mode metadata — tells the host CLI to exec into the
           # container instead of running locally. Removed when container mode
           # is disabled so the host CLI falls back to native execution.
           ${if cfg.container.enable then ''
-            cat > ${cfg.stateDir}/.hermes/.container-mode <<'HERMES_CONTAINER_MODE_EOF'
+            cat > "$ACTIVATION_TMP/container-mode" <<'HERMES_CONTAINER_MODE_EOF'
     # Written by NixOS activation script. Do not edit manually.
     backend=${cfg.container.backend}
     container_name=${containerName}
     exec_user=${cfg.user}
     hermes_bin=${containerDataDir}/current-package/bin/hermes
     HERMES_CONTAINER_MODE_EOF
-            chown ${cfg.user}:${cfg.group} ${cfg.stateDir}/.hermes/.container-mode
-            chmod 0644 ${cfg.stateDir}/.hermes/.container-mode
+            _profile_leaf --write-leaf .container-mode \
+              --content-file "$ACTIVATION_TMP/container-mode" --leaf-mode 0644
           '' else ''
-            rm -f ${cfg.stateDir}/.hermes/.container-mode
+            _profile_leaf --remove-leaf .container-mode
 
             # Remove symlink bridge for hostUsers
             ${lib.concatStringsSep "\n" (map (user:
@@ -862,11 +827,11 @@
           # Seed auth file if provided
           ${lib.optionalString (cfg.authFile != null) ''
             ${if cfg.authFileForceOverwrite then ''
-              install -o ${cfg.user} -g ${cfg.group} -m 0600 ${cfg.authFile} ${cfg.stateDir}/.hermes/auth.json
+              _profile_leaf --write-leaf auth.json \
+                --content-file ${cfg.authFile} --leaf-mode 0600
             '' else ''
-              if [ ! -f ${cfg.stateDir}/.hermes/auth.json ]; then
-                install -o ${cfg.user} -g ${cfg.group} -m 0600 ${cfg.authFile} ${cfg.stateDir}/.hermes/auth.json
-              fi
+              _profile_leaf --write-leaf auth.json --if-missing \
+                --content-file ${cfg.authFile} --leaf-mode 0600
             ''}
           ''}
 
@@ -874,8 +839,7 @@
           # Hermes reads $HERMES_HOME/.env at startup via load_hermes_dotenv(),
           # so this is the single source of truth for both native and container mode.
           ${lib.optionalString (cfg.environment != {} || cfg.environmentFiles != []) ''
-            ENV_FILE="${cfg.stateDir}/.hermes/.env"
-            install -o ${cfg.user} -g ${cfg.group} -m 0640 /dev/null "$ENV_FILE"
+            ENV_FILE="$ACTIVATION_TMP/env"
             cat > "$ENV_FILE" <<'HERMES_NIX_ENV_EOF'
     ${envFileContent}
     HERMES_NIX_ENV_EOF
@@ -885,6 +849,8 @@
                 cat "${f}" >> "$ENV_FILE"
               fi
             '') cfg.environmentFiles)}
+            _profile_leaf --write-leaf .env \
+              --content-file "$ENV_FILE" --leaf-mode 0640
           ''}
 
           # Link documents into workspace
@@ -893,24 +859,16 @@
           '') cfg.documents)}
 
         # ── Declarative plugins ─────────────────────────────────────────
-        # Remove stale managed symlinks (plugins removed from config)
-        find ${cfg.stateDir}/.hermes/plugins -maxdepth 1 -type l -name 'nix-managed-*' -delete 2>/dev/null || true
-
-        ${lib.concatStringsSep "\n" (map (plugin:
-          let
-            name = lib.getName plugin;
-          in ''
+          ${lib.concatStringsSep "\n" (map (plugin: ''
             if [ ! -f "${plugin}/plugin.yaml" ]; then
               echo "ERROR: extraPlugins entry '${plugin}' has no plugin.yaml" >&2
               exit 1
             fi
-            ln -sfn ${plugin} ${cfg.stateDir}/.hermes/plugins/nix-managed-${name}
-            chown -h ${cfg.user}:${cfg.group} ${cfg.stateDir}/.hermes/plugins/nix-managed-${name}
           '') cfg.extraPlugins)}
+          _profile_leaf --sync-plugins-manifest ${managedPluginsManifest}
 
-          _restore_profile_parent_mode
+          _cleanup_profile_activation
           trap - EXIT
-          )
         '';
       }
 

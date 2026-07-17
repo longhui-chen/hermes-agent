@@ -1903,7 +1903,8 @@ def test_managed_profile_trust_requires_root_owned_readonly_anchor(
     owner = home.stat()
     trust = tmp_path / "profile-trust"
     trust.write_text(
-        f"version=1\nhome={home}\nuid={owner.st_uid}\ngid={owner.st_gid}\n",
+        f"version=2\nhome={home}\nuid={owner.st_uid}\ngid={owner.st_gid}\n"
+        f"dev={owner.st_dev}\nino={owner.st_ino}\n",
         encoding="utf-8",
     )
     trust.chmod(0o444)

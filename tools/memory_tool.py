@@ -103,19 +103,33 @@ def _managed_profile_trust() -> Optional[tuple[Path, int, int]]:
             if key in fields:
                 return None
             fields[key] = value
-        if set(fields) != {"version", "home", "uid", "gid"}:
+        if set(fields) != {"version", "home", "uid", "gid", "dev", "ino"}:
             return None
-        if fields["version"] != "1":
+        if fields["version"] != "2":
             return None
         uid = int(fields["uid"])
         gid = int(fields["gid"])
-        if uid < 0 or gid < 0 or not fields["home"].startswith("/"):
+        device = int(fields["dev"])
+        inode = int(fields["ino"])
+        if (
+            uid < 0
+            or gid < 0
+            or device < 0
+            or inode <= 0
+            or not fields["home"].startswith("/")
+        ):
             return None
         trusted_home = Path(os.path.realpath(fields["home"]))
         if Path(os.path.realpath(get_hermes_home())) != trusted_home:
             return None
+        current = os.stat(trusted_home, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != (device, inode)
+        ):
+            return None
         return trusted_home, uid, gid
-    except (UnicodeDecodeError, ValueError):
+    except (OSError, UnicodeDecodeError, ValueError):
         return None
 
 
