@@ -29,6 +29,7 @@ import base64
 import json
 import logging
 import os
+import re
 import threading
 import uuid
 from typing import Any, Dict, Optional
@@ -37,6 +38,54 @@ from urllib.parse import SplitResult, urlsplit, urlunsplit
 import requests
 
 from hermes_cli.config import cfg_get, load_config, read_raw_config
+
+
+_HANDBACK_SENSITIVE_CONTROL = re.compile(
+    r"(?ix)"
+    r"\b(?:password|passcode|one[- ]?time(?:\s+(?:password|code))?|otp|"
+    r"verification(?:\s+code)?|security\s+code|\d+[- ]digit\s+code|pin|"
+    r"card\s+number|credit\s+card|debit\s+card|cvv|cvc|social\s+security|"
+    r"ssn|passport|tax\s+id)\b|密码|验证码|银行卡|身份证"
+)
+_HANDBACK_EDITABLE_CONTROL = re.compile(
+    r"(?i)^\s*-\s*(?:textbox|searchbox|combobox|listbox|option|spinbutton|slider|checkbox|radio|switch)\b"
+)
+_HANDBACK_VALUE_ATTRIBUTE = re.compile(
+    r"(?i)\bvalue=(?:\"[^\"]*\"|'[^']*'|\S+)"
+)
+
+
+def _redact_handback_page_state(value: str) -> str:
+    """Apply mandatory privacy filtering to state captured after human control."""
+    from tools.browser_tool import _redact_browser_output
+
+    redacted = _redact_browser_output(value)
+    lines = []
+    for line in redacted.splitlines():
+        if _HANDBACK_EDITABLE_CONTROL.search(line) or _HANDBACK_SENSITIVE_CONTROL.search(line):
+            lines.append("[REDACTED sensitive form control]")
+        else:
+            lines.append(_HANDBACK_VALUE_ATTRIBUTE.sub("value=\"[REDACTED]\"", line))
+    return "\n".join(lines)
+
+
+def _redact_handback_url(value: str) -> str:
+    """Return only a credential-free browser location after human control."""
+    from agent.redact import redact_cdp_url
+
+    redacted = redact_cdp_url(value)
+    parts = urlsplit(redacted)
+    hostname = parts.hostname
+    if not hostname:
+        return ""
+    authority = f"[{hostname}]" if ":" in hostname else hostname
+    try:
+        port = parts.port
+    except ValueError:
+        return ""
+    if port is not None:
+        authority = f"{authority}:{port}"
+    return urlunsplit((parts.scheme, authority, "", "", ""))
 from tools.browser_camofox_state import get_camofox_identity
 from tools.registry import tool_error
 
@@ -48,8 +97,8 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT = 30  # fallback when config is unreadable
 _SNAPSHOT_MAX_CHARS = 80_000  # camofox paginates at this limit
-_vnc_url: Optional[str] = None  # cached from /health response
-_vnc_url_checked = False  # only probe once per process
+_vnc_url: Optional[str] = None  # single-profile cache from /health response
+_vnc_url_checked = False  # only probe once per single-profile process
 
 # Cached command timeout from config (resolved lazily, like browser_tool)
 _cached_cmd_timeout: Optional[int] = None
@@ -80,9 +129,37 @@ def _get_command_timeout() -> int:
     return result
 
 
+def _runtime_value(name: str, default: str = "") -> str:
+    """Resolve per-profile browser runtime configuration safely.
+
+    ``get_secret`` transparently falls back to ``os.environ`` in the legacy
+    single-profile process. In multiplex mode it reads only the active
+    profile's context-local scope and fails closed when that scope is missing.
+    """
+    from agent.secret_scope import get_secret
+
+    value = get_secret(name, default)
+    return str(value or default)
+
+
 def _auth_headers() -> Dict[str, str]:
-    """Return Authorization header when CAMOFOX_API_KEY is set."""
-    key = os.getenv("CAMOFOX_API_KEY", "").strip()
+    """Return the configured Camofox authentication header.
+
+    A local-server proxy authenticates Hermes with the per-agent action token
+    using a dedicated header. Direct Camofox connections retain the upstream
+    bearer-key contract for backwards compatibility.
+    """
+    auth_mode = _runtime_value("CAMOFOX_AUTH_MODE").strip().lower()
+    if auth_mode == "zettlab_action_token":
+        token = _runtime_value("ZETTLAB_AGENT_ACTION_TOKEN").strip()
+        if not token:
+            raise RuntimeError(
+                "CAMOFOX_AUTH_MODE=zettlab_action_token requires "
+                "ZETTLAB_AGENT_ACTION_TOKEN"
+            )
+        return {"X-Zettlab-Agent-Action-Token": token}
+
+    key = _runtime_value("CAMOFOX_API_KEY").strip()
     if key:
         return {"Authorization": f"Bearer {key}"}
     return {}
@@ -90,7 +167,7 @@ def _auth_headers() -> Dict[str, str]:
 
 def get_camofox_url() -> str:
     """Return the configured Camofox server URL, or empty string."""
-    return os.getenv("CAMOFOX_URL", "").rstrip("/")
+    return _runtime_value("CAMOFOX_URL").rstrip("/")
 
 
 def _config_cdp_url() -> str:
@@ -123,7 +200,7 @@ def is_camofox_mode() -> bool:
     var suppressed Camofox, so ``CAMOFOX_URL`` + a config CDP override still
     routed navigation through Camofox.)
     """
-    if os.getenv("BROWSER_CDP_URL", "").strip():
+    if _runtime_value("BROWSER_CDP_URL").strip():
         return False
     if _config_cdp_url():
         return False
@@ -137,8 +214,8 @@ def check_camofox_available() -> bool:
     if not url:
         return False
     try:
-        resp = requests.get(f"{url}/health", timeout=5)
-        if resp.status_code == 200 and not _vnc_url_checked:
+        resp = requests.get(f"{url}/health", timeout=5, headers=_auth_headers())
+        if resp.status_code == 200 and not _vnc_url_checked and not _local_server_managed():
             try:
                 data = resp.json()
                 vnc_port = data.get("vncPort")
@@ -157,6 +234,13 @@ def check_camofox_available() -> bool:
 
 def get_vnc_url() -> Optional[str]:
     """Return the VNC URL if the Camofox server exposes one, or None."""
+    from agent.secret_scope import is_multiplex_active
+
+    # A process-global VNC endpoint cannot be safely attributed to one profile
+    # in a multiplex gateway. Managed deployments expose their authenticated
+    # viewer through local-server instead.
+    if _local_server_managed() or is_multiplex_active():
+        return None
     if not _vnc_url_checked:
         check_camofox_available()
     return _vnc_url
@@ -184,6 +268,11 @@ def _managed_persistence_enabled() -> bool:
     return bool(_get_camofox_config().get("managed_persistence"))
 
 
+def _local_server_managed() -> bool:
+    """Return whether local-server owns Camofox process/profile lifecycle."""
+    return _env_flag("CAMOFOX_MANAGED_BY_LOCAL_SERVER") is True
+
+
 def _camofox_identity_override(task_id: Optional[str], camofox_cfg: Dict[str, Any]) -> Optional[Dict[str, str]]:
     """Return an externally configured Camofox identity, if one is set.
 
@@ -191,20 +280,20 @@ def _camofox_identity_override(task_id: Optional[str], camofox_cfg: Dict[str, An
     so Hermes operates in the same browser profile instead of creating a
     separate private session.
     """
-    user_id = os.getenv("CAMOFOX_USER_ID", "").strip() or str(camofox_cfg.get("user_id") or "").strip()
+    user_id = _runtime_value("CAMOFOX_USER_ID").strip() or str(camofox_cfg.get("user_id") or "").strip()
     if not user_id:
         return None
 
     session_key = (
-        os.getenv("CAMOFOX_SESSION_KEY", "").strip()
+        _runtime_value("CAMOFOX_SESSION_KEY").strip()
         or str(camofox_cfg.get("session_key") or "").strip()
-        or f"task_{(task_id or 'default')[:16]}"
+        or get_camofox_identity(task_id)["session_key"]
     )
     return {"user_id": user_id, "session_key": session_key}
 
 
 def _env_flag(name: str) -> Optional[bool]:
-    raw = os.getenv(name, "").strip().lower()
+    raw = _runtime_value(name).strip().lower()
     if not raw:
         return None
     if raw in {"1", "true", "yes", "on"}:
@@ -217,6 +306,8 @@ def _env_flag(name: str) -> Optional[bool]:
 
 def _adopt_existing_tab_enabled(camofox_cfg: Dict[str, Any]) -> bool:
     """Return whether Hermes should recover an existing Camofox tab ID."""
+    if _local_server_managed():
+        return True
     env_value = _env_flag("CAMOFOX_ADOPT_EXISTING_TAB")
     if env_value is not None:
         return env_value
@@ -244,7 +335,7 @@ def _loopback_rewrite_enabled(camofox_cfg: Dict[str, Any]) -> bool:
 def _loopback_rewrite_host(camofox_cfg: Dict[str, Any]) -> str:
     """Return the host alias used when rewriting loopback page URLs."""
     return (
-        os.getenv("CAMOFOX_LOOPBACK_HOST_ALIAS", "").strip()
+        _runtime_value("CAMOFOX_LOOPBACK_HOST_ALIAS").strip()
         or str(camofox_cfg.get("loopback_host_alias") or "").strip()
         or "host.docker.internal"
     )
@@ -309,9 +400,22 @@ def _rewrite_loopback_url_for_camofox(url: str) -> tuple[str, Optional[Dict[str,
 # ---------------------------------------------------------------------------
 # Session management
 # ---------------------------------------------------------------------------
-# Maps task_id -> {"user_id": str, "tab_id": str|None}
+# Maps a profile-scoped identity plus task to its process-local tab state.
 _sessions: Dict[str, Dict[str, Any]] = {}
 _sessions_lock = threading.Lock()
+
+
+def _session_cache_key(task_id: str, identity: Dict[str, str]) -> str:
+    return f"{identity['user_id']}\x00{identity['session_key']}\x00{task_id}"
+
+
+def _session_lock(session: Dict[str, Any]) -> threading.Lock:
+    with _sessions_lock:
+        lock = session.get("_lock")
+        if lock is None:
+            lock = threading.Lock()
+            session["_lock"] = lock
+        return lock
 
 
 def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
@@ -342,8 +446,7 @@ def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
         for tab in tabs
         if isinstance(tab, dict) and tab.get("listItemId") == session_key
     ]
-    candidates = matching_tabs or [tab for tab in tabs if isinstance(tab, dict)]
-    latest = candidates[-1] if candidates else None
+    latest = matching_tabs[-1] if matching_tabs else None
     tab_id = latest.get("tabId") if isinstance(latest, dict) else None
     if isinstance(tab_id, str) and tab_id:
         session["tab_id"] = tab_id
@@ -360,68 +463,103 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
     to the same persistent browser profile across restarts.
     """
     task_id = task_id or "default"
+    camofox_cfg = _get_camofox_config()
+    profile_identity = get_camofox_identity(task_id)
+    identity_override = _camofox_identity_override(task_id, camofox_cfg)
+    cache_identity = identity_override or profile_identity
+    cache_key = _session_cache_key(task_id, cache_identity)
     with _sessions_lock:
-        if task_id in _sessions:
-            return _adopt_existing_tab(_sessions[task_id])
-
-        camofox_cfg = _get_camofox_config()
-        identity_override = _camofox_identity_override(task_id, camofox_cfg)
-        if identity_override:
-            session = {
-                "user_id": identity_override["user_id"],
-                "tab_id": None,
-                "session_key": identity_override["session_key"],
-                "managed": True,
-                "adopt_existing_tab": _adopt_existing_tab_enabled(camofox_cfg),
-            }
-        elif bool(camofox_cfg.get("managed_persistence")):
-            identity = get_camofox_identity(task_id)
-            session = {
-                "user_id": identity["user_id"],
-                "tab_id": None,
-                "session_key": identity["session_key"],
-                "managed": True,
-                "adopt_existing_tab": _adopt_existing_tab_enabled(camofox_cfg),
-            }
+        if cache_key in _sessions:
+            session = _sessions[cache_key]
         else:
-            session = {
-                "user_id": f"hermes_{uuid.uuid4().hex[:10]}",
-                "tab_id": None,
-                "session_key": f"task_{task_id[:16]}",
-                "managed": False,
-                "adopt_existing_tab": False,
-            }
-        _sessions[task_id] = session
+            if identity_override:
+                session = {
+                    "user_id": identity_override["user_id"],
+                    "tab_id": None,
+                    "session_key": identity_override["session_key"],
+                    "managed": True,
+                    "adopt_existing_tab": _adopt_existing_tab_enabled(camofox_cfg),
+                    "_lock": threading.Lock(),
+                }
+            elif _local_server_managed() or bool(camofox_cfg.get("managed_persistence")):
+                session = {
+                    "user_id": profile_identity["user_id"],
+                    "tab_id": None,
+                    "session_key": profile_identity["session_key"],
+                    "managed": True,
+                    "adopt_existing_tab": _adopt_existing_tab_enabled(camofox_cfg),
+                    "_lock": threading.Lock(),
+                }
+            else:
+                session = {
+                    "user_id": f"hermes_{uuid.uuid4().hex[:10]}",
+                    "tab_id": None,
+                    "session_key": profile_identity["session_key"],
+                    "managed": False,
+                    "adopt_existing_tab": False,
+                    "_lock": threading.Lock(),
+                }
+            _sessions[cache_key] = session
+
+    with _session_lock(session):
         return _adopt_existing_tab(session)
 
 
 def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, Any]:
     """Ensure a tab exists for the session, creating one if needed."""
     session = _get_session(task_id)
-    if session["tab_id"]:
+    with _session_lock(session):
+        if session["tab_id"]:
+            return session
+        base = get_camofox_url()
+        resp = requests.post(
+            f"{base}/tabs",
+            json={
+                "userId": session["user_id"],
+                "listItemId": session["session_key"],
+                "url": url,
+            },
+            timeout=_get_command_timeout(),
+            headers=_auth_headers(),
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        session["tab_id"] = data.get("tabId")
         return session
-    base = get_camofox_url()
-    resp = requests.post(
-        f"{base}/tabs",
-        json={
-            "userId": session["user_id"],
-            "listItemId": session["session_key"],
-            "url": url,
-        },
-        timeout=_get_command_timeout(),
-        headers=_auth_headers(),
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    session["tab_id"] = data.get("tabId")
-    return session
 
 
 def _drop_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
     """Remove and return session info."""
     task_id = task_id or "default"
     with _sessions_lock:
-        return _sessions.pop(task_id, None)
+        camofox_cfg = _get_camofox_config()
+        identity = _camofox_identity_override(task_id, camofox_cfg) or get_camofox_identity(task_id)
+        return _sessions.pop(_session_cache_key(task_id, identity), None)
+
+
+def _release_local_server_lease() -> None:
+    """Best-effort release of the profile's long-lived Agent runtime lease."""
+    try:
+        _post("/_zettlab/release", {}, timeout=5)
+    except Exception as exc:
+        logger.debug("Camofox local-server lease release failed: %s", exc)
+
+
+def _takeover_ui_hint(session: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Build the opaque identifiers the App needs to claim this exact tab."""
+    if not _local_server_managed():
+        return None
+    agent_id = _runtime_value("ZET_AGENT_ID").strip()
+    browser_session_id = str(session.get("session_key") or "").strip()
+    tab_id = str(session.get("tab_id") or "").strip()
+    if not agent_id or not browser_session_id or not tab_id:
+        return None
+    return {
+        "type": "takeover_browser",
+        "agent_id": agent_id,
+        "browser_session_id": browser_session_id,
+        "tab_id": tab_id,
+    }
 
 
 def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
@@ -434,8 +572,14 @@ def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
     :func:`camofox_close`.
     """
     camofox_cfg = _get_camofox_config()
-    if bool(camofox_cfg.get("managed_persistence")) or _camofox_identity_override(task_id, camofox_cfg):
+    if (
+        _local_server_managed()
+        or bool(camofox_cfg.get("managed_persistence"))
+        or _camofox_identity_override(task_id, camofox_cfg)
+    ):
         _drop_session(task_id)
+        if _local_server_managed():
+            _release_local_server_lease()
         logger.debug("Camofox soft cleanup for task %s (managed persistence)", task_id)
         return True
     return False
@@ -485,6 +629,132 @@ def _delete(path: str, body: dict = None, timeout: Optional[int] = None) -> dict
     return resp.json()
 
 
+def _control_error_payload(exc: BaseException) -> Optional[Dict[str, Any]]:
+    """Return a validated local-server control error envelope, if present."""
+    if not isinstance(exc, requests.HTTPError) or exc.response is None:
+        return None
+    try:
+        payload = exc.response.json()
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    status = exc.response.status_code
+    code = payload.get("error")
+    if (status, code) not in {
+        (423, "browser_human_controlled"),
+        (409, "browser_resnapshot_required"),
+    }:
+        return None
+    return payload
+
+
+def _retryable_control_result(
+    exc: BaseException,
+    session: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Translate takeover/handback HTTP responses into retryable tool JSON.
+
+    A handback invalidates accessibility refs. On the 409 transition response,
+    Hermes captures a fresh snapshot and acknowledges the resume token before
+    asking the model to retry. The blocked action itself is never replayed.
+    """
+    payload = _control_error_payload(exc)
+    if payload is None:
+        return None
+
+    code = payload["error"]
+    result: Dict[str, Any] = {
+        "success": False,
+        "error": code,
+        "retryable": True,
+    }
+    message = payload.get("message")
+    if isinstance(message, str) and message:
+        result["message"] = message[:500]
+    retry_after_ms = payload.get("retry_after_ms")
+    if isinstance(retry_after_ms, int) and not isinstance(retry_after_ms, bool):
+        result["retry_after_ms"] = max(0, min(retry_after_ms, 60_000))
+    takeover_session_id = payload.get("takeover_session_id")
+    if isinstance(takeover_session_id, str) and takeover_session_id:
+        result["takeover_session_id"] = takeover_session_id[:256]
+
+    if code != "browser_resnapshot_required":
+        return json.dumps(result)
+
+    result["resnapshot_completed"] = False
+    result["resume_acknowledged"] = False
+    if not session or not session.get("tab_id") or not session.get("user_id"):
+        return json.dumps(result)
+
+    try:
+        snapshot_data = _get(
+            f"/tabs/{session['tab_id']}/snapshot",
+            params={"userId": session["user_id"]},
+        )
+        snapshot = snapshot_data.get("snapshot", "")
+        if not isinstance(snapshot, str):
+            snapshot = ""
+        from tools.browser_tool import (
+            SNAPSHOT_SUMMARIZE_THRESHOLD,
+            _redact_browser_output,
+            _truncate_snapshot,
+        )
+
+        if len(snapshot) > SNAPSHOT_SUMMARIZE_THRESHOLD:
+            snapshot = _truncate_snapshot(snapshot)
+        result["snapshot"] = _redact_handback_page_state(snapshot)
+        result["element_count"] = snapshot_data.get("refsCount", 0)
+        result["resnapshot_completed"] = True
+
+        tabs = _get("/tabs", params={"userId": session["user_id"]}, timeout=5).get("tabs", [])
+        current_tab = next(
+            (tab for tab in tabs if isinstance(tab, dict) and tab.get("tabId") == session["tab_id"]),
+            None,
+        )
+        current_url = current_tab.get("url") if isinstance(current_tab, dict) else None
+        current_title = current_tab.get("title") if isinstance(current_tab, dict) else None
+        if not isinstance(current_url, str) or not current_url.strip() or not isinstance(current_title, str):
+            result["resnapshot_completed"] = False
+            return json.dumps(result)
+        result["url"] = _redact_handback_url(current_url.strip())
+        result["title"] = "[REDACTED after human control]"
+    except Exception as snapshot_exc:
+        logger.warning("Camofox handback resnapshot failed: %s", snapshot_exc)
+        return json.dumps(result)
+
+    resume_token = payload.get("resume_token")
+    if not isinstance(resume_token, str) or not resume_token:
+        return json.dumps(result)
+
+    try:
+        _post(
+            "/_zettlab/control/resume/ack",
+            {
+                "userId": session["user_id"],
+                "tabId": session["tab_id"],
+                "resumeToken": resume_token,
+            },
+        )
+        result["resume_acknowledged"] = True
+    except Exception as ack_exc:
+        logger.warning("Camofox handback acknowledgement failed: %s", ack_exc)
+    return json.dumps(result)
+
+
+def _tool_error_from_exception(
+    exc: BaseException,
+    *,
+    session: Optional[Dict[str, Any]] = None,
+    prefix: str = "",
+) -> str:
+    retryable = _retryable_control_result(exc, session)
+    if retryable is not None:
+        return retryable
+    return tool_error(f"{prefix}{exc}", success=False)
+
+
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
@@ -523,6 +793,9 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
             "url": data.get("url", browser_url),
             "title": data.get("title", ""),
         }
+        takeover_hint = _takeover_ui_hint(session)
+        if takeover_hint:
+            result["ui_hint"] = takeover_hint
         if rewrite_info:
             result["requested_url"] = url
             result["url_rewrite"] = rewrite_info
@@ -558,8 +831,17 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
 
         return json.dumps(result)
     except requests.HTTPError as e:
-        return tool_error(f"Navigation failed: {e}", success=False)
+        return _tool_error_from_exception(
+            e,
+            session=locals().get("session"),
+            prefix="Navigation failed: ",
+        )
     except requests.ConnectionError:
+        if _local_server_managed():
+            return json.dumps({
+                "success": False,
+                "error": "The device local browser is temporarily unavailable.",
+            })
         return json.dumps({
             "success": False,
             "error": f"Cannot connect to Camofox at {get_camofox_url()}. "
@@ -567,7 +849,7 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
                      "or: docker run -p 9377:9377 -e CAMOFOX_PORT=9377 jo-inc/camofox-browser",
         })
     except Exception as e:
-        return tool_error(str(e), success=False)
+        return _tool_error_from_exception(e, session=locals().get("session"))
 
 
 def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
@@ -605,7 +887,7 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
             "element_count": refs_count,
         })
     except Exception as e:
-        return tool_error(str(e), success=False)
+        return _tool_error_from_exception(e, session=locals().get("session"))
 
 
 def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
@@ -628,7 +910,7 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
             "url": data.get("url", ""),
         })
     except Exception as e:
-        return tool_error(str(e), success=False)
+        return _tool_error_from_exception(e, session=locals().get("session"))
 
 
 def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
@@ -665,6 +947,9 @@ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     except Exception as e:
         from agent.display import redact_browser_typed_text_for_display
 
+        retryable = _retryable_control_result(e, locals().get("session"))
+        if retryable is not None:
+            return retryable
         return tool_error(redact_browser_typed_text_for_display(str(e), text), success=False)
 
 
@@ -681,7 +966,7 @@ def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
         )
         return json.dumps({"success": True, "scrolled": direction})
     except Exception as e:
-        return tool_error(str(e), success=False)
+        return _tool_error_from_exception(e, session=locals().get("session"))
 
 
 def camofox_back(task_id: Optional[str] = None) -> str:
@@ -697,7 +982,7 @@ def camofox_back(task_id: Optional[str] = None) -> str:
         )
         return json.dumps({"success": True, "url": data.get("url", "")})
     except Exception as e:
-        return tool_error(str(e), success=False)
+        return _tool_error_from_exception(e, session=locals().get("session"))
 
 
 def camofox_press(key: str, task_id: Optional[str] = None) -> str:
@@ -713,7 +998,7 @@ def camofox_press(key: str, task_id: Optional[str] = None) -> str:
         )
         return json.dumps({"success": True, "pressed": key})
     except Exception as e:
-        return tool_error(str(e), success=False)
+        return _tool_error_from_exception(e, session=locals().get("session"))
 
 
 def camofox_close(task_id: Optional[str] = None) -> str:
@@ -722,6 +1007,14 @@ def camofox_close(task_id: Optional[str] = None) -> str:
         session = _drop_session(task_id)
         if not session:
             return json.dumps({"success": True, "closed": True})
+
+        if _local_server_managed():
+            _release_local_server_lease()
+            return json.dumps({
+                "success": True,
+                "closed": False,
+                "released": True,
+            })
 
         _delete(
             f"/sessions/{session['user_id']}",
@@ -775,7 +1068,7 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
             "count": len(images),
         })
     except Exception as e:
-        return tool_error(str(e), success=False)
+        return _tool_error_from_exception(e, session=locals().get("session"))
 
 
 def camofox_vision(question: str, annotate: bool = False,
@@ -868,7 +1161,7 @@ def camofox_vision(question: str, annotate: bool = False,
             "screenshot_path": screenshot_path,
         })
     except Exception as e:
-        return tool_error(str(e), success=False)
+        return _tool_error_from_exception(e, session=locals().get("session"))
 
 
 def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
@@ -886,6 +1179,3 @@ def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
         "note": "Console log capture is not available with the Camofox backend. "
                 "Use browser_snapshot or browser_vision to inspect page state.",
     })
-
-
-

@@ -3145,6 +3145,11 @@ def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
         result = None
         for _ in range(_SCROLL_REPEATS):
             result = camofox_scroll(direction, task_id)
+            try:
+                if json.loads(result).get("success") is not True:
+                    return result
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return result
         return result
 
     effective_task_id = _last_session_key(task_id or "default")
@@ -3690,7 +3695,7 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
 
 def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
     """Evaluate JS via Camofox's /tabs/{tab_id}/eval endpoint (if available)."""
-    from tools.browser_camofox import _ensure_tab, _post
+    from tools.browser_camofox import _ensure_tab, _post, _tool_error_from_exception
     try:
         tab_info = _ensure_tab(task_id or "default")
         tab_id = tab_info.get("tab_id") or tab_info.get("id")
@@ -3719,7 +3724,7 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
                 "error": "JavaScript evaluation is not supported by this Camofox server. "
                          "Use browser_snapshot or browser_vision to inspect page state.",
             })
-        return tool_error(error_msg, success=False)
+        return _tool_error_from_exception(e, session=locals().get("tab_info"))
 
 
 def _maybe_start_recording(task_id: str):

@@ -53,6 +53,39 @@ class TestCheckRequirements:
 
 
 class TestToolCompletionPayload:
+    def test_emits_only_bounded_takeover_hint_for_live_clients(self):
+        payload = _tool_completion_payload(
+            "call_browser_1",
+            "browser_navigate",
+            json.dumps({
+                "success": True,
+                "snapshot": "sensitive page content",
+                "ui_hint": {
+                    "type": "takeover_browser",
+                    "agent_id": "agent-1",
+                    "browser_session_id": "session-1",
+                    "tab_id": "tab-1",
+                    "extra": "ignored",
+                },
+            }),
+        )
+
+        assert payload["ui_hint"] == {
+            "type": "takeover_browser",
+            "agent_id": "agent-1",
+            "browser_session_id": "session-1",
+            "tab_id": "tab-1",
+        }
+        assert "snapshot" not in payload
+
+    def test_rejects_incomplete_takeover_hint(self):
+        payload = _tool_completion_payload(
+            "call_browser_2",
+            "browser_navigate",
+            json.dumps({"success": True, "ui_hint": {"type": "takeover_browser", "agent_id": "agent-1"}}),
+        )
+        assert "ui_hint" not in payload
+
     def test_promotes_connector_error_printed_by_execute_code_output(self):
         printed = {
             "ok": False,

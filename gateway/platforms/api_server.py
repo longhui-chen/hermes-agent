@@ -502,6 +502,9 @@ def _tool_completion_payload(
     connector_error = decoded.get("connector_error")
     has_connector_error = _has_tool_error_value(connector_error)
     if not (has_error or has_error_code or has_connector_error):
+        ui_hint = _takeover_ui_hint(decoded)
+        if ui_hint is not None:
+            payload["ui_hint"] = ui_hint
         return payload
 
     error_msg = (
@@ -525,6 +528,25 @@ def _tool_completion_payload(
             if value is not None and wire_key not in payload:
                 payload[wire_key] = value
     return payload
+
+
+def _takeover_ui_hint(decoded: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    """Return only the exact, bounded App handoff contract from tool output."""
+    if decoded.get("success") is not True:
+        return None
+    hint = decoded.get("ui_hint")
+    if not isinstance(hint, dict) or hint.get("type") != "takeover_browser":
+        return None
+    out = {"type": "takeover_browser"}
+    for key in ("agent_id", "browser_session_id", "tab_id"):
+        value = hint.get(key)
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        if not value or len(value) > 256:
+            return None
+        out[key] = value
+    return out
 
 
 def _promote_connector_error_from_tool_output(decoded: Dict[str, Any]) -> Dict[str, Any]:

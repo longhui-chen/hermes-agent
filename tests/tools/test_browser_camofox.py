@@ -3,6 +3,7 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import requests
 
 from tools.browser_camofox import (
     camofox_back,
@@ -173,7 +174,8 @@ class TestCamofoxNavigate:
 
     def test_connection_error_returns_helpful_message(self, monkeypatch):
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:19999")
-        result = json.loads(camofox_navigate("https://example.com", task_id="t_err"))
+        with patch("tools.browser_camofox.requests.post", side_effect=requests.ConnectionError("offline")):
+            result = json.loads(camofox_navigate("https://example.com", task_id="t_err"))
         assert result["success"] is False
         assert "Cannot connect" in result["error"]
 
@@ -455,5 +457,4 @@ class TestBrowserToolRouting:
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
         from tools.browser_tool import check_browser_requirements
         assert check_browser_requirements() is True
-
 

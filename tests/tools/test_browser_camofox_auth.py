@@ -18,6 +18,10 @@ from tools.browser_camofox import (
     camofox_scroll,
     camofox_snapshot,
     camofox_type,
+    check_camofox_available,
+    get_camofox_url,
+    get_vnc_url,
+    is_camofox_mode,
 )
 
 
@@ -44,6 +48,86 @@ class TestAuthHeaders:
     def test_empty_when_key_blank(self, monkeypatch):
         monkeypatch.setenv("CAMOFOX_API_KEY", "   ")
         assert _auth_headers() == {}
+
+    def test_action_token_mode_uses_dedicated_header(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_AUTH_MODE", "zettlab_action_token")
+        monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "agent-action-token")
+        monkeypatch.setenv("CAMOFOX_API_KEY", "direct-api-key")
+
+        assert _auth_headers() == {
+            "X-Zettlab-Agent-Action-Token": "agent-action-token",
+        }
+
+    def test_action_token_mode_fails_closed_without_token(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_AUTH_MODE", "zettlab_action_token")
+        monkeypatch.delenv("ZETTLAB_AGENT_ACTION_TOKEN", raising=False)
+        monkeypatch.setenv("CAMOFOX_API_KEY", "must-not-fall-back")
+
+        with pytest.raises(RuntimeError, match="ZETTLAB_AGENT_ACTION_TOKEN"):
+            _auth_headers()
+
+    def test_multiplex_reads_only_active_profile_scope(self, monkeypatch):
+        from agent.secret_scope import (
+            reset_secret_scope,
+            set_multiplex_active,
+            set_secret_scope,
+        )
+
+        monkeypatch.setenv("CAMOFOX_URL", "http://wrong-profile:9377")
+        monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "wrong-profile-token")
+        set_multiplex_active(True)
+        scope_token = set_secret_scope({
+            "CAMOFOX_URL": "http://127.0.0.1:9420/internal/browser",
+            "CAMOFOX_AUTH_MODE": "zettlab_action_token",
+            "ZETTLAB_AGENT_ACTION_TOKEN": "active-profile-token",
+        })
+        try:
+            assert get_camofox_url() == "http://127.0.0.1:9420/internal/browser"
+            assert _auth_headers() == {
+                "X-Zettlab-Agent-Action-Token": "active-profile-token",
+            }
+        finally:
+            reset_secret_scope(scope_token)
+            set_multiplex_active(False)
+
+    def test_multiplex_without_profile_scope_fails_closed(self):
+        from agent.secret_scope import UnscopedSecretError, set_multiplex_active
+
+        set_multiplex_active(True)
+        try:
+            with pytest.raises(UnscopedSecretError):
+                get_camofox_url()
+        finally:
+            set_multiplex_active(False)
+
+    def test_multiplex_cdp_override_is_profile_scoped(self, monkeypatch):
+        from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
+
+        monkeypatch.setenv("BROWSER_CDP_URL", "http://foreign-profile:9222")
+        set_multiplex_active(True)
+        scope_token = set_secret_scope({
+            "CAMOFOX_URL": "http://127.0.0.1:9420/internal/browser",
+            "BROWSER_CDP_URL": "",
+        })
+        try:
+            assert is_camofox_mode() is True
+        finally:
+            reset_secret_scope(scope_token)
+            set_multiplex_active(False)
+
+    def test_multiplex_never_exposes_process_global_vnc(self, monkeypatch):
+        from agent.secret_scope import reset_secret_scope, set_multiplex_active, set_secret_scope
+        import tools.browser_camofox as mod
+
+        mod._vnc_url = "http://first-profile:6080"
+        mod._vnc_url_checked = True
+        set_multiplex_active(True)
+        token = set_secret_scope({"CAMOFOX_URL": "http://second-profile:9377"})
+        try:
+            assert get_vnc_url() is None
+        finally:
+            reset_secret_scope(token)
+            set_multiplex_active(False)
 
 
 class TestAuthHeadersSent:
@@ -93,6 +177,18 @@ class TestAuthHeadersSent:
         camofox_close(task_id="auth_test_4")
         _, kwargs = mock_delete.call_args
         assert kwargs["headers"] == {"Authorization": "Bearer my-api-key"}
+
+    @patch("tools.browser_camofox.requests.get")
+    def test_health_sends_auth(self, mock_get):
+        mock_get.return_value = _mock_response(json_data={"ok": True})
+
+        assert check_camofox_available() is True
+
+        mock_get.assert_called_once_with(
+            "http://localhost:9377/health",
+            timeout=5,
+            headers={"Authorization": "Bearer my-api-key"},
+        )
 
 
 class TestNoAuthHeadersWhenKeyUnset:
