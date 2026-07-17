@@ -940,10 +940,10 @@ async def test_uncached_profile_cleanup_db_open_blocks_profile_unload(
     release = threading.Event()
     real_session_db = SessionDB
 
-    def slow_open(path):
+    def slow_open(path, **kwargs):
         started.set()
         assert release.wait(2)
-        return real_session_db(path)
+        return real_session_db(path, **kwargs)
 
     monkeypatch.setattr("hermes_state.SessionDB", slow_open)
     adapter = ZetAgentAdapter(
@@ -1292,3 +1292,457 @@ async def test_gateway_runtime_import_cleanup_continues_after_profile_failure():
     assert await adapter._cleanup_stale_runtime_imports_once() == 3
     assert failed.calls == 1
     assert healthy.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_session_import_rejects_profile_state_db_symlink(tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    victim_home = tmp_path / "profiles" / "victim"
+    victim = SessionDB(victim_home / "state.db")
+    profile_home = tmp_path / "profiles" / "attacker"
+    profile_home.mkdir(parents=True)
+    (profile_home / "state.db").symlink_to(victim_home / "state.db")
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    request = _DirectImportRequest({
+        "import_id": "symlink-import", "operation": "stage",
+        "source": "workbuddy", "source_session_id": "source",
+        "target_session_id": "target", "title": None,
+        "payload_sha256": hashlib.sha256(b"symlink-import").hexdigest(),
+        "expected_message_count": 1, "chunk_index": 0,
+        "messages": [{"role": "user", "content": "private", "created_at": 1}],
+    })
+    request["hermes_profile_home"] = str(profile_home)
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        response = await adapter._handle_session_import(request)
+        assert response.status == 500
+        assert json.loads(response.text)["error"]["code"] == "runtime_import_failed"
+        assert (profile_home / "state.db").is_symlink()
+        assert victim._conn.execute(
+            "SELECT COUNT(*) FROM runtime_imports"
+        ).fetchone()[0] == 0
+    finally:
+        reset_hermes_home_override(token)
+        victim.close()
+
+
+@pytest.mark.asyncio
+async def test_session_import_rejects_profile_home_symlink(tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    victim_home = tmp_path / "profiles" / "victim"
+    victim = SessionDB(victim_home / "state.db")
+    linked_home = tmp_path / "profiles" / "linked"
+    linked_home.symlink_to(victim_home, target_is_directory=True)
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    request = _DirectImportRequest({
+        "import_id": "linked-home", "operation": "stage",
+        "source": "workbuddy", "source_session_id": "source",
+        "target_session_id": "target", "title": None,
+        "payload_sha256": hashlib.sha256(b"linked-home").hexdigest(),
+        "expected_message_count": 1, "chunk_index": 0,
+        "messages": [{"role": "user", "content": "private", "created_at": 1}],
+    })
+    request["hermes_profile_home"] = str(linked_home)
+    token = set_hermes_home_override(str(linked_home))
+    try:
+        response = await adapter._handle_session_import(request)
+        assert response.status == 500
+        assert victim._conn.execute(
+            "SELECT COUNT(*) FROM runtime_imports"
+        ).fetchone()[0] == 0
+        assert adapter._session_dbs == {}
+    finally:
+        reset_hermes_home_override(token)
+        victim.close()
+
+
+@pytest.mark.asyncio
+async def test_session_import_rejects_hardlinked_profile_state_db(tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    victim_home = tmp_path / "profiles" / "victim"
+    victim = SessionDB(victim_home / "state.db")
+    victim.close()
+    profile_home = tmp_path / "profiles" / "attacker"
+    profile_home.mkdir(parents=True)
+    os.link(victim_home / "state.db", profile_home / "state.db")
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    request = _DirectImportRequest({
+        "import_id": "hardlink-import", "operation": "stage",
+        "source": "workbuddy", "source_session_id": "source",
+        "target_session_id": "target", "title": None,
+        "payload_sha256": hashlib.sha256(b"hardlink-import").hexdigest(),
+        "expected_message_count": 1, "chunk_index": 0,
+        "messages": [{"role": "user", "content": "private", "created_at": 1}],
+    })
+    request["hermes_profile_home"] = str(profile_home)
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        response = await adapter._handle_session_import(request)
+        assert response.status == 500
+        assert adapter._session_dbs == {}
+        reopened = SessionDB(victim_home / "state.db", read_only=True)
+        try:
+            assert reopened._conn.execute(
+                "SELECT COUNT(*) FROM runtime_imports"
+            ).fetchone()[0] == 0
+        finally:
+            reopened.close()
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_session_db_open_rejects_leaf_replacement_before_initialization(
+    tmp_path, monkeypatch
+):
+    import gateway.platforms.api_server as api_server
+
+    victim_path = tmp_path / "victim.db"
+    victim = api_server.sqlite3.connect(victim_path)
+    victim.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+    victim.execute("INSERT INTO marker VALUES ('unchanged')")
+    victim.commit()
+    victim.close()
+    victim_before = victim_path.read_bytes()
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    real_connect = api_server.sqlite3.connect
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+
+    def replace_after_connect(path, *args, **kwargs):
+        connection = real_connect(path, *args, **kwargs)
+        state_path = profile_home / "state.db"
+        moved_path = profile_home / "state.db.original"
+        state_path.rename(moved_path)
+        state_path.symlink_to(victim_path)
+        return connection
+
+    monkeypatch.setattr(api_server.sqlite3, "connect", replace_after_connect)
+
+    assert adapter._ensure_session_db(profile_home) is None
+    assert adapter._session_dbs == {}
+    assert victim_path.read_bytes() == victim_before
+    check = real_connect(victim_path)
+    try:
+        assert check.execute("SELECT value FROM marker").fetchone()[0] == "unchanged"
+        assert check.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'runtime_imports'"
+        ).fetchone()[0] == 0
+    finally:
+        check.close()
+
+
+def test_session_db_open_rejects_hardlink_added_during_connection(
+    tmp_path, monkeypatch
+):
+    import gateway.platforms.api_server as api_server
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    linked_path = tmp_path / "other-profile-state.db"
+    real_connect = api_server.sqlite3.connect
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+
+    def add_hardlink_after_connect(path, *args, **kwargs):
+        connection = real_connect(path, *args, **kwargs)
+        os.link(profile_home / "state.db", linked_path)
+        return connection
+
+    monkeypatch.setattr(api_server.sqlite3, "connect", add_hardlink_after_connect)
+
+    assert adapter._ensure_session_db(profile_home) is None
+    assert adapter._session_dbs == {}
+    assert linked_path.stat().st_nlink == 2
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="Linux procfd anchoring is the production security boundary",
+)
+def test_linux_procfd_aba_never_touches_victim(
+    tmp_path, monkeypatch
+):
+    import gateway.platforms.api_server as api_server
+
+    victim_path = tmp_path / "victim.db"
+    victim = api_server.sqlite3.connect(victim_path)
+    victim.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+    victim.execute("INSERT INTO marker VALUES ('unchanged')")
+    victim.commit()
+    victim.close()
+    victim_before = victim_path.read_bytes()
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    real_connect = api_server.sqlite3.connect
+    observed_paths = []
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+
+    def aba_during_connect(path, *args, **kwargs):
+        path = os.fspath(path)
+        observed_paths.append(path)
+        assert path.startswith("/proc/self/fd/")
+        state_path = profile_home / "state.db"
+        moved_path = profile_home / "state.db.original"
+        state_path.rename(moved_path)
+        state_path.symlink_to(victim_path)
+        try:
+            # Connecting through procfd must still bind SQLite to the inode
+            # opened before the canonical pathname was redirected.
+            return real_connect(path, *args, **kwargs)
+        finally:
+            state_path.unlink()
+            moved_path.rename(state_path)
+
+    monkeypatch.setattr(api_server.sqlite3, "connect", aba_during_connect)
+
+    # Depending on SQLite's resolved WAL sidecar path, the original database
+    # may continue or fail closed after the double rename. Either result is
+    # acceptable; publishing a connection to the victim is not.
+    db = adapter._ensure_session_db(profile_home)
+    if db is not None:
+        db.close()
+    assert observed_paths and observed_paths[0].startswith("/proc/self/fd/")
+    assert victim_path.read_bytes() == victim_before
+    check = real_connect(victim_path)
+    try:
+        assert check.execute("SELECT value FROM marker").fetchone()[0] == "unchanged"
+        assert check.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'runtime_imports'"
+        ).fetchone()[0] == 0
+    finally:
+        check.close()
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="Linux procfd anchoring is the production security boundary",
+)
+def test_linux_unlinked_procfd_fails_closed_without_touching_replacement(
+    tmp_path, monkeypatch
+):
+    import gateway.platforms.api_server as api_server
+
+    victim_path = tmp_path / "victim.db"
+    victim = api_server.sqlite3.connect(victim_path)
+    victim.execute("CREATE TABLE marker (value TEXT NOT NULL)")
+    victim.execute("INSERT INTO marker VALUES ('unchanged')")
+    victim.commit()
+    victim.close()
+    victim_before = victim_path.read_bytes()
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    real_connect = api_server.sqlite3.connect
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+
+    def unlink_and_replace(path, *args, **kwargs):
+        path = os.fspath(path)
+        assert path.startswith("/proc/self/fd/")
+        state_path = profile_home / "state.db"
+        state_path.unlink()
+        state_path.symlink_to(victim_path)
+        # The deleted procfd target cannot be reopened by SQLite. This must
+        # fail instead of retrying the now-victim-controlled canonical path.
+        return real_connect(path, *args, **kwargs)
+
+    monkeypatch.setattr(api_server.sqlite3, "connect", unlink_and_replace)
+
+    assert adapter._ensure_session_db(profile_home) is None
+    assert adapter._session_dbs == {}
+    assert victim_path.read_bytes() == victim_before
+    check = real_connect(victim_path)
+    try:
+        assert check.execute("SELECT value FROM marker").fetchone()[0] == "unchanged"
+        assert check.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'runtime_imports'"
+        ).fetchone()[0] == 0
+    finally:
+        check.close()
+
+
+@pytest.mark.asyncio
+async def test_uncached_cleanup_rejects_profile_state_db_symlink(
+    tmp_path, monkeypatch
+):
+    victim_home = tmp_path / "profiles" / "victim"
+    victim = SessionDB(victim_home / "state.db")
+    victim.stage_completed_transcript_import(
+        import_id="victim-staging", source="marvis", source_session_id="source",
+        target_session_id="target", title=None,
+        payload_sha256=hashlib.sha256(b"victim-staging").hexdigest(),
+        expected_message_count=1, chunk_index=0,
+        messages=[{"role": "user", "content": "private", "created_at": 0}],
+    )
+    victim._conn.execute(
+        "UPDATE runtime_imports SET updated_at = ?",
+        (time.time() - 25 * 60 * 60,),
+    )
+    victim.close()
+
+    profile_home = tmp_path / "profiles" / "attacker"
+    profile_home.mkdir(parents=True)
+    (profile_home / "state.db").symlink_to(victim_home / "state.db")
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    adapter._ensure_session_db = lambda: None
+    monkeypatch.setattr(
+        adapter, "_multiplex_profile_homes", lambda: {"attacker": profile_home}
+    )
+
+    assert await adapter._cleanup_stale_runtime_imports_once() == 0
+    reopened = SessionDB(victim_home / "state.db", read_only=True)
+    try:
+        assert reopened._conn.execute(
+            "SELECT COUNT(*) FROM runtime_imports WHERE import_id = ?",
+            ("victim-staging",),
+        ).fetchone()[0] == 1
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_first_session_db_open_is_off_loop_and_published_once(
+    tmp_path, monkeypatch
+):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    event_loop_thread = threading.get_ident()
+    open_threads = []
+    open_calls = 0
+    stage_calls = []
+    started = threading.Event()
+    release = threading.Event()
+
+    class _DB:
+        def stage_completed_transcript_import(self, **kwargs):
+            stage_calls.append(kwargs["import_id"])
+            return {"status": "staged"}
+
+    db = _DB()
+
+    def slow_open(_profile_home, *, create=True):
+        nonlocal open_calls
+        assert create is True
+        open_calls += 1
+        open_threads.append(threading.get_ident())
+        started.set()
+        assert release.wait(10)
+        return db
+
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    monkeypatch.setattr(adapter, "_open_profile_session_db", slow_open)
+
+    def request(import_id):
+        value = _DirectImportRequest({
+            "import_id": import_id, "operation": "stage", "source": "workbuddy",
+            "source_session_id": import_id, "target_session_id": import_id,
+            "title": None, "payload_sha256": hashlib.sha256(import_id.encode()).hexdigest(),
+            "expected_message_count": 1, "chunk_index": 0,
+            "messages": [{"role": "user", "content": "safe", "created_at": 1}],
+        })
+        value["hermes_profile_home"] = str(profile_home)
+        return value
+
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        first = asyncio.create_task(adapter._handle_session_import(request("first")))
+        second = asyncio.create_task(adapter._handle_session_import(request("second")))
+        assert await asyncio.to_thread(started.wait, 2)
+        assert not first.done() and not second.done()
+        release.set()
+        responses = await asyncio.gather(first, second)
+    finally:
+        reset_hermes_home_override(token)
+        release.set()
+
+    assert [response.status for response in responses] == [200, 200]
+    assert open_calls == 1
+    assert open_threads == [open_threads[0]]
+    assert open_threads[0] != event_loop_thread
+    assert sorted(stage_calls) == ["first", "second"]
+    assert list(adapter._session_dbs.values()) == [db]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_unload_holds_barrier_until_staging_cleanup_exits(tmp_path):
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    started = threading.Event()
+    release = threading.Event()
+    close_started = threading.Event()
+    close_release = threading.Event()
+    events = []
+
+    class _DB:
+        closed = False
+
+        def discard_runtime_import_staging(self):
+            events.append("discard-start")
+            started.set()
+            assert release.wait(10)
+            events.append("discard-end")
+
+        def close(self):
+            events.append("close-start")
+            close_started.set()
+            assert close_release.wait(10)
+            self.closed = True
+            events.append("close-end")
+
+    class _Request(dict):
+        def __init__(self):
+            super().__init__(
+                hermes_profile="coder", hermes_profile_home=str(profile_home)
+            )
+            self.headers = {"Authorization": "Bearer test-key"}
+            self.method = "POST"
+            self.path_qs = "/p/coder/v1/profile/unload"
+            self.remote = "127.0.0.1"
+            self.transport = None
+
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    db = _DB()
+    adapter._session_dbs[adapter._profile_home_key(profile_home)] = db
+    task = asyncio.create_task(adapter._handle_profile_unload(_Request()))
+    assert await asyncio.to_thread(started.wait, 2)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    assert adapter._begin_runtime_import_operation(profile_home) is None
+
+    release.set()
+    assert await asyncio.to_thread(close_started.wait, 2)
+    assert not task.done()
+    assert adapter._begin_runtime_import_operation(profile_home) is None
+    close_release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert db.closed is True
+    assert events == ["discard-start", "discard-end", "close-start", "close-end"]
+    key = adapter._begin_runtime_import_operation(profile_home)
+    assert key == adapter._profile_home_key(profile_home)
+    adapter._end_runtime_import_operation(key)

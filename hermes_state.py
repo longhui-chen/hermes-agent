@@ -963,7 +963,14 @@ class SessionDB:
     # merge cost is amortised far below the checkpoint cadence.
     _OPTIMIZE_EVERY_N_WRITES = 1000
 
-    def __init__(self, db_path: Path = None, read_only: bool = False):
+    def __init__(
+        self,
+        db_path: Path = None,
+        read_only: bool = False,
+        *,
+        _preopened_connection: Optional[sqlite3.Connection] = None,
+        _allow_path_reopen: bool = True,
+    ):
         self.db_path = db_path or DEFAULT_DB_PATH
         self.read_only = read_only
 
@@ -975,6 +982,8 @@ class SessionDB:
         self._conn = None
         try:
             if read_only:
+                if _preopened_connection is not None:
+                    raise ValueError("read-only SessionDB cannot use a write connection")
                 # Read-only attach for cross-profile aggregation: SELECT-only,
                 # so we skip schema init entirely (no DDL, no FTS probe, no
                 # column reconcile). Crucially this takes NO write lock, so
@@ -996,24 +1005,26 @@ class SessionDB:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
             def _connect_and_init():
-                self._conn = sqlite3.connect(
-                    str(self.db_path),
-                    check_same_thread=False,
-                    # Short timeout — application-level retry with random
-                    # jitter handles contention instead of sitting in
-                    # SQLite's internal busy handler for up to 30s.
-                    timeout=1.0,
-                    # auto-starts transactions on DML, which conflicts with
-                    # our explicit BEGIN IMMEDIATE.  None = we manage
-                    # transactions ourselves.
-                    isolation_level=None,
-                )
+                if self._conn is None:
+                    self._conn = sqlite3.connect(
+                        str(self.db_path),
+                        check_same_thread=False,
+                        # Short timeout — application-level retry with random
+                        # jitter handles contention instead of sitting in
+                        # SQLite's internal busy handler for up to 30s.
+                        timeout=1.0,
+                        # auto-starts transactions on DML, which conflicts with
+                        # our explicit BEGIN IMMEDIATE.  None = we manage
+                        # transactions ourselves.
+                        isolation_level=None,
+                    )
                 self._conn.row_factory = sqlite3.Row
                 apply_wal_with_fallback(self._conn, db_label="state.db")
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._init_schema()
 
             try:
+                self._conn = _preopened_connection
                 _connect_and_init()
             except sqlite3.DatabaseError as exc:
                 # The malformed-schema class (e.g. a duplicate sqlite_master
@@ -1023,7 +1034,11 @@ class SessionDB:
                 # place (backup first; canonical sessions/messages preserved),
                 # then reopen once. This is what lets Desktop/Dashboard
                 # self-heal instead of silently showing "no sessions".
-                if not is_malformed_db_error(exc) or not _claim_repair_attempt(self.db_path):
+                if (
+                    not _allow_path_reopen
+                    or not is_malformed_db_error(exc)
+                    or not _claim_repair_attempt(self.db_path)
+                ):
                     raise
                 logger.error(
                     "state.db schema is malformed (%s) — attempting automatic "

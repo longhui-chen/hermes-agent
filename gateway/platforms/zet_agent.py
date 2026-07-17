@@ -1804,7 +1804,13 @@ class ZetAgentAdapter(APIServerAdapter):
                 raise ValueError("request body must be an object")
             operation = body.get("operation")
             import_id = body.get("import_id")
-            session_db = self._ensure_session_db()
+            # SessionDB construction opens SQLite, initializes schema and may
+            # run bounded stale-import cleanup. Keep all of that off the shared
+            # aiohttp loop, and retain the profile operation barrier even if
+            # the request is cancelled while the worker is still opening.
+            session_db = await _to_thread_with_completion_barrier(
+                self._ensure_session_db
+            )
             if session_db is None:
                 raise RuntimeError("session db unavailable")
             if operation == "stage":
@@ -1929,12 +1935,14 @@ class ZetAgentAdapter(APIServerAdapter):
             try:
                 session_db = cached_db
                 if key == default_key and session_db is None:
-                    session_db = self._ensure_session_db()
+                    session_db = await _to_thread_with_completion_barrier(
+                        self._ensure_session_db
+                    )
                 if session_db is None or id(session_db) in seen:
                     continue
                 seen.add(id(session_db))
                 try:
-                    deleted += await asyncio.to_thread(
+                    deleted += await _to_thread_with_completion_barrier(
                         session_db.cleanup_stale_runtime_imports
                     )
                 except Exception:
@@ -1949,7 +1957,6 @@ class ZetAgentAdapter(APIServerAdapter):
         # every served profile with an existing state.db so expired private
         # transcript staging still converges without a foreground request.
         try:
-            from hermes_state import SessionDB
             profile_homes = tuple(self._multiplex_profile_homes().values())
         except Exception:
             logger.warning(
@@ -1959,7 +1966,6 @@ class ZetAgentAdapter(APIServerAdapter):
             profile_homes = ()
         for profile_home in profile_homes:
             key = self._profile_home_key(profile_home)
-            state_db = Path(profile_home) / "state.db"
             if key in cached_keys:
                 continue
             operation_key = self._begin_runtime_import_operation(key)
@@ -1968,15 +1974,19 @@ class ZetAgentAdapter(APIServerAdapter):
             session_db = None
             generation = self._profile_directory_identity(key)
             try:
-                if generation is None or not state_db.is_file():
+                if generation is None:
                     continue
-                session_db = await asyncio.to_thread(SessionDB, state_db)
+                session_db = await _to_thread_with_completion_barrier(
+                    self._open_profile_session_db,
+                    Path(profile_home),
+                    create=False,
+                )
                 if self._profile_directory_identity(key) != generation:
                     logger.warning(
                         "[zet_agent] runtime import profile changed while DB opened; skipping cleanup"
                     )
                     continue
-                deleted += await asyncio.to_thread(
+                deleted += await _to_thread_with_completion_barrier(
                     session_db.cleanup_stale_runtime_imports
                 )
             except Exception:
@@ -1985,15 +1995,23 @@ class ZetAgentAdapter(APIServerAdapter):
                     exc_info=True,
                 )
             finally:
+                cancelled = None
                 if session_db is not None:
                     try:
-                        session_db.close()
+                        await _to_thread_with_completion_barrier(session_db.close)
+                    except asyncio.CancelledError as exc:
+                        # The helper has already waited for close to finish.
+                        # Release the operation barrier before propagating the
+                        # request cancellation.
+                        cancelled = exc
                     except Exception:
                         logger.warning(
                             "[zet_agent] runtime import cleanup DB close failed",
                             exc_info=True,
                         )
                 self._end_runtime_import_operation(operation_key)
+                if cancelled is not None:
+                    raise cancelled
         return deleted
 
     async def _sweep_stale_runtime_imports(self) -> None:
@@ -2901,15 +2919,37 @@ class ZetAgentAdapter(APIServerAdapter):
             if db is not None:
                 if db is self._session_db:
                     self._session_db = None
+
+                async def _close_detached_session_db() -> None:
+                    close = getattr(db, "close", None)
+                    if not callable(close):
+                        return
+                    try:
+                        await _to_thread_with_completion_barrier(close)
+                    except Exception:
+                        logger.warning(
+                            "[zet_agent] profile-unload: SessionDB close failed",
+                            exc_info=True,
+                        )
+
                 discard_staging = getattr(db, "discard_runtime_import_staging", None)
                 if callable(discard_staging):
                     try:
-                        await asyncio.to_thread(discard_staging)
-                    except asyncio.CancelledError:
+                        await _to_thread_with_completion_barrier(discard_staging)
+                    except asyncio.CancelledError as cancelled:
+                        # The discard worker has finished before this branch is
+                        # entered. Close in a second completion barrier, then
+                        # release the profile barrier and preserve cancellation.
+                        try:
+                            await _close_detached_session_db()
+                        except asyncio.CancelledError:
+                            # A repeated cancellation is delivered only after
+                            # the close worker has completed.
+                            pass
                         self._unblock_runtime_import_profile(
                             profile_home, unload_barrier_owner
                         )
-                        raise
+                        raise cancelled
                     except Exception:
                         # Unload remains best-effort, but always attempt to
                         # remove unpublished external transcripts before the
@@ -2918,15 +2958,15 @@ class ZetAgentAdapter(APIServerAdapter):
                             "[zet_agent] profile-unload: runtime import staging cleanup failed",
                             exc_info=True,
                         )
-                close = getattr(db, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except Exception:
-                        logger.warning(
-                            "[zet_agent] profile-unload: SessionDB close failed",
-                            exc_info=True,
-                        )
+                try:
+                    await _close_detached_session_db()
+                except asyncio.CancelledError:
+                    # _to_thread_with_completion_barrier has already observed
+                    # close completion, so it is now safe to release unload.
+                    self._unblock_runtime_import_profile(
+                        profile_home, unload_barrier_owner
+                    )
+                    raise
                 closed_session_db = True
             # 该 profile 的 goal barrier timers 一并取消（codex P1）：daemon
             # Timer 携带旧 profile 的 runtime scope，卸载后触发会用内存旧
