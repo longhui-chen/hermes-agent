@@ -2461,8 +2461,9 @@ def test_reset_all_deletes_unreadable_regular_receipt_without_parsing(
     assert not receipt.exists()
 
 
+@pytest.mark.parametrize("same_inode", [True, False], ids=["hardlinked", "independent"])
 def test_reset_removes_both_hardlink_probe_crash_residue_names(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, same_inode
 ):
     home = tmp_path / ".hermes"
     memories = home / "memories"
@@ -2470,7 +2471,10 @@ def test_reset_removes_both_hardlink_probe_crash_residue_names(
     source = memories / f"{memory_tool._IMPORT_LINK_PROBE_PREFIX}crash.tmp"
     linked = memories / f"{memory_tool._IMPORT_LINK_PROBE_PREFIX}crash.tmp.link"
     source.write_bytes(b"")
-    os.link(source, linked)
+    if same_inode:
+        os.link(source, linked)
+    else:
+        linked.write_bytes(b"")
     monkeypatch.setenv("HERMES_HOME", str(home))
 
     assert curated_memory_has_state("memory") is True
