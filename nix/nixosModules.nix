@@ -742,13 +742,34 @@
           mkdir -p ${cfg.stateDir}/home
           mkdir -p ${cfg.workingDirectory}
           chown ${cfg.user}:${cfg.group} ${cfg.stateDir} ${cfg.stateDir}/home ${cfg.workingDirectory}
-          chmod 2770 ${cfg.stateDir} ${cfg.workingDirectory}
+          # Activation performs several root-owned leaf updates below. Remove
+          # shared-group write from their parent for the whole critical section
+          # so hostUsers cannot swap the verified profile between operations.
+          (
+          chmod 2770 ${cfg.workingDirectory}
+          chmod 2700 ${cfg.stateDir}
           chmod 0750 ${cfg.stateDir}/home
+          _restore_profile_parent_mode() {
+            chmod 2770 ${cfg.stateDir}
+          }
+          trap _restore_profile_parent_mode EXIT
 
           PROFILE_UID="$(${pkgs.coreutils}/bin/id -u ${lib.escapeShellArg cfg.user})"
           PROFILE_GID="$(${pkgs.glibc.bin}/bin/getent group ${lib.escapeShellArg cfg.group} | ${pkgs.coreutils}/bin/cut -d: -f3)"
           ${pkgs.python3}/bin/python3 ${safeProfileDirs} \
             --shared-file-modes ${profileHomeShell} "$PROFILE_UID" "$PROFILE_GID"
+
+          # The shared group cannot mutate the profile while the parent is
+          # locked down above. Reject pre-existing special leaves before any
+          # subsequent root pathname write can follow or overwrite them.
+          PROFILE_HOME=${profileHomeShell}
+          for _managed_leaf in config.yaml .managed .container-mode auth.json .env; do
+            _managed_path="$PROFILE_HOME/$_managed_leaf"
+            if [ -L "$_managed_path" ] || { [ -e "$_managed_path" ] && [ ! -f "$_managed_path" ]; }; then
+              echo "ERROR: unsafe managed profile leaf: $_managed_path" >&2
+              exit 1
+            fi
+          done
 
           # Root-owned trust anchor for the intentionally group-writable profile.
           # It binds the permission exception to this exact HERMES_HOME and the
@@ -886,6 +907,10 @@
             ln -sfn ${plugin} ${cfg.stateDir}/.hermes/plugins/nix-managed-${name}
             chown -h ${cfg.user}:${cfg.group} ${cfg.stateDir}/.hermes/plugins/nix-managed-${name}
           '') cfg.extraPlugins)}
+
+          _restore_profile_parent_mode
+          trap - EXIT
+          )
         '';
       }
 

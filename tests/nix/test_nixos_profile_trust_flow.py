@@ -294,6 +294,69 @@ def test_recursive_profile_scan_recovers_from_transient_identity_churn(
     assert attempts == 1
 
 
+@pytest.mark.parametrize("operation", ["recursive_ownership", "shared_file_modes"])
+def test_recursive_profile_scan_skips_beyond_bounded_depth(
+    tmp_path, monkeypatch, capsys, operation
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    current = home.stat()
+    safe_profile_dirs.ensure_transaction_directories(
+        home, current.st_uid, current.st_gid
+    )
+    monkeypatch.setattr(safe_profile_dirs, "_MAX_RECURSIVE_DEPTH", 8)
+    cursor = home / "sessions"
+    for index in range(20):
+        cursor = cursor / f"level-{index}"
+        cursor.mkdir()
+    deepest = cursor / "private.txt"
+    deepest.write_text("private")
+    deepest.chmod(0o600)
+
+    safe_profile_dirs.ensure_transaction_directories(
+        home,
+        current.st_uid,
+        current.st_gid,
+        **{operation: True},
+    )
+
+    assert "skipping managed profile subtree deeper than 8" in capsys.readouterr().err
+    assert stat.S_IMODE(deepest.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("leaf", sorted(safe_profile_dirs._MANAGED_ROOT_LEAVES))
+@pytest.mark.parametrize("kind", ["symlink", "fifo"])
+def test_safe_profile_directory_flow_rejects_unsafe_managed_leaf(
+    tmp_path, leaf, kind
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    current = home.stat()
+    safe_profile_dirs.ensure_transaction_directories(
+        home, current.st_uid, current.st_gid
+    )
+    unsafe = home / leaf
+    if kind == "symlink":
+        outside = tmp_path / "outside"
+        outside.write_text("do not touch")
+        unsafe.symlink_to(outside)
+    else:
+        os.mkfifo(unsafe)
+
+    with pytest.raises(OSError, match="unsafe managed profile leaf"):
+        safe_profile_dirs.ensure_transaction_directories(
+            home,
+            current.st_uid,
+            current.st_gid,
+            shared_file_modes=True,
+        )
+
+    if kind == "symlink":
+        assert outside.read_text() == "do not touch"
+    else:
+        assert stat.S_ISFIFO(unsafe.lstat().st_mode)
+
+
 def test_nixos_module_uses_nofollow_helper_for_transaction_directories():
     source = (Path(__file__).parents[2] / "nix" / "nixosModules.nix").read_text()
 
@@ -310,6 +373,15 @@ def test_nixos_module_uses_nofollow_helper_for_transaction_directories():
     assert '"$PROFILE_GID" > "$TRUST_TMP"' in source
     assert "stat -c %u ${profileHomeShell}" not in source
     assert "stat -c %g ${profileHomeShell}" not in source
+    helper_call = source.index("--shared-file-modes ${profileHomeShell}")
+    parent_lock = source.index("chmod 2700 ${cfg.stateDir}")
+    leaf_guard = source.index("for _managed_leaf in config.yaml")
+    parent_restore = source.rindex("_restore_profile_parent_mode")
+    assert parent_lock < helper_call < leaf_guard < parent_restore
+    assert "trap _restore_profile_parent_mode EXIT" in source
+    assert "trap - EXIT" in source
+    assert '[ -L "$_managed_path" ]' in source
+    assert '[ ! -f "$_managed_path" ]' in source
 
 
 def test_container_gid_uses_configured_group_for_host_users():

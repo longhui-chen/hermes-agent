@@ -7,9 +7,12 @@ import argparse
 import errno
 import os
 import stat
+import sys
 from pathlib import Path
 
 _RECURSIVE_IDENTITY_RETRIES = 3
+_MAX_RECURSIVE_DEPTH = 64
+_MANAGED_ROOT_LEAVES = {"config.yaml", ".managed", ".container-mode", "auth.json", ".env"}
 
 
 def _directory_flags() -> int:
@@ -183,6 +186,16 @@ def _open_recursive_directory(
     return None
 
 
+def _reject_unsafe_managed_leaves(home_fd: int) -> None:
+    for name in _MANAGED_ROOT_LEAVES:
+        try:
+            visible = os.stat(name, dir_fd=home_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(visible.st_mode):
+            raise OSError(errno.EINVAL, f"unsafe managed profile leaf: {name}")
+
+
 def _normalize_tree(
     directory_fd: int,
     uid: int,
@@ -193,6 +206,7 @@ def _normalize_tree(
     shared_file_modes: bool,
     group_write_tree: bool = False,
     top_level: bool = False,
+    depth: int = 0,
 ) -> None:
     for name in os.listdir(directory_fd):
         try:
@@ -202,6 +216,13 @@ def _normalize_tree(
         if visible.st_dev != root_device:
             continue
         if stat.S_ISDIR(visible.st_mode):
+            if depth >= _MAX_RECURSIVE_DEPTH:
+                print(
+                    f"warning: skipping managed profile subtree deeper than "
+                    f"{_MAX_RECURSIVE_DEPTH}: {name}",
+                    file=sys.stderr,
+                )
+                continue
             opened_child = _open_recursive_directory(directory_fd, name, visible)
             if opened_child is None:
                 continue
@@ -223,6 +244,7 @@ def _normalize_tree(
                         or top_level
                         and name in {"cron", "sessions", "logs", "memories", "plugins"}
                     ),
+                    depth=depth + 1,
                 )
             finally:
                 os.close(child_fd)
@@ -273,6 +295,7 @@ def ensure_transaction_directories(
         backups_fd = _normalize_child(
             imports_fd, "backups", uid, gid, 0o2770, expected_device=root_device
         )
+        _reject_unsafe_managed_leaves(home_fd)
         if recursive_ownership or shared_file_modes:
             _normalize_tree(
                 home_fd,
