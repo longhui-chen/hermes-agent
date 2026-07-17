@@ -4514,17 +4514,16 @@ class APIServerAdapter(BasePlatformAdapter):
         loop = asyncio.get_running_loop()
 
         def _run():
-            from gateway.session_context import clear_session_vars
-            from tools.file_operations import set_zettlab_turn_id
+            from gateway.session_context import clear_session_vars, set_zettlab_turn_id
 
             tokens = self._bind_api_server_session(
                 chat_id=session_id or "",
                 session_key=gateway_session_key or session_id or "",
                 session_id=session_id or "",
             )
-            # turn_id is NAS-fallback-only, not a general session attribute, so
-            # it rides its own feature-scoped contextvar (set/cleared alongside
-            # the session vars to stay leak-free on reused executor threads).
+            # turn_id is request-scoped correlation for NAS fallback and
+            # terminal skill subprocesses. Keep it in its own contextvar and
+            # clear it with the session vars on reused executor threads.
             set_zettlab_turn_id(turn_id or "")
             try:
                 agent = self._create_agent(

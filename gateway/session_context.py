@@ -108,6 +108,18 @@ _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNS
 # propagates that into this contextvar at session-bind time.
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
 
+# Zettlab local-server sends metadata.turn_id with each API request. This token
+# stays task-local so concurrent requests cannot overwrite one another.
+_ZETTLAB_TURN_ID: ContextVar = ContextVar("zettlab_turn_id", default="")
+
+
+def set_zettlab_turn_id(turn_id: str) -> None:
+    _ZETTLAB_TURN_ID.set(turn_id or "")
+
+
+def zettlab_turn_id() -> str:
+    return _ZETTLAB_TURN_ID.get().strip()
+
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
 _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)

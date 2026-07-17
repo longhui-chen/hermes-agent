@@ -4,6 +4,7 @@ import logging
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -328,6 +329,19 @@ def _inject_session_context_env(env: dict) -> None:
             # Unset for THIS task while a concurrent host is engaged: drop any
             # inherited global so a sibling session's value can't leak in.
             env.pop(var_name, None)
+
+
+def _with_zettlab_turn_id(command: str) -> str:
+    """Prefix a terminal command with this request's correlation token."""
+    try:
+        from gateway.session_context import zettlab_turn_id
+
+        turn_id = zettlab_turn_id()
+    except Exception:
+        turn_id = ""
+    if not turn_id:
+        return command
+    return f"export ZETTLAB_TURN_ID={shlex.quote(turn_id)}\n{command}"
 
 
 PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset({
@@ -955,7 +969,10 @@ class LocalEnvironment(BaseEnvironment):
         self.init_session()
 
     def _snapshot_ephemeral_env_keys(self) -> tuple[str, ...]:
-        return tuple(sorted(PROFILE_SCOPED_SUBPROCESS_ENV_KEYS))
+        return tuple(sorted((*PROFILE_SCOPED_SUBPROCESS_ENV_KEYS, "ZETTLAB_TURN_ID")))
+
+    def _wrap_command(self, command: str, cwd: str) -> str:
+        return super()._wrap_command(_with_zettlab_turn_id(command), cwd)
 
     def get_temp_dir(self) -> str:
         """Return a shell-safe writable temp dir for local execution.
