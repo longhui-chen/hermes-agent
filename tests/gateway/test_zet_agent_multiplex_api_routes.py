@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import queue
+import threading
 from pathlib import Path
 
 import pytest
@@ -71,6 +73,118 @@ def _add_prefixed_zet_agent_routes(app: web.Application, adapter: ZetAgentAdapte
         "/p/{profile}/v1/sessions/{session_id}/interrupt",
         adapter._profile_handler(adapter._handle_session_interrupt),
     )
+
+
+@pytest.mark.asyncio
+async def test_clarify_id_is_stable_across_stream_pending_and_exact_response():
+    """The same Hermes-generated id must drive live, reconnect and response.
+
+    This exercises the real callback -> HTTP route path. A wrong id must not
+    consume the pending callback; the right id unblocks exactly that callback.
+    """
+    adapter = _make_adapter()
+    app = web.Application()
+    app.router.add_get(
+        "/v1/sessions/{session_id}/pending", adapter._handle_pending,
+    )
+    app.router.add_post(
+        "/v1/sessions/{session_id}/clarify/respond", adapter._handle_clarify_respond,
+    )
+    stream_q: queue.Queue = queue.Queue()
+    answered = []
+    ask = adapter._make_clarify_cb(stream_q, "sid-clarify-id")
+    thread = threading.Thread(
+        target=lambda: answered.append(ask("Choose a runtime", ["A", "B"])),
+        daemon=True,
+    )
+    thread.start()
+    event_name, streamed = stream_q.get(timeout=1)
+    assert event_name == "__tool_progress__"
+    clarify_id = streamed.get("clarify_id")
+    assert isinstance(clarify_id, str) and len(clarify_id) == 32
+
+    async with TestClient(TestServer(app)) as cli:
+        pending = await cli.get(
+            "/v1/sessions/sid-clarify-id/pending",
+            headers={"Authorization": "Bearer test-key"},
+        )
+        pending_data = await pending.json()
+        assert pending.status == 200
+        assert pending_data["clarify"]["clarify_id"] == clarify_id
+
+        wrong = await cli.post(
+            "/v1/sessions/sid-clarify-id/clarify/respond",
+            json={"clarify_id": "not-the-live-card", "response": "wrong"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+        assert wrong.status == 404
+        assert thread.is_alive(), "a mismatched id must not consume FIFO state"
+
+        resolved = await cli.post(
+            "/v1/sessions/sid-clarify-id/clarify/respond",
+            json={"clarify_id": clarify_id, "response": "B"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+        assert resolved.status == 200
+        assert await resolved.json() == {"resolved": 1}
+
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert answered == ["B"]
+
+
+@pytest.mark.asyncio
+async def test_exact_clarify_response_keeps_pending_projection_on_fifo_head():
+    """Resolving a later exact id cannot replace /pending's oldest card."""
+    adapter = _make_adapter()
+    app = web.Application()
+    app.router.add_get(
+        "/v1/sessions/{session_id}/pending", adapter._handle_pending,
+    )
+    app.router.add_post(
+        "/v1/sessions/{session_id}/clarify/respond", adapter._handle_clarify_respond,
+    )
+    stream_q: queue.Queue = queue.Queue()
+    ask = adapter._make_clarify_cb(stream_q, "sid-two-clarifies")
+    answers = []
+    def ask_and_record(question):
+        answers.append((question, ask(question, None)))
+
+    first = threading.Thread(target=lambda: ask_and_record("first"), daemon=True)
+    second = threading.Thread(target=lambda: ask_and_record("second"), daemon=True)
+    first.start()
+    second.start()
+    _, first_payload = stream_q.get(timeout=1)
+    _, second_payload = stream_q.get(timeout=1)
+
+    headers = {"Authorization": "Bearer test-key"}
+    async with TestClient(TestServer(app)) as cli:
+        pending = await cli.get("/v1/sessions/sid-two-clarifies/pending", headers=headers)
+        assert (await pending.json())["clarify"]["clarify_id"] == first_payload["clarify_id"]
+
+        later = await cli.post(
+            "/v1/sessions/sid-two-clarifies/clarify/respond",
+            json={"clarify_id": second_payload["clarify_id"], "response": "later answer"},
+            headers=headers,
+        )
+        assert later.status == 200
+        pending_after_later = await cli.get("/v1/sessions/sid-two-clarifies/pending", headers=headers)
+        assert (await pending_after_later.json())["clarify"]["clarify_id"] == first_payload["clarify_id"]
+
+        first_reply = await cli.post(
+            "/v1/sessions/sid-two-clarifies/clarify/respond",
+            json={"clarify_id": first_payload["clarify_id"], "response": "first answer"},
+            headers=headers,
+        )
+        assert first_reply.status == 200
+
+    first.join(timeout=1)
+    second.join(timeout=1)
+    assert not first.is_alive() and not second.is_alive()
+    assert dict(answers) == {
+        first_payload["question"]: "first answer",
+        second_payload["question"]: "later answer",
+    }
 
 
 @pytest.fixture

@@ -79,6 +79,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -225,16 +226,19 @@ class _ClarifyEntry:
     """One pending clarify request inside a session FIFO queue.
 
     The agent thread enters ``wait()`` on ``event``; the HTTP respond
-    handler pops the oldest entry, stores the response, and calls
-    ``event.set()`` to unblock the agent. Mirrors hermes-webui's
-    api/clarify.py shape so the wire protocol stays Plan-E rev4
-    compliant (no request_id; per-session FIFO).
+    handler resolves the matching entry, stores the response, and calls
+    ``event.set()`` to unblock the agent. ``clarify_id`` is generated at
+    creation and is the stable identity sent both over the live stream and
+    through the reconnect ``/pending`` projection. Older callers may omit it
+    when responding, in which case the historical FIFO behavior is retained.
     """
 
-    __slots__ = ("event", "response")
+    __slots__ = ("clarify_id", "event", "payload", "response")
 
-    def __init__(self) -> None:
+    def __init__(self, clarify_id: str, payload: Dict[str, Any]) -> None:
+        self.clarify_id = clarify_id
         self.event = threading.Event()
+        self.payload = payload
         self.response: Optional[str] = None
 
 
@@ -583,7 +587,7 @@ class ZetAgentAdapter(APIServerAdapter):
         return _notify
 
     # ------------------------------------------------------------------
-    # Clarify — per-session FIFO queue, oldest pending wins on respond
+    # Clarify — stable instance IDs with legacy FIFO fallback on respond
     # ------------------------------------------------------------------
 
     def _make_clarify_cb(self, stream_q: Any, session_id: str):
@@ -595,26 +599,35 @@ class ZetAgentAdapter(APIServerAdapter):
         pops the entry and signals it. Timeout returns "" so a stale
         clarify never hangs the turn forever.
 
-        Plan-E rev4 wire model: no clarify_id — the respond handler
-        always answers the oldest pending entry in the session.
+        A new opaque ``clarify_id`` is attached before either the SSE event
+        or reconnect projection is published. The response endpoint uses this
+        identity when the client provides it; legacy clients that do not yet
+        send the field retain the historical FIFO response behavior.
         """
         def _ask(question: str, choices: Optional[List[str]]) -> str:
-            entry = _ClarifyEntry()
-            with self._clarify_state_lock:
-                self._clarify_queues.setdefault(session_id, []).append(entry)
-
             # Stamp the deadline using the same constant the agent
             # thread waits on a few lines below. Clients see the wall-
             # clock time we will actually give up at.
             expires_at_ms = int((time.time() + CLARIFY_RESPONSE_TIMEOUT) * 1000)
+            clarify_id = uuid.uuid4().hex
             payload = {
                 "type": "hermes.clarify",
+                "clarify_id": clarify_id,
                 "question": question,
                 "choices_offered": list(choices or []),
                 "expires_at_ms": expires_at_ms,
             }
+            entry = _ClarifyEntry(clarify_id, payload)
+            with self._clarify_state_lock:
+                queue = self._clarify_queues.setdefault(session_id, [])
+                queue.append(entry)
+                # /pending is the projection of the entry legacy clients
+                # would answer next.  Keep that projection on FIFO's head
+                # even if a future producer can enqueue concurrently.
+                is_pending_head = len(queue) == 1
             with self._pending_lock:
-                self._pending_clarify[session_id] = payload
+                if is_pending_head:
+                    self._pending_clarify[session_id] = payload
             try:
                 stream_q.put(("__tool_progress__", payload))
             except Exception:
@@ -697,14 +710,25 @@ class ZetAgentAdapter(APIServerAdapter):
         """Remove an unresolved entry (push failure or timeout). The
         respond handler removes via popleft on success; this path
         handles error rollback so the queue doesn't accumulate."""
+        next_payload: Optional[Dict[str, Any]] = None
         with self._clarify_state_lock:
             queue = self._clarify_queues.get(session_id)
             if queue and entry in queue:
                 queue.remove(entry)
             if queue is not None and not queue:
                 self._clarify_queues.pop(session_id, None)
+            elif queue:
+                # The pending projection always represents the entry at the
+                # front of the legacy FIFO. This also keeps reconnect correct
+                # should a future producer create more than one entry.
+                next_payload = queue[0].payload
         with self._pending_lock:
-            self._pending_clarify.pop(session_id, None)
+            current = self._pending_clarify.get(session_id)
+            if current and current.get("clarify_id") == entry.clarify_id:
+                if next_payload is None:
+                    self._pending_clarify.pop(session_id, None)
+                else:
+                    self._pending_clarify[session_id] = next_payload
 
     def _register_active_session_turn(self, session_id: Optional[str], agent_ref: list, agent_task: Any) -> None:
         """Stash the in-flight chat-completions turn so the session
@@ -1364,13 +1388,14 @@ class ZetAgentAdapter(APIServerAdapter):
         return web.json_response({"resolved": resolved})
 
     async def _handle_clarify_respond(self, request: "web.Request") -> "web.Response":
-        """POST /v1/sessions/{session_id}/clarify/respond — answer the
-        oldest pending clarify prompt for the session.
+        """POST /v1/sessions/{session_id}/clarify/respond — answer one
+        pending clarify prompt.
 
-        Body: ``{"response": "..."}``. Plan-E rev4: no clarify_id —
-        oldest pending entry in the session FIFO is resolved. 404 when
-        the queue is empty so a stale APP retry surfaces explicitly
-        instead of silently dropping the answer.
+        Body: ``{"response": "...", "clarify_id": "..."}``. A supplied
+        id must match a live entry and is never allowed to consume another
+        prompt. Omitting it preserves the legacy oldest-pending FIFO behavior.
+        404 makes stale or mismatched retries explicit rather than silently
+        applying an answer to a different card.
         """
         auth_err = self._check_auth(request)
         if auth_err:
@@ -1383,12 +1408,24 @@ class ZetAgentAdapter(APIServerAdapter):
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
         response_text = str(body.get("response", "") or "")
+        clarify_id = str(body.get("clarify_id", "") or "").strip()
 
+        next_payload: Optional[Dict[str, Any]] = None
         with self._clarify_state_lock:
             queue = self._clarify_queues.get(session_id)
-            entry = queue.pop(0) if queue else None
+            entry: Optional[_ClarifyEntry] = None
+            if queue:
+                if clarify_id:
+                    for i, candidate in enumerate(queue):
+                        if candidate.clarify_id == clarify_id:
+                            entry = queue.pop(i)
+                            break
+                else:
+                    entry = queue.pop(0)
             if queue is not None and not queue:
                 self._clarify_queues.pop(session_id, None)
+            elif queue:
+                next_payload = queue[0].payload
         if entry is None:
             return web.json_response(
                 _openai_error(
@@ -1401,7 +1438,12 @@ class ZetAgentAdapter(APIServerAdapter):
         entry.response = response_text
         entry.event.set()
         with self._pending_lock:
-            self._pending_clarify.pop(session_id, None)
+            current = self._pending_clarify.get(session_id)
+            if current and current.get("clarify_id") == entry.clarify_id:
+                if next_payload is None:
+                    self._pending_clarify.pop(session_id, None)
+                else:
+                    self._pending_clarify[session_id] = next_payload
         # Goal projection: mirror the approval respond hook.
         try:
             await asyncio.to_thread(self._goals().on_interaction_resolved, session_id)
