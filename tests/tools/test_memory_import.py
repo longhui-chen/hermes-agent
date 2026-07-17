@@ -1366,17 +1366,27 @@ def test_durable_profile_creation_retries_parent_barrier_after_failed_attempt(
     home = tmp_path / "missing" / "deep" / ".hermes"
     monkeypatch.setenv("HERMES_HOME", str(home))
     original_fsync = memory_tool._fsync_directory_fd
+    original_mkdir = memory_tool.os.mkdir
     failed = False
+    missing_created = False
 
-    def fail_first_new_child(directory_fd, path):
+    def track_first_mkdir(name, mode=0o777, *, dir_fd=None):
+        nonlocal missing_created
+        result = original_mkdir(name, mode, dir_fd=dir_fd)
+        if name == "missing":
+            missing_created = True
+        return result
+
+    def fail_first_parent_barrier(directory_fd, path):
         nonlocal failed
-        if path == tmp_path / "missing" and not failed:
+        if path == tmp_path and missing_created and not failed:
             failed = True
             raise OSError(errno.EIO, "simulated parent chain fsync failure")
         return original_fsync(directory_fd, path)
 
+    monkeypatch.setattr(memory_tool.os, "mkdir", track_first_mkdir)
     monkeypatch.setattr(
-        memory_tool, "_fsync_directory_fd", fail_first_new_child
+        memory_tool, "_fsync_directory_fd", fail_first_parent_barrier
     )
     store = MemoryStore(memory_char_limit=100, user_char_limit=100)
     with pytest.raises(OSError, match="simulated parent chain"):
@@ -2420,6 +2430,85 @@ def test_reset_all_removes_unclassified_receipt_but_single_target_fails_closed(
     result = reset_curated_memory("all")
     assert result["status"] == "completed"
     assert not receipt.exists()
+
+
+@pytest.mark.parametrize(
+    "receipt_bytes",
+    [b"\xff\xfe", b"x" * (memory_tool.MAX_CURATED_MEMORY_FILE_BYTES + 1)],
+    ids=["invalid-utf8", "oversize"],
+)
+def test_reset_all_deletes_unreadable_regular_receipt_without_parsing(
+    tmp_path, monkeypatch, receipt_bytes
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    imports = memories / ".imports"
+    imports.mkdir(parents=True)
+    receipt = imports / "unreadable.json"
+    receipt.write_bytes(receipt_bytes)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert curated_memory_has_state("all") is True
+    for target in ("memory", "user"):
+        with pytest.raises(MemoryImportConflict):
+            curated_memory_has_state(target)
+        with pytest.raises(MemoryImportConflict):
+            reset_curated_memory(target)
+        assert receipt.exists()
+        assert not (memories / ".curated-memory-transaction.lock").exists()
+
+    assert reset_curated_memory("all")["status"] == "completed"
+    assert not receipt.exists()
+
+
+def test_reset_removes_both_hardlink_probe_crash_residue_names(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    source = memories / f"{memory_tool._IMPORT_LINK_PROBE_PREFIX}crash.tmp"
+    linked = memories / f"{memory_tool._IMPORT_LINK_PROBE_PREFIX}crash.tmp.link"
+    source.write_bytes(b"")
+    os.link(source, linked)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert curated_memory_has_state("memory") is True
+    result = reset_curated_memory("memory")
+
+    assert result["status"] == "completed"
+    assert not source.exists()
+    assert not linked.exists()
+    assert curated_memory_has_state("memory") is False
+
+
+@pytest.mark.parametrize("leaf_kind", ["directory", "symlink", "fifo"])
+def test_reset_rejects_nonregular_hardlink_probe_residue(
+    tmp_path, monkeypatch, leaf_kind
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    residue = memories / (
+        f"{memory_tool._IMPORT_LINK_PROBE_PREFIX}unsafe.tmp.link"
+    )
+    outside = tmp_path / "outside"
+    outside.write_text("survives", encoding="utf-8")
+    if leaf_kind == "directory":
+        residue.mkdir()
+    elif leaf_kind == "symlink":
+        residue.symlink_to(outside)
+    else:
+        os.mkfifo(residue)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    assert curated_memory_has_state("memory") is True
+    with pytest.raises(MemoryImportConflict, match="regular file"):
+        reset_curated_memory("memory")
+
+    assert os.path.lexists(residue)
+    assert outside.read_text(encoding="utf-8") == "survives"
+    assert not (memories / ".curated-memory-transaction.lock").exists()
 
 
 @pytest.mark.parametrize(

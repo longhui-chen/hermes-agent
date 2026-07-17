@@ -528,7 +528,7 @@ class _ImportDirectoryHandles:
         return value if isinstance(value, dict) else None
 
     def preflight_reset(
-        self,
+        self, *, parse_import_receipts: bool = True
     ) -> tuple[List[str], List[str], List[str], Dict[str, Optional[Dict[str, Any]]]]:
         """Snapshot all reset inputs before allowing the first unlink."""
         try:
@@ -548,11 +548,15 @@ class _ImportDirectoryHandles:
                     continue
                 for name in names:
                     os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-            receipt_targets = {
-                name: self.read_receipt(self.imports_fd, name)
-                for name in imports_names
-                if name.endswith(".json")
-            }
+            receipt_targets = (
+                {
+                    name: self.read_receipt(self.imports_fd, name)
+                    for name in imports_names
+                    if name.endswith(".json")
+                }
+                if parse_import_receipts
+                else {}
+            )
         except OSError as exc:
             raise MemoryImportConflict(
                 f"cannot preflight curated memory reset: {exc}"
@@ -1196,7 +1200,7 @@ def _read_import_receipt_no_follow(path: Path) -> Optional[Dict[str, Any]]:
         with os.fdopen(fd, "r", encoding="utf-8") as handle:
             fd = -1
             value = json.load(handle)
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     finally:
         if fd >= 0:
@@ -1898,7 +1902,9 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
             initial_imports_names,
             initial_backup_names,
             initial_receipt_targets,
-        ) = reset_dirs.preflight_reset()
+        ) = reset_dirs.preflight_reset(
+            parse_import_receipts=target != "all"
+        )
         _validate_reset_candidate_types(
             reset_dirs,
             target,
@@ -1924,7 +1930,9 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
             imports_names,
             backup_names,
             receipt_targets,
-        ) = reset_dirs.preflight_reset()
+        ) = reset_dirs.preflight_reset(
+            parse_import_receipts=target != "all"
+        )
         _validate_reset_candidate_types(
             reset_dirs, target, memory_names, imports_names, backup_names
         )
@@ -1940,7 +1948,9 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
             imports_names,
             backup_names,
             receipt_targets,
-        ) = reset_dirs.preflight_reset()
+        ) = reset_dirs.preflight_reset(
+            parse_import_receipts=target != "all"
+        )
 
         transaction_id = secrets.token_hex(16)
         plan: List[Dict[str, str]] = []
@@ -1990,8 +2000,11 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
                 if name.endswith(".json"):
                     add_plan("imports", name, str(Path(".imports") / name))
 
+        for name in memory_names:
+            if name.startswith(_IMPORT_LINK_PROBE_PREFIX):
+                add_plan("memory", name, name)
+
         for scope, names, prefix, relative_dir in (
-            ("memory", memory_names, _IMPORT_LINK_PROBE_PREFIX, Path(".")),
             ("memory", memory_names, ".mem_", Path(".")),
             ("memory", memory_names, ".drift_", Path(".")),
             ("memory", memory_names, ".reset_receipt_", Path(".")),
