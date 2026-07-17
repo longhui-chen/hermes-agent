@@ -1773,6 +1773,7 @@ def _cleanup_isolated_reset(
     handles: _ImportDirectoryHandles,
     receipt_name: str,
     plan: List[Dict[str, str]],
+    receipt: Dict[str, Any],
 ) -> bool:
     cleanup_pending = False
     for entry in plan:
@@ -1803,10 +1804,13 @@ def _cleanup_isolated_reset(
         # The receipt removal was not durably confirmed. Recreate a marker so
         # callers can observe cleanup_pending and a retry has work to recover.
         try:
+            retry_receipt = dict(receipt)
+            retry_receipt["state"] = "isolated"
+            retry_receipt["plan"] = plan
             _write_reset_receipt(
                 handles,
                 receipt_name,
-                {"version": 1, "state": "isolated", "plan": plan},
+                retry_receipt,
             )
         except (OSError, MemoryImportConflict):
             pass
@@ -1943,9 +1947,9 @@ def _reset_receipts_require_forward_all(
         ):
             continue
         receipt = handles.read_receipt(handles.mem_fd, receipt_name)
-        _validate_reset_receipt(receipt)
+        state, _plan = _validate_reset_receipt(receipt)
         original_targets = _reset_receipt_targets(receipt)
-        if set(original_targets) == {"memory", "user"}:
+        if state == "staging" and set(original_targets) == {"memory", "user"}:
             forward_all = True
     return forward_all
 
@@ -1976,7 +1980,7 @@ def _recover_reset_transactions(
             _fsync_directory_fd(handles.mem_fd, handles.mem_dir)
         else:
             cleanup_pending |= _cleanup_isolated_reset(
-                handles, receipt_name, plan
+                handles, receipt_name, plan, receipt
             )
     return cleanup_pending
 
@@ -2394,7 +2398,7 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
                         "status": "cleanup_pending",
                     }
                 cleanup_pending = _cleanup_isolated_reset(
-                    reset_dirs, receipt_name, plan
+                    reset_dirs, receipt_name, plan, current_receipt
                 )
                 return {
                     "deleted": [entry["label"] for entry in plan],
@@ -2432,7 +2436,9 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
             raise
 
         deleted = [entry["label"] for entry in plan]
-        cleanup_pending = _cleanup_isolated_reset(reset_dirs, receipt_name, plan)
+        cleanup_pending = _cleanup_isolated_reset(
+            reset_dirs, receipt_name, plan, receipt
+        )
         reset_dirs.verify_attached()
         return {
             "deleted": deleted,

@@ -1237,6 +1237,96 @@ def test_single_target_finishes_crashed_reset_all_forward(
 
 
 @pytest.mark.parametrize(
+    ("requested_target", "new_other_name"),
+    [("memory", "USER.md"), ("user", "MEMORY.md")],
+)
+def test_single_target_does_not_reopen_isolated_reset_all(
+    tmp_path, monkeypatch, requested_target, new_other_name
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    (memories / ".imports" / "backups").mkdir(parents=True)
+    receipt = memories / f"{memory_tool._RESET_RECEIPT_PREFIX}isolated-all.json"
+    receipt.write_text(json.dumps({
+        "version": 1,
+        "state": "isolated",
+        "targets": ["memory", "user"],
+        "plan": [],
+        "created_at": 1.0,
+        "isolated_at": 2.0,
+    }), encoding="utf-8")
+    new_other = memories / new_other_name
+    new_other.write_text("created after reset-all committed", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    result = reset_curated_memory(requested_target)
+
+    assert result["status"] == "completed"
+    assert result["targets"] == [requested_target]
+    assert new_other.read_text(encoding="utf-8") == (
+        "created after reset-all committed"
+    )
+    assert not receipt.exists()
+
+
+@pytest.mark.parametrize(
+    ("requested_target", "new_other_name"),
+    [("memory", "USER.md"), ("user", "MEMORY.md")],
+)
+def test_recreated_isolated_marker_preserves_reset_all_direction(
+    tmp_path, monkeypatch, requested_target, new_other_name
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    canonical = memories / "MEMORY.md"
+    canonical.write_text("private before reset", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    original_fsync = memory_tool._fsync_directory_fd
+    failed = False
+
+    def fail_after_receipt_unlink(directory_fd, path):
+        nonlocal failed
+        if (
+            not failed
+            and path == memories
+            and not canonical.exists()
+            and not list(memories.glob(f"{memory_tool._RESET_STAGE_PREFIX}*"))
+            and not list(memories.glob(f"{memory_tool._RESET_RECEIPT_PREFIX}*"))
+        ):
+            failed = True
+            raise OSError(errno.EIO, "simulated final receipt fsync failure")
+        return original_fsync(directory_fd, path)
+
+    monkeypatch.setattr(
+        memory_tool, "_fsync_directory_fd", fail_after_receipt_unlink
+    )
+    result = reset_curated_memory("all")
+
+    assert result["status"] == "cleanup_pending"
+    marker_path = next(
+        memories.glob(f"{memory_tool._RESET_RECEIPT_PREFIX}*.json")
+    )
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    assert marker["state"] == "isolated"
+    assert marker["targets"] == ["memory", "user"]
+    assert "created_at" in marker
+    assert "isolated_at" in marker
+
+    monkeypatch.setattr(memory_tool, "_fsync_directory_fd", original_fsync)
+    new_other = memories / new_other_name
+    new_other.write_text("created after reset-all committed", encoding="utf-8")
+    retry = reset_curated_memory(requested_target)
+
+    assert retry["status"] == "completed"
+    assert retry["targets"] == [requested_target]
+    assert new_other.read_text(encoding="utf-8") == (
+        "created after reset-all committed"
+    )
+    assert not marker_path.exists()
+
+
+@pytest.mark.parametrize(
     "receipt_value",
     [
         {
