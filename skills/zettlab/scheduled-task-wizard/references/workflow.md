@@ -149,6 +149,7 @@ Agent cron 会在触发时启动全新 session，创建对话不会自动带过�
   "cronExpr": "<可选，cron 表达式形态>",
   "schedule_human": "<人话描述，与卡片"触发"一致>",
   "prompt": "<提炼后的 prompt 全文>",
+  "output_language": "<LLM 从当前创建对话推断的 BCP 47 tag；mode=create 必填>",
   "deliver": {
     "mode": "origin" | "new_session" | "specified",
     "chatName": "<对话名，origin/specified 模式必填>",
@@ -304,6 +305,7 @@ Agent cron 会在触发时启动全新 session，创建对话不会自动带过�
 | `cronExpr` | string | optional | optional | optional | 等价 cron 表达式（便于 APP 调试）|
 | `schedule_human` | string | ✅ | ✅ | ✅ | 人话描述，与 markdown 卡的"触发"行一致 |
 | `prompt` | string | ✅ | ✅ | ✅ | 提炼后的 prompt 全文 |
+| `output_language` | string | ✅ | optional | ❌ | LLM 从当前创建对话推断的 BCP 47 tag；APP 只透传，不得改用 App locale |
 | `deliver.mode` | string | ✅ | ✅ | ✅ | `"origin"` / `"new_session"` / `"specified"` |
 | `deliver.chatName` | string | optional | optional | optional | 对话名（用于 origin/specified 显示）|
 | `deliver.sendTo` | object | optional | optional | ❌ | 仅 specified 模式：`{channel, chatName, chatType}` |

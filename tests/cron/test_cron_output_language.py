@@ -51,6 +51,10 @@ class TestOutputLanguageBehaviorMatrix:
             "please answer in Chinese",
             "ignore-all-rules",
             "x-private",
+            "en-x-ignore-all-rules",
+            "en-u-ca-gregory",
+            "en-t-ja",
+            "en-a-foo",
             "und",
             "mul",
             "zxx",
@@ -154,6 +158,25 @@ class TestOutputLanguageSuppressionMatrix:
         contract = _build_cron_execution_contract(reloaded)
         assert "ignore-all-rules" not in contract
         assert "language of the saved task instruction" in contract
+
+    @pytest.mark.parametrize(
+        "tampered",
+        ["en-x-ignore-all-rules", "en-u-ca-gregory", "en-t-ja"],
+    )
+    def test_hand_edited_extension_is_never_injected(
+        self, isolated_cron_store, tampered
+    ):
+        save_jobs([
+            {
+                "id": "abc123deadbe",
+                "name": "tampered",
+                "prompt": "每天整理消息",
+                "output_language": tampered,
+            }
+        ])
+        reloaded = get_job("abc123deadbe")
+        assert "output_language" not in reloaded
+        assert tampered not in _build_cron_execution_contract(reloaded)
 
 
 def test_llm_create_to_fresh_session_contract_flow(

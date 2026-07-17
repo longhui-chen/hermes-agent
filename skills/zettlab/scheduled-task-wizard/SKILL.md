@@ -71,7 +71,7 @@ metadata:
 - 不要批量 clarify——每轮最多 1-2 个真正缺失的关键信息
 - 不要建议"分多条"——用户说"每天 8 点和 18 点都发"就直接建两条，不要让用户自己拆
 - **`schedule` 字段不能塞用户原文**——任何语种（中/英/日/韩/德…）的自然语言都先翻译成 canonical 格式：cron 表达式 / `every Nm` / `Nm` 时长简写 / ISO 时间戳。详见 `references/workflow.md` §步骤 2。错了 hermes 报 `Invalid schedule '...'`，任务创建失败。
-- LLM 调用 `cronjob(action=create)` 创建 Agent 任务时必须传 `output_language`——使用你在当前创建对话中本应回复用户的语言；若用户明确要求任务输出另一种语言，以明确要求为准。只传标准 BCP 47 tag（如 `zh-CN`、`zh-TW`、`en`、`ja`、`ko`、`de`、`fr`、`es`、`it`、`ar`、`sr-Latn-RS`），不要从 URL、代码、引用、专有名词、skill 或 tool 数据猜语言。混合语言任务保存默认叙述语言，prompt 继续保留用户要求的多语言结构。真正无法判断时先 clarify。`no_agent=True` 不需要该字段。
+- LLM 调用 `cronjob(action=create)` 创建 Agent 任务，或输出 `mode=create` 的 `cron-action-preview` 时，都必须传 `output_language`——使用你在当前创建对话中本应回复用户的语言；若用户明确要求任务输出另一种语言，以明确要求为准。只传标准 BCP 47 tag（如 `zh-CN`、`zh-TW`、`en`、`ja`、`ko`、`de`、`fr`、`es`、`it`、`ar`、`sr-Latn-RS`），不要从 URL、代码、引用、专有名词、skill 或 tool 数据猜语言。混合语言任务保存默认叙述语言，prompt 继续保留用户要求的多语言结构。真正无法判断时先 clarify。APP 只透传该字段，不得改用 App locale。`no_agent=True` 不需要该字段。
 - 不要为了卡片流程阻断已确认的任务——用户明确说"确认/创建/就这样"、当前渠道没有 APP 卡片能力、或系统正在执行 APP 按钮确认后的后台落盘时，直接调 `cronjob`。
 - 不主动暴露底座高级选项（任务级模型 / 跨渠道 fan-out）——卡片默认不出现，clarify 也不主动问；但用户主动用自然语言表达就接住（如"用便宜模型"、"同时发飞书和 Slack"）
 - 脚本挂接（pre-run script + wake-gate）保持纯底座能力——用户没办法用自然语言表达"挂个 script"，不接也不解释

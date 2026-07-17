@@ -89,6 +89,12 @@ def normalize_output_language_tag(value: Any) -> Optional[str]:
     primary = normalized.split("-", 1)[0].lower()
     if primary in {"und", "mul", "zxx", "x"}:
         return None
+    # A one-character subtag after the primary language is an extension
+    # singleton (including private-use ``x``). Output-language preferences do
+    # not need extensions, and allowing their arbitrary payload would turn
+    # this persisted field into a durable system-prompt injection surface.
+    if any(len(subtag) == 1 for subtag in normalized.split("-")[1:]):
+        return None
     return normalized
 
 

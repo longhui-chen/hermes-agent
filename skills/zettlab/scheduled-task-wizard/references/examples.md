@@ -32,6 +32,7 @@
 >   "cronExpr": "0 8 * * *",
 >   "schedule_human": "每天 08:00",
 >   "prompt": "用 web_search 搜索最近 24 小时内的全球 AI 重要新闻，按重要性排前 5 条，每条一句话总结+链接。用中文输出。如本周期没有值得汇报的新内容，请只回复 [SILENT]。",
+>   "output_language": "zh-CN",
 >   "deliver": { "mode": "origin", "chatName": "与 ZettClaw 助手的对话" },
 >   "repeat": { "times": null, "completed": 0 }
 > }
