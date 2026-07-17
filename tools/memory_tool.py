@@ -249,10 +249,19 @@ class _ImportDirectoryHandles:
             raise MemoryImportConflict(
                 f"managed memory directory {name} is unsafe: {exc}"
             ) from exc
-        if not stat.S_ISDIR(os.fstat(fd).st_mode):
+        opened = os.fstat(fd)
+        if not stat.S_ISDIR(opened.st_mode):
             os.close(fd)
             raise MemoryImportConflict(
                 f"managed memory directory {name} must be a real directory"
+            )
+        if (
+            hasattr(os, "geteuid") and opened.st_uid != os.geteuid()
+        ) or stat.S_IMODE(opened.st_mode) & 0o022:
+            os.close(fd)
+            raise MemoryImportConflict(
+                f"managed memory directory {name} must be owned by this user "
+                "and not group/world writable"
             )
         return fd
 
@@ -806,18 +815,30 @@ def _anchored_import_directories(
             _ACTIVE_MEMORY_IMPORT_DIRS.reset(token)
 
 
-def _require_real_directory(path: Path, *, label: str, create: bool) -> None:
+def _require_real_directory(
+    path: Path, *, label: str, create: bool, secure_owner: bool = False
+) -> None:
     if create:
         try:
             os.mkdir(path, 0o700)
         except FileExistsError:
             pass
     try:
-        mode = os.lstat(path).st_mode
+        current = os.lstat(path)
     except FileNotFoundError as exc:
         raise MemoryImportConflict(f"{label} does not exist") from exc
-    if not stat.S_ISDIR(mode):
+    if not stat.S_ISDIR(current.st_mode):
         raise MemoryImportConflict(f"{label} must be a real directory, not a symlink")
+    if secure_owner and (
+        (
+            hasattr(os, "geteuid")
+            and current.st_uid != os.geteuid()
+        )
+        or stat.S_IMODE(current.st_mode) & 0o022
+    ):
+        raise MemoryImportConflict(
+            f"{label} must be owned by this user and not group/world writable"
+        )
 
 
 def _existing_profile_directory_for_fsync_probe() -> Path:
@@ -838,6 +859,9 @@ def _existing_profile_directory_for_fsync_probe() -> Path:
             raise MemoryImportConflict(
                 f"{label} must be a real directory, not a symlink"
             )
+        _require_real_directory(
+            path, label=label, create=False, secure_owner=True
+        )
     if os.path.lexists(mem_dir):
         return mem_dir
     if os.path.lexists(home):
@@ -1041,7 +1065,9 @@ def _require_profile_memory_snapshot(
     home = get_hermes_home()
     if create:
         _durably_create_directory_chain(home)
-    _require_real_directory(home, label="HERMES_HOME", create=False)
+    _require_real_directory(
+        home, label="HERMES_HOME", create=False, secure_owner=True
+    )
     try:
         resolved_home = home.resolve(strict=True)
     except OSError as exc:
@@ -1050,7 +1076,10 @@ def _require_profile_memory_snapshot(
     if create:
         _durably_create_directory_chain(mem_dir)
     _require_real_directory(
-        mem_dir, label="profile memories directory", create=False
+        mem_dir,
+        label="profile memories directory",
+        create=False,
+        secure_owner=True,
     )
     try:
         resolved_memory = mem_dir.resolve(strict=True)
@@ -1107,6 +1136,7 @@ def _require_managed_memory_directory(path: Path, *, create: bool) -> Path:
             current,
             label=f"managed memory directory {current.name}",
             create=create,
+            secure_owner=True,
         )
     expected = mem_dir.resolve(strict=True) / relative
     if path.resolve(strict=True) != expected:
@@ -1794,6 +1824,7 @@ def _validate_reset_receipt(value: Any) -> tuple[str, List[Dict[str, str]]]:
         if (
             scope not in {"memory", "imports", "backups"}
             or stage_scope not in {"memory", "imports", "backups"}
+            or ("stage_scope" in raw and stage_scope != scope)
             or not all(isinstance(item, str) and item and "/" not in item and "\\" not in item
                        for item in (name, stage))
             or not isinstance(label, str)
@@ -1816,8 +1847,15 @@ def _recover_reset_transactions(
     handles: _ImportDirectoryHandles,
     memory_names: List[str],
     *,
-    allow_invalid: bool = False,
+    purge_all: bool = False,
 ) -> bool:
+    # Reset-all is a forward-only privacy purge. Do not parse or roll back a
+    # previous reset transaction: its receipt, sources, and fixed-prefix stage
+    # names are all discovered by the fresh deletion plan. Besides making a
+    # malformed or contradictory receipt non-blocking, this guarantees that
+    # reset-all never enters legacy cross-directory copy recovery.
+    if purge_all:
+        return False
     cleanup_pending = False
     receipt_names = [
         name
@@ -1825,23 +1863,8 @@ def _recover_reset_transactions(
         if name.startswith(_RESET_RECEIPT_PREFIX) and name.endswith(".json")
     ]
     for receipt_name in receipt_names:
-        try:
-            receipt = handles.read_receipt(handles.mem_fd, receipt_name)
-            state, plan = _validate_reset_receipt(receipt)
-        except MemoryImportConflict:
-            if allow_invalid:
-                continue
-            raise
-        # Receipts written before same-directory atomic staging may require a
-        # cross-directory copy to recover. For reset-all, do not replay that
-        # legacy protocol: source, stage, and receipt are all managed deletion
-        # candidates for the fresh transaction below. Targeted reset remains
-        # fail-closed and preserves its legacy rollback behavior.
-        if allow_invalid and any(
-            not isinstance(raw, dict) or "stage_scope" not in raw
-            for raw in receipt.get("plan", [])
-        ):
-            continue
+        receipt = handles.read_receipt(handles.mem_fd, receipt_name)
+        state, plan = _validate_reset_receipt(receipt)
         if state == "staging":
             _reset_restore_plan(handles, plan)
             os.unlink(receipt_name, dir_fd=handles.mem_fd)
@@ -2066,7 +2089,7 @@ def reset_curated_memory(target: str) -> Dict[str, Any]:
         )
         _validate_reset_receipts(target, imports_names, receipt_targets)
         if _recover_reset_transactions(
-            reset_dirs, memory_names, allow_invalid=target == "all"
+            reset_dirs, memory_names, purge_all=target == "all"
         ):
             return {
                 "deleted": [],

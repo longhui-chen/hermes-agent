@@ -1502,6 +1502,57 @@ def test_durable_directory_creation_binds_fileexists_identity_before_open(
     assert not target.exists()
 
 
+@pytest.mark.parametrize("managed_part", ["home", "memories"])
+@pytest.mark.parametrize("unsafe_kind", ["world-writable", "wrong-owner"])
+def test_existing_managed_profile_chain_requires_secure_ownership(
+    tmp_path, monkeypatch, managed_part, unsafe_kind
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    home.mkdir(mode=0o700)
+    memories.mkdir(mode=0o700)
+    unsafe = home if managed_part == "home" else memories
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    if unsafe_kind == "world-writable":
+        unsafe.chmod(0o777)
+    else:
+        original_lstat = memory_tool.os.lstat
+
+        def wrong_owner(path, *args, **kwargs):
+            current = original_lstat(path, *args, **kwargs)
+            if Path(path) == unsafe:
+                values = list(current)
+                values[4] = current.st_uid + 1
+                return os.stat_result(values)
+            return current
+
+        monkeypatch.setattr(memory_tool.os, "lstat", wrong_owner)
+
+    with pytest.raises(
+        MemoryImportConflict, match="owned by this user.*group/world writable"
+    ):
+        memory_tool._require_profile_memory_snapshot(create=True)
+    assert memory_tool.portable_memory_import_supported() is False
+    assert memory_tool.portable_memory_reset_supported() is False
+
+
+def test_managed_profile_security_does_not_reject_unmanaged_system_ancestors(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    home.mkdir(mode=0o700)
+    memories.mkdir(mode=0o700)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    resolved, _home_identity, _mem_identity = (
+        memory_tool._require_profile_memory_snapshot(create=True)
+    )
+
+    assert resolved == memories
+
+
 def test_durable_directory_creation_rejects_dotdot_components(
     tmp_path, monkeypatch
 ):
@@ -2535,6 +2586,80 @@ def test_reset_all_removes_corrupt_reset_transaction_and_all_fixed_stages(
             backups_stage,
         )
     )
+
+
+def test_reset_all_purges_contradictory_same_scope_transaction(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    (memories / ".imports" / "backups").mkdir(parents=True)
+    source = memories / "MEMORY.md"
+    stage_name = f"{memory_tool._RESET_STAGE_PREFIX}contradictory"
+    stage = memories / stage_name
+    receipt = memories / f"{memory_tool._RESET_RECEIPT_PREFIX}contradictory.json"
+    source.write_text("new source created after crash", encoding="utf-8")
+    stage.write_text("original staged source", encoding="utf-8")
+    receipt.write_text(json.dumps({
+        "version": 1,
+        "state": "staging",
+        "plan": [{
+            "scope": "memory",
+            "stage_scope": "memory",
+            "name": source.name,
+            "stage": stage_name,
+            "label": source.name,
+        }],
+    }), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    result = reset_curated_memory("all")
+
+    assert result["status"] == "completed"
+    assert not source.exists()
+    assert not stage.exists()
+    assert not receipt.exists()
+
+
+def test_explicit_cross_scope_reset_stage_is_rejected_or_purged(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    backups = memories / ".imports" / "backups"
+    backups.mkdir(parents=True)
+    source = backups / "memory-cross-scope.bak"
+    stage_name = f"{memory_tool._RESET_STAGE_PREFIX}cross-scope"
+    stage = memories / stage_name
+    receipt = memories / f"{memory_tool._RESET_RECEIPT_PREFIX}cross-scope.json"
+    source.write_text("managed backup", encoding="utf-8")
+    stage.write_text("cross-scope stage", encoding="utf-8")
+    receipt.write_text(json.dumps({
+        "version": 1,
+        "state": "staging",
+        "plan": [{
+            "scope": "backups",
+            "stage_scope": "memory",
+            "name": source.name,
+            "stage": stage_name,
+            "label": source.name,
+        }],
+    }), encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    with pytest.raises(MemoryImportConflict, match="unsafe"):
+        reset_curated_memory("memory")
+    assert source.exists()
+    assert stage.exists()
+    assert receipt.exists()
+
+    def reject_copy(*_args, **_kwargs):
+        raise AssertionError("reset-all must not replay cross-scope copy recovery")
+
+    monkeypatch.setattr(memory_tool, "_reset_link_or_copy", reject_copy)
+
+    assert reset_curated_memory("all")["status"] == "completed"
+    assert not source.exists()
+    assert not stage.exists()
+    assert not receipt.exists()
 
 
 def test_reset_retries_same_scope_atomic_stage_without_copying(
