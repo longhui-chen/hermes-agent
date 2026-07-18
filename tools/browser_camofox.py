@@ -94,11 +94,67 @@ def _set_handback_privacy_filter(session: Dict[str, Any], enabled: bool) -> None
         session["privacy_filter_after_handback"] = enabled
 
 
+def _handback_privacy_filter_enabled(session: Dict[str, Any]) -> bool:
+    """Return whether raw page reads are blocked after human control."""
+    with _session_lock(session):
+        return bool(session.get("privacy_filter_after_handback"))
+
+
 def _filter_page_state_after_handback(session: Dict[str, Any], value: str) -> str:
     """Filter page state while a human-mutated page remains current."""
-    with _session_lock(session):
-        enabled = bool(session.get("privacy_filter_after_handback"))
-    return _redact_handback_page_state(value) if enabled else value
+    return _redact_handback_page_state(value) if _handback_privacy_filter_enabled(session) else value
+
+
+def _unsafe_handback_url(value: str) -> bool:
+    """Fail closed under the browser's metadata, private, and DNS policy."""
+    from tools.browser_tool import (
+        _is_always_blocked_url,
+        _is_safe_url,
+        _url_is_private,
+    )
+
+    # _is_safe_url rejects DNS failures, malformed URLs, and private targets by
+    # default. _url_is_private is deliberately retained as an unconditional
+    # floor because _is_safe_url honors HERMES_ALLOW_PRIVATE_URLS/config opt-outs,
+    # which must never weaken handback evidence validation.
+    return (
+        _is_always_blocked_url(value)
+        or _url_is_private(value)
+        or not _is_safe_url(value)
+    )
+
+
+def _valid_resume_url_origin(value: str) -> bool:
+    """Require a credential-free HTTP(S) origin without path/query/fragment."""
+    try:
+        parts = urlsplit(value)
+        if parts.scheme not in {"http", "https"} or not parts.hostname:
+            return False
+        if parts.username is not None or parts.password is not None:
+            return False
+        if parts.path not in {"", "/"} or parts.query or parts.fragment:
+            return False
+        # Accessing port validates malformed authorities such as ``host:bad``.
+        parts.port
+        return True
+    except ValueError:
+        return False
+
+
+def _exact_session_tab(tabs: Any, session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return only the tab bound to this exact managed browser session."""
+    if not isinstance(tabs, list):
+        return None
+    return next(
+        (
+            tab
+            for tab in tabs
+            if isinstance(tab, dict)
+            and tab.get("tabId") == session.get("tab_id")
+            and tab.get("listItemId") == session.get("session_key")
+        ),
+        None,
+    )
 
 
 from tools.browser_camofox_state import get_camofox_identity
@@ -712,6 +768,28 @@ def _retryable_control_result(
     _set_handback_privacy_filter(session, True)
 
     try:
+        before_tabs = _get(
+            "/tabs",
+            params={"userId": session["user_id"]},
+            timeout=5,
+        ).get("tabs", [])
+        before_tab = _exact_session_tab(before_tabs, session)
+        resume_origin = before_tab.get("resumeUrlOrigin") if before_tab else None
+        pending_url = before_tab.get("url") if before_tab else None
+        if (
+            not isinstance(pending_url, str)
+            or pending_url != ""
+            or not isinstance(resume_origin, str)
+            or not _valid_resume_url_origin(resume_origin.strip())
+            or _unsafe_handback_url(resume_origin.strip())
+        ):
+            result.update({
+                "error": "browser_handback_origin_blocked",
+                "message": "Browser handback lacks a safe resume origin. Close the browser session before retrying.",
+                "retryable": False,
+            })
+            return json.dumps(result)
+
         snapshot_data = _get(
             f"/tabs/{session['tab_id']}/snapshot",
             params={"userId": session["user_id"]},
@@ -719,6 +797,26 @@ def _retryable_control_result(
         snapshot = snapshot_data.get("snapshot", "")
         if not isinstance(snapshot, str):
             snapshot = ""
+
+        after_tabs = _get(
+            "/tabs",
+            params={"userId": session["user_id"]},
+            timeout=5,
+        ).get("tabs", [])
+        after_tab = _exact_session_tab(after_tabs, session)
+        current_url = after_tab.get("url") if after_tab else None
+        if (
+            not isinstance(current_url, str)
+            or not current_url.strip()
+            or _unsafe_handback_url(current_url.strip())
+        ):
+            result.update({
+                "error": "browser_handback_url_blocked",
+                "message": "Browser handback ended on an unsafe or unverifiable URL. Close the browser session before retrying.",
+                "retryable": False,
+            })
+            return json.dumps(result)
+
         from tools.browser_tool import (
             SNAPSHOT_SUMMARIZE_THRESHOLD,
             _truncate_snapshot,
@@ -729,16 +827,6 @@ def _retryable_control_result(
         result["snapshot"] = _filter_page_state_after_handback(session, snapshot)
         result["element_count"] = snapshot_data.get("refsCount", 0)
         result["resnapshot_completed"] = True
-
-        tabs = _get("/tabs", params={"userId": session["user_id"]}, timeout=5).get("tabs", [])
-        current_tab = next(
-            (tab for tab in tabs if isinstance(tab, dict) and tab.get("tabId") == session["tab_id"]),
-            None,
-        )
-        current_url = current_tab.get("url") if isinstance(current_tab, dict) else None
-        if not isinstance(current_url, str) or not current_url.strip():
-            result["resnapshot_completed"] = False
-            return json.dumps(result)
         result["url"] = _redact_handback_url(current_url.strip())
         result["title"] = "[REDACTED after human control]"
     except Exception as snapshot_exc:
@@ -1106,6 +1194,11 @@ def camofox_vision(question: str, annotate: bool = False,
         session = _get_session(task_id)
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
+        if _handback_privacy_filter_enabled(session):
+            return tool_error(
+                "Browser vision is blocked after human control until the Agent navigates to a new page or closes the session.",
+                success=False,
+            )
 
         # Get screenshot as binary PNG
         resp = _get_raw(

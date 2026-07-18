@@ -471,5 +471,10 @@ class TestBrowserToolRouting:
 
     def test_check_requirements_passes_with_camofox(self, monkeypatch):
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
-        from tools.browser_tool import check_browser_requirements
+        from tools.browser_tool import (
+            check_browser_requirements,
+            check_browser_vision_requirements,
+        )
         assert check_browser_requirements() is True
+        assert check_browser_requirements._profile_scope_sensitive is True
+        assert check_browser_vision_requirements._profile_scope_sensitive is True

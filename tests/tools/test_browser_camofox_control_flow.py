@@ -23,6 +23,29 @@ def _http_error(status: int, payload: dict) -> requests.HTTPError:
     return requests.HTTPError(response=response)
 
 
+def _pending_tabs(origin: str = "https://example.com", url: str = "") -> dict:
+    return {
+        "tabs": [{
+            "tabId": "tab-agent",
+            "listItemId": "task_opaque",
+            "url": url,
+            "title": "",
+            "resumeUrlOrigin": origin,
+        }],
+    }
+
+
+def _current_tabs(url: str = "https://example.com/account") -> dict:
+    return {
+        "tabs": [{
+            "tabId": "tab-agent",
+            "listItemId": "task_opaque",
+            "url": url,
+            "title": "Account",
+        }],
+    }
+
+
 @pytest.fixture
 def managed_session(monkeypatch):
     monkeypatch.setenv("CAMOFOX_URL", "http://127.0.0.1:8080/api/v1/internal/browser/camofox")
@@ -86,8 +109,9 @@ def test_handback_resnapshots_then_acks_before_retry(managed_session):
         patch("tools.browser_camofox._get_session", return_value=managed_session),
         patch("tools.browser_camofox._post", side_effect=fake_post),
         patch("tools.browser_camofox._get", side_effect=[
+            _pending_tabs(),
             {"snapshot": '- button "Continue" [e9]', "refsCount": 1},
-            {"tabs": [{"tabId": "tab-agent", "url": "https://example.com/account", "title": "Account"}]},
+            _current_tabs(),
         ]) as mock_get,
     ):
         result = json.loads(camofox_click("@e4", task_id="agent-task"))
@@ -101,8 +125,10 @@ def test_handback_resnapshots_then_acks_before_retry(managed_session):
     assert result["url"] == "https://example.com"
     assert result["title"] == "[REDACTED after human control]"
     assert "resume-secret" not in json.dumps(result)
-    assert mock_get.call_args_list[0].args == ("/tabs/tab-agent/snapshot",)
-    assert mock_get.call_args_list[0].kwargs == {"params": {"userId": "hermes_profile"}}
+    assert mock_get.call_args_list[0].args == ("/tabs",)
+    assert mock_get.call_args_list[1].args == ("/tabs/tab-agent/snapshot",)
+    assert mock_get.call_args_list[1].kwargs == {"params": {"userId": "hermes_profile"}}
+    assert mock_get.call_args_list[2].args == ("/tabs",)
     assert post_calls[-1] == (
         "/_zettlab/control/resume/ack",
         {
@@ -124,8 +150,9 @@ def test_handback_without_resume_token_does_not_ack(managed_session):
         patch("tools.browser_camofox._get_session", return_value=managed_session),
         patch("tools.browser_camofox._post", side_effect=stale) as mock_post,
         patch("tools.browser_camofox._get", side_effect=[
+            _pending_tabs(),
             {"snapshot": '- heading "Signed in"', "refsCount": 0},
-            {"tabs": [{"tabId": "tab-agent", "url": "https://example.com", "title": "Example"}]},
+            _current_tabs("https://example.com"),
         ]),
     ):
         result = json.loads(camofox_click("@e4", task_id="agent-task"))
@@ -141,8 +168,9 @@ def test_handback_ack_does_not_require_tab_title(managed_session):
         patch("tools.browser_camofox._get_session", return_value=managed_session),
         patch("tools.browser_camofox._post", side_effect=[stale, {"ok": True}]) as mock_post,
         patch("tools.browser_camofox._get", side_effect=[
+            _pending_tabs(),
             {"snapshot": '- heading "Signed in"', "refsCount": 0},
-            {"tabs": [{"tabId": "tab-agent", "url": "https://example.com/account"}]},
+            _current_tabs(),
         ]),
     ):
         result = json.loads(camofox_click("@e4", task_id="agent-task"))
@@ -159,17 +187,14 @@ def test_handback_redacts_sensitive_human_page_state(managed_session):
         patch("tools.browser_camofox._get_session", return_value=managed_session),
         patch("tools.browser_camofox._post", side_effect=[stale, {"ok": True}]),
         patch("tools.browser_camofox._get", side_effect=[
+            _pending_tabs("https://example.com:8443"),
             {
                 "snapshot": '- textbox "Password": hunter2\n- textbox "Enter the 6-digit code": 654321\n- textbox "Card number": 4242424242424242\n- textbox "Nickname": private nickname\ntextbox "Email": root@example.com\nsearchbox "People": Alice Root\n- textbox: Alice Smith\n- spinbutton "Amount": 1200\n- combobox "Account":\n  - option "Checking 1234" [selected]\n- listbox "Address":\n  - option "1 Private Lane" [selected]\n- heading "eyJabcdefghijk.payload.signature"',
                 "refsCount": 4,
             },
-            {
-                "tabs": [{
-                    "tabId": "tab-agent",
-                    "url": "https://alice:password@example.com:8443/reset/path-secret?session_token=raw-secret&redirect=https%3A%2F%2Fnested.example%2F%3FaccessToken%3Dnested-secret#authorization_code=raw-fragment-secret",
-                    "title": "Alice Smith alice@example.com +86 13800138000 OTP 123456",
-                }],
-            },
+            _current_tabs(
+                "https://alice:password@example.com:8443/reset/path-secret?session_token=raw-secret&redirect=https%3A%2F%2Fnested.example%2F%3FaccessToken%3Dnested-secret#authorization_code=raw-fragment-secret"
+            ),
         ]),
     ):
         result = json.loads(camofox_click("@e4", task_id="agent-task"))
@@ -200,31 +225,23 @@ def test_handback_redacts_sensitive_human_page_state(managed_session):
     assert result["resume_acknowledged"] is True
 
 
-def test_handback_privacy_filter_persists_for_snapshot_and_annotated_vision(
+def test_handback_privacy_filter_blocks_raw_vision_and_filters_snapshot(
     managed_session,
 ):
     stale = _http_error(409, {"error": "browser_resnapshot_required", "resume_token": "resume-secret"})
     private_snapshot = 'textbox "Nickname": private nickname\n- button "Continue" [e9]'
-    screenshot = MagicMock()
-    screenshot.content = b"fakepng"
-    llm_response = MagicMock()
-    llm_choice = MagicMock()
-    llm_choice.message.content = "The form has a continue button."
-    llm_response.choices = [llm_choice]
 
     with (
         patch("tools.browser_camofox._get_session", return_value=managed_session),
         patch("tools.browser_camofox._post", side_effect=[stale, {"ok": True}]),
         patch("tools.browser_camofox._get", side_effect=[
+            _pending_tabs(),
             {"snapshot": private_snapshot, "refsCount": 1},
-            {"tabs": [{"tabId": "tab-agent", "url": "https://example.com/account"}]},
-            {"snapshot": private_snapshot, "refsCount": 1},
+            _current_tabs(),
             {"snapshot": private_snapshot, "refsCount": 1},
         ]),
-        patch("tools.browser_camofox._get_raw", return_value=screenshot),
-        patch("tools.browser_camofox.open", create=True),
-        patch("tools.browser_camofox.load_config", return_value={}),
-        patch("agent.auxiliary_client.call_llm", return_value=llm_response) as mock_llm,
+        patch("tools.browser_camofox._get_raw") as mock_get_raw,
+        patch("agent.auxiliary_client.call_llm") as mock_llm,
     ):
         handback = json.loads(camofox_click("@e4", task_id="agent-task"))
         later_snapshot = json.loads(camofox_snapshot(task_id="agent-task"))
@@ -234,10 +251,117 @@ def test_handback_privacy_filter_persists_for_snapshot_and_annotated_vision(
     assert managed_session["privacy_filter_after_handback"] is True
     assert "private nickname" not in later_snapshot["snapshot"]
     assert "[REDACTED sensitive form control]" in later_snapshot["snapshot"]
-    vision_prompt = mock_llm.call_args.kwargs["messages"][0]["content"][0]["text"]
-    assert "private nickname" not in vision_prompt
-    assert "[REDACTED sensitive form control]" in vision_prompt
-    assert vision["success"] is True
+    assert vision["success"] is False
+    assert "blocked after human control" in vision["error"]
+    mock_get_raw.assert_not_called()
+    mock_llm.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "current_url",
+    [
+        "http://localhost/admin",
+        "http://10.0.0.8/private",
+        "http://169.254.169.254/latest/meta-data/",
+    ],
+)
+def test_handback_private_or_metadata_url_stays_blocked(managed_session, current_url):
+    stale = _http_error(409, {"error": "browser_resnapshot_required", "resume_token": "resume-secret"})
+    with (
+        patch("tools.browser_camofox._get_session", return_value=managed_session),
+        patch("tools.browser_camofox._post", side_effect=stale) as mock_post,
+        patch("tools.browser_camofox._get", return_value=_pending_tabs(current_url)) as mock_get,
+    ):
+        result = json.loads(camofox_click("@e4", task_id="agent-task"))
+
+    assert result["error"] == "browser_handback_origin_blocked"
+    assert result["retryable"] is False
+    assert result["resnapshot_completed"] is False
+    assert result["resume_acknowledged"] is False
+    assert current_url not in json.dumps(result)
+    assert managed_session["privacy_filter_after_handback"] is True
+    mock_post.assert_called_once()
+    mock_get.assert_called_once_with("/tabs", params={"userId": "hermes_profile"}, timeout=5)
+
+
+@pytest.mark.parametrize(
+    ("is_safe", "is_private"),
+    [
+        (False, False),  # Hermes DNS failure while the browser may still resolve it.
+        (True, True),  # Private split-DNS answer despite an opted-out safe-url policy.
+    ],
+)
+def test_handback_origin_fails_closed_on_dns_or_private_resolution(
+    managed_session,
+    is_safe,
+    is_private,
+):
+    stale = _http_error(409, {"error": "browser_resnapshot_required", "resume_token": "resume-secret"})
+    with (
+        patch("tools.browser_camofox._get_session", return_value=managed_session),
+        patch("tools.browser_camofox._post", side_effect=stale) as mock_post,
+        patch("tools.browser_camofox._get", return_value=_pending_tabs("https://split.example")) as mock_get,
+        patch("tools.browser_tool._is_always_blocked_url", return_value=False),
+        patch("tools.browser_tool._is_safe_url", return_value=is_safe),
+        patch("tools.browser_tool._url_is_private", return_value=is_private),
+    ):
+        result = json.loads(camofox_click("@e4", task_id="agent-task"))
+
+    assert result["error"] == "browser_handback_origin_blocked"
+    assert result["resnapshot_completed"] is False
+    assert result["resume_acknowledged"] is False
+    assert "snapshot" not in result
+    mock_post.assert_called_once()
+    mock_get.assert_called_once()
+
+
+def test_handback_rejects_nonempty_pending_url_even_with_safe_origin(managed_session):
+    stale = _http_error(409, {"error": "browser_resnapshot_required", "resume_token": "resume-secret"})
+    with (
+        patch("tools.browser_camofox._get_session", return_value=managed_session),
+        patch("tools.browser_camofox._post", side_effect=stale) as mock_post,
+        patch(
+            "tools.browser_camofox._get",
+            return_value=_pending_tabs(
+                "https://example.com",
+                url="https://example.com/hidden-path?secret=value",
+            ),
+        ) as mock_get,
+        patch("tools.browser_camofox._unsafe_handback_url", return_value=False),
+    ):
+        result = json.loads(camofox_click("@e4", task_id="agent-task"))
+
+    assert result["error"] == "browser_handback_origin_blocked"
+    assert result["resnapshot_completed"] is False
+    assert result["resume_acknowledged"] is False
+    assert "snapshot" not in result
+    assert "hidden-path" not in json.dumps(result)
+    mock_post.assert_called_once()
+    mock_get.assert_called_once()
+
+
+def test_handback_does_not_expose_snapshot_or_ack_if_url_turns_unsafe(managed_session):
+    stale = _http_error(409, {"error": "browser_resnapshot_required", "resume_token": "resume-secret"})
+    private_snapshot = '- heading "Internal account data"\n- textbox "Secret": value'
+    with (
+        patch("tools.browser_camofox._get_session", return_value=managed_session),
+        patch("tools.browser_camofox._post", side_effect=stale) as mock_post,
+        patch("tools.browser_camofox._get", side_effect=[
+            _pending_tabs(),
+            {"snapshot": private_snapshot, "refsCount": 1},
+            _current_tabs("http://127.0.0.1/private"),
+        ]),
+    ):
+        result = json.loads(camofox_click("@e4", task_id="agent-task"))
+
+    assert result["error"] == "browser_handback_url_blocked"
+    assert result["retryable"] is False
+    assert result["resnapshot_completed"] is False
+    assert result["resume_acknowledged"] is False
+    assert "snapshot" not in result
+    assert "Internal account data" not in json.dumps(result)
+    assert managed_session["privacy_filter_after_handback"] is True
+    mock_post.assert_called_once()
 
 
 def test_agent_navigation_clears_handback_privacy_filter(managed_session):
@@ -258,10 +382,7 @@ def test_handback_does_not_ack_without_current_tab_metadata(managed_session):
     with (
         patch("tools.browser_camofox._get_session", return_value=managed_session),
         patch("tools.browser_camofox._post", side_effect=stale) as mock_post,
-        patch("tools.browser_camofox._get", side_effect=[
-            {"snapshot": '- heading "Signed in"', "refsCount": 0},
-            {"tabs": []},
-        ]),
+        patch("tools.browser_camofox._get", return_value={"tabs": []}),
     ):
         result = json.loads(camofox_click("@e4", task_id="agent-task"))
 
@@ -276,8 +397,9 @@ def test_console_evaluate_uses_handback_recovery(managed_session):
         patch("tools.browser_camofox._ensure_tab", return_value=managed_session),
         patch("tools.browser_camofox._post", side_effect=[stale, {"ok": True}]),
         patch("tools.browser_camofox._get", side_effect=[
+            _pending_tabs(),
             {"snapshot": '- heading "Signed in"', "refsCount": 0},
-            {"tabs": [{"tabId": "tab-agent", "url": "https://example.com", "title": "Example"}]},
+            _current_tabs("https://example.com"),
         ]),
     ):
         result = json.loads(_camofox_eval("document.title", "agent-task"))
@@ -285,6 +407,19 @@ def test_console_evaluate_uses_handback_recovery(managed_session):
     assert result["error"] == "browser_resnapshot_required"
     assert result["resnapshot_completed"] is True
     assert result["resume_acknowledged"] is True
+
+
+def test_console_evaluate_is_blocked_while_handback_privacy_filter_is_active(managed_session):
+    managed_session["privacy_filter_after_handback"] = True
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=managed_session),
+        patch("tools.browser_camofox._post") as mock_post,
+    ):
+        result = json.loads(_camofox_eval("document.querySelector('input').value", "agent-task"))
+
+    assert result["success"] is False
+    assert "blocked after human control" in result["error"]
+    mock_post.assert_not_called()
 
 
 def test_scroll_stops_after_first_control_block():

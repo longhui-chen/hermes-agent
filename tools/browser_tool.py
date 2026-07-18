@@ -3695,9 +3695,22 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
 
 def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
     """Evaluate JS via Camofox's /tabs/{tab_id}/eval endpoint (if available)."""
-    from tools.browser_camofox import _ensure_tab, _post, _tool_error_from_exception
+    from tools.browser_camofox import (
+        _ensure_tab,
+        _handback_privacy_filter_enabled,
+        _post,
+        _tool_error_from_exception,
+    )
     try:
         tab_info = _ensure_tab(task_id or "default")
+        if _handback_privacy_filter_enabled(tab_info):
+            return json.dumps({
+                "success": False,
+                "error": (
+                    "Browser evaluation is blocked after human control until the "
+                    "Agent navigates to a new page or closes the session."
+                ),
+            }, ensure_ascii=False)
         tab_id = tab_info.get("tab_id") or tab_info.get("id")
         resp = _post(f"/tabs/{tab_id}/evaluate", body={"expression": expression, "userId": tab_info["user_id"]})
 
@@ -4619,6 +4632,13 @@ def check_browser_vision_requirements() -> bool:
     except ImportError:
         return False
     return check_vision_requirements()
+
+
+# These checks read profile-scoped browser secrets (including CAMOFOX_URL and
+# its action token). Shared multiplex gateways must not reuse another profile's
+# cached availability verdict.
+check_browser_requirements._profile_scope_sensitive = True
+check_browser_vision_requirements._profile_scope_sensitive = True
 
 
 # ============================================================================
