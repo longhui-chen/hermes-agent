@@ -48,7 +48,7 @@ _HANDBACK_SENSITIVE_CONTROL = re.compile(
     r"ssn|passport|tax\s+id)\b|密码|验证码|银行卡|身份证"
 )
 _HANDBACK_EDITABLE_CONTROL = re.compile(
-    r"(?i)^\s*-\s*(?:textbox|searchbox|combobox|listbox|option|spinbutton|slider|checkbox|radio|switch)\b"
+    r"(?i)^\s*(?:-\s*)?(?:textbox|searchbox|combobox|listbox|option|spinbutton|slider|checkbox|radio|switch)\b"
 )
 _HANDBACK_VALUE_ATTRIBUTE = re.compile(
     r"(?i)\bvalue=(?:\"[^\"]*\"|'[^']*'|\S+)"
@@ -86,6 +86,21 @@ def _redact_handback_url(value: str) -> str:
     if port is not None:
         authority = f"{authority}:{port}"
     return urlunsplit((parts.scheme, authority, "", "", ""))
+
+
+def _set_handback_privacy_filter(session: Dict[str, Any], enabled: bool) -> None:
+    """Persist handback privacy filtering for subsequent reads of this tab."""
+    with _session_lock(session):
+        session["privacy_filter_after_handback"] = enabled
+
+
+def _filter_page_state_after_handback(session: Dict[str, Any], value: str) -> str:
+    """Filter page state while a human-mutated page remains current."""
+    with _session_lock(session):
+        enabled = bool(session.get("privacy_filter_after_handback"))
+    return _redact_handback_page_state(value) if enabled else value
+
+
 from tools.browser_camofox_state import get_camofox_identity
 from tools.registry import tool_error
 
@@ -479,6 +494,7 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "session_key": identity_override["session_key"],
                     "managed": True,
                     "adopt_existing_tab": _adopt_existing_tab_enabled(camofox_cfg),
+                    "privacy_filter_after_handback": False,
                     "_lock": threading.Lock(),
                 }
             elif _local_server_managed() or bool(camofox_cfg.get("managed_persistence")):
@@ -488,6 +504,7 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "session_key": profile_identity["session_key"],
                     "managed": True,
                     "adopt_existing_tab": _adopt_existing_tab_enabled(camofox_cfg),
+                    "privacy_filter_after_handback": False,
                     "_lock": threading.Lock(),
                 }
             else:
@@ -497,6 +514,7 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "session_key": profile_identity["session_key"],
                     "managed": False,
                     "adopt_existing_tab": False,
+                    "privacy_filter_after_handback": False,
                     "_lock": threading.Lock(),
                 }
             _sessions[cache_key] = session
@@ -688,6 +706,11 @@ def _retryable_control_result(
     if not session or not session.get("tab_id") or not session.get("user_id"):
         return json.dumps(result)
 
+    # Human-entered values can remain in the current accessibility tree after
+    # handback. Keep filtering every later read until Hermes explicitly leaves
+    # this page or clears the local session.
+    _set_handback_privacy_filter(session, True)
+
     try:
         snapshot_data = _get(
             f"/tabs/{session['tab_id']}/snapshot",
@@ -698,13 +721,12 @@ def _retryable_control_result(
             snapshot = ""
         from tools.browser_tool import (
             SNAPSHOT_SUMMARIZE_THRESHOLD,
-            _redact_browser_output,
             _truncate_snapshot,
         )
 
         if len(snapshot) > SNAPSHOT_SUMMARIZE_THRESHOLD:
             snapshot = _truncate_snapshot(snapshot)
-        result["snapshot"] = _redact_handback_page_state(snapshot)
+        result["snapshot"] = _filter_page_state_after_handback(session, snapshot)
         result["element_count"] = snapshot_data.get("refsCount", 0)
         result["resnapshot_completed"] = True
 
@@ -714,8 +736,7 @@ def _retryable_control_result(
             None,
         )
         current_url = current_tab.get("url") if isinstance(current_tab, dict) else None
-        current_title = current_tab.get("title") if isinstance(current_tab, dict) else None
-        if not isinstance(current_url, str) or not current_url.strip() or not isinstance(current_title, str):
+        if not isinstance(current_url, str) or not current_url.strip():
             result["resnapshot_completed"] = False
             return json.dumps(result)
         result["url"] = _redact_handback_url(current_url.strip())
@@ -788,6 +809,7 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
                     data = {"ok": True, "url": browser_url}
                 else:
                     raise
+        _set_handback_privacy_filter(session, False)
         result = {
             "success": True,
             "url": data.get("url", browser_url),
@@ -866,6 +888,9 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
         )
 
         snapshot = data.get("snapshot", "")
+        if not isinstance(snapshot, str):
+            snapshot = ""
+        snapshot = _filter_page_state_after_handback(session, snapshot)
         refs_count = data.get("refsCount", 0)
 
         # Apply same summarization logic as the main browser tool
@@ -1042,6 +1067,9 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
             params={"userId": session["user_id"]},
         )
         snapshot = data.get("snapshot", "")
+        if not isinstance(snapshot, str):
+            snapshot = ""
+        snapshot = _filter_page_state_after_handback(session, snapshot)
 
         # Parse img elements from the accessibility tree.
         # Format: img "alt text" or img "alt text" [eN]
@@ -1105,7 +1133,11 @@ def camofox_vision(question: str, annotate: bool = False,
                     f"/tabs/{session['tab_id']}/snapshot",
                     params={"userId": session["user_id"]},
                 )
-                annotation_context = f"\n\nAccessibility tree (element refs for interaction):\n{snap_data.get('snapshot', '')[:3000]}"
+                snapshot = snap_data.get("snapshot", "")
+                if not isinstance(snapshot, str):
+                    snapshot = ""
+                snapshot = _filter_page_state_after_handback(session, snapshot)
+                annotation_context = f"\n\nAccessibility tree (element refs for interaction):\n{snapshot[:3000]}"
             except Exception:
                 pass
 

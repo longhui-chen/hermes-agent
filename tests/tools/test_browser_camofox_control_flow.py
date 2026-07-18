@@ -6,7 +6,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from tools.browser_camofox import camofox_click, camofox_close, camofox_navigate
+from tools.browser_camofox import (
+    camofox_click,
+    camofox_close,
+    camofox_navigate,
+    camofox_snapshot,
+    camofox_vision,
+)
 from tools.browser_tool import _camofox_eval, browser_scroll
 
 
@@ -129,6 +135,24 @@ def test_handback_without_resume_token_does_not_ack(managed_session):
     assert mock_post.call_count == 1
 
 
+def test_handback_ack_does_not_require_tab_title(managed_session):
+    stale = _http_error(409, {"error": "browser_resnapshot_required", "resume_token": "resume-secret"})
+    with (
+        patch("tools.browser_camofox._get_session", return_value=managed_session),
+        patch("tools.browser_camofox._post", side_effect=[stale, {"ok": True}]) as mock_post,
+        patch("tools.browser_camofox._get", side_effect=[
+            {"snapshot": '- heading "Signed in"', "refsCount": 0},
+            {"tabs": [{"tabId": "tab-agent", "url": "https://example.com/account"}]},
+        ]),
+    ):
+        result = json.loads(camofox_click("@e4", task_id="agent-task"))
+
+    assert result["resnapshot_completed"] is True
+    assert result["resume_acknowledged"] is True
+    assert result["title"] == "[REDACTED after human control]"
+    assert mock_post.call_count == 2
+
+
 def test_handback_redacts_sensitive_human_page_state(managed_session):
     stale = _http_error(409, {"error": "browser_resnapshot_required", "resume_token": "resume-secret"})
     with (
@@ -136,7 +160,7 @@ def test_handback_redacts_sensitive_human_page_state(managed_session):
         patch("tools.browser_camofox._post", side_effect=[stale, {"ok": True}]),
         patch("tools.browser_camofox._get", side_effect=[
             {
-                "snapshot": '- textbox "Password": hunter2\n- textbox "Enter the 6-digit code": 654321\n- textbox "Card number": 4242424242424242\n- textbox "Nickname": private nickname\n- textbox "Email": alice@example.com\n- textbox: Alice Smith\n- spinbutton "Amount": 1200\n- combobox "Account":\n  - option "Checking 1234" [selected]\n- listbox "Address":\n  - option "1 Private Lane" [selected]\n- heading "eyJabcdefghijk.payload.signature"',
+                "snapshot": '- textbox "Password": hunter2\n- textbox "Enter the 6-digit code": 654321\n- textbox "Card number": 4242424242424242\n- textbox "Nickname": private nickname\ntextbox "Email": root@example.com\nsearchbox "People": Alice Root\n- textbox: Alice Smith\n- spinbutton "Amount": 1200\n- combobox "Account":\n  - option "Checking 1234" [selected]\n- listbox "Address":\n  - option "1 Private Lane" [selected]\n- heading "eyJabcdefghijk.payload.signature"',
                 "refsCount": 4,
             },
             {
@@ -155,6 +179,8 @@ def test_handback_redacts_sensitive_human_page_state(managed_session):
     assert "654321" not in encoded
     assert "4242424242424242" not in encoded
     assert "private nickname" not in encoded
+    assert "root@example.com" not in encoded
+    assert "Alice Root" not in encoded
     assert "alice@example.com" not in encoded
     assert "Alice Smith" not in encoded
     assert "1200" not in encoded
@@ -172,6 +198,59 @@ def test_handback_redacts_sensitive_human_page_state(managed_session):
     assert "123456" not in encoded
     assert "sk-12345678901234567890" not in encoded
     assert result["resume_acknowledged"] is True
+
+
+def test_handback_privacy_filter_persists_for_snapshot_and_annotated_vision(
+    managed_session,
+):
+    stale = _http_error(409, {"error": "browser_resnapshot_required", "resume_token": "resume-secret"})
+    private_snapshot = 'textbox "Nickname": private nickname\n- button "Continue" [e9]'
+    screenshot = MagicMock()
+    screenshot.content = b"fakepng"
+    llm_response = MagicMock()
+    llm_choice = MagicMock()
+    llm_choice.message.content = "The form has a continue button."
+    llm_response.choices = [llm_choice]
+
+    with (
+        patch("tools.browser_camofox._get_session", return_value=managed_session),
+        patch("tools.browser_camofox._post", side_effect=[stale, {"ok": True}]),
+        patch("tools.browser_camofox._get", side_effect=[
+            {"snapshot": private_snapshot, "refsCount": 1},
+            {"tabs": [{"tabId": "tab-agent", "url": "https://example.com/account"}]},
+            {"snapshot": private_snapshot, "refsCount": 1},
+            {"snapshot": private_snapshot, "refsCount": 1},
+        ]),
+        patch("tools.browser_camofox._get_raw", return_value=screenshot),
+        patch("tools.browser_camofox.open", create=True),
+        patch("tools.browser_camofox.load_config", return_value={}),
+        patch("agent.auxiliary_client.call_llm", return_value=llm_response) as mock_llm,
+    ):
+        handback = json.loads(camofox_click("@e4", task_id="agent-task"))
+        later_snapshot = json.loads(camofox_snapshot(task_id="agent-task"))
+        vision = json.loads(camofox_vision("What is visible?", annotate=True, task_id="agent-task"))
+
+    assert handback["resume_acknowledged"] is True
+    assert managed_session["privacy_filter_after_handback"] is True
+    assert "private nickname" not in later_snapshot["snapshot"]
+    assert "[REDACTED sensitive form control]" in later_snapshot["snapshot"]
+    vision_prompt = mock_llm.call_args.kwargs["messages"][0]["content"][0]["text"]
+    assert "private nickname" not in vision_prompt
+    assert "[REDACTED sensitive form control]" in vision_prompt
+    assert vision["success"] is True
+
+
+def test_agent_navigation_clears_handback_privacy_filter(managed_session):
+    managed_session["privacy_filter_after_handback"] = True
+    with (
+        patch("tools.browser_camofox._get_session", return_value=managed_session),
+        patch("tools.browser_camofox._post", return_value={"url": "https://example.com/next"}),
+        patch("tools.browser_camofox._get", return_value={"snapshot": '- heading "Next"', "refsCount": 0}),
+    ):
+        result = json.loads(camofox_navigate("https://example.com/next", task_id="agent-task"))
+
+    assert result["success"] is True
+    assert managed_session["privacy_filter_after_handback"] is False
 
 
 def test_handback_does_not_ack_without_current_tab_metadata(managed_session):
