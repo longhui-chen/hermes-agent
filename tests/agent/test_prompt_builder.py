@@ -560,6 +560,38 @@ class TestBuildSkillsSystemPrompt:
         assert "Debug Python scripts" in result
         assert "available_skills" in result
 
+    def test_flow_rebuilds_external_presets_index_after_directory_update(
+        self, monkeypatch, tmp_path
+    ):
+        """An existing chat must see a newly activated preset without restart."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        local_skills = tmp_path / "skills"
+        local_skills.mkdir()
+        external_presets = tmp_path / "zettlab-presets" / "skills"
+        linear_skill = external_presets / "linear"
+        linear_skill.mkdir(parents=True)
+        (linear_skill / "SKILL.md").write_text(
+            "---\nname: linear\ndescription: Read Linear\n---\n"
+        )
+        (tmp_path / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external_presets}\n"
+        )
+        from agent.skill_utils import _external_dirs_cache_clear
+        _external_dirs_cache_clear()
+
+        first = build_skills_system_prompt()
+        assert "linear" in first
+        assert "discord" not in first
+
+        discord_skill = external_presets / "discord"
+        discord_skill.mkdir()
+        (discord_skill / "SKILL.md").write_text(
+            "---\nname: discord\ndescription: Read Discord\n---\n"
+        )
+
+        second = build_skills_system_prompt()
+        assert "discord" in second
+
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cat_dir = tmp_path / "skills" / "tools"

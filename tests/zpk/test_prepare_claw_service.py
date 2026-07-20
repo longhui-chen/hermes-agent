@@ -51,11 +51,14 @@ def test_prepare_claw_service_normalizes_inline_gateway_config(tmp_path: Path):
         encoding="utf-8",
     )
 
+    presets_dir = tmp_path / "presets" / "v0.7.12"
+    presets_dir.mkdir(parents=True)
+
     subprocess.run(
         [str(app_root / "prepare-claw-service.sh")],
         check=True,
         cwd=str(app_root),
-        env=_script_env(),
+        env=_script_env(ZETTLAB_PRESETS_DIR=str(presets_dir)),
     )
 
     config = (hermes_home / "config.yaml").read_text(encoding="utf-8")
@@ -67,7 +70,7 @@ def test_prepare_claw_service_normalizes_inline_gateway_config(tmp_path: Path):
     assert env_path.exists()
     env_text = env_path.read_text(encoding="utf-8")
     assert "ZET_AGENT_KEY=" in env_text
-    assert "ZETTLAB_PRESETS_DIR=/volume1/subvol/agents/zettlab-presets/current\n" in env_text
+    assert f"ZETTLAB_PRESETS_DIR={presets_dir}\n" in env_text
 
 
 def test_prepare_claw_service_respects_presets_dir_override(tmp_path: Path):
@@ -76,15 +79,18 @@ def test_prepare_claw_service_respects_presets_dir_override(tmp_path: Path):
 
     app_root, _hermes_home, env_path = _prepare_script_fixture(tmp_path)
 
+    presets_dir = tmp_path / "presets" / "v0.7.12"
+    presets_dir.mkdir(parents=True)
+
     subprocess.run(
         [str(app_root / "prepare-claw-service.sh")],
         check=True,
         cwd=str(app_root),
-        env=_script_env(ZETTLAB_PRESETS_DIR="/custom/presets/current"),
+        env=_script_env(ZETTLAB_PRESETS_DIR=str(presets_dir)),
     )
 
     env_text = env_path.read_text(encoding="utf-8")
-    assert "ZETTLAB_PRESETS_DIR=/custom/presets/current\n" in env_text
+    assert f"ZETTLAB_PRESETS_DIR={presets_dir}\n" in env_text
 
 
 def test_prepare_claw_service_preserves_existing_presets_dir(tmp_path: Path):
@@ -92,8 +98,10 @@ def test_prepare_claw_service_preserves_existing_presets_dir(tmp_path: Path):
         pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
 
     app_root, _hermes_home, env_path = _prepare_script_fixture(tmp_path)
+    presets_dir = tmp_path / "presets" / "v0.7.12"
+    presets_dir.mkdir(parents=True)
     env_path.parent.mkdir(parents=True)
-    env_path.write_text("ZETTLAB_PRESETS_DIR=/volume1/agents/zettlab-presets/current\n", encoding="utf-8")
+    env_path.write_text(f"ZETTLAB_PRESETS_DIR={presets_dir}\nCUSTOM_SAFE=keep-me\n", encoding="utf-8")
 
     subprocess.run(
         [str(app_root / "prepare-claw-service.sh")],
@@ -103,7 +111,27 @@ def test_prepare_claw_service_preserves_existing_presets_dir(tmp_path: Path):
     )
 
     env_text = env_path.read_text(encoding="utf-8")
-    assert "ZETTLAB_PRESETS_DIR=/volume1/agents/zettlab-presets/current\n" in env_text
+    assert f"ZETTLAB_PRESETS_DIR={presets_dir}\n" in env_text
+    assert "CUSTOM_SAFE=keep-me\n" in env_text
+
+
+def test_prepare_claw_service_omits_untrusted_world_writable_presets_dir(tmp_path: Path):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, _hermes_home, env_path = _prepare_script_fixture(tmp_path)
+    presets_dir = tmp_path / "presets" / "v0.7.12"
+    presets_dir.mkdir(parents=True)
+    presets_dir.chmod(0o777)
+
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(ZETTLAB_PRESETS_DIR=str(presets_dir)),
+    )
+
+    assert "ZETTLAB_PRESETS_DIR=" not in env_path.read_text(encoding="utf-8")
 
 
 def test_prepare_claw_service_strips_newlines_from_presets_dir(tmp_path: Path):
@@ -120,7 +148,7 @@ def test_prepare_claw_service_strips_newlines_from_presets_dir(tmp_path: Path):
     )
 
     env_text = env_path.read_text(encoding="utf-8")
-    assert "ZETTLAB_PRESETS_DIR=/custom/presets/currentEVIL=1\n" in env_text
+    assert "ZETTLAB_PRESETS_DIR=" not in env_text
     assert "\nEVIL=1" not in env_text
 
 
@@ -128,6 +156,7 @@ def test_zpk_agent_service_names_are_device_facing():
     repo_root = Path(__file__).resolve().parents[2]
 
     service = (repo_root / "zpk" / "init.d" / "zettlab-claw.service").read_text(encoding="utf-8")
+    start_wrapper = (repo_root / "zpk" / "start-claw-service.sh").read_text(encoding="utf-8")
     package_meta = (repo_root / "zpk" / "package.meta").read_text(encoding="utf-8")
     install = (repo_root / "zpk" / "install.sh").read_text(encoding="utf-8")
     start = (repo_root / "zpk" / "init.d" / "start.sh").read_text(encoding="utf-8")
@@ -137,6 +166,9 @@ def test_zpk_agent_service_names_are_device_facing():
     meta = json.loads(package_meta)
 
     assert "EnvironmentFile=-__APP_BASE__/data/secrets/zettlab-claw.env" in service
+    assert "ExecStart=__APP_BASE__/current/start-claw-service.sh" in service
+    assert '"$APP_ROOT/prepare-claw-service.sh"' in start_wrapper
+    assert ". \"$ENV_FILE\"" not in start_wrapper
     assert meta["service_name"] == "zettlab-claw"
     assert "restart" not in meta
     assert "systemctl restart zettlab-claw.service" not in install

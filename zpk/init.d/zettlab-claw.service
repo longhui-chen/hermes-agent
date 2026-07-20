@@ -12,7 +12,7 @@ Environment=HERMES_BUNDLED_PLUGINS=__APP_BASE__/current/lib/hermes-agent/plugins
 Environment=ZET_AGENT_ENABLED=true
 Environment=ZET_AGENT_HOST=127.0.0.1
 Environment=ZET_AGENT_PORT=7900
-ExecStart=__APP_BASE__/current/bin/hermes gateway run --force --accept-hooks
+ExecStart=__APP_BASE__/current/start-claw-service.sh
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=210
