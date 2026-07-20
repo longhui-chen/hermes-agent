@@ -1720,6 +1720,29 @@ def _build_skills_manifest(skills_dir: Path) -> dict[str, list[int]]:
     return manifest
 
 
+def _external_skills_dirs_cache_fingerprint(
+    external_dirs: list[Path],
+) -> tuple[tuple[str, int, int], ...]:
+    """Return a cheap identity/version fingerprint for external skill roots.
+
+    External preset directories are normally read-only and versioned.  Their
+    path alone is nevertheless insufficient for a long-lived gateway: a preset
+    activation can replace a directory in place while an old chat session keeps
+    the in-process prompt cache alive.  Directory inode and mtime invalidate
+    that entry without recursively hashing the whole preset tree on every turn.
+    """
+    fingerprint: list[tuple[str, int, int]] = []
+    for directory in external_dirs:
+        try:
+            stat = directory.stat()
+            fingerprint.append((str(directory), stat.st_ino, stat.st_mtime_ns))
+        except OSError:
+            # The resolved path remains part of the key so a missing/recreated
+            # external directory cannot reuse a prompt built for a prior tree.
+            fingerprint.append((str(directory), -1, -1))
+    return tuple(fingerprint)
+
+
 def _load_skills_snapshot(skills_dir: Path) -> Optional[dict]:
     """Load the disk snapshot if it exists and its manifest still matches."""
     snapshot_path = _skills_prompt_snapshot_path()
@@ -1891,7 +1914,7 @@ def build_skills_system_prompt(
     disabled = get_disabled_skill_names(_platform_hint or None)
     cache_key = (
         str(skills_dir.resolve()),
-        tuple(str(d) for d in external_dirs),
+        _external_skills_dirs_cache_fingerprint(external_dirs),
         tuple(sorted(str(t) for t in (available_tools or set()))),
         tuple(sorted(str(ts) for ts in (available_toolsets or set()))),
         _platform_hint,

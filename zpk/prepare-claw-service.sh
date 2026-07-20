@@ -23,32 +23,40 @@ env_file_value() {
     return 1
 }
 
-detect_zettlab_presets_dir() {
-    if [ -n "${ZETTLAB_PRESETS_DIR:-}" ]; then
-        printf '%s\n' "$ZETTLAB_PRESETS_DIR"
-        return
-    fi
+presets_dir_is_trusted() {
+    local candidate="$1" resolved uid mode other
+    [ -n "$candidate" ] || return 1
+    resolved="$(readlink -f "$candidate" 2>/dev/null || true)"
+    [ -n "$resolved" ] && [ -d "$resolved" ] || return 1
 
-    local existing
-    existing="$(env_file_value ZETTLAB_PRESETS_DIR || true)"
-    if [ -n "$existing" ]; then
-        printf '%s\n' "$existing"
-        return
+    # zettlab-claw normally runs as root. Require the resolved version directory
+    # to be root-owned and not world-writable before exposing it to Hermes. Local
+    # non-root test/dev runs retain the world-writable rejection but cannot assert
+    # device ownership.
+    mode="$(stat -c '%a' "$resolved" 2>/dev/null || stat -f '%Lp' "$resolved" 2>/dev/null || true)"
+    [ -n "$mode" ] || return 1
+    other="${mode: -1}"
+    (( (10#$other & 2) == 0 )) || return 1
+    if [ "$(id -u)" -eq 0 ]; then
+        uid="$(stat -c '%u' "$resolved" 2>/dev/null || stat -f '%u' "$resolved" 2>/dev/null || true)"
+        [ "$uid" = "0" ] || return 1
     fi
-
-    if [ -d "$DEFAULT_ZETTLAB_PRESETS_DIR" ]; then
-        printf '%s\n' "$DEFAULT_ZETTLAB_PRESETS_DIR"
-        return
-    fi
-    if [ -d "$LEGACY_ZETTLAB_PRESETS_DIR" ]; then
-        printf '%s\n' "$LEGACY_ZETTLAB_PRESETS_DIR"
-        return
-    fi
-
-    printf '%s\n' "$DEFAULT_ZETTLAB_PRESETS_DIR"
+    return 0
 }
 
-ZETTLAB_PRESETS_DIR="$(detect_zettlab_presets_dir)"
+detect_zettlab_presets_dir() {
+    local existing candidate
+    existing="$(env_file_value ZETTLAB_PRESETS_DIR || true)"
+    for candidate in "${ZETTLAB_PRESETS_DIR:-}" "$existing" "$DEFAULT_ZETTLAB_PRESETS_DIR" "$LEGACY_ZETTLAB_PRESETS_DIR"; do
+        if presets_dir_is_trusted "$candidate"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+ZETTLAB_PRESETS_DIR="$(detect_zettlab_presets_dir || true)"
 ZETTLAB_PRESETS_DIR="$(printf '%s' "$ZETTLAB_PRESETS_DIR" | tr -d '\r\n')"
 
 generate_key() {
@@ -79,11 +87,26 @@ write_agent_env() {
     fi
 
     {
+        # Preserve user-managed EnvironmentFile entries verbatim while replacing
+        # only the fields owned by this package. Do not source the file: shell
+        # evaluation would let a malformed user value execute during service boot.
+        if [ -f "$ENV_FILE" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+                case "$line" in
+                    ZET_AGENT_KEY=*|ZET_AGENT_ENABLED=*|ZET_AGENT_HOST=*|ZET_AGENT_PORT=*|ZETTLAB_PRESETS_DIR=*)
+                        continue
+                        ;;
+                esac
+                printf '%s\n' "$line"
+            done < "$ENV_FILE"
+        fi
         printf 'ZET_AGENT_KEY=%s\n' "$key"
         printf 'ZET_AGENT_ENABLED=true\n'
         printf 'ZET_AGENT_HOST=127.0.0.1\n'
         printf 'ZET_AGENT_PORT=7900\n'
-        printf 'ZETTLAB_PRESETS_DIR=%s\n' "$ZETTLAB_PRESETS_DIR"
+        if [ -n "$ZETTLAB_PRESETS_DIR" ]; then
+            printf 'ZETTLAB_PRESETS_DIR=%s\n' "$ZETTLAB_PRESETS_DIR"
+        fi
     } > "$ENV_FILE.tmp.$$"
     chmod 0600 "$ENV_FILE.tmp.$$"
     mv "$ENV_FILE.tmp.$$" "$ENV_FILE"
