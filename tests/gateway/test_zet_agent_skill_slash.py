@@ -31,10 +31,16 @@ def _make_adapter() -> ZetAgentAdapter:
 
 
 def _patch_skill_layer(monkeypatch, *, known=("deep-research",), load_raises=False):
-    """Stub the three skill_commands entry points the hook imports lazily."""
+    """Stub the skill_commands entry points the hook (and the canonical
+    ``build_skill_invocation_message`` it delegates to) reach lazily."""
+    import tools.skill_usage as skill_usage
+
+    from gateway.session_context import get_session_env
+
     calls = {}
 
     def fake_scan():
+        calls["scan_platform"] = get_session_env("HERMES_SESSION_PLATFORM")
         return {
             f"/{name}": {"name": name, "skill_dir": f"/fake/skills/{name}"}
             for name in known
@@ -44,6 +50,7 @@ def _patch_skill_layer(monkeypatch, *, known=("deep-research",), load_raises=Fal
         if load_raises:
             raise RuntimeError("boom")
         calls["load_identifier"] = identifier
+        calls["load_platform"] = get_session_env("HERMES_SESSION_PLATFORM")
         return ({"content": "SKILL BODY"}, Path("/fake/skills/deep-research"), "deep-research")
 
     def fake_build(loaded_skill, skill_dir, activation_note, user_instruction="", **kwargs):
@@ -52,8 +59,10 @@ def _patch_skill_layer(monkeypatch, *, known=("deep-research",), load_raises=Fal
         return f"<<EXPANDED:{loaded_skill['content']}|task={user_instruction}>>"
 
     monkeypatch.setattr(skill_commands, "scan_skill_commands", fake_scan)
+    monkeypatch.setattr(skill_commands, "get_skill_commands", fake_scan)
     monkeypatch.setattr(skill_commands, "_load_skill_payload", fake_load)
     monkeypatch.setattr(skill_commands, "_build_skill_message", fake_build)
+    monkeypatch.setattr(skill_usage, "bump_use", lambda name: None)
     return calls
 
 
@@ -97,6 +106,56 @@ def test_load_failure_falls_back_to_original(monkeypatch):
     adapter = _make_adapter()
     original = "/deep-research 研究黄金"
     assert adapter._expand_inbound_skill_slash(original) == original
+
+
+def test_expansion_binds_zet_agent_platform_and_restores(monkeypatch):
+    # The expansion runs BEFORE the session is bound, so the hook must bind
+    # the platform contextvar itself: without it scan/load resolve platform
+    # None and skills.platform_disabled.zet_agent is silently ignored (a
+    # skill disabled only for zet_agent would still expand). The binding must
+    # also be token-restored — it must not leak past the hook.
+    from gateway.session_context import get_session_env
+
+    calls = _patch_skill_layer(monkeypatch)
+    adapter = _make_adapter()
+    before = get_session_env("HERMES_SESSION_PLATFORM")
+    adapter._expand_inbound_skill_slash("/deep-research 研究黄金")
+    assert calls["scan_platform"] == "zet_agent"
+    assert calls["load_platform"] == "zet_agent"
+    assert get_session_env("HERMES_SESSION_PLATFORM") == before
+
+
+def test_expanded_payload_uses_canonical_memory_scaffolding(monkeypatch):
+    # Memory compatibility: the expanded payload must round-trip through
+    # extract_user_instruction_from_skill_message (what MemoryManager.
+    # _strip_skill_scaffolding calls). A bespoke activation note fails the
+    # canonical-prefix check and the FULL skill body would be fed to memory
+    # providers as if the user typed it.
+    import tools.skill_usage as skill_usage
+
+    def fake_scan():
+        return {"/deep-research": {"name": "deep-research", "skill_dir": "/fake/skills/deep-research"}}
+
+    def fake_load(identifier, task_id=None):
+        return ({"content": "SKILL BODY"}, None, "deep-research")
+
+    monkeypatch.setattr(skill_commands, "scan_skill_commands", fake_scan)
+    monkeypatch.setattr(skill_commands, "get_skill_commands", fake_scan)
+    monkeypatch.setattr(skill_commands, "_load_skill_payload", fake_load)
+    monkeypatch.setattr(skill_usage, "bump_use", lambda name: None)
+
+    adapter = _make_adapter()
+    out = adapter._expand_inbound_skill_slash("/deep-research 研究黄金为什么下跌")
+    assert out.startswith(skill_commands._SKILL_INVOCATION_PREFIX)
+    assert (
+        skill_commands.extract_user_instruction_from_skill_message(out)
+        == "研究黄金为什么下跌"
+    )
+    # Bare invocation → no user content worth remembering: extract must
+    # return None so memory callers skip the turn entirely.
+    bare = adapter._expand_inbound_skill_slash("/deep-research")
+    assert bare.startswith(skill_commands._SKILL_INVOCATION_PREFIX)
+    assert skill_commands.extract_user_instruction_from_skill_message(bare) is None
 
 
 def test_base_api_server_hook_is_noop():

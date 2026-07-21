@@ -309,6 +309,24 @@ def reset_session_vars() -> None:
         pass
 
 
+def push_session_platform(platform: str):
+    """Bind ONLY the platform contextvar; returns a token for :func:`pop_session_platform`.
+
+    Unlike ``set_session_vars``/``clear_session_vars`` (not nestable — clearing
+    stamps every var to ``""``), this pair is token-based and restores the
+    prior value exactly, so it can wrap a narrow pre-session window. Used by
+    zet_agent's inbound skill-slash expansion, which runs in the HTTP handler
+    BEFORE the session is bound and must still resolve platform-scoped skill
+    config (``skills.platform_disabled``, frontmatter ``platforms:`` filters).
+    """
+    return _SESSION_PLATFORM.set(platform or "")
+
+
+def pop_session_platform(token) -> None:
+    """Restore the platform contextvar bound by :func:`push_session_platform`."""
+    _SESSION_PLATFORM.reset(token)
+
+
 def get_session_env(name: str, default: str = "") -> str:
     """Read a session context variable by its legacy ``HERMES_SESSION_*`` name.
 

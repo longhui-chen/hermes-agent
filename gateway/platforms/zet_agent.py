@@ -387,79 +387,85 @@ class ZetAgentAdapter(APIServerAdapter):
           - any internal failure logs and falls back to the original text —
             a broken skill must degrade to today's behavior, never block
             the message.
+
+        Two invariants this hook must uphold:
+          - the whole expansion runs with the platform contextvar bound to
+            ``zet_agent`` (push/pop, token-restored): it executes in the HTTP
+            handler BEFORE the session is bound, and without the binding
+            ``skills.platform_disabled.zet_agent`` and frontmatter
+            ``platforms:`` filters silently resolve against no platform —
+            a skill disabled only for zet_agent would still expand.
+          - the payload is built by the canonical
+            ``build_skill_invocation_message`` (same scaffolding as the CLI
+            slash): MemoryManager._strip_skill_scaffolding keys off the
+            canonical activation prefix to recover the user's instruction,
+            so a bespoke note here would leak the full skill body into
+            long-term memory / embeddings.
         """
         if not isinstance(user_message, str):
             return user_message
         text = user_message.lstrip()
         if not text.startswith("/"):
             return user_message
-        try:
-            from agent.skill_commands import (
-                _build_skill_message,
-                _load_skill_payload,
-                scan_skill_commands,
-            )
-            commands = scan_skill_commands()
-        except Exception:
-            logger.warning(
-                "[zet_agent] skill slash scan failed; passing message through",
-                exc_info=True,
-            )
-            return user_message
-        token = text.split(None, 1)[0].rstrip()
-        info = commands.get(token)
-        if not info:
-            return user_message
-
-        # Task text = everything besides the command token(s); duplicated
-        # "/name ..." lines collapse (first occurrence wins).
-        remainder: List[str] = []
-        for i, line in enumerate(text.splitlines()):
-            stripped = line.strip()
-            if i == 0 or stripped.startswith(token):
-                rest = stripped[len(token):].strip() if stripped.startswith(token) else stripped
-                if rest and rest not in remainder:
-                    remainder.append(rest)
-                continue
-            remainder.append(line)
-        task_text = "\n".join(remainder).strip()
-
-        try:
-            loaded = _load_skill_payload(info.get("skill_dir") or info.get("name"))
-        except Exception:
-            logger.warning(
-                "[zet_agent] skill slash %s load failed; passing message through",
-                token, exc_info=True,
-            )
-            return user_message
-        if not loaded:
-            logger.warning(
-                "[zet_agent] skill slash %s resolved by scan but failed to load; "
-                "passing message through", token,
-            )
-            return user_message
-        loaded_skill, skill_dir, display_name = loaded
-        note = (
-            f'[IMPORTANT: The "{display_name}" skill was invoked via its '
-            f"slash command. Follow its instructions for this message.]"
+        from gateway.session_context import (
+            pop_session_platform,
+            push_session_platform,
         )
+
+        platform_token = push_session_platform("zet_agent")
         try:
-            part = _build_skill_message(
-                loaded_skill, skill_dir, note, user_instruction=task_text,
+            try:
+                from agent.skill_commands import (
+                    build_skill_invocation_message,
+                    scan_skill_commands,
+                )
+                commands = scan_skill_commands()
+            except Exception:
+                logger.warning(
+                    "[zet_agent] skill slash scan failed; passing message through",
+                    exc_info=True,
+                )
+                return user_message
+            token = text.split(None, 1)[0].rstrip()
+            if token not in commands:
+                return user_message
+
+            # Task text = everything besides the command token(s); duplicated
+            # "/name ..." lines collapse (first occurrence wins).
+            remainder: List[str] = []
+            for i, line in enumerate(text.splitlines()):
+                stripped = line.strip()
+                if i == 0 or stripped.startswith(token):
+                    rest = stripped[len(token):].strip() if stripped.startswith(token) else stripped
+                    if rest and rest not in remainder:
+                        remainder.append(rest)
+                    continue
+                remainder.append(line)
+            task_text = "\n".join(remainder).strip()
+
+            try:
+                part = build_skill_invocation_message(
+                    token, user_instruction=task_text,
+                )
+            except Exception:
+                logger.warning(
+                    "[zet_agent] skill slash %s build failed; passing message through",
+                    token, exc_info=True,
+                )
+                return user_message
+            if not part:
+                logger.warning(
+                    "[zet_agent] skill slash %s resolved by scan but failed to "
+                    "load; passing message through", token,
+                )
+                return user_message
+            logger.info(
+                "[zet_agent] expanded skill slash %s (task_chars=%d)",
+                token, len(task_text),
             )
-        except Exception:
-            logger.warning(
-                "[zet_agent] skill slash %s build failed; passing message through",
-                token, exc_info=True,
-            )
-            return user_message
-        if not part:
-            return user_message
-        logger.info(
-            "[zet_agent] expanded skill slash %s (task_chars=%d)",
-            token, len(task_text),
-        )
-        return part
+            return part
+        finally:
+            pop_session_platform(platform_token)
 
     async def _emit_native_session_title(
         self,
