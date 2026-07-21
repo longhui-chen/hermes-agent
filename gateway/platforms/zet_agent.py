@@ -74,6 +74,7 @@ After the first successful exchange, reuse Hermes' native
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -364,6 +365,101 @@ class ZetAgentAdapter(APIServerAdapter):
         if text.startswith("[Zettlab internal routing directive]") and marker in text:
             return text.rsplit(marker, 1)[1].strip()
         return text
+
+    def _expand_inbound_skill_slash(self, user_message: Any) -> Any:
+        """Expand a leading ``/<skill-name>`` into the full skill payload.
+
+        The App's skill quick-pick inserts a literal ``/<skill>`` line into
+        the outgoing message. On the CLI that token is expanded by the slash
+        command layer; on this OpenAI-compatible surface it previously
+        reached the LLM as plain text, so the skill only fired if the model
+        volunteered a skill_view call (model-dependent, flaky). This hook
+        gives the App path the same guarantee as the CLI.
+
+        Behavior contract (HR4 — pure addition, fail-open):
+          - only plain-string messages whose first token is ``/<name>`` AND
+            whose name is present in scan_skill_commands() are expanded;
+            anything else (unknown slash, multimodal content, mid-text
+            slashes) passes through byte-identical.
+          - repeated copies of the same command line (the quick-pick appends
+            rather than replaces, so retries stack duplicates) collapse into
+            one invocation with a deduplicated task text.
+          - any internal failure logs and falls back to the original text —
+            a broken skill must degrade to today's behavior, never block
+            the message.
+        """
+        if not isinstance(user_message, str):
+            return user_message
+        text = user_message.lstrip()
+        if not text.startswith("/"):
+            return user_message
+        try:
+            from agent.skill_commands import (
+                _build_skill_message,
+                _load_skill_payload,
+                scan_skill_commands,
+            )
+            commands = scan_skill_commands()
+        except Exception:
+            logger.warning(
+                "[zet_agent] skill slash scan failed; passing message through",
+                exc_info=True,
+            )
+            return user_message
+        token = text.split(None, 1)[0].rstrip()
+        info = commands.get(token)
+        if not info:
+            return user_message
+
+        # Task text = everything besides the command token(s); duplicated
+        # "/name ..." lines collapse (first occurrence wins).
+        remainder: List[str] = []
+        for i, line in enumerate(text.splitlines()):
+            stripped = line.strip()
+            if i == 0 or stripped.startswith(token):
+                rest = stripped[len(token):].strip() if stripped.startswith(token) else stripped
+                if rest and rest not in remainder:
+                    remainder.append(rest)
+                continue
+            remainder.append(line)
+        task_text = "\n".join(remainder).strip()
+
+        try:
+            loaded = _load_skill_payload(info.get("skill_dir") or info.get("name"))
+        except Exception:
+            logger.warning(
+                "[zet_agent] skill slash %s load failed; passing message through",
+                token, exc_info=True,
+            )
+            return user_message
+        if not loaded:
+            logger.warning(
+                "[zet_agent] skill slash %s resolved by scan but failed to load; "
+                "passing message through", token,
+            )
+            return user_message
+        loaded_skill, skill_dir, display_name = loaded
+        note = (
+            f'[IMPORTANT: The "{display_name}" skill was invoked via its '
+            f"slash command. Follow its instructions for this message.]"
+        )
+        try:
+            part = _build_skill_message(
+                loaded_skill, skill_dir, note, user_instruction=task_text,
+            )
+        except Exception:
+            logger.warning(
+                "[zet_agent] skill slash %s build failed; passing message through",
+                token, exc_info=True,
+            )
+            return user_message
+        if not part:
+            return user_message
+        logger.info(
+            "[zet_agent] expanded skill slash %s (task_chars=%d)",
+            token, len(task_text),
+        )
+        return part
 
     async def _emit_native_session_title(
         self,
@@ -2102,6 +2198,13 @@ class ZetAgentAdapter(APIServerAdapter):
             )
         try:
             db_rows_cleared = session_db.clear_all_system_prompts()
+            if inspect.isawaitable(db_rows_cleared):
+                # gw._session_db is the AsyncSessionDB facade (gateway/run.py
+                # wraps SessionDB so SQLite never blocks the event loop): its
+                # methods return coroutines. Without this await the clear was
+                # a silent no-op AND the coroutine leaked into the JSON
+                # response (TypeError → 500) — ZET-1139 regression class.
+                db_rows_cleared = await db_rows_cleared
         except Exception as exc:
             logger.exception(
                 "[zet_agent] skills-reload: DB clear failed; "
@@ -2297,6 +2400,10 @@ class ZetAgentAdapter(APIServerAdapter):
             )
         try:
             db_rows_cleared = session_db.clear_all_system_prompts()
+            if inspect.isawaitable(db_rows_cleared):
+                # Same AsyncSessionDB facade as skills-reload above: await or
+                # the clear silently no-ops and the coroutine breaks the JSON.
+                db_rows_cleared = await db_rows_cleared
         except Exception as exc:
             logger.exception(
                 "[zet_agent] profile-reload: DB clear failed; "

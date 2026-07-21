@@ -2352,6 +2352,17 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
 
+    def _expand_inbound_skill_slash(self, user_message: Any) -> Any:
+        """Platform hook: expand a leading ``/<skill>`` slash command in the
+        inbound user text into the full skill payload.
+
+        Base implementation is a no-op so plain api_server behavior is
+        unchanged; the zet_agent subclass overrides it to give the Zettlab
+        App's skill quick-pick (which inserts a literal ``/<skill>`` line)
+        CLI-slash parity. See ZetAgent._expand_inbound_skill_slash.
+        """
+        return user_message
+
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
         auth_err = self._check_auth(request)
@@ -2415,6 +2426,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 {"error": {"message": "No user message found in messages", "type": "invalid_request_error"}},
                 status=400,
             )
+
+        # Platform hook (no-op here; real logic in zet_agent): expand a
+        # leading "/<skill>" slash command into the skill payload so the
+        # App's skill quick-pick has the same guarantee as the CLI slash.
+        user_message = self._expand_inbound_skill_slash(user_message)
 
         # Allow caller to scope long-term memory (e.g. Honcho) with a
         # stable per-channel identifier via X-Hermes-Session-Key.  This
