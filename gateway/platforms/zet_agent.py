@@ -366,7 +366,28 @@ class ZetAgentAdapter(APIServerAdapter):
             return text.rsplit(marker, 1)[1].strip()
         return text
 
-    def _expand_inbound_skill_slash(self, user_message: Any) -> Any:
+    async def _expand_inbound_skill_slash(self, user_message: Any) -> Any:
+        """Async shell: fast-path pass-through, then expand off the event loop.
+
+        The cheap shape checks run inline; anything that touches the skills
+        layer (directory scan, SKILL.md load, template expansion) is blocking
+        file I/O and must NOT run on the aiohttp event loop — a slow disk or a
+        large external skills dir would stall every session's SSE / approval /
+        reload traffic. ``asyncio.to_thread`` copies the current contextvars
+        into the worker, so the platform binding inside the blocking body
+        stays task-local.
+        """
+        if not isinstance(user_message, str):
+            return user_message
+        if not user_message.lstrip().startswith("/"):
+            return user_message
+        import asyncio
+
+        return await asyncio.to_thread(
+            self._expand_inbound_skill_slash_blocking, user_message
+        )
+
+    def _expand_inbound_skill_slash_blocking(self, user_message: str) -> Any:
         """Expand a leading ``/<skill-name>`` into the full skill payload.
 
         The App's skill quick-pick inserts a literal ``/<skill>`` line into
@@ -388,13 +409,19 @@ class ZetAgentAdapter(APIServerAdapter):
             a broken skill must degrade to today's behavior, never block
             the message.
 
-        Two invariants this hook must uphold:
+        Three invariants this hook must uphold:
           - the whole expansion runs with the platform contextvar bound to
             ``zet_agent`` (push/pop, token-restored): it executes in the HTTP
             handler BEFORE the session is bound, and without the binding
             ``skills.platform_disabled.zet_agent`` and frontmatter
             ``platforms:`` filters silently resolve against no platform —
             a skill disabled only for zet_agent would still expand.
+          - the platform-disabled gate is ALSO enforced with an explicit
+            ``platform="zet_agent"`` argument: the resolution chain reads the
+            ``HERMES_PLATFORM`` process env BEFORE the contextvar, so an
+            externally provisioned env value (e.g. a hand-edited .env loaded
+            with override=True at boot) would shadow the binding above. The
+            explicit argument has top precedence and cannot be shadowed.
           - the payload is built by the canonical
             ``build_skill_invocation_message`` (same scaffolding as the CLI
             slash): MemoryManager._strip_skill_scaffolding keys off the
@@ -427,8 +454,28 @@ class ZetAgentAdapter(APIServerAdapter):
                 )
                 return user_message
             token = text.split(None, 1)[0].rstrip()
-            if token not in commands:
+            info = commands.get(token)
+            if not info:
                 return user_message
+            try:
+                from tools.skills_tool import _is_skill_disabled
+
+                if _is_skill_disabled(
+                    info.get("name") or token.lstrip("/"), platform="zet_agent"
+                ):
+                    logger.info(
+                        "[zet_agent] skill slash %s is disabled for zet_agent; "
+                        "passing message through", token,
+                    )
+                    return user_message
+            except Exception:
+                # _is_skill_disabled fail-opens internally; only an import
+                # failure lands here — degrade to the scan-level filter.
+                logger.warning(
+                    "[zet_agent] skill slash %s disabled-check failed; "
+                    "continuing with scan-level filter only", token,
+                    exc_info=True,
+                )
 
             # Task text = everything besides the command token(s); duplicated
             # "/name ..." lines collapse (first occurrence wins).

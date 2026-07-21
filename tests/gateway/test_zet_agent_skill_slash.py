@@ -14,6 +14,7 @@ Covers two zet_agent changes:
    the coroutine object 500'd the JSON response).
 """
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -30,14 +31,26 @@ def _make_adapter() -> ZetAgentAdapter:
     return ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
 
 
-def _patch_skill_layer(monkeypatch, *, known=("deep-research",), load_raises=False):
+def _expand(adapter, message):
+    """Drive the async hook to completion (it offloads to a worker thread)."""
+    return asyncio.run(adapter._expand_inbound_skill_slash(message))
+
+
+def _patch_skill_layer(monkeypatch, *, known=("deep-research",), load_raises=False, disabled=False):
     """Stub the skill_commands entry points the hook (and the canonical
     ``build_skill_invocation_message`` it delegates to) reach lazily."""
     import tools.skill_usage as skill_usage
+    import tools.skills_tool as skills_tool
 
     from gateway.session_context import get_session_env
 
     calls = {}
+
+    def fake_is_disabled(name, platform=None):
+        calls["disabled_check"] = (name, platform)
+        return disabled
+
+    monkeypatch.setattr(skills_tool, "_is_skill_disabled", fake_is_disabled)
 
     def fake_scan():
         calls["scan_platform"] = get_session_env("HERMES_SESSION_PLATFORM")
@@ -69,7 +82,7 @@ def _patch_skill_layer(monkeypatch, *, known=("deep-research",), load_raises=Fal
 def test_known_skill_slash_expands(monkeypatch):
     calls = _patch_skill_layer(monkeypatch)
     adapter = _make_adapter()
-    out = adapter._expand_inbound_skill_slash("/deep-research 研究黄金为什么下跌")
+    out = _expand(adapter, "/deep-research 研究黄金为什么下跌")
     assert out.startswith("<<EXPANDED:SKILL BODY")
     assert calls["user_instruction"] == "研究黄金为什么下跌"
     assert calls["load_identifier"] == "/fake/skills/deep-research"
@@ -81,7 +94,7 @@ def test_duplicate_command_lines_collapse(monkeypatch):
     calls = _patch_skill_layer(monkeypatch)
     adapter = _make_adapter()
     text = "/deep-research 黄金\n\n/deep-research 黄金\n\n/deep-research 黄金"
-    out = adapter._expand_inbound_skill_slash(text)
+    out = _expand(adapter, text)
     assert out.count("<<EXPANDED:") == 1
     assert calls["user_instruction"] == "黄金"
 
@@ -90,22 +103,22 @@ def test_unknown_slash_passes_through(monkeypatch):
     _patch_skill_layer(monkeypatch, known=("other-skill",))
     adapter = _make_adapter()
     original = "/deep-research 研究黄金"
-    assert adapter._expand_inbound_skill_slash(original) == original
+    assert _expand(adapter, original) == original
 
 
 def test_plain_text_and_multimodal_pass_through(monkeypatch):
     _patch_skill_layer(monkeypatch)
     adapter = _make_adapter()
-    assert adapter._expand_inbound_skill_slash("你好，帮我查天气") == "你好，帮我查天气"
+    assert _expand(adapter, "你好，帮我查天气") == "你好，帮我查天气"
     multimodal = [{"type": "text", "text": "/deep-research x"}]
-    assert adapter._expand_inbound_skill_slash(multimodal) is multimodal
+    assert _expand(adapter, multimodal) is multimodal
 
 
 def test_load_failure_falls_back_to_original(monkeypatch):
     _patch_skill_layer(monkeypatch, load_raises=True)
     adapter = _make_adapter()
     original = "/deep-research 研究黄金"
-    assert adapter._expand_inbound_skill_slash(original) == original
+    assert _expand(adapter, original) == original
 
 
 def test_expansion_binds_zet_agent_platform_and_restores(monkeypatch):
@@ -119,7 +132,7 @@ def test_expansion_binds_zet_agent_platform_and_restores(monkeypatch):
     calls = _patch_skill_layer(monkeypatch)
     adapter = _make_adapter()
     before = get_session_env("HERMES_SESSION_PLATFORM")
-    adapter._expand_inbound_skill_slash("/deep-research 研究黄金")
+    _expand(adapter, "/deep-research 研究黄金")
     assert calls["scan_platform"] == "zet_agent"
     assert calls["load_platform"] == "zet_agent"
     assert get_session_env("HERMES_SESSION_PLATFORM") == before
@@ -132,6 +145,7 @@ def test_expanded_payload_uses_canonical_memory_scaffolding(monkeypatch):
     # canonical-prefix check and the FULL skill body would be fed to memory
     # providers as if the user typed it.
     import tools.skill_usage as skill_usage
+    import tools.skills_tool as skills_tool
 
     def fake_scan():
         return {"/deep-research": {"name": "deep-research", "skill_dir": "/fake/skills/deep-research"}}
@@ -143,9 +157,10 @@ def test_expanded_payload_uses_canonical_memory_scaffolding(monkeypatch):
     monkeypatch.setattr(skill_commands, "get_skill_commands", fake_scan)
     monkeypatch.setattr(skill_commands, "_load_skill_payload", fake_load)
     monkeypatch.setattr(skill_usage, "bump_use", lambda name: None)
+    monkeypatch.setattr(skills_tool, "_is_skill_disabled", lambda name, platform=None: False)
 
     adapter = _make_adapter()
-    out = adapter._expand_inbound_skill_slash("/deep-research 研究黄金为什么下跌")
+    out = _expand(adapter, "/deep-research 研究黄金为什么下跌")
     assert out.startswith(skill_commands._SKILL_INVOCATION_PREFIX)
     assert (
         skill_commands.extract_user_instruction_from_skill_message(out)
@@ -153,9 +168,24 @@ def test_expanded_payload_uses_canonical_memory_scaffolding(monkeypatch):
     )
     # Bare invocation → no user content worth remembering: extract must
     # return None so memory callers skip the turn entirely.
-    bare = adapter._expand_inbound_skill_slash("/deep-research")
+    bare = _expand(adapter, "/deep-research")
     assert bare.startswith(skill_commands._SKILL_INVOCATION_PREFIX)
     assert skill_commands.extract_user_instruction_from_skill_message(bare) is None
+
+
+def test_platform_disabled_skill_passes_through_even_with_foreign_env(monkeypatch):
+    # The disabled gate must use the EXPLICIT platform argument: the
+    # resolution chain reads the HERMES_PLATFORM process env before the
+    # contextvar, so an externally provisioned value would shadow the
+    # binding. With the skill disabled for zet_agent the message must pass
+    # through as plain text — no skill payload injected.
+    monkeypatch.setenv("HERMES_PLATFORM", "telegram")
+    calls = _patch_skill_layer(monkeypatch, disabled=True)
+    adapter = _make_adapter()
+    original = "/deep-research 研究黄金"
+    assert _expand(adapter, original) == original
+    assert calls["disabled_check"] == ("deep-research", "zet_agent")
+    assert "user_instruction" not in calls, "disabled skill must never be built"
 
 
 def test_base_api_server_hook_is_noop():
@@ -163,7 +193,7 @@ def test_base_api_server_hook_is_noop():
     # identity for every shape.
     base = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
     for value in ("/deep-research x", "hello", ["parts"], None):
-        assert base._expand_inbound_skill_slash(value) is value
+        assert asyncio.run(base._expand_inbound_skill_slash(value)) is value
 
 
 @pytest.mark.asyncio
