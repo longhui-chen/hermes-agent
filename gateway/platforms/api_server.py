@@ -2433,7 +2433,14 @@ class APIServerAdapter(BasePlatformAdapter):
         # Platform hook (no-op here; real logic in zet_agent): expand a
         # leading "/<skill>" slash command into the skill payload so the
         # App's skill quick-pick has the same guarantee as the CLI slash.
-        user_message = await self._expand_inbound_skill_slash(user_message)
+        # Skipped under tool_choice="none": that is an API-level "no tools
+        # this turn" boundary (request_overrides strips every agent tool
+        # below), while skill expansion both injects tool-driving
+        # instructions and is not side-effect-free — skills.inline_shell=true
+        # executes SKILL.md preprocessing at build time. The literal
+        # "/<skill>" text passes through unexpanded instead.
+        if body.get("tool_choice") != "none":
+            user_message = await self._expand_inbound_skill_slash(user_message)
 
         # Allow caller to scope long-term memory (e.g. Honcho) with a
         # stable per-channel identifier via X-Hermes-Session-Key.  This

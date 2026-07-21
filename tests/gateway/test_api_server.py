@@ -1262,6 +1262,48 @@ class TestChatCompletionsEndpoint:
             }
 
     @pytest.mark.asyncio
+    async def test_tool_choice_none_skips_inbound_skill_slash_expansion(self, adapter):
+        # tool_choice=none is an API-level "no tools this turn" boundary;
+        # skill expansion injects tool-driving instructions and is not
+        # side-effect-free (skills.inline_shell=true executes SKILL.md
+        # preprocessing at build time), so the hook must be bypassed entirely
+        # and the literal "/<skill>" text reach the agent unexpanded.
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        usage = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run, \
+                 patch.object(adapter, "_expand_inbound_skill_slash", new_callable=AsyncMock) as mock_expand:
+                mock_run.return_value = (mock_result, usage)
+                mock_expand.side_effect = lambda msg: f"<<EXPANDED:{msg}>>"
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "/deep-research 黄金"}],
+                        "stream": False,
+                        "tool_choice": "none",
+                    },
+                )
+                assert resp.status == 200
+                mock_expand.assert_not_awaited()
+                assert mock_run.await_args.kwargs["user_message"] == "/deep-research 黄金"
+
+                # Without the boundary the hook runs as usual.
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "/deep-research 黄金"}],
+                        "stream": False,
+                    },
+                )
+                assert resp.status == 200
+                mock_expand.assert_awaited_once()
+                assert mock_run.await_args.kwargs["user_message"] == "<<EXPANDED:/deep-research 黄金>>"
+
+    @pytest.mark.asyncio
     async def test_meeting_summary_tool_choice_none_integration_flow_disables_agent_tools(self, adapter):
         mock_result = {
             "final_response": '{"title":"产品计划会","overall":"讨论发布计划"}',
