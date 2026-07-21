@@ -43,6 +43,7 @@ import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -994,6 +995,7 @@ try:
         pause_job as _cron_pause,
         resume_job as _cron_resume,
         trigger_job as _cron_trigger,
+        job_occurrence_projection as _cron_occurrence_projection,
     )
     _CRON_AVAILABLE = True
 except ImportError:
@@ -1005,6 +1007,7 @@ except ImportError:
     _cron_pause = None
     _cron_resume = None
     _cron_trigger = None
+    _cron_occurrence_projection = None
 
 
 def _notify_cron_provider_jobs_changed() -> None:
@@ -1511,6 +1514,7 @@ class APIServerAdapter(BasePlatformAdapter):
         router.add_post("/p/{profile}/api/sessions/{session_id}/chat/stream", self._profile_handler(self._handle_session_chat_stream))
 
         router.add_get("/p/{profile}/api/jobs", self._profile_handler(self._handle_list_jobs))
+        router.add_get("/p/{profile}/api/jobs/occurrences", self._profile_handler(self._handle_list_job_occurrences))
         router.add_post("/p/{profile}/api/jobs", self._profile_handler(self._handle_create_job))
         router.add_get("/p/{profile}/api/jobs/{job_id}", self._profile_handler(self._handle_get_job))
         router.add_patch("/p/{profile}/api/jobs/{job_id}", self._profile_handler(self._handle_update_job))
@@ -1520,6 +1524,26 @@ class APIServerAdapter(BasePlatformAdapter):
         router.add_post("/p/{profile}/api/jobs/{job_id}/run", self._profile_handler(self._handle_run_job))
         if _CRON_AVAILABLE:
             router.add_post("/p/{profile}/api/cron/fire", self._profile_handler(self._handle_cron_fire))
+            router.add_get("/p/{profile}/internal/v1/cron/capabilities", self._profile_handler(self._handle_cron_capabilities))
+            router.add_post("/p/{profile}/internal/v1/cron/jobs/{job_id}/reconcile", self._profile_handler(self._handle_calendar_job_reconcile))
+            router.add_post("/p/{profile}/internal/v1/cron/calendar-recovery-arms/{dedupe_key}/reconcile", self._profile_handler(self._handle_calendar_recovery_reconcile))
+
+    def _register_unprefixed_cron_control_routes(
+        self,
+        router: "web.UrlDispatcher",
+    ) -> None:
+        """Register the cron control plane used by per-profile processes.
+
+        ``zettlab-local-server`` addresses a dedicated profile process without
+        a ``/p/<profile>`` prefix.  Keep these routes in one helper so the base
+        API server and ``zet_agent`` adapter cannot drift apart again.
+        """
+        if not _CRON_AVAILABLE:
+            return
+        router.add_post("/api/cron/fire", self._handle_cron_fire)
+        router.add_get("/internal/v1/cron/capabilities", self._handle_cron_capabilities)
+        router.add_post("/internal/v1/cron/jobs/{job_id}/reconcile", self._handle_calendar_job_reconcile)
+        router.add_post("/internal/v1/cron/calendar-recovery-arms/{dedupe_key}/reconcile", self._handle_calendar_recovery_reconcile)
 
     # ------------------------------------------------------------------
     # Agent creation helper
@@ -3868,6 +3892,7 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
+    _CALENDAR_JOB_ID_RE = __import__("re").compile(r"cal-alert-[a-f0-9]{32}")
     # Allowed fields for update — prevents clients injecting arbitrary keys
     _UPDATE_ALLOWED_FIELDS = {
         "name", "schedule", "prompt", "deliver", "skills", "skill",
@@ -3896,6 +3921,20 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             return job_id, web.json_response(
                 {"error": "Invalid job ID format"}, status=400,
+            )
+        return job_id, None
+
+    def _check_calendar_job_id(self, request: "web.Request") -> tuple:
+        """Accept only planner-generated calendar job identifiers."""
+        job_id = request.match_info["job_id"]
+        if not self._CALENDAR_JOB_ID_RE.fullmatch(job_id):
+            logger.warning(
+                "Calendar reconcile rejected invalid job ID %r: %s",
+                job_id,
+                self._request_audit_log_suffix(request),
+            )
+            return job_id, web.json_response(
+                {"error": "Invalid calendar job ID format"}, status=400,
             )
         return job_id, None
 
@@ -4005,6 +4044,62 @@ class APIServerAdapter(BasePlatformAdapter):
             include_disabled = request.query.get("include_disabled", "").lower() in {"true", "1"}
             jobs = _cron_list(include_disabled=include_disabled)
             return web.json_response({"jobs": jobs})
+        except Exception as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+
+    async def _handle_list_job_occurrences(self, request: "web.Request") -> "web.Response":
+        """GET /api/jobs/occurrences — real runs plus bounded future previews."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        cron_err = self._check_jobs_available()
+        if cron_err:
+            return cron_err
+        try:
+            raw_from = request.query.get("from", "")
+            raw_to = request.query.get("to", "")
+            if len(raw_from) > 128 or len(raw_to) > 128:
+                raise ValueError("occurrence bounds are too long")
+            from_at = datetime.fromisoformat(raw_from.replace("Z", "+00:00"))
+            to_at = datetime.fromisoformat(raw_to.replace("Z", "+00:00"))
+            if from_at.tzinfo is None or to_at.tzinfo is None:
+                raise ValueError("occurrence bounds must include a timezone")
+            if to_at <= from_at:
+                raise ValueError("occurrence 'to' must be after 'from'")
+            if to_at.astimezone(timezone.utc) - from_at.astimezone(timezone.utc) > timedelta(days=370):
+                raise ValueError("occurrence window must not exceed 370 days")
+            try:
+                limit = max(1, min(int(request.query.get("limit", "2000")), 2000))
+            except ValueError:
+                raise ValueError("occurrence limit must be an integer")
+            jobs = _cron_list(include_disabled=True)
+            requested_job_ids = request.query.getall("job_id", [])
+            if len(requested_job_ids) > 256:
+                raise ValueError("too many occurrence job filters")
+            if requested_job_ids:
+                selected_ids = set()
+                for job_id in requested_job_ids:
+                    if (
+                        not isinstance(job_id, str)
+                        or not job_id
+                        or len(job_id) > 256
+                        or job_id in {".", ".."}
+                        or "/" in job_id
+                        or "\\" in job_id
+                    ):
+                        raise ValueError("invalid occurrence job filter")
+                    selected_ids.add(job_id)
+                jobs = [job for job in jobs if job.get("id") in selected_ids]
+            projection = await asyncio.to_thread(
+                _cron_occurrence_projection,
+                jobs,
+                from_at,
+                to_at,
+                limit=limit,
+            )
+            return web.json_response({**projection, "limit": limit})
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -4264,11 +4359,75 @@ class APIServerAdapter(BasePlatformAdapter):
         from cron.scheduler_provider import resolve_cron_scheduler
         provider = resolve_cron_scheduler()
 
+        from cron.calendar_delivery import (
+            begin_external_calendar_fire,
+            is_invalid_calendar_job,
+            is_managed_calendar_event_alert,
+            quarantine_invalid_calendar_job,
+            run_external_calendar_delivery,
+        )
+        from cron.jobs import get_job_raw
+        # Managed calendar validation is a wire-contract check.  In
+        # particular, prompt:null must not be normalized to an empty string.
+        job = get_job_raw(job_id)
+        provider_fire_id = str(
+            (body or {}).get("provider_fire_id")
+            or (body or {}).get("fire_id")
+            or (body or {}).get("dedupe_key")
+            or request.headers.get("X-Chronos-Fire-ID", "")
+            or claims.get("fire_id")
+            or claims.get("jti")
+            or ""
+        )
+        if len(provider_fire_id) > 256:
+            return web.json_response({"error": "invalid fire id"}, status=400)
+        if is_managed_calendar_event_alert(job):
+            capabilities = provider.calendar_capabilities()
+            try:
+                begin = await asyncio.to_thread(
+                    begin_external_calendar_fire,
+                    job,
+                    provider_name=str(capabilities.get("provider") or provider.name),
+                    provider_contract_version=int(capabilities.get("contract_version") or 0),
+                    provider_fire_id=provider_fire_id,
+                )
+            except Exception as exc:
+                logger.warning("calendar external fire preflight remains retryable for %s: %s", job_id, exc)
+                return web.json_response({"error": "calendar delivery preflight required"}, status=503,
+                                         headers={"Retry-After": "5"})
+            if begin.get("state") in {"fired", "expired", "cancelled", "superseded"} or begin.get("attempt_replayed") is True:
+                return web.json_response({"status": "accepted", "job_id": job_id, **begin}, status=202)
+            task = asyncio.create_task(asyncio.to_thread(run_external_calendar_delivery, job, begin))
+            try:
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+            except (TypeError, AttributeError):
+                pass
+            return web.json_response({"status": "accepted", "job_id": job_id,
+                                      "attempt_sequence": begin.get("attempt_sequence"),
+                                      "dedupe_key": begin.get("dedupe_key")}, status=202)
+        if is_invalid_calendar_job(job):
+            quarantine_invalid_calendar_job(job)
+            return web.json_response({"error": "invalid calendar job contract"}, status=422)
+
+        from cron.jobs import normalize_external_fire_at
+        if (body or {}).get("fire_at") is None:
+            return web.json_response({"error": "missing fire_at"}, status=400)
+        try:
+            ordinary_fire_at = normalize_external_fire_at((body or {}).get("fire_at"))
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
         loop = asyncio.get_running_loop()
         # Fire in the background (202 immediately). fire_due claims via the
         # store CAS, so a retry while this is in flight is de-duped.
         task = asyncio.create_task(
-            asyncio.to_thread(provider.fire_due, job_id, adapters=None, loop=loop)
+            asyncio.to_thread(
+                provider.fire_due,
+                job_id,
+                adapters=None,
+                loop=loop,
+                fire_at=ordinary_fire_at,
+            )
         )
         try:
             self._background_tasks.add(task)
@@ -4277,6 +4436,65 @@ class APIServerAdapter(BasePlatformAdapter):
             pass
 
         return web.json_response({"status": "accepted", "job_id": job_id}, status=202)
+
+    async def _handle_cron_capabilities(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        from cron.scheduler_provider import resolve_cron_scheduler
+        return web.json_response(resolve_cron_scheduler().calendar_capabilities())
+
+    async def _handle_calendar_job_reconcile(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        job_id, id_err = self._check_calendar_job_id(request)
+        if id_err:
+            return id_err
+        if request.content_length is not None and request.content_length > 16 * 1024:
+            return web.json_response({"error": "request too large"}, status=413)
+        try:
+            body = await request.json()
+            action = str((body or {}).get("expected_action") or "")
+            revision = int((body or {}).get("projection_revision") or 0)
+            if action not in {"upsert", "delete"} or revision <= 0:
+                raise ValueError("invalid reconcile contract")
+            from cron.scheduler_provider import resolve_cron_scheduler
+            result = await asyncio.to_thread(
+                resolve_cron_scheduler().reconcile_calendar_job,
+                job_id, action, revision,
+            )
+            return web.json_response(result)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            logger.warning("calendar provider reconcile failed for %s: %s", job_id, exc)
+            return web.json_response({"error": "provider reconcile failed"}, status=503)
+
+    async def _handle_calendar_recovery_reconcile(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        dedupe_key = str(request.match_info.get("dedupe_key") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", dedupe_key):
+            return web.json_response({"error": "invalid recovery dedupe key"}, status=400)
+        if request.content_length is not None and request.content_length > 16 * 1024:
+            return web.json_response({"error": "request too large"}, status=413)
+        try:
+            body = await request.json()
+            if not isinstance(body, dict) or body.get("dedupe_key") != dedupe_key:
+                raise ValueError("invalid recovery contract")
+            from cron.scheduler_provider import resolve_cron_scheduler
+            result = await asyncio.to_thread(
+                resolve_cron_scheduler().reconcile_calendar_recovery_arm,
+                body,
+            )
+            return web.json_response(result)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            logger.warning("calendar recovery reconcile failed for %s: %s", dedupe_key, exc)
+            return web.json_response({"error": "provider recovery reconcile failed"}, status=503)
 
 
     # ------------------------------------------------------------------
@@ -5264,6 +5482,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
+            self._app.router.add_get("/api/jobs/occurrences", self._handle_list_job_occurrences)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
             self._app.router.add_get("/api/jobs/{job_id}", self._handle_get_job)
             self._app.router.add_patch("/api/jobs/{job_id}", self._handle_update_job)
@@ -5275,8 +5494,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated by a
             # NAS-minted JWT (NOT API_SERVER_KEY), so it has its own auth path.
-            if _CRON_AVAILABLE:
-                self._app.router.add_post("/api/cron/fire", self._handle_cron_fire)
+            self._register_unprefixed_cron_control_routes(self._app.router)
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)

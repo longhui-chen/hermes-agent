@@ -166,6 +166,104 @@ def test_reconcile_skips_already_armed_same_time(temp_home, chronos, monkeypatch
     assert fake.provisions == []  # already armed at the same time → no re-arm
 
 
+def test_calendar_reconcile_requires_remote_observation(chronos, monkeypatch):
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+    prov, fake = chronos
+    job = managed_job(next_run_at="2026-07-15T01:00:00Z")
+    monkeypatch.setattr("cron.jobs.get_job_raw", lambda _jid: job)
+    fake._armed = [{"job_id": job["id"], "fire_at": job["next_run_at"]}]
+    result = prov.reconcile_calendar_job(job["id"], "upsert", 2)
+    assert result["status"] == "armed"
+    assert result["observed_fire_at"] == job["next_run_at"]
+    fake._armed = [{"job_id": job["id"], "fire_at": "2026-07-15T02:00:00Z"}]
+    with pytest.raises(RuntimeError, match="durably observed"):
+        prov.reconcile_calendar_job(job["id"], "upsert", 2)
+
+
+def test_calendar_cancel_requires_remote_absence(chronos):
+    prov, fake = chronos
+    fake._armed = []
+    assert prov.reconcile_calendar_job("cal-alert", "delete", 2)["status"] == "cancelled"
+    assert fake.cancels == ["cal-alert"]
+
+
+def test_stale_calendar_delete_flow_preserves_newer_projection(chronos, monkeypatch):
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+    prov, fake = chronos
+    monkeypatch.setattr(
+        "cron.jobs.get_job_raw",
+        lambda _jid: managed_job(calendar_projection_revision=3),
+    )
+
+    result = prov.reconcile_calendar_job("cal-alert-abc", "delete", 2)
+
+    assert result["status"] == "superseded"
+    assert fake.cancels == []
+
+
+def test_generic_reconcile_flow_preserves_managed_calendar_recovery_arm(
+    temp_home, chronos, monkeypatch,
+):
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+    prov, fake = chronos
+    job = managed_job(
+        enabled=True,
+        state="scheduled",
+        next_run_at="2026-07-15T01:00:00Z",
+    )
+    retry_at = "2026-07-15T01:02:03Z"
+    fake._armed = [{"job_id": job["id"], "fire_at": retry_at}]
+    monkeypatch.setattr("cron.jobs.load_jobs", lambda: [job])
+
+    prov.reconcile()
+
+    assert fake.provisions == []
+    assert fake.cancels == []
+    assert fake._armed == [{"job_id": job["id"], "fire_at": retry_at}]
+
+
+def test_generic_reconcile_cancels_paused_managed_calendar_arm(
+    temp_home, chronos, monkeypatch,
+):
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+    prov, fake = chronos
+    job = managed_job(
+        enabled=True,
+        state="paused",
+        next_run_at="2026-07-15T01:00:00Z",
+    )
+    fake._armed = [{"job_id": job["id"], "fire_at": job["next_run_at"]}]
+    monkeypatch.setattr("cron.jobs.load_jobs", lambda: [job])
+
+    prov.reconcile()
+
+    assert fake.cancels == [job["id"]]
+
+
+def test_calendar_recovery_arm_uses_attempt_dedupe_and_observed_time(chronos, monkeypatch):
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+    prov, fake = chronos
+    job = managed_job(next_run_at="2026-07-15T01:00:00Z")
+    monkeypatch.setattr("cron.jobs.get_job_raw", lambda _jid: job)
+    original_provision = fake.provision
+
+    def provision_and_observe(**kwargs):
+        result = original_provision(**kwargs)
+        fake._armed = [{"job_id": kwargs["job_id"], "fire_at": kwargs["fire_at"]}]
+        return result
+
+    fake.provision = provision_and_observe
+    intent = {
+        "job_id": job["id"], "projection_revision": 2,
+        "attempt_sequence": 4, "dedupe_key": "d" * 64,
+        "retry_at": "2026-07-15T01:02:03Z", "deadline_at": "2026-07-15T01:05:00Z",
+    }
+    result = prov.reconcile_calendar_recovery_arm(intent)
+    assert result["observed_fire_at"] == intent["retry_at"]
+    assert fake.provisions[-1]["dedup_key"] == "d" * 64
+    assert fake.provisions[-1]["fire_at"] == intent["retry_at"]
+
+
 # -- fire_due re-arm ----------------------------------------------------------
 
 def test_fire_due_rearms_next_oneshot(chronos, monkeypatch):

@@ -1,4 +1,5 @@
 from unittest.mock import MagicMock
+import inspect
 
 import pytest
 
@@ -30,6 +31,9 @@ def test_install_normalizes_legacy_zettlab_origin():
     import gateway.platforms.zet_agent_cron as zet_agent_cron
 
     zet_agent_cron.install()
+    signature = inspect.signature(scheduler.mark_job_run)
+    assert "scheduled_at" in signature.parameters
+    assert "output_filename" in signature.parameters
 
     job = {
         "origin": {
@@ -358,6 +362,22 @@ def test_silent_run_skips_session_persist(monkeypatch):
 
     # 真实产出 → 非静默（正常落卡路径不受影响）
     zc._LATEST_OUTPUT["job-s"] = "# Cron Job: x\n\n## Response\n\n日报已生成。\n"
+    assert zc._is_silent_run("job-s") is False
+
+    # 行中提到静默协议、但末尾给出真实结果，必须投递。旧 substring
+    # 判断会把这种实际模型输出误吞，造成日历已完成而会话无卡片。
+    zc._LATEST_OUTPUT["job-s"] = (
+        "# Cron Job: x\n\n## Response\n\n"
+        "I considered [SILENT], but this run has a result.\n\n"
+        "E2E unified reminder delivery executed\n"
+    )
+    assert zc._is_silent_run("job-s") is False
+
+    # Status-like text inside the untrusted response is not producer metadata.
+    zc._LATEST_OUTPUT["job-s"] = (
+        "# Cron Job: x\n\n## Response\n\n"
+        "**Status:** silent\n\n12 个付款任务执行失败\n"
+    )
     assert zc._is_silent_run("job-s") is False
 
     # 无缓存输出 → 非静默（fail-open，不误吞真运行）
