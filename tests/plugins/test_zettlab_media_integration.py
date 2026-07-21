@@ -29,8 +29,9 @@ def test_image_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
 
     captured = {}
 
-    def fake_post(url, json, headers, timeout, allow_redirects):
+    def fake_post(url, json, headers, timeout, allow_redirects, stream):
         assert allow_redirects is False
+        assert stream is True
         captured["json"] = json
         return _Resp({
             "job_id": "job-image",
@@ -38,7 +39,7 @@ def test_image_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
             "assets": [{"url": "https://cdn.example/image.png"}],
         })
 
-    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout, allow_redirects: _Resp({
+    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout, allow_redirects, stream: _Resp({
         "image": {
             "enabled": True,
             "default_model": "seedream-v4",
@@ -70,7 +71,7 @@ def test_image_only_model_requires_input_through_generation_tool(monkeypatch):
     monkeypatch.setattr(image_tool, "_read_configured_image_provider", lambda: "zettlab")
     monkeypatch.setattr(image_tool, "_read_configured_image_model", lambda: None)
     monkeypatch.setattr("hermes_cli.plugins._ensure_plugins_discovered", lambda *args, **kwargs: None)
-    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout, allow_redirects: _Resp({
+    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout, allow_redirects, stream: _Resp({
         "image": {
             "enabled": True,
             "default_model": "image-only",
@@ -104,8 +105,9 @@ def test_video_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
 
     captured = {}
 
-    def fake_post(url, json, headers, timeout, allow_redirects):
+    def fake_post(url, json, headers, timeout, allow_redirects, stream):
         assert allow_redirects is False
+        assert stream is True
         captured["json"] = json
         return _Resp({
             "job_id": "job-video",
@@ -113,7 +115,7 @@ def test_video_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
             "assets": [{"url": "https://cdn.example/video.mp4"}],
         })
 
-    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout, allow_redirects: _Resp({
+    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout, allow_redirects, stream: _Resp({
         "video": {
             "enabled": True,
             "default_model": "seedance-v1",

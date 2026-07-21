@@ -83,7 +83,7 @@ class ZettlabVideoGenProvider(VideoGenProvider):
             "max_duration": max(durations) if durations else 10,
             "min_duration": min(durations) if durations else 1,
             "supports_audio": False,
-            "supports_negative_prompt": True,
+            "supports_negative_prompt": False,
             "max_reference_images": max(0, max_refs - 1),
         }
 
@@ -163,6 +163,25 @@ class ZettlabVideoGenProvider(VideoGenProvider):
                 if isinstance(model_capability, dict)
                 else None
             )
+            type_limits = model_capability.get("_type_limits") if isinstance(model_capability, dict) else None
+            max_remote_inputs = None
+            if isinstance(type_limits, dict):
+                declared_limit = type_limits.get("max_remote_media_inputs")
+                if isinstance(declared_limit, int) and not isinstance(declared_limit, bool) and declared_limit >= 0:
+                    max_remote_inputs = declared_limit
+            if inputs and (
+                not isinstance(configured_modalities, list)
+                or "image" not in configured_modalities
+                or (max_remote_inputs is not None and max_remote_inputs < len(inputs))
+            ):
+                return error_response(
+                    error="Image inputs are not enabled for this Zettlab video generation model.",
+                    error_type="unsupported_input",
+                    provider="zettlab",
+                    model=resolved_model,
+                    prompt=prompt,
+                    aspect_ratio=effective_aspect_ratio,
+                )
             if (
                 isinstance(configured_modalities, list)
                 and "image" in configured_modalities
@@ -177,19 +196,20 @@ class ZettlabVideoGenProvider(VideoGenProvider):
                     prompt=prompt,
                     aspect_ratio=effective_aspect_ratio,
                 )
-            parameters: Dict[str, Any] = {}
-            if negative_prompt:
-                parameters["negative_prompt"] = negative_prompt
-            if audio is not None:
-                parameters["audio"] = bool(audio)
-            if seed is not None:
-                parameters["seed"] = seed
+            if negative_prompt or audio is not None or seed is not None:
+                return error_response(
+                    error="negative_prompt, audio, and seed are not enabled for Zettlab video generation.",
+                    error_type="unsupported_parameter",
+                    provider="zettlab",
+                    model=resolved_model,
+                    prompt=prompt,
+                    aspect_ratio=effective_aspect_ratio,
+                )
             payload: Dict[str, Any] = {
                 "output_count": 1,
                 "aspect_ratio": effective_aspect_ratio,
                 "resolution": effective_resolution,
                 "remote_media_inputs": inputs,
-                "parameters": parameters,
             }
             if effective_duration is not None:
                 payload["duration"] = effective_duration
@@ -197,6 +217,7 @@ class ZettlabVideoGenProvider(VideoGenProvider):
                 media_type="video",
                 model=resolved_model,
                 prompt=prompt,
+                timeout_seconds=media_client.timeout_from_model_capability("video", model_capability),
                 payload=payload,
             )
             video = media_client.first_asset_url(job)

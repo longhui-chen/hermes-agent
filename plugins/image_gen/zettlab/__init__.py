@@ -104,6 +104,25 @@ class ZettlabImageGenProvider(ImageGenProvider):
                 if isinstance(model_capability, dict)
                 else None
             )
+            type_limits = model_capability.get("_type_limits") if isinstance(model_capability, dict) else None
+            max_remote_inputs = None
+            if isinstance(type_limits, dict):
+                declared_limit = type_limits.get("max_remote_media_inputs")
+                if isinstance(declared_limit, int) and not isinstance(declared_limit, bool) and declared_limit >= 0:
+                    max_remote_inputs = declared_limit
+            if inputs and (
+                not isinstance(configured_modalities, list)
+                or "image" not in configured_modalities
+                or (max_remote_inputs is not None and max_remote_inputs < len(inputs))
+            ):
+                return error_response(
+                    error="Image inputs are not enabled for this Zettlab image generation model.",
+                    error_type="unsupported_input",
+                    provider="zettlab",
+                    model=model,
+                    prompt=prompt,
+                    aspect_ratio=aspect,
+                )
             if (
                 isinstance(configured_modalities, list)
                 and "image" in configured_modalities
@@ -118,13 +137,13 @@ class ZettlabImageGenProvider(ImageGenProvider):
                     prompt=prompt,
                     aspect_ratio=aspect,
                 )
-            output_count = int(kwargs.get("num_images") or kwargs.get("output_count") or 1)
             job = media_client.create_and_wait(
                 media_type="image",
                 model=model,
                 prompt=prompt,
+                timeout_seconds=media_client.timeout_from_model_capability("image", model_capability),
                 payload={
-                    "output_count": max(1, output_count),
+                    "output_count": 1,
                     "aspect_ratio": aspect,
                     "remote_media_inputs": inputs,
                 },
