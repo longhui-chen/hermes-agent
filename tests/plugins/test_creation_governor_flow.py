@@ -13,7 +13,11 @@ PLUGIN_PATH = (
 
 
 class _Llm:
+    def __init__(self):
+        self.calls = []
+
     def complete(self, _messages, **_kwargs):
+        self.calls.append((_messages, _kwargs))
         return SimpleNamespace(
             text=json.dumps({
                 "decision": "agent",
@@ -71,3 +75,58 @@ def test_registered_hooks_produce_a_complete_answer_plus_attachment_envelope():
     assert output.startswith("Here is the actual business analysis.")
     assert "<!--creation-recommendation:start " in output
     assert "Business Research Partner" in output
+
+
+def test_card_mute_action_blocks_future_checks_and_delivery(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("creation_governor_flow", PLUGIN_PATH)
+    plugin = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(plugin)
+    plugin._reset_state_for_tests()
+    monkeypatch.setattr(
+        plugin, "_preferences_db_path", lambda: tmp_path / "creation-governor-flow.db"
+    )
+    context = _Context()
+    plugin.register(context)
+
+    context.hooks[0][0][1](
+        session_id="flow-muted-session",
+        user_message="Look into this business problem.",
+        conversation_history=[],
+    )
+    assert context.hooks[1][0][1](
+        session_id="flow-muted-session",
+        response_text="Here is the actual business analysis.",
+    )
+    assert len(context.llm.calls) == 1
+
+    response = {
+        "version": 1,
+        "type": "creation_recommendation_response",
+        "action": "mute_session",
+        "creation_type": "agent",
+        "title": "Business Research Partner",
+        "dedup_key": "agent:business-research-partner",
+        "evidence_turn_ids": ["evidence-1"],
+    }
+    mute_context = context.hooks[0][0][1](
+        session_id="flow-muted-session",
+        user_message=(
+            "[creation_recommendation_response]\n"
+            f"{json.dumps(response)}\n"
+            "[/creation_recommendation_response]"
+        ),
+        conversation_history=[],
+    )
+    assert "disabled proactive creation recommendations" in mute_context["context"]
+
+    assert context.hooks[0][0][1](
+        session_id="flow-muted-session",
+        user_message="Now inspect another business question.",
+        conversation_history=[],
+    ) is None
+    assert len(context.llm.calls) == 1
+    assert context.hooks[1][0][1](
+        session_id="flow-muted-session",
+        response_text="This answer remains untouched.",
+    ) is None

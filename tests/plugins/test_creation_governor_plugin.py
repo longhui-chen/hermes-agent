@@ -46,6 +46,23 @@ def _candidate(
     }
 
 
+def _recommendation_response(action, *, title="Google Ads Analyst"):
+    payload = {
+        "version": 1,
+        "type": "creation_recommendation_response",
+        "action": action,
+        "creation_type": "agent",
+        "title": title,
+        "dedup_key": "agent:google-ads-analyst",
+        "evidence_turn_ids": ["evidence-1"],
+    }
+    return (
+        "[creation_recommendation_response]\n"
+        f"{json.dumps(payload)}\n"
+        "[/creation_recommendation_response]"
+    )
+
+
 class _FakeLlm:
     def __init__(self, results):
         self.results = list(results)
@@ -279,6 +296,93 @@ def test_dismissal_latches_the_same_semantic_candidate():
         plugin._detect_creation_opportunity(first, session_id="dismiss-session")
     )
     assert result == {"status": "candidate_recorded", "reason": "dismissed"}
+
+
+def test_session_mute_persists_across_plugin_state_reset_and_can_be_undone(
+    tmp_path, monkeypatch
+):
+    plugin = _load_plugin()
+    preferences_db = tmp_path / "creation-governor-test.db"
+    monkeypatch.setattr(plugin, "_preferences_db_path", lambda: preferences_db)
+    llm = _FakeLlm([_candidate()])
+    plugin.register(_Context(llm))
+
+    plugin._on_pre_llm_call(
+        session_id="muted-session",
+        user_message="Analyze my Google Ads account.",
+        conversation_history=[],
+    )
+    assert plugin._transform_llm_output(
+        session_id="muted-session",
+        response_text="Here is the analysis.",
+    )
+
+    mute_context = plugin._on_pre_llm_call(
+        session_id="muted-session",
+        user_message=_recommendation_response("mute_session"),
+        conversation_history=[],
+    )
+    assert "disabled proactive creation recommendations" in mute_context["context"]
+    assert plugin._is_session_muted("muted-session") is True
+    assert preferences_db.exists()
+
+    plugin._reset_state_for_tests()
+    after_restart_llm = _FakeLlm([_candidate()])
+    plugin.register(_Context(after_restart_llm))
+    assert plugin._is_session_muted("muted-session") is True
+    assert (
+        plugin._on_pre_llm_call(
+            session_id="muted-session",
+            user_message="Analyze a different campaign.",
+            conversation_history=[],
+        )
+        is None
+    )
+    assert after_restart_llm.calls == []
+    assert json.loads(
+        plugin._detect_creation_opportunity(
+            _candidate(), session_id="muted-session"
+        )
+    ) == {"status": "candidate_recorded", "reason": "session_muted"}
+    assert (
+        plugin._transform_llm_output(
+            session_id="muted-session",
+            response_text="No recommendation should be appended.",
+        )
+        is None
+    )
+
+    unmute_context = plugin._on_pre_llm_call(
+        session_id="muted-session",
+        user_message=_recommendation_response("unmute_session"),
+        conversation_history=[],
+    )
+    assert "re-enabled proactive creation recommendations" in unmute_context["context"]
+    assert plugin._is_session_muted("muted-session") is False
+
+
+def test_mute_transform_guard_wins_when_a_candidate_is_already_pending(
+    tmp_path, monkeypatch
+):
+    plugin = _load_plugin()
+    monkeypatch.setattr(
+        plugin, "_preferences_db_path", lambda: tmp_path / "creation-governor-test.db"
+    )
+    plugin.register(_Context(_FakeLlm([_candidate()])))
+    plugin._on_pre_llm_call(
+        session_id="in-flight-session",
+        user_message="Analyze my Google Ads account.",
+        conversation_history=[],
+    )
+
+    assert plugin._set_session_muted("in-flight-session", True) is True
+    assert (
+        plugin._transform_llm_output(
+            session_id="in-flight-session",
+            response_text="The analysis completed after the mute action.",
+        )
+        is None
+    )
 
 
 def test_optional_tool_accepts_none_and_rejects_invalid_or_low_confidence():

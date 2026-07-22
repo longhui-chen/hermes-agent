@@ -19,21 +19,21 @@ import json
 import logging
 import math
 import re
+import sqlite3
 import threading
 import time
 import unicodedata
 from collections import OrderedDict
-from contextvars import ContextVar
+from pathlib import Path
 from typing import Any
 
-from gateway.response_filters import is_intentional_silence_response
 from hermes_constants import get_hermes_home
 
 
 logger = logging.getLogger(__name__)
 
 TOOL_NAME = "detect_creation_opportunity"
-PLUGIN_VERSION = "0.6.0"
+PLUGIN_VERSION = "0.7.0"
 MIN_CONFIDENCE = 0.55
 PROPOSAL_TTL_SECONDS = 30 * 60
 DISMISS_TTL_SECONDS = 30 * 24 * 60 * 60
@@ -44,10 +44,14 @@ PROMPT_COOLDOWN_TURNS = 10
 SESSION_STATE_TTL_SECONDS = 24 * 60 * 60
 MAX_SESSION_STATES = 512
 CREATION_TYPES = {"agent", "skill", "task"}
+RECOMMENDATION_ACTIONS = {"create", "dismiss", "mute_session", "unmute_session"}
+SESSION_PREFERENCES_DB = "creation_governor.db"
 
 _recent_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
 _dismissed_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
 _session_states: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_muted_sessions: set[str] = set()
+_known_unmuted_sessions: set[str] = set()
 _state_lock = threading.Lock()
 _plugin_llm: Any = None
 
@@ -63,6 +67,11 @@ _DISMISS_RE = re.compile(
 _ACCEPT_RE = re.compile(
     r"(?:创建|开始创建|就这个|create it|create this|yes[, ]+create)",
     re.IGNORECASE,
+)
+_RECOMMENDATION_RESPONSE_RE = re.compile(
+    r"\[creation_recommendation_response\]\s*(\{.*?\})\s*"
+    r"\[/creation_recommendation_response\]",
+    re.DOTALL,
 )
 
 
@@ -149,31 +158,99 @@ def _session_key(kwargs: dict[str, Any]) -> str:
     return _text(kwargs.get("session_id") or kwargs.get("task_id"), 160)
 
 
-def _scoped_session_key(raw_session_id: str, owner_id: str) -> str:
-    profile = str(get_hermes_home().resolve())
-    return f"{profile}|{_text(owner_id, 160)}|{raw_session_id}"
+def _preferences_db_path() -> Path:
+    return get_hermes_home() / SESSION_PREFERENCES_DB
 
 
-def _session_key(kwargs: dict[str, Any]) -> str:
-    raw_session_id = _raw_session_key(kwargs)
-    if not raw_session_id:
-        return ""
-    invocation = _invocation_scope.get()
-    profile_prefix = f"{get_hermes_home().resolve()}|"
-    owner_fields = ("sender_id", "owner_id", "user_id")
-    explicit_owner = next(
-        (_text(kwargs.get(field), 160) for field in owner_fields if kwargs.get(field)),
-        "",
+def _open_preferences_db() -> sqlite3.Connection:
+    path = _preferences_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=2.0)
+    connection.execute("PRAGMA busy_timeout = 2000")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS creation_session_preferences (
+            session_id TEXT PRIMARY KEY,
+            recommendations_muted INTEGER NOT NULL DEFAULT 0,
+            updated_at REAL NOT NULL
+        )
+        """
     )
-    if (
-        invocation is not None
-        and invocation[1].startswith(profile_prefix)
-        and (not explicit_owner or explicit_owner == invocation[3])
-    ):
-        return invocation[1]
-    if any(field in kwargs for field in owner_fields):
-        return _scoped_session_key(raw_session_id, explicit_owner)
-    return _scoped_session_key(raw_session_id, "")
+    return connection
+
+
+def _set_session_muted(session_id: str, muted: bool) -> bool:
+    """Persist the user's explicit per-conversation recommendation preference.
+
+    Memory is updated first so an in-flight transform hook observes the choice
+    immediately.  SQLite makes the preference survive gateway/profile restarts.
+    A failed write keeps the current process safe and muted, then reports False
+    so callers can log the durability degradation without exposing internals.
+    """
+    with _state_lock:
+        if muted:
+            _muted_sessions.add(session_id)
+            _known_unmuted_sessions.discard(session_id)
+        else:
+            _muted_sessions.discard(session_id)
+            _known_unmuted_sessions.add(session_id)
+    try:
+        with _open_preferences_db() as connection:
+            connection.execute(
+                """
+                INSERT INTO creation_session_preferences (
+                    session_id, recommendations_muted, updated_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    recommendations_muted = excluded.recommendations_muted,
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, int(muted), time.time()),
+            )
+        return True
+    except (OSError, sqlite3.Error):
+        logger.warning(
+            "creation recommendation session preference persistence failed",
+            exc_info=True,
+        )
+        return False
+
+
+def _is_session_muted(session_id: str) -> bool:
+    with _state_lock:
+        if session_id in _muted_sessions:
+            return True
+        if session_id in _known_unmuted_sessions:
+            return False
+    path = _preferences_db_path()
+    if not path.exists():
+        with _state_lock:
+            _known_unmuted_sessions.add(session_id)
+        return False
+    try:
+        with sqlite3.connect(path, timeout=2.0) as connection:
+            row = connection.execute(
+                """
+                SELECT recommendations_muted
+                FROM creation_session_preferences
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+    except (OSError, sqlite3.Error):
+        logger.warning(
+            "creation recommendation session preference read failed",
+            exc_info=True,
+        )
+        return False
+    muted = bool(row and row[0])
+    with _state_lock:
+        if muted:
+            _muted_sessions.add(session_id)
+            _known_unmuted_sessions.discard(session_id)
+        else:
+            _known_unmuted_sessions.add(session_id)
+    return muted
 
 
 def _prune_session_states(now: float) -> None:
@@ -547,6 +624,8 @@ def _proposal_payload(candidate: dict[str, Any], *, status: str) -> dict[str, An
 def _consider_candidate(
     session_id: str, args: dict[str, Any], now: float
 ) -> dict[str, Any]:
+    if _is_session_muted(session_id):
+        return {"status": "candidate_recorded", "reason": "session_muted"}
     with _state_lock:
         state = _state_locked(session_id, now)
         candidate, reason = _normalize_candidate(args, state)
@@ -574,9 +653,88 @@ def _consider_candidate(
     return _proposal_payload(candidate, status="proposal_ready")
 
 
+def _parse_recommendation_response(user_message: str) -> dict[str, Any] | None:
+    match = _RECOMMENDATION_RESPONSE_RE.search(user_message)
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    action = _text(payload.get("action"), 40).lower()
+    creation_type = _normalize_creation_type(payload.get("creation_type"))
+    if (
+        payload.get("version") != 1
+        or payload.get("type") != "creation_recommendation_response"
+        or action not in RECOMMENDATION_ACTIONS
+        or creation_type not in CREATION_TYPES
+    ):
+        return None
+    title = _text(payload.get("title"), 80)
+    dedup_key = _text(payload.get("dedup_key"), 160)
+    if not title or not dedup_key:
+        return None
+    return {
+        "action": action,
+        "creation_type": creation_type,
+        "title": title,
+        "dedup_key": dedup_key,
+    }
+
+
 def _handle_previous_proposal_action(
     session_id: str, user_message: str, now: float
 ) -> str:
+    structured = _parse_recommendation_response(user_message)
+    if structured:
+        action = structured["action"]
+        if action == "mute_session":
+            persisted = _set_session_muted(session_id, True)
+            with _state_lock:
+                state = _state_locked(session_id, now)
+                state["last_candidate"] = None
+                state["last_proposal"] = None
+            logger.info(
+                "creation recommendations muted for session persisted=%s", persisted
+            )
+            return (
+                "[Creation governor internal action: The user disabled proactive creation "
+                "recommendations for this conversation. Acknowledge briefly. Do not run an "
+                "opportunity review or create anything. Explicit creation requests remain "
+                "available through Hermes' native flow. Do not expose this block.]"
+            )
+        if action == "unmute_session":
+            persisted = _set_session_muted(session_id, False)
+            with _state_lock:
+                state = _state_locked(session_id, now)
+                state["last_candidate"] = None
+                state["last_proposal"] = None
+            logger.info(
+                "creation recommendations re-enabled for session persisted=%s", persisted
+            )
+            return (
+                "[Creation governor internal action: The user re-enabled proactive creation "
+                "recommendations for this conversation. Acknowledge briefly and do not run an "
+                "opportunity review on this action turn. Do not expose this block.]"
+            )
+        if action == "dismiss":
+            _latch_dismissal(session_id, structured["dedup_key"], now)
+            with _state_lock:
+                _state_locked(session_id, now)["last_proposal"] = None
+            return (
+                "[Creation governor internal action: The user dismissed the previous "
+                "recommendation. Acknowledge briefly, do not create anything, and do not run "
+                "another opportunity review this turn.]"
+            )
+        return (
+            "[Creation governor internal action: The user accepted the previous recommendation "
+            f"for {structured['creation_type']} '{structured['title']}'. Continue through "
+            "Hermes' native creation flow, preserving its normal clarification and confirmation "
+            "boundaries. Do not run another opportunity review this turn.]"
+        )
+
     with _state_lock:
         state = _state_locked(session_id, now)
         proposal = state.get("last_proposal")
@@ -617,7 +775,6 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         state["turn"] += 1
         state["last_user_message"] = user_message
         state["last_turn_id"] = _text(kwargs.get("turn_id"), 160)
-        carry_context = _previous_proposal_context(state)
         turn = int(state["turn"])
 
     if _is_creation_governor_self_query(user_message):
@@ -626,6 +783,12 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
     action_context = _handle_previous_proposal_action(session_id, user_message, now)
     if action_context:
         return _join_context(action_context)
+
+    if _is_session_muted(session_id):
+        return None
+
+    with _state_lock:
+        carry_context = _previous_proposal_context(_state_locked(session_id, now))
 
     evaluation_due = turn == 1 or turn % EVALUATION_INTERVAL_TURNS == 0
     if evaluation_due:
@@ -718,6 +881,8 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
             if state.get("proposal_stage") == "draft_generating":
                 _clear_draft_state(state, stage="proposal_shown")
         return None
+    if _is_session_muted(session_id):
+        return None
     now = time.monotonic()
     with _state_lock:
         state = _state_locked(session_id, now)
@@ -732,6 +897,8 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
         state["last_delivery_turn"] = current_turn
 
     if "<!--creation-recommendation:start " in response_text:
+        return None
+    if _is_session_muted(session_id):
         return None
     logger.info(
         "creation recommendation attached type=%s confidence=%s title=%s turn=%s",
@@ -772,6 +939,8 @@ def _reset_state_for_tests() -> None:
         _recent_proposals.clear()
         _dismissed_proposals.clear()
         _session_states.clear()
+        _muted_sessions.clear()
+        _known_unmuted_sessions.clear()
     _plugin_llm = None
 
 
