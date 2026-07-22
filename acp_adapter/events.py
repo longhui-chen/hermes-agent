@@ -205,6 +205,16 @@ class ACPMessageDeliveryState:
                 await asyncio.sleep(0)
         self._consume_completed()
 
+    def reset_segment(self) -> None:
+        """Close commentary at a tool boundary; track only the next segment."""
+        self.wait_sync()
+        self._pending.clear()
+        self._prefix_chars = 0
+        self._prefix_hash = hashlib.sha256()
+        self._failed = False
+        self._overflowed = False
+        self._prefix_closed = False
+
     def remaining_content(self, final_response: str) -> str:
         """Return only the suffix not already confirmed by append-only ACP."""
         self._consume_completed()
@@ -404,7 +414,11 @@ def make_message_cb(
 ) -> Callable:
     """Create a callback that streams agent response text to the editor."""
 
-    def _message(text: str) -> bool:
+    def _message(text: str | None) -> bool:
+        if text is None:
+            if delivery_state is not None:
+                delivery_state.reset_segment()
+            return False
         if not text:
             return False
         update = acp.update_agent_message_text(text)

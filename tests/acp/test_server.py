@@ -1283,6 +1283,32 @@ class TestPrompt:
         assert agent_chunks[0].content.text == "streamed answer"
 
     @pytest.mark.asyncio
+    async def test_tool_boundary_resets_commentary_prefix(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        def mock_run(*args, **kwargs):
+            state.agent.stream_delta_callback("checking")
+            state.agent.stream_delta_callback(None)
+            state.agent.stream_delta_callback("final answer")
+            return {"final_response": "final answer", "messages": []}
+
+        state.agent.run_conversation = mock_run
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="hello")]
+        await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        texts = [
+            getattr(getattr(call.args[1], "content", None), "text", None)
+            for call in mock_conn.session_update.call_args_list
+            if len(call.args) > 1
+        ]
+        assert texts.count("final answer") == 1
+
+    @pytest.mark.asyncio
     async def test_prompt_delivers_transformed_response_after_streaming(self, agent):
         """If a transform_llm_output plugin hook modifies the response after
         streaming, ACP must deliver the transformed final_response so the

@@ -429,7 +429,7 @@ def test_background_post_hook_does_not_erase_foreground_draft_state():
     plugin = _load_plugin()
     prompt = plugin._proposal_payload(
         "skill", "会议纪要流程", "固化整理步骤", "会议转录", 0.9
-    )["user_prompt"]
+    )["user_prompt"] + "\n" + plugin._owner_marker("owner-a")
     draft = plugin._on_pre_llm_call(
         session_id="shared-draft-session",
         sender_id="owner-a",
@@ -1020,6 +1020,108 @@ def test_codex_app_server_cannot_enter_or_retain_draft_state():
         )
     )
     assert denied == {"status": "not_proposed", "reason": "unsupported_runtime"}
+
+
+def test_shared_history_cannot_rehydrate_another_owner_draft(monkeypatch):
+    plugin = _load_plugin()
+    monkeypatch.setattr(
+        plugin,
+        "_judge_creation_opportunity",
+        lambda message, history: {
+            "creation_type": "skill",
+            "suggested_name": "合同审查助手",
+            "reason": "复用审查规则",
+            "evidence": message,
+            "confidence": 0.9,
+            "dedup_key": "skill:合同审查助手",
+        },
+    )
+    plugin._on_pre_llm_call(
+        session_id="shared-thread",
+        sender_id="owner-a",
+        user_message="分析合同",
+        conversation_history=[],
+    )
+    proposal = plugin._transform_llm_output(
+        session_id="shared-thread",
+        sender_id="owner-a",
+        response_text="分析完成。",
+        turn_exit_reason="text_response(finish_reason=stop)",
+    )
+    assert plugin._owner_marker("owner-a") in proposal
+    draft = "这是 A 的草案。\n\n" + plugin._DRAFT_CONFIRM_PROMPT
+
+    plugin._reset_state_for_tests()
+    same_owner = plugin._on_pre_llm_call(
+        session_id="shared-thread",
+        sender_id="owner-a",
+        user_message="生成方案",
+        conversation_history=[{"role": "assistant", "content": proposal}],
+    )
+    assert "draft only" in same_owner["context"]
+
+    plugin._reset_state_for_tests()
+    result = plugin._on_pre_llm_call(
+        session_id="shared-thread",
+        sender_id="owner-b",
+        user_message="确认创建",
+        conversation_history=[
+            {"role": "assistant", "content": proposal},
+            {"role": "assistant", "content": draft},
+        ],
+    )
+
+    assert result is None
+
+
+def test_partial_stream_draft_never_enters_confirmation(monkeypatch):
+    plugin = _load_plugin()
+    monkeypatch.setattr(
+        plugin,
+        "_judge_creation_opportunity",
+        lambda message, history: {
+            "creation_type": "skill",
+            "suggested_name": "会议纪要流程",
+            "reason": "固化整理步骤",
+            "evidence": message,
+            "confidence": 0.9,
+            "dedup_key": "skill:会议纪要流程",
+        },
+    )
+    plugin._on_pre_llm_call(
+        session_id="partial-draft",
+        user_message="整理会议",
+        conversation_history=[],
+    )
+    proposal = plugin._transform_llm_output(
+        session_id="partial-draft",
+        response_text="整理完成。",
+    )
+    plugin._on_pre_llm_call(
+        session_id="partial-draft",
+        user_message="生成方案",
+        conversation_history=[{"role": "assistant", "content": proposal}],
+    )
+
+    transformed = plugin._transform_llm_output(
+        session_id="partial-draft",
+        response_text="截断的草案",
+        completed=True,
+        failed=False,
+        turn_exit_reason="partial_stream_recovery",
+    )
+    plugin._on_post_llm_call(
+        session_id="partial-draft",
+        assistant_response="截断的草案",
+        completed=True,
+        failed=False,
+        persistence_succeeded=True,
+        turn_exit_reason="partial_stream_recovery",
+    )
+
+    state = plugin._session_states[plugin._session_key({"session_id": "partial-draft"})]
+    assert transformed is None
+    assert state["proposal_stage"] == "proposal_shown"
 
 
 def test_plugin_self_query_reports_real_status_and_never_proposes(monkeypatch):

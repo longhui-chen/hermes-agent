@@ -8,6 +8,7 @@ hands confirmed work to Hermes' existing native creator.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import re
 import threading
@@ -245,6 +246,7 @@ _PERSISTED_PROPOSAL_RE = re.compile(
     r"要不要为你生成创建方案[？?]",
     re.DOTALL,
 )
+_OWNER_MARKER_RE = re.compile(r"<!-- creation-governor-owner:([0-9a-f]{16}) -->")
 _TYPE_BY_LABEL = {"Agent": "agent", "Skill": "skill", "定时任务": "scheduled_task"}
 _NONINTERACTIVE_PLATFORMS = {"cron", "subagent", "batch"}
 _DRAFT_CONFIRM_PROMPT = "如果方案符合预期，请回复“确认创建”；在此之前不会执行创建。"
@@ -448,7 +450,25 @@ def _restore_proposal_match(state: dict[str, Any], match: re.Match[str], stage: 
         state["awaiting_proposal_id"] = _proposal_identity(state["last_proposal"])
 
 
-def _rehydrate_persisted_proposal(state: dict[str, Any], history: list[dict[str, Any]]) -> None:
+def _owner_marker(owner_id: str) -> str:
+    if not owner_id:
+        return ""
+    digest = hashlib.sha256(owner_id.encode("utf-8")).hexdigest()[:16]
+    return f"<!-- creation-governor-owner:{digest} -->"
+
+
+def _owner_matches(text: str, owner_id: str) -> bool:
+    if not owner_id:
+        return True
+    match = _OWNER_MARKER_RE.search(text)
+    return bool(match and match.group(0) == _owner_marker(owner_id))
+
+
+def _rehydrate_persisted_proposal(
+    state: dict[str, Any],
+    history: list[dict[str, Any]],
+    owner_id: str = "",
+) -> None:
     if isinstance(state.get("last_proposal"), dict):
         return
     assistant_texts = [
@@ -460,14 +480,14 @@ def _rehydrate_persisted_proposal(state: dict[str, Any], history: list[dict[str,
         return
     latest = assistant_texts[-1]
     latest_match = _PERSISTED_PROPOSAL_RE.search(latest)
-    if latest_match:
+    if latest_match and _owner_matches(latest, owner_id):
         _restore_proposal_match(state, latest_match, "proposal_shown")
         return
     if _DRAFT_CONFIRM_PROMPT not in latest:
         return
     for prior in reversed(assistant_texts[:-1]):
         prior_match = _PERSISTED_PROPOSAL_RE.search(prior)
-        if prior_match:
+        if prior_match and _owner_matches(prior, owner_id):
             _restore_proposal_match(state, prior_match, "awaiting_confirmation")
             return
 
@@ -552,7 +572,7 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
             state["turn"]
         ):
             state["pending_proposal"] = None
-        _rehydrate_persisted_proposal(state, history)
+        _rehydrate_persisted_proposal(state, history, owner_id)
         proposal = state.get("last_proposal")
         stage = state.get("proposal_stage")
 
@@ -691,6 +711,10 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
             state.get("proposal_stage") == "draft_generating"
             and int(state.get("draft_only_turn") or -1) == int(state["turn"])
         ):
+            turn_exit_reason = str(kwargs.get("turn_exit_reason") or "")
+            if turn_exit_reason and not turn_exit_reason.startswith("text_response("):
+                _clear_draft_state(state, stage="proposal_shown")
+                return None
             if _DRAFT_CONFIRM_PROMPT in response_text:
                 return None
             return response_text.rstrip() + "\n\n" + _DRAFT_CONFIRM_PROMPT
@@ -715,11 +739,14 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
     if rejection:
         return None
     user_prompt = payload["user_prompt"]
+    invocation = _invocation_scope.get()
+    owner_marker = _owner_marker(invocation[3] if invocation is not None else "")
     if user_prompt in response_text or (
         proposal["suggested_name"] in response_text and "创建方案" in response_text
     ):
-        return None
-    return response_text.rstrip() + "\n\n" + user_prompt
+        return response_text.rstrip() + ("\n" + owner_marker if owner_marker else "")
+    suffix = user_prompt + ("\n" + owner_marker if owner_marker else "")
+    return response_text.rstrip() + "\n\n" + suffix
 
 
 def _on_post_llm_call(**kwargs: Any) -> None:
@@ -748,6 +775,10 @@ def _on_post_llm_call(**kwargs: Any) -> None:
             and not kwargs.get("failed")
             and not kwargs.get("interrupted")
             and kwargs.get("persistence_succeeded") is True
+            and (
+                not kwargs.get("turn_exit_reason")
+                or str(kwargs.get("turn_exit_reason")).startswith("text_response(")
+            )
             and _DRAFT_CONFIRM_PROMPT in assistant_response
         )
         if not delivered:
