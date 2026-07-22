@@ -57,7 +57,10 @@ def _patch_skill_layer(monkeypatch, *, known=("deep-research",), load_raises=Fal
     monkeypatch.setattr(skills_tool, "_is_skill_disabled", fake_is_disabled)
 
     def fake_scan():
+        import os as _os
+
         calls["scan_platform"] = get_session_env("HERMES_SESSION_PLATFORM")
+        calls["scan_env_platform"] = _os.environ.get("HERMES_PLATFORM")
         return {
             f"/{name}": {"name": name, "skill_dir": f"/fake/skills/{name}"}
             for name in known
@@ -243,6 +246,63 @@ def test_platform_disabled_skill_passes_through_even_with_foreign_env(monkeypatc
     assert _expand(adapter, original) == original
     assert calls["disabled_check"] == ("deep-research", "zet_agent")
     assert "user_instruction" not in calls, "disabled skill must never be built"
+
+
+def test_scan_runs_with_platform_env_pinned_and_restored(monkeypatch):
+    # skills 层的平台解析先读 HERMES_PLATFORM 进程 env 再读 contextvar——
+    # 外部注入的 env 会让 scan_skill_commands 按外平台的 platform_disabled
+    # 视图建表：zet_agent 允许、他平台禁用的 skill 会被当成未安装而静默
+    # 不生效。展开窗口内必须把 env 钉为 zet_agent，结束后精确还原。
+    monkeypatch.setenv("HERMES_PLATFORM", "telegram")
+    calls = _patch_skill_layer(monkeypatch)
+    adapter = _make_adapter()
+    out = _expand(adapter, "/deep-research 研究黄金")
+    assert out.startswith("<<EXPANDED:")
+    assert calls["scan_env_platform"] == "zet_agent"
+    import os
+
+    assert os.environ.get("HERMES_PLATFORM") == "telegram", "env must be restored"
+
+
+def test_cancelled_caller_does_not_leak_semaphore_permit(monkeypatch):
+    # 取消等待方（客户端断开）不会停掉 executor 里的 worker；许可必须绑定
+    # worker 实际完成才归还，否则连发-断开循环可绕过并发上限堆满共享
+    # executor（review P1）。
+    import threading
+
+    _patch_skill_layer(monkeypatch)
+    adapter = _make_adapter()
+    started = threading.Event()
+    release_worker = threading.Event()
+
+    def slow_blocking(msg, slug, session_id=None):
+        started.set()
+        release_worker.wait(5)
+        return "done"
+
+    monkeypatch.setattr(
+        adapter, "_expand_inbound_skill_invocation_blocking", slow_blocking
+    )
+
+    async def _run():
+        task = asyncio.create_task(
+            adapter._expand_inbound_skill_invocation("x", "deep-research")
+        )
+        await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        sema = adapter._skill_invoke_semaphore
+        cap = adapter._SKILL_INVOKE_MAX_CONCURRENCY
+        assert sema._value == cap - 1, "permit must stay held while the worker runs"
+        release_worker.set()
+        for _ in range(200):
+            if sema._value == cap:
+                break
+            await asyncio.sleep(0.01)
+        assert sema._value == cap, "permit must return when the worker finishes"
+
+    asyncio.run(_run())
 
 
 def test_base_api_server_hook_is_noop():

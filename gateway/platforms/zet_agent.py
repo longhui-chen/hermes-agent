@@ -82,6 +82,7 @@ import re
 import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -377,6 +378,41 @@ class ZetAgentAdapter(APIServerAdapter):
     _SKILL_INVOKE_ACQUIRE_TIMEOUT = 2.0
     _skill_invoke_semaphore = None
 
+    # Refcounted process-env pin used during expansion. The skills layer's
+    # platform resolution reads os.environ["HERMES_PLATFORM"] BEFORE the
+    # session contextvar (skill_commands._resolve_skill_commands_platform),
+    # so an externally provisioned value (hand-edited .env loaded with
+    # override=True at boot) would make scan_skill_commands() build the
+    # command table under a FOREIGN platform's skills.platform_disabled view
+    # — a skill allowed on zet_agent but disabled elsewhere would look
+    # uninstalled and the App invocation would silently no-op. Pinning the
+    # env for the expansion window is sound because the LS-spawned zet_agent
+    # process is single-platform by construction (API_SERVER_ENABLED=false,
+    # zet_agent only); concurrent readers seeing "zet_agent" is correct here.
+    _platform_env_lock = threading.Lock()
+    _platform_env_depth = 0
+    _platform_env_prior: Optional[str] = None
+
+    @classmethod
+    @contextmanager
+    def _force_zet_agent_platform_env(cls):
+        with cls._platform_env_lock:
+            cls._platform_env_depth += 1
+            if cls._platform_env_depth == 1:
+                cls._platform_env_prior = os.environ.get("HERMES_PLATFORM")
+                os.environ["HERMES_PLATFORM"] = "zet_agent"
+        try:
+            yield
+        finally:
+            with cls._platform_env_lock:
+                cls._platform_env_depth -= 1
+                if cls._platform_env_depth == 0:
+                    if cls._platform_env_prior is None:
+                        os.environ.pop("HERMES_PLATFORM", None)
+                    else:
+                        os.environ["HERMES_PLATFORM"] = cls._platform_env_prior
+                    cls._platform_env_prior = None
+
     async def _expand_inbound_skill_invocation(
         self, user_message: Any, skill_slug: str, session_id: Optional[str] = None
     ) -> Any:
@@ -409,13 +445,36 @@ class ZetAgentAdapter(APIServerAdapter):
                 "[zet_agent] skill expansion saturated; passing message through",
             )
             return user_message
-        try:
-            return await asyncio.to_thread(
-                self._expand_inbound_skill_invocation_blocking,
-                user_message, skill_slug, session_id,
-            )
-        finally:
-            sema.release()
+        # The permit is returned when the WORKER finishes, not when this await
+        # ends: cancelling the awaiting request (client disconnect) does not
+        # stop the executor thread, and a try/finally (or a done-callback on
+        # the asyncio wrapper future — task cancellation marks it cancelled
+        # immediately while the thread keeps running) would let a
+        # connect-and-drop loop bypass the concurrency cap and pile workers
+        # onto the shared default executor. The worker itself schedules the
+        # release from its finally via call_soon_threadsafe — the only point
+        # that provably runs exactly once, when the thread is truly done.
+        # run_in_executor + copied context (to_thread equivalent) keeps the
+        # platform binding task-local.
+        import contextvars
+
+        loop = asyncio.get_running_loop()
+        ctx = contextvars.copy_context()
+
+        def _worker():
+            try:
+                return ctx.run(
+                    self._expand_inbound_skill_invocation_blocking,
+                    user_message, skill_slug, session_id,
+                )
+            finally:
+                try:
+                    loop.call_soon_threadsafe(sema.release)
+                except RuntimeError:
+                    # Loop already closed (shutdown) — the permit is moot.
+                    pass
+
+        return await loop.run_in_executor(None, _worker)
 
     def _expand_inbound_skill_invocation_blocking(
         self, user_message: str, skill_slug: str, session_id: Optional[str] = None
@@ -469,82 +528,96 @@ class ZetAgentAdapter(APIServerAdapter):
         token = "/" + skill_slug
         platform_token = push_session_platform("zet_agent")
         try:
-            try:
-                from agent.skill_commands import (
-                    build_skill_invocation_message,
-                    scan_skill_commands,
+            with self._force_zet_agent_platform_env():
+                return self._expand_with_platform_pinned(
+                    user_message, skill_slug, token, session_id
                 )
-                commands = scan_skill_commands()
-            except Exception:
-                logger.warning(
-                    "[zet_agent] skill scan failed; passing message through",
-                    exc_info=True,
-                )
-                return user_message
-            info = commands.get(token)
-            if not info:
-                logger.warning(
-                    "[zet_agent] requested skill %s not installed (App inventory "
-                    "drift?); passing message through", skill_slug,
-                )
-                return user_message
-            try:
-                from tools.skills_tool import _is_skill_disabled
-
-                if _is_skill_disabled(
-                    info.get("name") or skill_slug, platform="zet_agent"
-                ):
-                    logger.info(
-                        "[zet_agent] skill %s is disabled for zet_agent; "
-                        "passing message through", skill_slug,
-                    )
-                    return user_message
-            except Exception:
-                # _is_skill_disabled fail-opens internally; only an import
-                # failure lands here — degrade to the scan-level filter.
-                logger.warning(
-                    "[zet_agent] skill %s disabled-check failed; "
-                    "continuing with scan-level filter only", skill_slug,
-                    exc_info=True,
-                )
-
-            # Task text = the message minus the quick-pick's visible token(s).
-            # The token may sit anywhere (the pick appends at the cursor) and
-            # may repeat (re-selects); strip standalone occurrences only, so
-            # a genuine mention like "path/to/x" is never touched.
-            task_text = re.sub(
-                r"(?<!\S)" + re.escape(token) + r"(?!\S)", "", user_message
-            )
-            task_text = "\n".join(
-                line for line in (l.rstrip() for l in task_text.splitlines()) if line
-            ).strip()
-
-            try:
-                # task_id = the resolved chat session, so ${HERMES_SESSION_ID}
-                # templates and session-scoped skill state resolve against the
-                # REAL session — CLI/gateway slash parity (review P1).
-                part = build_skill_invocation_message(
-                    token, user_instruction=task_text, task_id=session_id or None,
-                )
-            except Exception:
-                logger.warning(
-                    "[zet_agent] skill %s build failed; passing message through",
-                    skill_slug, exc_info=True,
-                )
-                return user_message
-            if not part:
-                logger.warning(
-                    "[zet_agent] skill %s resolved by scan but failed to "
-                    "load; passing message through", skill_slug,
-                )
-                return user_message
-            logger.info(
-                "[zet_agent] expanded skill invocation %s (task_chars=%d)",
-                skill_slug, len(task_text),
-            )
-            return part
         finally:
             pop_session_platform(platform_token)
+
+    def _expand_with_platform_pinned(
+        self,
+        user_message: str,
+        skill_slug: str,
+        token: str,
+        session_id: Optional[str],
+    ) -> Any:
+        """Body of the expansion; runs with HERMES_PLATFORM pinned and the
+        session platform contextvar bound to zet_agent (see caller)."""
+        try:
+            from agent.skill_commands import (
+                build_skill_invocation_message,
+                scan_skill_commands,
+            )
+            commands = scan_skill_commands()
+        except Exception:
+            logger.warning(
+                "[zet_agent] skill scan failed; passing message through",
+                exc_info=True,
+            )
+            return user_message
+        info = commands.get(token)
+        if not info:
+            logger.warning(
+                "[zet_agent] requested skill %s not installed (App inventory "
+                "drift?); passing message through", skill_slug,
+            )
+            return user_message
+        try:
+            from tools.skills_tool import _is_skill_disabled
+
+            if _is_skill_disabled(
+                info.get("name") or skill_slug, platform="zet_agent"
+            ):
+                logger.info(
+                    "[zet_agent] skill %s is disabled for zet_agent; "
+                    "passing message through", skill_slug,
+                )
+                return user_message
+        except Exception:
+            # _is_skill_disabled fail-opens internally; only an import
+            # failure lands here — degrade to the scan-level filter.
+            logger.warning(
+                "[zet_agent] skill %s disabled-check failed; "
+                "continuing with scan-level filter only", skill_slug,
+                exc_info=True,
+            )
+
+        # Task text = the message minus the quick-pick's visible token(s).
+        # The token may sit anywhere (the pick appends at the cursor) and
+        # may repeat (re-selects); strip standalone occurrences only, so
+        # a genuine mention like "path/to/x" is never touched.
+        task_text = re.sub(
+            r"(?<!\S)" + re.escape(token) + r"(?!\S)", "", user_message
+        )
+        task_text = "\n".join(
+            line for line in (l.rstrip() for l in task_text.splitlines()) if line
+        ).strip()
+
+        try:
+            # task_id = the resolved chat session, so ${HERMES_SESSION_ID}
+            # templates and session-scoped skill state resolve against the
+            # REAL session — CLI/gateway slash parity (review P1).
+            part = build_skill_invocation_message(
+                token, user_instruction=task_text, task_id=session_id or None,
+            )
+        except Exception:
+            logger.warning(
+                "[zet_agent] skill %s build failed; passing message through",
+                skill_slug, exc_info=True,
+            )
+            return user_message
+        if not part:
+            logger.warning(
+                "[zet_agent] skill %s resolved by scan but failed to "
+                "load; passing message through", skill_slug,
+            )
+            return user_message
+        logger.info(
+            "[zet_agent] expanded skill invocation %s (task_chars=%d)",
+            skill_slug, len(task_text),
+        )
+        return part
 
     async def _emit_native_session_title(
         self,
