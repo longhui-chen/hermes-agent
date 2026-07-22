@@ -26,6 +26,7 @@ import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.prompt_builder import STEER_USER_PREFIX
+from agent.response_format import response_format_requires_structured_output
 
 
 def finalize_turn(
@@ -346,6 +347,11 @@ def finalize_turn(
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
             _pre_transform_response = final_response
+            _structured_output = response_format_requires_structured_output(
+                (getattr(agent, "request_overrides", None) or {}).get(
+                    "response_format"
+                )
+            )
             _transform_results = _invoke_hook(
                 "transform_llm_output",
                 response_text=final_response,
@@ -359,6 +365,7 @@ def finalize_turn(
                 turn_exit_reason=_turn_exit_reason,
                 execution_origin=getattr(agent, "_memory_write_origin", "") or "",
                 is_kanban_worker=bool(os.environ.get("HERMES_KANBAN_TASK")),
+                structured_output=_structured_output,
             )
             for _hook_result in _transform_results:
                 if isinstance(_hook_result, str) and _hook_result:
@@ -375,6 +382,9 @@ def finalize_turn(
                 if (
                     final_response.startswith(_pre_transform_response)
                     and len(final_response) > len(_pre_transform_response)
+                    and getattr(
+                        agent, "_interim_content_was_streamed", lambda _text: False
+                    )(_pre_transform_response)
                     and getattr(agent, "_has_stream_consumers", lambda: False)()
                 ):
                     try:

@@ -17,6 +17,7 @@ from collections import OrderedDict
 from contextvars import ContextVar
 from typing import Any
 
+from gateway.response_filters import is_intentional_silence_response
 from hermes_constants import get_hermes_home
 
 
@@ -34,7 +35,7 @@ CREATION_TYPES = {"agent", "skill", "scheduled_task"}
 _recent_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
 _session_states: OrderedDict[str, dict[str, Any]] = OrderedDict()
 _recent_lock = threading.Lock()
-_invocation_scope: ContextVar[tuple[str, str, bool] | None] = ContextVar(
+_invocation_scope: ContextVar[tuple[str, str, str | None] | None] = ContextVar(
     "creation_governor_invocation_scope",
     default=None,
 )
@@ -450,8 +451,13 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
     raw_session_id = _raw_session_key(kwargs)
     session_id = _session_key(kwargs)
     noninteractive = _is_noninteractive(kwargs)
-    _invocation_scope.set((raw_session_id, session_id, noninteractive))
+    suppression_reason = None
     if noninteractive:
+        suppression_reason = "noninteractive_session"
+    elif kwargs.get("structured_output"):
+        suppression_reason = "structured_output"
+    _invocation_scope.set((raw_session_id, session_id, suppression_reason))
+    if suppression_reason:
         if session_id:
             with _recent_lock:
                 state = _state_locked(session_id, time.monotonic())
@@ -537,7 +543,13 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
     """Append a missed scheduled proposal and start the ten-turn prompt cooldown."""
     session_id = _session_key(kwargs)
     response_text = str(kwargs.get("response_text") or "")
-    if not session_id or not response_text or _is_noninteractive(kwargs):
+    if (
+        not session_id
+        or not response_text
+        or _is_noninteractive(kwargs)
+        or kwargs.get("structured_output")
+        or is_intentional_silence_response(response_text)
+    ):
         return None
     if kwargs.get("failed") or kwargs.get("interrupted") or kwargs.get("completed") is False:
         with _recent_lock:
@@ -612,7 +624,7 @@ def _propose_creation(args: dict[str, Any], **kwargs: Any) -> str:
         state = _state_locked(session_id, now)
         invocation = _invocation_scope.get()
         if invocation is not None and invocation[0] == _raw_session_key(kwargs) and invocation[2]:
-            return json.dumps({"status": "not_proposed", "reason": "noninteractive_session"})
+            return json.dumps({"status": "not_proposed", "reason": invocation[2]})
         if int(state.get("native_bypass_turn") or -1) == int(state["turn"]):
             return json.dumps({"status": "not_proposed", "reason": "native_creation_path"})
     rejection = _commit_proposal(session_id, proposal, dedup_key, now)

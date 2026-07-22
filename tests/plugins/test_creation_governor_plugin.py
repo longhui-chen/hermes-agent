@@ -436,6 +436,58 @@ def test_failed_or_partial_turn_never_appends_a_proposal(monkeypatch):
     ) is None
 
 
+def test_structured_output_never_evaluates_or_appends_natural_language(monkeypatch):
+    plugin = _load_plugin()
+    calls = []
+    monkeypatch.setattr(
+        plugin,
+        "_judge_creation_opportunity",
+        lambda *args: calls.append(args),
+    )
+
+    assert plugin._on_pre_llm_call(
+        session_id="structured-session",
+        sender_id="owner-a",
+        user_message="帮我分析这份合同",
+        conversation_history=[],
+        structured_output=True,
+    ) is None
+    assert plugin._transform_llm_output(
+        session_id="structured-session",
+        sender_id="owner-a",
+        response_text='{"result":"ok"}',
+        structured_output=True,
+    ) is None
+    assert calls == []
+
+
+def test_intentional_silence_response_is_never_transformed(monkeypatch):
+    plugin = _load_plugin()
+    monkeypatch.setattr(
+        plugin,
+        "_judge_creation_opportunity",
+        lambda message, history: {
+            "creation_type": "agent",
+            "suggested_name": "合同审查助手",
+            "reason": "可复用",
+            "evidence": message,
+            "confidence": 0.9,
+            "dedup_key": "agent:合同审查助手",
+        },
+    )
+    plugin._on_pre_llm_call(
+        session_id="silent-session",
+        user_message="帮我分析这份合同",
+        conversation_history=[],
+    )
+
+    for marker in ("NO_REPLY", "[SILENT]"):
+        assert plugin._transform_llm_output(
+            session_id="silent-session",
+            response_text=marker,
+        ) is None
+
+
 def test_acceptance_generates_a_draft_then_requires_explicit_creation_confirmation(monkeypatch):
     plugin = _load_plugin()
     monkeypatch.setattr(

@@ -35,6 +35,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
 )
+from agent.response_format import response_format_requires_structured_output
 
 logger = logging.getLogger(__name__)
 
@@ -445,6 +446,9 @@ def build_turn_context(
     plugin_user_context = ""
     try:
         from hermes_cli.plugins import invoke_hook as _invoke_hook
+        _structured_output = response_format_requires_structured_output(
+            (getattr(agent, "request_overrides", None) or {}).get("response_format")
+        )
         _pre_results = _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
@@ -458,6 +462,7 @@ def build_turn_context(
             sender_id=getattr(agent, "_user_id", None) or "",
             execution_origin=getattr(agent, "_memory_write_origin", "") or "",
             is_kanban_worker=bool(os.environ.get("HERMES_KANBAN_TASK")),
+            structured_output=_structured_output,
         )
         _ctx_parts: list[str] = []
         for r in _pre_results:

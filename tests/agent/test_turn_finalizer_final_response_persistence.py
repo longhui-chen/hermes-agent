@@ -35,6 +35,7 @@ class FakeAgent:
         self.persisted_messages = None
         self.streamed_deltas = []
         self.stream_delivery = True
+        self.original_response_streamed = True
 
     def _handle_max_iterations(self, messages, api_call_count):
         raise AssertionError("not expected")
@@ -63,6 +64,9 @@ class FakeAgent:
     def _fire_stream_delta(self, text):
         self.streamed_deltas.append(text)
         return self.stream_delivery
+
+    def _interim_content_was_streamed(self, _text):
+        return self.original_response_streamed
 
     def _file_mutation_verifier_enabled(self):
         return False
@@ -254,6 +258,43 @@ def test_transform_stream_flag_requires_confirmed_callback_delivery(monkeypatch)
     assert result["response_transform_streamed"] is False
 
 
+def test_transform_suffix_requires_original_response_to_have_streamed(monkeypatch):
+    proposal = "\n\n要不要为你生成创建方案？"
+
+    def invoke_hook(name, **kwargs):
+        if name == "transform_llm_output":
+            return [kwargs["response_text"] + proposal]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+    agent.original_response_streamed = False
+    messages = [
+        {"role": "user", "content": "分析一下"},
+        {"role": "assistant", "content": "分析完成。"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="分析完成。",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="分析一下",
+        original_user_message="分析一下",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"] == "分析完成。" + proposal
+    assert result["response_transform_streamed"] is False
+    assert agent.streamed_deltas == []
+
+
 def test_output_transform_receives_turn_outcome(monkeypatch):
     transform_kwargs = {}
 
@@ -265,6 +306,7 @@ def test_output_transform_receives_turn_outcome(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
     agent = FakeAgent()
     agent._user_id = "owner-a"
+    agent.request_overrides = {"response_format": {"type": "json_object"}}
     messages = [
         {"role": "user", "content": "分析一下"},
         {"role": "assistant", "content": "任务失败。"},
@@ -291,5 +333,6 @@ def test_output_transform_receives_turn_outcome(monkeypatch):
     assert transform_kwargs["interrupted"] is False
     assert transform_kwargs["turn_exit_reason"] == "error_near_max_iterations(provider error)"
     assert transform_kwargs["sender_id"] == "owner-a"
+    assert transform_kwargs["structured_output"] is True
     assert result["final_response"] == "任务失败。"
     assert agent.streamed_deltas == []
