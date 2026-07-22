@@ -1688,7 +1688,7 @@ class AIAgent:
         self._persist_user_message_idx = None
         self._current_streamed_assistant_text = ""
 
-    def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
+    def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None) -> bool:
         """Save session state to both JSON log and SQLite on any exit path.
 
         Ensures conversations are never lost, even on errors or early returns.
@@ -1706,7 +1706,7 @@ class AIAgent:
         self._drop_length_continuation_scaffolding(messages)
         self._session_messages = messages
         self._save_session_log(messages)
-        self._flush_messages_to_session_db(messages, conversation_history)
+        return self._flush_messages_to_session_db(messages, conversation_history)
 
     def _drop_length_continuation_scaffolding(self, messages: List[Dict]) -> None:
         """Remove internal length-continuation prompts from durable transcripts."""
@@ -1789,7 +1789,11 @@ class AIAgent:
         from agent.agent_runtime_helpers import repair_message_sequence
         return repair_message_sequence(self, messages)
 
-    def _flush_messages_to_session_db(self, messages: List[Dict], conversation_history: List[Dict] = None):
+    def _flush_messages_to_session_db(
+        self,
+        messages: List[Dict],
+        conversation_history: List[Dict] = None,
+    ) -> bool:
         """Persist any un-flushed messages to the SQLite session store.
 
         Deduplicates via an intrinsic ``_DB_PERSISTED_MARKER`` stamped on each
@@ -1814,9 +1818,9 @@ class AIAgent:
         # where the next live turn re-reads it as an instruction and the agent
         # "becomes" the curator. Hard-stop before any DB touch.
         if getattr(self, "_persist_disabled", False):
-            return
+            return True
         if not self._session_db:
-            return
+            return True
         # Persist user-message override (#48677 chokepoint): historically this
         # mutated the live `messages` list in place, which — on the early
         # crash-resilience persist that runs BEFORE the API call is built —
@@ -1941,6 +1945,8 @@ class AIAgent:
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
                     timestamp=_row_timestamp,
                 )
+                if not isinstance(_db_message_id, int) or _db_message_id <= 0:
+                    raise RuntimeError("Session DB append_message returned no row id")
                 msg["_db_message_id"] = _db_message_id
                 msg[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
@@ -1948,8 +1954,10 @@ class AIAgent:
             # allocated next turn at a recycled address.
             self._flushed_db_message_ids = set()
             self._last_flushed_db_idx = len(messages)
+            return True
         except Exception as e:
             logger.warning("Session DB append_message failed: %s", e)
+            return False
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:
         """
@@ -4731,7 +4739,12 @@ class AIAgent:
             and not bool(getattr(self, "_zet_agent_plan_presented", False))
         )
 
-    def _fire_stream_delta(self, text: str) -> bool:
+    def _fire_stream_delta(
+        self,
+        text: str,
+        *,
+        require_confirmation: bool = False,
+    ) -> bool:
         """Fire stream callbacks and report whether any consumer received text."""
         if self._should_suppress_plan_stream_text():
             return False
@@ -4775,7 +4788,15 @@ class AIAgent:
                 text = text.lstrip("\n")
         if not text:
             return False
-        callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
+        confirmation_cb = getattr(self, "stream_delta_confirmation_callback", None)
+        if require_confirmation and confirmation_cb is not None:
+            callbacks = [confirmation_cb]
+        else:
+            callbacks = [
+                cb
+                for cb in (self.stream_delta_callback, self._stream_callback)
+                if cb is not None
+            ]
         delivered = False
         for cb in callbacks:
             try:

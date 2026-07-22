@@ -34,6 +34,7 @@ class FakeAgent:
         self.valid_tool_names = []
         self.persisted_messages = None
         self.streamed_deltas = []
+        self.confirmed_streamed_deltas = []
         self.stream_delivery = True
         self.original_response_streamed = True
 
@@ -57,12 +58,18 @@ class FakeAgent:
 
     def _persist_session(self, messages, conversation_history):
         self.persisted_messages = list(messages)
+        return True
 
     def _has_stream_consumers(self):
         return True
 
-    def _fire_stream_delta(self, text):
-        self.streamed_deltas.append(text)
+    def _fire_stream_delta(self, text, *, require_confirmation=False):
+        target = (
+            self.confirmed_streamed_deltas
+            if require_confirmation
+            else self.streamed_deltas
+        )
+        target.append(text)
         return self.stream_delivery
 
     def _interim_content_was_streamed(self, _text):
@@ -102,11 +109,18 @@ class DurableFakeAgent(FakeAgent):
             )
             message["_db_message_id"] = row_id
             message["_db_persisted"] = True
+        return True
 
 
 class FailingPersistenceAgent(FakeAgent):
     def _persist_session(self, messages, conversation_history):
         raise OSError("disk unavailable")
+
+
+class FalsePersistenceAgent(FakeAgent):
+    def _persist_session(self, messages, conversation_history):
+        self.persisted_messages = list(messages)
+        return False
 
 
 def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
@@ -188,7 +202,8 @@ def test_transformed_response_is_streamed_once_and_persisted(monkeypatch):
     assert result["final_response"] == expected
     assert result["messages"][-1]["content"] == expected
     assert agent.persisted_messages[-1]["content"] == expected
-    assert agent.streamed_deltas == [proposal]
+    assert agent.streamed_deltas == []
+    assert agent.confirmed_streamed_deltas == [proposal]
     assert result["response_transformed"] is True
     assert result["response_transform_streamed"] is True
 
@@ -362,6 +377,44 @@ def test_post_hook_receives_false_when_transformed_response_is_not_durable(monke
 
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
     agent = FailingPersistenceAgent()
+    messages = [
+        {"role": "user", "content": "生成方案"},
+        {"role": "assistant", "content": "这是草案。"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="这是草案。",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="生成方案",
+        original_user_message="生成方案",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"].endswith("确认创建")
+    assert post_kwargs["persistence_succeeded"] is False
+    assert any("persist_transformed_session" in item for item in result["cleanup_errors"])
+
+
+def test_post_hook_receives_false_when_persistence_reports_append_failure(monkeypatch):
+    post_kwargs = {}
+
+    def invoke_hook(name, **kwargs):
+        if name == "transform_llm_output":
+            return [kwargs["response_text"] + "\n\n确认创建"]
+        if name == "post_llm_call":
+            post_kwargs.update(kwargs)
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FalsePersistenceAgent()
     messages = [
         {"role": "user", "content": "生成方案"},
         {"role": "assistant", "content": "这是草案。"},

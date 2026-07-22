@@ -1330,11 +1330,14 @@ class TestPrompt:
 
         def mock_run(*args, **kwargs):
             state.agent.stream_delta_callback("original answer")
-            state.agent.stream_delta_callback("\n\n[plugin appended this]")
+            delivered = state.agent.stream_delta_confirmation_callback(
+                "\n\n[plugin appended this]"
+            )
+            assert delivered is True
             return {
                 "final_response": "original answer\n\n[plugin appended this]",
                 "response_transformed": True,
-                "response_transform_streamed": True,
+                "response_transform_streamed": delivered,
                 "messages": [],
             }
 
@@ -1354,6 +1357,47 @@ class TestPrompt:
         assert [chunk.content.text for chunk in agent_chunks] == [
             "original answer",
             "\n\n[plugin appended this]",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_prompt_falls_back_after_confirmed_transform_delivery_fails(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        def mock_run(*args, **kwargs):
+            state.agent.stream_delta_callback("original answer")
+            delivered = state.agent.stream_delta_confirmation_callback(
+                "\n\n[plugin appended this]"
+            )
+            assert delivered is False
+            return {
+                "final_response": "original answer\n\n[plugin appended this]",
+                "response_transformed": True,
+                "response_transform_streamed": delivered,
+                "messages": [],
+            }
+
+        state.agent.run_conversation = mock_run
+        delivered_texts = []
+
+        async def session_update(*args, **kwargs):
+            update = kwargs.get("update") or args[1]
+            text = getattr(getattr(update, "content", None), "text", None)
+            if text == "\n\n[plugin appended this]":
+                raise RuntimeError("editor backpressure")
+            if text:
+                delivered_texts.append(text)
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock(side_effect=session_update)
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="hello")]
+        await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        assert delivered_texts == [
+            "original answer",
+            "original answer\n\n[plugin appended this]",
         ]
 
 

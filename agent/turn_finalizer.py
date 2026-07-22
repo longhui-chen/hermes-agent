@@ -207,8 +207,11 @@ def finalize_turn(
             if _tail_role != "assistant":
                 messages.append({"role": "assistant", "content": final_response})
 
-        agent._persist_session(messages, conversation_history)
-        _session_persistence_succeeded = True
+        _session_persistence_succeeded = (
+            agent._persist_session(messages, conversation_history) is not False
+        )
+        if not _session_persistence_succeeded:
+            raise RuntimeError("session database persistence was not confirmed")
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
@@ -394,7 +397,8 @@ def finalize_turn(
                     try:
                         _response_transform_streamed = bool(
                             agent._fire_stream_delta(
-                                final_response[len(_pre_transform_response):]
+                                final_response[len(_pre_transform_response):],
+                                require_confirmation=True,
                             )
                         )
                     except Exception as _stream_err:
@@ -432,7 +436,11 @@ def finalize_turn(
                         else:
                             _session_persistence_succeeded = False
                     try:
-                        agent._persist_session(messages, conversation_history)
+                        if agent._persist_session(messages, conversation_history) is False:
+                            raise RuntimeError(
+                                "session database persistence was not confirmed"
+                            )
+                        _session_persistence_succeeded = True
                     except Exception as _persist_err:
                         _session_persistence_succeeded = False
                         _cleanup_errors.append(f"persist_transformed_session: {_persist_err}")

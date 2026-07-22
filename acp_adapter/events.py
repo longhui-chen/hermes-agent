@@ -10,6 +10,7 @@ thread while the event loop lives on the main thread).
 import asyncio
 import json
 import logging
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from collections import deque
 from typing import Any, Callable, Deque, Dict
 
@@ -23,6 +24,8 @@ from .tools import (
 )
 
 logger = logging.getLogger(__name__)
+
+CONFIRMED_UPDATE_TIMEOUT_SECONDS = 5.0
 
 
 def _json_loads_maybe_prefix(value: str) -> Any:
@@ -84,26 +87,62 @@ def _build_plan_update_from_todo_result(result: Any) -> AgentPlanUpdate | None:
     return AgentPlanUpdate(session_update="plan", entries=entries)
 
 
+async def _confirmed_session_update(
+    conn: acp.Client,
+    session_id: str,
+    update: Any,
+    *,
+    timeout: float = CONFIRMED_UPDATE_TIMEOUT_SECONDS,
+) -> bool:
+    """Wait for one final update, cancelling it before reporting failure."""
+    try:
+        await asyncio.wait_for(conn.session_update(session_id, update), timeout=timeout)
+        return True
+    except TimeoutError:
+        # asyncio.wait_for does not return until cancellation has propagated to
+        # the update coroutine, so a False result is safe for final fallback.
+        logger.debug("Timed out sending confirmed ACP update", exc_info=True)
+        return False
+    except Exception:
+        logger.debug("Failed to send confirmed ACP update", exc_info=True)
+        return False
+
+
 def _send_update(
     conn: acp.Client,
     session_id: str,
     loop: asyncio.AbstractEventLoop,
     update: Any,
+    *,
+    confirm_delivery: bool = False,
 ) -> bool:
-    """Send an ACP update from a worker thread and report confirmed completion."""
+    """Schedule an ACP update, optionally waiting for confirmed final delivery."""
     from agent.async_utils import safe_schedule_threadsafe
 
+    update_coro = (
+        _confirmed_session_update(conn, session_id, update)
+        if confirm_delivery
+        else conn.session_update(session_id, update)
+    )
     future = safe_schedule_threadsafe(
-        conn.session_update(session_id, update),
+        update_coro,
         loop,
         logger=logger,
         log_message="Failed to send ACP update",
     )
     if future is None:
         return False
-    try:
-        future.result(timeout=5)
+    if not confirm_delivery:
         return True
+    try:
+        return bool(future.result(timeout=CONFIRMED_UPDATE_TIMEOUT_SECONDS + 1.0))
+    except FutureTimeoutError:
+        # This outer guard covers a stalled event loop. The normal backpressure
+        # timeout is handled inside _confirmed_session_update, which waits for
+        # cancellation before returning False.
+        future.cancel()
+        logger.debug("ACP event loop stalled during confirmed update", exc_info=True)
+        return False
     except Exception:
         logger.debug("Failed to send ACP update", exc_info=True)
         return False
@@ -269,6 +308,8 @@ def make_message_cb(
     conn: acp.Client,
     session_id: str,
     loop: asyncio.AbstractEventLoop,
+    *,
+    confirm_delivery: bool = False,
 ) -> Callable:
     """Create a callback that streams agent response text to the editor."""
 
@@ -276,6 +317,12 @@ def make_message_cb(
         if not text:
             return False
         update = acp.update_agent_message_text(text)
-        return _send_update(conn, session_id, loop, update)
+        return _send_update(
+            conn,
+            session_id,
+            loop,
+            update,
+            confirm_delivery=confirm_delivery,
+        )
 
     return _message

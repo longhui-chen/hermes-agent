@@ -29,6 +29,7 @@ def test_tool_name_persisted_to_session_db():
     """tool_name set by make_tool_result_message must be passed through to
     append_message so the column is populated on first flush to the session DB."""
     session_db = MagicMock()
+    session_db.append_message.return_value = 1
     agent = _make_agent(session_db)
 
     messages = [
@@ -43,3 +44,13 @@ def test_tool_name_persisted_to_session_db():
     ]
     assert len(tool_appends) == 1
     assert tool_appends[0].kwargs["tool_name"] == "terminal"
+
+
+def test_flush_reports_append_failure_without_marking_message_persisted():
+    session_db = MagicMock()
+    session_db.append_message.side_effect = OSError("database is locked")
+    agent = _make_agent(session_db)
+    message = {"role": "assistant", "content": "draft"}
+
+    assert agent._flush_messages_to_session_db([message]) is False
+    assert message.get("_db_persisted") is not True

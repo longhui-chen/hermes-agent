@@ -13,6 +13,7 @@ from acp.schema import AgentPlanUpdate
 
 from acp_adapter.events import (
     _build_plan_update_from_todo_result,
+    _confirmed_session_update,
     _send_update,
     make_message_cb,
     make_step_cb,
@@ -366,6 +367,20 @@ class TestMessageCallback:
             assert cb("Here is your answer.") is True
 
         mock_rcts.assert_called_once()
+        future.result.assert_not_called()
+
+    def test_confirmed_message_waits_for_delivery(self, mock_conn, event_loop_fixture):
+        cb = make_message_cb(
+            mock_conn,
+            "session-1",
+            event_loop_fixture,
+            confirm_delivery=True,
+        )
+
+        with patch("acp_adapter.events._send_update", return_value=True) as send_update:
+            assert cb("final suffix") is True
+
+        assert send_update.call_args.kwargs["confirm_delivery"] is True
 
     def test_ignores_empty_message(self, mock_conn, event_loop_fixture):
         """Empty text should not emit any update."""
@@ -390,6 +405,30 @@ class TestMessageCallback:
 # ---------------------------------------------------------------------------
 
 class TestSendUpdate:
+    @pytest.mark.asyncio
+    async def test_confirmed_update_cancels_slow_delivery_before_fallback(self):
+        cancelled = asyncio.Event()
+
+        async def _slow_update(_session_id, _update):
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        conn = MagicMock()
+        conn.session_update = _slow_update
+
+        delivered = await _confirmed_session_update(
+            conn,
+            "session-1",
+            {"type": "final-suffix"},
+            timeout=0.01,
+        )
+
+        assert delivered is False
+        assert cancelled.is_set()
+
     def test_scheduler_failure_closes_update_coroutine(self, event_loop_fixture):
         """If run_coroutine_threadsafe raises, _send_update must close the coro."""
         created = {"coro": None}

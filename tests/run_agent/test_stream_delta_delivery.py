@@ -14,6 +14,7 @@ def _agent(callback):
         _stream_context_scrubber=None,
         _current_streamed_assistant_text="",
         stream_delta_callback=callback,
+        stream_delta_confirmation_callback=None,
         _stream_callback=None,
         _strip_think_blocks=lambda text: text,
         _record_streamed_assistant_text=recorded.append,
@@ -62,3 +63,19 @@ def test_stream_delta_honors_explicit_delivery_rejection():
     assert AIAgent._fire_stream_delta(agent, "queued but not delivered") is False
     assert delivered == ["queued but not delivered"]
     assert recorded == []
+
+
+def test_confirmed_stream_delta_uses_dedicated_consumer():
+    ordinary = []
+    confirmed = []
+    agent, recorded = _agent(ordinary.append)
+    agent.stream_delta_confirmation_callback = confirmed.append
+
+    assert AIAgent._fire_stream_delta(
+        agent,
+        "final suffix",
+        require_confirmation=True,
+    ) is True
+    assert ordinary == []
+    assert confirmed == ["final suffix"]
+    assert recorded == ["final suffix"]

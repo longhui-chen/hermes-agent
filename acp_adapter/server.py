@@ -1411,10 +1411,23 @@ class HermesACPAgent(acp.Agent):
             reasoning_cb = make_thinking_cb(conn, session_id, loop)
             step_cb = make_step_cb(conn, session_id, loop, tool_call_ids, tool_call_meta)
             message_cb = make_message_cb(conn, session_id, loop)
+            confirmed_message_cb = make_message_cb(
+                conn,
+                session_id,
+                loop,
+                confirm_delivery=True,
+            )
 
             def stream_delta_cb(text: str) -> bool:
                 nonlocal streamed_message
                 delivered = bool(message_cb(text))
+                if delivered:
+                    streamed_message = True
+                return delivered
+
+            def confirmed_stream_delta_cb(text: str) -> bool:
+                nonlocal streamed_message
+                delivered = bool(confirmed_message_cb(text))
                 if delivered:
                     streamed_message = True
                 return delivered
@@ -1436,6 +1449,7 @@ class HermesACPAgent(acp.Agent):
             reasoning_cb = None
             step_cb = None
             stream_delta_cb = None
+            confirmed_stream_delta_cb = None
             approval_cb = None
 
         agent = state.agent
@@ -1447,6 +1461,7 @@ class HermesACPAgent(acp.Agent):
         agent.reasoning_callback = reasoning_cb
         agent.step_callback = step_cb
         agent.stream_delta_callback = stream_delta_cb
+        agent.stream_delta_confirmation_callback = confirmed_stream_delta_cb
 
         # Approval callback is per-thread (thread-local, GHSA-qg5c-hvr5-hjgr).
         # Set it INSIDE _run_agent so the TLS write happens in the executor
