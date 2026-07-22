@@ -107,11 +107,11 @@ CASES = {
         _lanes(python=True, ci_review=True),
     ),
     "workflow yml → ci_review (also fail-open all)": (
-        [".github/workflows/typecheck.yml"],
+        [".github/workflows/seed-policy-check.yml"],
         DEFAULT,
     ),
     "composite action → ci_review (also fail-open all)": (
-        [".github/actions/retry/action.yml"],
+        [".github/actions/example/action.yml"],
         DEFAULT,
     ),
     # Normal desktop source doesn't trigger ci_review.
