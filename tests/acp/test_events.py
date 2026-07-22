@@ -12,7 +12,6 @@ import acp
 from acp.schema import AgentPlanUpdate
 
 from acp_adapter.events import (
-    ACPMessageDeliveryState,
     _build_plan_update_from_todo_result,
     _send_update,
     make_message_cb,
@@ -357,44 +356,16 @@ class TestMessageCallback:
         """Message callback should emit AgentMessageChunk."""
         loop = event_loop_fixture
 
-        delivery_state = ACPMessageDeliveryState()
-        cb = make_message_cb(
-            mock_conn,
-            "session-1",
-            loop,
-            delivery_state=delivery_state,
-        )
+        cb = make_message_cb(mock_conn, "session-1", loop)
 
-        future = MagicMock(spec=Future)
-        future.done.return_value = False
+        with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
+            future = MagicMock(spec=Future)
+            future.result.return_value = None
+            mock_rcts.return_value = future
 
-        def schedule(coro, *_args, **_kwargs):
-            coro.close()
-            return future
+            cb("Here is your answer.")
 
-        with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=schedule) as scheduled:
-            assert cb("Here is your answer.") is True
-
-        scheduled.assert_called_once()
-        future.result.assert_not_called()
-        assert len(delivery_state._pending) == 1
-
-    def test_confirmed_message_waits_for_delivery(self, mock_conn, event_loop_fixture):
-        delivery_state = MagicMock(spec=ACPMessageDeliveryState)
-        delivery_state.enqueue.return_value = True
-        delivery_state.wait_sync.return_value = True
-        cb = make_message_cb(
-            mock_conn,
-            "session-1",
-            event_loop_fixture,
-            confirm_delivery=True,
-            delivery_state=delivery_state,
-        )
-
-        assert cb("final suffix") is True
-
-        delivery_state.enqueue.assert_called_once()
-        delivery_state.wait_sync.assert_called_once()
+        mock_rcts.assert_called_once()
 
     def test_ignores_empty_message(self, mock_conn, event_loop_fixture):
         """Empty text should not emit any update."""
@@ -403,15 +374,9 @@ class TestMessageCallback:
         cb = make_message_cb(mock_conn, "session-1", loop)
 
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
-            assert cb("") is False
+            cb("")
 
         mock_rcts.assert_not_called()
-
-    def test_reports_failed_session_update(self, mock_conn, event_loop_fixture):
-        cb = make_message_cb(mock_conn, "session-1", event_loop_fixture)
-
-        with patch("acp_adapter.events._send_update", return_value=False):
-            assert cb("not delivered") is False
 
 
 # ---------------------------------------------------------------------------
@@ -419,98 +384,6 @@ class TestMessageCallback:
 # ---------------------------------------------------------------------------
 
 class TestSendUpdate:
-    @pytest.mark.asyncio
-    async def test_turn_delivery_wait_cancels_slow_ordinary_update(self):
-        cancelled = asyncio.Event()
-
-        async def _slow_update(_session_id, _update):
-            try:
-                await asyncio.sleep(60)
-            except asyncio.CancelledError:
-                cancelled.set()
-                raise
-
-        conn = MagicMock()
-        conn.session_update = _slow_update
-        state = ACPMessageDeliveryState()
-        assert state.enqueue(
-            conn,
-            "session-1",
-            asyncio.get_running_loop(),
-            {"type": "chunk"},
-            "partial",
-        ) is True
-
-        await state.finish(timeout=0.01)
-
-        assert cancelled.is_set()
-
-    @pytest.mark.asyncio
-    async def test_failed_ordinary_update_prevents_confirmed_suffix(self, mock_conn):
-        mock_conn.session_update.side_effect = RuntimeError("ordinary delta failed")
-        state = ACPMessageDeliveryState()
-        ordinary = make_message_cb(
-            mock_conn,
-            "session-1",
-            asyncio.get_running_loop(),
-            delivery_state=state,
-        )
-        confirmed = make_message_cb(
-            mock_conn,
-            "session-1",
-            asyncio.get_running_loop(),
-            confirm_delivery=True,
-            delivery_state=state,
-        )
-
-        assert ordinary("original") is True
-        assert await asyncio.to_thread(confirmed, "suffix") is False
-        assert mock_conn.session_update.await_count == 1
-
-    def test_pending_message_updates_are_bounded(self, mock_conn, event_loop_fixture):
-        state = ACPMessageDeliveryState(max_pending=2)
-        futures = [MagicMock(spec=Future) for _ in range(2)]
-        for future in futures:
-            future.done.return_value = False
-
-        def schedule(coro, *_args, **_kwargs):
-            coro.close()
-            return futures.pop(0)
-
-        with patch("agent.async_utils.safe_schedule_threadsafe", side_effect=schedule):
-            cb = make_message_cb(
-                mock_conn,
-                "session-1",
-                event_loop_fixture,
-                delivery_state=state,
-            )
-            assert cb("one") is True
-            assert cb("two") is True
-            assert cb("three") is False
-
-        assert len(state._pending) == 2
-
-    def test_partial_delivery_returns_only_missing_suffix(self):
-        state = ACPMessageDeliveryState()
-        delivered = Future()
-        delivered.set_result(True)
-        state._pending.append((delivered, "original "))
-
-        assert state.remaining_content("original answer") == "answer"
-
-    def test_timeout_status_preserves_completed_prefix(self):
-        state = ACPMessageDeliveryState()
-        delivered = Future()
-        delivered.set_result(True)
-        cancelled = Future()
-        cancelled.cancel()
-        state._pending.extend(
-            [(delivered, "one "), (cancelled, "two")]
-        )
-        state._failed = True
-
-        assert state.remaining_content("one two") == "two"
-
     def test_scheduler_failure_closes_update_coroutine(self, event_loop_fixture):
         """If run_coroutine_threadsafe raises, _send_update must close the coro."""
         created = {"coro": None}

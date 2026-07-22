@@ -34,9 +34,6 @@ class FakeAgent:
         self.valid_tool_names = []
         self.persisted_messages = None
         self.streamed_deltas = []
-        self.confirmed_streamed_deltas = []
-        self.stream_delivery = True
-        self.original_response_streamed = True
 
     def _handle_max_iterations(self, messages, api_call_count):
         raise AssertionError("not expected")
@@ -59,21 +56,6 @@ class FakeAgent:
     def _persist_session(self, messages, conversation_history):
         self.persisted_messages = list(messages)
         return True
-
-    def _has_stream_consumers(self):
-        return True
-
-    def _fire_stream_delta(self, text, *, require_confirmation=False):
-        target = (
-            self.confirmed_streamed_deltas
-            if require_confirmation
-            else self.streamed_deltas
-        )
-        target.append(text)
-        return self.stream_delivery
-
-    def _interim_content_was_streamed(self, _text):
-        return self.original_response_streamed
 
     def _file_mutation_verifier_enabled(self):
         return False
@@ -115,12 +97,6 @@ class DurableFakeAgent(FakeAgent):
 class FailingPersistenceAgent(FakeAgent):
     def _persist_session(self, messages, conversation_history):
         raise OSError("disk unavailable")
-
-
-class FalsePersistenceAgent(FakeAgent):
-    def _persist_session(self, messages, conversation_history):
-        self.persisted_messages = list(messages)
-        return False
 
 
 class FailedInPlaceUpdateAgent(FakeAgent):
@@ -172,8 +148,8 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert agent.persisted_messages[-1] == {"role": "assistant", "content": "Done."}
 
 
-def test_transformed_response_is_streamed_once_and_persisted(monkeypatch):
-    """A post-stream append must become both visible and durable."""
+def test_transformed_response_is_persisted_for_existing_final_delivery(monkeypatch):
+    """A transform updates the final response and durable transcript."""
     proposal = "\n\n要不要为你生成创建方案？"
 
     def invoke_hook(name, **kwargs):
@@ -209,9 +185,7 @@ def test_transformed_response_is_streamed_once_and_persisted(monkeypatch):
     assert result["messages"][-1]["content"] == expected
     assert agent.persisted_messages[-1]["content"] == expected
     assert agent.streamed_deltas == []
-    assert agent.confirmed_streamed_deltas == [proposal]
     assert result["response_transformed"] is True
-    assert result["response_transform_streamed"] is True
 
 
 def test_transformed_response_survives_cold_session_db_readback(monkeypatch, tmp_path):
@@ -247,78 +221,6 @@ def test_transformed_response_survives_cold_session_db_readback(monkeypatch, tmp
 
     cold_db = SessionDB(db_path=tmp_path / "state.db")
     assert cold_db.get_messages(agent.session_id)[-1]["content"] == "分析完成。" + proposal
-
-
-def test_transform_stream_flag_requires_confirmed_callback_delivery(monkeypatch):
-    proposal = "\n\n要不要为你生成创建方案？"
-
-    def invoke_hook(name, **kwargs):
-        if name == "transform_llm_output":
-            return [kwargs["response_text"] + proposal]
-        return []
-
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
-    agent = FakeAgent()
-    agent.stream_delivery = False
-    messages = [
-        {"role": "user", "content": "分析一下"},
-        {"role": "assistant", "content": "分析完成。"},
-    ]
-
-    result = finalize_turn(
-        agent,
-        final_response="分析完成。",
-        api_call_count=1,
-        interrupted=False,
-        failed=False,
-        messages=messages,
-        conversation_history=[],
-        effective_task_id="task",
-        turn_id="turn",
-        user_message="分析一下",
-        original_user_message="分析一下",
-        _should_review_memory=False,
-        _turn_exit_reason="text_response(finish_reason=stop)",
-    )
-
-    assert result["response_transform_streamed"] is False
-
-
-def test_transform_suffix_requires_original_response_to_have_streamed(monkeypatch):
-    proposal = "\n\n要不要为你生成创建方案？"
-
-    def invoke_hook(name, **kwargs):
-        if name == "transform_llm_output":
-            return [kwargs["response_text"] + proposal]
-        return []
-
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
-    agent = FakeAgent()
-    agent.original_response_streamed = False
-    messages = [
-        {"role": "user", "content": "分析一下"},
-        {"role": "assistant", "content": "分析完成。"},
-    ]
-
-    result = finalize_turn(
-        agent,
-        final_response="分析完成。",
-        api_call_count=1,
-        interrupted=False,
-        failed=False,
-        messages=messages,
-        conversation_history=[],
-        effective_task_id="task",
-        turn_id="turn",
-        user_message="分析一下",
-        original_user_message="分析一下",
-        _should_review_memory=False,
-        _turn_exit_reason="text_response(finish_reason=stop)",
-    )
-
-    assert result["final_response"] == "分析完成。" + proposal
-    assert result["response_transform_streamed"] is False
-    assert agent.streamed_deltas == []
 
 
 def test_output_transform_receives_turn_outcome(monkeypatch):
@@ -365,14 +267,13 @@ def test_output_transform_receives_turn_outcome(monkeypatch):
     assert transform_kwargs["sender_id"] == "canonical-owner-a"
     assert transform_kwargs["structured_output"] is True
     assert post_kwargs["assistant_response"] == "任务失败。"
-    assert post_kwargs["persistence_succeeded"] is True
     assert post_kwargs["sender_id"] == "canonical-owner-a"
     assert post_kwargs["failed"] is True
     assert result["final_response"] == "任务失败。"
     assert agent.streamed_deltas == []
 
 
-def test_post_hook_receives_false_when_transformed_response_is_not_durable(monkeypatch):
+def test_transformed_persistence_exception_is_reported_without_losing_response(monkeypatch):
     post_kwargs = {}
 
     def invoke_hook(name, **kwargs):
@@ -406,49 +307,11 @@ def test_post_hook_receives_false_when_transformed_response_is_not_durable(monke
     )
 
     assert result["final_response"].endswith("确认创建")
-    assert post_kwargs["persistence_succeeded"] is False
+    assert post_kwargs["assistant_response"].endswith("确认创建")
     assert any("persist_transformed_session" in item for item in result["cleanup_errors"])
 
 
-def test_post_hook_receives_false_when_persistence_reports_append_failure(monkeypatch):
-    post_kwargs = {}
-
-    def invoke_hook(name, **kwargs):
-        if name == "transform_llm_output":
-            return [kwargs["response_text"] + "\n\n确认创建"]
-        if name == "post_llm_call":
-            post_kwargs.update(kwargs)
-        return []
-
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
-    agent = FalsePersistenceAgent()
-    messages = [
-        {"role": "user", "content": "生成方案"},
-        {"role": "assistant", "content": "这是草案。"},
-    ]
-
-    result = finalize_turn(
-        agent,
-        final_response="这是草案。",
-        api_call_count=1,
-        interrupted=False,
-        failed=False,
-        messages=messages,
-        conversation_history=[],
-        effective_task_id="task",
-        turn_id="turn",
-        user_message="生成方案",
-        original_user_message="生成方案",
-        _should_review_memory=False,
-        _turn_exit_reason="text_response(finish_reason=stop)",
-    )
-
-    assert result["final_response"].endswith("确认创建")
-    assert post_kwargs["persistence_succeeded"] is False
-    assert any("persist_transformed_session" in item for item in result["cleanup_errors"])
-
-
-def test_post_hook_preserves_failed_in_place_update_status(monkeypatch):
+def test_failed_in_place_update_is_reported_without_changing_hook_contract(monkeypatch):
     post_kwargs = {}
 
     def invoke_hook(name, **kwargs):
@@ -470,7 +333,7 @@ def test_post_hook_preserves_failed_in_place_update_status(monkeypatch):
         },
     ]
 
-    finalize_turn(
+    result = finalize_turn(
         agent,
         final_response="这是草案。",
         api_call_count=1,
@@ -486,7 +349,11 @@ def test_post_hook_preserves_failed_in_place_update_status(monkeypatch):
         _turn_exit_reason="text_response(finish_reason=stop)",
     )
 
-    assert post_kwargs["persistence_succeeded"] is False
+    assert post_kwargs["assistant_response"].endswith("确认创建")
+    assert any(
+        "update_transformed_session_message" in item
+        for item in result["cleanup_errors"]
+    )
 
 
 def test_output_transform_uses_last_chained_result(monkeypatch):

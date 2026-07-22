@@ -64,8 +64,6 @@ from acp.schema import (
 
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
 from acp_adapter.events import (
-    ACPMessageDeliveryState,
-    CONFIRMED_UPDATE_TIMEOUT_SECONDS,
     _build_plan_update_from_todo_result,
     make_message_cb,
     make_step_cb,
@@ -1399,7 +1397,7 @@ class HermesACPAgent(acp.Agent):
         previous_approval_cb = None
         edit_approval_requester = None
 
-        message_delivery = ACPMessageDeliveryState()
+        streamed_message = False
 
         if conn:
             tool_progress_cb = make_tool_progress_cb(
@@ -1412,25 +1410,13 @@ class HermesACPAgent(acp.Agent):
             )
             reasoning_cb = make_thinking_cb(conn, session_id, loop)
             step_cb = make_step_cb(conn, session_id, loop, tool_call_ids, tool_call_meta)
-            message_cb = make_message_cb(
-                conn,
-                session_id,
-                loop,
-                delivery_state=message_delivery,
-            )
-            confirmed_message_cb = make_message_cb(
-                conn,
-                session_id,
-                loop,
-                confirm_delivery=True,
-                delivery_state=message_delivery,
-            )
+            message_cb = make_message_cb(conn, session_id, loop)
 
-            def stream_delta_cb(text: str) -> bool:
-                return bool(message_cb(text))
-
-            def confirmed_stream_delta_cb(text: str) -> bool:
-                return bool(confirmed_message_cb(text))
+            def stream_delta_cb(text: str) -> None:
+                nonlocal streamed_message
+                if text:
+                    streamed_message = True
+                message_cb(text)
 
             approval_cb = make_approval_callback(conn.request_permission, loop, session_id)
             try:
@@ -1449,7 +1435,6 @@ class HermesACPAgent(acp.Agent):
             reasoning_cb = None
             step_cb = None
             stream_delta_cb = None
-            confirmed_stream_delta_cb = None
             approval_cb = None
 
         agent = state.agent
@@ -1461,7 +1446,6 @@ class HermesACPAgent(acp.Agent):
         agent.reasoning_callback = reasoning_cb
         agent.step_callback = step_cb
         agent.stream_delta_callback = stream_delta_cb
-        agent.stream_delta_confirmation_callback = confirmed_stream_delta_cb
 
         # Approval callback is per-thread (thread-local, GHSA-qg5c-hvr5-hjgr).
         # Set it INSIDE _run_agent so the TLS write happens in the executor
@@ -1583,8 +1567,6 @@ class HermesACPAgent(acp.Agent):
                 state.current_prompt_text = ""
             return PromptResponse(stop_reason="end_turn")
 
-        await message_delivery.finish(timeout=CONFIRMED_UPDATE_TIMEOUT_SECONDS)
-
         if result.get("messages"):
             state.history = result["messages"]
             # Persist updated history so sessions survive process restarts.
@@ -1667,12 +1649,17 @@ class HermesACPAgent(acp.Agent):
                 )
             except Exception:
                 logger.debug("Failed to auto-title ACP session %s", session_id, exc_info=True)
-        remaining_response = message_delivery.remaining_content(final_response)
-        if remaining_response and conn and not suppress_interrupt_response:
-            # ACP message updates are append-only. Send only the suffix that was
-            # not already confirmed so a partial stream failure cannot duplicate
-            # the successfully delivered prefix.
-            update = acp.update_agent_message_text(remaining_response)
+        if (
+            final_response
+            and conn
+            and not suppress_interrupt_response
+            and (not streamed_message or result.get("response_transformed"))
+        ):
+            # Deliver the final response when streaming did not already send it,
+            # or when a plugin hook transformed the response after streaming
+            # finished (e.g. transform_llm_output) — otherwise the appended /
+            # rewritten text never reaches the client.
+            update = acp.update_agent_message_text(final_response)
             await conn.session_update(session_id, update)
 
         # Mark this turn idle before draining queued work so recursive prompt()

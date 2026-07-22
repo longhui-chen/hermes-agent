@@ -146,8 +146,6 @@ def finalize_turn(
     # are surfaced on the result dict via ``cleanup_errors`` rather than
     # killing the turn.
     _cleanup_errors = []
-    _session_persistence_succeeded = False
-
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
     try:
@@ -207,11 +205,7 @@ def finalize_turn(
             if _tail_role != "assistant":
                 messages.append({"role": "assistant", "content": final_response})
 
-        _session_persistence_succeeded = (
-            agent._persist_session(messages, conversation_history) is not False
-        )
-        if not _session_persistence_succeeded:
-            raise RuntimeError("session database persistence was not confirmed")
+        agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
@@ -342,7 +336,6 @@ def finalize_turn(
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
     _response_transformed = False
-    _response_transform_streamed = False
     _structured_output = False
 
     # Plugin hook: transform_llm_output
@@ -384,72 +377,38 @@ def finalize_turn(
             _response_transformed = final_response != _pre_transform_response
 
             if _response_transformed:
-                _session_persistence_succeeded = True
-                # The model's original text may already have been streamed.  An
-                # append-only transform can still be delivered exactly once by
-                # streaming only its suffix before the caller emits its done
-                # sentinel. Rewrites continue to use each platform's existing
-                # final-message replacement path.
-                if (
-                    final_response.startswith(_pre_transform_response)
-                    and len(final_response) > len(_pre_transform_response)
-                    and getattr(
-                        agent, "_interim_content_was_streamed", lambda _text: False
-                    )(_pre_transform_response)
-                    and getattr(agent, "_has_stream_consumers", lambda: False)()
-                ):
-                    try:
-                        _response_transform_streamed = bool(
-                            agent._fire_stream_delta(
-                                final_response[len(_pre_transform_response):],
-                                require_confirmation=True,
-                            )
-                        )
-                    except Exception as _stream_err:
-                        logger.warning(
-                            "Failed to stream transform_llm_output suffix: %s",
-                            _stream_err,
-                        )
-
                 # Keep the durable transcript identical to the response returned
-                # to the user so a restart can recover plugin-added prompts.
+                # to the user. Delivery remains the responsibility of each
+                # runtime's existing final-response path.
                 if messages and messages[-1].get("role") == "assistant":
                     _assistant_message = messages[-1]
                     _assistant_message["content"] = final_response
                     _db_message_id = _assistant_message.get("_db_message_id")
                     _session_db = getattr(agent, "_session_db", None)
-                    _in_place_update_failed = False
-                    if _assistant_message.get("_db_persisted"):
-                        if isinstance(_db_message_id, int) and _session_db is not None:
-                            try:
-                                if not _session_db.update_message_content(
-                                    agent.session_id,
-                                    _db_message_id,
-                                    final_response,
-                                ):
-                                    raise RuntimeError("persisted assistant row not found")
-                            except Exception as _update_err:
-                                _in_place_update_failed = True
-                                _session_persistence_succeeded = False
-                                _cleanup_errors.append(
-                                    f"update_transformed_session_message: {_update_err}"
-                                )
-                                logger.error(
-                                    "finalize_turn: transformed SessionDB update failed: %s",
-                                    _update_err,
-                                    exc_info=True,
-                                )
-                        else:
-                            _in_place_update_failed = True
-                            _session_persistence_succeeded = False
-                    try:
-                        if agent._persist_session(messages, conversation_history) is False:
-                            raise RuntimeError(
-                                "session database persistence was not confirmed"
+                    if (
+                        _assistant_message.get("_db_persisted")
+                        and isinstance(_db_message_id, int)
+                        and _session_db is not None
+                    ):
+                        try:
+                            if not _session_db.update_message_content(
+                                agent.session_id,
+                                _db_message_id,
+                                final_response,
+                            ):
+                                raise RuntimeError("persisted assistant row not found")
+                        except Exception as _update_err:
+                            _cleanup_errors.append(
+                                f"update_transformed_session_message: {_update_err}"
                             )
-                        _session_persistence_succeeded = not _in_place_update_failed
+                            logger.error(
+                                "finalize_turn: transformed SessionDB update failed: %s",
+                                _update_err,
+                                exc_info=True,
+                            )
+                    try:
+                        agent._persist_session(messages, conversation_history)
                     except Exception as _persist_err:
-                        _session_persistence_succeeded = False
                         _cleanup_errors.append(f"persist_transformed_session: {_persist_err}")
                         logger.error(
                             "finalize_turn: transformed _persist_session failed: %s",
@@ -485,7 +444,6 @@ def finalize_turn(
                 completed=completed,
                 failed=failed,
                 interrupted=interrupted,
-                persistence_succeeded=_session_persistence_succeeded,
                 execution_origin=getattr(agent, "_memory_write_origin", "") or "",
                 structured_output=_structured_output,
             )
@@ -526,7 +484,6 @@ def finalize_turn(
         "partial": False,  # True only when stopped due to invalid tool calls
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
-        "response_transform_streamed": _response_transform_streamed,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
         "model": agent.model,
         "provider": agent.provider,

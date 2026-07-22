@@ -8,7 +8,6 @@ hands confirmed work to Hermes' existing native creator.
 from __future__ import annotations
 
 import json
-import hashlib
 import math
 import re
 import threading
@@ -33,6 +32,7 @@ SESSION_STATE_TTL_SECONDS = 24 * 60 * 60
 MAX_SESSION_STATES = 512
 CREATION_TYPES = {"agent", "skill", "scheduled_task"}
 UNSUPPORTED_API_MODES = {"codex_app_server"}
+UNSUPPORTED_PLATFORMS = {"acp"}
 
 _recent_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
 _session_states: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -241,13 +241,6 @@ _ACCEPT_DRAFT_RE = re.compile(
 )
 _CONFIRM_CREATE_RE = re.compile(r"^(?:确认创建|按方案创建|就按这个方案创建|现在创建)$")
 _REJECT_PROPOSAL_RE = re.compile(r"^(?:暂不创建|不创建|不用了|先不用|取消)$")
-_PERSISTED_PROPOSAL_RE = re.compile(
-    r"这类任务可以沉淀成(Agent|Skill|定时任务)「([^」]{1,80})」.*?"
-    r"要不要为你生成创建方案[？?]",
-    re.DOTALL,
-)
-_OWNER_MARKER_RE = re.compile(r"<!-- creation-governor-owner:([0-9a-f]{16}) -->")
-_TYPE_BY_LABEL = {"Agent": "agent", "Skill": "skill", "定时任务": "scheduled_task"}
 _NONINTERACTIVE_PLATFORMS = {"cron", "subagent", "batch"}
 _DRAFT_CONFIRM_PROMPT = "如果方案符合预期，请回复“确认创建”；在此之前不会执行创建。"
 
@@ -432,66 +425,6 @@ def _previous_proposal_context(state: dict[str, Any]) -> str:
     )
 
 
-def _restore_proposal_match(state: dict[str, Any], match: re.Match[str], stage: str) -> None:
-    creation_type = _TYPE_BY_LABEL[match.group(1)]
-    suggested_name = _text(match.group(2), 80)
-    state["last_proposal"] = {
-        "creation_type": creation_type,
-        "suggested_name": suggested_name,
-        "reason": "Recovered from the persisted creation proposal",
-        "evidence": "Persisted assistant proposal",
-        "confidence": MIN_CONFIDENCE,
-        "dedup_key": _dedup_key(f"{creation_type}:{suggested_name}"),
-    }
-    state["last_prompt_turn"] = max(0, int(state["turn"]) - 1)
-    _clear_draft_state(state, stage=stage)
-    if stage == "awaiting_confirmation":
-        state["draft_delivered_turn"] = max(0, int(state["turn"]) - 1)
-        state["awaiting_proposal_id"] = _proposal_identity(state["last_proposal"])
-
-
-def _owner_marker(owner_id: str) -> str:
-    if not owner_id:
-        return ""
-    digest = hashlib.sha256(owner_id.encode("utf-8")).hexdigest()[:16]
-    return f"<!-- creation-governor-owner:{digest} -->"
-
-
-def _owner_matches(text: str, owner_id: str) -> bool:
-    if not owner_id:
-        return True
-    match = _OWNER_MARKER_RE.search(text)
-    return bool(match and match.group(0) == _owner_marker(owner_id))
-
-
-def _rehydrate_persisted_proposal(
-    state: dict[str, Any],
-    history: list[dict[str, Any]],
-    owner_id: str = "",
-) -> None:
-    if isinstance(state.get("last_proposal"), dict):
-        return
-    assistant_texts = [
-        str(message.get("content") or "")
-        for message in history
-        if isinstance(message, dict) and message.get("role") == "assistant"
-    ]
-    if not assistant_texts:
-        return
-    latest = assistant_texts[-1]
-    latest_match = _PERSISTED_PROPOSAL_RE.search(latest)
-    if latest_match and _owner_matches(latest, owner_id):
-        _restore_proposal_match(state, latest_match, "proposal_shown")
-        return
-    if _DRAFT_CONFIRM_PROMPT not in latest:
-        return
-    for prior in reversed(assistant_texts[:-1]):
-        prior_match = _PERSISTED_PROPOSAL_RE.search(prior)
-        if prior_match and _owner_matches(prior, owner_id):
-            _restore_proposal_match(state, prior_match, "awaiting_confirmation")
-            return
-
-
 def _draft_context(proposal: dict[str, Any]) -> str:
     return (
         "[Creation governor internal instruction: The user accepted the proposal for "
@@ -520,7 +453,10 @@ def _is_noninteractive(kwargs: dict[str, Any]) -> bool:
 
 
 def _is_unsupported_runtime(kwargs: dict[str, Any]) -> bool:
-    return _text(kwargs.get("api_mode"), 80).lower() in UNSUPPORTED_API_MODES
+    return bool(
+        _text(kwargs.get("api_mode"), 80).lower() in UNSUPPORTED_API_MODES
+        or _text(kwargs.get("platform"), 40).lower() in UNSUPPORTED_PLATFORMS
+    )
 
 
 def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
@@ -572,12 +508,11 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
             state["turn"]
         ):
             state["pending_proposal"] = None
-        _rehydrate_persisted_proposal(state, history, owner_id)
         proposal = state.get("last_proposal")
         stage = state.get("proposal_stage")
 
         # A draft-generating or authorized state is valid for one turn only.
-        # If that turn ended without the post-delivery transition, fail closed.
+        # If that turn ended without the post-completion transition, fail closed.
         if stage == "draft_generating" and int(
             state.get("draft_only_turn") or -1
         ) != int(state["turn"]):
@@ -614,7 +549,7 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
             stage = state["proposal_stage"]
 
         # A confirmation phrase is meaningful only for the immediately preceding,
-        # durably delivered draft. Never reinterpret a stale confirmation as a new
+        # normally completed draft. Never reinterpret a stale confirmation as a new
         # creation opportunity or expose context for an older proposal.
         if _CONFIRM_CREATE_RE.fullmatch(user_message):
             state["pending_proposal"] = None
@@ -739,18 +674,15 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
     if rejection:
         return None
     user_prompt = payload["user_prompt"]
-    invocation = _invocation_scope.get()
-    owner_marker = _owner_marker(invocation[3] if invocation is not None else "")
     if user_prompt in response_text or (
         proposal["suggested_name"] in response_text and "创建方案" in response_text
     ):
-        return response_text.rstrip() + ("\n" + owner_marker if owner_marker else "")
-    suffix = user_prompt + ("\n" + owner_marker if owner_marker else "")
-    return response_text.rstrip() + "\n\n" + suffix
+        return None
+    return response_text.rstrip() + "\n\n" + user_prompt
 
 
 def _on_post_llm_call(**kwargs: Any) -> None:
-    """Commit draft confirmation only after the final response is durable."""
+    """Commit draft confirmation only after a normal completed draft turn."""
     if (
         _is_noninteractive(kwargs)
         or _is_unsupported_runtime(kwargs)
@@ -769,19 +701,18 @@ def _on_post_llm_call(**kwargs: Any) -> None:
         ):
             return
         proposal = state.get("last_proposal")
-        delivered = bool(
+        completed_draft = bool(
             isinstance(proposal, dict)
             and kwargs.get("completed") is not False
             and not kwargs.get("failed")
             and not kwargs.get("interrupted")
-            and kwargs.get("persistence_succeeded") is True
             and (
                 not kwargs.get("turn_exit_reason")
                 or str(kwargs.get("turn_exit_reason")).startswith("text_response(")
             )
             and _DRAFT_CONFIRM_PROMPT in assistant_response
         )
-        if not delivered:
+        if not completed_draft:
             _clear_draft_state(state, stage="proposal_shown")
             return
         state["proposal_stage"] = "awaiting_confirmation"
