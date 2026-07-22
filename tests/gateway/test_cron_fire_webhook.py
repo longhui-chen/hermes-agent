@@ -103,6 +103,76 @@ async def test_unprefixed_calendar_reconcile_accepts_only_planner_job_ids(adapte
     assert observed == [(valid_id, "upsert", 3)]
 
 
+RECOVERY_RECONCILE_2XX_CONTRACT = [
+    (
+        {"status": "armed", "provider": "chronos", "observed_fire_at": "2026-07-22T12:34:56Z"},
+        {"status": "armed", "provider": "chronos", "observed_fire_at": "2026-07-22T12:34:56Z"},
+    ),
+    (
+        {"status": "not_required", "provider": "builtin", "observed_fire_at": "2026-07-22T12:34:56Z"},
+        {"status": "not_required", "provider": "builtin", "observed_fire_at": "2026-07-22T12:34:56Z"},
+    ),
+    (
+        {"status": "cancelled", "provider": "chronos", "observed_fire_at": "forged"},
+        {"status": "cancelled", "provider": "chronos"},
+    ),
+    (
+        {"status": "superseded", "provider": "chronos", "observed_fire_at": "forged"},
+        {"status": "superseded", "provider": "chronos"},
+    ),
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("provider_result", "expected_body"), RECOVERY_RECONCILE_2XX_CONTRACT)
+async def test_calendar_recovery_reconcile_2xx_wire_contract(
+    adapter, monkeypatch, provider_result, expected_body,
+):
+    class Provider:
+        def reconcile_calendar_recovery_arm(self, _body):
+            return provider_result
+
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: Provider())
+    app = _create_cron_control_app(adapter)
+    dedupe = "d" * 64
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            f"/internal/v1/cron/calendar-recovery-arms/{dedupe}/reconcile",
+            headers={"Authorization": "Bearer sk-secret"},
+            json={"dedupe_key": dedupe},
+        )
+        status = response.status
+        body = await response.json()
+
+    assert status == 200
+    assert body == expected_body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_result", [
+    {"status": "armed", "provider": "chronos"},
+    {"status": "unknown", "provider": "chronos"},
+])
+async def test_calendar_recovery_reconcile_rejects_invalid_provider_result(
+    adapter, monkeypatch, provider_result,
+):
+    class Provider:
+        def reconcile_calendar_recovery_arm(self, _body):
+            return provider_result
+
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: Provider())
+    app = _create_cron_control_app(adapter)
+    dedupe = "d" * 64
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            f"/internal/v1/cron/calendar-recovery-arms/{dedupe}/reconcile",
+            headers={"Authorization": "Bearer sk-secret"},
+            json={"dedupe_key": dedupe},
+        )
+
+    assert response.status == 503
+
+
 @pytest.mark.asyncio
 async def test_valid_token_accepts_and_fires(adapter, monkeypatch):
     """Valid NAS-JWT + {job_id} → 202 and fire_due invoked with that id."""

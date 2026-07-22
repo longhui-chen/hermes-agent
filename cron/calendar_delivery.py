@@ -85,6 +85,17 @@ def is_invalid_calendar_job(job: Any) -> bool:
     return isinstance(job, dict) and job.get("source") == "calendar" and not is_managed_calendar_event_alert(job)
 
 
+def is_active_managed_calendar_event_alert(job: Any) -> bool:
+    """Return whether a managed alert is still eligible to enter Planner."""
+    return bool(
+        is_managed_calendar_event_alert(job)
+        and job.get("enabled", True) is True
+        and job.get("state") not in {
+            "paused", "staged", "completed", "error", "quarantined",
+        }
+    )
+
+
 def quarantine_invalid_calendar_job(job: dict) -> None:
     job_id = str(job.get("id") or "")
     if not job_id:
@@ -435,9 +446,7 @@ def begin_external_calendar_fire(
     """Persist an external fire attempt before the webhook is acknowledged."""
     if not is_managed_calendar_event_alert(job):
         raise RuntimeError("calendar delivery: invalid external fire contract")
-    if job.get("enabled", True) is not True or job.get("state") in {
-        "paused", "staged", "completed", "error", "quarantined",
-    }:
+    if not is_active_managed_calendar_event_alert(job):
         # An already-armed callback can race pause/delete convergence. Treat
         # it as terminally consumed without contacting Planner or staging a
         # user-visible notification.
@@ -548,6 +557,8 @@ def run_calendar_delivery(job: dict, initial_state: dict | None = None) -> dict:
         state = _planner_post(f"/{job['calendar_delivery_key']}/finalize", {
             **fence, "nonce": prepare_payload["nonce"],
         })
+        if state.get("state") in _TERMINAL:
+            return {"terminal": True, "ledger_state": state.get("state"), **state}
         if _require_delivery_generation(state.get("delivery_generation")) != delivery_generation:
             raise RuntimeError("calendar delivery: delivery generation changed during finalize")
         _verify_finalize_receipt(db, job, state, session_id, message_id)

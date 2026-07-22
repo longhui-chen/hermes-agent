@@ -77,6 +77,67 @@ def test_install_bypasses_scheduler_delivery_for_zet_agent(monkeypatch):
     adapter.send.assert_not_called()
 
 
+def test_ordinary_once_cron_keeps_completed_row_and_visible_cron_summary(
+    tmp_path, monkeypatch,
+):
+    import cron.jobs as cron_jobs
+    import cron.scheduler as scheduler
+    import gateway.platforms.zet_agent_cron as zc
+    import hermes_state
+    from hermes_state import SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    monkeypatch.delenv("ZET_CHAT_APPEND_URL", raising=False)
+    zc.install()
+
+    session_id = "zettlab:userA:main:ordinary-cron"
+    job_id = "ordinary-once-visible"
+    job = {
+        "id": job_id,
+        "name": "普通一次性任务",
+        "prompt": "生成普通报告",
+        "schedule": {"kind": "once", "run_at": "2026-07-22T01:00:00Z"},
+        "schedule_display": "2026-07-22 01:00",
+        "repeat": {"times": 1, "completed": 0},
+        "enabled": True,
+        "state": "scheduled",
+        "deliver": "origin",
+        "origin": {"platform": "zet_agent", "chat_id": session_id},
+        "timezone": "UTC",
+    }
+    cron_jobs.save_jobs([job])
+    db = SessionDB()
+    try:
+        db.create_session(session_id, source="zet_agent", user_id="userA")
+    finally:
+        db.close()
+
+    zc._LATEST_OUTPUT[job_id] = (
+        "# Cron Job: 普通一次性任务\n\n## Response\n\n普通任务已完成，报告共 3 项。\n"
+    )
+    scheduler.mark_job_run(
+        job_id,
+        True,
+        scheduled_at="2026-07-22T01:00:00Z",
+        output_filename="run.md",
+    )
+
+    stored = cron_jobs.get_job_raw(job_id)
+    assert stored["enabled"] is False
+    assert stored["state"] == "completed"
+    assert stored["repeat"]["completed"] == 1
+    db = SessionDB()
+    try:
+        messages = db.get_messages(session_id)
+    finally:
+        db.close()
+    assert len(messages) == 1
+    assert messages[0]["llm_visible"] == 1
+    assert "```cron-summary" in messages[0]["content"]
+    assert "普通任务已完成，报告共 3 项。" in messages[0]["content"]
+
+
 def test_detect_fake_success(monkeypatch):
     import gateway.platforms.zet_agent_cron as zc
 

@@ -386,11 +386,24 @@ class ChronosCronScheduler(CronScheduler):
         if canonical_retry is None:
             raise ValueError("invalid recovery time")
         with _CALENDAR_RECONCILE_LOCK:
-            from cron.calendar_delivery import is_managed_calendar_event_alert
+            from cron.calendar_delivery import is_active_managed_calendar_event_alert
             from cron.jobs import get_job_raw
             job = get_job_raw(job_id)
-            if not is_managed_calendar_event_alert(job) or job.get("calendar_projection_revision") != revision:
-                raise RuntimeError("managed calendar recovery projection missing")
+            if job is None:
+                return {"status": "cancelled", "provider": self.name}
+            current_revision = job.get("calendar_projection_revision")
+            if (
+                not isinstance(current_revision, int)
+                or isinstance(current_revision, bool)
+                or current_revision <= 0
+            ):
+                return {"status": "cancelled", "provider": self.name}
+            if current_revision > revision:
+                return {"status": "superseded", "provider": self.name}
+            if current_revision < revision:
+                raise RuntimeError("managed calendar recovery projection not materialized yet")
+            if not is_active_managed_calendar_event_alert(job):
+                return {"status": "cancelled", "provider": self.name}
             recovery = _calendar_recovery_state(job)
             if recovery is not None:
                 stored_revision, stored_generation, stored_retry, stored_sequence = recovery
@@ -401,7 +414,6 @@ class ChronosCronScheduler(CronScheduler):
                     return {
                         "status": "superseded",
                         "provider": self.name,
-                        "observed_fire_at": stored_retry,
                     }
                 if (
                     stored_revision == revision

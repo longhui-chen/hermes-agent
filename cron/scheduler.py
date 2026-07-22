@@ -3294,8 +3294,13 @@ def run_one_job(
             if terminal:
                 # Planner owns the delivery saga, but the built-in ticker owns
                 # this local one-shot row. Persist its terminal state so the
-                # same due job cannot re-enter Planner on every 60s tick.
-                mark_job_run(
+                # same due job cannot re-enter Planner on every 60s tick. Import
+                # the store primitive directly: zet_agent patches this module's
+                # generic mark_job_run symbol to emit a visible cron-summary,
+                # while the calendar saga has already persisted its one hidden,
+                # llm_visible=0 notification through SessionDB.
+                from cron.jobs import mark_job_run as mark_calendar_job_run
+                mark_calendar_job_run(
                     job["id"],
                     True,
                     scheduled_at=triggered_at or _hermes_now().isoformat(),

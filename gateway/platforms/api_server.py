@@ -4484,12 +4484,15 @@ class APIServerAdapter(BasePlatformAdapter):
             body = await request.json()
             if not isinstance(body, dict) or body.get("dedupe_key") != dedupe_key:
                 raise ValueError("invalid recovery contract")
-            from cron.scheduler_provider import resolve_cron_scheduler
+            from cron.scheduler_provider import (
+                normalize_calendar_recovery_reconcile_result,
+                resolve_cron_scheduler,
+            )
             result = await asyncio.to_thread(
                 resolve_cron_scheduler().reconcile_calendar_recovery_arm,
                 body,
             )
-            return web.json_response(result)
+            return web.json_response(normalize_calendar_recovery_reconcile_result(result))
         except ValueError as exc:
             return web.json_response({"error": str(exc)}, status=400)
         except Exception as exc:

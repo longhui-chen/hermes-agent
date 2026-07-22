@@ -26,6 +26,39 @@ from typing import Any
 from hermes_time import now as _hermes_now
 
 
+CALENDAR_RECOVERY_RECONCILE_OBSERVED_STATUSES = frozenset({"armed", "not_required"})
+CALENDAR_RECOVERY_RECONCILE_TERMINAL_STATUSES = frozenset({"cancelled", "superseded"})
+CALENDAR_RECOVERY_RECONCILE_2XX_STATUSES = (
+    CALENDAR_RECOVERY_RECONCILE_OBSERVED_STATUSES
+    | CALENDAR_RECOVERY_RECONCILE_TERMINAL_STATUSES
+)
+
+
+def normalize_calendar_recovery_reconcile_result(result: Any) -> dict:
+    """Return the bounded recovery 2xx wire contract from a provider result.
+
+    ``armed`` and ``not_required`` prove a concrete fire time and therefore
+    require ``observed_fire_at``. ``cancelled`` and ``superseded`` are terminal
+    acknowledgements, not observations; provider-supplied observation fields
+    are deliberately discarded so a caller cannot mistake them for an arm.
+    """
+    if not isinstance(result, dict):
+        raise RuntimeError("invalid calendar recovery provider result")
+    status = result.get("status")
+    provider = result.get("provider")
+    if status not in CALENDAR_RECOVERY_RECONCILE_2XX_STATUSES:
+        raise RuntimeError("invalid calendar recovery provider status")
+    if not isinstance(provider, str) or not provider.strip() or len(provider.strip()) > 32:
+        raise RuntimeError("invalid calendar recovery provider identity")
+    body = {"status": status, "provider": provider.strip()}
+    if status in CALENDAR_RECOVERY_RECONCILE_OBSERVED_STATUSES:
+        observed = result.get("observed_fire_at")
+        if not isinstance(observed, str) or not observed.strip() or len(observed.strip()) > 64:
+            raise RuntimeError("calendar recovery observation missing")
+        body["observed_fire_at"] = observed.strip()
+    return body
+
+
 class CronScheduler(ABC):
     """Axis-B trigger provider. Decides WHEN a due cron job fires.
 

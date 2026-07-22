@@ -423,6 +423,42 @@ def test_calendar_recovery_arm_uses_attempt_dedupe_and_observed_time(
     }
 
 
+@pytest.mark.parametrize(
+    ("stored_overrides", "intent_revision", "expected_status", "expected_error"),
+    [
+        (None, 2, "cancelled", None),
+        ({"calendar_projection_revision": 3}, 2, "superseded", None),
+        ({"calendar_projection_revision": 1}, 2, None, "not materialized"),
+        ({"calendar_projection_revision": 2, "enabled": False}, 2, "cancelled", None),
+    ],
+    ids=["missing", "stored-newer", "future-not-materialized", "inactive"],
+)
+def test_calendar_recovery_projection_terminal_contract_behavior_matrix(
+    temp_home, chronos, stored_overrides, intent_revision, expected_status, expected_error,
+):
+    from cron.jobs import save_jobs
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+
+    provider, fake = chronos
+    save_jobs([] if stored_overrides is None else [managed_job(**stored_overrides)])
+    intent = {
+        "job_id": "cal-alert-" + "a" * 32,
+        "projection_revision": intent_revision,
+        "delivery_generation": 1,
+        "attempt_sequence": 1,
+        "dedupe_key": "d" * 64,
+        "retry_at": "2026-07-15T01:02:03Z",
+        "deadline_at": "2026-07-15T01:05:00Z",
+    }
+
+    if expected_error is not None:
+        with pytest.raises(RuntimeError, match=expected_error):
+            provider.reconcile_calendar_recovery_arm(intent)
+    else:
+        assert provider.reconcile_calendar_recovery_arm(intent)["status"] == expected_status
+    assert fake.provisions == []
+
+
 def test_restart_delayed_older_recovery_sequence_cannot_overwrite_newer_arm(
     temp_home, chronos,
 ):
@@ -467,7 +503,6 @@ def test_restart_delayed_older_recovery_sequence_cannot_overwrite_newer_arm(
     assert result == {
         "status": "superseded",
         "provider": "chronos",
-        "observed_fire_at": expected_marker["retry_at"],
     }
     assert len(fake.provisions) == provision_count
     assert fake._armed == [{"job_id": job["id"], "fire_at": expected_marker["retry_at"]}]
