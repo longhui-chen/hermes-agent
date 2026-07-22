@@ -180,6 +180,26 @@ def _extract_turn_id(body: Dict[str, Any]) -> str:
     return tid
 
 
+def _extract_skill_slug(body: Dict[str, Any]) -> str:
+    """Extract metadata.skill_slug — the App quick-pick's EXPLICIT skill
+    invocation signal (ZET fork).
+
+    The client owns the text↔selection UX (it drops the field when the user
+    edits the inserted "/<slug>" token away); the server NEVER sniffs message
+    text for slash commands — in-band signaling is ambiguous ("/<skill> 是什么"
+    would fire the skill) and this explicit field is the only trigger.
+    Absent/malformed → no skill. A leading slash is tolerated and stripped so
+    the client may send either "deep-research" or "/deep-research"."""
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("skill_slug", metadata.get("skillSlug", ""))
+    slug = str(raw or "").strip().lstrip("/")
+    if not slug or any(c.isspace() or ord(c) < 0x20 for c in slug):
+        return ""
+    return slug
+
+
 def _normalize_chat_content(
     content: Any, *, _max_depth: int = 10, _depth: int = 0,
 ) -> str:
@@ -2352,6 +2372,37 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
 
+    async def _expand_inbound_skill_invocation(
+        self,
+        user_message: Any,
+        skill_slug: str,
+        session_id: Optional[str] = None,
+        on_settled: Optional[Any] = None,
+    ) -> Any:
+        """Platform hook: expand an EXPLICITLY requested skill (by slug) into
+        the full skill payload.
+
+        Triggered only when the request carried ``metadata.skill_slug`` (the
+        App quick-pick's invocation signal) — the message text is never
+        sniffed for slash commands. Base implementation is a no-op so plain
+        api_server behavior is unchanged; the zet_agent subclass overrides it
+        for CLI-slash parity. Async so that override can push the blocking
+        skill-directory scan/load off the event loop (it runs inside the
+        request handler, before the agent's executor thread exists).
+        ``session_id`` is the resolved chat session — the override forwards
+        it as the skill builder's task_id so ``${HERMES_SESSION_ID}``
+        templates resolve against the real session. ``on_settled`` (when
+        given) is invoked EXACTLY ONCE on the event loop when the expansion
+        work has truly finished — including after the awaiting caller was
+        cancelled while a worker thread was still running. Callers use it to
+        hold resource accounting (e.g. the profile active-run count) open for
+        exactly as long as expansion side effects can still occur. See
+        ZetAgent._expand_inbound_skill_invocation.
+        """
+        if on_settled is not None:
+            on_settled()
+        return user_message
+
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
         auth_err = self._check_auth(request)
@@ -2484,6 +2535,32 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
+        # Explicit skill invocation (zet_agent hook; base no-op): triggered
+        # ONLY by metadata.skill_slug — never by sniffing the message text.
+        # The expansion runs LATE on purpose; the placement is load-bearing:
+        #   - AFTER session_id is final, so skill templates resolve
+        #     ${HERMES_SESSION_ID} against the real session (session_id is
+        #     forwarded as the builder's task_id), matching the CLI slash;
+        #   - INSIDE the Idempotency-Key compute for non-streaming, so a
+        #     retried/concurrent key reuses the first agent result without
+        #     re-running expansion side effects (skills.inline_shell=true
+        #     executes SKILL.md preprocessing at build time);
+        #   - SKIPPED under tool_choice="none": that is an API-level "no
+        #     tools this turn" boundary (request_overrides strips every agent
+        #     tool) and expansion injects tool-driving instructions — the
+        #     message passes through unexpanded instead.
+        skill_slug = _extract_skill_slug(body)
+
+        async def _expanded_user_message(on_settled=None):
+            if not skill_slug or body.get("tool_choice") == "none":
+                if on_settled is not None:
+                    on_settled()
+                return user_message
+            return await self._expand_inbound_skill_invocation(
+                user_message, skill_slug, session_id=session_id,
+                on_settled=on_settled,
+            )
+
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
@@ -2584,9 +2661,27 @@ class APIServerAdapter(BasePlatformAdapter):
             # The structured callbacks are strictly richer (they carry the
             # tool_call id), so they own the chat-completions SSE channel.
             agent_ref = [None]
+            # Streaming has no idempotency layer — expand once, right before
+            # the run (see _expanded_user_message for the placement contract).
+            # The profile active-run count opens FIRST so /v1/profile/unload
+            # cannot tear the profile down under an in-flight expansion.
             profile_run_key = self._begin_profile_chat_run(
                 request.get("hermes_profile_home")
             )
+            # 同非流式:展开自持一份计数,worker 真正结束才经 on_settled 释放。
+            expansion_run_key = self._begin_profile_chat_run(
+                request.get("hermes_profile_home")
+            )
+            try:
+                user_message = await _expanded_user_message(
+                    on_settled=lambda: self._end_profile_chat_run(expansion_run_key)
+                )
+            except BaseException:
+                # The stream path ends the run in the agent task's
+                # done-callback; a failure before that task exists must not
+                # leak the active-run count (unload would then hang/refuse).
+                self._end_profile_chat_run(profile_run_key)
+                raise
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
@@ -2617,12 +2712,30 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
         async def _compute_completion():
+            # The profile active-run count opens BEFORE expansion: /v1/profile
+            # /unload treats zero active runs as idle, and an expansion still
+            # in flight (scan/load/inline_shell) must not let the profile be
+            # torn down under it. Expansion stays INSIDE the idempotency-
+            # protected compute: an Idempotency-Key hit (or a concurrent
+            # duplicate awaiting the first flight) must reuse the cached
+            # result without re-running expansion side effects.
             profile_run_key = self._begin_profile_chat_run(
                 request.get("hermes_profile_home")
             )
+            # Expansion holds its OWN active-run count, released via
+            # on_settled when the worker truly finishes: a cancelled await
+            # ends the turn's count in the finally below, but a still-running
+            # scan/load/inline_shell worker must keep the profile pinned so
+            # /v1/profile/unload cannot tear the runtime down under it.
+            expansion_run_key = self._begin_profile_chat_run(
+                request.get("hermes_profile_home")
+            )
             try:
+                expanded_message = await _expanded_user_message(
+                    on_settled=lambda: self._end_profile_chat_run(expansion_run_key)
+                )
                 return await self._run_agent(
-                    user_message=user_message,
+                    user_message=expanded_message,
                     conversation_history=history,
                     ephemeral_system_prompt=system_prompt,
                     session_id=session_id,
