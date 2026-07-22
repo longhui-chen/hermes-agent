@@ -1516,6 +1516,48 @@ class TestPrompt:
         assert attempts == 2
         assert delivered_texts == ["final answer"]
 
+    @pytest.mark.asyncio
+    async def test_prompt_preserves_prefix_before_tail_timeout(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "acp_adapter.server.CONFIRMED_UPDATE_TIMEOUT_SECONDS",
+            0.01,
+        )
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        def mock_run(*args, **kwargs):
+            state.agent.stream_delta_callback("one ")
+            state.agent.stream_delta_callback("two")
+            return {"final_response": "one two", "messages": []}
+
+        state.agent.run_conversation = mock_run
+        tail_attempts = 0
+        delivered_texts = []
+
+        async def session_update(*args, **kwargs):
+            nonlocal tail_attempts
+            update = kwargs.get("update") or args[1]
+            text = getattr(getattr(update, "content", None), "text", None)
+            if text == "two":
+                tail_attempts += 1
+                if tail_attempts == 1:
+                    await asyncio.sleep(60)
+            if text:
+                delivered_texts.append(text)
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock(side_effect=session_update)
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="hello")]
+        await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        assert delivered_texts == ["one ", "two"]
+
 
     @pytest.mark.asyncio
     async def test_prompt_auto_titles_session(self, agent):

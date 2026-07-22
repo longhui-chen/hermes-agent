@@ -121,6 +121,7 @@ class ACPMessageDeliveryState:
         self._prefix_hash = hashlib.sha256()
         self._failed = False
         self._overflowed = False
+        self._prefix_closed = False
 
     def _consume_completed(self) -> None:
         while self._pending and self._pending[0][0].done():
@@ -129,8 +130,11 @@ class ACPMessageDeliveryState:
                 delivered = future.result() is not False
             except BaseException:
                 delivered = False
-            if self._failed or not delivered:
+            if not delivered:
                 self._failed = True
+                self._prefix_closed = True
+                continue
+            if self._prefix_closed:
                 continue
             self._prefix_chars += len(text)
             self._prefix_hash.update(text.encode("utf-8"))

@@ -498,6 +498,19 @@ class TestSendUpdate:
 
         assert state.remaining_content("original answer") == "answer"
 
+    def test_timeout_status_preserves_completed_prefix(self):
+        state = ACPMessageDeliveryState()
+        delivered = Future()
+        delivered.set_result(True)
+        cancelled = Future()
+        cancelled.cancel()
+        state._pending.extend(
+            [(delivered, "one "), (cancelled, "two")]
+        )
+        state._failed = True
+
+        assert state.remaining_content("one two") == "two"
+
     def test_scheduler_failure_closes_update_coroutine(self, event_loop_fixture):
         """If run_coroutine_threadsafe raises, _send_update must close the coro."""
         created = {"coro": None}
