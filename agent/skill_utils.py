@@ -389,10 +389,12 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
         return set()
 
     from gateway.session_context import get_session_env
+    # ZET fork: session ContextVar outranks the process env (see
+    # skill_commands._resolve_skill_commands_platform for the rationale).
     resolved_platform = (
         platform
-        or os.getenv("HERMES_PLATFORM")
         or get_session_env("HERMES_SESSION_PLATFORM")
+        or os.getenv("HERMES_PLATFORM")
     )
     global_disabled = _normalize_string_set(skills_cfg.get("disabled"))
     if resolved_platform:

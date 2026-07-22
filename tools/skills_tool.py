@@ -645,7 +645,9 @@ def _is_skill_disabled(name: str, platform: str = None) -> bool:
         from hermes_cli.config import load_config
         config = load_config()
         skills_cfg = config.get("skills", {})
-        resolved_platform = platform or os.getenv("HERMES_PLATFORM") or _get_session_platform()
+        # ZET fork: session ContextVar outranks the process env (see
+        # skill_commands._resolve_skill_commands_platform for the rationale).
+        resolved_platform = platform or _get_session_platform() or os.getenv("HERMES_PLATFORM")
         global_disabled = skills_cfg.get("disabled", [])
         if resolved_platform:
             platform_disabled = cfg_get(skills_cfg, "platform_disabled", resolved_platform)
