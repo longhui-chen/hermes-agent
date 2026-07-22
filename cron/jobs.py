@@ -1528,6 +1528,87 @@ def save_jobs(jobs: List[Dict[str, Any]]):
         _save_jobs_unlocked(jobs)
 
 
+def update_job_provider_state(
+    job_id: str,
+    provider: str,
+    state: Optional[Dict[str, Any]],
+    *,
+    revision_field: str,
+    expected_revision: int,
+) -> str:
+    """CAS-update one provider's bounded durable metadata on a job.
+
+    Returns ``updated``, ``missing``, ``superseded`` (the stored projection is
+    newer), or ``future`` (the requested projection has not reached jobs.json).
+    Provider state is execution metadata, so it must never bypass the same
+    projection revision fence that guards the provider's external mutation.
+    """
+    if (
+        not isinstance(job_id, str)
+        or not job_id
+        or len(job_id) > 128
+        or not isinstance(provider, str)
+        or re.fullmatch(r"[a-z0-9_-]{1,32}", provider) is None
+        or not isinstance(revision_field, str)
+        or re.fullmatch(r"[a-z0-9_]{1,64}", revision_field) is None
+        or not isinstance(expected_revision, int)
+        or isinstance(expected_revision, bool)
+        or expected_revision <= 0
+    ):
+        raise ValueError("invalid provider state identity")
+    if state is not None:
+        if not isinstance(state, dict):
+            raise ValueError("provider state must be an object")
+        encoded = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > 4096:
+            raise ValueError("provider state exceeded cap")
+
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            if job.get("id") != job_id:
+                continue
+            current_revision = job.get(revision_field)
+            if (
+                not isinstance(current_revision, int)
+                or isinstance(current_revision, bool)
+                or current_revision <= 0
+            ):
+                return "future"
+            if current_revision > expected_revision:
+                return "superseded"
+            if current_revision < expected_revision:
+                return "future"
+            existing = job.get("provider_state")
+            if existing is None:
+                provider_state: Dict[str, Any] = {}
+            elif isinstance(existing, dict) and len(existing) <= 16:
+                raw_existing = json.dumps(existing, ensure_ascii=False, separators=(",", ":"))
+                if len(raw_existing.encode("utf-8")) > 16 * 1024:
+                    raise ValueError("persisted provider state exceeded cap")
+                provider_state = dict(existing)
+            else:
+                raise ValueError("invalid persisted provider state")
+            if state is None:
+                provider_state.pop(provider, None)
+            else:
+                provider_state[provider] = state
+            if len(provider_state) > 16:
+                raise ValueError("provider state exceeded provider cap")
+            rebuilt = json.dumps(provider_state, ensure_ascii=False, separators=(",", ":"))
+            if len(rebuilt.encode("utf-8")) > 16 * 1024:
+                raise ValueError("provider state exceeded total cap")
+            if provider_state:
+                job["provider_state"] = provider_state
+            else:
+                job.pop("provider_state", None)
+            _save_jobs_unlocked(jobs)
+            return "updated"
+    return "missing"
+
+
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     """Normalize and validate a cron job workdir.
 

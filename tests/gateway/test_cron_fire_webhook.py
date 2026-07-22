@@ -8,6 +8,7 @@ test_chronos_verify.py.
 """
 
 import asyncio
+import hashlib
 
 import pytest
 from aiohttp import web
@@ -64,7 +65,9 @@ async def test_unprefixed_calendar_reconcile_accepts_only_planner_job_ids(adapte
 
     monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: Provider())
     app = _create_cron_control_app(adapter)
-    valid_id = "cal-alert-" + "a" * 32
+    # Mirrors local-server's production contract: cal-alert- + the first
+    # 32 lowercase hex characters of a canonical SHA-256 delivery key.
+    valid_id = "cal-alert-" + hashlib.sha256(b"planner-delivery").hexdigest()[:32]
     headers = {"Authorization": "Bearer sk-secret"}
     async with TestClient(TestServer(app)) as cli:
         accepted = await cli.post(
@@ -80,10 +83,23 @@ async def test_unprefixed_calendar_reconcile_accepts_only_planner_job_ids(adapte
             json={"expected_action": "upsert", "projection_revision": 3},
         )
         rejected_status = rejected.status
+        noncanonical_statuses = []
+        for invalid_id in (
+            "cal-alert-recovery",
+            "cal-alert-" + "A" * 32,
+            "cal-alert-" + "a" * 31 + "_",
+        ):
+            response = await cli.post(
+                f"/internal/v1/cron/jobs/{invalid_id}/reconcile",
+                headers=headers,
+                json={"expected_action": "upsert", "projection_revision": 3},
+            )
+            noncanonical_statuses.append(response.status)
 
     assert accepted_status == 200
     assert accepted_body == {"status": "not_required", "provider": "builtin"}
     assert rejected_status in {400, 404}
+    assert noncanonical_statuses == [400, 400, 400]
     assert observed == [(valid_id, "upsert", 3)]
 
 

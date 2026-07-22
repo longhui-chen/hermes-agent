@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import sqlite3
 import stat
@@ -12,7 +13,7 @@ import pytest
 
 def managed_job(**overrides):
     job = {
-        "id": "cal-alert-abc",
+        "id": "cal-alert-" + "a" * 32,
         "source": "calendar",
         "calendar_job_kind": "event_alert",
         "calendar_delivery_key": "a" * 64,
@@ -63,8 +64,9 @@ def test_raw_calendar_job_flow_preserves_null_prompt_contract():
 
     save_jobs([managed_job()])
 
-    assert get_job("cal-alert-abc")["prompt"] == ""
-    raw = get_job_raw("cal-alert-abc")
+    job_id = "cal-alert-" + "a" * 32
+    assert get_job(job_id)["prompt"] == ""
+    raw = get_job_raw(job_id)
     assert raw["prompt"] is None
     assert is_managed_calendar_event_alert(raw) is True
 
@@ -81,7 +83,7 @@ def test_run_one_job_terminal_calendar_marks_local_job_complete():
     run.assert_called_once()
     claim.assert_not_called()
     mark.assert_called_once_with(
-        "cal-alert-abc",
+        "cal-alert-" + "a" * 32,
         True,
         scheduled_at="2026-07-15T01:00:00Z",
     )
@@ -143,10 +145,14 @@ def test_delivery_saga_claim_commit_prepare_finalize_activate_ack(monkeypatch):
     import cron.calendar_delivery as delivery
 
     calls = []
+    owner = managed_job()["calendar_owner_user_id"]
+    session_id = "zettlab:oh_" + hashlib.sha256(owner.encode("utf-8")).hexdigest() + ":main:calendar-reminders"
     responses = iter([
         {"state": "claimed", "delivery_generation": 1, "fence_token": 4},
-        {"state": "committed", "delivery_generation": 1, "fence_token": 4},
-        {"state": "prepared", "delivery_generation": 1, "fence_token": 4, "content": "visible"},
+        {"state": "committed", "delivery_generation": 1, "fence_token": 4,
+         "session_id": session_id, "content": "visible"},
+        {"state": "prepared", "delivery_generation": 1, "fence_token": 4,
+         "session_id": session_id, "content": "visible"},
         {"state": "queued", "delivery_generation": 1, "fence_token": 4, "receipt": {}},
         {"state": "fired", "delivery_generation": 1, "fence_token": 4},
     ])

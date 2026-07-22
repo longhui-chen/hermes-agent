@@ -26,13 +26,98 @@ Wire contract: ``docs/chronos-managed-cron-contract.md``.
 
 from __future__ import annotations
 
+import datetime as dt
+import hashlib
 import logging
+import re
 import threading
 from typing import Any, Dict, Optional
 
 from cron.scheduler_provider import CronScheduler
 
 logger = logging.getLogger("cron.chronos")
+_CALENDAR_JOB_ID_RE = re.compile(r"cal-alert-[a-f0-9]{32}")
+_CALENDAR_RECONCILE_LOCK = threading.Lock()
+_MAX_RECOVERY_UINT64 = 2**64 - 1
+
+
+def _valid_recovery_uint64(value: Any) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 0 < value <= _MAX_RECOVERY_UINT64
+    )
+
+
+def _canonical_calendar_retry_at(value: Any) -> Optional[str]:
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return None
+    try:
+        retry = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if retry.tzinfo is None or retry.utcoffset() != dt.timedelta(0):
+        return None
+    return retry.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _calendar_recovery_state(job: Any) -> Optional[tuple[int, int, str, int]]:
+    if not isinstance(job, dict):
+        return None
+    provider_state = job.get("provider_state")
+    chronos_state = provider_state.get("chronos") if isinstance(provider_state, dict) else None
+    recovery = chronos_state.get("calendar_recovery") if isinstance(chronos_state, dict) else None
+    if not isinstance(recovery, dict) or len(recovery) != 4:
+        return None
+    revision = recovery.get("projection_revision")
+    delivery_generation = recovery.get("delivery_generation")
+    retry_at = recovery.get("retry_at")
+    attempt_sequence = recovery.get("attempt_sequence")
+    if (
+        not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision <= 0
+    ):
+        return None
+    if not _valid_recovery_uint64(delivery_generation):
+        return None
+    if not _valid_recovery_uint64(attempt_sequence):
+        return None
+    canonical_retry = _canonical_calendar_retry_at(retry_at)
+    if canonical_retry is None:
+        return None
+    return revision, delivery_generation, canonical_retry, attempt_sequence
+
+
+def _persist_calendar_recovery_state(
+    job_id: str,
+    projection_revision: int,
+    retry_at: Optional[str],
+    delivery_generation: Optional[int] = None,
+    attempt_sequence: Optional[int] = None,
+) -> str:
+    from cron.jobs import update_job_provider_state
+    state = None
+    if retry_at is not None:
+        if not _valid_recovery_uint64(delivery_generation):
+            raise ValueError("invalid recovery delivery generation")
+        if not _valid_recovery_uint64(attempt_sequence):
+            raise ValueError("invalid recovery attempt sequence")
+        state = {
+            "calendar_recovery": {
+                "projection_revision": projection_revision,
+                "delivery_generation": delivery_generation,
+                "retry_at": retry_at,
+                "attempt_sequence": attempt_sequence,
+            },
+        }
+    return update_job_provider_state(
+        job_id,
+        "chronos",
+        state,
+        revision_field="calendar_projection_revision",
+        expected_revision=projection_revision,
+    )
 
 
 def _cfg(*keys: str, default: Any = "") -> Any:
@@ -153,6 +238,27 @@ class ChronosCronScheduler(CronScheduler):
             with self._lock:
                 self._armed.pop(job_id, None)
 
+    def _rearm_calendar_recovery(
+        self,
+        job_id: str,
+        revision: int,
+        delivery_generation: int,
+        retry_at: str,
+        attempt_sequence: int,
+    ) -> None:
+        """Reassert a durable recovery intent after a crash or lost NAS ACK."""
+        dedup_key = hashlib.sha256(
+            f"calendar-recovery\x00{job_id}\x00{revision}\x00{delivery_generation}\x00{attempt_sequence}\x00{retry_at}".encode("utf-8")
+        ).hexdigest()
+        self._get_client().provision(
+            job_id=job_id,
+            fire_at=retry_at,
+            agent_callback_url=self._callback_url(),
+            dedup_key=dedup_key,
+        )
+        with self._lock:
+            self._armed[job_id] = retry_at
+
     def _list_armed(self, *, force_remote: bool = False) -> Dict[str, str]:
         """Observed armed one-shots: job_id → fire_at.
 
@@ -188,28 +294,64 @@ class ChronosCronScheduler(CronScheduler):
         from cron.calendar_delivery import is_managed_calendar_event_alert
         from cron.jobs import get_job_raw
 
-        if expected_action == "delete":
-            current = get_job_raw(job_id)
-            current_revision = current.get("calendar_projection_revision") if isinstance(current, dict) else None
-            if (isinstance(current_revision, int) and not isinstance(current_revision, bool)
-                    and current_revision > projection_revision):
-                return {"status": "superseded", "provider": self.name}
-            self._cancel(job_id)
-            if job_id in self._list_armed(force_remote=True):
-                raise RuntimeError("Chronos cancel not yet observed")
-            return {"status": "cancelled", "provider": self.name}
-        if expected_action != "upsert" or projection_revision <= 0:
+        if expected_action not in {"delete", "upsert"} or projection_revision <= 0:
             raise ValueError("invalid calendar reconcile request")
-        job = get_job_raw(job_id)
-        if not is_managed_calendar_event_alert(job):
-            raise RuntimeError("managed calendar job missing or invalid")
-        if job.get("calendar_projection_revision") != projection_revision:
-            raise RuntimeError("calendar projection revision mismatch")
-        self._arm_one_shot(job)
-        observed = self._list_armed(force_remote=True)
-        if observed.get(job_id) != job.get("next_run_at"):
-            raise RuntimeError("Chronos fire time not durably observed")
-        return {"status": "armed", "provider": self.name, "observed_fire_at": observed[job_id]}
+        with _CALENDAR_RECONCILE_LOCK:
+            if expected_action == "delete":
+                current = get_job_raw(job_id)
+                current_revision = current.get("calendar_projection_revision") if isinstance(current, dict) else None
+                if (isinstance(current_revision, int) and not isinstance(current_revision, bool)
+                        and current_revision > projection_revision):
+                    return {"status": "superseded", "provider": self.name}
+                self._cancel(job_id)
+                if job_id in self._list_armed(force_remote=True):
+                    raise RuntimeError("Chronos cancel not yet observed")
+                return {"status": "cancelled", "provider": self.name}
+            job = get_job_raw(job_id)
+            if not is_managed_calendar_event_alert(job):
+                raise RuntimeError("managed calendar job missing or invalid")
+            current_revision = job.get("calendar_projection_revision")
+            if current_revision > projection_revision:
+                return {"status": "superseded", "provider": self.name}
+            if current_revision < projection_revision:
+                raise RuntimeError("calendar projection revision mismatch")
+            recovery = _calendar_recovery_state(job)
+            observed = self._list_armed(force_remote=True)
+            if recovery is not None:
+                recovery_revision, delivery_generation, retry_at, attempt_sequence = recovery
+                if recovery_revision > projection_revision:
+                    return {
+                        "status": "superseded",
+                        "provider": self.name,
+                        "observed_fire_at": retry_at,
+                    }
+                if recovery_revision == projection_revision:
+                    if observed.get(job_id) != retry_at:
+                        self._rearm_calendar_recovery(
+                            job_id,
+                            recovery_revision,
+                            delivery_generation,
+                            retry_at,
+                            attempt_sequence,
+                        )
+                        observed = self._list_armed(force_remote=True)
+                        if observed.get(job_id) != retry_at:
+                            raise RuntimeError("Chronos recovery fire time not durably observed")
+                    return {
+                        "status": "recovery_preserved",
+                        "provider": self.name,
+                        "observed_fire_at": retry_at,
+                    }
+            persisted = _persist_calendar_recovery_state(job_id, projection_revision, None)
+            if persisted != "updated":
+                if persisted == "superseded":
+                    return {"status": "superseded", "provider": self.name}
+                raise RuntimeError("calendar projection revision changed before arm")
+            self._arm_one_shot(job)
+            observed = self._list_armed(force_remote=True)
+            if observed.get(job_id) != job.get("next_run_at"):
+                raise RuntimeError("Chronos fire time not durably observed")
+            return {"status": "armed", "provider": self.name, "observed_fire_at": observed[job_id]}
 
     def reconcile_calendar_recovery_arm(self, intent: dict) -> dict:
         """Provision and observe one exact planner recovery attempt.
@@ -218,9 +360,6 @@ class ChronosCronScheduler(CronScheduler):
         sequence and canonical retry time, so replaying a lost HTTP response is
         idempotent without suppressing a later legitimate attempt.
         """
-        import datetime as dt
-        import re
-
         if not isinstance(intent, dict):
             raise ValueError("invalid recovery intent")
         job_id = str(intent.get("job_id") or "")
@@ -228,11 +367,13 @@ class ChronosCronScheduler(CronScheduler):
         retry_at = str(intent.get("retry_at") or "")
         deadline_at = str(intent.get("deadline_at") or "")
         revision = intent.get("projection_revision")
+        generation = intent.get("delivery_generation")
         sequence = intent.get("attempt_sequence")
-        if (not re.fullmatch(r"cal-alert-[A-Za-z0-9_-]{1,64}", job_id)
+        if (not _CALENDAR_JOB_ID_RE.fullmatch(job_id)
                 or not re.fullmatch(r"[0-9a-f]{64}", dedupe_key)
                 or not isinstance(revision, int) or isinstance(revision, bool) or revision <= 0
-                or not isinstance(sequence, int) or isinstance(sequence, bool) or sequence <= 0):
+                or not _valid_recovery_uint64(generation)
+                or not _valid_recovery_uint64(sequence)):
             raise ValueError("invalid recovery identity")
         try:
             retry = dt.datetime.fromisoformat(retry_at.replace("Z", "+00:00"))
@@ -241,24 +382,69 @@ class ChronosCronScheduler(CronScheduler):
             raise ValueError("invalid recovery time") from exc
         if retry.tzinfo is None or deadline.tzinfo is None or retry >= deadline:
             raise ValueError("invalid recovery window")
-        from cron.calendar_delivery import is_managed_calendar_event_alert
-        from cron.jobs import get_job_raw
-        job = get_job_raw(job_id)
-        if not is_managed_calendar_event_alert(job) or job.get("calendar_projection_revision") != revision:
-            raise RuntimeError("managed calendar recovery projection missing")
-        canonical_retry = retry.astimezone(dt.timezone.utc).isoformat().replace("+00:00", "Z")
-        self._get_client().provision(
-            job_id=job_id,
-            fire_at=canonical_retry,
-            agent_callback_url=self._callback_url(),
-            dedup_key=dedupe_key,
-        )
-        with self._lock:
-            self._armed[job_id] = canonical_retry
-        observed = self._list_armed(force_remote=True)
-        if observed.get(job_id) != canonical_retry:
-            raise RuntimeError("Chronos recovery fire time not durably observed")
-        return {"status": "armed", "provider": self.name, "observed_fire_at": observed[job_id]}
+        canonical_retry = _canonical_calendar_retry_at(retry_at)
+        if canonical_retry is None:
+            raise ValueError("invalid recovery time")
+        with _CALENDAR_RECONCILE_LOCK:
+            from cron.calendar_delivery import is_managed_calendar_event_alert
+            from cron.jobs import get_job_raw
+            job = get_job_raw(job_id)
+            if not is_managed_calendar_event_alert(job) or job.get("calendar_projection_revision") != revision:
+                raise RuntimeError("managed calendar recovery projection missing")
+            recovery = _calendar_recovery_state(job)
+            if recovery is not None:
+                stored_revision, stored_generation, stored_retry, stored_sequence = recovery
+                if stored_revision > revision or (
+                    stored_revision == revision
+                    and (stored_generation, stored_sequence) > (generation, sequence)
+                ):
+                    return {
+                        "status": "superseded",
+                        "provider": self.name,
+                        "observed_fire_at": stored_retry,
+                    }
+                if (
+                    stored_revision == revision
+                    and (stored_generation, stored_sequence) == (generation, sequence)
+                ):
+                    observed = self._list_armed(force_remote=True)
+                    if observed.get(job_id) != stored_retry:
+                        self._rearm_calendar_recovery(
+                            job_id,
+                            revision,
+                            stored_generation,
+                            stored_retry,
+                            stored_sequence,
+                        )
+                        observed = self._list_armed(force_remote=True)
+                        if observed.get(job_id) != stored_retry:
+                            raise RuntimeError("Chronos recovery fire time not durably observed")
+                    return {
+                        "status": "armed",
+                        "provider": self.name,
+                        "observed_fire_at": stored_retry,
+                    }
+            persisted = _persist_calendar_recovery_state(
+                job_id,
+                revision,
+                canonical_retry,
+                generation,
+                sequence,
+            )
+            if persisted != "updated":
+                raise RuntimeError("managed calendar recovery projection changed")
+            self._get_client().provision(
+                job_id=job_id,
+                fire_at=canonical_retry,
+                agent_callback_url=self._callback_url(),
+                dedup_key=dedupe_key,
+            )
+            with self._lock:
+                self._armed[job_id] = canonical_retry
+            observed = self._list_armed(force_remote=True)
+            if observed.get(job_id) != canonical_retry:
+                raise RuntimeError("Chronos recovery fire time not durably observed")
+            return {"status": "armed", "provider": self.name, "observed_fire_at": observed[job_id]}
 
     # -- reconcile --------------------------------------------------------
 
