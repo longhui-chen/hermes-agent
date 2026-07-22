@@ -366,7 +366,20 @@ class ZetAgentAdapter(APIServerAdapter):
             return text.rsplit(marker, 1)[1].strip()
         return text
 
-    async def _expand_inbound_skill_slash(self, user_message: Any) -> Any:
+    # Bounded concurrency for slash expansion: the worker threads come from
+    # the SAME default executor _run_agent runs on, and expansion happens
+    # BEFORE the request counts against _inflight_agent_runs — without its own
+    # cap, a burst of "/"-prefixed requests (even unknown /typo commands)
+    # could queue enough scan/load jobs to starve real agent runs. Saturation
+    # fails open: the message passes through unexpanded (today's pre-feature
+    # behavior) instead of queueing.
+    _SKILL_SLASH_MAX_CONCURRENCY = 4
+    _SKILL_SLASH_ACQUIRE_TIMEOUT = 2.0
+    _skill_slash_semaphore = None
+
+    async def _expand_inbound_skill_slash(
+        self, user_message: Any, session_id: Optional[str] = None
+    ) -> Any:
         """Async shell: fast-path pass-through, then expand off the event loop.
 
         The cheap shape checks run inline; anything that touches the skills
@@ -383,11 +396,31 @@ class ZetAgentAdapter(APIServerAdapter):
             return user_message
         import asyncio
 
-        return await asyncio.to_thread(
-            self._expand_inbound_skill_slash_blocking, user_message
-        )
+        sema = self._skill_slash_semaphore
+        if sema is None:
+            # Lazy init on the event loop; no await between check and set, so
+            # concurrent first calls cannot race in a single-threaded loop.
+            sema = asyncio.Semaphore(self._SKILL_SLASH_MAX_CONCURRENCY)
+            self._skill_slash_semaphore = sema
+        try:
+            await asyncio.wait_for(
+                sema.acquire(), timeout=self._SKILL_SLASH_ACQUIRE_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[zet_agent] skill slash expansion saturated; passing message through",
+            )
+            return user_message
+        try:
+            return await asyncio.to_thread(
+                self._expand_inbound_skill_slash_blocking, user_message, session_id
+            )
+        finally:
+            sema.release()
 
-    def _expand_inbound_skill_slash_blocking(self, user_message: str) -> Any:
+    def _expand_inbound_skill_slash_blocking(
+        self, user_message: str, session_id: Optional[str] = None
+    ) -> Any:
         """Expand a leading ``/<skill-name>`` into the full skill payload.
 
         The App's skill quick-pick inserts a literal ``/<skill>`` line into
@@ -491,8 +524,11 @@ class ZetAgentAdapter(APIServerAdapter):
             task_text = "\n".join(remainder).strip()
 
             try:
+                # task_id = the resolved chat session, so ${HERMES_SESSION_ID}
+                # templates and session-scoped skill state resolve against the
+                # REAL session — CLI/gateway slash parity (review P1).
                 part = build_skill_invocation_message(
-                    token, user_instruction=task_text,
+                    token, user_instruction=task_text, task_id=session_id or None,
                 )
             except Exception:
                 logger.warning(

@@ -31,9 +31,11 @@ def _make_adapter() -> ZetAgentAdapter:
     return ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
 
 
-def _expand(adapter, message):
+def _expand(adapter, message, session_id=None):
     """Drive the async hook to completion (it offloads to a worker thread)."""
-    return asyncio.run(adapter._expand_inbound_skill_slash(message))
+    return asyncio.run(
+        adapter._expand_inbound_skill_slash(message, session_id=session_id)
+    )
 
 
 def _patch_skill_layer(monkeypatch, *, known=("deep-research",), load_raises=False, disabled=False):
@@ -63,6 +65,7 @@ def _patch_skill_layer(monkeypatch, *, known=("deep-research",), load_raises=Fal
         if load_raises:
             raise RuntimeError("boom")
         calls["load_identifier"] = identifier
+        calls["load_task_id"] = task_id
         calls["load_platform"] = get_session_env("HERMES_SESSION_PLATFORM")
         return ({"content": "SKILL BODY"}, Path("/fake/skills/deep-research"), "deep-research")
 
@@ -171,6 +174,37 @@ def test_expanded_payload_uses_canonical_memory_scaffolding(monkeypatch):
     bare = _expand(adapter, "/deep-research")
     assert bare.startswith(skill_commands._SKILL_INVOCATION_PREFIX)
     assert skill_commands.extract_user_instruction_from_skill_message(bare) is None
+
+
+def test_session_id_forwarded_as_builder_task_id(monkeypatch):
+    # ${HERMES_SESSION_ID} templates / session-scoped skill state must resolve
+    # against the REAL chat session: the hook forwards session_id as the
+    # canonical builder's task_id (CLI/gateway slash parity).
+    calls = _patch_skill_layer(monkeypatch)
+    adapter = _make_adapter()
+    _expand(adapter, "/deep-research 研究黄金", session_id="sess-42")
+    assert calls["load_task_id"] == "sess-42"
+    # No session (defensive default) → builder gets None, not "".
+    _expand(adapter, "/deep-research 研究黄金", session_id="")
+    assert calls["load_task_id"] is None
+
+
+def test_saturated_expansion_fails_open_to_passthrough(monkeypatch):
+    # The expansion semaphore bounds how many scan/load jobs can occupy the
+    # shared default executor. When saturated the hook must fail OPEN — the
+    # literal "/<skill>" text passes through (pre-feature behavior) instead of
+    # queueing behind other expansions and starving agent runs.
+    calls = _patch_skill_layer(monkeypatch)
+    adapter = _make_adapter()
+    monkeypatch.setattr(ZetAgentAdapter, "_SKILL_SLASH_ACQUIRE_TIMEOUT", 0.05)
+
+    async def _run():
+        adapter._skill_slash_semaphore = asyncio.Semaphore(0)  # all slots busy
+        return await adapter._expand_inbound_skill_slash("/deep-research 黄金")
+
+    original = "/deep-research 黄金"
+    assert asyncio.run(_run()) == original
+    assert "load_identifier" not in calls, "saturated path must not touch the skills layer"
 
 
 def test_platform_disabled_skill_passes_through_even_with_foreign_env(monkeypatch):

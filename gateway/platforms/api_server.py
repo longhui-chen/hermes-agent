@@ -2352,7 +2352,9 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
 
-    async def _expand_inbound_skill_slash(self, user_message: Any) -> Any:
+    async def _expand_inbound_skill_slash(
+        self, user_message: Any, session_id: Optional[str] = None
+    ) -> Any:
         """Platform hook: expand a leading ``/<skill>`` slash command in the
         inbound user text into the full skill payload.
 
@@ -2361,7 +2363,10 @@ class APIServerAdapter(BasePlatformAdapter):
         App's skill quick-pick (which inserts a literal ``/<skill>`` line)
         CLI-slash parity. Async so that override can push the blocking
         skill-directory scan/load off the event loop (it runs inside the
-        request handler, before the agent's executor thread exists). See
+        request handler, before the agent's executor thread exists).
+        ``session_id`` is the resolved chat session — the override forwards
+        it as the skill builder's task_id so ``${HERMES_SESSION_ID}``
+        templates resolve against the real session. See
         ZetAgent._expand_inbound_skill_slash.
         """
         return user_message
@@ -2430,18 +2435,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=400,
             )
 
-        # Platform hook (no-op here; real logic in zet_agent): expand a
-        # leading "/<skill>" slash command into the skill payload so the
-        # App's skill quick-pick has the same guarantee as the CLI slash.
-        # Skipped under tool_choice="none": that is an API-level "no tools
-        # this turn" boundary (request_overrides strips every agent tool
-        # below), while skill expansion both injects tool-driving
-        # instructions and is not side-effect-free — skills.inline_shell=true
-        # executes SKILL.md preprocessing at build time. The literal
-        # "/<skill>" text passes through unexpanded instead.
-        if body.get("tool_choice") != "none":
-            user_message = await self._expand_inbound_skill_slash(user_message)
-
         # Allow caller to scope long-term memory (e.g. Honcho) with a
         # stable per-channel identifier via X-Hermes-Session-Key.  This
         # is independent of X-Hermes-Session-Id: the key persists across
@@ -2509,6 +2502,26 @@ class APIServerAdapter(BasePlatformAdapter):
                     break
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
+
+        # Inbound "/<skill>" expansion (zet_agent hook; base no-op) runs LATE
+        # on purpose — the placement is load-bearing:
+        #   - AFTER session_id is final, so skill templates resolve
+        #     ${HERMES_SESSION_ID} against the real session (session_id is
+        #     forwarded as the builder's task_id), matching the CLI slash;
+        #   - INSIDE the Idempotency-Key compute for non-streaming, so a
+        #     retried/concurrent key reuses the first agent result without
+        #     re-running expansion side effects (skills.inline_shell=true
+        #     executes SKILL.md preprocessing at build time);
+        #   - SKIPPED under tool_choice="none": that is an API-level "no
+        #     tools this turn" boundary (request_overrides strips every agent
+        #     tool) and expansion injects tool-driving instructions — the
+        #     literal "/<skill>" text passes through unexpanded instead.
+        async def _expanded_user_message():
+            if body.get("tool_choice") == "none":
+                return user_message
+            return await self._expand_inbound_skill_slash(
+                user_message, session_id=session_id
+            )
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
@@ -2610,6 +2623,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # The structured callbacks are strictly richer (they carry the
             # tool_call id), so they own the chat-completions SSE channel.
             agent_ref = [None]
+            # Streaming has no idempotency layer — expand once, right before
+            # the run (see _expanded_user_message for the placement contract).
+            user_message = await _expanded_user_message()
             profile_run_key = self._begin_profile_chat_run(
                 request.get("hermes_profile_home")
             )
@@ -2643,12 +2659,17 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
         async def _compute_completion():
+            # Expansion lives INSIDE the idempotency-protected compute: an
+            # Idempotency-Key hit (or a concurrent duplicate awaiting the
+            # first flight) must reuse the cached result without re-running
+            # expansion side effects.
+            expanded_message = await _expanded_user_message()
             profile_run_key = self._begin_profile_chat_run(
                 request.get("hermes_profile_home")
             )
             try:
                 return await self._run_agent(
-                    user_message=user_message,
+                    user_message=expanded_message,
                     conversation_history=history,
                     ephemeral_system_prompt=system_prompt,
                     session_id=session_id,

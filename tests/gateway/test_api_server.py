@@ -1276,7 +1276,7 @@ class TestChatCompletionsEndpoint:
             with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run, \
                  patch.object(adapter, "_expand_inbound_skill_slash", new_callable=AsyncMock) as mock_expand:
                 mock_run.return_value = (mock_result, usage)
-                mock_expand.side_effect = lambda msg: f"<<EXPANDED:{msg}>>"
+                mock_expand.side_effect = lambda msg, session_id=None: f"<<EXPANDED:{msg}>>"
                 resp = await cli.post(
                     "/v1/chat/completions",
                     json={
@@ -1302,6 +1302,42 @@ class TestChatCompletionsEndpoint:
                 assert resp.status == 200
                 mock_expand.assert_awaited_once()
                 assert mock_run.await_args.kwargs["user_message"] == "<<EXPANDED:/deep-research 黄金>>"
+                # The hook receives the resolved session so skill templates
+                # can resolve ${HERMES_SESSION_ID} (builder task_id).
+                assert (
+                    mock_expand.await_args.kwargs["session_id"]
+                    == mock_run.await_args.kwargs["session_id"]
+                )
+
+    @pytest.mark.asyncio
+    async def test_idempotency_key_dedupes_skill_slash_expansion(self, adapter):
+        # Expansion lives INSIDE the Idempotency-Key compute: a retried key
+        # must reuse the cached agent result WITHOUT re-running expansion —
+        # with skills.inline_shell=true the build step executes SKILL.md
+        # preprocessing, so re-expansion means re-running local scripts.
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        usage = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run, \
+                 patch.object(adapter, "_expand_inbound_skill_slash", new_callable=AsyncMock) as mock_expand:
+                mock_run.return_value = (mock_result, usage)
+                mock_expand.side_effect = lambda msg, session_id=None: f"<<EXPANDED:{msg}>>"
+                payload = {
+                    "model": "hermes-agent",
+                    "messages": [{"role": "user", "content": "/deep-research 黄金"}],
+                    "stream": False,
+                }
+                for _ in range(2):
+                    resp = await cli.post(
+                        "/v1/chat/completions",
+                        json=payload,
+                        headers={"Idempotency-Key": "idem-slash-1"},
+                    )
+                    assert resp.status == 200
+                mock_run.assert_awaited_once()
+                mock_expand.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_meeting_summary_tool_choice_none_integration_flow_disables_agent_tools(self, adapter):
