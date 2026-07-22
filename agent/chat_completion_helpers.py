@@ -57,6 +57,19 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
 
+def _apply_zettlab_summary_headers(summary_kwargs: Dict[str, Any], agent: Any) -> None:
+    """Stamp Zettlab routing/billing headers on manual summary Chat calls."""
+    try:
+        from agent.transports.chat_completions import _apply_zettlab_billing_headers
+
+        _apply_zettlab_billing_headers(
+            summary_kwargs,
+            {"session_id": getattr(agent, "session_id", "")},
+        )
+    except Exception:
+        return
+
+
 def _ra():
     """Lazy ``run_agent`` reference.
 
@@ -986,6 +999,10 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
     tools_for_api = agent.tools
 
     if agent.api_mode == "anthropic_messages":
+        from agent.response_format import response_format_requires_structured_output
+
+        if response_format_requires_structured_output((agent.request_overrides or {}).get("response_format")):
+            raise ValueError("response_format is not supported by the Anthropic Messages transport.")
         _transport = agent._get_transport()
         anthropic_messages = agent._prepare_anthropic_messages_for_api(api_messages)
         ctx_len = getattr(agent, "context_compressor", None)
@@ -2076,6 +2093,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
             if summary_extra_body:
                 summary_kwargs["extra_body"] = summary_extra_body
+            _apply_zettlab_summary_headers(summary_kwargs, agent)
 
             if agent.api_mode == "anthropic_messages":
                 _tsum = agent._get_transport()
@@ -2129,6 +2147,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
+                _apply_zettlab_summary_headers(summary_kwargs, agent)
 
                 summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary_retry").chat.completions.create(**summary_kwargs)
                 _retry_result = agent._get_transport().normalize_response(summary_response)
@@ -2834,7 +2853,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # reasoning display.  Non-reasoning text is harmlessly
                 # suppressed by the CLI's _stream_delta when the stream
                 # box is already closed (tool boundary flush).
-                elif agent.stream_delta_callback:
+                elif (
+                    agent.stream_delta_callback
+                    and not getattr(
+                        agent, "_should_suppress_plan_stream_text", lambda: False
+                    )()
+                ):
                     try:
                         agent.stream_delta_callback(delta.content)
                         agent._record_streamed_assistant_text(delta.content)

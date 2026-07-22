@@ -761,3 +761,66 @@ class TestHermesInternalDynamicSecrets:
         assert "GATEWAY_RELAY_SECRET" in _HERMES_PROVIDER_ENV_BLOCKLIST
         assert "GATEWAY_RELAY_DELIVERY_KEY" in _HERMES_PROVIDER_ENV_BLOCKLIST
         assert "GATEWAY_RELAY_ID" in _HERMES_PROVIDER_ENV_BLOCKLIST
+
+
+class TestSessionContextVarBridge:
+    """Per-turn session vars are bound to a task-local ContextVar by the
+    gateway (run.py:_set_session_env). Both the foreground (_make_run_env)
+    and background (_sanitize_subprocess_env) subprocess-env builders must
+    bridge that ContextVar into the child env, OVERRIDING any stale
+    process-global os.environ value left by a concurrent same-agent turn.
+
+    Without the background bridge, a connector skill spawned in background
+    forwards the racy global HERMES_SESSION_KEY, and local-server routes the
+    connector call to another session's token (cross-session token bleed).
+    """
+
+    def test_make_run_env_bridges_session_key_over_stale_global(self):
+        from tools.environments.local import _make_run_env
+        from gateway.session_context import set_session_vars, clear_session_vars
+        # A concurrent turn has clobbered the process-global value.
+        with patch.dict(
+            os.environ,
+            {"PATH": "/usr/bin:/bin", "HERMES_SESSION_KEY": "other-turn"},
+            clear=True,
+        ):
+            tokens = set_session_vars(session_key="my-turn")
+            try:
+                result = _make_run_env({})
+            finally:
+                clear_session_vars(tokens)
+        assert result["HERMES_SESSION_KEY"] == "my-turn"
+
+    def test_sanitize_subprocess_env_bridges_session_key_over_stale_global(self):
+        from tools.environments.local import _sanitize_subprocess_env
+        from gateway.session_context import set_session_vars, clear_session_vars
+        base = {"PATH": "/usr/bin:/bin", "HERMES_SESSION_KEY": "other-turn"}
+        tokens = set_session_vars(session_key="my-turn")
+        try:
+            result = _sanitize_subprocess_env(base)
+        finally:
+            clear_session_vars(tokens)
+        assert result["HERMES_SESSION_KEY"] == "my-turn"
+
+    def test_sanitize_subprocess_env_keeps_base_when_session_cleared(self):
+        # After clear_session_vars the ContextVar holds "" (explicitly cleared),
+        # which is authoritative and intentionally overwrites any stale base
+        # env value so a previous session key cannot leak into a subprocess.
+        from tools.environments.local import _sanitize_subprocess_env
+        from gateway.session_context import set_session_vars, clear_session_vars
+        clear_session_vars(set_session_vars(session_key=""))
+        result = _sanitize_subprocess_env(
+            {"PATH": "/usr/bin:/bin", "HERMES_SESSION_KEY": "cli-session"}
+        )
+        assert result["HERMES_SESSION_KEY"] == ""
+
+    def test_sanitize_subprocess_env_keeps_base_in_fresh_context(self):
+        # Once the process has engaged session ContextVars, a fresh task with
+        # _UNSET vars strips stale base env values rather than inheriting them.
+        import contextvars
+        from tools.environments.local import _sanitize_subprocess_env
+        result = contextvars.Context().run(
+            _sanitize_subprocess_env,
+            {"PATH": "/usr/bin:/bin", "HERMES_SESSION_KEY": "cli-session"},
+        )
+        assert "HERMES_SESSION_KEY" not in result

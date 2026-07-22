@@ -235,6 +235,33 @@ class TestSessionLifecycle:
         session = db.get_session("s1")
         assert session["system_prompt"] == "You are a helpful assistant."
 
+    def test_clear_all_system_prompts_nulls_filled_rows(self, db):
+        """clear_all_system_prompts nulls every row that had a prompt."""
+        db.create_session(session_id="s1", source="cli")
+        db.update_system_prompt("s1", "old prompt 1")
+        db.create_session(session_id="s2", source="cli")
+        db.update_system_prompt("s2", "old prompt 2")
+        db.create_session(session_id="s3", source="cli")
+        # s3 has no system_prompt set — should not be counted in rowcount.
+
+        cleared = db.clear_all_system_prompts()
+        assert cleared == 2
+
+        assert db.get_session("s1")["system_prompt"] is None
+        assert db.get_session("s2")["system_prompt"] is None
+        assert db.get_session("s3")["system_prompt"] is None
+
+    def test_clear_all_system_prompts_idempotent(self, db):
+        """A second call returns 0 rows cleared — nothing left to null."""
+        db.create_session(session_id="s1", source="cli")
+        db.update_system_prompt("s1", "p")
+        assert db.clear_all_system_prompts() == 1
+        assert db.clear_all_system_prompts() == 0
+
+    def test_clear_all_system_prompts_empty_db(self, db):
+        """No sessions → 0 cleared, no error."""
+        assert db.clear_all_system_prompts() == 0
+
     def test_update_token_counts(self, db):
         db.create_session(session_id="s1", source="cli")
         db.update_token_counts("s1", input_tokens=200, output_tokens=100)
@@ -999,6 +1026,30 @@ class TestMessageStorage:
 
         session = db.get_session("s1")
         assert session["message_count"] == 2
+
+    def test_delete_message_removes_single_row(self, db):
+        # steer reclaim 撤回补写行的支撑：按 (session_id, row_id) 精确删除，
+        # 计数同步递减，重复删除幂等返回 False。
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="Hello")
+        phantom_id = db.append_message("s1", role="user", content="mid-task steer")
+
+        assert db.delete_message("s1", phantom_id) is True
+        messages = db.get_messages("s1")
+        assert len(messages) == 1
+        assert messages[0]["content"] == "Hello"
+        assert db.get_session("s1")["message_count"] == 1
+
+        assert db.delete_message("s1", phantom_id) is False
+        assert db.get_session("s1")["message_count"] == 1
+
+    def test_delete_message_scoped_to_session(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.create_session(session_id="s2", source="cli")
+        mid = db.append_message("s1", role="user", content="Hello")
+
+        assert db.delete_message("s2", mid) is False
+        assert len(db.get_messages("s1")) == 1
 
     def test_observed_flag_round_trips_for_gateway_replay(self, db):
         db.create_session(session_id="s1", source="telegram:-100")
@@ -3110,6 +3161,11 @@ class TestSessionTitle:
         assert db.set_auto_title_if_empty("s1", "Replacement Title") is False
         assert db.get_session_title("s1") == "Generated Title"
 
+        assert db.set_session_title_if_empty("s1", "Replacement Title") is False
+        db.set_session_title("s1", "Manual Rename")
+        assert db.set_session_title_if_empty("s1", "Late Generated Title") is False
+        assert db.get_session_title("s1") == "Manual Rename"
+
     def test_title_in_search_sessions(self, db):
         db.create_session(session_id="s1", source="cli")
         db.set_session_title("s1", "Debugging Auth")
@@ -4774,6 +4830,30 @@ class TestStateMeta:
         assert db.get_meta("key") == "v2"
 
 
+class TestCompressionLocks:
+    def test_acquire_release_cycle(self, db):
+        assert db.try_acquire_compression_lock("sess-1", "holder-a") is True
+        assert db.get_compression_lock_holder("sess-1") == "holder-a"
+        assert db.try_acquire_compression_lock("sess-1", "holder-b") is False
+
+        db.release_compression_lock("sess-1", "holder-b")
+        assert db.get_compression_lock_holder("sess-1") == "holder-a"
+
+        db.release_compression_lock("sess-1", "holder-a")
+        assert db.get_compression_lock_holder("sess-1") is None
+        assert db.try_acquire_compression_lock("sess-1", "holder-b") is True
+
+    def test_expired_lock_can_be_reclaimed(self, db):
+        assert db.try_acquire_compression_lock("sess-2", "holder-a") is True
+        db._conn.execute(
+            "UPDATE compression_locks SET expires_at = ? WHERE session_id = ?",
+            (time.time() - 1, "sess-2"),
+        )
+        db._conn.commit()
+        assert db.try_acquire_compression_lock("sess-2", "holder-b") is True
+        assert db.get_compression_lock_holder("sess-2") == "holder-b"
+
+
 class TestVacuum:
     def test_vacuum_runs_without_error(self, db):
         """VACUUM must succeed on a fresh DB (no rows to reclaim)."""
@@ -6358,4 +6438,3 @@ class TestLoneSurrogatePersistence:
         db.create_session("s1", source="cli")
         assert db.set_session_title("s1", "title \ud835 bad") is True
         assert db.get_session("s1")["title"] == "title \ufffd bad"
-

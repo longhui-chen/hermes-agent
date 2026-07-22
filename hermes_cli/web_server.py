@@ -11274,6 +11274,7 @@ class CronJobCreate(BaseModel):
     enabled_toolsets: Optional[List[str]] = None
     workdir: Optional[str] = None
     no_agent: bool = False
+    output_language: Optional[str] = None
 
 
 class CronJobUpdate(BaseModel):
@@ -11450,6 +11451,25 @@ def _annotate_cron_job(job: Dict[str, Any], profile: str, home: Path) -> Dict[st
     return annotated
 
 
+@contextmanager
+def _cron_profile_scope(home: Path):
+    """Scope cron helpers to one profile home without mutating module globals."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+
+    home_token = set_hermes_home_override(str(home))
+    secret_token = set_secret_scope(build_profile_secret_scope(Path(home)))
+    try:
+        yield
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+
 def _call_cron_for_profile(target_profile: Optional[str], func_name: str, *args, **kwargs):
     """Run cron.jobs helpers against the selected profile's cron directory.
 
@@ -11459,17 +11479,10 @@ def _call_cron_for_profile(target_profile: Optional[str], func_name: str, *args,
     """
     profile_name, home = _cron_profile_home(target_profile)
     from cron import jobs as cron_jobs
-    from hermes_constants import (
-        reset_hermes_home_override,
-        set_hermes_home_override,
-    )
 
-    token = set_hermes_home_override(str(home))
-    try:
+    with _cron_profile_scope(home):
         with cron_jobs.use_cron_store(home):
             result = getattr(cron_jobs, func_name)(*args, **kwargs)
-    finally:
-        reset_hermes_home_override(token)
 
     if isinstance(result, list):
         return [_annotate_cron_job(j, profile_name, home) for j in result]
@@ -11616,6 +11629,7 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
             enabled_toolsets=_cron_string_list(body.enabled_toolsets),
             workdir=_cron_optional_text(body.workdir),
             no_agent=no_agent,
+            output_language=body.output_language,
         )
     except HTTPException:
         raise
@@ -11771,18 +11785,11 @@ def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
     _profile_name, home = _cron_profile_home(profile)
     from cron import jobs as cron_jobs
     from cron.scheduler_provider import resolve_cron_scheduler
-    from hermes_constants import (
-        reset_hermes_home_override,
-        set_hermes_home_override,
-    )
 
-    token = set_hermes_home_override(str(home))
-    try:
+    with _cron_profile_scope(home):
         with cron_jobs.use_cron_store(home):
             provider = resolve_cron_scheduler()
             return bool(provider.fire_due(job_id, adapters=None, loop=None))
-    finally:
-        reset_hermes_home_override(token)
 
 
 @app.post("/api/cron/fire")
@@ -14326,6 +14333,7 @@ async def create_profile_endpoint(body: ProfileCreate):
         clone = body.clone_from_default
         clone_from = "default" if clone else None
         clone_config = clone
+    seed_skills_result = None
     try:
         path = profiles_mod.create_profile(
             name=body.name,
@@ -14341,7 +14349,7 @@ async def create_profile_endpoint(body: ProfileCreate):
         # user-installed skills. When no_skills=True, create_profile() wrote
         # the opt-out marker and seed_profile_skills() will no-op.
         if not clone:
-            profiles_mod.seed_profile_skills(path, quiet=True)
+            seed_skills_result = profiles_mod.seed_profile_skills(path, quiet=True)
 
         # Match the CLI's profile-create flow: named profiles should get a
         # wrapper in ~/.local/bin when the alias is safe to create.
@@ -14408,7 +14416,7 @@ async def create_profile_endpoint(body: ProfileCreate):
             )
             hub_installs.append({"identifier": ident, "pid": None})
 
-    return {
+    response = {
         "ok": True,
         "name": body.name,
         "path": str(path),
@@ -14417,6 +14425,16 @@ async def create_profile_endpoint(body: ProfileCreate):
         "skills_disabled": skills_disabled,
         "hub_installs": hub_installs,
     }
+    if seed_skills_result and seed_skills_result.get("policy_error"):
+        # Surface the fail-closed seed-policy error the dashboard would otherwise
+        # never see: the profile was created, but bundled skills were NOT seeded
+        # (seed policy corrupt/missing). Mirrors the CLI create warning.
+        response["skills_warning"] = (
+            "Profile created, but bundled skills were NOT seeded: the seed policy "
+            "is present but unreadable/corrupt (fail-closed). Fix "
+            "config/skill_seed_policy.json and run `hermes update`."
+        )
+    return response
 
 
 @app.get("/api/profiles/active")

@@ -6450,6 +6450,149 @@ def test_session_steer_errors_when_agent_has_no_steer_method():
     assert resp["error"]["code"] == 4010
 
 
+def _steer_goal_turn_fixture(monkeypatch, agent):
+    """prompt.submit dispatcher 测试脚手架（照 pending_title 测试的 stub 面）。"""
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None, **kw):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    session = {
+        "agent": agent,
+        "session_key": "test-session",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+        "attached_images": [],
+        "image_counter": 0,
+        "cols": 80,
+        "slash_worker": None,
+        "show_reasoning": False,
+        "tool_progress_mode": "all",
+    }
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(
+        server, "_sync_session_key_after_compress", lambda *a, **kw: None
+    )
+    # 防递归：leftover steer 入队后 run() 尾部会 drain 队列再跑一轮。
+    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *a, **kw: False)
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    return session
+
+
+def test_turn_leftover_steer_skips_goal_hook(monkeypatch):
+    """第十轮 review：leftover /steer 必须先于 goal judge 取出并让 judge
+    让路——用户的改向尚未执行，judge 按当前 final_response 评估会烧掉一轮
+    预算、甚至记下 done/paused verdict，随后 steer 才排队。zet 链路同款跳过。"""
+    calls = {}
+
+    class _Agent:
+        session_id = "test-session"
+        model = "x"
+        provider = "openrouter"
+        base_url = ""
+        api_key = ""
+        _cached_system_prompt = ""
+
+        def run_conversation(self, prompt, **kw):
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+                "pending_steer": "改个方向",
+            }
+
+        def _drain_pending_steer(self, close=False):
+            return None
+
+    class _FakeGoalManager:
+        def __init__(self, *a, **kw):
+            pass
+
+        def is_active(self):
+            return True
+
+        def evaluate_after_turn(self, *a, **kw):
+            calls["evaluated"] = True
+            return {"message": "", "should_continue": False}
+
+    import hermes_cli.goals as _goals_mod
+
+    monkeypatch.setattr(_goals_mod, "GoalManager", _FakeGoalManager)
+    session = _steer_goal_turn_fixture(monkeypatch, _Agent())
+
+    try:
+        server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "hello"},
+            }
+        )
+        assert "evaluated" not in calls  # judge 已让路
+        assert session["queued_prompt"]["text"] == "改个方向"  # steer 排为下一条
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_turn_without_leftover_steer_still_evaluates_goal(monkeypatch):
+    """对照组：无 leftover steer 时 goal judge 照常评估（门控不误伤）。"""
+    calls = {}
+
+    class _Agent:
+        session_id = "test-session"
+        model = "x"
+        provider = "openrouter"
+        base_url = ""
+        api_key = ""
+        _cached_system_prompt = ""
+
+        def run_conversation(self, prompt, **kw):
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+            }
+
+        def _drain_pending_steer(self, close=False):
+            return None
+
+    class _FakeGoalManager:
+        def __init__(self, *a, **kw):
+            pass
+
+        def is_active(self):
+            return True
+
+        def evaluate_after_turn(self, *a, **kw):
+            calls["evaluated"] = True
+            return {"message": "", "should_continue": False}
+
+    import hermes_cli.goals as _goals_mod
+
+    monkeypatch.setattr(_goals_mod, "GoalManager", _FakeGoalManager)
+    session = _steer_goal_turn_fixture(monkeypatch, _Agent())
+
+    try:
+        server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "hello"},
+            }
+        )
+        assert calls.get("evaluated") is True
+        assert "queued_prompt" not in session
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_session_info_includes_mcp_servers(monkeypatch):
     fake_status = [
         {"name": "github", "transport": "http", "tools": 12, "connected": True},

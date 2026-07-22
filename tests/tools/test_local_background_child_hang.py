@@ -154,6 +154,7 @@ class TestBackgroundChildDoesNotHang:
         assert "[OUTPUT TRUNCATED" in result["output"]
         assert result["output"].endswith("[Command timed out after 1s]")
 
+    @pytest.mark.live_system_guard_bypass
     def test_timeout_path_still_works(self, local_env):
         """Foreground command exceeding timeout must still be killed."""
         t0 = time.monotonic()

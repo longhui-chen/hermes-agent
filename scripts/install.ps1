@@ -2406,7 +2406,7 @@ function Copy-ConfigTemplates {
         Write-Info "$configPath already exists, keeping it"
     }
     
-    # Create SOUL.md if it doesn't exist (global persona file).
+    # Create SOUL.md if it doesn't exist (neutral identity slot).
     # IMPORTANT: write without a BOM.  Windows PowerShell 5.1's
     # ``Set-Content -Encoding UTF8`` writes UTF-8 WITH a byte-order-mark
     # (the default PS5 behaviour), and Hermes's prompt-injection scanner
@@ -2418,10 +2418,11 @@ function Copy-ConfigTemplates {
     $soulPath = "$HermesHome\SOUL.md"
     if (-not (Test-Path $soulPath)) {
         # MUST match DEFAULT_SOUL_MD in hermes_cli/default_soul.py. The runtime
-        # upgrades the old comment-only scaffold to this text on next run, so
-        # drift is self-healing, but keep them in sync to avoid first-run churn.
+        # never migrates an existing profile-owned SOUL file.
         $soulContent = @"
-You are Hermes Agent, an intelligent AI assistant created by Nous Research. You are helpful, knowledgeable, and direct. You assist users with a wide range of tasks including answering questions, writing and editing code, analyzing information, creative work, and executing actions via your tools. You communicate clearly, admit uncertainty when appropriate, and prioritize being genuinely useful over being verbose unless otherwise directed below. Be targeted and efficient in your exploration and investigations.
+# Agent SOUL
+
+This profile has not been given a specialized persona yet. Treat this file as an open identity slot: follow the user's current request, the shared Zettlab agent base prompt, and any future edits to this SOUL.md. Do not assume any named specialist identity unless this file, a template package, or the current user explicitly defines that identity.
 "@
         $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
         [System.IO.File]::WriteAllText($soulPath, $soulContent, $utf8NoBom)
@@ -2436,14 +2437,42 @@ You are Hermes Agent, an intelligent AI assistant created by Nous Research. You 
     if (Test-Path $pythonExe) {
         try {
             & $pythonExe "$InstallDir\tools\skills_sync.py" 2>$null
-            Write-Success "Skills synced to $HermesHome\skills"
+            # `&` does NOT throw on a native non-zero exit, so check explicitly:
+            # exit 2 = fail-closed corrupt policy (seeded nothing). Throw so the
+            # catch runs the pre-baked manifest fallback instead of reporting a
+            # bogus success.
+            if ($LASTEXITCODE -ne 0) {
+                throw "skills_sync.py exited with $LASTEXITCODE"
+            }
+            Write-Success "Skills synced to ~/.hermes/skills/"
         } catch {
-            # Fallback: simple directory copy
-            $bundledSkills = "$InstallDir\skills"
+            # Fallback (python seeder unavailable): copy ONLY the policy's seed
+            # set from the pre-baked manifest — policy-correct without python.
+            # Never bulk-copy the whole bundle (would seed the un-curated set).
+            $manifest = "$InstallDir\config\seed_fallback_manifest.txt"
             $userSkills = "$HermesHome\skills"
-            if ((Test-Path $bundledSkills) -and -not (Get-ChildItem $userSkills -Exclude '.bundled_manifest' -ErrorAction SilentlyContinue)) {
-                Copy-Item -Path "$bundledSkills\*" -Destination $userSkills -Recurse -Force -ErrorAction SilentlyContinue
-                Write-Success "Skills copied to $HermesHome\skills"
+            if ((Test-Path $manifest) -and -not (Get-ChildItem $userSkills -Exclude '.bundled_manifest' -ErrorAction SilentlyContinue)) {
+                $seedFailures = 0
+                foreach ($src in (Get-Content $manifest | Where-Object { $_.Trim() -ne '' })) {
+                    $rel = ($src -split '/', 2)[1]            # strip first path component
+                    $destDir = Split-Path -Parent "$userSkills\$($rel -replace '/', '\')"
+                    New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+                    try {
+                        Copy-Item -Path "$InstallDir\$($src -replace '/', '\')" -Destination "$userSkills\$($rel -replace '/', '\')" -Recurse -Force -ErrorAction Stop
+                    } catch {
+                        $seedFailures++
+                    }
+                }
+                # Only mark the profile policy-managed when every seed copied. On
+                # partial failure, skip the marker and report honestly — the first
+                # 'hermes' run (no manifest -> treated as new) re-seeds under
+                # policy and completes the missing skills.
+                if ($seedFailures -eq 0) {
+                    New-Item -ItemType File -Force -Path "$userSkills\.seed_policy" | Out-Null
+                    Write-Success "Skills seeded from policy fallback"
+                } else {
+                    Write-Warn "Skill fallback seeding incomplete ($seedFailures copy failure(s)); marker not written — the first 'hermes' run will complete seeding under policy."
+                }
             }
         }
     }

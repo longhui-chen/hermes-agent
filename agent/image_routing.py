@@ -202,9 +202,11 @@ def _supports_vision_override(
     # 1. Top-level shortcut
     model_cfg_raw = cfg.get("model")
     model_cfg: Dict[str, Any] = model_cfg_raw if isinstance(model_cfg_raw, dict) else {}
-    top = _coerce_capability_bool(model_cfg.get("supports_vision"))
-    if top is not None:
-        return top
+    config_model = str(model_cfg.get("default") or "").strip()
+    if not config_model or config_model == model:
+        top = _coerce_capability_bool(model_cfg.get("supports_vision"))
+        if top is not None:
+            return top
 
     # 2. Per-provider, per-model. Named custom providers (e.g. "my-vllm")
     # get rewritten to provider="custom" at runtime

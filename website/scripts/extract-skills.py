@@ -247,8 +247,134 @@ def _source_url(source: str, identifier: str, extra: dict) -> str:
     return ""
 
 
+# Keep the Skills Hub in lock-step with what a new profile actually seeds
+# (config/skill_seed_policy.json — a pure allowlist over upstream-verbatim
+# skills/). Without this the Hub would advertise the full un-curated set.
+# Mirrors website/scripts/generate-skill-docs.py and tools/skills_sync.py. With
+# no policy, the Hub lists everything (upstream).
+SEED_POLICY_PATH = os.path.join(REPO_ROOT, "config", "skill_seed_policy.json")
+
+
+def _load_seed_policy():
+    if not os.path.isfile(SEED_POLICY_PATH):
+        return None
+    try:
+        with open(SEED_POLICY_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return {"seed": set(data.get("seed", []))}
+    except (OSError, ValueError):
+        return None
+
+
+def _frontmatter_name(skill_md_path):
+    """Return the SKILL.md frontmatter ``name`` (the upstream id), or None."""
+    try:
+        with open(skill_md_path, encoding="utf-8") as f:
+            content = f.read()
+    except OSError:
+        return None
+    if not content.startswith("---"):
+        return None
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return None
+    try:
+        fm = yaml.safe_load(parts[1])
+    except yaml.YAMLError:
+        return None
+    if not fm or not isinstance(fm, dict):
+        return None
+    return fm.get("name")
+
+
+def _skill_record(root, base_path, source_label):
+    """Build the Hub metadata dict for the skill at ``root`` (or None to skip)."""
+    skill_path = os.path.join(root, "SKILL.md")
+    with open(skill_path, encoding="utf-8") as f:
+        content = f.read()
+
+    if not content.startswith("---"):
+        return None
+
+    parts = content.split("---", 2)
+    if len(parts) < 3:
+        return None
+
+    try:
+        fm = yaml.safe_load(parts[1])
+    except yaml.YAMLError:
+        return None
+
+    if not fm or not isinstance(fm, dict):
+        return None
+
+    body = parts[2].strip()
+    overview = _extract_overview(body)
+
+    rel = os.path.relpath(root, base_path)
+    category = rel.split(os.sep)[0]
+
+    tags = []
+    metadata = fm.get("metadata")
+    if isinstance(metadata, dict):
+        hermes_meta = metadata.get("hermes", {})
+        if isinstance(hermes_meta, dict):
+            tags = hermes_meta.get("tags", [])
+    if not tags:
+        tags = fm.get("tags", [])
+    if isinstance(tags, str):
+        tags = [tags]
+
+    prereq = fm.get("prerequisites") or {}
+    env_vars = []
+    commands = []
+    if isinstance(prereq, dict):
+        ev = prereq.get("env_vars")
+        if isinstance(ev, list):
+            env_vars = [str(x) for x in ev if x]
+        elif isinstance(ev, str) and ev.strip():
+            env_vars = [ev.strip()]
+        cmds = prereq.get("commands")
+        if isinstance(cmds, list):
+            commands = [str(x) for x in cmds if x]
+        elif isinstance(cmds, str) and cmds.strip():
+            commands = [cmds.strip()]
+
+    docs_path = _docs_page_path(rel, source_label)
+    # Only link to a doc page that actually exists. The bundled doc pages are
+    # committed snapshots regenerated at deploy; a renamed skill (e.g.
+    # html-artifacts) or a not-yet-generated one has no page yet, so linking
+    # would 404. The Skills Hub UI falls back gracefully when docsPath is empty
+    # (see website/src/pages/skills/index.tsx). Once the doc generator runs at
+    # deploy the page exists and the link reappears automatically.
+    if docs_path:
+        page_file = os.path.join(
+            REPO_ROOT, "website", "docs", "user-guide", "skills", *docs_path.split("/")
+        )
+        if not os.path.isfile(page_file + ".md"):
+            docs_path = ""
+
+    return {
+        "name": fm.get("name", os.path.basename(root)),
+        "description": fm.get("description", ""),
+        "overview": overview,
+        "category": category,
+        "categoryLabel": CATEGORY_LABELS.get(category, category.replace("-", " ").title()),
+        "source": source_label,
+        "tags": tags or [],
+        "platforms": fm.get("platforms", []),
+        "author": fm.get("author", ""),
+        "version": fm.get("version", ""),
+        "license": fm.get("license", ""),
+        "envVars": env_vars,
+        "commands": commands,
+        "docsPath": docs_path,
+    }
+
+
 def extract_local_skills():
     skills = []
+    policy = _load_seed_policy()
 
     for base_dir, source_label in LOCAL_SKILL_DIRS:
         base_path = os.path.join(REPO_ROOT, base_dir)
@@ -259,73 +385,18 @@ def extract_local_skills():
             if "SKILL.md" not in files:
                 continue
 
-            skill_path = os.path.join(root, "SKILL.md")
-            with open(skill_path, encoding="utf-8") as f:
-                content = f.read()
+            # Built-in source under an active policy: keep only allowlisted
+            # skills (matched by frontmatter name against upstream-verbatim
+            # skills/). Optional skills are unaffected; no policy -> emit
+            # everything (upstream behaviour).
+            if source_label == "built-in" and policy is not None:
+                sid = _frontmatter_name(os.path.join(root, "SKILL.md")) or os.path.basename(root)
+                if sid not in policy["seed"]:
+                    continue  # not allowlisted -> not advertised in the Hub
 
-            if not content.startswith("---"):
-                continue
-
-            parts = content.split("---", 2)
-            if len(parts) < 3:
-                continue
-
-            try:
-                fm = yaml.safe_load(parts[1])
-            except yaml.YAMLError:
-                continue
-
-            if not fm or not isinstance(fm, dict):
-                continue
-
-            body = parts[2].strip()
-            overview = _extract_overview(body)
-
-            rel = os.path.relpath(root, base_path)
-            category = rel.split(os.sep)[0]
-
-            tags = []
-            metadata = fm.get("metadata")
-            if isinstance(metadata, dict):
-                hermes_meta = metadata.get("hermes", {})
-                if isinstance(hermes_meta, dict):
-                    tags = hermes_meta.get("tags", [])
-            if not tags:
-                tags = fm.get("tags", [])
-            if isinstance(tags, str):
-                tags = [tags]
-
-            prereq = fm.get("prerequisites") or {}
-            env_vars = []
-            commands = []
-            if isinstance(prereq, dict):
-                ev = prereq.get("env_vars")
-                if isinstance(ev, list):
-                    env_vars = [str(x) for x in ev if x]
-                elif isinstance(ev, str) and ev.strip():
-                    env_vars = [ev.strip()]
-                cmds = prereq.get("commands")
-                if isinstance(cmds, list):
-                    commands = [str(x) for x in cmds if x]
-                elif isinstance(cmds, str) and cmds.strip():
-                    commands = [cmds.strip()]
-
-            skills.append({
-                "name": fm.get("name", os.path.basename(root)),
-                "description": fm.get("description", ""),
-                "overview": overview,
-                "category": category,
-                "categoryLabel": CATEGORY_LABELS.get(category, category.replace("-", " ").title()),
-                "source": source_label,
-                "tags": tags or [],
-                "platforms": fm.get("platforms", []),
-                "author": fm.get("author", ""),
-                "version": fm.get("version", ""),
-                "license": fm.get("license", ""),
-                "envVars": env_vars,
-                "commands": commands,
-                "docsPath": _docs_page_path(rel, source_label),
-            })
+            rec = _skill_record(root, base_path, source_label)
+            if rec is not None:
+                skills.append(rec)
 
     return skills
 

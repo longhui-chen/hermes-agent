@@ -196,6 +196,14 @@ class TestSupportsVisionOverride:
         cfg = {"model": {"supports_vision": False}}
         assert _supports_vision_override(cfg, "custom", "my-llava") is False
 
+    def test_top_level_shortcut_only_applies_to_config_default(self):
+        cfg = {"model": {"default": "lite", "supports_vision": False}}
+        assert _supports_vision_override(cfg, "custom", "my-llava") is None
+
+    def test_top_level_shortcut_applies_when_default_matches(self):
+        cfg = {"model": {"default": "my-llava", "supports_vision": True}}
+        assert _supports_vision_override(cfg, "custom", "my-llava") is True
+
     def test_per_provider_per_model_via_runtime_name(self):
         cfg = {
             "providers": {

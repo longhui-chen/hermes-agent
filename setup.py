@@ -80,8 +80,27 @@ setup(
         "build": ReadOnlySourceBuild,
         "egg_info": ReadOnlySourceEggInfo,
     },
+    # NOTE: data_files is declared HERE (programmatically) rather than in
+    # pyproject.toml's [tool.setuptools.data-files] on purpose. A wheel must ship
+    # the bundled skill TREES (skills/, optional-skills/) with their nested
+    # category/skill structure preserved — static pyproject data-files globs
+    # flatten everything into one target dir, which breaks skill discovery.
+    # _data_file_tree() walks each tree and emits one (target_dir, files) pair
+    # per subdirectory, preserving structure, and picks up new skills
+    # automatically (no per-skill list to maintain).
+    #
+    # Because pyproject fields take precedence over setup.py, [tool.setuptools.
+    # data-files] MUST stay absent from pyproject.toml — otherwise it silently
+    # overrides this list and the wheel ships zero skills. locales/ lives here too
+    # for the same reason (it used to be the lone pyproject entry; #27632/#35374).
     data_files=[
         *_data_file_tree("skills"),
         *_data_file_tree("optional-skills"),
+        # i18n catalogs (locales/ is a bare data dir, not a package). Without these
+        # in the wheel, sealed installs surface raw i18n keys (#27632/#35374/#23943).
+        *_data_file_tree("locales"),
+        # Ship the seed policy + fallback manifest alongside skills/ so a wheel
+        # install resolves them (else the seed filter silently no-ops).
+        ("config", ["config/skill_seed_policy.json", "config/seed_fallback_manifest.txt"]),
     ]
 )

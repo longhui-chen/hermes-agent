@@ -161,11 +161,19 @@ _SECRET_SUBSTRINGS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL",
 # are non-secret runtime-location flags (the same set hermes_cli treats as the
 # runtime location) that repo-root modules a sandbox script imports may read at
 # import time.  None match _SECRET_SUBSTRINGS.
+#
+# HERMES_HOME_FALLBACK is the same class of flag: it records the profile home
+# that the missing-HOME fallback injected (see hermes_constants). It must
+# survive scrubbing so a grandchild spawned by an execute_code sandbox inside
+# a nested hermes chain keeps its profile HOME — dropping it lets the child's
+# apply_subprocess_home_env() "repair" HOME back to the pwd-guessed real home
+# (/root) and re-break ZET-1938 on the second hop.
 _HERMES_CHILD_ALLOWED = frozenset({
     "HERMES_HOME",
     "HERMES_PROFILE",
     "HERMES_CONFIG",
     "HERMES_ENV",
+    "HERMES_HOME_FALLBACK",
 })
 
 # Windows-only: a handful of variables are required by the OS/CRT itself.
@@ -225,6 +233,10 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
         is_windows = _IS_WINDOWS
 
     scrubbed = {}
+    try:
+        from tools.environments.local import PROFILE_SCOPED_SUBPROCESS_ENV_KEYS
+    except Exception:
+        PROFILE_SCOPED_SUBPROCESS_ENV_KEYS = frozenset()
     # Non-secret HERMES_* vars dropped by the tightened allowlist (#27303). The
     # broad "HERMES_" prefix used to pass these through; now only the
     # operational set does. The drop is intentional (those vars can carry
@@ -234,6 +246,8 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     # diagnosable and points at the env_passthrough opt-in escape hatch.
     _dropped_hermes = []
     for k, v in source_env.items():
+        if k in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
+            continue
         if is_passthrough(k):
             scrubbed[k] = v
             continue
@@ -262,6 +276,26 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
             ", ".join(sorted(_dropped_hermes)),
         )
     return scrubbed
+
+
+def _inject_execute_code_session_context_env(env: dict) -> None:
+    """Bridge non-secret gateway session routing vars into execute_code.
+
+    The execute_code child must not receive connector bearer tokens or model
+    credentials, but it may need the same HERMES_SESSION_* routing metadata as
+    terminal() so helper RPCs can stay bound to the correct chat session.
+    """
+    try:
+        from tools.environments.local import _inject_session_context_env
+    except Exception:
+        return
+    _inject_session_context_env(env)
+    logger.debug(
+        "execute_code: session routing env injected "
+        "(session_key_present=%s, connector_auth_present=%s)",
+        bool(env.get("HERMES_SESSION_KEY")),
+        bool(env.get("ZETTLAB_CONNECTORS_AUTH_TOKEN")),
+    )
 
 
 def check_sandbox_requirements() -> bool:
@@ -1061,7 +1095,8 @@ def _execute_remote(
             f"HERMES_RPC_TOKEN={shlex.quote(rpc_token)} "
             f"PYTHONDONTWRITEBYTECODE=1"
         )
-        tz = os.getenv("HERMES_TIMEZONE", "").strip()
+        import hermes_time
+        tz = hermes_time.get_timezone_name()
         if tz:
             env_prefix += f" TZ={shlex.quote(tz)}"
 
@@ -1341,6 +1376,7 @@ def execute_code(
         # passed through — without those, the child can't create a socket
         # or spawn a subprocess.  See ``_scrub_child_env`` for the rules.
         child_env = _scrub_child_env(os.environ)
+        _inject_execute_code_session_context_env(child_env)
         child_env["HERMES_RPC_SOCKET"] = rpc_endpoint
         child_env["HERMES_RPC_TOKEN"] = rpc_token
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -1377,7 +1413,8 @@ def execute_code(
         # code reflects the correct wall-clock time.  Only TZ is set —
         # HERMES_TIMEZONE is an internal Hermes setting and must not leak
         # into child processes.
-        _tz_name = os.getenv("HERMES_TIMEZONE", "").strip()
+        import hermes_time
+        _tz_name = hermes_time.get_timezone_name()
         if _tz_name:
             child_env["TZ"] = _tz_name
         child_env.pop("HERMES_TIMEZONE", None)

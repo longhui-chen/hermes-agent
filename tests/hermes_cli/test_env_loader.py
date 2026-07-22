@@ -3,7 +3,13 @@ import importlib
 import os
 import sys
 
+from hermes_cli import env_loader
 from hermes_cli.env_loader import load_hermes_dotenv
+
+
+def _reset_env_loader_operator_snapshot(monkeypatch):
+    monkeypatch.setattr(env_loader, "_ORIGINAL_PROCESS_ENV", None)
+    monkeypatch.setattr(env_loader, "_ORIGINAL_OPERATOR_VALUES", None)
 
 
 def test_user_env_overrides_stale_shell_values(tmp_path, monkeypatch):
@@ -85,6 +91,21 @@ def test_null_bytes_in_user_env_are_stripped(tmp_path, monkeypatch):
     assert loaded == [env_file]
     assert os.getenv("GLM_API_KEY") == "abc"
     assert os.getenv("OPENAI_API_KEY") == "sk-123"
+
+
+def test_presets_dir_operator_env_survives_stale_user_env(tmp_path, monkeypatch):
+    home = tmp_path / "hermes"
+    home.mkdir()
+    env_file = home / ".env"
+    env_file.write_text("ZETTLAB_PRESETS_DIR=/old/presets/current\n", encoding="utf-8")
+
+    _reset_env_loader_operator_snapshot(monkeypatch)
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", "/volume1/subvol/agents/zettlab-presets/current")
+
+    loaded = load_hermes_dotenv(hermes_home=home)
+
+    assert loaded == [env_file]
+    assert os.getenv("ZETTLAB_PRESETS_DIR") == "/volume1/subvol/agents/zettlab-presets/current"
 
 
 def test_main_import_applies_user_env_over_shell_values(tmp_path, monkeypatch):

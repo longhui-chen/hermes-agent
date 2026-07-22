@@ -395,7 +395,13 @@ class TestSecondaryProfileConfigHandling:
     @pytest.mark.asyncio
     async def test_secondary_webhook_uses_degradable_error(self, monkeypatch):
         from gateway.run import SecondaryPortBindingConfigError
+class TestPortBindingSkip:
+    """A secondary profile enabling a port-binding platform is skipped."""
+
+    @pytest.mark.asyncio
+    async def test_secondary_webhook_skips_listener(self, monkeypatch):
         from gateway.config import GatewayConfig, Platform, PlatformConfig
+        from gateway.run import SecondaryPortBindingConfigError
 
         runner = GatewayRunner.__new__(GatewayRunner)
         runner.config = GatewayConfig(multiplex_profiles=True)
@@ -409,11 +415,16 @@ class TestSecondaryProfileConfigHandling:
         monkeypatch.setattr(
             "gateway.config.load_gateway_config", lambda: reviewer_cfg
         )
+        monkeypatch.setattr(
+            runner,
+            "_create_adapter",
+            lambda *_: pytest.fail("port-binding adapter should be skipped"),
+        )
 
-        with pytest.raises(SecondaryPortBindingConfigError) as ei:
+        with pytest.raises(SecondaryPortBindingConfigError) as exc_info:
             await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
-        assert "webhook" in str(ei.value)
-        assert "reviewer" in str(ei.value)
+        assert "webhook" in str(exc_info.value)
+        assert "reviewer" in str(exc_info.value)
         assert "reviewer" not in runner._profile_adapters
 
     @pytest.mark.asyncio

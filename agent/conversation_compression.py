@@ -797,7 +797,18 @@ def compress_context(
         f"{approx_tokens:,}" if approx_tokens else "unknown", agent.model,
         focus_topic,
     )
+    _old_session_id = agent.session_id or ""
     agent._emit_status(COMPACTION_STATUS)
+    agent._emit_structured_status(
+        "context.compaction",
+        {
+            "state": "started",
+            "message": "上下文正在压缩",
+            "old_session_id": _old_session_id,
+            "before_messages": _pre_msg_count,
+            "before_tokens": approx_tokens,
+        },
+    )
 
     # ── Compression lock ────────────────────────────────────────────────
     # Atomic, state.db-backed lock per session_id.  Without this, two
@@ -1058,6 +1069,20 @@ def compress_context(
 
         messages_before_compression = copy.deepcopy(messages)
         compressed = compress_fn(messages, **compress_kwargs)
+    except Exception as _compress_err:
+        # Surface the failure to the gateway, then release the lock so the
+        # session isn't permanently blocked from future compression.
+        agent._emit_structured_status(
+            "context.compaction",
+            {
+                "state": "failed",
+                "message": "上下文压缩失败",
+                "old_session_id": _old_session_id,
+                "error": str(_compress_err),
+            },
+        )
+        _release_lock()
+        raise
     except BaseException:
         # ANY exception after lock acquisition — memory hook, capability
         # inspection, engine lookup, or compress() — must release the lock so
@@ -1489,6 +1514,19 @@ def compress_context(
             "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
             agent.session_id or "none", _pre_msg_count, len(compressed),
             f"{_compressed_est:,}",
+        )
+        agent._emit_structured_status(
+            "context.compaction",
+            {
+                "state": "succeeded",
+                "message": "上下文压缩成功",
+                "old_session_id": _old_session_id,
+                "new_session_id": agent.session_id or "",
+                "before_messages": _pre_msg_count,
+                "after_messages": len(compressed),
+                "before_tokens": approx_tokens,
+                "after_tokens": _compressed_est,
+            },
         )
         return compressed, new_system_prompt
     finally:

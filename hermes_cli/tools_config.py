@@ -150,7 +150,12 @@ def gui_toolset_label(label: str) -> str:
 # `hermes tools` → X (Twitter) Search setup walks users through credential
 # setup. The tool's check_fn means the schema still won't appear to the
 # model if the credential later goes missing or expires.
-_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search"}
+#
+# markdown_vault_write (vault_write / vault_delete) is default-OFF: enabling the
+# markdown_vault plugin must expose only the read tools until a profile
+# explicitly opts into note mutation/deletion (HR3/HR4 — write capability is
+# independently gated, not granted by merely enabling the plugin).
+_DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "markdown_vault_write"}
 
 
 def _xai_credentials_present() -> bool:

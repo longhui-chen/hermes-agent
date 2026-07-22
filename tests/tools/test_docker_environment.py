@@ -362,6 +362,27 @@ def test_docker_env_appears_in_run_command(monkeypatch):
     assert "GNUPGHOME=/root/.gnupg" in run_args_str
 
 
+def test_docker_env_scrubs_profile_scoped_connector_runtime_at_container_create(monkeypatch):
+    """docker run -e must not receive connector bearer from docker_env."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(env={
+        "ZETTLAB_CONNECTORS_URL": "http://from-docker-env",
+        "ZETTLAB_CONNECTORS_AUTH_TOKEN": "docker-env-token",
+        "ZET_AGENT_ID": "agent-from-docker-env",
+        "SAFE_TOKEN": "safe-value",
+    })
+
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    run_args_str = " ".join(run_calls[0][0])
+    assert "ZETTLAB_CONNECTORS_URL" not in run_args_str
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in run_args_str
+    assert "ZET_AGENT_ID" not in run_args_str
+    assert "SAFE_TOKEN=safe-value" in run_args_str
+
+
 def test_docker_env_appears_in_init_env_args(monkeypatch):
     """Explicit docker_env values should appear in _build_init_env_args."""
     env = _make_execute_only_env()
@@ -401,6 +422,38 @@ def test_docker_env_and_forward_env_merge_in_init_args(monkeypatch):
 
     assert "SSH_AUTH_SOCK=/run/user/1000/agent.sock" in args_str
     assert "TOKEN=secret123" in args_str
+
+
+def test_init_env_args_scrubs_profile_scoped_connector_runtime(monkeypatch):
+    """Docker init_session must not snapshot connector bearer from any source."""
+    env = _make_execute_only_env(forward_env=[
+        "ZETTLAB_CONNECTORS_URL",
+        "ZETTLAB_CONNECTORS_AUTH_TOKEN",
+        "ZET_AGENT_ID",
+        "SAFE_TOKEN",
+    ])
+    env._env = {
+        "ZETTLAB_CONNECTORS_URL": "http://from-docker-env",
+        "ZETTLAB_CONNECTORS_AUTH_TOKEN": "docker-env-token",
+        "ZET_AGENT_ID": "docker-env-agent",
+    }
+
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_URL", "http://from-shell")
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "shell-token")
+    monkeypatch.setenv("ZET_AGENT_ID", "shell-agent")
+    monkeypatch.setenv("SAFE_TOKEN", "safe-value")
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {
+        "ZETTLAB_CONNECTORS_AUTH_TOKEN": "dotenv-token",
+        "SAFE_TOKEN": "dotenv-safe",
+    })
+
+    args = env._build_init_env_args()
+    args_str = " ".join(args)
+
+    assert "ZETTLAB_CONNECTORS_URL" not in args_str
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in args_str
+    assert "ZET_AGENT_ID" not in args_str
+    assert "SAFE_TOKEN=safe-value" in args_str
 
 
 

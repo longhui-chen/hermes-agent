@@ -79,7 +79,8 @@ class TestRunningJobGuard:
         }
 
         # Simulate the job already running.
-        sched._running_job_ids.add("guard-job")
+        running_key = sched._running_job_key(job)
+        sched._running_job_ids.add(running_key)
 
         dispatched = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
@@ -93,7 +94,7 @@ class TestRunningJobGuard:
         assert n == 0  # skipped, not dispatched
         assert dispatched == []
 
-        sched._running_job_ids.discard("guard-job")
+        sched._running_job_ids.discard(running_key)
         sched._shutdown_parallel_pool()
 
 
@@ -244,7 +245,8 @@ class TestSequentialPool:
         }
 
         # Simulate the job already running.
-        sched._running_job_ids.add("guard-seq")
+        running_key = sched._running_job_key(job)
+        sched._running_job_ids.add(running_key)
 
         dispatched = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
@@ -258,7 +260,7 @@ class TestSequentialPool:
         assert n == 0  # skipped, not dispatched
         assert dispatched == []
 
-        sched._running_job_ids.discard("guard-seq")
+        sched._running_job_ids.discard(running_key)
         sched._shutdown_parallel_pool()
 
     def test_get_sequential_pool_is_persistent(self):

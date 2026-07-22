@@ -29,7 +29,14 @@ import pytest
 
 import gateway.session_context as sc
 from gateway.session_context import _VAR_MAP, clear_session_vars, set_session_vars
-from tools.environments.local import _make_run_env, _sanitize_subprocess_env, hermes_subprocess_env
+from tools.code_execution_tool import _inject_execute_code_session_context_env, _scrub_child_env
+from tools.environments.local import (
+    LocalEnvironment,
+    _make_run_env,
+    _sanitize_subprocess_env,
+    build_connector_runtime_env,
+    hermes_subprocess_env,
+)
 
 # The full set of session vars the bridge owns.
 SESSION_VARS = list(_VAR_MAP.keys())
@@ -60,6 +67,21 @@ def _isolate_session_context():
 def _engage():
     """Mark the session-context machinery engaged, like a concurrent host would."""
     sc._session_context_engaged = True
+
+
+@pytest.fixture(autouse=True)
+def _isolate_secret_scope():
+    """Clean multiplex/profile secret scope around env-bridge tests."""
+    from agent import secret_scope as ss
+
+    saved_active = ss.is_multiplex_active()
+    token = ss.set_secret_scope(None)
+    ss.set_multiplex_active(False)
+    try:
+        yield
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(saved_active)
 
 
 # --------------------------------------------------------------------------- #
@@ -302,3 +324,250 @@ def test_hermes_subprocess_env_unengaged_preserves_fallback(monkeypatch):
     # not engaged (autouse fixture leaves _session_context_engaged False)
     env = hermes_subprocess_env()
     assert env.get("HERMES_SESSION_KEY") == "cli-fallback-key"
+
+
+# --------------------------------------------------------------------------- #
+# multiplex profile-scoped connector runtime env
+# --------------------------------------------------------------------------- #
+
+def test_make_run_env_keeps_profile_scoped_connector_runtime_out_of_popen_env(monkeypatch):
+    """Terminal Popen env must not carry profile-scoped connector bearer.
+
+    The gateway process may have stale globals from another profile, and the
+    LocalEnvironment snapshot may also carry stale values. The generic terminal
+    path is model-controlled shell, not the connector-specific runner, so it
+    must stay free of these keys even when a profile scope exists.
+    """
+    from agent import secret_scope as ss
+
+    ss.set_multiplex_active(True)
+    monkeypatch.setenv(
+        "ZETTLAB_CONNECTORS_URL",
+        "http://127.0.0.1:9090/api/v1/internal/connectors/rpc?agent_id=foreign",
+    )
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "foreign-token")
+    monkeypatch.setenv("ZET_AGENT_ID", "foreign")
+    token = ss.set_secret_scope({
+        "ZETTLAB_CONNECTORS_URL": "http://127.0.0.1:9090/api/v1/internal/connectors/rpc?agent_id=main",
+        "ZETTLAB_CONNECTORS_AUTH_TOKEN": "main-token",
+        "ZET_AGENT_ID": "main",
+    })
+    try:
+        env = _make_run_env({
+            "ZETTLAB_CONNECTORS_URL": "http://127.0.0.1:9090/api/v1/internal/connectors/rpc?agent_id=snapshot",
+            "ZETTLAB_CONNECTORS_AUTH_TOKEN": "snapshot-token",
+            "ZET_AGENT_ID": "snapshot",
+        })
+    finally:
+        ss.reset_secret_scope(token)
+
+    assert "ZETTLAB_CONNECTORS_URL" not in env
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in env
+    assert "ZET_AGENT_ID" not in env
+
+
+def test_make_run_env_strips_connector_runtime_without_profile_scope(monkeypatch):
+    """Multiplex mode must not inherit stale connector env without a scope."""
+    from agent import secret_scope as ss
+
+    ss.set_multiplex_active(True)
+    monkeypatch.setenv(
+        "ZETTLAB_CONNECTORS_URL",
+        "http://127.0.0.1:9090/api/v1/internal/connectors/rpc?agent_id=foreign",
+    )
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "foreign-token")
+    monkeypatch.setenv("ZET_AGENT_ID", "foreign")
+
+    env = _make_run_env({})
+
+    assert "ZETTLAB_CONNECTORS_URL" not in env
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in env
+    assert "ZET_AGENT_ID" not in env
+
+
+def test_make_run_env_strips_connector_runtime_without_multiplex(monkeypatch):
+    """Generic terminal commands must not inherit connector bearer in any mode."""
+    monkeypatch.setenv(
+        "ZETTLAB_CONNECTORS_URL",
+        "http://127.0.0.1:9090/api/v1/internal/connectors/rpc?agent_id=single",
+    )
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "single-token")
+    monkeypatch.setenv("ZET_AGENT_ID", "single")
+
+    env = _make_run_env({
+        "ZETTLAB_CONNECTORS_URL": "http://127.0.0.1:9090/api/v1/internal/connectors/rpc?agent_id=extra",
+        "ZETTLAB_CONNECTORS_AUTH_TOKEN": "extra-token",
+        "ZET_AGENT_ID": "extra",
+    })
+
+    assert "ZETTLAB_CONNECTORS_URL" not in env
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in env
+    assert "ZET_AGENT_ID" not in env
+
+
+def test_local_snapshot_wrapper_unsets_connector_runtime_before_and_after_command():
+    """Sourced shell snapshots must not re-expose or re-persist connector bearer."""
+    env = LocalEnvironment.__new__(LocalEnvironment)
+    env._session_id = "snapshot-test"
+    env._snapshot_path = "/tmp/hermes-snapshot-test.sh"
+    env._cwd_file = "/tmp/hermes-cwd-test.txt"
+    env._cwd_marker = "__HERMES_CWD_snapshot_test__"
+    env._snapshot_ready = True
+
+    script = env._wrap_command("printf done", "/tmp")
+
+    source_idx = script.index("source /tmp/hermes-snapshot-test.sh")
+    first_unset_idx = script.index("unset ZETTLAB_CONNECTORS_AUTH_TOKEN")
+    eval_idx = script.index("eval 'printf done'")
+    second_unset_idx = script.index(
+        "unset ZETTLAB_CONNECTORS_AUTH_TOKEN",
+        first_unset_idx + 1,
+    )
+    dump_idx = script.index("export -p >")
+
+    assert source_idx < first_unset_idx < eval_idx
+    assert eval_idx < second_unset_idx < dump_idx
+
+
+def test_local_snapshot_bootstrap_unsets_connector_runtime_before_first_dump():
+    """init_session must not publish connector bearer in the initial snapshot."""
+    env = LocalEnvironment.__new__(LocalEnvironment)
+    env.cwd = "/tmp"
+    env._session_id = "bootstrap-test"
+    env._snapshot_path = "/tmp/hermes-snapshot-bootstrap.sh"
+    env._cwd_file = "/tmp/hermes-cwd-bootstrap.txt"
+    env._cwd_marker = "__HERMES_CWD_bootstrap_test__"
+    env._snapshot_timeout = 5
+    captured: dict[str, str] = {}
+
+    class _Proc:
+        pass
+
+    env._run_bash = lambda script, **kwargs: captured.setdefault("script", script) or _Proc()
+    env._wait_for_process = lambda proc, **kwargs: {"returncode": 0, "output": ""}
+    env._update_cwd = lambda result: None
+
+    env.init_session()
+    script = captured["script"]
+
+    unset_idx = script.index("unset ZETTLAB_CONNECTORS_AUTH_TOKEN")
+    dump_idx = script.index("export -p >")
+
+    assert unset_idx < dump_idx
+
+
+def test_build_connector_runtime_env_uses_profile_scope(monkeypatch):
+    """Only the allowlisted connector runner receives current profile values."""
+    from agent import secret_scope as ss
+
+    ss.set_multiplex_active(True)
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "foreign-token")
+    token = ss.set_secret_scope({
+        "ZETTLAB_CONNECTORS_URL": "http://127.0.0.1:9090/api/v1/internal/connectors/rpc?agent_id=main",
+        "ZETTLAB_CONNECTORS_AUTH_TOKEN": "main-token",
+        "ZET_AGENT_ID": "main",
+    })
+    try:
+        env = build_connector_runtime_env()
+    finally:
+        ss.reset_secret_scope(token)
+
+    assert env["ZETTLAB_CONNECTORS_AUTH_TOKEN"] == "main-token"
+    assert env["ZET_AGENT_ID"] == "main"
+
+
+def test_sanitize_and_nonterminal_spawn_scrub_connector_runtime_env(monkeypatch):
+    """Background/PTY and helper spawn paths must not receive connector bearer."""
+    from agent import secret_scope as ss
+
+    ss.set_multiplex_active(True)
+    monkeypatch.setenv(
+        "ZETTLAB_CONNECTORS_URL",
+        "http://127.0.0.1:9090/api/v1/internal/connectors/rpc?agent_id=foreign",
+    )
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "foreign-token")
+    monkeypatch.setenv("ZET_AGENT_ID", "foreign")
+    token = ss.set_secret_scope({
+        "ZETTLAB_CONNECTORS_URL": "http://127.0.0.1:9090/api/v1/internal/connectors/rpc?agent_id=profile-b",
+        "ZETTLAB_CONNECTORS_AUTH_TOKEN": "profile-b-token",
+        "ZET_AGENT_ID": "profile-b",
+    })
+    try:
+        sanitized = _sanitize_subprocess_env({})
+        helper = hermes_subprocess_env()
+    finally:
+        ss.reset_secret_scope(token)
+
+    for env in (sanitized, helper):
+        assert "ZETTLAB_CONNECTORS_URL" not in env
+        assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in env
+        assert "ZET_AGENT_ID" not in env
+
+
+def test_sanitize_and_nonterminal_spawn_scrub_connector_runtime_env_without_multiplex(monkeypatch):
+    """Non-multiplex helper paths still scrub connector bearer from os.environ."""
+    monkeypatch.setenv(
+        "ZETTLAB_CONNECTORS_URL",
+        "http://127.0.0.1:9090/api/v1/internal/connectors/rpc?agent_id=single",
+    )
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "single-token")
+    monkeypatch.setenv("ZET_AGENT_ID", "single")
+
+    sanitized = _sanitize_subprocess_env({
+        "ZETTLAB_CONNECTORS_URL": "http://127.0.0.1:9090/api/v1/internal/connectors/rpc?agent_id=base",
+        "ZETTLAB_CONNECTORS_AUTH_TOKEN": "base-token",
+        "ZET_AGENT_ID": "base",
+    })
+    helper = hermes_subprocess_env()
+
+    for env in (sanitized, helper):
+        assert "ZETTLAB_CONNECTORS_URL" not in env
+        assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in env
+        assert "ZET_AGENT_ID" not in env
+
+
+# --------------------------------------------------------------------------- #
+# execute_code sandbox child env
+# --------------------------------------------------------------------------- #
+
+def test_execute_code_child_gets_bound_session_routing_without_connector_bearer(monkeypatch):
+    """execute_code should know its session key but not receive connector tokens.
+
+    The sandbox child can route helper RPCs back to the right chat session via
+    HERMES_SESSION_KEY, while ZETTLAB_CONNECTORS_AUTH_TOKEN stays out of the
+    arbitrary Python environment.
+    """
+    monkeypatch.setenv("HERMES_SESSION_KEY", "foreign-session")
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_URL", "http://127.0.0.1:9090/api/v1/internal/connectors/rpc")
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "connector-bearer")
+    tokens = set_session_vars(
+        session_key="real-session",
+        platform="api",
+        chat_id="chat-1",
+    )
+    try:
+        env = _scrub_child_env(os.environ, is_passthrough=lambda _: False, is_windows=False)
+        _inject_execute_code_session_context_env(env)
+    finally:
+        clear_session_vars(tokens)
+
+    assert env.get("HERMES_SESSION_KEY") == "real-session"
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in env
+    assert "ZETTLAB_CONNECTORS_URL" not in env
+
+
+def test_execute_code_scrubs_connector_runtime_even_when_passthrough_allows_it(monkeypatch):
+    """Connector runtime keys must not be recoverable through env_passthrough."""
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_URL", "http://127.0.0.1:9090/rpc")
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "connector-bearer")
+    monkeypatch.setenv("ZET_AGENT_ID", "agent-1")
+
+    env = _scrub_child_env(
+        os.environ,
+        is_passthrough=lambda name: name.startswith("ZET"),
+        is_windows=False,
+    )
+
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in env
+    assert "ZETTLAB_CONNECTORS_URL" not in env
+    assert "ZET_AGENT_ID" not in env

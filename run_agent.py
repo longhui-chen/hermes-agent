@@ -146,7 +146,7 @@ from tools.browser_tool import cleanup_browser
 
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import sanitize_context
-from agent.error_classifier import FailoverReason
+from agent.error_classifier import normalized_provider_error_code, FailoverReason
 from agent.redact import redact_sensitive_text
 from agent.message_content import flatten_message_text
 from agent.model_metadata import (
@@ -217,18 +217,20 @@ from agent.tool_dispatch_helpers import (
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
 
 
-# Internal flags that mark a message as ephemeral empty-response/prefill
-# recovery scaffolding: the synthetic assistant "(empty)" turn and user nudge
-# injected after an empty response, the terminal "(empty)" sentinel, and the
-# thinking-only prefill placeholder. These exist only to drive the next API
-# retry; the in-memory loop pops them before appending the real response.
+# Internal flags that mark ephemeral recovery/protocol scaffolding: the
+# synthetic assistant "(empty)" turn and user nudge injected after an empty
+# response, the terminal "(empty)" sentinel, the thinking-only prefill
+# placeholder, and Plan mode protocol retries. These exist only to drive the
+# next API retry; the in-memory loop pops them before appending the real response.
 # Persistence must mirror that, otherwise an append-only flush can commit them
 # to the session store and a resumed session replays synthetic "(empty)"/nudge
 # turns as if they were genuine context.
 _EPHEMERAL_SCAFFOLDING_FLAGS = (
     "_empty_recovery_synthetic",
     "_empty_terminal_sentinel",
+    "_length_continuation_synthetic",
     "_thinking_prefill",
+    "_plan_protocol_synthetic",
     # verify-on-stop and pre_verify nudges append a synthetic user nudge to
     # keep the agent going one more turn before it can claim completion.
     # The nudge exists only to drive the verification loop; persisting it
@@ -493,6 +495,7 @@ class AIAgent:
         checkpoint_max_total_size_mb: int = 500,
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
+        config_context_length: int = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         from agent.agent_init import init_agent
@@ -569,6 +572,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            config_context_length=config_context_length,
         )
 
     def _get_session_db_for_recall(self):
@@ -973,6 +977,23 @@ class AIAgent:
                 _thinking_cb(text)
             except Exception:
                 logger.debug("thinking_callback error in _emit_wait_notice", exc_info=True)
+
+    def _emit_structured_status(self, event_type: str, payload: Dict[str, Any]) -> None:
+        """Emit a structured gateway status event without changing CLI output.
+
+        Only fires when the wired ``status_callback`` opted in via the
+        ``_hermes_accepts_structured_status`` marker (set by the gateway's
+        zet_agent wrapper). CLI/other consumers that only understand the
+        ``(kind, message)`` lifecycle/warn contract are left untouched.
+        """
+        if not self.status_callback:
+            return
+        if not getattr(self.status_callback, "_hermes_accepts_structured_status", False):
+            return
+        try:
+            self.status_callback(event_type, payload)
+        except Exception:
+            logger.debug("status_callback error in _emit_structured_status", exc_info=True)
 
     # ── Buffered retry/fallback status ────────────────────────────────────
     # Retry and fallback chains were flooding the CLI/gateway with status
@@ -1718,6 +1739,28 @@ class AIAgent:
                 if timestamp is not None:
                     msg["timestamp"] = timestamp
 
+    def _discard_current_turn_on_interrupt(self, messages: list) -> None:
+        """ZET-641: roll back the current turn when an interrupt fires
+        before the agent produced any visible output (no streaming text,
+        no committed tool call).
+
+        After this, messages ends at the previous turn's tail — the
+        user's message for this turn is gone, no assistant scaffolding
+        either. The app side mirrors this by retracting the user bubble
+        back into the input box; without server-side rollback, state.db
+        would keep a phantom user row that re-surfaces on next session
+        load (orphan user message, no reply).
+
+        Idempotent: if there is no current-turn user message tracked,
+        does nothing. Also clears the streamed-assistant buffers so a
+        stale fragment doesn't leak into the next turn.
+        """
+        idx = getattr(self, "_persist_user_message_idx", None)
+        if isinstance(idx, int) and 0 <= idx < len(messages) and isinstance(messages[idx], dict) and messages[idx].get("role") == "user":
+            del messages[idx:]
+        self._persist_user_message_idx = None
+        self._current_streamed_assistant_text = ""
+
     def _persist_session(self, messages: List[Dict], conversation_history: List[Dict] = None):
         """Save session state to both JSON log and SQLite on any exit path.
 
@@ -1740,6 +1783,7 @@ class AIAgent:
         persist_lock = getattr(self, "_session_persist_lock", None)
         if persist_lock is None:
             self._drop_trailing_empty_response_scaffolding(messages)
+            self._drop_length_continuation_scaffolding(messages)
             self._session_messages = messages
             self._save_session_log(messages)
             self._flush_messages_to_session_db(messages, conversation_history)
@@ -1748,10 +1792,33 @@ class AIAgent:
 
         with persist_lock:
             self._drop_trailing_empty_response_scaffolding(messages)
+            self._drop_length_continuation_scaffolding(messages)
             self._session_messages = messages
             self._save_session_log(messages)
             self._flush_messages_to_session_db(messages, conversation_history)
             note_turn_persisted(self)
+
+    def _drop_length_continuation_scaffolding(self, messages: List[Dict]) -> None:
+        """Remove internal length-continuation prompts from durable transcripts."""
+        if not messages:
+            return
+        raw_last_flushed = getattr(self, "_last_flushed_db_idx", 0)
+        last_flushed_idx = raw_last_flushed if isinstance(raw_last_flushed, int) else 0
+        removed_before_flush_idx = 0
+        if last_flushed_idx > 0:
+            removed_before_flush_idx = sum(
+                1 for msg in messages[:last_flushed_idx]
+                if isinstance(msg, dict) and msg.get("_length_continuation_synthetic")
+            )
+        messages[:] = [
+            msg for msg in messages
+            if not (
+                isinstance(msg, dict)
+                and msg.get("_length_continuation_synthetic")
+            )
+        ]
+        if removed_before_flush_idx:
+            self._last_flushed_db_idx = max(0, last_flushed_idx - removed_before_flush_idx)
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
@@ -1771,6 +1838,7 @@ class AIAgent:
             and (
                 messages[-1].get("_empty_recovery_synthetic")
                 or messages[-1].get("_empty_terminal_sentinel")
+                or messages[-1].get("_length_continuation_synthetic")
             )
         ):
             messages.pop()
@@ -2376,6 +2444,33 @@ class AIAgent:
         from agent.agent_runtime_helpers import extract_api_error_context
         return extract_api_error_context(error)
 
+    def _provider_error_payload(self, classified, error: Exception) -> Dict[str, Any]:
+        """Build the safe, structured provider-error payload for chat surfaces."""
+        payload: Dict[str, Any] = {
+            "code": normalized_provider_error_code(classified),
+            "reason": classified.reason.value,
+        }
+        if classified.provider:
+            payload["provider"] = classified.provider
+        elif getattr(self, "provider", None):
+            payload["provider"] = getattr(self, "provider")
+        if classified.model:
+            payload["model"] = classified.model
+        elif getattr(self, "model", None):
+            payload["model"] = getattr(self, "model")
+        if classified.status_code is not None:
+            payload["status_code"] = classified.status_code
+        if classified.provider_error_code:
+            payload["provider_error_code"] = classified.provider_error_code
+        message = classified.message or self._summarize_api_error(error)
+        if message:
+            payload["provider_message"] = message[:500]
+        payload["retryable"] = bool(classified.retryable)
+        payload["recoverable"] = bool(
+            classified.retryable or classified.should_compress or classified.should_fallback
+        )
+        return payload
+
     def _usage_summary_for_api_request_hook(self, response: Any) -> Optional[Dict[str, Any]]:
         """Token buckets for ``post_api_request`` plugins (no raw ``response`` object)."""
         if response is None:
@@ -2912,7 +3007,10 @@ class AIAgent:
             text: The user text to inject. Empty strings are ignored.
 
         Returns:
-            True if the steer was accepted, False if the text was empty.
+            True if the steer was accepted. False when the text is empty,
+            the slot is closed (turn finalizing), or a hard interrupt is
+            winding the turn down — callers re-queue the text as a normal
+            next-turn message on False.
         """
         if not text or not text.strip():
             return False
@@ -2922,30 +3020,60 @@ class AIAgent:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
             # Fall back to direct attribute set; no concurrent callers expected
             # in those stubs.
+            if getattr(self, "_steer_closed", False):
+                return False
+            if getattr(self, "_interrupt_requested", False):
+                return False
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
             return True
         with _lock:
+            # After the turn finalizer's closing drain there is no consumer
+            # left for this slot (the SSE task may linger for a moment, so
+            # task.done() alone can't catch this window) — refuse so the
+            # caller re-delivers the text as a normal next-turn message
+            # instead of it vanishing.
+            if getattr(self, "_steer_closed", False):
+                return False
+            # A hard interrupt is winding the turn down: the pre-API drain
+            # refuses to inject while the flag is up, and the finalizer's
+            # interrupted branch discards leftovers WITHOUT a steer_dropped
+            # receipt (stop supersedes steer by design) — text accepted in
+            # this window would vanish silently. Refuse so callers re-queue.
+            if getattr(self, "_interrupt_requested", False):
+                return False
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
         return True
 
-    def _drain_pending_steer(self) -> Optional[str]:
+    def _drain_pending_steer(self, close: bool = False) -> Optional[str]:
         """Return the pending steer text (if any) and clear the slot.
 
         Safe to call from the agent execution thread after appending tool
         results. Returns None when no steer is pending.
+
+        Args:
+            close: When True (the turn finalizer's last drain), atomically
+                mark the slot closed so a steer racing the SSE-teardown
+                window is refused by ``steer()`` (and re-queued by the
+                caller) instead of being stashed with no consumer left.
+                ``run_conversation`` reopens the slot at the next turn's
+                start.
         """
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             text = getattr(self, "_pending_steer", None)
             self._pending_steer = None
+            if close:
+                self._steer_closed = True
             return text
         with _lock:
             text = self._pending_steer
             self._pending_steer = None
+            if close:
+                self._steer_closed = True
         return text
 
     def _record_file_mutation_result(
@@ -3208,10 +3336,10 @@ class AIAgent:
         # which already surfaces its own message) — don't second-guess.
         return ""
 
-    def _apply_pending_steer_to_tool_results(self, messages: list, num_tool_msgs: int) -> None:
-        """Forwarder — see ``agent.agent_runtime_helpers.apply_pending_steer_to_tool_results``."""
-        from agent.agent_runtime_helpers import apply_pending_steer_to_tool_results
-        return apply_pending_steer_to_tool_results(self, messages, num_tool_msgs)
+    def _drain_steer_for_next_api_call(self, messages: list) -> None:
+        """Forwarder — see ``agent.agent_runtime_helpers.drain_steer_for_next_api_call``."""
+        from agent.agent_runtime_helpers import drain_steer_for_next_api_call
+        return drain_steer_for_next_api_call(self, messages)
 
     def _touch_activity(self, desc: str) -> None:
         """Update the last-activity timestamp and description (thread-safe).
@@ -5155,12 +5283,22 @@ class AIAgent:
                 where, _n,
             )
 
+    def _should_suppress_plan_stream_text(self) -> bool:
+        """Keep provisional plain text out of Plan Review SSE responses."""
+        return (
+            (getattr(self, "platform", "") or "") == "zet_agent"
+            and bool(getattr(self, "_zet_agent_plan_mode_active", False))
+            and not bool(getattr(self, "_zet_agent_plan_presented", False))
+        )
+
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
-        # Single-writer guard (#65991): a superseded stream must not interleave
-        # its tokens into the turn alongside the retry that replaced it.
+        # A superseded retry and provisional Plan Review text are both
+        # forbidden from reaching the live stream.
         if self._stream_writer_superseded():
             self._note_dropped_stream_writer("_fire_stream_delta")
+            return
+        if self._should_suppress_plan_stream_text():
             return
         # If a tool iteration set the break flag, prepend a single paragraph
         # break before the first real text delta.  This prevents the original
@@ -5219,6 +5357,8 @@ class AIAgent:
         # reasoning deltas the same way as content deltas.
         if self._stream_writer_superseded():
             self._note_dropped_stream_writer("_fire_reasoning_delta")
+            return
+        if self._should_suppress_plan_stream_text():
             return
         cb = self.reasoning_callback
         if cb is not None:
@@ -5401,6 +5541,9 @@ class AIAgent:
         Custom/local models absent from models.dev would otherwise be
         misclassified as non-vision and have their images stripped.
         """
+        runtime_override = getattr(self, "runtime_supports_vision", None)
+        if isinstance(runtime_override, bool):
+            return runtime_override
         try:
             from hermes_cli.config import load_config
             from agent.image_routing import _lookup_supports_vision
@@ -5979,7 +6122,20 @@ class AIAgent:
     def _build_assistant_message(self, assistant_message, finish_reason: str) -> dict:
         """Forwarder — see ``agent.chat_completion_helpers.build_assistant_message``."""
         from agent.chat_completion_helpers import build_assistant_message
-        return build_assistant_message(self, assistant_message, finish_reason)
+        message = build_assistant_message(self, assistant_message, finish_reason)
+        if (
+            self._should_suppress_plan_stream_text()
+            and (getattr(assistant_message, "tool_calls", None) or [])
+        ):
+            # Tool-call responses can carry sibling content/reasoning on weak
+            # OpenAI-compatible providers. It is provisional Plan output, not
+            # transcript content. Preserve a non-empty reasoning_content pad for
+            # DeepSeek/Kimi replay validation without retaining the visible draft.
+            message["content"] = ""
+            message["reasoning"] = None
+            if "reasoning_content" in message:
+                message["reasoning_content"] = " "
+        return message
 
     def _needs_thinking_reasoning_pad(self) -> bool:
         """Return True when the active provider enforces reasoning_content echo-back.

@@ -170,6 +170,13 @@ class TestCreateProfile:
                         "plans", "workspace", "cron"]:
             assert (profile_dir / subdir).is_dir(), f"Missing subdir: {subdir}"
 
+    @pytest.mark.parametrize("profile", ["coder", "main", "memo"])
+    def test_fresh_profile_always_seeds_neutral_soul(self, profile_env, profile):
+        profile_dir = create_profile(profile, no_alias=True)
+        content = (profile_dir / "SOUL.md").read_text(encoding="utf-8")
+        assert "specialized persona" in content
+        assert "Zettlab Memo" not in content
+
     def test_seeds_placeholder_env_file(self, profile_env):
         """Fresh profiles get their own .env (owner-only) so channel/env
         writes are profile-scoped from day one instead of falling through

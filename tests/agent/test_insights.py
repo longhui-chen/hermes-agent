@@ -54,8 +54,8 @@ def populated_db(db):
     db.append_message(
         "s1",
         role="assistant",
-        content="Let me load the PR workflow skill.",
-        tool_calls=[{"function": {"name": "skill_view", "arguments": '{"name":"github-pr-workflow"}'}}],
+        content="Let me load the review workflow skill.",
+        tool_calls=[{"function": {"name": "skill_view", "arguments": '{"name":"requesting-code-review"}'}}],
     )
     db.append_message("s1", role="user", content="Thanks!")
     db.append_message("s1", role="assistant", content="You're welcome!")
@@ -115,10 +115,10 @@ def populated_db(db):
     db.append_message(
         "s4",
         role="assistant",
-        content="Load and update GitHub skills.",
+        content="Load and update review skills.",
         tool_calls=[
-            {"function": {"name": "skill_view", "arguments": '{"name":"github-pr-workflow"}'}},
-            {"function": {"name": "skill_manage", "arguments": '{"name":"github-code-review"}'}},
+            {"function": {"name": "skill_view", "arguments": '{"name":"requesting-code-review"}'}},
+            {"function": {"name": "skill_manage", "arguments": '{"name":"test-driven-development"}'}},
         ],
     )
 
@@ -434,7 +434,7 @@ class TestInsightsPopulated:
         assert skills["summary"]["total_skill_actions"] == 4
 
         top_skill = skills["top_skills"][0]
-        assert top_skill["skill"] == "github-pr-workflow"
+        assert top_skill["skill"] == "requesting-code-review"
         assert top_skill["view_count"] == 2
         assert top_skill["manage_count"] == 0
         assert top_skill["total_count"] == 2

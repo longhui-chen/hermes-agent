@@ -87,7 +87,11 @@ class TestPulseSocketReachable:
         sock_path.parent.mkdir(parents=True)
         # Create + bind, then close so the path is a stale socket file.
         s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        s.bind(str(sock_path))
+        try:
+            s.bind(str(sock_path))
+        except OSError:
+            s.close()
+            pytest.skip("AF_UNIX socket unavailable here (sandbox denial or path too long)")
         s.close()
         monkeypatch.delenv("PULSE_SERVER", raising=False)
         monkeypatch.delenv("PULSE_RUNTIME_PATH", raising=False)
@@ -101,7 +105,11 @@ class TestPulseSocketReachable:
         sock_path = tmp_path / "pulse" / "native"
         sock_path.parent.mkdir(parents=True)
         server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        server.bind(str(sock_path))
+        try:
+            server.bind(str(sock_path))
+        except OSError:
+            server.close()
+            pytest.skip("AF_UNIX socket unavailable here (sandbox denial or path too long)")
         server.listen(1)
         try:
             monkeypatch.delenv("PULSE_SERVER", raising=False)
@@ -116,7 +124,11 @@ class TestPulseSocketReachable:
         import socket as _socket
         sock_path = tmp_path / "native"
         server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        server.bind(str(sock_path))
+        try:
+            server.bind(str(sock_path))
+        except OSError:
+            server.close()
+            pytest.skip("AF_UNIX socket unavailable here (sandbox denial or path too long)")
         server.listen(1)
         try:
             monkeypatch.delenv("PULSE_RUNTIME_PATH", raising=False)
@@ -1416,6 +1428,7 @@ class TestConfigurableSilenceParams:
 class TestSubprocessTimeoutKill:
     """Bug: proc.wait(timeout) raised TimeoutExpired but process was not killed."""
 
+    @pytest.mark.live_system_guard_bypass
     def test_timeout_kills_process(self):
         import subprocess
         proc = subprocess.Popen(["sleep", "600"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

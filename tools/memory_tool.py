@@ -26,6 +26,7 @@ Design:
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 from contextlib import contextmanager
@@ -83,6 +84,35 @@ ENTRY_DELIMITER = "\n§\n"
 # ---------------------------------------------------------------------------
 
 from tools.threat_patterns import first_threat_message as _first_threat_message
+
+_HAN_RE = re.compile(r'[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]')
+_LATIN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_'-]*")
+
+
+def _zettlab_user_profile_language_enabled() -> bool:
+    """True in the Zettlab per-agent gateway runtime."""
+    enabled = os.getenv("ZET_AGENT_ENABLED", "").strip().lower()
+    if enabled in {"1", "true", "yes", "on"}:
+        return True
+    return bool(os.getenv("ZET_AGENT_ID") or os.getenv("ZETTLAB_AGENT_ACTION_TOKEN"))
+
+
+def _validate_user_profile_language(target: str, content: str) -> Optional[str]:
+    """Keep Zettlab-generated USER.md entries in Simplified Chinese."""
+    if target != "user" or not _zettlab_user_profile_language_enabled():
+        return None
+    text = content.strip()
+    if not text or _HAN_RE.search(text):
+        return None
+    latin_words = _LATIN_WORD_RE.findall(text)
+    # Short names, codes, model IDs, and timezones are not a language choice.
+    if len(latin_words) < 3 and len(text) < 24:
+        return None
+    return (
+        "Blocked: Zettlab user profile entries must be written in Simplified Chinese. "
+        "Keep names, product names, commands, and code identifiers as-is, but rewrite "
+        "the surrounding user-profile statement in Chinese before calling memory again."
+    )
 
 
 def _scan_memory_content(content: str) -> Optional[str]:
@@ -353,6 +383,9 @@ class MemoryStore:
         scan_error = _scan_memory_content(content)
         if scan_error:
             return {"success": False, "error": scan_error}
+        language_error = _validate_user_profile_language(target, content)
+        if language_error:
+            return {"success": False, "error": language_error}
 
         with self._file_lock(self._path_for(target)):
             # Re-read from disk under lock to pick up writes from other sessions.
@@ -408,6 +441,9 @@ class MemoryStore:
         scan_error = _scan_memory_content(new_content)
         if scan_error:
             return {"success": False, "error": scan_error}
+        language_error = _validate_user_profile_language(target, new_content)
+        if language_error:
+            return {"success": False, "error": language_error}
 
         with self._file_lock(self._path_for(target)):
             bak = self._reload_target(target)
@@ -1089,8 +1125,9 @@ MEMORY_SCHEMA = {
         "memory stops the user repeating themselves.\n\n"
         "IF FULL: an add is rejected with the current entries shown. Reissue as ONE batch that "
         "removes or shortens enough stale entries and adds the new one together.\n\n"
-        "TARGETS: 'user' = who the user is (name, role, preferences, style). 'memory' = your "
-        "notes (environment, conventions, tool quirks, lessons).\n\n"
+        "TARGETS: 'user' = who the user is (name, role, preferences, style). "
+        "In the Zettlab App runtime, write these user-profile entries in Simplified Chinese. "
+        "'memory' = your notes (environment, conventions, tool quirks, lessons).\n\n"
         "SKIP: trivial/obvious info, easily re-discovered facts, raw data dumps, task progress, "
         "completed-work logs, temporary TODO state (use session_search for those). Reusable "
         "procedures belong in a skill, not memory."
@@ -1156,7 +1193,5 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
-
 
 

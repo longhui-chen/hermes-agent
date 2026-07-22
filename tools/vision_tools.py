@@ -40,7 +40,11 @@ from pathlib import Path
 from typing import Any, Awaitable, Dict, Optional
 from urllib.parse import urlparse
 import httpx
-from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
+from agent.auxiliary_client import (
+    _get_auxiliary_task_config,
+    async_call_llm,
+    extract_content_or_reasoning,
+)
 from hermes_constants import get_hermes_dir
 from tools.debug_helpers import DebugSession
 from tools.website_policy import check_website_access
@@ -1228,9 +1232,7 @@ async def vision_analyze_tool(
         vision_timeout = 120.0
         vision_temperature = 0.1
         try:
-            from hermes_cli.config import cfg_get, load_config
-            _cfg = load_config()
-            _vision_cfg = cfg_get(_cfg, "auxiliary", "vision", default={})
+            _vision_cfg = _get_auxiliary_task_config("vision")
             _vt = _vision_cfg.get("timeout")
             if _vt is not None:
                 vision_timeout = float(_vt)

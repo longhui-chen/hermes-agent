@@ -352,4 +352,4 @@ def build_gateway_parser(
         "providers", help="List available proxy upstream providers"
     )
     proxy_parser.set_defaults(func=cmd_proxy)
-    gateway_parser.set_defaults(func=cmd_gateway)
+    gateway_parser.set_defaults(func=cmd_gateway, gateway_command="run")

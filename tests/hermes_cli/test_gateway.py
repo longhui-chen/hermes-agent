@@ -14,9 +14,203 @@ import pytest
 import hermes_cli.gateway as gateway
 
 
+def test_main_gateway_run_defers_mcp_discovery_but_preserves_accept_hooks(
+    monkeypatch,
+):
+    import hermes_cli.config as config_mod
+    import hermes_cli.main as main_mod
+
+    calls: list[str] = []
+
+    monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "run", "--accept-hooks"])
+    monkeypatch.delenv("HERMES_ACCEPT_HOOKS", raising=False)
+    monkeypatch.setattr(config_mod, "load_config", lambda: {})
+    monkeypatch.setattr(config_mod, "get_container_exec_info", lambda: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.plugins",
+        SimpleNamespace(discover_plugins=lambda: calls.append("plugins")),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool",
+        SimpleNamespace(discover_mcp_tools=lambda: calls.append("mcp")),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.mcp_startup",
+        SimpleNamespace(start_background_mcp_discovery=lambda **_: calls.append("mcp-bg")),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.shell_hooks",
+        SimpleNamespace(
+            register_from_config=lambda _cfg, accept_hooks=False: calls.append(
+                f"hooks:{accept_hooks}"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "cmd_gateway",
+        lambda args: calls.append(
+            f"gateway:{args.gateway_command}:{getattr(args, 'accept_hooks', False)}"
+        ),
+    )
+
+    main_mod.main()
+
+    assert "HERMES_ACCEPT_HOOKS" not in os.environ
+    assert calls == ["plugins", "hooks:True", "gateway:run:True"]
+
+
+def test_main_gateway_run_without_accept_hooks_keeps_env_clear(monkeypatch):
+    import hermes_cli.config as config_mod
+    import hermes_cli.main as main_mod
+
+    calls: list[str] = []
+
+    monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "run"])
+    monkeypatch.delenv("HERMES_ACCEPT_HOOKS", raising=False)
+    monkeypatch.setattr(config_mod, "load_config", lambda: {})
+    monkeypatch.setattr(config_mod, "get_container_exec_info", lambda: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.plugins",
+        SimpleNamespace(discover_plugins=lambda: calls.append("plugins")),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool",
+        SimpleNamespace(discover_mcp_tools=lambda: calls.append("mcp")),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.mcp_startup",
+        SimpleNamespace(start_background_mcp_discovery=lambda **_: calls.append("mcp-bg")),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.shell_hooks",
+        SimpleNamespace(
+            register_from_config=lambda _cfg, accept_hooks=False: calls.append(
+                f"hooks:{accept_hooks}"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "cmd_gateway",
+        lambda args: calls.append(
+            f"gateway:{args.gateway_command}:{getattr(args, 'accept_hooks', False)}"
+        ),
+    )
+
+    main_mod.main()
+
+    assert "HERMES_ACCEPT_HOOKS" not in os.environ
+    assert calls == ["plugins", "hooks:False", "gateway:run:False"]
+
+
+def test_main_gateway_default_run_preserves_accept_hooks(monkeypatch):
+    import hermes_cli.config as config_mod
+    import hermes_cli.main as main_mod
+
+    calls: list[str] = []
+
+    monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "--accept-hooks"])
+    monkeypatch.delenv("HERMES_ACCEPT_HOOKS", raising=False)
+    monkeypatch.setattr(config_mod, "load_config", lambda: {})
+    monkeypatch.setattr(config_mod, "get_container_exec_info", lambda: None)
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.plugins",
+        SimpleNamespace(discover_plugins=lambda: calls.append("plugins")),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool",
+        SimpleNamespace(discover_mcp_tools=lambda: calls.append("mcp")),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.shell_hooks",
+        SimpleNamespace(
+            register_from_config=lambda _cfg, accept_hooks=False: calls.append(
+                f"hooks:{accept_hooks}"
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        main_mod,
+        "cmd_gateway",
+        lambda args: calls.append(
+            f"gateway:{args.gateway_command}:{getattr(args, 'accept_hooks', False)}"
+        ),
+    )
+
+    main_mod.main()
+
+    assert "HERMES_ACCEPT_HOOKS" not in os.environ
+    assert calls == ["plugins", "hooks:True", "gateway:run:True"]
+
+
+def test_main_chat_starts_mcp_discovery_at_cli_startup(monkeypatch):
+    import hermes_cli.config as config_mod
+    import hermes_cli.main as main_mod
+    import hermes_cli.mcp_startup as mcp_startup_mod
+
+    calls: list[str] = []
+
+    monkeypatch.setattr(sys, "argv", ["hermes", "chat", "-q", "hello"])
+    monkeypatch.setattr(config_mod, "load_config", lambda: {})
+    monkeypatch.setattr(config_mod, "get_container_exec_info", lambda: None)
+    monkeypatch.setattr(main_mod, "_has_any_provider_configured", lambda: True)
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.plugins",
+        SimpleNamespace(discover_plugins=lambda: calls.append("plugins")),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tools.mcp_tool",
+        SimpleNamespace(discover_mcp_tools=lambda: calls.append("mcp")),
+    )
+    monkeypatch.setattr(
+        mcp_startup_mod,
+        "start_background_mcp_discovery",
+        lambda *, logger, thread_name: calls.append(f"mcp-bg:{thread_name}"),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.shell_hooks",
+        SimpleNamespace(
+            register_from_config=lambda _cfg, accept_hooks=False: calls.append(
+                f"hooks:{accept_hooks}"
+            )
+        ),
+    )
+    monkeypatch.setattr(main_mod, "cmd_chat", lambda args: calls.append(args.command))
+
+    main_mod.main()
+
+    assert calls == ["plugins", "mcp-bg:cli-mcp-discovery", "hooks:False", "chat"]
+
+
 def _install_fake_gateway_run(monkeypatch, start_gateway):
     module = ModuleType("gateway.run")
-    module.start_gateway = start_gateway
+
+    def _compat_start_gateway(**kwargs):
+        try:
+            return start_gateway(**kwargs)
+        except TypeError:
+            if "accept_hooks" not in kwargs:
+                raise
+            kwargs = dict(kwargs)
+            kwargs.pop("accept_hooks", None)
+            return start_gateway(**kwargs)
+
+    module.start_gateway = _compat_start_gateway
     monkeypatch.setitem(sys.modules, "gateway.run", module)
     # ``run_gateway()`` calls ``refresh_systemd_unit_if_needed()`` on every
     # invocation so that restart settings stay current after exit-code-75
@@ -47,8 +241,8 @@ def _install_fake_gateway_run(monkeypatch, start_gateway):
 def test_run_gateway_exits_cleanly_on_keyboard_interrupt(monkeypatch, capsys):
     calls = []
 
-    def fake_start_gateway(*, replace, verbosity):
-        calls.append((replace, verbosity))
+    def fake_start_gateway(*, replace, verbosity, accept_hooks=False):
+        calls.append((replace, verbosity, accept_hooks))
         return object()
 
     def fake_asyncio_run(coro):
@@ -60,7 +254,7 @@ def test_run_gateway_exits_cleanly_on_keyboard_interrupt(monkeypatch, capsys):
     gateway.run_gateway()
 
     out = capsys.readouterr().out
-    assert calls == [(False, 0)]
+    assert calls == [(False, 0, False)]
     assert "Press Ctrl+C to stop" in out
     assert "Gateway stopped." in out
 
@@ -68,8 +262,8 @@ def test_run_gateway_exits_cleanly_on_keyboard_interrupt(monkeypatch, capsys):
 def test_run_gateway_exits_nonzero_when_start_gateway_reports_failure(monkeypatch):
     calls = []
 
-    def fake_start_gateway(*, replace, verbosity):
-        calls.append((replace, verbosity))
+    def fake_start_gateway(*, replace, verbosity, accept_hooks=False):
+        calls.append((replace, verbosity, accept_hooks))
         return object()
 
     _install_fake_gateway_run(monkeypatch, fake_start_gateway)
@@ -79,7 +273,22 @@ def test_run_gateway_exits_nonzero_when_start_gateway_reports_failure(monkeypatc
         gateway.run_gateway(verbose=1, quiet=True, replace=True)
 
     assert exc_info.value.code == 1
-    assert calls == [(True, None)]
+    assert calls == [(True, None, False)]
+
+
+def test_run_gateway_passes_accept_hooks_to_start_gateway(monkeypatch):
+    calls = []
+
+    def fake_start_gateway(*, replace, verbosity, accept_hooks=False):
+        calls.append((replace, verbosity, accept_hooks))
+        return object()
+
+    _install_fake_gateway_run(monkeypatch, fake_start_gateway)
+    monkeypatch.setattr(gateway.asyncio, "run", lambda coro: True)
+
+    gateway.run_gateway(accept_hooks=True)
+
+    assert calls == [(False, 0, True)]
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX PTY coverage")
@@ -112,7 +321,7 @@ def test_gateway_run_subprocess_preserves_daemon_exit_codes(
 
         outcome = os.environ["HERMES_TEST_GATEWAY_OUTCOME"]
 
-        async def start_gateway(*, replace, verbosity):
+        async def start_gateway(*, replace, verbosity, accept_hooks=False):
             if outcome == "failure":
                 return False
             raise SystemExit(int(outcome.split(":", 1)[1]))
@@ -185,8 +394,8 @@ def test_run_gateway_refuses_root_in_official_docker(monkeypatch, tmp_path, caps
 def test_run_gateway_root_guard_has_escape_hatch(monkeypatch):
     calls = []
 
-    def fake_start_gateway(*, replace, verbosity):
-        calls.append((replace, verbosity))
+    def fake_start_gateway(*, replace, verbosity, accept_hooks=False):
+        calls.append((replace, verbosity, accept_hooks))
         return object()
 
     _install_fake_gateway_run(monkeypatch, fake_start_gateway)
@@ -197,7 +406,7 @@ def test_run_gateway_root_guard_has_escape_hatch(monkeypatch):
 
     gateway.run_gateway(verbose=2, replace=True)
 
-    assert calls == [(True, 2)]
+    assert calls == [(True, 2, False)]
 
 
 def _clear_supervisor_markers(monkeypatch):
@@ -402,8 +611,8 @@ def test_gateway_run_force_flag_survives_parser_extraction():
 def test_run_gateway_windows_foreground_keeps_ctrl_c_enabled(monkeypatch):
     calls = []
 
-    def fake_start_gateway(*, replace, verbosity):
-        calls.append((replace, verbosity))
+    def fake_start_gateway(*, replace, verbosity, accept_hooks=False):
+        calls.append((replace, verbosity, accept_hooks))
         return object()
 
     class _TTY:
@@ -425,15 +634,15 @@ def test_run_gateway_windows_foreground_keeps_ctrl_c_enabled(monkeypatch):
 
     gateway.run_gateway()
 
-    assert calls == [(False, 0)]
+    assert calls == [(False, 0, False)]
     assert (gateway.signal.SIGINT, gateway.signal.SIG_IGN) not in signal_calls
 
 
 def test_run_gateway_windows_detached_absorbs_console_controls(monkeypatch):
     calls = []
 
-    def fake_start_gateway(*, replace, verbosity):
-        calls.append((replace, verbosity))
+    def fake_start_gateway(*, replace, verbosity, accept_hooks=False):
+        calls.append((replace, verbosity, accept_hooks))
         return object()
 
     class _TTY:
@@ -455,7 +664,7 @@ def test_run_gateway_windows_detached_absorbs_console_controls(monkeypatch):
 
     gateway.run_gateway()
 
-    assert calls == [(False, 0)]
+    assert calls == [(False, 0, False)]
     assert (gateway.signal.SIGINT, gateway.signal.SIG_IGN) in signal_calls
 
 

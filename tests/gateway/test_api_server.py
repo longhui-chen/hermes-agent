@@ -31,6 +31,7 @@ from gateway.platforms.api_server import (
     _IdempotencyCache,
     _derive_chat_session_id,
     _redact_api_error_text,
+    _tool_completion_payload,
     check_api_server_requirements,
     cors_middleware,
     security_headers_middleware,
@@ -49,6 +50,72 @@ class TestCheckRequirements:
     @patch("gateway.platforms.api_server.AIOHTTP_AVAILABLE", False)
     def test_returns_false_without_aiohttp(self):
         assert check_api_server_requirements() is False
+
+
+class TestToolCompletionPayload:
+    def test_promotes_connector_error_printed_by_execute_code_output(self):
+        printed = {
+            "ok": False,
+            "error": {
+                "code": "connector_runtime_auth_required",
+                "message": "ZETTLAB_CONNECTORS_AUTH_TOKEN is not set for this skill session.",
+            },
+            "connector_error": {
+                "code": "connector_runtime_auth_required",
+                "errorCode": "connector_runtime_auth_required",
+                "provider": "weread",
+                "nextAction": {"type": "refresh_connector_context"},
+            },
+        }
+        payload = _tool_completion_payload(
+            "call_exec_1",
+            "execute_code",
+            json.dumps({
+                "status": "error",
+                "error": "Script exited with code 1",
+                "output": json.dumps(printed),
+            }),
+        )
+
+        assert payload["outcome"] == "error"
+        assert payload["errorCode"] == "connector_runtime_auth_required"
+        assert payload["provider"] == "weread"
+        assert payload["connector_error"]["provider"] == "weread"
+        assert payload["connector_error"]["nextAction"]["type"] == "refresh_connector_context"
+
+    def test_promotes_json_rpc_connector_error_data_from_terminal_output(self):
+        printed = {
+            "error": {
+                "code": -32000,
+                "message": "Connector disabled for this chat.",
+                "data": {
+                    "errorCode": "denied_by_chat_override",
+                    "nextAction": {
+                        "type": "enable_chat_override",
+                        "provider": "linear",
+                        "toolName": "linear.list_issues",
+                    },
+                },
+            },
+        }
+        payload = _tool_completion_payload(
+            "call_terminal_1",
+            "terminal",
+            json.dumps({
+                "status": "error",
+                "error": "Command failed",
+                "output": json.dumps(printed),
+            }),
+        )
+
+        assert payload["outcome"] == "error"
+        assert payload["errorCode"] == "denied_by_chat_override"
+        assert payload["provider"] == "linear"
+        connector_error = payload["connector_error"]
+        assert connector_error["errorCode"] == "denied_by_chat_override"
+        assert connector_error["provider"] == "linear"
+        assert connector_error["nextAction"]["type"] == "enable_chat_override"
+        assert connector_error["nextAction"]["toolName"] == "linear.list_issues"
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +466,59 @@ class TestAdapterInit:
 
         assert isinstance(agent, FakeAgent)
         assert captured["max_iterations"] == 200
+
+    def test_create_agent_disables_tools_for_tool_choice_none(self, monkeypatch):
+        captured = {}
+
+        class FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.tools = [
+                    {"type": "function", "function": {"name": "present_plan"}},
+                    {"type": "function", "function": {"name": "todo"}},
+                ]
+                self.valid_tool_names = {"present_plan", "todo"}
+                self._skip_mcp_refresh = False
+
+        monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+        monkeypatch.setattr(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            lambda: {
+                "provider": "openai",
+                "base_url": "https://example.test/v1",
+                "api_mode": "chat_completions",
+            },
+        )
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5")
+        monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_reasoning_config",
+            staticmethod(lambda: {}),
+        )
+        monkeypatch.setattr(
+            "gateway.run.GatewayRunner._load_fallback_model",
+            staticmethod(lambda: None),
+        )
+        monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 90)
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+
+        adapter = APIServerAdapter(PlatformConfig(enabled=True))
+        monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+
+        agent = adapter._create_agent(
+            session_id="meeting-summary",
+            request_overrides={
+                "tool_choice": "none",
+                "response_format": {"type": "json_object"},
+            },
+        )
+
+        assert agent.tools == []
+        assert agent.valid_tool_names == set()
+        assert agent._skip_mcp_refresh is True
+        assert captured["request_overrides"] == {
+            "response_format": {"type": "json_object"},
+        }
 
     def test_create_agent_handles_fallback_model_kwarg_collision(self, monkeypatch):
         """When the primary provider auth-fails, _resolve_runtime_agent_kwargs()
@@ -793,7 +913,10 @@ class TestHealthDetailedEndpoint:
             "active_agents": 2,
             "exit_reason": None,
             "updated_at": "2026-04-14T00:00:00Z",
-        }), patch("gateway.run._resolve_gateway_model", return_value="test/model"):
+        }), patch("gateway.run._resolve_gateway_model", return_value="test/model"), patch(
+            "gateway.platforms.api_server.collect_runtime_readiness",
+            return_value={"status": "ok"},
+        ):
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
                 assert resp.status == 200
@@ -1191,6 +1314,153 @@ class TestChatCompletionsEndpoint:
             assert resp.status == 400
 
     @pytest.mark.asyncio
+    async def test_invalid_response_format_returns_400(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            for response_format in (
+                "json_object",
+                {"type": "bogus"},
+                {"type": "json_schema"},
+                {"type": "json_schema", "json_schema": {"name": "x"}},
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "response_format": response_format,
+                    },
+                )
+                assert resp.status == 400
+                data = await resp.json()
+                assert "response_format" in data["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_response_format_passed_to_agent_request_overrides(self, adapter):
+        mock_result = {
+            "final_response": '{"ok":true}',
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "Return JSON"}],
+                        "stream": False,
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+
+            assert resp.status == 200
+            assert mock_run.await_args.kwargs["request_overrides"] == {
+                "response_format": {"type": "json_object"},
+            }
+
+    @pytest.mark.asyncio
+    async def test_meeting_summary_tool_choice_none_integration_flow_disables_agent_tools(self, adapter):
+        mock_result = {
+            "final_response": '{"title":"产品计划会","overall":"讨论发布计划"}',
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": "发布计划先给大家看，确认后再执行。",
+                            }
+                        ],
+                        "stream": False,
+                        "tool_choice": "none",
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+
+            assert resp.status == 200
+            assert mock_run.await_args.kwargs["request_overrides"] == {
+                "tool_choice": "none",
+                "response_format": {"type": "json_object"},
+            }
+
+    @pytest.mark.asyncio
+    async def test_text_response_format_is_accepted(self, adapter):
+        mock_result = {
+            "final_response": "ok",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    mock_result,
+                    {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                )
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "Return text"}],
+                        "stream": False,
+                        "response_format": {"type": "text"},
+                    },
+                )
+
+            assert resp.status == 200
+            assert mock_run.await_args.kwargs["request_overrides"] is None
+
+    def test_structured_response_format_rejects_unsupported_transports(self, adapter):
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_mode": "anthropic_messages", "provider": "anthropic", "base_url": ""},
+        ), patch.object(adapter, "_create_agent") as mock_create:
+            assert "Anthropic" in adapter._response_format_transport_error(
+                {"response_format": {"type": "json_object"}}
+            )
+            mock_create.assert_not_called()
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={
+                "api_mode": "chat_completions",
+                "provider": "google-gemini-cli",
+                "base_url": "cloudcode-pa://google",
+            },
+        ), patch.object(adapter, "_create_agent") as mock_create:
+            assert "Gemini" in adapter._response_format_transport_error(
+                {"response_format": {"type": "json_object"}}
+            )
+            mock_create.assert_not_called()
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_mode": "anthropic_messages", "provider": "anthropic", "base_url": ""},
+        ), patch.object(adapter, "_create_agent") as mock_create:
+            assert adapter._response_format_transport_error({"response_format": {"type": "text"}}) is None
+            mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_stream_true_returns_sse(self, adapter):
         """stream=true returns SSE format with the full response."""
         app = _create_app(adapter)
@@ -1206,22 +1476,57 @@ class TestChatCompletionsEndpoint:
                     {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
                 )
 
-            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent) as mock_run:
+            with (
+                patch.object(adapter, "_response_format_transport_error", return_value=None),
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent) as mock_run,
+            ):
                 resp = await cli.post(
                     "/v1/chat/completions",
                     json={
                         "model": "test",
                         "messages": [{"role": "user", "content": "hi"}],
                         "stream": True,
+                        "response_format": {"type": "json_object"},
                     },
                 )
                 assert resp.status == 200
+                assert mock_run.await_args.kwargs["request_overrides"] == {
+                    "response_format": {"type": "json_object"},
+                }
                 assert "text/event-stream" in resp.headers.get("Content-Type", "")
                 assert resp.headers.get("X-Accel-Buffering") == "no"
                 body = await resp.text()
                 assert "data: " in body
                 assert "[DONE]" in body
                 assert "Hello!" in body
+
+    @pytest.mark.asyncio
+    async def test_stream_response_format_error_returns_400_before_sse(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(
+                    adapter,
+                    "_response_format_transport_error",
+                    return_value="response_format is not supported by the Gemini transport.",
+                ),
+                patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run,
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+
+            assert resp.status == 400
+            assert "text/event-stream" not in resp.headers.get("Content-Type", "")
+            data = await resp.json()
+            assert data["error"]["param"] == "response_format"
+            mock_run.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_stream_string_false_returns_json_completion(self, adapter):
@@ -1298,11 +1603,12 @@ class TestChatCompletionsEndpoint:
                 )
                 assert resp.status == 200
 
-            assert len(fake_task.callbacks) == 1
+            assert len(fake_task.callbacks) == 2
             stream_q = mock_write_sse.call_args.args[4]
             assert stream_q.empty()
             fake_task.callbacks[0](fake_task)
             assert stream_q.get_nowait() is None
+            fake_task.callbacks[1](fake_task)
 
     @pytest.mark.asyncio
     async def test_stream_sends_keepalive_during_quiet_tool_gap(self, adapter):
@@ -1389,6 +1695,137 @@ class TestChatCompletionsEndpoint:
                 # All partial text must be present too
                 assert "Thinking" in body
                 assert " about it..." in body
+
+    @pytest.mark.asyncio
+    async def test_stream_agent_failure_emits_hermes_error(self, adapter):
+        mock_result = {
+            "final_response": "",
+            "completed": False,
+            "partial": False,
+            "failed": True,
+            "error": "provider auth failed",
+            "messages": [],
+            "api_calls": 1,
+            "provider_error": {
+                "code": "provider_billing",
+                "reason": "billing",
+                "provider": "openrouter",
+                "model": "gpt-5",
+                "status_code": 402,
+                "provider_error_code": "insufficient_credits",
+                "provider_message": "insufficient credits",
+                "recoverable": False,
+            },
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+            assert resp.status == 200
+            body = await resp.text()
+
+        assert "event: hermes.error" in body
+        assert '"message": "provider auth failed"' in body
+        assert '"code": "provider_billing"' in body
+        assert '"reason": "billing"' in body
+        assert '"provider": "openrouter"' in body
+        assert '"model": "gpt-5"' in body
+        assert '"status_code": 402' in body
+        assert '"provider_error_code": "insufficient_credits"' in body
+        assert '"provider_message": "insufficient credits"' in body
+        assert '"recoverable": false' in body
+        assert '"finish_reason": "error"' in body
+        assert "[DONE]" in body
+
+    @pytest.mark.asyncio
+    async def test_stream_agent_failure_hermes_error_is_redacted(self, adapter):
+        raw_secret = "sk-stream-error-leak-1234567890"
+        mock_result = {
+            "final_response": "",
+            "completed": False,
+            "partial": False,
+            "failed": True,
+            "error": f"provider auth failed OPENAI_API_KEY={raw_secret}",
+            "messages": [],
+            "api_calls": 1,
+            "provider_error": {
+                "code": "provider_auth",
+                "reason": "auth",
+                "provider": "openrouter",
+                "model": "gpt-5",
+                "status_code": 401,
+                "provider_error_code": "invalid_api_key",
+                "provider_message": f"upstream rejected AWS_SECRET_ACCESS_KEY={raw_secret}",
+                "recoverable": True,
+            },
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (mock_result, {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0})
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+            assert resp.status == 200
+            body = await resp.text()
+
+        assert "event: hermes.error" in body
+        assert raw_secret not in body
+        assert "OPENAI_API_KEY=" in body
+        assert "AWS_SECRET_ACCESS_KEY=" in body
+        assert '"finish_reason": "error"' in body
+
+    @pytest.mark.asyncio
+    async def test_stream_partial_agent_result_uses_length_finish_reason(self, adapter):
+        mock_result = {
+            "final_response": "partial answer",
+            "completed": False,
+            "partial": True,
+            "failed": False,
+            "error": "max tokens exceeded",
+            "messages": [],
+            "api_calls": 1,
+        }
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                if cb:
+                    cb("partial answer")
+                return mock_result, {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "stream": True,
+                    },
+                )
+            assert resp.status == 200
+            body = await resp.text()
+
+        assert "event: hermes.error" in body
+        assert '"code": "output_truncated"' in body
+        assert '"finish_reason": "length"' in body
+        assert "partial answer" in body
 
     @pytest.mark.asyncio
     async def test_stream_includes_tool_progress(self, adapter):
@@ -1570,6 +2007,224 @@ class TestChatCompletionsEndpoint:
             assert len(pairs) == 2, f"expected 2 events (running+completed), got {pairs}"
             assert pairs[0] == ("running", "call_terminal_1"), pairs
             assert pairs[1] == ("completed", "call_terminal_1"), pairs
+
+    @pytest.mark.asyncio
+    async def test_stream_tool_complete_includes_error_outcome(self, adapter):
+        import asyncio
+        import json as _json
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                ts_cb = kwargs.get("tool_start_callback")
+                tc_cb = kwargs.get("tool_complete_callback")
+                if ts_cb:
+                    ts_cb("call_linear_1", "linear_list_issues", {"first": 3})
+                if tc_cb:
+                    tc_cb(
+                        "call_linear_1",
+                        "linear_list_issues",
+                        {"first": 3},
+                        _json.dumps({
+                            "error": "denied_by_agent_policy",
+                            "errorCode": "denied_by_agent_policy",
+                            "connector_error": {
+                                "code": "denied_by_agent_policy",
+                                "provider": "linear",
+                                "status": 403,
+                            },
+                        }),
+                    )
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("The connector call failed.")
+                return (
+                    {"final_response": "The connector call failed.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "list linear issues"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        events = []
+        lines = body.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip() != "event: hermes.tool.progress":
+                continue
+            for follow in lines[i + 1: i + 4]:
+                if follow.startswith("data: "):
+                    events.append(_json.loads(follow[len("data: "):]))
+                    break
+        completed = [event for event in events if event.get("status") == "completed"]
+        assert len(completed) == 1
+        assert completed[0]["outcome"] == "error"
+        assert completed[0]["error"] == "denied_by_agent_policy"
+        assert completed[0]["errorCode"] == "denied_by_agent_policy"
+        assert completed[0]["connector_error"]["provider"] == "linear"
+        assert completed[0]["connector_error"]["status"] == 403
+
+    @pytest.mark.asyncio
+    async def test_stream_tool_complete_preserves_connector_reauth_next_action(self, adapter):
+        import asyncio
+        import json as _json
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                cb = kwargs.get("stream_delta_callback")
+                ts_cb = kwargs.get("tool_start_callback")
+                tc_cb = kwargs.get("tool_complete_callback")
+                if ts_cb:
+                    ts_cb("call_weread_1", "weread_get_bookshelf", {})
+                if tc_cb:
+                    tc_cb(
+                        "call_weread_1",
+                        "weread_get_bookshelf",
+                        {},
+                        _json.dumps({
+                            "error": "expired",
+                            "errorCode": "expired",
+                            "connector_error": {
+                                "errorCode": "expired",
+                                "provider": "weread",
+                                "connectionId": "conn-weread",
+                                "toolName": "weread.get_bookshelf",
+                                "detail": "provider_token_rejected",
+                                "nextAction": {
+                                    "type": "reauth",
+                                    "provider": "weread",
+                                    "connectionId": "conn-weread",
+                                    "toolName": "weread.get_bookshelf",
+                                },
+                            },
+                        }),
+                    )
+                if cb:
+                    await asyncio.sleep(0.05)
+                    cb("Please reconnect WeRead.")
+                return (
+                    {"final_response": "Please reconnect WeRead.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "list weread bookshelf"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        events = []
+        lines = body.splitlines()
+        for i, line in enumerate(lines):
+            if line.strip() != "event: hermes.tool.progress":
+                continue
+            for follow in lines[i + 1: i + 4]:
+                if follow.startswith("data: "):
+                    events.append(_json.loads(follow[len("data: "):]))
+                    break
+        completed = [event for event in events if event.get("status") == "completed"]
+        assert len(completed) == 1
+        assert completed[0]["outcome"] == "error"
+        assert completed[0]["errorCode"] == "expired"
+        connector_error = completed[0]["connector_error"]
+        assert connector_error["errorCode"] == "expired"
+        assert connector_error["detail"] == "provider_token_rejected"
+        assert connector_error["nextAction"]["type"] == "reauth"
+        assert connector_error["nextAction"]["connectionId"] == "conn-weread"
+
+    @pytest.mark.asyncio
+    async def test_stream_tool_complete_treats_empty_error_fields_as_success(self, adapter):
+        import asyncio
+        import json as _json
+
+        empty_error_values = [
+            None,
+            "",
+            "   ",
+            {},
+            [],
+            {"message": ""},
+            {"message": None, "details": []},
+        ]
+
+        for index, error_value in enumerate(empty_error_values):
+            app = _create_app(adapter)
+            async with TestClient(TestServer(app)) as cli:
+                async def _mock_run_agent(**kwargs):
+                    cb = kwargs.get("stream_delta_callback")
+                    ts_cb = kwargs.get("tool_start_callback")
+                    tc_cb = kwargs.get("tool_complete_callback")
+                    call_id = f"call_terminal_{index}"
+                    if ts_cb:
+                        ts_cb(call_id, "terminal", {"command": "ls -la"})
+                    if tc_cb:
+                        tc_cb(
+                            call_id,
+                            "terminal",
+                            {"command": "ls -la"},
+                            _json.dumps({
+                                "output": "total 136\n",
+                                "exit_code": 0,
+                                "error": error_value,
+                                "errorCode": "",
+                                "connector_error": {
+                                    "code": "",
+                                    "provider": "",
+                                    "status": None,
+                                },
+                            }),
+                        )
+                    if cb:
+                        await asyncio.sleep(0.05)
+                        cb("done.")
+                    return (
+                        {"final_response": "done.", "messages": [], "api_calls": 1},
+                        {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    )
+
+                with patch.object(adapter, "_run_agent", side_effect=_mock_run_agent):
+                    resp = await cli.post(
+                        "/v1/chat/completions",
+                        json={
+                            "model": "test",
+                            "messages": [{"role": "user", "content": "list"}],
+                            "stream": True,
+                        },
+                    )
+                    assert resp.status == 200
+                    body = await resp.text()
+
+            events = []
+            lines = body.splitlines()
+            for line_index, line in enumerate(lines):
+                if line.strip() != "event: hermes.tool.progress":
+                    continue
+                for follow in lines[line_index + 1: line_index + 4]:
+                    if follow.startswith("data: "):
+                        events.append(_json.loads(follow[len("data: "):]))
+                        break
+            completed = [event for event in events if event.get("status") == "completed"]
+            assert len(completed) == 1
+            assert completed[0]["outcome"] == "success", error_value
+            assert "error" not in completed[0]
+            assert "errorCode" not in completed[0]
+            assert "connector_error" not in completed[0]
 
     @pytest.mark.asyncio
     async def test_stream_tool_lifecycle_skips_internal_and_orphan_completes(self, adapter):
@@ -3258,13 +3913,13 @@ class TestChatCompletionsAgentIncomplete:
 
     @pytest.mark.asyncio
     async def test_truncation_with_partial_text_uses_length_finish_reason(self, adapter):
-        """Partial text + truncation marker → finish_reason='length', 200 OK,
+        """Partial text + structured partial state → finish_reason='length', 200 OK,
         plus hermes extras + headers."""
         mock_result = {
             "final_response": "Here is part one of the answer",
             "completed": False,
             "partial": True,
-            "error": "Response truncated due to output length limit",
+            "error": "max tokens exceeded",
             "messages": [],
             "api_calls": 1,
         }
@@ -3746,6 +4401,7 @@ class TestSessionIdHeader:
         mock_db = MagicMock()
         mock_db.get_messages_as_conversation.return_value = db_history
         auth_adapter._session_db = mock_db
+        auth_adapter._session_dbs[auth_adapter._profile_home_key()] = mock_db
         app = _create_app(auth_adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:

@@ -19,6 +19,7 @@ from __future__ import annotations
 import pytest
 
 import model_tools
+from agent import secret_scope
 
 
 @pytest.fixture(autouse=True)
@@ -113,3 +114,24 @@ class TestQuietModeCacheIsolation:
         explains why the bug only hit Gateway."""
         model_tools.get_tool_definitions(quiet_mode=False)
         assert len(model_tools._tool_defs_cache) == 0
+
+    def test_multiplex_quiet_mode_bypasses_process_cache(self, monkeypatch):
+        calls = 0
+
+        def compute(*_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return [{"type": "function", "function": {"name": f"tool-{calls}"}}]
+
+        previous_multiplex = secret_scope.is_multiplex_active()
+        secret_scope.set_multiplex_active(True)
+        monkeypatch.setattr(model_tools, "_compute_tool_definitions", compute)
+        try:
+            first = model_tools.get_tool_definitions(quiet_mode=True)
+            second = model_tools.get_tool_definitions(quiet_mode=True)
+        finally:
+            secret_scope.set_multiplex_active(previous_multiplex)
+
+        assert calls == 2
+        assert first != second
+        assert not model_tools._tool_defs_cache

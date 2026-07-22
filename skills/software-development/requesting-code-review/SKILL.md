@@ -8,7 +8,7 @@ platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [code-review, security, verification, quality, pre-commit, auto-fix]
-    related_skills: [subagent-driven-development, plan, test-driven-development, github-code-review]
+    related_skills: [subagent-driven-development, plan, test-driven-development]
 ---
 
 # Pre-Commit Code Verification
@@ -27,8 +27,7 @@ quality gates, an independent reviewer subagent, and an auto-fix loop.
 
 **Skip for:** documentation-only changes, pure config tweaks, or when user says "skip verification".
 
-**This skill vs github-code-review:** This skill verifies YOUR changes before committing.
-`github-code-review` reviews OTHER people's PRs on GitHub with inline comments.
+This skill verifies YOUR changes before committing. Provider-specific PR review workflows should use connector-backed presets rather than direct Hermes provider credentials.
 
 ## Step 1 — Get the diff
 

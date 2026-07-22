@@ -18,7 +18,7 @@ import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
-from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+from agent.prompt_builder import default_agent_identity
 
 logger = logging.getLogger(__name__)
 
@@ -844,7 +844,7 @@ def _preflight_codex_api_kwargs(
         instructions = ""
     if not isinstance(instructions, str):
         instructions = str(instructions)
-    instructions = instructions.strip() or DEFAULT_AGENT_IDENTITY
+    instructions = instructions.strip() or default_agent_identity()
 
     normalized_input = _preflight_codex_input_items(
         api_kwargs.get("input"),
@@ -913,7 +913,7 @@ def _preflight_codex_api_kwargs(
         "model", "instructions", "input", "tools", "store",
         "reasoning", "include", "max_output_tokens", "temperature",
         "tool_choice", "parallel_tool_calls", "prompt_cache_key", "service_tier",
-        "extra_headers", "extra_body", "timeout",
+        "extra_headers", "extra_body", "timeout", "text",
     }
     normalized: Dict[str, Any] = {
         "model": model,
@@ -949,6 +949,27 @@ def _preflight_codex_api_kwargs(
     temperature = api_kwargs.get("temperature")
     if isinstance(temperature, (int, float)):
         normalized["temperature"] = float(temperature)
+
+    text_cfg = api_kwargs.get("text")
+    if text_cfg is not None:
+        if not isinstance(text_cfg, dict):
+            raise ValueError("Codex Responses request 'text' must be an object.")
+        text_format = text_cfg.get("format")
+        if text_format is not None:
+            if not isinstance(text_format, dict):
+                raise ValueError("Codex Responses request 'text.format' must be an object.")
+            fmt_type = text_format.get("type")
+            if fmt_type not in {"json_object", "json_schema"}:
+                raise ValueError("Codex Responses request 'text.format.type' is unsupported.")
+            if fmt_type == "json_schema":
+                if not isinstance(text_format.get("name"), str) or not text_format.get("name", "").strip():
+                    raise ValueError("Codex Responses request 'text.format.name' must be a non-empty string.")
+                if not isinstance(text_format.get("schema"), dict):
+                    raise ValueError("Codex Responses request 'text.format.schema' must be an object.")
+                strict = text_format.get("strict")
+                if strict is not None and not isinstance(strict, bool):
+                    raise ValueError("Codex Responses request 'text.format.strict' must be a boolean.")
+            normalized["text"] = {"format": dict(text_format)}
 
     # Pass through tool_choice, parallel_tool_calls, prompt_cache_key
     for passthrough_key in ("tool_choice", "parallel_tool_calls", "prompt_cache_key"):

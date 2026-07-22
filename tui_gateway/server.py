@@ -5590,7 +5590,7 @@ def _clear_inflight_turn(session: dict) -> None:
     session["inflight_turn"] = None
 
 
-def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
+def _enqueue_prompt(session: dict, text: Any, transport: Any, prepend: bool = False) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
     Used when a prompt arrives mid-turn (see ``_handle_busy_submit``). A single
@@ -5598,6 +5598,12 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
     consecutive-user merge in ``repair_message_sequence``) so nothing the user
     typed is dropped. ``transport`` is pinned so the drained turn streams back to
     the client that sent it even if the session transport is rebound meanwhile.
+
+    ``prepend`` merges *text* in FRONT of an already-queued prompt instead of
+    after it — used for the leftover /steer requeue: the steer was accepted
+    while the ended turn ran, so a prompt queued later in that window must not
+    execute (or read, once merged) ahead of the redirect. The existing entry's
+    transport is kept in that case — it is the later arrival.
     """
     existing = session.get("queued_prompt")
     if (
@@ -5606,7 +5612,11 @@ def _enqueue_prompt(session: dict, text: Any, transport: Any) -> None:
         and isinstance(text, str)
     ):
         prev = existing["text"]
-        text = f"{prev}\n\n{text}" if prev and text else (prev or text)
+        if prepend:
+            text = f"{text}\n\n{prev}" if prev and text else (prev or text)
+            transport = existing.get("transport") or transport
+        else:
+            text = f"{prev}\n\n{text}" if prev and text else (prev or text)
     session["queued_prompt"] = {"text": text, "transport": transport}
 
 
@@ -9372,6 +9382,22 @@ def _(rid, params: dict) -> dict:
         accepted = agent.steer(text)
     except Exception as exc:
         return _err(rid, 5000, f"steer failed: {exc}")
+    if not accepted and text.strip():
+        if not session.get("running"):
+            # Session already idle: _drain_queued_prompt only fires at a
+            # turn's tail — a server-side enqueue now would sit until some
+            # future turn ends and then run out of order. Report rejected
+            # so the client falls back to its own queue/submit path.
+            return _ok(rid, {"status": "rejected", "text": text})
+        # Slot closed by the turn finalizer (turn finishing) — requeue the
+        # text as the next turn so it isn't dropped. Report "queued": the
+        # text WILL run next turn, and existing clients (ui-tui
+        # useSubmission / desktop use-composer-submit) fall back to their
+        # own client-side queue on any non-queued status — reporting
+        # "rejected" here would double-queue and re-run the same steer
+        # twice. `requeued` disambiguates for clients that care.
+        _enqueue_prompt(session, text, session.get("transport"))
+        return _ok(rid, {"status": "queued", "text": text, "requeued": True})
     return _ok(rid, {"status": "queued" if accepted else "rejected", "text": text})
 
 
@@ -9933,6 +9959,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
         one_turn_restore = session.pop("one_turn_model_restore", None)
+        _leftover_steer = None  # un-consumed /steer handed back by the turn
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -10208,6 +10235,20 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 _clear_inflight_turn(session)
             _emit("message.complete", sid, payload)
 
+            # Pull the leftover /steer BEFORE the goal hook: a steer that
+            # arrived after the last API call means the user redirected
+            # this turn — evaluating the goal on a final_response that
+            # ignores the redirect would burn a turn of budget (and could
+            # record a done/paused verdict) before the steer even runs.
+            # Mirrors zet_agent's pending-steer goal-hook skip. The slot
+            # close+drain is the same salvage the tail block used to do.
+            _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
+            if not _leftover_steer:
+                try:
+                    _leftover_steer = agent._drain_pending_steer(close=True)
+                except Exception:
+                    _leftover_steer = None
+
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
             # whether the goal is done and — if not and we're still under
@@ -10216,7 +10257,10 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             # ("✓ Goal achieved" / "⏸ budget exhausted") is surfaced as
             # a system line so the user sees progress regardless of
             # outcome. Mirrors gateway/run._post_turn_goal_continuation.
-            if status == "complete" and isinstance(raw, str) and raw.strip():
+            # Skipped when a leftover steer is about to requeue — that
+            # steer becomes the next prompt and the judge re-evaluates at
+            # the end of THAT turn.
+            if status == "complete" and not _leftover_steer and isinstance(raw, str) and raw.strip():
                 try:
                     from hermes_cli.goals import GoalManager
 
@@ -10392,6 +10436,32 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 session["last_active"] = time.time()
                 _clear_inflight_turn(session)
             _emit("session.info", sid, _session_info(agent, session))
+
+        # Leftover /steer handed back by the turn finalizer (the turn ended
+        # before another model call could absorb it): requeue as the next
+        # prompt — same as CLI/gateway — instead of silently dropping text
+        # the user was told was accepted. _enqueue_prompt merges losslessly
+        # with any prompt already queued mid-turn. The extraction itself
+        # runs inside the try (before the goal hook, which it gates); this
+        # tail only covers turns that died before reaching it.
+        if not _leftover_steer:
+            # Exception paths (image preprocessing / run_conversation
+            # raising) skip the in-try extraction, and early-return paths
+            # (invalid-response / provider error) bypass finalize_turn: a
+            # steer accepted in that window is still sitting in the slot
+            # with nothing to drain it — it would leak into the NEXT
+            # prompt's pre-API drain and execute a stale redirect out of
+            # order. Close+drain here (no-op when the in-try extraction
+            # already ran: the slot is drained and closed).
+            try:
+                _leftover_steer = agent._drain_pending_steer(close=True)
+            except Exception:
+                _leftover_steer = None
+        if _leftover_steer:
+            # prepend=True：steer 在已结束的 turn 内被接受，先于 turn 中
+            # 排队的后续 prompt 到达——合并进单槽时必须排在它前面，否则
+            # 后到的普通 prompt 抢在改向前执行/被读取。
+            _enqueue_prompt(session, _leftover_steer, session.get("transport"), prepend=True)
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;

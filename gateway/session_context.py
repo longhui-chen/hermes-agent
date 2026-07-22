@@ -36,6 +36,7 @@ needs to replace the import + call site:
     platform = get_session_env("HERMES_SESSION_PLATFORM", "")
 """
 
+import re
 from contextvars import ContextVar
 from typing import Any
 
@@ -114,11 +115,28 @@ _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNS
 # propagates that into this contextvar at session-bind time.
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
 
+# Zettlab local-server sends metadata.turn_id with each API request. This token
+# stays task-local so concurrent requests cannot overwrite one another.
+_ZETTLAB_TURN_ID: ContextVar = ContextVar("zettlab_turn_id", default="")
+
+
+def set_zettlab_turn_id(turn_id: str) -> None:
+    _ZETTLAB_TURN_ID.set(turn_id or "")
+
+
+def zettlab_turn_id() -> str:
+    return _ZETTLAB_TURN_ID.get().strip()
+
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
 _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
+# Human-readable cron job name for the current run — stamped as X-Task-Title so
+# the credit ledger's cron task card shows the real job name (and survives the
+# job being deleted, since the App can no longer resolve it from the live list).
+# Set per-job in run_job(); empty for interactive sessions.
+_CRON_TASK_TITLE: ContextVar = ContextVar("HERMES_CRON_TASK_TITLE", default=_UNSET)
 
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
@@ -136,6 +154,7 @@ _VAR_MAP = {
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
+    "HERMES_CRON_TASK_TITLE": _CRON_TASK_TITLE,
 }
 
 
@@ -371,3 +390,53 @@ def async_delivery_supported() -> bool:
     if value is _UNSET:
         return True
     return bool(value)
+
+
+# ---------------------------------------------------------------------------
+# Credit-ledger task attribution
+# ---------------------------------------------------------------------------
+
+# Cron sessions are ``cron_<job_id>_<YYYYMMDD>_<HHMMSS>`` (a fresh id per run).
+# Strip the trailing date+time so every run of a job collapses to a stable
+# ``cron_<job_id>`` — the credit ledger then aggregates all runs into one task
+# card per cron job instead of one card per minute.
+_CRON_RUN_TS_RE = re.compile(r"_\d{8}_\d{6}$")
+
+
+def billing_task_id_for(session_id: str) -> str:
+    """Map a session_id to the credit-ledger task_id to attribute spend to.
+
+    - Interactive sessions (``zettlab:<uid>:<agent>:<rand>``) → used as-is, so a
+      conversation's turns aggregate into one task card.
+    - Cron sessions (``cron_<job>_<YYYYMMDD>_<HHMMSS>``) → collapsed to a stable
+      ``cron_<job>`` so all runs of a cron job aggregate into one card.
+    - Anything else → '' (don't attribute; also avoids leaking X-Task-Id to
+      third-party providers on non-NAS sessions).
+    """
+    if not isinstance(session_id, str) or not session_id:
+        return ""
+    if session_id.startswith("zettlab:"):
+        return session_id
+    if session_id.startswith("cron_"):
+        return _CRON_RUN_TS_RE.sub("", session_id)
+    return ""
+
+
+def billing_task_id() -> str:
+    """``billing_task_id_for`` for the current session context (env/contextvar)."""
+    return billing_task_id_for(get_session_env("HERMES_SESSION_ID", ""))
+
+
+def billing_task_title_encoded() -> str:
+    """Percent-encoded cron job name for the current run, for the X-Task-Title header.
+
+    Only cron runs set ``HERMES_CRON_TASK_TITLE`` (see run_job), so this returns
+    '' for interactive sessions. HTTP headers are ASCII-only, so the (possibly
+    CJK) title is percent-encoded here; ai-api ``url.QueryUnescape``-decodes it
+    once at the boundary before persisting to ``scene_params.task_title``.
+    Returns '' when there is no title to stamp.
+    """
+    from urllib.parse import quote
+
+    title = get_session_env("HERMES_CRON_TASK_TITLE", "").strip()
+    return quote(title, safe="") if title else ""

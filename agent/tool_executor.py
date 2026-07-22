@@ -187,6 +187,49 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
     )
 
 
+def _zet_agent_plan_mode_block_message(agent, function_name: str, function_args: dict) -> Optional[str]:
+    """Block legacy markdown plan-mode paths in Zettlab App sessions."""
+    if (getattr(agent, "platform", "") or "") != "zet_agent":
+        return None
+
+    if (
+        bool(getattr(agent, "_zet_agent_plan_mode_active", False))
+        and function_name not in {"clarify", "present_plan"}
+    ):
+        return (
+            "This Zettlab App turn is in Plan mode. Only `clarify` and "
+            "`present_plan` are allowed until the user reviews the plan. "
+            f"Do not call `{function_name}` or perform side effects."
+        )
+
+    if function_name == "skill_view":
+        name = str(function_args.get("name") or "").strip().lower()
+        file_path = str(function_args.get("file_path") or "").strip()
+        if name == "plan" and not file_path:
+            return (
+                "Zettlab App plan mode uses the `present_plan` tool to render "
+                "a structured confirmation card. Do not load the markdown "
+                "`plan` skill here. Call `present_plan` with `title` and "
+                "`groups`, then stop and wait for user confirmation."
+            )
+
+    if function_name == "write_file":
+        path = str(function_args.get("path") or "").replace("\\", "/")
+        if (
+            path == ".hermes/plans"
+            or path.startswith(".hermes/plans/")
+            or "/.hermes/plans/" in path
+            or path.endswith("/.hermes/plans")
+        ):
+            return (
+                "Writing `.hermes/plans` is disabled for Zettlab App plan mode. "
+                "Use `present_plan` to show the plan in the App and wait for "
+                "confirmation instead of saving a markdown plan file."
+            )
+
+    return None
+
+
 def _emit_cancelled_terminal_post_tool_call(
     agent,
     *,
@@ -450,20 +493,25 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 middleware_trace=list(middleware_trace),
             )
         else:
-            try:
-                from hermes_cli.plugins import resolve_pre_tool_block
-                block_message = resolve_pre_tool_block(
-                    function_name,
-                    function_args,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    middleware_trace=list(middleware_trace),
-                )
-            except Exception:
-                block_message = None
+            block_message = _zet_agent_plan_mode_block_message(agent, function_name, function_args)
+            block_error_type = "zet_agent_plan_mode_block"
+            if block_message is None:
+                try:
+                    from hermes_cli.plugins import resolve_pre_tool_block
+                    block_message = resolve_pre_tool_block(
+                        function_name,
+                        function_args,
+                        task_id=effective_task_id or "",
+                        session_id=getattr(agent, "session_id", "") or "",
+                        tool_call_id=getattr(tool_call, "id", "") or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        middleware_trace=list(middleware_trace),
+                    )
+                    block_error_type = "plugin_block"
+                except Exception:
+                    block_message = None
+                    block_error_type = "plugin_block"
 
             if block_message is not None:
                 block_result = json.dumps({"error": block_message}, ensure_ascii=False)
@@ -475,7 +523,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     effective_task_id=effective_task_id,
                     tool_call_id=getattr(tool_call, "id", "") or "",
                     status="blocked",
-                    error_type="plugin_block",
+                    error_type=block_error_type,
                     error_message=block_message,
                     middleware_trace=list(middleware_trace),
                 )
@@ -1005,23 +1053,18 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             stage=f"tool result {name}",
         )
 
-        # ── Per-tool /steer drain ───────────────────────────────────
-        # Same as the sequential path: drain between each collected
-        # result so the steer lands as early as possible.
-        agent._apply_pending_steer_to_tool_results(messages, 1)
-
     # ── Per-turn aggregate budget enforcement ─────────────────────────
     num_tools = len(parsed_calls)
     if finalize and num_tools > 0:
         turn_tool_msgs = messages[-num_tools:]
         enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id), config=_tool_budget)
 
-    # ── /steer injection ──────────────────────────────────────────────
-    # Append any pending user steer text to the last tool result so the
-    # agent sees it on its next iteration. Runs AFTER budget enforcement
-    # so the steer marker is never truncated. See steer() for details.
-    if finalize and num_tools > 0:
-        agent._apply_pending_steer_to_tool_results(messages, num_tools)
+    # NOTE: no /steer injection here. Draining at the batch boundary could
+    # inject into a turn that immediately breaks out of the loop (present-
+    # plan / guardrail / budget paths) — the steer would persist as an
+    # unanswered user message with no dropped receipt. The conversation
+    # loop's pre-API drain (drain_steer_for_next_api_call) is the single
+    # injection point: it only fires when a next model call is certain.
 
 
 
@@ -1075,7 +1118,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 messages,
                 stage=f"invalid tool arguments {function_name}",
             )
-            agent._apply_pending_steer_to_tool_results(messages, 1)
             continue
 
         # Tool Search unwrap — see execute_tool_calls_concurrent for full
@@ -1113,20 +1155,24 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             _block_msg = _ts_scope_block
             _block_error_type = "tool_scope_block"
         else:
-            try:
-                from hermes_cli.plugins import resolve_pre_tool_block
-                _block_msg = resolve_pre_tool_block(
-                    function_name,
-                    function_args,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    middleware_trace=list(middleware_trace),
-                )
-            except Exception:
-                pass
+            _block_msg = _zet_agent_plan_mode_block_message(agent, function_name, function_args)
+            if _block_msg is not None:
+                _block_error_type = "zet_agent_plan_mode_block"
+            else:
+                try:
+                    from hermes_cli.plugins import resolve_pre_tool_block
+                    _block_msg = resolve_pre_tool_block(
+                        function_name,
+                        function_args,
+                        task_id=effective_task_id or "",
+                        session_id=getattr(agent, "session_id", "") or "",
+                        tool_call_id=getattr(tool_call, "id", "") or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        middleware_trace=list(middleware_trace),
+                    )
+                except Exception:
+                    pass
 
         _guardrail_block_decision: ToolGuardrailDecision | None = None
         if _block_msg is None:
@@ -1263,6 +1309,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
+            # Emit hermes.todo event onto the SSE stream (zet_agent platform).
+            # todo_emit_callback is injected by ZetAgentAdapter._create_agent
+            # when a stream_q is available; absent it, this is a no-op.
+            _todo_emit_cb = getattr(agent, "todo_emit_callback", None)
+            if callable(_todo_emit_cb):
+                try:
+                    import json as _json
+                    _todo_payload = _json.loads(function_result)
+                    _todo_emit_cb(_todo_payload.get("todos", []), _todo_payload.get("summary", {}))
+                except Exception:
+                    pass
         elif function_name == "session_search":
             def _execute(next_args: dict) -> Any:
                 session_db = agent._get_session_db_for_recall()
@@ -1367,6 +1424,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('read_terminal', function_args, tool_duration, result=function_result)}")
+        elif function_name == "present_plan":
+            from tools.plan_tool import present_plan as _present_plan
+            function_result = _present_plan(
+                title=function_args.get("title", ""),
+                groups=function_args.get("groups", []),
+                callback=getattr(agent, "plan_emit_callback", None),
+            )
+            agent._zet_agent_plan_presented = True
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl('present_plan', function_args, tool_duration, result=function_result)}")
         elif function_name == "delegate_task":
             tasks_arg = function_args.get("tasks")
             if tasks_arg and isinstance(tasks_arg, list):
@@ -1689,12 +1757,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             stage=f"tool result {function_name}",
         )
 
-        # ── Per-tool /steer drain ───────────────────────────────────
-        # Drain pending steer BETWEEN individual tool calls so the
-        # injection lands as soon as a tool finishes — not after the
-        # entire batch.  The model sees it on the next API iteration.
-        agent._apply_pending_steer_to_tool_results(messages, 1)
-
         if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
             if agent.verbose_logging:
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
@@ -1730,11 +1792,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     if finalize and num_tools_seq > 0:
         enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id), config=_tool_budget)
 
-    # ── /steer injection ──────────────────────────────────────────────
-    # See _execute_tool_calls_parallel for the rationale. Same hook,
-    # applied to sequential execution as well.
-    if finalize and num_tools_seq > 0:
-        agent._apply_pending_steer_to_tool_results(messages, num_tools_seq)
+    # NOTE: no /steer injection here — see the parallel path's note; the
+    # conversation loop's pre-API drain is the single injection point.
 
 
 
@@ -1751,7 +1810,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     identical ordering and side-effect boundaries to fully-sequential
     execution, with I/O parallelism recovered inside the safe runs.
 
-    Turn-end work (aggregate budget enforcement + /steer injection) is done
+    Turn-end aggregate budget enforcement is done
     once here for the WHOLE batch; the per-segment executor calls run with
     ``finalize=False`` so a multi-segment turn cannot multiply the budget or
     truncate a steer marker.
@@ -1782,7 +1841,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
                 finalize=False,
             )
 
-    # ── Whole-turn finalize (budget + /steer) ─────────────────────────
+    # ── Whole-turn finalize (budget) ──────────────────────────────────
     total_tools = len(assistant_message.tool_calls)
     if total_tools > 0:
         _tool_budget = _budget_for_agent(agent)
@@ -1791,7 +1850,6 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             env=get_active_env(effective_task_id),
             config=_tool_budget,
         )
-        agent._apply_pending_steer_to_tool_results(messages, total_tools)
 
 
 __all__ = [

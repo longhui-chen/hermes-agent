@@ -51,7 +51,7 @@ _HERMES_CORE_TOOLS = [
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
-    "todo", "memory",
+    "todo", "present_plan", "memory",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the
@@ -65,6 +65,11 @@ _HERMES_CORE_TOOLS = [
     "execute_code", "delegate_task",
     # Cronjob management
     "cronjob",
+    # Cross-platform messaging (gated on gateway running via check_fn)
+    "send_message",
+    # List THIS agent's connected IM channels (gated on zet_agent env via check_fn)
+    "list_my_channels",
+    "send_channel_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     # Kanban multi-agent coordination — only in schema when the agent is
@@ -202,8 +207,8 @@ TOOLSETS = {
     },
     
     "todo": {
-        "description": "Task planning and tracking for multi-step work",
-        "tools": ["todo"],
+        "description": "Task planning, plan previews, and tracking for multi-step work",
+        "tools": ["todo", "present_plan"],
         "includes": []
     },
     
@@ -431,6 +436,20 @@ TOOLSETS = {
     
     "hermes-cli": {
         "description": "Full interactive CLI toolset - all default tools plus cronjob management",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
+    "hermes-zet-agent": {
+        # Zet Agent (APIServerAdapter subclass) extends api_server's
+        # OpenAI-compatible /v1/chat/completions surface with structured
+        # SSE events (reasoning/approval/clarify/title) on the
+        # `event: hermes.tool.progress` channel. Because the platform
+        # layer handles those interactive prompts (via threading.Event
+        # blocking + HTTP respond endpoints), it can safely expose the
+        # full _HERMES_CORE_TOOLS set — including clarify, send_message,
+        # and text_to_speech that hermes-api-server explicitly excludes.
+        "description": "Zet Agent — APIServerAdapter + interactive SSE extension (reasoning/approval/clarify/title)",
         "tools": _HERMES_CORE_TOOLS,
         "includes": []
     },

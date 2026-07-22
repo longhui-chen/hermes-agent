@@ -23,6 +23,8 @@
 #   scripts/run_tests.sh tests/foo.py -v --tb=long  # bare flags "just work"
 #   scripts/run_tests.sh -k 'pattern'               # value flags pass through too
 #   scripts/run_tests.sh tests/foo.py -- --tb=long  # explicit '--' still works
+#   scripts/run_tests.sh -- -v --tb=long            # pytest args only
+#   scripts/run_tests.sh --coverage                 # + cov.json (coverage gate)
 #
 # Bare pytest flags (anything starting with '-' that isn't one of this
 # runner's own options: -j/--jobs, --paths, --slice, --file-timeout, etc.)

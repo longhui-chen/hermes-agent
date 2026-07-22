@@ -2838,6 +2838,32 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def clear_all_system_prompts(self) -> int:
+        """Null out the cached system_prompt for every session in this DB.
+
+        Each agent owns its own state.db (path is per-agent under
+        profiles/<agent_id>/state.db), so "all sessions" here is already
+        scoped to a single agent — no agent_id filter is needed.
+
+        The continuing-session rebuild path in AIAgent re-uses the stored
+        system_prompt when present (to preserve the Anthropic prefix-cache
+        prefix across turns); when SOUL.md / IDENTITY.md / profile metadata
+        change on disk, the stored prompts go stale and the next turn would
+        otherwise keep replaying the old prompt. Clearing the column forces
+        every session's next turn to rebuild from disk.
+
+        Called by the prompt-class reload endpoints
+        (/v1/profile/reload, /v1/skills/reload). Returns the row count
+        actually updated (i.e. sessions that had a non-null prompt).
+        """
+        def _do(conn):
+            cur = conn.execute(
+                "UPDATE sessions SET system_prompt = NULL "
+                "WHERE system_prompt IS NOT NULL"
+            )
+            return cur.rowcount
+        return self._execute_write(_do)
+
     def update_token_counts(
         self,
         session_id: str,
@@ -3284,6 +3310,84 @@ class SessionDB:
             return matches[0]
         return None
 
+    # Compression is a multi-step read-modify-write sequence that rotates
+    # session_id and creates a successor row. Two agents sharing one
+    # session_id must not both run that sequence concurrently.
+    def try_acquire_compression_lock(
+        self,
+        session_id: str,
+        holder: str,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        """Try to atomically acquire the compression lock for ``session_id``."""
+        if not session_id or not holder:
+            return False
+        now = time.time()
+        expires_at = now + max(0.0, float(ttl_seconds))
+
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM compression_locks "
+                "WHERE session_id = ? AND expires_at < ?",
+                (session_id, now),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO compression_locks "
+                "(session_id, holder, acquired_at, expires_at) "
+                "VALUES (?, ?, ?, ?)",
+                (session_id, holder, now, expires_at),
+            )
+            row = conn.execute(
+                "SELECT holder FROM compression_locks WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return row is not None and (
+                row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+            ) == holder
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning(
+                "try_acquire_compression_lock(%s) failed: %s",
+                session_id, exc,
+            )
+            return False
+
+    def release_compression_lock(self, session_id: str, holder: str) -> None:
+        """Release the compression lock for ``session_id`` iff we own it."""
+        if not session_id or not holder:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM compression_locks "
+                "WHERE session_id = ? AND holder = ?",
+                (session_id, holder),
+            )
+
+        try:
+            self._execute_write(_do)
+        except sqlite3.Error as exc:
+            logger.warning(
+                "release_compression_lock(%s) failed: %s",
+                session_id, exc,
+            )
+
+    def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
+        """Return the current non-expired lock holder for ``session_id``."""
+        if not session_id:
+            return None
+        now = time.time()
+        row = self._conn.execute(
+            "SELECT holder FROM compression_locks "
+            "WHERE session_id = ? AND expires_at >= ?",
+            (session_id, now),
+        ).fetchone()
+        if row is None:
+            return None
+        return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+
     # Maximum length for session titles
     MAX_TITLE_LENGTH = 100
 
@@ -3449,6 +3553,15 @@ class SessionDB:
         :meth:`set_session_title`.
         """
         return self._set_session_title(session_id, title, only_if_empty=True)
+
+    def set_session_title_if_empty(self, session_id: str, title: str) -> bool:
+        """Atomically set an auto-generated title only while it is still empty.
+
+        A user may rename the session while title generation is waiting on the
+        model. The read and conditional update therefore share one immediate
+        transaction so the generated title can never overwrite that rename.
+        """
+        return self.set_auto_title_if_empty(session_id, title)
 
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
@@ -4269,6 +4382,31 @@ class SessionDB:
             return msg_id
 
         return self._execute_write(_do)
+
+    def delete_message(self, session_id: str, message_id: int) -> bool:
+        """Delete a single message row, scoped to *session_id*.
+
+        Used to undo a crash-resilience row whose in-memory message was
+        retracted before any model call consumed it (steer reclaim on
+        early-return turns) — leaving the row would replay a phantom user
+        message on /resume. The FTS DELETE triggers keep the search
+        indexes consistent. Returns True if a row was deleted.
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                "DELETE FROM messages WHERE id = ? AND session_id = ?",
+                (message_id, session_id),
+            )
+            if cursor.rowcount > 0:
+                conn.execute(
+                    """UPDATE sessions SET message_count =
+                       CASE WHEN message_count > 0 THEN message_count - 1 ELSE 0 END
+                       WHERE id = ?""",
+                    (session_id,),
+                )
+            return cursor.rowcount > 0
+
+        return bool(self._execute_write(_do))
 
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.

@@ -261,7 +261,7 @@ When loaded, Hermes checks if these files exist. Missing files trigger `setup_ne
 Use `required_environment_variables` for simple API keys and tokens (strings stored in `~/.hermes/.env`). Use `required_credential_files` for OAuth token files, client secrets, service account JSON, certificates, or any credential that's a file on disk.
 :::
 
-See the `skills/productivity/google-workspace/SKILL.md` for a complete example using both.
+Connector-backed provider skills live in `zettlab-presets`; Hermes-bundled skills should avoid provider-specific OAuth setup and direct provider API credentials.
 
 ## Skill Guidelines
 

@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli.timeouts import get_provider_request_timeout
-from agent.prompt_builder import format_steer_marker
+from agent.prompt_builder import STEER_USER_PREFIX, format_steer_user_message
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED
@@ -59,7 +59,7 @@ def _ra():
 
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset(
-    {"todo", "session_search", "memory", "clarify", "read_terminal", "delegate_task"}
+    {"todo", "session_search", "memory", "clarify", "read_terminal", "delegate_task", "present_plan"}
 )
 
 
@@ -3327,69 +3327,264 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
 
 
 
-def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: int) -> None:
-    """Append any pending /steer text to the last tool result in this turn.
+def drain_steer_for_next_api_call(agent, messages: list) -> None:
+    """Deliver any pending /steer as a user turn, right before an API call.
 
-    Called at the end of a tool-call batch, before the next API call.
-    The steer is appended to the last ``role:"tool"`` message's content
-    with a clear marker so the model understands it came from the user
-    and NOT from the tool itself. Role alternation is preserved —
-    nothing new is inserted, we only modify existing content.
+    This is the ONLY injection point (the earlier per-batch hook in
+    tool_executor was removed): draining here means the very next model
+    request is guaranteed to carry the text. Draining at the end of a tool
+    batch instead could inject into a turn that immediately breaks out of
+    the loop (present-plan / guardrail halt / budget exhausted) — the steer
+    would persist as an unanswered user message, merge into the NEXT turn's
+    input, and resurrect a stale redirect with no dropped receipt. On break
+    paths the slot stays pending and the finalizer surfaces steer_dropped.
 
-    Args:
-        messages: The running messages list.
-        num_tool_msgs: Number of tool results appended in this batch;
-            used to locate the tail slice safely.
+    Delivery shape depends on the current tail:
+      - tail is a user message with str content → concatenate (strict
+        providers reject adjacent user turns; repair's Pass 2 would merge
+        str+str anyway, but doing it here keeps the request well-formed
+        even when repair is skipped)
+      - tail is a user message with list (multimodal) content → append a
+        text block (repair deliberately skips list merges, so adjacent
+        user(list)+user(str) would otherwise reach strict providers)
+      - anything else (the normal tool-batch tail) → append a new
+        ``role:"user"`` message (the legal "ongoing dialog" sequence)
     """
-    if num_tool_msgs <= 0 or not messages:
+    if not messages:
         return
-    steer_text = agent._drain_pending_steer()
+    # Atomic drain-unless-interrupted: a hard interrupt supersedes any
+    # pending steer (interrupt() drops the slot by design). Racing that —
+    # checking the flag outside the lock, or draining first — could write
+    # the steer into ``messages`` as an unanswered user turn that merges
+    # into the NEXT turn's input and resurrects an instruction the user
+    # already cancelled. Under the lock, either the interrupt flag is
+    # visible here (leave the slot for interrupt()/the finalizer to
+    # surface as steer_dropped) or the drain happened strictly before
+    # the interrupt (a legal pre-stop injection).
+    _lock = getattr(agent, "_pending_steer_lock", None)
+    if _lock is not None:
+        with _lock:
+            if getattr(agent, "_interrupt_requested", False):
+                return
+            steer_text = agent._pending_steer
+            agent._pending_steer = None
+    else:
+        if getattr(agent, "_interrupt_requested", False):
+            return
+        steer_text = getattr(agent, "_pending_steer", None)
+        agent._pending_steer = None
     if not steer_text:
         return
-    # Find the last tool-role message in the recent tail. Skipping
-    # non-tool messages defends against future code appending
-    # something else at the boundary.
-    target_idx = None
-    for j in range(len(messages) - 1, max(len(messages) - num_tool_msgs - 1, -1), -1):
-        msg = messages[j]
-        if isinstance(msg, dict) and msg.get("role") == "tool":
-            target_idx = j
-            break
-    if target_idx is None:
-        # No tool result in this batch (e.g. all skipped by interrupt);
-        # put the steer back so the caller's fallback path can deliver
-        # it as a normal next-turn user message.
-        _lock = getattr(agent, "_pending_steer_lock", None)
-        if _lock is not None:
-            with _lock:
-                if agent._pending_steer:
-                    agent._pending_steer = agent._pending_steer + "\n" + steer_text
-                else:
-                    agent._pending_steer = steer_text
+    steer_msg = format_steer_user_message(steer_text)
+    tail = messages[-1] if isinstance(messages[-1], dict) else None
+    if tail is not None and tail.get("role") == "user":
+        tail_content = tail.get("content")
+        merged = False
+        if isinstance(tail_content, str):
+            joined = (tail_content + "\n\n" + steer_msg["content"]) if tail_content else steer_msg["content"]
+            tail["content"] = joined
+            merged = True
+        elif isinstance(tail_content, list):
+            tail_content.append({"type": "text", "text": steer_msg["content"]})
+            merged = True
         else:
-            existing = getattr(agent, "_pending_steer", None)
-            agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
-        return
-    marker = format_steer_marker(steer_text)
-    existing_content = messages[target_idx].get("content", "")
-    if not isinstance(existing_content, str):
-        # Anthropic multimodal content blocks — preserve them and append
-        # a text block at the end.
-        try:
-            blocks = list(existing_content) if existing_content else []
-            blocks.append({"type": "text", "text": marker.lstrip()})
-            messages[target_idx]["content"] = blocks
-        except Exception:
-            # Fall back to string replacement if content shape is unexpected.
-            messages[target_idx]["content"] = f"{existing_content}{marker}"
+            messages.append(steer_msg)
+        # Consumed-steer marker for the goal hook (every delivery shape):
+        # the model sees this text on the next call, so the post-turn goal
+        # judge must treat the round as user-initiated.
+        agent._turn_last_steer_text = steer_text
+        # Crash-resilience persistence stamps the turn-opening user row
+        # BEFORE this merge and _persist_session (append-only) skips
+        # stamped messages — the merged steer would exist in memory but
+        # never reach the session DB (lost on restart/resume/compaction).
+        # Append it as its own durable user row instead; on reload the
+        # adjacent user rows re-merge via repair's Pass 2, so the replayed
+        # shape matches what the model saw.
+        if merged and tail.get(_ra()._DB_PERSISTED_MARKER):
+            _persist_merged_steer_row(agent, steer_msg["content"])
     else:
-        messages[target_idx]["content"] = existing_content + marker
+        messages.append(steer_msg)
+        agent._turn_last_steer_text = steer_text
     _ra().logger.info(
-        "Delivered /steer to agent after tool batch (%d chars): %s",
+        "Delivered /steer before next API call (%d chars): %s",
         len(steer_text),
         steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
     )
 
+
+
+def _persist_merged_steer_row(agent, steer_content: str) -> None:
+    """Best-effort durable row for a steer merged into an already-persisted
+    user message (see drain_steer_for_next_api_call). Failure is logged and
+    swallowed — persistence must never break the turn (same contract as
+    _persist_session).
+
+    Mirrors the flush chokepoint's guards: honors ``_persist_disabled``
+    (harness turns must never write the user's session history) and runs
+    the content through ``_redact_message_content`` — a mid-turn steer can
+    contain pasted API keys/tokens, and bypassing redaction here would
+    persist them in plaintext while every other row is scrubbed.
+
+    The written row id is recorded on ``agent._steer_merged_db_rows`` so
+    ``reclaim_tail_steer`` can undo the row if the same turn retracts the
+    merge before any model call consumed it — otherwise a failed turn's
+    history keeps a phantom steer row AND the client's re-queue delivers
+    the text again next turn (double row on /resume)."""
+    if getattr(agent, "_persist_disabled", False):
+        return
+    db = getattr(agent, "_session_db", None)
+    sid = getattr(agent, "session_id", None)
+    if db is None or not sid:
+        return
+    try:
+        redact = getattr(agent, "_redact_message_content", None)
+        content = redact(steer_content) if callable(redact) else steer_content
+        row_id = db.append_message(session_id=sid, role="user", content=content)
+        if isinstance(row_id, int):
+            rows = getattr(agent, "_steer_merged_db_rows", None)
+            if not isinstance(rows, list):
+                rows = []
+                agent._steer_merged_db_rows = rows
+            rows.append((steer_content, row_id))
+    except Exception:
+        _ra().logger.debug("steer merge: session DB append failed", exc_info=True)
+
+
+def reclaim_tail_steer(agent, messages: list) -> None:
+    """Pop an un-answered steer user message off the tail and restash it.
+
+    Early-return paths between the pre-API drain and a successful model
+    response (Nous rate-guard, thinking-budget exhaustion) persist
+    ``messages`` and return without another model call — the injected
+    steer would survive as an unanswered user message that merges into
+    the NEXT turn's input, while bypassing the finalizer's pending_steer
+    hand-back. Restashing puts the text back where the recovery paths
+    can see it: zet_agent's early-return salvage drains it into
+    ``pending_steer`` (→ steer_dropped → client re-queue), and a reused
+    CLI agent re-injects it on the next turn's pre-API drain.
+
+    Merged shapes are reclaimed too: a steer that arrived before the
+    first API call was folded into the opening user message (str concat /
+    list text-block append). The STEER_USER_PREFIX makes the folded
+    suffix identifiable, so it is split back out — nothing else auto-
+    retries a failed turn on the zet path (the App's steered bubble never
+    re-sends itself), so leaving it merged would both lose the redirect
+    and persist it inside a failed turn's history.
+    """
+    if not messages:
+        return
+    tail = messages[-1]
+    if not (isinstance(tail, dict) and tail.get("role") == "user"):
+        return
+    content = tail.get("content")
+    reclaimed: list = []
+    if isinstance(content, str):
+        if content.startswith(STEER_USER_PREFIX):
+            # Standalone steer message (or a merge into an empty opener —
+            # same shape, and an empty opener carries nothing else worth
+            # keeping): pop the whole message.
+            messages.pop()
+            reclaimed.append(content[len(STEER_USER_PREFIX):])
+        else:
+            # Folded suffixes: "<original>\n\n<prefix><steer>" — possibly
+            # several if multiple drains hit the same opener. Split them
+            # back out, restoring the original content.
+            sep = "\n\n" + STEER_USER_PREFIX
+            idx = content.rfind(sep)
+            while idx >= 0:
+                reclaimed.insert(0, content[idx + len(sep):])
+                content = content[:idx]
+                idx = content.rfind(sep)
+            if reclaimed:
+                tail["content"] = content
+    elif isinstance(content, list):
+        while content:
+            last = content[-1]
+            if (
+                isinstance(last, dict)
+                and last.get("type") == "text"
+                and isinstance(last.get("text"), str)
+                and last["text"].startswith(STEER_USER_PREFIX)
+            ):
+                reclaimed.insert(0, content.pop()["text"][len(STEER_USER_PREFIX):])
+            else:
+                break
+    if not reclaimed:
+        return
+    # Undo the crash-resilience rows _persist_merged_steer_row wrote for
+    # these exact merges: the text just left ``messages``, so a surviving
+    # DB row would replay a phantom steer on /resume — and the re-queued
+    # delivery next turn would then persist it a second time. Matched by
+    # recorded row id (LIFO on identical text), never by content scan.
+    rows = getattr(agent, "_steer_merged_db_rows", None)
+    if isinstance(rows, list) and rows:
+        db = getattr(agent, "_session_db", None)
+        sid = getattr(agent, "session_id", None)
+        delete = getattr(db, "delete_message", None) if db is not None else None
+        for _text in reclaimed:
+            _full = STEER_USER_PREFIX + _text
+            for _i in range(len(rows) - 1, -1, -1):
+                if rows[_i][0] == _full:
+                    _row_id = rows.pop(_i)[1]
+                    if callable(delete) and sid:
+                        try:
+                            delete(sid, _row_id)
+                        except Exception:
+                            _ra().logger.debug(
+                                "steer reclaim: phantom row delete failed",
+                                exc_info=True,
+                            )
+                    break
+    text = "\n".join(reclaimed)
+    # Restash-unless-interrupted, mirroring the drain's atomic guard: a
+    # hard interrupt supersedes the steer (interrupt() drops the slot by
+    # design), and these early-return paths bypass finalize_turn's
+    # interrupted-leftover discard — an unconditional restash would
+    # resurrect an instruction the user already cancelled.
+    def _restash_unless_interrupted() -> bool:
+        if getattr(agent, "_interrupt_requested", False):
+            return False
+        existing = getattr(agent, "_pending_steer", None)
+        agent._pending_steer = (text + "\n" + existing) if existing else text
+        return True
+
+    _lock = getattr(agent, "_pending_steer_lock", None)
+    if _lock is not None:
+        with _lock:
+            restashed = _restash_unless_interrupted()
+    else:
+        restashed = _restash_unless_interrupted()
+    if restashed:
+        _ra().logger.info(
+            "Reclaimed un-answered /steer from early-return turn (%d chars)",
+            len(text),
+        )
+    else:
+        _ra().logger.info(
+            "Discarding reclaimed /steer — interrupt supersedes it (%d chars)",
+            len(text),
+        )
+
+
+def reclaim_and_handback_steer(agent, messages: list):
+    """``reclaim_tail_steer`` + the finalizer's closing drain, for the
+    early-return paths in ``run_conversation``.
+
+    Those returns bypass ``finalize_turn`` entirely: only zet_agent / TUI
+    / ACP wrap a slot salvage around the call, while classic CLI and the
+    messaging gateway consume steer exclusively from
+    ``result["pending_steer"]``. Handing the text back here — and closing
+    the slot, same as the finalizer — keeps every surface on that
+    contract; a bare restash would otherwise sit in the cached agent
+    until a later unrelated prompt's pre-API drain executes the stale
+    redirect out of order. Returns the drained text (or None)."""
+    reclaim_tail_steer(agent, messages)
+    try:
+        drain = getattr(agent, "_drain_pending_steer", None)
+        return drain(close=True) if callable(drain) else None
+    except Exception:
+        _ra().logger.debug("steer handback drain failed", exc_info=True)
+        return None
 
 
 def force_close_tcp_sockets(client: Any) -> int:
@@ -3467,7 +3662,9 @@ __all__ = [
     "copy_reasoning_content_for_api",
     "cleanup_dead_connections",
     "extract_api_error_context",
-    "apply_pending_steer_to_tool_results",
+    "drain_steer_for_next_api_call",
+    "reclaim_tail_steer",
+    "reclaim_and_handback_steer",
     "_iter_pool_sockets",
     "force_close_tcp_sockets",
 ]

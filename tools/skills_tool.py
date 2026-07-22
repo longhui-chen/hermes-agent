@@ -70,7 +70,7 @@ import json
 import logging
 import time
 
-from hermes_constants import get_hermes_home, display_hermes_home
+from hermes_constants import get_hermes_home, display_hermes_home, get_skills_dir
 import os
 import re
 from enum import Enum
@@ -140,23 +140,16 @@ def _skills_scan_signature(dirs_to_scan, disabled) -> tuple:
 # This is the single source of truth -- agent edits, hub installs, and bundled
 # skills all coexist here without polluting the git repo.
 HERMES_HOME = get_hermes_home()
-SKILLS_DIR = HERMES_HOME / "skills"
-_SKILLS_DIR_AT_IMPORT = SKILLS_DIR
+_DEFAULT_SKILLS_DIR = HERMES_HOME / "skills"
+SKILLS_DIR = _DEFAULT_SKILLS_DIR
 
 
-def _skills_dir() -> Path:
-    """Return the active profile's skills directory at call time.
-
-    Some long-lived runtimes import this module before the active profile has
-    set HERMES_HOME. Keep the legacy SKILLS_DIR module attribute for tests and
-    external patchers, but when it has not been patched, resolve from the live
-    profile-scoped HERMES_HOME on every call.
-    """
-    configured = Path(SKILLS_DIR)
-    if configured != _SKILLS_DIR_AT_IMPORT:
-        return configured
-    return get_hermes_home() / "skills"
-
+def _active_skills_dir() -> Path:
+    """Return the current profile's skills dir while preserving test overrides."""
+    current = Path(SKILLS_DIR)
+    if current != _DEFAULT_SKILLS_DIR:
+        return current
+    return get_skills_dir()
 
 # Anthropic-recommended limits for progressive disclosure efficiency
 MAX_NAME_LENGTH = 64
@@ -566,9 +559,9 @@ def _get_category_from_path(skill_path: Path) -> Optional[str]:
     For paths like: ~/.hermes/skills/mlops/axolotl/SKILL.md -> "mlops"
     Also works for external skill dirs configured via skills.external_dirs.
     """
-    # Try the active profile skills dir first (respects monkeypatching in tests),
-    # then fall back to external dirs from config.
-    dirs_to_check = [_skills_dir()]
+    # Try the active profile's local skills dir first (while still respecting
+    # monkeypatched SKILLS_DIR in tests), then fall back to external dirs.
+    dirs_to_check = [_active_skills_dir()]
     try:
         from agent.skill_utils import get_external_skills_dirs
         dirs_to_check.extend(get_external_skills_dirs())
@@ -690,10 +683,10 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     disabled = set() if skip_disabled else _get_disabled_skill_names()
 
     # Collect directories to scan — same resolution as the scan loop below
-    # (_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
+    # (_active_skills_dir() resolves the LIVE profile HERMES_HOME; the module-level
     # SKILLS_DIR can be stale in long-lived runtimes).
     dirs_to_scan: list = []
-    active_skills_dir = _skills_dir()
+    active_skills_dir = _active_skills_dir()
     if active_skills_dir.exists():
         dirs_to_scan.append(active_skills_dir)
     dirs_to_scan.extend(get_external_skills_dirs())
@@ -797,7 +790,7 @@ def skills_list(category: str = None, task_id: str = None) -> str:
         JSON string with minimal skill info: name, description, category
     """
     try:
-        active_skills_dir = _skills_dir()
+        active_skills_dir = _active_skills_dir()
         if not active_skills_dir.exists():
             active_skills_dir.mkdir(parents=True, exist_ok=True)
             return json.dumps(
@@ -1081,7 +1074,7 @@ def skill_view(
 
         # Build list of all skill directories to search
         all_dirs = []
-        active_skills_dir = _skills_dir()
+        active_skills_dir = _active_skills_dir()
         if active_skills_dir.exists():
             all_dirs.append(active_skills_dir)
         all_dirs.extend(get_external_skills_dirs())

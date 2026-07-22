@@ -139,7 +139,8 @@ class TestStdioPidTracking:
             _orphan_stdio_pid_servers[fake_pid] = "orphan"
 
         # Should not raise (ProcessLookupError is caught)
-        _kill_orphaned_mcp_children()
+        with patch("tools.mcp_tool.os.kill", side_effect=ProcessLookupError):
+            _kill_orphaned_mcp_children()
 
         with _lock:
             assert fake_pid not in _orphan_stdio_pids
