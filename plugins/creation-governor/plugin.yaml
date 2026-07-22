@@ -1,0 +1,10 @@
+name: creation-governor
+version: 0.4.2
+description: "Periodically judge and gently reveal reusable Agent, Skill, or scheduled-task opportunities in task chats."
+author: Zettlab
+kind: standalone
+provides_tools:
+  - propose_creation
+provides_hooks:
+  - pre_llm_call
+  - transform_llm_output
