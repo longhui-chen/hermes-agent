@@ -51,25 +51,25 @@ class _FakeLlm:
         self.results = list(results)
         self.calls = []
 
-    def complete_structured(self, **kwargs):
-        self.calls.append(kwargs)
+    def complete(self, messages, **kwargs):
+        self.calls.append((messages, kwargs))
         parsed = self.results.pop(0)
-        return SimpleNamespace(parsed=parsed)
+        return SimpleNamespace(text=json.dumps(parsed))
 
 
-class _ResponseFormatFallbackLlm:
+class _PlainFailureStructuredFallbackLlm:
     def __init__(self, result):
         self.result = result
-        self.structured_calls = []
         self.complete_calls = []
-
-    def complete_structured(self, **kwargs):
-        self.structured_calls.append(kwargs)
-        raise RuntimeError("This response_format type is unavailable now")
+        self.structured_calls = []
 
     def complete(self, messages, **kwargs):
         self.complete_calls.append((messages, kwargs))
-        return SimpleNamespace(text=f"```json\n{json.dumps(self.result)}\n```")
+        raise RuntimeError("ordinary completion is temporarily unavailable")
+
+    def complete_structured(self, **kwargs):
+        self.structured_calls.append(kwargs)
+        return SimpleNamespace(parsed=self.result)
 
 
 class _Context:
@@ -92,7 +92,7 @@ def _decode_envelope(text):
     return json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
 
 
-def test_first_turn_and_every_third_turn_run_bounded_structured_checks():
+def test_first_turn_and_every_third_turn_run_bounded_json_checks():
     plugin = _load_plugin()
     none = _candidate(
         decision="none",
@@ -115,13 +115,15 @@ def test_first_turn_and_every_third_turn_run_bounded_structured_checks():
     assert len(llm.calls) == 3
     assert plugin._session_states["checkpoint-session"]["last_evaluation_turn"] == 6
     assert all(
-        call["purpose"] == "creation_opportunity_checkpoint" for call in llm.calls
+        call[1]["purpose"] == "creation_opportunity_checkpoint_json"
+        for call in llm.calls
     )
-    assert all(call["max_tokens"] == 500 for call in llm.calls)
-    assert "high-recall zero-shot" in llm.calls[0]["instructions"]
-    assert "ongoing external work domain" in llm.calls[0]["instructions"]
-    assert "today" in llm.calls[0]["instructions"]
-    assert "not by itself a future trigger" in llm.calls[0]["instructions"]
+    assert all(call[1]["max_tokens"] == 500 for call in llm.calls)
+    instructions = llm.calls[0][0][0]["content"]
+    assert "high-recall zero-shot" in instructions
+    assert "ongoing external work domain" in instructions
+    assert "today" in instructions
+    assert "not by itself a future trigger" in instructions
 
 
 def test_positive_checkpoint_preserves_answer_and_appends_card_envelope_once():
@@ -164,9 +166,9 @@ def test_positive_checkpoint_preserves_answer_and_appends_card_envelope_once():
     )
 
 
-def test_checkpoint_falls_back_when_provider_rejects_response_format():
+def test_checkpoint_falls_back_to_structured_when_plain_completion_fails():
     plugin = _load_plugin()
-    llm = _ResponseFormatFallbackLlm(_candidate())
+    llm = _PlainFailureStructuredFallbackLlm(_candidate())
     plugin.register(_Context(llm))
 
     plugin._on_pre_llm_call(
@@ -181,7 +183,7 @@ def test_checkpoint_falls_back_when_provider_rejects_response_format():
 
     assert len(llm.structured_calls) == 1
     assert len(llm.complete_calls) == 1
-    assert llm.complete_calls[0][1]["purpose"].endswith("json_fallback")
+    assert llm.structured_calls[0]["purpose"].endswith("structured_fallback")
     assert "<!--creation-recommendation:start " in transformed
     assert _decode_envelope(transformed)["creation_type"] == "agent"
 

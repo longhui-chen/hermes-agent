@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,9 +13,9 @@ PLUGIN_PATH = (
 
 
 class _Llm:
-    def complete_structured(self, **_kwargs):
+    def complete(self, _messages, **_kwargs):
         return SimpleNamespace(
-            parsed={
+            text=json.dumps({
                 "decision": "agent",
                 "suggested_name": "Business Research Partner",
                 "reason": "Future questions benefit from retained context and judgment.",
@@ -22,7 +23,7 @@ class _Llm:
                 "confidence": 0.8,
                 "dedup_key": "business-research-partner",
                 "proposal_text": "Would you like me to create this research partner?",
-            }
+            })
         )
 
 

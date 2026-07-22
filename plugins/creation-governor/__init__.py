@@ -369,13 +369,29 @@ make a judgment about an ongoing external work domain should normally be agent r
 even on the first request and even when the requested snapshot is scoped to today/current/latest.
 Choose none only when reuse value is genuinely absent, not merely unstated.
 
+Apply this semantic gate before returning none. Ask, in order: (a) will the underlying information,
+account, project, or operating environment change after this turn; (b) would a responsible role with
+retained context make a future judgment better; (c) would a stable method save meaningful effort on
+a different future input? If any answer is yes, none is forbidden: choose task for a future trigger,
+otherwise agent for continuing ownership/judgment, otherwise skill for the reusable method. Ambiguity
+about whether the user will repeat the request is not evidence for none. Do not reduce an analytical
+request to a fact lookup merely because the current data or connector is unavailable.
+
 Judge reuse value separately from current execution availability. Missing authorization,
 connectors, data, or tools may block today's execution but is not a reason to ignore a clear
 long-term need. Recommend only the first-layer object the user most needs, never multiple objects.
 Match the user's language. For a positive decision, provide a concise name, concrete reason,
 one-sentence optional proposal_text asking whether to create it, confidence, a stable semantic
 dedup_key, and evidence_turn_ids chosen only from the supplied labels. For none, use empty strings,
-an empty evidence list, and confidence 0. Never claim anything was created."""
+an empty evidence list, and confidence 0. Never claim anything was created.
+
+中文请求必须按同一套语义规则判断，不要因为用户没有说“重复”“以后”“保存”或“创建”就返回
+none。先判断需求所涉及的账户、项目、业务环境或信息是否会继续变化；如果会变化且后续判断需要
+保留背景、综合数据或自主选择工具，选择 agent。如果价值来自未来的时间、事件、后台监控或提醒，
+选择 task。如果输入会变化但处理方法相对稳定，选择 skill。只有寒暄、低价值封闭事实、微小的一次性
+转换、用户已经明确要求创建，或 Agent/Skill/Task 三种长期价值都确实不存在时，才选择 none。
+“今天”“最近”“当前”只是本次数据范围，不等于没有长期价值。缺少授权、连接器或数据只影响本次
+执行，不能作为返回 none 的理由。名称、原因和询问是否创建的 proposal_text 使用用户的语言。"""
 
 
 def _run_forced_evaluation(
@@ -387,34 +403,13 @@ def _run_forced_evaluation(
     if llm is None:
         return None
     evidence = _conversation_evidence(conversation_history, user_message)
-    try:
-        result = llm.complete_structured(
-            instructions=_DETECTOR_INSTRUCTIONS,
-            input=[{"type": "text", "text": evidence}],
-            json_schema=_DETECTOR_SCHEMA,
-            schema_name="creation_opportunity",
-            temperature=0.0,
-            max_tokens=500,
-            timeout=25.0,
-            purpose="creation_opportunity_checkpoint",
-        )
-        return result.parsed if isinstance(result.parsed, dict) else None
-    except Exception as structured_error:
-        error_text = str(structured_error).casefold()
-        response_format_unavailable = "response_format" in error_text and any(
-            marker in error_text
-            for marker in ("unavailable", "unsupported", "not support", "invalid")
-        )
-        if not response_format_unavailable:
-            logger.warning("creation opportunity checkpoint failed", exc_info=True)
-            return None
 
-    # Some OpenAI-compatible providers reject response_format even though the same
-    # model can reliably return JSON from an ordinary bounded completion. Keep the
-    # product check working without weakening local validation or exposing raw text.
-    logger.info(
-        "creation opportunity checkpoint provider lacks response_format; using plain JSON fallback"
-    )
+    # Prefer an ordinary bounded JSON completion.  Some OpenAI-compatible
+    # gateways accept ``response_format`` but collapse optional semantic
+    # judgments to the schema's empty ``none`` shape.  The same model produces
+    # materially better zero-shot classifications when asked for JSON in the
+    # prompt, and the candidate still passes strict local normalization before
+    # it can be displayed.
     try:
         result = llm.complete(
             [
@@ -432,18 +427,39 @@ def _run_forced_evaluation(
             temperature=0.0,
             max_tokens=500,
             timeout=25.0,
-            purpose="creation_opportunity_checkpoint_json_fallback",
+            purpose="creation_opportunity_checkpoint_json",
         )
         parsed = _parse_detector_json(result.text)
         logger.info(
-            "creation opportunity fallback decision=%s confidence=%s title=%s",
+            "creation opportunity JSON decision=%s confidence=%s title=%s",
             parsed.get("decision") if parsed else None,
             parsed.get("confidence") if parsed else None,
             _text(parsed.get("suggested_name"), 80) if parsed else "",
         )
-        return parsed
+        if parsed is not None:
+            return parsed
     except Exception:
-        logger.warning("creation opportunity JSON fallback failed", exc_info=True)
+        logger.warning(
+            "creation opportunity JSON checkpoint failed; trying structured fallback",
+            exc_info=True,
+        )
+
+    # Retain a structured fallback for providers where ordinary completions are
+    # temporarily unavailable but response_format works.
+    try:
+        result = llm.complete_structured(
+            instructions=_DETECTOR_INSTRUCTIONS,
+            input=[{"type": "text", "text": evidence}],
+            json_schema=_DETECTOR_SCHEMA,
+            schema_name="creation_opportunity",
+            temperature=0.0,
+            max_tokens=500,
+            timeout=25.0,
+            purpose="creation_opportunity_checkpoint_structured_fallback",
+        )
+        return result.parsed if isinstance(result.parsed, dict) else None
+    except Exception:
+        logger.warning("creation opportunity structured fallback failed", exc_info=True)
         return None
 
 
@@ -620,7 +636,16 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
             conversation_history=kwargs.get("conversation_history"),
         )
         if candidate is not None:
-            _consider_candidate(session_id, candidate, now)
+            candidate_result = _consider_candidate(session_id, candidate, now)
+            logger.info(
+                "creation opportunity checkpoint result status=%s reason=%s "
+                "decision=%s confidence=%s title=%s",
+                candidate_result.get("status"),
+                candidate_result.get("reason"),
+                candidate.get("decision"),
+                candidate.get("confidence"),
+                _text(candidate.get("suggested_name"), 80),
+            )
             return _join_context(
                 carry_context, _main_model_review_context(evaluation_completed=True)
             )
@@ -708,6 +733,13 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
 
     if "<!--creation-recommendation:start " in response_text:
         return None
+    logger.info(
+        "creation recommendation attached type=%s confidence=%s title=%s turn=%s",
+        proposal.get("creation_type"),
+        proposal.get("confidence"),
+        _text(proposal.get("suggested_name"), 80),
+        current_turn,
+    )
     return response_text.rstrip() + "\n\n" + _recommendation_envelope(proposal)
 
 
