@@ -18305,6 +18305,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "session_id": effective_session_id,
                 "response_previewed": result.get("response_previewed", False),
                 "response_transformed": result.get("response_transformed", False),
+                "response_transform_streamed": result.get(
+                    "response_transform_streamed", False
+                ),
                 # Pass through the agent_persisted flag so the persistence block
                 # above can correctly determine whether the codex app-server path
                 # self-persisted (it didn't — see codex_runtime.py).  Default

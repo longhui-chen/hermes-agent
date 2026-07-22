@@ -27,6 +27,7 @@ def test_plugin_flow_registers_judgment_hooks_and_a_non_creating_proposal_tool()
     assert [args[0] for args, _kwargs in context.hooks] == [
         "pre_llm_call",
         "transform_llm_output",
+        "post_llm_call",
         "pre_tool_call",
     ]
     assert [tool["name"] for tool in context.tools] == ["propose_creation"]
@@ -71,6 +72,7 @@ def test_real_plugin_manager_loads_all_governor_hooks():
     assert set(loaded.hooks_registered) == {
         "pre_llm_call",
         "transform_llm_output",
+        "post_llm_call",
         "pre_tool_call",
     }
     assert loaded.tools_registered == ["propose_creation"]

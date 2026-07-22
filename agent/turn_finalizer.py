@@ -146,6 +146,7 @@ def finalize_turn(
     # are surfaced on the result dict via ``cleanup_errors`` rather than
     # killing the turn.
     _cleanup_errors = []
+    _session_persistence_succeeded = False
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
@@ -207,6 +208,7 @@ def finalize_turn(
                 messages.append({"role": "assistant", "content": final_response})
 
         agent._persist_session(messages, conversation_history)
+        _session_persistence_succeeded = True
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
@@ -338,11 +340,12 @@ def finalize_turn(
 
     _response_transformed = False
     _response_transform_streamed = False
+    _structured_output = False
 
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
-    # First hook to return a string wins; None/empty return leaves text unchanged.
+    # Transform hooks run as a chain; None/empty leaves the current text unchanged.
     if final_response and not interrupted:
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
@@ -370,10 +373,10 @@ def finalize_turn(
             for _hook_result in _transform_results:
                 if isinstance(_hook_result, str) and _hook_result:
                     final_response = _hook_result
-                    _response_transformed = True
-                    break  # First non-empty string wins
+            _response_transformed = final_response != _pre_transform_response
 
             if _response_transformed:
+                _session_persistence_succeeded = True
                 # The model's original text may already have been streamed.  An
                 # append-only transform can still be delivered exactly once by
                 # streaming only its suffix before the caller emits its done
@@ -406,30 +409,31 @@ def finalize_turn(
                     _assistant_message["content"] = final_response
                     _db_message_id = _assistant_message.get("_db_message_id")
                     _session_db = getattr(agent, "_session_db", None)
-                    if (
-                        _assistant_message.get("_db_persisted")
-                        and isinstance(_db_message_id, int)
-                        and _session_db is not None
-                    ):
-                        try:
-                            if not _session_db.update_message_content(
-                                agent.session_id,
-                                _db_message_id,
-                                final_response,
-                            ):
-                                raise RuntimeError("persisted assistant row not found")
-                        except Exception as _update_err:
-                            _cleanup_errors.append(
-                                f"update_transformed_session_message: {_update_err}"
-                            )
-                            logger.error(
-                                "finalize_turn: transformed SessionDB update failed: %s",
-                                _update_err,
-                                exc_info=True,
-                            )
+                    if _assistant_message.get("_db_persisted"):
+                        if isinstance(_db_message_id, int) and _session_db is not None:
+                            try:
+                                if not _session_db.update_message_content(
+                                    agent.session_id,
+                                    _db_message_id,
+                                    final_response,
+                                ):
+                                    raise RuntimeError("persisted assistant row not found")
+                            except Exception as _update_err:
+                                _session_persistence_succeeded = False
+                                _cleanup_errors.append(
+                                    f"update_transformed_session_message: {_update_err}"
+                                )
+                                logger.error(
+                                    "finalize_turn: transformed SessionDB update failed: %s",
+                                    _update_err,
+                                    exc_info=True,
+                                )
+                        else:
+                            _session_persistence_succeeded = False
                     try:
                         agent._persist_session(messages, conversation_history)
                     except Exception as _persist_err:
+                        _session_persistence_succeeded = False
                         _cleanup_errors.append(f"persist_transformed_session: {_persist_err}")
                         logger.error(
                             "finalize_turn: transformed _persist_session failed: %s",
@@ -456,6 +460,13 @@ def finalize_turn(
                 conversation_history=list(messages),
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
+                sender_id=getattr(agent, "_user_id", None) or "",
+                completed=completed,
+                failed=failed,
+                interrupted=interrupted,
+                persistence_succeeded=_session_persistence_succeeded,
+                execution_origin=getattr(agent, "_memory_write_origin", "") or "",
+                structured_output=_structured_output,
             )
         except Exception as exc:
             logger.warning("post_llm_call hook failed: %s", exc)

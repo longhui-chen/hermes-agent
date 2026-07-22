@@ -1108,6 +1108,7 @@ async def test_streamed_transform_suffix_is_not_replaced_or_sent_again(monkeypat
     )
 
     assert result.get("already_sent") is True
+    assert result.get("response_transform_streamed") is True
     delivered = [call["content"] for call in adapter.sent] + [call["content"] for call in adapter.edits]
     assert any("[plugin appended this]" in text for text in delivered)
 

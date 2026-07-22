@@ -8,4 +8,5 @@ provides_tools:
 provides_hooks:
   - pre_llm_call
   - transform_llm_output
+  - post_llm_call
   - pre_tool_call

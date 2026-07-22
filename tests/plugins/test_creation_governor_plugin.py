@@ -107,6 +107,12 @@ def test_prompt_cooldown_suppresses_the_next_ten_turns():
         )
 
     assert propose("first")["status"] == "proposal_ready"
+    plugin._transform_llm_output(
+        session_id="cooldown-session",
+        response_text="任务结果",
+        completed=True,
+        failed=False,
+    )
     for turn in range(1, 11):
         plugin._on_pre_llm_call(
             session_id="cooldown-session",
@@ -145,6 +151,12 @@ def test_cooldown_rejection_does_not_consume_the_dedup_key():
         )
 
     assert propose("first")["status"] == "proposal_ready"
+    plugin._transform_llm_output(
+        session_id="atomic-session",
+        response_text="任务结果",
+        completed=True,
+        failed=False,
+    )
     assert propose("held-back") == {"status": "not_proposed", "reason": "prompt_cooldown"}
     for _ in range(11):
         plugin._on_pre_llm_call(
@@ -371,6 +383,82 @@ def test_background_review_does_not_disable_later_foreground_turn(monkeypatch):
     assert "要不要为你生成创建方案" in transformed
 
 
+def test_background_review_does_not_erase_foreground_pending_proposal():
+    plugin = _load_plugin()
+    plugin._on_pre_llm_call(
+        session_id="shared-pending-session",
+        sender_id="owner-a",
+        user_message="你好",
+        conversation_history=[],
+    )
+    proposed = json.loads(
+        plugin._propose_creation(
+            {
+                "creation_type": "agent",
+                "suggested_name": "合同审查助手",
+                "reason": "复用审查口径",
+                "evidence": "合同分析任务",
+                "confidence": 0.9,
+                "dedup_key": "agent:合同审查助手",
+            },
+            session_id="shared-pending-session",
+            sender_id="owner-a",
+        )
+    )
+    assert proposed["status"] == "proposal_ready"
+
+    plugin._on_pre_llm_call(
+        session_id="shared-pending-session",
+        sender_id="owner-a",
+        execution_origin="background_review",
+        user_message="background memory review",
+        conversation_history=[],
+    )
+
+    transformed = plugin._transform_llm_output(
+        session_id="shared-pending-session",
+        sender_id="owner-a",
+        response_text="合同分析完成。",
+        completed=True,
+        failed=False,
+    )
+    assert "要不要为你生成创建方案" in transformed
+
+
+def test_background_post_hook_does_not_erase_foreground_draft_state():
+    plugin = _load_plugin()
+    prompt = plugin._proposal_payload(
+        "skill", "会议纪要流程", "固化整理步骤", "会议转录", 0.9
+    )["user_prompt"]
+    draft = plugin._on_pre_llm_call(
+        session_id="shared-draft-session",
+        sender_id="owner-a",
+        user_message="生成方案",
+        conversation_history=[{"role": "assistant", "content": prompt}],
+    )
+    assert "draft only" in draft["context"]
+
+    plugin._on_post_llm_call(
+        session_id="shared-draft-session",
+        sender_id="owner-a",
+        execution_origin="background_review",
+        assistant_response="后台复审完成。",
+        completed=True,
+        failed=False,
+        interrupted=False,
+        persistence_succeeded=True,
+    )
+
+    draft_response = plugin._transform_llm_output(
+        session_id="shared-draft-session",
+        sender_id="owner-a",
+        response_text="这是前台草案。",
+        completed=True,
+        failed=False,
+    )
+    assert "确认创建" in draft_response
+
+
 def test_pending_proposal_is_isolated_by_profile(monkeypatch):
     plugin = _load_plugin()
     active_home = [Path("/profiles/a")]
@@ -550,6 +638,14 @@ def test_acceptance_generates_a_draft_then_requires_explicit_creation_confirmati
         failed=False,
     )
     assert "确认创建" in draft_response
+    plugin._on_post_llm_call(
+        session_id="confirm-session",
+        assistant_response=draft_response,
+        completed=True,
+        failed=False,
+        interrupted=False,
+        persistence_succeeded=True,
+    )
 
     confirmed = plugin._on_pre_llm_call(
         session_id="confirm-session",
@@ -562,6 +658,248 @@ def test_acceptance_generates_a_draft_then_requires_explicit_creation_confirmati
         tool_name="skill_manage",
         args={},
     ) is None
+
+
+def test_failed_draft_never_authorizes_creation(monkeypatch):
+    plugin = _load_plugin()
+    monkeypatch.setattr(
+        plugin,
+        "_judge_creation_opportunity",
+        lambda message, history: {
+            "creation_type": "skill",
+            "suggested_name": "会议纪要流程",
+            "reason": "固化整理步骤",
+            "evidence": message,
+            "confidence": 0.9,
+            "dedup_key": "skill:会议纪要流程",
+        },
+    )
+    plugin._on_pre_llm_call(
+        session_id="failed-draft",
+        user_message="帮我整理这份会议转录",
+        conversation_history=[],
+    )
+    proposal = plugin._transform_llm_output(
+        session_id="failed-draft",
+        response_text="已整理。",
+        completed=True,
+        failed=False,
+    )
+    plugin._on_pre_llm_call(
+        session_id="failed-draft",
+        user_message="生成方案",
+        conversation_history=[{"role": "assistant", "content": proposal}],
+    )
+    plugin._on_post_llm_call(
+        session_id="failed-draft",
+        assistant_response="供应商失败。",
+        completed=False,
+        failed=True,
+        interrupted=False,
+        persistence_succeeded=True,
+    )
+
+    assert plugin._on_pre_llm_call(
+        session_id="failed-draft",
+        user_message="确认创建",
+        conversation_history=[{"role": "assistant", "content": "供应商失败。"}],
+    ) is None
+
+
+def test_interrupted_draft_must_be_generated_again_before_confirmation(monkeypatch):
+    plugin = _load_plugin()
+    prompt = plugin._proposal_payload(
+        "skill", "会议纪要流程", "固化整理步骤", "会议转录", 0.9
+    )["user_prompt"]
+    plugin._on_pre_llm_call(
+        session_id="interrupted-draft",
+        user_message="生成方案",
+        conversation_history=[{"role": "assistant", "content": prompt}],
+    )
+
+    assert plugin._on_pre_llm_call(
+        session_id="interrupted-draft",
+        user_message="确认创建",
+        conversation_history=[{"role": "assistant", "content": prompt}],
+    ) is None
+
+
+def test_confirmation_expires_after_unrelated_turn(monkeypatch):
+    plugin = _load_plugin()
+    prompt = plugin._proposal_payload(
+        "skill", "会议纪要流程", "固化整理步骤", "会议转录", 0.9
+    )["user_prompt"]
+    draft = plugin._on_pre_llm_call(
+        session_id="stale-confirmation",
+        user_message="生成方案",
+        conversation_history=[{"role": "assistant", "content": prompt}],
+    )
+    assert "draft only" in draft["context"]
+    draft_response = plugin._transform_llm_output(
+        session_id="stale-confirmation",
+        response_text="这是草案。",
+        completed=True,
+        failed=False,
+    )
+    plugin._on_post_llm_call(
+        session_id="stale-confirmation",
+        assistant_response=draft_response,
+        completed=True,
+        failed=False,
+        interrupted=False,
+        persistence_succeeded=True,
+    )
+    plugin._on_pre_llm_call(
+        session_id="stale-confirmation",
+        user_message="先聊一下别的事情",
+        conversation_history=[{"role": "assistant", "content": draft_response}],
+    )
+
+    assert plugin._on_pre_llm_call(
+        session_id="stale-confirmation",
+        user_message="确认创建",
+        conversation_history=[{"role": "assistant", "content": "好的，我们聊别的。"}],
+    ) is None
+
+
+def test_native_creation_request_invalidates_old_draft(monkeypatch):
+    plugin = _load_plugin()
+    prompt = plugin._proposal_payload(
+        "skill", "会议纪要流程", "固化整理步骤", "会议转录", 0.9
+    )["user_prompt"]
+    plugin._on_pre_llm_call(
+        session_id="native-invalidates",
+        user_message="生成方案",
+        conversation_history=[{"role": "assistant", "content": prompt}],
+    )
+    draft_response = plugin._transform_llm_output(
+        session_id="native-invalidates",
+        response_text="这是旧 Skill 草案。",
+        completed=True,
+        failed=False,
+    )
+    plugin._on_post_llm_call(
+        session_id="native-invalidates",
+        assistant_response=draft_response,
+        completed=True,
+        failed=False,
+        interrupted=False,
+        persistence_succeeded=True,
+    )
+    plugin._on_pre_llm_call(
+        session_id="native-invalidates",
+        user_message="创建一个新的合同审查 Agent",
+        conversation_history=[{"role": "assistant", "content": draft_response}],
+    )
+
+    assert plugin._on_pre_llm_call(
+        session_id="native-invalidates",
+        user_message="确认创建",
+        conversation_history=[{"role": "assistant", "content": "新的 Agent 方案。"}],
+    ) is None
+
+
+def test_draft_requires_successful_persistence_before_confirmation():
+    plugin = _load_plugin()
+    prompt = plugin._proposal_payload(
+        "skill", "会议纪要流程", "固化整理步骤", "会议转录", 0.9
+    )["user_prompt"]
+    plugin._on_pre_llm_call(
+        session_id="draft-persist-failed",
+        user_message="生成方案",
+        conversation_history=[{"role": "assistant", "content": prompt}],
+    )
+    draft_response = plugin._transform_llm_output(
+        session_id="draft-persist-failed",
+        response_text="这是草案。",
+        completed=True,
+        failed=False,
+    )
+    plugin._on_post_llm_call(
+        session_id="draft-persist-failed",
+        assistant_response=draft_response,
+        completed=True,
+        failed=False,
+        interrupted=False,
+        persistence_succeeded=False,
+    )
+
+    assert plugin._on_pre_llm_call(
+        session_id="draft-persist-failed",
+        user_message="确认创建",
+        conversation_history=[{"role": "assistant", "content": draft_response}],
+    ) is None
+
+
+def test_later_output_safety_transform_can_revoke_draft_confirmation():
+    plugin = _load_plugin()
+    prompt = plugin._proposal_payload(
+        "skill", "会议纪要流程", "固化整理步骤", "会议转录", 0.9
+    )["user_prompt"]
+    plugin._on_pre_llm_call(
+        session_id="draft-safety-redaction",
+        user_message="生成方案",
+        conversation_history=[{"role": "assistant", "content": prompt}],
+    )
+    plugin._transform_llm_output(
+        session_id="draft-safety-redaction",
+        response_text="这是草案。",
+        completed=True,
+        failed=False,
+    )
+
+    # The post hook sees the final chained and durable response. If a later
+    # safety transform removes the confirmation prompt, authorization must not
+    # survive based on the governor's intermediate output.
+    safe_final = "这是经过安全转换后的草案。"
+    plugin._on_post_llm_call(
+        session_id="draft-safety-redaction",
+        assistant_response=safe_final,
+        completed=True,
+        failed=False,
+        interrupted=False,
+        persistence_succeeded=True,
+    )
+
+    assert plugin._on_pre_llm_call(
+        session_id="draft-safety-redaction",
+        user_message="确认创建",
+        conversation_history=[{"role": "assistant", "content": safe_final}],
+    ) is None
+
+
+def test_tool_proposal_commits_only_after_final_output_delivery():
+    plugin = _load_plugin()
+    plugin._on_pre_llm_call(
+        session_id="tool-delivery",
+        user_message="你好",
+        conversation_history=[],
+    )
+    result = json.loads(
+        plugin._propose_creation(
+            {
+                "creation_type": "agent",
+                "suggested_name": "合同审查助手",
+                "reason": "可复用",
+                "evidence": "合同任务",
+                "confidence": 0.9,
+                "dedup_key": "agent:合同审查助手",
+            },
+            session_id="tool-delivery",
+        )
+    )
+    state = plugin._session_states[plugin._session_key({"session_id": "tool-delivery"})]
+
+    assert result["status"] == "proposal_ready"
+    assert state["proposal_stage"] is None
+    transformed = plugin._transform_llm_output(
+        session_id="tool-delivery",
+        response_text="合同分析完成。",
+        completed=True,
+        failed=False,
+    )
+    assert "要不要为你生成创建方案" in transformed
+    assert state["proposal_stage"] == "proposal_shown"
 
 
 def test_persisted_proposal_rehydrates_after_plugin_restart():

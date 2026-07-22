@@ -104,6 +104,11 @@ class DurableFakeAgent(FakeAgent):
             message["_db_persisted"] = True
 
 
+class FailingPersistenceAgent(FakeAgent):
+    def _persist_session(self, messages, conversation_history):
+        raise OSError("disk unavailable")
+
+
 def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     """A recovered/previewed final response must be durable in session history.
 
@@ -297,10 +302,13 @@ def test_transform_suffix_requires_original_response_to_have_streamed(monkeypatc
 
 def test_output_transform_receives_turn_outcome(monkeypatch):
     transform_kwargs = {}
+    post_kwargs = {}
 
     def invoke_hook(name, **kwargs):
         if name == "transform_llm_output":
             transform_kwargs.update(kwargs)
+        if name == "post_llm_call":
+            post_kwargs.update(kwargs)
         return []
 
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
@@ -334,5 +342,80 @@ def test_output_transform_receives_turn_outcome(monkeypatch):
     assert transform_kwargs["turn_exit_reason"] == "error_near_max_iterations(provider error)"
     assert transform_kwargs["sender_id"] == "owner-a"
     assert transform_kwargs["structured_output"] is True
+    assert post_kwargs["assistant_response"] == "任务失败。"
+    assert post_kwargs["persistence_succeeded"] is True
+    assert post_kwargs["sender_id"] == "owner-a"
+    assert post_kwargs["failed"] is True
     assert result["final_response"] == "任务失败。"
     assert agent.streamed_deltas == []
+
+
+def test_post_hook_receives_false_when_transformed_response_is_not_durable(monkeypatch):
+    post_kwargs = {}
+
+    def invoke_hook(name, **kwargs):
+        if name == "transform_llm_output":
+            return [kwargs["response_text"] + "\n\n确认创建"]
+        if name == "post_llm_call":
+            post_kwargs.update(kwargs)
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FailingPersistenceAgent()
+    messages = [
+        {"role": "user", "content": "生成方案"},
+        {"role": "assistant", "content": "这是草案。"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="这是草案。",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="生成方案",
+        original_user_message="生成方案",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"].endswith("确认创建")
+    assert post_kwargs["persistence_succeeded"] is False
+    assert any("persist_transformed_session" in item for item in result["cleanup_errors"])
+
+
+def test_output_transform_uses_last_chained_result(monkeypatch):
+    def invoke_hook(name, **kwargs):
+        if name == "transform_llm_output":
+            return [kwargs["response_text"] + " secret", "safe final"]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "分析一下"},
+        {"role": "assistant", "content": "original"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="original",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="分析一下",
+        original_user_message="分析一下",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"] == "safe final"
+    assert result["messages"][-1]["content"] == "safe final"

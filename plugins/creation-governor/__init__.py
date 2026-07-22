@@ -115,6 +115,9 @@ def _state_locked(session_id: str, now: float) -> dict[str, Any]:
             "last_proposal": None,
             "proposal_stage": None,
             "draft_only_turn": None,
+            "draft_delivered_turn": None,
+            "awaiting_proposal_id": None,
+            "authorized_turn": None,
             "native_bypass_turn": None,
             "last_user_message": "",
             "last_seen": now,
@@ -128,6 +131,45 @@ def _state_locked(session_id: str, now: float) -> dict[str, Any]:
 
 def _prompt_is_cooling_down(state: dict[str, Any]) -> bool:
     return int(state["turn"]) - int(state["last_prompt_turn"]) <= PROMPT_COOLDOWN_TURNS
+
+
+def _proposal_identity(proposal: dict[str, Any] | None) -> str:
+    if not isinstance(proposal, dict):
+        return ""
+    return _dedup_key(
+        f"{proposal.get('creation_type')}:{proposal.get('suggested_name')}"
+    )
+
+
+def _clear_draft_state(state: dict[str, Any], *, stage: str | None) -> None:
+    state["proposal_stage"] = stage
+    state["draft_only_turn"] = None
+    state["draft_delivered_turn"] = None
+    state["awaiting_proposal_id"] = None
+    state["authorized_turn"] = None
+
+
+def _latest_assistant_text(history: list[dict[str, Any]]) -> str:
+    for message in reversed(history):
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            return str(message.get("content") or "")
+    return ""
+
+
+def _proposal_prompt_is_latest(
+    proposal: dict[str, Any], history: list[dict[str, Any]]
+) -> bool:
+    latest = _latest_assistant_text(history)
+    if not latest:
+        return False
+    payload = _proposal_payload(
+        proposal["creation_type"],
+        proposal["suggested_name"],
+        str(proposal.get("reason") or ""),
+        str(proposal.get("evidence") or ""),
+        float(proposal.get("confidence") or MIN_CONFIDENCE),
+    )
+    return payload["user_prompt"] in latest
 
 
 def _commit_proposal(
@@ -154,7 +196,7 @@ def _commit_proposal(
             _recent_proposals.popitem(last=False)
         state["last_prompt_turn"] = state["turn"]
         state["last_proposal"] = dict(proposal)
-        state["proposal_stage"] = "proposal_shown"
+        _clear_draft_state(state, stage="proposal_shown")
         state["pending_proposal"] = None
     return None
 
@@ -366,6 +408,8 @@ def _judge_creation_opportunity(
 
 
 def _previous_proposal_context(state: dict[str, Any]) -> str:
+    if state.get("proposal_stage") != "proposal_shown":
+        return ""
     proposal = state.get("last_proposal")
     if not isinstance(proposal, dict):
         return ""
@@ -392,7 +436,10 @@ def _restore_proposal_match(state: dict[str, Any], match: re.Match[str], stage: 
         "dedup_key": _dedup_key(f"{creation_type}:{suggested_name}"),
     }
     state["last_prompt_turn"] = max(0, int(state["turn"]) - 1)
-    state["proposal_stage"] = stage
+    _clear_draft_state(state, stage=stage)
+    if stage == "awaiting_confirmation":
+        state["draft_delivered_turn"] = max(0, int(state["turn"]) - 1)
+        state["awaiting_proposal_id"] = _proposal_identity(state["last_proposal"])
 
 
 def _rehydrate_persisted_proposal(state: dict[str, Any], history: list[dict[str, Any]]) -> None:
@@ -458,10 +505,11 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         suppression_reason = "structured_output"
     _invocation_scope.set((raw_session_id, session_id, suppression_reason))
     if suppression_reason:
-        if session_id:
+        if session_id and suppression_reason == "structured_output":
             with _recent_lock:
                 state = _state_locked(session_id, time.monotonic())
                 state["pending_proposal"] = None
+                _clear_draft_state(state, stage=None)
         return None
     if not session_id:
         return None
@@ -474,30 +522,82 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         state = _state_locked(session_id, now)
         state["turn"] += 1
         state["last_user_message"] = user_message
+        pending = state.get("pending_proposal")
+        if isinstance(pending, dict) and int(pending.get("turn", -1)) != int(
+            state["turn"]
+        ):
+            state["pending_proposal"] = None
         _rehydrate_persisted_proposal(state, history)
         proposal = state.get("last_proposal")
         stage = state.get("proposal_stage")
-        if isinstance(proposal, dict) and stage == "proposal_shown" and _ACCEPT_DRAFT_RE.fullmatch(user_message):
-            state["proposal_stage"] = "awaiting_confirmation"
+
+        # A draft-generating or authorized state is valid for one turn only.
+        # If that turn ended without the post-delivery transition, fail closed.
+        if stage == "draft_generating" and int(
+            state.get("draft_only_turn") or -1
+        ) != int(state["turn"]):
+            _clear_draft_state(state, stage="proposal_shown")
+            stage = state["proposal_stage"]
+        if stage == "creation_authorized" and int(
+            state.get("authorized_turn") or -1
+        ) != int(state["turn"]):
+            _clear_draft_state(state, stage=None)
+            stage = state["proposal_stage"]
+
+        if isinstance(proposal, dict) and _REJECT_PROPOSAL_RE.fullmatch(user_message):
+            _clear_draft_state(state, stage="dismissed")
+            state["pending_proposal"] = None
+            return None
+
+        if isinstance(proposal, dict) and stage == "awaiting_confirmation":
+            delivered_turn = state.get("draft_delivered_turn")
+            confirmation_is_current = bool(
+                isinstance(delivered_turn, int)
+                and delivered_turn == int(state["turn"]) - 1
+                and state.get("awaiting_proposal_id")
+                == _proposal_identity(proposal)
+                and _DRAFT_CONFIRM_PROMPT in _latest_assistant_text(history)
+            )
+            if confirmation_is_current and _CONFIRM_CREATE_RE.fullmatch(user_message):
+                _clear_draft_state(state, stage="creation_authorized")
+                state["authorized_turn"] = state["turn"]
+                state["pending_proposal"] = None
+                return {"context": _authorized_creation_context(proposal)}
+            # Any other turn, including a stale or mismatched confirmation,
+            # invalidates the one-shot draft authorization.
+            _clear_draft_state(state, stage=None)
+            stage = state["proposal_stage"]
+
+        # A confirmation phrase is meaningful only for the immediately preceding,
+        # durably delivered draft. Never reinterpret a stale confirmation as a new
+        # creation opportunity or expose context for an older proposal.
+        if _CONFIRM_CREATE_RE.fullmatch(user_message):
+            state["pending_proposal"] = None
+            _clear_draft_state(state, stage=None)
+            return None
+
+        if (
+            isinstance(proposal, dict)
+            and stage == "proposal_shown"
+            and _ACCEPT_DRAFT_RE.fullmatch(user_message)
+        ):
+            if not _proposal_prompt_is_latest(proposal, history):
+                _clear_draft_state(state, stage=None)
+                return None
+            state["proposal_stage"] = "draft_generating"
             state["draft_only_turn"] = state["turn"]
             state["pending_proposal"] = None
             return {"context": _draft_context(proposal)}
-        if isinstance(proposal, dict) and stage == "awaiting_confirmation" and _CONFIRM_CREATE_RE.fullmatch(user_message):
-            state["proposal_stage"] = "creation_authorized"
-            state["pending_proposal"] = None
-            return {"context": _authorized_creation_context(proposal)}
-        if isinstance(proposal, dict) and _REJECT_PROPOSAL_RE.fullmatch(user_message):
-            state["proposal_stage"] = "dismissed"
-            state["pending_proposal"] = None
-            return None
         carry_context = _previous_proposal_context(state)
         if _is_creation_governor_self_query(user_message):
+            _clear_draft_state(state, stage=None)
             state["pending_proposal"] = None
             return {"context": _self_description_context()}
         if _uses_native_creation_path(user_message):
+            _clear_draft_state(state, stage=None)
             state["native_bypass_turn"] = state["turn"]
             state["pending_proposal"] = None
-            return {"context": carry_context} if carry_context else None
+            return None
         if _prompt_is_cooling_down(state):
             return {"context": carry_context} if carry_context else None
         turn = int(state["turn"])
@@ -553,12 +653,18 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
         return None
     if kwargs.get("failed") or kwargs.get("interrupted") or kwargs.get("completed") is False:
         with _recent_lock:
-            _state_locked(session_id, time.monotonic())["pending_proposal"] = None
+            state = _state_locked(session_id, time.monotonic())
+            state["pending_proposal"] = None
+            if state.get("proposal_stage") == "draft_generating":
+                _clear_draft_state(state, stage="proposal_shown")
         return None
     now = time.monotonic()
     with _recent_lock:
         state = _state_locked(session_id, now)
-        if int(state.get("draft_only_turn") or -1) == int(state["turn"]):
+        if (
+            state.get("proposal_stage") == "draft_generating"
+            and int(state.get("draft_only_turn") or -1) == int(state["turn"])
+        ):
             if _DRAFT_CONFIRM_PROMPT in response_text:
                 return None
             return response_text.rstrip() + "\n\n" + _DRAFT_CONFIRM_PROMPT
@@ -590,6 +696,39 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
     return response_text.rstrip() + "\n\n" + user_prompt
 
 
+def _on_post_llm_call(**kwargs: Any) -> None:
+    """Commit draft confirmation only after the final response is durable."""
+    if _is_noninteractive(kwargs) or kwargs.get("structured_output"):
+        return
+    session_id = _session_key(kwargs)
+    if not session_id:
+        return
+    assistant_response = str(kwargs.get("assistant_response") or "")
+    with _recent_lock:
+        state = _state_locked(session_id, time.monotonic())
+        if not (
+            state.get("proposal_stage") == "draft_generating"
+            and int(state.get("draft_only_turn") or -1) == int(state["turn"])
+        ):
+            return
+        proposal = state.get("last_proposal")
+        delivered = bool(
+            isinstance(proposal, dict)
+            and kwargs.get("completed") is not False
+            and not kwargs.get("failed")
+            and not kwargs.get("interrupted")
+            and kwargs.get("persistence_succeeded") is True
+            and _DRAFT_CONFIRM_PROMPT in assistant_response
+        )
+        if not delivered:
+            _clear_draft_state(state, stage="proposal_shown")
+            return
+        state["proposal_stage"] = "awaiting_confirmation"
+        state["draft_delivered_turn"] = state["turn"]
+        state["awaiting_proposal_id"] = _proposal_identity(proposal)
+        state["draft_only_turn"] = None
+
+
 def _propose_creation(args: dict[str, Any], **kwargs: Any) -> str:
     creation_type = _text(args.get("creation_type"), 40).lower()
     suggested_name = _text(args.get("suggested_name"), 80)
@@ -611,6 +750,8 @@ def _propose_creation(args: dict[str, Any], **kwargs: Any) -> str:
         )
 
     session_id = _session_key(kwargs)
+    if not session_id:
+        return json.dumps({"status": "not_proposed", "reason": "missing_session"})
     now = time.monotonic()
     proposal = {
         "creation_type": creation_type,
@@ -627,9 +768,22 @@ def _propose_creation(args: dict[str, Any], **kwargs: Any) -> str:
             return json.dumps({"status": "not_proposed", "reason": invocation[2]})
         if int(state.get("native_bypass_turn") or -1) == int(state["turn"]):
             return json.dumps({"status": "not_proposed", "reason": "native_creation_path"})
-    rejection = _commit_proposal(session_id, proposal, dedup_key, now)
-    if rejection:
-        return json.dumps({"status": "not_proposed", "reason": rejection})
+        if _prompt_is_cooling_down(state):
+            return json.dumps({"status": "not_proposed", "reason": "prompt_cooldown"})
+        pending = state.get("pending_proposal")
+        if isinstance(pending, dict) and int(pending.get("turn", -1)) == int(
+            state["turn"]
+        ):
+            return json.dumps({"status": "not_proposed", "reason": "prompt_cooldown"})
+        expired_before = now - PROPOSAL_TTL_SECONDS
+        for key, created_at in tuple(_recent_proposals.items()):
+            if created_at < expired_before:
+                _recent_proposals.pop(key, None)
+        identity = (session_id, dedup_key)
+        if identity in _recent_proposals:
+            _recent_proposals.move_to_end(identity)
+            return json.dumps({"status": "not_proposed", "reason": "recent_duplicate"})
+        state["pending_proposal"] = dict(proposal, turn=state["turn"])
     return json.dumps(
         _proposal_payload(creation_type, suggested_name, reason, evidence, confidence),
         ensure_ascii=False,
@@ -661,6 +815,7 @@ def _reset_state_for_tests() -> None:
 def register(ctx: Any) -> None:
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_hook("transform_llm_output", _transform_llm_output)
+    ctx.register_hook("post_llm_call", _on_post_llm_call)
     ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_tool(
         name=TOOL_NAME,
