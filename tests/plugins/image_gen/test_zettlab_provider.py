@@ -12,7 +12,7 @@ from types import SimpleNamespace
 import pytest
 import requests
 
-from plugins.image_gen.zettlab import ZettlabImageGenProvider, register
+from plugins.image_gen.zettlab import ZettlabImageGenProvider, _gateway_aspect_ratio, register
 
 
 def _spawn_parent_watchdog_probe(output):
@@ -175,7 +175,12 @@ def test_zettlab_image_generate_creates_media_job(monkeypatch):
         return _Resp({
             "image": {
                 "enabled": True,
-                "models": [{"id": "seedream-v4", "modalities": ["text", "image"]}],
+                "models": [{
+                    "id": "seedream-v4",
+                    "modalities": ["text", "image"],
+                    "aspect_ratios": ["1:1", "16:9", "9:16"],
+                    "resolutions": ["2K"],
+                }],
                 "limits": {
                     "provider_timeout_seconds": 300,
                     "finalization_timeout_seconds": 600,
@@ -224,10 +229,26 @@ def test_zettlab_image_generate_creates_media_job(monkeypatch):
     assert captured["json"]["media_type"] == "image"
     assert captured["json"]["model"] == "seedream-v4"
     assert captured["json"]["output_count"] == 1
+    assert captured["json"]["aspect_ratio"] == "1:1"
+    assert captured["json"]["resolution"] == "2K"
     assert captured["json"]["remote_media_inputs"] == [
         {"url": "https://example.com/source.png", "role": "source"},
         {"url": "https://example.com/ref.png", "role": "reference"},
     ]
+
+
+@pytest.mark.parametrize(
+    ("aspect", "allowed", "expected"),
+    [
+        ("landscape", ["4:3", "16:9"], "16:9"),
+        ("square", ["16:9", "1:1"], "1:1"),
+        ("portrait", ["3:4", "9:16"], "9:16"),
+        ("landscape", ["4:3"], "4:3"),
+        ("square", ["square"], "square"),
+    ],
+)
+def test_gateway_aspect_ratio_uses_model_capabilities(aspect, allowed, expected):
+    assert _gateway_aspect_ratio(aspect, {"aspect_ratios": allowed}) == expected
 
 
 def test_zettlab_image_generate_uses_gateway_default_when_model_is_omitted(monkeypatch):

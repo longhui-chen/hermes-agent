@@ -15,6 +15,32 @@ from agent.image_gen_provider import (
 from plugins import zettlab_media_client as media_client
 
 
+_GATEWAY_ASPECT_PREFERENCES = {
+    "landscape": ("16:9", "4:3", "3:2", "21:9"),
+    "square": ("1:1",),
+    "portrait": ("9:16", "3:4", "2:3"),
+}
+
+
+def _capability_strings(model_capability: Optional[Dict[str, Any]], key: str) -> List[str]:
+    if not isinstance(model_capability, dict):
+        return []
+    values = model_capability.get(key)
+    if not isinstance(values, list):
+        return []
+    return [value.strip() for value in values if isinstance(value, str) and value.strip()]
+
+
+def _gateway_aspect_ratio(aspect: str, model_capability: Optional[Dict[str, Any]]) -> str:
+    allowed = _capability_strings(model_capability, "aspect_ratios")
+    if not allowed or aspect in allowed:
+        return aspect
+    for candidate in _GATEWAY_ASPECT_PREFERENCES.get(aspect, ()):
+        if candidate in allowed:
+            return candidate
+    return allowed[0]
+
+
 class ZettlabImageGenProvider(ImageGenProvider):
     @property
     def name(self) -> str:
@@ -137,16 +163,21 @@ class ZettlabImageGenProvider(ImageGenProvider):
                     prompt=prompt,
                     aspect_ratio=aspect,
                 )
+            gateway_aspect = _gateway_aspect_ratio(aspect, model_capability)
+            payload: Dict[str, Any] = {
+                "output_count": 1,
+                "aspect_ratio": gateway_aspect,
+                "remote_media_inputs": inputs,
+            }
+            resolutions = _capability_strings(model_capability, "resolutions")
+            if resolutions:
+                payload["resolution"] = resolutions[0]
             job = media_client.create_and_wait(
                 media_type="image",
                 model=model,
                 prompt=prompt,
                 timeout_seconds=media_client.timeout_from_model_capability("image", model_capability),
-                payload={
-                    "output_count": 1,
-                    "aspect_ratio": aspect,
-                    "remote_media_inputs": inputs,
-                },
+                payload=payload,
             )
             image = media_client.first_asset_url(job)
         except Exception as exc:

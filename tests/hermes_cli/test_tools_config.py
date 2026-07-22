@@ -338,6 +338,28 @@ def test_get_platform_tools_mixed_does_not_resurrect_default_off():
     assert "rl" not in enabled
 
 
+def test_get_platform_tools_zet_agent_keeps_capability_gated_video_generation():
+    config = {
+        "video_gen": {"provider": "zettlab"},
+        "platform_toolsets": {
+            "zet_agent": ["hermes-zet-agent", "cronjob"],
+        },
+    }
+
+    enabled = _get_platform_tools(
+        config,
+        "zet_agent",
+        include_default_mcp_servers=False,
+    )
+
+    assert "video_gen" in enabled
+    assert "video_gen" not in _get_platform_tools(
+        config,
+        "cli",
+        include_default_mcp_servers=False,
+    )
+
+
 def test_get_platform_tools_preserves_explicit_empty_selection():
     config = {"platform_toolsets": {"cli": []}}
 
