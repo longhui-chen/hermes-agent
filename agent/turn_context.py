@@ -460,7 +460,11 @@ def build_turn_context(
             model=agent.model,
             api_mode=getattr(agent, "api_mode", None) or "",
             platform=getattr(agent, "platform", None) or "",
-            sender_id=getattr(agent, "_user_id", None) or "",
+            sender_id=(
+                getattr(agent, "_user_id_alt", None)
+                or getattr(agent, "_user_id", None)
+                or ""
+            ),
             execution_origin=getattr(agent, "_memory_write_origin", "") or "",
             is_kanban_worker=bool(os.environ.get("HERMES_KANBAN_TASK")),
             structured_output=_structured_output,

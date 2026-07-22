@@ -36,7 +36,7 @@ UNSUPPORTED_API_MODES = {"codex_app_server"}
 _recent_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
 _session_states: OrderedDict[str, dict[str, Any]] = OrderedDict()
 _recent_lock = threading.Lock()
-_invocation_scope: ContextVar[tuple[str, str, str | None] | None] = ContextVar(
+_invocation_scope: ContextVar[tuple[str, str, str | None, str] | None] = ContextVar(
     "creation_governor_invocation_scope",
     default=None,
 )
@@ -82,16 +82,21 @@ def _session_key(kwargs: dict[str, Any]) -> str:
     raw_session_id = _raw_session_key(kwargs)
     if not raw_session_id:
         return ""
-    owner_fields = ("sender_id", "owner_id", "user_id")
-    if any(field in kwargs for field in owner_fields):
-        owner_id = next(
-            (_text(kwargs.get(field), 160) for field in owner_fields if kwargs.get(field)),
-            "",
-        )
-        return _scoped_session_key(raw_session_id, owner_id)
     invocation = _invocation_scope.get()
-    if invocation is not None and invocation[0] == raw_session_id:
+    profile_prefix = f"{get_hermes_home().resolve()}|"
+    owner_fields = ("sender_id", "owner_id", "user_id")
+    explicit_owner = next(
+        (_text(kwargs.get(field), 160) for field in owner_fields if kwargs.get(field)),
+        "",
+    )
+    if (
+        invocation is not None
+        and invocation[1].startswith(profile_prefix)
+        and (not explicit_owner or explicit_owner == invocation[3])
+    ):
         return invocation[1]
+    if any(field in kwargs for field in owner_fields):
+        return _scoped_session_key(raw_session_id, explicit_owner)
     return _scoped_session_key(raw_session_id, "")
 
 
@@ -501,7 +506,17 @@ def _is_unsupported_runtime(kwargs: dict[str, Any]) -> bool:
 def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
     """Schedule hidden judgments and carry proposal context across transformed output."""
     raw_session_id = _raw_session_key(kwargs)
-    session_id = _session_key(kwargs)
+    owner_id = next(
+        (
+            _text(kwargs.get(field), 160)
+            for field in ("sender_id", "owner_id", "user_id")
+            if kwargs.get(field)
+        ),
+        "",
+    )
+    session_id = (
+        _scoped_session_key(raw_session_id, owner_id) if raw_session_id else ""
+    )
     noninteractive = _is_noninteractive(kwargs)
     suppression_reason = None
     if noninteractive:
@@ -510,7 +525,7 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         suppression_reason = "structured_output"
     elif _is_unsupported_runtime(kwargs):
         suppression_reason = "unsupported_runtime"
-    _invocation_scope.set((raw_session_id, session_id, suppression_reason))
+    _invocation_scope.set((raw_session_id, session_id, suppression_reason, owner_id))
     if suppression_reason:
         if session_id and suppression_reason in {
             "structured_output",
@@ -784,7 +799,7 @@ def _propose_creation(args: dict[str, Any], **kwargs: Any) -> str:
     with _recent_lock:
         state = _state_locked(session_id, now)
         invocation = _invocation_scope.get()
-        if invocation is not None and invocation[0] == _raw_session_key(kwargs) and invocation[2]:
+        if invocation is not None and invocation[2]:
             return json.dumps({"status": "not_proposed", "reason": invocation[2]})
         if int(state.get("native_bypass_turn") or -1) == int(state["turn"]):
             return json.dumps({"status": "not_proposed", "reason": "native_creation_path"})

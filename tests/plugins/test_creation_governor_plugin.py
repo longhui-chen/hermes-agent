@@ -630,6 +630,11 @@ def test_acceptance_generates_a_draft_then_requires_explicit_creation_confirmati
         tool_name="delegate_task",
         args={},
     )["action"] == "block"
+    assert plugin._on_pre_tool_call(
+        session_id="confirm-session-after-compression",
+        tool_name="write_file",
+        args={},
+    )["action"] == "block"
 
     draft_response = plugin._transform_llm_output(
         session_id="confirm-session",

@@ -200,6 +200,8 @@ def test_task_id_passthrough():
 
 def test_pre_llm_hook_receives_execution_origin_and_kanban_marker(monkeypatch):
     agent = _FakeAgent()
+    agent._user_id = "transport-user"
+    agent._user_id_alt = "canonical-user"
     agent._memory_write_origin = "background_review"
     agent.request_overrides = {"response_format": {"type": "json_schema"}}
     captured = {}
@@ -215,6 +217,7 @@ def test_pre_llm_hook_receives_execution_origin_and_kanban_marker(monkeypatch):
 
     assert captured["platform"] == "cli"
     assert captured["api_mode"] == "chat_completions"
+    assert captured["sender_id"] == "canonical-user"
     assert captured["execution_origin"] == "background_review"
     assert captured["is_kanban_worker"] is True
     assert captured["structured_output"] is True

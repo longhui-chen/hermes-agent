@@ -1379,12 +1379,16 @@ class TestPrompt:
 
         state.agent.run_conversation = mock_run
         delivered_texts = []
+        suffix_attempts = 0
 
         async def session_update(*args, **kwargs):
+            nonlocal suffix_attempts
             update = kwargs.get("update") or args[1]
             text = getattr(getattr(update, "content", None), "text", None)
             if text == "\n\n[plugin appended this]":
-                raise RuntimeError("editor backpressure")
+                suffix_attempts += 1
+                if suffix_attempts == 1:
+                    raise RuntimeError("editor backpressure")
             if text:
                 delivered_texts.append(text)
 
@@ -1397,7 +1401,7 @@ class TestPrompt:
 
         assert delivered_texts == [
             "original answer",
-            "original answer\n\n[plugin appended this]",
+            "\n\n[plugin appended this]",
         ]
 
     @pytest.mark.asyncio
@@ -1432,6 +1436,37 @@ class TestPrompt:
 
         assert attempts == 2
         assert delivered_texts == ["final answer"]
+
+    @pytest.mark.asyncio
+    async def test_prompt_retries_only_missing_suffix_after_partial_stream(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        def mock_run(*args, **kwargs):
+            state.agent.stream_delta_callback("one ")
+            state.agent.stream_delta_callback("two ")
+            state.agent.stream_delta_callback("three")
+            return {"final_response": "one two three", "messages": []}
+
+        state.agent.run_conversation = mock_run
+        delivered_texts = []
+
+        async def session_update(*args, **kwargs):
+            update = kwargs.get("update") or args[1]
+            text = getattr(getattr(update, "content", None), "text", None)
+            if text == "two ":
+                raise RuntimeError("middle delta failed")
+            if text:
+                delivered_texts.append(text)
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock(side_effect=session_update)
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="hello")]
+        await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        assert delivered_texts == ["one ", "two three"]
 
     @pytest.mark.asyncio
     async def test_prompt_cancels_slow_ordinary_stream_before_fallback(

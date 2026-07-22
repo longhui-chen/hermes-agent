@@ -365,7 +365,11 @@ def finalize_turn(
                 model=agent.model,
                 api_mode=getattr(agent, "api_mode", None) or "",
                 platform=getattr(agent, "platform", None) or "",
-                sender_id=getattr(agent, "_user_id", None) or "",
+                sender_id=(
+                    getattr(agent, "_user_id_alt", None)
+                    or getattr(agent, "_user_id", None)
+                    or ""
+                ),
                 completed=completed,
                 failed=failed,
                 interrupted=interrupted,
@@ -473,7 +477,11 @@ def finalize_turn(
                 model=agent.model,
                 api_mode=getattr(agent, "api_mode", None) or "",
                 platform=getattr(agent, "platform", None) or "",
-                sender_id=getattr(agent, "_user_id", None) or "",
+                sender_id=(
+                    getattr(agent, "_user_id_alt", None)
+                    or getattr(agent, "_user_id", None)
+                    or ""
+                ),
                 completed=completed,
                 failed=failed,
                 interrupted=interrupted,

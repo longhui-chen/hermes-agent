@@ -64,8 +64,8 @@ from acp.schema import (
 
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
 from acp_adapter.events import (
+    ACPMessageDeliveryState,
     CONFIRMED_UPDATE_TIMEOUT_SECONDS,
-    _await_scheduled_updates,
     _build_plan_update_from_todo_result,
     make_message_cb,
     make_step_cb,
@@ -1399,8 +1399,7 @@ class HermesACPAgent(acp.Agent):
         previous_approval_cb = None
         edit_approval_requester = None
 
-        streamed_message = False
-        pending_message_updates = []
+        message_delivery = ACPMessageDeliveryState()
 
         if conn:
             tool_progress_cb = make_tool_progress_cb(
@@ -1417,22 +1416,18 @@ class HermesACPAgent(acp.Agent):
                 conn,
                 session_id,
                 loop,
-                pending_updates=pending_message_updates,
+                delivery_state=message_delivery,
             )
             confirmed_message_cb = make_message_cb(
                 conn,
                 session_id,
                 loop,
                 confirm_delivery=True,
-                pending_updates=pending_message_updates,
+                delivery_state=message_delivery,
             )
 
             def stream_delta_cb(text: str) -> bool:
-                nonlocal streamed_message
-                delivered = bool(message_cb(text))
-                if delivered:
-                    streamed_message = True
-                return delivered
+                return bool(message_cb(text))
 
             def confirmed_stream_delta_cb(text: str) -> bool:
                 return bool(confirmed_message_cb(text))
@@ -1588,11 +1583,7 @@ class HermesACPAgent(acp.Agent):
                 state.current_prompt_text = ""
             return PromptResponse(stop_reason="end_turn")
 
-        if streamed_message:
-            streamed_message = await _await_scheduled_updates(
-                pending_message_updates,
-                timeout=CONFIRMED_UPDATE_TIMEOUT_SECONDS,
-            )
+        await message_delivery.finish(timeout=CONFIRMED_UPDATE_TIMEOUT_SECONDS)
 
         if result.get("messages"):
             state.history = result["messages"]
@@ -1676,23 +1667,12 @@ class HermesACPAgent(acp.Agent):
                 )
             except Exception:
                 logger.debug("Failed to auto-title ACP session %s", session_id, exc_info=True)
-        if (
-            final_response
-            and conn
-            and not suppress_interrupt_response
-            and (
-                not streamed_message
-                or (
-                    result.get("response_transformed")
-                    and not result.get("response_transform_streamed")
-                )
-            )
-        ):
-            # Deliver the final response when streaming did not already send it,
-            # or when a plugin hook transformed the response after streaming
-            # finished (e.g. transform_llm_output) — otherwise the appended /
-            # rewritten text never reaches the client.
-            update = acp.update_agent_message_text(final_response)
+        remaining_response = message_delivery.remaining_content(final_response)
+        if remaining_response and conn and not suppress_interrupt_response:
+            # ACP message updates are append-only. Send only the suffix that was
+            # not already confirmed so a partial stream failure cannot duplicate
+            # the successfully delivered prefix.
+            update = acp.update_agent_message_text(remaining_response)
             await conn.session_update(session_id, update)
 
         # Mark this turn idle before draining queued work so recursive prompt()
