@@ -1276,7 +1276,7 @@ class TestChatCompletionsEndpoint:
             with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run, \
                  patch.object(adapter, "_expand_inbound_skill_invocation", new_callable=AsyncMock) as mock_expand:
                 mock_run.return_value = (mock_result, usage)
-                mock_expand.side_effect = lambda msg, slug, session_id=None: f"<<EXPANDED:{slug}:{msg}>>"
+                mock_expand.side_effect = lambda msg, slug, session_id=None, on_settled=None: (on_settled() if on_settled else None) or f"<<EXPANDED:{slug}:{msg}>>"
                 resp = await cli.post(
                     "/v1/chat/completions",
                     json={
@@ -1351,7 +1351,7 @@ class TestChatCompletionsEndpoint:
             with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run, \
                  patch.object(adapter, "_expand_inbound_skill_invocation", new_callable=AsyncMock) as mock_expand:
                 mock_run.return_value = (mock_result, usage)
-                mock_expand.side_effect = lambda msg, slug, session_id=None: f"<<EXPANDED:{slug}:{msg}>>"
+                mock_expand.side_effect = lambda msg, slug, session_id=None, on_settled=None: (on_settled() if on_settled else None) or f"<<EXPANDED:{slug}:{msg}>>"
                 payload = {
                     "model": "hermes-agent",
                     "messages": [{"role": "user", "content": "/deep-research 黄金"}],

@@ -379,7 +379,11 @@ class ZetAgentAdapter(APIServerAdapter):
     _skill_invoke_semaphore = None
 
     async def _expand_inbound_skill_invocation(
-        self, user_message: Any, skill_slug: str, session_id: Optional[str] = None
+        self,
+        user_message: Any,
+        skill_slug: str,
+        session_id: Optional[str] = None,
+        on_settled: Optional[Any] = None,
     ) -> Any:
         """Async shell: fast-path pass-through, then expand off the event loop.
 
@@ -391,7 +395,21 @@ class ZetAgentAdapter(APIServerAdapter):
         into the worker, so the platform binding inside the blocking body
         stays task-local.
         """
+        def _settled() -> None:
+            # 结算回调与信号量同生命周期:凡释放许可(或根本没占用)的点
+            # 恰好一次地通知调用方「展开副作用已终止」。
+            if on_settled is None:
+                return
+            try:
+                on_settled()
+            except Exception:
+                logger.warning(
+                    "[zet_agent] skill expansion on_settled callback failed",
+                    exc_info=True,
+                )
+
         if not skill_slug or not isinstance(user_message, str):
+            _settled()
             return user_message
         import asyncio
 
@@ -409,7 +427,12 @@ class ZetAgentAdapter(APIServerAdapter):
             logger.warning(
                 "[zet_agent] skill expansion saturated; passing message through",
             )
+            _settled()
             return user_message
+        except asyncio.CancelledError:
+            # 许可未取得、worker 不存在:副作用已终止,当场结算。
+            _settled()
+            raise
         # Permit accounting must survive BOTH cancellation shapes (a
         # try/finally or a done-callback on the asyncio wrapper handles
         # neither correctly):
@@ -433,13 +456,17 @@ class ZetAgentAdapter(APIServerAdapter):
         state_lock = threading.Lock()
         state = {"started": False, "released": False}
 
+        def _finish_on_loop():
+            sema.release()
+            _settled()
+
         def _release_from_worker():
             with state_lock:
                 if state["released"]:
                     return
                 state["released"] = True
             try:
-                loop.call_soon_threadsafe(sema.release)
+                loop.call_soon_threadsafe(_finish_on_loop)
             except RuntimeError:
                 # Loop already closed (shutdown) — the permit is moot.
                 pass
@@ -468,7 +495,9 @@ class ZetAgentAdapter(APIServerAdapter):
                 if refund:
                     state["released"] = True
             if refund:
+                # queued-cancel:fn 永不执行,当场退款并结算。
                 sema.release()
+                _settled()
             raise
 
     def _expand_inbound_skill_invocation_blocking(

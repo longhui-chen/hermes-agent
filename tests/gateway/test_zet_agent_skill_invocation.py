@@ -348,6 +348,60 @@ def test_cancelled_caller_does_not_leak_semaphore_permit(monkeypatch):
     asyncio.run(_run())
 
 
+def test_on_settled_fires_exactly_once_per_lifecycle_path(monkeypatch):
+    # on_settled 是资源核算(profile 活跃计数)的释放信号:每条生命周期路径
+    # 都必须恰好一次——正常完成/直通/饱和直通/排队取消退款,以及关键的
+    # 「等待方被取消而 worker 仍在跑」(此时必须等 worker 真正结束才结算,
+    # 否则 /v1/profile/unload 会在展开中拆掉 runtime,review P1)。
+    import threading
+
+    _patch_skill_layer(monkeypatch)
+    adapter = _make_adapter()
+
+    settled = []
+    # 正常完成
+    _ = asyncio.run(adapter._expand_inbound_skill_invocation(
+        "/deep-research 黄金", "deep-research", on_settled=lambda: settled.append("ok")))
+    assert settled == ["ok"]
+
+    # 直通(空 slug)
+    settled.clear()
+    _ = asyncio.run(adapter._expand_inbound_skill_invocation(
+        "你好", "", on_settled=lambda: settled.append("pass")))
+    assert settled == ["pass"]
+
+    # running-cancel:worker 在跑时取消等待方——结算必须延后到 worker 结束。
+    settled.clear()
+    started = threading.Event()
+    release_worker = threading.Event()
+
+    def slow_blocking(msg, slug, session_id=None):
+        started.set()
+        release_worker.wait(5)
+        return "done"
+
+    monkeypatch.setattr(
+        adapter, "_expand_inbound_skill_invocation_blocking", slow_blocking
+    )
+
+    async def _run():
+        task = asyncio.create_task(adapter._expand_inbound_skill_invocation(
+            "x", "deep-research", on_settled=lambda: settled.append("late")))
+        await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert settled == [], "must NOT settle while the worker still runs"
+        release_worker.set()
+        for _ in range(200):
+            if settled:
+                break
+            await asyncio.sleep(0.01)
+        assert settled == ["late"], "must settle exactly once when the worker finishes"
+
+    asyncio.run(_run())
+
+
 def test_base_api_server_hook_is_noop():
     # HR4: plain api_server behavior must be unchanged — the base hook is
     # identity for every shape.
