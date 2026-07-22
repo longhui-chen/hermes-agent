@@ -11,6 +11,7 @@ import os
 import re
 import secrets
 import socket
+import stat
 import threading
 import urllib.error
 import urllib.parse
@@ -171,6 +172,17 @@ def _clean_display_text(value: Any, limit: int) -> str:
     return text.strip()[:limit]
 
 
+def _require_delivery_generation(value: Any) -> int:
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value <= 0
+        or value >= 2**64
+    ):
+        raise RuntimeError("calendar delivery: invalid delivery generation")
+    return value
+
+
 def _stage_message(job: dict, state: dict) -> tuple[Any, str, int, str]:
     from hermes_state import SessionDB
 
@@ -184,6 +196,7 @@ def _stage_message(job: dict, state: dict) -> tuple[Any, str, int, str]:
     content = state.get("content")
     if not isinstance(content, str) or not content or len(content.encode("utf-8")) > 16 * 1024:
         raise RuntimeError("calendar delivery: invalid authoritative content")
+    delivery_generation = _require_delivery_generation(state.get("delivery_generation"))
     db = SessionDB()
     try:
         existing_session = db.get_session(session_id)
@@ -196,6 +209,7 @@ def _stage_message(job: dict, state: dict) -> tuple[Any, str, int, str]:
             session_id=session_id,
             content=content,
             delivery_key=job["calendar_delivery_key"],
+            delivery_generation=delivery_generation,
         )
     except Exception:
         db.close()
@@ -210,23 +224,82 @@ def _private_key_file(db: Any) -> Path:
 def _load_or_create_nonce_key(db: Any) -> bytes:
     path = _private_key_file(db)
     path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        info = path.lstat()
-        if path.is_symlink() or not path.is_file() or info.st_mode & 0o077:
-            raise RuntimeError("calendar delivery: unsafe nonce key")
-        raw = path.read_bytes()
+
+    def load_existing() -> bytes:
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(path, flags)
+        except OSError as exc:
+            if path.is_symlink():
+                raise RuntimeError("calendar delivery: unsafe nonce key") from exc
+            raise
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+                raise RuntimeError("calendar delivery: unsafe nonce key")
+            chunks = []
+            remaining = 33
+            while remaining:
+                chunk = os.read(fd, remaining)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+        finally:
+            os.close(fd)
         if len(raw) != 32:
             raise RuntimeError("calendar delivery: invalid nonce key")
         return raw
+
+    try:
+        return load_existing()
     except FileNotFoundError:
-        raw = secrets.token_bytes(32)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        pass
+
+    raw = secrets.token_bytes(32)
+    tmp = path.with_name(
+        f"{path.name}.{os.getpid()}.{threading.get_ident()}.{secrets.token_hex(8)}.tmp"
+    )
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    fd = os.open(tmp, flags, 0o600)
+    try:
         try:
-            os.write(fd, raw)
+            os.fchmod(fd, 0o600)
+            view = memoryview(raw)
+            written = 0
+            while written < len(view):
+                count = os.write(fd, view[written:])
+                if count <= 0:
+                    raise OSError("calendar delivery: nonce key short write")
+                written += count
+            if os.fstat(fd).st_size != len(raw):
+                raise OSError("calendar delivery: incomplete nonce key write")
             os.fsync(fd)
         finally:
             os.close(fd)
+        try:
+            os.link(tmp, path, follow_symlinks=False)
+        except FileExistsError:
+            return load_existing()
+        directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0)
+        directory_fd = os.open(path.parent, directory_flags)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
         return raw
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _delivery_nonce(db: Any, job: dict, state: dict) -> bytes:
@@ -397,13 +470,9 @@ def run_external_calendar_delivery(job: dict, begin_state: dict) -> dict:
     attempt = begin_state.get("attempt_sequence")
     if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt <= 0:
         raise RuntimeError("calendar delivery: missing external attempt sequence")
-    generation = begin_state.get("delivery_generation")
-    if (
-        not isinstance(generation, int)
-        or isinstance(generation, bool)
-        or generation <= 0
-        or generation >= 2**64
-    ):
+    try:
+        generation = _require_delivery_generation(begin_state.get("delivery_generation"))
+    except RuntimeError:
         raise RuntimeError("calendar delivery: missing external delivery generation")
     result: dict | None = None
     failure = ""
@@ -449,6 +518,7 @@ def run_calendar_delivery(job: dict, initial_state: dict | None = None) -> dict:
         return {"terminal": True, "ledger_state": state.get("state"), **state}
     if state.get("retry_after"):
         return {"terminal": False, "ledger_state": state.get("state"), **state}
+    delivery_generation = _require_delivery_generation(state.get("delivery_generation"))
     fence = _fence_payload(state, job, worker_id)
     if state.get("state") == "claimed":
         state = _planner_post(f"/{job['calendar_delivery_key']}/commit", fence)
@@ -456,6 +526,8 @@ def run_calendar_delivery(job: dict, initial_state: dict | None = None) -> dict:
         return {"terminal": True, "ledger_state": state.get("state"), **state}
     if state.get("state") not in {"committed", "prepared", "queued"}:
         return {"terminal": False, "ledger_state": state.get("state"), **state}
+    if _require_delivery_generation(state.get("delivery_generation")) != delivery_generation:
+        raise RuntimeError("calendar delivery: delivery generation changed during commit")
     db, session_id, message_id, content = _stage_message(job, state)
     try:
         nonce = _delivery_nonce(db, job, state)
@@ -471,11 +543,17 @@ def run_calendar_delivery(job: dict, initial_state: dict | None = None) -> dict:
                 return {"terminal": True, "ledger_state": state.get("state"), **state}
             if state.get("state") not in {"prepared", "queued"} or state.get("content") != content:
                 raise RuntimeError("calendar delivery: prepare content/state mismatch")
+            if _require_delivery_generation(state.get("delivery_generation")) != delivery_generation:
+                raise RuntimeError("calendar delivery: delivery generation changed during prepare")
         state = _planner_post(f"/{job['calendar_delivery_key']}/finalize", {
             **fence, "nonce": prepare_payload["nonce"],
         })
+        if _require_delivery_generation(state.get("delivery_generation")) != delivery_generation:
+            raise RuntimeError("calendar delivery: delivery generation changed during finalize")
         _verify_finalize_receipt(db, job, state, session_id, message_id)
-        if not db.activate_calendar_notification(job["calendar_delivery_key"], message_id):
+        if not db.activate_calendar_notification(
+            job["calendar_delivery_key"], delivery_generation, message_id
+        ):
             raise RuntimeError("calendar delivery: staged SessionDB activation failed")
     finally:
         db.close()

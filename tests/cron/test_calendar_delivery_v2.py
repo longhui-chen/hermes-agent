@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import os
+import sqlite3
+import stat
+from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -153,8 +158,8 @@ def test_delivery_saga_claim_commit_prepare_finalize_activate_ack(monkeypatch):
     monkeypatch.setattr(delivery, "_planner_post", post)
     monkeypatch.setattr(delivery, "_worker_id", lambda: "worker-a")
     class FakeDB:
-        def activate_calendar_notification(self, key, message_id):
-            calls.append(("activate", {"key": key, "message_id": message_id}))
+        def activate_calendar_notification(self, key, generation, message_id):
+            calls.append(("activate", {"key": key, "generation": generation, "message_id": message_id}))
             return True
         def close(self): pass
     monkeypatch.setattr(delivery, "_stage_message", lambda job, _state: (FakeDB(), job["origin"]["chat_id"], 9, "visible"))
@@ -197,8 +202,8 @@ def test_delivery_saga_resumes_durable_post_prepare_states(monkeypatch, resume_s
     ])
     monkeypatch.setattr(delivery, "_planner_post", lambda path, body: calls.append((path, body)) or next(responses))
     class FakeDB:
-        def activate_calendar_notification(self, key, message_id):
-            calls.append(("activate", {"key": key, "message_id": message_id}))
+        def activate_calendar_notification(self, key, generation, message_id):
+            calls.append(("activate", {"key": key, "generation": generation, "message_id": message_id}))
             return True
         def close(self): pass
     monkeypatch.setattr(delivery, "_stage_message", lambda job, _state: (FakeDB(), job["origin"]["chat_id"], 9, "visible"))
@@ -305,18 +310,22 @@ def test_stage_uses_authoritative_owner_session_and_content(monkeypatch):
             calls.append(("create", session_id, source, user_id))
         def set_session_title(self, session_id, title):
             calls.append(("title", session_id, title))
-        def stage_calendar_notification(self, session_id, content, delivery_key):
-            calls.append(("stage", session_id, content, delivery_key))
+        def stage_calendar_notification(self, session_id, content, delivery_key, delivery_generation):
+            calls.append(("stage", session_id, content, delivery_key, delivery_generation))
             return 17
         def close(self): pass
 
     monkeypatch.setattr(hermes_state, "SessionDB", FakeDB)
-    state = {"session_id": expected_session, "content": "canonical-content"}
+    state = {
+        "session_id": expected_session,
+        "content": "canonical-content",
+        "delivery_generation": 7,
+    }
     db, session_id, message_id, content = delivery._stage_message(job, state)
     assert session_id == expected_session
     assert message_id == 17
     assert content == "canonical-content"
-    assert calls[-1] == ("stage", expected_session, "canonical-content", "a" * 64)
+    assert calls[-1] == ("stage", expected_session, "canonical-content", "a" * 64, 7)
     db.close()
 
 
@@ -327,6 +336,7 @@ def test_stage_rejects_tampered_authoritative_session():
         delivery._stage_message(managed_job(), {
             "session_id": "zettlab:oh_attacker:main:calendar-reminders",
             "content": "canonical-content",
+            "delivery_generation": 1,
         })
 
 
@@ -340,17 +350,17 @@ def test_session_db_calendar_message_visible_to_ui_but_not_llm(tmp_path):
         db.create_session(session_id, source="zet_agent", user_id="iam:a:user:b")
         key = "b" * 64
         unsafe = "UNIQUE_CALENDAR_PROMPT 大别山恶意指令"
-        first = db.stage_calendar_notification(session_id, unsafe, key)
-        replay = db.stage_calendar_notification(session_id, unsafe, key)
+        first = db.stage_calendar_notification(session_id, unsafe, key, 1)
+        replay = db.stage_calendar_notification(session_id, unsafe, key, 1)
         assert replay == first
         other_session = "zettlab:oh_other:main:calendar-reminders"
         db.create_session(other_session, source="zet_agent", user_id="iam:a:user:other")
         with pytest.raises(ValueError, match="session collision"):
-            db.stage_calendar_notification(other_session, unsafe, key)
+            db.stage_calendar_notification(other_session, unsafe, key, 1)
         assert db.get_messages(session_id) == []
         with pytest.raises(ValueError, match="content collision"):
-            db.stage_calendar_notification(session_id, "different retry body", key)
-        assert db.activate_calendar_notification(key, first) is True
+            db.stage_calendar_notification(session_id, "different retry body", key, 1)
+        assert db.activate_calendar_notification(key, 1, first) is True
         visible = db.get_messages(session_id)
         assert len(visible) == 1
         assert visible[0]["content"] == unsafe
@@ -364,6 +374,290 @@ def test_session_db_calendar_message_visible_to_ui_but_not_llm(tmp_path):
         assert unsafe not in _read_session(db, session_id)
     finally:
         db.close()
+
+
+def test_session_db_calendar_delivery_generation_behavior_matrix(tmp_path):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        session_id = "zettlab:oh_abc:main:calendar-reminders"
+        db.create_session(session_id, source="zet_agent", user_id="iam:a:user:b")
+        key = "c" * 64
+
+        generation_one = db.stage_calendar_notification(session_id, "old content", key, 1)
+        generation_two = db.stage_calendar_notification(session_id, "new content", key, 2)
+
+        assert generation_two != generation_one
+        assert db.stage_calendar_notification(session_id, "new content", key, 2) == generation_two
+        assert db.activate_calendar_notification(key, 1, generation_two) is False
+        assert db.get_messages(session_id) == []
+        assert db.activate_calendar_notification(key, 2, generation_two) is True
+        assert [message["content"] for message in db.get_messages(session_id)] == ["new content"]
+
+        max_generation = 2**64 - 1
+        generation_three = db.stage_calendar_notification(
+            session_id, "latest content", key, max_generation
+        )
+        assert db.activate_calendar_notification(key, max_generation, generation_three) is True
+        assert [message["content"] for message in db.get_messages(session_id)] == [
+            "new content",
+            "latest content",
+        ]
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("generation", [None, 0, True, -1, 2**64])
+def test_session_db_calendar_delivery_generation_requires_bounded_uint64(tmp_path, generation):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        session_id = "zettlab:oh_abc:main:calendar-reminders"
+        db.create_session(session_id, source="zet_agent", user_id="iam:a:user:b")
+        with pytest.raises(ValueError, match="delivery generation"):
+            db.stage_calendar_notification(session_id, "content", "d" * 64, generation)
+    finally:
+        db.close()
+
+
+def test_session_db_migrates_legacy_calendar_delivery_index(tmp_path):
+    from hermes_state import SessionDB
+
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    session_id = "zettlab:oh_abc:main:calendar-reminders"
+    try:
+        db.create_session(session_id, source="zet_agent", user_id="iam:a:user:b")
+        legacy_id = db.stage_calendar_notification(session_id, "legacy content", "e" * 64, 1)
+        db._conn.execute("DROP INDEX idx_messages_calendar_delivery")
+        db._conn.execute(
+            "CREATE UNIQUE INDEX idx_messages_calendar_delivery "
+            "ON messages(calendar_delivery_key) WHERE calendar_delivery_key IS NOT NULL"
+        )
+        db._conn.execute(
+            "UPDATE messages SET calendar_delivery_generation = NULL WHERE id = ?",
+            (legacy_id,),
+        )
+        db._conn.commit()
+    finally:
+        db.close()
+
+    reopened = SessionDB(db_path=db_path)
+    try:
+        columns = [
+            row[2]
+            for row in reopened._conn.execute(
+                'PRAGMA index_info("idx_messages_calendar_delivery")'
+            ).fetchall()
+        ]
+        assert columns == ["calendar_delivery_key", "calendar_delivery_generation"]
+        index_row = next(
+            row
+            for row in reopened._conn.execute('PRAGMA index_list("messages")').fetchall()
+            if row[1] == "idx_messages_calendar_delivery"
+        )
+        assert index_row[2] == 1
+        assert index_row[4] == 1
+        index_sql = reopened._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            ("idx_messages_calendar_delivery",),
+        ).fetchone()[0]
+        assert index_sql.endswith("WHERE calendar_delivery_key IS NOT NULL")
+        assert reopened._conn.execute(
+            "SELECT calendar_delivery_generation FROM messages WHERE id = ?",
+            (legacy_id,),
+        ).fetchone()[0] == "1"
+        new_id = reopened.stage_calendar_notification(session_id, "new content", "e" * 64, 2)
+        assert new_id != legacy_id
+    finally:
+        reopened.close()
+
+
+def test_session_db_calendar_index_migration_rolls_back_after_drop(tmp_path):
+    from hermes_state import SessionDB
+
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    session_id = "zettlab:oh_abc:main:calendar-reminders"
+    try:
+        db.create_session(session_id, source="zet_agent", user_id="iam:a:user:b")
+        message_id = db.stage_calendar_notification(session_id, "legacy content", "f" * 64, 1)
+        db._conn.execute("DROP INDEX idx_messages_calendar_delivery")
+        db._conn.execute(
+            "CREATE UNIQUE INDEX idx_messages_calendar_delivery "
+            "ON messages(calendar_delivery_key) WHERE calendar_delivery_key IS NOT NULL"
+        )
+        db._conn.execute(
+            "UPDATE messages SET calendar_delivery_generation = NULL WHERE id = ?",
+            (message_id,),
+        )
+        db._conn.execute(
+            "CREATE TRIGGER fail_calendar_generation_migration "
+            "BEFORE UPDATE OF calendar_delivery_generation ON messages "
+            "BEGIN SELECT RAISE(ABORT, 'injected calendar migration failure'); END"
+        )
+    finally:
+        db.close()
+
+    with pytest.raises(RuntimeError, match="calendar delivery index migration failed"):
+        SessionDB(db_path=db_path)
+
+    raw = sqlite3.connect(db_path)
+    try:
+        columns = [
+            row[2]
+            for row in raw.execute('PRAGMA index_info("idx_messages_calendar_delivery")')
+        ]
+        assert columns == ["calendar_delivery_key"]
+        assert raw.execute(
+            "SELECT calendar_delivery_generation FROM messages WHERE id = ?",
+            (message_id,),
+        ).fetchone()[0] is None
+    finally:
+        raw.close()
+
+
+def test_session_db_calendar_index_migration_rejects_duplicate_legacy_rows(tmp_path):
+    from hermes_state import SessionDB
+
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    session_id = "zettlab:oh_abc:main:calendar-reminders"
+    try:
+        db.create_session(session_id, source="zet_agent", user_id="iam:a:user:b")
+        first_id = db.stage_calendar_notification(session_id, "first visible", "1" * 64, 1)
+        assert db.activate_calendar_notification("1" * 64, 1, first_id) is True
+        db._conn.execute("DROP INDEX idx_messages_calendar_delivery")
+        db._conn.execute(
+            "UPDATE messages SET calendar_delivery_generation = NULL WHERE id = ?",
+            (first_id,),
+        )
+        db._conn.execute(
+            """INSERT INTO messages (
+                   session_id, role, content, timestamp, observed, active, llm_visible,
+                   calendar_delivery_key, calendar_delivery_generation, calendar_delivery_state
+               ) VALUES (?, 'assistant', ?, 2, 1, 1, 0, ?, NULL, 'fully_visible')""",
+            (session_id, "second visible", "1" * 64),
+        )
+    finally:
+        db.close()
+
+    with pytest.raises(RuntimeError, match="duplicate legacy rows"):
+        SessionDB(db_path=db_path)
+
+    raw = sqlite3.connect(db_path)
+    try:
+        rows = raw.execute(
+            "SELECT content, calendar_delivery_generation, calendar_delivery_state "
+            "FROM messages WHERE calendar_delivery_key = ? ORDER BY id",
+            ("1" * 64,),
+        ).fetchall()
+        assert rows == [
+            ("first visible", None, "fully_visible"),
+            ("second visible", None, "fully_visible"),
+        ]
+        assert raw.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' "
+            "AND name = 'idx_messages_calendar_delivery'"
+        ).fetchone() is None
+    finally:
+        raw.close()
+
+
+def test_session_db_calendar_index_migration_locked_is_fail_closed(tmp_path):
+    from hermes_state import SessionDB
+
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    db.close()
+    locker = sqlite3.connect(db_path, isolation_level=None)
+    candidate = sqlite3.connect(db_path, timeout=0.01, isolation_level=None)
+    try:
+        locker.execute("BEGIN IMMEDIATE")
+        with pytest.raises(RuntimeError, match="database is locked"):
+            SessionDB._migrate_calendar_delivery_index(candidate)
+        assert candidate.in_transaction is False
+        columns = [
+            row[2]
+            for row in candidate.execute('PRAGMA index_info("idx_messages_calendar_delivery")')
+        ]
+        assert columns == ["calendar_delivery_key", "calendar_delivery_generation"]
+    finally:
+        locker.rollback()
+        locker.close()
+        candidate.close()
+
+
+def test_nonce_key_short_writes_are_completed_and_restart_stable(tmp_path, monkeypatch):
+    import cron.calendar_delivery as delivery
+
+    db = SimpleNamespace(db_path=tmp_path / "state.db")
+    real_write = os.write
+
+    def short_write(fd, raw):
+        return real_write(fd, raw[:7])
+
+    monkeypatch.setattr(delivery.os, "write", short_write)
+    first = delivery._load_or_create_nonce_key(db)
+    second = delivery._load_or_create_nonce_key(db)
+
+    assert len(first) == 32
+    assert second == first
+    assert delivery._private_key_file(db).read_bytes() == first
+    assert stat.S_IMODE(delivery._private_key_file(db).stat().st_mode) == 0o600
+
+
+def test_nonce_key_publish_failure_leaves_no_partial_final_file(tmp_path, monkeypatch):
+    import cron.calendar_delivery as delivery
+
+    db = SimpleNamespace(db_path=tmp_path / "state.db")
+    final_path = delivery._private_key_file(db)
+    real_link = os.link
+    monkeypatch.setattr(
+        delivery.os,
+        "link",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("injected publish failure")),
+    )
+
+    with pytest.raises(OSError, match="injected publish failure"):
+        delivery._load_or_create_nonce_key(db)
+
+    assert not final_path.exists()
+    assert list(tmp_path.glob(".calendar-delivery-nonce.key.*.tmp")) == []
+
+    monkeypatch.setattr(delivery.os, "link", real_link)
+    assert len(delivery._load_or_create_nonce_key(db)) == 32
+
+
+def test_nonce_key_concurrent_creators_converge_on_one_key(tmp_path):
+    import cron.calendar_delivery as delivery
+
+    db = SimpleNamespace(db_path=tmp_path / "state.db")
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        keys = list(pool.map(lambda _index: delivery._load_or_create_nonce_key(db), range(24)))
+
+    assert len(set(keys)) == 1
+    assert delivery._private_key_file(db).read_bytes() == keys[0]
+
+
+@pytest.mark.parametrize("unsafe", ["symlink", "wide-mode"])
+def test_nonce_key_existing_unsafe_file_fails_closed(tmp_path, unsafe):
+    import cron.calendar_delivery as delivery
+
+    db = SimpleNamespace(db_path=tmp_path / "state.db")
+    path = delivery._private_key_file(db)
+    if unsafe == "symlink":
+        target = tmp_path / "attacker-key"
+        target.write_bytes(b"x" * 32)
+        path.symlink_to(target)
+    else:
+        path.write_bytes(b"x" * 32)
+        path.chmod(0o644)
+
+    with pytest.raises(RuntimeError, match="unsafe nonce key"):
+        delivery._load_or_create_nonce_key(db)
 
 
 def test_legacy_calendar_history_is_quarantined_on_open(tmp_path):

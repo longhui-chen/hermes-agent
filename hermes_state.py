@@ -765,6 +765,7 @@ CREATE TABLE IF NOT EXISTS messages (
     compacted INTEGER NOT NULL DEFAULT 0,
     llm_visible INTEGER NOT NULL DEFAULT 1,
     calendar_delivery_key TEXT,
+    calendar_delivery_generation TEXT,
     calendar_delivery_state TEXT
 );
 
@@ -1333,6 +1334,106 @@ class SessionDB:
                             "reconcile %s.%s: %s", table_name, col_name, exc,
                         )
 
+    @staticmethod
+    def _calendar_delivery_index_is_valid(conn: sqlite3.Connection) -> bool:
+        """Return whether the calendar idempotency index has its exact contract."""
+        index_row = None
+        for row in conn.execute('PRAGMA index_list("messages")').fetchall():
+            name = row["name"] if isinstance(row, sqlite3.Row) else row[1]
+            if name == "idx_messages_calendar_delivery":
+                index_row = row
+                break
+        if index_row is None:
+            return False
+        unique = index_row["unique"] if isinstance(index_row, sqlite3.Row) else index_row[2]
+        partial = index_row["partial"] if isinstance(index_row, sqlite3.Row) else index_row[4]
+        if int(unique) != 1 or int(partial) != 1:
+            return False
+        columns = [
+            row["name"] if isinstance(row, sqlite3.Row) else row[2]
+            for row in conn.execute(
+                'PRAGMA index_info("idx_messages_calendar_delivery")'
+            ).fetchall()
+        ]
+        if columns != ["calendar_delivery_key", "calendar_delivery_generation"]:
+            return False
+        sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            ("idx_messages_calendar_delivery",),
+        ).fetchone()
+        sql = (sql_row["sql"] if isinstance(sql_row, sqlite3.Row) else sql_row[0]) if sql_row else ""
+        predicate = re.search(r"\bWHERE\s+(.+?)\s*$", sql or "", re.IGNORECASE | re.DOTALL)
+        return bool(
+            predicate
+            and " ".join(predicate.group(1).split()).lower()
+            == "calendar_delivery_key is not null"
+        )
+
+    @staticmethod
+    def _migrate_calendar_delivery_index(conn: sqlite3.Connection) -> None:
+        """Atomically install and verify the generation-scoped delivery index.
+
+        Never repairs duplicate legacy rows by deleting or coalescing them:
+        those rows may be fully-visible audit history, so startup fails closed
+        with the database unchanged and requires an explicit operator decision.
+        """
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error as exc:
+            raise RuntimeError(
+                f"calendar delivery index migration failed: {exc}"
+            ) from exc
+        try:
+            if not SessionDB._calendar_delivery_index_is_valid(conn):
+                conn.execute("DROP INDEX IF EXISTS idx_messages_calendar_delivery")
+            conn.execute(
+                "UPDATE messages SET calendar_delivery_generation = '1' "
+                "WHERE calendar_delivery_key IS NOT NULL "
+                "AND calendar_delivery_generation IS NULL"
+            )
+            duplicate = conn.execute(
+                "SELECT calendar_delivery_key, calendar_delivery_generation "
+                "FROM messages WHERE calendar_delivery_key IS NOT NULL "
+                "GROUP BY calendar_delivery_key, calendar_delivery_generation "
+                "HAVING COUNT(*) > 1 LIMIT 1"
+            ).fetchone()
+            if duplicate is not None:
+                raise RuntimeError(
+                    "calendar delivery index migration failed: duplicate legacy rows "
+                    "require manual resolution"
+                )
+            if not SessionDB._calendar_delivery_index_is_valid(conn):
+                conn.execute(
+                    "CREATE UNIQUE INDEX idx_messages_calendar_delivery "
+                    "ON messages(calendar_delivery_key, calendar_delivery_generation) "
+                    "WHERE calendar_delivery_key IS NOT NULL"
+                )
+            if not SessionDB._calendar_delivery_index_is_valid(conn):
+                raise RuntimeError(
+                    "calendar delivery index migration failed: installed index "
+                    "does not satisfy unique columns and partial predicate invariant"
+                )
+            conn.commit()
+        except BaseException as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            if not isinstance(exc, Exception):
+                raise
+            if isinstance(exc, RuntimeError) and str(exc).startswith(
+                "calendar delivery index migration failed:"
+            ):
+                raise
+            if isinstance(exc, sqlite3.IntegrityError) and "UNIQUE constraint failed" in str(exc):
+                raise RuntimeError(
+                    "calendar delivery index migration failed: duplicate legacy rows "
+                    "require manual resolution"
+                ) from exc
+            raise RuntimeError(
+                f"calendar delivery index migration failed: {exc}"
+            ) from exc
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -1390,14 +1491,11 @@ class SessionDB:
         except sqlite3.OperationalError as exc:
             logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
 
-        try:
-            cursor.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_calendar_delivery "
-                "ON messages(calendar_delivery_key) "
-                "WHERE calendar_delivery_key IS NOT NULL"
-            )
-        except sqlite3.OperationalError as exc:
-            logger.debug("idx_messages_calendar_delivery create skipped: %s", exc)
+        # The original index keyed only by the stable delivery key. Projection
+        # replacement reuses that key and increments a uint64 generation. The
+        # whole DROP/backfill/CREATE transition must be one write transaction:
+        # isolation_level=None otherwise autocommits every individual step.
+        self._migrate_calendar_delivery_index(self._conn)
 
         # Deferred indexes that reference the reconciler-added ``active``
         # column (idx_messages_session_active) — same ordering constraint.
@@ -3378,21 +3476,34 @@ class SessionDB:
         return self._execute_write(_do)
 
     def stage_calendar_notification(
-        self, session_id: str, content: str, delivery_key: str
+        self,
+        session_id: str,
+        content: str,
+        delivery_key: str,
+        delivery_generation: int,
     ) -> int:
         """Idempotently stage a hidden calendar message excluded from all replay."""
         if not isinstance(delivery_key, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", delivery_key):
             raise ValueError("invalid calendar delivery key")
+        if (
+            not isinstance(delivery_generation, int)
+            or isinstance(delivery_generation, bool)
+            or delivery_generation <= 0
+            or delivery_generation >= 2**64
+        ):
+            raise ValueError("invalid calendar delivery generation")
         if not isinstance(session_id, str) or not session_id or len(session_id) > 200:
             raise ValueError("invalid calendar session id")
         if not isinstance(content, str) or len(content.encode("utf-8")) > 16 * 1024:
             raise ValueError("calendar notification content exceeded cap")
         stored_content = self._encode_content(content)
+        stored_generation = str(delivery_generation)
 
         def _do(conn):
             existing = conn.execute(
-                "SELECT id, session_id, content FROM messages WHERE calendar_delivery_key = ? LIMIT 1",
-                (delivery_key,),
+                "SELECT id, session_id, content FROM messages "
+                "WHERE calendar_delivery_key = ? AND calendar_delivery_generation = ? LIMIT 1",
+                (delivery_key, stored_generation),
             ).fetchone()
             if existing is not None:
                 if existing["session_id"] != session_id:
@@ -3400,26 +3511,50 @@ class SessionDB:
                 if self._decode_content(existing["content"]) != content:
                     raise ValueError("calendar delivery key content collision")
                 return int(existing[0])
+            other_generation = conn.execute(
+                "SELECT session_id FROM messages WHERE calendar_delivery_key = ? LIMIT 1",
+                (delivery_key,),
+            ).fetchone()
+            if other_generation is not None and other_generation["session_id"] != session_id:
+                raise ValueError("calendar delivery key session collision")
             cursor = conn.execute(
                 """INSERT INTO messages (
                        session_id, role, content, timestamp, platform_message_id,
                        observed, active, llm_visible, calendar_delivery_key,
-                       calendar_delivery_state
-                   ) VALUES (?, 'assistant', ?, ?, ?, 1, 0, 0, ?, 'staged')""",
-                (session_id, stored_content, time.time(), delivery_key, delivery_key),
+                       calendar_delivery_generation, calendar_delivery_state
+                   ) VALUES (?, 'assistant', ?, ?, ?, 1, 0, 0, ?, ?, 'staged')""",
+                (
+                    session_id,
+                    stored_content,
+                    time.time(),
+                    delivery_key,
+                    delivery_key,
+                    stored_generation,
+                ),
             )
             return int(cursor.lastrowid)
 
         return self._execute_write(_do)
 
-    def activate_calendar_notification(self, delivery_key: str, message_id: int) -> bool:
+    def activate_calendar_notification(
+        self, delivery_key: str, delivery_generation: int, message_id: int
+    ) -> bool:
         """CAS the exact staged row visible after a verified local finalize receipt."""
         if not isinstance(delivery_key, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", delivery_key):
             raise ValueError("invalid calendar delivery key")
+        if (
+            not isinstance(delivery_generation, int)
+            or isinstance(delivery_generation, bool)
+            or delivery_generation <= 0
+            or delivery_generation >= 2**64
+        ):
+            raise ValueError("invalid calendar delivery generation")
+        stored_generation = str(delivery_generation)
         def _do(conn):
             row = conn.execute(
                 "SELECT id, session_id, calendar_delivery_state FROM messages "
-                "WHERE calendar_delivery_key = ? LIMIT 1", (delivery_key,),
+                "WHERE calendar_delivery_key = ? AND calendar_delivery_generation = ? LIMIT 1",
+                (delivery_key, stored_generation),
             ).fetchone()
             if row is None or int(row["id"]) != int(message_id):
                 return False
@@ -3427,8 +3562,9 @@ class SessionDB:
                 return True
             cursor = conn.execute(
                 "UPDATE messages SET active = 1, calendar_delivery_state = 'fully_visible' "
-                "WHERE id = ? AND calendar_delivery_key = ? AND calendar_delivery_state = 'staged'",
-                (message_id, delivery_key),
+                "WHERE id = ? AND calendar_delivery_key = ? "
+                "AND calendar_delivery_generation = ? AND calendar_delivery_state = 'staged'",
+                (message_id, delivery_key, stored_generation),
             )
             if cursor.rowcount != 1:
                 return False

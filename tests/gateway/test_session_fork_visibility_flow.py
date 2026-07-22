@@ -24,9 +24,9 @@ async def test_session_fork_flow_keeps_calendar_notification_hidden_from_model(t
         )
         delivery_key = "a" * 64
         message_id = db.stage_calendar_notification(
-            source_id, "display-only calendar text", delivery_key,
+            source_id, "display-only calendar text", delivery_key, 1,
         )
-        assert db.activate_calendar_notification(delivery_key, message_id) is True
+        assert db.activate_calendar_notification(delivery_key, 1, message_id) is True
 
         async with TestClient(TestServer(app)) as client:
             response = await client.post(
