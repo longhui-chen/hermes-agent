@@ -23,6 +23,7 @@ move-and-name refactor with no semantic change.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import uuid
 from dataclasses import dataclass
@@ -455,6 +456,8 @@ def build_turn_context(
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
+            execution_origin=getattr(agent, "_memory_write_origin", "") or "",
+            is_kanban_worker=bool(os.environ.get("HERMES_KANBAN_TASK")),
         )
         _ctx_parts: list[str] = []
         for r in _pre_results:

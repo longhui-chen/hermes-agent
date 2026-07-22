@@ -1653,7 +1653,13 @@ class HermesACPAgent(acp.Agent):
             final_response
             and conn
             and not suppress_interrupt_response
-            and (not streamed_message or result.get("response_transformed"))
+            and (
+                not streamed_message
+                or (
+                    result.get("response_transformed")
+                    and not result.get("response_transform_streamed")
+                )
+            )
         ):
             # Deliver the final response when streaming did not already send it,
             # or when a plugin hook transformed the response after streaming

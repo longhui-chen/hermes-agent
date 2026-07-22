@@ -64,7 +64,7 @@ def test_low_confidence_and_recent_duplicates_are_suppressed():
     duplicate = json.loads(plugin._propose_creation(base, session_id="session-a"))
     other_session = json.loads(plugin._propose_creation(base, session_id="session-b"))
     assert first["status"] == "proposal_ready"
-    assert duplicate == {"status": "not_proposed", "reason": "recent_duplicate"}
+    assert duplicate == {"status": "not_proposed", "reason": "prompt_cooldown"}
     assert other_session["status"] == "proposal_ready"
 
 
@@ -124,6 +124,35 @@ def test_prompt_cooldown_suppresses_the_next_ten_turns():
         conversation_history=[],
     )
     assert propose("after-ten")["status"] == "proposal_ready"
+
+
+def test_cooldown_rejection_does_not_consume_the_dedup_key():
+    plugin = _load_plugin()
+
+    def propose(key: str):
+        return json.loads(
+            plugin._propose_creation(
+                {
+                    "creation_type": "agent",
+                    "suggested_name": f"分析助手-{key}",
+                    "reason": "任务可以复用",
+                    "evidence": "用户提交了一项分析任务",
+                    "confidence": 0.7,
+                    "dedup_key": key,
+                },
+                session_id="atomic-session",
+            )
+        )
+
+    assert propose("first")["status"] == "proposal_ready"
+    assert propose("held-back") == {"status": "not_proposed", "reason": "prompt_cooldown"}
+    for _ in range(11):
+        plugin._on_pre_llm_call(
+            session_id="atomic-session",
+            user_message="你好",
+            conversation_history=[],
+        )
+    assert propose("held-back")["status"] == "proposal_ready"
 
 
 def test_first_task_is_judged_and_missing_prompt_is_appended(monkeypatch):
@@ -227,6 +256,7 @@ def test_direct_native_creation_and_schedule_requests_skip_plugin_judge(monkeypa
     )
     messages = (
         "创建一个 Meta 广告分析 Agent",
+        "新增一个合同审查助手",
         "每天早上九点把 AI 新闻汇总给我",
         "帮我新建一个会议纪要 Skill",
     )
@@ -237,6 +267,234 @@ def test_direct_native_creation_and_schedule_requests_skip_plugin_judge(monkeypa
             conversation_history=[],
         )
     assert calls == []
+
+
+def test_native_creation_bypass_is_enforced_in_the_tool_handler():
+    plugin = _load_plugin()
+    plugin._on_pre_llm_call(
+        session_id="native-handler-session",
+        user_message="新增一个合同审查助手",
+        conversation_history=[],
+    )
+    result = json.loads(
+        plugin._propose_creation(
+            {
+                "creation_type": "agent",
+                "suggested_name": "合同审查助手",
+                "reason": "可复用",
+                "evidence": "用户明确要求新增助手",
+                "confidence": 0.9,
+                "dedup_key": "agent:合同审查助手",
+            },
+            session_id="native-handler-session",
+        )
+    )
+    assert result == {"status": "not_proposed", "reason": "native_creation_path"}
+
+
+def test_unicode_dedup_keys_preserve_semantic_identity():
+    plugin = _load_plugin()
+    assert plugin._dedup_key("skill:会议纪要流程") == "skill:会议纪要流程"
+    assert plugin._dedup_key("agent:合同审查助手") == "agent:合同审查助手"
+    assert plugin._dedup_key("skill:会议纪要流程") != plugin._dedup_key("skill:合同审查流程")
+
+
+def test_noninteractive_execution_origins_never_evaluate_or_propose(monkeypatch):
+    plugin = _load_plugin()
+    calls = []
+    monkeypatch.setattr(plugin, "_judge_creation_opportunity", lambda *args: calls.append(args))
+    cases = (
+        {"platform": "cron"},
+        {"platform": "subagent"},
+        {"platform": "api_server", "execution_origin": "background_review"},
+        {"platform": "api_server", "is_kanban_worker": True},
+    )
+    for index, extra in enumerate(cases):
+        session_id = f"background-{index}"
+        result = plugin._on_pre_llm_call(
+            session_id=session_id,
+            user_message="帮我分析这份合同",
+            conversation_history=[],
+            **extra,
+        )
+        assert result is None
+        denied = json.loads(
+            plugin._propose_creation(
+                {
+                    "creation_type": "agent",
+                    "suggested_name": "合同审查助手",
+                    "reason": "可复用",
+                    "evidence": "后台任务",
+                    "confidence": 0.9,
+                    "dedup_key": "agent:合同审查助手",
+                },
+                session_id=session_id,
+            )
+        )
+        assert denied == {"status": "not_proposed", "reason": "noninteractive_session"}
+    assert calls == []
+
+
+def test_failed_or_partial_turn_never_appends_a_proposal(monkeypatch):
+    plugin = _load_plugin()
+    monkeypatch.setattr(
+        plugin,
+        "_judge_creation_opportunity",
+        lambda message, history: {
+            "creation_type": "agent",
+            "suggested_name": "合同审查助手",
+            "reason": "可复用",
+            "evidence": message,
+            "confidence": 0.9,
+            "dedup_key": "agent:合同审查助手",
+        },
+    )
+    plugin._on_pre_llm_call(
+        session_id="failed-session",
+        user_message="帮我分析这份合同",
+        conversation_history=[],
+    )
+    assert plugin._transform_llm_output(
+        session_id="failed-session",
+        response_text="供应商调用失败。",
+        completed=False,
+        failed=True,
+        interrupted=False,
+        turn_exit_reason="provider_error",
+    ) is None
+
+
+def test_acceptance_generates_a_draft_then_requires_explicit_creation_confirmation(monkeypatch):
+    plugin = _load_plugin()
+    monkeypatch.setattr(
+        plugin,
+        "_judge_creation_opportunity",
+        lambda message, history: {
+            "creation_type": "skill",
+            "suggested_name": "会议纪要流程",
+            "reason": "固化整理步骤",
+            "evidence": message,
+            "confidence": 0.9,
+            "dedup_key": "skill:会议纪要流程",
+        },
+    )
+    plugin._on_pre_llm_call(
+        session_id="confirm-session",
+        user_message="帮我整理这份会议转录",
+        conversation_history=[],
+    )
+    proposal = plugin._transform_llm_output(
+        session_id="confirm-session",
+        response_text="会议纪要已整理。",
+        completed=True,
+        failed=False,
+    )
+
+    draft = plugin._on_pre_llm_call(
+        session_id="confirm-session",
+        user_message="生成方案",
+        conversation_history=[{"role": "assistant", "content": proposal}],
+    )
+    assert "draft only" in draft["context"]
+    assert "确认创建" in draft["context"]
+    block = plugin._on_pre_tool_call(
+        session_id="confirm-session",
+        tool_name="skill_manage",
+        args={},
+    )
+    assert block["action"] == "block"
+    assert plugin._on_pre_tool_call(
+        session_id="confirm-session",
+        tool_name="write_file",
+        args={},
+    )["action"] == "block"
+
+    draft_response = plugin._transform_llm_output(
+        session_id="confirm-session",
+        response_text="方案包含输入格式、整理步骤和输出模板。",
+        completed=True,
+        failed=False,
+    )
+    assert "确认创建" in draft_response
+
+    confirmed = plugin._on_pre_llm_call(
+        session_id="confirm-session",
+        user_message="确认创建",
+        conversation_history=[{"role": "assistant", "content": draft_response}],
+    )
+    assert "authorized native creation" in confirmed["context"]
+    assert plugin._on_pre_tool_call(
+        session_id="confirm-session",
+        tool_name="skill_manage",
+        args={},
+    ) is None
+
+
+def test_persisted_proposal_rehydrates_after_plugin_restart():
+    plugin = _load_plugin()
+    prompt = plugin._proposal_payload(
+        "skill",
+        "会议纪要流程",
+        "固化整理步骤",
+        "会议转录",
+        0.9,
+    )["user_prompt"]
+
+    restarted = _load_plugin()
+    draft = restarted._on_pre_llm_call(
+        session_id="restarted-session",
+        user_message="生成方案",
+        conversation_history=[
+            {"role": "assistant", "content": "已整理。\n\n" + prompt},
+            {"role": "user", "content": "生成方案"},
+        ],
+    )
+    assert "会议纪要流程" in draft["context"]
+    assert "draft only" in draft["context"]
+
+
+def test_persisted_draft_rehydrates_final_confirmation_after_restart():
+    plugin = _load_plugin()
+    prompt = plugin._proposal_payload(
+        "skill",
+        "会议纪要流程",
+        "固化整理步骤",
+        "会议转录",
+        0.9,
+    )["user_prompt"]
+    draft_response = "方案包含输入、处理步骤和输出模板。\n\n" + plugin._DRAFT_CONFIRM_PROMPT
+
+    restarted = _load_plugin()
+    confirmed = restarted._on_pre_llm_call(
+        session_id="restarted-confirm-session",
+        user_message="确认创建",
+        conversation_history=[
+            {"role": "assistant", "content": "已整理。\n\n" + prompt},
+            {"role": "user", "content": "生成方案"},
+            {"role": "assistant", "content": draft_response},
+            {"role": "user", "content": "确认创建"},
+        ],
+    )
+    assert "会议纪要流程" in confirmed["context"]
+    assert "authorized native creation" in confirmed["context"]
+
+
+def test_old_proposal_is_not_rehydrated_past_a_newer_assistant_reply():
+    plugin = _load_plugin()
+    prompt = plugin._proposal_payload(
+        "skill", "旧流程", "旧原因", "旧证据", 0.9
+    )["user_prompt"]
+    result = plugin._on_pre_llm_call(
+        session_id="stale-proposal-session",
+        user_message="生成方案",
+        conversation_history=[
+            {"role": "assistant", "content": prompt},
+            {"role": "user", "content": "先聊别的"},
+            {"role": "assistant", "content": "好的，我们先聊别的。"},
+            {"role": "user", "content": "生成方案"},
+        ],
+    )
+    assert result is None
 
 
 def test_plugin_self_query_reports_real_status_and_never_proposes(monkeypatch):

@@ -1,8 +1,8 @@
 """Suggest creation opportunities without replacing native creators.
 
-The plugin intentionally has no lifecycle hooks and never intercepts a write.
-Its single tool lets the main model surface an implicit creation opportunity.
-Explicit creation requests continue through Hermes' existing creation paths.
+The plugin lets interactive chats surface an implicit creation opportunity.
+It gates the suggested path as proposal -> draft -> explicit confirmation, then
+hands confirmed work to Hermes' existing native creator.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ import math
 import re
 import threading
 import time
+import unicodedata
 from collections import OrderedDict
 from typing import Any
 
@@ -37,7 +38,8 @@ def _text(value: Any, limit: int) -> str:
 
 
 def _dedup_key(value: Any) -> str:
-    normalized = re.sub(r"[^a-z0-9._:-]+", "-", str(value or "").strip().lower())
+    value = unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+    normalized = re.sub(r"[^\w.:-]+", "-", value, flags=re.UNICODE)
     return normalized.strip("-")[:120]
 
 
@@ -81,6 +83,10 @@ def _state_locked(session_id: str, now: float) -> dict[str, Any]:
             "last_prompt_turn": -10_000,
             "pending_proposal": None,
             "last_proposal": None,
+            "proposal_stage": None,
+            "draft_only_turn": None,
+            "native_bypass_turn": None,
+            "proposals_disabled": False,
             "last_user_message": "",
             "last_seen": now,
         }
@@ -95,15 +101,33 @@ def _prompt_is_cooling_down(state: dict[str, Any]) -> bool:
     return int(state["turn"]) - int(state["last_prompt_turn"]) <= PROMPT_COOLDOWN_TURNS
 
 
-def _claim_prompt_slot(session_id: str, proposal: dict[str, Any], now: float) -> bool:
+def _commit_proposal(
+    session_id: str,
+    proposal: dict[str, Any],
+    dedup_key: str,
+    now: float,
+) -> str | None:
+    """Atomically claim cooldown, dedup, and session state for one visible prompt."""
+    identity = (session_id, dedup_key)
     with _recent_lock:
         state = _state_locked(session_id, now)
         if _prompt_is_cooling_down(state):
-            return False
+            return "prompt_cooldown"
+        expired_before = now - PROPOSAL_TTL_SECONDS
+        for key, created_at in tuple(_recent_proposals.items()):
+            if created_at < expired_before:
+                _recent_proposals.pop(key, None)
+        if identity in _recent_proposals:
+            _recent_proposals.move_to_end(identity)
+            return "recent_duplicate"
+        _recent_proposals[identity] = now
+        while len(_recent_proposals) > MAX_RECENT_PROPOSALS:
+            _recent_proposals.popitem(last=False)
         state["last_prompt_turn"] = state["turn"]
         state["last_proposal"] = dict(proposal)
+        state["proposal_stage"] = "proposal_shown"
         state["pending_proposal"] = None
-        return True
+    return None
 
 
 _TASK_HINT_RE = re.compile(
@@ -113,9 +137,10 @@ _TASK_HINT_RE = re.compile(
     re.IGNORECASE,
 )
 _EXPLICIT_CREATION_RE = re.compile(
-    r"(?:(?:创建|新建|建立|做成|保存成|生成).{0,48}"
-    r"(?:agent|智能体|skill|技能|定时任务|scheduled\s*task|task))|"
-    r"(?:(?:create|build|make|new)\s+.{0,48}(?:agent|skill|scheduled\s*task))",
+    r"(?:(?:创建|新建|新增|建立|建个|建一个|再来一个|安装|做成|保存成|生成|我想要|给我).{0,48}"
+    r"(?:agent|智能体|助手|skill|技能|定时任务|scheduled\s*task|task))|"
+    r"(?:(?:create|build|make|new|add|install|spin\s+up)\s+.{0,48}"
+    r"(?:agent|assistant|skill|scheduled\s*task))",
     re.IGNORECASE,
 )
 _DIRECT_SCHEDULE_RE = re.compile(
@@ -133,6 +158,20 @@ _SELF_QUERY_RE = re.compile(
     r"(?:creation[\s_-]*governor|propose_creation)",
     re.IGNORECASE,
 )
+_ACCEPT_DRAFT_RE = re.compile(
+    r"^(?:生成方案|先生成方案|看看方案|可以，?生成方案|生成吧|那就生成|好|好的|可以|行)$"
+)
+_CONFIRM_CREATE_RE = re.compile(r"^(?:确认创建|按方案创建|就按这个方案创建|现在创建)$")
+_REJECT_PROPOSAL_RE = re.compile(r"^(?:暂不创建|不创建|不用了|先不用|取消)$")
+_PERSISTED_PROPOSAL_RE = re.compile(
+    r"这类任务可以沉淀成(Agent|Skill|定时任务)「([^」]{1,80})」.*?"
+    r"要不要为你生成创建方案[？?]",
+    re.DOTALL,
+)
+_TYPE_BY_LABEL = {"Agent": "agent", "Skill": "skill", "定时任务": "scheduled_task"}
+_NONINTERACTIVE_PLATFORMS = {"cron", "subagent", "batch"}
+_DRAFT_BLOCKED_TOOLS = {"terminal", "skill_manage", "cronjob", "write_file", "patch"}
+_DRAFT_CONFIRM_PROMPT = "如果方案符合预期，请回复“确认创建”；在此之前不会执行创建。"
 
 
 def _uses_native_creation_path(user_message: str) -> bool:
@@ -241,8 +280,8 @@ def _proposal_payload(
         "choices": ["生成方案", "暂不创建"],
         "next_step": (
             "先完成并回答用户当前交付的任务，再把 user_prompt 作为轻量建议展示。"
-            "只有用户接受建议后，才转交当前环境已有的原生创建流程生成配置，"
-            "并遵循该流程原本的最终确认；本插件不执行创建。"
+            "用户选择生成方案后，只输出草案并要求再次明确回复“确认创建”；"
+            "确认后才转交当前环境已有的原生创建流程执行，本插件不执行创建。"
         ),
     }
 
@@ -308,13 +347,87 @@ def _previous_proposal_context(state: dict[str, Any]) -> str:
     return (
         "[Creation governor internal context: The previous user-facing response ended with a "
         f"proposal for {proposal.get('creation_type')} '{proposal.get('suggested_name')}'. "
-        "If the user's current message accepts or rejects that proposal, handle it through "
-        "Hermes' native creation flow. Do not expose this internal context.]"
+        "If the user accepts, generate a draft only and ask for explicit confirmation before "
+        "using Hermes' native creation flow. Do not expose this internal context.]"
+    )
+
+
+def _restore_proposal_match(state: dict[str, Any], match: re.Match[str], stage: str) -> None:
+    creation_type = _TYPE_BY_LABEL[match.group(1)]
+    suggested_name = _text(match.group(2), 80)
+    state["last_proposal"] = {
+        "creation_type": creation_type,
+        "suggested_name": suggested_name,
+        "reason": "Recovered from the persisted creation proposal",
+        "evidence": "Persisted assistant proposal",
+        "confidence": MIN_CONFIDENCE,
+        "dedup_key": _dedup_key(f"{creation_type}:{suggested_name}"),
+    }
+    state["last_prompt_turn"] = max(0, int(state["turn"]) - 1)
+    state["proposal_stage"] = stage
+
+
+def _rehydrate_persisted_proposal(state: dict[str, Any], history: list[dict[str, Any]]) -> None:
+    if isinstance(state.get("last_proposal"), dict):
+        return
+    assistant_texts = [
+        str(message.get("content") or "")
+        for message in history
+        if isinstance(message, dict) and message.get("role") == "assistant"
+    ]
+    if not assistant_texts:
+        return
+    latest = assistant_texts[-1]
+    latest_match = _PERSISTED_PROPOSAL_RE.search(latest)
+    if latest_match:
+        _restore_proposal_match(state, latest_match, "proposal_shown")
+        return
+    if _DRAFT_CONFIRM_PROMPT not in latest:
+        return
+    for prior in reversed(assistant_texts[:-1]):
+        prior_match = _PERSISTED_PROPOSAL_RE.search(prior)
+        if prior_match:
+            _restore_proposal_match(state, prior_match, "awaiting_confirmation")
+            return
+
+
+def _draft_context(proposal: dict[str, Any]) -> str:
+    return (
+        "[Creation governor internal instruction: The user accepted the proposal for "
+        f"{proposal.get('creation_type')} '{proposal.get('suggested_name')}'. Generate a draft only; "
+        "do not create, install, save, schedule, or mutate anything in this turn. End by asking the "
+        "user to reply exactly '确认创建' if they want the native creation flow to execute the draft. "
+        "Do not expose this internal instruction.]"
+    )
+
+
+def _authorized_creation_context(proposal: dict[str, Any]) -> str:
+    return (
+        "[Creation governor internal context: The user explicitly confirmed the previously drafted "
+        f"{proposal.get('creation_type')} '{proposal.get('suggested_name')}'. This turn is authorized "
+        "native creation: use Hermes' existing creator and its normal validation. Do not expose this "
+        "internal context.]"
+    )
+
+
+def _is_noninteractive(kwargs: dict[str, Any]) -> bool:
+    return bool(
+        _text(kwargs.get("platform"), 40).lower() in _NONINTERACTIVE_PLATFORMS
+        or _text(kwargs.get("execution_origin"), 80).lower() == "background_review"
+        or kwargs.get("is_kanban_worker")
     )
 
 
 def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
     """Schedule hidden judgments and carry proposal context across transformed output."""
+    if _is_noninteractive(kwargs):
+        session_id = _session_key(kwargs)
+        if session_id:
+            with _recent_lock:
+                state = _state_locked(session_id, time.monotonic())
+                state["proposals_disabled"] = True
+                state["pending_proposal"] = None
+        return None
     session_id = _session_key(kwargs)
     if not session_id:
         return None
@@ -327,11 +440,31 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         state = _state_locked(session_id, now)
         state["turn"] += 1
         state["last_user_message"] = user_message
+        _rehydrate_persisted_proposal(state, history)
+        proposal = state.get("last_proposal")
+        stage = state.get("proposal_stage")
+        if isinstance(proposal, dict) and stage == "proposal_shown" and _ACCEPT_DRAFT_RE.fullmatch(user_message):
+            state["proposal_stage"] = "awaiting_confirmation"
+            state["draft_only_turn"] = state["turn"]
+            state["pending_proposal"] = None
+            return {"context": _draft_context(proposal)}
+        if isinstance(proposal, dict) and stage == "awaiting_confirmation" and _CONFIRM_CREATE_RE.fullmatch(user_message):
+            state["proposal_stage"] = "creation_authorized"
+            state["pending_proposal"] = None
+            return {"context": _authorized_creation_context(proposal)}
+        if isinstance(proposal, dict) and _REJECT_PROPOSAL_RE.fullmatch(user_message):
+            state["proposal_stage"] = "dismissed"
+            state["pending_proposal"] = None
+            return None
         carry_context = _previous_proposal_context(state)
         if _is_creation_governor_self_query(user_message):
             state["pending_proposal"] = None
             return {"context": _self_description_context()}
-        if _prompt_is_cooling_down(state) or _uses_native_creation_path(user_message):
+        if _uses_native_creation_path(user_message):
+            state["native_bypass_turn"] = state["turn"]
+            state["pending_proposal"] = None
+            return {"context": carry_context} if carry_context else None
+        if _prompt_is_cooling_down(state):
             return {"context": carry_context} if carry_context else None
         turn = int(state["turn"])
         last_evaluation_turn = int(state["last_evaluation_turn"])
@@ -378,9 +511,19 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
     response_text = str(kwargs.get("response_text") or "")
     if not session_id or not response_text:
         return None
+    if kwargs.get("failed") or kwargs.get("interrupted") or kwargs.get("completed") is False:
+        with _recent_lock:
+            _state_locked(session_id, time.monotonic())["pending_proposal"] = None
+        return None
     now = time.monotonic()
     with _recent_lock:
         state = _state_locked(session_id, now)
+        if state.get("proposals_disabled"):
+            return None
+        if int(state.get("draft_only_turn") or -1) == int(state["turn"]):
+            if _DRAFT_CONFIRM_PROMPT in response_text:
+                return None
+            return response_text.rstrip() + "\n\n" + _DRAFT_CONFIRM_PROMPT
         pending = state.get("pending_proposal")
         if not isinstance(pending, dict) or int(pending.get("turn", -1)) != int(state["turn"]):
             return None
@@ -391,10 +534,6 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
         proposal = dict(pending)
 
     dedup_key = _dedup_key(proposal.get("dedup_key"))
-    if not _claim_proposal(session_id, dedup_key, now):
-        with _recent_lock:
-            _state_locked(session_id, now)["pending_proposal"] = None
-        return None
     payload = _proposal_payload(
         proposal["creation_type"],
         proposal["suggested_name"],
@@ -402,7 +541,8 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
         proposal["evidence"],
         proposal["confidence"],
     )
-    if not _claim_prompt_slot(session_id, proposal, now):
+    rejection = _commit_proposal(session_id, proposal, dedup_key, now)
+    if rejection:
         return None
     user_prompt = payload["user_prompt"]
     if user_prompt in response_text or (
@@ -434,10 +574,6 @@ def _propose_creation(args: dict[str, Any], **kwargs: Any) -> str:
 
     session_id = _session_key(kwargs)
     now = time.monotonic()
-    if not _claim_proposal(session_id, dedup_key, now):
-        return json.dumps(
-            {"status": "not_proposed", "reason": "recent_duplicate"}
-        )
     proposal = {
         "creation_type": creation_type,
         "suggested_name": suggested_name,
@@ -446,12 +582,35 @@ def _propose_creation(args: dict[str, Any], **kwargs: Any) -> str:
         "confidence": confidence,
         "dedup_key": dedup_key,
     }
-    if not _claim_prompt_slot(session_id, proposal, now):
-        return json.dumps({"status": "not_proposed", "reason": "prompt_cooldown"})
+    with _recent_lock:
+        state = _state_locked(session_id, now)
+        if state.get("proposals_disabled"):
+            return json.dumps({"status": "not_proposed", "reason": "noninteractive_session"})
+        if int(state.get("native_bypass_turn") or -1) == int(state["turn"]):
+            return json.dumps({"status": "not_proposed", "reason": "native_creation_path"})
+    rejection = _commit_proposal(session_id, proposal, dedup_key, now)
+    if rejection:
+        return json.dumps({"status": "not_proposed", "reason": rejection})
     return json.dumps(
         _proposal_payload(creation_type, suggested_name, reason, evidence, confidence),
         ensure_ascii=False,
     )
+
+
+def _on_pre_tool_call(**kwargs: Any) -> dict[str, str] | None:
+    """Mechanically prevent creation side effects during the draft-only turn."""
+    session_id = _session_key(kwargs)
+    tool_name = _text(kwargs.get("tool_name"), 80)
+    if not session_id or tool_name not in _DRAFT_BLOCKED_TOOLS:
+        return None
+    with _recent_lock:
+        state = _state_locked(session_id, time.monotonic())
+        if int(state.get("draft_only_turn") or -1) != int(state["turn"]):
+            return None
+    return {
+        "action": "block",
+        "message": "Creation is blocked while presenting the draft. Wait for explicit '确认创建'.",
+    }
 
 
 def _reset_state_for_tests() -> None:
@@ -463,6 +622,7 @@ def _reset_state_for_tests() -> None:
 def register(ctx: Any) -> None:
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_hook("transform_llm_output", _transform_llm_output)
+    ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_tool(
         name=TOOL_NAME,
         toolset="skills",

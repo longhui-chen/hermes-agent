@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
+from hermes_cli.plugins import PluginManager
 from tests.plugins.test_creation_governor_plugin import _load_plugin
 
 
@@ -25,6 +27,7 @@ def test_plugin_flow_registers_judgment_hooks_and_a_non_creating_proposal_tool()
     assert [args[0] for args, _kwargs in context.hooks] == [
         "pre_llm_call",
         "transform_llm_output",
+        "pre_tool_call",
     ]
     assert [tool["name"] for tool in context.tools] == ["propose_creation"]
     description = context.tools[0]["schema"]["description"]
@@ -49,5 +52,25 @@ def test_plugin_flow_registers_judgment_hooks_and_a_non_creating_proposal_tool()
 
     assert result["status"] == "proposal_ready"
     assert result["creation_type"] == "scheduled_task"
-    assert "生成配置" in result["next_step"]
+    assert "只输出草案" in result["next_step"]
+    assert "确认创建" in result["next_step"]
     assert "create" not in context.tools[0]["name"]
+
+
+def test_real_plugin_manager_loads_all_governor_hooks():
+    plugin_root = Path(__file__).resolve().parents[2] / "plugins"
+    manager = PluginManager()
+    manifests = manager._scan_directory(plugin_root, source="bundled")
+    manifest = next(item for item in manifests if item.name == "creation-governor")
+
+    manager._load_plugin(manifest)
+
+    loaded = manager._plugins[manifest.key or manifest.name]
+    assert loaded.enabled is True
+    assert loaded.error is None
+    assert set(loaded.hooks_registered) == {
+        "pre_llm_call",
+        "transform_llm_output",
+        "pre_tool_call",
+    }
+    assert loaded.tools_registered == ["propose_creation"]

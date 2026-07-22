@@ -19155,6 +19155,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # after streaming finished — when the response was transformed, always
             # send the final version so the appended content reaches the client.
             _transformed = bool(response.get("response_transformed"))
+            _transform_streamed = bool(response.get("response_transform_streamed"))
             # Only suppress the normal send when the actual final reply reached
             # the user: the stream consumer streamed it (final_response_sent /
             # final_content_delivered), or the interim preview delivered that
@@ -19166,7 +19167,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _final,
                 previewed=_previewed,
             )
-            if not _is_empty_sentinel and not _transformed and (_streamed or _content_delivered):
+            if not _is_empty_sentinel and (
+                _transform_streamed
+                or (not _transformed and (_streamed or _content_delivered))
+            ):
                 logger.info(
                     "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
                     session_key or "?",

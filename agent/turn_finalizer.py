@@ -336,6 +336,7 @@ def finalize_turn(
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
     _response_transformed = False
+    _response_transform_streamed = False
 
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
@@ -344,18 +345,59 @@ def finalize_turn(
     if final_response and not interrupted:
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
+            _pre_transform_response = final_response
             _transform_results = _invoke_hook(
                 "transform_llm_output",
                 response_text=final_response,
                 session_id=agent.session_id or "",
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
+                completed=completed,
+                failed=failed,
+                interrupted=interrupted,
+                turn_exit_reason=_turn_exit_reason,
+                execution_origin=getattr(agent, "_memory_write_origin", "") or "",
+                is_kanban_worker=bool(os.environ.get("HERMES_KANBAN_TASK")),
             )
             for _hook_result in _transform_results:
                 if isinstance(_hook_result, str) and _hook_result:
                     final_response = _hook_result
                     _response_transformed = True
                     break  # First non-empty string wins
+
+            if _response_transformed:
+                # The model's original text may already have been streamed.  An
+                # append-only transform can still be delivered exactly once by
+                # streaming only its suffix before the caller emits its done
+                # sentinel. Rewrites continue to use each platform's existing
+                # final-message replacement path.
+                if (
+                    final_response.startswith(_pre_transform_response)
+                    and len(final_response) > len(_pre_transform_response)
+                    and getattr(agent, "_has_stream_consumers", lambda: False)()
+                ):
+                    try:
+                        agent._fire_stream_delta(final_response[len(_pre_transform_response):])
+                        _response_transform_streamed = True
+                    except Exception as _stream_err:
+                        logger.warning(
+                            "Failed to stream transform_llm_output suffix: %s",
+                            _stream_err,
+                        )
+
+                # Keep the durable transcript identical to the response returned
+                # to the user so a restart can recover plugin-added prompts.
+                if messages and messages[-1].get("role") == "assistant":
+                    messages[-1]["content"] = final_response
+                    try:
+                        agent._persist_session(messages, conversation_history)
+                    except Exception as _persist_err:
+                        _cleanup_errors.append(f"persist_transformed_session: {_persist_err}")
+                        logger.error(
+                            "finalize_turn: transformed _persist_session failed: %s",
+                            _persist_err,
+                            exc_info=True,
+                        )
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
 
@@ -414,6 +456,7 @@ def finalize_turn(
         "partial": False,  # True only when stopped due to invalid tool calls
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
+        "response_transform_streamed": _response_transform_streamed,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
         "model": agent.model,
         "provider": agent.provider,

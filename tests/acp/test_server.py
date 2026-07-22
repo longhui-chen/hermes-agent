@@ -44,7 +44,12 @@ from hermes_state import SessionDB
 @pytest.fixture()
 def mock_manager():
     """SessionManager with a mock agent factory."""
-    return SessionManager(agent_factory=lambda: MagicMock(name="MockAIAgent"))
+    def make_agent():
+        mock = MagicMock(name="MockAIAgent")
+        mock._drain_pending_steer.return_value = None
+        return mock
+
+    return SessionManager(agent_factory=make_agent)
 
 
 @pytest.fixture()
@@ -1317,6 +1322,39 @@ class TestPrompt:
         assert any(
             text and "[plugin appended this]" in text for text in all_texts
         ), f"expected transformed final to be delivered, got: {all_texts!r}"
+
+    @pytest.mark.asyncio
+    async def test_prompt_does_not_duplicate_an_already_streamed_transform_suffix(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        def mock_run(*args, **kwargs):
+            state.agent.stream_delta_callback("original answer")
+            state.agent.stream_delta_callback("\n\n[plugin appended this]")
+            return {
+                "final_response": "original answer\n\n[plugin appended this]",
+                "response_transformed": True,
+                "response_transform_streamed": True,
+                "messages": [],
+            }
+
+        state.agent.run_conversation = mock_run
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="hello")]
+        await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        updates = [
+            call.kwargs.get("update") or call.args[1]
+            for call in mock_conn.session_update.call_args_list
+        ]
+        agent_chunks = [update for update in updates if update.session_update == "agent_message_chunk"]
+        assert [chunk.content.text for chunk in agent_chunks] == [
+            "original answer",
+            "\n\n[plugin appended this]",
+        ]
 
 
     @pytest.mark.asyncio
