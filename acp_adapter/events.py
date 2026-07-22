@@ -89,8 +89,8 @@ def _send_update(
     session_id: str,
     loop: asyncio.AbstractEventLoop,
     update: Any,
-) -> None:
-    """Fire-and-forget an ACP session update from a worker thread."""
+) -> bool:
+    """Send an ACP update from a worker thread and report confirmed completion."""
     from agent.async_utils import safe_schedule_threadsafe
 
     future = safe_schedule_threadsafe(
@@ -100,11 +100,13 @@ def _send_update(
         log_message="Failed to send ACP update",
     )
     if future is None:
-        return
+        return False
     try:
         future.result(timeout=5)
+        return True
     except Exception:
         logger.debug("Failed to send ACP update", exc_info=True)
+        return False
 
 
 # ------------------------------------------------------------------
@@ -270,10 +272,10 @@ def make_message_cb(
 ) -> Callable:
     """Create a callback that streams agent response text to the editor."""
 
-    def _message(text: str) -> None:
+    def _message(text: str) -> bool:
         if not text:
-            return
+            return False
         update = acp.update_agent_message_text(text)
-        _send_update(conn, session_id, loop, update)
+        return _send_update(conn, session_id, loop, update)
 
     return _message

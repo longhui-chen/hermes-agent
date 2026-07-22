@@ -31,6 +31,7 @@ PROMPT_COOLDOWN_TURNS = 10
 SESSION_STATE_TTL_SECONDS = 24 * 60 * 60
 MAX_SESSION_STATES = 512
 CREATION_TYPES = {"agent", "skill", "scheduled_task"}
+UNSUPPORTED_API_MODES = {"codex_app_server"}
 
 _recent_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
 _session_states: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -493,6 +494,10 @@ def _is_noninteractive(kwargs: dict[str, Any]) -> bool:
     )
 
 
+def _is_unsupported_runtime(kwargs: dict[str, Any]) -> bool:
+    return _text(kwargs.get("api_mode"), 80).lower() in UNSUPPORTED_API_MODES
+
+
 def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
     """Schedule hidden judgments and carry proposal context across transformed output."""
     raw_session_id = _raw_session_key(kwargs)
@@ -503,9 +508,14 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         suppression_reason = "noninteractive_session"
     elif kwargs.get("structured_output"):
         suppression_reason = "structured_output"
+    elif _is_unsupported_runtime(kwargs):
+        suppression_reason = "unsupported_runtime"
     _invocation_scope.set((raw_session_id, session_id, suppression_reason))
     if suppression_reason:
-        if session_id and suppression_reason == "structured_output":
+        if session_id and suppression_reason in {
+            "structured_output",
+            "unsupported_runtime",
+        }:
             with _recent_lock:
                 state = _state_locked(session_id, time.monotonic())
                 state["pending_proposal"] = None
@@ -647,6 +657,7 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
         not session_id
         or not response_text
         or _is_noninteractive(kwargs)
+        or _is_unsupported_runtime(kwargs)
         or kwargs.get("structured_output")
         or is_intentional_silence_response(response_text)
     ):
@@ -698,7 +709,11 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
 
 def _on_post_llm_call(**kwargs: Any) -> None:
     """Commit draft confirmation only after the final response is durable."""
-    if _is_noninteractive(kwargs) or kwargs.get("structured_output"):
+    if (
+        _is_noninteractive(kwargs)
+        or _is_unsupported_runtime(kwargs)
+        or kwargs.get("structured_output")
+    ):
         return
     session_id = _session_key(kwargs)
     if not session_id:
@@ -747,6 +762,11 @@ def _propose_creation(args: dict[str, Any], **kwargs: Any) -> str:
     if not math.isfinite(confidence) or confidence < MIN_CONFIDENCE:
         return json.dumps(
             {"status": "not_proposed", "reason": "confidence_below_threshold"}
+        )
+
+    if _is_unsupported_runtime(kwargs):
+        return json.dumps(
+            {"status": "not_proposed", "reason": "unsupported_runtime"}
         )
 
     session_id = _session_key(kwargs)

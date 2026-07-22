@@ -48,3 +48,17 @@ def test_stream_delta_reports_failed_consumer_delivery():
 
     assert AIAgent._fire_stream_delta(agent, "not delivered") is False
     assert recorded == []
+
+
+def test_stream_delta_honors_explicit_delivery_rejection():
+    delivered = []
+
+    def reject(text):
+        delivered.append(text)
+        return False
+
+    agent, recorded = _agent(reject)
+
+    assert AIAgent._fire_stream_delta(agent, "queued but not delivered") is False
+    assert delivered == ["queued but not delivered"]
+    assert recorded == []

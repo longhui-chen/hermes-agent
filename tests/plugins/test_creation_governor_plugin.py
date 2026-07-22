@@ -969,6 +969,54 @@ def test_old_proposal_is_not_rehydrated_past_a_newer_assistant_reply():
     assert result is None
 
 
+def test_codex_app_server_cannot_enter_or_retain_draft_state():
+    plugin = _load_plugin()
+    session_id = "codex-app-server-session"
+    plugin._on_pre_llm_call(
+        session_id=session_id,
+        user_message="你好",
+        conversation_history=[],
+    )
+    proposal = {
+        "creation_type": "skill",
+        "suggested_name": "会议纪要流程",
+        "reason": "固化整理步骤",
+        "evidence": "会议转录",
+        "confidence": 0.9,
+        "dedup_key": "skill:会议纪要流程",
+    }
+    proposed = json.loads(plugin._propose_creation(proposal, session_id=session_id))
+    assert proposed["status"] == "proposal_ready"
+    proposal_response = plugin._transform_llm_output(
+        session_id=session_id,
+        response_text="会议纪要已整理。",
+        completed=True,
+        failed=False,
+    )
+
+    result = plugin._on_pre_llm_call(
+        session_id=session_id,
+        api_mode="codex_app_server",
+        user_message="生成方案",
+        conversation_history=[{"role": "assistant", "content": proposal_response}],
+    )
+
+    state = plugin._session_states[
+        plugin._session_key({"session_id": session_id})
+    ]
+    assert result is None
+    assert state["proposal_stage"] is None
+    assert state["pending_proposal"] is None
+    denied = json.loads(
+        plugin._propose_creation(
+            proposal,
+            session_id=session_id,
+            api_mode="codex_app_server",
+        )
+    )
+    assert denied == {"status": "not_proposed", "reason": "unsupported_runtime"}
+
+
 def test_plugin_self_query_reports_real_status_and_never_proposes(monkeypatch):
     plugin = _load_plugin()
     calls = []

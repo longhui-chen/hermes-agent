@@ -363,7 +363,7 @@ class TestMessageCallback:
             future.result.return_value = None
             mock_rcts.return_value = future
 
-            cb("Here is your answer.")
+            assert cb("Here is your answer.") is True
 
         mock_rcts.assert_called_once()
 
@@ -374,9 +374,15 @@ class TestMessageCallback:
         cb = make_message_cb(mock_conn, "session-1", loop)
 
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
-            cb("")
+            assert cb("") is False
 
         mock_rcts.assert_not_called()
+
+    def test_reports_failed_session_update(self, mock_conn, event_loop_fixture):
+        cb = make_message_cb(mock_conn, "session-1", event_loop_fixture)
+
+        with patch("acp_adapter.events._send_update", return_value=False):
+            assert cb("not delivered") is False
 
 
 # ---------------------------------------------------------------------------

@@ -76,3 +76,31 @@ def test_real_plugin_manager_loads_all_governor_hooks():
         "pre_tool_call",
     }
     assert loaded.tools_registered == ["propose_creation"]
+
+
+def test_real_plugin_manager_disables_governor_for_codex_app_server():
+    plugin = _load_plugin()
+    plugin_root = Path(__file__).resolve().parents[2] / "plugins"
+    manager = PluginManager()
+    manifests = manager._scan_directory(plugin_root, source="bundled")
+    manifest = next(item for item in manifests if item.name == "creation-governor")
+    manager._load_plugin(manifest)
+    prompt = plugin._proposal_payload(
+        "skill", "会议纪要流程", "固化整理步骤", "会议转录", 0.9
+    )["user_prompt"]
+
+    results = manager.invoke_hook(
+        "pre_llm_call",
+        session_id="codex-app-server-flow",
+        api_mode="codex_app_server",
+        user_message="生成方案",
+        conversation_history=[{"role": "assistant", "content": prompt}],
+    )
+
+    assert results == []
+    callback_globals = manager._hooks["pre_llm_call"][0].__globals__
+    state_key = callback_globals["_session_key"](
+        {"session_id": "codex-app-server-flow"}
+    )
+    state = callback_globals["_session_states"][state_key]
+    assert state["proposal_stage"] is None

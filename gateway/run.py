@@ -19171,7 +19171,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 previewed=_previewed,
             )
             if not _is_empty_sentinel and (
-                _transform_streamed
+                (_transform_streamed and (_streamed or _content_delivered))
                 or (not _transformed and (_streamed or _content_delivered))
             ):
                 logger.info(

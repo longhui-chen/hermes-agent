@@ -458,6 +458,7 @@ def build_turn_context(
             conversation_history=list(messages),
             is_first_turn=(not bool(conversation_history)),
             model=agent.model,
+            api_mode=getattr(agent, "api_mode", None) or "",
             platform=getattr(agent, "platform", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
             execution_origin=getattr(agent, "_memory_write_origin", "") or "",

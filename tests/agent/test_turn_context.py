@@ -214,6 +214,7 @@ def test_pre_llm_hook_receives_execution_origin_and_kanban_marker(monkeypatch):
     _build(agent)
 
     assert captured["platform"] == "cli"
+    assert captured["api_mode"] == "chat_completions"
     assert captured["execution_origin"] == "background_review"
     assert captured["is_kanban_worker"] is True
     assert captured["structured_output"] is True

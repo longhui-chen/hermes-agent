@@ -4779,8 +4779,12 @@ class AIAgent:
         delivered = False
         for cb in callbacks:
             try:
-                cb(text)
-                delivered = True
+                callback_result = cb(text)
+                # Legacy callbacks return None after synchronous delivery.
+                # An explicit False lets queue-backed transports report that
+                # the user-facing update did not actually reach its consumer.
+                if callback_result is not False:
+                    delivered = True
             except Exception:
                 pass
         if delivered:
