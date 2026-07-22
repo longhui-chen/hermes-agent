@@ -378,41 +378,6 @@ class ZetAgentAdapter(APIServerAdapter):
     _SKILL_INVOKE_ACQUIRE_TIMEOUT = 2.0
     _skill_invoke_semaphore = None
 
-    # Refcounted process-env pin used during expansion. The skills layer's
-    # platform resolution reads os.environ["HERMES_PLATFORM"] BEFORE the
-    # session contextvar (skill_commands._resolve_skill_commands_platform),
-    # so an externally provisioned value (hand-edited .env loaded with
-    # override=True at boot) would make scan_skill_commands() build the
-    # command table under a FOREIGN platform's skills.platform_disabled view
-    # — a skill allowed on zet_agent but disabled elsewhere would look
-    # uninstalled and the App invocation would silently no-op. Pinning the
-    # env for the expansion window is sound because the LS-spawned zet_agent
-    # process is single-platform by construction (API_SERVER_ENABLED=false,
-    # zet_agent only); concurrent readers seeing "zet_agent" is correct here.
-    _platform_env_lock = threading.Lock()
-    _platform_env_depth = 0
-    _platform_env_prior: Optional[str] = None
-
-    @classmethod
-    @contextmanager
-    def _force_zet_agent_platform_env(cls):
-        with cls._platform_env_lock:
-            cls._platform_env_depth += 1
-            if cls._platform_env_depth == 1:
-                cls._platform_env_prior = os.environ.get("HERMES_PLATFORM")
-                os.environ["HERMES_PLATFORM"] = "zet_agent"
-        try:
-            yield
-        finally:
-            with cls._platform_env_lock:
-                cls._platform_env_depth -= 1
-                if cls._platform_env_depth == 0:
-                    if cls._platform_env_prior is None:
-                        os.environ.pop("HERMES_PLATFORM", None)
-                    else:
-                        os.environ["HERMES_PLATFORM"] = cls._platform_env_prior
-                    cls._platform_env_prior = None
-
     async def _expand_inbound_skill_invocation(
         self, user_message: Any, skill_slug: str, session_id: Optional[str] = None
     ) -> Any:
@@ -445,36 +410,66 @@ class ZetAgentAdapter(APIServerAdapter):
                 "[zet_agent] skill expansion saturated; passing message through",
             )
             return user_message
-        # The permit is returned when the WORKER finishes, not when this await
-        # ends: cancelling the awaiting request (client disconnect) does not
-        # stop the executor thread, and a try/finally (or a done-callback on
-        # the asyncio wrapper future — task cancellation marks it cancelled
-        # immediately while the thread keeps running) would let a
-        # connect-and-drop loop bypass the concurrency cap and pile workers
-        # onto the shared default executor. The worker itself schedules the
-        # release from its finally via call_soon_threadsafe — the only point
-        # that provably runs exactly once, when the thread is truly done.
-        # run_in_executor + copied context (to_thread equivalent) keeps the
-        # platform binding task-local.
+        # Permit accounting must survive BOTH cancellation shapes (a
+        # try/finally or a done-callback on the asyncio wrapper handles
+        # neither correctly):
+        #   - worker RUNNING when the caller is cancelled: the thread keeps
+        #     going, so the permit must stay held until the worker's own
+        #     finally releases it (early release = connect-and-drop loop
+        #     bypasses the cap and piles workers onto the shared executor);
+        #   - worker still QUEUED when the caller is cancelled: the executor
+        #     future is cancelled before the fn ever starts, its finally will
+        #     never run, so the CALLER must refund the permit right here —
+        #     otherwise 4 drops leak all permits until process restart.
+        # A started/released flag pair under a lock makes the two paths
+        # mutually exclusive and the release exactly-once; a worker that
+        # loses the race (starts after a queued-cancel refund) exits without
+        # touching the skills layer. run_in_executor + copied context
+        # (to_thread equivalent) keeps the platform binding task-local.
         import contextvars
 
         loop = asyncio.get_running_loop()
         ctx = contextvars.copy_context()
+        state_lock = threading.Lock()
+        state = {"started": False, "released": False}
+
+        def _release_from_worker():
+            with state_lock:
+                if state["released"]:
+                    return
+                state["released"] = True
+            try:
+                loop.call_soon_threadsafe(sema.release)
+            except RuntimeError:
+                # Loop already closed (shutdown) — the permit is moot.
+                pass
 
         def _worker():
+            with state_lock:
+                if state["released"]:
+                    # Queued-cancel already refunded the permit; stay out of
+                    # the skills layer (the caller is gone anyway).
+                    return user_message
+                state["started"] = True
             try:
                 return ctx.run(
                     self._expand_inbound_skill_invocation_blocking,
                     user_message, skill_slug, session_id,
                 )
             finally:
-                try:
-                    loop.call_soon_threadsafe(sema.release)
-                except RuntimeError:
-                    # Loop already closed (shutdown) — the permit is moot.
-                    pass
+                _release_from_worker()
 
-        return await loop.run_in_executor(None, _worker)
+        fut = loop.run_in_executor(None, _worker)
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            with state_lock:
+                refund = not state["started"] and not state["released"]
+                if refund:
+                    state["released"] = True
+            if refund:
+                sema.release()
+            raise
 
     def _expand_inbound_skill_invocation_blocking(
         self, user_message: str, skill_slug: str, session_id: Optional[str] = None
@@ -507,12 +502,14 @@ class ZetAgentAdapter(APIServerAdapter):
             ``skills.platform_disabled.zet_agent`` and frontmatter
             ``platforms:`` filters silently resolve against no platform —
             a skill disabled only for zet_agent would still expand.
-          - the platform-disabled gate is ALSO enforced with an explicit
-            ``platform="zet_agent"`` argument: the resolution chain reads the
-            ``HERMES_PLATFORM`` process env BEFORE the contextvar, so an
-            externally provisioned env value (e.g. a hand-edited .env loaded
-            with override=True at boot) would shadow the binding above. The
-            explicit argument has top precedence and cannot be shadowed.
+          - the fork's skill-scope resolvers read the session ContextVar
+            BEFORE the process ``HERMES_PLATFORM`` env (ZET fork semantic —
+            see skill_commands._resolve_skill_commands_platform), so the
+            binding above governs scan/build even when an external env value
+            exists, without mutating process-global state that a co-hosted
+            platform could observe. The platform-disabled gate is ALSO
+            enforced with an explicit ``platform="zet_agent"`` argument —
+            top precedence, cannot be shadowed by anything.
           - the payload is built by the canonical
             ``build_skill_invocation_message`` (same scaffolding as the CLI
             slash): MemoryManager._strip_skill_scaffolding keys off the
@@ -528,22 +525,23 @@ class ZetAgentAdapter(APIServerAdapter):
         token = "/" + skill_slug
         platform_token = push_session_platform("zet_agent")
         try:
-            with self._force_zet_agent_platform_env():
-                return self._expand_with_platform_pinned(
-                    user_message, skill_slug, token, session_id
-                )
+            return self._expand_under_platform_binding(
+                user_message, skill_slug, token, session_id
+            )
         finally:
             pop_session_platform(platform_token)
 
-    def _expand_with_platform_pinned(
+    def _expand_under_platform_binding(
         self,
         user_message: str,
         skill_slug: str,
         token: str,
         session_id: Optional[str],
     ) -> Any:
-        """Body of the expansion; runs with HERMES_PLATFORM pinned and the
-        session platform contextvar bound to zet_agent (see caller)."""
+        """Body of the expansion; runs with the session platform contextvar
+        bound to zet_agent (see caller). The fork's skill-scope resolvers
+        read that ContextVar BEFORE the process HERMES_PLATFORM env, so the
+        binding is authoritative here without touching global state."""
         try:
             from agent.skill_commands import (
                 build_skill_invocation_message,

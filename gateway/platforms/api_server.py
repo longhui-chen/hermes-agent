@@ -2649,10 +2649,19 @@ class APIServerAdapter(BasePlatformAdapter):
             agent_ref = [None]
             # Streaming has no idempotency layer — expand once, right before
             # the run (see _expanded_user_message for the placement contract).
-            user_message = await _expanded_user_message()
+            # The profile active-run count opens FIRST so /v1/profile/unload
+            # cannot tear the profile down under an in-flight expansion.
             profile_run_key = self._begin_profile_chat_run(
                 request.get("hermes_profile_home")
             )
+            try:
+                user_message = await _expanded_user_message()
+            except BaseException:
+                # The stream path ends the run in the agent task's
+                # done-callback; a failure before that task exists must not
+                # leak the active-run count (unload would then hang/refuse).
+                self._end_profile_chat_run(profile_run_key)
+                raise
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
@@ -2683,15 +2692,18 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
         async def _compute_completion():
-            # Expansion lives INSIDE the idempotency-protected compute: an
-            # Idempotency-Key hit (or a concurrent duplicate awaiting the
-            # first flight) must reuse the cached result without re-running
-            # expansion side effects.
-            expanded_message = await _expanded_user_message()
+            # The profile active-run count opens BEFORE expansion: /v1/profile
+            # /unload treats zero active runs as idle, and an expansion still
+            # in flight (scan/load/inline_shell) must not let the profile be
+            # torn down under it. Expansion stays INSIDE the idempotency-
+            # protected compute: an Idempotency-Key hit (or a concurrent
+            # duplicate awaiting the first flight) must reuse the cached
+            # result without re-running expansion side effects.
             profile_run_key = self._begin_profile_chat_run(
                 request.get("hermes_profile_home")
             )
             try:
+                expanded_message = await _expanded_user_message()
                 return await self._run_agent(
                     user_message=expanded_message,
                     conversation_history=history,

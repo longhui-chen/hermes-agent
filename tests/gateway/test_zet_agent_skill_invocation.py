@@ -248,20 +248,63 @@ def test_platform_disabled_skill_passes_through_even_with_foreign_env(monkeypatc
     assert "user_instruction" not in calls, "disabled skill must never be built"
 
 
-def test_scan_runs_with_platform_env_pinned_and_restored(monkeypatch):
-    # skills 层的平台解析先读 HERMES_PLATFORM 进程 env 再读 contextvar——
-    # 外部注入的 env 会让 scan_skill_commands 按外平台的 platform_disabled
-    # 视图建表：zet_agent 允许、他平台禁用的 skill 会被当成未安装而静默
-    # 不生效。展开窗口内必须把 env 钉为 zet_agent，结束后精确还原。
+def test_contextvar_binding_outranks_foreign_platform_env(monkeypatch):
+    # ZET fork 语义：技能层平台解析 ContextVar 优先于进程 HERMES_PLATFORM。
+    # 外部注入的 env 不再遮蔽展开窗口的绑定（zet_agent 允许、他平台禁用的
+    # skill 不会被误判为未安装），且展开不改任何进程全局状态——共存平台
+    # 的并发线程看到的 env 原封不动。
+    import os
+
+    from agent.skill_commands import _resolve_skill_commands_platform
+    from gateway.session_context import (
+        pop_session_platform,
+        push_session_platform,
+        reset_session_vars,
+    )
+
+    # 组合运行时其它用例可能在本上下文残留已绑定的 contextvar——先清到
+    # _UNSET,让「绑定外回退 env」的断言确定性成立。
+    reset_session_vars()
     monkeypatch.setenv("HERMES_PLATFORM", "telegram")
     calls = _patch_skill_layer(monkeypatch)
     adapter = _make_adapter()
     out = _expand(adapter, "/deep-research 研究黄金")
     assert out.startswith("<<EXPANDED:")
-    assert calls["scan_env_platform"] == "zet_agent"
-    import os
+    assert calls["scan_env_platform"] == "telegram", "process env must never be mutated"
 
-    assert os.environ.get("HERMES_PLATFORM") == "telegram", "env must be restored"
+    # resolver 单元断言：绑定内 contextvar 赢，绑定外回退 env。
+    tok = push_session_platform("zet_agent")
+    try:
+        assert _resolve_skill_commands_platform() == "zet_agent"
+    finally:
+        pop_session_platform(tok)
+    assert _resolve_skill_commands_platform() == "telegram"
+    assert os.environ.get("HERMES_PLATFORM") == "telegram"
+
+
+def test_queued_cancel_refunds_semaphore_permit(monkeypatch):
+    # executor 满载时 worker 还在队列里就被取消：fn 永不执行、finally 永不
+    # 触发——必须由等待方当场退款，否则 4 次断开就把许可漏光（review P1）。
+    _patch_skill_layer(monkeypatch)
+    adapter = _make_adapter()
+
+    async def _run():
+        loop = asyncio.get_running_loop()
+        never = loop.create_future()  # 模拟排队中的 executor future
+        monkeypatch.setattr(loop, "run_in_executor", lambda executor, fn: never)
+        task = asyncio.create_task(
+            adapter._expand_inbound_skill_invocation("x", "deep-research")
+        )
+        await asyncio.sleep(0)  # 让 acquire 与 run_in_executor 调用完成
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        sema = adapter._skill_invoke_semaphore
+        assert sema._value == adapter._SKILL_INVOKE_MAX_CONCURRENCY, (
+            "queued-cancel must refund the permit immediately"
+        )
+
+    asyncio.run(_run())
 
 
 def test_cancelled_caller_does_not_leak_semaphore_permit(monkeypatch):
