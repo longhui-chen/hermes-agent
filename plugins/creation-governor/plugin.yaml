@@ -1,10 +1,10 @@
 name: creation-governor
-version: 0.5.4
-description: "Use the main model's zero-shot semantic judgment to gently reveal reusable Agent, Skill, or scheduled-task opportunities."
+version: 0.6.0
+description: "Run bounded zero-shot creation checks and conditionally attach low-noise Agent, Skill, or Task recommendations."
 author: Zettlab
 kind: standalone
 provides_tools:
-  - propose_creation
+  - detect_creation_opportunity
 provides_hooks:
   - pre_llm_call
   - transform_llm_output

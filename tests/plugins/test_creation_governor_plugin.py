@@ -1,6 +1,8 @@
+import base64
 import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,7 +16,9 @@ PLUGIN_PATH = (
 
 
 def _load_plugin():
-    spec = importlib.util.spec_from_file_location("creation_governor_plugin", PLUGIN_PATH)
+    spec = importlib.util.spec_from_file_location(
+        "creation_governor_plugin", PLUGIN_PATH
+    )
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
@@ -22,335 +26,346 @@ def _load_plugin():
     return module
 
 
-def _proposal(
+def _candidate(
     *,
-    creation_type="agent",
-    suggested_name="Meta Ads Analyst",
-    reason="Retained context will improve future analysis.",
-    evidence="The user asked for a substantive domain analysis.",
-    confidence=0.78,
-    dedup_key="meta-ads-analysis",
-    proposal_text="This could be reusable as a Meta Ads Analyst Agent—would you like me to prepare the creation plan?",
+    decision="agent",
+    suggested_name="Google Ads Analyst",
+    reason="Retained account context and judgment will improve future analysis.",
+    confidence=0.82,
+    dedup_key="google-ads-analyst",
+    proposal_text="Would you like me to create this Google Ads Analyst Agent?",
 ):
     return {
-        "creation_type": creation_type,
+        "decision": decision,
         "suggested_name": suggested_name,
         "reason": reason,
-        "evidence": evidence,
+        "evidence_turn_ids": ["evidence-1"],
         "confidence": confidence,
         "dedup_key": dedup_key,
         "proposal_text": proposal_text,
     }
 
 
-def test_unicode_dedup_keys_are_nonempty_and_do_not_collapse():
+class _FakeLlm:
+    def __init__(self, results):
+        self.results = list(results)
+        self.calls = []
+
+    def complete_structured(self, **kwargs):
+        self.calls.append(kwargs)
+        parsed = self.results.pop(0)
+        return SimpleNamespace(parsed=parsed)
+
+
+class _ResponseFormatFallbackLlm:
+    def __init__(self, result):
+        self.result = result
+        self.structured_calls = []
+        self.complete_calls = []
+
+    def complete_structured(self, **kwargs):
+        self.structured_calls.append(kwargs)
+        raise RuntimeError("This response_format type is unavailable now")
+
+    def complete(self, messages, **kwargs):
+        self.complete_calls.append((messages, kwargs))
+        return SimpleNamespace(text=f"```json\n{json.dumps(self.result)}\n```")
+
+
+class _Context:
+    def __init__(self, llm=None):
+        self.llm = llm
+        self.tools = []
+        self.hooks = []
+
+    def register_tool(self, **kwargs):
+        self.tools.append(kwargs)
+
+    def register_hook(self, *args, **kwargs):
+        self.hooks.append((args, kwargs))
+
+
+def _decode_envelope(text):
+    prefix = "<!--creation-recommendation:start "
+    encoded = text.split(prefix, 1)[1].split("-->", 1)[0].strip()
+    encoded += "=" * (-len(encoded) % 4)
+    return json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+
+
+def test_first_turn_and_every_third_turn_run_bounded_structured_checks():
     plugin = _load_plugin()
-    news = plugin._semantic_dedup_key("每日新闻", "scheduled_task", "每日新闻简报")
-    meeting = plugin._semantic_dedup_key("会议纪要", "skill", "会议纪要流程")
-
-    assert news.startswith("scheduled_task:")
-    assert meeting.startswith("skill:")
-    assert news != meeting
-    assert len(news) > len("scheduled_task:")
-
-
-def test_first_turn_receives_zero_shot_review_without_keyword_classification():
-    plugin = _load_plugin()
-    inputs = (
-        "帮我看看今天有什么 AI 新闻",
-        "Take a look at our customer pipeline.",
-        "Analiza el rendimiento reciente de la campaña.",
+    none = _candidate(
+        decision="none",
+        suggested_name="",
+        reason="",
+        confidence=0,
+        dedup_key="",
+        proposal_text="",
     )
+    llm = _FakeLlm([none, none, none])
+    plugin.register(_Context(llm))
 
-    contexts = []
-    for index, message in enumerate(inputs):
-        result = plugin._on_pre_llm_call(
-            session_id=f"language-{index}",
-            user_message=message,
+    for turn in range(1, 7):
+        plugin._on_pre_llm_call(
+            session_id="checkpoint-session",
+            user_message=f"message {turn}",
             conversation_history=[],
         )
-        assert result is not None
-        contexts.append(result["context"])
 
-    assert contexts[0] == contexts[1] == contexts[2]
-    assert "zero-shot" in contexts[0]
-    assert "not from keywords" in contexts[0]
-    assert "One substantive request is enough" in contexts[0]
-    assert "first tool call" in contexts[0]
-    assert "future fresh information" in contexts[0]
-    assert "must not mention, draft, or paraphrase" in contexts[0]
-    assert not hasattr(plugin, "_TASK_HINT_RE")
-    assert not hasattr(plugin, "_TOPIC_RULES")
-    assert not hasattr(plugin, "_judge_creation_opportunity")
-
-
-def test_third_turn_forces_a_silent_checkpoint_and_repeats_every_three_turns():
-    plugin = _load_plugin()
-    results = []
-    for turn in range(1, 7):
-        results.append(
-            plugin._on_pre_llm_call(
-                session_id="checkpoint-session",
-                user_message=f"message {turn}",
-                conversation_history=[],
-            )["context"]
-        )
-
-    assert "Silently consider" in results[0]
-    assert "scheduled checkpoint" not in results[1]
-    assert "scheduled checkpoint" in results[2]
-    assert "scheduled checkpoint" in results[5]
+    assert len(llm.calls) == 3
     assert plugin._session_states["checkpoint-session"]["last_evaluation_turn"] == 6
+    assert all(
+        call["purpose"] == "creation_opportunity_checkpoint" for call in llm.calls
+    )
+    assert all(call["max_tokens"] == 500 for call in llm.calls)
+    assert "high-recall zero-shot" in llm.calls[0]["instructions"]
+    assert "ongoing external work domain" in llm.calls[0]["instructions"]
+    assert "today" in llm.calls[0]["instructions"]
+    assert "not by itself a future trigger" in llm.calls[0]["instructions"]
 
 
-def test_tool_approved_english_proposal_is_delivered_exactly_once():
+def test_positive_checkpoint_preserves_answer_and_appends_card_envelope_once():
     plugin = _load_plugin()
-    plugin._on_pre_llm_call(
+    llm = _FakeLlm([_candidate()])
+    plugin.register(_Context(llm))
+
+    context = plugin._on_pre_llm_call(
         session_id="english-session",
-        user_message="Review my recent Meta ads performance.",
+        turn_id="turn-1",
+        user_message="Tell me which Google Ads campaign performed best today.",
         conversation_history=[],
     )
-    args = _proposal()
-    result = json.loads(plugin._propose_creation(args, session_id="english-session"))
 
-    assert result["status"] == "proposal_ready"
-    assert result["delivery"] == "deferred_to_transform_hook"
-    assert "user_prompt" not in result
-    assert args["proposal_text"] not in result["next_step"]
-    assert "Review my recent Meta ads performance" in result["next_step"]
-    assert "is not a deliverable" in result["next_step"]
-
+    assert "already completed" in context["context"]
     transformed = plugin._transform_llm_output(
         session_id="english-session",
-        response_text="Here is the performance analysis.",
+        response_text="Campaign A had the strongest ROAS.",
     )
-    assert transformed.endswith(args["proposal_text"])
-    assert plugin._transform_llm_output(
-        session_id="english-session",
-        response_text=transformed,
-    ) is None
+    assert transformed.startswith("Campaign A had the strongest ROAS.")
+    assert "<!--creation-recommendation:start " in transformed
+    assert "This could become a reusable Agent" in transformed
+    payload = _decode_envelope(transformed)
+    assert payload == {
+        "version": 1,
+        "type": "creation_recommendation",
+        "creation_type": "agent",
+        "title": "Google Ads Analyst",
+        "reason": "Retained account context and judgment will improve future analysis.",
+        "dedup_key": "agent:google-ads-analyst",
+        "confidence": 0.82,
+        "evidence_turn_ids": ["evidence-1"],
+    }
+    assert (
+        plugin._transform_llm_output(
+            session_id="english-session",
+            response_text=transformed,
+        )
+        is None
+    )
 
 
-def test_tool_preserves_chinese_and_mixed_language_proposal_text():
+def test_checkpoint_falls_back_when_provider_rejects_response_format():
     plugin = _load_plugin()
+    llm = _ResponseFormatFallbackLlm(_candidate())
+    plugin.register(_Context(llm))
+
     plugin._on_pre_llm_call(
-        session_id="mixed-session",
-        user_message="帮我 review 一下最近的 Meta ads",
+        session_id="fallback-session",
+        user_message="Tell me which Google Ads campaign performed best today.",
         conversation_history=[],
     )
-    args = _proposal(
-        suggested_name="Meta 广告分析师",
-        reason="保留账户背景和判断口径，后续分析会更稳定。",
-        evidence="用户希望分析近期 Meta ads 表现。",
-        dedup_key="Meta 广告分析",
-        proposal_text="这类分析以后可能还会用到，要不要为你准备一个「Meta 广告分析师」Agent 的创建方案？",
+    transformed = plugin._transform_llm_output(
+        session_id="fallback-session",
+        response_text="Campaign A had the strongest ROAS.",
     )
-    result = json.loads(plugin._propose_creation(args, session_id="mixed-session"))
 
-    assert result["status"] == "proposal_ready"
-    assert result["delivery"] == "deferred_to_transform_hook"
-    stored = plugin._session_states["mixed-session"]["last_proposal"]
-    assert stored["dedup_key"].startswith("agent:")
-    assert stored["dedup_key"] != "agent:"
+    assert len(llm.structured_calls) == 1
+    assert len(llm.complete_calls) == 1
+    assert llm.complete_calls[0][1]["purpose"].endswith("json_fallback")
+    assert "<!--creation-recommendation:start " in transformed
+    assert _decode_envelope(transformed)["creation_type"] == "agent"
 
 
-def test_response_that_already_names_the_proposal_is_not_duplicated():
+def test_none_checkpoint_is_completely_invisible():
     plugin = _load_plugin()
+    none = _candidate(
+        decision="none",
+        suggested_name="",
+        reason="",
+        confidence=0,
+        dedup_key="",
+        proposal_text="",
+    )
+    plugin.register(_Context(_FakeLlm([none])))
+
     plugin._on_pre_llm_call(
-        session_id="already-rendered",
-        user_message="Please review this campaign.",
+        session_id="none-session",
+        user_message="Hello",
         conversation_history=[],
     )
-    args = _proposal()
-    plugin._propose_creation(args, session_id="already-rendered")
-
-    response = f"Done. {args['proposal_text']}"
-    assert plugin._transform_llm_output(
-        session_id="already-rendered",
-        response_text=response,
-    ) is None
-
-
-def test_prompt_cooldown_suppresses_the_next_ten_user_turns():
-    plugin = _load_plugin()
-    plugin._on_pre_llm_call(
-        session_id="cooldown-session",
-        user_message="Analyze this account.",
-        conversation_history=[],
+    assert (
+        plugin._transform_llm_output(
+            session_id="none-session",
+            response_text="Hello!",
+        )
+        is None
     )
-    assert json.loads(
-        plugin._propose_creation(_proposal(), session_id="cooldown-session")
-    )["status"] == "proposal_ready"
 
-    for turn in range(1, 11):
+
+def test_display_cooldown_does_not_stop_background_checkpoints():
+    plugin = _load_plugin()
+    candidates = [
+        _candidate(),
+        _candidate(suggested_name="Second candidate", dedup_key="second"),
+        _candidate(suggested_name="Third candidate", dedup_key="third"),
+        _candidate(suggested_name="Fourth candidate", dedup_key="fourth"),
+        _candidate(suggested_name="After cooldown", dedup_key="after-cooldown"),
+    ]
+    llm = _FakeLlm(candidates)
+    plugin.register(_Context(llm))
+
+    for turn in range(1, 13):
         plugin._on_pre_llm_call(
             session_id="cooldown-session",
-            user_message=f"follow up {turn}",
+            user_message=f"request {turn}",
             conversation_history=[],
         )
-        blocked = _proposal(
-            suggested_name=f"Analyst {turn}",
-            dedup_key=f"blocked-{turn}",
-            proposal_text=f"Would you like an Analyst {turn} creation plan?",
+        transformed = plugin._transform_llm_output(
+            session_id="cooldown-session",
+            response_text=f"answer {turn}",
         )
-        assert json.loads(
-            plugin._propose_creation(blocked, session_id="cooldown-session")
-        ) == {"status": "not_proposed", "reason": "prompt_cooldown"}
+        if turn == 1:
+            assert transformed is not None
+        elif turn < 12:
+            assert transformed is None
+        else:
+            assert transformed is not None
+            assert "After cooldown" in transformed
 
+    assert len(llm.calls) == 5
+
+
+def test_dismissal_latches_the_same_semantic_candidate():
+    plugin = _load_plugin()
+    first = _candidate(
+        suggested_name="广告分析助手",
+        reason="保留账户背景后，后续判断会更稳定。",
+        proposal_text="要为你创建这个广告分析助手吗？",
+    )
+    plugin.register(_Context(_FakeLlm([first])))
     plugin._on_pre_llm_call(
-        session_id="cooldown-session",
-        user_message="one more follow up",
+        session_id="dismiss-session",
+        user_message="看看广告效果",
         conversation_history=[],
     )
-    allowed = _proposal(
-        suggested_name="New Analyst",
-        dedup_key="after-ten",
-        proposal_text="Would you like me to prepare a New Analyst creation plan?",
+    shown = plugin._transform_llm_output(
+        session_id="dismiss-session",
+        response_text="分析完成。",
     )
+    assert "可以沉淀为一个 Agent" in shown
+
+    action = plugin._on_pre_llm_call(
+        session_id="dismiss-session",
+        user_message="暂时不要创建「广告分析助手」",
+        conversation_history=[],
+    )
+    assert "dismissed" in action["context"]
+
+    with plugin._state_lock:
+        plugin._session_states["dismiss-session"]["last_prompt_turn"] = -10_000
+    result = json.loads(
+        plugin._detect_creation_opportunity(first, session_id="dismiss-session")
+    )
+    assert result == {"status": "candidate_recorded", "reason": "dismissed"}
+
+
+def test_optional_tool_accepts_none_and_rejects_invalid_or_low_confidence():
+    plugin = _load_plugin()
     assert json.loads(
-        plugin._propose_creation(allowed, session_id="cooldown-session")
-    )["status"] == "proposal_ready"
-
-
-def test_cooldown_removes_review_nudge_but_keeps_short_acceptance_context():
-    plugin = _load_plugin()
-    plugin._on_pre_llm_call(
-        session_id="carry-session",
-        user_message="Analyze this account.",
-        conversation_history=[],
-    )
-    plugin._propose_creation(_proposal(), session_id="carry-session")
-
-    next_turn = plugin._on_pre_llm_call(
-        session_id="carry-session",
-        user_message="Yes, do that.",
-        conversation_history=[],
-    )
-    assert "previous user-facing response" in next_turn["context"]
-    assert "zero-shot review" not in next_turn["context"]
-
-    for index in range(3):
-        result = plugin._on_pre_llm_call(
-            session_id="carry-session",
-            user_message=f"continuation {index}",
-            conversation_history=[],
+        plugin._detect_creation_opportunity(
+            _candidate(
+                decision="none",
+                suggested_name="",
+                reason="",
+                confidence=0,
+                dedup_key="",
+                proposal_text="",
+            ),
+            session_id="none-tool",
         )
-    assert result is None
+    ) == {"status": "no_candidate", "reason": "none"}
+    assert json.loads(
+        plugin._detect_creation_opportunity(
+            _candidate(decision="artifact"), session_id="invalid"
+        )
+    ) == {"status": "not_proposed", "reason": "unsupported_creation_type"}
+    assert json.loads(
+        plugin._detect_creation_opportunity(
+            _candidate(confidence=0.2), session_id="low"
+        )
+    ) == {"status": "not_proposed", "reason": "confidence_below_threshold"}
 
 
-def test_recent_duplicate_suppression_expires():
+def test_unicode_dedup_keys_are_stable_and_nonempty():
     plugin = _load_plugin()
-    assert plugin._claim_proposal("session-a", "skill:meeting-notes", 10.0) is True
-    assert plugin._claim_proposal("session-a", "skill:meeting-notes", 11.0) is False
-    later = 10.0 + plugin.PROPOSAL_TTL_SECONDS + 1
-    assert plugin._claim_proposal("session-a", "skill:meeting-notes", later) is True
+    news = plugin._semantic_dedup_key("每日新闻", "task", "每日新闻简报")
+    meeting = plugin._semantic_dedup_key("会议纪要", "skill", "会议纪要流程")
+    assert news.startswith("task:")
+    assert meeting.startswith("skill:")
+    assert news != meeting
 
 
-def test_low_confidence_and_invalid_types_are_rejected():
+def test_self_query_reports_runtime_without_triggering_evaluation():
     plugin = _load_plugin()
-    low = _proposal(confidence=0.3)
-    invalid = _proposal(creation_type="artifact")
-
-    assert json.loads(plugin._propose_creation(low, session_id="low")) == {
-        "status": "not_proposed",
-        "reason": "confidence_below_threshold",
-    }
-    assert json.loads(plugin._propose_creation(invalid, session_id="invalid")) == {
-        "status": "invalid",
-        "error": "unsupported_creation_type",
-    }
-
-
-def test_missing_user_facing_proposal_text_is_rejected():
-    plugin = _load_plugin()
-    args = _proposal(proposal_text="")
-    assert json.loads(plugin._propose_creation(args, session_id="missing")) == {
-        "status": "invalid",
-        "error": "missing_proposal_fields",
-    }
-
-
-def test_plugin_self_query_reports_zero_shot_status_without_reviewing():
-    plugin = _load_plugin()
+    llm = _FakeLlm([])
+    plugin.register(_Context(llm))
     context = plugin._on_pre_llm_call(
-        session_id="self-query-session",
+        session_id="self-query",
         user_message="Do you have creation governor?",
         conversation_history=[],
     )
-
     assert plugin.PLUGIN_VERSION in context["context"]
-    assert "zero-shot semantic opportunity judgment" in context["context"]
-    assert "internal zero-shot review" not in context["context"]
+    assert "first turn and every third turn" in context["context"]
+    assert llm.calls == []
 
 
-def test_tool_schema_uses_semantic_definitions_without_scenario_examples():
+def test_tool_schema_is_zero_shot_and_supports_all_outcomes():
     plugin = _load_plugin()
-
-    class Context:
-        def __init__(self):
-            self.tools = []
-            self.hooks = []
-
-        def register_tool(self, **kwargs):
-            self.tools.append(kwargs)
-
-        def register_hook(self, *args, **kwargs):
-            self.hooks.append((args, kwargs))
-
-    context = Context()
+    context = _Context()
     plugin.register(context)
     schema = context.tools[0]["schema"]
     description = schema["description"]
 
-    assert "zero-shot semantic discovery" in description
-    assert "An Agent is appropriate" in description
-    assert "A Skill is appropriate" in description
-    assert "A scheduled_task is appropriate" in description
-    assert "phrased as being for today" in description
-    assert "before a long tool chain" in description
-    assert "explicitly asks to create" in description
+    assert context.tools[0]["name"] == "detect_creation_opportunity"
+    assert context.tools[0]["toolset"] == "creation_governor"
+    assert "zero-shot" in description
+    assert "today is not by itself a trigger" in description
+    assert "Missing connectors" in description
     assert "Meta" not in description
     assert "AI news" not in description
-    assert context.tools[0]["toolset"] == "creation_governor"
-    assert schema["parameters"]["properties"]["creation_type"]["enum"] == [
+    assert schema["parameters"]["properties"]["decision"]["enum"] == [
         "agent",
         "skill",
-        "scheduled_task",
+        "task",
+        "none",
     ]
-    assert "proposal_text" in schema["parameters"]["required"]
 
 
-@pytest.mark.parametrize(
-    ("creation_type", "name", "proposal_text"),
-    [
-        ("agent", "Research Partner", "Would you like me to prepare a Research Partner Agent plan?"),
-        ("skill", "摘要整理流程", "要不要为你准备一个「摘要整理流程」Skill 的创建方案？"),
-        ("scheduled_task", "Informe semanal", "¿Quieres que prepare el plan de esta tarea semanal?"),
-    ],
-)
-def test_all_creation_types_and_languages_share_the_same_governor(
-    creation_type,
-    name,
-    proposal_text,
-):
+@pytest.mark.parametrize("decision", ["agent", "skill", "task"])
+def test_all_creation_types_share_the_same_envelope(decision):
     plugin = _load_plugin()
-    session_id = f"type-{creation_type}"
+    candidate = _candidate(decision=decision, dedup_key=f"{decision}-example")
     plugin._on_pre_llm_call(
-        session_id=session_id,
-        user_message="A substantive request in the user's own language.",
+        session_id=f"type-{decision}",
+        user_message="A reusable request.",
         conversation_history=[],
     )
-    args = _proposal(
-        creation_type=creation_type,
-        suggested_name=name,
-        dedup_key=f"{creation_type}-semantic-purpose",
-        proposal_text=proposal_text,
+    result = json.loads(
+        plugin._detect_creation_opportunity(candidate, session_id=f"type-{decision}")
     )
-    result = json.loads(plugin._propose_creation(args, session_id=session_id))
-
     assert result["status"] == "proposal_ready"
     transformed = plugin._transform_llm_output(
-        session_id=session_id,
-        response_text="The user's current task is complete.",
+        session_id=f"type-{decision}",
+        response_text="The current task is complete.",
     )
-    assert transformed.endswith(proposal_text)
+    assert _decode_envelope(transformed)["creation_type"] == decision
