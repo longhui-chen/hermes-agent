@@ -315,9 +315,10 @@ def push_session_platform(platform: str):
     Unlike ``set_session_vars``/``clear_session_vars`` (not nestable — clearing
     stamps every var to ``""``), this pair is token-based and restores the
     prior value exactly, so it can wrap a narrow pre-session window. Used by
-    zet_agent's inbound skill-slash expansion, which runs in the HTTP handler
-    BEFORE the session is bound and must still resolve platform-scoped skill
-    config (``skills.platform_disabled``, frontmatter ``platforms:`` filters).
+    zet_agent's inbound skill invocation expansion (metadata.skill_slug),
+    which runs in the HTTP handler BEFORE the session is bound and must still
+    resolve platform-scoped skill config (``skills.platform_disabled``,
+    frontmatter ``platforms:`` filters).
     """
     return _SESSION_PLATFORM.set(platform or "")
 
