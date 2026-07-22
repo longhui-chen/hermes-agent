@@ -74,12 +74,16 @@ After the first successful exchange, reuse Hermes' native
 """
 
 import asyncio
+import inspect
 import json
 import logging
 import os
+import re
 import threading
 import time
+import uuid
 from collections import OrderedDict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -225,16 +229,19 @@ class _ClarifyEntry:
     """One pending clarify request inside a session FIFO queue.
 
     The agent thread enters ``wait()`` on ``event``; the HTTP respond
-    handler pops the oldest entry, stores the response, and calls
-    ``event.set()`` to unblock the agent. Mirrors hermes-webui's
-    api/clarify.py shape so the wire protocol stays Plan-E rev4
-    compliant (no request_id; per-session FIFO).
+    handler resolves the matching entry, stores the response, and calls
+    ``event.set()`` to unblock the agent. ``clarify_id`` is generated at
+    creation and is the stable identity sent both over the live stream and
+    through the reconnect ``/pending`` projection. Older callers may omit it
+    when responding, in which case the historical FIFO behavior is retained.
     """
 
-    __slots__ = ("event", "response")
+    __slots__ = ("clarify_id", "event", "payload", "response")
 
-    def __init__(self) -> None:
+    def __init__(self, clarify_id: str, payload: Dict[str, Any]) -> None:
+        self.clarify_id = clarify_id
         self.event = threading.Event()
+        self.payload = payload
         self.response: Optional[str] = None
 
 
@@ -271,7 +278,10 @@ class ZetAgentAdapter(APIServerAdapter):
         # One-shot warn flag for closure-sniff failures.
         self._sniff_warned: bool = False
 
-        # Pending clarify prompts: session_id -> list[_ClarifyEntry] (FIFO).
+        # Pending clarify prompts: {profile-home}|{session_id} ->
+        # list[_ClarifyEntry] (FIFO). A bare session id is not a gateway
+        # identity in multiplex mode: /p/main and /p/coder may legitimately
+        # run one same-named session at the same time.
         # Plan-E rev4 wire model is "single oldest pending wins on respond";
         # the queue holds entries created concurrently within one session,
         # though in practice clarify_callback blocks the agent thread so
@@ -283,8 +293,8 @@ class ZetAgentAdapter(APIServerAdapter):
         self._clarify_queues: Dict[str, List[_ClarifyEntry]] = {}
 
         # Mirror of the most recently pushed (and not yet resolved) prompt
-        # payload per session. Used by GET /v1/sessions/{sid}/pending so a
-        # reconnecting client (chat.resume path) can re-render the modal
+        # payload per scoped session. Used by GET /v1/sessions/{sid}/pending
+        # so a reconnecting client (chat.resume path) can re-render the modal
         # for any interaction the agent thread is still blocked on.
         self._pending_lock = threading.Lock()
         self._pending_clarify: Dict[str, Dict[str, Any]] = {}
@@ -364,6 +374,284 @@ class ZetAgentAdapter(APIServerAdapter):
         if text.startswith("[Zettlab internal routing directive]") and marker in text:
             return text.rsplit(marker, 1)[1].strip()
         return text
+
+    # Bounded concurrency for skill expansion: the worker threads come from
+    # the SAME default executor _run_agent runs on, and expansion happens
+    # BEFORE the request counts against _inflight_agent_runs — without its own
+    # cap, a burst of skill-invocation requests could queue enough scan/load
+    # jobs to starve real agent runs. Saturation fails open: the message
+    # passes through unexpanded instead of queueing.
+    _SKILL_INVOKE_MAX_CONCURRENCY = 4
+    _SKILL_INVOKE_ACQUIRE_TIMEOUT = 2.0
+    _skill_invoke_semaphore = None
+
+    async def _expand_inbound_skill_invocation(
+        self,
+        user_message: Any,
+        skill_slug: str,
+        session_id: Optional[str] = None,
+        on_settled: Optional[Any] = None,
+    ) -> Any:
+        """Async shell: fast-path pass-through, then expand off the event loop.
+
+        The cheap shape checks run inline; anything that touches the skills
+        layer (directory scan, SKILL.md load, template expansion) is blocking
+        file I/O and must NOT run on the aiohttp event loop — a slow disk or a
+        large external skills dir would stall every session's SSE / approval /
+        reload traffic. ``asyncio.to_thread`` copies the current contextvars
+        into the worker, so the platform binding inside the blocking body
+        stays task-local.
+        """
+        def _settled() -> None:
+            # 结算回调与信号量同生命周期:凡释放许可(或根本没占用)的点
+            # 恰好一次地通知调用方「展开副作用已终止」。
+            if on_settled is None:
+                return
+            try:
+                on_settled()
+            except Exception:
+                logger.warning(
+                    "[zet_agent] skill expansion on_settled callback failed",
+                    exc_info=True,
+                )
+
+        if not skill_slug or not isinstance(user_message, str):
+            _settled()
+            return user_message
+        import asyncio
+
+        sema = self._skill_invoke_semaphore
+        if sema is None:
+            # Lazy init on the event loop; no await between check and set, so
+            # concurrent first calls cannot race in a single-threaded loop.
+            sema = asyncio.Semaphore(self._SKILL_INVOKE_MAX_CONCURRENCY)
+            self._skill_invoke_semaphore = sema
+        try:
+            await asyncio.wait_for(
+                sema.acquire(), timeout=self._SKILL_INVOKE_ACQUIRE_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[zet_agent] skill expansion saturated; passing message through",
+            )
+            _settled()
+            return user_message
+        except asyncio.CancelledError:
+            # 许可未取得、worker 不存在:副作用已终止,当场结算。
+            _settled()
+            raise
+        # Permit accounting must survive BOTH cancellation shapes (a
+        # try/finally or a done-callback on the asyncio wrapper handles
+        # neither correctly):
+        #   - worker RUNNING when the caller is cancelled: the thread keeps
+        #     going, so the permit must stay held until the worker's own
+        #     finally releases it (early release = connect-and-drop loop
+        #     bypasses the cap and piles workers onto the shared executor);
+        #   - worker still QUEUED when the caller is cancelled: the executor
+        #     future is cancelled before the fn ever starts, its finally will
+        #     never run, so the CALLER must refund the permit right here —
+        #     otherwise 4 drops leak all permits until process restart.
+        # A started/released flag pair under a lock makes the two paths
+        # mutually exclusive and the release exactly-once; a worker that
+        # loses the race (starts after a queued-cancel refund) exits without
+        # touching the skills layer. run_in_executor + copied context
+        # (to_thread equivalent) keeps the platform binding task-local.
+        import contextvars
+
+        loop = asyncio.get_running_loop()
+        ctx = contextvars.copy_context()
+        state_lock = threading.Lock()
+        state = {"started": False, "released": False}
+
+        def _finish_on_loop():
+            sema.release()
+            _settled()
+
+        def _release_from_worker():
+            with state_lock:
+                if state["released"]:
+                    return
+                state["released"] = True
+            try:
+                loop.call_soon_threadsafe(_finish_on_loop)
+            except RuntimeError:
+                # Loop already closed (shutdown) — the permit is moot.
+                pass
+
+        def _worker():
+            with state_lock:
+                if state["released"]:
+                    # Queued-cancel already refunded the permit; stay out of
+                    # the skills layer (the caller is gone anyway).
+                    return user_message
+                state["started"] = True
+            try:
+                return ctx.run(
+                    self._expand_inbound_skill_invocation_blocking,
+                    user_message, skill_slug, session_id,
+                )
+            finally:
+                _release_from_worker()
+
+        fut = loop.run_in_executor(None, _worker)
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            with state_lock:
+                refund = not state["started"] and not state["released"]
+                if refund:
+                    state["released"] = True
+            if refund:
+                # queued-cancel:fn 永不执行,当场退款并结算。
+                sema.release()
+                _settled()
+            raise
+
+    def _expand_inbound_skill_invocation_blocking(
+        self, user_message: str, skill_slug: str, session_id: Optional[str] = None
+    ) -> Any:
+        """Expand an explicitly requested skill (metadata.skill_slug) into the
+        full skill payload.
+
+        The App's skill quick-pick inserts a visible ``/<slug>`` token into
+        the input text AND sends ``metadata.skill_slug`` with the message; the
+        client drops the field when the user edits the token away. Only that
+        explicit field triggers expansion — the text is never sniffed for
+        slash commands (in-band signaling is ambiguous: "/<skill> 是什么"
+        would fire the skill). On the CLI the same expansion is done by the
+        slash command layer; this hook gives the App path the same guarantee.
+
+        Behavior contract (HR4 — pure addition, fail-open):
+          - only fires when the slug resolves to an installed skill; an
+            unknown/stale slug (App inventory drift) logs and passes the
+            message through byte-identical.
+          - the visible ``/<slug>`` token(s) the quick-pick inserted are
+            stripped from the task text (they are display artifacts, not part
+            of the user's instruction); everything else is preserved.
+          - any internal failure logs and falls back to the original text —
+            a broken skill must degrade to a plain message, never block it.
+
+        Three invariants this hook must uphold:
+          - the whole expansion runs with the platform contextvar bound to
+            ``zet_agent`` (push/pop, token-restored): it executes in the HTTP
+            handler BEFORE the session is bound, and without the binding
+            ``skills.platform_disabled.zet_agent`` and frontmatter
+            ``platforms:`` filters silently resolve against no platform —
+            a skill disabled only for zet_agent would still expand.
+          - the fork's skill-scope resolvers read the session ContextVar
+            BEFORE the process ``HERMES_PLATFORM`` env (ZET fork semantic —
+            see skill_commands._resolve_skill_commands_platform), so the
+            binding above governs scan/build even when an external env value
+            exists, without mutating process-global state that a co-hosted
+            platform could observe. The platform-disabled gate is ALSO
+            enforced with an explicit ``platform="zet_agent"`` argument —
+            top precedence, cannot be shadowed by anything.
+          - the payload is built by the canonical
+            ``build_skill_invocation_message`` (same scaffolding as the CLI
+            slash): MemoryManager._strip_skill_scaffolding keys off the
+            canonical activation prefix to recover the user's instruction,
+            so a bespoke note here would leak the full skill body into
+            long-term memory / embeddings.
+        """
+        from gateway.session_context import (
+            pop_session_platform,
+            push_session_platform,
+        )
+
+        token = "/" + skill_slug
+        platform_token = push_session_platform("zet_agent")
+        try:
+            return self._expand_under_platform_binding(
+                user_message, skill_slug, token, session_id
+            )
+        finally:
+            pop_session_platform(platform_token)
+
+    def _expand_under_platform_binding(
+        self,
+        user_message: str,
+        skill_slug: str,
+        token: str,
+        session_id: Optional[str],
+    ) -> Any:
+        """Body of the expansion; runs with the session platform contextvar
+        bound to zet_agent (see caller). The fork's skill-scope resolvers
+        read that ContextVar BEFORE the process HERMES_PLATFORM env, so the
+        binding is authoritative here without touching global state."""
+        try:
+            from agent.skill_commands import (
+                build_skill_invocation_message,
+                scan_skill_commands,
+            )
+            commands = scan_skill_commands()
+        except Exception:
+            logger.warning(
+                "[zet_agent] skill scan failed; passing message through",
+                exc_info=True,
+            )
+            return user_message
+        info = commands.get(token)
+        if not info:
+            logger.warning(
+                "[zet_agent] requested skill %s not installed (App inventory "
+                "drift?); passing message through", skill_slug,
+            )
+            return user_message
+        try:
+            from tools.skills_tool import _is_skill_disabled
+
+            if _is_skill_disabled(
+                info.get("name") or skill_slug, platform="zet_agent"
+            ):
+                logger.info(
+                    "[zet_agent] skill %s is disabled for zet_agent; "
+                    "passing message through", skill_slug,
+                )
+                return user_message
+        except Exception:
+            # _is_skill_disabled fail-opens internally; only an import
+            # failure lands here — degrade to the scan-level filter.
+            logger.warning(
+                "[zet_agent] skill %s disabled-check failed; "
+                "continuing with scan-level filter only", skill_slug,
+                exc_info=True,
+            )
+
+        # Task text = the message minus the quick-pick's visible token(s).
+        # The token may sit anywhere (the pick appends at the cursor) and
+        # may repeat (re-selects); strip standalone occurrences only, so
+        # a genuine mention like "path/to/x" is never touched.
+        task_text = re.sub(
+            r"(?<!\S)" + re.escape(token) + r"(?!\S)", "", user_message
+        )
+        task_text = "\n".join(
+            line for line in (l.rstrip() for l in task_text.splitlines()) if line
+        ).strip()
+
+        try:
+            # task_id = the resolved chat session, so ${HERMES_SESSION_ID}
+            # templates and session-scoped skill state resolve against the
+            # REAL session — CLI/gateway slash parity (review P1).
+            part = build_skill_invocation_message(
+                token, user_instruction=task_text, task_id=session_id or None,
+            )
+        except Exception:
+            logger.warning(
+                "[zet_agent] skill %s build failed; passing message through",
+                skill_slug, exc_info=True,
+            )
+            return user_message
+        if not part:
+            logger.warning(
+                "[zet_agent] skill %s resolved by scan but failed to "
+                "load; passing message through", skill_slug,
+            )
+            return user_message
+        logger.info(
+            "[zet_agent] expanded skill invocation %s (task_chars=%d)",
+            skill_slug, len(task_text),
+        )
+        return part
 
     async def _emit_native_session_title(
         self,
@@ -583,7 +871,7 @@ class ZetAgentAdapter(APIServerAdapter):
         return _notify
 
     # ------------------------------------------------------------------
-    # Clarify — per-session FIFO queue, oldest pending wins on respond
+    # Clarify — stable instance IDs with legacy FIFO fallback on respond
     # ------------------------------------------------------------------
 
     def _make_clarify_cb(self, stream_q: Any, session_id: str):
@@ -595,31 +883,45 @@ class ZetAgentAdapter(APIServerAdapter):
         pops the entry and signals it. Timeout returns "" so a stale
         clarify never hangs the turn forever.
 
-        Plan-E rev4 wire model: no clarify_id — the respond handler
-        always answers the oldest pending entry in the session.
+        A new opaque ``clarify_id`` is attached before either the SSE event
+        or reconnect projection is published. The response endpoint uses this
+        identity when the client provides it; legacy clients that do not yet
+        send the field retain the historical FIFO response behavior.
         """
-        def _ask(question: str, choices: Optional[List[str]]) -> str:
-            entry = _ClarifyEntry()
-            with self._clarify_state_lock:
-                self._clarify_queues.setdefault(session_id, []).append(entry)
+        # Capture profile identity while the callback is attached. The agent
+        # invokes it later from its worker thread, where the request's profile
+        # contextvar need not be active any more.
+        scoped_session_key = self._active_turn_key(session_id)
 
+        def _ask(question: str, choices: Optional[List[str]]) -> str:
             # Stamp the deadline using the same constant the agent
             # thread waits on a few lines below. Clients see the wall-
             # clock time we will actually give up at.
             expires_at_ms = int((time.time() + CLARIFY_RESPONSE_TIMEOUT) * 1000)
+            clarify_id = uuid.uuid4().hex
             payload = {
                 "type": "hermes.clarify",
+                "clarify_id": clarify_id,
                 "question": question,
                 "choices_offered": list(choices or []),
                 "expires_at_ms": expires_at_ms,
             }
+            entry = _ClarifyEntry(clarify_id, payload)
+            with self._clarify_state_lock:
+                queue = self._clarify_queues.setdefault(scoped_session_key, [])
+                queue.append(entry)
+                # /pending is the projection of the entry legacy clients
+                # would answer next.  Keep that projection on FIFO's head
+                # even if a future producer can enqueue concurrently.
+                is_pending_head = len(queue) == 1
             with self._pending_lock:
-                self._pending_clarify[session_id] = payload
+                if is_pending_head:
+                    self._pending_clarify[scoped_session_key] = payload
             try:
                 stream_q.put(("__tool_progress__", payload))
             except Exception:
                 logger.debug("[zet_agent] clarify push failed", exc_info=True)
-                self._discard_clarify_entry(session_id, entry)
+                self._discard_clarify_entry(scoped_session_key, entry)
                 return ""
             # Goal projection: clarify blocks the turn on user input — mirror
             # the approval hook (waiting banner; no GoalManager mutation).
@@ -634,7 +936,7 @@ class ZetAgentAdapter(APIServerAdapter):
                     "[zet_agent] clarify timeout after %ss session=%s",
                     CLARIFY_RESPONSE_TIMEOUT, session_id,
                 )
-                self._discard_clarify_entry(session_id, entry)
+                self._discard_clarify_entry(scoped_session_key, entry)
                 return ""
             return entry.response or ""
 
@@ -693,18 +995,29 @@ class ZetAgentAdapter(APIServerAdapter):
 
         return _emit
 
-    def _discard_clarify_entry(self, session_id: str, entry: _ClarifyEntry) -> None:
+    def _discard_clarify_entry(self, scoped_session_key: str, entry: _ClarifyEntry) -> None:
         """Remove an unresolved entry (push failure or timeout). The
         respond handler removes via popleft on success; this path
         handles error rollback so the queue doesn't accumulate."""
+        next_payload: Optional[Dict[str, Any]] = None
         with self._clarify_state_lock:
-            queue = self._clarify_queues.get(session_id)
+            queue = self._clarify_queues.get(scoped_session_key)
             if queue and entry in queue:
                 queue.remove(entry)
             if queue is not None and not queue:
-                self._clarify_queues.pop(session_id, None)
+                self._clarify_queues.pop(scoped_session_key, None)
+            elif queue:
+                # The pending projection always represents the entry at the
+                # front of the legacy FIFO. This also keeps reconnect correct
+                # should a future producer create more than one entry.
+                next_payload = queue[0].payload
         with self._pending_lock:
-            self._pending_clarify.pop(session_id, None)
+            current = self._pending_clarify.get(scoped_session_key)
+            if current and current.get("clarify_id") == entry.clarify_id:
+                if next_payload is None:
+                    self._pending_clarify.pop(scoped_session_key, None)
+                else:
+                    self._pending_clarify[scoped_session_key] = next_payload
 
     def _register_active_session_turn(self, session_id: Optional[str], agent_ref: list, agent_task: Any) -> None:
         """Stash the in-flight chat-completions turn so the session
@@ -1364,31 +1677,45 @@ class ZetAgentAdapter(APIServerAdapter):
         return web.json_response({"resolved": resolved})
 
     async def _handle_clarify_respond(self, request: "web.Request") -> "web.Response":
-        """POST /v1/sessions/{session_id}/clarify/respond — answer the
-        oldest pending clarify prompt for the session.
+        """POST /v1/sessions/{session_id}/clarify/respond — answer one
+        pending clarify prompt.
 
-        Body: ``{"response": "..."}``. Plan-E rev4: no clarify_id —
-        oldest pending entry in the session FIFO is resolved. 404 when
-        the queue is empty so a stale APP retry surfaces explicitly
-        instead of silently dropping the answer.
+        Body: ``{"response": "...", "clarify_id": "..."}``. A supplied
+        id must match a live entry and is never allowed to consume another
+        prompt. Omitting it preserves the legacy oldest-pending FIFO behavior.
+        404 makes stale or mismatched retries explicit rather than silently
+        applying an answer to a different card.
         """
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
 
         session_id = request.match_info.get("session_id", "")
+        scoped_session_key = self._active_turn_key(session_id)
         try:
             body = await request.json()
         except Exception:
             return web.json_response(_openai_error("Invalid JSON"), status=400)
 
         response_text = str(body.get("response", "") or "")
+        clarify_id = str(body.get("clarify_id", "") or "").strip()
 
+        next_payload: Optional[Dict[str, Any]] = None
         with self._clarify_state_lock:
-            queue = self._clarify_queues.get(session_id)
-            entry = queue.pop(0) if queue else None
+            queue = self._clarify_queues.get(scoped_session_key)
+            entry: Optional[_ClarifyEntry] = None
+            if queue:
+                if clarify_id:
+                    for i, candidate in enumerate(queue):
+                        if candidate.clarify_id == clarify_id:
+                            entry = queue.pop(i)
+                            break
+                else:
+                    entry = queue.pop(0)
             if queue is not None and not queue:
-                self._clarify_queues.pop(session_id, None)
+                self._clarify_queues.pop(scoped_session_key, None)
+            elif queue:
+                next_payload = queue[0].payload
         if entry is None:
             return web.json_response(
                 _openai_error(
@@ -1401,7 +1728,12 @@ class ZetAgentAdapter(APIServerAdapter):
         entry.response = response_text
         entry.event.set()
         with self._pending_lock:
-            self._pending_clarify.pop(session_id, None)
+            current = self._pending_clarify.get(scoped_session_key)
+            if current and current.get("clarify_id") == entry.clarify_id:
+                if next_payload is None:
+                    self._pending_clarify.pop(scoped_session_key, None)
+                else:
+                    self._pending_clarify[scoped_session_key] = next_payload
         # Goal projection: mirror the approval respond hook.
         try:
             await asyncio.to_thread(self._goals().on_interaction_resolved, session_id)
@@ -1426,9 +1758,10 @@ class ZetAgentAdapter(APIServerAdapter):
         if auth_err:
             return auth_err
         session_id = request.match_info.get("session_id", "")
+        scoped_session_key = self._active_turn_key(session_id)
         with self._pending_lock:
             ap = self._pending_approval.get(session_id)
-            cl = self._pending_clarify.get(session_id)
+            cl = self._pending_clarify.get(scoped_session_key)
         return web.json_response({
             "approval": ap,
             "clarify": cl,
@@ -1539,7 +1872,7 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception:
                 logger.debug("[zet_agent] session interrupt: agent.interrupt failed", exc_info=True)
 
-        self._interrupt_pending_interactions(session_id)
+        self._interrupt_pending_interactions(session_id, turn_key)
 
         if task is not None and not task.done():
             try:
@@ -1659,7 +1992,7 @@ class ZetAgentAdapter(APIServerAdapter):
             {"session_id": session_id, "status": status, "accepted": accepted}
         )
 
-    def _interrupt_pending_interactions(self, session_id: str) -> None:
+    def _interrupt_pending_interactions(self, session_id: str, scoped_session_key: Optional[str] = None) -> None:
         """Best-effort cleanup of agent-thread blockers for ``session_id``.
 
         Without this, ``agent.interrupt()`` flips the flag but the
@@ -1675,8 +2008,10 @@ class ZetAgentAdapter(APIServerAdapter):
         """
         # Clarify queue: drain pending entries and signal their events
         # with empty response so the ask_user callback unblocks.
+        if scoped_session_key is None:
+            scoped_session_key = self._active_turn_key(session_id)
         with self._clarify_state_lock:
-            clarify_queue = list(self._clarify_queues.pop(session_id, []) or [])
+            clarify_queue = list(self._clarify_queues.pop(scoped_session_key, []) or [])
         for entry in clarify_queue:
             try:
                 entry.response = ""
@@ -1707,7 +2042,7 @@ class ZetAgentAdapter(APIServerAdapter):
             logger.debug("[zet_agent] session interrupt: terminal cleanup failed", exc_info=True)
 
         with self._pending_lock:
-            self._pending_clarify.pop(session_id, None)
+            self._pending_clarify.pop(scoped_session_key, None)
             self._pending_approval.pop(session_id, None)
 
     # ------------------------------------------------------------------
@@ -2102,6 +2437,13 @@ class ZetAgentAdapter(APIServerAdapter):
             )
         try:
             db_rows_cleared = session_db.clear_all_system_prompts()
+            if inspect.isawaitable(db_rows_cleared):
+                # gw._session_db is the AsyncSessionDB facade (gateway/run.py
+                # wraps SessionDB so SQLite never blocks the event loop): its
+                # methods return coroutines. Without this await the clear was
+                # a silent no-op AND the coroutine leaked into the JSON
+                # response (TypeError → 500) — ZET-1139 regression class.
+                db_rows_cleared = await db_rows_cleared
         except Exception as exc:
             logger.exception(
                 "[zet_agent] skills-reload: DB clear failed; "
@@ -2297,6 +2639,10 @@ class ZetAgentAdapter(APIServerAdapter):
             )
         try:
             db_rows_cleared = session_db.clear_all_system_prompts()
+            if inspect.isawaitable(db_rows_cleared):
+                # Same AsyncSessionDB facade as skills-reload above: await or
+                # the clear silently no-ops and the coroutine breaks the JSON.
+                db_rows_cleared = await db_rows_cleared
         except Exception as exc:
             logger.exception(
                 "[zet_agent] profile-reload: DB clear failed; "
