@@ -414,6 +414,7 @@ def finalize_turn(
                     _assistant_message["content"] = final_response
                     _db_message_id = _assistant_message.get("_db_message_id")
                     _session_db = getattr(agent, "_session_db", None)
+                    _in_place_update_failed = False
                     if _assistant_message.get("_db_persisted"):
                         if isinstance(_db_message_id, int) and _session_db is not None:
                             try:
@@ -424,6 +425,7 @@ def finalize_turn(
                                 ):
                                     raise RuntimeError("persisted assistant row not found")
                             except Exception as _update_err:
+                                _in_place_update_failed = True
                                 _session_persistence_succeeded = False
                                 _cleanup_errors.append(
                                     f"update_transformed_session_message: {_update_err}"
@@ -434,13 +436,14 @@ def finalize_turn(
                                     exc_info=True,
                                 )
                         else:
+                            _in_place_update_failed = True
                             _session_persistence_succeeded = False
                     try:
                         if agent._persist_session(messages, conversation_history) is False:
                             raise RuntimeError(
                                 "session database persistence was not confirmed"
                             )
-                        _session_persistence_succeeded = True
+                        _session_persistence_succeeded = not _in_place_update_failed
                     except Exception as _persist_err:
                         _session_persistence_succeeded = False
                         _cleanup_errors.append(f"persist_transformed_session: {_persist_err}")

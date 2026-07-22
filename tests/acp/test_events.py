@@ -12,6 +12,7 @@ import acp
 from acp.schema import AgentPlanUpdate
 
 from acp_adapter.events import (
+    _await_scheduled_updates,
     _build_plan_update_from_todo_result,
     _confirmed_session_update,
     _send_update,
@@ -357,7 +358,13 @@ class TestMessageCallback:
         """Message callback should emit AgentMessageChunk."""
         loop = event_loop_fixture
 
-        cb = make_message_cb(mock_conn, "session-1", loop)
+        pending = []
+        cb = make_message_cb(
+            mock_conn,
+            "session-1",
+            loop,
+            pending_updates=pending,
+        )
 
         with patch("acp_adapter.events.asyncio.run_coroutine_threadsafe") as mock_rcts:
             future = MagicMock(spec=Future)
@@ -368,6 +375,7 @@ class TestMessageCallback:
 
         mock_rcts.assert_called_once()
         future.result.assert_not_called()
+        assert pending == [future]
 
     def test_confirmed_message_waits_for_delivery(self, mock_conn, event_loop_fixture):
         cb = make_message_cb(
@@ -405,6 +413,43 @@ class TestMessageCallback:
 # ---------------------------------------------------------------------------
 
 class TestSendUpdate:
+    @pytest.mark.asyncio
+    async def test_turn_delivery_wait_cancels_slow_ordinary_update(self):
+        cancelled = asyncio.Event()
+
+        async def _slow_update():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        future = asyncio.run_coroutine_threadsafe(
+            _slow_update(),
+            asyncio.get_running_loop(),
+        )
+
+        delivered = await _await_scheduled_updates([future], timeout=0.01)
+
+        assert delivered is False
+        assert cancelled.is_set()
+
+    @pytest.mark.asyncio
+    async def test_failed_ordinary_update_prevents_confirmed_suffix(self, mock_conn):
+        failed = Future()
+        failed.set_exception(RuntimeError("ordinary delta failed"))
+
+        delivered = await _confirmed_session_update(
+            mock_conn,
+            "session-1",
+            {"type": "final-suffix"},
+            timeout=0.1,
+            prerequisite_updates=[failed],
+        )
+
+        assert delivered is False
+        mock_conn.session_update.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_confirmed_update_cancels_slow_delivery_before_fallback(self):
         cancelled = asyncio.Event()

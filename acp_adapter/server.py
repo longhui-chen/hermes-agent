@@ -64,6 +64,8 @@ from acp.schema import (
 
 from acp_adapter.auth import TERMINAL_SETUP_AUTH_METHOD_ID, build_auth_methods, detect_provider
 from acp_adapter.events import (
+    CONFIRMED_UPDATE_TIMEOUT_SECONDS,
+    _await_scheduled_updates,
     _build_plan_update_from_todo_result,
     make_message_cb,
     make_step_cb,
@@ -1398,6 +1400,7 @@ class HermesACPAgent(acp.Agent):
         edit_approval_requester = None
 
         streamed_message = False
+        pending_message_updates = []
 
         if conn:
             tool_progress_cb = make_tool_progress_cb(
@@ -1410,12 +1413,18 @@ class HermesACPAgent(acp.Agent):
             )
             reasoning_cb = make_thinking_cb(conn, session_id, loop)
             step_cb = make_step_cb(conn, session_id, loop, tool_call_ids, tool_call_meta)
-            message_cb = make_message_cb(conn, session_id, loop)
+            message_cb = make_message_cb(
+                conn,
+                session_id,
+                loop,
+                pending_updates=pending_message_updates,
+            )
             confirmed_message_cb = make_message_cb(
                 conn,
                 session_id,
                 loop,
                 confirm_delivery=True,
+                pending_updates=pending_message_updates,
             )
 
             def stream_delta_cb(text: str) -> bool:
@@ -1426,11 +1435,7 @@ class HermesACPAgent(acp.Agent):
                 return delivered
 
             def confirmed_stream_delta_cb(text: str) -> bool:
-                nonlocal streamed_message
-                delivered = bool(confirmed_message_cb(text))
-                if delivered:
-                    streamed_message = True
-                return delivered
+                return bool(confirmed_message_cb(text))
 
             approval_cb = make_approval_callback(conn.request_permission, loop, session_id)
             try:
@@ -1582,6 +1587,12 @@ class HermesACPAgent(acp.Agent):
                 state.is_running = False
                 state.current_prompt_text = ""
             return PromptResponse(stop_reason="end_turn")
+
+        if streamed_message:
+            streamed_message = await _await_scheduled_updates(
+                pending_message_updates,
+                timeout=CONFIRMED_UPDATE_TIMEOUT_SECONDS,
+            )
 
         if result.get("messages"):
             state.history = result["messages"]

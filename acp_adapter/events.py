@@ -10,7 +10,7 @@ thread while the event loop lives on the main thread).
 import asyncio
 import json
 import logging
-from concurrent.futures import TimeoutError as FutureTimeoutError
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from collections import deque
 from typing import Any, Callable, Deque, Dict
 
@@ -93,10 +93,21 @@ async def _confirmed_session_update(
     update: Any,
     *,
     timeout: float = CONFIRMED_UPDATE_TIMEOUT_SECONDS,
+    prerequisite_updates: list[Future] | None = None,
 ) -> bool:
     """Wait for one final update, cancelling it before reporting failure."""
+    loop = asyncio.get_running_loop()
+    started = loop.time()
     try:
-        await asyncio.wait_for(conn.session_update(session_id, update), timeout=timeout)
+        if not await _await_scheduled_updates(
+            prerequisite_updates or [],
+            timeout=timeout,
+        ):
+            return False
+        remaining = timeout - (loop.time() - started)
+        if remaining <= 0:
+            return False
+        await asyncio.wait_for(conn.session_update(session_id, update), timeout=remaining)
         return True
     except TimeoutError:
         # asyncio.wait_for does not return until cancellation has propagated to
@@ -108,6 +119,31 @@ async def _confirmed_session_update(
         return False
 
 
+async def _await_scheduled_updates(
+    futures: list[Future],
+    *,
+    timeout: float = CONFIRMED_UPDATE_TIMEOUT_SECONDS,
+) -> bool:
+    """Confirm a turn's queued ACP updates, cancelling stragglers on timeout."""
+    if not futures:
+        return True
+    wrapped = [asyncio.wrap_future(future) for future in tuple(futures)]
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*wrapped, return_exceptions=True),
+            timeout=timeout,
+        )
+    except TimeoutError:
+        for future in futures:
+            future.cancel()
+        # Let run_coroutine_threadsafe propagate cancellation to the loop task
+        # before the caller emits a fallback response.
+        await asyncio.sleep(0)
+        logger.debug("Timed out waiting for queued ACP updates", exc_info=True)
+        return False
+    return not any(isinstance(result, BaseException) for result in results)
+
+
 def _send_update(
     conn: acp.Client,
     session_id: str,
@@ -115,12 +151,18 @@ def _send_update(
     update: Any,
     *,
     confirm_delivery: bool = False,
+    pending_updates: list[Future] | None = None,
 ) -> bool:
     """Schedule an ACP update, optionally waiting for confirmed final delivery."""
     from agent.async_utils import safe_schedule_threadsafe
 
     update_coro = (
-        _confirmed_session_update(conn, session_id, update)
+        _confirmed_session_update(
+            conn,
+            session_id,
+            update,
+            prerequisite_updates=list(pending_updates or []),
+        )
         if confirm_delivery
         else conn.session_update(session_id, update)
     )
@@ -133,6 +175,8 @@ def _send_update(
     if future is None:
         return False
     if not confirm_delivery:
+        if pending_updates is not None:
+            pending_updates.append(future)
         return True
     try:
         return bool(future.result(timeout=CONFIRMED_UPDATE_TIMEOUT_SECONDS + 1.0))
@@ -310,6 +354,7 @@ def make_message_cb(
     loop: asyncio.AbstractEventLoop,
     *,
     confirm_delivery: bool = False,
+    pending_updates: list[Future] | None = None,
 ) -> Callable:
     """Create a callback that streams agent response text to the editor."""
 
@@ -323,6 +368,7 @@ def make_message_cb(
             loop,
             update,
             confirm_delivery=confirm_delivery,
+            pending_updates=pending_updates,
         )
 
     return _message

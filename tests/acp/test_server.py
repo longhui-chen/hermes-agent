@@ -1400,6 +1400,87 @@ class TestPrompt:
             "original answer\n\n[plugin appended this]",
         ]
 
+    @pytest.mark.asyncio
+    async def test_prompt_falls_back_when_ordinary_stream_delivery_fails(self, agent):
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        def mock_run(*args, **kwargs):
+            state.agent.stream_delta_callback("final answer")
+            return {"final_response": "final answer", "messages": []}
+
+        state.agent.run_conversation = mock_run
+        attempts = 0
+        delivered_texts = []
+
+        async def session_update(*args, **kwargs):
+            nonlocal attempts
+            update = kwargs.get("update") or args[1]
+            text = getattr(getattr(update, "content", None), "text", None)
+            if text == "final answer":
+                attempts += 1
+                if attempts == 1:
+                    raise RuntimeError("stream delivery failed")
+                delivered_texts.append(text)
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock(side_effect=session_update)
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="hello")]
+        await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        assert attempts == 2
+        assert delivered_texts == ["final answer"]
+
+    @pytest.mark.asyncio
+    async def test_prompt_cancels_slow_ordinary_stream_before_fallback(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "acp_adapter.server.CONFIRMED_UPDATE_TIMEOUT_SECONDS",
+            0.01,
+        )
+        new_resp = await agent.new_session(cwd=".")
+        state = agent.session_manager.get_session(new_resp.session_id)
+
+        def mock_run(*args, **kwargs):
+            state.agent.stream_delta_callback("final answer")
+            return {"final_response": "final answer", "messages": []}
+
+        state.agent.run_conversation = mock_run
+        attempts = 0
+        cancelled = asyncio.Event()
+        delivered_texts = []
+
+        async def session_update(*args, **kwargs):
+            nonlocal attempts
+            update = kwargs.get("update") or args[1]
+            text = getattr(getattr(update, "content", None), "text", None)
+            if text != "final answer":
+                return
+            attempts += 1
+            if attempts == 1:
+                try:
+                    await asyncio.sleep(60)
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+            delivered_texts.append(text)
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock(side_effect=session_update)
+        agent._conn = mock_conn
+
+        prompt = [TextContentBlock(type="text", text="hello")]
+        await agent.prompt(prompt=prompt, session_id=new_resp.session_id)
+
+        assert cancelled.is_set()
+        assert attempts == 2
+        assert delivered_texts == ["final answer"]
+
 
     @pytest.mark.asyncio
     async def test_prompt_auto_titles_session(self, agent):
