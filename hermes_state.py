@@ -3369,6 +3369,24 @@ class SessionDB:
 
         return bool(self._execute_write(_do))
 
+    def update_message_content(
+        self,
+        session_id: str,
+        message_id: int,
+        content: Any,
+    ) -> bool:
+        """Update one already-persisted message without appending a duplicate row."""
+        stored_content = self._encode_content(content)
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE messages SET content = ? WHERE id = ? AND session_id = ?",
+                (stored_content, message_id, session_id),
+            )
+            return cursor.rowcount > 0
+
+        return bool(self._execute_write(_do))
+
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
 

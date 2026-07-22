@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from agent.turn_finalizer import finalize_turn
+from hermes_state import SessionDB
 
 
 class FakeAgent:
@@ -33,6 +34,7 @@ class FakeAgent:
         self.valid_tool_names = []
         self.persisted_messages = None
         self.streamed_deltas = []
+        self.stream_delivery = True
 
     def _handle_max_iterations(self, messages, api_call_count):
         raise AssertionError("not expected")
@@ -60,6 +62,7 @@ class FakeAgent:
 
     def _fire_stream_delta(self, text):
         self.streamed_deltas.append(text)
+        return self.stream_delivery
 
     def _file_mutation_verifier_enabled(self):
         return False
@@ -75,6 +78,26 @@ class FakeAgent:
 
     def _sync_external_memory_for_turn(self, **_kwargs):
         pass
+
+
+class DurableFakeAgent(FakeAgent):
+    def __init__(self, db_path):
+        super().__init__()
+        self._session_db = SessionDB(db_path=db_path)
+        self._session_db.create_session(self.session_id, source="test")
+
+    def _persist_session(self, messages, conversation_history):
+        self.persisted_messages = list(messages)
+        for message in messages:
+            if message.get("_db_persisted"):
+                continue
+            row_id = self._session_db.append_message(
+                self.session_id,
+                message["role"],
+                message.get("content"),
+            )
+            message["_db_message_id"] = row_id
+            message["_db_persisted"] = True
 
 
 def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
@@ -161,6 +184,76 @@ def test_transformed_response_is_streamed_once_and_persisted(monkeypatch):
     assert result["response_transform_streamed"] is True
 
 
+def test_transformed_response_survives_cold_session_db_readback(monkeypatch, tmp_path):
+    proposal = "\n\n要不要为你生成创建方案？"
+
+    def invoke_hook(name, **kwargs):
+        if name == "transform_llm_output":
+            return [kwargs["response_text"] + proposal]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = DurableFakeAgent(tmp_path / "state.db")
+    messages = [
+        {"role": "user", "content": "分析一下"},
+        {"role": "assistant", "content": "分析完成。"},
+    ]
+
+    finalize_turn(
+        agent,
+        final_response="分析完成。",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="分析一下",
+        original_user_message="分析一下",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    cold_db = SessionDB(db_path=tmp_path / "state.db")
+    assert cold_db.get_messages(agent.session_id)[-1]["content"] == "分析完成。" + proposal
+
+
+def test_transform_stream_flag_requires_confirmed_callback_delivery(monkeypatch):
+    proposal = "\n\n要不要为你生成创建方案？"
+
+    def invoke_hook(name, **kwargs):
+        if name == "transform_llm_output":
+            return [kwargs["response_text"] + proposal]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+    agent.stream_delivery = False
+    messages = [
+        {"role": "user", "content": "分析一下"},
+        {"role": "assistant", "content": "分析完成。"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="分析完成。",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="分析一下",
+        original_user_message="分析一下",
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["response_transform_streamed"] is False
+
+
 def test_output_transform_receives_turn_outcome(monkeypatch):
     transform_kwargs = {}
 
@@ -171,6 +264,7 @@ def test_output_transform_receives_turn_outcome(monkeypatch):
 
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
     agent = FakeAgent()
+    agent._user_id = "owner-a"
     messages = [
         {"role": "user", "content": "分析一下"},
         {"role": "assistant", "content": "任务失败。"},
@@ -196,5 +290,6 @@ def test_output_transform_receives_turn_outcome(monkeypatch):
     assert transform_kwargs["failed"] is True
     assert transform_kwargs["interrupted"] is False
     assert transform_kwargs["turn_exit_reason"] == "error_near_max_iterations(provider error)"
+    assert transform_kwargs["sender_id"] == "owner-a"
     assert result["final_response"] == "任务失败。"
     assert agent.streamed_deltas == []

@@ -335,6 +335,78 @@ def test_noninteractive_execution_origins_never_evaluate_or_propose(monkeypatch)
     assert calls == []
 
 
+def test_background_review_does_not_disable_later_foreground_turn(monkeypatch):
+    plugin = _load_plugin()
+    monkeypatch.setattr(
+        plugin,
+        "_judge_creation_opportunity",
+        lambda message, history: {
+            "creation_type": "agent",
+            "suggested_name": "合同审查助手",
+            "reason": "可复用",
+            "evidence": message,
+            "confidence": 0.9,
+            "dedup_key": "agent:合同审查助手",
+        },
+    )
+    plugin._on_pre_llm_call(
+        session_id="shared-session",
+        sender_id="owner-a",
+        user_message="后台检查合同",
+        conversation_history=[],
+        execution_origin="background_review",
+    )
+    plugin._on_pre_llm_call(
+        session_id="shared-session",
+        sender_id="owner-a",
+        user_message="帮我分析这份合同",
+        conversation_history=[],
+    )
+
+    transformed = plugin._transform_llm_output(
+        session_id="shared-session",
+        sender_id="owner-a",
+        response_text="合同分析完成。",
+    )
+    assert "要不要为你生成创建方案" in transformed
+
+
+def test_pending_proposal_is_isolated_by_profile(monkeypatch):
+    plugin = _load_plugin()
+    active_home = [Path("/profiles/a")]
+    monkeypatch.setattr(plugin, "get_hermes_home", lambda: active_home[0])
+
+    plugin._on_pre_llm_call(
+        session_id="same-raw-session",
+        sender_id="owner-a",
+        user_message="帮我分析这份合同",
+        conversation_history=[],
+    )
+    active_home[0] = Path("/profiles/b")
+
+    assert plugin._transform_llm_output(
+        session_id="same-raw-session",
+        sender_id="owner-a",
+        response_text="另一个 Profile 的回复。",
+    ) is None
+
+
+def test_pending_proposal_is_isolated_by_owner():
+    plugin = _load_plugin()
+    plugin._on_pre_llm_call(
+        session_id="shared-owner-session",
+        sender_id="owner-a",
+        user_message="帮我分析这份合同",
+        conversation_history=[],
+    )
+
+    assert plugin._transform_llm_output(
+        session_id="shared-owner-session",
+        sender_id="owner-b",
+        response_text="另一个用户的回复。",
+    ) is None
+
+
 def test_failed_or_partial_turn_never_appends_a_proposal(monkeypatch):
     plugin = _load_plugin()
     monkeypatch.setattr(
@@ -406,6 +478,16 @@ def test_acceptance_generates_a_draft_then_requires_explicit_creation_confirmati
     assert plugin._on_pre_tool_call(
         session_id="confirm-session",
         tool_name="write_file",
+        args={},
+    )["action"] == "block"
+    assert plugin._on_pre_tool_call(
+        session_id="confirm-session",
+        tool_name="execute_code",
+        args={},
+    )["action"] == "block"
+    assert plugin._on_pre_tool_call(
+        session_id="confirm-session",
+        tool_name="delegate_task",
         args={},
     )["action"] == "block"
 
@@ -517,7 +599,9 @@ def test_plugin_self_query_reports_real_status_and_never_proposes(monkeypatch):
         session_id="self-query-session",
         response_text="有，creation-governor 已安装并运行。",
     ) is None
-    state = plugin._session_states["self-query-session"]
+    state = plugin._session_states[
+        plugin._session_key({"session_id": "self-query-session"})
+    ]
     assert state["last_evaluation_turn"] == 0
     assert state["last_prompt_turn"] == -10_000
 

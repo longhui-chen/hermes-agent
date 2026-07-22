@@ -352,6 +352,7 @@ def finalize_turn(
                 session_id=agent.session_id or "",
                 model=agent.model,
                 platform=getattr(agent, "platform", None) or "",
+                sender_id=getattr(agent, "_user_id", None) or "",
                 completed=completed,
                 failed=failed,
                 interrupted=interrupted,
@@ -377,8 +378,11 @@ def finalize_turn(
                     and getattr(agent, "_has_stream_consumers", lambda: False)()
                 ):
                     try:
-                        agent._fire_stream_delta(final_response[len(_pre_transform_response):])
-                        _response_transform_streamed = True
+                        _response_transform_streamed = bool(
+                            agent._fire_stream_delta(
+                                final_response[len(_pre_transform_response):]
+                            )
+                        )
                     except Exception as _stream_err:
                         logger.warning(
                             "Failed to stream transform_llm_output suffix: %s",
@@ -388,7 +392,31 @@ def finalize_turn(
                 # Keep the durable transcript identical to the response returned
                 # to the user so a restart can recover plugin-added prompts.
                 if messages and messages[-1].get("role") == "assistant":
-                    messages[-1]["content"] = final_response
+                    _assistant_message = messages[-1]
+                    _assistant_message["content"] = final_response
+                    _db_message_id = _assistant_message.get("_db_message_id")
+                    _session_db = getattr(agent, "_session_db", None)
+                    if (
+                        _assistant_message.get("_db_persisted")
+                        and isinstance(_db_message_id, int)
+                        and _session_db is not None
+                    ):
+                        try:
+                            if not _session_db.update_message_content(
+                                agent.session_id,
+                                _db_message_id,
+                                final_response,
+                            ):
+                                raise RuntimeError("persisted assistant row not found")
+                        except Exception as _update_err:
+                            _cleanup_errors.append(
+                                f"update_transformed_session_message: {_update_err}"
+                            )
+                            logger.error(
+                                "finalize_turn: transformed SessionDB update failed: %s",
+                                _update_err,
+                                exc_info=True,
+                            )
                     try:
                         agent._persist_session(messages, conversation_history)
                     except Exception as _persist_err:

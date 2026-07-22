@@ -14,7 +14,10 @@ import threading
 import time
 import unicodedata
 from collections import OrderedDict
+from contextvars import ContextVar
 from typing import Any
+
+from hermes_constants import get_hermes_home
 
 
 TOOL_NAME = "propose_creation"
@@ -31,6 +34,10 @@ CREATION_TYPES = {"agent", "skill", "scheduled_task"}
 _recent_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
 _session_states: OrderedDict[str, dict[str, Any]] = OrderedDict()
 _recent_lock = threading.Lock()
+_invocation_scope: ContextVar[tuple[str, str, bool] | None] = ContextVar(
+    "creation_governor_invocation_scope",
+    default=None,
+)
 
 
 def _text(value: Any, limit: int) -> str:
@@ -60,8 +67,30 @@ def _claim_proposal(session_id: str, dedup_key: str, now: float) -> bool:
     return True
 
 
-def _session_key(kwargs: dict[str, Any]) -> str:
+def _raw_session_key(kwargs: dict[str, Any]) -> str:
     return _text(kwargs.get("session_id") or kwargs.get("task_id"), 160)
+
+
+def _scoped_session_key(raw_session_id: str, owner_id: str) -> str:
+    profile = str(get_hermes_home().resolve())
+    return f"{profile}|{_text(owner_id, 160)}|{raw_session_id}"
+
+
+def _session_key(kwargs: dict[str, Any]) -> str:
+    raw_session_id = _raw_session_key(kwargs)
+    if not raw_session_id:
+        return ""
+    owner_fields = ("sender_id", "owner_id", "user_id")
+    if any(field in kwargs for field in owner_fields):
+        owner_id = next(
+            (_text(kwargs.get(field), 160) for field in owner_fields if kwargs.get(field)),
+            "",
+        )
+        return _scoped_session_key(raw_session_id, owner_id)
+    invocation = _invocation_scope.get()
+    if invocation is not None and invocation[0] == raw_session_id:
+        return invocation[1]
+    return _scoped_session_key(raw_session_id, "")
 
 
 def _prune_session_states(now: float) -> None:
@@ -86,7 +115,6 @@ def _state_locked(session_id: str, now: float) -> dict[str, Any]:
             "proposal_stage": None,
             "draft_only_turn": None,
             "native_bypass_turn": None,
-            "proposals_disabled": False,
             "last_user_message": "",
             "last_seen": now,
         }
@@ -170,7 +198,6 @@ _PERSISTED_PROPOSAL_RE = re.compile(
 )
 _TYPE_BY_LABEL = {"Agent": "agent", "Skill": "skill", "定时任务": "scheduled_task"}
 _NONINTERACTIVE_PLATFORMS = {"cron", "subagent", "batch"}
-_DRAFT_BLOCKED_TOOLS = {"terminal", "skill_manage", "cronjob", "write_file", "patch"}
 _DRAFT_CONFIRM_PROMPT = "如果方案符合预期，请回复“确认创建”；在此之前不会执行创建。"
 
 
@@ -420,15 +447,16 @@ def _is_noninteractive(kwargs: dict[str, Any]) -> bool:
 
 def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
     """Schedule hidden judgments and carry proposal context across transformed output."""
-    if _is_noninteractive(kwargs):
-        session_id = _session_key(kwargs)
+    raw_session_id = _raw_session_key(kwargs)
+    session_id = _session_key(kwargs)
+    noninteractive = _is_noninteractive(kwargs)
+    _invocation_scope.set((raw_session_id, session_id, noninteractive))
+    if noninteractive:
         if session_id:
             with _recent_lock:
                 state = _state_locked(session_id, time.monotonic())
-                state["proposals_disabled"] = True
                 state["pending_proposal"] = None
         return None
-    session_id = _session_key(kwargs)
     if not session_id:
         return None
     user_message = _text(kwargs.get("user_message"), 2000)
@@ -509,7 +537,7 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
     """Append a missed scheduled proposal and start the ten-turn prompt cooldown."""
     session_id = _session_key(kwargs)
     response_text = str(kwargs.get("response_text") or "")
-    if not session_id or not response_text:
+    if not session_id or not response_text or _is_noninteractive(kwargs):
         return None
     if kwargs.get("failed") or kwargs.get("interrupted") or kwargs.get("completed") is False:
         with _recent_lock:
@@ -518,8 +546,6 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
     now = time.monotonic()
     with _recent_lock:
         state = _state_locked(session_id, now)
-        if state.get("proposals_disabled"):
-            return None
         if int(state.get("draft_only_turn") or -1) == int(state["turn"]):
             if _DRAFT_CONFIRM_PROMPT in response_text:
                 return None
@@ -584,7 +610,8 @@ def _propose_creation(args: dict[str, Any], **kwargs: Any) -> str:
     }
     with _recent_lock:
         state = _state_locked(session_id, now)
-        if state.get("proposals_disabled"):
+        invocation = _invocation_scope.get()
+        if invocation is not None and invocation[0] == _raw_session_key(kwargs) and invocation[2]:
             return json.dumps({"status": "not_proposed", "reason": "noninteractive_session"})
         if int(state.get("native_bypass_turn") or -1) == int(state["turn"]):
             return json.dumps({"status": "not_proposed", "reason": "native_creation_path"})
@@ -600,8 +627,7 @@ def _propose_creation(args: dict[str, Any], **kwargs: Any) -> str:
 def _on_pre_tool_call(**kwargs: Any) -> dict[str, str] | None:
     """Mechanically prevent creation side effects during the draft-only turn."""
     session_id = _session_key(kwargs)
-    tool_name = _text(kwargs.get("tool_name"), 80)
-    if not session_id or tool_name not in _DRAFT_BLOCKED_TOOLS:
+    if not session_id:
         return None
     with _recent_lock:
         state = _state_locked(session_id, time.monotonic())
@@ -617,6 +643,7 @@ def _reset_state_for_tests() -> None:
     with _recent_lock:
         _recent_proposals.clear()
         _session_states.clear()
+    _invocation_scope.set(None)
 
 
 def register(ctx: Any) -> None:

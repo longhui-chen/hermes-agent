@@ -333,9 +333,10 @@ def test_plan_mode_suppresses_provisional_plain_text_streaming():
     )
     agent._should_suppress_plan_stream_text = lambda: AIAgent._should_suppress_plan_stream_text(agent)
 
-    AIAgent._fire_stream_delta(agent, "这段纯文本计划不能提前进入 SSE")
+    delivered = AIAgent._fire_stream_delta(agent, "这段纯文本计划不能提前进入 SSE")
 
     assert streamed == []
+    assert delivered is False
 
 
 def test_plan_mode_suppresses_provisional_reasoning_streaming():

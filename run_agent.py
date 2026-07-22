@@ -1926,7 +1926,7 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
-                self._session_db.append_message(
+                _db_message_id = self._session_db.append_message(
                     session_id=self.session_id,
                     role=role,
                     content=content,
@@ -1941,6 +1941,7 @@ class AIAgent:
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
                     timestamp=_row_timestamp,
                 )
+                msg["_db_message_id"] = _db_message_id
                 msg[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
@@ -4730,10 +4731,10 @@ class AIAgent:
             and not bool(getattr(self, "_zet_agent_plan_presented", False))
         )
 
-    def _fire_stream_delta(self, text: str) -> None:
-        """Fire all registered stream delta callbacks (display + TTS)."""
+    def _fire_stream_delta(self, text: str) -> bool:
+        """Fire stream callbacks and report whether any consumer received text."""
         if self._should_suppress_plan_stream_text():
-            return
+            return False
         # If a tool iteration set the break flag, prepend a single paragraph
         # break before the first real text delta.  This prevents the original
         # problem (text concatenation across tool boundaries) without stacking
@@ -4773,7 +4774,7 @@ class AIAgent:
             ):
                 text = text.lstrip("\n")
         if not text:
-            return
+            return False
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
         delivered = False
         for cb in callbacks:
@@ -4784,6 +4785,7 @@ class AIAgent:
                 pass
         if delivered:
             self._record_streamed_assistant_text(text)
+        return delivered
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
