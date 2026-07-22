@@ -1,10 +1,14 @@
-from __future__ import annotations
-
+import importlib.util
 import json
 from pathlib import Path
 
-from hermes_cli.plugins import PluginManager
-from tests.plugins.test_creation_governor_plugin import _load_plugin
+
+PLUGIN_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "plugins"
+    / "creation-governor"
+    / "__init__.py"
+)
 
 
 class _Context:
@@ -19,8 +23,12 @@ class _Context:
         self.hooks.append((args, kwargs))
 
 
-def test_plugin_flow_registers_judgment_hooks_and_a_non_creating_proposal_tool():
-    plugin = _load_plugin()
+def test_plugin_flow_registers_zero_shot_review_and_non_creating_proposal_tool():
+    spec = importlib.util.spec_from_file_location("creation_governor_flow", PLUGIN_PATH)
+    plugin = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(plugin)
+    plugin._reset_state_for_tests()
     context = _Context()
     plugin.register(context)
 
@@ -31,30 +39,36 @@ def test_plugin_flow_registers_judgment_hooks_and_a_non_creating_proposal_tool()
         "pre_tool_call",
     ]
     assert [tool["name"] for tool in context.tools] == ["propose_creation"]
-    description = context.tools[0]["schema"]["description"]
-    assert "a single ordinary task is enough" in description
-    assert "same permissive rule equally to all three creation types" in description
-    assert "one AI-news lookup" in description
-    assert "direct scheduled instruction" in description
+    assert context.tools[0]["toolset"] == "creation_governor"
+    assert "zero-shot" in context.tools[0]["schema"]["description"]
+
+    pre_context = context.hooks[0][0][1](
+        session_id="flow-session",
+        user_message="Look into this business problem.",
+        conversation_history=[],
+    )
+    assert "semantic rubric" in pre_context["context"]
 
     result = json.loads(
         context.tools[0]["handler"](
             {
-                "creation_type": "scheduled_task",
-                "suggested_name": "每日竞品简报",
-                "reason": "价值来自每天自动执行",
-                "evidence": "用户连续讨论每日竞品变化",
-                "confidence": 0.95,
-                "dedup_key": "daily-competitor-brief",
+                "creation_type": "agent",
+                "suggested_name": "Business Research Partner",
+                "reason": "Future questions benefit from retained context and judgment.",
+                "evidence": "The user requested a substantive business investigation.",
+                "confidence": 0.8,
+                "dedup_key": "business-research-partner",
+                "proposal_text": "Would you like me to prepare a Business Research Partner Agent creation plan?",
             },
             session_id="flow-session",
         )
     )
 
     assert result["status"] == "proposal_ready"
-    assert result["creation_type"] == "scheduled_task"
-    assert "只输出草案" in result["next_step"]
-    assert "确认创建" in result["next_step"]
+    assert result["creation_type"] == "agent"
+    assert result["delivery"] == "deferred_to_transform_hook"
+    assert "Look into this business problem" in result["next_step"]
+    assert "does not create anything" in result["next_step"]
     assert "create" not in context.tools[0]["name"]
 
 
