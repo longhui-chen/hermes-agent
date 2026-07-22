@@ -180,6 +180,26 @@ def _extract_turn_id(body: Dict[str, Any]) -> str:
     return tid
 
 
+def _extract_skill_slug(body: Dict[str, Any]) -> str:
+    """Extract metadata.skill_slug — the App quick-pick's EXPLICIT skill
+    invocation signal (ZET fork).
+
+    The client owns the text↔selection UX (it drops the field when the user
+    edits the inserted "/<slug>" token away); the server NEVER sniffs message
+    text for slash commands — in-band signaling is ambiguous ("/<skill> 是什么"
+    would fire the skill) and this explicit field is the only trigger.
+    Absent/malformed → no skill. A leading slash is tolerated and stripped so
+    the client may send either "deep-research" or "/deep-research"."""
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("skill_slug", metadata.get("skillSlug", ""))
+    slug = str(raw or "").strip().lstrip("/")
+    if not slug or any(c.isspace() or ord(c) < 0x20 for c in slug):
+        return ""
+    return slug
+
+
 def _normalize_chat_content(
     content: Any, *, _max_depth: int = 10, _depth: int = 0,
 ) -> str:
@@ -2352,22 +2372,23 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
 
-    async def _expand_inbound_skill_slash(
-        self, user_message: Any, session_id: Optional[str] = None
+    async def _expand_inbound_skill_invocation(
+        self, user_message: Any, skill_slug: str, session_id: Optional[str] = None
     ) -> Any:
-        """Platform hook: expand a leading ``/<skill>`` slash command in the
-        inbound user text into the full skill payload.
+        """Platform hook: expand an EXPLICITLY requested skill (by slug) into
+        the full skill payload.
 
-        Base implementation is a no-op so plain api_server behavior is
-        unchanged; the zet_agent subclass overrides it to give the Zettlab
-        App's skill quick-pick (which inserts a literal ``/<skill>`` line)
-        CLI-slash parity. Async so that override can push the blocking
+        Triggered only when the request carried ``metadata.skill_slug`` (the
+        App quick-pick's invocation signal) — the message text is never
+        sniffed for slash commands. Base implementation is a no-op so plain
+        api_server behavior is unchanged; the zet_agent subclass overrides it
+        for CLI-slash parity. Async so that override can push the blocking
         skill-directory scan/load off the event loop (it runs inside the
         request handler, before the agent's executor thread exists).
         ``session_id`` is the resolved chat session — the override forwards
         it as the skill builder's task_id so ``${HERMES_SESSION_ID}``
         templates resolve against the real session. See
-        ZetAgent._expand_inbound_skill_slash.
+        ZetAgent._expand_inbound_skill_invocation.
         """
         return user_message
 
@@ -2503,8 +2524,9 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
-        # Inbound "/<skill>" expansion (zet_agent hook; base no-op) runs LATE
-        # on purpose — the placement is load-bearing:
+        # Explicit skill invocation (zet_agent hook; base no-op): triggered
+        # ONLY by metadata.skill_slug — never by sniffing the message text.
+        # The expansion runs LATE on purpose; the placement is load-bearing:
         #   - AFTER session_id is final, so skill templates resolve
         #     ${HERMES_SESSION_ID} against the real session (session_id is
         #     forwarded as the builder's task_id), matching the CLI slash;
@@ -2515,12 +2537,14 @@ class APIServerAdapter(BasePlatformAdapter):
         #   - SKIPPED under tool_choice="none": that is an API-level "no
         #     tools this turn" boundary (request_overrides strips every agent
         #     tool) and expansion injects tool-driving instructions — the
-        #     literal "/<skill>" text passes through unexpanded instead.
+        #     message passes through unexpanded instead.
+        skill_slug = _extract_skill_slug(body)
+
         async def _expanded_user_message():
-            if body.get("tool_choice") == "none":
+            if not skill_slug or body.get("tool_choice") == "none":
                 return user_message
-            return await self._expand_inbound_skill_slash(
-                user_message, session_id=session_id
+            return await self._expand_inbound_skill_invocation(
+                user_message, skill_slug, session_id=session_id
             )
 
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"

@@ -1262,21 +1262,21 @@ class TestChatCompletionsEndpoint:
             }
 
     @pytest.mark.asyncio
-    async def test_tool_choice_none_skips_inbound_skill_slash_expansion(self, adapter):
+    async def test_tool_choice_none_skips_skill_invocation(self, adapter):
         # tool_choice=none is an API-level "no tools this turn" boundary;
         # skill expansion injects tool-driving instructions and is not
         # side-effect-free (skills.inline_shell=true executes SKILL.md
         # preprocessing at build time), so the hook must be bypassed entirely
-        # and the literal "/<skill>" text reach the agent unexpanded.
+        # even when metadata.skill_slug is present.
         mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
         usage = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
 
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run, \
-                 patch.object(adapter, "_expand_inbound_skill_slash", new_callable=AsyncMock) as mock_expand:
+                 patch.object(adapter, "_expand_inbound_skill_invocation", new_callable=AsyncMock) as mock_expand:
                 mock_run.return_value = (mock_result, usage)
-                mock_expand.side_effect = lambda msg, session_id=None: f"<<EXPANDED:{msg}>>"
+                mock_expand.side_effect = lambda msg, slug, session_id=None: f"<<EXPANDED:{slug}:{msg}>>"
                 resp = await cli.post(
                     "/v1/chat/completions",
                     json={
@@ -1284,6 +1284,7 @@ class TestChatCompletionsEndpoint:
                         "messages": [{"role": "user", "content": "/deep-research 黄金"}],
                         "stream": False,
                         "tool_choice": "none",
+                        "metadata": {"skill_slug": "deep-research"},
                     },
                 )
                 assert resp.status == 200
@@ -1297,11 +1298,12 @@ class TestChatCompletionsEndpoint:
                         "model": "hermes-agent",
                         "messages": [{"role": "user", "content": "/deep-research 黄金"}],
                         "stream": False,
+                        "metadata": {"skill_slug": "deep-research"},
                     },
                 )
                 assert resp.status == 200
                 mock_expand.assert_awaited_once()
-                assert mock_run.await_args.kwargs["user_message"] == "<<EXPANDED:/deep-research 黄金>>"
+                assert mock_run.await_args.kwargs["user_message"] == "<<EXPANDED:deep-research:/deep-research 黄金>>"
                 # The hook receives the resolved session so skill templates
                 # can resolve ${HERMES_SESSION_ID} (builder task_id).
                 assert (
@@ -1310,9 +1312,35 @@ class TestChatCompletionsEndpoint:
                 )
 
     @pytest.mark.asyncio
-    async def test_idempotency_key_dedupes_skill_slash_expansion(self, adapter):
-        # Expansion lives INSIDE the Idempotency-Key compute: a retried key
-        # must reuse the cached agent result WITHOUT re-running expansion —
+    async def test_slash_text_without_skill_slug_is_never_expanded(self, adapter):
+        # The explicit metadata.skill_slug field is the ONLY trigger: message
+        # text is never sniffed, so a literal "/<skill> ..." (e.g. the user
+        # ASKING about the command, or an old App without the field) reaches
+        # the agent verbatim and the hook is never consulted.
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        usage = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run, \
+                 patch.object(adapter, "_expand_inbound_skill_invocation", new_callable=AsyncMock) as mock_expand:
+                mock_run.return_value = (mock_result, usage)
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "/deep-research 是什么？"}],
+                        "stream": False,
+                    },
+                )
+                assert resp.status == 200
+                mock_expand.assert_not_awaited()
+                assert mock_run.await_args.kwargs["user_message"] == "/deep-research 是什么？"
+
+    @pytest.mark.asyncio
+    async def test_idempotency_key_dedupes_skill_invocation(self, adapter):
+        # Expansion lives INSIDE the idempotency-protected compute: a retried
+        # key must reuse the cached agent result WITHOUT re-running expansion —
         # with skills.inline_shell=true the build step executes SKILL.md
         # preprocessing, so re-expansion means re-running local scripts.
         mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
@@ -1321,13 +1349,14 @@ class TestChatCompletionsEndpoint:
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run, \
-                 patch.object(adapter, "_expand_inbound_skill_slash", new_callable=AsyncMock) as mock_expand:
+                 patch.object(adapter, "_expand_inbound_skill_invocation", new_callable=AsyncMock) as mock_expand:
                 mock_run.return_value = (mock_result, usage)
-                mock_expand.side_effect = lambda msg, session_id=None: f"<<EXPANDED:{msg}>>"
+                mock_expand.side_effect = lambda msg, slug, session_id=None: f"<<EXPANDED:{slug}:{msg}>>"
                 payload = {
                     "model": "hermes-agent",
                     "messages": [{"role": "user", "content": "/deep-research 黄金"}],
                     "stream": False,
+                    "metadata": {"skill_slug": "deep-research"},
                 }
                 for _ in range(2):
                     resp = await cli.post(

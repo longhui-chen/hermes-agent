@@ -1,12 +1,14 @@
-"""ZET fork: inbound skill-slash expansion + reload AsyncSessionDB await fix.
+"""ZET fork: explicit skill invocation (metadata.skill_slug) + reload fix.
 
 Covers two zet_agent changes:
 
-1. ``_expand_inbound_skill_slash`` — the App's skill quick-pick inserts a
-   literal ``/<skill>`` line; the OpenAI-compatible surface previously passed
-   it to the LLM verbatim (skill fired only if the model volunteered a
-   skill_view call). The hook expands a known leading slash into the full
-   skill payload and must pass everything else through byte-identical.
+1. ``_expand_inbound_skill_invocation`` — the App's skill quick-pick inserts
+   a visible ``/<slug>`` token into the input text AND sends
+   ``metadata.skill_slug`` with the message (the client drops the field when
+   the user edits the token away). Only that explicit field triggers
+   expansion; the message text is NEVER sniffed for slash commands. The hook
+   loads the requested skill, strips the display token(s) from the task text
+   and rebuilds the message with the canonical CLI-slash scaffolding.
 
 2. ``_handle_skills_reload`` — ``gateway_runner._session_db`` is the
    AsyncSessionDB facade whose methods return coroutines; the handler must
@@ -31,10 +33,10 @@ def _make_adapter() -> ZetAgentAdapter:
     return ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
 
 
-def _expand(adapter, message, session_id=None):
+def _expand(adapter, message, slug="deep-research", session_id=None):
     """Drive the async hook to completion (it offloads to a worker thread)."""
     return asyncio.run(
-        adapter._expand_inbound_skill_slash(message, session_id=session_id)
+        adapter._expand_inbound_skill_invocation(message, slug, session_id=session_id)
     )
 
 
@@ -82,7 +84,7 @@ def _patch_skill_layer(monkeypatch, *, known=("deep-research",), load_raises=Fal
     return calls
 
 
-def test_known_skill_slash_expands(monkeypatch):
+def test_requested_skill_expands(monkeypatch):
     calls = _patch_skill_layer(monkeypatch)
     adapter = _make_adapter()
     out = _expand(adapter, "/deep-research 研究黄金为什么下跌")
@@ -91,29 +93,47 @@ def test_known_skill_slash_expands(monkeypatch):
     assert calls["load_identifier"] == "/fake/skills/deep-research"
 
 
-def test_duplicate_command_lines_collapse(monkeypatch):
-    # The quick-pick appends rather than replaces, so retries stack the same
-    # command; the expansion must collapse them into ONE invocation.
+def test_display_token_stripped_wherever_it_sits(monkeypatch):
+    # The quick-pick appends the visible token at the cursor, so it can sit
+    # anywhere and repeat after re-selects; standalone occurrences are display
+    # artifacts and must be stripped from the task text. Slash sequences glued
+    # to other text (paths) are NOT the token and must survive.
     calls = _patch_skill_layer(monkeypatch)
     adapter = _make_adapter()
-    text = "/deep-research 黄金\n\n/deep-research 黄金\n\n/deep-research 黄金"
-    out = _expand(adapter, text)
-    assert out.count("<<EXPANDED:") == 1
+
+    _expand(adapter, "帮我研究黄金 /deep-research")
+    assert calls["user_instruction"] == "帮我研究黄金"
+
+    _expand(adapter, "/deep-research 黄金\n/deep-research")
     assert calls["user_instruction"] == "黄金"
 
+    _expand(adapter, "看下 repo/deep-research 目录 /deep-research")
+    assert calls["user_instruction"] == "看下 repo/deep-research 目录"
 
-def test_unknown_slash_passes_through(monkeypatch):
+
+def test_slug_without_token_in_text_still_expands(monkeypatch):
+    # The explicit field is authoritative — the server does not require the
+    # display token to be present in the text at all.
+    calls = _patch_skill_layer(monkeypatch)
+    adapter = _make_adapter()
+    out = _expand(adapter, "研究黄金")
+    assert out.startswith("<<EXPANDED:")
+    assert calls["user_instruction"] == "研究黄金"
+
+
+def test_unknown_slug_passes_through(monkeypatch):
+    # App inventory drift (stale panel, uninstalled skill) must fail open.
     _patch_skill_layer(monkeypatch, known=("other-skill",))
     adapter = _make_adapter()
     original = "/deep-research 研究黄金"
     assert _expand(adapter, original) == original
 
 
-def test_plain_text_and_multimodal_pass_through(monkeypatch):
+def test_empty_slug_and_multimodal_pass_through(monkeypatch):
     _patch_skill_layer(monkeypatch)
     adapter = _make_adapter()
-    assert _expand(adapter, "你好，帮我查天气") == "你好，帮我查天气"
-    multimodal = [{"type": "text", "text": "/deep-research x"}]
+    assert _expand(adapter, "你好，帮我查天气", slug="") == "你好，帮我查天气"
+    multimodal = [{"type": "text", "text": "研究黄金"}]
     assert _expand(adapter, multimodal) is multimodal
 
 
@@ -169,8 +189,9 @@ def test_expanded_payload_uses_canonical_memory_scaffolding(monkeypatch):
         skill_commands.extract_user_instruction_from_skill_message(out)
         == "研究黄金为什么下跌"
     )
-    # Bare invocation → no user content worth remembering: extract must
-    # return None so memory callers skip the turn entirely.
+    # Bare invocation (only the display token, no task text) → no user
+    # content worth remembering: extract must return None so memory callers
+    # skip the turn entirely.
     bare = _expand(adapter, "/deep-research")
     assert bare.startswith(skill_commands._SKILL_INVOCATION_PREFIX)
     assert skill_commands.extract_user_instruction_from_skill_message(bare) is None
@@ -192,15 +213,17 @@ def test_session_id_forwarded_as_builder_task_id(monkeypatch):
 def test_saturated_expansion_fails_open_to_passthrough(monkeypatch):
     # The expansion semaphore bounds how many scan/load jobs can occupy the
     # shared default executor. When saturated the hook must fail OPEN — the
-    # literal "/<skill>" text passes through (pre-feature behavior) instead of
-    # queueing behind other expansions and starving agent runs.
+    # message passes through untouched instead of queueing behind other
+    # expansions and starving agent runs.
     calls = _patch_skill_layer(monkeypatch)
     adapter = _make_adapter()
-    monkeypatch.setattr(ZetAgentAdapter, "_SKILL_SLASH_ACQUIRE_TIMEOUT", 0.05)
+    monkeypatch.setattr(ZetAgentAdapter, "_SKILL_INVOKE_ACQUIRE_TIMEOUT", 0.05)
 
     async def _run():
-        adapter._skill_slash_semaphore = asyncio.Semaphore(0)  # all slots busy
-        return await adapter._expand_inbound_skill_slash("/deep-research 黄金")
+        adapter._skill_invoke_semaphore = asyncio.Semaphore(0)  # all slots busy
+        return await adapter._expand_inbound_skill_invocation(
+            "/deep-research 黄金", "deep-research"
+        )
 
     original = "/deep-research 黄金"
     assert asyncio.run(_run()) == original
@@ -227,7 +250,9 @@ def test_base_api_server_hook_is_noop():
     # identity for every shape.
     base = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
     for value in ("/deep-research x", "hello", ["parts"], None):
-        assert asyncio.run(base._expand_inbound_skill_slash(value)) is value
+        assert asyncio.run(
+            base._expand_inbound_skill_invocation(value, "deep-research")
+        ) is value
 
 
 @pytest.mark.asyncio

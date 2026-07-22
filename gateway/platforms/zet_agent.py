@@ -78,6 +78,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import threading
 import time
 from collections import OrderedDict
@@ -366,19 +367,18 @@ class ZetAgentAdapter(APIServerAdapter):
             return text.rsplit(marker, 1)[1].strip()
         return text
 
-    # Bounded concurrency for slash expansion: the worker threads come from
+    # Bounded concurrency for skill expansion: the worker threads come from
     # the SAME default executor _run_agent runs on, and expansion happens
     # BEFORE the request counts against _inflight_agent_runs — without its own
-    # cap, a burst of "/"-prefixed requests (even unknown /typo commands)
-    # could queue enough scan/load jobs to starve real agent runs. Saturation
-    # fails open: the message passes through unexpanded (today's pre-feature
-    # behavior) instead of queueing.
-    _SKILL_SLASH_MAX_CONCURRENCY = 4
-    _SKILL_SLASH_ACQUIRE_TIMEOUT = 2.0
-    _skill_slash_semaphore = None
+    # cap, a burst of skill-invocation requests could queue enough scan/load
+    # jobs to starve real agent runs. Saturation fails open: the message
+    # passes through unexpanded instead of queueing.
+    _SKILL_INVOKE_MAX_CONCURRENCY = 4
+    _SKILL_INVOKE_ACQUIRE_TIMEOUT = 2.0
+    _skill_invoke_semaphore = None
 
-    async def _expand_inbound_skill_slash(
-        self, user_message: Any, session_id: Optional[str] = None
+    async def _expand_inbound_skill_invocation(
+        self, user_message: Any, skill_slug: str, session_id: Optional[str] = None
     ) -> Any:
         """Async shell: fast-path pass-through, then expand off the event loop.
 
@@ -390,57 +390,56 @@ class ZetAgentAdapter(APIServerAdapter):
         into the worker, so the platform binding inside the blocking body
         stays task-local.
         """
-        if not isinstance(user_message, str):
-            return user_message
-        if not user_message.lstrip().startswith("/"):
+        if not skill_slug or not isinstance(user_message, str):
             return user_message
         import asyncio
 
-        sema = self._skill_slash_semaphore
+        sema = self._skill_invoke_semaphore
         if sema is None:
             # Lazy init on the event loop; no await between check and set, so
             # concurrent first calls cannot race in a single-threaded loop.
-            sema = asyncio.Semaphore(self._SKILL_SLASH_MAX_CONCURRENCY)
-            self._skill_slash_semaphore = sema
+            sema = asyncio.Semaphore(self._SKILL_INVOKE_MAX_CONCURRENCY)
+            self._skill_invoke_semaphore = sema
         try:
             await asyncio.wait_for(
-                sema.acquire(), timeout=self._SKILL_SLASH_ACQUIRE_TIMEOUT
+                sema.acquire(), timeout=self._SKILL_INVOKE_ACQUIRE_TIMEOUT
             )
         except asyncio.TimeoutError:
             logger.warning(
-                "[zet_agent] skill slash expansion saturated; passing message through",
+                "[zet_agent] skill expansion saturated; passing message through",
             )
             return user_message
         try:
             return await asyncio.to_thread(
-                self._expand_inbound_skill_slash_blocking, user_message, session_id
+                self._expand_inbound_skill_invocation_blocking,
+                user_message, skill_slug, session_id,
             )
         finally:
             sema.release()
 
-    def _expand_inbound_skill_slash_blocking(
-        self, user_message: str, session_id: Optional[str] = None
+    def _expand_inbound_skill_invocation_blocking(
+        self, user_message: str, skill_slug: str, session_id: Optional[str] = None
     ) -> Any:
-        """Expand a leading ``/<skill-name>`` into the full skill payload.
+        """Expand an explicitly requested skill (metadata.skill_slug) into the
+        full skill payload.
 
-        The App's skill quick-pick inserts a literal ``/<skill>`` line into
-        the outgoing message. On the CLI that token is expanded by the slash
-        command layer; on this OpenAI-compatible surface it previously
-        reached the LLM as plain text, so the skill only fired if the model
-        volunteered a skill_view call (model-dependent, flaky). This hook
-        gives the App path the same guarantee as the CLI.
+        The App's skill quick-pick inserts a visible ``/<slug>`` token into
+        the input text AND sends ``metadata.skill_slug`` with the message; the
+        client drops the field when the user edits the token away. Only that
+        explicit field triggers expansion — the text is never sniffed for
+        slash commands (in-band signaling is ambiguous: "/<skill> 是什么"
+        would fire the skill). On the CLI the same expansion is done by the
+        slash command layer; this hook gives the App path the same guarantee.
 
         Behavior contract (HR4 — pure addition, fail-open):
-          - only plain-string messages whose first token is ``/<name>`` AND
-            whose name is present in scan_skill_commands() are expanded;
-            anything else (unknown slash, multimodal content, mid-text
-            slashes) passes through byte-identical.
-          - repeated copies of the same command line (the quick-pick appends
-            rather than replaces, so retries stack duplicates) collapse into
-            one invocation with a deduplicated task text.
+          - only fires when the slug resolves to an installed skill; an
+            unknown/stale slug (App inventory drift) logs and passes the
+            message through byte-identical.
+          - the visible ``/<slug>`` token(s) the quick-pick inserted are
+            stripped from the task text (they are display artifacts, not part
+            of the user's instruction); everything else is preserved.
           - any internal failure logs and falls back to the original text —
-            a broken skill must degrade to today's behavior, never block
-            the message.
+            a broken skill must degrade to a plain message, never block it.
 
         Three invariants this hook must uphold:
           - the whole expansion runs with the platform contextvar bound to
@@ -462,16 +461,12 @@ class ZetAgentAdapter(APIServerAdapter):
             so a bespoke note here would leak the full skill body into
             long-term memory / embeddings.
         """
-        if not isinstance(user_message, str):
-            return user_message
-        text = user_message.lstrip()
-        if not text.startswith("/"):
-            return user_message
         from gateway.session_context import (
             pop_session_platform,
             push_session_platform,
         )
 
+        token = "/" + skill_slug
         platform_token = push_session_platform("zet_agent")
         try:
             try:
@@ -482,46 +477,47 @@ class ZetAgentAdapter(APIServerAdapter):
                 commands = scan_skill_commands()
             except Exception:
                 logger.warning(
-                    "[zet_agent] skill slash scan failed; passing message through",
+                    "[zet_agent] skill scan failed; passing message through",
                     exc_info=True,
                 )
                 return user_message
-            token = text.split(None, 1)[0].rstrip()
             info = commands.get(token)
             if not info:
+                logger.warning(
+                    "[zet_agent] requested skill %s not installed (App inventory "
+                    "drift?); passing message through", skill_slug,
+                )
                 return user_message
             try:
                 from tools.skills_tool import _is_skill_disabled
 
                 if _is_skill_disabled(
-                    info.get("name") or token.lstrip("/"), platform="zet_agent"
+                    info.get("name") or skill_slug, platform="zet_agent"
                 ):
                     logger.info(
-                        "[zet_agent] skill slash %s is disabled for zet_agent; "
-                        "passing message through", token,
+                        "[zet_agent] skill %s is disabled for zet_agent; "
+                        "passing message through", skill_slug,
                     )
                     return user_message
             except Exception:
                 # _is_skill_disabled fail-opens internally; only an import
                 # failure lands here — degrade to the scan-level filter.
                 logger.warning(
-                    "[zet_agent] skill slash %s disabled-check failed; "
-                    "continuing with scan-level filter only", token,
+                    "[zet_agent] skill %s disabled-check failed; "
+                    "continuing with scan-level filter only", skill_slug,
                     exc_info=True,
                 )
 
-            # Task text = everything besides the command token(s); duplicated
-            # "/name ..." lines collapse (first occurrence wins).
-            remainder: List[str] = []
-            for i, line in enumerate(text.splitlines()):
-                stripped = line.strip()
-                if i == 0 or stripped.startswith(token):
-                    rest = stripped[len(token):].strip() if stripped.startswith(token) else stripped
-                    if rest and rest not in remainder:
-                        remainder.append(rest)
-                    continue
-                remainder.append(line)
-            task_text = "\n".join(remainder).strip()
+            # Task text = the message minus the quick-pick's visible token(s).
+            # The token may sit anywhere (the pick appends at the cursor) and
+            # may repeat (re-selects); strip standalone occurrences only, so
+            # a genuine mention like "path/to/x" is never touched.
+            task_text = re.sub(
+                r"(?<!\S)" + re.escape(token) + r"(?!\S)", "", user_message
+            )
+            task_text = "\n".join(
+                line for line in (l.rstrip() for l in task_text.splitlines()) if line
+            ).strip()
 
             try:
                 # task_id = the resolved chat session, so ${HERMES_SESSION_ID}
@@ -532,19 +528,19 @@ class ZetAgentAdapter(APIServerAdapter):
                 )
             except Exception:
                 logger.warning(
-                    "[zet_agent] skill slash %s build failed; passing message through",
-                    token, exc_info=True,
+                    "[zet_agent] skill %s build failed; passing message through",
+                    skill_slug, exc_info=True,
                 )
                 return user_message
             if not part:
                 logger.warning(
-                    "[zet_agent] skill slash %s resolved by scan but failed to "
-                    "load; passing message through", token,
+                    "[zet_agent] skill %s resolved by scan but failed to "
+                    "load; passing message through", skill_slug,
                 )
                 return user_message
             logger.info(
-                "[zet_agent] expanded skill slash %s (task_chars=%d)",
-                token, len(task_text),
+                "[zet_agent] expanded skill invocation %s (task_chars=%d)",
+                skill_slug, len(task_text),
             )
             return part
         finally:
