@@ -190,7 +190,7 @@ def test_positive_checkpoint_preserves_answer_and_appends_card_envelope_once():
     )
 
 
-def test_checkpoint_falls_back_to_structured_when_plain_completion_fails():
+def test_checkpoint_failure_degrades_without_a_second_blocking_model_call():
     plugin = _load_plugin()
     llm = _PlainFailureStructuredFallbackLlm(_candidate())
     plugin.register(_Context(llm))
@@ -205,11 +205,9 @@ def test_checkpoint_falls_back_to_structured_when_plain_completion_fails():
         response_text="Campaign A had the strongest ROAS.",
     )
 
-    assert len(llm.structured_calls) == 1
     assert len(llm.complete_calls) == 1
-    assert llm.structured_calls[0]["purpose"].endswith("structured_fallback")
-    assert "<!--creation-recommendation:start " in transformed
-    assert _decode_envelope(transformed)["creation_type"] == "agent"
+    assert len(llm.structured_calls) == 0
+    assert transformed is None
 
 
 def test_none_checkpoint_is_completely_invisible():

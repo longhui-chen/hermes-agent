@@ -576,7 +576,7 @@ def _run_forced_evaluation(
             ],
             temperature=0.0,
             max_tokens=500,
-            timeout=5.0,
+            timeout=3.0,
             purpose="creation_opportunity_checkpoint_json",
         )
         parsed = _parse_detector_json(result.text)
@@ -589,27 +589,7 @@ def _run_forced_evaluation(
         if parsed is not None:
             return parsed
     except Exception:
-        logger.warning(
-            "creation opportunity JSON checkpoint failed; trying structured fallback",
-            exc_info=True,
-        )
-
-    # Retain a structured fallback for providers where ordinary completions are
-    # temporarily unavailable but response_format works.
-    try:
-        result = llm.complete_structured(
-            instructions=_DETECTOR_INSTRUCTIONS,
-            input=[{"type": "text", "text": evidence}],
-            json_schema=_DETECTOR_SCHEMA,
-            schema_name="creation_opportunity",
-            temperature=0.0,
-            max_tokens=500,
-            timeout=5.0,
-            purpose="creation_opportunity_checkpoint_structured_fallback",
-        )
-        return result.parsed if isinstance(result.parsed, dict) else None
-    except Exception:
-        logger.warning("creation opportunity structured fallback failed", exc_info=True)
+        logger.warning("creation opportunity JSON checkpoint failed", exc_info=True)
         return None
 
 
