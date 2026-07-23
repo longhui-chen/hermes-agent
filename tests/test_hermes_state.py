@@ -730,6 +730,15 @@ class TestMessageStorage:
         assert db.delete_message("s2", mid) is False
         assert len(db.get_messages("s1")) == 1
 
+    def test_update_message_content_is_scoped_to_session_and_row(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.create_session(session_id="s2", source="cli")
+        message_id = db.append_message("s1", role="assistant", content="before")
+
+        assert db.update_message_content("s2", message_id, "wrong session") is False
+        assert db.update_message_content("s1", message_id, "after") is True
+        assert db.get_messages("s1")[0]["content"] == "after"
+
     def test_observed_flag_round_trips_for_gateway_replay(self, db):
         db.create_session(session_id="s1", source="telegram:-100")
         db.append_message(
