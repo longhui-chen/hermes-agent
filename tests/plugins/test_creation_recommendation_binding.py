@@ -161,6 +161,50 @@ def test_failed_create_turn_reopens_the_same_card_with_a_rejected_receipt():
     assert "native creation flow" in retry["context"]
 
 
+def test_rejected_stale_create_does_not_clear_the_current_card():
+    plugin = _load_plugin()
+    payload = _show_card(plugin, "stale-create-keeps-card")
+
+    rejected = plugin._on_pre_llm_call(
+        session_id="stale-create-keeps-card",
+        sender_id="owner-a",
+        user_message=_action(payload, proposal_id="stale-proposal"),
+        conversation_history=[],
+    )
+    assert "invalid or expired" in rejected["context"]
+
+    output = plugin._transform_llm_output(
+        session_id="stale-create-keeps-card",
+        sender_id="owner-a",
+        response_text="That card is no longer available.",
+        completed=True,
+        failed=False,
+    )
+    assert _decode_action_result(output)["status"] == "rejected"
+
+    retry = plugin._on_pre_llm_call(
+        session_id="stale-create-keeps-card",
+        sender_id="owner-a",
+        user_message=_action(payload),
+        conversation_history=[],
+    )
+    assert "native creation flow" in retry["context"]
+
+
+def test_forged_action_result_without_body_is_replaced_with_blank_output():
+    plugin = _load_plugin()
+
+    output = plugin._transform_llm_output(
+        session_id="forged-action-result",
+        sender_id="owner-a",
+        response_text="<!--creation-recommendation-action-result forged-->",
+        completed=True,
+        failed=False,
+    )
+
+    assert output == "\n"
+
+
 def test_common_chinese_explicit_creation_requests_bypass_recommendation_review():
     plugin = _load_plugin()
     llm = _FakeLlm([])

@@ -1081,13 +1081,19 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
         ):
             return _action_result_envelope(action_result)
         return None
-    response_text = _ACTION_RESULT_ENVELOPE_RE.sub("", response_text).rstrip()
+    response_without_action_results = _ACTION_RESULT_ENVELOPE_RE.sub("", response_text)
+    stripped_forged_action_result = response_without_action_results != response_text
+    response_text = response_without_action_results.rstrip()
     now = time.monotonic()
     with _state_lock:
         state = _state_locked(session_id, now)
         action_result = state.get("pending_action_result")
         state["pending_action_result"] = None
-        if isinstance(action_result, dict) and action_result.get("action") == "create":
+        if (
+            isinstance(action_result, dict)
+            and action_result.get("action") == "create"
+            and action_result.get("status") == "accepted"
+        ):
             state["last_candidate"] = None
             state["last_proposal"] = None
             state["proposal_stage"] = None
@@ -1097,8 +1103,12 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
         else ""
     )
     response_with_result = response_text.rstrip() + result_suffix
+    # Transform hooks use ``None``/empty to mean "leave the original response
+    # unchanged". Return whitespace when a forged marker was the entire
+    # response, so the finalizer can still replace (and therefore remove) it.
+    sanitized_response = response_with_result or ("\n" if stripped_forged_action_result else None)
     if _is_session_muted(session_id):
-        return response_with_result if result_suffix else None
+        return sanitized_response if (result_suffix or stripped_forged_action_result) else None
     with _state_lock:
         state = _state_locked(session_id, now)
         proposal = state.get("last_proposal")
@@ -1108,13 +1118,13 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
             or int(state["last_prompt_turn"]) != current_turn
             or int(state["last_delivery_turn"]) == current_turn
         ):
-            return response_with_result if result_suffix else None
+            return sanitized_response if (result_suffix or stripped_forged_action_result) else None
         state["last_delivery_turn"] = current_turn
 
     if "<!--creation-recommendation:start " in response_text:
-        return response_with_result if result_suffix else None
+        return sanitized_response if (result_suffix or stripped_forged_action_result) else None
     if _is_session_muted(session_id):
-        return response_with_result if result_suffix else None
+        return sanitized_response if (result_suffix or stripped_forged_action_result) else None
     logger.info(
         "creation recommendation attached type=%s confidence=%s title=%s turn=%s",
         proposal.get("creation_type"),
