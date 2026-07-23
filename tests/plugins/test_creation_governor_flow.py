@@ -1,3 +1,4 @@
+import base64
 import importlib.util
 import json
 from pathlib import Path
@@ -56,8 +57,6 @@ def test_registered_hooks_produce_a_complete_answer_plus_attachment_envelope():
     assert [args[0] for args, _kwargs in context.hooks] == [
         "pre_llm_call",
         "transform_llm_output",
-        "post_llm_call",
-        "pre_tool_call",
     ]
     assert [tool["name"] for tool in context.tools] == ["detect_creation_opportunity"]
 
@@ -94,21 +93,29 @@ def test_card_mute_action_blocks_future_checks_and_delivery(tmp_path, monkeypatc
         user_message="Look into this business problem.",
         conversation_history=[],
     )
-    assert context.hooks[1][0][1](
+    shown = context.hooks[1][0][1](
         session_id="flow-muted-session",
         response_text="Here is the actual business analysis.",
     )
+    assert shown
     assert len(context.llm.calls) == 1
 
     response = {
         "version": 1,
         "type": "creation_recommendation_response",
         "action": "mute_session",
+        "proposal_id": base64.urlsafe_b64decode(
+            shown.split("<!--creation-recommendation:start ", 1)[1]
+            .split("-->", 1)[0]
+            .strip()
+            + "=="
+        ).decode("utf-8"),
         "creation_type": "agent",
         "title": "Business Research Partner",
         "dedup_key": "agent:business-research-partner",
         "evidence_turn_ids": ["evidence-1"],
     }
+    response["proposal_id"] = json.loads(response["proposal_id"])["proposal_id"]
     mute_context = context.hooks[0][0][1](
         session_id="flow-muted-session",
         user_message=(

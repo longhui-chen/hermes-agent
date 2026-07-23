@@ -46,11 +46,14 @@ def _candidate(
     }
 
 
-def _recommendation_response(action, *, title="Google Ads Analyst"):
+def _recommendation_response(
+    action, *, proposal_id="", title="Google Ads Analyst"
+):
     payload = {
         "version": 1,
         "type": "creation_recommendation_response",
         "action": action,
+        "proposal_id": proposal_id,
         "creation_type": "agent",
         "title": title,
         "dedup_key": "agent:google-ads-analyst",
@@ -130,7 +133,8 @@ def test_first_turn_and_every_third_turn_run_bounded_json_checks():
         )
 
     assert len(llm.calls) == 3
-    assert plugin._session_states["checkpoint-session"]["last_evaluation_turn"] == 6
+    state_key = plugin._session_key({"session_id": "checkpoint-session"})
+    assert plugin._session_states[state_key]["last_evaluation_turn"] == 6
     assert all(
         call[1]["purpose"] == "creation_opportunity_checkpoint_json"
         for call in llm.calls
@@ -167,12 +171,15 @@ def test_positive_checkpoint_preserves_answer_and_appends_card_envelope_once():
     assert payload == {
         "version": 1,
         "type": "creation_recommendation",
+        "proposal_id": payload["proposal_id"],
+        "expires_at": payload["expires_at"],
         "creation_type": "agent",
         "title": "Google Ads Analyst",
         "reason": "Retained account context and judgment will improve future analysis.",
         "dedup_key": "agent:google-ads-analyst",
         "confidence": 0.82,
         "evidence_turn_ids": ["evidence-1"],
+        "source_turn_id": "turn-1",
     }
     assert (
         plugin._transform_llm_output(
@@ -290,8 +297,9 @@ def test_dismissal_latches_the_same_semantic_candidate():
     )
     assert "dismissed" in action["context"]
 
+    state_key = plugin._session_key({"session_id": "dismiss-session"})
     with plugin._state_lock:
-        plugin._session_states["dismiss-session"]["last_prompt_turn"] = -10_000
+        plugin._session_states[state_key]["last_prompt_turn"] = -10_000
     result = json.loads(
         plugin._detect_creation_opportunity(first, session_id="dismiss-session")
     )
@@ -312,24 +320,29 @@ def test_session_mute_persists_across_plugin_state_reset_and_can_be_undone(
         user_message="Analyze my Google Ads account.",
         conversation_history=[],
     )
-    assert plugin._transform_llm_output(
+    shown = plugin._transform_llm_output(
         session_id="muted-session",
         response_text="Here is the analysis.",
     )
+    assert shown
+    proposal_id = _decode_envelope(shown)["proposal_id"]
 
     mute_context = plugin._on_pre_llm_call(
         session_id="muted-session",
-        user_message=_recommendation_response("mute_session"),
+        user_message=_recommendation_response(
+            "mute_session", proposal_id=proposal_id
+        ),
         conversation_history=[],
     )
     assert "disabled proactive creation recommendations" in mute_context["context"]
-    assert plugin._is_session_muted("muted-session") is True
+    state_key = plugin._session_key({"session_id": "muted-session"})
+    assert plugin._is_session_muted(state_key) is True
     assert preferences_db.exists()
 
     plugin._reset_state_for_tests()
     after_restart_llm = _FakeLlm([_candidate()])
     plugin.register(_Context(after_restart_llm))
-    assert plugin._is_session_muted("muted-session") is True
+    assert plugin._is_session_muted(state_key) is True
     assert (
         plugin._on_pre_llm_call(
             session_id="muted-session",
@@ -358,7 +371,7 @@ def test_session_mute_persists_across_plugin_state_reset_and_can_be_undone(
         conversation_history=[],
     )
     assert "re-enabled proactive creation recommendations" in unmute_context["context"]
-    assert plugin._is_session_muted("muted-session") is False
+    assert plugin._is_session_muted(state_key) is False
 
 
 def test_mute_transform_guard_wins_when_a_candidate_is_already_pending(
@@ -375,7 +388,8 @@ def test_mute_transform_guard_wins_when_a_candidate_is_already_pending(
         conversation_history=[],
     )
 
-    assert plugin._set_session_muted("in-flight-session", True) is True
+    state_key = plugin._session_key({"session_id": "in-flight-session"})
+    assert plugin._set_session_muted(state_key, True) is True
     assert (
         plugin._transform_llm_output(
             session_id="in-flight-session",

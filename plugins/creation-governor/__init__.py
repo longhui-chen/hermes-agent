@@ -24,9 +24,11 @@ import threading
 import time
 import unicodedata
 from collections import OrderedDict
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
+from gateway.response_filters import is_intentional_silence_response
 from hermes_constants import get_hermes_home
 
 
@@ -46,6 +48,9 @@ MAX_SESSION_STATES = 512
 CREATION_TYPES = {"agent", "skill", "task"}
 RECOMMENDATION_ACTIONS = {"create", "dismiss", "mute_session", "unmute_session"}
 SESSION_PREFERENCES_DB = "creation_governor.db"
+UNSUPPORTED_API_MODES = {"codex_app_server"}
+UNSUPPORTED_PLATFORMS = {"acp"}
+_NONINTERACTIVE_PLATFORMS = {"cron", "subagent", "batch"}
 
 _recent_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
 _dismissed_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
@@ -54,6 +59,10 @@ _muted_sessions: set[str] = set()
 _known_unmuted_sessions: set[str] = set()
 _state_lock = threading.Lock()
 _plugin_llm: Any = None
+_invocation_scope: ContextVar[tuple[str, str, str | None, str] | None] = ContextVar(
+    "creation_governor_invocation_scope",
+    default=None,
+)
 
 _SELF_QUERY_RE = re.compile(
     r"(?:creation[\s_-]*governor|detect_creation_opportunity|propose_creation)",
@@ -66,6 +75,18 @@ _DISMISS_RE = re.compile(
 )
 _ACCEPT_RE = re.compile(
     r"(?:创建|开始创建|就这个|create it|create this|yes[, ]+create)",
+    re.IGNORECASE,
+)
+_EXPLICIT_CREATION_RE = re.compile(
+    r"(?:(?:创建|新建|新增|建立|建个|建一个|再来一个|安装|做成|保存成|生成).{0,48}"
+    r"(?:agent|智能体|助手|skill|技能|定时任务|scheduled\s*task|task))|"
+    r"(?:(?:create|build|make|new|add|install|spin\s+up)\s+.{0,48}"
+    r"(?:agent|assistant|skill|scheduled\s*task))",
+    re.IGNORECASE,
+)
+_DIRECT_SCHEDULE_RE = re.compile(
+    r"(?:每天|每日|每周|每月|每个工作日|定时|提醒我|"
+    r"every\s+(?:day|week|month)|daily|weekly|monthly|remind\s+me)",
     re.IGNORECASE,
 )
 _RECOMMENDATION_RESPONSE_RE = re.compile(
@@ -154,8 +175,34 @@ def _latch_dismissal(session_id: str, dedup_key: str, now: float) -> None:
         )
 
 
-def _session_key(kwargs: dict[str, Any]) -> str:
+def _raw_session_key(kwargs: dict[str, Any]) -> str:
     return _text(kwargs.get("session_id") or kwargs.get("task_id"), 160)
+
+
+def _scoped_session_key(raw_session_id: str, owner_id: str) -> str:
+    profile = str(get_hermes_home().resolve())
+    return f"{profile}|{_text(owner_id, 160)}|{raw_session_id}"
+
+
+def _session_key(kwargs: dict[str, Any]) -> str:
+    raw_session_id = _raw_session_key(kwargs)
+    if not raw_session_id:
+        return ""
+    invocation = _invocation_scope.get()
+    profile_prefix = f"{get_hermes_home().resolve()}|"
+    owner_fields = ("sender_id", "owner_id", "user_id")
+    explicit_owner = next(
+        (_text(kwargs.get(field), 160) for field in owner_fields if kwargs.get(field)),
+        "",
+    )
+    if (
+        invocation is not None
+        and invocation[0] == raw_session_id
+        and invocation[1].startswith(profile_prefix)
+        and (not explicit_owner or explicit_owner == invocation[3])
+    ):
+        return invocation[1]
+    return _scoped_session_key(raw_session_id, explicit_owner)
 
 
 def _preferences_db_path() -> Path:
@@ -298,26 +345,52 @@ def _claim_prompt_slot(session_id: str, candidate: dict[str, Any], now: float) -
     with _state_lock:
         state = _state_locked(session_id, now)
         if _prompt_is_cooling_down(state):
-            return "prompt_cooldown"
-        expired_before = now - PROPOSAL_TTL_SECONDS
-        for key, created_at in tuple(_recent_proposals.items()):
-            if created_at < expired_before:
-                _recent_proposals.pop(key, None)
-        if identity in _recent_proposals:
-            _recent_proposals.move_to_end(identity)
-            return "recent_duplicate"
-        _recent_proposals[identity] = now
-        while len(_recent_proposals) > MAX_RECENT_PROPOSALS:
-            _recent_proposals.popitem(last=False)
+            return False
+        identity_source = (
+            f"{session_id}|{candidate['dedup_key']}|{state['turn']}|"
+            f"{candidate.get('source_turn_id') or ''}"
+        )
+        candidate["proposal_id"] = hashlib.sha256(
+            identity_source.encode("utf-8")
+        ).hexdigest()[:32]
+        candidate["expires_at"] = time.time() + PROPOSAL_TTL_SECONDS
         state["last_prompt_turn"] = state["turn"]
         state["last_delivery_turn"] = -10_000
         state["last_candidate"] = dict(candidate)
         state["last_proposal"] = dict(candidate)
+        state["proposal_stage"] = "proposal_shown"
         return True
+
+
+def _is_noninteractive(kwargs: dict[str, Any]) -> bool:
+    return bool(
+        _text(kwargs.get("platform"), 40).lower() in _NONINTERACTIVE_PLATFORMS
+        or _text(kwargs.get("execution_origin"), 80).lower() == "background_review"
+        or kwargs.get("is_kanban_worker")
+    )
+
+
+def _is_unsupported_runtime(kwargs: dict[str, Any]) -> bool:
+    return bool(
+        _text(kwargs.get("api_mode"), 80).lower() in UNSUPPORTED_API_MODES
+        or _text(kwargs.get("platform"), 40).lower() in UNSUPPORTED_PLATFORMS
+        or kwargs.get("supports_followup_turns") is False
+        or (
+            _text(kwargs.get("platform"), 40).lower() == "api_server"
+            and kwargs.get("streaming_output")
+        )
+    )
 
 
 def _is_creation_governor_self_query(user_message: str) -> bool:
     return bool(_SELF_QUERY_RE.search(user_message))
+
+
+def _uses_native_creation_path(user_message: str) -> bool:
+    return bool(
+        _EXPLICIT_CREATION_RE.search(user_message)
+        or _DIRECT_SCHEDULE_RE.search(user_message)
+    )
 
 
 def _self_description_context() -> str:
@@ -503,7 +576,7 @@ def _run_forced_evaluation(
             ],
             temperature=0.0,
             max_tokens=500,
-            timeout=25.0,
+            timeout=5.0,
             purpose="creation_opportunity_checkpoint_json",
         )
         parsed = _parse_detector_json(result.text)
@@ -531,7 +604,7 @@ def _run_forced_evaluation(
             schema_name="creation_opportunity",
             temperature=0.0,
             max_tokens=500,
-            timeout=25.0,
+            timeout=5.0,
             purpose="creation_opportunity_checkpoint_structured_fallback",
         )
         return result.parsed if isinstance(result.parsed, dict) else None
@@ -674,10 +747,12 @@ def _parse_recommendation_response(user_message: str) -> dict[str, Any] | None:
         return None
     title = _text(payload.get("title"), 80)
     dedup_key = _text(payload.get("dedup_key"), 160)
-    if not title or not dedup_key:
+    proposal_id = _text(payload.get("proposal_id"), 80)
+    if not title or not dedup_key or (action != "unmute_session" and not proposal_id):
         return None
     return {
         "action": action,
+        "proposal_id": proposal_id,
         "creation_type": creation_type,
         "title": title,
         "dedup_key": dedup_key,
@@ -690,12 +765,27 @@ def _handle_previous_proposal_action(
     structured = _parse_recommendation_response(user_message)
     if structured:
         action = structured["action"]
+        with _state_lock:
+            state = _state_locked(session_id, now)
+            proposal = state.get("last_proposal")
+            current = bool(
+                isinstance(proposal, dict)
+                and state.get("proposal_stage") == "proposal_shown"
+                and float(proposal.get("expires_at") or 0) >= time.time()
+                and structured["proposal_id"] == proposal.get("proposal_id")
+                and structured["creation_type"] == proposal.get("creation_type")
+                and structured["title"] == proposal.get("suggested_name")
+                and structured["dedup_key"] == proposal.get("dedup_key")
+            )
+        if action != "unmute_session" and not current:
+            return ""
         if action == "mute_session":
             persisted = _set_session_muted(session_id, True)
             with _state_lock:
                 state = _state_locked(session_id, now)
                 state["last_candidate"] = None
                 state["last_proposal"] = None
+                state["proposal_stage"] = None
             logger.info(
                 "creation recommendations muted for session persisted=%s", persisted
             )
@@ -711,6 +801,7 @@ def _handle_previous_proposal_action(
                 state = _state_locked(session_id, now)
                 state["last_candidate"] = None
                 state["last_proposal"] = None
+                state["proposal_stage"] = None
             logger.info(
                 "creation recommendations re-enabled for session persisted=%s", persisted
             )
@@ -722,12 +813,18 @@ def _handle_previous_proposal_action(
         if action == "dismiss":
             _latch_dismissal(session_id, structured["dedup_key"], now)
             with _state_lock:
-                _state_locked(session_id, now)["last_proposal"] = None
+                state = _state_locked(session_id, now)
+                state["last_proposal"] = None
+                state["proposal_stage"] = None
             return (
                 "[Creation governor internal action: The user dismissed the previous "
                 "recommendation. Acknowledge briefly, do not create anything, and do not run "
                 "another opportunity review this turn.]"
             )
+        with _state_lock:
+            state = _state_locked(session_id, now)
+            state["last_proposal"] = None
+            state["proposal_stage"] = None
         return (
             "[Creation governor internal action: The user accepted the previous recommendation "
             f"for {structured['creation_type']} '{structured['title']}'. Continue through "
@@ -765,8 +862,29 @@ def _handle_previous_proposal_action(
 
 
 def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
-    session_id = _session_key(kwargs)
+    raw_session_id = _raw_session_key(kwargs)
+    owner_id = next(
+        (
+            _text(kwargs.get(field), 160)
+            for field in ("sender_id", "owner_id", "user_id")
+            if kwargs.get(field)
+        ),
+        "",
+    )
+    session_id = (
+        _scoped_session_key(raw_session_id, owner_id) if raw_session_id else ""
+    )
+    suppression_reason = None
+    if _is_noninteractive(kwargs):
+        suppression_reason = "noninteractive_session"
+    elif kwargs.get("structured_output"):
+        suppression_reason = "structured_output"
+    elif _is_unsupported_runtime(kwargs):
+        suppression_reason = "unsupported_runtime"
+    _invocation_scope.set((raw_session_id, session_id, suppression_reason, owner_id))
     if not session_id:
+        return None
+    if suppression_reason:
         return None
     user_message = _text(kwargs.get("user_message"), 2000)
     now = time.monotonic()
@@ -780,9 +898,19 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
     if _is_creation_governor_self_query(user_message):
         return _join_context(_self_description_context())
 
+    if "[creation_recommendation_response]" in user_message:
+        action_context = _handle_previous_proposal_action(session_id, user_message, now)
+        return _join_context(action_context)
     action_context = _handle_previous_proposal_action(session_id, user_message, now)
     if action_context:
         return _join_context(action_context)
+    if _uses_native_creation_path(user_message):
+        with _state_lock:
+            state = _state_locked(session_id, now)
+            state["last_candidate"] = None
+            state["last_proposal"] = None
+            state["proposal_stage"] = None
+        return None
 
     if _is_session_muted(session_id):
         return None
@@ -829,12 +957,15 @@ def _encode_recommendation(candidate: dict[str, Any]) -> str:
     payload = {
         "version": 1,
         "type": "creation_recommendation",
+        "proposal_id": candidate["proposal_id"],
+        "expires_at": candidate["expires_at"],
         "creation_type": candidate["creation_type"],
         "title": candidate["suggested_name"],
         "reason": candidate["reason"],
         "dedup_key": candidate["dedup_key"],
         "confidence": candidate["confidence"],
         "evidence_turn_ids": candidate.get("evidence_turn_ids") or [],
+        "source_turn_id": candidate.get("source_turn_id") or "",
     }
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
@@ -875,11 +1006,12 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
     ):
         return None
     if kwargs.get("failed") or kwargs.get("interrupted") or kwargs.get("completed") is False:
-        with _recent_lock:
+        with _state_lock:
             state = _state_locked(session_id, time.monotonic())
-            state["pending_proposal"] = None
-            if state.get("proposal_stage") == "draft_generating":
-                _clear_draft_state(state, stage="proposal_shown")
+            if state.get("proposal_stage") == "proposal_shown":
+                state["last_candidate"] = None
+                state["last_proposal"] = None
+                state["proposal_stage"] = None
         return None
     if _is_session_muted(session_id):
         return None
@@ -911,26 +1043,18 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
 
 
 def _detect_creation_opportunity(args: dict[str, Any], **kwargs: Any) -> str:
+    invocation = _invocation_scope.get()
+    if invocation is not None and invocation[2]:
+        return json.dumps({"status": "not_proposed", "reason": invocation[2]})
+    if _is_noninteractive(kwargs) or _is_unsupported_runtime(kwargs) or kwargs.get(
+        "structured_output"
+    ):
+        return json.dumps({"status": "not_proposed", "reason": "unsupported_runtime"})
     session_id = _session_key(kwargs)
     if not session_id:
         return json.dumps({"status": "invalid", "error": "missing_session_id"})
     result = _consider_candidate(session_id, args, time.monotonic())
     return json.dumps(result, ensure_ascii=False)
-
-
-def _on_pre_tool_call(**kwargs: Any) -> dict[str, str] | None:
-    """Mechanically prevent creation side effects during the draft-only turn."""
-    session_id = _session_key(kwargs)
-    if not session_id:
-        return None
-    with _recent_lock:
-        state = _state_locked(session_id, time.monotonic())
-        if int(state.get("draft_only_turn") or -1) != int(state["turn"]):
-            return None
-    return {
-        "action": "block",
-        "message": "Creation is blocked while presenting the draft. Wait for explicit '确认创建'.",
-    }
 
 
 def _reset_state_for_tests() -> None:
@@ -942,6 +1066,7 @@ def _reset_state_for_tests() -> None:
         _muted_sessions.clear()
         _known_unmuted_sessions.clear()
     _plugin_llm = None
+    _invocation_scope.set(None)
 
 
 def register(ctx: Any) -> None:
@@ -953,8 +1078,6 @@ def register(ctx: Any) -> None:
 
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_hook("transform_llm_output", _transform_llm_output)
-    ctx.register_hook("post_llm_call", _on_post_llm_call)
-    ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_tool(
         name=TOOL_NAME,
         toolset="creation_governor",

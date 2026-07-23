@@ -117,3 +117,73 @@ def test_structured_create_requires_the_current_proposal_id_and_owner():
         conversation_history=[],
     )
     assert replay is None
+
+
+def test_recommendations_fail_closed_for_unsupported_or_failed_turns():
+    plugin = _load_plugin()
+
+    assert (
+        plugin._on_pre_llm_call(
+            session_id="one-shot",
+            platform="cli",
+            supports_followup_turns=False,
+            user_message="分析广告效果",
+            conversation_history=[],
+        )
+        is None
+    )
+    blocked = json.loads(
+        plugin._detect_creation_opportunity(
+            _candidate(),
+            session_id="one-shot",
+            platform="cli",
+            supports_followup_turns=False,
+        )
+    )
+    assert blocked == {"status": "not_proposed", "reason": "unsupported_runtime"}
+
+    _show_card(plugin, "failed-turn")
+    assert (
+        plugin._transform_llm_output(
+            session_id="failed-turn",
+            sender_id="owner-a",
+            response_text="部分结果",
+            completed=False,
+            failed=True,
+        )
+        is None
+    )
+    state_key = plugin._session_key(
+        {"session_id": "failed-turn", "sender_id": "owner-a"}
+    )
+    assert plugin._session_states[state_key]["last_proposal"] is None
+
+
+def test_explicit_creation_and_expired_cards_cannot_enter_recommendation_flow():
+    plugin = _load_plugin()
+
+    assert (
+        plugin._on_pre_llm_call(
+            session_id="native-create",
+            sender_id="owner-a",
+            user_message="请创建一个广告分析 Agent",
+            conversation_history=[],
+        )
+        is None
+    )
+
+    payload = _show_card(plugin, "expired-card")
+    state_key = plugin._session_key(
+        {"session_id": "expired-card", "sender_id": "owner-a"}
+    )
+    plugin._session_states[state_key]["last_proposal"]["expires_at"] = 0
+
+    assert (
+        plugin._on_pre_llm_call(
+            session_id="expired-card",
+            sender_id="owner-a",
+            user_message=_action(payload),
+            conversation_history=[],
+        )
+        is None
+    )
