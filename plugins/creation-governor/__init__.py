@@ -56,7 +56,7 @@ _recent_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
 _dismissed_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
 _session_states: OrderedDict[str, dict[str, Any]] = OrderedDict()
 _muted_sessions: set[str] = set()
-_known_unmuted_sessions: set[str] = set()
+_known_unmuted_sessions: OrderedDict[str, float] = OrderedDict()
 _state_lock = threading.Lock()
 _plugin_llm: Any = None
 _invocation_scope: ContextVar[tuple[str, str, str | None, str] | None] = ContextVar(
@@ -80,6 +80,8 @@ _ACCEPT_RE = re.compile(
 _EXPLICIT_CREATION_RE = re.compile(
     r"(?:(?:创建|新建|新增|建立|建个|建一个|再来一个|安装|做成|保存成|生成).{0,48}"
     r"(?:agent|智能体|助手|skill|技能|定时任务|scheduled\s*task|task))|"
+    r"(?:(?:给我|我想要|我需要|帮我|来(?:一个|个)|要(?:一个|个)).{0,48}"
+    r"(?:agent|智能体|助手|skill|技能|定时任务|scheduled\s*task|task))|"
     r"(?:(?:create|build|make|new|add|install|spin\s+up)\s+.{0,48}"
     r"(?:agent|assistant|skill|scheduled\s*task))",
     re.IGNORECASE,
@@ -93,6 +95,9 @@ _RECOMMENDATION_RESPONSE_RE = re.compile(
     r"\[creation_recommendation_response\]\s*(\{.*?\})\s*"
     r"\[/creation_recommendation_response\]",
     re.DOTALL,
+)
+_ACTION_RESULT_ENVELOPE_RE = re.compile(
+    r"<!--creation-recommendation-action-result\s+[A-Za-z0-9_-]+\s*-->"
 )
 
 
@@ -229,18 +234,9 @@ def _open_preferences_db() -> sqlite3.Connection:
 def _set_session_muted(session_id: str, muted: bool) -> bool:
     """Persist the user's explicit per-conversation recommendation preference.
 
-    Memory is updated first so an in-flight transform hook observes the choice
-    immediately.  SQLite makes the preference survive gateway/profile restarts.
-    A failed write keeps the current process safe and muted, then reports False
-    so callers can log the durability degradation without exposing internals.
+    SQLite commits before memory changes so a client never receives a durable
+    success result for a preference that would disappear after a restart.
     """
-    with _state_lock:
-        if muted:
-            _muted_sessions.add(session_id)
-            _known_unmuted_sessions.discard(session_id)
-        else:
-            _muted_sessions.discard(session_id)
-            _known_unmuted_sessions.add(session_id)
     try:
         with _open_preferences_db() as connection:
             connection.execute(
@@ -254,25 +250,35 @@ def _set_session_muted(session_id: str, muted: bool) -> bool:
                 """,
                 (session_id, int(muted), time.time()),
             )
-        return True
     except (OSError, sqlite3.Error):
         logger.warning(
             "creation recommendation session preference persistence failed",
             exc_info=True,
         )
         return False
+    with _state_lock:
+        if muted:
+            _muted_sessions.add(session_id)
+            _known_unmuted_sessions.pop(session_id, None)
+        else:
+            _muted_sessions.discard(session_id)
+            _remember_unmuted_session(session_id, time.monotonic())
+    return True
 
 
 def _is_session_muted(session_id: str) -> bool:
+    now = time.monotonic()
     with _state_lock:
+        _prune_known_unmuted_sessions(now)
         if session_id in _muted_sessions:
             return True
         if session_id in _known_unmuted_sessions:
+            _remember_unmuted_session(session_id, now)
             return False
     path = _preferences_db_path()
     if not path.exists():
         with _state_lock:
-            _known_unmuted_sessions.add(session_id)
+            _remember_unmuted_session(session_id, now)
         return False
     try:
         with sqlite3.connect(path, timeout=2.0) as connection:
@@ -294,13 +300,29 @@ def _is_session_muted(session_id: str) -> bool:
     with _state_lock:
         if muted:
             _muted_sessions.add(session_id)
-            _known_unmuted_sessions.discard(session_id)
+            _known_unmuted_sessions.pop(session_id, None)
         else:
-            _known_unmuted_sessions.add(session_id)
+            _remember_unmuted_session(session_id, now)
     return muted
 
 
+def _remember_unmuted_session(session_id: str, now: float) -> None:
+    _known_unmuted_sessions[session_id] = now
+    _known_unmuted_sessions.move_to_end(session_id)
+    _prune_known_unmuted_sessions(now)
+
+
+def _prune_known_unmuted_sessions(now: float) -> None:
+    expired_before = now - SESSION_STATE_TTL_SECONDS
+    for session_id, last_seen in tuple(_known_unmuted_sessions.items()):
+        if last_seen < expired_before:
+            _known_unmuted_sessions.pop(session_id, None)
+    while len(_known_unmuted_sessions) > MAX_SESSION_STATES:
+        _known_unmuted_sessions.popitem(last=False)
+
+
 def _prune_session_states(now: float) -> None:
+    _prune_known_unmuted_sessions(now)
     expired_before = now - SESSION_STATE_TTL_SECONDS
     for key, state in tuple(_session_states.items()):
         if float(state.get("last_seen", 0)) < expired_before:
@@ -321,6 +343,7 @@ def _state_locked(session_id: str, now: float) -> dict[str, Any]:
             "last_candidate": None,
             "last_proposal": None,
             "proposal_stage": None,
+            "pending_action_result": None,
             "draft_only_turn": None,
             "draft_delivered_turn": None,
             "awaiting_proposal_id": None,
@@ -761,6 +784,9 @@ def _handle_previous_proposal_action(
             return ""
         if action == "mute_session":
             persisted = _set_session_muted(session_id, True)
+            if not persisted:
+                logger.warning("creation recommendation mute was not persisted")
+                return ""
             with _state_lock:
                 state = _state_locked(session_id, now)
                 state["last_candidate"] = None
@@ -777,6 +803,9 @@ def _handle_previous_proposal_action(
             )
         if action == "unmute_session":
             persisted = _set_session_muted(session_id, False)
+            if not persisted:
+                logger.warning("creation recommendation unmute was not persisted")
+                return ""
             with _state_lock:
                 state = _state_locked(session_id, now)
                 state["last_candidate"] = None
@@ -802,9 +831,7 @@ def _handle_previous_proposal_action(
                 "another opportunity review this turn.]"
             )
         with _state_lock:
-            state = _state_locked(session_id, now)
-            state["last_proposal"] = None
-            state["proposal_stage"] = None
+            _state_locked(session_id, now)["proposal_stage"] = "create_action_pending"
         return (
             "[Creation governor internal action: The user accepted the previous recommendation "
             f"for {structured['creation_type']} '{structured['title']}'. Continue through "
@@ -879,8 +906,21 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         return _join_context(_self_description_context())
 
     if "[creation_recommendation_response]" in user_message:
+        structured = _parse_recommendation_response(user_message)
         action_context = _handle_previous_proposal_action(session_id, user_message, now)
-        return _join_context(action_context)
+        if structured:
+            with _state_lock:
+                state = _state_locked(session_id, now)
+                state["pending_action_result"] = {
+                    "proposal_id": structured["proposal_id"],
+                    "action": structured["action"],
+                    "status": "accepted" if action_context else "rejected",
+                }
+        return _join_context(
+            action_context
+            or "[Creation governor internal action: Ignore this invalid or expired "
+            "recommendation action. Do not create anything from it and do not expose this block.]"
+        )
     action_context = _handle_previous_proposal_action(session_id, user_message, now)
     if action_context:
         return _join_context(action_context)
@@ -946,6 +986,7 @@ def _encode_recommendation(candidate: dict[str, Any]) -> str:
         "confidence": candidate["confidence"],
         "evidence_turn_ids": candidate.get("evidence_turn_ids") or [],
         "source_turn_id": candidate.get("source_turn_id") or "",
+        "action_receipts": True,
     }
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
@@ -973,29 +1014,101 @@ def _recommendation_envelope(candidate: dict[str, Any]) -> str:
     )
 
 
+def _action_result_envelope(result: dict[str, Any]) -> str:
+    payload = {
+        "version": 1,
+        "type": "creation_recommendation_action_result",
+        "proposal_id": result["proposal_id"],
+        "action": result["action"],
+        "status": result["status"],
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    return f"<!--creation-recommendation-action-result {encoded}-->"
+
+
 def _transform_llm_output(**kwargs: Any) -> str | None:
     session_id = _session_key(kwargs)
     response_text = str(kwargs.get("response_text") or "")
-    if (
-        not session_id
-        or not response_text
-        or _is_noninteractive(kwargs)
-        or _is_unsupported_runtime(kwargs)
-        or kwargs.get("structured_output")
-        or is_intentional_silence_response(response_text)
+    if not session_id:
+        return None
+    if _is_noninteractive(kwargs) or _is_unsupported_runtime(kwargs) or kwargs.get(
+        "structured_output"
     ):
+        with _state_lock:
+            _state_locked(session_id, time.monotonic())["pending_action_result"] = None
+        return None
+    if not response_text or is_intentional_silence_response(response_text):
+        with _state_lock:
+            state = _state_locked(session_id, time.monotonic())
+            action_result = state.get("pending_action_result")
+            state["pending_action_result"] = None
+            if (
+                isinstance(action_result, dict)
+                and action_result.get("action") == "create"
+                and state.get("proposal_stage") == "create_action_pending"
+            ):
+                state["proposal_stage"] = "proposal_shown"
+                action_result = action_result | {"status": "rejected"}
+        if (
+            isinstance(action_result, dict)
+            and (
+                action_result.get("status") == "rejected"
+                or action_result.get("action") in {"dismiss", "mute_session", "unmute_session"}
+            )
+        ):
+            return _action_result_envelope(action_result)
         return None
     if kwargs.get("failed") or kwargs.get("interrupted") or kwargs.get("completed") is False:
         with _state_lock:
             state = _state_locked(session_id, time.monotonic())
-            if state.get("proposal_stage") == "proposal_shown":
+            action_result = state.get("pending_action_result")
+            state["pending_action_result"] = None
+            retryable_create = isinstance(action_result, dict) and action_result.get("action") == "create"
+            if retryable_create and state.get("proposal_stage") == "create_action_pending":
+                state["proposal_stage"] = "proposal_shown"
+                action_result = action_result | {"status": "rejected"}
+            if state.get("proposal_stage") == "proposal_shown" and not retryable_create:
                 state["last_candidate"] = None
                 state["last_proposal"] = None
                 state["proposal_stage"] = None
+        if (
+            isinstance(action_result, dict)
+            and (
+                action_result.get("status") == "rejected"
+                or action_result.get("action") in {"dismiss", "mute_session", "unmute_session"}
+            )
+        ):
+            return _action_result_envelope(action_result)
         return None
-    if _is_session_muted(session_id):
-        return None
+    response_without_action_results = _ACTION_RESULT_ENVELOPE_RE.sub("", response_text)
+    stripped_forged_action_result = response_without_action_results != response_text
+    response_text = response_without_action_results.rstrip()
     now = time.monotonic()
+    with _state_lock:
+        state = _state_locked(session_id, now)
+        action_result = state.get("pending_action_result")
+        state["pending_action_result"] = None
+        if (
+            isinstance(action_result, dict)
+            and action_result.get("action") == "create"
+            and action_result.get("status") == "accepted"
+        ):
+            state["last_candidate"] = None
+            state["last_proposal"] = None
+            state["proposal_stage"] = None
+    result_suffix = (
+        "\n\n" + _action_result_envelope(action_result)
+        if isinstance(action_result, dict)
+        else ""
+    )
+    response_with_result = response_text.rstrip() + result_suffix
+    # Transform hooks use ``None``/empty to mean "leave the original response
+    # unchanged". Return whitespace when a forged marker was the entire
+    # response, so the finalizer can still replace (and therefore remove) it.
+    sanitized_response = response_with_result or ("\n" if stripped_forged_action_result else None)
+    if _is_session_muted(session_id):
+        return sanitized_response if (result_suffix or stripped_forged_action_result) else None
     with _state_lock:
         state = _state_locked(session_id, now)
         proposal = state.get("last_proposal")
@@ -1005,13 +1118,13 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
             or int(state["last_prompt_turn"]) != current_turn
             or int(state["last_delivery_turn"]) == current_turn
         ):
-            return None
+            return sanitized_response if (result_suffix or stripped_forged_action_result) else None
         state["last_delivery_turn"] = current_turn
 
     if "<!--creation-recommendation:start " in response_text:
-        return None
+        return sanitized_response if (result_suffix or stripped_forged_action_result) else None
     if _is_session_muted(session_id):
-        return None
+        return sanitized_response if (result_suffix or stripped_forged_action_result) else None
     logger.info(
         "creation recommendation attached type=%s confidence=%s title=%s turn=%s",
         proposal.get("creation_type"),
@@ -1019,7 +1132,7 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
         _text(proposal.get("suggested_name"), 80),
         current_turn,
     )
-    return response_text.rstrip() + "\n\n" + _recommendation_envelope(proposal)
+    return response_with_result + "\n\n" + _recommendation_envelope(proposal)
 
 
 def _detect_creation_opportunity(args: dict[str, Any], **kwargs: Any) -> str:
