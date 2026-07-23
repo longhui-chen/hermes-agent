@@ -49,6 +49,26 @@ class TestExtractPlanAutoExecute:
         assert _extract_plan_auto_execute({"metadata": {"planAutoExecute": "false"}}) is False
         assert _extract_plan_auto_execute({"metadata": {"planAutoExecute": "true"}}) is True
 
+    def test_unparseable_value_returns_none_not_auto(self):
+        # 字段存在但值无法解析（null / 空串 / 未知字符串）→ None（回落到
+        # env/default manual），绝不能被提成 auto，否则绕过 capability opt-in。
+        for bad in (None, "", "  ", "maybe", "yesnt", "1.5x", [], {}, object()):
+            assert (
+                _extract_plan_auto_execute({"metadata": {"plan_auto_execute": bad}})
+                is None
+            ), bad
+
+    def test_numeric_optin_still_parses(self):
+        # 明确的数值型 bool 仍算显式 opt-in（1 → True，0 → False）。
+        assert _extract_plan_auto_execute({"metadata": {"plan_auto_execute": 1}}) is True
+        assert _extract_plan_auto_execute({"metadata": {"plan_auto_execute": 0}}) is False
+
+    def test_unparseable_value_flows_to_manual_default(self, monkeypatch):
+        # 端到端：坏值 → extract None → resolve 默认 manual（无 env）。
+        monkeypatch.delenv("HERMES_ZET_AGENT_PLAN_AUTO_EXECUTE", raising=False)
+        extracted = _extract_plan_auto_execute({"metadata": {"plan_auto_execute": None}})
+        assert _resolve_plan_auto_execute(extracted) is False
+
 
 class TestResolvePlanAutoExecute:
     def test_default_is_manual(self, monkeypatch):

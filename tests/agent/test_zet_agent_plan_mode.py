@@ -8,6 +8,7 @@ from agent.conversation_loop import (
     _should_force_present_plan_tool_choice,
 )
 from agent.tool_executor import _zet_agent_plan_mode_block_message
+from gateway.platforms.zet_agent import _zettlab_workflow_addendum
 
 
 def _agent(**overrides):
@@ -353,3 +354,23 @@ def test_zet_agent_plan_blocks_are_scoped_to_app_plan_mode():
     assert _zet_agent_plan_mode_block_message(
         _agent(), "write_file", {"path": "/tmp/output/plan.md"}
     ) is None
+
+
+def test_workflow_addendum_plan_first_section_is_capability_aware():
+    # auto opt-in：Plan-First 段命令展示后同轮继续执行、不等确认。
+    auto = _zettlab_workflow_addendum(True)
+    assert "直接在同一轮继续把计划执行下去" in auto
+    assert "不要停下、不要等用户确认" in auto
+    assert "停下、等用户在确认卡上确认后再执行" not in auto
+
+    # manual（默认 / 未 opt-in）：Plan-First 段命令停下等用户确认，禁止先跑副作用。
+    manual = _zettlab_workflow_addendum(False)
+    assert "停下、等用户在确认卡上确认后再执行" in manual
+    assert "在收到用户确认前，不要执行计划里的任何实际操作" in manual
+    assert "直接在同一轮继续把计划执行下去" not in manual
+
+    # 两版共享工作风格 / 用户画像语言段，只有 Plan-First 段随能力切换。
+    for text in (auto, manual):
+        assert "## 工作风格" in text
+        assert "## 计划先行（Plan-First）" in text
+        assert "## 用户画像语言" in text

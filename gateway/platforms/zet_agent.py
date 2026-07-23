@@ -190,7 +190,7 @@ ZETTLAB_CONNECTORS_SERVER_NAME = "zettlab_connectors"
 # 不写进 SOUL.md 是为了保留 per-agent 的灵活性 —— 用户在某个 agent 的
 # 身份定位里如果显式覆盖（比如"快速执行不要确认"），那条 SOUL 仍然
 # 跟在这段 addendum 后面，模型会以更靠后的、更具体的指令为准。
-ZETTLAB_WORKFLOW_ADDENDUM = """\
+_ZET_ADDENDUM_HEAD = """\
 ## 工作风格
 
 执行以下结构化变更前，先用 clarify 工具向用户确认意图（把关键参数列成 2-4 个选项让用户选）：
@@ -199,8 +199,12 @@ ZETTLAB_WORKFLOW_ADDENDUM = """\
 - 发送外部消息（邮件、IM 推送）
 
 用户已经明确指定全部关键参数（频率、时间、目标、内容）时直接执行，无需再 clarify。
-信息查询、闲聊、回答问题不要 clarify。
+信息查询、闲聊、回答问题不要 clarify。"""
 
+# Plan-First section, auto-execute variant: App opted in (capability negotiation)
+# to render the plan card as a read-only preview and let the model carry the plan
+# out in the same turn.
+_ZET_PLAN_FIRST_AUTO = """\
 ## 计划先行（Plan-First）
 
 面对复杂多步任务（涉及 3 个以上阶段、不可逆操作或大量数据变更）时：
@@ -211,13 +215,46 @@ ZETTLAB_WORKFLOW_ADDENDUM = """\
 用户说"plan 模式"、"计划模式"、"先给计划"时，也按上述 App 计划卡片流程处理（展示计划后直接执行，不等确认）。
 不要加载名为 `plan` 的 markdown skill，也不要写 `.hermes/plans`；那是 CLI/文档计划模式，不是 Zettlab App 的确认卡片。
 
-简单的单步请求、查询、闲聊不需要 present_plan，直接执行即可。
+简单的单步请求、查询、闲聊不需要 present_plan，直接执行即可。"""
 
+# Plan-First section, manual variant: no auto-execute opt-in (legacy confirm card,
+# and the safe default for any client that did not opt in). Mirrors the global
+# PLAN_SCHEMA stop-and-wait contract so a self-initiated present_plan (outside App
+# plan mode, where _should_end_after_present_plan does NOT halt the turn) cannot
+# run write/terminal/message side effects before the user confirms.
+_ZET_PLAN_FIRST_MANUAL = """\
+## 计划先行（Plan-First）
+
+面对复杂多步任务（涉及 3 个以上阶段、不可逆操作或大量数据变更）时：
+1. 先调用 `present_plan` 工具，把执行计划结构化呈现给用户（分组列出每步要做什么）。
+2. 计划卡片是给用户确认的预览，展示后**停下、等用户在确认卡上确认后再执行**；在收到用户确认前，不要执行计划里的任何实际操作（写文件、terminal、发送外部消息等有副作用的动作）。
+3. 收到用户确认后再逐步执行，用 `todo` 工具记录和更新进度，每完成一步立即把对应 todo 标记为 completed。
+
+用户说"plan 模式"、"计划模式"、"先给计划"时，也按上述 App 计划卡片流程处理（展示计划后停下，等用户确认再执行）。
+不要加载名为 `plan` 的 markdown skill，也不要写 `.hermes/plans`；那是 CLI/文档计划模式，不是 Zettlab App 的确认卡片。
+
+简单的单步请求、查询、闲聊不需要 present_plan，直接执行即可。"""
+
+_ZET_ADDENDUM_TAIL = """\
 ## 用户画像语言
 
 写入长期用户画像（memory 工具 target="user"，即 USER.md）时，必须使用简体中文。
-姓名、产品名、命令、代码标识符可以保留原文，但描述用户特征、偏好、沟通风格的正文必须写成中文。
-"""
+姓名、产品名、命令、代码标识符可以保留原文，但描述用户特征、偏好、沟通风格的正文必须写成中文。"""
+
+
+def _zettlab_workflow_addendum(auto_execute: bool) -> str:
+    """Assemble the zet_agent workflow addendum with a capability-aware Plan-First
+    section.
+
+    ``auto_execute`` mirrors the resolved per-turn ``_zet_agent_plan_auto_execute``
+    flag (App capability opt-in > env kill-switch > default False). When True the
+    Plan-First section tells the model to carry the plan out in the same turn after
+    ``present_plan``; when False it tells the model to stop and wait for the user's
+    confirmation, matching the legacy confirm card and the global stop-and-wait
+    PLAN_SCHEMA so no side effect runs before the user confirms.
+    """
+    plan_first = _ZET_PLAN_FIRST_AUTO if auto_execute else _ZET_PLAN_FIRST_MANUAL
+    return "\n\n".join((_ZET_ADDENDUM_HEAD, plan_first, _ZET_ADDENDUM_TAIL)) + "\n"
 
 
 def check_zet_agent_requirements() -> bool:
@@ -985,10 +1022,11 @@ class ZetAgentAdapter(APIServerAdapter):
         ``auto_execute`` on the payload tells the App whether this is a
         read-only auto-execute card (agent keeps executing in the same turn) or
         the legacy confirmation card (App gates execution on a user tap). It
-        follows the turn-level auto-execute flag (default on) regardless of
-        whether the App requested plan mode or the model presented a plan on its
-        own — both should show a read-only card and keep executing. Only the
-        manual kill-switch (env / per-turn meta = false) makes it the legacy card.
+        follows the resolved turn-level auto-execute flag (App capability opt-in
+        > env kill-switch > default False/manual) regardless of whether the App
+        requested plan mode or the model presented a plan on its own. Only a
+        client that opted in (or the env kill-switch) turns it into the read-only
+        auto card; every other case stays the legacy confirmation card.
         """
         def _emit(title: str, groups: List[Dict[str, Any]]) -> None:
             payload = {
@@ -1112,13 +1150,23 @@ class ZetAgentAdapter(APIServerAdapter):
         sniffed ``_stream_q``. If sniff fails we degrade silently to
         upstream behaviour (no extension events, but no crash).
         """
+        # Pull the zet_agent-only Plan auto-execute hint out of request_overrides
+        # before it can reach the AIAgent (and the LLM request body). _run_agent
+        # stamps the resolved per-turn flag here so the Plan-First addendum section
+        # matches the turn's confirm/auto behaviour. Absent (async /v1/runs path,
+        # or non-plan callers) → None → manual (safe default).
+        plan_auto_execute = None
+        if isinstance(request_overrides, dict) and "_zet_plan_auto_execute" in request_overrides:
+            request_overrides = dict(request_overrides)
+            plan_auto_execute = request_overrides.pop("_zet_plan_auto_execute", None)
+
         # 在 ephemeral_system_prompt 头部接 zettlab 工作风格 addendum。
         # 上游传进来的 ephemeral 通常是 SOUL.md / IDENTITY.md 的拼接（per-agent
         # 人格），让 addendum 在前、SOUL 在后是有意的：模型在系统提示里靠后
         # 的 instruction 优先级更高，per-agent SOUL 真要 override 这条 workflow
         # 时仍能压过去。
         ephemeral_system_prompt = (
-            ZETTLAB_WORKFLOW_ADDENDUM
+            _zettlab_workflow_addendum(bool(plan_auto_execute))
             + ("\n\n" + ephemeral_system_prompt if ephemeral_system_prompt else "")
         )
 
