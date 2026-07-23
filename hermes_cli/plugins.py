@@ -1912,11 +1912,21 @@ class PluginManager:
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
+        transformed_text = kwargs.get("response_text")
         for cb in callbacks:
             try:
-                ret = cb(**kwargs)
+                callback_kwargs = kwargs
+                if hook_name == "transform_llm_output":
+                    callback_kwargs = dict(kwargs, response_text=transformed_text)
+                ret = cb(**callback_kwargs)
                 if ret is not None:
                     results.append(ret)
+                if (
+                    hook_name == "transform_llm_output"
+                    and isinstance(ret, str)
+                    and ret
+                ):
+                    transformed_text = ret
             except Exception as exc:
                 logger.warning(
                     "Hook '%s' callback %s raised: %s",

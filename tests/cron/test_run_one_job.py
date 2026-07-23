@@ -11,6 +11,7 @@ the extraction didn't change `tick`'s behavior); the rest unit-test the
 extracted helper directly.
 """
 import cron.scheduler as s
+from datetime import datetime, timezone
 
 
 def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final response",
@@ -31,7 +32,7 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         calls.append(("deliver", job["id"]))
         return None
 
-    def fake_mark(jid, ok, err=None, delivery_error=None):
+    def fake_mark(jid, ok, err=None, delivery_error=None, **_kwargs):
         calls.append(("mark", jid, ok))
 
     monkeypatch.setattr(s, "run_job", fake_run_job)
@@ -110,7 +111,7 @@ def test_run_one_job_exception_marks_failure(monkeypatch):
     marks = []
     monkeypatch.setattr(
         s, "mark_job_run",
-        lambda jid, ok, err=None, delivery_error=None: marks.append((jid, ok)),
+        lambda jid, ok, err=None, delivery_error=None, **_kwargs: marks.append((jid, ok)),
     )
 
     ok = s.run_one_job({"id": "j6", "name": "t"})
@@ -274,3 +275,23 @@ def test_run_one_job_tears_down_deferred_agent_when_save_raises(monkeypatch):
     assert ok is False
     assert "deliver" not in order
     assert order == ["save-raise", "agent.close", "cleanup_stale"], order
+
+
+def test_run_one_job_defaults_to_run_now_instead_of_consuming_future_schedule(monkeypatch):
+    fixed_now = datetime(2026, 7, 21, 8, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(s, "_hermes_now", lambda: fixed_now)
+    _patch_pipeline(monkeypatch)
+    captured = {}
+
+    def fake_mark(jid, ok, err=None, delivery_error=None, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(s, "mark_job_run", fake_mark)
+    ok = s.run_one_job({
+        "id": "run-now",
+        "name": "manual",
+        "next_run_at": "2026-07-22T09:00:00+00:00",
+    })
+
+    assert ok is True
+    assert captured["scheduled_at"] == fixed_now.isoformat()

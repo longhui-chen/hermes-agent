@@ -5,7 +5,7 @@ import itertools
 import json
 import logging
 import os
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import ANY, AsyncMock, patch, MagicMock
 
 import pytest
 
@@ -2599,7 +2599,7 @@ class TestSilentDelivery:
         deliver_mock.assert_not_called()
         assert any(SILENT_MARKER in r.message for r in caplog.records)
 
-    def test_silent_with_note_suppresses_delivery(self):
+    def test_silent_with_note_delivers_substantive_content(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT] No changes detected", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
@@ -2607,10 +2607,10 @@ class TestSilentDelivery:
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
-        deliver_mock.assert_not_called()
+        deliver_mock.assert_called_once()
 
-    def test_silent_trailing_suppresses_delivery(self):
-        """Agent appended [SILENT] after explanation text — must still suppress."""
+    def test_silent_trailing_delivers_substantive_content(self):
+        """An untrusted sentinel cannot erase the preceding result."""
         response = "2 deals filtered out (like<10, reply<15).\n\n[SILENT]"
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
@@ -2619,9 +2619,9 @@ class TestSilentDelivery:
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
-        deliver_mock.assert_not_called()
+        deliver_mock.assert_called_once()
 
-    def test_silent_is_case_insensitive(self):
+    def test_silent_prefix_with_content_delivers(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[silent] nothing new", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
@@ -2629,7 +2629,7 @@ class TestSilentDelivery:
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
-        deliver_mock.assert_not_called()
+        deliver_mock.assert_called_once()
 
     def test_bracketless_silent_variants_suppress(self):
         """Bracketless near-markers the model emits when it drops brackets
@@ -2660,16 +2660,17 @@ class TestSilentDelivery:
     def test_is_cron_silence_response_contract(self):
         """Direct behavior contract for the cron silence matcher."""
         from cron.scheduler import _is_cron_silence_response as sil
-        # Suppress: bare/bracketed/bracketless tokens, prefix, trailing-line.
+        # Suppress only exact bare/bracketed/bracketless tokens.
         assert sil("[SILENT]")
-        assert sil("[silent] nothing new")
-        assert sil("[SILENT] No changes detected")
-        assert sil("2 deals filtered.\n\n[SILENT]")
         assert sil("SILENT")
         assert sil("NO_REPLY")
         assert sil("NO REPLY")
-        assert sil("Summary.\nSILENT")
-        # Deliver: real content, mid-sentence quotes, bare words, junk.
+        assert sil(" [silent] \n")
+        # Deliver: any substantive content beside a token, plus junk.
+        assert not sil("[silent] nothing new")
+        assert not sil("[SILENT] No changes detected")
+        assert not sil("2 deals filtered.\n\n[SILENT]")
+        assert not sil("Summary.\nSILENT")
         assert not sil("Daily report: 4 PRs merged.")
         assert not sil("I stayed [SILENT] but here is the report: 3 items.")
         assert not sil("Silent retry succeeded after 2 attempts.")
@@ -2716,6 +2717,8 @@ class TestSilentDelivery:
             False,
             "Agent completed but produced empty response (model error, timeout, or misconfiguration)",
             delivery_error=None,
+            scheduled_at=ANY,
+            output_filename="out.md",
         )
 
 

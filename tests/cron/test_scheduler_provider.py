@@ -363,12 +363,63 @@ def test_fire_due_default_claims_then_runs(monkeypatch):
     from cron.scheduler_provider import InProcessCronScheduler
 
     ran = []
-    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid: True, raising=False)
+    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid, **kwargs: True, raising=False)
     monkeypatch.setattr(jobs, "get_job", lambda jid: {"id": jid, "name": "t"})
     monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: ran.append(job["id"]) or True)
 
     assert InProcessCronScheduler().fire_due("j1") is True
     assert ran == ["j1"]
+
+
+def test_fire_due_preserves_planned_occurrence_identity_from_real_claim_store(tmp_path, monkeypatch):
+    """A few seconds of webhook latency must not move the calendar node."""
+    from datetime import datetime, timezone
+
+    import cron.jobs as jobs
+    import cron.scheduler as sched
+    import cron.scheduler_provider as provider_module
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    planned = datetime(2026, 7, 21, 9, 0, tzinfo=timezone.utc)
+    fired = datetime(2026, 7, 21, 9, 0, 5, tzinfo=timezone.utc)
+    jobs.save_jobs(
+        [{
+            "id": "external-daily",
+            "name": "external daily",
+            "prompt": "x",
+            "enabled": True,
+            "state": "scheduled",
+            "timezone": "UTC",
+            "schedule": {"kind": "cron", "expr": "0 9 * * *", "display": "daily"},
+            "repeat": {"times": None, "completed": 0},
+            "next_run_at": planned.isoformat(),
+        }, {
+            "id": "external-once",
+            "name": "external once",
+            "prompt": "x",
+            "enabled": True,
+            "state": "scheduled",
+            "timezone": "UTC",
+            "schedule": {"kind": "once", "run_at": planned.isoformat(), "display": "once"},
+            "repeat": {"times": 1, "completed": 0},
+            "next_run_at": planned.isoformat(),
+        }]
+    )
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: fired)
+    monkeypatch.setattr(provider_module, "_hermes_now", lambda: fired)
+    triggered = []
+    monkeypatch.setattr(
+        sched,
+        "run_one_job",
+        lambda _job, **kwargs: triggered.append(kwargs["triggered_at"]) or True,
+    )
+
+    assert InProcessCronScheduler().fire_due("external-daily") is True
+    assert InProcessCronScheduler().fire_due("external-once") is True
+    assert triggered == [planned.isoformat(), planned.isoformat()]
+    stored = jobs.get_job("external-daily")
+    assert stored["in_flight_occurrence"]["scheduled_at"] == planned.isoformat()
 
 
 def test_fire_due_lost_claim_does_not_run(monkeypatch):
@@ -379,7 +430,7 @@ def test_fire_due_lost_claim_does_not_run(monkeypatch):
     from cron.scheduler_provider import InProcessCronScheduler
 
     ran = []
-    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid: False, raising=False)
+    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid, **kwargs: False, raising=False)
     monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: ran.append(job["id"]) or True)
 
     assert InProcessCronScheduler().fire_due("j1") is False
@@ -394,7 +445,7 @@ def test_fire_due_missing_job_does_not_run(monkeypatch):
     from cron.scheduler_provider import InProcessCronScheduler
 
     ran = []
-    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid: True, raising=False)
+    monkeypatch.setattr(jobs, "claim_job_for_fire", lambda jid, **kwargs: True, raising=False)
     monkeypatch.setattr(jobs, "get_job", lambda jid: None)
     monkeypatch.setattr(sched, "run_one_job", lambda job, **kw: ran.append(job["id"]) or True)
 

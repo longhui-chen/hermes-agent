@@ -158,6 +158,28 @@ def gui_toolset_label(label: str) -> str:
 _DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "markdown_vault_write"}
 
 
+def _uses_zettlab_video_generation(config: dict, platform: str) -> bool:
+    video_config = config.get("video_gen")
+    return (
+        platform == "zet_agent"
+        and isinstance(video_config, dict)
+        and str(video_config.get("provider") or "").strip() == "zettlab"
+    )
+
+
+def _default_off_toolsets_for_platform(config: dict, platform: str) -> Set[str]:
+    """Return default-off toolsets after applying platform-specific gates."""
+    default_off = set(_DEFAULT_OFF_TOOLSETS)
+    if platform in default_off and platform not in _TOOLSET_PLATFORM_RESTRICTIONS:
+        default_off.remove(platform)
+
+    if _uses_zettlab_video_generation(config, platform):
+        # Provider availability is still gated by ai-gateway capabilities.
+        default_off.discard("video_gen")
+
+    return default_off
+
+
 def _xai_credentials_present() -> bool:
     """Cheap, side-effect-free check for usable xAI credentials.
 
@@ -1797,9 +1819,7 @@ def _get_platform_tools(
                 if ts_tools and ts_tools.issubset(composite_tools):
                     expanded.add(ts_key)
 
-            default_off = set(_DEFAULT_OFF_TOOLSETS)
-            if platform in default_off and platform not in _TOOLSET_PLATFORM_RESTRICTIONS:
-                default_off.remove(platform)
+            default_off = _default_off_toolsets_for_platform(config, platform)
             if "homeassistant" in default_off and os.getenv("HASS_TOKEN"):
                 default_off.remove("homeassistant")
             _exempt_explicit_platform_native(
@@ -1845,14 +1865,12 @@ def _get_platform_tools(
         if x_search_auto_enabled:
             enabled_toolsets.add("x_search")
 
-        default_off = set(_DEFAULT_OFF_TOOLSETS)
+        default_off = _default_off_toolsets_for_platform(config, platform)
         # Legacy safety: if the platform's own name matches a default-off
         # toolset (e.g. `homeassistant` platform + `homeassistant` toolset),
         # keep that toolset enabled on first install.  Skip this dodge for
         # platform-restricted toolsets — those are always opt-in even on
         # their own platform (e.g. `discord` + `discord` should stay OFF).
-        if platform in default_off and platform not in _TOOLSET_PLATFORM_RESTRICTIONS:
-            default_off.remove(platform)
         # Home Assistant is already runtime-gated by its check_fn (requires
         # HASS_TOKEN to register any tools). When a user has configured
         # HASS_TOKEN, they've explicitly opted in — don't also strip it via
@@ -1871,6 +1889,13 @@ def _get_platform_tools(
             default_off, platform, explicitly_configured=explicitly_configured
         )
         enabled_toolsets -= default_off
+
+    # Zettlab video generation is controlled by ai-gateway capabilities, not
+    # the local opt-in used by paid third-party providers. It cannot be
+    # reverse-mapped from the core composite because the shared toolset also
+    # contains provider-specific edit/extend tools.
+    if _uses_zettlab_video_generation(config, platform):
+        enabled_toolsets.add("video_gen")
 
     # Recover non-configurable platform toolsets (e.g. discord, feishu_doc,
     # feishu_drive).  These are part of the platform's default composite but

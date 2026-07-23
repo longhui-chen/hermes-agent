@@ -400,6 +400,8 @@ def install() -> None:
         success: bool,
         error: Optional[str] = None,
         delivery_error: Optional[str] = None,
+        scheduled_at: Optional[str] = None,
+        output_filename: Optional[str] = None,
     ):
         _dbg(f"_wrapped_mark CALLED job={job_id} success={success}")
         # Snapshot job BEFORE delegating — _orig_mark auto-deletes once+
@@ -448,7 +450,12 @@ def install() -> None:
 
         try:
             result = _orig_mark(
-                job_id, success, error, delivery_error=effective_delivery_error
+                job_id,
+                success,
+                error,
+                delivery_error=effective_delivery_error,
+                scheduled_at=scheduled_at,
+                output_filename=output_filename,
             )
 
             # PRD UX：once+repeat=N 跑满后 hermes 默认把 job 从 jobs.json pop
@@ -912,9 +919,20 @@ def _is_silent_run(job_id: str) -> bool:
     doc = _LATEST_OUTPUT.get(job_id, "")
     if not doc.strip():
         return False
-    if _SILENT_STATUS_RE.search(doc):
+    metadata = re.split(r"^##\s+(?:Prompt|Response)\s*$", doc, maxsplit=1, flags=re.MULTILINE)[0]
+    if _SILENT_STATUS_RE.search(metadata):
         return True
-    return _SILENT_MARKER in _extract_response_body(doc).strip().upper()
+    body = _extract_response_body(doc).strip()
+    # Reuse the scheduler's canonical rule. A real response may discuss the
+    # sentinel in prose (or in model reasoning) and still end with useful
+    # content; substring matching silently dropped those completed jobs from
+    # the APP conversation while scheduler delivery considered them non-silent.
+    try:
+        from cron.scheduler import _is_cron_silence_response
+        return _is_cron_silence_response(body)
+    except Exception:
+        # Import-cycle/startup fallback: fail open for any substantive output.
+        return body.strip().upper() == _SILENT_MARKER
 
 
 # ── Failure classification / friendly messaging ────────────────────

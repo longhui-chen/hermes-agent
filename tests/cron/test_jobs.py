@@ -798,11 +798,14 @@ class TestMarkJobRun:
         assert updated["repeat"]["completed"] == 1
         assert updated["last_status"] == "ok"
 
-    def test_repeat_limit_removes_job(self, tmp_cron_dir):
+    def test_repeat_limit_retains_inert_completed_job(self, tmp_cron_dir):
         job = create_job(prompt="Once", schedule="30m", repeat=1)
         mark_job_run(job["id"], success=True)
-        # Job should be removed after hitting repeat limit
-        assert get_job(job["id"]) is None
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["enabled"] is False
+        assert updated["state"] == "completed"
+        assert updated["next_run_at"] is None
 
     def test_repeat_negative_one_is_infinite(self, tmp_cron_dir):
         # LLMs often pass repeat=-1 to mean "infinite/forever".
@@ -1407,12 +1410,17 @@ class TestGetDueJobs:
         assert get_due_jobs() == []
         assert get_job("inflight") is not None  # still visible to list/run
 
-        # The claiming tick really died (running set empty) → recovered as before.
+        # The claiming tick really died (running set empty) → retain an inert
+        # terminal record so calendar/history readers keep stable metadata.
         monkeypatch.setattr(
             scheduler_mod, "get_running_job_ids", lambda: frozenset()
         )
         assert get_due_jobs() == []
-        assert get_job("inflight") is None  # stale entry cleaned up
+        retained = get_job("inflight")
+        assert retained is not None
+        assert retained["enabled"] is False
+        assert retained["state"] == "error"
+        assert retained["next_run_at"] is None
 
     def test_stale_maxed_oneshot_kept_when_running_check_errors(
         self, tmp_cron_dir, monkeypatch
@@ -1483,10 +1491,14 @@ class TestGetDueJobs:
         assert get_due_jobs() == []
         assert get_job("slowrun") is not None
 
-        # Run completes → outcome lands on a record that still exists
-        # (times=1 reached, so mark_job_run retires the job normally).
+        # Run completes → outcome lands on a retained inert record so the
+        # occurrence history can still join against its stable job metadata.
         mark_job_run("slowrun", True)
-        assert get_job("slowrun") is None
+        retained = get_job("slowrun")
+        assert retained is not None
+        assert retained["enabled"] is False
+        assert retained["state"] == "completed"
+        assert retained["next_run_at"] is None
 
     def test_heartbeat_run_claim_noop_without_claim(self, tmp_cron_dir):
         """heartbeat_run_claim is a safe no-op when there is nothing to refresh
@@ -2267,12 +2279,15 @@ class TestClaimDispatch:
         # Persisted BEFORE any side effect — survives a crash.
         assert load_jobs()[0]["repeat"]["completed"] == 1
 
-    def test_already_dispatched_oneshot_is_removed(self, tmp_cron_dir):
+    def test_already_dispatched_oneshot_is_retained_inert(self, tmp_cron_dir):
         # A prior tick claimed (completed==times) then died before mark_job_run
-        # could remove the job.  The next claim must refuse AND clean up.
+        # could finish the job. The next claim must refuse and retain evidence.
         save_jobs([self._oneshot(times=1, completed=1)])
         assert claim_dispatch("os1") is False
-        assert load_jobs() == []  # removed, will not re-fire
+        retained = load_jobs()[0]
+        assert retained["enabled"] is False
+        assert retained["state"] == "error"
+        assert retained["next_run_at"] is None
 
     def test_recurring_job_is_not_claimed(self, tmp_cron_dir):
         job = {
@@ -2305,12 +2320,15 @@ class TestClaimDispatch:
 
     def test_mark_job_run_does_not_double_count_preclaimed_oneshot(self, tmp_cron_dir):
         # Full lifecycle: claim bumps completed to times, then mark_job_run must
-        # NOT increment again — it recognizes the pre-claim and removes the job.
+        # NOT increment again — it recognizes the pre-claim and terminalizes it.
         save_jobs([self._oneshot(times=1, completed=0)])
         assert claim_dispatch("os1") is True
         assert load_jobs()[0]["repeat"]["completed"] == 1
         mark_job_run("os1", success=True)
-        assert load_jobs() == []  # completed once, removed — not fired twice
+        retained = load_jobs()[0]
+        assert retained["repeat"]["completed"] == 1
+        assert retained["enabled"] is False
+        assert retained["state"] == "completed"
 
     def test_mark_job_run_still_increments_recurring(self, tmp_cron_dir):
         # The double-count guard is one-shot-specific; recurring jobs keep the
@@ -2339,7 +2357,10 @@ class TestClaimDispatch:
         }])
         due = get_due_jobs()
         assert due == []
-        assert load_jobs() == []  # cleaned up
+        retained = load_jobs()[0]
+        assert retained["enabled"] is False
+        assert retained["state"] == "error"
+        assert retained["next_run_at"] is None
 
     def test_bad_schedule_does_not_crash_or_block_sibling_jobs(self, tmp_cron_dir):
         """Regression for a job with non-dict 'schedule' (null / string / etc.

@@ -2879,6 +2879,7 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
             # Cron jobs management
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
+            self._app.router.add_get("/api/jobs/occurrences", self._handle_list_job_occurrences)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
             self._app.router.add_get("/api/jobs/{job_id}", self._handle_get_job)
             self._app.router.add_patch("/api/jobs/{job_id}", self._handle_update_job)
@@ -2886,6 +2887,7 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
             self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+            self._register_unprefixed_cron_control_routes(self._app.router)
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             if hasattr(self, "_handle_get_run"):

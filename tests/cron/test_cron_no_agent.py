@@ -308,17 +308,16 @@ def _calendar_job(content="开会：项目评审 16:00", **extra):
     return job
 
 
-def test_run_job_calendar_delivers_content(hermes_env):
-    """Calendar reminder delivers its pre-rendered content verbatim."""
-    from cron.scheduler import run_job
+def test_run_job_legacy_calendar_content_is_suppressed(hermes_env):
+    """Legacy/broad calendar jobs cannot bypass the exact planner contract."""
+    from cron.scheduler import run_job, SILENT_MARKER
 
     job = _calendar_job(content="开会：项目评审 16:00")
     success, doc, final_response, error = run_job(job)
     assert success is True
     assert error is None
-    assert final_response == "开会：项目评审 16:00"
-    assert "开会：项目评审 16:00" in doc
-    assert "notify-only" in doc
+    assert final_response == SILENT_MARKER
+    assert "开会：项目评审 16:00" not in doc
 
 
 def test_run_job_calendar_no_script_required(hermes_env):
@@ -354,15 +353,15 @@ def test_run_job_calendar_never_invokes_aiagent(hermes_env):
     ai_mock.assert_not_called()
 
 
-def test_run_job_calendar_short_circuit_requires_once_no_agent(hermes_env):
-    """A stray source=calendar marker must not change non-reminder cron semantics."""
-    from cron.scheduler import run_job
+def test_run_job_calendar_near_miss_is_always_silent(hermes_env):
+    """A calendar marker near-miss is quarantined/silent, never generic execution."""
+    from cron.scheduler import run_job, SILENT_MARKER
 
     job = _calendar_job(no_agent=False, schedule={"kind": "cron", "expr": "* * * * *"})
     success, _doc, final_response, error = run_job(job)
-    assert success is False
-    assert final_response == ""
-    assert error
+    assert success is True
+    assert final_response == SILENT_MARKER
+    assert error is None
     assert "开会：项目评审 16:00" not in final_response
 
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from plugins.video_gen.zettlab import ZettlabVideoGenProvider, register
 
 
@@ -29,7 +31,6 @@ def _capabilities():
                 "durations": [5, 10],
             }],
             "limits": {
-                "max_remote_media_inputs": 1,
                 "provider_timeout_seconds": 1200,
                 "finalization_timeout_seconds": 600,
             },
@@ -40,7 +41,11 @@ def _capabilities():
 def test_zettlab_video_provider_reads_capabilities(monkeypatch):
     from plugins import zettlab_media_client as client
 
-    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout, allow_redirects: _Resp(_capabilities()))
+    monkeypatch.setattr(
+        client._SESSION,
+        "get",
+        lambda url, timeout, allow_redirects, stream: _Resp(_capabilities()),
+    )
 
     provider = ZettlabVideoGenProvider()
     assert provider.is_available() is True
@@ -93,8 +98,9 @@ def test_zettlab_video_generate_creates_media_job(monkeypatch):
     captured = {}
     monkeypatch.setattr(client._SESSION, "get", lambda url, **kwargs: _Resp(_capabilities()))
 
-    def fake_post(url, json, headers, timeout, allow_redirects):
+    def fake_post(url, json, headers, timeout, allow_redirects, stream):
         assert allow_redirects is False
+        assert stream is True
         captured["url"] = url
         captured["json"] = json
         captured["headers"] = headers
@@ -114,12 +120,10 @@ def test_zettlab_video_generate_creates_media_job(monkeypatch):
     got = ZettlabVideoGenProvider().generate(
         "make a short clip",
         model="seedance-v1",
-        image_url="https://example.com/source.png",
         duration=5,
         aspect_ratio="16:9",
         resolution="720p",
-        negative_prompt="blurry",
-        seed=42,
+        image_url="https://example.com/source.png",
     )
 
     assert got["success"] is True
@@ -132,10 +136,30 @@ def test_zettlab_video_generate_creates_media_job(monkeypatch):
     assert captured["json"]["media_type"] == "video"
     assert captured["json"]["model"] == "seedance-v1"
     assert captured["json"]["duration"] == 5
-    assert captured["json"]["parameters"] == {"negative_prompt": "blurry", "seed": 42}
+    assert "parameters" not in captured["json"]
     assert captured["json"]["remote_media_inputs"] == [
         {"url": "https://example.com/source.png", "role": "source"},
     ]
+
+
+def test_zettlab_video_rejects_disabled_custom_parameters(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setattr(client._SESSION, "get", lambda url, **kwargs: _Resp(_capabilities()))
+    monkeypatch.setattr(
+        client,
+        "create_and_wait",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("unsupported request should not be sent")),
+    )
+
+    got = ZettlabVideoGenProvider().generate(
+        "make a short clip",
+        model="seedance-v1",
+        negative_prompt="blurry",
+    )
+
+    assert got["success"] is False
+    assert got["error_type"] == "unsupported_parameter"
 
 
 def test_zettlab_video_generate_uses_gateway_default_when_model_is_omitted(monkeypatch):
@@ -156,8 +180,9 @@ def test_zettlab_video_generate_uses_gateway_default_when_model_is_omitted(monke
 
     monkeypatch.setattr(client, "type_capability", fake_capability)
 
-    def fake_post(url, json, headers, timeout, allow_redirects):
+    def fake_post(url, json, headers, timeout, allow_redirects, stream):
         assert allow_redirects is False
+        assert stream is True
         captured.update(json)
         return _Resp({"job_id": "job-video-default", "status": "done", "assets": [{"url": "https://cdn.example/default.mp4"}]})
 
@@ -271,6 +296,21 @@ def test_first_asset_url_accepts_legacy_top_level_shortcut_without_assets():
     assert client.first_asset_url({"status": "done", "video": "https://cdn.example/legacy.mp4"}) == (
         "https://cdn.example/legacy.mp4"
     )
+
+
+@pytest.mark.parametrize(
+    ("assets", "message"),
+    [
+        ([], "completed without assets"),
+        (["bad-shape"], "invalid shape"),
+        ([{}], "no retrievable URL"),
+    ],
+)
+def test_first_asset_url_errors_preserve_job_id(assets, message):
+    from plugins import zettlab_media_client as client
+
+    with pytest.raises(client.ZettlabMediaError, match=rf"{message}.*job_id=job-assets"):
+        client.first_asset_url({"job_id": "job-assets", "status": "done", "assets": assets})
 
 
 def test_register_calls_video_provider_registry():

@@ -454,7 +454,7 @@ async def test_prefixed_cron_fire_uses_scoped_profile_home(profile_homes, monkey
     seen = []
 
     class SpyProvider:
-        def fire_due(self, job_id, *, adapters=None, loop=None):
+        def fire_due(self, job_id, *, adapters=None, loop=None, fire_at=None):
             from hermes_constants import get_hermes_home
             seen.append((get_hermes_home(), job_id))
             return True
@@ -462,7 +462,7 @@ async def test_prefixed_cron_fire_uses_scoped_profile_home(profile_homes, monkey
     monkeypatch.setattr(api_server, "_CRON_AVAILABLE", True)
     monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: SpyProvider())
     monkeypatch.setattr(
-        "plugins.cron.chronos.verify.get_fire_verifier",
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
         lambda: (lambda **_kwargs: {"purpose": "cron_fire"}),
     )
 
@@ -473,7 +473,7 @@ async def test_prefixed_cron_fire_uses_scoped_profile_home(profile_homes, monkey
     async with TestClient(TestServer(app)) as cli:
         resp = await cli.post(
             "/p/coder/api/cron/fire",
-            json={"job_id": "nightly"},
+            json={"job_id": "nightly", "fire_at": "2026-07-21T09:00:00Z"},
             headers={"Authorization": "Bearer fire-token"},
         )
 

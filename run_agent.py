@@ -2093,7 +2093,7 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
-                self._session_db.append_message(
+                _db_message_id = self._session_db.append_message(
                     session_id=self.session_id,
                     role=role,
                     content=content,
@@ -2109,6 +2109,8 @@ class AIAgent:
                     timestamp=_row_timestamp,
                     api_content=_row_api_content,
                 )
+                if isinstance(_db_message_id, int) and _db_message_id > 0:
+                    msg["_db_message_id"] = _db_message_id
                 msg[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
