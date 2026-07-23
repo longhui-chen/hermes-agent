@@ -601,3 +601,26 @@ def test_claimed_oneshot_stays_visible_until_terminal_run_is_recorded(tmp_path, 
     assert len(result) == 1
     assert result[0]["status"] == "scheduled"
     assert result[0]["scheduled_at"] == "2026-07-21T06:03:00+00:00"
+
+
+def test_occurrence_sidecar_replace_does_not_follow_final_symlink(tmp_path, monkeypatch):
+    output_root = tmp_path / "cron" / "output"
+    monkeypatch.setattr(jobs, "_output_dir", lambda: output_root)
+    job = _job(id="sidecar-safe")
+    job_dir = output_root / job["id"]
+    job_dir.mkdir(parents=True)
+    victim = tmp_path / "config.yaml"
+    victim.write_text("keep-me", encoding="utf-8")
+    sidecar = job_dir / ".occurrences.json"
+    sidecar.symlink_to(victim)
+
+    jobs._append_job_occurrence(
+        job,
+        datetime(2026, 7, 23, tzinfo=UTC),
+        success=True,
+        delivery_error=None,
+    )
+
+    assert victim.read_text(encoding="utf-8") == "keep-me"
+    assert not sidecar.is_symlink()
+    assert sidecar.stat().st_mode & 0o777 == 0o600

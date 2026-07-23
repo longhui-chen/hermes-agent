@@ -372,6 +372,38 @@ def test_generic_reconcile_flow_preserves_managed_calendar_recovery_arm(
     assert fake._armed == [{"job_id": job["id"], "fire_at": retry_at}]
 
 
+def test_generic_reconcile_replays_missing_persisted_calendar_recovery_arm(
+    temp_home, chronos, monkeypatch,
+):
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+    prov, fake = chronos
+    retry_at = "2026-07-15T01:02:03Z"
+    job = managed_job(
+        enabled=True,
+        state="scheduled",
+        next_run_at="2026-07-15T01:00:00Z",
+        provider_state={"chronos": {"calendar_recovery": {
+            "projection_revision": 2,
+            "delivery_generation": 3,
+            "retry_at": retry_at,
+            "attempt_sequence": 4,
+        }}},
+    )
+    monkeypatch.setattr("cron.jobs.load_jobs", lambda: [job])
+
+    prov.reconcile()
+
+    assert fake.provisions == [{
+        "job_id": job["id"],
+        "fire_at": retry_at,
+        "agent_callback_url": "https://agent.example/",
+        "dedup_key": hashlib.sha256(
+            f"calendar-recovery\x00{job['id']}\x002\x003\x004\x00{retry_at}".encode()
+        ).hexdigest(),
+    }]
+    assert fake.cancels == []
+
+
 def test_generic_reconcile_cancels_paused_managed_calendar_arm(
     temp_home, chronos, monkeypatch,
 ):

@@ -216,6 +216,27 @@ def test_external_fire_rejects_future_occurrence(temp_home, monkeypatch):
     assert jobs.get_job(job["id"]).get("fire_claim") is None
 
 
+def test_external_fire_clock_skew_advances_from_protocol_fire_at(temp_home, monkeypatch):
+    import cron.jobs as jobs
+
+    now = datetime(2026, 7, 21, 8, 59, tzinfo=timezone.utc)
+    fire_at = "2026-07-21T09:00:00+00:00"
+    monkeypatch.setattr(jobs, "_hermes_now", lambda: now)
+    job = jobs.create_job(prompt="x", schedule="0 9 * * *", name="daily", timezone="UTC")
+    jobs.update_job(job["id"], {"next_run_at": fire_at})
+
+    assert jobs.claim_job_for_fire(job["id"], fire_at=fire_at) is True
+    claimed = jobs.get_job(job["id"])
+    assert claimed["next_run_at"] == "2026-07-22T09:00:00+00:00"
+    jobs.mark_job_run(
+        job["id"],
+        success=True,
+        scheduled_at=claimed["in_flight_occurrence"]["scheduled_at"],
+    )
+
+    assert jobs.get_job(job["id"])["next_run_at"] == "2026-07-22T09:00:00+00:00"
+
+
 def test_external_fire_watermark_rejects_arbitrarily_old_completed_fire(temp_home, monkeypatch):
     import cron.jobs as jobs
 

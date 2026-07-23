@@ -463,15 +463,19 @@ class ChronosCronScheduler(CronScheduler):
     def reconcile(self) -> None:
         """Converge the NAS-armed one-shots toward jobs.json (desired state):
         arm missing / re-arm changed-time, cancel orphaned."""
-        from cron.calendar_delivery import is_managed_calendar_event_alert
+        from cron.calendar_delivery import is_active_managed_calendar_event_alert
         from cron.jobs import load_jobs
 
         jobs = load_jobs()
-        managed_calendar_ids = {
-            str(j.get("id")) for j in jobs
-            if is_managed_calendar_event_alert(j)
-            and j.get("enabled") is True
-            and j.get("state") != "paused"
+        managed_calendar_jobs = {
+            str(j.get("id")): j for j in jobs
+            if is_active_managed_calendar_event_alert(j)
+        }
+        managed_calendar_ids = set(managed_calendar_jobs)
+        recovery_desired = {
+            job_id: recovery
+            for job_id, job in managed_calendar_jobs.items()
+            if (recovery := _calendar_recovery_state(job)) is not None
         }
         desired: Dict[str, str] = {
             j["id"]: j["next_run_at"]
@@ -479,7 +483,10 @@ class ChronosCronScheduler(CronScheduler):
             if j.get("source") != "calendar"
             and j.get("enabled") and j.get("next_run_at") and j.get("state") != "paused"
         }
-        observed = self._list_armed()
+        # Recovery markers are durable Planner intents. Observe NAS directly
+        # before deciding they are still armed; a warm in-memory entry can be
+        # stale after NAS loses an arm.
+        observed = self._list_armed(force_remote=bool(recovery_desired))
 
         # Arm missing or changed-time.
         for job_id, fire_at in desired.items():
@@ -492,6 +499,24 @@ class ChronosCronScheduler(CronScheduler):
                         self._arm_one_shot(job)
                     except Exception as e:
                         logger.warning("Chronos failed to arm job %s: %s", job_id, e)
+
+        # Managed calendar jobs are projected explicitly and therefore stay
+        # out of the generic desired set. Their persisted recovery marker is
+        # nevertheless authoritative across process restarts and lost NAS
+        # arms, so replay that exact immutable attempt rather than next_run_at.
+        for job_id, recovery in recovery_desired.items():
+            revision, generation, retry_at, sequence = recovery
+            if observed.get(job_id) != retry_at:
+                try:
+                    self._rearm_calendar_recovery(
+                        job_id, revision, generation, retry_at, sequence,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Chronos failed to re-arm calendar recovery %s: %s",
+                        job_id,
+                        e,
+                    )
 
         # Cancel orphans (armed but no longer desired).
         for job_id in list(observed.keys()):

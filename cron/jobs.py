@@ -458,8 +458,13 @@ def _append_job_occurrence(
                 json.dump({"records": records, "truncated": truncated}, handle, separators=(",", ":"))
                 handle.flush()
                 os.fsync(handle.fileno())
-            atomic_replace(tmp_path, path)
-            _secure_file(path)
+            # This sidecar is producer-owned state, not a user-managed config
+            # symlink. The shared atomic_replace intentionally follows final
+            # symlinks; using it here would let an output-dir symlink overwrite
+            # an arbitrary target. The temp file is created in the same 0700
+            # directory with mode 0600, so a direct replace is atomic and
+            # cannot cross devices or follow the destination symlink.
+            os.replace(tmp_path, path)
         except BaseException:
             try:
                 os.unlink(tmp_path)
@@ -2241,6 +2246,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
                 fire_claim = job.get("fire_claim")
+                completed_fire_at = None
                 if isinstance(fire_claim, dict):
                     completed_fire_at = _parse_occurrence_instant(fire_claim.get("fire_at"))
                     if completed_fire_at is not None:
@@ -2300,9 +2306,17 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         save_jobs(jobs)
                         return
                 
+                # External schedulers own the occurrence instant. Use their
+                # canonical fire_at as the recurrence base so tolerated future
+                # clock skew cannot recompute the just-completed cron slot.
+                next_run_base = (
+                    completed_fire_at.isoformat()
+                    if completed_fire_at is not None
+                    else now
+                )
                 # Compute next run
                 job["next_run_at"] = compute_next_run(
-                    job["schedule"], now, tz_name=job.get("timezone")
+                    job["schedule"], next_run_base, tz_name=job.get("timezone")
                 )
 
                 # If no next run, decide whether this is terminal completion
@@ -2593,8 +2607,9 @@ def claim_job_for_fire(
                 original_scheduled_at=original_trigger,
             )
             if should_advance and kind in {"cron", "interval"}:
+                advance_base = effective_trigger if canonical_fire_at is not None else now
                 nxt = compute_next_run(
-                    job["schedule"], now.isoformat(), tz_name=job.get("timezone")
+                    job["schedule"], advance_base.isoformat(), tz_name=job.get("timezone")
                 )
                 if nxt:
                     job["next_run_at"] = nxt
