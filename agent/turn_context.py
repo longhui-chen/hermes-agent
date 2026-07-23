@@ -468,6 +468,10 @@ def build_turn_context(
             execution_origin=getattr(agent, "_memory_write_origin", "") or "",
             is_kanban_worker=bool(os.environ.get("HERMES_KANBAN_TASK")),
             structured_output=_structured_output,
+            supports_followup_turns=bool(
+                getattr(agent, "_supports_followup_turns", True)
+            ),
+            streaming_output=bool(getattr(agent, "stream_delta_callback", None)),
         )
         _ctx_parts: list[str] = []
         for r in _pre_results:

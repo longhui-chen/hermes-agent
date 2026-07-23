@@ -239,6 +239,8 @@ def test_output_transform_receives_turn_outcome(monkeypatch):
     agent._user_id = "owner-a"
     agent._user_id_alt = "canonical-owner-a"
     agent.request_overrides = {"response_format": {"type": "json_object"}}
+    agent._supports_followup_turns = False
+    agent.stream_delta_callback = lambda _delta: None
     messages = [
         {"role": "user", "content": "分析一下"},
         {"role": "assistant", "content": "任务失败。"},
@@ -266,9 +268,13 @@ def test_output_transform_receives_turn_outcome(monkeypatch):
     assert transform_kwargs["turn_exit_reason"] == "error_near_max_iterations(provider error)"
     assert transform_kwargs["sender_id"] == "canonical-owner-a"
     assert transform_kwargs["structured_output"] is True
+    assert transform_kwargs["supports_followup_turns"] is False
+    assert transform_kwargs["streaming_output"] is True
     assert post_kwargs["assistant_response"] == "任务失败。"
     assert post_kwargs["sender_id"] == "canonical-owner-a"
     assert post_kwargs["failed"] is True
+    assert post_kwargs["supports_followup_turns"] is False
+    assert post_kwargs["streaming_output"] is True
     assert result["final_response"] == "任务失败。"
     assert agent.streamed_deltas == []
 

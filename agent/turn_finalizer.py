@@ -370,6 +370,12 @@ def finalize_turn(
                 execution_origin=getattr(agent, "_memory_write_origin", "") or "",
                 is_kanban_worker=bool(os.environ.get("HERMES_KANBAN_TASK")),
                 structured_output=_structured_output,
+                supports_followup_turns=bool(
+                    getattr(agent, "_supports_followup_turns", True)
+                ),
+                streaming_output=bool(
+                    getattr(agent, "stream_delta_callback", None)
+                ),
             )
             for _hook_result in _transform_results:
                 if isinstance(_hook_result, str) and _hook_result:
@@ -446,6 +452,12 @@ def finalize_turn(
                 interrupted=interrupted,
                 execution_origin=getattr(agent, "_memory_write_origin", "") or "",
                 structured_output=_structured_output,
+                supports_followup_turns=bool(
+                    getattr(agent, "_supports_followup_turns", True)
+                ),
+                streaming_output=bool(
+                    getattr(agent, "stream_delta_callback", None)
+                ),
             )
         except Exception as exc:
             logger.warning("post_llm_call hook failed: %s", exc)

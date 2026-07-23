@@ -456,6 +456,11 @@ def _is_unsupported_runtime(kwargs: dict[str, Any]) -> bool:
     return bool(
         _text(kwargs.get("api_mode"), 80).lower() in UNSUPPORTED_API_MODES
         or _text(kwargs.get("platform"), 40).lower() in UNSUPPORTED_PLATFORMS
+        or kwargs.get("supports_followup_turns") is False
+        or (
+            _text(kwargs.get("platform"), 40).lower() == "api_server"
+            and kwargs.get("streaming_output")
+        )
     )
 
 

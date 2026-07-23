@@ -204,6 +204,8 @@ def test_pre_llm_hook_receives_execution_origin_and_kanban_marker(monkeypatch):
     agent._user_id_alt = "canonical-user"
     agent._memory_write_origin = "background_review"
     agent.request_overrides = {"response_format": {"type": "json_schema"}}
+    agent._supports_followup_turns = False
+    agent.stream_delta_callback = lambda _delta: None
     captured = {}
 
     def invoke_hook(name, **kwargs):
@@ -221,6 +223,8 @@ def test_pre_llm_hook_receives_execution_origin_and_kanban_marker(monkeypatch):
     assert captured["execution_origin"] == "background_review"
     assert captured["is_kanban_worker"] is True
     assert captured["structured_output"] is True
+    assert captured["supports_followup_turns"] is False
+    assert captured["streaming_output"] is True
 
 
 def test_persist_user_message_becomes_original():

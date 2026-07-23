@@ -104,3 +104,51 @@ def test_real_plugin_manager_disables_governor_for_codex_app_server():
     )
     state = callback_globals["_session_states"][state_key]
     assert state["proposal_stage"] is None
+
+
+def test_real_plugin_manager_disables_non_followup_and_streaming_api_flows():
+    plugin_root = Path(__file__).resolve().parents[2] / "plugins"
+    manager = PluginManager()
+    manifests = manager._scan_directory(plugin_root, source="bundled")
+    manifest = next(item for item in manifests if item.name == "creation-governor")
+    manager._load_plugin(manifest)
+
+    for session_id, capabilities in (
+        ("one-shot-flow", {"platform": "cli", "supports_followup_turns": False}),
+        (
+            "streaming-api-flow",
+            {"platform": "api_server", "streaming_output": True},
+        ),
+    ):
+        results = manager.invoke_hook(
+            "pre_llm_call",
+            session_id=session_id,
+            user_message="帮我分析这份合同",
+            conversation_history=[],
+            **capabilities,
+        )
+        transformed = manager.invoke_hook(
+            "transform_llm_output",
+            session_id=session_id,
+            response_text='{"result":"ok"}',
+            **capabilities,
+        )
+
+        assert results == []
+        assert transformed == []
+        callback_globals = manager._hooks["pre_llm_call"][0].__globals__
+        state_key = callback_globals["_session_key"]({"session_id": session_id})
+        state = callback_globals["_session_states"][state_key]
+        assert state["proposal_stage"] is None
+
+    supported = manager.invoke_hook(
+        "pre_llm_call",
+        session_id="non-streaming-api-flow",
+        platform="api_server",
+        streaming_output=False,
+        supports_followup_turns=True,
+        user_message="帮我分析这份合同",
+        conversation_history=[],
+    )
+    assert len(supported) == 1
+    assert "Creation governor internal instruction" in supported[0]["context"]

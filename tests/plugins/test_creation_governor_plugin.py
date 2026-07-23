@@ -581,6 +581,86 @@ def test_structured_output_never_evaluates_or_appends_natural_language(monkeypat
     assert calls == []
 
 
+def test_streaming_api_server_never_evaluates_or_appends_a_proposal(monkeypatch):
+    plugin = _load_plugin()
+    calls = []
+    monkeypatch.setattr(
+        plugin,
+        "_judge_creation_opportunity",
+        lambda *args: calls.append(args),
+    )
+
+    kwargs = {
+        "session_id": "streaming-api-session",
+        "platform": "api_server",
+        "streaming_output": True,
+    }
+    assert plugin._on_pre_llm_call(
+        **kwargs,
+        user_message="帮我分析这份合同",
+        conversation_history=[],
+    ) is None
+    assert plugin._transform_llm_output(
+        **kwargs,
+        response_text="分析完成。",
+    ) is None
+    denied = json.loads(
+        plugin._propose_creation(
+            {
+                "creation_type": "skill",
+                "suggested_name": "合同审查流程",
+                "reason": "复用审查规则",
+                "evidence": "合同任务",
+                "confidence": 0.9,
+                "dedup_key": "skill:合同审查流程",
+            },
+            **kwargs,
+        )
+    )
+    assert denied == {"status": "not_proposed", "reason": "unsupported_runtime"}
+    assert calls == []
+
+
+def test_one_shot_runtime_never_evaluates_or_appends_a_proposal(monkeypatch):
+    plugin = _load_plugin()
+    calls = []
+    monkeypatch.setattr(
+        plugin,
+        "_judge_creation_opportunity",
+        lambda *args: calls.append(args),
+    )
+
+    kwargs = {
+        "session_id": "one-shot-session",
+        "platform": "cli",
+        "supports_followup_turns": False,
+    }
+    assert plugin._on_pre_llm_call(
+        **kwargs,
+        user_message="帮我分析这份合同",
+        conversation_history=[],
+    ) is None
+    assert plugin._transform_llm_output(
+        **kwargs,
+        response_text='{"result":"ok"}',
+    ) is None
+    denied = json.loads(
+        plugin._propose_creation(
+            {
+                "creation_type": "skill",
+                "suggested_name": "合同审查流程",
+                "reason": "复用审查规则",
+                "evidence": "合同任务",
+                "confidence": 0.9,
+                "dedup_key": "skill:合同审查流程",
+            },
+            **kwargs,
+        )
+    )
+    assert denied == {"status": "not_proposed", "reason": "unsupported_runtime"}
+    assert calls == []
+
+
 def test_intentional_silence_response_is_never_transformed(monkeypatch):
     plugin = _load_plugin()
     monkeypatch.setattr(
