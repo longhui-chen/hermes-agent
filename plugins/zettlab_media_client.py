@@ -30,6 +30,7 @@ MAX_ERROR_RESPONSE_BYTES = 64 * 1024
 MAX_MEDIA_REQUEST_BYTES = 1024 * 1024
 MAX_MEDIA_RESPONSE_BYTES = 1024 * 1024
 ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
+ARTIFACT_SESSION_HEADER = "X-Zettlab-Artifact-Session-Id"
 _STARTER_CAPACITY = threading.BoundedSemaphore(value=2)
 
 
@@ -652,6 +653,7 @@ def create_and_wait(
     model: str,
     prompt: str,
     payload: Dict[str, Any],
+    session_id: Optional[str] = None,
     timeout_seconds: Optional[int] = None,
     poll_interval: float = 2.0,
 ) -> Dict[str, Any]:
@@ -669,6 +671,12 @@ def create_and_wait(
         "X-Step-Title": "media_generation",
         **action_headers(),
     }
+    normalized_session_id = str(session_id or "").strip()
+    if normalized_session_id:
+        headers[ARTIFACT_SESSION_HEADER] = normalized_session_id
+        headers["X-Task-Id"] = normalized_session_id
+    poll_headers = dict(headers)
+    poll_headers.pop(ARTIFACT_SESSION_HEADER, None)
     create_deadline = deadline
     resp = _SESSION.post(
         f"{base_url(media_type)}/media/generation-jobs",
@@ -706,7 +714,7 @@ def create_and_wait(
                 poll_deadline = min(deadline, time.monotonic() + REQUEST_TIMEOUT)
                 resp = _SESSION.get(
                     f"{base_url(media_type)}/media/generation-jobs/{job_id}",
-                    headers=headers,
+                    headers=poll_headers,
                     timeout=max(0.2, poll_deadline - time.monotonic()),
                     allow_redirects=False,
                     stream=True,
@@ -740,6 +748,14 @@ def create_and_wait(
                 raise ZettlabMediaError("media generation poll response is not a JSON object")
             status = str(job.get("status") or "")
             if status == "done":
+                if normalized_session_id:
+                    job = _finalize_artifact_or_fallback(
+                        media_type=media_type,
+                        job_id=job_id,
+                        headers=headers,
+                        deadline=deadline,
+                        fallback_job=job,
+                    )
                 return job
             if status in {"failed", "cancelled"}:
                 raise _failed_job_error(job)
@@ -749,6 +765,62 @@ def create_and_wait(
         if f"job_id={job_id}" in str(exc):
             raise
         raise ZettlabMediaError(f"{exc}; job_id={job_id}") from exc
+
+
+def _finalize_artifact_or_fallback(
+    *,
+    media_type: str,
+    job_id: str,
+    headers: Dict[str, str],
+    deadline: float,
+    fallback_job: Dict[str, Any],
+) -> Dict[str, Any]:
+    retry_delay = 0.5
+    for attempt in range(3):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return fallback_job
+        try:
+            resp = _SESSION.get(
+                f"{base_url(media_type)}/media/generation-jobs/{job_id}",
+                headers=headers,
+                timeout=max(0.2, remaining),
+                allow_redirects=False,
+                stream=True,
+            )
+            try:
+                status_code = int(getattr(resp, "status_code", 0) or 0)
+                if status_code == 408 or status_code == 429 or status_code >= 500:
+                    raise requests.HTTPError(
+                        f"retryable artifact finalization HTTP {status_code}",
+                        response=resp,
+                    )
+                _raise_for_status(resp, job_id=job_id)
+                job = _bounded_response_json(resp, MAX_MEDIA_RESPONSE_BYTES)
+            finally:
+                _close_response(resp)
+        except (ZettlabMediaDeadlineError, requests.RequestException):
+            if attempt == 2:
+                return fallback_job
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return fallback_job
+            _interruptible_sleep(min(retry_delay, remaining))
+            retry_delay = min(2.0, retry_delay * 2)
+            continue
+        if not isinstance(job, dict):
+            raise ZettlabMediaError(
+                f"media artifact finalization response is not a JSON object; job_id={job_id}"
+            )
+        status = str(job.get("status") or "")
+        if status in {"failed", "cancelled"}:
+            raise _failed_job_error(job)
+        if status != "done":
+            raise ZettlabMediaError(
+                f"media artifact finalization returned status={status or 'unknown'}; job_id={job_id}"
+            )
+        return job
+    return fallback_job
 
 
 def _interruptible_sleep(delay: float) -> None:
@@ -774,6 +846,28 @@ def first_asset_url(job: Dict[str, Any]) -> str:
     if not isinstance(assets[0], dict):
         raise ZettlabMediaError(f"media generation asset has invalid shape; job_id={job_id}")
     raise ZettlabMediaError(f"media generation asset has no retrievable URL; job_id={job_id}")
+
+
+def first_asset_local_path(job: Dict[str, Any]) -> str:
+    job_id = str(job.get("job_id") or "unknown").strip() or "unknown"
+    assets = job.get("assets")
+    if isinstance(assets, list) and assets and isinstance(assets[0], dict):
+        path = assets[0].get("local_path")
+        if isinstance(path, str) and path.strip() and assets[0].get("persisted") is True:
+            return path.strip()
+    raise ZettlabMediaError(
+        f"media generation completed but the asset was not persisted on the device; "
+        f"job_id={job_id}"
+    )
+
+
+def first_asset_location(job: Dict[str, Any], *, prefer_local: bool) -> str:
+    if prefer_local:
+        try:
+            return first_asset_local_path(job)
+        except ZettlabMediaError:
+            pass
+    return first_asset_url(job)
 
 
 def _timeout_from_capability(media_type: str) -> int:

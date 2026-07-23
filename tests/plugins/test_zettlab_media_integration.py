@@ -143,6 +143,167 @@ def test_video_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
     assert "duration" not in captured["json"]
 
 
+def test_generated_media_local_artifact_flow(monkeypatch):
+    from agent import image_gen_registry, video_gen_registry
+    from plugins import zettlab_media_client as client
+    from plugins.image_gen.zettlab import ZettlabImageGenProvider
+    from plugins.video_gen.zettlab import ZettlabVideoGenProvider
+    from tools import image_generation_tool as image_tool
+    from tools import video_generation_tool as video_tool
+
+    image_gen_registry._reset_for_tests()
+    video_gen_registry._reset_for_tests()
+    image_gen_registry.register_provider(ZettlabImageGenProvider())
+    video_gen_registry.register_provider(ZettlabVideoGenProvider())
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
+    monkeypatch.setattr(image_tool, "_read_configured_image_provider", lambda: "zettlab")
+    monkeypatch.setattr(image_tool, "_read_configured_image_model", lambda: None)
+    monkeypatch.setattr(video_tool, "_read_configured_video_provider", lambda: "zettlab")
+    monkeypatch.setattr(video_tool, "_read_configured_video_model", lambda: None)
+    monkeypatch.setattr("hermes_cli.plugins._ensure_plugins_discovered", lambda *args, **kwargs: None)
+
+    capabilities = {
+        "image": {
+            "enabled": True,
+            "default_model": "seedream-v4",
+            "models": [{"id": "seedream-v4"}],
+        },
+        "video": {
+            "enabled": True,
+            "default_model": "seedance-v1",
+            "models": [{"id": "seedance-v1"}],
+        },
+    }
+    monkeypatch.setattr(
+        client._SESSION,
+        "get",
+        lambda url, timeout, allow_redirects, stream: _Resp(capabilities),
+    )
+
+    captured_headers = []
+
+    def fake_post(url, json, headers, timeout, allow_redirects, stream):
+        captured_headers.append(dict(headers))
+        media_type = json["media_type"]
+        extension = "png" if media_type == "image" else "mp4"
+        return _Resp({
+            "job_id": f"job-{media_type}",
+            "status": "done",
+            "media_type": media_type,
+            "assets": [{
+                "url": f"https://cdn.example/{media_type}.{extension}",
+                "local_path": f"/volume1/agents/data/main/output/session-local/{media_type}.{extension}",
+                "persisted": True,
+            }],
+        })
+
+    monkeypatch.setattr(client._SESSION, "post", fake_post)
+
+    image = json.loads(image_tool._handle_image_generate(
+        {"prompt": "make an image"},
+        task_id="zettlab:user:main:session-local",
+    ))
+    video = json.loads(video_tool._handle_video_generate(
+        {"prompt": "make a video"},
+        task_id="zettlab:user:main:session-local",
+    ))
+
+    assert image["image"].endswith("/session-local/image.png")
+    assert video["video"].endswith("/session-local/video.mp4")
+    assert all(
+        headers[client.ARTIFACT_SESSION_HEADER] == "zettlab:user:main:session-local"
+        for headers in captured_headers
+    )
+    assert all(
+        headers["X-Task-Id"] == "zettlab:user:main:session-local"
+        for headers in captured_headers
+    )
+
+
+def test_generated_media_falls_back_to_remote_url_with_older_local_server(monkeypatch):
+    from agent import image_gen_registry
+    from plugins import zettlab_media_client as client
+    from plugins.image_gen.zettlab import ZettlabImageGenProvider
+    from tools import image_generation_tool as image_tool
+
+    image_gen_registry._reset_for_tests()
+    image_gen_registry.register_provider(ZettlabImageGenProvider())
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
+    monkeypatch.setattr(image_tool, "_read_configured_image_provider", lambda: "zettlab")
+    monkeypatch.setattr(image_tool, "_read_configured_image_model", lambda: None)
+    monkeypatch.setattr("hermes_cli.plugins._ensure_plugins_discovered", lambda *args, **kwargs: None)
+    monkeypatch.setattr(client._SESSION, "get", lambda *args, **kwargs: _Resp({
+        "image": {
+            "enabled": True,
+            "default_model": "seedream-v4",
+            "models": [{"id": "seedream-v4"}],
+        },
+    }))
+    monkeypatch.setattr(client._SESSION, "post", lambda *args, **kwargs: _Resp({
+        "job_id": "job-old-server",
+        "status": "done",
+        "assets": [{"url": "https://cdn.example/generated.png"}],
+    }))
+
+    got = json.loads(image_tool._handle_image_generate(
+        {"prompt": "make an image"},
+        task_id="zettlab:user:main:session-local",
+    ))
+
+    assert got["success"] is True
+    assert got["image"] == "https://cdn.example/generated.png"
+
+
+def test_async_media_uses_short_polls_then_remaining_budget_for_artifact_finalization(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
+    monkeypatch.setattr(client, "_interruptible_sleep", lambda delay: None)
+    monkeypatch.setattr(client._SESSION, "post", lambda *args, **kwargs: _Resp({
+        "job_id": "job-video",
+        "status": "running",
+    }))
+    calls = []
+
+    def fake_get(url, headers, timeout, allow_redirects, stream):
+        calls.append({"headers": dict(headers), "timeout": timeout})
+        if len(calls) == 1:
+            return _Resp({
+                "job_id": "job-video",
+                "status": "done",
+                "assets": [{"url": "https://cdn.example/video.mp4"}],
+            })
+        if len(calls) == 2:
+            raise client.requests.ConnectionError("temporary finalization failure")
+        return _Resp({
+            "job_id": "job-video",
+            "status": "done",
+            "assets": [{
+                "url": "https://cdn.example/video.mp4",
+                "local_path": "/volume1/agents/data/main/output/session-local/video.mp4",
+                "persisted": True,
+            }],
+        })
+
+    monkeypatch.setattr(client._SESSION, "get", fake_get)
+
+    job = client.create_and_wait(
+        media_type="video",
+        model="seedance-v1",
+        prompt="make a video",
+        payload={},
+        session_id="zettlab:user:main:session-local",
+        timeout_seconds=120,
+    )
+
+    assert client.ARTIFACT_SESSION_HEADER not in calls[0]["headers"]
+    assert calls[0]["timeout"] <= client.REQUEST_TIMEOUT
+    assert calls[1]["headers"][client.ARTIFACT_SESSION_HEADER].endswith("session-local")
+    assert calls[1]["timeout"] > client.REQUEST_TIMEOUT
+    assert calls[2]["headers"][client.ARTIFACT_SESSION_HEADER].endswith("session-local")
+    assert client.first_asset_local_path(job).endswith("video.mp4")
+
+
 def test_zet_agent_exposes_video_tool_when_gateway_capability_is_enabled(monkeypatch):
     from agent import video_gen_registry
     from hermes_cli.tools_config import _get_platform_tools

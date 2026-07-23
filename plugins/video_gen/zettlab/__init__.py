@@ -213,14 +213,16 @@ class ZettlabVideoGenProvider(VideoGenProvider):
             }
             if effective_duration is not None:
                 payload["duration"] = effective_duration
+            session_id = kwargs.get("_task_id")
             job = media_client.create_and_wait(
                 media_type="video",
                 model=resolved_model,
                 prompt=prompt,
                 timeout_seconds=media_client.timeout_from_model_capability("video", model_capability),
                 payload=payload,
+                session_id=session_id,
             )
-            video = media_client.first_asset_url(job)
+            video = media_client.first_asset_location(job, prefer_local=bool(session_id))
         except Exception as exc:
             return error_response(
                 error=f"Zettlab video generation failed: {exc}",
