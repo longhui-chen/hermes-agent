@@ -995,7 +995,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 "type": "hermes.plan",
                 "title": title,
                 "groups": groups,
-                "auto_execute": bool(getattr(agent, "_zet_agent_plan_auto_execute", True)),
+                "auto_execute": bool(getattr(agent, "_zet_agent_plan_auto_execute", False)),
             }
             try:
                 stream_q.put(("__tool_progress__", payload))

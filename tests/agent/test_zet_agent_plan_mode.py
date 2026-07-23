@@ -255,8 +255,8 @@ def test_present_plan_does_not_end_turn_when_auto_execute_enabled():
             _zet_agent_plan_auto_execute=True,
         )
     )
-    # 默认（未显式设置 flag）即 auto-execute，同样不结束 turn。
-    assert not _should_end_after_present_plan(
+    # 默认（未 opt-in）= manual：present_plan 后结束 turn 等用户确认（capability negotiation）。
+    assert _should_end_after_present_plan(
         _agent(
             _zet_agent_plan_mode_active=True,
             _zet_agent_plan_presented=True,
@@ -307,6 +307,19 @@ def test_present_plan_tool_text_switches_on_auto_execute():
     # 无显式参数默认 manual（保守），走"停下等确认"文案。
     default_text = present_plan("减脂计划", groups, callback=cb)
     assert "wait for the user's confirmation" in default_text.lower()
+
+
+def test_present_plan_bad_args_returns_error_without_emit():
+    # F2：空 title 返回 error 且不 emit 卡片 —— tool_executor 据此不标 plan_presented，
+    # 保持 Plan gate 不放开真实工具（弱模型一次坏参数不能绕过计划卡执行副作用）。
+    import json as _json
+    from tools.plan_tool import present_plan
+    emitted = []
+    result = present_plan("", [{"icon": "🏃", "label": "P", "items": ["x"]}],
+                          callback=lambda t, g: emitted.append(t), auto_execute=True)
+    parsed = _json.loads(result)
+    assert isinstance(parsed, dict) and parsed.get("error")
+    assert emitted == []
 
 
 def test_zet_agent_blocks_legacy_markdown_plan_skill_paths():

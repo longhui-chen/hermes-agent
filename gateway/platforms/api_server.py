@@ -183,18 +183,20 @@ def _extract_plan_auto_execute(body: Dict[str, Any]) -> Optional[bool]:
 def _resolve_plan_auto_execute(meta_override: Optional[bool]) -> bool:
     """Resolve the effective App Plan-mode auto-execute flag for one turn.
 
-    Precedence: per-turn metadata override > env kill-switch
-    (``HERMES_ZET_AGENT_PLAN_AUTO_EXECUTE``) > default ``True`` (auto-execute).
-    The legacy "present the plan, then wait for the user's confirmation" path
-    stays fully available by setting the flag false at either layer.
+    Precedence: per-turn metadata override (App capability opt-in) > env
+    (``HERMES_ZET_AGENT_PLAN_AUTO_EXECUTE``) > default ``False`` (legacy manual
+    confirm card). Default is manual so older App / local-server builds that do
+    NOT send ``plan_auto_execute`` never auto-execute a plan's side effects
+    before a client that can render the confirm gate — auto-execute requires an
+    explicit client capability opt-in (HR4 capability negotiation).
     """
     if meta_override is not None:
         return meta_override
     raw = os.environ.get("HERMES_ZET_AGENT_PLAN_AUTO_EXECUTE")
     if raw is not None and raw.strip() != "":
         from utils import is_truthy_value
-        return is_truthy_value(raw, default=True)
-    return True
+        return is_truthy_value(raw, default=False)
+    return False
 
 
 def _extract_turn_id(body: Dict[str, Any]) -> str:

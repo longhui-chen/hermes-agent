@@ -51,20 +51,22 @@ class TestExtractPlanAutoExecute:
 
 
 class TestResolvePlanAutoExecute:
-    def test_default_is_auto(self, monkeypatch):
+    def test_default_is_manual(self, monkeypatch):
+        # 默认 manual（capability negotiation）：未 opt-in（meta None）+ 无 env → 不 auto。
         monkeypatch.delenv("HERMES_ZET_AGENT_PLAN_AUTO_EXECUTE", raising=False)
-        assert _resolve_plan_auto_execute(None) is True
+        assert _resolve_plan_auto_execute(None) is False
 
     def test_meta_override_beats_default(self, monkeypatch):
         monkeypatch.delenv("HERMES_ZET_AGENT_PLAN_AUTO_EXECUTE", raising=False)
         assert _resolve_plan_auto_execute(False) is False
         assert _resolve_plan_auto_execute(True) is True
 
-    def test_env_kill_switch(self, monkeypatch):
-        # 全局急停：env=0 时缺省 override 回落 manual。
+    def test_env_opt_in_and_kill_switch(self, monkeypatch):
+        # env 可全局 opt-in auto（"1"）或强制 manual（"0"）；per-turn meta 仍优先。
+        monkeypatch.setenv("HERMES_ZET_AGENT_PLAN_AUTO_EXECUTE", "1")
+        assert _resolve_plan_auto_execute(None) is True
         monkeypatch.setenv("HERMES_ZET_AGENT_PLAN_AUTO_EXECUTE", "0")
         assert _resolve_plan_auto_execute(None) is False
-        # per-turn meta 仍优先于 env。
         assert _resolve_plan_auto_execute(True) is True
 
 

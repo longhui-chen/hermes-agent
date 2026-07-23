@@ -260,7 +260,7 @@ def _should_end_after_present_plan(agent: Any) -> bool:
         (getattr(agent, "platform", "") or "") == "zet_agent"
         and bool(getattr(agent, "_zet_agent_plan_mode_active", False))
         and bool(getattr(agent, "_zet_agent_plan_presented", False))
-        and not bool(getattr(agent, "_zet_agent_plan_auto_execute", True))
+        and not bool(getattr(agent, "_zet_agent_plan_auto_execute", False))
     )
 
 
