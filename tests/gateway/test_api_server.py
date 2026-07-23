@@ -53,6 +53,25 @@ class TestCheckRequirements:
 
 
 class TestToolCompletionPayload:
+    def test_media_completion_keeps_only_bounded_artifact_fields(self):
+        payload = _tool_completion_payload(
+            "call_image_1",
+            "image_generate",
+            json.dumps({
+                "success": True,
+                "image": "/mnt/data/agents/data/main/output/session/image.jpg",
+                "prompt": "private prompt must not enter progress events",
+                "assets": [{"url": "https://cdn.example/image.jpg"}],
+            }),
+        )
+
+        assert payload["output"] == {
+            "success": True,
+            "image": "/mnt/data/agents/data/main/output/session/image.jpg",
+        }
+        assert "prompt" not in payload["output"]
+        assert "assets" not in payload["output"]
+
     def test_promotes_connector_error_printed_by_execute_code_output(self):
         printed = {
             "ok": False,

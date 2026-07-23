@@ -673,10 +673,10 @@ def create_and_wait(
     }
     normalized_session_id = str(session_id or "").strip()
     if normalized_session_id:
-        headers[ARTIFACT_SESSION_HEADER] = normalized_session_id
         headers["X-Task-Id"] = normalized_session_id
-    poll_headers = dict(headers)
-    poll_headers.pop(ARTIFACT_SESSION_HEADER, None)
+    artifact_headers = dict(headers)
+    if normalized_session_id:
+        artifact_headers[ARTIFACT_SESSION_HEADER] = normalized_session_id
     create_deadline = deadline
     resp = _SESSION.post(
         f"{base_url(media_type)}/media/generation-jobs",
@@ -694,6 +694,15 @@ def create_and_wait(
     if not isinstance(job, dict):
         raise ZettlabMediaError("media generation job response is not a JSON object")
     if job.get("status") == "done":
+        job_id = str(job.get("job_id") or "").strip()
+        if normalized_session_id and job_id:
+            return _finalize_artifact_or_fallback(
+                media_type=media_type,
+                job_id=job_id,
+                headers=artifact_headers,
+                deadline=deadline,
+                fallback_job=job,
+            )
         return job
     if job.get("status") in {"failed", "cancelled"}:
         raise _failed_job_error(job)
@@ -714,7 +723,7 @@ def create_and_wait(
                 poll_deadline = min(deadline, time.monotonic() + REQUEST_TIMEOUT)
                 resp = _SESSION.get(
                     f"{base_url(media_type)}/media/generation-jobs/{job_id}",
-                    headers=poll_headers,
+                    headers=headers,
                     timeout=max(0.2, poll_deadline - time.monotonic()),
                     allow_redirects=False,
                     stream=True,
@@ -752,7 +761,7 @@ def create_and_wait(
                     job = _finalize_artifact_or_fallback(
                         media_type=media_type,
                         job_id=job_id,
-                        headers=headers,
+                        headers=artifact_headers,
                         deadline=deadline,
                         fallback_job=job,
                     )

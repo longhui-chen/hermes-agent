@@ -174,17 +174,14 @@ def test_generated_media_local_artifact_flow(monkeypatch):
             "models": [{"id": "seedance-v1"}],
         },
     }
-    monkeypatch.setattr(
-        client._SESSION,
-        "get",
-        lambda url, timeout, allow_redirects, stream: _Resp(capabilities),
-    )
+    create_headers = []
+    finalize_headers = []
 
-    captured_headers = []
-
-    def fake_post(url, json, headers, timeout, allow_redirects, stream):
-        captured_headers.append(dict(headers))
-        media_type = json["media_type"]
+    def fake_get(url, timeout, allow_redirects, stream, headers=None):
+        if url.endswith("/media/generation-capabilities"):
+            return _Resp(capabilities)
+        finalize_headers.append(dict(headers or {}))
+        media_type = "image" if url.endswith("job-image") else "video"
         extension = "png" if media_type == "image" else "mp4"
         return _Resp({
             "job_id": f"job-{media_type}",
@@ -194,6 +191,21 @@ def test_generated_media_local_artifact_flow(monkeypatch):
                 "url": f"https://cdn.example/{media_type}.{extension}",
                 "local_path": f"/volume1/agents/data/main/output/session-local/{media_type}.{extension}",
                 "persisted": True,
+            }],
+        })
+
+    monkeypatch.setattr(client._SESSION, "get", fake_get)
+
+    def fake_post(url, json, headers, timeout, allow_redirects, stream):
+        create_headers.append(dict(headers))
+        media_type = json["media_type"]
+        extension = "png" if media_type == "image" else "mp4"
+        return _Resp({
+            "job_id": f"job-{media_type}",
+            "status": "done",
+            "media_type": media_type,
+            "assets": [{
+                "url": f"https://cdn.example/{media_type}.{extension}",
             }],
         })
 
@@ -211,12 +223,16 @@ def test_generated_media_local_artifact_flow(monkeypatch):
     assert image["image"].endswith("/session-local/image.png")
     assert video["video"].endswith("/session-local/video.mp4")
     assert all(
-        headers[client.ARTIFACT_SESSION_HEADER] == "zettlab:user:main:session-local"
-        for headers in captured_headers
+        client.ARTIFACT_SESSION_HEADER not in headers
+        for headers in create_headers
     )
     assert all(
         headers["X-Task-Id"] == "zettlab:user:main:session-local"
-        for headers in captured_headers
+        for headers in create_headers
+    )
+    assert all(
+        headers[client.ARTIFACT_SESSION_HEADER] == "zettlab:user:main:session-local"
+        for headers in finalize_headers
     )
 
 
@@ -232,13 +248,22 @@ def test_generated_media_falls_back_to_remote_url_with_older_local_server(monkey
     monkeypatch.setattr(image_tool, "_read_configured_image_provider", lambda: "zettlab")
     monkeypatch.setattr(image_tool, "_read_configured_image_model", lambda: None)
     monkeypatch.setattr("hermes_cli.plugins._ensure_plugins_discovered", lambda *args, **kwargs: None)
-    monkeypatch.setattr(client._SESSION, "get", lambda *args, **kwargs: _Resp({
-        "image": {
-            "enabled": True,
-            "default_model": "seedream-v4",
-            "models": [{"id": "seedream-v4"}],
-        },
-    }))
+    def fake_get(url, *args, **kwargs):
+        if url.endswith("/media/generation-capabilities"):
+            return _Resp({
+                "image": {
+                    "enabled": True,
+                    "default_model": "seedream-v4",
+                    "models": [{"id": "seedream-v4"}],
+                },
+            })
+        return _Resp({
+            "job_id": "job-old-server",
+            "status": "done",
+            "assets": [{"url": "https://cdn.example/generated.png"}],
+        })
+
+    monkeypatch.setattr(client._SESSION, "get", fake_get)
     monkeypatch.setattr(client._SESSION, "post", lambda *args, **kwargs: _Resp({
         "job_id": "job-old-server",
         "status": "done",
