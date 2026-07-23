@@ -235,8 +235,28 @@ def test_unsupported_thinking_parameter_detection():
     )
 
 
-def test_present_plan_tool_result_ends_zet_agent_plan_turn():
+def test_present_plan_tool_result_ends_zet_agent_plan_turn_in_manual_mode():
+    # auto-execute 关闭（manual 计划评审）：present_plan 后结束 turn，等用户确认。
     assert _should_end_after_present_plan(
+        _agent(
+            _zet_agent_plan_mode_active=True,
+            _zet_agent_plan_presented=True,
+            _zet_agent_plan_auto_execute=False,
+        )
+    )
+
+
+def test_present_plan_does_not_end_turn_when_auto_execute_enabled():
+    # auto-execute 开启（显式）：present_plan 后不结束 turn，同一 turn 继续执行。
+    assert not _should_end_after_present_plan(
+        _agent(
+            _zet_agent_plan_mode_active=True,
+            _zet_agent_plan_presented=True,
+            _zet_agent_plan_auto_execute=True,
+        )
+    )
+    # 默认（未显式设置 flag）即 auto-execute，同样不结束 turn。
+    assert not _should_end_after_present_plan(
         _agent(
             _zet_agent_plan_mode_active=True,
             _zet_agent_plan_presented=True,
@@ -258,6 +278,35 @@ def test_present_plan_tool_result_does_not_end_regular_tool_turns():
             _zet_agent_plan_presented=True,
         )
     )
+
+
+def test_plan_mode_block_relaxes_after_present_plan_for_auto_execute():
+    # present_plan 之前：仍拦截副作用工具（auto / manual 一致，必须先出计划）。
+    before = _agent(_zet_agent_plan_mode_active=True, _zet_agent_plan_presented=False)
+    assert _zet_agent_plan_mode_block_message(before, "terminal", {}) is not None
+    # present_plan 之后：auto-execute 在同一 turn 继续执行，放开真实工具调用。
+    after = _agent(_zet_agent_plan_mode_active=True, _zet_agent_plan_presented=True)
+    assert _zet_agent_plan_mode_block_message(after, "terminal", {}) is None
+    assert _zet_agent_plan_mode_block_message(after, "write_file", {"path": "/tmp/x"}) is None
+
+
+def test_present_plan_tool_text_switches_on_auto_execute():
+    from tools.plan_tool import present_plan
+
+    groups = [{"icon": "🏃", "label": "Phase", "items": ["run"]}]
+    seen = []
+    cb = lambda title, g: seen.append((title, g))
+
+    manual = present_plan("减脂计划", groups, callback=cb, auto_execute=False)
+    assert "wait for the user's confirmation" in manual.lower()
+
+    auto = present_plan("减脂计划", groups, callback=cb, auto_execute=True)
+    assert "auto-execute" in auto.lower()
+    assert "do not ask the user to confirm" in auto.lower()
+
+    # 无显式参数默认 manual（保守），走"停下等确认"文案。
+    default_text = present_plan("减脂计划", groups, callback=cb)
+    assert "wait for the user's confirmation" in default_text.lower()
 
 
 def test_zet_agent_blocks_legacy_markdown_plan_skill_paths():

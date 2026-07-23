@@ -173,8 +173,13 @@ def _zet_agent_plan_mode_block_message(agent, function_name: str, function_args:
 
     if (
         bool(getattr(agent, "_zet_agent_plan_mode_active", False))
+        and not bool(getattr(agent, "_zet_agent_plan_presented", False))
         and function_name not in {"clarify", "present_plan"}
     ):
+        # Only gate BEFORE the plan is presented. Once present_plan fires,
+        # auto-execute mode keeps the turn running and must be allowed to call
+        # real tools; manual mode has already ended the turn by then, so this
+        # relaxation never exposes side-effect tools before the plan is shown.
         return (
             "This Zettlab App turn is in Plan mode. Only `clarify` and "
             "`present_plan` are allowed until the user reviews the plan. "
@@ -1345,6 +1350,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 title=function_args.get("title", ""),
                 groups=function_args.get("groups", []),
                 callback=getattr(agent, "plan_emit_callback", None),
+                auto_execute=bool(getattr(agent, "_zet_agent_plan_auto_execute", True)),
             )
             agent._zet_agent_plan_presented = True
             tool_duration = time.time() - tool_start_time

@@ -48,6 +48,10 @@ def _plan_agent(tool_names: tuple[str, ...]) -> AIAgent:
     agent.tool_delay = 0
     agent.compression_enabled = False
     agent.save_trajectories = False
+    # 这些用例覆盖 manual 计划评审流程（present_plan 后停下等确认）；显式关掉
+    # 自动执行，与新默认 auto-execute 区分开，否则 run_conversation 不会在
+    # present_plan 后结束而是继续循环。
+    agent._zet_agent_plan_auto_execute = False
     return agent
 
 

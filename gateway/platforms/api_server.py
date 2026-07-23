@@ -163,6 +163,40 @@ def _extract_plan_ack(body: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _extract_plan_auto_execute(body: Dict[str, Any]) -> Optional[bool]:
+    """Extract the App's per-turn Plan auto-execute override from metadata.
+
+    Returns None when the App did not send the field, so the caller falls back
+    to the env kill-switch / default ladder. When present, an explicit bool
+    decides whether App Plan mode auto-executes the plan in the same turn
+    (True) or stops for the user's confirmation card (False — legacy behaviour).
+    """
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    if "plan_auto_execute" not in metadata and "planAutoExecute" not in metadata:
+        return None
+    raw = metadata.get("plan_auto_execute", metadata.get("planAutoExecute"))
+    return _coerce_request_bool(raw, default=True)
+
+
+def _resolve_plan_auto_execute(meta_override: Optional[bool]) -> bool:
+    """Resolve the effective App Plan-mode auto-execute flag for one turn.
+
+    Precedence: per-turn metadata override > env kill-switch
+    (``HERMES_ZET_AGENT_PLAN_AUTO_EXECUTE``) > default ``True`` (auto-execute).
+    The legacy "present the plan, then wait for the user's confirmation" path
+    stays fully available by setting the flag false at either layer.
+    """
+    if meta_override is not None:
+        return meta_override
+    raw = os.environ.get("HERMES_ZET_AGENT_PLAN_AUTO_EXECUTE")
+    if raw is not None and raw.strip() != "":
+        from utils import is_truthy_value
+        return is_truthy_value(raw, default=True)
+    return True
+
+
 def _extract_turn_id(body: Dict[str, Any]) -> str:
     """Extract metadata.turn_id (zettlab local-server's per-turn correlation
     token) so the NAS agent-search fallback can echo it back as the
@@ -2430,6 +2464,7 @@ class APIServerAdapter(BasePlatformAdapter):
         stream = _coerce_request_bool(body.get("stream"), default=False)
         response_mode = _extract_response_mode(body)
         plan_ack = _extract_plan_ack(body)
+        plan_auto_execute = _extract_plan_auto_execute(body)
         turn_id = _extract_turn_id(body)
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
@@ -2694,6 +2729,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 response_mode=response_mode,
                 plan_ack=plan_ack,
+                plan_auto_execute=plan_auto_execute,
                 turn_id=turn_id,
                 request_overrides=request_overrides or None,
             ))
@@ -2742,6 +2778,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     gateway_session_key=gateway_session_key,
                     response_mode=response_mode,
                     plan_ack=plan_ack,
+                    plan_auto_execute=plan_auto_execute,
                     turn_id=turn_id,
                     request_overrides=request_overrides or None,
                 )
@@ -4610,6 +4647,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         response_mode: Optional[str] = None,
         plan_ack: Optional[Dict[str, Any]] = None,
+        plan_auto_execute: Optional[bool] = None,
         turn_id: Optional[str] = None,
         request_overrides: Optional[Dict[str, Any]] = None,
     ) -> tuple:
@@ -4653,6 +4691,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     agent_ref[0] = agent
                 agent._zet_agent_response_mode = response_mode or ""
                 agent._zet_agent_plan_ack = dict(plan_ack or {})
+                agent._zet_agent_plan_auto_execute = _resolve_plan_auto_execute(plan_auto_execute)
                 effective_task_id = session_id or str(uuid.uuid4())
                 result = agent.run_conversation(
                     user_message=user_message,

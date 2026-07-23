@@ -205,10 +205,10 @@ ZETTLAB_WORKFLOW_ADDENDUM = """\
 
 面对复杂多步任务（涉及 3 个以上阶段、不可逆操作或大量数据变更）时：
 1. 先调用 `present_plan` 工具，把执行计划结构化呈现给用户（分组列出每步要做什么）。
-2. 调用后立即停下，等用户明确说"开始"/"确认"/"go" 等确认信号后再执行。
+2. 计划卡片只是给用户看的只读预览，展示后**不要停下、不要等用户确认、不要问用户是否执行**，直接在同一轮继续把计划执行下去。
 3. 执行阶段用 `todo` 工具逐步记录和更新进度，每完成一步立即把对应 todo 标记为 completed。
 
-用户说"plan 模式"、"计划模式"、"先给计划"、"先别执行"或"等我确认"时，也按上述 App 计划卡片流程处理。
+用户说"plan 模式"、"计划模式"、"先给计划"时，也按上述 App 计划卡片流程处理（展示计划后直接执行，不等确认）。
 不要加载名为 `plan` 的 markdown skill，也不要写 `.hermes/plans`；那是 CLI/文档计划模式，不是 Zettlab App 的确认卡片。
 
 简单的单步请求、查询、闲聊不需要 present_plan，直接执行即可。
@@ -974,19 +974,28 @@ class ZetAgentAdapter(APIServerAdapter):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _make_plan_emit_cb(stream_q: Any):
+    def _make_plan_emit_cb(stream_q: Any, agent: Any):
         """Return a sync ``(title, groups) -> None`` callback.
 
         Called by tool_executor when the agent invokes present_plan.
         Pushes a ``hermes.plan`` event onto the SSE extension lane.
-        present_plan() returns a stop-and-wait instruction to the agent
-        immediately after, so this callback never blocks.
+        present_plan() returns an instruction to the agent immediately after,
+        so this callback never blocks.
+
+        ``auto_execute`` on the payload tells the App whether this is a
+        read-only auto-execute card (agent keeps executing in the same turn) or
+        the legacy confirmation card (App gates execution on a user tap). It
+        follows the turn-level auto-execute flag (default on) regardless of
+        whether the App requested plan mode or the model presented a plan on its
+        own — both should show a read-only card and keep executing. Only the
+        manual kill-switch (env / per-turn meta = false) makes it the legacy card.
         """
         def _emit(title: str, groups: List[Dict[str, Any]]) -> None:
             payload = {
                 "type": "hermes.plan",
                 "title": title,
                 "groups": groups,
+                "auto_execute": bool(getattr(agent, "_zet_agent_plan_auto_execute", True)),
             }
             try:
                 stream_q.put(("__tool_progress__", payload))
@@ -1270,7 +1279,7 @@ class ZetAgentAdapter(APIServerAdapter):
         # Non-blocking — tool_executor calls this, present_plan returns
         # immediately with a stop-and-wait instruction to the agent.
         try:
-            agent.plan_emit_callback = self._make_plan_emit_cb(stream_q)
+            agent.plan_emit_callback = self._make_plan_emit_cb(stream_q, agent)
         except Exception:
             logger.warning("[zet_agent] failed to attach plan_emit_callback", exc_info=True)
 
@@ -1306,6 +1315,7 @@ class ZetAgentAdapter(APIServerAdapter):
         gateway_session_key: Optional[str] = None,
         response_mode: Optional[str] = None,
         plan_ack: Optional[Dict[str, Any]] = None,
+        plan_auto_execute: Optional[bool] = None,
         turn_id: Optional[str] = None,
         request_overrides: Optional[Dict[str, Any]] = None,
     ):
@@ -1379,6 +1389,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 gateway_session_key=gateway_session_key,
                 response_mode=response_mode,
                 plan_ack=plan_ack,
+                plan_auto_execute=plan_auto_execute,
                 turn_id=turn_id,
                 request_overrides=request_overrides,
             )
