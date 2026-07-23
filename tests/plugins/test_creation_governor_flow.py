@@ -1,14 +1,40 @@
-from __future__ import annotations
-
+import base64
+import importlib.util
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
-from hermes_cli.plugins import PluginManager
-from tests.plugins.test_creation_governor_plugin import _load_plugin
+
+PLUGIN_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "plugins"
+    / "creation-governor"
+    / "__init__.py"
+)
+
+
+class _Llm:
+    def __init__(self):
+        self.calls = []
+
+    def complete(self, _messages, **_kwargs):
+        self.calls.append((_messages, _kwargs))
+        return SimpleNamespace(
+            text=json.dumps({
+                "decision": "agent",
+                "suggested_name": "Business Research Partner",
+                "reason": "Future questions benefit from retained context and judgment.",
+                "evidence_turn_ids": ["evidence-1"],
+                "confidence": 0.8,
+                "dedup_key": "business-research-partner",
+                "proposal_text": "Would you like me to create this research partner?",
+            })
+        )
 
 
 class _Context:
-    def __init__(self) -> None:
+    def __init__(self):
+        self.llm = _Llm()
         self.tools = []
         self.hooks = []
 
@@ -19,136 +45,95 @@ class _Context:
         self.hooks.append((args, kwargs))
 
 
-def test_plugin_flow_registers_judgment_hooks_and_a_non_creating_proposal_tool():
-    plugin = _load_plugin()
+def test_registered_hooks_produce_a_complete_answer_plus_attachment_envelope():
+    spec = importlib.util.spec_from_file_location("creation_governor_flow", PLUGIN_PATH)
+    plugin = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(plugin)
+    plugin._reset_state_for_tests()
     context = _Context()
     plugin.register(context)
 
     assert [args[0] for args, _kwargs in context.hooks] == [
         "pre_llm_call",
         "transform_llm_output",
-        "post_llm_call",
-        "pre_tool_call",
     ]
-    assert [tool["name"] for tool in context.tools] == ["propose_creation"]
-    description = context.tools[0]["schema"]["description"]
-    assert "a single ordinary task is enough" in description
-    assert "same permissive rule equally to all three creation types" in description
-    assert "one AI-news lookup" in description
-    assert "direct scheduled instruction" in description
+    assert [tool["name"] for tool in context.tools] == ["detect_creation_opportunity"]
 
-    result = json.loads(
-        context.tools[0]["handler"](
-            {
-                "creation_type": "scheduled_task",
-                "suggested_name": "每日竞品简报",
-                "reason": "价值来自每天自动执行",
-                "evidence": "用户连续讨论每日竞品变化",
-                "confidence": 0.95,
-                "dedup_key": "daily-competitor-brief",
-            },
-            session_id="flow-session",
-        )
-    )
-
-    assert result["status"] == "proposal_ready"
-    assert result["creation_type"] == "scheduled_task"
-    assert "只输出草案" in result["next_step"]
-    assert "确认创建" in result["next_step"]
-    assert "create" not in context.tools[0]["name"]
-
-
-def test_real_plugin_manager_loads_all_governor_hooks():
-    plugin_root = Path(__file__).resolve().parents[2] / "plugins"
-    manager = PluginManager()
-    manifests = manager._scan_directory(plugin_root, source="bundled")
-    manifest = next(item for item in manifests if item.name == "creation-governor")
-
-    manager._load_plugin(manifest)
-
-    loaded = manager._plugins[manifest.key or manifest.name]
-    assert loaded.enabled is True
-    assert loaded.error is None
-    assert set(loaded.hooks_registered) == {
-        "pre_llm_call",
-        "transform_llm_output",
-        "post_llm_call",
-        "pre_tool_call",
-    }
-    assert loaded.tools_registered == ["propose_creation"]
-
-
-def test_real_plugin_manager_disables_governor_for_codex_app_server():
-    plugin = _load_plugin()
-    plugin_root = Path(__file__).resolve().parents[2] / "plugins"
-    manager = PluginManager()
-    manifests = manager._scan_directory(plugin_root, source="bundled")
-    manifest = next(item for item in manifests if item.name == "creation-governor")
-    manager._load_plugin(manifest)
-    prompt = plugin._proposal_payload(
-        "skill", "会议纪要流程", "固化整理步骤", "会议转录", 0.9
-    )["user_prompt"]
-
-    results = manager.invoke_hook(
-        "pre_llm_call",
-        session_id="codex-app-server-flow",
-        api_mode="codex_app_server",
-        user_message="生成方案",
-        conversation_history=[{"role": "assistant", "content": prompt}],
-    )
-
-    assert results == []
-    callback_globals = manager._hooks["pre_llm_call"][0].__globals__
-    state_key = callback_globals["_session_key"](
-        {"session_id": "codex-app-server-flow"}
-    )
-    state = callback_globals["_session_states"][state_key]
-    assert state["proposal_stage"] is None
-
-
-def test_real_plugin_manager_disables_non_followup_and_streaming_api_flows():
-    plugin_root = Path(__file__).resolve().parents[2] / "plugins"
-    manager = PluginManager()
-    manifests = manager._scan_directory(plugin_root, source="bundled")
-    manifest = next(item for item in manifests if item.name == "creation-governor")
-    manager._load_plugin(manifest)
-
-    for session_id, capabilities in (
-        ("one-shot-flow", {"platform": "cli", "supports_followup_turns": False}),
-        (
-            "streaming-api-flow",
-            {"platform": "api_server", "streaming_output": True},
-        ),
-    ):
-        results = manager.invoke_hook(
-            "pre_llm_call",
-            session_id=session_id,
-            user_message="帮我分析这份合同",
-            conversation_history=[],
-            **capabilities,
-        )
-        transformed = manager.invoke_hook(
-            "transform_llm_output",
-            session_id=session_id,
-            response_text='{"result":"ok"}',
-            **capabilities,
-        )
-
-        assert results == []
-        assert transformed == []
-        callback_globals = manager._hooks["pre_llm_call"][0].__globals__
-        state_key = callback_globals["_session_key"]({"session_id": session_id})
-        state = callback_globals["_session_states"][state_key]
-        assert state["proposal_stage"] is None
-
-    supported = manager.invoke_hook(
-        "pre_llm_call",
-        session_id="non-streaming-api-flow",
-        platform="api_server",
-        streaming_output=False,
-        supports_followup_turns=True,
-        user_message="帮我分析这份合同",
+    pre_context = context.hooks[0][0][1](
+        session_id="flow-session",
+        user_message="Look into this business problem.",
         conversation_history=[],
     )
-    assert len(supported) == 1
-    assert "Creation governor internal instruction" in supported[0]["context"]
+    assert "background creation-opportunity review" in pre_context["context"]
+
+    output = context.hooks[1][0][1](
+        session_id="flow-session",
+        response_text="Here is the actual business analysis.",
+    )
+    assert output.startswith("Here is the actual business analysis.")
+    assert "<!--creation-recommendation:start " in output
+    assert "Business Research Partner" in output
+
+
+def test_card_mute_action_blocks_future_checks_and_delivery(tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location("creation_governor_flow", PLUGIN_PATH)
+    plugin = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(plugin)
+    plugin._reset_state_for_tests()
+    monkeypatch.setattr(
+        plugin, "_preferences_db_path", lambda: tmp_path / "creation-governor-flow.db"
+    )
+    context = _Context()
+    plugin.register(context)
+
+    context.hooks[0][0][1](
+        session_id="flow-muted-session",
+        user_message="Look into this business problem.",
+        conversation_history=[],
+    )
+    shown = context.hooks[1][0][1](
+        session_id="flow-muted-session",
+        response_text="Here is the actual business analysis.",
+    )
+    assert shown
+    assert len(context.llm.calls) == 1
+
+    response = {
+        "version": 1,
+        "type": "creation_recommendation_response",
+        "action": "mute_session",
+        "proposal_id": base64.urlsafe_b64decode(
+            shown.split("<!--creation-recommendation:start ", 1)[1]
+            .split("-->", 1)[0]
+            .strip()
+            + "=="
+        ).decode("utf-8"),
+        "creation_type": "agent",
+        "title": "Business Research Partner",
+        "dedup_key": "agent:business-research-partner",
+        "evidence_turn_ids": ["evidence-1"],
+    }
+    response["proposal_id"] = json.loads(response["proposal_id"])["proposal_id"]
+    mute_context = context.hooks[0][0][1](
+        session_id="flow-muted-session",
+        user_message=(
+            "[creation_recommendation_response]\n"
+            f"{json.dumps(response)}\n"
+            "[/creation_recommendation_response]"
+        ),
+        conversation_history=[],
+    )
+    assert "disabled proactive creation recommendations" in mute_context["context"]
+
+    assert context.hooks[0][0][1](
+        session_id="flow-muted-session",
+        user_message="Now inspect another business question.",
+        conversation_history=[],
+    ) is None
+    assert len(context.llm.calls) == 1
+    assert context.hooks[1][0][1](
+        session_id="flow-muted-session",
+        response_text="This answer remains untouched.",
+    ) is None

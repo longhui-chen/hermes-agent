@@ -1,45 +1,98 @@
-"""Suggest creation opportunities without replacing native creators.
+"""Discover reusable Agent, Skill, and Task opportunities without interrupting work.
 
-The plugin lets interactive chats surface an implicit creation opportunity.
-It gates the suggested path as proposal -> draft -> explicit confirmation, then
-hands confirmed work to Hermes' existing native creator.
+The plugin separates three product controls that should not be conflated:
+
+* evaluation cadence: first turn, every third turn, plus optional main-model calls;
+* candidate quality: a zero-shot semantic rubric with a structured ``none`` outcome;
+* display cadence: cooldown, semantic deduplication, and dismissal latching.
+
+The user's current task always remains the primary response.  A valid candidate is
+rendered as a backwards-compatible recommendation envelope: new Zettlab clients
+show a card, while older clients see the enclosed plain-text fallback.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
+import logging
 import math
 import re
+import sqlite3
 import threading
 import time
 import unicodedata
 from collections import OrderedDict
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any
 
 from gateway.response_filters import is_intentional_silence_response
 from hermes_constants import get_hermes_home
 
 
-TOOL_NAME = "propose_creation"
-PLUGIN_VERSION = "0.4.2"
+logger = logging.getLogger(__name__)
+
+TOOL_NAME = "detect_creation_opportunity"
+PLUGIN_VERSION = "0.7.0"
 MIN_CONFIDENCE = 0.55
 PROPOSAL_TTL_SECONDS = 30 * 60
+DISMISS_TTL_SECONDS = 30 * 24 * 60 * 60
 MAX_RECENT_PROPOSALS = 128
+MAX_DISMISSALS = 128
 EVALUATION_INTERVAL_TURNS = 3
 PROMPT_COOLDOWN_TURNS = 10
 SESSION_STATE_TTL_SECONDS = 24 * 60 * 60
 MAX_SESSION_STATES = 512
-CREATION_TYPES = {"agent", "skill", "scheduled_task"}
+CREATION_TYPES = {"agent", "skill", "task"}
+RECOMMENDATION_ACTIONS = {"create", "dismiss", "mute_session", "unmute_session"}
+SESSION_PREFERENCES_DB = "creation_governor.db"
 UNSUPPORTED_API_MODES = {"codex_app_server"}
 UNSUPPORTED_PLATFORMS = {"acp"}
+_NONINTERACTIVE_PLATFORMS = {"cron", "subagent", "batch"}
 
 _recent_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
+_dismissed_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
 _session_states: OrderedDict[str, dict[str, Any]] = OrderedDict()
-_recent_lock = threading.Lock()
+_muted_sessions: set[str] = set()
+_known_unmuted_sessions: set[str] = set()
+_state_lock = threading.Lock()
+_plugin_llm: Any = None
 _invocation_scope: ContextVar[tuple[str, str, str | None, str] | None] = ContextVar(
     "creation_governor_invocation_scope",
     default=None,
+)
+
+_SELF_QUERY_RE = re.compile(
+    r"(?:creation[\s_-]*governor|detect_creation_opportunity|propose_creation)",
+    re.IGNORECASE,
+)
+_CJK_RE = re.compile(r"[\u3400-\u9fff]")
+_DISMISS_RE = re.compile(
+    r"(?:暂时不要|不用创建|不要创建|先不创建|dismiss|not now|no thanks|do not create)",
+    re.IGNORECASE,
+)
+_ACCEPT_RE = re.compile(
+    r"(?:创建|开始创建|就这个|create it|create this|yes[, ]+create)",
+    re.IGNORECASE,
+)
+_EXPLICIT_CREATION_RE = re.compile(
+    r"(?:(?:创建|新建|新增|建立|建个|建一个|再来一个|安装|做成|保存成|生成).{0,48}"
+    r"(?:agent|智能体|助手|skill|技能|定时任务|scheduled\s*task|task))|"
+    r"(?:(?:create|build|make|new|add|install|spin\s+up)\s+.{0,48}"
+    r"(?:agent|assistant|skill|scheduled\s*task))",
+    re.IGNORECASE,
+)
+_DIRECT_SCHEDULE_RE = re.compile(
+    r"(?:每天|每日|每周|每月|每个工作日|定时|提醒我|"
+    r"every\s+(?:day|week|month)|daily|weekly|monthly|remind\s+me)",
+    re.IGNORECASE,
+)
+_RECOMMENDATION_RESPONSE_RE = re.compile(
+    r"\[creation_recommendation_response\]\s*(\{.*?\})\s*"
+    r"\[/creation_recommendation_response\]",
+    re.DOTALL,
 )
 
 
@@ -47,27 +100,79 @@ def _text(value: Any, limit: int) -> str:
     return " ".join(str(value or "").split())[:limit]
 
 
-def _dedup_key(value: Any) -> str:
-    value = unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
-    normalized = re.sub(r"[^\w.:-]+", "-", value, flags=re.UNICODE)
-    return normalized.strip("-")[:120]
+def _normalize_creation_type(value: Any) -> str:
+    normalized = _text(value, 40).lower().replace("-", "_")
+    if normalized == "scheduled_task":
+        return "task"
+    return normalized
+
+
+def _semantic_dedup_key(value: Any, creation_type: str, suggested_name: str) -> str:
+    raw = unicodedata.normalize("NFKC", str(value or "")).strip().lower()
+    slug = re.sub(r"[^a-z0-9._:-]+", "-", raw).strip("-")
+    prefix = creation_type if creation_type in CREATION_TYPES else "proposal"
+    if slug:
+        if not slug.startswith(f"{prefix}:"):
+            slug = f"{prefix}:{slug}"
+        return slug[:120]
+
+    fallback = unicodedata.normalize("NFKC", suggested_name).strip().casefold()
+    digest = hashlib.sha256(f"{prefix}:{fallback}".encode("utf-8")).hexdigest()[:24]
+    return f"{prefix}:{digest}"
+
+
+def _prune_timed_map(
+    values: OrderedDict[tuple[str, str], float],
+    *,
+    expired_before: float,
+    max_items: int,
+) -> None:
+    for key, created_at in tuple(values.items()):
+        if created_at < expired_before:
+            values.pop(key, None)
+    while len(values) > max_items:
+        values.popitem(last=False)
 
 
 def _claim_proposal(session_id: str, dedup_key: str, now: float) -> bool:
-    """Return False when the same opportunity was proposed recently."""
     identity = (session_id, dedup_key)
-    with _recent_lock:
-        expired_before = now - PROPOSAL_TTL_SECONDS
-        for key, created_at in tuple(_recent_proposals.items()):
-            if created_at < expired_before:
-                _recent_proposals.pop(key, None)
+    with _state_lock:
+        _prune_timed_map(
+            _recent_proposals,
+            expired_before=now - PROPOSAL_TTL_SECONDS,
+            max_items=MAX_RECENT_PROPOSALS,
+        )
         if identity in _recent_proposals:
             _recent_proposals.move_to_end(identity)
             return False
         _recent_proposals[identity] = now
-        while len(_recent_proposals) > MAX_RECENT_PROPOSALS:
-            _recent_proposals.popitem(last=False)
+        _prune_timed_map(
+            _recent_proposals,
+            expired_before=now - PROPOSAL_TTL_SECONDS,
+            max_items=MAX_RECENT_PROPOSALS,
+        )
     return True
+
+
+def _is_dismissed(session_id: str, dedup_key: str, now: float) -> bool:
+    identity = (session_id, dedup_key)
+    with _state_lock:
+        _prune_timed_map(
+            _dismissed_proposals,
+            expired_before=now - DISMISS_TTL_SECONDS,
+            max_items=MAX_DISMISSALS,
+        )
+        return identity in _dismissed_proposals
+
+
+def _latch_dismissal(session_id: str, dedup_key: str, now: float) -> None:
+    with _state_lock:
+        _dismissed_proposals[(session_id, dedup_key)] = now
+        _prune_timed_map(
+            _dismissed_proposals,
+            expired_before=now - DISMISS_TTL_SECONDS,
+            max_items=MAX_DISMISSALS,
+        )
 
 
 def _raw_session_key(kwargs: dict[str, Any]) -> str:
@@ -92,13 +197,107 @@ def _session_key(kwargs: dict[str, Any]) -> str:
     )
     if (
         invocation is not None
+        and invocation[0] == raw_session_id
         and invocation[1].startswith(profile_prefix)
         and (not explicit_owner or explicit_owner == invocation[3])
     ):
         return invocation[1]
-    if any(field in kwargs for field in owner_fields):
-        return _scoped_session_key(raw_session_id, explicit_owner)
-    return _scoped_session_key(raw_session_id, "")
+    return _scoped_session_key(raw_session_id, explicit_owner)
+
+
+def _preferences_db_path() -> Path:
+    return get_hermes_home() / SESSION_PREFERENCES_DB
+
+
+def _open_preferences_db() -> sqlite3.Connection:
+    path = _preferences_db_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=2.0)
+    connection.execute("PRAGMA busy_timeout = 2000")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS creation_session_preferences (
+            session_id TEXT PRIMARY KEY,
+            recommendations_muted INTEGER NOT NULL DEFAULT 0,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    return connection
+
+
+def _set_session_muted(session_id: str, muted: bool) -> bool:
+    """Persist the user's explicit per-conversation recommendation preference.
+
+    Memory is updated first so an in-flight transform hook observes the choice
+    immediately.  SQLite makes the preference survive gateway/profile restarts.
+    A failed write keeps the current process safe and muted, then reports False
+    so callers can log the durability degradation without exposing internals.
+    """
+    with _state_lock:
+        if muted:
+            _muted_sessions.add(session_id)
+            _known_unmuted_sessions.discard(session_id)
+        else:
+            _muted_sessions.discard(session_id)
+            _known_unmuted_sessions.add(session_id)
+    try:
+        with _open_preferences_db() as connection:
+            connection.execute(
+                """
+                INSERT INTO creation_session_preferences (
+                    session_id, recommendations_muted, updated_at
+                ) VALUES (?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    recommendations_muted = excluded.recommendations_muted,
+                    updated_at = excluded.updated_at
+                """,
+                (session_id, int(muted), time.time()),
+            )
+        return True
+    except (OSError, sqlite3.Error):
+        logger.warning(
+            "creation recommendation session preference persistence failed",
+            exc_info=True,
+        )
+        return False
+
+
+def _is_session_muted(session_id: str) -> bool:
+    with _state_lock:
+        if session_id in _muted_sessions:
+            return True
+        if session_id in _known_unmuted_sessions:
+            return False
+    path = _preferences_db_path()
+    if not path.exists():
+        with _state_lock:
+            _known_unmuted_sessions.add(session_id)
+        return False
+    try:
+        with sqlite3.connect(path, timeout=2.0) as connection:
+            row = connection.execute(
+                """
+                SELECT recommendations_muted
+                FROM creation_session_preferences
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+    except (OSError, sqlite3.Error):
+        logger.warning(
+            "creation recommendation session preference read failed",
+            exc_info=True,
+        )
+        return False
+    muted = bool(row and row[0])
+    with _state_lock:
+        if muted:
+            _muted_sessions.add(session_id)
+            _known_unmuted_sessions.discard(session_id)
+        else:
+            _known_unmuted_sessions.add(session_id)
+    return muted
 
 
 def _prune_session_states(now: float) -> None:
@@ -118,7 +317,8 @@ def _state_locked(session_id: str, now: float) -> dict[str, Any]:
             "turn": 0,
             "last_evaluation_turn": 0,
             "last_prompt_turn": -10_000,
-            "pending_proposal": None,
+            "last_delivery_turn": -10_000,
+            "last_candidate": None,
             "last_proposal": None,
             "proposal_stage": None,
             "draft_only_turn": None,
@@ -127,6 +327,7 @@ def _state_locked(session_id: str, now: float) -> dict[str, Any]:
             "authorized_turn": None,
             "native_bypass_turn": None,
             "last_user_message": "",
+            "last_turn_id": "",
             "last_seen": now,
         }
         _session_states[session_id] = state
@@ -140,308 +341,25 @@ def _prompt_is_cooling_down(state: dict[str, Any]) -> bool:
     return int(state["turn"]) - int(state["last_prompt_turn"]) <= PROMPT_COOLDOWN_TURNS
 
 
-def _proposal_identity(proposal: dict[str, Any] | None) -> str:
-    if not isinstance(proposal, dict):
-        return ""
-    return _dedup_key(
-        f"{proposal.get('creation_type')}:{proposal.get('suggested_name')}"
-    )
-
-
-def _clear_draft_state(state: dict[str, Any], *, stage: str | None) -> None:
-    state["proposal_stage"] = stage
-    state["draft_only_turn"] = None
-    state["draft_delivered_turn"] = None
-    state["awaiting_proposal_id"] = None
-    state["authorized_turn"] = None
-
-
-def _latest_assistant_text(history: list[dict[str, Any]]) -> str:
-    for message in reversed(history):
-        if isinstance(message, dict) and message.get("role") == "assistant":
-            return str(message.get("content") or "")
-    return ""
-
-
-def _proposal_prompt_is_latest(
-    proposal: dict[str, Any], history: list[dict[str, Any]]
-) -> bool:
-    latest = _latest_assistant_text(history)
-    if not latest:
-        return False
-    payload = _proposal_payload(
-        proposal["creation_type"],
-        proposal["suggested_name"],
-        str(proposal.get("reason") or ""),
-        str(proposal.get("evidence") or ""),
-        float(proposal.get("confidence") or MIN_CONFIDENCE),
-    )
-    return payload["user_prompt"] in latest
-
-
-def _commit_proposal(
-    session_id: str,
-    proposal: dict[str, Any],
-    dedup_key: str,
-    now: float,
-) -> str | None:
-    """Atomically claim cooldown, dedup, and session state for one visible prompt."""
-    identity = (session_id, dedup_key)
-    with _recent_lock:
+def _claim_prompt_slot(session_id: str, candidate: dict[str, Any], now: float) -> bool:
+    with _state_lock:
         state = _state_locked(session_id, now)
         if _prompt_is_cooling_down(state):
-            return "prompt_cooldown"
-        expired_before = now - PROPOSAL_TTL_SECONDS
-        for key, created_at in tuple(_recent_proposals.items()):
-            if created_at < expired_before:
-                _recent_proposals.pop(key, None)
-        if identity in _recent_proposals:
-            _recent_proposals.move_to_end(identity)
-            return "recent_duplicate"
-        _recent_proposals[identity] = now
-        while len(_recent_proposals) > MAX_RECENT_PROPOSALS:
-            _recent_proposals.popitem(last=False)
+            return False
+        identity_source = (
+            f"{session_id}|{candidate['dedup_key']}|{state['turn']}|"
+            f"{candidate.get('source_turn_id') or ''}"
+        )
+        candidate["proposal_id"] = hashlib.sha256(
+            identity_source.encode("utf-8")
+        ).hexdigest()[:32]
+        candidate["expires_at"] = time.time() + PROPOSAL_TTL_SECONDS
         state["last_prompt_turn"] = state["turn"]
-        state["last_proposal"] = dict(proposal)
-        _clear_draft_state(state, stage="proposal_shown")
-        state["pending_proposal"] = None
-    return None
-
-
-_TASK_HINT_RE = re.compile(
-    r"(?:帮我|请|看看|看一下|查一下|查询|搜索|找一下|分析|整理|总结|写|做|"
-    r"检查|评估|研究|优化|对比|翻译|汇总|监控|跟踪|提醒|"
-    r"help\s+me|check|find|search|analy[sz]e|review|summari[sz]e|write|research)",
-    re.IGNORECASE,
-)
-_EXPLICIT_CREATION_RE = re.compile(
-    r"(?:(?:创建|新建|新增|建立|建个|建一个|再来一个|安装|做成|保存成|生成|我想要|给我).{0,48}"
-    r"(?:agent|智能体|助手|skill|技能|定时任务|scheduled\s*task|task))|"
-    r"(?:(?:create|build|make|new|add|install|spin\s+up)\s+.{0,48}"
-    r"(?:agent|assistant|skill|scheduled\s*task))",
-    re.IGNORECASE,
-)
-_DIRECT_SCHEDULE_RE = re.compile(
-    r"(?:每天|每日|每周|每月|每个工作日|定时|到点|早上\s*\d|上午\s*\d|"
-    r"下午\s*\d|晚上\s*\d|\d{1,2}\s*点|提醒我|"
-    r"every\s+(?:day|week|month)|daily|weekly|monthly|remind\s+me|at\s+\d{1,2})",
-    re.IGNORECASE,
-)
-_SMALL_TALK_RE = re.compile(
-    r"^(?:你好|您好|嗨|哈喽|谢谢|多谢|好的|好|行|可以|继续|嗯+|哦+|再见|"
-    r"hi|hello|thanks|thank\s+you|ok|okay|continue)[!！,.，。\s]*$",
-    re.IGNORECASE,
-)
-_SELF_QUERY_RE = re.compile(
-    r"(?:creation[\s_-]*governor|propose_creation)",
-    re.IGNORECASE,
-)
-_ACCEPT_DRAFT_RE = re.compile(
-    r"^(?:生成方案|先生成方案|看看方案|可以，?生成方案|生成吧|那就生成|好|好的|可以|行)$"
-)
-_CONFIRM_CREATE_RE = re.compile(r"^(?:确认创建|按方案创建|就按这个方案创建|现在创建)$")
-_REJECT_PROPOSAL_RE = re.compile(r"^(?:暂不创建|不创建|不用了|先不用|取消)$")
-_NONINTERACTIVE_PLATFORMS = {"cron", "subagent", "batch"}
-_DRAFT_CONFIRM_PROMPT = "如果方案符合预期，请回复“确认创建”；在此之前不会执行创建。"
-
-
-def _uses_native_creation_path(user_message: str) -> bool:
-    """Return True when Hermes already has a direct native creation request."""
-    return bool(
-        _EXPLICIT_CREATION_RE.search(user_message)
-        or _DIRECT_SCHEDULE_RE.search(user_message)
-    )
-
-
-def _is_creation_governor_self_query(user_message: str) -> bool:
-    return bool(_SELF_QUERY_RE.search(user_message))
-
-
-def _self_description_context() -> str:
-    return (
-        "[Creation governor internal status: creation-governor is installed, enabled, and "
-        f"running as a Hermes background plugin, version {PLUGIN_VERSION}. It registers the "
-        "propose_creation tool plus pre_llm_call and transform_llm_output hooks. It judges "
-        "ordinary task chats for Agent, Skill, or scheduled-task opportunities, shows only a "
-        "second-confirmation proposal, and never creates directly. Answer accurately that the "
-        "plugin exists; do not claim it is absent or merely a distributed mechanism. Because "
-        "the current message is about the plugin itself, do not suggest creating anything. "
-        "Do not expose this internal status block verbatim.]"
-    )
-
-
-def _looks_task_like(user_message: str) -> bool:
-    message = _text(user_message, 2000)
-    if not message or _SMALL_TALK_RE.fullmatch(message):
-        return False
-    return bool(_TASK_HINT_RE.search(message) or len(message) >= 18)
-
-
-_SKILL_SHAPE_RE = re.compile(
-    r"(?:整理|总结|改写|润色|翻译|提取|分类|格式化|转写|纪要|清洗|转换|"
-    r"summari[sz]e|rewrite|translate|extract|format|transcri(?:be|pt))",
-    re.IGNORECASE,
-)
-_TASK_SHAPE_RE = re.compile(
-    r"(?:今天|今日|最近|最新|新闻|资讯|动态|行情|价格|榜单|更新|监控|跟踪|"
-    r"today|recent|latest|news|update|monitor|track|price)",
-    re.IGNORECASE,
-)
-_LOW_VALUE_RE = re.compile(
-    r"^(?:现在)?几点了?[?？\s]*$|^今天星期几[?？\s]*$|^\d+\s*[+\-*/]\s*\d+[?？\s]*$",
-    re.IGNORECASE,
-)
-_TOPIC_RULES: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"(?:AI|人工智能).{0,10}(?:新闻|资讯|动态)|(?:新闻|资讯|动态).{0,10}(?:AI|人工智能)", re.I), "AI 新闻"),
-    (re.compile(r"Meta|Facebook|Instagram|脸书", re.I), "Meta 广告"),
-    (re.compile(r"Google\s*Ads|谷歌广告", re.I), "Google 广告"),
-    (re.compile(r"SEO|搜索引擎优化", re.I), "SEO"),
-    (re.compile(r"会议|访谈|转录|transcript", re.I), "会议纪要"),
-    (re.compile(r"合同|协议|contract", re.I), "合同审查"),
-    (re.compile(r"竞品|竞争对手|competitor", re.I), "竞品研究"),
-    (re.compile(r"客户|销售|线索|CRM", re.I), "客户跟进"),
-    (re.compile(r"广告|投放|campaign|ROAS|CPA", re.I), "广告投放"),
-    (re.compile(r"新闻|资讯|动态|news", re.I), "行业新闻"),
-    (re.compile(r"数据|表格|CSV|Excel", re.I), "数据处理"),
-    (re.compile(r"文章|内容|文案|content", re.I), "内容创作"),
-    (re.compile(r"代码|程序|bug|code", re.I), "代码处理"),
-)
-
-
-def _infer_topic(user_message: str) -> tuple[str, bool]:
-    for pattern, topic in _TOPIC_RULES:
-        if pattern.search(user_message):
-            return topic, True
-    cleaned = re.sub(
-        r"^(?:请|麻烦|能不能|可以|帮我|帮忙)?\s*(?:看看|看一下|查一下|查询|"
-        r"搜索|找一下|分析|整理|总结|写|做|检查|评估|研究|优化|对比|翻译|汇总)?\s*",
-        "",
-        user_message,
-        flags=re.IGNORECASE,
-    )
-    cleaned = re.sub(r"[，。！？,.!?\s]+", " ", cleaned).strip()
-    if not cleaned:
-        return "任务", False
-    return _text(cleaned, 16), False
-
-
-def _proposal_payload(
-    creation_type: str,
-    suggested_name: str,
-    reason: str,
-    evidence: str,
-    confidence: float,
-) -> dict[str, Any]:
-    labels = {
-        "agent": "Agent",
-        "skill": "Skill",
-        "scheduled_task": "定时任务",
-    }
-    return {
-        "status": "proposal_ready",
-        "creation_type": creation_type,
-        "suggested_name": suggested_name,
-        "reason": reason,
-        "evidence": evidence,
-        "confidence": confidence,
-        "user_prompt": (
-            f"顺便问一下：这类任务可以沉淀成{labels[creation_type]}"
-            f"「{suggested_name}」，以后直接复用。要不要为你生成创建方案？"
-        ),
-        "choices": ["生成方案", "暂不创建"],
-        "next_step": (
-            "先完成并回答用户当前交付的任务，再把 user_prompt 作为轻量建议展示。"
-            "用户选择生成方案后，只输出草案并要求再次明确回复“确认创建”；"
-            "确认后才转交当前环境已有的原生创建流程执行，本插件不执行创建。"
-        ),
-    }
-
-
-def _judge_creation_opportunity(
-    user_message: str,
-    conversation_history: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    """Run a cheap local judgment; no auxiliary model or extra credentials required."""
-    message = _text(user_message, 2000)
-    if (
-        not _looks_task_like(message)
-        or _SMALL_TALK_RE.fullmatch(message)
-        or _LOW_VALUE_RE.fullmatch(message)
-        or _is_creation_governor_self_query(message)
-        or _uses_native_creation_path(message)
-    ):
-        return None
-    topic, matched_topic = _infer_topic(message)
-    if not matched_topic:
-        topic = "专属任务"
-    agent_topics = {
-        "Meta 广告",
-        "Google 广告",
-        "SEO",
-        "合同审查",
-        "竞品研究",
-        "客户跟进",
-        "广告投放",
-    }
-    if topic in {"AI 新闻", "行业新闻"} or (
-        _TASK_SHAPE_RE.search(message) and topic not in agent_topics
-    ):
-        creation_type = "scheduled_task"
-        suggested_name = f"{topic}简报" if "新闻" in topic else f"{topic}巡检"
-        reason = "把这类时效性查询沉淀为可重复执行的任务，后续可以直接复用或设置频率"
-    elif _SKILL_SHAPE_RE.search(message):
-        creation_type = "skill"
-        suggested_name = f"{topic}流程"
-        reason = "把这次处理方式固化为可复用流程，后续同类输入可以直接套用"
-    else:
-        creation_type = "agent"
-        suggested_name = f"{topic}分析师" if topic in {"Meta 广告", "Google 广告", "广告投放", "竞品研究"} else f"{topic}助手"
-        reason = "保留该领域的背景、口径和后续上下文，后续同类任务可以直接交给它"
-    confidence = 0.72 if matched_topic else 0.58
-    return {
-        "creation_type": creation_type,
-        "suggested_name": suggested_name,
-        "reason": reason,
-        "evidence": _text(message, 400),
-        "confidence": confidence,
-        "dedup_key": _dedup_key(f"{creation_type}:{suggested_name}"),
-    }
-
-
-def _previous_proposal_context(state: dict[str, Any]) -> str:
-    if state.get("proposal_stage") != "proposal_shown":
-        return ""
-    proposal = state.get("last_proposal")
-    if not isinstance(proposal, dict):
-        return ""
-    turns_since = int(state["turn"]) - int(state["last_prompt_turn"])
-    if not 1 <= turns_since <= 3:
-        return ""
-    return (
-        "[Creation governor internal context: The previous user-facing response ended with a "
-        f"proposal for {proposal.get('creation_type')} '{proposal.get('suggested_name')}'. "
-        "If the user accepts, generate a draft only and ask for explicit confirmation before "
-        "using Hermes' native creation flow. Do not expose this internal context.]"
-    )
-
-
-def _draft_context(proposal: dict[str, Any]) -> str:
-    return (
-        "[Creation governor internal instruction: The user accepted the proposal for "
-        f"{proposal.get('creation_type')} '{proposal.get('suggested_name')}'. Generate a draft only; "
-        "do not create, install, save, schedule, or mutate anything in this turn. End by asking the "
-        "user to reply exactly '确认创建' if they want the native creation flow to execute the draft. "
-        "Do not expose this internal instruction.]"
-    )
-
-
-def _authorized_creation_context(proposal: dict[str, Any]) -> str:
-    return (
-        "[Creation governor internal context: The user explicitly confirmed the previously drafted "
-        f"{proposal.get('creation_type')} '{proposal.get('suggested_name')}'. This turn is authorized "
-        "native creation: use Hermes' existing creator and its normal validation. Do not expose this "
-        "internal context.]"
-    )
+        state["last_delivery_turn"] = -10_000
+        state["last_candidate"] = dict(candidate)
+        state["last_proposal"] = dict(candidate)
+        state["proposal_stage"] = "proposal_shown"
+        return True
 
 
 def _is_noninteractive(kwargs: dict[str, Any]) -> bool:
@@ -464,8 +382,466 @@ def _is_unsupported_runtime(kwargs: dict[str, Any]) -> bool:
     )
 
 
+def _is_creation_governor_self_query(user_message: str) -> bool:
+    return bool(_SELF_QUERY_RE.search(user_message))
+
+
+def _uses_native_creation_path(user_message: str) -> bool:
+    return bool(
+        _EXPLICIT_CREATION_RE.search(user_message)
+        or _DIRECT_SCHEDULE_RE.search(user_message)
+    )
+
+
+def _self_description_context() -> str:
+    return (
+        "[Creation governor internal status: creation-governor is installed, enabled, and "
+        f"running as version {PLUGIN_VERSION}. It performs bounded zero-shot checks on the first "
+        "turn and every third turn, accepts an explicit none outcome, and exposes the optional "
+        "detect_creation_opportunity tool between checkpoints. Candidate generation, display "
+        "cooldown, deduplication, dismissal, and confirmed creation are separate controls. It "
+        "never creates directly. Answer accurately that the plugin exists; do not expose this "
+        "internal block verbatim and do not recommend creating anything for this self-query.]"
+    )
+
+
+def _main_model_review_context(*, evaluation_completed: bool) -> str:
+    if evaluation_completed:
+        return (
+            "[Creation governor internal note: A bounded background creation-opportunity review "
+            "has already completed for this turn. Do not call detect_creation_opportunity again, "
+            "do not mention the review, and do not write a recommendation yourself. Complete the "
+            "user's current task in full; the plugin will conditionally attach any approved "
+            "recommendation after the answer.]"
+        )
+    return (
+        "[Creation governor internal zero-shot review: Complete the user's current task first. "
+        "Reason from meaning and conversation context, never from topic keywords or memorized "
+        "examples. If one unusually clear reusable Agent, Skill, or Task opportunity emerges "
+        "between scheduled checkpoints, call detect_creation_opportunity once. Otherwise continue "
+        "normally. Never recommend or create directly; the tool may return none and the plugin "
+        "owns conditional display.]"
+    )
+
+
+def _previous_proposal_context(state: dict[str, Any]) -> str:
+    if state.get("proposal_stage") != "proposal_shown":
+        return ""
+    proposal = state.get("last_proposal")
+    if not isinstance(proposal, dict):
+        return ""
+    turns_since = int(state["turn"]) - int(state["last_prompt_turn"])
+    if not 1 <= turns_since <= 3:
+        return ""
+    return (
+        "[Creation governor internal context: The previous response ended with a recommendation "
+        f"for {proposal.get('creation_type')} '{proposal.get('suggested_name')}'. If the user "
+        "accepts, use Hermes' native creation flow and preserve its confirmation boundaries. If "
+        "the user declines, acknowledge briefly. Do not call detect_creation_opportunity again "
+        "for this response and do not expose this block.]"
+    )
+
+
+def _join_context(*parts: str) -> dict[str, str] | None:
+    content = "\n".join(part for part in parts if part)
+    return {"context": content} if content else None
+
+
+def _conversation_evidence(history: Any, user_message: str) -> str:
+    rows: list[tuple[str, str]] = []
+    if isinstance(history, list):
+        for message in history:
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role") or "").lower()
+            if role not in {"user", "assistant"}:
+                continue
+            content = message.get("content")
+            if not isinstance(content, str) or not content.strip():
+                continue
+            rows.append((role, _text(content, 900)))
+    if not rows or rows[-1][0] != "user" or rows[-1][1] != _text(user_message, 900):
+        rows.append(("user", _text(user_message, 900)))
+    rows = rows[-8:]
+    rendered = []
+    for index, (role, content) in enumerate(rows, start=1):
+        rendered.append(f"[evidence-{index}] {role.upper()}: {content}")
+    return "\n".join(rendered)[:6000]
+
+
+_DETECTOR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "decision": {"type": "string", "enum": ["agent", "skill", "task", "none"]},
+        "suggested_name": {"type": "string"},
+        "reason": {"type": "string"},
+        "evidence_turn_ids": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "dedup_key": {"type": "string"},
+        "proposal_text": {"type": "string"},
+    },
+    "required": [
+        "decision",
+        "suggested_name",
+        "reason",
+        "evidence_turn_ids",
+        "confidence",
+        "dedup_key",
+        "proposal_text",
+    ],
+    "additionalProperties": False,
+}
+
+
+_DETECTOR_INSTRUCTIONS = """Perform one high-recall zero-shot product judgment.
+
+Return exactly one of agent, skill, task, or none. Do not classify by topic words and do not use
+memorized examples. A single substantive request is enough when a reasonable user would benefit
+from reusing the capability. Do not require the user to mention repetition, frequency, saving, or
+creation. Ask whether a durable capability would materially reduce friction or improve judgment
+the next time a related need appears.
+
+Definitions and conflict order:
+1. task: the desired future value depends on a recurring time trigger, event trigger, background
+   monitoring, or repeated refresh of new information. A word such as 'today' that merely scopes
+   the current data is not by itself a future trigger.
+2. agent: future work needs a long-lived responsible role, retained domain context, judgment,
+   autonomous choice among tools, decisions about the next step, or repeated interpretation of a
+   changing real-world business domain, account, operation, project, or body of evidence.
+3. skill: future inputs vary but a stable input-to-output method can be reused without an
+   independent identity or durable state.
+4. none: small talk, a trivial transformation, a low-value closed-world fact lookup, an explicit
+   request to create/configure/schedule something through Hermes' native flow, or no reasonable
+   reuse value.
+
+High-recall boundary: a substantive request to inspect, compare, diagnose, research, optimize, or
+make a judgment about an ongoing external work domain should normally be agent rather than none,
+even on the first request and even when the requested snapshot is scoped to today/current/latest.
+Choose none only when reuse value is genuinely absent, not merely unstated.
+
+Apply this semantic gate before returning none. Ask, in order: (a) will the underlying information,
+account, project, or operating environment change after this turn; (b) would a responsible role with
+retained context make a future judgment better; (c) would a stable method save meaningful effort on
+a different future input? If any answer is yes, none is forbidden: choose task for a future trigger,
+otherwise agent for continuing ownership/judgment, otherwise skill for the reusable method. Ambiguity
+about whether the user will repeat the request is not evidence for none. Do not reduce an analytical
+request to a fact lookup merely because the current data or connector is unavailable.
+
+Judge reuse value separately from current execution availability. Missing authorization,
+connectors, data, or tools may block today's execution but is not a reason to ignore a clear
+long-term need. Recommend only the first-layer object the user most needs, never multiple objects.
+Match the user's language. For a positive decision, provide a concise name, concrete reason,
+one-sentence optional proposal_text asking whether to create it, confidence, a stable semantic
+dedup_key, and evidence_turn_ids chosen only from the supplied labels. For none, use empty strings,
+an empty evidence list, and confidence 0. Never claim anything was created.
+
+中文请求必须按同一套语义规则判断，不要因为用户没有说“重复”“以后”“保存”或“创建”就返回
+none。先判断需求所涉及的账户、项目、业务环境或信息是否会继续变化；如果会变化且后续判断需要
+保留背景、综合数据或自主选择工具，选择 agent。如果价值来自未来的时间、事件、后台监控或提醒，
+选择 task。如果输入会变化但处理方法相对稳定，选择 skill。只有寒暄、低价值封闭事实、微小的一次性
+转换、用户已经明确要求创建，或 Agent/Skill/Task 三种长期价值都确实不存在时，才选择 none。
+“今天”“最近”“当前”只是本次数据范围，不等于没有长期价值。缺少授权、连接器或数据只影响本次
+执行，不能作为返回 none 的理由。名称、原因和询问是否创建的 proposal_text 使用用户的语言。"""
+
+
+def _run_forced_evaluation(
+    *,
+    user_message: str,
+    conversation_history: Any,
+) -> dict[str, Any] | None:
+    llm = _plugin_llm
+    if llm is None:
+        return None
+    evidence = _conversation_evidence(conversation_history, user_message)
+
+    # Prefer an ordinary bounded JSON completion.  Some OpenAI-compatible
+    # gateways accept ``response_format`` but collapse optional semantic
+    # judgments to the schema's empty ``none`` shape.  The same model produces
+    # materially better zero-shot classifications when asked for JSON in the
+    # prompt, and the candidate still passes strict local normalization before
+    # it can be displayed.
+    try:
+        result = llm.complete(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        _DETECTOR_INSTRUCTIONS
+                        + "\n\nReturn only one compact JSON object with exactly these keys: "
+                        "decision, suggested_name, reason, evidence_turn_ids, confidence, "
+                        "dedup_key, proposal_text. Do not use Markdown fences."
+                    ),
+                },
+                {"role": "user", "content": evidence},
+            ],
+            temperature=0.0,
+            max_tokens=500,
+            timeout=3.0,
+            purpose="creation_opportunity_checkpoint_json",
+        )
+        parsed = _parse_detector_json(result.text)
+        logger.info(
+            "creation opportunity JSON decision=%s confidence=%s title=%s",
+            parsed.get("decision") if parsed else None,
+            parsed.get("confidence") if parsed else None,
+            _text(parsed.get("suggested_name"), 80) if parsed else "",
+        )
+        if parsed is not None:
+            return parsed
+    except Exception:
+        logger.warning("creation opportunity JSON checkpoint failed", exc_info=True)
+        return None
+
+
+def _parse_detector_json(value: Any) -> dict[str, Any] | None:
+    text = str(value or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, count=1, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text, count=1)
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            return None
+        try:
+            parsed = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _normalize_candidate(
+    args: dict[str, Any], state: dict[str, Any]
+) -> tuple[dict[str, Any] | None, str]:
+    decision = _normalize_creation_type(
+        args.get("decision") or args.get("creation_type")
+    )
+    if decision == "none":
+        return None, "none"
+    if decision not in CREATION_TYPES:
+        return None, "unsupported_creation_type"
+
+    suggested_name = _text(args.get("suggested_name"), 80)
+    reason = _text(args.get("reason"), 400)
+    proposal_text = _text(args.get("proposal_text"), 500)
+    try:
+        confidence = float(args.get("confidence", 0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    if not math.isfinite(confidence) or confidence < MIN_CONFIDENCE:
+        return None, "confidence_below_threshold"
+    if not suggested_name or not reason or not proposal_text:
+        return None, "missing_candidate_fields"
+
+    evidence_turn_ids = args.get("evidence_turn_ids")
+    if not isinstance(evidence_turn_ids, list):
+        evidence_turn_ids = []
+    evidence_turn_ids = [
+        _text(value, 80) for value in evidence_turn_ids[:8] if _text(value, 80)
+    ]
+    dedup_key = _semantic_dedup_key(args.get("dedup_key"), decision, suggested_name)
+    return {
+        "creation_type": decision,
+        "suggested_name": suggested_name,
+        "reason": reason,
+        "evidence_turn_ids": evidence_turn_ids,
+        "confidence": confidence,
+        "dedup_key": dedup_key,
+        "proposal_text": proposal_text,
+        "current_request": _text(state.get("last_user_message"), 1000),
+        "source_turn_id": _text(state.get("last_turn_id"), 160),
+    }, "candidate"
+
+
+def _proposal_payload(candidate: dict[str, Any], *, status: str) -> dict[str, Any]:
+    current_request = (
+        candidate.get("current_request") or "the current request already in context"
+    )
+    return {
+        "status": status,
+        "decision": candidate["creation_type"],
+        "suggested_name": candidate["suggested_name"],
+        "delivery": "deferred_to_transform_hook"
+        if status == "proposal_ready"
+        else "not_displayed",
+        "next_step": (
+            "Now complete the user's current task in full. A placeholder such as 'done' or "
+            "'ready' is not a deliverable. Do not mention, quote, or paraphrase the creation "
+            f"candidate. Current request: {current_request}"
+        ),
+    }
+
+
+def _consider_candidate(
+    session_id: str, args: dict[str, Any], now: float
+) -> dict[str, Any]:
+    if _is_session_muted(session_id):
+        return {"status": "candidate_recorded", "reason": "session_muted"}
+    with _state_lock:
+        state = _state_locked(session_id, now)
+        candidate, reason = _normalize_candidate(args, state)
+        state["last_candidate"] = dict(candidate) if candidate else None
+    if candidate is None:
+        return {
+            "status": "no_candidate" if reason == "none" else "not_proposed",
+            "reason": reason,
+        }
+
+    if _is_dismissed(session_id, candidate["dedup_key"], now):
+        return {"status": "candidate_recorded", "reason": "dismissed"}
+    with _state_lock:
+        state = _state_locked(session_id, now)
+        if _prompt_is_cooling_down(state):
+            return _proposal_payload(candidate, status="candidate_recorded") | {
+                "reason": "prompt_cooldown"
+            }
+    if not _claim_proposal(session_id, candidate["dedup_key"], now):
+        return {"status": "candidate_recorded", "reason": "recent_duplicate"}
+    if not _claim_prompt_slot(session_id, candidate, now):
+        return _proposal_payload(candidate, status="candidate_recorded") | {
+            "reason": "prompt_cooldown"
+        }
+    return _proposal_payload(candidate, status="proposal_ready")
+
+
+def _parse_recommendation_response(user_message: str) -> dict[str, Any] | None:
+    match = _RECOMMENDATION_RESPONSE_RE.search(user_message)
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    action = _text(payload.get("action"), 40).lower()
+    creation_type = _normalize_creation_type(payload.get("creation_type"))
+    if (
+        payload.get("version") != 1
+        or payload.get("type") != "creation_recommendation_response"
+        or action not in RECOMMENDATION_ACTIONS
+        or creation_type not in CREATION_TYPES
+    ):
+        return None
+    title = _text(payload.get("title"), 80)
+    dedup_key = _text(payload.get("dedup_key"), 160)
+    proposal_id = _text(payload.get("proposal_id"), 80)
+    if not title or not dedup_key or (action != "unmute_session" and not proposal_id):
+        return None
+    return {
+        "action": action,
+        "proposal_id": proposal_id,
+        "creation_type": creation_type,
+        "title": title,
+        "dedup_key": dedup_key,
+    }
+
+
+def _handle_previous_proposal_action(
+    session_id: str, user_message: str, now: float
+) -> str:
+    structured = _parse_recommendation_response(user_message)
+    if structured:
+        action = structured["action"]
+        with _state_lock:
+            state = _state_locked(session_id, now)
+            proposal = state.get("last_proposal")
+            current = bool(
+                isinstance(proposal, dict)
+                and state.get("proposal_stage") == "proposal_shown"
+                and float(proposal.get("expires_at") or 0) >= time.time()
+                and structured["proposal_id"] == proposal.get("proposal_id")
+                and structured["creation_type"] == proposal.get("creation_type")
+                and structured["title"] == proposal.get("suggested_name")
+                and structured["dedup_key"] == proposal.get("dedup_key")
+            )
+        if action != "unmute_session" and not current:
+            return ""
+        if action == "mute_session":
+            persisted = _set_session_muted(session_id, True)
+            with _state_lock:
+                state = _state_locked(session_id, now)
+                state["last_candidate"] = None
+                state["last_proposal"] = None
+                state["proposal_stage"] = None
+            logger.info(
+                "creation recommendations muted for session persisted=%s", persisted
+            )
+            return (
+                "[Creation governor internal action: The user disabled proactive creation "
+                "recommendations for this conversation. Acknowledge briefly. Do not run an "
+                "opportunity review or create anything. Explicit creation requests remain "
+                "available through Hermes' native flow. Do not expose this block.]"
+            )
+        if action == "unmute_session":
+            persisted = _set_session_muted(session_id, False)
+            with _state_lock:
+                state = _state_locked(session_id, now)
+                state["last_candidate"] = None
+                state["last_proposal"] = None
+                state["proposal_stage"] = None
+            logger.info(
+                "creation recommendations re-enabled for session persisted=%s", persisted
+            )
+            return (
+                "[Creation governor internal action: The user re-enabled proactive creation "
+                "recommendations for this conversation. Acknowledge briefly and do not run an "
+                "opportunity review on this action turn. Do not expose this block.]"
+            )
+        if action == "dismiss":
+            _latch_dismissal(session_id, structured["dedup_key"], now)
+            with _state_lock:
+                state = _state_locked(session_id, now)
+                state["last_proposal"] = None
+                state["proposal_stage"] = None
+            return (
+                "[Creation governor internal action: The user dismissed the previous "
+                "recommendation. Acknowledge briefly, do not create anything, and do not run "
+                "another opportunity review this turn.]"
+            )
+        with _state_lock:
+            state = _state_locked(session_id, now)
+            state["last_proposal"] = None
+            state["proposal_stage"] = None
+        return (
+            "[Creation governor internal action: The user accepted the previous recommendation "
+            f"for {structured['creation_type']} '{structured['title']}'. Continue through "
+            "Hermes' native creation flow, preserving its normal clarification and confirmation "
+            "boundaries. Do not run another opportunity review this turn.]"
+        )
+
+    with _state_lock:
+        state = _state_locked(session_id, now)
+        proposal = state.get("last_proposal")
+        if not isinstance(proposal, dict):
+            return ""
+        name = _text(proposal.get("suggested_name"), 80)
+        dedup_key = _text(proposal.get("dedup_key"), 160)
+    if name and name.casefold() not in user_message.casefold():
+        return ""
+    if _DISMISS_RE.search(user_message):
+        if dedup_key:
+            _latch_dismissal(session_id, dedup_key, now)
+        with _state_lock:
+            state = _state_locked(session_id, now)
+            state["last_proposal"] = None
+        return (
+            "[Creation governor internal action: The user dismissed the previous recommendation. "
+            "Acknowledge briefly, do not create anything, and do not run another opportunity "
+            "review this turn.]"
+        )
+    if _ACCEPT_RE.search(user_message):
+        return (
+            "[Creation governor internal action: The user accepted the previous recommendation. "
+            "Continue through Hermes' native creation flow, preserving its normal clarification "
+            "and confirmation boundaries. Do not run another opportunity review this turn.]"
+        )
+    return ""
+
+
 def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
-    """Schedule hidden judgments and carry proposal context across transformed output."""
     raw_session_id = _raw_session_key(kwargs)
     owner_id = next(
         (
@@ -478,154 +854,126 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
     session_id = (
         _scoped_session_key(raw_session_id, owner_id) if raw_session_id else ""
     )
-    noninteractive = _is_noninteractive(kwargs)
     suppression_reason = None
-    if noninteractive:
+    if _is_noninteractive(kwargs):
         suppression_reason = "noninteractive_session"
     elif kwargs.get("structured_output"):
         suppression_reason = "structured_output"
     elif _is_unsupported_runtime(kwargs):
         suppression_reason = "unsupported_runtime"
     _invocation_scope.set((raw_session_id, session_id, suppression_reason, owner_id))
-    if suppression_reason:
-        if session_id and suppression_reason in {
-            "structured_output",
-            "unsupported_runtime",
-        }:
-            with _recent_lock:
-                state = _state_locked(session_id, time.monotonic())
-                state["pending_proposal"] = None
-                _clear_draft_state(state, stage=None)
-        return None
     if not session_id:
         return None
+    if suppression_reason:
+        return None
     user_message = _text(kwargs.get("user_message"), 2000)
-    history = kwargs.get("conversation_history")
-    if not isinstance(history, list):
-        history = []
     now = time.monotonic()
-    with _recent_lock:
+    with _state_lock:
         state = _state_locked(session_id, now)
         state["turn"] += 1
         state["last_user_message"] = user_message
-        pending = state.get("pending_proposal")
-        if isinstance(pending, dict) and int(pending.get("turn", -1)) != int(
-            state["turn"]
-        ):
-            state["pending_proposal"] = None
-        proposal = state.get("last_proposal")
-        stage = state.get("proposal_stage")
-
-        # A draft-generating or authorized state is valid for one turn only.
-        # If that turn ended without the post-completion transition, fail closed.
-        if stage == "draft_generating" and int(
-            state.get("draft_only_turn") or -1
-        ) != int(state["turn"]):
-            _clear_draft_state(state, stage="proposal_shown")
-            stage = state["proposal_stage"]
-        if stage == "creation_authorized" and int(
-            state.get("authorized_turn") or -1
-        ) != int(state["turn"]):
-            _clear_draft_state(state, stage=None)
-            stage = state["proposal_stage"]
-
-        if isinstance(proposal, dict) and _REJECT_PROPOSAL_RE.fullmatch(user_message):
-            _clear_draft_state(state, stage="dismissed")
-            state["pending_proposal"] = None
-            return None
-
-        if isinstance(proposal, dict) and stage == "awaiting_confirmation":
-            delivered_turn = state.get("draft_delivered_turn")
-            confirmation_is_current = bool(
-                isinstance(delivered_turn, int)
-                and delivered_turn == int(state["turn"]) - 1
-                and state.get("awaiting_proposal_id")
-                == _proposal_identity(proposal)
-                and _DRAFT_CONFIRM_PROMPT in _latest_assistant_text(history)
-            )
-            if confirmation_is_current and _CONFIRM_CREATE_RE.fullmatch(user_message):
-                _clear_draft_state(state, stage="creation_authorized")
-                state["authorized_turn"] = state["turn"]
-                state["pending_proposal"] = None
-                return {"context": _authorized_creation_context(proposal)}
-            # Any other turn, including a stale or mismatched confirmation,
-            # invalidates the one-shot draft authorization.
-            _clear_draft_state(state, stage=None)
-            stage = state["proposal_stage"]
-
-        # A confirmation phrase is meaningful only for the immediately preceding,
-        # normally completed draft. Never reinterpret a stale confirmation as a new
-        # creation opportunity or expose context for an older proposal.
-        if _CONFIRM_CREATE_RE.fullmatch(user_message):
-            state["pending_proposal"] = None
-            _clear_draft_state(state, stage=None)
-            return None
-
-        if (
-            isinstance(proposal, dict)
-            and stage == "proposal_shown"
-            and _ACCEPT_DRAFT_RE.fullmatch(user_message)
-        ):
-            if not _proposal_prompt_is_latest(proposal, history):
-                _clear_draft_state(state, stage=None)
-                return None
-            state["proposal_stage"] = "draft_generating"
-            state["draft_only_turn"] = state["turn"]
-            state["pending_proposal"] = None
-            return {"context": _draft_context(proposal)}
-        carry_context = _previous_proposal_context(state)
-        if _is_creation_governor_self_query(user_message):
-            _clear_draft_state(state, stage=None)
-            state["pending_proposal"] = None
-            return {"context": _self_description_context()}
-        if _uses_native_creation_path(user_message):
-            _clear_draft_state(state, stage=None)
-            state["native_bypass_turn"] = state["turn"]
-            state["pending_proposal"] = None
-            return None
-        if _prompt_is_cooling_down(state):
-            return {"context": carry_context} if carry_context else None
+        state["last_turn_id"] = _text(kwargs.get("turn_id"), 160)
         turn = int(state["turn"])
-        last_evaluation_turn = int(state["last_evaluation_turn"])
-        due = (
-            (last_evaluation_turn == 0 and _looks_task_like(user_message))
-            or (last_evaluation_turn == 0 and turn >= EVALUATION_INTERVAL_TURNS)
-            or (
-                last_evaluation_turn > 0
-                and turn - last_evaluation_turn >= EVALUATION_INTERVAL_TURNS
-            )
+
+    if _is_creation_governor_self_query(user_message):
+        return _join_context(_self_description_context())
+
+    if "[creation_recommendation_response]" in user_message:
+        action_context = _handle_previous_proposal_action(session_id, user_message, now)
+        return _join_context(action_context)
+    action_context = _handle_previous_proposal_action(session_id, user_message, now)
+    if action_context:
+        return _join_context(action_context)
+    if _uses_native_creation_path(user_message):
+        with _state_lock:
+            state = _state_locked(session_id, now)
+            state["last_candidate"] = None
+            state["last_proposal"] = None
+            state["proposal_stage"] = None
+        return None
+
+    if _is_session_muted(session_id):
+        return None
+
+    with _state_lock:
+        carry_context = _previous_proposal_context(_state_locked(session_id, now))
+
+    evaluation_due = turn == 1 or turn % EVALUATION_INTERVAL_TURNS == 0
+    if evaluation_due:
+        with _state_lock:
+            _state_locked(session_id, now)["last_evaluation_turn"] = turn
+        candidate = _run_forced_evaluation(
+            user_message=user_message,
+            conversation_history=kwargs.get("conversation_history"),
         )
-        if not due:
-            return {"context": carry_context} if carry_context else None
-        # Mark before the out-of-band call so failures cannot cause repeated calls in one turn.
-        state["last_evaluation_turn"] = turn
+        if candidate is not None:
+            candidate_result = _consider_candidate(session_id, candidate, now)
+            logger.info(
+                "creation opportunity checkpoint result status=%s reason=%s "
+                "decision=%s confidence=%s title=%s",
+                candidate_result.get("status"),
+                candidate_result.get("reason"),
+                candidate.get("decision"),
+                candidate.get("confidence"),
+                _text(candidate.get("suggested_name"), 80),
+            )
+            return _join_context(
+                carry_context, _main_model_review_context(evaluation_completed=True)
+            )
+        logger.info(
+            "creation opportunity checkpoint unavailable; falling back to main-model review"
+        )
 
-    proposal = _judge_creation_opportunity(user_message, history)
-    if proposal is None:
-        return {"context": carry_context} if carry_context else None
+    with _state_lock:
+        state = _state_locked(session_id, now)
+        if _prompt_is_cooling_down(state):
+            return _join_context(carry_context)
+    return _join_context(
+        carry_context, _main_model_review_context(evaluation_completed=False)
+    )
 
-    with _recent_lock:
-        state = _state_locked(session_id, time.monotonic())
-        state["pending_proposal"] = dict(proposal, turn=state["turn"])
-    payload = _proposal_payload(
-        proposal["creation_type"],
-        proposal["suggested_name"],
-        proposal["reason"],
-        proposal["evidence"],
-        proposal["confidence"],
+
+def _encode_recommendation(candidate: dict[str, Any]) -> str:
+    payload = {
+        "version": 1,
+        "type": "creation_recommendation",
+        "proposal_id": candidate["proposal_id"],
+        "expires_at": candidate["expires_at"],
+        "creation_type": candidate["creation_type"],
+        "title": candidate["suggested_name"],
+        "reason": candidate["reason"],
+        "dedup_key": candidate["dedup_key"],
+        "confidence": candidate["confidence"],
+        "evidence_turn_ids": candidate.get("evidence_turn_ids") or [],
+        "source_turn_id": candidate.get("source_turn_id") or "",
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _fallback_text(candidate: dict[str, Any]) -> str:
+    creation_type = candidate["creation_type"]
+    name = candidate["suggested_name"]
+    reason = candidate["reason"]
+    proposal_text = candidate["proposal_text"]
+    chinese = bool(_CJK_RE.search(name + reason + proposal_text))
+    if chinese:
+        label = {"agent": "Agent", "skill": "Skill", "task": "Task"}[creation_type]
+        return f"💡 可以沉淀为一个 {label}\n\n**「{name}」**\n\n{reason}\n\n{proposal_text}"
+    label = {"agent": "Agent", "skill": "Skill", "task": "Task"}[creation_type]
+    return f"💡 This could become a reusable {label}\n\n**{name}**\n\n{reason}\n\n{proposal_text}"
+
+
+def _recommendation_envelope(candidate: dict[str, Any]) -> str:
+    encoded = _encode_recommendation(candidate)
+    return (
+        f"<!--creation-recommendation:start {encoded}-->\n\n"
+        f"{_fallback_text(candidate)}\n\n"
+        "<!--creation-recommendation:end-->"
     )
-    context = (
-        "[Creation governor internal instruction: First complete the user's current task. Then "
-        "end the answer with the following lightweight capability proposal exactly once: "
-        f"{payload['user_prompt']} Do not say this was generated by a plugin or evaluator.]"
-    )
-    if carry_context:
-        context = carry_context + "\n" + context
-    return {"context": context}
 
 
 def _transform_llm_output(**kwargs: Any) -> str | None:
-    """Append a missed scheduled proposal and start the ten-turn prompt cooldown."""
     session_id = _session_key(kwargs)
     response_text = str(kwargs.get("response_text") or "")
     if (
@@ -638,257 +986,105 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
     ):
         return None
     if kwargs.get("failed") or kwargs.get("interrupted") or kwargs.get("completed") is False:
-        with _recent_lock:
+        with _state_lock:
             state = _state_locked(session_id, time.monotonic())
-            state["pending_proposal"] = None
-            if state.get("proposal_stage") == "draft_generating":
-                _clear_draft_state(state, stage="proposal_shown")
+            if state.get("proposal_stage") == "proposal_shown":
+                state["last_candidate"] = None
+                state["last_proposal"] = None
+                state["proposal_stage"] = None
+        return None
+    if _is_session_muted(session_id):
         return None
     now = time.monotonic()
-    with _recent_lock:
+    with _state_lock:
         state = _state_locked(session_id, now)
-        if (
-            state.get("proposal_stage") == "draft_generating"
-            and int(state.get("draft_only_turn") or -1) == int(state["turn"])
-        ):
-            turn_exit_reason = str(kwargs.get("turn_exit_reason") or "")
-            if turn_exit_reason and not turn_exit_reason.startswith("text_response("):
-                _clear_draft_state(state, stage="proposal_shown")
-                return None
-            if _DRAFT_CONFIRM_PROMPT in response_text:
-                return None
-            return response_text.rstrip() + "\n\n" + _DRAFT_CONFIRM_PROMPT
-        pending = state.get("pending_proposal")
-        if not isinstance(pending, dict) or int(pending.get("turn", -1)) != int(state["turn"]):
-            return None
-        # A proactive tool call in the same turn may already have claimed the slot.
-        if _prompt_is_cooling_down(state):
-            state["pending_proposal"] = None
-            return None
-        proposal = dict(pending)
-
-    dedup_key = _dedup_key(proposal.get("dedup_key"))
-    payload = _proposal_payload(
-        proposal["creation_type"],
-        proposal["suggested_name"],
-        proposal["reason"],
-        proposal["evidence"],
-        proposal["confidence"],
-    )
-    rejection = _commit_proposal(session_id, proposal, dedup_key, now)
-    if rejection:
-        return None
-    user_prompt = payload["user_prompt"]
-    if user_prompt in response_text or (
-        proposal["suggested_name"] in response_text and "创建方案" in response_text
-    ):
-        return None
-    return response_text.rstrip() + "\n\n" + user_prompt
-
-
-def _on_post_llm_call(**kwargs: Any) -> None:
-    """Commit draft confirmation only after a normal completed draft turn."""
-    if (
-        _is_noninteractive(kwargs)
-        or _is_unsupported_runtime(kwargs)
-        or kwargs.get("structured_output")
-    ):
-        return
-    session_id = _session_key(kwargs)
-    if not session_id:
-        return
-    assistant_response = str(kwargs.get("assistant_response") or "")
-    with _recent_lock:
-        state = _state_locked(session_id, time.monotonic())
-        if not (
-            state.get("proposal_stage") == "draft_generating"
-            and int(state.get("draft_only_turn") or -1) == int(state["turn"])
-        ):
-            return
         proposal = state.get("last_proposal")
-        completed_draft = bool(
-            isinstance(proposal, dict)
-            and kwargs.get("completed") is not False
-            and not kwargs.get("failed")
-            and not kwargs.get("interrupted")
-            and (
-                not kwargs.get("turn_exit_reason")
-                or str(kwargs.get("turn_exit_reason")).startswith("text_response(")
-            )
-            and _DRAFT_CONFIRM_PROMPT in assistant_response
-        )
-        if not completed_draft:
-            _clear_draft_state(state, stage="proposal_shown")
-            return
-        state["proposal_stage"] = "awaiting_confirmation"
-        state["draft_delivered_turn"] = state["turn"]
-        state["awaiting_proposal_id"] = _proposal_identity(proposal)
-        state["draft_only_turn"] = None
-
-
-def _propose_creation(args: dict[str, Any], **kwargs: Any) -> str:
-    creation_type = _text(args.get("creation_type"), 40).lower()
-    suggested_name = _text(args.get("suggested_name"), 80)
-    reason = _text(args.get("reason"), 400)
-    evidence = _text(args.get("evidence"), 400)
-    dedup_key = _dedup_key(args.get("dedup_key"))
-    try:
-        confidence = float(args.get("confidence", 0))
-    except (TypeError, ValueError):
-        confidence = 0.0
-
-    if creation_type not in CREATION_TYPES:
-        return json.dumps({"status": "invalid", "error": "unsupported_creation_type"})
-    if not suggested_name or not reason or not evidence or not dedup_key:
-        return json.dumps({"status": "invalid", "error": "missing_proposal_fields"})
-    if not math.isfinite(confidence) or confidence < MIN_CONFIDENCE:
-        return json.dumps(
-            {"status": "not_proposed", "reason": "confidence_below_threshold"}
-        )
-
-    if _is_unsupported_runtime(kwargs):
-        return json.dumps(
-            {"status": "not_proposed", "reason": "unsupported_runtime"}
-        )
-
-    session_id = _session_key(kwargs)
-    if not session_id:
-        return json.dumps({"status": "not_proposed", "reason": "missing_session"})
-    now = time.monotonic()
-    proposal = {
-        "creation_type": creation_type,
-        "suggested_name": suggested_name,
-        "reason": reason,
-        "evidence": evidence,
-        "confidence": confidence,
-        "dedup_key": dedup_key,
-    }
-    with _recent_lock:
-        state = _state_locked(session_id, now)
-        invocation = _invocation_scope.get()
-        if invocation is not None and invocation[2]:
-            return json.dumps({"status": "not_proposed", "reason": invocation[2]})
-        if int(state.get("native_bypass_turn") or -1) == int(state["turn"]):
-            return json.dumps({"status": "not_proposed", "reason": "native_creation_path"})
-        if _prompt_is_cooling_down(state):
-            return json.dumps({"status": "not_proposed", "reason": "prompt_cooldown"})
-        pending = state.get("pending_proposal")
-        if isinstance(pending, dict) and int(pending.get("turn", -1)) == int(
-            state["turn"]
+        current_turn = int(state["turn"])
+        if (
+            not isinstance(proposal, dict)
+            or int(state["last_prompt_turn"]) != current_turn
+            or int(state["last_delivery_turn"]) == current_turn
         ):
-            return json.dumps({"status": "not_proposed", "reason": "prompt_cooldown"})
-        expired_before = now - PROPOSAL_TTL_SECONDS
-        for key, created_at in tuple(_recent_proposals.items()):
-            if created_at < expired_before:
-                _recent_proposals.pop(key, None)
-        identity = (session_id, dedup_key)
-        if identity in _recent_proposals:
-            _recent_proposals.move_to_end(identity)
-            return json.dumps({"status": "not_proposed", "reason": "recent_duplicate"})
-        state["pending_proposal"] = dict(proposal, turn=state["turn"])
-    return json.dumps(
-        _proposal_payload(creation_type, suggested_name, reason, evidence, confidence),
-        ensure_ascii=False,
+            return None
+        state["last_delivery_turn"] = current_turn
+
+    if "<!--creation-recommendation:start " in response_text:
+        return None
+    if _is_session_muted(session_id):
+        return None
+    logger.info(
+        "creation recommendation attached type=%s confidence=%s title=%s turn=%s",
+        proposal.get("creation_type"),
+        proposal.get("confidence"),
+        _text(proposal.get("suggested_name"), 80),
+        current_turn,
     )
+    return response_text.rstrip() + "\n\n" + _recommendation_envelope(proposal)
 
 
-def _on_pre_tool_call(**kwargs: Any) -> dict[str, str] | None:
-    """Mechanically prevent creation side effects during the draft-only turn."""
+def _detect_creation_opportunity(args: dict[str, Any], **kwargs: Any) -> str:
+    invocation = _invocation_scope.get()
+    if invocation is not None and invocation[2]:
+        return json.dumps({"status": "not_proposed", "reason": invocation[2]})
+    if _is_noninteractive(kwargs) or _is_unsupported_runtime(kwargs) or kwargs.get(
+        "structured_output"
+    ):
+        return json.dumps({"status": "not_proposed", "reason": "unsupported_runtime"})
     session_id = _session_key(kwargs)
     if not session_id:
-        return None
-    with _recent_lock:
-        state = _state_locked(session_id, time.monotonic())
-        if int(state.get("draft_only_turn") or -1) != int(state["turn"]):
-            return None
-    return {
-        "action": "block",
-        "message": "Creation is blocked while presenting the draft. Wait for explicit '确认创建'.",
-    }
+        return json.dumps({"status": "invalid", "error": "missing_session_id"})
+    result = _consider_candidate(session_id, args, time.monotonic())
+    return json.dumps(result, ensure_ascii=False)
 
 
 def _reset_state_for_tests() -> None:
-    with _recent_lock:
+    global _plugin_llm
+    with _state_lock:
         _recent_proposals.clear()
+        _dismissed_proposals.clear()
         _session_states.clear()
+        _muted_sessions.clear()
+        _known_unmuted_sessions.clear()
+    _plugin_llm = None
     _invocation_scope.set(None)
 
 
 def register(ctx: Any) -> None:
+    global _plugin_llm
+    try:
+        _plugin_llm = ctx.llm
+    except Exception:
+        _plugin_llm = None
+
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_hook("transform_llm_output", _transform_llm_output)
-    ctx.register_hook("post_llm_call", _on_post_llm_call)
-    ctx.register_hook("pre_tool_call", _on_pre_tool_call)
     ctx.register_tool(
         name=TOOL_NAME,
-        toolset="skills",
+        toolset="creation_governor",
         schema={
             "name": TOOL_NAME,
             "description": (
-                "After completing the user's current task, proactively suggest one persistent "
-                "Agent, Skill, or scheduled task whenever the task itself could plausibly recur "
-                "or benefit from saved context, a specialized workflow, or ongoing ownership. "
-                "Use a broad discovery threshold: a single ordinary task is enough; the user "
-                "does not need to mention repetition, persistence, automation, or future use. "
-                "Apply this same permissive rule equally to all three creation types; do not require "
-                "proof of ongoing ownership for Agent, repeated use for Skill, or an existing cadence "
-                "for scheduled_task. For example, one request to check recent Meta ads can justify a "
-                "Meta Ads analyst Agent; one transcript cleanup can justify a transcript Skill; and "
-                "one AI-news lookup can justify proposing an AI-news briefing task. Choose the type "
-                "that would make the clearest useful next capability, and propose only one at a time. "
-                "Do not call when the user explicitly asks to create an Agent/Skill/task, or gives "
-                "a direct scheduled instruction such as 'every day at 9'; those use Hermes' native "
-                "creation behavior. Do not call for artifacts. This tool only proposes; it never "
-                "creates, and the user must confirm before the native creation flow begins."
+                "Perform one high-recall zero-shot semantic choice among Agent, Skill, Task, and "
+                "none. A single substantive request is enough; never require the user to mention "
+                "repetition, saving, or creation. Use "
+                "meaning and conversation context, never topic keyword matching or memorized "
+                "examples. Task means desired future time/event/background execution; a current "
+                "data range such as today is not by itself a trigger. Agent means a long-lived "
+                "responsible role with retained context, judgment, autonomous tool choice, or "
+                "interpretation of a changing real-world work domain. A substantive first request "
+                "to inspect, compare, diagnose, research, optimize, or make a judgment about an "
+                "ongoing external work domain should normally be Agent rather than none. "
+                "Skill means a stable reusable input-to-output method without an independent "
+                "identity. Missing connectors or authorization affect current execution, not "
+                "reuse value. Explicit creation requests use Hermes' native flow and return none. "
+                "Call only between scheduled checkpoints when one unusually clear opportunity "
+                "emerges. The tool never creates and may return none. The plugin owns cooldown, "
+                "deduplication, dismissal, and conditional card/text delivery after the current "
+                "task is complete."
             ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "creation_type": {
-                        "type": "string",
-                        "enum": ["agent", "skill", "scheduled_task"],
-                        "description": (
-                            "The single best next capability. Apply the same broad discovery "
-                            "threshold to Agent, Skill, and scheduled_task."
-                        ),
-                    },
-                    "suggested_name": {
-                        "type": "string",
-                        "description": "A concise user-facing name.",
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "Why persistence would create long-term value.",
-                    },
-                    "evidence": {
-                        "type": "string",
-                        "description": "A concise paraphrase of evidence already in context.",
-                    },
-                    "confidence": {
-                        "type": "number",
-                        "minimum": 0,
-                        "maximum": 1,
-                        "description": (
-                            "Confidence that persistence could be useful. Use 0.55 or above; "
-                            "false-positive suggestions are acceptable because creation requires confirmation."
-                        ),
-                    },
-                    "dedup_key": {
-                        "type": "string",
-                        "description": "Stable semantic key for suppressing repeat suggestions.",
-                    },
-                },
-                "required": [
-                    "creation_type",
-                    "suggested_name",
-                    "reason",
-                    "evidence",
-                    "confidence",
-                    "dedup_key",
-                ],
-            },
+            "parameters": _DETECTOR_SCHEMA,
         },
-        handler=_propose_creation,
-        description="Suggest an implicit creation opportunity",
+        handler=_detect_creation_opportunity,
+        description="Detect one reusable creation opportunity or none",
         emoji="💡",
     )
