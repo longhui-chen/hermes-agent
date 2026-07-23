@@ -1,6 +1,7 @@
 import base64
 import importlib.util
 import json
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -112,6 +113,13 @@ def _decode_envelope(text):
     return json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
 
 
+def _decode_action_result(text):
+    prefix = "<!--creation-recommendation-action-result "
+    encoded = text.split(prefix, 1)[1].split("-->", 1)[0].strip()
+    encoded += "=" * (-len(encoded) % 4)
+    return json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+
+
 def test_first_turn_and_every_third_turn_run_bounded_json_checks():
     plugin = _load_plugin()
     none = _candidate(
@@ -180,6 +188,7 @@ def test_positive_checkpoint_preserves_answer_and_appends_card_envelope_once():
         "confidence": 0.82,
         "evidence_turn_ids": ["evidence-1"],
         "source_turn_id": "turn-1",
+        "action_receipts": True,
     }
     assert (
         plugin._transform_llm_output(
@@ -370,6 +379,51 @@ def test_session_mute_persists_across_plugin_state_reset_and_can_be_undone(
     )
     assert "re-enabled proactive creation recommendations" in unmute_context["context"]
     assert plugin._is_session_muted(state_key) is False
+
+
+def test_mute_is_rejected_when_its_preference_cannot_be_persisted(monkeypatch):
+    plugin = _load_plugin()
+    llm = _FakeLlm([_candidate()])
+    plugin.register(_Context(llm))
+    plugin._on_pre_llm_call(
+        session_id="unpersisted-mute",
+        user_message="Analyze my Google Ads account.",
+        conversation_history=[],
+    )
+    shown = plugin._transform_llm_output(
+        session_id="unpersisted-mute",
+        response_text="Here is the analysis.",
+    )
+    proposal_id = _decode_envelope(shown)["proposal_id"]
+    monkeypatch.setattr(plugin, "_set_session_muted", lambda *_args: False)
+
+    rejected = plugin._on_pre_llm_call(
+        session_id="unpersisted-mute",
+        user_message=_recommendation_response("mute_session", proposal_id=proposal_id),
+        conversation_history=[],
+    )
+    assert "invalid or expired" in rejected["context"]
+    result = plugin._transform_llm_output(
+        session_id="unpersisted-mute",
+        response_text="I could not save that preference.",
+    )
+    assert _decode_action_result(result)["status"] == "rejected"
+    state_key = plugin._session_key({"session_id": "unpersisted-mute"})
+    assert plugin._is_session_muted(state_key) is False
+
+
+def test_known_unmuted_sessions_are_bounded_and_pruned_with_session_state(
+    tmp_path, monkeypatch
+):
+    plugin = _load_plugin()
+    monkeypatch.setattr(plugin, "_preferences_db_path", lambda: tmp_path / "missing.db")
+
+    for index in range(plugin.MAX_SESSION_STATES + 1):
+        assert plugin._is_session_muted(f"unmuted-{index}") is False
+
+    assert len(plugin._known_unmuted_sessions) <= plugin.MAX_SESSION_STATES
+    plugin._prune_session_states(time.monotonic() + plugin.SESSION_STATE_TTL_SECONDS + 1)
+    assert not plugin._known_unmuted_sessions
 
 
 def test_mute_transform_guard_wins_when_a_candidate_is_already_pending(

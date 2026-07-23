@@ -4,7 +4,7 @@ import base64
 import json
 import re
 
-from tests.plugins.test_creation_governor_plugin import _load_plugin
+from tests.plugins.test_creation_governor_plugin import _Context, _FakeLlm, _load_plugin
 
 
 def _candidate() -> dict[str, object]:
@@ -21,6 +21,16 @@ def _candidate() -> dict[str, object]:
 
 def _decode_envelope(text: str) -> dict[str, object]:
     match = re.search(r"<!--creation-recommendation:start ([A-Za-z0-9_-]+)-->", text)
+    assert match is not None
+    encoded = match.group(1)
+    encoded += "=" * (-len(encoded) % 4)
+    return json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
+
+
+def _decode_action_result(text: str) -> dict[str, object]:
+    match = re.search(
+        r"<!--creation-recommendation-action-result ([A-Za-z0-9_-]+)-->", text
+    )
     assert match is not None
     encoded = match.group(1)
     encoded += "=" * (-len(encoded) % 4)
@@ -91,7 +101,8 @@ def test_structured_create_requires_the_current_proposal_id_and_owner():
         user_message=_action(payload, proposal_id="stale-proposal"),
         conversation_history=[],
     )
-    assert stale is None
+    assert stale is not None
+    assert "invalid or expired" in stale["context"]
 
     wrong_owner = plugin._on_pre_llm_call(
         session_id="bound-action",
@@ -99,7 +110,8 @@ def test_structured_create_requires_the_current_proposal_id_and_owner():
         user_message=_action(payload),
         conversation_history=[],
     )
-    assert wrong_owner is None
+    assert wrong_owner is not None
+    assert "invalid or expired" in wrong_owner["context"]
 
     accepted = plugin._on_pre_llm_call(
         session_id="bound-action",
@@ -116,7 +128,56 @@ def test_structured_create_requires_the_current_proposal_id_and_owner():
         user_message=_action(payload),
         conversation_history=[],
     )
-    assert replay is None
+    assert replay is not None
+    assert "invalid or expired" in replay["context"]
+
+
+def test_failed_create_turn_reopens_the_same_card_with_a_rejected_receipt():
+    plugin = _load_plugin()
+    payload = _show_card(plugin, "retry-create")
+
+    accepted = plugin._on_pre_llm_call(
+        session_id="retry-create",
+        sender_id="owner-a",
+        user_message=_action(payload),
+        conversation_history=[],
+    )
+    assert "native creation flow" in accepted["context"]
+    failed = plugin._transform_llm_output(
+        session_id="retry-create",
+        sender_id="owner-a",
+        response_text="The native flow stopped before completion.",
+        completed=False,
+        failed=True,
+    )
+    assert _decode_action_result(failed)["status"] == "rejected"
+
+    retry = plugin._on_pre_llm_call(
+        session_id="retry-create",
+        sender_id="owner-a",
+        user_message=_action(payload),
+        conversation_history=[],
+    )
+    assert "native creation flow" in retry["context"]
+
+
+def test_common_chinese_explicit_creation_requests_bypass_recommendation_review():
+    plugin = _load_plugin()
+    llm = _FakeLlm([])
+    plugin.register(_Context(llm))
+
+    for message in ("给我一个广告分析智能体", "我想要一个 Agent"):
+        assert (
+            plugin._on_pre_llm_call(
+                session_id=f"explicit-{message}",
+                sender_id="owner-a",
+                user_message=message,
+                conversation_history=[],
+            )
+            is None
+        )
+
+    assert llm.calls == []
 
 
 def test_recommendations_fail_closed_for_unsupported_or_failed_turns():
@@ -178,12 +239,11 @@ def test_explicit_creation_and_expired_cards_cannot_enter_recommendation_flow():
     )
     plugin._session_states[state_key]["last_proposal"]["expires_at"] = 0
 
-    assert (
-        plugin._on_pre_llm_call(
-            session_id="expired-card",
-            sender_id="owner-a",
-            user_message=_action(payload),
-            conversation_history=[],
-        )
-        is None
+    expired = plugin._on_pre_llm_call(
+        session_id="expired-card",
+        sender_id="owner-a",
+        user_message=_action(payload),
+        conversation_history=[],
     )
+    assert expired is not None
+    assert "invalid or expired" in expired["context"]
