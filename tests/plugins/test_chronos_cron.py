@@ -360,6 +360,12 @@ def test_generic_reconcile_flow_preserves_managed_calendar_recovery_arm(
         enabled=True,
         state="scheduled",
         next_run_at="2026-07-15T01:00:00Z",
+        provider_state={"chronos": {"calendar_recovery": {
+            "projection_revision": 2,
+            "delivery_generation": 3,
+            "retry_at": "2026-07-15T01:02:03Z",
+            "attempt_sequence": 4,
+        }}},
     )
     retry_at = "2026-07-15T01:02:03Z"
     fake._armed = [{"job_id": job["id"], "fire_at": retry_at}]
@@ -370,6 +376,33 @@ def test_generic_reconcile_flow_preserves_managed_calendar_recovery_arm(
     assert fake.provisions == []
     assert fake.cancels == []
     assert fake._armed == [{"job_id": job["id"], "fire_at": retry_at}]
+
+
+@pytest.mark.parametrize("warm_cache", [False, True], ids=["cold-start", "warm-cache"])
+def test_generic_reconcile_restores_missing_active_managed_calendar_arm(
+    temp_home, chronos, monkeypatch, warm_cache,
+):
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+    prov, fake = chronos
+    job = managed_job(
+        enabled=True,
+        state="scheduled",
+        next_run_at="2026-07-15T01:00:00Z",
+    )
+    if warm_cache:
+        prov._armed = {job["id"]: job["next_run_at"]}
+    monkeypatch.setattr("cron.jobs.load_jobs", lambda: [job])
+    monkeypatch.setattr("cron.jobs.get_job", lambda _job_id: job)
+
+    prov.reconcile()
+
+    assert fake.provisions == [{
+        "job_id": job["id"],
+        "fire_at": job["next_run_at"],
+        "agent_callback_url": "https://agent.example/",
+        "dedup_key": f"{job['id']}:{job['next_run_at']}",
+    }]
+    assert fake.cancels == []
 
 
 def test_generic_reconcile_replays_missing_persisted_calendar_recovery_arm(

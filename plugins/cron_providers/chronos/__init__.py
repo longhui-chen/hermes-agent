@@ -483,10 +483,15 @@ class ChronosCronScheduler(CronScheduler):
             if j.get("source") != "calendar"
             and j.get("enabled") and j.get("next_run_at") and j.get("state") != "paused"
         }
-        # Recovery markers are durable Planner intents. Observe NAS directly
-        # before deciding they are still armed; a warm in-memory entry can be
-        # stale after NAS loses an arm.
-        observed = self._list_armed(force_remote=bool(recovery_desired))
+        desired.update({
+            job_id: job["next_run_at"]
+            for job_id, job in managed_calendar_jobs.items()
+            if job_id not in recovery_desired and job.get("next_run_at")
+        })
+        # Managed calendar jobs must be observed directly: a warm in-memory
+        # entry can be stale after NAS loses an arm. Recovery markers remain
+        # the sole desired arm for their job and are replayed below.
+        observed = self._list_armed(force_remote=bool(managed_calendar_jobs))
 
         # Arm missing or changed-time.
         for job_id, fire_at in desired.items():
@@ -500,10 +505,9 @@ class ChronosCronScheduler(CronScheduler):
                     except Exception as e:
                         logger.warning("Chronos failed to arm job %s: %s", job_id, e)
 
-        # Managed calendar jobs are projected explicitly and therefore stay
-        # out of the generic desired set. Their persisted recovery marker is
-        # nevertheless authoritative across process restarts and lost NAS
-        # arms, so replay that exact immutable attempt rather than next_run_at.
+        # A persisted recovery marker is authoritative across process restarts
+        # and lost NAS arms, so replay that exact immutable attempt rather than
+        # next_run_at.
         for job_id, recovery in recovery_desired.items():
             revision, generation, retry_at, sequence = recovery
             if observed.get(job_id) != retry_at:
