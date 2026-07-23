@@ -164,6 +164,51 @@ def _extract_plan_ack(body: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _extract_plan_auto_execute(body: Dict[str, Any]) -> Optional[bool]:
+    """Extract the App's per-turn Plan auto-execute override from metadata.
+
+    Returns None when the App did not send the field OR sent a value that is not
+    a parseable boolean (null / "" / unknown string), so the caller falls back to
+    the env kill-switch / default ladder (legacy manual). Only an explicit bool-ish
+    value counts as a capability opt-in: True auto-executes the plan in the same
+    turn, False keeps the legacy confirmation card. Never let an unparseable value
+    silently enable auto-execute — that would bypass the client capability gate.
+    """
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    if "plan_auto_execute" not in metadata and "planAutoExecute" not in metadata:
+        return None
+    raw = metadata.get("plan_auto_execute", metadata.get("planAutoExecute"))
+    # Probe with both defaults: a real bool-ish value ignores the default and
+    # yields the same result twice; an unparseable value yields different results,
+    # so we return None (fall back) instead of promoting it to auto-execute.
+    as_true = _coerce_request_bool(raw, default=True)
+    as_false = _coerce_request_bool(raw, default=False)
+    if as_true == as_false:
+        return as_true
+    return None
+
+
+def _resolve_plan_auto_execute(meta_override: Optional[bool]) -> bool:
+    """Resolve the effective App Plan-mode auto-execute flag for one turn.
+
+    Precedence: per-turn metadata override (App capability opt-in) > env
+    (``HERMES_ZET_AGENT_PLAN_AUTO_EXECUTE``) > default ``False`` (legacy manual
+    confirm card). Default is manual so older App / local-server builds that do
+    NOT send ``plan_auto_execute`` never auto-execute a plan's side effects
+    before a client that can render the confirm gate — auto-execute requires an
+    explicit client capability opt-in (HR4 capability negotiation).
+    """
+    if meta_override is not None:
+        return meta_override
+    raw = os.environ.get("HERMES_ZET_AGENT_PLAN_AUTO_EXECUTE")
+    if raw is not None and raw.strip() != "":
+        from utils import is_truthy_value
+        return is_truthy_value(raw, default=False)
+    return False
+
+
 def _extract_turn_id(body: Dict[str, Any]) -> str:
     """Extract metadata.turn_id (zettlab local-server's per-turn correlation
     token) so the NAS agent-search fallback can echo it back as the
@@ -1632,6 +1677,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
         agent_request_overrides = dict(request_overrides or {})
         disable_tools = agent_request_overrides.pop("tool_choice", None) == "none"
+        # Drop the zet_agent-only Plan auto-execute hint if it reached the base
+        # (non-zet_agent) adapter — it is consumed by zet_agent._create_agent and
+        # must never leak into the AIAgent / LLM request body.
+        agent_request_overrides.pop("_zet_plan_auto_execute", None)
 
         agent = AIAgent(
             model=model,
@@ -2454,6 +2503,7 @@ class APIServerAdapter(BasePlatformAdapter):
         stream = _coerce_request_bool(body.get("stream"), default=False)
         response_mode = _extract_response_mode(body)
         plan_ack = _extract_plan_ack(body)
+        plan_auto_execute = _extract_plan_auto_execute(body)
         turn_id = _extract_turn_id(body)
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
@@ -2718,6 +2768,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 response_mode=response_mode,
                 plan_ack=plan_ack,
+                plan_auto_execute=plan_auto_execute,
                 turn_id=turn_id,
                 request_overrides=request_overrides or None,
             ))
@@ -2766,6 +2817,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     gateway_session_key=gateway_session_key,
                     response_mode=response_mode,
                     plan_ack=plan_ack,
+                    plan_auto_execute=plan_auto_execute,
                     turn_id=turn_id,
                     request_overrides=request_overrides or None,
                 )
@@ -4831,6 +4883,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         response_mode: Optional[str] = None,
         plan_ack: Optional[Dict[str, Any]] = None,
+        plan_auto_execute: Optional[bool] = None,
         turn_id: Optional[str] = None,
         request_overrides: Optional[Dict[str, Any]] = None,
     ) -> tuple:
@@ -4860,6 +4913,14 @@ class APIServerAdapter(BasePlatformAdapter):
             # clear it with the session vars on reused executor threads.
             set_zettlab_turn_id(turn_id or "")
             try:
+                # Resolve the auto-execute flag once up front so the capability-aware
+                # Plan-First system-prompt section (built inside _create_agent) and
+                # the turn-level flag agree. Thread it through request_overrides under
+                # an internal key that zet_agent._create_agent pops (and the base
+                # adapter drops) so it never leaks into the LLM request body.
+                resolved_plan_auto_execute = _resolve_plan_auto_execute(plan_auto_execute)
+                create_overrides = dict(request_overrides or {})
+                create_overrides["_zet_plan_auto_execute"] = resolved_plan_auto_execute
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
@@ -4868,12 +4929,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_start_callback=tool_start_callback,
                     tool_complete_callback=tool_complete_callback,
                     gateway_session_key=gateway_session_key,
-                    request_overrides=request_overrides,
+                    request_overrides=create_overrides,
                 )
                 if agent_ref is not None:
                     agent_ref[0] = agent
                 agent._zet_agent_response_mode = response_mode or ""
                 agent._zet_agent_plan_ack = dict(plan_ack or {})
+                agent._zet_agent_plan_auto_execute = resolved_plan_auto_execute
                 effective_task_id = session_id or str(uuid.uuid4())
                 result = agent.run_conversation(
                     user_message=user_message,
