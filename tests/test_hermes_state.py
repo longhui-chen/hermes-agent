@@ -907,6 +907,17 @@ class TestMessageStorage:
         assert msgs[0]["content"] == content
         assert msgs[1]["content"] == "I see a screenshot."
 
+    def test_replace_messages_preserves_hidden_model_visibility(self, db):
+        db.create_session(session_id="s1", source="api_server")
+        db.replace_messages(
+            "s1",
+            [{"role": "assistant", "content": "display only", "llm_visible": 0}],
+        )
+
+        stored = db.get_messages("s1")
+        assert stored[0]["llm_visible"] == 0
+        assert db.get_messages_for_model("s1") == []
+
     def test_get_messages_as_conversation(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="Hello")

@@ -739,6 +739,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     compression_failure_error TEXT,
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
+    model_history_cutoff_message_id INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -761,7 +762,11 @@ CREATE TABLE IF NOT EXISTS messages (
     platform_message_id TEXT,
     observed INTEGER DEFAULT 0,
     active INTEGER NOT NULL DEFAULT 1,
-    compacted INTEGER NOT NULL DEFAULT 0
+    compacted INTEGER NOT NULL DEFAULT 0,
+    llm_visible INTEGER NOT NULL DEFAULT 1,
+    calendar_delivery_key TEXT,
+    calendar_delivery_generation TEXT,
+    calendar_delivery_state TEXT
 );
 
 CREATE TABLE IF NOT EXISTS state_meta (
@@ -1329,6 +1334,106 @@ class SessionDB:
                             "reconcile %s.%s: %s", table_name, col_name, exc,
                         )
 
+    @staticmethod
+    def _calendar_delivery_index_is_valid(conn: sqlite3.Connection) -> bool:
+        """Return whether the calendar idempotency index has its exact contract."""
+        index_row = None
+        for row in conn.execute('PRAGMA index_list("messages")').fetchall():
+            name = row["name"] if isinstance(row, sqlite3.Row) else row[1]
+            if name == "idx_messages_calendar_delivery":
+                index_row = row
+                break
+        if index_row is None:
+            return False
+        unique = index_row["unique"] if isinstance(index_row, sqlite3.Row) else index_row[2]
+        partial = index_row["partial"] if isinstance(index_row, sqlite3.Row) else index_row[4]
+        if int(unique) != 1 or int(partial) != 1:
+            return False
+        columns = [
+            row["name"] if isinstance(row, sqlite3.Row) else row[2]
+            for row in conn.execute(
+                'PRAGMA index_info("idx_messages_calendar_delivery")'
+            ).fetchall()
+        ]
+        if columns != ["calendar_delivery_key", "calendar_delivery_generation"]:
+            return False
+        sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            ("idx_messages_calendar_delivery",),
+        ).fetchone()
+        sql = (sql_row["sql"] if isinstance(sql_row, sqlite3.Row) else sql_row[0]) if sql_row else ""
+        predicate = re.search(r"\bWHERE\s+(.+?)\s*$", sql or "", re.IGNORECASE | re.DOTALL)
+        return bool(
+            predicate
+            and " ".join(predicate.group(1).split()).lower()
+            == "calendar_delivery_key is not null"
+        )
+
+    @staticmethod
+    def _migrate_calendar_delivery_index(conn: sqlite3.Connection) -> None:
+        """Atomically install and verify the generation-scoped delivery index.
+
+        Never repairs duplicate legacy rows by deleting or coalescing them:
+        those rows may be fully-visible audit history, so startup fails closed
+        with the database unchanged and requires an explicit operator decision.
+        """
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error as exc:
+            raise RuntimeError(
+                f"calendar delivery index migration failed: {exc}"
+            ) from exc
+        try:
+            if not SessionDB._calendar_delivery_index_is_valid(conn):
+                conn.execute("DROP INDEX IF EXISTS idx_messages_calendar_delivery")
+            conn.execute(
+                "UPDATE messages SET calendar_delivery_generation = '1' "
+                "WHERE calendar_delivery_key IS NOT NULL "
+                "AND calendar_delivery_generation IS NULL"
+            )
+            duplicate = conn.execute(
+                "SELECT calendar_delivery_key, calendar_delivery_generation "
+                "FROM messages WHERE calendar_delivery_key IS NOT NULL "
+                "GROUP BY calendar_delivery_key, calendar_delivery_generation "
+                "HAVING COUNT(*) > 1 LIMIT 1"
+            ).fetchone()
+            if duplicate is not None:
+                raise RuntimeError(
+                    "calendar delivery index migration failed: duplicate legacy rows "
+                    "require manual resolution"
+                )
+            if not SessionDB._calendar_delivery_index_is_valid(conn):
+                conn.execute(
+                    "CREATE UNIQUE INDEX idx_messages_calendar_delivery "
+                    "ON messages(calendar_delivery_key, calendar_delivery_generation) "
+                    "WHERE calendar_delivery_key IS NOT NULL"
+                )
+            if not SessionDB._calendar_delivery_index_is_valid(conn):
+                raise RuntimeError(
+                    "calendar delivery index migration failed: installed index "
+                    "does not satisfy unique columns and partial predicate invariant"
+                )
+            conn.commit()
+        except BaseException as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            if not isinstance(exc, Exception):
+                raise
+            if isinstance(exc, RuntimeError) and str(exc).startswith(
+                "calendar delivery index migration failed:"
+            ):
+                raise
+            if isinstance(exc, sqlite3.IntegrityError) and "UNIQUE constraint failed" in str(exc):
+                raise RuntimeError(
+                    "calendar delivery index migration failed: duplicate legacy rows "
+                    "require manual resolution"
+                ) from exc
+            raise RuntimeError(
+                f"calendar delivery index migration failed: {exc}"
+            ) from exc
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -1353,6 +1458,26 @@ class SessionDB:
         # column gets created here.
         self._reconcile_columns(cursor)
 
+        # Phase-1 reversible u64 calendar sessions predate llm_visible. Hermes
+        # cannot prove their owner against the local-server authorization DB,
+        # so quarantine them at their current high-water mark. Display/audit
+        # remains available, while every model/search consumer is cut off.
+        cursor.execute(
+            r"""UPDATE sessions
+               SET model_history_cutoff_message_id = COALESCE(
+                       (SELECT MAX(m.id) FROM messages m WHERE m.session_id = sessions.id), 0
+                   ), archived = 1
+               WHERE id LIKE 'u64\_%:main:calendar-reminders' ESCAPE '\'
+                 AND model_history_cutoff_message_id = 0"""
+        )
+        cursor.execute(
+            r"""UPDATE messages SET llm_visible = 0
+               WHERE session_id IN (
+                   SELECT id FROM sessions
+                   WHERE id LIKE 'u64\_%:main:calendar-reminders' ESCAPE '\'
+               )"""
+        )
+
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL
         # makes the initial executescript fail on legacy DBs (the index's
@@ -1365,6 +1490,12 @@ class SessionDB:
             )
         except sqlite3.OperationalError as exc:
             logger.debug("idx_messages_platform_msg_id create skipped: %s", exc)
+
+        # The original index keyed only by the stable delivery key. Projection
+        # replacement reuses that key and increments a uint64 generation. The
+        # whole DROP/backfill/CREATE transition must be one write transaction:
+        # isolation_level=None otherwise autocommits every individual step.
+        self._migrate_calendar_delivery_index(self._conn)
 
         # Deferred indexes that reference the reconciler-added ``active``
         # column (idx_messages_session_active) — same ordering constraint.
@@ -3344,6 +3475,103 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+    def stage_calendar_notification(
+        self,
+        session_id: str,
+        content: str,
+        delivery_key: str,
+        delivery_generation: int,
+    ) -> int:
+        """Idempotently stage a hidden calendar message excluded from all replay."""
+        if not isinstance(delivery_key, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", delivery_key):
+            raise ValueError("invalid calendar delivery key")
+        if (
+            not isinstance(delivery_generation, int)
+            or isinstance(delivery_generation, bool)
+            or delivery_generation <= 0
+            or delivery_generation >= 2**64
+        ):
+            raise ValueError("invalid calendar delivery generation")
+        if not isinstance(session_id, str) or not session_id or len(session_id) > 200:
+            raise ValueError("invalid calendar session id")
+        if not isinstance(content, str) or len(content.encode("utf-8")) > 16 * 1024:
+            raise ValueError("calendar notification content exceeded cap")
+        stored_content = self._encode_content(content)
+        stored_generation = str(delivery_generation)
+
+        def _do(conn):
+            existing = conn.execute(
+                "SELECT id, session_id, content FROM messages "
+                "WHERE calendar_delivery_key = ? AND calendar_delivery_generation = ? LIMIT 1",
+                (delivery_key, stored_generation),
+            ).fetchone()
+            if existing is not None:
+                if existing["session_id"] != session_id:
+                    raise ValueError("calendar delivery key session collision")
+                if self._decode_content(existing["content"]) != content:
+                    raise ValueError("calendar delivery key content collision")
+                return int(existing[0])
+            other_generation = conn.execute(
+                "SELECT session_id FROM messages WHERE calendar_delivery_key = ? LIMIT 1",
+                (delivery_key,),
+            ).fetchone()
+            if other_generation is not None and other_generation["session_id"] != session_id:
+                raise ValueError("calendar delivery key session collision")
+            cursor = conn.execute(
+                """INSERT INTO messages (
+                       session_id, role, content, timestamp, platform_message_id,
+                       observed, active, llm_visible, calendar_delivery_key,
+                       calendar_delivery_generation, calendar_delivery_state
+                   ) VALUES (?, 'assistant', ?, ?, ?, 1, 0, 0, ?, ?, 'staged')""",
+                (
+                    session_id,
+                    stored_content,
+                    time.time(),
+                    delivery_key,
+                    delivery_key,
+                    stored_generation,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+        return self._execute_write(_do)
+
+    def activate_calendar_notification(
+        self, delivery_key: str, delivery_generation: int, message_id: int
+    ) -> bool:
+        """CAS the exact staged row visible after a verified local finalize receipt."""
+        if not isinstance(delivery_key, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", delivery_key):
+            raise ValueError("invalid calendar delivery key")
+        if (
+            not isinstance(delivery_generation, int)
+            or isinstance(delivery_generation, bool)
+            or delivery_generation <= 0
+            or delivery_generation >= 2**64
+        ):
+            raise ValueError("invalid calendar delivery generation")
+        stored_generation = str(delivery_generation)
+        def _do(conn):
+            row = conn.execute(
+                "SELECT id, session_id, calendar_delivery_state FROM messages "
+                "WHERE calendar_delivery_key = ? AND calendar_delivery_generation = ? LIMIT 1",
+                (delivery_key, stored_generation),
+            ).fetchone()
+            if row is None or int(row["id"]) != int(message_id):
+                return False
+            if row["calendar_delivery_state"] == "fully_visible":
+                return True
+            cursor = conn.execute(
+                "UPDATE messages SET active = 1, calendar_delivery_state = 'fully_visible' "
+                "WHERE id = ? AND calendar_delivery_key = ? "
+                "AND calendar_delivery_generation = ? AND calendar_delivery_state = 'staged'",
+                (message_id, delivery_key, stored_generation),
+            )
+            if cursor.rowcount != 1:
+                return False
+            conn.execute("UPDATE sessions SET message_count = message_count + 1 WHERE id = ?", (row["session_id"],))
+            return True
+        return bool(self._execute_write(_do))
+
     def delete_message(self, session_id: str, message_id: int) -> bool:
         """Delete a single message row, scoped to *session_id*.
 
@@ -3439,8 +3667,8 @@ class SessionDB:
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, llm_visible)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -3458,6 +3686,7 @@ class SessionDB:
                     codex_message_items_json,
                     platform_msg_id,
                     1 if msg.get("observed") else 0,
+                    0 if msg.get("llm_visible", 1) in (0, False) else 1,
                 ),
             )
             inserted += 1
@@ -3618,6 +3847,43 @@ class SessionDB:
             result.append(msg)
         return result
 
+    def get_messages_for_model(
+        self, session_id: str, include_inactive: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Load only transcript rows that may be exposed to the model.
+
+        Display and audit callers intentionally use :meth:`get_messages`. Model
+        consumers must use this method so hidden control-plane rows and history
+        quarantined by ``model_history_cutoff_message_id`` cannot be recovered
+        through direct session reads.
+        """
+        active_clause = "" if include_inactive else " AND m.active = 1"
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT m.* FROM messages m JOIN sessions s ON s.id = m.session_id "
+                "WHERE m.session_id = ? AND m.llm_visible = 1 "
+                "AND m.id > s.model_history_cutoff_message_id"
+                f"{active_clause} ORDER BY m.id",
+                (session_id,),
+            )
+            rows = cursor.fetchall()
+        result = []
+        for row in rows:
+            msg = dict(row)
+            if "content" in msg:
+                msg["content"] = self._decode_content(msg["content"])
+            if msg.get("tool_calls"):
+                try:
+                    msg["tool_calls"] = json.loads(msg["tool_calls"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Failed to deserialize tool_calls in get_messages_for_model, "
+                        "falling back to []"
+                    )
+                    msg["tool_calls"] = []
+            result.append(msg)
+        return result
+
     def get_messages_around(
         self,
         session_id: str,
@@ -3648,7 +3914,9 @@ class SessionDB:
         with self._lock:
             # Confirm the anchor exists in this session.
             anchor_exists = self._conn.execute(
-                "SELECT 1 FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
+                "SELECT 1 FROM messages m JOIN sessions s ON s.id = m.session_id "
+                "WHERE m.id = ? AND m.session_id = ? AND m.llm_visible = 1 "
+                "AND m.id > s.model_history_cutoff_message_id LIMIT 1",
                 (around_message_id, session_id),
             ).fetchone()
             if not anchor_exists:
@@ -3657,15 +3925,17 @@ class SessionDB:
             # Two queries: anchor + before (DESC, take window+1), and after
             # (ASC, take window). Final order is id ASC.
             before_rows = self._conn.execute(
-                "SELECT * FROM messages "
-                "WHERE session_id = ? AND id <= ? "
-                "ORDER BY id DESC LIMIT ?",
+                "SELECT m.* FROM messages m JOIN sessions s ON s.id = m.session_id "
+                "WHERE m.session_id = ? AND m.id <= ? AND m.llm_visible = 1 "
+                "AND m.id > s.model_history_cutoff_message_id "
+                "ORDER BY m.id DESC LIMIT ?",
                 (session_id, around_message_id, window + 1),
             ).fetchall()
             after_rows = self._conn.execute(
-                "SELECT * FROM messages "
-                "WHERE session_id = ? AND id > ? "
-                "ORDER BY id ASC LIMIT ?",
+                "SELECT m.* FROM messages m JOIN sessions s ON s.id = m.session_id "
+                "WHERE m.session_id = ? AND m.id > ? AND m.llm_visible = 1 "
+                "AND m.id > s.model_history_cutoff_message_id "
+                "ORDER BY m.id ASC LIMIT ?",
                 (session_id, around_message_id, window),
             ).fetchall()
 
@@ -3777,18 +4047,20 @@ class SessionDB:
                     role_params = list(keep_roles)
 
                 bookend_start_rows = self._conn.execute(
-                    f"SELECT * FROM messages "
-                    f"WHERE session_id = ? AND id < ?{role_clause} "
-                    f"AND length(content) > 0 "
-                    f"ORDER BY id ASC LIMIT ?",
+                    f"SELECT m.* FROM messages m JOIN sessions s ON s.id = m.session_id "
+                    f"WHERE m.session_id = ? AND m.id < ?{role_clause} "
+                    f"AND m.llm_visible = 1 AND m.id > s.model_history_cutoff_message_id "
+                    f"AND length(m.content) > 0 "
+                    f"ORDER BY m.id ASC LIMIT ?",
                     (session_id, window_min_id, *role_params, bookend),
                 ).fetchall()
 
                 bookend_end_rows = self._conn.execute(
-                    f"SELECT * FROM messages "
-                    f"WHERE session_id = ? AND id > ?{role_clause} "
-                    f"AND length(content) > 0 "
-                    f"ORDER BY id DESC LIMIT ?",
+                    f"SELECT m.* FROM messages m JOIN sessions s ON s.id = m.session_id "
+                    f"WHERE m.session_id = ? AND m.id > ?{role_clause} "
+                    f"AND m.llm_visible = 1 AND m.id > s.model_history_cutoff_message_id "
+                    f"AND length(m.content) > 0 "
+                    f"ORDER BY m.id DESC LIMIT ?",
                     (session_id, window_max_id, *role_params, bookend),
                 ).fetchall()
                 # End rows came back DESC for the LIMIT cap; flip to ASC.
@@ -3923,14 +4195,15 @@ class SessionDB:
         if include_ancestors:
             session_ids = self._session_lineage_root_to_tip(session_id)
 
-        active_clause = "" if include_inactive else " AND active = 1"
+        active_clause = "" if include_inactive else " AND m.active = 1"
         with self._lock:
             placeholders = ",".join("?" for _ in session_ids)
             rows = self._conn.execute(
-                "SELECT role, content, tool_call_id, tool_calls, tool_name, "
-                "finish_reason, reasoning, reasoning_content, reasoning_details, "
-                "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp "
-                f"FROM messages WHERE session_id IN ({placeholders})"
+                "SELECT m.role, m.content, m.tool_call_id, m.tool_calls, m.tool_name, "
+                "m.finish_reason, m.reasoning, m.reasoning_content, m.reasoning_details, "
+                "m.codex_reasoning_items, m.codex_message_items, m.platform_message_id, m.observed, m.timestamp "
+                f"FROM messages m JOIN sessions s ON s.id = m.session_id WHERE m.session_id IN ({placeholders}) "
+                "AND m.llm_visible = 1 AND m.id > s.model_history_cutoff_message_id"
                 # Order by AUTOINCREMENT id (true insertion order), NOT timestamp:
                 # append_message stamps rows with time.time(), which is not
                 # monotonic (WSL2, NTP steps, VM/laptop sleep resume). A later
@@ -3939,7 +4212,7 @@ class SessionDB:
                 # after its tool response, breaking tool-call/response adjacency
                 # and triggering an HTTP 400 on replay. This matches get_messages
                 # — see c03acca50 for the original fix.
-                f"{active_clause} ORDER BY id",
+                f"{active_clause} ORDER BY m.id",
                 tuple(session_ids),
             ).fetchall()
 
@@ -4402,7 +4675,7 @@ class SessionDB:
             order_by_sql = "ORDER BY rank"
 
         # Build WHERE clauses dynamically
-        where_clauses = ["messages_fts MATCH ?"]
+        where_clauses = ["messages_fts MATCH ?", "m.llm_visible = 1", "m.id > s.model_history_cutoff_message_id"]
         params: list = [query]
         if not include_inactive:
             # Live rows (active=1) AND compaction-archived rows (compacted=1)
@@ -4487,7 +4760,7 @@ class SessionDB:
                     else:
                         parts.append('"' + tok.replace('"', '""') + '"')
                 trigram_query = " ".join(parts)
-                tri_where = ["messages_fts_trigram MATCH ?"]
+                tri_where = ["messages_fts_trigram MATCH ?", "m.llm_visible = 1", "m.id > s.model_history_cutoff_message_id"]
                 tri_params: list = [trigram_query]
                 if not include_inactive:
                     tri_where.append("(m.active = 1 OR m.compacted = 1)")
@@ -4547,7 +4820,7 @@ class SessionDB:
                         "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' OR m.tool_calls LIKE ? ESCAPE '\\')"
                     )
                     like_params += [f"%{esc}%", f"%{esc}%", f"%{esc}%"]
-                like_where = [f"({' OR '.join(token_clauses)})"]
+                like_where = [f"({' OR '.join(token_clauses)})", "m.llm_visible = 1", "m.id > s.model_history_cutoff_message_id"]
                 if source_filter is not None:
                     like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
                     like_params.extend(source_filter)
@@ -4593,32 +4866,44 @@ class SessionDB:
                 with self._lock:
                     ctx_cursor = self._conn.execute(
                         """WITH target AS (
-                               SELECT session_id, timestamp, id
-                               FROM messages
-                               WHERE id = ?
+                               SELECT m.session_id, m.timestamp, m.id
+                               FROM messages m
+                               JOIN sessions s ON s.id = m.session_id
+                               WHERE m.id = ? AND m.llm_visible = 1
+                                 AND m.id > s.model_history_cutoff_message_id
                            )
                            SELECT role, content
                            FROM (
                                SELECT m.id, m.timestamp, m.role, m.content
                                FROM messages m
+                               JOIN sessions s ON s.id = m.session_id
                                JOIN target t ON t.session_id = m.session_id
-                               WHERE (m.timestamp < t.timestamp)
+                               WHERE m.llm_visible = 1
+                                 AND m.id > s.model_history_cutoff_message_id
+                                 AND ((m.timestamp < t.timestamp)
                                   OR (m.timestamp = t.timestamp AND m.id < t.id)
+                                 )
                                ORDER BY m.timestamp DESC, m.id DESC
                                LIMIT 1
                            )
                            UNION ALL
                            SELECT role, content
-                           FROM messages
-                           WHERE id = ?
+                           FROM messages m
+                           JOIN sessions s ON s.id = m.session_id
+                           WHERE m.id = ? AND m.llm_visible = 1
+                             AND m.id > s.model_history_cutoff_message_id
                            UNION ALL
                            SELECT role, content
                            FROM (
                                SELECT m.id, m.timestamp, m.role, m.content
                                FROM messages m
+                               JOIN sessions s ON s.id = m.session_id
                                JOIN target t ON t.session_id = m.session_id
-                               WHERE (m.timestamp > t.timestamp)
+                               WHERE m.llm_visible = 1
+                                 AND m.id > s.model_history_cutoff_message_id
+                                 AND ((m.timestamp > t.timestamp)
                                   OR (m.timestamp = t.timestamp AND m.id > t.id)
+                                 )
                                ORDER BY m.timestamp ASC, m.id ASC
                                LIMIT 1
                            )""",

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 from hermes_constants import display_hermes_home
+from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
 
@@ -603,17 +604,21 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     Returns {"claimed": bool, "success": bool, "error": str|None}.
     """
     job_id = job["id"]
+    triggered_at = _hermes_now().isoformat()
     try:
         from cron.scheduler import run_one_job
 
+        # Freeze one authoritative manual occurrence instant in the same
+        # locked claim that advances recurring schedules. Otherwise the API
+        # briefly exposes the job's future next_run while Run Now is executing.
         # At-most-once claim: bail without running if a tick/other fire owns it.
-        if not claim_job_for_fire(job_id):
+        if not claim_job_for_fire(job_id, triggered_at=triggered_at):
             return {"claimed": False, "success": False,
                     "error": "Job is already being fired by the scheduler; not run again."}
 
         # run_one_job records last_run_at/last_status via mark_job_run (which
         # also clears the fire claim) and returns True iff it processed the job.
-        processed = run_one_job(job)
+        processed = run_one_job(job, triggered_at=triggered_at)
         refreshed = get_job(job_id) or {}
         ok = refreshed.get("last_status") == "ok"
         return {
@@ -625,7 +630,7 @@ def _execute_job_now(job: Dict[str, Any]) -> Dict[str, Any]:
     except Exception as e:
         logger.error("Failed to execute cron job %s immediately: %s", job_id, e)
         try:
-            mark_job_run(job_id, False, str(e))
+            mark_job_run(job_id, False, str(e), scheduled_at=triggered_at)
         except Exception:
             pass
         return {"claimed": True, "success": False, "error": str(e)}
