@@ -155,6 +155,25 @@ def test_first_turn_and_every_third_turn_run_bounded_json_checks():
     assert "not by itself a future trigger" in instructions
 
 
+def test_api_server_never_evaluates_or_transforms_recommendations():
+    plugin = _load_plugin()
+    llm = _FakeLlm([_candidate()])
+    plugin.register(_Context(llm))
+
+    assert plugin._on_pre_llm_call(
+        session_id="openai-client-session",
+        platform="api_server",
+        user_message="Analyze my Google Ads account.",
+        conversation_history=[],
+    ) is None
+    assert llm.calls == []
+    assert plugin._transform_llm_output(
+        session_id="openai-client-session",
+        platform="api_server",
+        response_text="Here is the analysis.",
+    ) is None
+
+
 def test_positive_checkpoint_preserves_answer_and_appends_card_envelope_once():
     plugin = _load_plugin()
     llm = _FakeLlm([_candidate()])

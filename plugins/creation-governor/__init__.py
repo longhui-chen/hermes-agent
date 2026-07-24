@@ -49,7 +49,7 @@ CREATION_TYPES = {"agent", "skill", "task"}
 RECOMMENDATION_ACTIONS = {"create", "dismiss", "mute_session", "unmute_session"}
 SESSION_PREFERENCES_DB = "creation_governor.db"
 UNSUPPORTED_API_MODES = {"codex_app_server"}
-UNSUPPORTED_PLATFORMS = {"acp"}
+UNSUPPORTED_PLATFORMS = {"acp", "api_server"}
 _NONINTERACTIVE_PLATFORMS = {"cron", "subagent", "batch"}
 
 _recent_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
@@ -398,10 +398,6 @@ def _is_unsupported_runtime(kwargs: dict[str, Any]) -> bool:
         _text(kwargs.get("api_mode"), 80).lower() in UNSUPPORTED_API_MODES
         or _text(kwargs.get("platform"), 40).lower() in UNSUPPORTED_PLATFORMS
         or kwargs.get("supports_followup_turns") is False
-        or (
-            _text(kwargs.get("platform"), 40).lower() == "api_server"
-            and kwargs.get("streaming_output")
-        )
     )
 
 
