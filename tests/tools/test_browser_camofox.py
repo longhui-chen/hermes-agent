@@ -193,7 +193,11 @@ class TestCamofoxNavigate:
         with patch("tools.browser_camofox.requests.post", side_effect=requests.ConnectionError("offline")):
             result = json.loads(camofox_navigate("https://example.com", task_id="t_err"))
         assert result["success"] is False
-        assert "Cannot connect" in result["error"]
+        assert result["error"] == "browser_runtime_unavailable"
+        assert result["retryable"] is True
+        assert "Managed local browser service" in result["message"]
+        assert "npm" not in json.dumps(result)
+        assert "docker" not in json.dumps(result).lower()
 
 
 # ---------------------------------------------------------------------------

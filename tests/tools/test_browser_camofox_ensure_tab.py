@@ -24,6 +24,7 @@ def test_ensure_tab_sends_list_item_id():
     }
 
     mock_response = MagicMock()
+    mock_response.status_code = 200
     mock_response.json.return_value = {"tabId": "tab-42"}
     mock_response.raise_for_status = MagicMock()
 
@@ -46,6 +47,29 @@ def test_ensure_tab_sends_list_item_id():
 
     # Verify tab_id was set from response
     assert result["tab_id"] == "tab-42"
+
+
+def test_ensure_tab_omits_url_for_blank_tab():
+    """Camofox 1.13 creates a blank tab only when ``url`` is absent."""
+    from tools import browser_camofox as mod
+
+    fake_session = {
+        "user_id": "hermes_test123",
+        "tab_id": None,
+        "session_key": "task_my-session",
+        "managed": False,
+        "adopt_existing_tab": False,
+    }
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"tabId": "tab-blank"}
+
+    with patch.object(mod, "_get_session", return_value=fake_session), \
+         patch("tools.browser_camofox.requests.post", return_value=mock_response) as mock_post:
+        result = mod._ensure_tab("test-task")
+
+    assert "url" not in mock_post.call_args.kwargs["json"]
+    assert result["tab_id"] == "tab-blank"
 
 
 def test_ensure_tab_skips_creation_when_tab_exists():
@@ -76,6 +100,7 @@ def test_ensure_tab_singleflights_concurrent_creation():
         "managed": True, "adopt_existing_tab": False,
     }
     response = MagicMock()
+    response.status_code = 200
     response.json.return_value = {"tabId": "tab-only"}
     response.raise_for_status = MagicMock()
 
@@ -104,6 +129,7 @@ def test_slow_profile_does_not_block_another_profile():
             slow_started.set()
             assert release_slow.wait(1)
         response = MagicMock()
+        response.status_code = 200
         response.json.return_value = {"tabId": f"tab-{json['userId']}"}
         response.raise_for_status = MagicMock()
         return response

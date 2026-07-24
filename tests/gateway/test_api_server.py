@@ -86,6 +86,32 @@ class TestToolCompletionPayload:
         )
         assert "ui_hint" not in payload
 
+    def test_preserves_takeover_hint_when_navigation_fails(self):
+        payload = _tool_completion_payload(
+            "call_browser_failed",
+            "browser_navigate",
+            json.dumps({
+                "success": False,
+                "error": "browser_runtime_unavailable",
+                "tabId": "tab-blank",
+                "ui_hint": {
+                    "type": "takeover_browser",
+                    "agent_id": "agent-1",
+                    "browser_session_id": "session-1",
+                    "tab_id": "tab-blank",
+                },
+            }),
+        )
+
+        assert payload["outcome"] == "error"
+        assert payload["error"] == "browser_runtime_unavailable"
+        assert payload["ui_hint"] == {
+            "type": "takeover_browser",
+            "agent_id": "agent-1",
+            "browser_session_id": "session-1",
+            "tab_id": "tab-blank",
+        }
+
     def test_promotes_connector_error_printed_by_execute_code_output(self):
         printed = {
             "ok": False,

@@ -8,19 +8,8 @@ click/type/scroll by ref, screenshots, etc.
 When ``CAMOFOX_URL`` is set (e.g. ``http://localhost:9377``), the browser
 tools route through this module instead of the ``agent-browser`` CLI.
 
-Setup::
-
-    # Option 1: npm
-    git clone https://github.com/jo-inc/camofox-browser && cd camofox-browser
-    npm install && npm start   # downloads Camoufox (~300MB) on first run
-
-    # Option 2: Docker
-    docker run -p 9377:9377 -e CAMOFOX_PORT=9377 jo-inc/camofox-browser
-
-Then set ``CAMOFOX_URL=http://localhost:9377`` in ``~/.hermes/.env``.
-For Docker Camofox, optionally set ``CAMOFOX_REWRITE_LOOPBACK_URLS=true``
-so page URLs like ``http://127.0.0.1:3000`` are opened inside the
-container as ``http://host.docker.internal:3000``.
+The service is managed by the device's local-server. Set ``CAMOFOX_URL`` to
+the managed proxy endpoint; Hermes does not start or install Camofox itself.
 """
 
 from __future__ import annotations
@@ -174,6 +163,25 @@ _vnc_url_checked = False  # only probe once per single-profile process
 # Cached command timeout from config (resolved lazily, like browser_tool)
 _cached_cmd_timeout: Optional[int] = None
 _cmd_timeout_resolved = False
+
+_SAFE_HTTP_ERROR_STRING_FIELDS = {
+    "error": 256,
+    "message": 1_000,
+    "detail": 2_000,
+    "phase": 128,
+    "takeover_session_id": 256,
+    "takeoverSessionId": 256,
+    "resume_token": 512,
+    "resumeToken": 512,
+}
+
+
+class CamofoxHTTPError(requests.HTTPError):
+    """HTTP failure carrying only fields safe to expose to the Agent."""
+
+    def __init__(self, response: requests.Response, payload: Dict[str, Any]):
+        super().__init__(f"HTTP {response.status_code}", response=response)
+        self.payload = payload
 
 
 def _get_command_timeout() -> int:
@@ -579,25 +587,19 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
         return _adopt_existing_tab(session)
 
 
-def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, Any]:
+def _ensure_tab(task_id: Optional[str], url: Optional[str] = None) -> Dict[str, Any]:
     """Ensure a tab exists for the session, creating one if needed."""
     session = _get_session(task_id)
     with _session_lock(session):
         if session["tab_id"]:
             return session
-        base = get_camofox_url()
-        resp = requests.post(
-            f"{base}/tabs",
-            json={
-                "userId": session["user_id"],
-                "listItemId": session["session_key"],
-                "url": url,
-            },
-            timeout=_get_command_timeout(),
-            headers=_auth_headers(),
-        )
-        resp.raise_for_status()
-        data = resp.json()
+        body = {
+            "userId": session["user_id"],
+            "listItemId": session["session_key"],
+        }
+        if url is not None:
+            body["url"] = url
+        data = _post("/tabs", body)
         session["tab_id"] = data.get("tabId")
         return session
 
@@ -663,13 +665,40 @@ def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
 # HTTP helpers
 # ---------------------------------------------------------------------------
 
+def _safe_http_error_payload(resp: requests.Response) -> Dict[str, Any]:
+    """Build an Agent-safe error without exposing arbitrary response text."""
+    payload: Dict[str, Any] = {"success": False}
+    try:
+        body = resp.json()
+    except (TypeError, ValueError):
+        body = None
+
+    if isinstance(body, dict):
+        for field, limit in _SAFE_HTTP_ERROR_STRING_FIELDS.items():
+            value = body.get(field)
+            if isinstance(value, str) and value:
+                payload[field] = value[:limit]
+        if isinstance(body.get("retryable"), bool):
+            payload["retryable"] = body["retryable"]
+
+    if "error" not in payload:
+        payload["error"] = f"HTTP {resp.status_code}"
+    return payload
+
+
+def _raise_for_status(resp: requests.Response) -> None:
+    if 200 <= resp.status_code < 400:
+        return
+    raise CamofoxHTTPError(resp, _safe_http_error_payload(resp))
+
+
 def _post(path: str, body: dict, timeout: Optional[int] = None) -> dict:
     """POST JSON to camofox and return parsed response."""
     if timeout is None:
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
     resp = requests.post(url, json=body, timeout=timeout, headers=_auth_headers())
-    resp.raise_for_status()
+    _raise_for_status(resp)
     return resp.json()
 
 
@@ -679,7 +708,7 @@ def _get(path: str, params: dict = None, timeout: Optional[int] = None) -> dict:
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
     resp = requests.get(url, params=params, timeout=timeout, headers=_auth_headers())
-    resp.raise_for_status()
+    _raise_for_status(resp)
     return resp.json()
 
 
@@ -689,7 +718,7 @@ def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None) -> r
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
     resp = requests.get(url, params=params, timeout=timeout, headers=_auth_headers())
-    resp.raise_for_status()
+    _raise_for_status(resp)
     return resp
 
 
@@ -699,7 +728,7 @@ def _delete(path: str, body: dict = None, timeout: Optional[int] = None) -> dict
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
     resp = requests.delete(url, json=body, timeout=timeout, headers=_auth_headers())
-    resp.raise_for_status()
+    _raise_for_status(resp)
     return resp.json()
 
 
@@ -857,51 +886,87 @@ def _tool_error_from_exception(
     *,
     session: Optional[Dict[str, Any]] = None,
     prefix: str = "",
+    extra: Optional[Dict[str, Any]] = None,
 ) -> str:
     retryable = _retryable_control_result(exc, session)
     if retryable is not None:
-        return retryable
-    return tool_error(f"{prefix}{exc}", success=False)
+        payload = json.loads(retryable)
+        if extra:
+            payload.update(extra)
+        return json.dumps(payload, ensure_ascii=False)
+    if isinstance(exc, CamofoxHTTPError):
+        payload = dict(exc.payload)
+        if extra:
+            payload.update(extra)
+        return json.dumps(payload, ensure_ascii=False)
+    if isinstance(exc, requests.ConnectionError):
+        payload = {
+            "success": False,
+            "error": "browser_runtime_unavailable",
+            "message": (
+                "Managed local browser service is unavailable. "
+                "Retry later or check the device browser environment."
+            ),
+            "retryable": True,
+        }
+        if extra:
+            payload.update(extra)
+        return json.dumps(payload, ensure_ascii=False)
+    return tool_error(f"{prefix}{exc}", success=False, **(extra or {}))
 
 
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
 
+def _navigation_tab_context(session: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Return enough opaque tab identity for takeover after navigation fails."""
+    if not session or not session.get("tab_id"):
+        return {}
+    context: Dict[str, Any] = {"tabId": session["tab_id"]}
+    takeover_hint = _takeover_ui_hint(session)
+    if takeover_hint:
+        context["ui_hint"] = takeover_hint
+    return context
+
+
 def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
     """Navigate to a URL via Camofox."""
+    session: Optional[Dict[str, Any]] = None
     try:
         browser_url, rewrite_info = _rewrite_loopback_url_for_camofox(url)
-        session = _get_session(task_id)
-        if not session["tab_id"]:
-            # Create tab with the target URL directly
-            session = _ensure_tab(task_id, browser_url)
-            data = {"ok": True, "url": browser_url}
-        else:
-            # Navigate existing tab — recover from stale tab 404
-            try:
+        # Camofox 1.13 rejects non-http(s) values such as ``about:blank`` when
+        # ``url`` is present on tab creation. Omitting it creates the blank tab
+        # and gives Hermes a stable tabId before navigation can time out.
+        session = _ensure_tab(task_id)
+        try:
+            data = _post(
+                f"/tabs/{session['tab_id']}/navigate",
+                {"userId": session["user_id"], "url": browser_url},
+                timeout=60,
+            )
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                logger.warning(
+                    "Camofox tab %s returned 404 — tab was garbage collected. "
+                    "Creating a fresh tab.",
+                    session["tab_id"],
+                )
+                session["tab_id"] = None
+                session = _ensure_tab(task_id)
                 data = _post(
                     f"/tabs/{session['tab_id']}/navigate",
                     {"userId": session["user_id"], "url": browser_url},
                     timeout=60,
                 )
-            except requests.HTTPError as e:
-                if e.response is not None and e.response.status_code == 404:
-                    logger.warning(
-                        "Camofox tab %s returned 404 — tab was garbage collected. "
-                        "Creating a fresh tab.",
-                        session["tab_id"],
-                    )
-                    session["tab_id"] = None
-                    session = _ensure_tab(task_id, browser_url)
-                    data = {"ok": True, "url": browser_url}
-                else:
-                    raise
+            else:
+                raise
         _set_handback_privacy_filter(session, False)
         result = {
             "success": True,
             "url": data.get("url", browser_url),
             "title": data.get("title", ""),
+            "tabId": session["tab_id"],
         }
         takeover_hint = _takeover_ui_hint(session)
         if takeover_hint:
@@ -943,23 +1008,16 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
     except requests.HTTPError as e:
         return _tool_error_from_exception(
             e,
-            session=locals().get("session"),
+            session=session,
             prefix="Navigation failed: ",
+            extra=_navigation_tab_context(session),
         )
-    except requests.ConnectionError:
-        if _local_server_managed():
-            return json.dumps({
-                "success": False,
-                "error": "The device local browser is temporarily unavailable.",
-            })
-        return json.dumps({
-            "success": False,
-            "error": f"Cannot connect to Camofox at {get_camofox_url()}. "
-                     "Is the server running? Start with: npm start (in camofox-browser dir) "
-                     "or: docker run -p 9377:9377 -e CAMOFOX_PORT=9377 jo-inc/camofox-browser",
-        })
     except Exception as e:
-        return _tool_error_from_exception(e, session=locals().get("session"))
+        return _tool_error_from_exception(
+            e,
+            session=session,
+            extra=_navigation_tab_context(session),
+        )
 
 
 def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
@@ -1060,10 +1118,11 @@ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     except Exception as e:
         from agent.display import redact_browser_typed_text_for_display
 
-        retryable = _retryable_control_result(e, locals().get("session"))
-        if retryable is not None:
-            return retryable
-        return tool_error(redact_browser_typed_text_for_display(str(e), text), success=False)
+        failure = json.loads(
+            _tool_error_from_exception(e, session=locals().get("session"))
+        )
+        failure = redact_browser_typed_text_for_display(failure, text)
+        return json.dumps(failure, ensure_ascii=False)
 
 
 def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:

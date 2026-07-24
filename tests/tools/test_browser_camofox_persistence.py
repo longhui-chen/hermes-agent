@@ -9,11 +9,13 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from tools.browser_camofox import (
     _drop_session,
     _get_session,
     _managed_persistence_enabled,
+    camofox_click,
     camofox_close,
     camofox_navigate,
     camofox_soft_cleanup,
@@ -220,9 +222,180 @@ class TestManagedPersistenceMode:
 
         assert first["success"] is True
         assert second["success"] is True
-        tab_requests = [req for req in requests_seen if "userId" in req]
+        tab_requests = [req for req in requests_seen if "listItemId" in req]
         assert len(tab_requests) == 2
         assert tab_requests[0]["userId"] == tab_requests[1]["userId"]
+
+
+class TestCamofoxHTTPFailures:
+    def test_runtime_error_keeps_blank_tab_for_takeover(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        monkeypatch.setenv("CAMOFOX_MANAGED_BY_LOCAL_SERVER", "true")
+        monkeypatch.setenv("ZET_AGENT_ID", "agent-42")
+        create = _mock_response(json_data={"tabId": "tab-blank"})
+        failed_navigation = _mock_response(
+            status=503,
+            json_data={
+                "error": "browser_runtime_start_timeout",
+                "message": "Local browser did not become ready in time",
+                "phase": "health_check",
+                "retryable": True,
+                "internal_path": "/private/runtime/path",
+            },
+        )
+
+        with patch(
+            "tools.browser_camofox.requests.post",
+            side_effect=[create, failed_navigation],
+        ) as mock_post:
+            result = json.loads(
+                camofox_navigate("https://example.com", task_id="task-1")
+            )
+
+        assert result == {
+            "success": False,
+            "error": "browser_runtime_start_timeout",
+            "message": "Local browser did not become ready in time",
+            "phase": "health_check",
+            "retryable": True,
+            "tabId": "tab-blank",
+            "ui_hint": {
+                "type": "takeover_browser",
+                "agent_id": "agent-42",
+                "browser_session_id": get_camofox_identity("task-1")["session_key"],
+                "tab_id": "tab-blank",
+            },
+        }
+        assert "url" not in mock_post.call_args_list[0].kwargs["json"]
+        assert mock_post.call_args_list[1].kwargs["json"]["url"] == "https://example.com"
+
+    def test_navigation_timeout_keeps_blank_tab_for_takeover(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        monkeypatch.setenv("CAMOFOX_MANAGED_BY_LOCAL_SERVER", "true")
+        monkeypatch.setenv("ZET_AGENT_ID", "agent-42")
+        create = _mock_response(json_data={"tabId": "tab-blank"})
+
+        with patch(
+            "tools.browser_camofox.requests.post",
+            side_effect=[create, requests.Timeout("navigation timed out")],
+        ):
+            result = json.loads(
+                camofox_navigate("https://example.com", task_id="task-1")
+            )
+
+        assert result["success"] is False
+        assert result["tabId"] == "tab-blank"
+        assert result["ui_hint"] == {
+            "type": "takeover_browser",
+            "agent_id": "agent-42",
+            "browser_session_id": get_camofox_identity("task-1")["session_key"],
+            "tab_id": "tab-blank",
+        }
+
+    def test_human_control_error_keeps_takeover_identifiers(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        create = _mock_response(json_data={"tabId": "tab-blank"})
+        controlled = _mock_response(
+            status=423,
+            json_data={
+                "error": "browser_human_controlled",
+                "message": "browser tab is controlled by the user",
+                "takeover_session_id": "takeover-1",
+            },
+        )
+
+        with patch(
+            "tools.browser_camofox.requests.post", side_effect=[create, controlled]
+        ):
+            result = json.loads(
+                camofox_navigate("https://example.com", task_id="task-1")
+            )
+
+        assert result["success"] is False
+        assert result["error"] == "browser_human_controlled"
+        assert result["takeover_session_id"] == "takeover-1"
+        assert result["tabId"] == "tab-blank"
+
+    def test_camofox_json_error_is_filtered_and_preserved(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        session = {
+            "user_id": "profile-1",
+            "tab_id": "tab-1",
+            "session_key": "task-1",
+        }
+        response = _mock_response(
+            status=400,
+            json_data={
+                "error": "invalid_ref",
+                "detail": "Element reference is invalid",
+                "secret": "must-not-leak",
+            },
+        )
+
+        with (
+            patch("tools.browser_camofox._get_session", return_value=session),
+            patch("tools.browser_camofox.requests.post", return_value=response),
+        ):
+            result = json.loads(camofox_click("@missing", task_id="task-1"))
+
+        assert result == {
+            "success": False,
+            "error": "invalid_ref",
+            "detail": "Element reference is invalid",
+        }
+
+    def test_non_json_error_returns_only_http_status(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        session = {
+            "user_id": "profile-1",
+            "tab_id": "tab-1",
+            "session_key": "task-1",
+        }
+        response = MagicMock()
+        response.status_code = 500
+        response.json.side_effect = ValueError("not json")
+        response.text = "<html>private upstream diagnostics</html>"
+
+        with (
+            patch("tools.browser_camofox._get_session", return_value=session),
+            patch("tools.browser_camofox.requests.post", return_value=response),
+        ):
+            result = json.loads(camofox_click("@missing", task_id="task-1"))
+
+        assert result == {"success": False, "error": "HTTP 500"}
+
+    def test_stale_tab_recovery_recreates_blank_then_navigates(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        session = {
+            "user_id": "profile-1",
+            "tab_id": "tab-stale",
+            "session_key": "task-1",
+        }
+        stale = _mock_response(status=404, json_data={"error": "tab_not_found"})
+        create = _mock_response(json_data={"tabId": "tab-new"})
+        navigated = _mock_response(
+            json_data={"url": "https://example.com", "title": "Example"}
+        )
+
+        with (
+            patch("tools.browser_camofox._get_session", return_value=session),
+            patch(
+                "tools.browser_camofox.requests.post",
+                side_effect=[stale, create, navigated],
+            ) as mock_post,
+            patch(
+                "tools.browser_camofox._get",
+                return_value={"snapshot": "", "refsCount": 0},
+            ),
+        ):
+            result = json.loads(
+                camofox_navigate("https://example.com", task_id="task-1")
+            )
+
+        assert result["success"] is True
+        assert result["tabId"] == "tab-new"
+        assert "url" not in mock_post.call_args_list[1].kwargs["json"]
+        assert mock_post.call_args_list[2].kwargs["json"]["url"] == "https://example.com"
 
 
 class TestConfiguredCamofoxIdentity:

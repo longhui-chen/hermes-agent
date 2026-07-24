@@ -501,10 +501,10 @@ def _tool_completion_payload(
     has_error_code = _has_tool_error_value(decoded.get("errorCode"))
     connector_error = decoded.get("connector_error")
     has_connector_error = _has_tool_error_value(connector_error)
+    ui_hint = _takeover_ui_hint(decoded)
+    if ui_hint is not None:
+        payload["ui_hint"] = ui_hint
     if not (has_error or has_error_code or has_connector_error):
-        ui_hint = _takeover_ui_hint(decoded)
-        if ui_hint is not None:
-            payload["ui_hint"] = ui_hint
         return payload
 
     error_msg = (
@@ -532,7 +532,8 @@ def _tool_completion_payload(
 
 def _takeover_ui_hint(decoded: Dict[str, Any]) -> Optional[Dict[str, str]]:
     """Return only the exact, bounded App handoff contract from tool output."""
-    if decoded.get("success") is not True:
+    success = decoded.get("success")
+    if success is not True and success is not False:
         return None
     hint = decoded.get("ui_hint")
     if not isinstance(hint, dict) or hint.get("type") != "takeover_browser":
