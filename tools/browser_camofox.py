@@ -618,6 +618,19 @@ def _drop_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
         return _sessions.pop(_session_cache_key(task_id, identity), None)
 
 
+def _drop_session_by_identity(session: Dict[str, Any]) -> None:
+    """Remove a known session object from the cache without a task_id.
+
+    Used by error paths that only have the ``session`` dict on hand (e.g. a
+    control-flow handler deep inside exception translation), not the task_id
+    that produced it.
+    """
+    with _sessions_lock:
+        key = next((k for k, v in _sessions.items() if v is session), None)
+        if key is not None:
+            _sessions.pop(key, None)
+
+
 def _release_local_server_lease() -> None:
     """Best-effort release of the profile's long-lived Agent runtime lease."""
     try:
@@ -817,10 +830,22 @@ def _retryable_control_result(
             or not _valid_resume_url_origin(resume_origin.strip())
             or _unsafe_handback_url(resume_origin.strip())
         ):
+            # An unsafe resume origin is not something the caller can act on
+            # by retrying, and leaving the session dangling here would strand
+            # the profile forever (nothing else ever revisits this state).
+            # Close it out now so the *next* browser call starts clean.
+            _drop_session_by_identity(session)
+            if _local_server_managed():
+                _release_local_server_lease()
             result.update({
                 "error": "browser_handback_origin_blocked",
-                "message": "Browser handback lacks a safe resume origin. Close the browser session before retrying.",
+                "message": (
+                    "Browser handback lacked a safe resume origin, so the "
+                    "session was closed automatically. Call browser_navigate "
+                    "to start a new browser session."
+                ),
                 "retryable": False,
+                "session_closed": True,
             })
             return json.dumps(result)
 

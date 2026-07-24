@@ -276,12 +276,51 @@ def test_handback_private_or_metadata_url_stays_blocked(managed_session, current
 
     assert result["error"] == "browser_handback_origin_blocked"
     assert result["retryable"] is False
+    assert result["session_closed"] is True
     assert result["resnapshot_completed"] is False
     assert result["resume_acknowledged"] is False
     assert current_url not in json.dumps(result)
     assert managed_session["privacy_filter_after_handback"] is True
-    mock_post.assert_called_once()
+    # One call for the original (stale) action, one for the auto-release.
+    assert mock_post.call_count == 2
     mock_get.assert_called_once_with("/tabs", params={"userId": "hermes_profile"}, timeout=5)
+
+
+def test_handback_origin_blocked_clears_local_session_and_releases_lease(managed_session):
+    """An unsafe resume origin must not strand the profile.
+
+    Regression test for a real stuck-forever session observed in local VM
+    integration testing: the tool used to report "Close the browser session
+    before retrying" without ever closing it, so nothing ever did and the
+    profile stayed wedged until a human restarted services by hand.
+    """
+    import tools.browser_camofox as browser_camofox
+
+    cache_key = browser_camofox._session_cache_key("agent-task", {
+        "user_id": managed_session["user_id"],
+        "session_key": managed_session["session_key"],
+    })
+    browser_camofox._sessions[cache_key] = managed_session
+    try:
+        stale = _http_error(409, {"error": "browser_resnapshot_required", "resume_token": "resume-secret"})
+        with (
+            patch("tools.browser_camofox._get_session", return_value=managed_session),
+            patch("tools.browser_camofox._post", side_effect=stale) as mock_post,
+            patch("tools.browser_camofox._get", return_value=_pending_tabs("http://localhost/admin")),
+        ):
+            result = json.loads(camofox_click("@e4", task_id="agent-task"))
+
+        assert result["error"] == "browser_handback_origin_blocked"
+        assert result["session_closed"] is True
+        # The local cache entry for this session must be gone ...
+        assert cache_key not in browser_camofox._sessions
+        # ... and the local-server lease release must have been attempted
+        # (second _post call; the first is the original stale action).
+        assert mock_post.call_count == 2
+        release_call = mock_post.call_args_list[1]
+        assert release_call.args[0] == "/_zettlab/release"
+    finally:
+        browser_camofox._sessions.pop(cache_key, None)
 
 
 @pytest.mark.parametrize(
@@ -308,10 +347,11 @@ def test_handback_origin_fails_closed_on_dns_or_private_resolution(
         result = json.loads(camofox_click("@e4", task_id="agent-task"))
 
     assert result["error"] == "browser_handback_origin_blocked"
+    assert result["session_closed"] is True
     assert result["resnapshot_completed"] is False
     assert result["resume_acknowledged"] is False
     assert "snapshot" not in result
-    mock_post.assert_called_once()
+    assert mock_post.call_count == 2
     mock_get.assert_called_once()
 
 
@@ -332,11 +372,12 @@ def test_handback_rejects_nonempty_pending_url_even_with_safe_origin(managed_ses
         result = json.loads(camofox_click("@e4", task_id="agent-task"))
 
     assert result["error"] == "browser_handback_origin_blocked"
+    assert result["session_closed"] is True
     assert result["resnapshot_completed"] is False
     assert result["resume_acknowledged"] is False
     assert "snapshot" not in result
     assert "hidden-path" not in json.dumps(result)
-    mock_post.assert_called_once()
+    assert mock_post.call_count == 2
     mock_get.assert_called_once()
 
 
@@ -386,9 +427,12 @@ def test_handback_does_not_ack_without_current_tab_metadata(managed_session):
     ):
         result = json.loads(camofox_click("@e4", task_id="agent-task"))
 
+    assert result["error"] == "browser_handback_origin_blocked"
+    assert result["session_closed"] is True
     assert result["resnapshot_completed"] is False
     assert result["resume_acknowledged"] is False
-    assert mock_post.call_count == 1
+    # One call for the original (stale) action, one for the auto-release.
+    assert mock_post.call_count == 2
 
 
 def test_console_evaluate_uses_handback_recovery(managed_session):
