@@ -2,7 +2,7 @@ name: creation-governor
 version: 0.7.0
 description: "Run bounded zero-shot creation checks and conditionally attach low-noise Agent, Skill, or Task recommendations."
 author: Zettlab
-kind: standalone
+kind: backend
 provides_tools:
   - detect_creation_opportunity
 provides_hooks:
