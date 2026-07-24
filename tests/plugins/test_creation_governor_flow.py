@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+from hermes_cli.plugins import PluginManager
+
 
 PLUGIN_PATH = (
     Path(__file__).resolve().parents[2]
@@ -43,6 +45,21 @@ class _Context:
 
     def register_hook(self, *args, **kwargs):
         self.hooks.append((args, kwargs))
+
+
+def test_bundled_backend_loads_with_empty_plugins_enabled(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text("plugins:\n  enabled: []\n")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    loaded = manager._plugins["creation-governor"]
+    assert loaded.enabled is True, loaded.error
+    assert loaded.tools_registered == ["detect_creation_opportunity"]
+    assert set(loaded.hooks_registered) == {"pre_llm_call", "transform_llm_output"}
 
 
 def test_registered_hooks_produce_a_complete_answer_plus_attachment_envelope():

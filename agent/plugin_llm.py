@@ -628,6 +628,7 @@ class PluginLlm:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
+        fail_fast: bool = False,
         agent_id: Optional[str] = None,
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
@@ -657,6 +658,7 @@ class PluginLlm:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            fail_fast=fail_fast,
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
@@ -926,6 +928,7 @@ class PluginLlm:
         temperature: Optional[float],
         max_tokens: Optional[int],
         timeout: Optional[float],
+        fail_fast: bool = False,
         extra_body: Optional[Dict[str, Any]] = None,
     ) -> tuple[str, str, Any]:
         """Invoke the host's ``call_llm``. Lazy-imports
@@ -940,6 +943,7 @@ class PluginLlm:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout=timeout,
+                fail_fast=fail_fast,
                 extra_body=extra_body,
             )
         from agent.auxiliary_client import call_llm
@@ -954,6 +958,7 @@ class PluginLlm:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            fail_fast=fail_fast,
             extra_body=merged_extra or None,
         )
         provider, model = _resolve_attribution(

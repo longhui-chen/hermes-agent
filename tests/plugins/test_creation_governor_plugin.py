@@ -148,11 +148,31 @@ def test_first_turn_and_every_third_turn_run_bounded_json_checks():
         for call in llm.calls
     )
     assert all(call[1]["max_tokens"] == 500 for call in llm.calls)
+    assert all(call[1]["fail_fast"] is True for call in llm.calls)
     instructions = llm.calls[0][0][0]["content"]
     assert "high-recall zero-shot" in instructions
     assert "ongoing external work domain" in instructions
     assert "today" in instructions
     assert "not by itself a future trigger" in instructions
+
+
+def test_api_server_never_evaluates_or_transforms_recommendations():
+    plugin = _load_plugin()
+    llm = _FakeLlm([_candidate()])
+    plugin.register(_Context(llm))
+
+    assert plugin._on_pre_llm_call(
+        session_id="openai-client-session",
+        platform="api_server",
+        user_message="Analyze my Google Ads account.",
+        conversation_history=[],
+    ) is None
+    assert llm.calls == []
+    assert plugin._transform_llm_output(
+        session_id="openai-client-session",
+        platform="api_server",
+        response_text="Here is the analysis.",
+    ) is None
 
 
 def test_positive_checkpoint_preserves_answer_and_appends_card_envelope_once():
@@ -424,6 +444,18 @@ def test_known_unmuted_sessions_are_bounded_and_pruned_with_session_state(
     assert len(plugin._known_unmuted_sessions) <= plugin.MAX_SESSION_STATES
     plugin._prune_session_states(time.monotonic() + plugin.SESSION_STATE_TTL_SECONDS + 1)
     assert not plugin._known_unmuted_sessions
+
+
+def test_muted_sessions_are_bounded_and_pruned_with_session_state():
+    plugin = _load_plugin()
+    now = time.monotonic()
+
+    for index in range(plugin.MAX_SESSION_STATES + 1):
+        plugin._remember_muted_session(f"muted-{index}", now)
+
+    assert len(plugin._muted_sessions) <= plugin.MAX_SESSION_STATES
+    plugin._prune_session_states(now + plugin.SESSION_STATE_TTL_SECONDS + 1)
+    assert not plugin._muted_sessions
 
 
 def test_mute_transform_guard_wins_when_a_candidate_is_already_pending(
