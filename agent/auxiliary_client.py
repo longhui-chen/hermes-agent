@@ -5898,6 +5898,7 @@ def call_llm(
     max_tokens: int = None,
     tools: list = None,
     timeout: float = None,
+    fail_fast: bool = False,
     extra_body: dict = None,
     api_mode: str = None,
     stream: bool = False,
@@ -5921,6 +5922,8 @@ def call_llm(
         max_tokens: Max output tokens (handles max_tokens vs max_completion_tokens).
         tools: Tool definitions (for function calling).
         timeout: Request timeout in seconds (None = read from auxiliary.{task}.timeout config).
+        fail_fast: Make one request to the resolved provider and return its result
+            or error without retries or provider fallback.
         extra_body: Additional request body fields.
         stream: When True, return the raw SDK streaming iterator instead of a
             validated complete response. The caller is responsible for consuming
@@ -5936,6 +5939,14 @@ def call_llm(
     Raises:
         RuntimeError: If no provider is configured.
     """
+    if fail_fast and provider is None:
+        provider = _RUNTIME_MAIN_PROVIDER.get() or _read_main_provider()
+        model = model or _RUNTIME_MAIN_MODEL.get() or _read_main_model()
+        base_url = base_url or _RUNTIME_MAIN_BASE_URL.get()
+        api_key = api_key or _RUNTIME_MAIN_API_KEY.get()
+        api_mode = api_mode or _RUNTIME_MAIN_API_MODE.get()
+        if not provider:
+            raise RuntimeError("No active main provider configured for fail-fast auxiliary call")
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     if api_mode:
@@ -5951,7 +5962,12 @@ def call_llm(
             api_key=resolved_api_key or api_key,
             async_mode=False,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if (
+            client is None
+            and not fail_fast
+            and resolved_provider != "auto"
+            and not resolved_base_url
+        ):
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -5977,6 +5993,11 @@ def call_llm(
             main_runtime=main_runtime,
         )
         if client is None:
+            if fail_fast:
+                raise RuntimeError(
+                    f"No LLM provider configured for task={task} provider={resolved_provider}. "
+                    "Run: hermes setup"
+                )
             # When the user explicitly chose a non-OpenRouter provider but no
             # credentials were found, honor the task fallback_chain before
             # raising.  Missing raw env keys are recoverable for auxiliary
@@ -6032,6 +6053,9 @@ def call_llm(
     _client_base = str(getattr(client, "base_url", "") or "")
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+
+    if fail_fast:
+        return _validate_llm_response(client.chat.completions.create(**kwargs), task)
 
     # Streaming path: return the raw SDK Stream iterator directly. This is used by
     # the MoA aggregator so its tokens stream to the user. It deliberately skips

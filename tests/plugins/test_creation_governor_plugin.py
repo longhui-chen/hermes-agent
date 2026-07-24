@@ -148,6 +148,7 @@ def test_first_turn_and_every_third_turn_run_bounded_json_checks():
         for call in llm.calls
     )
     assert all(call[1]["max_tokens"] == 500 for call in llm.calls)
+    assert all(call[1]["fail_fast"] is True for call in llm.calls)
     instructions = llm.calls[0][0][0]["content"]
     assert "high-recall zero-shot" in instructions
     assert "ongoing external work domain" in instructions
@@ -443,6 +444,18 @@ def test_known_unmuted_sessions_are_bounded_and_pruned_with_session_state(
     assert len(plugin._known_unmuted_sessions) <= plugin.MAX_SESSION_STATES
     plugin._prune_session_states(time.monotonic() + plugin.SESSION_STATE_TTL_SECONDS + 1)
     assert not plugin._known_unmuted_sessions
+
+
+def test_muted_sessions_are_bounded_and_pruned_with_session_state():
+    plugin = _load_plugin()
+    now = time.monotonic()
+
+    for index in range(plugin.MAX_SESSION_STATES + 1):
+        plugin._remember_muted_session(f"muted-{index}", now)
+
+    assert len(plugin._muted_sessions) <= plugin.MAX_SESSION_STATES
+    plugin._prune_session_states(now + plugin.SESSION_STATE_TTL_SECONDS + 1)
+    assert not plugin._muted_sessions
 
 
 def test_mute_transform_guard_wins_when_a_candidate_is_already_pending(
