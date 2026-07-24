@@ -58,23 +58,46 @@ def _redact_handback_page_state(value: str) -> str:
     return "\n".join(lines)
 
 
-def _redact_handback_url(value: str) -> str:
-    """Return only a credential-free browser location after human control."""
-    from agent.redact import redact_cdp_url
+_EPOCH_HEADER = "X-Zettlab-Browser-Epoch"
 
-    redacted = redact_cdp_url(value)
-    parts = urlsplit(redacted)
-    hostname = parts.hostname
-    if not hostname:
-        return ""
-    authority = f"[{hostname}]" if ":" in hostname else hostname
+
+def _session_epoch_header(session: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """Declare the page epoch this session last synchronized with."""
+    if not isinstance(session, dict):
+        return {}
+    epoch = session.get("epoch")
+    if not isinstance(epoch, int) or isinstance(epoch, bool):
+        return {}
+    return {_EPOCH_HEADER: str(epoch)}
+
+
+def _adopt_session_epoch(session: Optional[Dict[str, Any]], epoch: Any) -> None:
+    """Record the server-reported page epoch on the session.
+
+    The epoch increments whenever human control of the page ends, so a change
+    means the page content is no longer what the Agent last saw and any values
+    a human typed may still be present. Adopting a changed epoch therefore
+    also enables the handback privacy filter; the filter clears when the Agent
+    navigates away. Keys are written without the session lock because single
+    key access is atomic and callers may already hold the lock.
+    """
+    if not isinstance(session, dict) or not isinstance(epoch, int) or isinstance(epoch, bool):
+        return
+    previous = session.get("epoch")
+    if previous is not None and previous != epoch:
+        session["privacy_filter_after_handback"] = True
+    session["epoch"] = epoch
+
+
+def _adopt_epoch_from_response(session: Optional[Dict[str, Any]], resp: "requests.Response") -> None:
+    """Adopt the epoch header a managed local-server proxy adds to responses."""
+    value = resp.headers.get(_EPOCH_HEADER) if resp is not None else None
+    if value is None:
+        return
     try:
-        port = parts.port
-    except ValueError:
-        return ""
-    if port is not None:
-        authority = f"{authority}:{port}"
-    return urlunsplit((parts.scheme, authority, "", "", ""))
+        _adopt_session_epoch(session, int(str(value).strip()))
+    except (TypeError, ValueError):
+        pass
 
 
 def _set_handback_privacy_filter(session: Dict[str, Any], enabled: bool) -> None:
@@ -92,58 +115,6 @@ def _handback_privacy_filter_enabled(session: Dict[str, Any]) -> bool:
 def _filter_page_state_after_handback(session: Dict[str, Any], value: str) -> str:
     """Filter page state while a human-mutated page remains current."""
     return _redact_handback_page_state(value) if _handback_privacy_filter_enabled(session) else value
-
-
-def _unsafe_handback_url(value: str) -> bool:
-    """Fail closed under the browser's metadata, private, and DNS policy."""
-    from tools.browser_tool import (
-        _is_always_blocked_url,
-        _is_safe_url,
-        _url_is_private,
-    )
-
-    # _is_safe_url rejects DNS failures, malformed URLs, and private targets by
-    # default. _url_is_private is deliberately retained as an unconditional
-    # floor because _is_safe_url honors HERMES_ALLOW_PRIVATE_URLS/config opt-outs,
-    # which must never weaken handback evidence validation.
-    return (
-        _is_always_blocked_url(value)
-        or _url_is_private(value)
-        or not _is_safe_url(value)
-    )
-
-
-def _valid_resume_url_origin(value: str) -> bool:
-    """Require a credential-free HTTP(S) origin without path/query/fragment."""
-    try:
-        parts = urlsplit(value)
-        if parts.scheme not in {"http", "https"} or not parts.hostname:
-            return False
-        if parts.username is not None or parts.password is not None:
-            return False
-        if parts.path not in {"", "/"} or parts.query or parts.fragment:
-            return False
-        # Accessing port validates malformed authorities such as ``host:bad``.
-        parts.port
-        return True
-    except ValueError:
-        return False
-
-
-def _exact_session_tab(tabs: Any, session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Return only the tab bound to this exact managed browser session."""
-    if not isinstance(tabs, list):
-        return None
-    return next(
-        (
-            tab
-            for tab in tabs
-            if isinstance(tab, dict)
-            and tab.get("tabId") == session.get("tab_id")
-            and tab.get("listItemId") == session.get("session_key")
-        ),
-        None,
-    )
 
 
 from tools.browser_camofox_state import get_camofox_identity
@@ -172,8 +143,6 @@ _SAFE_HTTP_ERROR_STRING_FIELDS = {
     "phase": 128,
     "takeover_session_id": 256,
     "takeoverSessionId": 256,
-    "resume_token": 512,
-    "resumeToken": 512,
 }
 
 
@@ -530,6 +499,7 @@ def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
     tab_id = latest.get("tabId") if isinstance(latest, dict) else None
     if isinstance(tab_id, str) and tab_id:
         session["tab_id"] = tab_id
+        _adopt_session_epoch(session, latest.get("epoch"))
         logger.debug("Adopted existing Camofox tab %s for %s", tab_id, session.get("user_id"))
 
     return session
@@ -560,6 +530,7 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "managed": True,
                     "adopt_existing_tab": _adopt_existing_tab_enabled(camofox_cfg),
                     "privacy_filter_after_handback": False,
+                    "epoch": None,
                     "_lock": threading.Lock(),
                 }
             elif _local_server_managed() or bool(camofox_cfg.get("managed_persistence")):
@@ -570,6 +541,7 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "managed": True,
                     "adopt_existing_tab": _adopt_existing_tab_enabled(camofox_cfg),
                     "privacy_filter_after_handback": False,
+                    "epoch": None,
                     "_lock": threading.Lock(),
                 }
             else:
@@ -580,6 +552,7 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "managed": False,
                     "adopt_existing_tab": False,
                     "privacy_filter_after_handback": False,
+                    "epoch": None,
                     "_lock": threading.Lock(),
                 }
             _sessions[cache_key] = session
@@ -604,6 +577,7 @@ def _ensure_tab(task_id: Optional[str], url: Optional[str] = None) -> Dict[str, 
             "/tabs",
             body,
             timeout=max(_get_command_timeout(), _TAB_CREATION_TIMEOUT_FLOOR),
+            session=session,
         )
         session["tab_id"] = data.get("tabId")
         return session
@@ -616,19 +590,6 @@ def _drop_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
         camofox_cfg = _get_camofox_config()
         identity = _camofox_identity_override(task_id, camofox_cfg) or get_camofox_identity(task_id)
         return _sessions.pop(_session_cache_key(task_id, identity), None)
-
-
-def _drop_session_by_identity(session: Dict[str, Any]) -> None:
-    """Remove a known session object from the cache without a task_id.
-
-    Used by error paths that only have the ``session`` dict on hand (e.g. a
-    control-flow handler deep inside exception translation), not the task_id
-    that produced it.
-    """
-    with _sessions_lock:
-        key = next((k for k, v in _sessions.items() if v is session), None)
-        if key is not None:
-            _sessions.pop(key, None)
 
 
 def _release_local_server_lease() -> None:
@@ -710,42 +671,50 @@ def _raise_for_status(resp: requests.Response) -> None:
     raise CamofoxHTTPError(resp, _safe_http_error_payload(resp))
 
 
-def _post(path: str, body: dict, timeout: Optional[int] = None) -> dict:
+def _request_headers(session: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    return {**_auth_headers(), **_session_epoch_header(session)}
+
+
+def _post(path: str, body: dict, timeout: Optional[int] = None, session: Optional[Dict[str, Any]] = None) -> dict:
     """POST JSON to camofox and return parsed response."""
     if timeout is None:
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
-    resp = requests.post(url, json=body, timeout=timeout, headers=_auth_headers())
+    resp = requests.post(url, json=body, timeout=timeout, headers=_request_headers(session))
+    _adopt_epoch_from_response(session, resp)
     _raise_for_status(resp)
     return resp.json()
 
 
-def _get(path: str, params: dict = None, timeout: Optional[int] = None) -> dict:
+def _get(path: str, params: dict = None, timeout: Optional[int] = None, session: Optional[Dict[str, Any]] = None) -> dict:
     """GET from camofox and return parsed response."""
     if timeout is None:
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
-    resp = requests.get(url, params=params, timeout=timeout, headers=_auth_headers())
+    resp = requests.get(url, params=params, timeout=timeout, headers=_request_headers(session))
+    _adopt_epoch_from_response(session, resp)
     _raise_for_status(resp)
     return resp.json()
 
 
-def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None) -> requests.Response:
+def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None, session: Optional[Dict[str, Any]] = None) -> requests.Response:
     """GET from camofox and return raw response (for binary data)."""
     if timeout is None:
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
-    resp = requests.get(url, params=params, timeout=timeout, headers=_auth_headers())
+    resp = requests.get(url, params=params, timeout=timeout, headers=_request_headers(session))
+    _adopt_epoch_from_response(session, resp)
     _raise_for_status(resp)
     return resp
 
 
-def _delete(path: str, body: dict = None, timeout: Optional[int] = None) -> dict:
+def _delete(path: str, body: dict = None, timeout: Optional[int] = None, session: Optional[Dict[str, Any]] = None) -> dict:
     """DELETE to camofox and return parsed response."""
     if timeout is None:
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
-    resp = requests.delete(url, json=body, timeout=timeout, headers=_auth_headers())
+    resp = requests.delete(url, json=body, timeout=timeout, headers=_request_headers(session))
+    _adopt_epoch_from_response(session, resp)
     _raise_for_status(resp)
     return resp.json()
 
@@ -763,10 +732,7 @@ def _control_error_payload(exc: BaseException) -> Optional[Dict[str, Any]]:
 
     status = exc.response.status_code
     code = payload.get("error")
-    if (status, code) not in {
-        (423, "browser_human_controlled"),
-        (409, "browser_resnapshot_required"),
-    }:
+    if (status, code) != (409, "browser_epoch_stale"):
         return None
     return payload
 
@@ -775,106 +741,52 @@ def _retryable_control_result(
     exc: BaseException,
     session: Optional[Dict[str, Any]] = None,
 ) -> Optional[str]:
-    """Translate takeover/handback HTTP responses into retryable tool JSON.
+    """Translate the epoch-staleness conflict into a retryable tool result.
 
-    A handback invalidates accessibility refs. On the 409 transition response,
-    Hermes captures a fresh snapshot and acknowledges the resume token before
-    asking the model to retry. The blocked action itself is never replayed.
+    A human controlled this page since the Agent last looked, so its element
+    refs are stale. Recovery is stateless and idempotent: adopt the current
+    epoch from the conflict payload, take one privacy-filtered snapshot (the
+    proxy always admits snapshots), and ask the model to retry with fresh
+    refs. There is no handshake to complete, so nothing here can strand the
+    session; a failed snapshot simply leaves the result retryable.
     """
     payload = _control_error_payload(exc)
     if payload is None:
         return None
 
-    code = payload["error"]
     result: Dict[str, Any] = {
         "success": False,
-        "error": code,
+        "error": "browser_epoch_stale",
         "retryable": True,
+        "resnapshot_completed": False,
+        "message": (
+            "Page state changed while a human controlled the browser. "
+            "A fresh privacy-filtered snapshot is included; retry using its refs."
+        ),
     }
-    message = payload.get("message")
-    if isinstance(message, str) and message:
-        result["message"] = message[:500]
-    retry_after_ms = payload.get("retry_after_ms")
-    if isinstance(retry_after_ms, int) and not isinstance(retry_after_ms, bool):
-        result["retry_after_ms"] = max(0, min(retry_after_ms, 60_000))
     takeover_session_id = payload.get("takeover_session_id")
     if isinstance(takeover_session_id, str) and takeover_session_id:
         result["takeover_session_id"] = takeover_session_id[:256]
 
-    if code != "browser_resnapshot_required":
-        return json.dumps(result)
-
-    result["resnapshot_completed"] = False
-    result["resume_acknowledged"] = False
     if not session or not session.get("tab_id") or not session.get("user_id"):
         return json.dumps(result)
 
-    # Human-entered values can remain in the current accessibility tree after
-    # handback. Keep filtering every later read until Hermes explicitly leaves
-    # this page or clears the local session.
+    # Human-entered values can remain in the page state. Filter every later
+    # read until the Agent explicitly leaves this page.
     _set_handback_privacy_filter(session, True)
+    epoch = payload.get("epoch")
+    if isinstance(epoch, int) and not isinstance(epoch, bool):
+        session["epoch"] = epoch
 
     try:
-        before_tabs = _get(
-            "/tabs",
-            params={"userId": session["user_id"]},
-            timeout=5,
-        ).get("tabs", [])
-        before_tab = _exact_session_tab(before_tabs, session)
-        resume_origin = before_tab.get("resumeUrlOrigin") if before_tab else None
-        pending_url = before_tab.get("url") if before_tab else None
-        if (
-            not isinstance(pending_url, str)
-            or pending_url != ""
-            or not isinstance(resume_origin, str)
-            or not _valid_resume_url_origin(resume_origin.strip())
-            or _unsafe_handback_url(resume_origin.strip())
-        ):
-            # An unsafe resume origin is not something the caller can act on
-            # by retrying, and leaving the session dangling here would strand
-            # the profile forever (nothing else ever revisits this state).
-            # Close it out now so the *next* browser call starts clean.
-            _drop_session_by_identity(session)
-            if _local_server_managed():
-                _release_local_server_lease()
-            result.update({
-                "error": "browser_handback_origin_blocked",
-                "message": (
-                    "Browser handback lacked a safe resume origin, so the "
-                    "session was closed automatically. Call browser_navigate "
-                    "to start a new browser session."
-                ),
-                "retryable": False,
-                "session_closed": True,
-            })
-            return json.dumps(result)
-
         snapshot_data = _get(
             f"/tabs/{session['tab_id']}/snapshot",
             params={"userId": session["user_id"]},
+            session=session,
         )
         snapshot = snapshot_data.get("snapshot", "")
         if not isinstance(snapshot, str):
             snapshot = ""
-
-        after_tabs = _get(
-            "/tabs",
-            params={"userId": session["user_id"]},
-            timeout=5,
-        ).get("tabs", [])
-        after_tab = _exact_session_tab(after_tabs, session)
-        current_url = after_tab.get("url") if after_tab else None
-        if (
-            not isinstance(current_url, str)
-            or not current_url.strip()
-            or _unsafe_handback_url(current_url.strip())
-        ):
-            result.update({
-                "error": "browser_handback_url_blocked",
-                "message": "Browser handback ended on an unsafe or unverifiable URL. Close the browser session before retrying.",
-                "retryable": False,
-            })
-            return json.dumps(result)
 
         from tools.browser_tool import (
             SNAPSHOT_SUMMARIZE_THRESHOLD,
@@ -883,31 +795,11 @@ def _retryable_control_result(
 
         if len(snapshot) > SNAPSHOT_SUMMARIZE_THRESHOLD:
             snapshot = _truncate_snapshot(snapshot)
-        result["snapshot"] = _filter_page_state_after_handback(session, snapshot)
+        result["snapshot"] = _redact_handback_page_state(snapshot)
         result["element_count"] = snapshot_data.get("refsCount", 0)
         result["resnapshot_completed"] = True
-        result["url"] = _redact_handback_url(current_url.strip())
-        result["title"] = "[REDACTED after human control]"
     except Exception as snapshot_exc:
-        logger.warning("Camofox handback resnapshot failed: %s", snapshot_exc)
-        return json.dumps(result)
-
-    resume_token = payload.get("resume_token")
-    if not isinstance(resume_token, str) or not resume_token:
-        return json.dumps(result)
-
-    try:
-        _post(
-            "/_zettlab/control/resume/ack",
-            {
-                "userId": session["user_id"],
-                "tabId": session["tab_id"],
-                "resumeToken": resume_token,
-            },
-        )
-        result["resume_acknowledged"] = True
-    except Exception as ack_exc:
-        logger.warning("Camofox handback acknowledgement failed: %s", ack_exc)
+        logger.warning("Camofox post-handback snapshot failed: %s", snapshot_exc)
     return json.dumps(result)
 
 
@@ -974,6 +866,7 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
                 f"/tabs/{session['tab_id']}/navigate",
                 {"userId": session["user_id"], "url": browser_url},
                 timeout=60,
+                session=session,
             )
         except requests.HTTPError as e:
             if e.response is not None and e.response.status_code == 404:
@@ -988,6 +881,7 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
                     f"/tabs/{session['tab_id']}/navigate",
                     {"userId": session["user_id"], "url": browser_url},
                     timeout=60,
+                    session=session,
                 )
             else:
                 raise
@@ -1021,6 +915,7 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
             snap_data = _get(
                 f"/tabs/{session['tab_id']}/snapshot",
                 params={"userId": session["user_id"]},
+                session=session,
             )
             snapshot_text = snap_data.get("snapshot", "")
             from tools.browser_tool import (
@@ -1061,6 +956,7 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
         data = _get(
             f"/tabs/{session['tab_id']}/snapshot",
             params={"userId": session["user_id"]},
+            session=session,
         )
 
         snapshot = data.get("snapshot", "")
@@ -1104,6 +1000,7 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
         data = _post(
             f"/tabs/{session['tab_id']}/click",
             {"userId": session["user_id"], "ref": clean_ref},
+            session=session,
         )
         return json.dumps({
             "success": True,
@@ -1126,6 +1023,7 @@ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
         _post(
             f"/tabs/{session['tab_id']}/type",
             {"userId": session["user_id"], "ref": clean_ref, "text": text},
+            session=session,
         )
         from agent.display import (
             redact_browser_typed_text_for_display,
@@ -1165,6 +1063,7 @@ def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
         _post(
             f"/tabs/{session['tab_id']}/scroll",
             {"userId": session["user_id"], "direction": direction},
+            session=session,
         )
         return json.dumps({"success": True, "scrolled": direction})
     except Exception as e:
@@ -1181,6 +1080,7 @@ def camofox_back(task_id: Optional[str] = None) -> str:
         data = _post(
             f"/tabs/{session['tab_id']}/back",
             {"userId": session["user_id"]},
+            session=session,
         )
         return json.dumps({"success": True, "url": data.get("url", "")})
     except Exception as e:
@@ -1197,6 +1097,7 @@ def camofox_press(key: str, task_id: Optional[str] = None) -> str:
         _post(
             f"/tabs/{session['tab_id']}/press",
             {"userId": session["user_id"], "key": key},
+            session=session,
         )
         return json.dumps({"success": True, "pressed": key})
     except Exception as e:
@@ -1242,6 +1143,7 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
         data = _get(
             f"/tabs/{session['tab_id']}/snapshot",
             params={"userId": session["user_id"]},
+            session=session,
         )
         snapshot = data.get("snapshot", "")
         if not isinstance(snapshot, str):
@@ -1293,6 +1195,7 @@ def camofox_vision(question: str, annotate: bool = False,
         resp = _get_raw(
             f"/tabs/{session['tab_id']}/screenshot",
             params={"userId": session["user_id"]},
+            session=session,
         )
 
         # Save screenshot to cache
@@ -1314,6 +1217,7 @@ def camofox_vision(question: str, annotate: bool = False,
                 snap_data = _get(
                     f"/tabs/{session['tab_id']}/snapshot",
                     params={"userId": session["user_id"]},
+                    session=session,
                 )
                 snapshot = snap_data.get("snapshot", "")
                 if not isinstance(snapshot, str):
