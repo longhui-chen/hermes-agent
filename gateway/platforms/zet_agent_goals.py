@@ -1259,8 +1259,13 @@ class ZetGoalDriver:
             except Exception:
                 pass
             try:
+                # Clarify queues are keyed by the same profile-scoped
+                # session identity as ZetAgentAdapter's active turns. A
+                # bare sid here would make coder's outstanding card keep
+                # main's goal projection in waiting (or vice versa).
+                clarify_key = self.adapter._active_turn_key(sid)
                 with self.adapter._clarify_state_lock:
-                    if self.adapter._clarify_queues.get(sid):
+                    if self.adapter._clarify_queues.get(clarify_key):
                         return True
             except Exception:
                 pass

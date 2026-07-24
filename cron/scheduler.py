@@ -315,23 +315,18 @@ from cron.jobs import (
 SILENT_MARKER = "[SILENT]"
 
 # Canonical silence tokens recognized in cron output.  Cron's contract is
-# intentionally looser than the gateway's exact-whole-response rule: the cron
-# system prompt *instructs* the agent to emit "[SILENT]", and real agents often
-# bracket it with a short note or trailing newline.  We therefore suppress when
-# a marker is the entire response OR appears as its own first/last line — but
-# NOT when a token merely appears mid-sentence in a genuine report (e.g.
-# "I considered staying [SILENT] but here is the summary…" must deliver).
+# deliberately requires the whole final response to be a sentinel. Model text
+# is untrusted: a marker beside any substantive content must never suppress a
+# failure report or successful result.
 _CRON_SILENCE_TOKENS = frozenset({"[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"})
 
 
 def _is_cron_silence_response(text: str) -> bool:
     """Return True when a cron final response should suppress delivery.
 
-    Recognizes the bracketed ``[SILENT]`` sentinel (whole-response, first line,
-    or last line) plus the bracketless ``SILENT`` / ``NO_REPLY`` / ``NO REPLY``
-    variants the model emits when it drops the brackets (#51438, #46917).
-    Whitespace-trimmed and case-insensitive.  A token buried mid-sentence is
-    treated as real content and delivered.
+    Recognizes a whitespace-trimmed, case-insensitive response containing only
+    the bracketed or legacy bracketless sentinel. Any additional content is a
+    real result and must be delivered.
     """
     if not isinstance(text, str):
         return False
@@ -342,21 +337,7 @@ def _is_cron_silence_response(text: str) -> bool:
     def _is_token(line: str) -> bool:
         return " ".join(line.strip().upper().split()) in _CRON_SILENCE_TOKENS
 
-    # Whole response is exactly a token.
-    if _is_token(stripped):
-        return True
-    # Marker on its own first or last line (trailing/leading note on a
-    # separate line — e.g. "2 deals filtered\n\n[SILENT]").
-    lines = [ln for ln in stripped.splitlines() if ln.strip()]
-    if lines and (_is_token(lines[0]) or _is_token(lines[-1])):
-        return True
-    # Bracketed sentinel used as a same-line prefix — the documented cron
-    # pattern "[SILENT] No changes detected".  Restricted to the bracketed
-    # form so a bare word like "Silent retry succeeded" is NOT swallowed.
-    upper = stripped.upper()
-    if upper.startswith("[SILENT]"):
-        return True
-    return False
+    return _is_token(stripped)
 
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
@@ -2413,33 +2394,18 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     # (kind=cron_summary). Placed before the no_agent block so a calendar
     # job never trips the "no_agent requires a script" guard. Additive and
     # self-contained to stay a small diff over upstream cron.
-    schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
-    if (
-        job.get("source") == "calendar"
-        and job.get("no_agent") is True
-        and schedule.get("kind") == "once"
-    ):
+    if job.get("source") == "calendar":
+        from cron.calendar_delivery import quarantine_invalid_calendar_job
+        quarantine_invalid_calendar_job(job)
         now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
-        content = str(job.get("content") or job.get("name") or "").strip()
-        if not content:
-            logger.info("Job '%s' (calendar): empty content — silent run", job_id)
-            silent_doc = (
-                f"# Cron Job: {job_name}\n\n"
-                f"**Job ID:** {job_id}\n"
-                f"**Run Time:** {now_iso}\n"
-                f"**Mode:** calendar (notify-only)\n"
-                f"**Status:** silent (empty content)\n"
-            )
-            return True, silent_doc, SILENT_MARKER, None
-        doc = (
+        silent_doc = (
             f"# Cron Job: {job_name}\n\n"
             f"**Job ID:** {job_id}\n"
             f"**Run Time:** {now_iso}\n"
-            f"**Mode:** calendar (notify-only)\n\n"
-            f"---\n\n"
-            f"{content}\n"
+            f"**Mode:** calendar (quarantined generic path)\n"
+            f"**Status:** silent\n"
         )
-        return True, doc, content, None
+        return True, silent_doc, SILENT_MARKER, None
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -3293,7 +3259,14 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+def run_one_job(
+    job: dict,
+    *,
+    adapters=None,
+    loop=None,
+    verbose: bool = False,
+    triggered_at: Optional[str] = None,
+) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
     This is the shared firing body extracted from ``tick``'s per-job closure so
@@ -3308,6 +3281,44 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    from cron.calendar_delivery import (
+        is_invalid_calendar_job,
+        is_managed_calendar_event_alert,
+        quarantine_invalid_calendar_job,
+        run_calendar_delivery,
+    )
+    if is_managed_calendar_event_alert(job):
+        try:
+            result = run_calendar_delivery(job)
+            terminal = bool(result.get("terminal"))
+            if terminal:
+                # Planner owns the delivery saga, but the built-in ticker owns
+                # this local one-shot row. Persist its terminal state so the
+                # same due job cannot re-enter Planner on every 60s tick. Import
+                # the store primitive directly: zet_agent patches this module's
+                # generic mark_job_run symbol to emit a visible cron-summary,
+                # while the calendar saga has already persisted its one hidden,
+                # llm_visible=0 notification through SessionDB.
+                from cron.jobs import mark_job_run as mark_calendar_job_run
+                mark_calendar_job_run(
+                    job["id"],
+                    True,
+                    scheduled_at=triggered_at or _hermes_now().isoformat(),
+                )
+            return terminal
+        except Exception as exc:
+            logger.warning("Calendar delivery %s remains recoverable: %s", job.get("id"), exc)
+            return False
+    if is_invalid_calendar_job(job):
+        quarantine_invalid_calendar_job(job)
+        logger.warning("Calendar job %s quarantined: invalid event-alert contract", job.get("id"))
+        return True
+
+    # Direct callers are "run now" by default. Due schedulers must pass their
+    # explicit plan/claim instant; never infer it from next_run_at because that
+    # may describe tomorrow's future occurrence.
+    occurrence_triggered_at = triggered_at or _hermes_now().isoformat()
+    output_filename: Optional[str] = None
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -3326,6 +3337,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         success, output, final_response, error = run_job(job)
 
         output_file = save_job_output(job["id"], output)
+        output_filename = os.path.basename(str(output_file))
         if verbose:
             logger.info("Output saved to: %s", output_file)
 
@@ -3362,12 +3374,25 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-        mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        mark_job_run(
+            job["id"],
+            success,
+            error,
+            delivery_error=delivery_error,
+            scheduled_at=occurrence_triggered_at,
+            output_filename=output_filename,
+        )
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
-        mark_job_run(job["id"], False, str(e))
+        mark_job_run(
+            job["id"],
+            False,
+            str(e),
+            scheduled_at=occurrence_triggered_at,
+            output_filename=output_filename,
+        )
         return False
 
 
@@ -3436,8 +3461,10 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
         # For parallel jobs that are already running, advance_next_run keeps
         # bumping next_run_at forward so the grace window never expires.
         # mark_job_run() overwrites next_run_at on completion.
+        from cron.calendar_delivery import is_managed_calendar_event_alert
         for job in due_jobs:
-            advance_next_run(job["id"])
+            if not is_managed_calendar_event_alert(job):
+                advance_next_run(job["id"])
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
@@ -3471,7 +3498,13 @@ def tick(verbose: bool = True, adapters=None, loop=None, sync: bool = True) -> i
             module-level ``run_one_job`` so ``tick`` and external providers
             (Chronos ``fire_due``) use the identical execute→save→deliver→mark
             body."""
-            return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
+            return run_one_job(
+                job,
+                adapters=adapters,
+                loop=loop,
+                verbose=verbose,
+                triggered_at=job.get("_occurrence_triggered_at"),
+            )
 
         # Partition due jobs: those with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so

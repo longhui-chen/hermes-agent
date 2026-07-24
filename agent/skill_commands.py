@@ -135,9 +135,15 @@ def _resolve_skill_commands_platform() -> Optional[str]:
     try:
         from gateway.session_context import get_session_env
 
+        # ZET fork: the per-turn session ContextVar outranks the process-wide
+        # HERMES_PLATFORM env. A bound context is strictly more specific than
+        # a global pin, and env-first would let one platform's env leak into
+        # another platform's turn in a co-hosted gateway process (and defeat
+        # zet_agent's expansion-window binding). Unbound contexts (CLI, cron
+        # scheduler) still fall back to the env exactly as before.
         resolved_platform = (
-            os.getenv("HERMES_PLATFORM")
-            or get_session_env("HERMES_SESSION_PLATFORM")
+            get_session_env("HERMES_SESSION_PLATFORM")
+            or os.getenv("HERMES_PLATFORM")
         )
     except Exception:
         resolved_platform = os.getenv("HERMES_PLATFORM")

@@ -7,7 +7,7 @@ last_run_at stayed null forever. Now action='run' claims the job (at-most-once,
 blocking a concurrent tick) and fires it inline via the shared run_one_job body.
 """
 import json
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from tools.cronjob_tools import cronjob, _execute_job_now
 
@@ -29,8 +29,8 @@ class TestCronjobRunExecutesImmediately:
         assert out["success"] is True
         assert out["job"]["executed"] is True
         assert out["job"]["execution_success"] is True
-        m_claim.assert_called_once_with("job-run-1")   # at-most-once claim taken
-        m_run.assert_called_once()                       # fired via the shared body
+        m_claim.assert_called_once_with("job-run-1", triggered_at=ANY)
+        m_run.assert_called_once_with(_JOB, triggered_at=ANY)
 
     def test_run_skips_when_claim_lost(self):
         """If the scheduler already holds the fire claim, do NOT double-run."""
@@ -79,3 +79,4 @@ class TestCronjobRunExecutesImmediately:
         assert res["success"] is False
         assert "boom" in res["error"]
         m_mark.assert_called_once()
+        assert m_mark.call_args.kwargs["scheduled_at"]

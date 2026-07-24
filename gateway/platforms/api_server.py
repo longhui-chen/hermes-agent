@@ -43,6 +43,7 @@ import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -163,6 +164,51 @@ def _extract_plan_ack(body: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _extract_plan_auto_execute(body: Dict[str, Any]) -> Optional[bool]:
+    """Extract the App's per-turn Plan auto-execute override from metadata.
+
+    Returns None when the App did not send the field OR sent a value that is not
+    a parseable boolean (null / "" / unknown string), so the caller falls back to
+    the env kill-switch / default ladder (legacy manual). Only an explicit bool-ish
+    value counts as a capability opt-in: True auto-executes the plan in the same
+    turn, False keeps the legacy confirmation card. Never let an unparseable value
+    silently enable auto-execute — that would bypass the client capability gate.
+    """
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    if "plan_auto_execute" not in metadata and "planAutoExecute" not in metadata:
+        return None
+    raw = metadata.get("plan_auto_execute", metadata.get("planAutoExecute"))
+    # Probe with both defaults: a real bool-ish value ignores the default and
+    # yields the same result twice; an unparseable value yields different results,
+    # so we return None (fall back) instead of promoting it to auto-execute.
+    as_true = _coerce_request_bool(raw, default=True)
+    as_false = _coerce_request_bool(raw, default=False)
+    if as_true == as_false:
+        return as_true
+    return None
+
+
+def _resolve_plan_auto_execute(meta_override: Optional[bool]) -> bool:
+    """Resolve the effective App Plan-mode auto-execute flag for one turn.
+
+    Precedence: per-turn metadata override (App capability opt-in) > env
+    (``HERMES_ZET_AGENT_PLAN_AUTO_EXECUTE``) > default ``False`` (legacy manual
+    confirm card). Default is manual so older App / local-server builds that do
+    NOT send ``plan_auto_execute`` never auto-execute a plan's side effects
+    before a client that can render the confirm gate — auto-execute requires an
+    explicit client capability opt-in (HR4 capability negotiation).
+    """
+    if meta_override is not None:
+        return meta_override
+    raw = os.environ.get("HERMES_ZET_AGENT_PLAN_AUTO_EXECUTE")
+    if raw is not None and raw.strip() != "":
+        from utils import is_truthy_value
+        return is_truthy_value(raw, default=False)
+    return False
+
+
 def _extract_turn_id(body: Dict[str, Any]) -> str:
     """Extract metadata.turn_id (zettlab local-server's per-turn correlation
     token) so the NAS agent-search fallback can echo it back as the
@@ -178,6 +224,26 @@ def _extract_turn_id(body: Dict[str, Any]) -> str:
     if not tid or any(c.isspace() or ord(c) < 0x20 for c in tid):
         return ""
     return tid
+
+
+def _extract_skill_slug(body: Dict[str, Any]) -> str:
+    """Extract metadata.skill_slug — the App quick-pick's EXPLICIT skill
+    invocation signal (ZET fork).
+
+    The client owns the text↔selection UX (it drops the field when the user
+    edits the inserted "/<slug>" token away); the server NEVER sniffs message
+    text for slash commands — in-band signaling is ambiguous ("/<skill> 是什么"
+    would fire the skill) and this explicit field is the only trigger.
+    Absent/malformed → no skill. A leading slash is tolerated and stripped so
+    the client may send either "deep-research" or "/deep-research"."""
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("skill_slug", metadata.get("skillSlug", ""))
+    slug = str(raw or "").strip().lstrip("/")
+    if not slug or any(c.isspace() or ord(c) < 0x20 for c in slug):
+        return ""
+    return slug
 
 
 def _normalize_chat_content(
@@ -1017,6 +1083,7 @@ try:
         pause_job as _cron_pause,
         resume_job as _cron_resume,
         trigger_job as _cron_trigger,
+        job_occurrence_projection as _cron_occurrence_projection,
     )
     _CRON_AVAILABLE = True
 except ImportError:
@@ -1028,6 +1095,7 @@ except ImportError:
     _cron_pause = None
     _cron_resume = None
     _cron_trigger = None
+    _cron_occurrence_projection = None
 
 
 def _notify_cron_provider_jobs_changed() -> None:
@@ -1534,6 +1602,7 @@ class APIServerAdapter(BasePlatformAdapter):
         router.add_post("/p/{profile}/api/sessions/{session_id}/chat/stream", self._profile_handler(self._handle_session_chat_stream))
 
         router.add_get("/p/{profile}/api/jobs", self._profile_handler(self._handle_list_jobs))
+        router.add_get("/p/{profile}/api/jobs/occurrences", self._profile_handler(self._handle_list_job_occurrences))
         router.add_post("/p/{profile}/api/jobs", self._profile_handler(self._handle_create_job))
         router.add_get("/p/{profile}/api/jobs/{job_id}", self._profile_handler(self._handle_get_job))
         router.add_patch("/p/{profile}/api/jobs/{job_id}", self._profile_handler(self._handle_update_job))
@@ -1543,6 +1612,26 @@ class APIServerAdapter(BasePlatformAdapter):
         router.add_post("/p/{profile}/api/jobs/{job_id}/run", self._profile_handler(self._handle_run_job))
         if _CRON_AVAILABLE:
             router.add_post("/p/{profile}/api/cron/fire", self._profile_handler(self._handle_cron_fire))
+            router.add_get("/p/{profile}/internal/v1/cron/capabilities", self._profile_handler(self._handle_cron_capabilities))
+            router.add_post("/p/{profile}/internal/v1/cron/jobs/{job_id}/reconcile", self._profile_handler(self._handle_calendar_job_reconcile))
+            router.add_post("/p/{profile}/internal/v1/cron/calendar-recovery-arms/{dedupe_key}/reconcile", self._profile_handler(self._handle_calendar_recovery_reconcile))
+
+    def _register_unprefixed_cron_control_routes(
+        self,
+        router: "web.UrlDispatcher",
+    ) -> None:
+        """Register the cron control plane used by per-profile processes.
+
+        ``zettlab-local-server`` addresses a dedicated profile process without
+        a ``/p/<profile>`` prefix.  Keep these routes in one helper so the base
+        API server and ``zet_agent`` adapter cannot drift apart again.
+        """
+        if not _CRON_AVAILABLE:
+            return
+        router.add_post("/api/cron/fire", self._handle_cron_fire)
+        router.add_get("/internal/v1/cron/capabilities", self._handle_cron_capabilities)
+        router.add_post("/internal/v1/cron/jobs/{job_id}/reconcile", self._handle_calendar_job_reconcile)
+        router.add_post("/internal/v1/cron/calendar-recovery-arms/{dedupe_key}/reconcile", self._handle_calendar_recovery_reconcile)
 
     # ------------------------------------------------------------------
     # Agent creation helper
@@ -1611,6 +1700,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
         agent_request_overrides = dict(request_overrides or {})
         disable_tools = agent_request_overrides.pop("tool_choice", None) == "none"
+        # Drop the zet_agent-only Plan auto-execute hint if it reached the base
+        # (non-zet_agent) adapter — it is consumed by zet_agent._create_agent and
+        # must never leak into the AIAgent / LLM request body.
+        agent_request_overrides.pop("_zet_plan_auto_execute", None)
 
         agent = AIAgent(
             model=model,
@@ -2375,6 +2468,37 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
 
+    async def _expand_inbound_skill_invocation(
+        self,
+        user_message: Any,
+        skill_slug: str,
+        session_id: Optional[str] = None,
+        on_settled: Optional[Any] = None,
+    ) -> Any:
+        """Platform hook: expand an EXPLICITLY requested skill (by slug) into
+        the full skill payload.
+
+        Triggered only when the request carried ``metadata.skill_slug`` (the
+        App quick-pick's invocation signal) — the message text is never
+        sniffed for slash commands. Base implementation is a no-op so plain
+        api_server behavior is unchanged; the zet_agent subclass overrides it
+        for CLI-slash parity. Async so that override can push the blocking
+        skill-directory scan/load off the event loop (it runs inside the
+        request handler, before the agent's executor thread exists).
+        ``session_id`` is the resolved chat session — the override forwards
+        it as the skill builder's task_id so ``${HERMES_SESSION_ID}``
+        templates resolve against the real session. ``on_settled`` (when
+        given) is invoked EXACTLY ONCE on the event loop when the expansion
+        work has truly finished — including after the awaiting caller was
+        cancelled while a worker thread was still running. Callers use it to
+        hold resource accounting (e.g. the profile active-run count) open for
+        exactly as long as expansion side effects can still occur. See
+        ZetAgent._expand_inbound_skill_invocation.
+        """
+        if on_settled is not None:
+            on_settled()
+        return user_message
+
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
         auth_err = self._check_auth(request)
@@ -2402,6 +2526,7 @@ class APIServerAdapter(BasePlatformAdapter):
         stream = _coerce_request_bool(body.get("stream"), default=False)
         response_mode = _extract_response_mode(body)
         plan_ack = _extract_plan_ack(body)
+        plan_auto_execute = _extract_plan_auto_execute(body)
         turn_id = _extract_turn_id(body)
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
@@ -2507,6 +2632,32 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
+        # Explicit skill invocation (zet_agent hook; base no-op): triggered
+        # ONLY by metadata.skill_slug — never by sniffing the message text.
+        # The expansion runs LATE on purpose; the placement is load-bearing:
+        #   - AFTER session_id is final, so skill templates resolve
+        #     ${HERMES_SESSION_ID} against the real session (session_id is
+        #     forwarded as the builder's task_id), matching the CLI slash;
+        #   - INSIDE the Idempotency-Key compute for non-streaming, so a
+        #     retried/concurrent key reuses the first agent result without
+        #     re-running expansion side effects (skills.inline_shell=true
+        #     executes SKILL.md preprocessing at build time);
+        #   - SKIPPED under tool_choice="none": that is an API-level "no
+        #     tools this turn" boundary (request_overrides strips every agent
+        #     tool) and expansion injects tool-driving instructions — the
+        #     message passes through unexpanded instead.
+        skill_slug = _extract_skill_slug(body)
+
+        async def _expanded_user_message(on_settled=None):
+            if not skill_slug or body.get("tool_choice") == "none":
+                if on_settled is not None:
+                    on_settled()
+                return user_message
+            return await self._expand_inbound_skill_invocation(
+                user_message, skill_slug, session_id=session_id,
+                on_settled=on_settled,
+            )
+
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
@@ -2607,9 +2758,27 @@ class APIServerAdapter(BasePlatformAdapter):
             # The structured callbacks are strictly richer (they carry the
             # tool_call id), so they own the chat-completions SSE channel.
             agent_ref = [None]
+            # Streaming has no idempotency layer — expand once, right before
+            # the run (see _expanded_user_message for the placement contract).
+            # The profile active-run count opens FIRST so /v1/profile/unload
+            # cannot tear the profile down under an in-flight expansion.
             profile_run_key = self._begin_profile_chat_run(
                 request.get("hermes_profile_home")
             )
+            # 同非流式:展开自持一份计数,worker 真正结束才经 on_settled 释放。
+            expansion_run_key = self._begin_profile_chat_run(
+                request.get("hermes_profile_home")
+            )
+            try:
+                user_message = await _expanded_user_message(
+                    on_settled=lambda: self._end_profile_chat_run(expansion_run_key)
+                )
+            except BaseException:
+                # The stream path ends the run in the agent task's
+                # done-callback; a failure before that task exists must not
+                # leak the active-run count (unload would then hang/refuse).
+                self._end_profile_chat_run(profile_run_key)
+                raise
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
@@ -2622,6 +2791,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 response_mode=response_mode,
                 plan_ack=plan_ack,
+                plan_auto_execute=plan_auto_execute,
                 turn_id=turn_id,
                 request_overrides=request_overrides or None,
             ))
@@ -2640,18 +2810,37 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
         async def _compute_completion():
+            # The profile active-run count opens BEFORE expansion: /v1/profile
+            # /unload treats zero active runs as idle, and an expansion still
+            # in flight (scan/load/inline_shell) must not let the profile be
+            # torn down under it. Expansion stays INSIDE the idempotency-
+            # protected compute: an Idempotency-Key hit (or a concurrent
+            # duplicate awaiting the first flight) must reuse the cached
+            # result without re-running expansion side effects.
             profile_run_key = self._begin_profile_chat_run(
                 request.get("hermes_profile_home")
             )
+            # Expansion holds its OWN active-run count, released via
+            # on_settled when the worker truly finishes: a cancelled await
+            # ends the turn's count in the finally below, but a still-running
+            # scan/load/inline_shell worker must keep the profile pinned so
+            # /v1/profile/unload cannot tear the runtime down under it.
+            expansion_run_key = self._begin_profile_chat_run(
+                request.get("hermes_profile_home")
+            )
             try:
+                expanded_message = await _expanded_user_message(
+                    on_settled=lambda: self._end_profile_chat_run(expansion_run_key)
+                )
                 return await self._run_agent(
-                    user_message=user_message,
+                    user_message=expanded_message,
                     conversation_history=history,
                     ephemeral_system_prompt=system_prompt,
                     session_id=session_id,
                     gateway_session_key=gateway_session_key,
                     response_mode=response_mode,
                     plan_ack=plan_ack,
+                    plan_auto_execute=plan_auto_execute,
                     turn_id=turn_id,
                     request_overrides=request_overrides or None,
                 )
@@ -3891,6 +4080,7 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
+    _CALENDAR_JOB_ID_RE = __import__("re").compile(r"cal-alert-[a-f0-9]{32}")
     # Allowed fields for update — prevents clients injecting arbitrary keys
     _UPDATE_ALLOWED_FIELDS = {
         "name", "schedule", "prompt", "deliver", "skills", "skill",
@@ -3919,6 +4109,20 @@ class APIServerAdapter(BasePlatformAdapter):
             )
             return job_id, web.json_response(
                 {"error": "Invalid job ID format"}, status=400,
+            )
+        return job_id, None
+
+    def _check_calendar_job_id(self, request: "web.Request") -> tuple:
+        """Accept only planner-generated calendar job identifiers."""
+        job_id = request.match_info["job_id"]
+        if not self._CALENDAR_JOB_ID_RE.fullmatch(job_id):
+            logger.warning(
+                "Calendar reconcile rejected invalid job ID %r: %s",
+                job_id,
+                self._request_audit_log_suffix(request),
+            )
+            return job_id, web.json_response(
+                {"error": "Invalid calendar job ID format"}, status=400,
             )
         return job_id, None
 
@@ -4028,6 +4232,62 @@ class APIServerAdapter(BasePlatformAdapter):
             include_disabled = request.query.get("include_disabled", "").lower() in {"true", "1"}
             jobs = _cron_list(include_disabled=include_disabled)
             return web.json_response({"jobs": jobs})
+        except Exception as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+
+    async def _handle_list_job_occurrences(self, request: "web.Request") -> "web.Response":
+        """GET /api/jobs/occurrences — real runs plus bounded future previews."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        cron_err = self._check_jobs_available()
+        if cron_err:
+            return cron_err
+        try:
+            raw_from = request.query.get("from", "")
+            raw_to = request.query.get("to", "")
+            if len(raw_from) > 128 or len(raw_to) > 128:
+                raise ValueError("occurrence bounds are too long")
+            from_at = datetime.fromisoformat(raw_from.replace("Z", "+00:00"))
+            to_at = datetime.fromisoformat(raw_to.replace("Z", "+00:00"))
+            if from_at.tzinfo is None or to_at.tzinfo is None:
+                raise ValueError("occurrence bounds must include a timezone")
+            if to_at <= from_at:
+                raise ValueError("occurrence 'to' must be after 'from'")
+            if to_at.astimezone(timezone.utc) - from_at.astimezone(timezone.utc) > timedelta(days=370):
+                raise ValueError("occurrence window must not exceed 370 days")
+            try:
+                limit = max(1, min(int(request.query.get("limit", "2000")), 2000))
+            except ValueError:
+                raise ValueError("occurrence limit must be an integer")
+            jobs = _cron_list(include_disabled=True)
+            requested_job_ids = request.query.getall("job_id", [])
+            if len(requested_job_ids) > 256:
+                raise ValueError("too many occurrence job filters")
+            if requested_job_ids:
+                selected_ids = set()
+                for job_id in requested_job_ids:
+                    if (
+                        not isinstance(job_id, str)
+                        or not job_id
+                        or len(job_id) > 256
+                        or job_id in {".", ".."}
+                        or "/" in job_id
+                        or "\\" in job_id
+                    ):
+                        raise ValueError("invalid occurrence job filter")
+                    selected_ids.add(job_id)
+                jobs = [job for job in jobs if job.get("id") in selected_ids]
+            projection = await asyncio.to_thread(
+                _cron_occurrence_projection,
+                jobs,
+                from_at,
+                to_at,
+                limit=limit,
+            )
+            return web.json_response({**projection, "limit": limit})
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -4287,11 +4547,75 @@ class APIServerAdapter(BasePlatformAdapter):
         from cron.scheduler_provider import resolve_cron_scheduler
         provider = resolve_cron_scheduler()
 
+        from cron.calendar_delivery import (
+            begin_external_calendar_fire,
+            is_invalid_calendar_job,
+            is_managed_calendar_event_alert,
+            quarantine_invalid_calendar_job,
+            run_external_calendar_delivery,
+        )
+        from cron.jobs import get_job_raw
+        # Managed calendar validation is a wire-contract check.  In
+        # particular, prompt:null must not be normalized to an empty string.
+        job = get_job_raw(job_id)
+        provider_fire_id = str(
+            (body or {}).get("provider_fire_id")
+            or (body or {}).get("fire_id")
+            or (body or {}).get("dedupe_key")
+            or request.headers.get("X-Chronos-Fire-ID", "")
+            or claims.get("fire_id")
+            or claims.get("jti")
+            or ""
+        )
+        if len(provider_fire_id) > 256:
+            return web.json_response({"error": "invalid fire id"}, status=400)
+        if is_managed_calendar_event_alert(job):
+            capabilities = provider.calendar_capabilities()
+            try:
+                begin = await asyncio.to_thread(
+                    begin_external_calendar_fire,
+                    job,
+                    provider_name=str(capabilities.get("provider") or provider.name),
+                    provider_contract_version=int(capabilities.get("contract_version") or 0),
+                    provider_fire_id=provider_fire_id,
+                )
+            except Exception as exc:
+                logger.warning("calendar external fire preflight remains retryable for %s: %s", job_id, exc)
+                return web.json_response({"error": "calendar delivery preflight required"}, status=503,
+                                         headers={"Retry-After": "5"})
+            if begin.get("state") in {"fired", "expired", "cancelled", "superseded"} or begin.get("attempt_replayed") is True:
+                return web.json_response({"status": "accepted", "job_id": job_id, **begin}, status=202)
+            task = asyncio.create_task(asyncio.to_thread(run_external_calendar_delivery, job, begin))
+            try:
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
+            except (TypeError, AttributeError):
+                pass
+            return web.json_response({"status": "accepted", "job_id": job_id,
+                                      "attempt_sequence": begin.get("attempt_sequence"),
+                                      "dedupe_key": begin.get("dedupe_key")}, status=202)
+        if is_invalid_calendar_job(job):
+            quarantine_invalid_calendar_job(job)
+            return web.json_response({"error": "invalid calendar job contract"}, status=422)
+
+        from cron.jobs import normalize_external_fire_at
+        if (body or {}).get("fire_at") is None:
+            return web.json_response({"error": "missing fire_at"}, status=400)
+        try:
+            ordinary_fire_at = normalize_external_fire_at((body or {}).get("fire_at"))
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
         loop = asyncio.get_running_loop()
         # Fire in the background (202 immediately). fire_due claims via the
         # store CAS, so a retry while this is in flight is de-duped.
         task = asyncio.create_task(
-            asyncio.to_thread(provider.fire_due, job_id, adapters=None, loop=loop)
+            asyncio.to_thread(
+                provider.fire_due,
+                job_id,
+                adapters=None,
+                loop=loop,
+                fire_at=ordinary_fire_at,
+            )
         )
         try:
             self._background_tasks.add(task)
@@ -4300,6 +4624,68 @@ class APIServerAdapter(BasePlatformAdapter):
             pass
 
         return web.json_response({"status": "accepted", "job_id": job_id}, status=202)
+
+    async def _handle_cron_capabilities(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        from cron.scheduler_provider import resolve_cron_scheduler
+        return web.json_response(resolve_cron_scheduler().calendar_capabilities())
+
+    async def _handle_calendar_job_reconcile(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        job_id, id_err = self._check_calendar_job_id(request)
+        if id_err:
+            return id_err
+        if request.content_length is not None and request.content_length > 16 * 1024:
+            return web.json_response({"error": "request too large"}, status=413)
+        try:
+            body = await request.json()
+            action = str((body or {}).get("expected_action") or "")
+            revision = int((body or {}).get("projection_revision") or 0)
+            if action not in {"upsert", "delete"} or revision <= 0:
+                raise ValueError("invalid reconcile contract")
+            from cron.scheduler_provider import resolve_cron_scheduler
+            result = await asyncio.to_thread(
+                resolve_cron_scheduler().reconcile_calendar_job,
+                job_id, action, revision,
+            )
+            return web.json_response(result)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            logger.warning("calendar provider reconcile failed for %s: %s", job_id, exc)
+            return web.json_response({"error": "provider reconcile failed"}, status=503)
+
+    async def _handle_calendar_recovery_reconcile(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        dedupe_key = str(request.match_info.get("dedupe_key") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", dedupe_key):
+            return web.json_response({"error": "invalid recovery dedupe key"}, status=400)
+        if request.content_length is not None and request.content_length > 16 * 1024:
+            return web.json_response({"error": "request too large"}, status=413)
+        try:
+            body = await request.json()
+            if not isinstance(body, dict) or body.get("dedupe_key") != dedupe_key:
+                raise ValueError("invalid recovery contract")
+            from cron.scheduler_provider import (
+                normalize_calendar_recovery_reconcile_result,
+                resolve_cron_scheduler,
+            )
+            result = await asyncio.to_thread(
+                resolve_cron_scheduler().reconcile_calendar_recovery_arm,
+                body,
+            )
+            return web.json_response(normalize_calendar_recovery_reconcile_result(result))
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            logger.warning("calendar recovery reconcile failed for %s: %s", dedupe_key, exc)
+            return web.json_response({"error": "provider recovery reconcile failed"}, status=503)
 
 
     # ------------------------------------------------------------------
@@ -4520,6 +4906,7 @@ class APIServerAdapter(BasePlatformAdapter):
         gateway_session_key: Optional[str] = None,
         response_mode: Optional[str] = None,
         plan_ack: Optional[Dict[str, Any]] = None,
+        plan_auto_execute: Optional[bool] = None,
         turn_id: Optional[str] = None,
         request_overrides: Optional[Dict[str, Any]] = None,
     ) -> tuple:
@@ -4549,6 +4936,14 @@ class APIServerAdapter(BasePlatformAdapter):
             # clear it with the session vars on reused executor threads.
             set_zettlab_turn_id(turn_id or "")
             try:
+                # Resolve the auto-execute flag once up front so the capability-aware
+                # Plan-First system-prompt section (built inside _create_agent) and
+                # the turn-level flag agree. Thread it through request_overrides under
+                # an internal key that zet_agent._create_agent pops (and the base
+                # adapter drops) so it never leaks into the LLM request body.
+                resolved_plan_auto_execute = _resolve_plan_auto_execute(plan_auto_execute)
+                create_overrides = dict(request_overrides or {})
+                create_overrides["_zet_plan_auto_execute"] = resolved_plan_auto_execute
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
@@ -4557,12 +4952,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_start_callback=tool_start_callback,
                     tool_complete_callback=tool_complete_callback,
                     gateway_session_key=gateway_session_key,
-                    request_overrides=request_overrides,
+                    request_overrides=create_overrides,
                 )
                 if agent_ref is not None:
                     agent_ref[0] = agent
                 agent._zet_agent_response_mode = response_mode or ""
                 agent._zet_agent_plan_ack = dict(plan_ack or {})
+                agent._zet_agent_plan_auto_execute = resolved_plan_auto_execute
                 effective_task_id = session_id or str(uuid.uuid4())
                 result = agent.run_conversation(
                     user_message=user_message,
@@ -5287,6 +5683,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_delete("/v1/responses/{response_id}", self._handle_delete_response)
             # Cron jobs management API
             self._app.router.add_get("/api/jobs", self._handle_list_jobs)
+            self._app.router.add_get("/api/jobs/occurrences", self._handle_list_job_occurrences)
             self._app.router.add_post("/api/jobs", self._handle_create_job)
             self._app.router.add_get("/api/jobs/{job_id}", self._handle_get_job)
             self._app.router.add_patch("/api/jobs/{job_id}", self._handle_update_job)
@@ -5298,8 +5695,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated by a
             # NAS-minted JWT (NOT API_SERVER_KEY), so it has its own auth path.
-            if _CRON_AVAILABLE:
-                self._app.router.add_post("/api/cron/fire", self._handle_cron_fire)
+            self._register_unprefixed_cron_control_routes(self._app.router)
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)

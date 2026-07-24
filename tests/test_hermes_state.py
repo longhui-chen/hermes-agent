@@ -730,6 +730,15 @@ class TestMessageStorage:
         assert db.delete_message("s2", mid) is False
         assert len(db.get_messages("s1")) == 1
 
+    def test_update_message_content_is_scoped_to_session_and_row(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.create_session(session_id="s2", source="cli")
+        message_id = db.append_message("s1", role="assistant", content="before")
+
+        assert db.update_message_content("s2", message_id, "wrong session") is False
+        assert db.update_message_content("s1", message_id, "after") is True
+        assert db.get_messages("s1")[0]["content"] == "after"
+
     def test_observed_flag_round_trips_for_gateway_replay(self, db):
         db.create_session(session_id="s1", source="telegram:-100")
         db.append_message(
@@ -897,6 +906,17 @@ class TestMessageStorage:
         assert len(msgs) == 2
         assert msgs[0]["content"] == content
         assert msgs[1]["content"] == "I see a screenshot."
+
+    def test_replace_messages_preserves_hidden_model_visibility(self, db):
+        db.create_session(session_id="s1", source="api_server")
+        db.replace_messages(
+            "s1",
+            [{"role": "assistant", "content": "display only", "llm_visible": 0}],
+        )
+
+        stored = db.get_messages("s1")
+        assert stored[0]["llm_visible"] == 0
+        assert db.get_messages_for_model("s1") == []
 
     def test_get_messages_as_conversation(self, db):
         db.create_session(session_id="s1", source="cli")

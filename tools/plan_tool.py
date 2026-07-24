@@ -45,6 +45,7 @@ def present_plan(
     title: str,
     groups: List[Dict[str, Any]],
     callback: Optional[Callable] = None,
+    auto_execute: bool = False,
 ) -> str:
     """
     Present a structured execution plan to the user.
@@ -92,11 +93,20 @@ def present_plan(
         })
 
     if callback is not None:
-        # zet_agent：推 hermes.plan SSE → App 渲染结构化确认卡。
+        # zet_agent：推 hermes.plan SSE → App 渲染结构化计划卡。
         try:
             callback(title, cleaned_groups)
         except Exception:
             pass
+        if auto_execute:
+            # App plan 模式且开启自动执行：计划卡只读展示，agent 在同一 turn 直接
+            # 继续执行，不再等用户点确认（manual 老路径见下方 return，完整保留）。
+            return (
+                "Plan presented to the user's App as a read-only card. "
+                "Auto-execute is enabled: start carrying out the plan now in "
+                "this same turn. Do NOT ask the user to confirm or say you are "
+                "waiting — just proceed, and track progress with the `todo` tool."
+            )
         return (
             "Plan presented to user. "
             "Stop and wait for the user's confirmation before executing."
@@ -192,6 +202,7 @@ registry.register(
         title=args.get("title", ""),
         groups=args.get("groups", []),
         callback=kw.get("callback"),
+        auto_execute=kw.get("auto_execute", False),
     ),
     check_fn=check_plan_requirements,
     emoji="📋",

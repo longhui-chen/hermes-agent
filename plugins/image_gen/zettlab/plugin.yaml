@@ -1,0 +1,5 @@
+name: zettlab
+version: 1.0.0
+description: "Zettlab image generation backend via local-server ai-proxy and ai-gateway media generation jobs."
+author: Zettlab
+kind: backend

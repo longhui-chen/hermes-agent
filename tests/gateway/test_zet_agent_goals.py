@@ -53,6 +53,9 @@ class FakeAdapter:
     def _check_auth(self, request):
         return None
 
+    def _active_turn_key(self, session_id):
+        return f"test-home|{session_id}"
+
 
 @pytest.fixture
 def driver(hermes_home):
@@ -1127,7 +1130,7 @@ class TestInteractionResolvedGuards:
         reports.clear()
 
         # 会话里还有一张 clarify 卡片在等。
-        driver.adapter._clarify_queues[SID] = [object()]
+        driver.adapter._clarify_queues[driver.adapter._active_turn_key(SID)] = [object()]
         driver.on_interaction_resolved(SID)
 
         assert driver._interaction_flag_set(SID), "还有卡片挂着时不得清等待标记"

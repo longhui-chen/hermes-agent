@@ -173,8 +173,13 @@ def _zet_agent_plan_mode_block_message(agent, function_name: str, function_args:
 
     if (
         bool(getattr(agent, "_zet_agent_plan_mode_active", False))
+        and not bool(getattr(agent, "_zet_agent_plan_presented", False))
         and function_name not in {"clarify", "present_plan"}
     ):
+        # Only gate BEFORE the plan is presented. Once present_plan fires,
+        # auto-execute mode keeps the turn running and must be allowed to call
+        # real tools; manual mode has already ended the turn by then, so this
+        # relaxation never exposes side-effect tools before the plan is shown.
         return (
             "This Zettlab App turn is in Plan mode. Only `clarify` and "
             "`present_plan` are allowed until the user reviews the plan. "
@@ -1345,8 +1350,21 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 title=function_args.get("title", ""),
                 groups=function_args.get("groups", []),
                 callback=getattr(agent, "plan_emit_callback", None),
+                auto_execute=bool(getattr(agent, "_zet_agent_plan_auto_execute", False)),
             )
-            agent._zet_agent_plan_presented = True
+            # 只有计划成功呈现（有效 title、已 emit 卡片）才标记 presented；坏参数（如空
+            # title）会返回 error 且没 emit 卡片，此时保持 Plan gate 不放开真实工具，逼
+            # 模型重试 present_plan（否则弱模型一次坏参数就可能在用户没看到任何计划卡时
+            # 执行 write_file / terminal 副作用）。
+            _plan_presented_ok = True
+            try:
+                _pr = json.loads(function_result)
+                if isinstance(_pr, dict) and _pr.get("error"):
+                    _plan_presented_ok = False
+            except (ValueError, TypeError):
+                _plan_presented_ok = True
+            if _plan_presented_ok:
+                agent._zet_agent_plan_presented = True
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('present_plan', function_args, tool_duration, result=function_result)}")

@@ -391,6 +391,9 @@ class CLIAgentSetupMixin:
                 notice_callback=self._on_notice,
                 notice_clear_callback=self._on_notice_clear,
             )
+            self.agent._supports_followup_turns = not bool(
+                getattr(self, "_single_query_mode", False)
+            )
             # Store reference for atexit memory provider shutdown.
             # NOTE: this MUST write to the ``cli`` module's global, not a
             # local module global. ``_run_cleanup`` (in cli.py) reads
