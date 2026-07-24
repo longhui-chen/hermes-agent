@@ -156,6 +156,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _DEFAULT_TIMEOUT = 30  # fallback when config is unreadable
+_TAB_CREATION_TIMEOUT_FLOOR = 60  # managed Camofox may need a cold start
 _SNAPSHOT_MAX_CHARS = 80_000  # camofox paginates at this limit
 _vnc_url: Optional[str] = None  # single-profile cache from /health response
 _vnc_url_checked = False  # only probe once per single-profile process
@@ -599,7 +600,11 @@ def _ensure_tab(task_id: Optional[str], url: Optional[str] = None) -> Dict[str, 
         }
         if url is not None:
             body["url"] = url
-        data = _post("/tabs", body)
+        data = _post(
+            "/tabs",
+            body,
+            timeout=max(_get_command_timeout(), _TAB_CREATION_TIMEOUT_FLOOR),
+        )
         session["tab_id"] = data.get("tabId")
         return session
 

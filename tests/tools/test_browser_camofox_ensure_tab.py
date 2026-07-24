@@ -29,6 +29,7 @@ def test_ensure_tab_sends_list_item_id():
     mock_response.raise_for_status = MagicMock()
 
     with patch.object(mod, "_get_session", return_value=fake_session), \
+         patch.object(mod, "_get_command_timeout", return_value=30), \
          patch.object(mod, "get_camofox_url", return_value="http://localhost:9377"), \
          patch("tools.browser_camofox.requests.post", return_value=mock_response) as mock_post:
         result = mod._ensure_tab("test-task", url="https://example.com")
@@ -44,6 +45,7 @@ def test_ensure_tab_sends_list_item_id():
     assert body["listItemId"] == "task_my-session"
     assert body["userId"] == "hermes_test123"
     assert body["url"] == "https://example.com"
+    assert call_kwargs.kwargs["timeout"] == 60
 
     # Verify tab_id was set from response
     assert result["tab_id"] == "tab-42"
