@@ -747,10 +747,24 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
     # skip releasing the local-server lease, and the release call itself could
     # no longer resolve its endpoint or credential.
     local_server_managed = _local_server_managed()
-    release_url = f"{get_camofox_url()}/_zettlab/release" if local_server_managed else ""
-    release_headers = _auth_headers() if local_server_managed else {}
+    camofox_base = get_camofox_url()
+    try:
+        scoped_headers = _auth_headers()
+    except Exception:
+        scoped_headers = {}
+    release_url = f"{camofox_base}/_zettlab/release" if local_server_managed else ""
+    release_headers = dict(scoped_headers) if local_server_managed else {}
+    # Direct Camofox sessions are torn down with DELETE /sessions/<user_id>,
+    # and that runs from the scope-less maintenance thread too, so its endpoint
+    # and credential have to be captured here like the lease context is.
+    delete_base = "" if local_server_managed else camofox_base
+    delete_headers = {} if local_server_managed else dict(scoped_headers)
+    # The lease is per profile, and in multiplex every profile shares the same
+    # loopback CAMOFOX_URL — only the credential differs. Group holders by the
+    # profile identity plus a digest of that credential, never by URL.
+    release_owner = _release_owner_key(cache_identity.get("user_id", ""), scoped_headers)
     now = time.monotonic()
-    with _sessions_lock:
+    with _owner_lock(release_owner), _sessions_lock:
         idle = _prune_idle_sessions_locked(now)
         if cache_key in _sessions:
             session = _sessions[cache_key]
@@ -769,6 +783,9 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "local_server_managed": local_server_managed,
                     "release_url": release_url,
                     "release_headers": release_headers,
+                    "release_owner": release_owner,
+                    "delete_base": delete_base,
+                    "delete_headers": delete_headers,
                     "last_used_at": now,
                     "_lock": threading.Lock(),
                 }
@@ -785,6 +802,9 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "local_server_managed": local_server_managed,
                     "release_url": release_url,
                     "release_headers": release_headers,
+                    "release_owner": release_owner,
+                    "delete_base": delete_base,
+                    "delete_headers": delete_headers,
                     "last_used_at": now,
                     "_lock": threading.Lock(),
                 }
@@ -801,6 +821,9 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "local_server_managed": local_server_managed,
                     "release_url": release_url,
                     "release_headers": release_headers,
+                    "release_owner": release_owner,
+                    "delete_base": delete_base,
+                    "delete_headers": delete_headers,
                     "last_used_at": now,
                     "_lock": threading.Lock(),
                 }
@@ -1013,7 +1036,44 @@ def _run_maintenance() -> None:
                 return
 
 
-def _profile_still_in_use(release_url: str, exclude_key: str = "") -> bool:
+def _release_owner_key(user_id: str, headers: Dict[str, str]) -> str:
+    """Stable per-profile identity for lease ownership.
+
+    The credential is hashed rather than stored a second time; the digest only
+    has to distinguish profiles inside this process.
+    """
+    import hashlib
+
+    credential = ""
+    for key in ("X-Zettlab-Agent-Action-Token", "Authorization"):
+        value = headers.get(key)
+        if value:
+            credential = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
+            break
+    return f"{user_id}\x00{credential}"
+
+
+_owner_locks: Dict[str, threading.Lock] = {}
+
+
+def _owner_lock(owner: str) -> threading.Lock:
+    """Serialize session registration against lease release for one profile.
+
+    Without it the "am I the last holder" answer can go stale between the check
+    and the request: another turn registers and starts the runtime, and this
+    release tears it down under them. Always acquired before ``_sessions_lock``.
+    """
+    with _sessions_lock:
+        lock = _owner_locks.get(owner)
+        if lock is None:
+            if len(_owner_locks) >= 256:
+                _owner_locks.clear()
+            lock = threading.Lock()
+            _owner_locks[owner] = lock
+        return lock
+
+
+def _profile_still_in_use(release_owner: str, exclude_key: str = "") -> bool:
     """Whether another tracked session still holds this profile's runtime.
 
     ``/_zettlab/release`` carries only the profile action token — no task or
@@ -1022,13 +1082,13 @@ def _profile_still_in_use(release_url: str, exclude_key: str = "") -> bool:
     ends would pull the runtime out from under the other, or out from under a
     human mid-takeover.
     """
-    if not release_url:
+    if not release_owner:
         return False
     with _sessions_lock:
         for key, session in _sessions.items():
             if key == exclude_key:
                 continue
-            if session.get("release_url") == release_url:
+            if session.get("release_owner") == release_owner:
                 return True
     return False
 
@@ -1043,20 +1103,35 @@ def _teardown_session(session: Optional[Dict[str, Any]]) -> None:
     if not isinstance(session, dict):
         return
     if session.get("local_server_managed"):
-        release_url = str(session.get("release_url") or "")
-        if _profile_still_in_use(release_url):
-            logger.debug("Camofox lease kept: another session still holds this profile")
-            return
-        _release_local_server_lease(session)
+        owner = str(session.get("release_owner") or "")
+        # The check and the release are one critical section: otherwise another
+        # turn can register and start the runtime in between, and this release
+        # tears it down under them.
+        with _owner_lock(owner):
+            if _profile_still_in_use(owner):
+                logger.debug("Camofox lease kept: another session still holds this profile")
+                return
+            _release_local_server_lease(session)
         return
     if session.get("managed"):
         # Managed persistence without local-server: the profile must survive.
         return
     user_id = str(session.get("user_id") or "")
-    if not user_id:
+    base = str(session.get("delete_base") or "")
+    if not user_id or not base:
         return
+    headers = session.get("delete_headers")
+    headers = dict(headers) if isinstance(headers, dict) else {}
     try:
-        _delete(f"/sessions/{quote(user_id, safe='')}")
+        # Captured endpoint and credential: this also runs from the scope-less
+        # maintenance thread, where re-reading them raises.
+        resp = requests.delete(
+            f"{base}/sessions/{quote(user_id, safe='')}",
+            timeout=5,
+            headers=headers,
+            allow_redirects=False,
+        )
+        _raise_for_status(resp)
     except Exception as exc:
         logger.debug("Camofox direct session close failed: %s", exc)
 
@@ -1142,10 +1217,12 @@ def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
         _remember_tab_epoch(session)
         _drop_session(task_id)
         if session.get("local_server_managed"):
-            if _profile_still_in_use(str(session.get("release_url") or "")):
-                logger.debug("Camofox lease kept: another turn still holds this profile")
-            else:
-                _release_local_server_lease(session)
+            owner = str(session.get("release_owner") or "")
+            with _owner_lock(owner):
+                if _profile_still_in_use(owner):
+                    logger.debug("Camofox lease kept: another turn still holds this profile")
+                else:
+                    _release_local_server_lease(session)
         logger.debug("Camofox soft cleanup for task %s (managed persistence)", task_id)
         return True
 
@@ -1834,10 +1911,11 @@ def camofox_close(task_id: Optional[str] = None) -> str:
         # Prefer the flag captured when the session was created: teardown can
         # run without the profile scope the live probe needs.
         if session.get("local_server_managed") or _local_server_managed():
-            release_url = str(session.get("release_url") or "")
-            if _profile_still_in_use(release_url):
-                return json.dumps({"success": True, "closed": False, "released": False})
-            _release_local_server_lease(session)
+            owner = str(session.get("release_owner") or "")
+            with _owner_lock(owner):
+                if _profile_still_in_use(owner):
+                    return json.dumps({"success": True, "closed": False, "released": False})
+                _release_local_server_lease(session)
             return json.dumps({
                 "success": True,
                 "closed": False,

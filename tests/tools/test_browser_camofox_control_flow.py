@@ -1170,6 +1170,9 @@ def test_lease_is_kept_while_another_turn_holds_the_profile():
             "user_id": "profileA", "session_key": "sess", "tab_id": f"tab-{task}",
             "managed": True, "local_server_managed": True, "task_id": task,
             "release_url": release_url, "release_headers": {},
+            # Ownership is the profile identity, not the URL: in multiplex every
+            # profile shares the same loopback CAMOFOX_URL.
+            "release_owner": "profileA\x00tokendigest",
             "last_used_at": time.monotonic(),
         }
 
@@ -1198,14 +1201,26 @@ def test_idle_direct_session_is_really_closed():
     import tools.browser_camofox as mod
     from tools.browser_camofox import _teardown_session
 
-    with patch("tools.browser_camofox._delete") as mock_delete:
+    ok = MagicMock()
+    ok.status_code = 200
+    ok.headers = {}
+    with patch("tools.browser_camofox.requests.delete", return_value=ok) as mock_delete:
         _teardown_session({
             "user_id": "hermes_abc123", "managed": False, "local_server_managed": False,
+            # Captured at creation: the maintenance thread has no profile scope
+            # to re-read these from.
+            "delete_base": "http://127.0.0.1:9377",
+            "delete_headers": {"Authorization": "Bearer direct-key"},
         })
-    mock_delete.assert_called_once_with("/sessions/hermes_abc123")
+    mock_delete.assert_called_once_with(
+        "http://127.0.0.1:9377/sessions/hermes_abc123",
+        timeout=5,
+        headers={"Authorization": "Bearer direct-key"},
+        allow_redirects=False,
+    )
 
     # A managed-persistence profile must survive instead.
-    with patch("tools.browser_camofox._delete") as mock_delete:
+    with patch("tools.browser_camofox.requests.delete") as mock_delete:
         _teardown_session({"user_id": "profileA", "managed": True, "local_server_managed": False})
     mock_delete.assert_not_called()
 
@@ -1244,3 +1259,58 @@ def test_get_images_refuses_a_blocked_page_after_handback():
 
     assert result["success"] is False
     assert "internal-topology" not in json.dumps(result)
+
+
+def test_lease_owner_is_the_profile_not_the_url():
+    """In multiplex every profile shares one loopback CAMOFOX_URL.
+
+    Grouping holders by URL would make profile A see profile B as its own
+    holder, skip the release and lose A's only release context.
+    """
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import _profile_still_in_use, _release_owner_key
+
+    a = _release_owner_key("profileA", {"X-Zettlab-Agent-Action-Token": "token-a"})
+    b = _release_owner_key("profileB", {"X-Zettlab-Agent-Action-Token": "token-b"})
+    assert a != b
+    # Same profile, same credential → same owner; the raw token is not stored.
+    assert a == _release_owner_key("profileA", {"X-Zettlab-Agent-Action-Token": "token-a"})
+    assert "token-a" not in a
+
+    mod._sessions.clear()
+    mod._sessions["profileB\x00sess\x00turn-b"] = {
+        "user_id": "profileB", "session_key": "sess", "task_id": "turn-b",
+        "managed": True, "local_server_managed": True, "release_owner": b,
+        "last_used_at": time.monotonic(),
+    }
+    assert _profile_still_in_use(a) is False, "another profile is not a holder"
+    assert _profile_still_in_use(b) is True
+    mod._sessions.clear()
+
+
+def test_release_is_serialized_against_session_registration():
+    """The holder check and the release must be one critical section.
+
+    Otherwise another turn registers and starts the runtime in between, and the
+    release tears it down under them — or under a human mid-takeover.
+    """
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import _owner_lock, _teardown_session
+
+    owner = "profileA\x00digest"
+    mod._sessions.clear()
+    released = []
+
+    def _record(session=None):
+        # If the lock were not held across the check, a concurrent registration
+        # could land here. Assert the section is exclusive instead of racing.
+        assert not _owner_lock(owner).acquire(blocking=False), "release ran outside the owner lock"
+        released.append(1)
+
+    with patch("tools.browser_camofox._release_local_server_lease", side_effect=_record):
+        _teardown_session({
+            "user_id": "profileA", "managed": True, "local_server_managed": True,
+            "release_owner": owner, "release_url": "http://127.0.0.1:9377/x/_zettlab/release",
+        })
+    assert released == [1]
+    mod._sessions.clear()
