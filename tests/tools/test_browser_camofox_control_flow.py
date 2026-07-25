@@ -674,3 +674,38 @@ def test_vision_discards_screenshot_when_handback_lands_mid_call():
 
     assert result["success"] is False
     assert "blocked after human control" in result["error"]
+
+
+def test_navigate_auto_snapshot_is_filtered_after_mid_call_handback():
+    """navigate's bonus snapshot goes through the same filter as camofox_snapshot.
+
+    A human taking over and handing back between the navigate response and the
+    snapshot response would otherwise put their typed credentials straight into
+    the tool result.
+    """
+    from tools.browser_camofox import camofox_navigate
+
+    session = {
+        "user_id": "u",
+        "tab_id": "tab-1",
+        "session_key": "s",
+        "privacy_filter_after_handback": False,
+        "epoch": 1,
+        "_lock": None,
+    }
+
+    def _get_with_handback(path, params=None, timeout=None, session=None):
+        # The snapshot response carries the post-handback epoch.
+        session["privacy_filter_after_handback"] = True
+        return {"snapshot": "textbox \"Password\" value=\"hunter2\"", "refsCount": 1}
+
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=session),
+        patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
+        patch("tools.browser_camofox._post", return_value={"url": "https://example.com/", "title": "Example"}),
+        patch("tools.browser_camofox._get", side_effect=_get_with_handback),
+    ):
+        result = json.loads(camofox_navigate("https://example.com/", task_id="agent-task"))
+
+    assert "hunter2" not in json.dumps(result)
+    assert "REDACTED" in result["snapshot"]

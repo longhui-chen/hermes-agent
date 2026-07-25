@@ -1167,7 +1167,11 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
             )
             if len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
                 snapshot_text = _truncate_snapshot(snapshot_text)
-            result["snapshot"] = snapshot_text
+            # Same rule as camofox_snapshot(): the epoch that enables the
+            # filter arrives with this very response, so a human who took over
+            # and handed back between the navigate and the snapshot must not
+            # have what they typed land in the tool result.
+            result["snapshot"] = _filter_page_state_after_handback(session, snapshot_text)
             result["element_count"] = snap_data.get("refsCount", 0)
         except Exception:
             pass  # Navigation succeeded; snapshot is a bonus
