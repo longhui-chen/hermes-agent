@@ -2078,3 +2078,65 @@ def test_direct_close_does_not_force_other_profiles_releases():
     mock_post.assert_not_called()
     assert len(mod._pending_lease_releases) == 1, "the other profile's release stays queued"
     mod._pending_lease_releases.clear()
+
+
+def test_a_waiting_mutation_does_not_inherit_a_newer_epoch():
+    """Refs are only valid for the page they were read from.
+
+    Another turn can advance the epoch while this one waits for the tab, and
+    the request header is built from the shared session — so without a check
+    the proxy would see a current epoch attached to stale refs and accept them.
+    """
+    from tools.browser_camofox import camofox_click
+
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
+        "privacy_filter_after_handback": False, "epoch": 4, "_lock": None,
+    }
+
+    def _post_should_not_run(path, body=None, timeout=None, session=None):
+        raise AssertionError("the mutation must not reach the runtime")
+
+    def _advance_epoch(owner):
+        # Stand in for the other turn finishing a navigate while this one waits.
+        session["epoch"] = 5
+        return _real_lock(owner)
+
+    import tools.browser_camofox as mod
+    _real_lock = mod._held_owner_lock
+
+    with (
+        patch("tools.browser_camofox._get_session", return_value=session),
+        patch("tools.browser_camofox._post", side_effect=_post_should_not_run),
+        patch("tools.browser_camofox._held_owner_lock", side_effect=_advance_epoch),
+    ):
+        result = json.loads(camofox_click("@e1", task_id="agent-task"))
+
+    assert result["success"] is False
+    assert result["error"] == "browser_epoch_stale"
+    assert result["retryable"] is True
+
+
+def test_a_busy_session_is_never_evicted():
+    """Evicting mid-operation closes the tab under a running tool call."""
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import _evict_surplus_sessions_locked
+
+    mod._sessions.clear()
+    old = time.monotonic() - (mod._EVICTION_GRACE_SECONDS + 10)
+    # One busy entry, oldest of all, plus enough idle ones to exceed the cap.
+    mod._sessions["p\x00s\x00busy"] = {
+        "user_id": "p", "session_key": "s", "task_id": "busy",
+        "in_flight": 1, "last_used_at": old - 100,
+    }
+    for i in range(mod._MAX_TRACKED_SESSIONS + 2):
+        mod._sessions[f"p\x00s\x00idle-{i:03d}"] = {
+            "user_id": "p", "session_key": "s", "task_id": f"idle-{i:03d}",
+            "in_flight": 0, "last_used_at": old + i,
+        }
+
+    evicted = _evict_surplus_sessions_locked()
+
+    assert "p\x00s\x00busy" in mod._sessions, "a session with work in flight was evicted"
+    assert all(s["task_id"] != "busy" for s in evicted)
+    mod._sessions.clear()

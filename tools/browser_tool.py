@@ -3699,8 +3699,7 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
         _ensure_tab,
         _handback_privacy_filter_enabled,
         _last_response_started_handback,
-        _post,
-        _tab_path,
+        _mutating_tab_call,
         _tool_error_from_exception,
     )
 
@@ -3718,7 +3717,10 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
         filtered_at_request = _handback_privacy_filter_enabled(tab_info)
         if filtered_at_request:
             return _blocked_after_handback()
-        resp = _post(_tab_path(tab_info, "/evaluate"), body={"expression": expression, "userId": tab_info["user_id"]}, session=tab_info)
+        # Arbitrary JS can change the document as readily as a click, so it
+        # runs in the same per-identity critical section — and it inherits the
+        # stale-epoch check with it.
+        resp = _mutating_tab_call(tab_info, "/evaluate", {"expression": expression, "userId": tab_info["user_id"]})
         # The epoch that enables the filter rides along with this response, so
         # a handback landing mid-call must invalidate the result rather than
         # hand the human's page data to the model. The request-time state is

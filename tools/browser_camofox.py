@@ -789,6 +789,19 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
         if cache_key in _sessions:
             session = _sessions[cache_key]
             session["last_used_at"] = now
+            # The gateway can rotate the action token or repoint CAMOFOX_URL
+            # while this entry lives. Browser requests would pick the new values
+            # up, but teardown uses what was captured at creation — so refresh
+            # it here or the release/delete goes to the old endpoint with the
+            # old credential and the current runtime loses its only handle.
+            if release_owner and session.get("release_owner") != release_owner:
+                logger.debug("Camofox session %s adopting rotated teardown context", task_id)
+            session["release_url"] = release_url
+            session["release_headers"] = release_headers
+            session["release_owner"] = release_owner
+            session["delete_base"] = delete_base
+            session["delete_headers"] = delete_headers
+            session["local_server_managed"] = local_server_managed
         else:
             if identity_override:
                 session = {
@@ -941,6 +954,29 @@ def _session_key_for_task_locked(task_id: str) -> Optional[str]:
 _MAX_TRACKED_SESSIONS = 64
 
 
+# A session between two calls of one composite operation (vision takes a
+# screenshot, then an annotation snapshot, with an LLM call in between) is not
+# in a request but is very much in use. The refcount covers the requests; this
+# grace covers the gaps inside an operation.
+_EVICTION_GRACE_SECONDS = 180
+
+
+def _begin_session_call(session: Optional[Dict[str, Any]]) -> None:
+    if not isinstance(session, dict):
+        return
+    with _sessions_lock:
+        session["in_flight"] = int(session.get("in_flight") or 0) + 1
+        session["last_used_at"] = time.monotonic()
+
+
+def _end_session_call(session: Optional[Dict[str, Any]]) -> None:
+    if not isinstance(session, dict):
+        return
+    with _sessions_lock:
+        session["in_flight"] = max(0, int(session.get("in_flight") or 0) - 1)
+        session["last_used_at"] = time.monotonic()
+
+
 def _evict_surplus_sessions_locked() -> list:
     """Drop the least recently used entries once past the ceiling.
 
@@ -951,13 +987,28 @@ def _evict_surplus_sessions_locked() -> list:
     surplus = len(_sessions) - _MAX_TRACKED_SESSIONS
     if surplus <= 0:
         return []
+    now = time.monotonic()
     by_age = sorted(_sessions.items(), key=lambda kv: float(kv[1].get("last_used_at") or 0.0))
     evicted = []
-    for key, session in by_age[:surplus]:
+    for key, session in by_age:
+        if len(evicted) >= surplus:
+            break
+        # Evicting a session mid-operation would close the tab under a running
+        # tool call — worse than being briefly over the ceiling.
+        if int(session.get("in_flight") or 0) > 0:
+            continue
+        if now - float(session.get("last_used_at") or 0.0) < _EVICTION_GRACE_SECONDS:
+            continue
         _sessions.pop(key, None)
         evicted.append(session)
+    if not evicted:
+        logger.warning(
+            "Camofox session cache is over its %d-entry ceiling but every entry is in use",
+            _MAX_TRACKED_SESSIONS,
+        )
+        return []
     logger.warning(
-        "Camofox session cache exceeded %d entries; reclaimed %d least-recently-used",
+        "Camofox session cache exceeded %d entries; reclaimed %d idle",
         _MAX_TRACKED_SESSIONS, len(evicted),
     )
     return evicted
@@ -972,7 +1023,8 @@ def _prune_idle_sessions_locked(now: float) -> list:
     expired = [
         key
         for key, session in _sessions.items()
-        if now - float(session.get("last_used_at") or 0.0) > _SESSION_IDLE_TTL_SECONDS
+        if int(session.get("in_flight") or 0) == 0
+        and now - float(session.get("last_used_at") or 0.0) > _SESSION_IDLE_TTL_SECONDS
     ]
     dropped = []
     for key in expired:
@@ -1521,7 +1573,11 @@ def _post(path: str, body: dict, timeout: Optional[int] = None, session: Optiona
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
     _response_facts.started_handback = False
-    resp = requests.post(url, json=body, timeout=timeout, headers=_request_headers(session), allow_redirects=False)
+    _begin_session_call(session)
+    try:
+        resp = requests.post(url, json=body, timeout=timeout, headers=_request_headers(session), allow_redirects=False)
+    finally:
+        _end_session_call(session)
     # POST /tabs establishes the baseline epoch for the new tab. Without it a
     # later response's epoch looks like the first one ever seen and is taken as
     # a safe baseline, so a takeover between creation and the first read would
@@ -1554,7 +1610,11 @@ def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None, sess
     _response_facts.started_handback = False
 
     def _once() -> requests.Response:
-        resp = requests.get(url, params=params, timeout=timeout, headers=_request_headers(session), allow_redirects=False)
+        _begin_session_call(session)
+        try:
+            resp = requests.get(url, params=params, timeout=timeout, headers=_request_headers(session), allow_redirects=False)
+        finally:
+            _end_session_call(session)
         _adopt_epoch_from_response(session, resp, tab_operation=_is_tab_operation(path))
         _raise_for_status(resp)
         return resp
@@ -1784,6 +1844,21 @@ def _retryable_control_result(
     return json.dumps(result)
 
 
+def _epoch_moved_result(session: Optional[Dict[str, Any]]) -> str:
+    payload = {
+        "success": False,
+        "error": "browser_epoch_stale",
+        "message": (
+            "Page state changed while this action waited for the browser tab. "
+            "Take a fresh snapshot and retry using its refs."
+        ),
+        "retryable": True,
+    }
+    if isinstance(session, dict) and session.get("epoch") is not None:
+        payload["epoch"] = session["epoch"]
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def _tool_error_from_exception(
     exc: BaseException,
     *,
@@ -1791,6 +1866,8 @@ def _tool_error_from_exception(
     prefix: str = "",
     extra: Optional[Dict[str, Any]] = None,
 ) -> str:
+    if isinstance(exc, CamofoxEpochMoved):
+        return _epoch_moved_result(session)
     retryable = _retryable_control_result(exc, session)
     if retryable is not None:
         payload = json.loads(retryable)
@@ -1825,6 +1902,10 @@ def _tool_error_from_exception(
 # Tool implementations
 # ---------------------------------------------------------------------------
 
+class CamofoxEpochMoved(Exception):
+    """Raised when the page moved on while a mutation waited for the tab."""
+
+
 def _mutating_tab_call(session: Dict[str, Any], path_suffix: str, body: Dict[str, Any]) -> Dict[str, Any]:
     """Run an operation that changes the document, holding the identity lock.
 
@@ -1836,7 +1917,17 @@ def _mutating_tab_call(session: Dict[str, Any], path_suffix: str, body: Dict[str
     long reads such as vision behind every mutation would cost more than it
     buys.
     """
+    # The refs in this call describe the page as it was when the Agent last
+    # read it. Another turn can advance the epoch while this one waits for the
+    # tab, and the request header is built from the shared session — so without
+    # this check the proxy would see a current epoch attached to stale refs and
+    # accept them, clicking or typing on a page the human just handed back.
+    observed_epoch = session.get("epoch")
     with _held_owner_lock(_browser_identity_key(session)):
+        if session.get("epoch") != observed_epoch:
+            raise CamofoxEpochMoved(
+                "the page changed while this operation waited for the browser tab"
+            )
         return _post(_tab_path(session, path_suffix), body, session=session)
 
 
