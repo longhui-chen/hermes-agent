@@ -861,7 +861,12 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "_lock": threading.Lock(),
                 }
             _sessions[cache_key] = session
-        idle.extend(_evict_surplus_sessions_locked())
+        # This call's own entry is exempt. It has not been handed back yet, so
+        # its in_flight is still 0, and if every other entry is busy it would be
+        # the only evictable one — the caller would then receive a session that
+        # is no longer in the cache, tear it down mid-use, and (direct mode)
+        # lose track of the tab it is about to create.
+        idle.extend(_evict_surplus_sessions_locked(protect_key=cache_key))
     for expired in idle:
         _teardown_session(expired)
     _run_pending_teardowns()
@@ -988,12 +993,15 @@ def _end_session_call(session: Optional[Dict[str, Any]]) -> None:
         session["last_used_at"] = time.monotonic()
 
 
-def _evict_surplus_sessions_locked() -> list:
+def _evict_surplus_sessions_locked(protect_key: str = "") -> list:
     """Drop the least recently used entries once past the ceiling.
 
     Returns them so the caller can tear them down outside the lock — evicting
     the tracking without releasing the browser state behind it would just move
     the leak somewhere less visible.
+
+    ``protect_key`` names the entry the current call is about to use. It stands
+    in for the reference that call has not been able to take yet.
     """
     surplus = len(_sessions) - _MAX_TRACKED_SESSIONS
     if surplus <= 0:
@@ -1003,6 +1011,8 @@ def _evict_surplus_sessions_locked() -> list:
     for key, session in by_age:
         if len(evicted) >= surplus:
             break
+        if protect_key and key == protect_key:
+            continue
         # Evicting a session mid-operation would close the tab under a running
         # tool call — worse than being briefly over the ceiling.
         if int(session.get("in_flight") or 0) > 0:
@@ -1914,6 +1924,99 @@ class CamofoxEpochMoved(Exception):
     """Raised when the page moved on while a mutation waited for the tab."""
 
 
+class CamofoxRefsStale(Exception):
+    """Raised when a ref describes a page the tab no longer shows."""
+
+
+# Document generation per physical tab. The epoch contract only advances on a
+# human handback, so it cannot see an ordinary navigate — and turns that share
+# a HERMES_SESSION_KEY share the tab while keeping their own session entry. A
+# parent's ``e1`` would otherwise still validate after its subagent navigated,
+# and land on whatever element reuses that ref on the new page.
+_document_generations: Dict[str, Dict[str, Any]] = {}
+_MAX_TRACKED_DOCUMENTS = 256
+
+
+def _document_key(session: Dict[str, Any]) -> str:
+    return f"{_browser_identity_key(session)}\x00{session.get('tab_id') or ''}"
+
+
+def _document_generation_locked(key: str) -> int:
+    entry = _document_generations.get(key)
+    return int(entry.get("generation") or 0) if entry else 0
+
+
+def _bump_document_generation(session: Dict[str, Any], url: str = "") -> None:
+    """Declare the tab's document replaced, invalidating every outstanding ref."""
+    key = _document_key(session)
+    with _sessions_lock:
+        entry = _document_generations.get(key)
+        generation = _document_generation_locked(key) + 1
+        _document_generations[key] = {
+            "generation": generation,
+            "url": url or (entry or {}).get("url", ""),
+        }
+        _forget_surplus_documents_locked(key)
+
+
+def _observe_document_url(session: Dict[str, Any], url: str) -> None:
+    """Bump the generation when an operation reports a different page.
+
+    A click can follow a link. Comparing the URL the runtime reports against
+    the one the last snapshot described keeps a plain in-page click from
+    invalidating refs, while a navigation caused by a click still does.
+    """
+    if not isinstance(url, str) or not url:
+        return
+    key = _document_key(session)
+    with _sessions_lock:
+        entry = _document_generations.get(key)
+        known = (entry or {}).get("url", "")
+        if known and known == url:
+            return
+        if not entry:
+            _document_generations[key] = {"generation": 0, "url": url}
+            _forget_surplus_documents_locked(key)
+            return
+        entry["generation"] = int(entry.get("generation") or 0) + 1
+        entry["url"] = url
+
+
+def _stamp_ref_generation(session: Dict[str, Any], url: str = "") -> None:
+    """Record the document version whose refs this session now holds."""
+    key = _document_key(session)
+    with _sessions_lock:
+        entry = _document_generations.setdefault(key, {"generation": 0, "url": ""})
+        if url:
+            entry["url"] = url
+        session["ref_document"] = key
+        session["ref_generation"] = int(entry.get("generation") or 0)
+        _forget_surplus_documents_locked(key)
+
+
+def _refs_are_current(session: Dict[str, Any]) -> bool:
+    key = _document_key(session)
+    with _sessions_lock:
+        if session.get("ref_document") != key:
+            return False
+        return session.get("ref_generation") == _document_generation_locked(key)
+
+
+def _forget_surplus_documents_locked(keep: str) -> None:
+    """Keep the registry bounded; it must never outgrow the session cache."""
+    while len(_document_generations) > _MAX_TRACKED_DOCUMENTS:
+        for key in _document_generations:
+            if key != keep:
+                _document_generations.pop(key, None)
+                break
+        else:
+            return
+
+
+# Suffixes whose whole purpose is to replace the document.
+_DOCUMENT_CHANGING_SUFFIXES = ("/navigate", "/back", "/forward", "/reload")
+
+
 def _mutating_tab_call(session: Dict[str, Any], path_suffix: str, body: Dict[str, Any]) -> Dict[str, Any]:
     """Run an operation that changes the document, holding the identity lock.
 
@@ -1936,7 +2039,19 @@ def _mutating_tab_call(session: Dict[str, Any], path_suffix: str, body: Dict[str
             raise CamofoxEpochMoved(
                 "the page changed while this operation waited for the browser tab"
             )
-        return _post(_tab_path(session, path_suffix), body, session=session)
+        # The epoch only moves on a human handback, so it cannot see another
+        # turn's ordinary navigate on the shared tab. A ref is only valid for
+        # the document version the snapshot that produced it described.
+        if "ref" in body and not _refs_are_current(session):
+            raise CamofoxRefsStale(
+                "this page has changed since the last snapshot; take a new "
+                "snapshot before acting on element refs"
+            )
+        try:
+            return _post(_tab_path(session, path_suffix), body, session=session)
+        finally:
+            if path_suffix in _DOCUMENT_CHANGING_SUFFIXES:
+                _bump_document_generation(session)
 
 
 def _navigation_tab_context(session: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -2016,6 +2131,10 @@ def _navigate_within_identity(
         # unconditionally below would let those values through, and the fresh
         # epoch means the server will not flag the next read as stale either.
         epoch_before_navigate = session.get("epoch")
+        # Declared before the request goes out, not after it returns: from this
+        # moment the document every outstanding ref describes is on its way out,
+        # and a concurrent turn's click must fail rather than race the landing.
+        _bump_document_generation(session)
         navigate_filtered_at_request = _handback_privacy_filter_enabled(session)
         # Only meaningful while the filter is on, and it costs a round trip, so
         # it is not taken on the normal path.
@@ -2130,6 +2249,10 @@ def _navigate_within_identity(
             else:
                 result["snapshot"] = _filter_page_state_after_handback(session, snapshot_text, snapshot_handback_revealed)
                 result["element_count"] = snap_data.get("refsCount", 0)
+                _stamp_ref_generation(
+                    session,
+                    snap_data.get("url", "") if isinstance(snap_data.get("url"), str) else data.get("url", ""),
+                )
         except Exception:
             pass  # Navigation succeeded; snapshot is a bonus
 
@@ -2194,6 +2317,11 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
             else:
                 snapshot = _truncate_snapshot(snapshot)
 
+        # The refs in this snapshot are only meaningful for the document it
+        # describes; record which version that is so a mutation carrying them
+        # can be refused after somebody else navigates the shared tab.
+        _stamp_ref_generation(session, data.get("url", "") if isinstance(data.get("url"), str) else "")
+
         return json.dumps({
             "success": True,
             "snapshot": snapshot,
@@ -2220,6 +2348,10 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
         # response's own fact, not just the shared flag a concurrent turn can
         # clear.
         result_handback_revealed = filtered_at_request or _last_response_started_handback()
+        # A click can follow a link. If the tab reports a different page than
+        # the snapshot described, every outstanding ref — this turn's included
+        # — now belongs to a page that is gone.
+        _observe_document_url(session, data.get("url", "") if isinstance(data.get("url"), str) else "")
         return json.dumps({
             "success": True,
             "clicked": clean_ref,

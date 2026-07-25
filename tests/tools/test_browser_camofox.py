@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 import requests
 
+import tools.browser_camofox as camofox_mod
 from tools.browser_camofox import (
     camofox_back,
     camofox_click,
@@ -22,6 +23,18 @@ from tools.browser_camofox import (
     _redact_handback_page_state,
     _rewrite_loopback_url_for_camofox,
 )
+
+
+def _mark_snapshot_taken(task_id: str) -> None:
+    """Record that this task has read a snapshot of the current document.
+
+    Acting on a ref requires one: the epoch contract cannot see an ordinary
+    navigate by another turn sharing the tab. These tests mock only POST, so
+    the snapshot navigate takes on its own never lands.
+    """
+    for session in camofox_mod._sessions.values():
+        if session.get("task_id") == task_id:
+            camofox_mod._stamp_ref_generation(session)
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +255,7 @@ class TestCamofoxInteractions:
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
         mock_post.return_value = _mock_response(json_data={"tabId": "tab4", "url": "https://x.com"})
         camofox_navigate("https://x.com", task_id="t4")
+        _mark_snapshot_taken("t4")
 
         mock_post.return_value = _mock_response(json_data={"ok": True, "url": "https://x.com"})
         result = json.loads(camofox_click("@e5", task_id="t4"))
@@ -253,6 +267,7 @@ class TestCamofoxInteractions:
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
         mock_post.return_value = _mock_response(json_data={"tabId": "tab5", "url": "https://x.com"})
         camofox_navigate("https://x.com", task_id="t5")
+        _mark_snapshot_taken("t5")
 
         mock_post.return_value = _mock_response(json_data={"ok": True})
         result = json.loads(camofox_type("@e3", "hello world", task_id="t5"))
@@ -266,6 +281,7 @@ class TestCamofoxInteractions:
         monkeypatch.setenv("HERMES_REDACT_SECRETS", "true")
         mock_post.return_value = _mock_response(json_data={"tabId": "tab5b", "url": "https://x.com"})
         camofox_navigate("https://x.com", task_id="t5b")
+        _mark_snapshot_taken("t5b")
 
         secret = "sk-proj-ABCD1234567890EFGH"
         mock_post.return_value = _mock_response(json_data={"ok": True})
@@ -280,6 +296,7 @@ class TestCamofoxInteractions:
         monkeypatch.setenv("HERMES_REDACT_SECRETS", "true")
         mock_post.return_value = _mock_response(json_data={"tabId": "tab5c", "url": "https://x.com"})
         camofox_navigate("https://x.com", task_id="t5c")
+        _mark_snapshot_taken("t5c")
 
         secret = "sk-proj-ABCD1234567890EFGH"
         mock_post.side_effect = RuntimeError(f"camofox failed while typing {secret}")

@@ -323,6 +323,10 @@ class TestCamofoxHTTPFailures:
             "tab_id": "tab-1",
             "session_key": "task-1",
         }
+        # Acting on a ref requires a snapshot of the current document.
+        import tools.browser_camofox as mod
+
+        mod._stamp_ref_generation(session)
         response = _mock_response(
             status=400,
             json_data={
@@ -351,6 +355,10 @@ class TestCamofoxHTTPFailures:
             "tab_id": "tab-1",
             "session_key": "task-1",
         }
+        # Acting on a ref requires a snapshot of the current document.
+        import tools.browser_camofox as mod
+
+        mod._stamp_ref_generation(session)
         response = MagicMock()
         response.status_code = 500
         response.json.side_effect = ValueError("not json")

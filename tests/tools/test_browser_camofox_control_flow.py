@@ -86,7 +86,7 @@ def managed_session(monkeypatch):
     monkeypatch.setenv("CAMOFOX_AUTH_MODE", "zettlab_action_token")
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "action-token")
     monkeypatch.setenv("CAMOFOX_MANAGED_BY_LOCAL_SERVER", "true")
-    return {
+    session = {
         "user_id": "hermes_profile",
         "tab_id": "tab-agent",
         "session_key": "task_opaque",
@@ -95,6 +95,12 @@ def managed_session(monkeypatch):
         "privacy_filter_after_handback": False,
         "epoch": 2,
     }
+    # These tests act on refs, which an Agent can only have obtained from a
+    # snapshot of the page the tab currently shows.
+    import tools.browser_camofox as mod
+
+    mod._stamp_ref_generation(session)
+    return session
 
 
 def test_epoch_stale_resnapshots_and_returns_retryable(managed_session):
@@ -1911,6 +1917,7 @@ def test_click_result_url_is_filtered_when_only_the_response_reveals_handback():
         "user_id": "u", "tab_id": "tab-1", "session_key": "s",
         "privacy_filter_after_handback": False, "epoch": 4, "_lock": None,
     }
+    mod._stamp_ref_generation(session)
 
     def _post_racing(path, body=None, timeout=None, session=None):
         mod._response_facts.started_handback = True
@@ -2143,3 +2150,85 @@ def test_a_busy_session_is_never_evicted():
     # reached by evicting idle entries rather than by sparing recent ones.
     assert len(mod._sessions) == mod._MAX_TRACKED_SESSIONS, "the ceiling was not enforced"
     mod._sessions.clear()
+
+
+def test_a_new_session_is_never_the_one_evicted():
+    """The entry this call is about to use is exempt from capacity eviction.
+
+    Its ``in_flight`` is still 0 when the ceiling is enforced — the reference is
+    taken by the tool call, after ``_get_session`` returns. With every other
+    entry busy it would be the only evictable one, and the caller would receive
+    a session that is no longer tracked: direct mode would DELETE a tab it has
+    not created yet and then lose the one it does create; managed mode would
+    schedule the release of a runtime that is still in use.
+    """
+    import tools.browser_camofox as mod
+
+    mod._sessions.clear()
+    base = time.monotonic() - 1000
+    for i in range(mod._MAX_TRACKED_SESSIONS):
+        mod._sessions[f"p\x00s\x00busy-{i:03d}"] = {
+            "user_id": "u", "session_key": "s", "task_id": f"busy-{i:03d}",
+            "in_flight": 1, "last_used_at": base + i,
+        }
+    fresh_key = "p\x00s\x00fresh"
+    mod._sessions[fresh_key] = {
+        "user_id": "u", "session_key": "s", "task_id": "fresh",
+        "in_flight": 0, "last_used_at": base + 10_000,
+    }
+
+    evicted = mod._evict_surplus_sessions_locked(protect_key=fresh_key)
+
+    assert fresh_key in mod._sessions, "the session about to be returned was evicted"
+    assert all(s.get("task_id") != "fresh" for s in evicted)
+    mod._sessions.clear()
+
+
+def test_refs_do_not_survive_another_turns_navigate():
+    """A ref only validates against the document version that produced it.
+
+    Turns sharing a HERMES_SESSION_KEY share the physical tab but keep their own
+    session entry, and the epoch contract only advances on a human handback — so
+    without a document generation a parent's ``e1`` still passes after its
+    subagent navigated, and lands on whatever reuses that ref on the new page.
+    """
+    import tools.browser_camofox as mod
+
+    parent = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "parent", "epoch": 2}
+    subagent = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "sub", "epoch": 2}
+
+    mod._stamp_ref_generation(parent, "https://a.example/list")
+    assert mod._refs_are_current(parent)
+
+    # The subagent navigates the shared tab.
+    mod._bump_document_generation(subagent)
+
+    assert not mod._refs_are_current(parent), "stale refs still validated after a navigate"
+    with pytest.raises(mod.CamofoxRefsStale):
+        mod._mutating_tab_call(parent, "/click", {"userId": "u", "ref": "e1"})
+
+    # Operations that carry no ref are unaffected: scrolling or pressing a key
+    # acts on the page, not on an element the Agent named.
+    with patch("tools.browser_camofox._post", return_value={"ok": True}) as mock_post:
+        mod._mutating_tab_call(parent, "/scroll", {"userId": "u", "direction": "down"})
+    assert mock_post.called
+
+    # A fresh snapshot re-establishes them.
+    mod._stamp_ref_generation(parent, "https://a.example/detail")
+    assert mod._refs_are_current(parent)
+
+
+def test_a_click_that_follows_a_link_invalidates_outstanding_refs():
+    """A click can navigate. The URL the tab reports is what settles it."""
+    import tools.browser_camofox as mod
+
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
+    mod._stamp_ref_generation(session, "https://a.example/list")
+
+    # Same page: an in-page click must not force a re-snapshot.
+    mod._observe_document_url(session, "https://a.example/list")
+    assert mod._refs_are_current(session)
+
+    # Followed a link: every outstanding ref belongs to a page that is gone.
+    mod._observe_document_url(session, "https://a.example/detail")
+    assert not mod._refs_are_current(session)
