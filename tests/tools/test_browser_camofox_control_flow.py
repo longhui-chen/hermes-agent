@@ -894,12 +894,13 @@ def test_lease_release_is_retried_and_queued_until_it_lands():
     # The reclaim thread is stubbed out so the queue can be inspected; its own
     # handoff is covered by test_queued_release_always_has_a_consumer.
     with (
-        patch("time.sleep", return_value=None),
         patch("tools.browser_camofox._ensure_maintenance_worker", return_value=None),
         patch("tools.browser_camofox.requests.post", return_value=unavailable) as failing,
     ):
         _release_local_server_lease(session)
-    assert failing.call_count > 1, "a transient failure must be retried, not just logged"
+    # Exactly one attempt inside the owner lock — retrying there would block the
+    # next turn on this profile — and the undelivered release stays queued.
+    assert failing.call_count == 1
     assert len(mod._pending_lease_releases) == 1, "an undelivered release must stay queued"
 
     ok = MagicMock()
@@ -1313,4 +1314,29 @@ def test_release_is_serialized_against_session_registration():
             "release_owner": owner, "release_url": "http://127.0.0.1:9377/x/_zettlab/release",
         })
     assert released == [1]
+    mod._sessions.clear()
+
+
+def test_queued_release_is_dropped_when_the_profile_is_in_use_again():
+    """A turn that started while the release was queued now owns the runtime.
+
+    Completing the queued release would tear it down under that turn — the
+    retry path has to re-check holders, not just re-send.
+    """
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import _flush_pending_lease_releases
+
+    owner = "profileA\x00digest"
+    mod._sessions.clear()
+    mod._pending_lease_releases[:] = [("http://127.0.0.1:9377/x/_zettlab/release", {}, 0, owner)]
+    mod._sessions["profileA\x00sess\x00new-turn"] = {
+        "user_id": "profileA", "session_key": "sess", "task_id": "new-turn",
+        "managed": True, "local_server_managed": True, "release_owner": owner,
+        "last_used_at": time.monotonic(),
+    }
+
+    with patch("tools.browser_camofox.requests.post") as mock_post:
+        _flush_pending_lease_releases()
+    mock_post.assert_not_called()
+    assert mod._pending_lease_releases == []
     mod._sessions.clear()

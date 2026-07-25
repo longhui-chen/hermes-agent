@@ -965,8 +965,11 @@ def _flush_pending_lease_releases() -> None:
         pending, _pending_lease_releases[:] = list(_pending_lease_releases), []
     for entry in pending:
         url, headers = entry[0], entry[1]
+        owner = entry[3] if len(entry) > 3 else ""
+        if owner and _profile_still_in_use(owner):
+            continue
         if not _attempt_lease_release(url, headers):
-            _queue_pending_lease_release(url, headers)
+            _queue_pending_lease_release(url, headers, owner=owner)
 
 
 # Reclaim has to run on its own clock. A multiplex turn whose cleanup happens
@@ -978,11 +981,11 @@ _MAX_PENDING_RELEASE_ATTEMPTS = 8
 _maintenance_worker: Optional[threading.Thread] = None
 
 
-def _queue_pending_lease_release(url: str, headers: Dict[str, str]) -> None:
+def _queue_pending_lease_release(url: str, headers: Dict[str, str], owner: str = "") -> None:
     with _sessions_lock:
         if len(_pending_lease_releases) >= _MAX_PENDING_LEASE_RELEASES:
             _pending_lease_releases.pop(0)
-        _pending_lease_releases.append((url, headers))
+        _pending_lease_releases.append((url, headers, 0, owner))
     _ensure_maintenance_worker()
 
 
@@ -1019,6 +1022,12 @@ def _run_maintenance() -> None:
         for entry in pending:
             url, headers = entry[0], entry[1]
             attempts = entry[2] if len(entry) > 2 else 0
+            owner = entry[3] if len(entry) > 3 else ""
+            # A turn that started while this release was queued owns the
+            # runtime now; completing the release would tear it down.
+            if owner and _profile_still_in_use(owner):
+                logger.debug("Camofox dropped a queued release: the profile is in use again")
+                continue
             if _attempt_lease_release(url, headers):
                 continue
             if attempts + 1 >= _MAX_PENDING_RELEASE_ATTEMPTS:
@@ -1029,7 +1038,7 @@ def _run_maintenance() -> None:
                 continue
             with _sessions_lock:
                 if len(_pending_lease_releases) < _MAX_PENDING_LEASE_RELEASES:
-                    _pending_lease_releases.append((url, headers, attempts + 1))
+                    _pending_lease_releases.append((url, headers, attempts + 1, owner))
         with _sessions_lock:
             if not _sessions and not _pending_lease_releases:
                 _maintenance_worker = None
@@ -1162,11 +1171,15 @@ def _release_local_server_lease(session: Optional[Dict[str, Any]] = None) -> Non
         except Exception as exc:
             logger.debug("Camofox local-server lease release unresolvable: %s", exc)
             return
-    try:
-        _retry_read(lambda: _attempt_lease_release(url, headers) or _raise_release_retry())
-    except Exception as exc:
-        logger.debug("Camofox local-server lease release deferred: %s", exc)
-        _queue_pending_lease_release(url, headers)
+    # One attempt only: this runs inside the owner lock, which also gates
+    # session registration for this profile. Retrying with backoff here would
+    # block the next turn on the same profile for as long as the runtime stays
+    # unreachable. The maintenance thread retries instead, and re-checks
+    # holders before each attempt.
+    if not _attempt_lease_release(url, headers):
+        _queue_pending_lease_release(url, headers, owner=str(
+            session.get("release_owner") or "" if isinstance(session, dict) else ""
+        ))
 
 
 class _LeaseReleaseRetry(requests.ConnectionError):
