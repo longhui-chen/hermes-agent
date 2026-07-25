@@ -13,6 +13,8 @@ import pytest
 import requests
 
 from tools.browser_camofox import (
+    _adopt_existing_tab,
+    camofox_back,
     _EPOCH_HEADER,
     _adopt_epoch_from_response,
     camofox_click,
@@ -283,3 +285,82 @@ def test_managed_close_releases_lease_without_destroying_profile(managed_session
     assert result == {"success": True, "closed": False, "released": True}
     mock_post.assert_called_once_with("/_zettlab/release", {}, timeout=5)
     mock_delete.assert_not_called()
+
+
+def test_privacy_filter_reduces_snapshot_urls_to_origin(managed_session):
+    """URL paths/queries in a post-handback snapshot carry session material.
+
+    The general redaction policy preserves web URL queries, so the handback
+    filter itself must reduce every URL in the accessibility tree to its
+    origin — OAuth codes, reset tokens and pre-signed links must not reach
+    the model.
+    """
+    managed_session["privacy_filter_after_handback"] = True
+    snapshot = (
+        '- link "Continue" [e2]:\n'
+        "  - /url: https://site.example/callback?code=OAUTHCODE123\n"
+        '- link "Download" [e3]:\n'
+        "  - /url: https://files.example/doc.pdf?X-Amz-Signature=PRESIGNED456"
+    )
+    with (
+        patch("tools.browser_camofox._get_session", return_value=managed_session),
+        patch("tools.browser_camofox._get", return_value={"snapshot": snapshot, "refsCount": 2}),
+    ):
+        result = json.loads(camofox_snapshot(task_id="agent-task"))
+
+    assert "OAUTHCODE123" not in result["snapshot"]
+    assert "PRESIGNED456" not in result["snapshot"]
+    assert "https://site.example/" in result["snapshot"]
+    assert "https://files.example/" in result["snapshot"]
+
+
+def test_privacy_filter_reduces_click_and_back_result_urls(managed_session):
+    """Action results must not leak the URL the snapshot filter just hid."""
+    managed_session["privacy_filter_after_handback"] = True
+    with (
+        patch("tools.browser_camofox._get_session", return_value=managed_session),
+        patch("tools.browser_camofox._post", return_value={"url": "https://site.example/reset?token=RESET789"}),
+    ):
+        clicked = json.loads(camofox_click("@e4", task_id="agent-task"))
+        back = json.loads(camofox_back(task_id="agent-task"))
+
+    assert clicked["url"] == "https://site.example/"
+    assert back["url"] == "https://site.example/"
+
+
+def test_click_result_url_is_untouched_without_privacy_filter(managed_session):
+    with (
+        patch("tools.browser_camofox._get_session", return_value=managed_session),
+        patch("tools.browser_camofox._post", return_value={"url": "https://site.example/page?q=fine"}),
+    ):
+        clicked = json.loads(camofox_click("@e4", task_id="agent-task"))
+
+    assert clicked["url"] == "https://site.example/page?q=fine"
+
+
+def test_adopting_existing_tab_defaults_privacy_filter_on():
+    """A fresh process cannot know whether a human touched the adopted tab.
+
+    A gateway restart right after a handback would otherwise skip the privacy
+    filter entirely, so adoption must start filtered; the first agent
+    navigation clears it.
+    """
+    session = {
+        "user_id": "hermes_profile",
+        "tab_id": None,
+        "session_key": "task_opaque",
+        "adopt_existing_tab": True,
+        "privacy_filter_after_handback": False,
+        "epoch": None,
+    }
+    with (
+        patch("tools.browser_camofox.get_camofox_url", return_value="http://127.0.0.1:8080"),
+        patch("tools.browser_camofox._get", return_value={
+            "tabs": [{"tabId": "tab-live", "listItemId": "task_opaque", "epoch": 7}],
+        }),
+    ):
+        adopted = _adopt_existing_tab(session)
+
+    assert adopted["tab_id"] == "tab-live"
+    assert adopted["epoch"] == 7
+    assert adopted["privacy_filter_after_handback"] is True

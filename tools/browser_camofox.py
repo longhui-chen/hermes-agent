@@ -42,6 +42,28 @@ _HANDBACK_EDITABLE_CONTROL = re.compile(
 _HANDBACK_VALUE_ATTRIBUTE = re.compile(
     r"(?i)\bvalue=(?:\"[^\"]*\"|'[^']*'|\S+)"
 )
+_HANDBACK_URL = re.compile(r"(?i)\bhttps?://[^\s\"'<>()\[\]]+")
+
+
+def _url_origin_only(url: str) -> str:
+    """Reduce a URL to its origin.
+
+    Pages a human just controlled routinely carry session material in URL
+    paths and queries (OAuth codes, reset tokens, pre-signed links), and the
+    general redaction policy deliberately preserves web URL queries — so the
+    handback privacy filter must drop everything past the origin itself.
+    """
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return "[REDACTED URL]"
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return "[REDACTED URL]"
+    return f"{parsed.scheme}://{parsed.netloc}/"
+
+
+def _reduce_urls_to_origin(value: str) -> str:
+    return _HANDBACK_URL.sub(lambda match: _url_origin_only(match.group(0)), value)
 
 
 def _redact_handback_page_state(value: str) -> str:
@@ -55,7 +77,7 @@ def _redact_handback_page_state(value: str) -> str:
             lines.append("[REDACTED sensitive form control]")
         else:
             lines.append(_HANDBACK_VALUE_ATTRIBUTE.sub("value=\"[REDACTED]\"", line))
-    return "\n".join(lines)
+    return _reduce_urls_to_origin("\n".join(lines))
 
 
 _EPOCH_HEADER = "X-Zettlab-Browser-Epoch"
@@ -115,6 +137,20 @@ def _handback_privacy_filter_enabled(session: Dict[str, Any]) -> bool:
 def _filter_page_state_after_handback(session: Dict[str, Any], value: str) -> str:
     """Filter page state while a human-mutated page remains current."""
     return _redact_handback_page_state(value) if _handback_privacy_filter_enabled(session) else value
+
+
+def _filter_url_after_handback(session: Dict[str, Any], url: Any) -> Any:
+    """Reduce an operation-result URL to its origin while the filter is active.
+
+    Click/back results report the page URL the human left behind; without this
+    the origin-only policy applied to snapshots could be bypassed by reading
+    the same URL from an action result.
+    """
+    if not isinstance(url, str) or not url:
+        return url
+    if not _handback_privacy_filter_enabled(session):
+        return url
+    return _url_origin_only(url)
 
 
 from tools.browser_camofox_state import get_camofox_identity
@@ -500,6 +536,12 @@ def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(tab_id, str) and tab_id:
         session["tab_id"] = tab_id
         _adopt_session_epoch(session, latest.get("epoch"))
+        # This process has no memory of the tab (fresh session cache), so it
+        # cannot know whether a human controlled the page since the last agent
+        # read — a gateway restart right after a handback would otherwise skip
+        # the privacy filter entirely. Filter by default; the first agent
+        # navigation clears it.
+        session["privacy_filter_after_handback"] = True
         logger.debug("Adopted existing Camofox tab %s for %s", tab_id, session.get("user_id"))
 
     return session
@@ -1005,7 +1047,7 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
         return json.dumps({
             "success": True,
             "clicked": clean_ref,
-            "url": data.get("url", ""),
+            "url": _filter_url_after_handback(session, data.get("url", "")),
         })
     except Exception as e:
         return _tool_error_from_exception(e, session=locals().get("session"))
@@ -1082,7 +1124,7 @@ def camofox_back(task_id: Optional[str] = None) -> str:
             {"userId": session["user_id"]},
             session=session,
         )
-        return json.dumps({"success": True, "url": data.get("url", "")})
+        return json.dumps({"success": True, "url": _filter_url_after_handback(session, data.get("url", ""))})
     except Exception as e:
         return _tool_error_from_exception(e, session=locals().get("session"))
 
