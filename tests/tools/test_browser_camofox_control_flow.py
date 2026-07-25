@@ -1625,3 +1625,91 @@ def test_handback_filter_redacts_urls_with_parenthesised_paths():
     assert "abc123" not in filtered
     assert "secret" not in filtered
     assert "https://example.com/" in filtered
+
+
+def test_epoch_verification_is_response_local_not_session_state():
+    """A concurrent response must not decide this navigate's outcome.
+
+    Two turns share the session dict, so a click carrying a valid epoch could
+    otherwise flip a shared "verified" flag back on between this navigate's
+    unverified response and the check that clears the filter.
+    """
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import camofox_navigate
+
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
+        "privacy_filter_after_handback": True, "epoch": 4, "_lock": None,
+        "local_server_managed": True,
+    }
+    # Whatever another turn last did on its own thread must not leak in.
+    mod._response_facts.epoch_verified = True
+
+    def _post_without_epoch(path, body=None, timeout=None, session=None):
+        mod._response_facts.epoch_verified = False  # this response carried none
+        return {"url": "https://other.example/", "title": "Other"}
+
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=session),
+        patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
+        patch("tools.browser_camofox._post", side_effect=_post_without_epoch),
+        patch("tools.browser_camofox._get", side_effect=_get_serving_tabs(
+            {"snapshot": "- heading \"Other\"", "refsCount": 1},
+            url="https://bank.example/login",
+        )),
+    ):
+        json.loads(camofox_navigate("https://other.example/", task_id="agent-task"))
+
+    assert session["privacy_filter_after_handback"] is True
+
+
+def test_vision_uses_the_privacy_state_from_when_it_captured():
+    """A concurrent navigate must not unblock an already-captured screenshot."""
+    from tools.browser_camofox import camofox_vision
+
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
+        "privacy_filter_after_handback": True, "epoch": 4, "_lock": None,
+    }
+
+    def _raw(path, params=None, timeout=None, session=None):
+        # The other turn's navigate lands while this capture is in flight.
+        session["privacy_filter_after_handback"] = False
+        resp = MagicMock()
+        resp.content = b"\x89PNG-private-screen"
+        return resp
+
+    with (
+        patch("tools.browser_camofox._get_session", return_value=session),
+        patch("tools.browser_camofox._get_raw", side_effect=_raw),
+    ):
+        result = json.loads(camofox_vision("what is on screen?", task_id="agent-task"))
+
+    assert result["success"] is False
+    assert "blocked after human control" in result["error"]
+
+
+def test_get_images_uses_the_privacy_state_from_when_it_requested():
+    """Same rule for image alt/src, which redaction does not remove."""
+    from tools.browser_camofox import camofox_get_images
+
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
+        "privacy_filter_after_handback": True, "epoch": 4, "_lock": None,
+    }
+
+    def _get_racing_navigate(path, params=None, timeout=None, session=None, **kwargs):
+        if path == "/tabs":
+            return {"tabs": [{"tabId": "tab-1", "listItemId": "s", "url": "http://10.0.0.5/admin"}]}
+        session["privacy_filter_after_handback"] = False
+        return {"snapshot": '- image "internal-topology"', "refsCount": 1}
+
+    with (
+        patch("tools.browser_camofox._get_session", return_value=session),
+        patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
+        patch("tools.browser_camofox._get", side_effect=_get_racing_navigate),
+    ):
+        result = json.loads(camofox_get_images(task_id="agent-task"))
+
+    assert result["success"] is False
+    assert "internal-topology" not in json.dumps(result)

@@ -977,7 +977,7 @@ def _drop_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
 # Releases that could not be delivered yet. The session they belonged to is
 # already gone, so this is the only remaining handle on that lease; the entries
 # are tiny (url + headers) and capped.
-_MAX_PENDING_LEASE_RELEASES = 32
+_MAX_PENDING_LEASE_RELEASES = 256
 _pending_lease_releases: list = []
 
 
@@ -1072,9 +1072,10 @@ def _queue_pending_teardown(
                 # Nothing may be discarded silently; make the overflow visible
                 # and keep the newest, which is the one still reachable.
                 dropped = _pending_lease_releases.pop(0)
-                logger.warning(
-                    "Camofox teardown queue is full; dropping a queued %s for %s",
-                    dropped["kind"], dropped["url"],
+                logger.error(
+                    "Camofox teardown queue is full (%d distinct targets); dropping a queued %s. "
+                    "The server side reclaims it when its own timeout expires.",
+                    _MAX_PENDING_LEASE_RELEASES, dropped["kind"],
                 )
             _pending_lease_releases.append({
                 "kind": kind,
@@ -1411,6 +1412,16 @@ def _request_headers(session: Optional[Dict[str, Any]]) -> Dict[str, str]:
     return {**_auth_headers(), **_session_epoch_header(session)}
 
 
+# Facts about the most recent response on this thread. A turn runs its browser
+# calls synchronously, so "the last response on this thread" is precisely "this
+# call's response" — unlike anything stored on the shared session dict.
+_response_facts = threading.local()
+
+
+def _last_response_epoch_verified() -> bool:
+    return bool(getattr(_response_facts, "epoch_verified", False))
+
+
 def _is_tab_operation(path: str) -> bool:
     """Whether this path targets one specific tab, i.e. carries an epoch."""
     return path.startswith("/tabs/")
@@ -1467,9 +1478,13 @@ def _post(path: str, body: dict, timeout: Optional[int] = None, session: Optiona
     # later response's epoch looks like the first one ever seen and is taken as
     # a safe baseline, so a takeover between creation and the first read would
     # go unnoticed.
-    verified = _adopt_epoch_from_response(session, resp, tab_operation=_is_tab_operation(path) or path == "/tabs")
-    if isinstance(session, dict):
-        session["last_epoch_verified"] = verified
+    # Response-local, not session state: concurrent turns share the session
+    # dict, so another response landing in between could flip a shared flag
+    # before this caller reads it. A thread-local is exactly the scope of one
+    # synchronous request/response pair.
+    _response_facts.epoch_verified = _adopt_epoch_from_response(
+        session, resp, tab_operation=_is_tab_operation(path) or path == "/tabs"
+    )
     _raise_for_status(resp)
     return resp.json()
 
@@ -1820,7 +1835,7 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
         # document identity really changed.
         # The epoch requirement only applies where the protocol exists: a
         # direct Camofox session has no epoch to verify.
-        epoch_protocol_ok = session.get("last_epoch_verified") or not session.get("local_server_managed")
+        epoch_protocol_ok = _last_response_epoch_verified() or not session.get("local_server_managed")
         if (
             epoch_protocol_ok
             and session.get("epoch") == epoch_before_navigate
@@ -2138,13 +2153,13 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
         # and secret-shaped text, so intranet metadata would pass straight
         # through. Same guard as camofox_snapshot, applied after the response
         # because that is what turns the filter on.
-        if _handback_privacy_filter_enabled(session) and not _handback_page_readable(session, data):
+        if (images_filtered_at_request or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, data):
             return _blocked_handback_page_error()
 
         snapshot = data.get("snapshot", "")
         if not isinstance(snapshot, str):
             snapshot = ""
-        snapshot = _filter_page_state_after_handback(session, snapshot)
+        snapshot = _filter_page_state_after_handback(session, snapshot, images_filtered_at_request)
 
         # Parse img elements from the accessibility tree.
         # Format: img "alt text" or img "alt text" [eN]
@@ -2188,16 +2203,17 @@ def camofox_vision(question: str, annotate: bool = False,
             )
 
         # Get screenshot as binary PNG
+        screenshot_filtered_at_request = _handback_privacy_filter_enabled(session)
         resp = _get_raw(
             _tab_path(session, "/screenshot"),
             params={"userId": session["user_id"]},
             session=session,
         )
-        # Re-check after the response: the epoch that turns the filter on
-        # arrives with this very response, so a handback landing between the
-        # pre-check and the reply would otherwise put the human's screen on
-        # disk and in front of the vision model.
-        if _handback_privacy_filter_enabled(session):
+        # Judged on the state when the capture was issued as well as now: the
+        # epoch that turns the filter on arrives with this very response, and a
+        # concurrent navigate could clear the shared flag before this check —
+        # either way the image is of the human's screen.
+        if screenshot_filtered_at_request or _handback_privacy_filter_enabled(session):
             return tool_error(
                 "Browser vision is blocked after human control until the Agent navigates to a new page or closes the session.",
                 success=False,
@@ -2219,6 +2235,7 @@ def camofox_vision(question: str, annotate: bool = False,
         annotation_context = ""
         if annotate:
             try:
+                annotation_filtered_at_request = _handback_privacy_filter_enabled(session)
                 snap_data = _get(
                     _tab_path(session, "/snapshot"),
                     params={"userId": session["user_id"]},
@@ -2227,12 +2244,12 @@ def camofox_vision(question: str, annotate: bool = False,
                 # A takeover can land between the screenshot and this call, and
                 # the filter it turns on only strips form values — ordinary
                 # intranet text would still reach the vision model.
-                if _handback_privacy_filter_enabled(session) and not _handback_page_readable(session, snap_data):
+                if (annotation_filtered_at_request or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, snap_data):
                     return _blocked_handback_page_error()
                 snapshot = snap_data.get("snapshot", "")
                 if not isinstance(snapshot, str):
                     snapshot = ""
-                snapshot = _filter_page_state_after_handback(session, snapshot)
+                snapshot = _filter_page_state_after_handback(session, snapshot, annotation_filtered_at_request)
                 annotation_context = f"\n\nAccessibility tree (element refs for interaction):\n{snapshot[:3000]}"
             except Exception:
                 pass
