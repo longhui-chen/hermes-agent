@@ -961,3 +961,12 @@ def test_recovery_refuses_to_snapshot_a_blocked_page():
     redact.assert_not_called()
     # Only the /tabs lookup ran; the snapshot was never requested.
     assert mock_get.call_count == 1
+
+    # The guard must discriminate, not just fail closed — otherwise a broken
+    # import would make the assertions above pass while blocking everything.
+    from tools.browser_camofox import _recovery_target_allowed
+
+    assert _recovery_target_allowed("https://example.com/page") is True
+    assert _recovery_target_allowed("http://169.254.169.254/latest/meta-data/") is False
+    assert _recovery_target_allowed("http://metadata.google.internal/") is False
+    assert _recovery_target_allowed("http://192.168.1.10/admin") is False
