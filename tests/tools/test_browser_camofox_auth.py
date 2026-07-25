@@ -65,6 +65,10 @@ class TestAuthHeaders:
             "http://evil.example:9377",
             "https://127.0.0.1:9377",
             "http://10.0.0.5:9377",
+            # Resolves wherever its owner points it — a name prefix test would
+            # have accepted this one.
+            "http://127.attacker.example/internal/browser/camofox",
+            "http://localhost.attacker.example:9377",
             "",
         ],
     )

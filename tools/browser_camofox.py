@@ -261,11 +261,17 @@ def _is_trusted_action_token_endpoint(url: str) -> bool:
         # was repointed somewhere this credential does not belong.
         return False
     host = (parsed.hostname or "").strip().lower()
-    if host in {"localhost", "127.0.0.1", "::1"}:
+    if host == "localhost":
         return True
-    # Cover the rest of 127.0.0.0/8 without pulling in ipaddress for the
-    # common case; anything else is treated as remote.
-    return host.startswith("127.")
+    # Everything else must be a literal loopback address. A prefix test would
+    # accept names like `127.attacker.example`, which resolve wherever their
+    # owner points them.
+    import ipaddress
+
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
 
 
 def _auth_headers() -> Dict[str, str]:
@@ -729,24 +735,29 @@ def _session_keys_for_task_locked(task_id: str) -> list:
     local-server browser lease would be stranded for the life of the process.
     Callers must hold ``_sessions_lock``.
     """
-    keys: list = []
     try:
         camofox_cfg = _get_camofox_config()
         identity = _camofox_identity_override(task_id, camofox_cfg) or get_camofox_identity(task_id)
         preferred = _session_cache_key(task_id, identity)
         if preferred in _sessions:
-            keys = [preferred]
+            return [preferred]
     except Exception:
         # Reading the identity needs the profile's secret scope, which the
         # cleanup callers have already exited — get_secret() fails closed
-        # there. The recorded task id below is enough on its own.
+        # there. Fall back to the task id recorded on the session.
         pass
-    keys.extend(
-        key
-        for key, session in _sessions.items()
-        if key not in keys and session.get("task_id") == task_id
-    )
-    return keys
+    matches = [key for key, session in _sessions.items() if session.get("task_id") == task_id]
+    if len(matches) == 1:
+        return matches
+    if matches:
+        # Two profiles are using the same task id (the API's session_id becomes
+        # the effective task id, so this is reachable). Without the identity
+        # there is no way to tell which one this cleanup owns, and popping both
+        # would delete another user's live browser state and release their
+        # lease. Leave them; the owning profile's next scoped call reclaims its
+        # own entry.
+        logger.debug("Camofox cleanup skipped ambiguous task id %s (%d profiles)", task_id, len(matches))
+    return []
 
 
 def _peek_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:

@@ -709,3 +709,37 @@ def test_navigate_auto_snapshot_is_filtered_after_mid_call_handback():
 
     assert "hunter2" not in json.dumps(result)
     assert "REDACTED" in result["snapshot"]
+
+
+def test_cleanup_refuses_to_guess_between_profiles_sharing_a_task_id():
+    """The task-id fallback must never reach into another profile's state.
+
+    The API's session_id becomes the effective task id, so two profiles can
+    legitimately carry the same one. Without the identity there is no way to
+    tell which session this cleanup owns, and popping both would delete another
+    user's live browser state and release their lease.
+    """
+    from agent.secret_scope import UnscopedSecretError
+    from tools.browser_camofox import _drop_session, _sessions
+
+    _sessions.clear()
+    for profile in ("profileA", "profileB"):
+        _sessions[f"{profile}\x00sess\x00shared-task"] = {
+            "user_id": profile,
+            "session_key": "sess",
+            "tab_id": f"tab-{profile}",
+            "managed": True,
+            "local_server_managed": True,
+            "task_id": "shared-task",
+        }
+
+    def _fail_closed(*args, **kwargs):
+        raise UnscopedSecretError("no secret scope installed")
+
+    with (
+        patch("tools.browser_camofox._camofox_identity_override", side_effect=_fail_closed),
+        patch("tools.browser_camofox.get_camofox_identity", side_effect=_fail_closed),
+    ):
+        assert _drop_session("shared-task") is None
+    assert len(_sessions) == 2, "an ambiguous task id must leave both profiles untouched"
+    _sessions.clear()
