@@ -27,6 +27,22 @@ from tools.browser_camofox import (
 from tools.browser_tool import _camofox_eval, browser_scroll
 
 
+
+def _get_serving_tabs(snapshot_payload, url="https://example.com/page"):
+    """Path-aware _get stub: /tabs answers the handback URL guard.
+
+    The guard runs whenever the handback filter is on, so any test that
+    exercises a filtered read needs the listing to resolve — otherwise it fails
+    closed and the test is measuring the wrong thing.
+    """
+    def _side_effect(path, params=None, timeout=None, session=None):
+        if path == "/tabs":
+            tab_id = (session or {}).get("tab_id") or "tab-1"
+            session_key = (session or {}).get("session_key") or "s"
+            return {"tabs": [{"tabId": tab_id, "listItemId": session_key, "url": url}]}
+        return snapshot_payload
+    return _side_effect
+
 def _http_error(status: int, payload: dict) -> requests.HTTPError:
     response = MagicMock()
     response.status_code = status
@@ -66,10 +82,10 @@ def test_epoch_stale_resnapshots_and_returns_retryable(managed_session):
     with (
         patch("tools.browser_camofox._get_session", return_value=managed_session),
         patch("tools.browser_camofox._post", side_effect=_epoch_stale(3)),
-        patch("tools.browser_camofox._get", return_value={
+        patch("tools.browser_camofox._get", side_effect=_get_serving_tabs({
             "snapshot": '- button "Continue" [e9]',
             "refsCount": 1,
-        }) as mock_get,
+        })) as mock_get,
     ):
         result = json.loads(camofox_click("@e4", task_id="agent-task"))
 
@@ -128,10 +144,10 @@ def test_epoch_stale_redacts_sensitive_human_page_state(managed_session):
     with (
         patch("tools.browser_camofox._get_session", return_value=managed_session),
         patch("tools.browser_camofox._post", side_effect=_epoch_stale(3)),
-        patch("tools.browser_camofox._get", return_value={
+        patch("tools.browser_camofox._get", side_effect=_get_serving_tabs({
             "snapshot": sensitive_snapshot,
             "refsCount": 4,
-        }),
+        })),
     ):
         result = json.loads(camofox_click("@e4", task_id="agent-task"))
 
@@ -150,10 +166,10 @@ def test_privacy_filter_blocks_raw_vision_and_filters_snapshot(managed_session):
     with (
         patch("tools.browser_camofox._get_session", return_value=managed_session),
         patch("tools.browser_camofox._post", side_effect=_epoch_stale(3)),
-        patch("tools.browser_camofox._get", return_value={
+        patch("tools.browser_camofox._get", side_effect=_get_serving_tabs({
             "snapshot": private_snapshot,
             "refsCount": 1,
-        }),
+        })),
         patch("tools.browser_camofox._get_raw") as mock_get_raw,
         patch("agent.auxiliary_client.call_llm") as mock_llm,
     ):
@@ -210,7 +226,10 @@ def test_agent_navigation_clears_handback_privacy_filter(managed_session):
     with (
         patch("tools.browser_camofox._get_session", return_value=managed_session),
         patch("tools.browser_camofox._post", return_value={"url": "https://example.com/next"}),
-        patch("tools.browser_camofox._get", return_value={"snapshot": '- heading "Next"', "refsCount": 0}),
+        patch("tools.browser_camofox._get", side_effect=_get_serving_tabs(
+            {"snapshot": '- heading "Next"', "refsCount": 0},
+            url="https://bank.example/login",
+        )),
     ):
         result = json.loads(camofox_navigate("https://example.com/next", task_id="agent-task"))
 
@@ -222,10 +241,10 @@ def test_console_evaluate_uses_epoch_recovery(managed_session):
     with (
         patch("tools.browser_camofox._ensure_tab", return_value=managed_session),
         patch("tools.browser_camofox._post", side_effect=_epoch_stale(3)),
-        patch("tools.browser_camofox._get", return_value={
+        patch("tools.browser_camofox._get", side_effect=_get_serving_tabs({
             "snapshot": '- heading "Signed in"',
             "refsCount": 0,
-        }),
+        })),
     ):
         result = json.loads(_camofox_eval("document.title", "agent-task"))
 
@@ -318,7 +337,7 @@ def test_privacy_filter_reduces_snapshot_urls_to_origin(managed_session):
     )
     with (
         patch("tools.browser_camofox._get_session", return_value=managed_session),
-        patch("tools.browser_camofox._get", return_value={"snapshot": snapshot, "refsCount": 2}),
+        patch("tools.browser_camofox._get", side_effect=_get_serving_tabs({"snapshot": snapshot, "refsCount": 2})),
     ):
         result = json.loads(camofox_snapshot(task_id="agent-task"))
 
@@ -759,7 +778,10 @@ def test_navigate_clears_privacy_filter_on_a_quiet_navigation():
         patch("tools.browser_camofox._ensure_tab", return_value=session),
         patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
         patch("tools.browser_camofox._post", return_value={"url": "https://example.com/", "title": "Example"}),
-        patch("tools.browser_camofox._get", return_value={"snapshot": "- heading \"Example\"", "refsCount": 1}),
+        patch("tools.browser_camofox._get", side_effect=_get_serving_tabs(
+            {"snapshot": "- heading \"Example\"", "refsCount": 1},
+            url="https://bank.example/login",
+        )),
     ):
         result = json.loads(camofox_navigate("https://example.com/", task_id="agent-task"))
 
@@ -970,3 +992,92 @@ def test_recovery_refuses_to_snapshot_a_blocked_page():
     assert _recovery_target_allowed("http://169.254.169.254/latest/meta-data/") is False
     assert _recovery_target_allowed("http://metadata.google.internal/") is False
     assert _recovery_target_allowed("http://192.168.1.10/admin") is False
+
+
+def test_snapshot_refuses_a_blocked_page_after_handback():
+    """The success path needs the same guard the 409 recovery path has.
+
+    If the Agent's first call after a handback is browser_snapshot, the proxy
+    answers 200 and only advances the epoch through the header — so a human who
+    left the tab on cloud metadata would have its contents redacted but still
+    delivered, along with actionable refs.
+    """
+    from tools.browser_camofox import camofox_snapshot
+
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
+        "privacy_filter_after_handback": False, "epoch": 3, "_lock": None,
+    }
+
+    def _get_with_handback(path, params=None, timeout=None, session=None, **kwargs):
+        if path == "/tabs":
+            return {"tabs": [{"tabId": "tab-1", "listItemId": "s", "url": "http://169.254.169.254/latest/meta-data/"}]}
+        session["privacy_filter_after_handback"] = True  # the epoch arrived with this response
+        return {"snapshot": "- text \"iam credentials\"", "refsCount": 3}
+
+    with (
+        patch("tools.browser_camofox._get_session", return_value=session),
+        patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
+        patch("tools.browser_camofox._get", side_effect=_get_with_handback),
+    ):
+        result = json.loads(camofox_snapshot(task_id="agent-task"))
+
+    assert result["success"] is False
+    assert "not allowed to read" in result["error"]
+    assert "iam credentials" not in json.dumps(result)
+
+
+def test_fragment_navigation_does_not_clear_the_handback_filter():
+    """A same-document navigation keeps the DOM the human typed into.
+
+    It also does not advance the handback epoch, so "the epoch stood still" is
+    not evidence the Agent left the page.
+    """
+    from tools.browser_camofox import camofox_navigate
+
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
+        "privacy_filter_after_handback": True, "epoch": 4, "_lock": None,
+    }
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=session),
+        patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
+        patch("tools.browser_camofox._post", return_value={"url": "https://bank.example/transfer#step2", "title": "Transfer"}),
+        patch("tools.browser_camofox._get", side_effect=_get_serving_tabs(
+            {"snapshot": "textbox \"Account\" value=\"12345678\"", "refsCount": 1},
+            url="https://bank.example/transfer",
+        )),
+    ):
+        result = json.loads(camofox_navigate("https://bank.example/transfer#step2", task_id="agent-task"))
+
+    assert session["privacy_filter_after_handback"] is True
+    assert "12345678" not in json.dumps(result)
+
+
+def test_managed_tab_read_without_epoch_header_fails_closed():
+    """A local-server that stops sending the epoch must not silently disarm it.
+
+    The epoch is the only signal that a human touched the page, so a successful
+    managed tab response without one is a protocol failure, and the safe
+    reading is "assume the page changed".
+    """
+    from tools.browser_camofox import _adopt_epoch_from_response
+
+    session = {"epoch": 5, "local_server_managed": True, "privacy_filter_after_handback": False}
+    resp = MagicMock()
+    resp.headers = {}
+    resp.status_code = 200
+
+    _adopt_epoch_from_response(session, resp, tab_operation=True)
+    assert session["privacy_filter_after_handback"] is True
+
+    # An error envelope carries no page data, so it says nothing either way.
+    session["privacy_filter_after_handback"] = False
+    resp.status_code = 503
+    _adopt_epoch_from_response(session, resp, tab_operation=True)
+    assert session["privacy_filter_after_handback"] is False
+
+    # Neither does a non-tab path.
+    resp.status_code = 200
+    _adopt_epoch_from_response(session, resp, tab_operation=False)
+    assert session["privacy_filter_after_handback"] is False
