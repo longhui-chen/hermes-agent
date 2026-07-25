@@ -530,3 +530,147 @@ def test_cleanup_finds_session_after_profile_scope_is_gone():
         assert released == [1]
         assert _sessions == {}
         assert _drop_session("agent-task") is None
+
+
+def test_handback_filter_redacts_ipv6_urls():
+    """A bracketed IPv6 authority must not slip past the origin reduction."""
+    from tools.browser_camofox import _redact_handback_page_state, _url_origin_only
+
+    assert _url_origin_only("https://[2001:db8::1]/cb?code=secret") == "https://[2001:db8::1]/"
+    assert _url_origin_only("https://[2001:db8::1]:8443/cb?code=secret") == "https://[2001:db8::1]:8443/"
+
+    filtered = _redact_handback_page_state("link /url: https://[2001:db8::1]/callback?code=abc123")
+    assert "abc123" not in filtered
+    assert "https://[2001:db8::1]/" in filtered
+
+
+def test_cleanup_survives_unscoped_secret_error():
+    """Cleanup must not be defeated by the fail-closed secret scope.
+
+    get_secret() raises UnscopedSecretError in multiplex mode without a profile
+    scope, which is exactly the state the idle reaper and shutdown run in. If
+    the task-id lookup propagated that, browser_tool would swallow it and the
+    session plus its local-server lease would leak.
+    """
+    from agent.secret_scope import UnscopedSecretError
+    from tools.browser_camofox import _sessions, camofox_soft_cleanup, has_camofox_session
+
+    _sessions.clear()
+    _sessions["profileA\x00sessA\x00agent-task"] = {
+        "user_id": "profileA",
+        "session_key": "sessA",
+        "tab_id": "tab-1",
+        "managed": True,
+        "local_server_managed": True,
+        "task_id": "agent-task",
+    }
+
+    def _fail_closed(*args, **kwargs):
+        raise UnscopedSecretError("no secret scope installed")
+
+    with (
+        patch("tools.browser_camofox._camofox_identity_override", side_effect=_fail_closed),
+        patch("tools.browser_camofox.get_camofox_identity", side_effect=_fail_closed),
+    ):
+        assert has_camofox_session("agent-task") is True
+        released = []
+        with patch("tools.browser_camofox._release_local_server_lease", side_effect=lambda: released.append(1)):
+            assert camofox_soft_cleanup("agent-task") is True
+        assert released == [1]
+        assert _sessions == {}
+
+
+def test_cleanup_without_session_never_releases_another_turns_lease():
+    """A turn that never opened a browser must not release the profile lease.
+
+    cleanup_task_resources() runs at the end of every turn, so an unconditional
+    release would tear the runtime down under a concurrent turn — or under a
+    human who is mid-takeover.
+    """
+    from tools.browser_camofox import _sessions, camofox_soft_cleanup
+
+    _sessions.clear()
+    released = []
+    with (
+        patch("tools.browser_camofox._get_camofox_config", return_value={}),
+        patch("tools.browser_camofox._local_server_managed", return_value=True),
+        patch("tools.browser_camofox._camofox_identity_override", return_value=None),
+        patch("tools.browser_camofox.get_camofox_identity", return_value={"user_id": "u", "session_key": "s"}),
+        patch("tools.browser_camofox._release_local_server_lease", side_effect=lambda: released.append(1)),
+    ):
+        assert camofox_soft_cleanup("never-used-browser") is True
+    assert released == []
+
+
+def test_reads_retry_transient_failures_but_mutations_do_not():
+    """Bounded backoff for idempotent reads; no blind replay of side effects."""
+    from tools.browser_camofox import _get, _post
+
+    unavailable = MagicMock()
+    unavailable.status_code = 503
+    unavailable.headers = {}
+    unavailable.json.return_value = {"error": "starting"}
+    ok = MagicMock()
+    ok.status_code = 200
+    ok.headers = {}
+    ok.json.return_value = {"tabs": []}
+
+    get_calls = []
+
+    def _flaky_get(url, params=None, timeout=None, headers=None, allow_redirects=None):
+        get_calls.append(url)
+        return unavailable if len(get_calls) < 3 else ok
+
+    with (
+        patch("tools.browser_camofox.get_camofox_url", return_value="http://127.0.0.1:9377"),
+        patch("tools.browser_camofox._auth_headers", return_value={}),
+        patch("time.sleep", return_value=None),
+        patch("tools.browser_camofox.requests.get", side_effect=_flaky_get),
+    ):
+        assert _get("/tabs") == {"tabs": []}
+    assert len(get_calls) == 3
+
+    post_calls = []
+
+    def _flaky_post(url, json=None, timeout=None, headers=None, allow_redirects=None):
+        post_calls.append(url)
+        return unavailable
+
+    with (
+        patch("tools.browser_camofox.get_camofox_url", return_value="http://127.0.0.1:9377"),
+        patch("tools.browser_camofox._auth_headers", return_value={}),
+        patch("tools.browser_camofox.requests.post", side_effect=_flaky_post),
+    ):
+        with pytest.raises(Exception):
+            _post("/tabs/t/click", {"ref": "e1"})
+    assert len(post_calls) == 1, "a mutation must never be replayed"
+
+
+def test_vision_discards_screenshot_when_handback_lands_mid_call():
+    """The epoch that enables the filter arrives with the screenshot response."""
+    from tools.browser_camofox import camofox_vision
+
+    session = {
+        "user_id": "u",
+        "tab_id": "tab-1",
+        "session_key": "s",
+        "privacy_filter_after_handback": False,
+        "epoch": 1,
+        "_lock": None,
+    }
+
+    def _raw(path, params=None, timeout=None, session=None):
+        # The response carries the post-handback epoch.
+        session["privacy_filter_after_handback"] = True
+        resp = MagicMock()
+        resp.content = b"\x89PNG-private-screen"
+        return resp
+
+    with (
+        patch("tools.browser_camofox._get_session", return_value=session),
+        patch("tools.browser_camofox._get_raw", side_effect=_raw),
+    ):
+        result = json.loads(camofox_vision("what is on screen?", task_id="agent-task"))
+
+    assert result["success"] is False
+    assert "blocked after human control" in result["error"]

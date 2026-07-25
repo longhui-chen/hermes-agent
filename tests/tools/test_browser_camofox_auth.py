@@ -51,12 +51,36 @@ class TestAuthHeaders:
 
     def test_action_token_mode_uses_dedicated_header(self, monkeypatch):
         monkeypatch.setenv("CAMOFOX_AUTH_MODE", "zettlab_action_token")
+        monkeypatch.setenv("CAMOFOX_URL", "http://127.0.0.1:9377/internal/browser/camofox")
         monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "agent-action-token")
         monkeypatch.setenv("CAMOFOX_API_KEY", "direct-api-key")
 
         assert _auth_headers() == {
             "X-Zettlab-Agent-Action-Token": "agent-action-token",
         }
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://evil.example:9377",
+            "https://127.0.0.1:9377",
+            "http://10.0.0.5:9377",
+            "",
+        ],
+    )
+    def test_action_token_never_leaves_loopback(self, monkeypatch, url):
+        """The token grants local Agent authority and must stay on loopback.
+
+        A profile .env that is misconfigured or overwritten with an external
+        address would otherwise hand the credential to whoever answers, with no
+        redirect involved.
+        """
+        monkeypatch.setenv("CAMOFOX_AUTH_MODE", "zettlab_action_token")
+        monkeypatch.setenv("CAMOFOX_URL", url)
+        monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "agent-action-token")
+
+        with pytest.raises(RuntimeError, match="loopback"):
+            _auth_headers()
 
     def test_action_token_mode_fails_closed_without_token(self, monkeypatch):
         monkeypatch.setenv("CAMOFOX_AUTH_MODE", "zettlab_action_token")

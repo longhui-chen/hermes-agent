@@ -3699,20 +3699,29 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
         _ensure_tab,
         _handback_privacy_filter_enabled,
         _post,
+        _tab_path,
         _tool_error_from_exception,
     )
+
+    def _blocked_after_handback() -> str:
+        return json.dumps({
+            "success": False,
+            "error": (
+                "Browser evaluation is blocked after human control until the "
+                "Agent navigates to a new page or closes the session."
+            ),
+        }, ensure_ascii=False)
+
     try:
         tab_info = _ensure_tab(task_id or "default")
         if _handback_privacy_filter_enabled(tab_info):
-            return json.dumps({
-                "success": False,
-                "error": (
-                    "Browser evaluation is blocked after human control until the "
-                    "Agent navigates to a new page or closes the session."
-                ),
-            }, ensure_ascii=False)
-        tab_id = tab_info.get("tab_id") or tab_info.get("id")
-        resp = _post(f"/tabs/{tab_id}/evaluate", body={"expression": expression, "userId": tab_info["user_id"]}, session=tab_info)
+            return _blocked_after_handback()
+        resp = _post(_tab_path(tab_info, "/evaluate"), body={"expression": expression, "userId": tab_info["user_id"]}, session=tab_info)
+        # The epoch that enables the filter rides along with this response, so
+        # a handback landing mid-call must invalidate the result rather than
+        # hand the human's page data to the model.
+        if _handback_privacy_filter_enabled(tab_info):
+            return _blocked_after_handback()
 
         # Camofox returns the result in a JSON envelope
         raw_result = resp.get("result") if isinstance(resp, dict) else resp

@@ -46,7 +46,11 @@ _HANDBACK_EDITABLE_CONTROL = re.compile(
 _HANDBACK_VALUE_ATTRIBUTE = re.compile(
     r"(?i)\bvalue=(?:\"[^\"]*\"|'[^']*'|\S+)"
 )
-_HANDBACK_URL = re.compile(r"(?i)\bhttps?://[^\s\"'<>()\[\]]+")
+# The optional bracketed group is what makes an IPv6 authority match at all:
+# without it `https://[2001:db8::1]/cb?code=…` is skipped entirely (brackets are
+# excluded from the tail so a URL inside markdown/parentheses is not swallowed),
+# and the whole query would reach the model verbatim.
+_HANDBACK_URL = re.compile(r"(?i)\bhttps?://(?:\[[0-9A-Fa-f:.]+\])?[^\s\"'<>()\[\]]*")
 
 
 def _url_origin_only(url: str) -> str:
@@ -67,6 +71,10 @@ def _url_origin_only(url: str) -> str:
     # ``user:password@`` userinfo, which is exactly the kind of credential a
     # human may have typed into a basic-auth URL during handback.
     host = parsed.hostname
+    if ":" in host:
+        # urlsplit strips the brackets off an IPv6 literal; put them back or
+        # the rebuilt origin is not a valid URL.
+        host = f"[{host}]"
     try:
         port = parsed.port
     except ValueError:
@@ -240,6 +248,26 @@ def _runtime_value(name: str, default: str = "") -> str:
     return str(value or default)
 
 
+def _is_trusted_action_token_endpoint(url: str) -> bool:
+    """Whether ``url`` is the local-server proxy the action token belongs to."""
+    if not url:
+        return False
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    if parsed.scheme != "http":
+        # The proxy is plain HTTP on loopback; anything else means the value
+        # was repointed somewhere this credential does not belong.
+        return False
+    host = (parsed.hostname or "").strip().lower()
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    # Cover the rest of 127.0.0.0/8 without pulling in ipaddress for the
+    # common case; anything else is treated as remote.
+    return host.startswith("127.")
+
+
 def _auth_headers() -> Dict[str, str]:
     """Return the configured Camofox authentication header.
 
@@ -254,6 +282,16 @@ def _auth_headers() -> Dict[str, str]:
             raise RuntimeError(
                 "CAMOFOX_AUTH_MODE=zettlab_action_token requires "
                 "ZETTLAB_AGENT_ACTION_TOKEN"
+            )
+        # The token grants local Agent authority, so it is only ever sent to
+        # the local-server proxy on loopback. If the profile's .env is
+        # misconfigured or overwritten with an external address, fail closed
+        # rather than hand the credential to whoever answers.
+        if not _is_trusted_action_token_endpoint(get_camofox_url()):
+            raise RuntimeError(
+                "CAMOFOX_AUTH_MODE=zettlab_action_token requires a loopback "
+                "CAMOFOX_URL; refusing to send the Agent action token to "
+                "a non-local endpoint"
             )
         return {"X-Zettlab-Agent-Action-Token": token}
 
@@ -691,10 +729,18 @@ def _session_keys_for_task_locked(task_id: str) -> list:
     local-server browser lease would be stranded for the life of the process.
     Callers must hold ``_sessions_lock``.
     """
-    camofox_cfg = _get_camofox_config()
-    identity = _camofox_identity_override(task_id, camofox_cfg) or get_camofox_identity(task_id)
-    preferred = _session_cache_key(task_id, identity)
-    keys = [preferred] if preferred in _sessions else []
+    keys: list = []
+    try:
+        camofox_cfg = _get_camofox_config()
+        identity = _camofox_identity_override(task_id, camofox_cfg) or get_camofox_identity(task_id)
+        preferred = _session_cache_key(task_id, identity)
+        if preferred in _sessions:
+            keys = [preferred]
+    except Exception:
+        # Reading the identity needs the profile's secret scope, which the
+        # cleanup callers have already exited — get_secret() fails closed
+        # there. The recorded task id below is enough on its own.
+        pass
     keys.extend(
         key
         for key, session in _sessions.items()
@@ -781,17 +827,21 @@ def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
         logger.debug("Camofox soft cleanup for task %s (managed persistence)", task_id)
         return True
 
-    camofox_cfg = _get_camofox_config()
-    if (
-        _local_server_managed()
-        or bool(camofox_cfg.get("managed_persistence"))
-        or _camofox_identity_override(task_id, camofox_cfg)
-    ):
-        if _local_server_managed():
-            _release_local_server_lease()
-        logger.debug("Camofox soft cleanup for task %s (managed persistence)", task_id)
+    # Nothing is tracked for this task, so it never took a browser lease and
+    # must not release one: cleanup_task_resources() runs at the end of every
+    # turn, and releasing here would tear down the runtime out from under a
+    # concurrent turn on the same profile that is actually using it.
+    try:
+        camofox_cfg = _get_camofox_config()
+        return bool(
+            _local_server_managed()
+            or camofox_cfg.get("managed_persistence")
+            or _camofox_identity_override(task_id, camofox_cfg)
+        )
+    except Exception:
+        # Scope-less cleanup path; with no tracked session there is nothing to
+        # tear down either way.
         return True
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -834,6 +884,39 @@ def _request_headers(session: Optional[Dict[str, Any]]) -> Dict[str, str]:
     return {**_auth_headers(), **_session_epoch_header(session)}
 
 
+# Bounded retry for reads only. A cold camofox start or a loaded device makes
+# the proxy briefly answer 502/503 or time out; without this a single blip ends
+# the tool call. Mutations (click/type/navigate) are never replayed — their side
+# effects are not idempotent — so they surface the retryable degradation to the
+# Agent instead.
+_READ_RETRY_ATTEMPTS = 3
+_READ_RETRY_BACKOFF_SECONDS = 0.25
+_RETRYABLE_READ_STATUSES = frozenset({502, 503, 504})
+
+
+def _is_retryable_read_error(exc: BaseException) -> bool:
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    resp = getattr(exc, "response", None)
+    return resp is not None and getattr(resp, "status_code", None) in _RETRYABLE_READ_STATUSES
+
+
+def _retry_read(operation):
+    """Run an idempotent read with bounded exponential backoff."""
+    import time
+
+    last_exc: Optional[BaseException] = None
+    for attempt in range(_READ_RETRY_ATTEMPTS):
+        try:
+            return operation()
+        except Exception as exc:
+            if not _is_retryable_read_error(exc) or attempt == _READ_RETRY_ATTEMPTS - 1:
+                raise
+            last_exc = exc
+            time.sleep(_READ_RETRY_BACKOFF_SECONDS * (2 ** attempt))
+    raise last_exc  # pragma: no cover - loop always returns or raises above
+
+
 def _post(path: str, body: dict, timeout: Optional[int] = None, session: Optional[Dict[str, Any]] = None) -> dict:
     """POST JSON to camofox and return parsed response."""
     if timeout is None:
@@ -847,13 +930,7 @@ def _post(path: str, body: dict, timeout: Optional[int] = None, session: Optiona
 
 def _get(path: str, params: dict = None, timeout: Optional[int] = None, session: Optional[Dict[str, Any]] = None) -> dict:
     """GET from camofox and return parsed response."""
-    if timeout is None:
-        timeout = _get_command_timeout()
-    url = f"{get_camofox_url()}{path}"
-    resp = requests.get(url, params=params, timeout=timeout, headers=_request_headers(session), allow_redirects=False)
-    _adopt_epoch_from_response(session, resp)
-    _raise_for_status(resp)
-    return resp.json()
+    return _get_raw(path, params=params, timeout=timeout, session=session).json()
 
 
 def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None, session: Optional[Dict[str, Any]] = None) -> requests.Response:
@@ -861,10 +938,14 @@ def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None, sess
     if timeout is None:
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
-    resp = requests.get(url, params=params, timeout=timeout, headers=_request_headers(session), allow_redirects=False)
-    _adopt_epoch_from_response(session, resp)
-    _raise_for_status(resp)
-    return resp
+
+    def _once() -> requests.Response:
+        resp = requests.get(url, params=params, timeout=timeout, headers=_request_headers(session), allow_redirects=False)
+        _adopt_epoch_from_response(session, resp)
+        _raise_for_status(resp)
+        return resp
+
+    return _retry_read(_once)
 
 
 def _delete(path: str, body: dict = None, timeout: Optional[int] = None, session: Optional[Dict[str, Any]] = None) -> dict:
@@ -980,7 +1061,10 @@ def _tool_error_from_exception(
         if extra:
             payload.update(extra)
         return json.dumps(payload, ensure_ascii=False)
-    if isinstance(exc, requests.ConnectionError):
+    # Timeout is a sibling of ConnectionError here, not a hard failure: a cold
+    # camofox start or a loaded device makes the proxy slow, and reporting that
+    # as unrecoverable turns a transient hiccup into a dead tool call.
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
         payload = {
             "success": False,
             "error": "browser_runtime_unavailable",
@@ -1358,6 +1442,15 @@ def camofox_vision(question: str, annotate: bool = False,
             params={"userId": session["user_id"]},
             session=session,
         )
+        # Re-check after the response: the epoch that turns the filter on
+        # arrives with this very response, so a handback landing between the
+        # pre-check and the reply would otherwise put the human's screen on
+        # disk and in front of the vision model.
+        if _handback_privacy_filter_enabled(session):
+            return tool_error(
+                "Browser vision is blocked after human control until the Agent navigates to a new page or closes the session.",
+                success=False,
+            )
 
         # Save screenshot to cache
         from hermes_constants import get_hermes_home

@@ -4636,3 +4636,82 @@ class TestSessionKeyHeader:
             assert resp.status == 200
             data = await resp.json()
             assert data["features"]["session_key_header"] == "X-Hermes-Session-Key"
+
+
+class TestTakeoverUIHintOverSSE:
+    """End-to-end coverage for the ui_hint field on the real streaming path.
+
+    The payload builder is unit-tested elsewhere, but that cannot catch the
+    field being dropped or mangled between the tool-complete callback, the
+    stream queue, and SSE serialization — nor a regression that breaks plain
+    conversational streaming for older clients.
+    """
+
+    @pytest.mark.asyncio
+    async def test_browser_takeover_hint_reaches_the_sse_stream(self, adapter):
+        app = _create_app(adapter)
+        hint_result = json.dumps({
+            "success": False,
+            "error": "browser_takeover_required",
+            "ui_hint": {
+                "type": "takeover_browser",
+                "agent_id": "agent-a",
+                "browser_session_id": "chat-1",
+                "tab_id": "tab-agent-1",
+            },
+        })
+
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                delta = kwargs.get("stream_delta_callback")
+                start = kwargs.get("tool_start_callback")
+                complete = kwargs.get("tool_complete_callback")
+                if delta:
+                    delta("Opening the browser.")
+                if start:
+                    start("call_1", "browser_navigate", {"url": "https://example.com"})
+                if complete:
+                    complete("call_1", "browser_navigate", {"url": "https://example.com"}, hint_result)
+                if delta:
+                    delta(None)
+                return (
+                    {"final_response": "Opening the browser.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with (
+                patch.object(adapter, "_response_format_transport_error", return_value=None),
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "open example.com"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        # Plain conversational streaming is untouched — an older client that
+        # ignores the custom event still gets its content and terminator.
+        assert "Opening the browser." in body
+        assert "[DONE]" in body
+
+        events = [
+            json.loads(line[len("data: "):])
+            for block in body.split("\n\n")
+            if "event: hermes.tool.progress" in block
+            for line in block.splitlines()
+            if line.startswith("data: ")
+        ]
+        completed = [e for e in events if e.get("status") == "completed"]
+        assert completed, f"no completed tool progress event in stream: {body}"
+        hint = completed[-1].get("ui_hint")
+        assert hint == {
+            "type": "takeover_browser",
+            "agent_id": "agent-a",
+            "browser_session_id": "chat-1",
+            "tab_id": "tab-agent-1",
+        }
