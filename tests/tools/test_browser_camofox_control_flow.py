@@ -2123,20 +2123,23 @@ def test_a_busy_session_is_never_evicted():
     from tools.browser_camofox import _evict_surplus_sessions_locked
 
     mod._sessions.clear()
-    old = time.monotonic() - (mod._EVICTION_GRACE_SECONDS + 10)
+    base = time.monotonic() - 1000
     # One busy entry, oldest of all, plus enough idle ones to exceed the cap.
     mod._sessions["p\x00s\x00busy"] = {
         "user_id": "p", "session_key": "s", "task_id": "busy",
-        "in_flight": 1, "last_used_at": old - 100,
+        "in_flight": 1, "last_used_at": base - 100,
     }
     for i in range(mod._MAX_TRACKED_SESSIONS + 2):
         mod._sessions[f"p\x00s\x00idle-{i:03d}"] = {
             "user_id": "p", "session_key": "s", "task_id": f"idle-{i:03d}",
-            "in_flight": 0, "last_used_at": old + i,
+            "in_flight": 0, "last_used_at": base + i,
         }
 
     evicted = _evict_surplus_sessions_locked()
 
     assert "p\x00s\x00busy" in mod._sessions, "a session with work in flight was evicted"
     assert all(s["task_id"] != "busy" for s in evicted)
+    # Recency alone must not spare an idle entry: the ceiling is hard, and it is
+    # reached by evicting idle entries rather than by sparing recent ones.
+    assert len(mod._sessions) == mod._MAX_TRACKED_SESSIONS, "the ceiling was not enforced"
     mod._sessions.clear()

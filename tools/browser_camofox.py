@@ -954,11 +954,22 @@ def _session_key_for_task_locked(task_id: str) -> Optional[str]:
 _MAX_TRACKED_SESSIONS = 64
 
 
-# A session between two calls of one composite operation (vision takes a
-# screenshot, then an annotation snapshot, with an LLM call in between) is not
-# in a request but is very much in use. The refcount covers the requests; this
-# grace covers the gaps inside an operation.
-_EVICTION_GRACE_SECONDS = 180
+@contextmanager
+def _session_operation(session: Optional[Dict[str, Any]]):
+    """Hold a session in use for a whole tool call, not just one request.
+
+    A time window cannot do this job: a client rotating session keys keeps
+    every entry inside any window, which turns the ceiling into no ceiling at
+    all. Only an explicit reference says "someone is working with this", and it
+    has to span the gaps inside a composite operation — vision takes a
+    screenshot, calls a model for up to two minutes, then takes an annotation
+    snapshot.
+    """
+    _begin_session_call(session)
+    try:
+        yield session
+    finally:
+        _end_session_call(session)
 
 
 def _begin_session_call(session: Optional[Dict[str, Any]]) -> None:
@@ -987,7 +998,6 @@ def _evict_surplus_sessions_locked() -> list:
     surplus = len(_sessions) - _MAX_TRACKED_SESSIONS
     if surplus <= 0:
         return []
-    now = time.monotonic()
     by_age = sorted(_sessions.items(), key=lambda kv: float(kv[1].get("last_used_at") or 0.0))
     evicted = []
     for key, session in by_age:
@@ -996,8 +1006,6 @@ def _evict_surplus_sessions_locked() -> list:
         # Evicting a session mid-operation would close the tab under a running
         # tool call — worse than being briefly over the ceiling.
         if int(session.get("in_flight") or 0) > 0:
-            continue
-        if now - float(session.get("last_used_at") or 0.0) < _EVICTION_GRACE_SECONDS:
             continue
         _sessions.pop(key, None)
         evicted.append(session)
@@ -1951,6 +1959,26 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
         # ``url`` is present on tab creation. Omitting it creates the blank tab
         # and gives Hermes a stable tabId before navigation can time out.
         session = _ensure_tab(task_id)
+        with _session_operation(session):
+            return _navigate_locked(session, task_id, url, browser_url, rewrite_info)
+    except requests.HTTPError as e:
+        return _tool_error_from_exception(
+            e, session=session, prefix="Navigation failed: ", extra=_navigation_tab_context(session),
+        )
+    except Exception as e:
+        return _tool_error_from_exception(
+            e, session=session, prefix="Navigation failed: ", extra=_navigation_tab_context(session),
+        )
+
+
+def _navigate_locked(
+    session: Dict[str, Any],
+    task_id: Optional[str],
+    url: str,
+    browser_url: str,
+    rewrite_info: Any,
+) -> str:
+    try:
         # Turns that share a browser identity share the physical tab, so the
         # navigate and the snapshot that describes where it landed have to be
         # one unit: otherwise this call returns its own url and title with the
@@ -2394,6 +2422,11 @@ def camofox_vision(question: str, annotate: bool = False,
                 "Browser vision is blocked after human control until the Agent navigates to a new page or closes the session.",
                 success=False,
             )
+        # Held for the whole call: the model round trip between the screenshot
+        # and the annotation snapshot can run for minutes, and the session is
+        # in use throughout. Released in the finally below.
+        _begin_session_call(session)
+        vision_reference_held = True
 
         # Get screenshot as binary PNG
         screenshot_filtered_at_request = _handback_privacy_filter_enabled(session)
@@ -2501,6 +2534,9 @@ def camofox_vision(question: str, annotate: bool = False,
         })
     except Exception as e:
         return _tool_error_from_exception(e, session=locals().get("session"))
+    finally:
+        if locals().get("vision_reference_held"):
+            _end_session_call(locals().get("session"))
 
 
 def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
