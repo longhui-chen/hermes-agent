@@ -650,6 +650,8 @@ def test_navigate_auto_snapshot_is_filtered_after_mid_call_handback():
     }
 
     def _get_with_handback(path, params=None, timeout=None, session=None):
+        if path == "/tabs":
+            return {"tabs": [{"tabId": "tab-1", "listItemId": "s", "url": "https://example.com/page"}]}
         # The snapshot response carries the post-handback epoch.
         session["privacy_filter_after_handback"] = True
         return {"snapshot": "textbox \"Password\" value=\"hunter2\"", "refsCount": 1}
@@ -889,8 +891,11 @@ def test_lease_release_is_retried_and_queued_until_it_lands():
     unavailable.headers = {}
     unavailable.json.return_value = {}
 
+    # The reclaim thread is stubbed out so the queue can be inspected; its own
+    # handoff is covered by test_queued_release_always_has_a_consumer.
     with (
         patch("time.sleep", return_value=None),
+        patch("tools.browser_camofox._ensure_maintenance_worker", return_value=None),
         patch("tools.browser_camofox.requests.post", return_value=unavailable) as failing,
     ):
         _release_local_server_lease(session)
@@ -1081,3 +1086,68 @@ def test_managed_tab_read_without_epoch_header_fails_closed():
     resp.status_code = 200
     _adopt_epoch_from_response(session, resp, tab_operation=False)
     assert session["privacy_filter_after_handback"] is False
+
+
+def test_queued_release_always_has_a_consumer():
+    """Enqueue and the worker's exit decision share one lock.
+
+    Without that handoff a release queued just as the worker was leaving would
+    sit there forever: the old thread still reports is_alive(), so no
+    replacement starts, and then it exits.
+    """
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import _queue_pending_lease_release
+
+    mod._pending_lease_releases.clear()
+    mod._maintenance_worker = None
+    try:
+        _queue_pending_lease_release("http://127.0.0.1:9377/x/_zettlab/release", {})
+        assert mod._maintenance_worker is not None, "a queued release must have a consumer"
+        assert mod._maintenance_worker.daemon is True
+    finally:
+        mod._pending_lease_releases.clear()
+
+
+def test_handback_filter_redacts_ipv6_with_userinfo():
+    """Basic-auth credentials in front of a bracketed IPv6 host.
+
+    Handling userinfo and IPv6 separately still truncated the match at the "@",
+    leaving the path and query — the OAuth code — in the text verbatim.
+    """
+    from tools.browser_camofox import _reduce_urls_to_origin
+
+    filtered = _reduce_urls_to_origin("go https://alice:secret@[2001:db8::1]/callback?code=abc123 now")
+    assert "abc123" not in filtered
+    assert "secret" not in filtered
+    assert "https://[2001:db8::1]/" in filtered
+
+
+def test_navigate_snapshot_is_withheld_for_a_blocked_page():
+    """navigate's inline snapshot needs the same guard as camofox_snapshot.
+
+    Redaction only strips form values; ordinary page text from cloud metadata
+    or an intranet host would still reach the model.
+    """
+    from tools.browser_camofox import camofox_navigate
+
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
+        "privacy_filter_after_handback": False, "epoch": 3, "_lock": None,
+    }
+
+    def _get_with_handback(path, params=None, timeout=None, session=None, **kwargs):
+        if path == "/tabs":
+            return {"tabs": [{"tabId": "tab-1", "listItemId": "s", "url": "http://169.254.169.254/latest/meta-data/"}]}
+        session["privacy_filter_after_handback"] = True
+        return {"snapshot": "- text \"iam credentials\"", "refsCount": 2}
+
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=session),
+        patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
+        patch("tools.browser_camofox._post", return_value={"url": "https://example.com/", "title": "Example"}),
+        patch("tools.browser_camofox._get", side_effect=_get_with_handback),
+    ):
+        result = json.loads(camofox_navigate("https://example.com/", task_id="agent-task"))
+
+    assert result.get("snapshot_withheld") is True
+    assert "iam credentials" not in json.dumps(result)

@@ -51,7 +51,12 @@ _HANDBACK_VALUE_ATTRIBUTE = re.compile(
 # without it `https://[2001:db8::1]/cb?code=…` is skipped entirely (brackets are
 # excluded from the tail so a URL inside markdown/parentheses is not swallowed),
 # and the whole query would reach the model verbatim.
-_HANDBACK_URL = re.compile(r"(?i)\bhttps?://(?:\[[0-9A-Fa-f:.]+\])?[^\s\"'<>()\[\]]*")
+_HANDBACK_URL = re.compile(
+    # userinfo may precede a bracketed IPv6 authority, and both are optional.
+    # Without allowing that combination the match stops at the "@" and the rest
+    # of the URL — path, query, OAuth code — is left in the text verbatim.
+    r"(?i)\bhttps?://(?:[^\s\"'<>()\[\]/@]*@)?(?:\[[0-9A-Fa-f:.]+\])?[^\s\"'<>()\[\]]*"
+)
 
 
 def _url_origin_only(url: str) -> str:
@@ -799,6 +804,9 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
     for expired in idle:
         _release_local_server_lease(expired)
     _flush_pending_lease_releases()
+    # A tracked session must be reclaimable even if this process never calls
+    # into the browser again.
+    _ensure_maintenance_worker()
 
     with _session_lock(session):
         return _adopt_existing_tab(session)
@@ -928,16 +936,19 @@ def _flush_pending_lease_releases() -> None:
     """Retry releases whose session context is already gone."""
     with _sessions_lock:
         pending, _pending_lease_releases[:] = list(_pending_lease_releases), []
-    for url, headers in pending:
+    for entry in pending:
+        url, headers = entry[0], entry[1]
         if not _attempt_lease_release(url, headers):
             _queue_pending_lease_release(url, headers)
 
 
-# The queue must drain on its own: the failed release may well have been the
-# last browser use of the process, so waiting for another session would leave
-# the lease held indefinitely.
-_PENDING_RELEASE_RETRY_DELAYS = (5, 15, 60, 300)
-_pending_release_worker: Optional[threading.Thread] = None
+# Reclaim has to run on its own clock. A multiplex turn whose cleanup happens
+# after the profile scope is gone cannot drop its own session, and the failed
+# release is often the last browser use of the process — nothing else would ever
+# come back to either one.
+_MAINTENANCE_TICK_SECONDS = 30
+_MAX_PENDING_RELEASE_ATTEMPTS = 8
+_maintenance_worker: Optional[threading.Thread] = None
 
 
 def _queue_pending_lease_release(url: str, headers: Dict[str, str]) -> None:
@@ -945,44 +956,57 @@ def _queue_pending_lease_release(url: str, headers: Dict[str, str]) -> None:
         if len(_pending_lease_releases) >= _MAX_PENDING_LEASE_RELEASES:
             _pending_lease_releases.pop(0)
         _pending_lease_releases.append((url, headers))
-    _ensure_pending_release_worker()
+    _ensure_maintenance_worker()
 
 
-def _ensure_pending_release_worker() -> None:
-    """Start the drain thread if it is not already running.
+def _ensure_maintenance_worker() -> None:
+    """Start the reclaim thread unless one is already running.
 
-    One short-lived daemon thread, started only when something is actually
-    pending and exiting as soon as the queue is empty or the bounded schedule
-    is exhausted — no permanent background thread on a 2 GB device.
+    The worker clears the global under the same lock in which it decides there
+    is nothing left to do, so an enqueue racing its exit either lands before
+    that check (the worker keeps going) or after it (this call sees None and
+    starts a replacement). Neither ordering can drop the work.
     """
-    global _pending_release_worker
+    global _maintenance_worker
     with _sessions_lock:
-        if _pending_release_worker is not None and _pending_release_worker.is_alive():
+        if _maintenance_worker is not None:
             return
         worker = threading.Thread(
-            target=_drain_pending_lease_releases,
-            name="camofox-lease-release",
+            target=_run_maintenance,
+            name="camofox-maintenance",
             daemon=True,
         )
-        _pending_release_worker = worker
+        _maintenance_worker = worker
     worker.start()
 
 
-def _drain_pending_lease_releases() -> None:
-    for delay in _PENDING_RELEASE_RETRY_DELAYS:
-        time.sleep(delay)
+def _run_maintenance() -> None:
+    global _maintenance_worker
+    while True:
+        time.sleep(_MAINTENANCE_TICK_SECONDS)
         with _sessions_lock:
-            if not _pending_lease_releases:
+            idle = _prune_idle_sessions_locked(time.monotonic())
+            pending, _pending_lease_releases[:] = list(_pending_lease_releases), []
+        for session in idle:
+            _release_local_server_lease(session)
+        for entry in pending:
+            url, headers = entry[0], entry[1]
+            attempts = entry[2] if len(entry) > 2 else 0
+            if _attempt_lease_release(url, headers):
+                continue
+            if attempts + 1 >= _MAX_PENDING_RELEASE_ATTEMPTS:
+                logger.warning(
+                    "Camofox gave up releasing a local-server browser lease; "
+                    "local-server reclaims it when its TTL expires"
+                )
+                continue
+            with _sessions_lock:
+                if len(_pending_lease_releases) < _MAX_PENDING_LEASE_RELEASES:
+                    _pending_lease_releases.append((url, headers, attempts + 1))
+        with _sessions_lock:
+            if not _sessions and not _pending_lease_releases:
+                _maintenance_worker = None
                 return
-        _flush_pending_lease_releases()
-    with _sessions_lock:
-        stranded = len(_pending_lease_releases)
-    if stranded:
-        logger.warning(
-            "Camofox could not release %d local-server browser lease(s); "
-            "local-server reclaims them when their TTL expires",
-            stranded,
-        )
 
 
 def _release_local_server_lease(session: Optional[Dict[str, Any]] = None) -> None:
@@ -1549,9 +1573,18 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
             # Same rule as camofox_snapshot(): the epoch that enables the
             # filter arrives with this very response, so a human who took over
             # and handed back between the navigate and the snapshot must not
-            # have what they typed land in the tool result.
-            result["snapshot"] = _filter_page_state_after_handback(session, snapshot_text)
-            result["element_count"] = snap_data.get("refsCount", 0)
+            # have what they typed land in the tool result — and if they left
+            # the tab somewhere the Agent may not read at all, redaction is not
+            # enough, the snapshot is dropped.
+            if _handback_privacy_filter_enabled(session) and not _handback_page_readable(session):
+                result["snapshot_withheld"] = True
+                result["warning"] = (
+                    "A human took over and left the browser on a page this Agent is not "
+                    "allowed to read. Page state was not captured."
+                )
+            else:
+                result["snapshot"] = _filter_page_state_after_handback(session, snapshot_text)
+                result["element_count"] = snap_data.get("refsCount", 0)
         except Exception:
             pass  # Navigation succeeded; snapshot is a bonus
 
