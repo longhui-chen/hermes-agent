@@ -44,6 +44,24 @@ def _get_serving_tabs(snapshot_payload, url="https://example.com/page"):
         return snapshot_payload
     return _side_effect
 
+@pytest.fixture(autouse=True)
+def _clear_response_facts():
+    """Reset the per-response thread-locals around every test.
+
+    Production resets them at the start of each transport call, but tests mock
+    that layer away — without this a test can pass on a neighbour's leftover.
+    """
+    import tools.browser_camofox as mod
+
+    for attr in ("started_handback", "epoch_verified"):
+        if hasattr(mod._response_facts, attr):
+            delattr(mod._response_facts, attr)
+    yield
+    for attr in ("started_handback", "epoch_verified"):
+        if hasattr(mod._response_facts, attr):
+            delattr(mod._response_facts, attr)
+
+
 def _http_error(status: int, payload: dict) -> requests.HTTPError:
     response = MagicMock()
     response.status_code = status
@@ -1311,9 +1329,22 @@ def test_release_is_serialized_against_session_registration():
     released = []
 
     def _record(session=None):
-        # If the lock were not held across the check, a concurrent registration
-        # could land here. Assert the section is exclusive instead of racing.
-        assert not _owner_lock(owner).acquire(blocking=False), "release ran outside the owner lock"
+        # The lock is reentrant for this thread, so exclusivity is checked from
+        # another one: it must not be able to take it while the release runs.
+        import threading as _threading
+
+        taken = []
+
+        def _try():
+            got = _owner_lock(owner).acquire(blocking=False)
+            taken.append(got)
+            if got:
+                _owner_lock(owner).release()
+
+        probe = _threading.Thread(target=_try)
+        probe.start()
+        probe.join()
+        assert taken == [False], "release ran outside the owner lock"
         released.append(1)
 
     with patch("tools.browser_camofox._release_local_server_lease", side_effect=_record):
@@ -1362,7 +1393,7 @@ def test_owner_lock_is_never_replaced_while_held():
     mod._owner_locks.clear()
     mod._sessions.clear()
     owner = "profileA\x00digest"
-    held = _owner_lock(owner)
+    held = _owner_lock(owner, reserve=True)
     held.acquire()
     try:
         # Push well past the cap with unrelated owners.
@@ -1371,6 +1402,7 @@ def test_owner_lock_is_never_replaced_while_held():
         assert _owner_lock(owner) is held, "a held lock must never be replaced"
     finally:
         held.release()
+        mod._owner_lock_refs.clear()
         mod._owner_locks.clear()
 
 
@@ -1869,3 +1901,84 @@ def test_navigate_snapshot_is_redacted_when_only_the_response_reveals_handback()
         result = json.loads(camofox_navigate("https://example.com/", task_id="agent-task"))
 
     assert "hunter2" not in json.dumps(result)
+
+
+def test_click_result_url_is_filtered_when_only_the_response_reveals_handback():
+    """The click result reports where the page ended up — where the human is."""
+    import tools.browser_camofox as mod
+
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
+        "privacy_filter_after_handback": False, "epoch": 4, "_lock": None,
+    }
+
+    def _post_racing(path, body=None, timeout=None, session=None):
+        mod._response_facts.started_handback = True
+        session["privacy_filter_after_handback"] = True
+        session["privacy_filter_after_handback"] = False
+        return {"url": "https://idp.example/callback?code=SECRET"}
+
+    with (
+        patch("tools.browser_camofox._get_session", return_value=session),
+        patch("tools.browser_camofox._post", side_effect=_post_racing),
+    ):
+        result = json.loads(camofox_click("@e1", task_id="agent-task"))
+
+    assert "SECRET" not in json.dumps(result)
+    assert result["url"] == "https://idp.example/"
+
+
+def test_retryable_failure_does_not_erase_a_revealed_handback():
+    """An earlier attempt can carry the epoch and still fail retryably."""
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import _get
+
+    attempts = {"n": 0}
+    unavailable = MagicMock()
+    unavailable.status_code = 503
+    unavailable.headers = {}
+    unavailable.json.return_value = {}
+    ok = MagicMock()
+    ok.status_code = 200
+    ok.headers = {}
+    ok.json.return_value = {"snapshot": "ready"}
+
+    def _flaky(url, params=None, timeout=None, headers=None, allow_redirects=None):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            # This response revealed the handback, then failed retryably.
+            mod._response_facts.started_handback = True
+            return unavailable
+        return ok
+
+    with (
+        patch("tools.browser_camofox.get_camofox_url", return_value="http://127.0.0.1:9377"),
+        patch("tools.browser_camofox._auth_headers", return_value={}),
+        patch("time.sleep", return_value=None),
+        patch("tools.browser_camofox.requests.get", side_effect=_flaky),
+    ):
+        _get("/tabs/tab-1/snapshot")
+
+    assert mod._last_response_started_handback() is True, "the fact must survive the retry"
+
+
+def test_session_cache_has_a_hard_ceiling():
+    """Time-based expiry cannot bound memory on a 2 GB device."""
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import _evict_surplus_sessions_locked
+
+    mod._sessions.clear()
+    for i in range(mod._MAX_TRACKED_SESSIONS + 5):
+        mod._sessions[f"p\x00s\x00task-{i:03d}"] = {
+            "user_id": "p", "session_key": "s", "task_id": f"task-{i:03d}",
+            "managed": True, "local_server_managed": True,
+            "last_used_at": float(i),
+        }
+    evicted = _evict_surplus_sessions_locked()
+
+    assert len(mod._sessions) == mod._MAX_TRACKED_SESSIONS
+    assert len(evicted) == 5
+    # The least recently used go first, and they come back for teardown rather
+    # than being dropped silently.
+    assert [s["task_id"] for s in evicted] == [f"task-{i:03d}" for i in range(5)]
+    mod._sessions.clear()

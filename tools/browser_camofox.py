@@ -215,7 +215,7 @@ def _filter_page_state_after_handback(
     return value
 
 
-def _filter_url_after_handback(session: Dict[str, Any], url: Any) -> Any:
+def _filter_url_after_handback(session: Dict[str, Any], url: Any, revealed: bool = False) -> Any:
     """Reduce an operation-result URL to its origin while the filter is active.
 
     Click/back results report the page URL the human left behind; without this
@@ -224,7 +224,7 @@ def _filter_url_after_handback(session: Dict[str, Any], url: Any) -> Any:
     """
     if not isinstance(url, str) or not url:
         return url
-    if not _handback_privacy_filter_enabled(session):
+    if not revealed and not _handback_privacy_filter_enabled(session):
         return url
     return _url_origin_only(url)
 
@@ -848,6 +848,7 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "_lock": threading.Lock(),
                 }
             _sessions[cache_key] = session
+        idle.extend(_evict_surplus_sessions_locked())
     for expired in idle:
         _teardown_session(expired)
     _run_pending_teardowns()
@@ -931,6 +932,35 @@ def _session_key_for_task_locked(task_id: str) -> Optional[str]:
         return None
     preferred = _session_cache_key(task_id, identity)
     return preferred if preferred in _sessions else None
+
+
+# A hard ceiling as well as a TTL: a client rotating session keys inside the
+# idle window would otherwise grow _sessions, its owner locks and the
+# local-server tabs behind them without bound, and time-based expiry cannot
+# bound memory on a 2 GB device.
+_MAX_TRACKED_SESSIONS = 64
+
+
+def _evict_surplus_sessions_locked() -> list:
+    """Drop the least recently used entries once past the ceiling.
+
+    Returns them so the caller can tear them down outside the lock — evicting
+    the tracking without releasing the browser state behind it would just move
+    the leak somewhere less visible.
+    """
+    surplus = len(_sessions) - _MAX_TRACKED_SESSIONS
+    if surplus <= 0:
+        return []
+    by_age = sorted(_sessions.items(), key=lambda kv: float(kv[1].get("last_used_at") or 0.0))
+    evicted = []
+    for key, session in by_age[:surplus]:
+        _sessions.pop(key, None)
+        evicted.append(session)
+    logger.warning(
+        "Camofox session cache exceeded %d entries; reclaimed %d least-recently-used",
+        _MAX_TRACKED_SESSIONS, len(evicted),
+    )
+    return evicted
 
 
 def _prune_idle_sessions_locked(now: float) -> list:
@@ -1150,7 +1180,7 @@ def _release_owner_key(user_id: str, headers: Dict[str, str]) -> str:
 
 
 _MAX_OWNER_LOCKS = 256
-_owner_locks: Dict[str, threading.Lock] = {}
+_owner_locks: Dict[str, threading.RLock] = {}
 # Owners with a lock currently reserved or held; never evicted.
 _owner_lock_refs: Dict[str, int] = {}
 
@@ -1177,7 +1207,7 @@ def _held_owner_lock(owner: str):
                 _owner_lock_refs.pop(owner, None)
 
 
-def _owner_lock(owner: str, reserve: bool = False) -> threading.Lock:
+def _owner_lock(owner: str, reserve: bool = False) -> threading.RLock:
     """Serialize session registration against lease release for one profile.
 
     Without it the "am I the last holder" answer can go stale between the check
@@ -1202,7 +1232,7 @@ def _owner_lock(owner: str, reserve: bool = False) -> threading.Lock:
                 if candidate.acquire(blocking=False):
                     candidate.release()
                     del _owner_locks[key]
-        lock = threading.Lock()
+        lock = threading.RLock()
         _owner_locks[owner] = lock
         return lock
 
@@ -1515,8 +1545,12 @@ def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None, sess
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
 
+    # Reset once for the whole call, not per attempt: an earlier attempt can
+    # carry the epoch that reveals a handback and still fail retryably, and
+    # that fact has to reach the caller.
+    _response_facts.started_handback = False
+
     def _once() -> requests.Response:
-        _response_facts.started_handback = False
         resp = requests.get(url, params=params, timeout=timeout, headers=_request_headers(session), allow_redirects=False)
         _adopt_epoch_from_response(session, resp, tab_operation=_is_tab_operation(path))
         _raise_for_status(resp)
@@ -1808,12 +1842,44 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
         # ``url`` is present on tab creation. Omitting it creates the blank tab
         # and gives Hermes a stable tabId before navigation can time out.
         session = _ensure_tab(task_id)
+        # Turns that share a browser identity share the physical tab, so the
+        # navigate and the snapshot that describes where it landed have to be
+        # one unit: otherwise this call returns its own url and title with the
+        # other turn's page state, and the refs point at the wrong document.
+        # The lock is reentrant, so _ensure_tab above having taken it is fine.
+        with _held_owner_lock(_browser_identity_key(session)):
+            return _navigate_within_identity(session, task_id, url, browser_url, rewrite_info)
+    except requests.HTTPError as e:
+        return _tool_error_from_exception(
+            e,
+            session=session,
+            prefix="Navigation failed: ",
+            extra=_navigation_tab_context(session),
+        )
+    except Exception as e:
+        return _tool_error_from_exception(
+            e,
+            session=session,
+            prefix="Navigation failed: ",
+            extra=_navigation_tab_context(session),
+        )
+
+
+def _navigate_within_identity(
+    session: Dict[str, Any],
+    task_id: Optional[str],
+    url: str,
+    browser_url: str,
+    rewrite_info: Any,
+) -> str:
+    try:
         # An epoch advance during this call means a human took over and handed
         # back while the navigation was in flight, so the page the Agent is
         # about to read is not the one it asked for. Clearing the filter
         # unconditionally below would let those values through, and the fresh
         # epoch means the server will not flag the next read as stale either.
         epoch_before_navigate = session.get("epoch")
+        navigate_filtered_at_request = _handback_privacy_filter_enabled(session)
         # Only meaningful while the filter is on, and it costs a round trip, so
         # it is not taken on the normal path.
         document_before_navigate = (
@@ -1864,8 +1930,13 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
         # the model in full, with the title alongside it.
         landed_url = data.get("url", browser_url)
         landed_title = data.get("title", "")
-        if _handback_privacy_filter_enabled(session):
-            landed_url = _filter_url_after_handback(session, landed_url)
+        # Same three signals the reads use: the state when the request went
+        # out, whether this response is the one that revealed the handback, and
+        # the state now. A concurrent navigate can clear the shared flag before
+        # this line runs.
+        landed_handback_revealed = navigate_filtered_at_request or _last_response_started_handback()
+        if landed_handback_revealed or _handback_privacy_filter_enabled(session):
+            landed_url = _filter_url_after_handback(session, landed_url, True)
             landed_title = "[REDACTED]" if landed_title else landed_title
         result = {
             "success": True,
@@ -2005,15 +2076,21 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
         # Strip @ prefix if present (our tool convention)
         clean_ref = ref.lstrip("@")
 
+        filtered_at_request = _handback_privacy_filter_enabled(session)
         data = _post(
             _tab_path(session, "/click"),
             {"userId": session["user_id"], "ref": clean_ref},
             session=session,
         )
+        # The result reports where the click landed, which is where the human
+        # is if one took over. Judged on the request-time state and this
+        # response's own fact, not just the shared flag a concurrent turn can
+        # clear.
+        result_handback_revealed = filtered_at_request or _last_response_started_handback()
         return json.dumps({
             "success": True,
             "clicked": clean_ref,
-            "url": _filter_url_after_handback(session, data.get("url", "")),
+            "url": _filter_url_after_handback(session, data.get("url", ""), result_handback_revealed),
         })
     except Exception as e:
         return _tool_error_from_exception(e, session=locals().get("session"))
@@ -2085,12 +2162,14 @@ def camofox_back(task_id: Optional[str] = None) -> str:
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
+        filtered_at_request = _handback_privacy_filter_enabled(session)
         data = _post(
             _tab_path(session, "/back"),
             {"userId": session["user_id"]},
             session=session,
         )
-        return json.dumps({"success": True, "url": _filter_url_after_handback(session, data.get("url", ""))})
+        result_handback_revealed = filtered_at_request or _last_response_started_handback()
+        return json.dumps({"success": True, "url": _filter_url_after_handback(session, data.get("url", ""), result_handback_revealed)})
     except Exception as e:
         return _tool_error_from_exception(e, session=locals().get("session"))
 
