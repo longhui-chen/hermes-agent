@@ -813,3 +813,73 @@ def test_multi_turn_readoption_does_not_look_like_a_handback():
         adopted = _adopt_existing_tab(session_moved)
     assert adopted["privacy_filter_after_handback"] is True
     mod._remembered_tab_epochs.clear()
+
+
+def test_navigate_result_url_is_filtered_after_mid_call_handback():
+    """The page the human landed on is reported by navigate itself.
+
+    Filtering only the bonus snapshot would still hand the model an OAuth
+    callback or reset link in full.
+    """
+    from tools.browser_camofox import camofox_navigate
+
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
+        "privacy_filter_after_handback": False, "epoch": 3, "_lock": None,
+    }
+
+    def _post_with_handback(path, body=None, timeout=None, session=None):
+        session["epoch"] = 4
+        session["privacy_filter_after_handback"] = True
+        return {"url": "https://idp.example/callback?code=SECRETCODE", "title": "Signed in as alice@example.com"}
+
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=session),
+        patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
+        patch("tools.browser_camofox._post", side_effect=_post_with_handback),
+        patch("tools.browser_camofox._get", return_value={"snapshot": "- heading \"Welcome\"", "refsCount": 1}),
+    ):
+        result = json.loads(camofox_navigate("https://example.com/", task_id="agent-task"))
+
+    body = json.dumps(result)
+    assert "SECRETCODE" not in body
+    assert "alice@example.com" not in body
+    assert result["url"] == "https://idp.example/"
+
+
+def test_lease_release_is_retried_and_queued_until_it_lands():
+    """The session is already gone, so this context is the only way to free it.
+
+    A transient failure that only logged would strand a long-lived
+    local-server lease on a 2 GB device with nothing left to retry it.
+    """
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import _release_local_server_lease, _flush_pending_lease_releases
+
+    mod._pending_lease_releases.clear()
+    session = {
+        "release_url": "http://127.0.0.1:9377/internal/browser/camofox/_zettlab/release",
+        "release_headers": {"X-Zettlab-Agent-Action-Token": "tok"},
+    }
+
+    unavailable = MagicMock()
+    unavailable.status_code = 503
+    unavailable.headers = {}
+    unavailable.json.return_value = {}
+
+    with (
+        patch("time.sleep", return_value=None),
+        patch("tools.browser_camofox.requests.post", return_value=unavailable) as failing,
+    ):
+        _release_local_server_lease(session)
+    assert failing.call_count > 1, "a transient failure must be retried, not just logged"
+    assert len(mod._pending_lease_releases) == 1, "an undelivered release must stay queued"
+
+    ok = MagicMock()
+    ok.status_code = 200
+    ok.headers = {}
+    with patch("tools.browser_camofox.requests.post", return_value=ok) as succeeding:
+        _flush_pending_lease_releases()
+    succeeding.assert_called_once()
+    assert mod._pending_lease_releases == []
+    mod._pending_lease_releases.clear()

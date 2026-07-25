@@ -753,6 +753,7 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
             _sessions[cache_key] = session
     for expired in idle:
         _release_local_server_lease(expired)
+    _flush_pending_lease_releases()
 
     with _session_lock(session):
         return _adopt_existing_tab(session)
@@ -856,13 +857,55 @@ def _drop_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
     return dropped
 
 
+# Releases that could not be delivered yet. The session they belonged to is
+# already gone, so this is the only remaining handle on that lease; the entries
+# are tiny (url + headers) and capped.
+_MAX_PENDING_LEASE_RELEASES = 32
+_pending_lease_releases: list = []
+
+
+def _attempt_lease_release(url: str, headers: Dict[str, str]) -> bool:
+    """POST the idempotent release once. True when the lease is definitely gone."""
+    try:
+        resp = requests.post(url, json={}, timeout=5, headers=headers, allow_redirects=False)
+        _raise_for_status(resp)
+        return True
+    except Exception as exc:
+        if _is_retryable_read_error(exc):
+            return False
+        # A non-retryable answer (404/409: already released, unknown lease)
+        # means there is nothing left to chase.
+        logger.debug("Camofox local-server lease release rejected: %s", exc)
+        return True
+
+
+def _flush_pending_lease_releases() -> None:
+    """Retry releases whose session context is already gone."""
+    with _sessions_lock:
+        pending, _pending_lease_releases[:] = list(_pending_lease_releases), []
+    for url, headers in pending:
+        if not _attempt_lease_release(url, headers):
+            _queue_pending_lease_release(url, headers)
+
+
+def _queue_pending_lease_release(url: str, headers: Dict[str, str]) -> None:
+    with _sessions_lock:
+        if len(_pending_lease_releases) >= _MAX_PENDING_LEASE_RELEASES:
+            _pending_lease_releases.pop(0)
+        _pending_lease_releases.append((url, headers))
+
+
 def _release_local_server_lease(session: Optional[Dict[str, Any]] = None) -> None:
-    """Best-effort release of the profile's long-lived Agent runtime lease.
+    """Release the profile's long-lived Agent runtime lease.
 
     The endpoint and credential are captured on the session while the profile
     scope still exists, because teardown reaches this from the idle reaper,
     ``/new`` and shutdown, where re-reading them raises ``UnscopedSecretError``
     and the lease would be stranded for the life of the process.
+
+    The release is idempotent, so a transient failure is retried with bounded
+    backoff and then queued: the caller has already dropped the session, and
+    this context is the only thing that can still free the lease.
     """
     url = ""
     headers: Dict[str, str] = {}
@@ -871,14 +914,26 @@ def _release_local_server_lease(session: Optional[Dict[str, Any]] = None) -> Non
         captured = session.get("release_headers")
         if isinstance(captured, dict):
             headers = dict(captured)
-    try:
-        if not url:
+    if not url:
+        try:
             url = f"{get_camofox_url()}/_zettlab/release"
             headers = _auth_headers()
-        resp = requests.post(url, json={}, timeout=5, headers=headers, allow_redirects=False)
-        _raise_for_status(resp)
+        except Exception as exc:
+            logger.debug("Camofox local-server lease release unresolvable: %s", exc)
+            return
+    try:
+        _retry_read(lambda: _attempt_lease_release(url, headers) or _raise_release_retry())
     except Exception as exc:
-        logger.debug("Camofox local-server lease release failed: %s", exc)
+        logger.debug("Camofox local-server lease release deferred: %s", exc)
+        _queue_pending_lease_release(url, headers)
+
+
+class _LeaseReleaseRetry(requests.ConnectionError):
+    """Marks a release attempt that should go through the retry/backoff path."""
+
+
+def _raise_release_retry() -> bool:
+    raise _LeaseReleaseRetry("browser lease release did not take effect")
 
 
 def _takeover_ui_hint(session: Dict[str, Any]) -> Optional[Dict[str, str]]:
@@ -1234,10 +1289,19 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
                 raise
         if session.get("epoch") == epoch_before_navigate:
             _set_handback_privacy_filter(session, False)
+        # A handback that landed mid-navigation leaves the filter on, and the
+        # page the human ended on is reported here: an OAuth callback, a reset
+        # link or any URL with personal query parameters would otherwise reach
+        # the model in full, with the title alongside it.
+        landed_url = data.get("url", browser_url)
+        landed_title = data.get("title", "")
+        if _handback_privacy_filter_enabled(session):
+            landed_url = _filter_url_after_handback(session, landed_url)
+            landed_title = "[REDACTED]" if landed_title else landed_title
         result = {
             "success": True,
-            "url": data.get("url", browser_url),
-            "title": data.get("title", ""),
+            "url": landed_url,
+            "title": landed_title,
             "tabId": session["tab_id"],
         }
         takeover_hint = _takeover_ui_hint(session)
