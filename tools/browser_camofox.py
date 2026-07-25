@@ -55,7 +55,11 @@ _HANDBACK_URL = re.compile(
     # userinfo may precede a bracketed IPv6 authority, and both are optional.
     # Without allowing that combination the match stops at the "@" and the rest
     # of the URL — path, query, OAuth code — is left in the text verbatim.
-    r"(?i)\bhttps?://(?:[^\s\"'<>()\[\]/@]*@)?(?:\[[0-9A-Fa-f:.]+\])?[^\s\"'<>()\[\]]*"
+    # The brackets themselves delimit the authority, so anything up to the
+    # closing one is accepted — an RFC 6874 zone identifier (`[fe80::1%25eth0]`)
+    # contains letters outside the hex alphabet and would otherwise stop the
+    # match at the scheme, leaving the path and query in the text.
+    r"(?i)\bhttps?://(?:[^\s\"'<>()\[\]/@]*@)?(?:\[[^\]\s]+\])?[^\s\"'<>()\[\]]*"
 )
 
 
@@ -802,7 +806,7 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                 }
             _sessions[cache_key] = session
     for expired in idle:
-        _release_local_server_lease(expired)
+        _teardown_session(expired)
     _flush_pending_lease_releases()
     # A tracked session must be reclaimable even if this process never calls
     # into the browser again.
@@ -906,7 +910,7 @@ def _drop_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
         dropped = _sessions.pop(key, None) if key else None
         idle = _prune_idle_sessions_locked(time.monotonic())
     for session in idle:
-        _release_local_server_lease(session)
+        _teardown_session(session)
     return dropped
 
 
@@ -988,7 +992,7 @@ def _run_maintenance() -> None:
             idle = _prune_idle_sessions_locked(time.monotonic())
             pending, _pending_lease_releases[:] = list(_pending_lease_releases), []
         for session in idle:
-            _release_local_server_lease(session)
+            _teardown_session(session)
         for entry in pending:
             url, headers = entry[0], entry[1]
             attempts = entry[2] if len(entry) > 2 else 0
@@ -1007,6 +1011,54 @@ def _run_maintenance() -> None:
             if not _sessions and not _pending_lease_releases:
                 _maintenance_worker = None
                 return
+
+
+def _profile_still_in_use(release_url: str, exclude_key: str = "") -> bool:
+    """Whether another tracked session still holds this profile's runtime.
+
+    ``/_zettlab/release`` carries only the profile action token — no task or
+    lease id — so it tears down the runtime for the whole profile. Two turns on
+    the same profile can each own a session, and releasing when the first one
+    ends would pull the runtime out from under the other, or out from under a
+    human mid-takeover.
+    """
+    if not release_url:
+        return False
+    with _sessions_lock:
+        for key, session in _sessions.items():
+            if key == exclude_key:
+                continue
+            if session.get("release_url") == release_url:
+                return True
+    return False
+
+
+def _teardown_session(session: Optional[Dict[str, Any]]) -> None:
+    """Release or close a dropped session according to how it was created.
+
+    A local-server-managed session holds a shared runtime lease; a direct
+    Camofox session owns a throwaway server-side session instead, and the only
+    thing that frees it is DELETE /sessions/<user_id>.
+    """
+    if not isinstance(session, dict):
+        return
+    if session.get("local_server_managed"):
+        release_url = str(session.get("release_url") or "")
+        if _profile_still_in_use(release_url):
+            logger.debug("Camofox lease kept: another session still holds this profile")
+            return
+        _release_local_server_lease(session)
+        return
+    if session.get("managed"):
+        # Managed persistence without local-server: the profile must survive.
+        return
+    user_id = str(session.get("user_id") or "")
+    if not user_id:
+        return
+    try:
+        _delete(f"/sessions/{quote(user_id, safe='')}")
+    except Exception as exc:
+        logger.debug("Camofox direct session close failed: %s", exc)
 
 
 def _release_local_server_lease(session: Optional[Dict[str, Any]] = None) -> None:
@@ -1090,7 +1142,10 @@ def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
         _remember_tab_epoch(session)
         _drop_session(task_id)
         if session.get("local_server_managed"):
-            _release_local_server_lease(session)
+            if _profile_still_in_use(str(session.get("release_url") or "")):
+                logger.debug("Camofox lease kept: another turn still holds this profile")
+            else:
+                _release_local_server_lease(session)
         logger.debug("Camofox soft cleanup for task %s (managed persistence)", task_id)
         return True
 
@@ -1779,6 +1834,9 @@ def camofox_close(task_id: Optional[str] = None) -> str:
         # Prefer the flag captured when the session was created: teardown can
         # run without the profile scope the live probe needs.
         if session.get("local_server_managed") or _local_server_managed():
+            release_url = str(session.get("release_url") or "")
+            if _profile_still_in_use(release_url):
+                return json.dumps({"success": True, "closed": False, "released": False})
             _release_local_server_lease(session)
             return json.dumps({
                 "success": True,
@@ -1812,6 +1870,13 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
             params={"userId": session["user_id"]},
             session=session,
         )
+        # Image alt/src are page content too: redaction only strips form values
+        # and secret-shaped text, so intranet metadata would pass straight
+        # through. Same guard as camofox_snapshot, applied after the response
+        # because that is what turns the filter on.
+        if _handback_privacy_filter_enabled(session) and not _handback_page_readable(session):
+            return _blocked_handback_page_error()
+
         snapshot = data.get("snapshot", "")
         if not isinstance(snapshot, str):
             snapshot = ""

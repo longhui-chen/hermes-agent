@@ -1151,3 +1151,96 @@ def test_navigate_snapshot_is_withheld_for_a_blocked_page():
 
     assert result.get("snapshot_withheld") is True
     assert "iam credentials" not in json.dumps(result)
+
+
+def test_lease_is_kept_while_another_turn_holds_the_profile():
+    """/_zettlab/release carries no task or lease id — it frees the profile.
+
+    Two turns on the same profile can each own a session, so releasing when the
+    first one ends would pull the runtime out from under the other, or out from
+    under a human mid-takeover.
+    """
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import camofox_soft_cleanup
+
+    release_url = "http://127.0.0.1:9377/internal/browser/camofox/_zettlab/release"
+    mod._sessions.clear()
+    for task in ("turn-a", "turn-b"):
+        mod._sessions[f"profileA\x00sess\x00{task}"] = {
+            "user_id": "profileA", "session_key": "sess", "tab_id": f"tab-{task}",
+            "managed": True, "local_server_managed": True, "task_id": task,
+            "release_url": release_url, "release_headers": {},
+            "last_used_at": time.monotonic(),
+        }
+
+    released = []
+    identity = {"user_id": "profileA", "session_key": "sess"}
+    with (
+        patch("tools.browser_camofox._get_camofox_config", return_value={}),
+        patch("tools.browser_camofox._camofox_identity_override", return_value=None),
+        patch("tools.browser_camofox.get_camofox_identity", return_value=identity),
+        patch("tools.browser_camofox._release_local_server_lease", side_effect=lambda s=None: released.append(1)),
+        patch("tools.browser_camofox._ensure_maintenance_worker", return_value=None),
+    ):
+        assert camofox_soft_cleanup("turn-a") is True
+        assert released == [], "the other turn still holds this profile"
+        assert camofox_soft_cleanup("turn-b") is True
+        assert released == [1], "the last holder must release"
+    mod._sessions.clear()
+
+
+def test_idle_direct_session_is_really_closed():
+    """A direct Camofox session owns a server-side session, not a lease.
+
+    Reclaiming it through the local-server release path would post to an
+    endpoint that does not exist there and leave the tab and browser running.
+    """
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import _teardown_session
+
+    with patch("tools.browser_camofox._delete") as mock_delete:
+        _teardown_session({
+            "user_id": "hermes_abc123", "managed": False, "local_server_managed": False,
+        })
+    mock_delete.assert_called_once_with("/sessions/hermes_abc123")
+
+    # A managed-persistence profile must survive instead.
+    with patch("tools.browser_camofox._delete") as mock_delete:
+        _teardown_session({"user_id": "profileA", "managed": True, "local_server_managed": False})
+    mock_delete.assert_not_called()
+
+
+def test_handback_filter_redacts_scoped_ipv6_urls():
+    """RFC 6874 zone identifiers contain letters outside the hex alphabet."""
+    from tools.browser_camofox import _reduce_urls_to_origin
+
+    filtered = _reduce_urls_to_origin("go https://u:p@[fe80::1%25eth0]/cb?code=abc123 now")
+    assert "abc123" not in filtered
+    assert "u:p@" not in filtered
+    assert "https://[fe80::1%25eth0]/" in filtered
+
+
+def test_get_images_refuses_a_blocked_page_after_handback():
+    """alt/src are page content the redaction pass does not remove."""
+    from tools.browser_camofox import camofox_get_images
+
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
+        "privacy_filter_after_handback": False, "epoch": 3, "_lock": None,
+    }
+
+    def _get_with_handback(path, params=None, timeout=None, session=None, **kwargs):
+        if path == "/tabs":
+            return {"tabs": [{"tabId": "tab-1", "listItemId": "s", "url": "http://169.254.169.254/latest/meta-data/"}]}
+        session["privacy_filter_after_handback"] = True
+        return {"snapshot": '- image "internal-topology":\n  - /url: http://10.0.0.5/diagram.png', "refsCount": 1}
+
+    with (
+        patch("tools.browser_camofox._get_session", return_value=session),
+        patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
+        patch("tools.browser_camofox._get", side_effect=_get_with_handback),
+    ):
+        result = json.loads(camofox_get_images(task_id="agent-task"))
+
+    assert result["success"] is False
+    assert "internal-topology" not in json.dumps(result)
