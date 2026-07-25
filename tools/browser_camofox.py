@@ -1025,7 +1025,7 @@ _MAX_PENDING_RELEASE_ATTEMPTS = 8
 _maintenance_worker: Optional[threading.Thread] = None
 
 
-def _run_pending_teardowns(force: bool = False) -> None:
+def _run_pending_teardowns(force: bool = False, only_url: str = "") -> None:
     """Drain scheduled teardowns.
 
     Releases are deliberately deferred: a profile's runtime is shared, and the
@@ -1036,7 +1036,10 @@ def _run_pending_teardowns(force: bool = False) -> None:
     """
     now = time.monotonic()
     with _sessions_lock:
-        ready = [e for e in _pending_lease_releases if force or e["ready_at"] <= now]
+        ready = [
+            e for e in _pending_lease_releases
+            if (e["url"] == only_url if only_url else (force or e["ready_at"] <= now))
+        ]
         for entry in ready:
             _pending_lease_releases.remove(entry)
     for entry in ready:
@@ -1822,6 +1825,21 @@ def _tool_error_from_exception(
 # Tool implementations
 # ---------------------------------------------------------------------------
 
+def _mutating_tab_call(session: Dict[str, Any], path_suffix: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """Run an operation that changes the document, holding the identity lock.
+
+    Turns that share a browser identity share the physical tab, so a click or a
+    back landing between another turn's navigate and the snapshot describing
+    where it landed would make that turn report one page and hand back another
+    page's refs. Reads are deliberately not serialized here: a snapshot of
+    whatever the tab currently shows is inherent to sharing it, and queueing
+    long reads such as vision behind every mutation would cost more than it
+    buys.
+    """
+    with _held_owner_lock(_browser_identity_key(session)):
+        return _post(_tab_path(session, path_suffix), body, session=session)
+
+
 def _navigation_tab_context(session: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Return enough opaque tab identity for takeover after navigation fails."""
     if not session or not session.get("tab_id"):
@@ -2077,11 +2095,7 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
         clean_ref = ref.lstrip("@")
 
         filtered_at_request = _handback_privacy_filter_enabled(session)
-        data = _post(
-            _tab_path(session, "/click"),
-            {"userId": session["user_id"], "ref": clean_ref},
-            session=session,
-        )
+        data = _mutating_tab_call(session, "/click", {"userId": session["user_id"], "ref": clean_ref})
         # The result reports where the click landed, which is where the human
         # is if one took over. Judged on the request-time state and this
         # response's own fact, not just the shared flag a concurrent turn can
@@ -2105,11 +2119,7 @@ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
 
         clean_ref = ref.lstrip("@")
 
-        _post(
-            _tab_path(session, "/type"),
-            {"userId": session["user_id"], "ref": clean_ref, "text": text},
-            session=session,
-        )
+        _mutating_tab_call(session, "/type", {"userId": session["user_id"], "ref": clean_ref, "text": text})
         from agent.display import (
             redact_browser_typed_text_for_display,
             redact_tool_args_for_display,
@@ -2145,11 +2155,7 @@ def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
-        _post(
-            _tab_path(session, "/scroll"),
-            {"userId": session["user_id"], "direction": direction},
-            session=session,
-        )
+        _mutating_tab_call(session, "/scroll", {"userId": session["user_id"], "direction": direction})
         return json.dumps({"success": True, "scrolled": direction})
     except Exception as e:
         return _tool_error_from_exception(e, session=locals().get("session"))
@@ -2163,11 +2169,7 @@ def camofox_back(task_id: Optional[str] = None) -> str:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
         filtered_at_request = _handback_privacy_filter_enabled(session)
-        data = _post(
-            _tab_path(session, "/back"),
-            {"userId": session["user_id"]},
-            session=session,
-        )
+        data = _mutating_tab_call(session, "/back", {"userId": session["user_id"]})
         result_handback_revealed = filtered_at_request or _last_response_started_handback()
         return json.dumps({"success": True, "url": _filter_url_after_handback(session, data.get("url", ""), result_handback_revealed)})
     except Exception as e:
@@ -2181,11 +2183,7 @@ def camofox_press(key: str, task_id: Optional[str] = None) -> str:
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
-        _post(
-            _tab_path(session, "/press"),
-            {"userId": session["user_id"], "key": key},
-            session=session,
-        )
+        _mutating_tab_call(session, "/press", {"userId": session["user_id"], "key": key})
         return json.dumps({"success": True, "pressed": key})
     except Exception as e:
         return _tool_error_from_exception(e, session=locals().get("session"))
@@ -2215,8 +2213,12 @@ def camofox_close(task_id: Optional[str] = None) -> str:
         # Queued with the context captured at creation, and retried: the local
         # state is already gone, so a transient failure here would otherwise
         # leave the server-side session running with nothing able to close it.
+        base = str(session.get("delete_base") or "")
         _teardown_session(session)
-        _run_pending_teardowns(force=True)
+        # Only this session's own teardown is forced. A blanket drain would
+        # also fire other profiles' releases while they are still inside their
+        # quiet window — one of them may be mid-takeover.
+        _run_pending_teardowns(only_url=f"{base}/sessions/{quote(str(session.get('user_id') or ''), safe='')}")
         with _sessions_lock:
             closed = not any(
                 entry["kind"] == "delete" and entry["url"].endswith(

@@ -1982,3 +1982,99 @@ def test_session_cache_has_a_hard_ceiling():
     # than being dropped silently.
     assert [s["task_id"] for s in evicted] == [f"task-{i:03d}" for i in range(5)]
     mod._sessions.clear()
+
+
+def test_a_mutation_cannot_land_inside_another_turns_navigation():
+    """Shared tab: a click between a navigate and its snapshot swaps the page.
+
+    The navigate would then report its own url with the other document's
+    snapshot and refs, and the Agent's next action lands on the wrong page.
+    """
+    import threading
+
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import camofox_click, camofox_navigate
+
+    mod._owner_locks.clear()
+    mod._owner_lock_refs.clear()
+    session = {
+        "user_id": "profileA", "session_key": "shared", "tab_id": "tab-1",
+        "privacy_filter_after_handback": False, "epoch": 1, "_lock": None,
+    }
+    order = []
+    navigate_in_flight = threading.Event()
+    click_done = threading.Event()
+
+    def _post(path, body=None, timeout=None, session=None):
+        if path.endswith("/navigate"):
+            order.append("navigate")
+            navigate_in_flight.set()
+            # Give the other turn every chance to slip in before the snapshot.
+            # Holding the identity lock is what must stop it.
+            click_done.wait(0.5)
+            return {"url": "https://a.example/", "title": "A"}
+        order.append("click")
+        click_done.set()
+        return {"url": "https://b.example/"}
+
+    def _get(path, params=None, timeout=None, session=None, **kwargs):
+        if path == "/tabs":
+            return {"tabs": [{"tabId": "tab-1", "listItemId": "shared", "url": "https://a.example/"}]}
+        order.append("snapshot")
+        return {"snapshot": "- heading \"A\"", "refsCount": 1}
+
+    def _click_turn():
+        navigate_in_flight.wait(2)
+        with (
+            patch("tools.browser_camofox._get_session", return_value=session),
+            patch("tools.browser_camofox._post", side_effect=_post),
+        ):
+            camofox_click("@e1", task_id="turn-b")
+
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=session),
+        patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
+        patch("tools.browser_camofox._post", side_effect=_post),
+        patch("tools.browser_camofox._get", side_effect=_get),
+    ):
+        other = threading.Thread(target=_click_turn)
+        other.start()
+        camofox_navigate("https://a.example/", task_id="turn-a")
+        other.join(5)
+
+    # The click may run before or after, but never between the navigate and the
+    # snapshot that describes where it landed.
+    assert order[:2] == ["navigate", "snapshot"], f"a mutation split the navigation: {order}"
+    mod._owner_locks.clear()
+
+
+def test_direct_close_does_not_force_other_profiles_releases():
+    """A blanket drain would fire another profile's release early.
+
+    That profile may be inside its quiet window precisely because someone is
+    mid-takeover on it.
+    """
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import _queue_pending_teardown, _run_pending_teardowns
+
+    mod._pending_lease_releases.clear()
+    with patch("tools.browser_camofox._ensure_maintenance_worker", return_value=None):
+        # Due, not merely queued: only the url filter may keep it out.
+        _queue_pending_teardown(
+            "release", "http://127.0.0.1:9377/x/_zettlab/release", {}, owner="other\x00p",
+        )
+        _queue_pending_teardown("delete", "http://127.0.0.1:9377/sessions/mine", {})
+
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.headers = {}
+        with (
+            patch("tools.browser_camofox.requests.delete", return_value=ok) as mock_delete,
+            patch("tools.browser_camofox.requests.post", return_value=ok) as mock_post,
+        ):
+            _run_pending_teardowns(only_url="http://127.0.0.1:9377/sessions/mine")
+
+    mock_delete.assert_called_once()
+    mock_post.assert_not_called()
+    assert len(mod._pending_lease_releases) == 1, "the other profile's release stays queued"
+    mod._pending_lease_releases.clear()
