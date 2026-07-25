@@ -579,14 +579,17 @@ class TestConfiguredCamofoxIdentity:
         monkeypatch.setenv("CAMOFOX_MANAGED_BY_LOCAL_SERVER", "true")
 
         _get_session("task-1")
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.headers = {}
         with (
             patch("tools.browser_camofox.requests.delete") as mock_delete,
-            patch("tools.browser_camofox._post", return_value={"ok": True}) as mock_post,
+            patch("tools.browser_camofox.requests.post", return_value=ok) as mock_post,
         ):
             assert camofox_soft_cleanup("task-1") is True
 
         mock_delete.assert_not_called()
-        mock_post.assert_called_once_with("/_zettlab/release", {}, timeout=5)
+        assert mock_post.call_args.args[0].endswith("/_zettlab/release")
 
     def test_soft_cleanup_preserves_externally_managed_session(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

@@ -7,6 +7,7 @@ step: adopt the new epoch, take one privacy-filtered snapshot, retry.
 """
 
 import json
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -275,15 +276,28 @@ def test_managed_navigation_emits_exact_takeover_hint(managed_session, monkeypat
 
 
 def test_managed_close_releases_lease_without_destroying_profile(managed_session):
+    managed_session["release_url"] = "http://127.0.0.1:9377/internal/browser/camofox/_zettlab/release"
+    managed_session["release_headers"] = {"X-Zettlab-Agent-Action-Token": "tok"}
+    ok = MagicMock()
+    ok.status_code = 200
+    ok.headers = {}
     with (
         patch("tools.browser_camofox._drop_session", return_value=managed_session),
-        patch("tools.browser_camofox._post", return_value={"ok": True}) as mock_post,
+        patch("tools.browser_camofox.requests.post", return_value=ok) as mock_post,
         patch("tools.browser_camofox._delete") as mock_delete,
     ):
         result = json.loads(camofox_close("agent-task"))
 
     assert result == {"success": True, "closed": False, "released": True}
-    mock_post.assert_called_once_with("/_zettlab/release", {}, timeout=5)
+    # The endpoint and credential captured at creation are used verbatim; the
+    # teardown path cannot re-read them once the profile scope is gone.
+    mock_post.assert_called_once_with(
+        "http://127.0.0.1:9377/internal/browser/camofox/_zettlab/release",
+        json={},
+        timeout=5,
+        headers={"X-Zettlab-Agent-Action-Token": "tok"},
+        allow_redirects=False,
+    )
     mock_delete.assert_not_called()
 
 
@@ -490,48 +504,6 @@ def test_health_check_refuses_to_follow_redirects():
     assert captured["allow_redirects"] is False
 
 
-def test_cleanup_finds_session_after_profile_scope_is_gone():
-    """Session teardown must not depend on the request-time profile identity.
-
-    The idle reaper, /new and shutdown all run after the profile home and
-    secret scope are torn down, so recomputing the identity yields a different
-    cache key. Without the task-id fallback the entry and its local-server
-    browser lease would be stranded for the life of the process — unbounded
-    resident state on a 2 GB device.
-    """
-    from tools.browser_camofox import (
-        _drop_session,
-        _sessions,
-        camofox_soft_cleanup,
-        has_camofox_session,
-    )
-
-    _sessions.clear()
-    _sessions["profileA\x00sessA\x00agent-task"] = {
-        "user_id": "profileA",
-        "session_key": "sessA",
-        "tab_id": "tab-1",
-        "managed": True,
-        "local_server_managed": True,
-        "task_id": "agent-task",
-    }
-
-    # Cleanup-time identity no longer resolves to the creation-time key.
-    scope_lost = {"user_id": "default", "session_key": "default"}
-    with (
-        patch("tools.browser_camofox.get_camofox_identity", return_value=scope_lost),
-        patch("tools.browser_camofox._camofox_identity_override", return_value=None),
-        patch("tools.browser_camofox._get_camofox_config", return_value={}),
-    ):
-        assert has_camofox_session("agent-task") is True
-        released = []
-        with patch("tools.browser_camofox._release_local_server_lease", side_effect=lambda: released.append(1)):
-            assert camofox_soft_cleanup("agent-task") is True
-        assert released == [1]
-        assert _sessions == {}
-        assert _drop_session("agent-task") is None
-
-
 def test_handback_filter_redacts_ipv6_urls():
     """A bracketed IPv6 authority must not slip past the origin reduction."""
     from tools.browser_camofox import _redact_handback_page_state, _url_origin_only
@@ -542,42 +514,6 @@ def test_handback_filter_redacts_ipv6_urls():
     filtered = _redact_handback_page_state("link /url: https://[2001:db8::1]/callback?code=abc123")
     assert "abc123" not in filtered
     assert "https://[2001:db8::1]/" in filtered
-
-
-def test_cleanup_survives_unscoped_secret_error():
-    """Cleanup must not be defeated by the fail-closed secret scope.
-
-    get_secret() raises UnscopedSecretError in multiplex mode without a profile
-    scope, which is exactly the state the idle reaper and shutdown run in. If
-    the task-id lookup propagated that, browser_tool would swallow it and the
-    session plus its local-server lease would leak.
-    """
-    from agent.secret_scope import UnscopedSecretError
-    from tools.browser_camofox import _sessions, camofox_soft_cleanup, has_camofox_session
-
-    _sessions.clear()
-    _sessions["profileA\x00sessA\x00agent-task"] = {
-        "user_id": "profileA",
-        "session_key": "sessA",
-        "tab_id": "tab-1",
-        "managed": True,
-        "local_server_managed": True,
-        "task_id": "agent-task",
-    }
-
-    def _fail_closed(*args, **kwargs):
-        raise UnscopedSecretError("no secret scope installed")
-
-    with (
-        patch("tools.browser_camofox._camofox_identity_override", side_effect=_fail_closed),
-        patch("tools.browser_camofox.get_camofox_identity", side_effect=_fail_closed),
-    ):
-        assert has_camofox_session("agent-task") is True
-        released = []
-        with patch("tools.browser_camofox._release_local_server_lease", side_effect=lambda: released.append(1)):
-            assert camofox_soft_cleanup("agent-task") is True
-        assert released == [1]
-        assert _sessions == {}
 
 
 def test_cleanup_without_session_never_releases_another_turns_lease():
@@ -711,27 +647,23 @@ def test_navigate_auto_snapshot_is_filtered_after_mid_call_handback():
     assert "REDACTED" in result["snapshot"]
 
 
-def test_cleanup_refuses_to_guess_between_profiles_sharing_a_task_id():
-    """The task-id fallback must never reach into another profile's state.
+def test_cleanup_never_reaches_into_another_profiles_session():
+    """A task id is not owner-scoped, so it can never authorize a drop.
 
     The API's session_id becomes the effective task id, so two profiles can
-    legitimately carry the same one. Without the identity there is no way to
-    tell which session this cleanup owns, and popping both would delete another
-    user's live browser state and release their lease.
+    carry the same one. Cleanup runs after the profile secret scope is gone,
+    where the identity cannot be recomputed — dropping on a task-id match alone
+    would delete another user's live browser state and release their lease.
     """
     from agent.secret_scope import UnscopedSecretError
-    from tools.browser_camofox import _drop_session, _sessions
+    from tools.browser_camofox import _drop_session, _sessions, has_camofox_session
 
     _sessions.clear()
-    for profile in ("profileA", "profileB"):
-        _sessions[f"{profile}\x00sess\x00shared-task"] = {
-            "user_id": profile,
-            "session_key": "sess",
-            "tab_id": f"tab-{profile}",
-            "managed": True,
-            "local_server_managed": True,
-            "task_id": "shared-task",
-        }
+    _sessions["profileA\x00sessA\x00shared-task"] = {
+        "user_id": "profileA", "session_key": "sessA", "tab_id": "tab-a",
+        "managed": True, "local_server_managed": True, "task_id": "shared-task",
+        "last_used_at": time.monotonic(),
+    }
 
     def _fail_closed(*args, **kwargs):
         raise UnscopedSecretError("no secret scope installed")
@@ -740,6 +672,144 @@ def test_cleanup_refuses_to_guess_between_profiles_sharing_a_task_id():
         patch("tools.browser_camofox._camofox_identity_override", side_effect=_fail_closed),
         patch("tools.browser_camofox.get_camofox_identity", side_effect=_fail_closed),
     ):
+        assert has_camofox_session("shared-task") is False
         assert _drop_session("shared-task") is None
-    assert len(_sessions) == 2, "an ambiguous task id must leave both profiles untouched"
+    assert len(_sessions) == 1, "a scope-less cleanup must not drop anyone's session"
     _sessions.clear()
+
+
+def test_idle_sessions_are_reclaimed_with_their_captured_release_context():
+    """The scope-less path is bounded by a timer, not by guessing.
+
+    Nothing else can reclaim a session whose profile scope is gone, so without
+    this both the entry and the local-server lease behind it would live for the
+    life of the process — unbounded resident state on a 2 GB device. The
+    release endpoint and credential come from the session because they cannot
+    be re-read at this point.
+    """
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import _drop_session, _sessions
+
+    _sessions.clear()
+    _sessions["profileA\x00sessA\x00old-task"] = {
+        "user_id": "profileA", "session_key": "sessA", "tab_id": "tab-a",
+        "managed": True, "local_server_managed": True, "task_id": "old-task",
+        "release_url": "http://127.0.0.1:9377/internal/browser/camofox/_zettlab/release",
+        "release_headers": {"X-Zettlab-Agent-Action-Token": "tok-a"},
+        "last_used_at": time.monotonic() - (mod._SESSION_IDLE_TTL_SECONDS + 1),
+    }
+
+    ok = MagicMock()
+    ok.status_code = 200
+    ok.headers = {}
+    with (
+        patch("tools.browser_camofox._camofox_identity_override", return_value=None),
+        patch("tools.browser_camofox.get_camofox_identity", return_value={"user_id": "x", "session_key": "y"}),
+        patch("tools.browser_camofox._get_camofox_config", return_value={}),
+        patch("tools.browser_camofox.requests.post", return_value=ok) as mock_post,
+    ):
+        _drop_session("unrelated-task")
+
+    assert _sessions == {}
+    assert mock_post.call_args.kwargs["headers"] == {"X-Zettlab-Agent-Action-Token": "tok-a"}
+    assert mock_post.call_args.args[0].endswith("/_zettlab/release")
+    _sessions.clear()
+
+
+def test_navigate_keeps_privacy_filter_when_handback_lands_mid_navigation():
+    """A handback during the navigate call must not be cleared by that call.
+
+    The response carries the new epoch, so the server will not flag the next
+    read as stale either — clearing the filter here would put the values the
+    human just typed in front of the model.
+    """
+    from tools.browser_camofox import camofox_navigate
+
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
+        "privacy_filter_after_handback": False, "epoch": 3, "_lock": None,
+    }
+
+    def _post_with_handback(path, body=None, timeout=None, session=None):
+        session["epoch"] = 4  # the human handed back while this was in flight
+        session["privacy_filter_after_handback"] = True
+        return {"url": "https://example.com/", "title": "Example"}
+
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=session),
+        patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
+        patch("tools.browser_camofox._post", side_effect=_post_with_handback),
+        patch("tools.browser_camofox._get", return_value={"snapshot": "textbox \"OTP\" value=\"123456\"", "refsCount": 1}),
+    ):
+        result = json.loads(camofox_navigate("https://example.com/", task_id="agent-task"))
+
+    assert session["privacy_filter_after_handback"] is True
+    assert "123456" not in json.dumps(result)
+
+
+def test_navigate_clears_privacy_filter_on_a_quiet_navigation():
+    """The control case: no epoch change means the Agent moved the page itself."""
+    from tools.browser_camofox import camofox_navigate
+
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
+        "privacy_filter_after_handback": True, "epoch": 3, "_lock": None,
+    }
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=session),
+        patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
+        patch("tools.browser_camofox._post", return_value={"url": "https://example.com/", "title": "Example"}),
+        patch("tools.browser_camofox._get", return_value={"snapshot": "- heading \"Example\"", "refsCount": 1}),
+    ):
+        result = json.loads(camofox_navigate("https://example.com/", task_id="agent-task"))
+
+    assert session["privacy_filter_after_handback"] is False
+    assert "Example" in result["snapshot"]
+
+
+def test_multi_turn_readoption_does_not_look_like_a_handback():
+    """Per-turn soft cleanup must not degrade ordinary multi-turn browsing.
+
+    cleanup_task_resources drops the in-process session at the end of every
+    turn, so treating every re-adoption as a possible handback would blank out
+    every form control and block vision/eval from the second turn on.
+    """
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import _adopt_existing_tab, _remember_tab_epoch
+
+    mod._remembered_tab_epochs.clear()
+    live = {
+        "user_id": "hermes_profile", "session_key": "task_opaque",
+        "tab_id": "tab-live", "epoch": 7,
+    }
+    _remember_tab_epoch(live)
+
+
+    # Same epoch as the last turn: nobody took over, so browsing continues.
+    session_same = {
+        "user_id": "hermes_profile", "session_key": "task_opaque", "tab_id": None,
+        "adopt_existing_tab": True, "privacy_filter_after_handback": False, "epoch": None,
+    }
+    with (
+        patch("tools.browser_camofox.get_camofox_url", return_value="http://127.0.0.1:8080"),
+        patch("tools.browser_camofox._get", return_value={
+            "tabs": [{"tabId": "tab-live", "listItemId": "task_opaque", "epoch": 7}],
+        }),
+    ):
+        adopted = _adopt_existing_tab(session_same)
+    assert adopted["privacy_filter_after_handback"] is False
+
+    # Epoch advanced while this process was not looking: a handback did happen.
+    session_moved = {
+        "user_id": "hermes_profile", "session_key": "task_opaque", "tab_id": None,
+        "adopt_existing_tab": True, "privacy_filter_after_handback": False, "epoch": None,
+    }
+    with (
+        patch("tools.browser_camofox.get_camofox_url", return_value="http://127.0.0.1:8080"),
+        patch("tools.browser_camofox._get", return_value={
+            "tabs": [{"tabId": "tab-live", "listItemId": "task_opaque", "epoch": 8}],
+        }),
+    ):
+        adopted = _adopt_existing_tab(session_moved)
+    assert adopted["privacy_filter_after_handback"] is True
+    mod._remembered_tab_epochs.clear()

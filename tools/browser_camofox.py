@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import threading
+import time
 import uuid
 from typing import Any, Dict, Optional
 from urllib.parse import SplitResult, quote, urlsplit, urlunsplit
@@ -590,6 +591,37 @@ def _session_lock(session: Dict[str, Any]) -> threading.Lock:
         return lock
 
 
+# Last epoch this process observed per tab. It deliberately outlives the
+# per-turn session cache so an ordinary multi-turn continuation can be told
+# apart from a gateway restart; bounded because a stale entry is only ever a
+# missed filter-suppression, never a leak.
+_MAX_REMEMBERED_TAB_EPOCHS = 256
+_remembered_tab_epochs: Dict[str, int] = {}
+
+
+def _tab_epoch_memory_key(session: Dict[str, Any], tab_id: str) -> str:
+    return f"{session.get('user_id')}\x00{session.get('session_key')}\x00{tab_id}"
+
+
+def _remembered_tab_epoch(session: Dict[str, Any], tab_id: str) -> Optional[int]:
+    with _sessions_lock:
+        return _remembered_tab_epochs.get(_tab_epoch_memory_key(session, tab_id))
+
+
+def _remember_tab_epoch(session: Optional[Dict[str, Any]]) -> None:
+    """Record the epoch a still-owned tab was last seen at."""
+    if not isinstance(session, dict):
+        return
+    tab_id = session.get("tab_id")
+    epoch = session.get("epoch")
+    if not tab_id or not isinstance(epoch, int) or isinstance(epoch, bool):
+        return
+    with _sessions_lock:
+        if len(_remembered_tab_epochs) >= _MAX_REMEMBERED_TAB_EPOCHS:
+            _remembered_tab_epochs.clear()
+        _remembered_tab_epochs[_tab_epoch_memory_key(session, tab_id)] = epoch
+
+
 def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
     """Attach process-local state to an already-open managed Camofox tab.
 
@@ -622,13 +654,22 @@ def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
     tab_id = _validated_tab_id(latest.get("tabId")) if isinstance(latest, dict) else None
     if tab_id:
         session["tab_id"] = tab_id
-        _adopt_session_epoch(session, latest.get("epoch"))
-        # This process has no memory of the tab (fresh session cache), so it
-        # cannot know whether a human controlled the page since the last agent
-        # read — a gateway restart right after a handback would otherwise skip
-        # the privacy filter entirely. Filter by default; the first agent
-        # navigation clears it.
-        session["privacy_filter_after_handback"] = True
+        adopted_epoch = latest.get("epoch")
+        _adopt_session_epoch(session, adopted_epoch)
+        # The in-process session cache is dropped at the end of every turn by
+        # cleanup_task_resources, so most adoptions are an ordinary multi-turn
+        # continuation, not a gateway restart. Filtering those would blank out
+        # every form control and block vision/eval from the second turn on.
+        # Compare against the last epoch this process saw for the tab instead:
+        # unchanged means no handback happened, anything else (including no
+        # record at all, i.e. a genuine restart) filters until the Agent
+        # navigates.
+        remembered = _remembered_tab_epoch(session, tab_id)
+        session["privacy_filter_after_handback"] = not (
+            isinstance(adopted_epoch, int)
+            and not isinstance(adopted_epoch, bool)
+            and remembered == adopted_epoch
+        )
         logger.debug("Adopted existing Camofox tab %s for %s", tab_id, session.get("user_id"))
 
     return session
@@ -647,13 +688,19 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
     identity_override = _camofox_identity_override(task_id, camofox_cfg)
     cache_identity = identity_override or profile_identity
     cache_key = _session_cache_key(task_id, cache_identity)
-    # Recorded on the session because lifecycle cleanup runs outside this
-    # request's profile and secret scope, where the probe would fail closed and
-    # skip releasing the local-server lease.
+    # Captured here because lifecycle cleanup runs outside this request's
+    # profile and secret scope, where these reads fail closed: the probe would
+    # skip releasing the local-server lease, and the release call itself could
+    # no longer resolve its endpoint or credential.
     local_server_managed = _local_server_managed()
+    release_url = f"{get_camofox_url()}/_zettlab/release" if local_server_managed else ""
+    release_headers = _auth_headers() if local_server_managed else {}
+    now = time.monotonic()
     with _sessions_lock:
+        idle = _prune_idle_sessions_locked(now)
         if cache_key in _sessions:
             session = _sessions[cache_key]
+            session["last_used_at"] = now
         else:
             if identity_override:
                 session = {
@@ -666,6 +713,9 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "epoch": None,
                     "task_id": task_id,
                     "local_server_managed": local_server_managed,
+                    "release_url": release_url,
+                    "release_headers": release_headers,
+                    "last_used_at": now,
                     "_lock": threading.Lock(),
                 }
             elif local_server_managed or bool(camofox_cfg.get("managed_persistence")):
@@ -679,6 +729,9 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "epoch": None,
                     "task_id": task_id,
                     "local_server_managed": local_server_managed,
+                    "release_url": release_url,
+                    "release_headers": release_headers,
+                    "last_used_at": now,
                     "_lock": threading.Lock(),
                 }
             else:
@@ -692,9 +745,14 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "epoch": None,
                     "task_id": task_id,
                     "local_server_managed": local_server_managed,
+                    "release_url": release_url,
+                    "release_headers": release_headers,
+                    "last_used_at": now,
                     "_lock": threading.Lock(),
                 }
             _sessions[cache_key] = session
+    for expired in idle:
+        _release_local_server_lease(expired)
 
     with _session_lock(session):
         return _adopt_existing_tab(session)
@@ -725,75 +783,100 @@ def _ensure_tab(task_id: Optional[str], url: Optional[str] = None) -> Dict[str, 
         return session
 
 
-def _session_keys_for_task_locked(task_id: str) -> list:
-    """Cache keys tracking task_id, preferring the identity-derived one.
+# A session whose profile scope is gone can only be reclaimed on a timer: the
+# owner is unknowable at that point, and guessing by task id alone would reach
+# into another profile's live browser state. The bound keeps _sessions and the
+# local-server leases behind it from growing for the life of the process.
+_SESSION_IDLE_TTL_SECONDS = 30 * 60
 
-    Lifecycle cleanup (idle reaper, ``/new``, shutdown) runs outside the
-    request's profile home and secret scope, so recomputing the identity there
-    yields a different key than the one used at creation. The task id recorded
-    on the session is stable, so fall back to it — otherwise the entry and its
-    local-server browser lease would be stranded for the life of the process.
+
+def _session_key_for_task_locked(task_id: str) -> Optional[str]:
+    """The cache key this task owns, or None when it cannot be established.
+
+    Only the identity-derived key is authoritative. Cleanup callers (idle
+    reaper, ``/new``, shutdown) run outside the request's profile home and
+    secret scope, where ``get_secret`` fails closed — and a task id is not
+    owner-scoped, since the API's ``session_id`` becomes the effective task id
+    and two profiles can legitimately carry the same one. Returning None there
+    is deliberate: :func:`_prune_idle_sessions_locked` reclaims the entry with
+    the release context captured while the scope still existed.
     Callers must hold ``_sessions_lock``.
     """
     try:
         camofox_cfg = _get_camofox_config()
         identity = _camofox_identity_override(task_id, camofox_cfg) or get_camofox_identity(task_id)
-        preferred = _session_cache_key(task_id, identity)
-        if preferred in _sessions:
-            return [preferred]
     except Exception:
-        # Reading the identity needs the profile's secret scope, which the
-        # cleanup callers have already exited — get_secret() fails closed
-        # there. Fall back to the task id recorded on the session.
-        pass
-    matches = [key for key, session in _sessions.items() if session.get("task_id") == task_id]
-    if len(matches) == 1:
-        return matches
-    if matches:
-        # Two profiles are using the same task id (the API's session_id becomes
-        # the effective task id, so this is reachable). Without the identity
-        # there is no way to tell which one this cleanup owns, and popping both
-        # would delete another user's live browser state and release their
-        # lease. Leave them; the owning profile's next scoped call reclaims its
-        # own entry.
-        logger.debug("Camofox cleanup skipped ambiguous task id %s (%d profiles)", task_id, len(matches))
-    return []
+        return None
+    preferred = _session_cache_key(task_id, identity)
+    return preferred if preferred in _sessions else None
+
+
+def _prune_idle_sessions_locked(now: float) -> list:
+    """Drop sessions untouched past the idle TTL, returning them for release.
+
+    Callers must hold ``_sessions_lock`` and must release the returned
+    sessions' leases outside it.
+    """
+    expired = [
+        key
+        for key, session in _sessions.items()
+        if now - float(session.get("last_used_at") or 0.0) > _SESSION_IDLE_TTL_SECONDS
+    ]
+    dropped = []
+    for key in expired:
+        session = _sessions.pop(key, None)
+        if session is not None:
+            logger.debug("Camofox reclaimed idle session %s", session.get("task_id"))
+            dropped.append(session)
+    return dropped
 
 
 def _peek_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
     """Return the tracked session for task_id without removing it."""
     task_id = task_id or "default"
     with _sessions_lock:
-        keys = _session_keys_for_task_locked(task_id)
-        return _sessions[keys[0]] if keys else None
+        key = _session_key_for_task_locked(task_id)
+        return _sessions.get(key) if key else None
 
 
 def has_camofox_session(task_id: Optional[str] = None) -> bool:
-    """Whether this process still tracks Camofox state for task_id.
-
-    Cleanup callers use this as scope-independent evidence that Camofox
-    teardown is still owed, since the mode probes they would otherwise rely on
-    fail closed outside the request's profile scope.
-    """
+    """Whether this process still tracks Camofox state this task owns."""
     return _peek_session(task_id) is not None
 
 
 def _drop_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
-    """Remove and return session info."""
+    """Remove and return session info, reclaiming idle sessions on the way."""
     task_id = task_id or "default"
     with _sessions_lock:
-        dropped: Optional[Dict[str, Any]] = None
-        for key in _session_keys_for_task_locked(task_id):
-            session = _sessions.pop(key, None)
-            if dropped is None:
-                dropped = session
-        return dropped
+        key = _session_key_for_task_locked(task_id)
+        dropped = _sessions.pop(key, None) if key else None
+        idle = _prune_idle_sessions_locked(time.monotonic())
+    for session in idle:
+        _release_local_server_lease(session)
+    return dropped
 
 
-def _release_local_server_lease() -> None:
-    """Best-effort release of the profile's long-lived Agent runtime lease."""
+def _release_local_server_lease(session: Optional[Dict[str, Any]] = None) -> None:
+    """Best-effort release of the profile's long-lived Agent runtime lease.
+
+    The endpoint and credential are captured on the session while the profile
+    scope still exists, because teardown reaches this from the idle reaper,
+    ``/new`` and shutdown, where re-reading them raises ``UnscopedSecretError``
+    and the lease would be stranded for the life of the process.
+    """
+    url = ""
+    headers: Dict[str, str] = {}
+    if isinstance(session, dict):
+        url = str(session.get("release_url") or "")
+        captured = session.get("release_headers")
+        if isinstance(captured, dict):
+            headers = dict(captured)
     try:
-        _post("/_zettlab/release", {}, timeout=5)
+        if not url:
+            url = f"{get_camofox_url()}/_zettlab/release"
+            headers = _auth_headers()
+        resp = requests.post(url, json={}, timeout=5, headers=headers, allow_redirects=False)
+        _raise_for_status(resp)
     except Exception as exc:
         logger.debug("Camofox local-server lease release failed: %s", exc)
 
@@ -832,9 +915,13 @@ def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
         # closed and would strand the entry plus its local-server lease.
         if not session.get("managed"):
             return False
+        # The tab survives this cleanup (that is the point of the soft path),
+        # so carry its epoch forward: the next turn re-adopts it and must be
+        # able to tell "same page, no handback" from a genuine restart.
+        _remember_tab_epoch(session)
         _drop_session(task_id)
         if session.get("local_server_managed"):
-            _release_local_server_lease()
+            _release_local_server_lease(session)
         logger.debug("Camofox soft cleanup for task %s (managed persistence)", task_id)
         return True
 
@@ -1115,6 +1202,12 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
         # ``url`` is present on tab creation. Omitting it creates the blank tab
         # and gives Hermes a stable tabId before navigation can time out.
         session = _ensure_tab(task_id)
+        # An epoch advance during this call means a human took over and handed
+        # back while the navigation was in flight, so the page the Agent is
+        # about to read is not the one it asked for. Clearing the filter
+        # unconditionally below would let those values through, and the fresh
+        # epoch means the server will not flag the next read as stale either.
+        epoch_before_navigate = session.get("epoch")
         try:
             data = _post(
                 _tab_path(session, "/navigate"),
@@ -1139,7 +1232,8 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
                 )
             else:
                 raise
-        _set_handback_privacy_filter(session, False)
+        if session.get("epoch") == epoch_before_navigate:
+            _set_handback_privacy_filter(session, False)
         result = {
             "success": True,
             "url": data.get("url", browser_url),
@@ -1372,7 +1466,7 @@ def camofox_close(task_id: Optional[str] = None) -> str:
         # Prefer the flag captured when the session was created: teardown can
         # run without the profile scope the live probe needs.
         if session.get("local_server_managed") or _local_server_managed():
-            _release_local_server_lease()
+            _release_local_server_lease(session)
             return json.dumps({
                 "success": True,
                 "closed": False,
