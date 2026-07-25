@@ -60,7 +60,11 @@ _HANDBACK_URL = re.compile(
     # closing one is accepted — an RFC 6874 zone identifier (`[fe80::1%25eth0]`)
     # contains letters outside the hex alphabet and would otherwise stop the
     # match at the scheme, leaving the path and query in the text.
-    r"(?i)\bhttps?://(?:[^\s\"'<>()\[\]/@]*@)?(?:\[[^\]\s]+\])?[^\s\"'<>()\[\]]*"
+    # Parentheses are legal in a path (`/(S(secret))/callback`), so excluding
+    # them left the sensitive tail in the text. They are accepted here and the
+    # whole match is replaced by the origin; over-matching a trailing delimiter
+    # from surrounding prose costs a bracket, under-matching costs a token.
+    r"(?i)\bhttps?://(?:[^\s\"'<>\[\]/@]*@)?(?:\[[^\]\s]+\])?[^\s\"'<>]*"
 )
 
 
@@ -148,7 +152,7 @@ def _adopt_epoch_from_response(
     resp: "requests.Response",
     *,
     tab_operation: bool = False,
-) -> None:
+) -> bool:
     """Adopt the epoch header a managed local-server proxy adds to responses.
 
     On a managed deployment the epoch is the only thing that tells this process
@@ -163,20 +167,21 @@ def _adopt_epoch_from_response(
     if value is not None:
         try:
             _adopt_session_epoch(session, int(str(value).strip()))
-            return
+            return True
         except (TypeError, ValueError):
             pass
     if not tab_operation or not isinstance(session, dict):
-        return
+        return False
     status = getattr(resp, "status_code", None)
     if not isinstance(status, int) or not (200 <= status < 300):
         # Error envelopes are generated before dispatch and carry no page data,
         # so a missing header there says nothing about the page.
-        return
+        return False
     if not session.get("local_server_managed"):
-        return
+        return False
     logger.warning("Camofox managed tab response carried no usable %s header", _EPOCH_HEADER)
     session["privacy_filter_after_handback"] = True
+    return False
 
 
 def _set_handback_privacy_filter(session: Dict[str, Any], enabled: bool) -> None:
@@ -191,9 +196,19 @@ def _handback_privacy_filter_enabled(session: Dict[str, Any]) -> bool:
         return bool(session.get("privacy_filter_after_handback"))
 
 
-def _filter_page_state_after_handback(session: Dict[str, Any], value: str) -> str:
-    """Filter page state while a human-mutated page remains current."""
-    return _redact_handback_page_state(value) if _handback_privacy_filter_enabled(session) else value
+def _filter_page_state_after_handback(
+    session: Dict[str, Any], value: str, filtered_at_request: bool = False
+) -> str:
+    """Filter page state while a human-mutated page remains current.
+
+    ``filtered_at_request`` carries the state from when the read was issued.
+    Concurrent turns share one session dict, so a navigate finishing in between
+    could otherwise clear the flag and let a capture taken under the filter
+    through unredacted.
+    """
+    if filtered_at_request or _handback_privacy_filter_enabled(session):
+        return _redact_handback_page_state(value)
+    return value
 
 
 def _filter_url_after_handback(session: Dict[str, Any], url: Any) -> Any:
@@ -1452,7 +1467,9 @@ def _post(path: str, body: dict, timeout: Optional[int] = None, session: Optiona
     # later response's epoch looks like the first one ever seen and is taken as
     # a safe baseline, so a takeover between creation and the first read would
     # go unnoticed.
-    _adopt_epoch_from_response(session, resp, tab_operation=_is_tab_operation(path) or path == "/tabs")
+    verified = _adopt_epoch_from_response(session, resp, tab_operation=_is_tab_operation(path) or path == "/tabs")
+    if isinstance(session, dict):
+        session["last_epoch_verified"] = verified
     _raise_for_status(resp)
     return resp.json()
 
@@ -1797,8 +1814,17 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
                 )
             else:
                 raise
-        if session.get("epoch") == epoch_before_navigate and _left_handback_document(
-            session, document_before_navigate, data.get("url", browser_url)
+        # Three things must hold before the page counts as left behind: this
+        # response actually carried a verified epoch (a protocol downgrade must
+        # not read as "nothing happened"), the epoch did not move, and the
+        # document identity really changed.
+        # The epoch requirement only applies where the protocol exists: a
+        # direct Camofox session has no epoch to verify.
+        epoch_protocol_ok = session.get("last_epoch_verified") or not session.get("local_server_managed")
+        if (
+            epoch_protocol_ok
+            and session.get("epoch") == epoch_before_navigate
+            and _left_handback_document(session, document_before_navigate, data.get("url", browser_url))
         ):
             _set_handback_privacy_filter(session, False)
         # A handback that landed mid-navigation leaves the filter on, and the
@@ -1836,6 +1862,7 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
 
         # Auto-take a compact snapshot so the model can act immediately
         try:
+            snapshot_filtered_at_request = _handback_privacy_filter_enabled(session)
             snap_data = _get(
                 _tab_path(session, "/snapshot"),
                 params={"userId": session["user_id"]},
@@ -1854,14 +1881,14 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
             # have what they typed land in the tool result — and if they left
             # the tab somewhere the Agent may not read at all, redaction is not
             # enough, the snapshot is dropped.
-            if _handback_privacy_filter_enabled(session) and not _handback_page_readable(session, snap_data):
+            if (snapshot_filtered_at_request or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, snap_data):
                 result["snapshot_withheld"] = True
                 result["warning"] = (
                     "A human took over and left the browser on a page this Agent is not "
                     "allowed to read. Page state was not captured."
                 )
             else:
-                result["snapshot"] = _filter_page_state_after_handback(session, snapshot_text)
+                result["snapshot"] = _filter_page_state_after_handback(session, snapshot_text, snapshot_filtered_at_request)
                 result["element_count"] = snap_data.get("refsCount", 0)
         except Exception:
             pass  # Navigation succeeded; snapshot is a bonus
@@ -1890,6 +1917,7 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
+        filtered_at_request = _handback_privacy_filter_enabled(session)
         data = _get(
             _tab_path(session, "/snapshot"),
             params={"userId": session["user_id"]},
@@ -1898,14 +1926,16 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
 
         # The response is what advances the epoch, so the filter can only be
         # known to be on at this point — the guard has to run here, not before
-        # the request.
-        if _handback_privacy_filter_enabled(session) and not _handback_page_readable(session, data):
+        # the request. The request-time state is carried alongside it: a
+        # concurrent navigate could clear the flag while this read was in
+        # flight, and the capture was still taken under it.
+        if (filtered_at_request or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, data):
             return _blocked_handback_page_error()
 
         snapshot = data.get("snapshot", "")
         if not isinstance(snapshot, str):
             snapshot = ""
-        snapshot = _filter_page_state_after_handback(session, snapshot)
+        snapshot = _filter_page_state_after_handback(session, snapshot, filtered_at_request)
         refs_count = data.get("refsCount", 0)
 
         # Apply same summarization logic as the main browser tool
@@ -2098,6 +2128,7 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
 
         import re
 
+        images_filtered_at_request = _handback_privacy_filter_enabled(session)
         data = _get(
             _tab_path(session, "/snapshot"),
             params={"userId": session["user_id"]},

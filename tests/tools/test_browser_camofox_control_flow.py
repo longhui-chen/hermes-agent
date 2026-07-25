@@ -1558,3 +1558,70 @@ def test_concurrent_turns_on_one_identity_create_one_tab():
     assert len(created) == 1, f"one tab per browser identity, got {created}"
     assert sessions["parent"]["tab_id"] == sessions["sub"]["tab_id"]
     mod._owner_locks.clear()
+
+
+def test_concurrent_navigate_cannot_unfilter_an_in_flight_capture():
+    """Two turns share one session dict, so the flag can move mid-read.
+
+    A capture taken while the filter was on must stay filtered even if a
+    navigate clears it before the response is processed.
+    """
+    from tools.browser_camofox import camofox_snapshot
+
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
+        "privacy_filter_after_handback": True, "epoch": 4, "_lock": None,
+    }
+
+    def _get_racing_navigate(path, params=None, timeout=None, session=None, **kwargs):
+        if path == "/tabs":
+            return {"tabs": [{"tabId": "tab-1", "listItemId": "s", "url": "https://example.com/"}]}
+        # The other turn's navigate lands here, clearing the shared flag.
+        session["privacy_filter_after_handback"] = False
+        return {"snapshot": "textbox \"Password\" value=\"hunter2\"", "refsCount": 1}
+
+    with (
+        patch("tools.browser_camofox._get_session", return_value=session),
+        patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
+        patch("tools.browser_camofox._get", side_effect=_get_racing_navigate),
+    ):
+        result = json.loads(camofox_snapshot(task_id="agent-task"))
+
+    assert "hunter2" not in json.dumps(result)
+
+
+def test_navigate_keeps_the_filter_when_the_epoch_was_not_verified():
+    """A protocol downgrade must not read as "nothing happened".
+
+    Without a verified epoch on this very response, "the epoch did not move"
+    only means nothing was reported — not that nobody took over.
+    """
+    from tools.browser_camofox import camofox_navigate
+
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
+        "privacy_filter_after_handback": True, "epoch": 4, "_lock": None,
+        "local_server_managed": True, "last_epoch_verified": False,
+    }
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=session),
+        patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
+        patch("tools.browser_camofox._post", return_value={"url": "https://other.example/", "title": "Other"}),
+        patch("tools.browser_camofox._get", side_effect=_get_serving_tabs(
+            {"snapshot": "- heading \"Other\"", "refsCount": 1},
+            url="https://bank.example/login",
+        )),
+    ):
+        json.loads(camofox_navigate("https://other.example/", task_id="agent-task"))
+
+    assert session["privacy_filter_after_handback"] is True
+
+
+def test_handback_filter_redacts_urls_with_parenthesised_paths():
+    """Parentheses are legal in a path, and the tail after them is the payload."""
+    from tools.browser_camofox import _reduce_urls_to_origin
+
+    filtered = _reduce_urls_to_origin("go https://example.com/(S(secret))/callback?code=abc123 now")
+    assert "abc123" not in filtered
+    assert "secret" not in filtered
+    assert "https://example.com/" in filtered
