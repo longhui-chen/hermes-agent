@@ -402,3 +402,131 @@ def test_internal_proxy_requests_reject_redirects(managed_session):
             _post("/tabs/x/navigate", {"userId": "u"}, session=managed_session)
 
     assert captured["allow_redirects"] is False
+
+
+def test_tab_id_from_runtime_must_be_opaque():
+    """A malformed tab id must never reach a request path.
+
+    The id is interpolated into /tabs/<id>/... requests that carry the Agent
+    action token, so path separators or a query/fragment could re-target those
+    privileged requests at other local-server routes.
+    """
+    from tools.browser_camofox import _tab_path, _validated_tab_id
+
+    assert _validated_tab_id("tab_abc-1.2:3") == "tab_abc-1.2:3"
+    for hostile in (
+        "../_zettlab/release",
+        "tab/../../secret",
+        "tab?x=1",
+        "tab#frag",
+        "tab id",
+        "",
+        None,
+        123,
+        "t" * 129,
+    ):
+        assert _validated_tab_id(hostile) is None, hostile
+
+    assert _tab_path({"tab_id": "tab-1"}, "/snapshot") == "/tabs/tab-1/snapshot"
+    with pytest.raises(ValueError):
+        _tab_path({"tab_id": "../escape"}, "/snapshot")
+
+
+def test_ensure_tab_rejects_malformed_runtime_tab_id():
+    """A compromised runtime cannot poison the session with a path-bearing id."""
+    from tools.browser_camofox import _ensure_tab, _sessions
+
+    _sessions.clear()
+    with (
+        patch("tools.browser_camofox._get_session", return_value={
+            "user_id": "u", "tab_id": None, "session_key": "s", "_lock": None,
+        }),
+        patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
+        patch("tools.browser_camofox._post", return_value={"tabId": "../_zettlab/release"}),
+    ):
+        with pytest.raises(ValueError):
+            _ensure_tab("agent-task")
+
+
+def test_adopting_existing_tab_rejects_malformed_tab_id():
+    """Adoption uses the same validation as creation."""
+    session = {
+        "user_id": "hermes_profile",
+        "tab_id": None,
+        "session_key": "task_opaque",
+        "adopt_existing_tab": True,
+        "privacy_filter_after_handback": False,
+        "epoch": None,
+    }
+    with (
+        patch("tools.browser_camofox.get_camofox_url", return_value="http://127.0.0.1:8080"),
+        patch("tools.browser_camofox._get", return_value={
+            "tabs": [{"tabId": "tab/../escape", "listItemId": "task_opaque"}],
+        }),
+    ):
+        adopted = _adopt_existing_tab(session)
+
+    assert adopted["tab_id"] is None
+
+
+def test_health_check_refuses_to_follow_redirects():
+    """The health probe carries the action token and must not follow a 30x."""
+    from tools.browser_camofox import check_camofox_available
+
+    captured = {}
+
+    def _capture(url, timeout=None, headers=None, allow_redirects=None):
+        captured["allow_redirects"] = allow_redirects
+        resp = MagicMock()
+        resp.status_code = 302
+        return resp
+
+    with (
+        patch("tools.browser_camofox.get_camofox_url", return_value="http://127.0.0.1:8080"),
+        patch("tools.browser_camofox.requests.get", side_effect=_capture),
+    ):
+        assert check_camofox_available() is False
+
+    assert captured["allow_redirects"] is False
+
+
+def test_cleanup_finds_session_after_profile_scope_is_gone():
+    """Session teardown must not depend on the request-time profile identity.
+
+    The idle reaper, /new and shutdown all run after the profile home and
+    secret scope are torn down, so recomputing the identity yields a different
+    cache key. Without the task-id fallback the entry and its local-server
+    browser lease would be stranded for the life of the process — unbounded
+    resident state on a 2 GB device.
+    """
+    from tools.browser_camofox import (
+        _drop_session,
+        _sessions,
+        camofox_soft_cleanup,
+        has_camofox_session,
+    )
+
+    _sessions.clear()
+    _sessions["profileA\x00sessA\x00agent-task"] = {
+        "user_id": "profileA",
+        "session_key": "sessA",
+        "tab_id": "tab-1",
+        "managed": True,
+        "local_server_managed": True,
+        "task_id": "agent-task",
+    }
+
+    # Cleanup-time identity no longer resolves to the creation-time key.
+    scope_lost = {"user_id": "default", "session_key": "default"}
+    with (
+        patch("tools.browser_camofox.get_camofox_identity", return_value=scope_lost),
+        patch("tools.browser_camofox._camofox_identity_override", return_value=None),
+        patch("tools.browser_camofox._get_camofox_config", return_value={}),
+    ):
+        assert has_camofox_session("agent-task") is True
+        released = []
+        with patch("tools.browser_camofox._release_local_server_lease", side_effect=lambda: released.append(1)):
+            assert camofox_soft_cleanup("agent-task") is True
+        assert released == [1]
+        assert _sessions == {}
+        assert _drop_session("agent-task") is None

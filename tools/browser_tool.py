@@ -4270,13 +4270,20 @@ def _cleanup_single_browser_session(task_id: str) -> None:
     # Skip full close when managed persistence is enabled — the browser
     # profile (and its session cookies) must survive across agent tasks.
     # The inactivity reaper still frees idle resources.
-    if _is_camofox_mode():
-        try:
-            from tools.browser_camofox import camofox_close, camofox_soft_cleanup
+    try:
+        from tools.browser_camofox import (
+            camofox_close,
+            camofox_soft_cleanup,
+            has_camofox_session,
+        )
+        # The idle reaper and shutdown paths run without the request's profile
+        # and secret scope, so _is_camofox_mode() fails closed there. A tracked
+        # session is scope-independent evidence that teardown is still owed.
+        if _is_camofox_mode() or has_camofox_session(task_id):
             if not camofox_soft_cleanup(task_id):
                 camofox_close(task_id)
-        except Exception as e:
-            logger.debug("Camofox cleanup for task %s: %s", task_id, e)
+    except Exception as e:
+        logger.debug("Camofox cleanup for task %s: %s", task_id, e)
 
     logger.debug("cleanup_browser called for task_id: %s", task_id)
     logger.debug("Active sessions: %s", list(_active_sessions.keys()))

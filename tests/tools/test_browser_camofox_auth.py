@@ -184,10 +184,13 @@ class TestAuthHeadersSent:
 
         assert check_camofox_available() is True
 
+        # allow_redirects=False keeps the credential from being replayed to a
+        # redirect target chosen by a misconfigured or compromised endpoint.
         mock_get.assert_called_once_with(
             "http://localhost:9377/health",
             timeout=5,
             headers={"Authorization": "Bearer my-api-key"},
+            allow_redirects=False,
         )
 
 

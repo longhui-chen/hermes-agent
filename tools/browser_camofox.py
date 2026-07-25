@@ -22,12 +22,16 @@ import re
 import threading
 import uuid
 from typing import Any, Dict, Optional
-from urllib.parse import SplitResult, urlsplit, urlunsplit
+from urllib.parse import SplitResult, quote, urlsplit, urlunsplit
 
 import requests
 
 from hermes_cli.config import cfg_get, load_config, read_raw_config
 
+
+# Camofox tab IDs are opaque handles; anything outside this alphabet cannot be
+# a legitimate ID and must never reach a request path.
+_TAB_ID_PATTERN = re.compile(r"\A[A-Za-z0-9_.:-]{1,128}\Z")
 
 _HANDBACK_SENSITIVE_CONTROL = re.compile(
     r"(?ix)"
@@ -308,7 +312,12 @@ def check_camofox_available() -> bool:
     if not url:
         return False
     try:
-        resp = requests.get(f"{url}/health", timeout=5, headers=_auth_headers())
+        # Never follow a redirect: requests keeps custom headers across hops, so
+        # a misconfigured or compromised proxy answering /health with a 30x
+        # would receive the Agent action token at another origin.
+        resp = requests.get(
+            f"{url}/health", timeout=5, headers=_auth_headers(), allow_redirects=False
+        )
         if resp.status_code == 200 and not _vnc_url_checked and not _local_server_managed():
             try:
                 data = resp.json()
@@ -503,6 +512,31 @@ def _session_cache_key(task_id: str, identity: Dict[str, str]) -> str:
     return f"{identity['user_id']}\x00{identity['session_key']}\x00{task_id}"
 
 
+def _validated_tab_id(raw: Any) -> Optional[str]:
+    """Return ``raw`` if it is a well-formed opaque Camofox tab ID, else None.
+
+    The ID comes back from the runtime and is then interpolated into
+    ``/tabs/<id>/...`` request paths that carry
+    ``X-Zettlab-Agent-Action-Token``. A malformed or hostile value containing
+    ``/``, ``..``, ``?`` or ``#`` could re-target those privileged requests at
+    other local-server routes, so only the documented opaque form is accepted.
+    """
+    if not isinstance(raw, str):
+        return None
+    tab_id = raw.strip()
+    if not _TAB_ID_PATTERN.match(tab_id):
+        return None
+    return tab_id
+
+
+def _tab_path(session: Dict[str, Any], suffix: str = "") -> str:
+    """Build a ``/tabs/<id>`` path with the ID encoded as a single segment."""
+    tab_id = _validated_tab_id(session.get("tab_id"))
+    if tab_id is None:
+        raise ValueError("browser tab id is missing or malformed")
+    return f"/tabs/{quote(tab_id, safe='')}{suffix}"
+
+
 def _session_lock(session: Dict[str, Any]) -> threading.Lock:
     with _sessions_lock:
         lock = session.get("_lock")
@@ -541,8 +575,8 @@ def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(tab, dict) and tab.get("listItemId") == session_key
     ]
     latest = matching_tabs[-1] if matching_tabs else None
-    tab_id = latest.get("tabId") if isinstance(latest, dict) else None
-    if isinstance(tab_id, str) and tab_id:
+    tab_id = _validated_tab_id(latest.get("tabId")) if isinstance(latest, dict) else None
+    if tab_id:
         session["tab_id"] = tab_id
         _adopt_session_epoch(session, latest.get("epoch"))
         # This process has no memory of the tab (fresh session cache), so it
@@ -569,6 +603,10 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
     identity_override = _camofox_identity_override(task_id, camofox_cfg)
     cache_identity = identity_override or profile_identity
     cache_key = _session_cache_key(task_id, cache_identity)
+    # Recorded on the session because lifecycle cleanup runs outside this
+    # request's profile and secret scope, where the probe would fail closed and
+    # skip releasing the local-server lease.
+    local_server_managed = _local_server_managed()
     with _sessions_lock:
         if cache_key in _sessions:
             session = _sessions[cache_key]
@@ -582,9 +620,11 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "adopt_existing_tab": _adopt_existing_tab_enabled(camofox_cfg),
                     "privacy_filter_after_handback": False,
                     "epoch": None,
+                    "task_id": task_id,
+                    "local_server_managed": local_server_managed,
                     "_lock": threading.Lock(),
                 }
-            elif _local_server_managed() or bool(camofox_cfg.get("managed_persistence")):
+            elif local_server_managed or bool(camofox_cfg.get("managed_persistence")):
                 session = {
                     "user_id": profile_identity["user_id"],
                     "tab_id": None,
@@ -593,6 +633,8 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "adopt_existing_tab": _adopt_existing_tab_enabled(camofox_cfg),
                     "privacy_filter_after_handback": False,
                     "epoch": None,
+                    "task_id": task_id,
+                    "local_server_managed": local_server_managed,
                     "_lock": threading.Lock(),
                 }
             else:
@@ -604,6 +646,8 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "adopt_existing_tab": False,
                     "privacy_filter_after_handback": False,
                     "epoch": None,
+                    "task_id": task_id,
+                    "local_server_managed": local_server_managed,
                     "_lock": threading.Lock(),
                 }
             _sessions[cache_key] = session
@@ -630,17 +674,63 @@ def _ensure_tab(task_id: Optional[str], url: Optional[str] = None) -> Dict[str, 
             timeout=max(_get_command_timeout(), _TAB_CREATION_TIMEOUT_FLOOR),
             session=session,
         )
-        session["tab_id"] = data.get("tabId")
+        tab_id = _validated_tab_id(data.get("tabId"))
+        if tab_id is None:
+            raise ValueError("browser runtime returned a malformed tab id")
+        session["tab_id"] = tab_id
         return session
+
+
+def _session_keys_for_task_locked(task_id: str) -> list:
+    """Cache keys tracking task_id, preferring the identity-derived one.
+
+    Lifecycle cleanup (idle reaper, ``/new``, shutdown) runs outside the
+    request's profile home and secret scope, so recomputing the identity there
+    yields a different key than the one used at creation. The task id recorded
+    on the session is stable, so fall back to it — otherwise the entry and its
+    local-server browser lease would be stranded for the life of the process.
+    Callers must hold ``_sessions_lock``.
+    """
+    camofox_cfg = _get_camofox_config()
+    identity = _camofox_identity_override(task_id, camofox_cfg) or get_camofox_identity(task_id)
+    preferred = _session_cache_key(task_id, identity)
+    keys = [preferred] if preferred in _sessions else []
+    keys.extend(
+        key
+        for key, session in _sessions.items()
+        if key not in keys and session.get("task_id") == task_id
+    )
+    return keys
+
+
+def _peek_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Return the tracked session for task_id without removing it."""
+    task_id = task_id or "default"
+    with _sessions_lock:
+        keys = _session_keys_for_task_locked(task_id)
+        return _sessions[keys[0]] if keys else None
+
+
+def has_camofox_session(task_id: Optional[str] = None) -> bool:
+    """Whether this process still tracks Camofox state for task_id.
+
+    Cleanup callers use this as scope-independent evidence that Camofox
+    teardown is still owed, since the mode probes they would otherwise rely on
+    fail closed outside the request's profile scope.
+    """
+    return _peek_session(task_id) is not None
 
 
 def _drop_session(task_id: Optional[str]) -> Optional[Dict[str, Any]]:
     """Remove and return session info."""
     task_id = task_id or "default"
     with _sessions_lock:
-        camofox_cfg = _get_camofox_config()
-        identity = _camofox_identity_override(task_id, camofox_cfg) or get_camofox_identity(task_id)
-        return _sessions.pop(_session_cache_key(task_id, identity), None)
+        dropped: Optional[Dict[str, Any]] = None
+        for key in _session_keys_for_task_locked(task_id):
+            session = _sessions.pop(key, None)
+            if dropped is None:
+                dropped = session
+        return dropped
 
 
 def _release_local_server_lease() -> None:
@@ -677,13 +767,26 @@ def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
     does nothing and returns ``False`` so the caller can fall back to
     :func:`camofox_close`.
     """
+    session = _peek_session(task_id)
+    if session is not None:
+        # Decide from the session's own creation-time state. Cleanup runs from
+        # the idle reaper, ``/new`` and shutdown, all outside the request's
+        # profile home and secret scope, where recomputing managed-ness fails
+        # closed and would strand the entry plus its local-server lease.
+        if not session.get("managed"):
+            return False
+        _drop_session(task_id)
+        if session.get("local_server_managed"):
+            _release_local_server_lease()
+        logger.debug("Camofox soft cleanup for task %s (managed persistence)", task_id)
+        return True
+
     camofox_cfg = _get_camofox_config()
     if (
         _local_server_managed()
         or bool(camofox_cfg.get("managed_persistence"))
         or _camofox_identity_override(task_id, camofox_cfg)
     ):
-        _drop_session(task_id)
         if _local_server_managed():
             _release_local_server_lease()
         logger.debug("Camofox soft cleanup for task %s (managed persistence)", task_id)
@@ -836,7 +939,7 @@ def _retryable_control_result(
 
     try:
         snapshot_data = _get(
-            f"/tabs/{session['tab_id']}/snapshot",
+            _tab_path(session, "/snapshot"),
             params={"userId": session["user_id"]},
             session=session,
         )
@@ -919,7 +1022,7 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
         session = _ensure_tab(task_id)
         try:
             data = _post(
-                f"/tabs/{session['tab_id']}/navigate",
+                _tab_path(session, "/navigate"),
                 {"userId": session["user_id"], "url": browser_url},
                 timeout=60,
                 session=session,
@@ -934,7 +1037,7 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
                 session["tab_id"] = None
                 session = _ensure_tab(task_id)
                 data = _post(
-                    f"/tabs/{session['tab_id']}/navigate",
+                    _tab_path(session, "/navigate"),
                     {"userId": session["user_id"], "url": browser_url},
                     timeout=60,
                     session=session,
@@ -969,7 +1072,7 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
         # Auto-take a compact snapshot so the model can act immediately
         try:
             snap_data = _get(
-                f"/tabs/{session['tab_id']}/snapshot",
+                _tab_path(session, "/snapshot"),
                 params={"userId": session["user_id"]},
                 session=session,
             )
@@ -1010,7 +1113,7 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
         data = _get(
-            f"/tabs/{session['tab_id']}/snapshot",
+            _tab_path(session, "/snapshot"),
             params={"userId": session["user_id"]},
             session=session,
         )
@@ -1054,7 +1157,7 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
         clean_ref = ref.lstrip("@")
 
         data = _post(
-            f"/tabs/{session['tab_id']}/click",
+            _tab_path(session, "/click"),
             {"userId": session["user_id"], "ref": clean_ref},
             session=session,
         )
@@ -1077,7 +1180,7 @@ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
         clean_ref = ref.lstrip("@")
 
         _post(
-            f"/tabs/{session['tab_id']}/type",
+            _tab_path(session, "/type"),
             {"userId": session["user_id"], "ref": clean_ref, "text": text},
             session=session,
         )
@@ -1117,7 +1220,7 @@ def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
         _post(
-            f"/tabs/{session['tab_id']}/scroll",
+            _tab_path(session, "/scroll"),
             {"userId": session["user_id"], "direction": direction},
             session=session,
         )
@@ -1134,7 +1237,7 @@ def camofox_back(task_id: Optional[str] = None) -> str:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
         data = _post(
-            f"/tabs/{session['tab_id']}/back",
+            _tab_path(session, "/back"),
             {"userId": session["user_id"]},
             session=session,
         )
@@ -1151,7 +1254,7 @@ def camofox_press(key: str, task_id: Optional[str] = None) -> str:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
         _post(
-            f"/tabs/{session['tab_id']}/press",
+            _tab_path(session, "/press"),
             {"userId": session["user_id"], "key": key},
             session=session,
         )
@@ -1167,7 +1270,9 @@ def camofox_close(task_id: Optional[str] = None) -> str:
         if not session:
             return json.dumps({"success": True, "closed": True})
 
-        if _local_server_managed():
+        # Prefer the flag captured when the session was created: teardown can
+        # run without the profile scope the live probe needs.
+        if session.get("local_server_managed") or _local_server_managed():
             _release_local_server_lease()
             return json.dumps({
                 "success": True,
@@ -1197,7 +1302,7 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
         import re
 
         data = _get(
-            f"/tabs/{session['tab_id']}/snapshot",
+            _tab_path(session, "/snapshot"),
             params={"userId": session["user_id"]},
             session=session,
         )
@@ -1249,7 +1354,7 @@ def camofox_vision(question: str, annotate: bool = False,
 
         # Get screenshot as binary PNG
         resp = _get_raw(
-            f"/tabs/{session['tab_id']}/screenshot",
+            _tab_path(session, "/screenshot"),
             params={"userId": session["user_id"]},
             session=session,
         )
@@ -1271,7 +1376,7 @@ def camofox_vision(question: str, annotate: bool = False,
         if annotate:
             try:
                 snap_data = _get(
-                    f"/tabs/{session['tab_id']}/snapshot",
+                    _tab_path(session, "/snapshot"),
                     params={"userId": session["user_id"]},
                     session=session,
                 )
