@@ -883,3 +883,81 @@ def test_lease_release_is_retried_and_queued_until_it_lands():
     succeeding.assert_called_once()
     assert mod._pending_lease_releases == []
     mod._pending_lease_releases.clear()
+
+
+def test_tab_id_rejects_dot_segments():
+    """`.` and `..` are allowed characters but are path segments, not ids.
+
+    quote() leaves dots alone, so `/tabs/../snapshot` would survive to whatever
+    normalizes the path next — carrying the Agent action token out of the tab
+    API.
+    """
+    from tools.browser_camofox import _validated_tab_id
+
+    for hostile in ("..", ".", "...", " .. "):
+        assert _validated_tab_id(hostile) is None, hostile
+    # A dot inside a real id stays legal.
+    assert _validated_tab_id("tab.1") == "tab.1"
+
+
+def test_readoption_restores_the_filter_a_mid_handback_turn_left_on():
+    """Remembering the epoch alone would clear a filter that must stay on.
+
+    A handback detected during a turn leaves the filter on at an epoch the
+    server also reports, so "epoch unchanged" does not mean "nothing happened".
+    """
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import _adopt_existing_tab, _remember_tab_epoch
+
+    mod._remembered_tab_epochs.clear()
+    # The turn ended while the page was still under the handback filter.
+    _remember_tab_epoch({
+        "user_id": "hermes_profile", "session_key": "task_opaque",
+        "tab_id": "tab-live", "epoch": 9, "privacy_filter_after_handback": True,
+    })
+
+    session = {
+        "user_id": "hermes_profile", "session_key": "task_opaque", "tab_id": None,
+        "adopt_existing_tab": True, "privacy_filter_after_handback": False, "epoch": None,
+    }
+    with (
+        patch("tools.browser_camofox.get_camofox_url", return_value="http://127.0.0.1:8080"),
+        patch("tools.browser_camofox._get", return_value={
+            "tabs": [{"tabId": "tab-live", "listItemId": "task_opaque", "epoch": 9}],
+        }),
+    ):
+        adopted = _adopt_existing_tab(session)
+
+    assert adopted["privacy_filter_after_handback"] is True
+    mod._remembered_tab_epochs.clear()
+
+
+def test_recovery_refuses_to_snapshot_a_blocked_page():
+    """The human may hand back on cloud metadata or an intranet page.
+
+    The deleted resume handshake validated this before acking; the recovery
+    snapshot must apply the same guard browser_navigate applies to the Agent's
+    own navigations.
+    """
+    from tools.browser_camofox import _retryable_control_result
+
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
+        "privacy_filter_after_handback": False, "epoch": 3, "_lock": None,
+    }
+    stale = _epoch_stale(epoch=4)
+
+    with (
+        patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
+        patch("tools.browser_camofox._get", return_value={
+            "tabs": [{"tabId": "tab-1", "listItemId": "s", "url": "http://169.254.169.254/latest/meta-data/"}],
+        }) as mock_get,
+        patch("tools.browser_camofox._redact_handback_page_state") as redact,
+    ):
+        result = json.loads(_retryable_control_result(stale, session=session))
+
+    assert result.get("blocked_page") is True
+    assert "snapshot" not in result
+    redact.assert_not_called()
+    # Only the /tabs lookup ran; the snapshot was never requested.
+    assert mock_get.call_count == 1

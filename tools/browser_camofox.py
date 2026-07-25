@@ -571,6 +571,11 @@ def _validated_tab_id(raw: Any) -> Optional[str]:
     tab_id = raw.strip()
     if not _TAB_ID_PATTERN.match(tab_id):
         return None
+    # `.` and `..` are made of allowed characters but are path segments, not
+    # identifiers: quote() leaves dots alone, so `/tabs/../snapshot` would
+    # survive to whatever normalizes the path next.
+    if set(tab_id) <= {"."}:
+        return None
     return tab_id
 
 
@@ -596,30 +601,38 @@ def _session_lock(session: Dict[str, Any]) -> threading.Lock:
 # apart from a gateway restart; bounded because a stale entry is only ever a
 # missed filter-suppression, never a leak.
 _MAX_REMEMBERED_TAB_EPOCHS = 256
-_remembered_tab_epochs: Dict[str, int] = {}
+_remembered_tab_epochs: Dict[str, tuple] = {}
 
 
 def _tab_epoch_memory_key(session: Dict[str, Any], tab_id: str) -> str:
     return f"{session.get('user_id')}\x00{session.get('session_key')}\x00{tab_id}"
 
 
-def _remembered_tab_epoch(session: Dict[str, Any], tab_id: str) -> Optional[int]:
+def _remembered_tab_state(session: Dict[str, Any], tab_id: str) -> Optional[tuple]:
     with _sessions_lock:
         return _remembered_tab_epochs.get(_tab_epoch_memory_key(session, tab_id))
 
 
 def _remember_tab_epoch(session: Optional[Dict[str, Any]]) -> None:
-    """Record the epoch a still-owned tab was last seen at."""
+    """Record the epoch a still-owned tab was last seen at, with its filter.
+
+    The privacy flag travels with the epoch because it does not follow from it:
+    a handback detected during this turn leaves the filter on at an epoch the
+    server also reports, so remembering the epoch alone would let the next
+    turn's adoption conclude "nothing happened" and clear the filter over a
+    page the human just typed into.
+    """
     if not isinstance(session, dict):
         return
     tab_id = session.get("tab_id")
     epoch = session.get("epoch")
     if not tab_id or not isinstance(epoch, int) or isinstance(epoch, bool):
         return
+    filtered = bool(session.get("privacy_filter_after_handback"))
     with _sessions_lock:
         if len(_remembered_tab_epochs) >= _MAX_REMEMBERED_TAB_EPOCHS:
             _remembered_tab_epochs.clear()
-        _remembered_tab_epochs[_tab_epoch_memory_key(session, tab_id)] = epoch
+        _remembered_tab_epochs[_tab_epoch_memory_key(session, tab_id)] = (epoch, filtered)
 
 
 def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
@@ -664,12 +677,19 @@ def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
         # unchanged means no handback happened, anything else (including no
         # record at all, i.e. a genuine restart) filters until the Agent
         # navigates.
-        remembered = _remembered_tab_epoch(session, tab_id)
-        session["privacy_filter_after_handback"] = not (
-            isinstance(adopted_epoch, int)
+        remembered = _remembered_tab_state(session, tab_id)
+        recognized = (
+            remembered is not None
+            and isinstance(adopted_epoch, int)
             and not isinstance(adopted_epoch, bool)
-            and remembered == adopted_epoch
+            and remembered[0] == adopted_epoch
         )
+        # Recognized means this process saw the tab at exactly this epoch last
+        # turn, so restore the filter state it had then — which stays on when
+        # that turn ended mid-handback. Anything else (moved epoch, or no
+        # record at all, i.e. a genuine restart) filters until the Agent
+        # navigates away.
+        session["privacy_filter_after_handback"] = remembered[1] if recognized else True
         logger.debug("Adopted existing Camofox tab %s for %s", tab_id, session.get("user_id"))
 
     return session
@@ -888,11 +908,56 @@ def _flush_pending_lease_releases() -> None:
             _queue_pending_lease_release(url, headers)
 
 
+# The queue must drain on its own: the failed release may well have been the
+# last browser use of the process, so waiting for another session would leave
+# the lease held indefinitely.
+_PENDING_RELEASE_RETRY_DELAYS = (5, 15, 60, 300)
+_pending_release_worker: Optional[threading.Thread] = None
+
+
 def _queue_pending_lease_release(url: str, headers: Dict[str, str]) -> None:
     with _sessions_lock:
         if len(_pending_lease_releases) >= _MAX_PENDING_LEASE_RELEASES:
             _pending_lease_releases.pop(0)
         _pending_lease_releases.append((url, headers))
+    _ensure_pending_release_worker()
+
+
+def _ensure_pending_release_worker() -> None:
+    """Start the drain thread if it is not already running.
+
+    One short-lived daemon thread, started only when something is actually
+    pending and exiting as soon as the queue is empty or the bounded schedule
+    is exhausted — no permanent background thread on a 2 GB device.
+    """
+    global _pending_release_worker
+    with _sessions_lock:
+        if _pending_release_worker is not None and _pending_release_worker.is_alive():
+            return
+        worker = threading.Thread(
+            target=_drain_pending_lease_releases,
+            name="camofox-lease-release",
+            daemon=True,
+        )
+        _pending_release_worker = worker
+    worker.start()
+
+
+def _drain_pending_lease_releases() -> None:
+    for delay in _PENDING_RELEASE_RETRY_DELAYS:
+        time.sleep(delay)
+        with _sessions_lock:
+            if not _pending_lease_releases:
+                return
+        _flush_pending_lease_releases()
+    with _sessions_lock:
+        stranded = len(_pending_lease_releases)
+    if stranded:
+        logger.warning(
+            "Camofox could not release %d local-server browser lease(s); "
+            "local-server reclaims them when their TTL expires",
+            stranded,
+        )
 
 
 def _release_local_server_lease(session: Optional[Dict[str, Any]] = None) -> None:
@@ -1130,6 +1195,45 @@ def _control_error_payload(exc: BaseException) -> Optional[Dict[str, Any]]:
     return payload
 
 
+def _current_tab_url(session: Dict[str, Any]) -> str:
+    """The proxy's view of where this tab currently is, or "" when unknown.
+
+    Read from ``/tabs`` rather than the page itself: the local-server proxy
+    owns that field for controlled tabs, so it is not something the page or a
+    compromised runtime can dictate.
+    """
+    tab_id = session.get("tab_id")
+    if not tab_id:
+        return ""
+    try:
+        listed = _get("/tabs", params={"userId": session["user_id"]}, timeout=5, session=session)
+    except Exception as exc:
+        logger.debug("Camofox tab url lookup failed: %s", exc)
+        return ""
+    tabs = listed.get("tabs") if isinstance(listed, dict) else None
+    if not isinstance(tabs, list):
+        return ""
+    for candidate in tabs:
+        if isinstance(candidate, dict) and candidate.get("tabId") == tab_id:
+            url = candidate.get("url")
+            return url if isinstance(url, str) else ""
+    return ""
+
+
+def _recovery_target_allowed(url: str) -> bool:
+    """Whether the Agent may read the page the human handed back.
+
+    Fails closed: if the guards cannot be imported or the check raises, the
+    page is treated as off limits.
+    """
+    try:
+        from tools.browser_tool import _is_always_blocked_url, _is_safe_url
+
+        return not _is_always_blocked_url(url) and _is_safe_url(url)
+    except Exception:
+        return False
+
+
 def _retryable_control_result(
     exc: BaseException,
     session: Optional[Dict[str, Any]] = None,
@@ -1170,6 +1274,21 @@ def _retryable_control_result(
     epoch = payload.get("epoch")
     if isinstance(epoch, int) and not isinstance(epoch, bool):
         session["epoch"] = epoch
+
+    # Where the human left the page is not where the Agent may follow. The
+    # deleted resume handshake used to validate this before acking; without an
+    # equivalent here, a handback on 169.254.169.254 or an intranet page would
+    # hand its contents to the model through the recovery snapshot, straight
+    # past the guard browser_navigate applies to the Agent's own navigations.
+    landed_url = _current_tab_url(session)
+    if landed_url and not _recovery_target_allowed(landed_url):
+        result["message"] = (
+            "The human left the browser on a page this Agent is not allowed to read "
+            "(cloud metadata or a private-network address). Page state was not captured. "
+            "Navigate to an allowed page before continuing."
+        )
+        result["blocked_page"] = True
+        return json.dumps(result)
 
     try:
         snapshot_data = _get(
