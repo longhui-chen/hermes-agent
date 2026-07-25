@@ -582,11 +582,17 @@ class TestConfiguredCamofoxIdentity:
         ok = MagicMock()
         ok.status_code = 200
         ok.headers = {}
+        from tools.browser_camofox import _run_pending_teardowns
+
         with (
             patch("tools.browser_camofox.requests.delete") as mock_delete,
             patch("tools.browser_camofox.requests.post", return_value=ok) as mock_post,
         ):
             assert camofox_soft_cleanup("task-1") is True
+            # The release waits out a quiet window before it is sent, so that a
+            # concurrent turn on the same profile keeps its runtime.
+            mock_post.assert_not_called()
+            _run_pending_teardowns(force=True)
 
         mock_delete.assert_not_called()
         assert mock_post.call_args.args[0].endswith("/_zettlab/release")

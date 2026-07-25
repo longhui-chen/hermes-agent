@@ -830,7 +830,7 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
             _sessions[cache_key] = session
     for expired in idle:
         _teardown_session(expired)
-    _flush_pending_lease_releases()
+    _run_pending_teardowns()
     # A tracked session must be reclaimable even if this process never calls
     # into the browser again.
     _ensure_maintenance_worker()
@@ -944,49 +944,94 @@ _MAX_PENDING_LEASE_RELEASES = 32
 _pending_lease_releases: list = []
 
 
-def _attempt_lease_release(url: str, headers: Dict[str, str]) -> bool:
-    """POST the idempotent release once. True when the lease is definitely gone."""
+# Reclaim runs on its own clock: a turn whose cleanup happens after the profile
+# scope is gone cannot drop its own session, and a failed teardown is often the
+# last browser use of the process.
+_MAINTENANCE_TICK_SECONDS = 30
+# Quiet window before a shared profile's runtime is actually released.
+_RELEASE_GRACE_SECONDS = 60
+_MAX_PENDING_RELEASE_ATTEMPTS = 8
+_maintenance_worker: Optional[threading.Thread] = None
+
+
+def _run_pending_teardowns(force: bool = False) -> None:
+    """Drain scheduled teardowns.
+
+    Releases are deliberately deferred: a profile's runtime is shared, and the
+    number of turns currently using it is not observable from here (a turn calls
+    _get_session many times but cleans up once, and two turns can share a task
+    id). Waiting for a quiet window and re-checking under the owner lock is what
+    makes "the last user is gone" true rather than guessed.
+    """
+    now = time.monotonic()
+    with _sessions_lock:
+        ready = [e for e in _pending_lease_releases if force or e["ready_at"] <= now]
+        for entry in ready:
+            _pending_lease_releases.remove(entry)
+    for entry in ready:
+        owner = entry.get("owner") or ""
+        with _owner_lock(owner):
+            if entry["kind"] == "release" and owner and _profile_still_in_use(owner):
+                logger.debug("Camofox dropped a scheduled release: the profile is in use again")
+                continue
+            if _attempt_teardown(entry):
+                continue
+        attempts = entry["attempts"] + 1
+        if attempts >= _MAX_PENDING_RELEASE_ATTEMPTS:
+            logger.warning(
+                "Camofox gave up on a %s for the local browser; the server side "
+                "reclaims it when its own timeout expires",
+                entry["kind"],
+            )
+            continue
+        entry["attempts"] = attempts
+        entry["ready_at"] = time.monotonic() + _MAINTENANCE_TICK_SECONDS
+        with _sessions_lock:
+            if len(_pending_lease_releases) < _MAX_PENDING_LEASE_RELEASES:
+                _pending_lease_releases.append(entry)
+
+
+def _attempt_teardown(entry: Dict[str, Any]) -> bool:
+    """Run one teardown request. True when nothing is left to chase."""
+    url, headers = entry["url"], entry["headers"]
     try:
-        resp = requests.post(url, json={}, timeout=5, headers=headers, allow_redirects=False)
+        if entry["kind"] == "delete":
+            resp = requests.delete(url, timeout=5, headers=headers, allow_redirects=False)
+        else:
+            resp = requests.post(url, json={}, timeout=5, headers=headers, allow_redirects=False)
         _raise_for_status(resp)
         return True
     except Exception as exc:
         if _is_retryable_read_error(exc):
             return False
-        # A non-retryable answer (404/409: already released, unknown lease)
-        # means there is nothing left to chase.
-        logger.debug("Camofox local-server lease release rejected: %s", exc)
+        # A definitive answer (already gone, unknown id) ends the chase.
+        logger.debug("Camofox %s rejected: %s", entry["kind"], exc)
         return True
 
 
-def _flush_pending_lease_releases() -> None:
-    """Retry releases whose session context is already gone."""
-    with _sessions_lock:
-        pending, _pending_lease_releases[:] = list(_pending_lease_releases), []
-    for entry in pending:
-        url, headers = entry[0], entry[1]
-        owner = entry[3] if len(entry) > 3 else ""
-        if owner and _profile_still_in_use(owner):
-            continue
-        if not _attempt_lease_release(url, headers):
-            _queue_pending_lease_release(url, headers, owner=owner)
-
-
-# Reclaim has to run on its own clock. A multiplex turn whose cleanup happens
-# after the profile scope is gone cannot drop its own session, and the failed
-# release is often the last browser use of the process — nothing else would ever
-# come back to either one.
-_MAINTENANCE_TICK_SECONDS = 30
-_MAX_PENDING_RELEASE_ATTEMPTS = 8
-_maintenance_worker: Optional[threading.Thread] = None
-
-
-def _queue_pending_lease_release(url: str, headers: Dict[str, str], owner: str = "") -> None:
+def _queue_pending_teardown(
+    kind: str,
+    url: str,
+    headers: Dict[str, str],
+    owner: str = "",
+    delay: float = 0.0,
+) -> None:
     with _sessions_lock:
         if len(_pending_lease_releases) >= _MAX_PENDING_LEASE_RELEASES:
             _pending_lease_releases.pop(0)
-        _pending_lease_releases.append((url, headers, 0, owner))
+        _pending_lease_releases.append({
+            "kind": kind,
+            "url": url,
+            "headers": dict(headers),
+            "owner": owner,
+            "attempts": 0,
+            "ready_at": time.monotonic() + delay,
+        })
     _ensure_maintenance_worker()
+
+
+def _queue_pending_lease_release(url: str, headers: Dict[str, str], owner: str = "") -> None:
+    _queue_pending_teardown("release", url, headers, owner)
 
 
 def _ensure_maintenance_worker() -> None:
@@ -1016,29 +1061,9 @@ def _run_maintenance() -> None:
         time.sleep(_MAINTENANCE_TICK_SECONDS)
         with _sessions_lock:
             idle = _prune_idle_sessions_locked(time.monotonic())
-            pending, _pending_lease_releases[:] = list(_pending_lease_releases), []
         for session in idle:
             _teardown_session(session)
-        for entry in pending:
-            url, headers = entry[0], entry[1]
-            attempts = entry[2] if len(entry) > 2 else 0
-            owner = entry[3] if len(entry) > 3 else ""
-            # A turn that started while this release was queued owns the
-            # runtime now; completing the release would tear it down.
-            if owner and _profile_still_in_use(owner):
-                logger.debug("Camofox dropped a queued release: the profile is in use again")
-                continue
-            if _attempt_lease_release(url, headers):
-                continue
-            if attempts + 1 >= _MAX_PENDING_RELEASE_ATTEMPTS:
-                logger.warning(
-                    "Camofox gave up releasing a local-server browser lease; "
-                    "local-server reclaims it when its TTL expires"
-                )
-                continue
-            with _sessions_lock:
-                if len(_pending_lease_releases) < _MAX_PENDING_LEASE_RELEASES:
-                    _pending_lease_releases.append((url, headers, attempts + 1, owner))
+        _run_pending_teardowns()
         with _sessions_lock:
             if not _sessions and not _pending_lease_releases:
                 _maintenance_worker = None
@@ -1062,6 +1087,7 @@ def _release_owner_key(user_id: str, headers: Dict[str, str]) -> str:
     return f"{user_id}\x00{credential}"
 
 
+_MAX_OWNER_LOCKS = 256
 _owner_locks: Dict[str, threading.Lock] = {}
 
 
@@ -1074,11 +1100,21 @@ def _owner_lock(owner: str) -> threading.Lock:
     """
     with _sessions_lock:
         lock = _owner_locks.get(owner)
-        if lock is None:
-            if len(_owner_locks) >= 256:
-                _owner_locks.clear()
-            lock = threading.Lock()
-            _owner_locks[owner] = lock
+        if lock is not None:
+            return lock
+        if len(_owner_locks) >= _MAX_OWNER_LOCKS:
+            # Evict only locks nobody holds and no session refers to. Clearing
+            # the map wholesale could hand the same owner a second lock while
+            # the first is still held, which is exactly the serialization this
+            # exists to provide.
+            live = {session.get("release_owner") for session in _sessions.values()}
+            for key in [k for k in _owner_locks if k not in live]:
+                candidate = _owner_locks[key]
+                if candidate.acquire(blocking=False):
+                    candidate.release()
+                    del _owner_locks[key]
+        lock = threading.Lock()
+        _owner_locks[owner] = lock
         return lock
 
 
@@ -1131,36 +1167,35 @@ def _teardown_session(session: Optional[Dict[str, Any]]) -> None:
         return
     headers = session.get("delete_headers")
     headers = dict(headers) if isinstance(headers, dict) else {}
-    try:
-        # Captured endpoint and credential: this also runs from the scope-less
-        # maintenance thread, where re-reading them raises.
-        resp = requests.delete(
-            f"{base}/sessions/{quote(user_id, safe='')}",
-            timeout=5,
-            headers=headers,
-            allow_redirects=False,
-        )
-        _raise_for_status(resp)
-    except Exception as exc:
-        logger.debug("Camofox direct session close failed: %s", exc)
+    # Queued like the lease release: this also runs from the scope-less
+    # maintenance thread, and a transient failure must not lose the only handle
+    # that can close the server-side session.
+    _queue_pending_teardown(
+        "delete",
+        f"{base}/sessions/{quote(user_id, safe='')}",
+        headers,
+    )
 
 
 def _release_local_server_lease(session: Optional[Dict[str, Any]] = None) -> None:
-    """Release the profile's long-lived Agent runtime lease.
+    """Schedule the release of this profile's long-lived Agent runtime lease.
 
-    The endpoint and credential are captured on the session while the profile
-    scope still exists, because teardown reaches this from the idle reaper,
-    ``/new`` and shutdown, where re-reading them raises ``UnscopedSecretError``
-    and the lease would be stranded for the life of the process.
+    Scheduled, not immediate: the endpoint frees the runtime for the whole
+    profile, and how many turns are still using it is not knowable here. The
+    maintenance thread runs it after a quiet window and re-checks holders under
+    the owner lock, so a turn that is still working — or a human mid-takeover —
+    keeps its browser.
 
-    The release is idempotent, so a transient failure is retried with bounded
-    backoff and then queued: the caller has already dropped the session, and
-    this context is the only thing that can still free the lease.
+    The endpoint and credential come from the session because teardown reaches
+    this from the idle reaper, ``/new`` and shutdown, where re-reading them
+    raises ``UnscopedSecretError``.
     """
     url = ""
     headers: Dict[str, str] = {}
+    owner = ""
     if isinstance(session, dict):
         url = str(session.get("release_url") or "")
+        owner = str(session.get("release_owner") or "")
         captured = session.get("release_headers")
         if isinstance(captured, dict):
             headers = dict(captured)
@@ -1171,23 +1206,9 @@ def _release_local_server_lease(session: Optional[Dict[str, Any]] = None) -> Non
         except Exception as exc:
             logger.debug("Camofox local-server lease release unresolvable: %s", exc)
             return
-    # One attempt only: this runs inside the owner lock, which also gates
-    # session registration for this profile. Retrying with backoff here would
-    # block the next turn on the same profile for as long as the runtime stays
-    # unreachable. The maintenance thread retries instead, and re-checks
-    # holders before each attempt.
-    if not _attempt_lease_release(url, headers):
-        _queue_pending_lease_release(url, headers, owner=str(
-            session.get("release_owner") or "" if isinstance(session, dict) else ""
-        ))
+    _queue_pending_teardown("release", url, headers, owner=owner, delay=_RELEASE_GRACE_SECONDS)
 
 
-class _LeaseReleaseRetry(requests.ConnectionError):
-    """Marks a release attempt that should go through the retry/backoff path."""
-
-
-def _raise_release_retry() -> bool:
-    raise _LeaseReleaseRetry("browser lease release did not take effect")
 
 
 def _takeover_ui_hint(session: Dict[str, Any]) -> Optional[Dict[str, str]]:
@@ -1340,7 +1361,11 @@ def _post(path: str, body: dict, timeout: Optional[int] = None, session: Optiona
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
     resp = requests.post(url, json=body, timeout=timeout, headers=_request_headers(session), allow_redirects=False)
-    _adopt_epoch_from_response(session, resp, tab_operation=_is_tab_operation(path))
+    # POST /tabs establishes the baseline epoch for the new tab. Without it a
+    # later response's epoch looks like the first one ever seen and is taken as
+    # a safe baseline, so a takeover between creation and the first read would
+    # go unnoticed.
+    _adopt_epoch_from_response(session, resp, tab_operation=_is_tab_operation(path) or path == "/tabs")
     _raise_for_status(resp)
     return resp.json()
 
@@ -1547,6 +1572,18 @@ def _retryable_control_result(
             params={"userId": session["user_id"]},
             session=session,
         )
+        # Re-check after the response: the human can take over again between
+        # the pre-check and this reply, and a snapshot is always admitted, so
+        # nothing else would stop the new page from coming back.
+        if not _handback_page_readable(session):
+            result["message"] = (
+                "The human left the browser on a page this Agent is not allowed to read "
+                "(cloud metadata or a private-network address). Page state was not captured. "
+                "Navigate to an allowed page before continuing."
+            )
+            result["blocked_page"] = True
+            return json.dumps(result)
+
         snapshot = snapshot_data.get("snapshot", "")
         if not isinstance(snapshot, str):
             snapshot = ""
@@ -2051,6 +2088,11 @@ def camofox_vision(question: str, annotate: bool = False,
                     params={"userId": session["user_id"]},
                     session=session,
                 )
+                # A takeover can land between the screenshot and this call, and
+                # the filter it turns on only strips form values — ordinary
+                # intranet text would still reach the vision model.
+                if _handback_privacy_filter_enabled(session) and not _handback_page_readable(session):
+                    return _blocked_handback_page_error()
                 snapshot = snap_data.get("snapshot", "")
                 if not isinstance(snapshot, str):
                     snapshot = ""

@@ -15,6 +15,7 @@ import requests
 
 from tools.browser_camofox import (
     _adopt_existing_tab,
+    _run_pending_teardowns,
     camofox_back,
     _EPOCH_HEADER,
     _adopt_epoch_from_response,
@@ -98,7 +99,9 @@ def test_epoch_stale_resnapshots_and_returns_retryable(managed_session):
     # The session adopted the new epoch and enabled the privacy filter.
     assert managed_session["epoch"] == 3
     assert managed_session["privacy_filter_after_handback"] is True
-    assert mock_get.call_args.args == ("/tabs/tab-agent/snapshot",)
+    # The blocked-page guard queries /tabs before and after the snapshot, so
+    # assert the snapshot happened rather than that it was last.
+    assert any(call.args[:1] == ("/tabs/tab-agent/snapshot",) for call in mock_get.call_args_list)
     assert mock_get.call_args.kwargs["params"] == {"userId": "hermes_profile"}
     assert mock_get.call_args.kwargs["session"] is managed_session
 
@@ -306,6 +309,8 @@ def test_managed_close_releases_lease_without_destroying_profile(managed_session
         patch("tools.browser_camofox._delete") as mock_delete,
     ):
         result = json.loads(camofox_close("agent-task"))
+        # The release is scheduled behind a quiet window; run it now.
+        _run_pending_teardowns(force=True)
 
     assert result == {"success": True, "closed": False, "released": True}
     # The endpoint and credential captured at creation are used verbatim; the
@@ -730,6 +735,7 @@ def test_idle_sessions_are_reclaimed_with_their_captured_release_context():
         patch("tools.browser_camofox.requests.post", return_value=ok) as mock_post,
     ):
         _drop_session("unrelated-task")
+        _run_pending_teardowns(force=True)
 
     assert _sessions == {}
     assert mock_post.call_args.kwargs["headers"] == {"X-Zettlab-Agent-Action-Token": "tok-a"}
@@ -871,19 +877,21 @@ def test_navigate_result_url_is_filtered_after_mid_call_handback():
     assert result["url"] == "https://idp.example/"
 
 
-def test_lease_release_is_retried_and_queued_until_it_lands():
-    """The session is already gone, so this context is the only way to free it.
+def test_lease_release_is_scheduled_and_retried_until_it_lands():
+    """The release is deferred and retried; it is never fire-and-forget.
 
-    A transient failure that only logged would strand a long-lived
-    local-server lease on a 2 GB device with nothing left to retry it.
+    The session is dropped before this runs, so the queued entry is the only
+    remaining handle on a long-lived local-server lease — a transient failure
+    that merely logged would strand it on a 2 GB device.
     """
     import tools.browser_camofox as mod
-    from tools.browser_camofox import _release_local_server_lease, _flush_pending_lease_releases
+    from tools.browser_camofox import _release_local_server_lease
 
     mod._pending_lease_releases.clear()
     session = {
         "release_url": "http://127.0.0.1:9377/internal/browser/camofox/_zettlab/release",
         "release_headers": {"X-Zettlab-Agent-Action-Token": "tok"},
+        "release_owner": "profileA\x00digest",
     }
 
     unavailable = MagicMock()
@@ -891,25 +899,25 @@ def test_lease_release_is_retried_and_queued_until_it_lands():
     unavailable.headers = {}
     unavailable.json.return_value = {}
 
-    # The reclaim thread is stubbed out so the queue can be inspected; its own
-    # handoff is covered by test_queued_release_always_has_a_consumer.
-    with (
-        patch("tools.browser_camofox._ensure_maintenance_worker", return_value=None),
-        patch("tools.browser_camofox.requests.post", return_value=unavailable) as failing,
-    ):
+    with patch("tools.browser_camofox._ensure_maintenance_worker", return_value=None):
         _release_local_server_lease(session)
-    # Exactly one attempt inside the owner lock — retrying there would block the
-    # next turn on this profile — and the undelivered release stays queued.
-    assert failing.call_count == 1
-    assert len(mod._pending_lease_releases) == 1, "an undelivered release must stay queued"
+        # Deferred: nothing has been sent yet, and the entry is waiting behind
+        # its quiet window.
+        assert len(mod._pending_lease_releases) == 1
+        assert mod._pending_lease_releases[0]["ready_at"] > time.monotonic()
 
-    ok = MagicMock()
-    ok.status_code = 200
-    ok.headers = {}
-    with patch("tools.browser_camofox.requests.post", return_value=ok) as succeeding:
-        _flush_pending_lease_releases()
-    succeeding.assert_called_once()
-    assert mod._pending_lease_releases == []
+        with patch("tools.browser_camofox.requests.post", return_value=unavailable) as failing:
+            _run_pending_teardowns(force=True)
+        assert failing.call_count == 1, "one attempt per run, not a retry loop"
+        assert len(mod._pending_lease_releases) == 1, "an undelivered release stays queued"
+
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.headers = {}
+        with patch("tools.browser_camofox.requests.post", return_value=ok) as succeeding:
+            _run_pending_teardowns(force=True)
+        succeeding.assert_called_once()
+        assert mod._pending_lease_releases == []
     mod._pending_lease_releases.clear()
 
 
@@ -1213,6 +1221,7 @@ def test_idle_direct_session_is_really_closed():
             "delete_base": "http://127.0.0.1:9377",
             "delete_headers": {"Authorization": "Bearer direct-key"},
         })
+        _run_pending_teardowns(force=True)
     mock_delete.assert_called_once_with(
         "http://127.0.0.1:9377/sessions/hermes_abc123",
         timeout=5,
@@ -1223,6 +1232,7 @@ def test_idle_direct_session_is_really_closed():
     # A managed-persistence profile must survive instead.
     with patch("tools.browser_camofox.requests.delete") as mock_delete:
         _teardown_session({"user_id": "profileA", "managed": True, "local_server_managed": False})
+        _run_pending_teardowns(force=True)
     mock_delete.assert_not_called()
 
 
@@ -1324,11 +1334,13 @@ def test_queued_release_is_dropped_when_the_profile_is_in_use_again():
     retry path has to re-check holders, not just re-send.
     """
     import tools.browser_camofox as mod
-    from tools.browser_camofox import _flush_pending_lease_releases
 
     owner = "profileA\x00digest"
     mod._sessions.clear()
-    mod._pending_lease_releases[:] = [("http://127.0.0.1:9377/x/_zettlab/release", {}, 0, owner)]
+    mod._pending_lease_releases[:] = [{
+        "kind": "release", "url": "http://127.0.0.1:9377/x/_zettlab/release",
+        "headers": {}, "owner": owner, "attempts": 0, "ready_at": 0.0,
+    }]
     mod._sessions["profileA\x00sess\x00new-turn"] = {
         "user_id": "profileA", "session_key": "sess", "task_id": "new-turn",
         "managed": True, "local_server_managed": True, "release_owner": owner,
@@ -1336,7 +1348,91 @@ def test_queued_release_is_dropped_when_the_profile_is_in_use_again():
     }
 
     with patch("tools.browser_camofox.requests.post") as mock_post:
-        _flush_pending_lease_releases()
+        _run_pending_teardowns(force=True)
     mock_post.assert_not_called()
     assert mod._pending_lease_releases == []
     mod._sessions.clear()
+
+
+def test_release_waits_out_a_turn_that_shares_the_cache_entry():
+    """Two turns can share one session entry, so holders cannot be counted.
+
+    A turn calls _get_session many times but cleans up once, and two turns on
+    one session id collapse into the same cache key — there is no number to
+    count. Deferring the release and re-checking after a quiet window is what
+    makes "the last user is gone" true instead of guessed.
+    """
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import camofox_soft_cleanup
+
+    owner = "profileA\x00digest"
+    identity = {"user_id": "profileA", "session_key": "sess"}
+    mod._sessions.clear()
+    mod._pending_lease_releases.clear()
+    mod._sessions["profileA\x00sess\x00shared"] = {
+        "user_id": "profileA", "session_key": "sess", "tab_id": "tab-1",
+        "managed": True, "local_server_managed": True, "task_id": "shared",
+        "release_url": "http://127.0.0.1:9377/x/_zettlab/release",
+        "release_headers": {}, "release_owner": owner,
+        "last_used_at": time.monotonic(),
+    }
+
+    with (
+        patch("tools.browser_camofox._get_camofox_config", return_value={}),
+        patch("tools.browser_camofox._camofox_identity_override", return_value=None),
+        patch("tools.browser_camofox.get_camofox_identity", return_value=identity),
+        patch("tools.browser_camofox._ensure_maintenance_worker", return_value=None),
+        patch("tools.browser_camofox.requests.post") as mock_post,
+    ):
+        # The first turn ends: the entry goes, the release is only scheduled.
+        assert camofox_soft_cleanup("shared") is True
+        mock_post.assert_not_called()
+
+        # The other turn is still working and re-registers before the window
+        # elapses; the scheduled release must be abandoned.
+        mod._sessions["profileA\x00sess\x00shared"] = {
+            "user_id": "profileA", "session_key": "sess", "tab_id": "tab-1",
+            "managed": True, "local_server_managed": True, "task_id": "shared",
+            "release_owner": owner, "last_used_at": time.monotonic(),
+        }
+        _run_pending_teardowns(force=True)
+        mock_post.assert_not_called()
+        assert mod._pending_lease_releases == []
+    mod._sessions.clear()
+
+
+def test_owner_lock_is_never_replaced_while_held():
+    """Evicting a held lock would split the critical section in two."""
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import _owner_lock
+
+    mod._owner_locks.clear()
+    mod._sessions.clear()
+    owner = "profileA\x00digest"
+    held = _owner_lock(owner)
+    held.acquire()
+    try:
+        # Push well past the cap with unrelated owners.
+        for i in range(mod._MAX_OWNER_LOCKS + 5):
+            _owner_lock(f"filler-{i}")
+        assert _owner_lock(owner) is held, "a held lock must never be replaced"
+    finally:
+        held.release()
+        mod._owner_locks.clear()
+
+
+def test_managed_tab_creation_without_epoch_fails_closed():
+    """POST /tabs establishes the baseline epoch for the new tab.
+
+    Without it a later response's epoch looks like the first one ever seen and
+    is taken as a safe baseline, so a takeover between creation and the first
+    read would go unnoticed.
+    """
+    from tools.browser_camofox import _adopt_epoch_from_response
+
+    session = {"epoch": None, "local_server_managed": True, "privacy_filter_after_handback": False}
+    resp = MagicMock()
+    resp.headers = {}
+    resp.status_code = 200
+    _adopt_epoch_from_response(session, resp, tab_operation=True)
+    assert session["privacy_filter_after_handback"] is True
