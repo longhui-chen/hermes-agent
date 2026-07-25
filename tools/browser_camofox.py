@@ -1912,14 +1912,15 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
             # have what they typed land in the tool result — and if they left
             # the tab somewhere the Agent may not read at all, redaction is not
             # enough, the snapshot is dropped.
-            if (snapshot_filtered_at_request or _last_response_started_handback() or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, snap_data):
+            snapshot_handback_revealed = snapshot_filtered_at_request or _last_response_started_handback()
+            if (snapshot_handback_revealed or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, snap_data):
                 result["snapshot_withheld"] = True
                 result["warning"] = (
                     "A human took over and left the browser on a page this Agent is not "
                     "allowed to read. Page state was not captured."
                 )
             else:
-                result["snapshot"] = _filter_page_state_after_handback(session, snapshot_text, snapshot_filtered_at_request or _last_response_started_handback())
+                result["snapshot"] = _filter_page_state_after_handback(session, snapshot_text, snapshot_handback_revealed)
                 result["element_count"] = snap_data.get("refsCount", 0)
         except Exception:
             pass  # Navigation succeeded; snapshot is a bonus
@@ -1960,13 +1961,16 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
         # the request. The request-time state is carried alongside it: a
         # concurrent navigate could clear the flag while this read was in
         # flight, and the capture was still taken under it.
-        if (filtered_at_request or _last_response_started_handback() or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, data):
+        # Latched before the guard runs: _handback_page_readable performs its own
+        # /tabs request, and every transport call resets the per-response fact.
+        handback_revealed = filtered_at_request or _last_response_started_handback()
+        if (handback_revealed or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, data):
             return _blocked_handback_page_error()
 
         snapshot = data.get("snapshot", "")
         if not isinstance(snapshot, str):
             snapshot = ""
-        snapshot = _filter_page_state_after_handback(session, snapshot, filtered_at_request or _last_response_started_handback())
+        snapshot = _filter_page_state_after_handback(session, snapshot, handback_revealed)
         refs_count = data.get("refsCount", 0)
 
         # Apply same summarization logic as the main browser tool
@@ -2169,13 +2173,14 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
         # and secret-shaped text, so intranet metadata would pass straight
         # through. Same guard as camofox_snapshot, applied after the response
         # because that is what turns the filter on.
-        if (images_filtered_at_request or _last_response_started_handback() or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, data):
+        images_handback_revealed = images_filtered_at_request or _last_response_started_handback()
+        if (images_handback_revealed or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, data):
             return _blocked_handback_page_error()
 
         snapshot = data.get("snapshot", "")
         if not isinstance(snapshot, str):
             snapshot = ""
-        snapshot = _filter_page_state_after_handback(session, snapshot, images_filtered_at_request or _last_response_started_handback())
+        snapshot = _filter_page_state_after_handback(session, snapshot, images_handback_revealed)
 
         # Parse img elements from the accessibility tree.
         # Format: img "alt text" or img "alt text" [eN]
@@ -2260,12 +2265,13 @@ def camofox_vision(question: str, annotate: bool = False,
                 # A takeover can land between the screenshot and this call, and
                 # the filter it turns on only strips form values — ordinary
                 # intranet text would still reach the vision model.
-                if (annotation_filtered_at_request or _last_response_started_handback() or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, snap_data):
+                annotation_handback_revealed = annotation_filtered_at_request or _last_response_started_handback()
+                if (annotation_handback_revealed or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, snap_data):
                     return _blocked_handback_page_error()
                 snapshot = snap_data.get("snapshot", "")
                 if not isinstance(snapshot, str):
                     snapshot = ""
-                snapshot = _filter_page_state_after_handback(session, snapshot, annotation_filtered_at_request or _last_response_started_handback())
+                snapshot = _filter_page_state_after_handback(session, snapshot, annotation_handback_revealed)
                 annotation_context = f"\n\nAccessibility tree (element refs for interaction):\n{snapshot[:3000]}"
             except Exception:
                 pass

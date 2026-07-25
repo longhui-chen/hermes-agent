@@ -1664,15 +1664,24 @@ def test_epoch_verification_is_response_local_not_session_state():
 
 
 def test_vision_uses_the_privacy_state_from_when_it_captured():
-    """A concurrent navigate must not unblock an already-captured screenshot."""
+    """A concurrent navigate must not unblock an already-captured screenshot.
+
+    The filter is off when the capture is issued — otherwise the pre-request
+    check would stop it and the race would never be reached — this response's
+    epoch reveals the handback, and the other turn clears the shared flag
+    before the check.
+    """
+    import tools.browser_camofox as mod
     from tools.browser_camofox import camofox_vision
 
     session = {
         "user_id": "u", "tab_id": "tab-1", "session_key": "s",
-        "privacy_filter_after_handback": True, "epoch": 4, "_lock": None,
+        "privacy_filter_after_handback": False, "epoch": 4, "_lock": None,
     }
 
     def _raw(path, params=None, timeout=None, session=None):
+        mod._response_facts.started_handback = True
+        session["privacy_filter_after_handback"] = True
         # The other turn's navigate lands while this capture is in flight.
         session["privacy_filter_after_handback"] = False
         resp = MagicMock()
@@ -1745,4 +1754,118 @@ def test_eval_uses_the_privacy_state_from_when_it_requested():
         result = json.loads(_camofox_eval("document.forms[0].password.value", "agent-task"))
 
     assert result["success"] is False
+    assert "hunter2" not in json.dumps(result)
+
+
+def test_navigate_inline_snapshot_guard_survives_a_racing_clear():
+    """navigate's own snapshot needs the same three-way test as the rest.
+
+    Filter off when the capture is issued, this response reveals the handback,
+    a concurrent turn clears the shared flag before the check.
+    """
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import camofox_navigate
+
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
+        "privacy_filter_after_handback": False, "epoch": 4, "_lock": None,
+    }
+
+    def _get_racing(path, params=None, timeout=None, session=None, **kwargs):
+        if path == "/tabs":
+            return {"tabs": [{"tabId": "tab-1", "listItemId": "s", "url": "http://169.254.169.254/latest/meta-data/"}]}
+        mod._response_facts.started_handback = True
+        session["privacy_filter_after_handback"] = True
+        session["privacy_filter_after_handback"] = False
+        return {"snapshot": "- text \"iam credentials\"", "refsCount": 1}
+
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=session),
+        patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
+        patch("tools.browser_camofox._post", return_value={"url": "https://example.com/", "title": "Example"}),
+        patch("tools.browser_camofox._get", side_effect=_get_racing),
+    ):
+        result = json.loads(camofox_navigate("https://example.com/", task_id="agent-task"))
+
+    assert result.get("snapshot_withheld") is True
+    assert "iam credentials" not in json.dumps(result)
+
+
+def test_vision_annotation_is_redacted_when_only_the_response_reveals_handback():
+    """The annotation reaches the vision model, so assert on what it is sent.
+
+    The only signal here is "this response revealed the handback": the filter
+    was off when the read was issued and a concurrent turn cleared it again
+    before the check. The guard's own /tabs lookup resets that per-response
+    fact, so it has to be latched before the guard runs.
+    """
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import camofox_vision
+
+    mod._response_facts.started_handback = False
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
+        "privacy_filter_after_handback": False, "epoch": 4, "_lock": None,
+    }
+
+    def _raw(path, params=None, timeout=None, session=None):
+        mod._response_facts.started_handback = False
+        resp = MagicMock()
+        resp.content = b"\x89PNG"
+        return resp
+
+    def _get_racing(path, params=None, timeout=None, session=None, **kwargs):
+        if path == "/tabs":
+            mod._response_facts.started_handback = False  # the guard's own call
+            return {"tabs": [{"tabId": "tab-1", "listItemId": "s", "url": "https://example.com/"}]}
+        mod._response_facts.started_handback = True
+        session["privacy_filter_after_handback"] = True
+        session["privacy_filter_after_handback"] = False  # the other turn clears it
+        return {"snapshot": 'textbox "Password" value="hunter2"', "refsCount": 1}
+
+    sent = {}
+
+    def _call_llm(messages=None, **kwargs):
+        sent["prompt"] = messages[0]["content"][0]["text"]
+        return "ok"
+
+    with (
+        patch("tools.browser_camofox._get_session", return_value=session),
+        patch("tools.browser_camofox._get_raw", side_effect=_raw),
+        patch("tools.browser_camofox._get", side_effect=_get_racing),
+        patch("agent.auxiliary_client.call_llm", side_effect=_call_llm),
+    ):
+        camofox_vision("what is here?", annotate=True, task_id="agent-task")
+
+    assert "hunter2" not in sent.get("prompt", ""), "the annotation reached the model unredacted"
+
+
+def test_navigate_snapshot_is_redacted_when_only_the_response_reveals_handback():
+    """Same invariant for navigate's inline snapshot."""
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import camofox_navigate
+
+    mod._response_facts.started_handback = False
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
+        "privacy_filter_after_handback": False, "epoch": 4, "_lock": None,
+    }
+
+    def _get_racing(path, params=None, timeout=None, session=None, **kwargs):
+        if path == "/tabs":
+            mod._response_facts.started_handback = False
+            return {"tabs": [{"tabId": "tab-1", "listItemId": "s", "url": "https://example.com/"}]}
+        mod._response_facts.started_handback = True
+        session["privacy_filter_after_handback"] = True
+        session["privacy_filter_after_handback"] = False
+        return {"snapshot": 'textbox "Password" value="hunter2"', "refsCount": 1}
+
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=session),
+        patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
+        patch("tools.browser_camofox._post", return_value={"url": "https://example.com/", "title": "Example"}),
+        patch("tools.browser_camofox._get", side_effect=_get_racing),
+    ):
+        result = json.loads(camofox_navigate("https://example.com/", task_id="agent-task"))
+
     assert "hunter2" not in json.dumps(result)
