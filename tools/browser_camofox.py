@@ -607,8 +607,17 @@ _sessions: Dict[str, Dict[str, Any]] = {}
 _sessions_lock = threading.Lock()
 
 
-def _session_cache_key(task_id: str, identity: Dict[str, str]) -> str:
-    return f"{identity['user_id']}\x00{identity['session_key']}\x00{task_id}"
+def _session_cache_key(task_id: str, identity: Dict[str, str], owner: str = "") -> str:
+    """Key a cached session by who it belongs to as well as what it is.
+
+    ``owner`` is the credential-derived profile identity. Without it, two
+    profiles in one multiplex gateway that were given the same explicit
+    CAMOFOX_USER_ID and session key collide on a single entry: they are
+    isolated by different action tokens and talk to different runtimes, but
+    they would share a tab id, an epoch and a handback privacy flag, so one
+    profile would drive the other's tab and could clear its privacy state.
+    """
+    return f"{owner}\x00{identity['user_id']}\x00{identity['session_key']}\x00{task_id}"
 
 
 def _validated_tab_id(raw: Any) -> Optional[str]:
@@ -761,7 +770,6 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
     profile_identity = get_camofox_identity(task_id)
     identity_override = _camofox_identity_override(task_id, camofox_cfg)
     cache_identity = identity_override or profile_identity
-    cache_key = _session_cache_key(task_id, cache_identity)
     # Captured here because lifecycle cleanup runs outside this request's
     # profile and secret scope, where these reads fail closed: the probe would
     # skip releasing the local-server lease, and the release call itself could
@@ -783,6 +791,9 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
     # loopback CAMOFOX_URL — only the credential differs. Group holders by the
     # profile identity plus a digest of that credential, never by URL.
     release_owner = _release_owner_key(cache_identity.get("user_id", ""), scoped_headers)
+    # Computed before the cache lookup: the credential digest inside it is what
+    # separates two profiles that were handed the same explicit identity.
+    cache_key = _session_cache_key(task_id, cache_identity, release_owner)
     now = time.monotonic()
     with _held_owner_lock(release_owner), _sessions_lock:
         idle = _prune_idle_sessions_locked(now)
@@ -887,7 +898,7 @@ def _browser_identity_key(session: Dict[str, Any]) -> str:
     would let both create a tab under the same listItemId. Adoption can then
     only guess which one is "the" tab.
     """
-    return f"{session.get('user_id')}\x00{session.get('session_key')}"
+    return f"{session.get('release_owner') or ''}\x00{session.get('user_id')}\x00{session.get('session_key')}"
 
 
 def _ensure_tab(task_id: Optional[str], url: Optional[str] = None) -> Dict[str, Any]:
@@ -946,9 +957,13 @@ def _session_key_for_task_locked(task_id: str) -> Optional[str]:
     try:
         camofox_cfg = _get_camofox_config()
         identity = _camofox_identity_override(task_id, camofox_cfg) or get_camofox_identity(task_id)
+        try:
+            owner = _release_owner_key(identity.get("user_id", ""), _auth_headers())
+        except Exception:
+            owner = ""
     except Exception:
         return None
-    preferred = _session_cache_key(task_id, identity)
+    preferred = _session_cache_key(task_id, identity, owner)
     return preferred if preferred in _sessions else None
 
 
@@ -1759,13 +1774,31 @@ def _blocked_handback_page_error() -> str:
 def _recovery_target_allowed(url: str) -> bool:
     """Whether the Agent may read the page the human handed back.
 
-    Fails closed: if the guards cannot be imported or the check raises, the
-    page is treated as off limits.
+    Two separate policies have to hold. The SSRF guards keep the Agent off
+    cloud metadata and private-network addresses, and the configured website
+    policy (``security.website_blocklist``) says which sites this deployment
+    refuses to hand to a model at all — browser_navigate() enforces the latter,
+    so a page reached by human takeover instead of by navigation must not slip
+    past it.
+
+    Fails closed: if the guards cannot be imported or a check raises, the page
+    is treated as off limits.
     """
     try:
         from tools.browser_tool import _is_always_blocked_url, _is_safe_url
 
-        return not _is_always_blocked_url(url) and _is_safe_url(url)
+        if _is_always_blocked_url(url) or not _is_safe_url(url):
+            return False
+    except Exception:
+        return False
+    try:
+        from tools.website_policy import check_website_access
+
+        return check_website_access(url) is None
+    except ImportError:
+        # Same fail-open as browser_tool's own import guard: a deployment
+        # without the policy module has no blocklist to enforce.
+        return True
     except Exception:
         return False
 
@@ -1938,7 +1971,13 @@ _MAX_TRACKED_DOCUMENTS = 256
 
 
 def _document_key(session: Dict[str, Any]) -> str:
-    return f"{_browser_identity_key(session)}\x00{session.get('tab_id') or ''}"
+    # The release owner is part of it for the same reason it is part of the
+    # session cache key: two profiles can be handed the same explicit identity,
+    # and they must not share a document generation either.
+    return (
+        f"{session.get('release_owner') or ''}\x00{_browser_identity_key(session)}"
+        f"\x00{session.get('tab_id') or ''}"
+    )
 
 
 def _document_generation_locked(key: str) -> int:
@@ -1982,15 +2021,40 @@ def _observe_document_url(session: Dict[str, Any], url: str) -> None:
         entry["url"] = url
 
 
-def _stamp_ref_generation(session: Dict[str, Any], url: str = "") -> None:
-    """Record the document version whose refs this session now holds."""
+def _observed_document_generation(session: Dict[str, Any]) -> tuple:
+    """Sample the document version before a capture goes out.
+
+    Read paths are deliberately not serialized behind the identity lock — a
+    snapshot of whatever the tab shows is inherent to sharing it, and queueing
+    a 120s vision call behind every mutation would cost more than it buys. So
+    the capture samples first and the stamp only lands if nothing moved, which
+    needs no lock and fails in the safe direction.
+    """
+    key = _document_key(session)
+    with _sessions_lock:
+        return key, _document_generation_locked(key)
+
+
+def _stamp_ref_generation(session: Dict[str, Any], url: str = "", observed: Any = None) -> None:
+    """Record the document version whose refs this session now holds.
+
+    ``observed`` is the sample taken before the capture. When it no longer
+    matches, the capture straddled a navigate: it may describe either page, so
+    it stamps nothing and any earlier stamp is dropped — the Agent has to take
+    a fresh snapshot before it can act on a ref again.
+    """
     key = _document_key(session)
     with _sessions_lock:
         entry = _document_generations.setdefault(key, {"generation": 0, "url": ""})
+        current = int(entry.get("generation") or 0)
+        if observed is not None and (observed[0] != key or observed[1] != current):
+            session.pop("ref_document", None)
+            session.pop("ref_generation", None)
+            return
         if url:
             entry["url"] = url
         session["ref_document"] = key
-        session["ref_generation"] = int(entry.get("generation") or 0)
+        session["ref_generation"] = current
         _forget_surplus_documents_locked(key)
 
 
@@ -2144,29 +2208,37 @@ def _navigate_within_identity(
             else ""
         )
         try:
-            data = _post(
-                _tab_path(session, "/navigate"),
-                {"userId": session["user_id"], "url": browser_url},
-                timeout=60,
-                session=session,
-            )
-        except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 404:
-                logger.warning(
-                    "Camofox tab %s returned 404 — tab was garbage collected. "
-                    "Creating a fresh tab.",
-                    session["tab_id"],
-                )
-                session["tab_id"] = None
-                session = _ensure_tab(task_id)
+            try:
                 data = _post(
                     _tab_path(session, "/navigate"),
                     {"userId": session["user_id"], "url": browser_url},
                     timeout=60,
                     session=session,
                 )
-            else:
-                raise
+            except requests.HTTPError as e:
+                if e.response is not None and e.response.status_code == 404:
+                    logger.warning(
+                        "Camofox tab %s returned 404 — tab was garbage collected. "
+                        "Creating a fresh tab.",
+                        session["tab_id"],
+                    )
+                    session["tab_id"] = None
+                    session = _ensure_tab(task_id)
+                    data = _post(
+                        _tab_path(session, "/navigate"),
+                        {"userId": session["user_id"], "url": browser_url},
+                        timeout=60,
+                        session=session,
+                    )
+                else:
+                    raise
+        finally:
+            # Bumped on both sides of the request. The pre-bump stops a
+            # concurrent click from racing the landing; this one stops a
+            # concurrent snapshot that sampled the pre-bump value, captured the
+            # old page while this navigate was still in flight, and would
+            # otherwise stamp its refs onto the page that lands here.
+            _bump_document_generation(session)
         # Three things must hold before the page counts as left behind: this
         # response actually carried a verified epoch (a protocol downgrade must
         # not read as "nothing happened"), the epoch did not move, and the
@@ -2221,6 +2293,7 @@ def _navigate_within_identity(
         # Auto-take a compact snapshot so the model can act immediately
         try:
             snapshot_filtered_at_request = _handback_privacy_filter_enabled(session)
+            observed_document = _observed_document_generation(session)
             snap_data = _get(
                 _tab_path(session, "/snapshot"),
                 params={"userId": session["user_id"]},
@@ -2252,6 +2325,7 @@ def _navigate_within_identity(
                 _stamp_ref_generation(
                     session,
                     snap_data.get("url", "") if isinstance(snap_data.get("url"), str) else data.get("url", ""),
+                    observed=observed_document,
                 )
         except Exception:
             pass  # Navigation succeeded; snapshot is a bonus
@@ -2281,6 +2355,7 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
         filtered_at_request = _handback_privacy_filter_enabled(session)
+        observed_document = _observed_document_generation(session)
         data = _get(
             _tab_path(session, "/snapshot"),
             params={"userId": session["user_id"]},
@@ -2320,7 +2395,11 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
         # The refs in this snapshot are only meaningful for the document it
         # describes; record which version that is so a mutation carrying them
         # can be refused after somebody else navigates the shared tab.
-        _stamp_ref_generation(session, data.get("url", "") if isinstance(data.get("url"), str) else "")
+        _stamp_ref_generation(
+            session,
+            data.get("url", "") if isinstance(data.get("url"), str) else "",
+            observed=observed_document,
+        )
 
         return json.dumps({
             "success": True,

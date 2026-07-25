@@ -1200,7 +1200,9 @@ def test_soft_cleanup_never_releases_a_shared_profile_lease():
     identity = {"user_id": "profileA", "session_key": "sess"}
     mod._sessions.clear()
     mod._pending_lease_releases.clear()
-    key = "profileA\x00sess\x00turn-a"
+    # The cache key carries the credential-derived owner: two profiles handed
+    # the same explicit identity must not share an entry.
+    key = mod._session_cache_key("turn-a", identity, owner)
     mod._sessions[key] = {
         "user_id": "profileA", "session_key": "sess", "tab_id": "tab-a",
         "managed": True, "local_server_managed": True, "task_id": "turn-a",
@@ -1213,6 +1215,7 @@ def test_soft_cleanup_never_releases_a_shared_profile_lease():
         patch("tools.browser_camofox._get_camofox_config", return_value={}),
         patch("tools.browser_camofox._camofox_identity_override", return_value=None),
         patch("tools.browser_camofox.get_camofox_identity", return_value=identity),
+        patch("tools.browser_camofox._release_owner_key", return_value=owner),
         patch("tools.browser_camofox._ensure_maintenance_worker", return_value=None),
         patch("tools.browser_camofox.requests.post") as mock_post,
     ):
@@ -2232,3 +2235,82 @@ def test_a_click_that_follows_a_link_invalidates_outstanding_refs():
     # Followed a link: every outstanding ref belongs to a page that is gone.
     mod._observe_document_url(session, "https://a.example/detail")
     assert not mod._refs_are_current(session)
+
+
+def test_a_snapshot_that_straddles_a_navigate_stamps_nothing():
+    """The stamp must describe the page the capture actually saw.
+
+    Reads are not serialized behind the identity lock on purpose, so the
+    capture samples the document version first and only registers it if nothing
+    moved in between. A capture that straddled a navigate could describe either
+    page, so it registers nothing and drops any earlier stamp.
+    """
+    import tools.browser_camofox as mod
+
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
+    mod._stamp_ref_generation(session, "https://a.example/list")
+    assert mod._refs_are_current(session)
+
+    observed = mod._observed_document_generation(session)
+    # Another turn navigates while this capture is in flight.
+    mod._bump_document_generation(session)
+    mod._stamp_ref_generation(session, "https://a.example/list", observed=observed)
+
+    assert not mod._refs_are_current(session), "refs from a straddled capture were accepted"
+    assert "ref_generation" not in session
+    with pytest.raises(mod.CamofoxRefsStale):
+        mod._mutating_tab_call(session, "/click", {"userId": "u", "ref": "e1"})
+
+    # An undisturbed capture still registers.
+    observed = mod._observed_document_generation(session)
+    mod._stamp_ref_generation(session, "https://a.example/detail", observed=observed)
+    assert mod._refs_are_current(session)
+
+
+def test_two_profiles_with_the_same_identity_do_not_share_a_session():
+    """A multiplex gateway can hand two profiles the same explicit identity.
+
+    They are isolated by different action tokens and talk to different runtimes,
+    so sharing one cache entry would let one profile drive the other's tab and
+    clear its handback privacy state.
+    """
+    import tools.browser_camofox as mod
+
+    identity = {"user_id": "shared_user", "session_key": "shared_session"}
+    first = mod._session_cache_key("task-1", identity, "shared_user\x00digest-a")
+    second = mod._session_cache_key("task-1", identity, "shared_user\x00digest-b")
+    assert first != second, "two profiles collided on one session cache entry"
+
+    # The tab lock and the document registry are separated the same way.
+    a = {"user_id": "shared_user", "session_key": "shared_session", "tab_id": "tab-1",
+         "release_owner": "shared_user\x00digest-a"}
+    b = {"user_id": "shared_user", "session_key": "shared_session", "tab_id": "tab-1",
+         "release_owner": "shared_user\x00digest-b"}
+    assert mod._browser_identity_key(a) != mod._browser_identity_key(b)
+    assert mod._document_key(a) != mod._document_key(b)
+
+    mod._stamp_ref_generation(a, "https://a.example/")
+    mod._bump_document_generation(b)
+    assert mod._refs_are_current(a), "another profile's navigate invalidated these refs"
+
+
+def test_handback_reads_reapply_the_website_policy():
+    """A page reached by human takeover must clear the same policy as a navigate.
+
+    security.website_blocklist is enforced in browser_navigate(); without it
+    here, a human could hand back a blocked site and its content would still go
+    to the model through snapshot, get_images or vision.
+    """
+    import tools.browser_camofox as mod
+
+    with (
+        patch("tools.browser_tool._is_always_blocked_url", return_value=False),
+        patch("tools.browser_tool._is_safe_url", return_value=True),
+    ):
+        with patch("tools.website_policy.check_website_access", return_value=None):
+            assert mod._recovery_target_allowed("https://allowed.example/page")
+        with patch("tools.website_policy.check_website_access", return_value="blocked by policy"):
+            assert not mod._recovery_target_allowed("https://blocked.example/page")
+    # The SSRF guards still run first and independently of the policy.
+    with patch("tools.website_policy.check_website_access", return_value=None):
+        assert not mod._recovery_target_allowed("http://169.254.169.254/latest/meta-data/")
