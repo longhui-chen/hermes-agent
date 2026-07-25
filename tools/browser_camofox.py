@@ -163,10 +163,13 @@ def _adopt_epoch_from_response(
     valid epoch, a later tab response without one is a protocol failure, and
     the safe reading of it is "assume the page changed".
     """
+    before = bool(session.get("privacy_filter_after_handback")) if isinstance(session, dict) else False
     value = resp.headers.get(_EPOCH_HEADER) if resp is not None else None
     if value is not None:
         try:
             _adopt_session_epoch(session, int(str(value).strip()))
+            if isinstance(session, dict) and not before and session.get("privacy_filter_after_handback"):
+                _response_facts.started_handback = True
             return True
         except (TypeError, ValueError):
             pass
@@ -181,6 +184,7 @@ def _adopt_epoch_from_response(
         return False
     logger.warning("Camofox managed tab response carried no usable %s header", _EPOCH_HEADER)
     session["privacy_filter_after_handback"] = True
+    _response_facts.started_handback = True
     return False
 
 
@@ -1422,6 +1426,16 @@ def _last_response_epoch_verified() -> bool:
     return bool(getattr(_response_facts, "epoch_verified", False))
 
 
+def _last_response_started_handback() -> bool:
+    """Whether the response just received is the one that revealed a handback.
+
+    The shared flag it sets can be cleared again by a concurrent turn before
+    this response's caller gets to look at it, so the caller has to remember
+    what its own response reported.
+    """
+    return bool(getattr(_response_facts, "started_handback", False))
+
+
 def _is_tab_operation(path: str) -> bool:
     """Whether this path targets one specific tab, i.e. carries an epoch."""
     return path.startswith("/tabs/")
@@ -1473,6 +1487,7 @@ def _post(path: str, body: dict, timeout: Optional[int] = None, session: Optiona
     if timeout is None:
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
+    _response_facts.started_handback = False
     resp = requests.post(url, json=body, timeout=timeout, headers=_request_headers(session), allow_redirects=False)
     # POST /tabs establishes the baseline epoch for the new tab. Without it a
     # later response's epoch looks like the first one ever seen and is taken as
@@ -1501,6 +1516,7 @@ def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None, sess
     url = f"{get_camofox_url()}{path}"
 
     def _once() -> requests.Response:
+        _response_facts.started_handback = False
         resp = requests.get(url, params=params, timeout=timeout, headers=_request_headers(session), allow_redirects=False)
         _adopt_epoch_from_response(session, resp, tab_operation=_is_tab_operation(path))
         _raise_for_status(resp)
@@ -1896,14 +1912,14 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
             # have what they typed land in the tool result — and if they left
             # the tab somewhere the Agent may not read at all, redaction is not
             # enough, the snapshot is dropped.
-            if (snapshot_filtered_at_request or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, snap_data):
+            if (snapshot_filtered_at_request or _last_response_started_handback() or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, snap_data):
                 result["snapshot_withheld"] = True
                 result["warning"] = (
                     "A human took over and left the browser on a page this Agent is not "
                     "allowed to read. Page state was not captured."
                 )
             else:
-                result["snapshot"] = _filter_page_state_after_handback(session, snapshot_text, snapshot_filtered_at_request)
+                result["snapshot"] = _filter_page_state_after_handback(session, snapshot_text, snapshot_filtered_at_request or _last_response_started_handback())
                 result["element_count"] = snap_data.get("refsCount", 0)
         except Exception:
             pass  # Navigation succeeded; snapshot is a bonus
@@ -1944,13 +1960,13 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
         # the request. The request-time state is carried alongside it: a
         # concurrent navigate could clear the flag while this read was in
         # flight, and the capture was still taken under it.
-        if (filtered_at_request or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, data):
+        if (filtered_at_request or _last_response_started_handback() or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, data):
             return _blocked_handback_page_error()
 
         snapshot = data.get("snapshot", "")
         if not isinstance(snapshot, str):
             snapshot = ""
-        snapshot = _filter_page_state_after_handback(session, snapshot, filtered_at_request)
+        snapshot = _filter_page_state_after_handback(session, snapshot, filtered_at_request or _last_response_started_handback())
         refs_count = data.get("refsCount", 0)
 
         # Apply same summarization logic as the main browser tool
@@ -2153,13 +2169,13 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
         # and secret-shaped text, so intranet metadata would pass straight
         # through. Same guard as camofox_snapshot, applied after the response
         # because that is what turns the filter on.
-        if (images_filtered_at_request or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, data):
+        if (images_filtered_at_request or _last_response_started_handback() or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, data):
             return _blocked_handback_page_error()
 
         snapshot = data.get("snapshot", "")
         if not isinstance(snapshot, str):
             snapshot = ""
-        snapshot = _filter_page_state_after_handback(session, snapshot, images_filtered_at_request)
+        snapshot = _filter_page_state_after_handback(session, snapshot, images_filtered_at_request or _last_response_started_handback())
 
         # Parse img elements from the accessibility tree.
         # Format: img "alt text" or img "alt text" [eN]
@@ -2213,7 +2229,7 @@ def camofox_vision(question: str, annotate: bool = False,
         # epoch that turns the filter on arrives with this very response, and a
         # concurrent navigate could clear the shared flag before this check —
         # either way the image is of the human's screen.
-        if screenshot_filtered_at_request or _handback_privacy_filter_enabled(session):
+        if screenshot_filtered_at_request or _last_response_started_handback() or _handback_privacy_filter_enabled(session):
             return tool_error(
                 "Browser vision is blocked after human control until the Agent navigates to a new page or closes the session.",
                 success=False,
@@ -2244,12 +2260,12 @@ def camofox_vision(question: str, annotate: bool = False,
                 # A takeover can land between the screenshot and this call, and
                 # the filter it turns on only strips form values — ordinary
                 # intranet text would still reach the vision model.
-                if (annotation_filtered_at_request or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, snap_data):
+                if (annotation_filtered_at_request or _last_response_started_handback() or _handback_privacy_filter_enabled(session)) and not _handback_page_readable(session, snap_data):
                     return _blocked_handback_page_error()
                 snapshot = snap_data.get("snapshot", "")
                 if not isinstance(snapshot, str):
                     snapshot = ""
-                snapshot = _filter_page_state_after_handback(session, snapshot, annotation_filtered_at_request)
+                snapshot = _filter_page_state_after_handback(session, snapshot, annotation_filtered_at_request or _last_response_started_handback())
                 annotation_context = f"\n\nAccessibility tree (element refs for interaction):\n{snapshot[:3000]}"
             except Exception:
                 pass

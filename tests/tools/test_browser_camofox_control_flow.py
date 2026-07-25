@@ -1713,3 +1713,36 @@ def test_get_images_uses_the_privacy_state_from_when_it_requested():
 
     assert result["success"] is False
     assert "internal-topology" not in json.dumps(result)
+
+
+def test_eval_uses_the_privacy_state_from_when_it_requested():
+    """The last read path that still consulted only the post-response flag.
+
+    A concurrent navigate clearing the shared flag must not release a result
+    fetched from the page the human just handed back.
+    """
+    from tools.browser_tool import _camofox_eval
+
+    import tools.browser_camofox as mod
+
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
+        "privacy_filter_after_handback": False, "epoch": 4, "_lock": None,
+    }
+
+    def _post_racing_navigate(path, body=None, timeout=None, session=None):
+        # This response is the one that reveals the handback...
+        mod._response_facts.started_handback = True
+        session["privacy_filter_after_handback"] = True
+        # ...and a concurrent navigate clears the shared flag before the check.
+        session["privacy_filter_after_handback"] = False
+        return {"result": "hunter2"}
+
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=session),
+        patch("tools.browser_camofox._post", side_effect=_post_racing_navigate),
+    ):
+        result = json.loads(_camofox_eval("document.forms[0].password.value", "agent-task"))
+
+    assert result["success"] is False
+    assert "hunter2" not in json.dumps(result)

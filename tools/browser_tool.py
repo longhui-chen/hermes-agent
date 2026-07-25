@@ -3698,6 +3698,7 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
     from tools.browser_camofox import (
         _ensure_tab,
         _handback_privacy_filter_enabled,
+        _last_response_started_handback,
         _post,
         _tab_path,
         _tool_error_from_exception,
@@ -3714,13 +3715,20 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
 
     try:
         tab_info = _ensure_tab(task_id or "default")
-        if _handback_privacy_filter_enabled(tab_info):
+        filtered_at_request = _handback_privacy_filter_enabled(tab_info)
+        if filtered_at_request:
             return _blocked_after_handback()
         resp = _post(_tab_path(tab_info, "/evaluate"), body={"expression": expression, "userId": tab_info["user_id"]}, session=tab_info)
         # The epoch that enables the filter rides along with this response, so
         # a handback landing mid-call must invalidate the result rather than
-        # hand the human's page data to the model.
-        if _handback_privacy_filter_enabled(tab_info):
+        # hand the human's page data to the model. The request-time state is
+        # part of the test because concurrent turns share this session dict: a
+        # navigate finishing in between could clear the flag before this runs.
+        if (
+            filtered_at_request
+            or _last_response_started_handback()
+            or _handback_privacy_filter_enabled(tab_info)
+        ):
             return _blocked_after_handback()
 
         # Camofox returns the result in a JSON envelope
