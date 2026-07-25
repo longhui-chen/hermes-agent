@@ -362,7 +362,10 @@ class TestCamofoxHTTPFailures:
         ):
             result = json.loads(camofox_click("@missing", task_id="task-1"))
 
-        assert result == {"success": False, "error": "HTTP 500"}
+        # Still no upstream diagnostics, and a 5xx is reported as retryable so
+        # a cold start does not read as a terminal failure.
+        assert result == {"success": False, "error": "HTTP 500", "retryable": True}
+        assert "private upstream diagnostics" not in json.dumps(result)
 
     def test_stale_tab_recovery_recreates_blank_then_navigates(self, monkeypatch):
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")

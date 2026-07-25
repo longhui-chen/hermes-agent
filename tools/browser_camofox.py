@@ -840,10 +840,31 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
         return _adopt_existing_tab(session)
 
 
+def _browser_identity_key(session: Dict[str, Any]) -> str:
+    """The identity Camofox itself keys a tab by: profile plus list item.
+
+    Deliberately not the task id. Concurrent turns under one session key — a
+    parent and its subagent, say — resolve to the same browser identity but
+    get their own cache entry and their own lock, so serializing on the task
+    would let both create a tab under the same listItemId. Adoption can then
+    only guess which one is "the" tab.
+    """
+    return f"{session.get('user_id')}\x00{session.get('session_key')}"
+
+
 def _ensure_tab(task_id: Optional[str], url: Optional[str] = None) -> Dict[str, Any]:
     """Ensure a tab exists for the session, creating one if needed."""
     session = _get_session(task_id)
-    with _session_lock(session):
+    if session["tab_id"]:
+        return session
+    # Serialized by browser identity, so a concurrent turn sharing it cannot
+    # create a second tab for the same listItemId.
+    with _held_owner_lock(_browser_identity_key(session)), _session_lock(session):
+        if session["tab_id"]:
+            return session
+        # Another turn may have created it while this one waited; adopt rather
+        # than duplicate.
+        _adopt_existing_tab(session)
         if session["tab_id"]:
             return session
         body = {
@@ -1023,9 +1044,12 @@ def _queue_pending_teardown(
         # events. Dropping the oldest entry to stay under a cap would throw
         # away the only handle that can close a runtime.
         for existing in _pending_lease_releases:
-            if existing["kind"] == kind and existing["url"] == url:
+            # Owner is part of the identity: in multiplex every profile posts
+            # to the same /_zettlab/release and differs only by credential, so
+            # merging on the URL alone would overwrite another profile's only
+            # release credential.
+            if existing["kind"] == kind and existing["url"] == url and existing.get("owner", "") == owner:
                 existing["headers"] = dict(headers)
-                existing["owner"] = owner or existing.get("owner", "")
                 existing["ready_at"] = min(existing["ready_at"], time.monotonic() + delay)
                 break
         else:
@@ -1347,6 +1371,13 @@ def _safe_http_error_payload(resp: requests.Response) -> Dict[str, Any]:
 
     if "error" not in payload:
         payload["error"] = f"HTTP {resp.status_code}"
+    if "retryable" not in payload:
+        # A proxy-generated 502/503 carries no JSON envelope, but a cold start
+        # or a brief overload is not a terminal answer. Mutations are never
+        # replayed automatically; this only tells the Agent it may try again.
+        status = resp.status_code
+        if isinstance(status, int) and (status in (408, 429) or 500 <= status < 600):
+            payload["retryable"] = True
     return payload
 
 

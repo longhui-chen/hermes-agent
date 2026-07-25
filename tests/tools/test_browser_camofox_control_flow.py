@@ -1482,3 +1482,79 @@ def test_owner_lock_survives_eviction_pressure_while_reserved():
         assert _owner_lock(owner) is held
     assert mod._owner_lock_refs == {}
     mod._owner_locks.clear()
+
+
+def test_release_teardowns_are_not_merged_across_profiles():
+    """In multiplex every profile posts to the same /_zettlab/release.
+
+    Merging on the URL alone would overwrite another profile's credential —
+    the only thing that can release its lease.
+    """
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import _queue_pending_teardown
+
+    url = "http://127.0.0.1:9377/internal/browser/camofox/_zettlab/release"
+    mod._pending_lease_releases.clear()
+    with patch("tools.browser_camofox._ensure_maintenance_worker", return_value=None):
+        _queue_pending_teardown("release", url, {"X-Zettlab-Agent-Action-Token": "tok-a"}, owner="profileA\x00a")
+        _queue_pending_teardown("release", url, {"X-Zettlab-Agent-Action-Token": "tok-b"}, owner="profileB\x00b")
+
+    assert len(mod._pending_lease_releases) == 2
+    tokens = {e["headers"]["X-Zettlab-Agent-Action-Token"] for e in mod._pending_lease_releases}
+    assert tokens == {"tok-a", "tok-b"}, "each profile keeps its own release credential"
+    mod._pending_lease_releases.clear()
+
+
+def test_concurrent_turns_on_one_identity_create_one_tab():
+    """Parent and subagent turns share a browser identity but not a task id.
+
+    Without a shared critical section both would create a tab under the same
+    listItemId, and adoption could then only guess which one is "the" tab.
+    """
+    import threading
+
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import _ensure_tab
+
+    mod._owner_locks.clear()
+    mod._owner_lock_refs.clear()
+    created = []
+    listed = []
+
+    def _post(path, body=None, timeout=None, session=None):
+        created.append(body["listItemId"])
+        listed.append({"tabId": f"tab-{len(created)}", "listItemId": body["listItemId"]})
+        return {"tabId": f"tab-{len(created)}"}
+
+    def _get(path, params=None, timeout=None, session=None, **kwargs):
+        return {"tabs": list(listed)}
+
+    def _session_for(task_id):
+        return {
+            "user_id": "profileA", "session_key": "shared-session", "tab_id": None,
+            "adopt_existing_tab": True, "privacy_filter_after_handback": False,
+            "epoch": None, "task_id": task_id, "_lock": threading.Lock(),
+        }
+
+    sessions = {"parent": _session_for("parent"), "sub": _session_for("sub")}
+    barrier = threading.Barrier(2)
+
+    def _run(task_id):
+        barrier.wait()
+        with (
+            patch("tools.browser_camofox._get_session", return_value=sessions[task_id]),
+            patch("tools.browser_camofox.get_camofox_url", return_value="http://127.0.0.1:9377"),
+            patch("tools.browser_camofox._post", side_effect=_post),
+            patch("tools.browser_camofox._get", side_effect=_get),
+        ):
+            _ensure_tab(task_id)
+
+    threads = [threading.Thread(target=_run, args=(t,)) for t in ("parent", "sub")]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(created) == 1, f"one tab per browser identity, got {created}"
+    assert sessions["parent"]["tab_id"] == sessions["sub"]["tab_id"]
+    mod._owner_locks.clear()
