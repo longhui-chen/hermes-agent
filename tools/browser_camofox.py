@@ -57,9 +57,18 @@ def _url_origin_only(url: str) -> str:
         parsed = urlsplit(url)
     except ValueError:
         return "[REDACTED URL]"
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return "[REDACTED URL]"
-    return f"{parsed.scheme}://{parsed.netloc}/"
+    # Rebuild from hostname (+ port) only. netloc would keep any
+    # ``user:password@`` userinfo, which is exactly the kind of credential a
+    # human may have typed into a basic-auth URL during handback.
+    host = parsed.hostname
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    authority = f"{host}:{port}" if port is not None else host
+    return f"{parsed.scheme}://{authority}/"
 
 
 def _reduce_urls_to_origin(value: str) -> str:
@@ -708,7 +717,12 @@ def _safe_http_error_payload(resp: requests.Response) -> Dict[str, Any]:
 
 
 def _raise_for_status(resp: requests.Response) -> None:
-    if 200 <= resp.status_code < 400:
+    # Only 2xx is success. The internal local-server proxy is a fixed loopback
+    # endpoint that never legitimately redirects, so a 3xx means misconfig or
+    # compromise; reject it rather than treating it as OK (requests is also
+    # called with allow_redirects=False so the action token is never resent to
+    # a redirect target).
+    if 200 <= resp.status_code < 300:
         return
     raise CamofoxHTTPError(resp, _safe_http_error_payload(resp))
 
@@ -722,7 +736,7 @@ def _post(path: str, body: dict, timeout: Optional[int] = None, session: Optiona
     if timeout is None:
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
-    resp = requests.post(url, json=body, timeout=timeout, headers=_request_headers(session))
+    resp = requests.post(url, json=body, timeout=timeout, headers=_request_headers(session), allow_redirects=False)
     _adopt_epoch_from_response(session, resp)
     _raise_for_status(resp)
     return resp.json()
@@ -733,7 +747,7 @@ def _get(path: str, params: dict = None, timeout: Optional[int] = None, session:
     if timeout is None:
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
-    resp = requests.get(url, params=params, timeout=timeout, headers=_request_headers(session))
+    resp = requests.get(url, params=params, timeout=timeout, headers=_request_headers(session), allow_redirects=False)
     _adopt_epoch_from_response(session, resp)
     _raise_for_status(resp)
     return resp.json()
@@ -744,7 +758,7 @@ def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None, sess
     if timeout is None:
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
-    resp = requests.get(url, params=params, timeout=timeout, headers=_request_headers(session))
+    resp = requests.get(url, params=params, timeout=timeout, headers=_request_headers(session), allow_redirects=False)
     _adopt_epoch_from_response(session, resp)
     _raise_for_status(resp)
     return resp
@@ -755,7 +769,7 @@ def _delete(path: str, body: dict = None, timeout: Optional[int] = None, session
     if timeout is None:
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
-    resp = requests.delete(url, json=body, timeout=timeout, headers=_request_headers(session))
+    resp = requests.delete(url, json=body, timeout=timeout, headers=_request_headers(session), allow_redirects=False)
     _adopt_epoch_from_response(session, resp)
     _raise_for_status(resp)
     return resp.json()

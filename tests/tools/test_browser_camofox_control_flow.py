@@ -364,3 +364,41 @@ def test_adopting_existing_tab_defaults_privacy_filter_on():
     assert adopted["tab_id"] == "tab-live"
     assert adopted["epoch"] == 7
     assert adopted["privacy_filter_after_handback"] is True
+
+
+def test_url_origin_only_strips_userinfo():
+    """Basic-auth credentials in a handback URL must never survive redaction."""
+    from tools.browser_camofox import _url_origin_only
+    assert _url_origin_only("https://alice:secret@example.com/reset?code=abc") == "https://example.com/"
+    assert _url_origin_only("https://user@host.example:8443/path") == "https://host.example:8443/"
+    assert _url_origin_only("http://example.com/x?y=1") == "http://example.com/"
+    # non-http(s) or unparseable → fully redacted, never echoed back
+    assert _url_origin_only("file:///etc/passwd") == "[REDACTED URL]"
+
+
+def test_internal_proxy_requests_reject_redirects(managed_session):
+    """The action token must not follow a cross-origin redirect.
+
+    Requests go out with allow_redirects=False and a 3xx is rejected as an
+    error rather than treated as success.
+    """
+    import requests as _requests
+    from tools.browser_camofox import _post
+
+    redirect = MagicMock()
+    redirect.status_code = 302
+    redirect.headers = {"Location": "https://evil.example/steal"}
+    redirect.json.return_value = {}
+
+    captured = {}
+
+    def _capture(url, json=None, timeout=None, headers=None, allow_redirects=None):
+        captured["allow_redirects"] = allow_redirects
+        captured["token"] = headers.get("X-Zettlab-Agent-Action-Token") if headers else None
+        return redirect
+
+    with patch("tools.browser_camofox.requests.post", side_effect=_capture):
+        with pytest.raises(Exception):
+            _post("/tabs/x/navigate", {"userId": "u"}, session=managed_session)
+
+    assert captured["allow_redirects"] is False
