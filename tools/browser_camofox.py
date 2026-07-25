@@ -21,6 +21,7 @@ import os
 import re
 import threading
 import time
+from contextlib import contextmanager
 import uuid
 from typing import Any, Dict, Optional
 from urllib.parse import SplitResult, quote, urlsplit, urlunsplit
@@ -764,7 +765,7 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
     # profile identity plus a digest of that credential, never by URL.
     release_owner = _release_owner_key(cache_identity.get("user_id", ""), scoped_headers)
     now = time.monotonic()
-    with _owner_lock(release_owner), _sessions_lock:
+    with _held_owner_lock(release_owner), _sessions_lock:
         idle = _prune_idle_sessions_locked(now)
         if cache_key in _sessions:
             session = _sessions[cache_key]
@@ -970,7 +971,7 @@ def _run_pending_teardowns(force: bool = False) -> None:
             _pending_lease_releases.remove(entry)
     for entry in ready:
         owner = entry.get("owner") or ""
-        with _owner_lock(owner):
+        with _held_owner_lock(owner):
             if entry["kind"] == "release" and owner and _profile_still_in_use(owner):
                 logger.debug("Camofox dropped a scheduled release: the profile is in use again")
                 continue
@@ -1017,16 +1018,33 @@ def _queue_pending_teardown(
     delay: float = 0.0,
 ) -> None:
     with _sessions_lock:
-        if len(_pending_lease_releases) >= _MAX_PENDING_LEASE_RELEASES:
-            _pending_lease_releases.pop(0)
-        _pending_lease_releases.append({
-            "kind": kind,
-            "url": url,
-            "headers": dict(headers),
-            "owner": owner,
-            "attempts": 0,
-            "ready_at": time.monotonic() + delay,
-        })
+        # Merge by target: repeat teardowns of the same thing are the same
+        # work, so the queue is bounded by distinct profiles rather than by
+        # events. Dropping the oldest entry to stay under a cap would throw
+        # away the only handle that can close a runtime.
+        for existing in _pending_lease_releases:
+            if existing["kind"] == kind and existing["url"] == url:
+                existing["headers"] = dict(headers)
+                existing["owner"] = owner or existing.get("owner", "")
+                existing["ready_at"] = min(existing["ready_at"], time.monotonic() + delay)
+                break
+        else:
+            if len(_pending_lease_releases) >= _MAX_PENDING_LEASE_RELEASES:
+                # Nothing may be discarded silently; make the overflow visible
+                # and keep the newest, which is the one still reachable.
+                dropped = _pending_lease_releases.pop(0)
+                logger.warning(
+                    "Camofox teardown queue is full; dropping a queued %s for %s",
+                    dropped["kind"], dropped["url"],
+                )
+            _pending_lease_releases.append({
+                "kind": kind,
+                "url": url,
+                "headers": dict(headers),
+                "owner": owner,
+                "attempts": 0,
+                "ready_at": time.monotonic() + delay,
+            })
     _ensure_maintenance_worker()
 
 
@@ -1089,9 +1107,33 @@ def _release_owner_key(user_id: str, headers: Dict[str, str]) -> str:
 
 _MAX_OWNER_LOCKS = 256
 _owner_locks: Dict[str, threading.Lock] = {}
+# Owners with a lock currently reserved or held; never evicted.
+_owner_lock_refs: Dict[str, int] = {}
 
 
-def _owner_lock(owner: str) -> threading.Lock:
+@contextmanager
+def _held_owner_lock(owner: str):
+    """Acquire the owner lock and keep it un-evictable for the duration.
+
+    Returning a bare lock left a window: between the lookup and the caller's
+    acquire, an eviction could remove it as unheld and unreferenced, and the
+    next registration would build a second lock for the same owner — two
+    critical sections where there must be one.
+    """
+    lock = _owner_lock(owner, reserve=True)
+    try:
+        with lock:
+            yield lock
+    finally:
+        with _sessions_lock:
+            count = _owner_lock_refs.get(owner, 0) - 1
+            if count > 0:
+                _owner_lock_refs[owner] = count
+            else:
+                _owner_lock_refs.pop(owner, None)
+
+
+def _owner_lock(owner: str, reserve: bool = False) -> threading.Lock:
     """Serialize session registration against lease release for one profile.
 
     Without it the "am I the last holder" answer can go stale between the check
@@ -1099,6 +1141,8 @@ def _owner_lock(owner: str) -> threading.Lock:
     release tears it down under them. Always acquired before ``_sessions_lock``.
     """
     with _sessions_lock:
+        if reserve:
+            _owner_lock_refs[owner] = _owner_lock_refs.get(owner, 0) + 1
         lock = _owner_locks.get(owner)
         if lock is not None:
             return lock
@@ -1108,6 +1152,7 @@ def _owner_lock(owner: str) -> threading.Lock:
             # the first is still held, which is exactly the serialization this
             # exists to provide.
             live = {session.get("release_owner") for session in _sessions.values()}
+            live.update(_owner_lock_refs)
             for key in [k for k in _owner_locks if k not in live]:
                 candidate = _owner_locks[key]
                 if candidate.acquire(blocking=False):
@@ -1152,7 +1197,7 @@ def _teardown_session(session: Optional[Dict[str, Any]]) -> None:
         # The check and the release are one critical section: otherwise another
         # turn can register and start the runtime in between, and this release
         # tears it down under them.
-        with _owner_lock(owner):
+        with _held_owner_lock(owner):
             if _profile_still_in_use(owner):
                 logger.debug("Camofox lease kept: another session still holds this profile")
                 return
@@ -1249,14 +1294,17 @@ def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
         # so carry its epoch forward: the next turn re-adopts it and must be
         # able to tell "same page, no handback" from a genuine restart.
         _remember_tab_epoch(session)
-        _drop_session(task_id)
         if session.get("local_server_managed"):
-            owner = str(session.get("release_owner") or "")
-            with _owner_lock(owner):
-                if _profile_still_in_use(owner):
-                    logger.debug("Camofox lease kept: another turn still holds this profile")
-                else:
-                    _release_local_server_lease(session)
+            # Deliberately no release here, and the entry stays. How long a
+            # turn will keep using the browser is not observable from this
+            # process — a vision call runs for minutes, a human takeover for
+            # longer — so any timer started at turn end is a guess. The entry's
+            # last-use stamp is the one real signal, and the idle sweep acts on
+            # that. Precise, immediate release needs a lease id the
+            # local-server can refcount; tracked as follow-up.
+            logger.debug("Camofox soft cleanup for task %s (lease left to the idle sweep)", task_id)
+            return True
+        _drop_session(task_id)
         logger.debug("Camofox soft cleanup for task %s (managed persistence)", task_id)
         return True
 
@@ -1336,7 +1384,15 @@ def _is_retryable_read_error(exc: BaseException) -> bool:
     if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
         return True
     resp = getattr(exc, "response", None)
-    return resp is not None and getattr(resp, "status_code", None) in _RETRYABLE_READ_STATUSES
+    if resp is None:
+        return False
+    status = getattr(resp, "status_code", None)
+    if not isinstance(status, int):
+        return False
+    # Every 5xx is the server failing to answer, not an answer. Treating an
+    # internal error as definitive would drop a teardown whose runtime is still
+    # alive. 408/429 are explicit "come back" replies.
+    return status in _RETRYABLE_READ_STATUSES or status in (408, 429) or 500 <= status < 600
 
 
 def _retry_read(operation):
@@ -1473,7 +1529,7 @@ def _left_handback_document(session: Dict[str, Any], document_before: str, lande
     return landed != document_before
 
 
-def _handback_page_readable(session: Dict[str, Any]) -> bool:
+def _handback_page_readable(session: Dict[str, Any], snapshot_data: Any = None) -> bool:
     """Whether a post-handback page may be read at all.
 
     Redaction is not enough on its own: the human may have left the tab on
@@ -1481,7 +1537,16 @@ def _handback_page_readable(session: Dict[str, Any]) -> bool:
     in any form. Only consulted while the handback filter is on, so the extra
     lookup costs nothing on the normal path. Fails closed when the URL cannot
     be established.
+
+    When the capture itself reports a URL, that one is authoritative: it is the
+    page the content actually came from. A separate lookup can only describe
+    where the tab is now, which is not necessarily where the snapshot was
+    taken — both are checked, and both must pass.
     """
+    if isinstance(snapshot_data, dict):
+        captured = snapshot_data.get("url")
+        if isinstance(captured, str) and captured and not _recovery_target_allowed(captured):
+            return False
     landed_url = _current_tab_url(session)
     if not landed_url:
         return False
@@ -1575,7 +1640,7 @@ def _retryable_control_result(
         # Re-check after the response: the human can take over again between
         # the pre-check and this reply, and a snapshot is always admitted, so
         # nothing else would stop the new page from coming back.
-        if not _handback_page_readable(session):
+        if not _handback_page_readable(session, snapshot_data):
             result["message"] = (
                 "The human left the browser on a page this Agent is not allowed to read "
                 "(cloud metadata or a private-network address). Page state was not captured. "
@@ -1758,7 +1823,7 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
             # have what they typed land in the tool result — and if they left
             # the tab somewhere the Agent may not read at all, redaction is not
             # enough, the snapshot is dropped.
-            if _handback_privacy_filter_enabled(session) and not _handback_page_readable(session):
+            if _handback_privacy_filter_enabled(session) and not _handback_page_readable(session, snap_data):
                 result["snapshot_withheld"] = True
                 result["warning"] = (
                     "A human took over and left the browser on a page this Agent is not "
@@ -1803,7 +1868,7 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
         # The response is what advances the epoch, so the filter can only be
         # known to be on at this point — the guard has to run here, not before
         # the request.
-        if _handback_privacy_filter_enabled(session) and not _handback_page_readable(session):
+        if _handback_privacy_filter_enabled(session) and not _handback_page_readable(session, data):
             return _blocked_handback_page_error()
 
         snapshot = data.get("snapshot", "")
@@ -1962,7 +2027,7 @@ def camofox_close(task_id: Optional[str] = None) -> str:
         # run without the profile scope the live probe needs.
         if session.get("local_server_managed") or _local_server_managed():
             owner = str(session.get("release_owner") or "")
-            with _owner_lock(owner):
+            with _held_owner_lock(owner):
                 if _profile_still_in_use(owner):
                     return json.dumps({"success": True, "closed": False, "released": False})
                 _release_local_server_lease(session)
@@ -1972,10 +2037,19 @@ def camofox_close(task_id: Optional[str] = None) -> str:
                 "released": True,
             })
 
-        _delete(
-            f"/sessions/{session['user_id']}",
-        )
-        return json.dumps({"success": True, "closed": True})
+        # Queued with the context captured at creation, and retried: the local
+        # state is already gone, so a transient failure here would otherwise
+        # leave the server-side session running with nothing able to close it.
+        _teardown_session(session)
+        _run_pending_teardowns(force=True)
+        with _sessions_lock:
+            closed = not any(
+                entry["kind"] == "delete" and entry["url"].endswith(
+                    f"/sessions/{quote(str(session.get('user_id') or ''), safe='')}"
+                )
+                for entry in _pending_lease_releases
+            )
+        return json.dumps({"success": True, "closed": closed})
     except Exception as e:
         return json.dumps({"success": True, "closed": True, "warning": str(e)})
 
@@ -2002,7 +2076,7 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
         # and secret-shaped text, so intranet metadata would pass straight
         # through. Same guard as camofox_snapshot, applied after the response
         # because that is what turns the filter on.
-        if _handback_privacy_filter_enabled(session) and not _handback_page_readable(session):
+        if _handback_privacy_filter_enabled(session) and not _handback_page_readable(session, data):
             return _blocked_handback_page_error()
 
         snapshot = data.get("snapshot", "")
@@ -2091,7 +2165,7 @@ def camofox_vision(question: str, annotate: bool = False,
                 # A takeover can land between the screenshot and this call, and
                 # the filter it turns on only strips form values — ordinary
                 # intranet text would still reach the vision model.
-                if _handback_privacy_filter_enabled(session) and not _handback_page_readable(session):
+                if _handback_privacy_filter_enabled(session) and not _handback_page_readable(session, snap_data):
                     return _blocked_handback_page_error()
                 snapshot = snap_data.get("snapshot", "")
                 if not isinstance(snapshot, str):

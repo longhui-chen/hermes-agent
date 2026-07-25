@@ -1162,42 +1162,40 @@ def test_navigate_snapshot_is_withheld_for_a_blocked_page():
     assert "iam credentials" not in json.dumps(result)
 
 
-def test_lease_is_kept_while_another_turn_holds_the_profile():
-    """/_zettlab/release carries no task or lease id — it frees the profile.
+def test_soft_cleanup_never_releases_a_shared_profile_lease():
+    """Turn end says nothing about whether the browser is still in use.
 
-    Two turns on the same profile can each own a session, so releasing when the
-    first one ends would pull the runtime out from under the other, or out from
-    under a human mid-takeover.
+    A vision call runs for minutes and a human takeover for longer, so any
+    timer started here is a guess. The entry stays and its last-use stamp is
+    what the idle sweep acts on.
     """
     import tools.browser_camofox as mod
     from tools.browser_camofox import camofox_soft_cleanup
 
-    release_url = "http://127.0.0.1:9377/internal/browser/camofox/_zettlab/release"
-    mod._sessions.clear()
-    for task in ("turn-a", "turn-b"):
-        mod._sessions[f"profileA\x00sess\x00{task}"] = {
-            "user_id": "profileA", "session_key": "sess", "tab_id": f"tab-{task}",
-            "managed": True, "local_server_managed": True, "task_id": task,
-            "release_url": release_url, "release_headers": {},
-            # Ownership is the profile identity, not the URL: in multiplex every
-            # profile shares the same loopback CAMOFOX_URL.
-            "release_owner": "profileA\x00tokendigest",
-            "last_used_at": time.monotonic(),
-        }
-
-    released = []
+    owner = "profileA\x00digest"
     identity = {"user_id": "profileA", "session_key": "sess"}
+    mod._sessions.clear()
+    mod._pending_lease_releases.clear()
+    key = "profileA\x00sess\x00turn-a"
+    mod._sessions[key] = {
+        "user_id": "profileA", "session_key": "sess", "tab_id": "tab-a",
+        "managed": True, "local_server_managed": True, "task_id": "turn-a",
+        "release_url": "http://127.0.0.1:9377/x/_zettlab/release",
+        "release_headers": {}, "release_owner": owner,
+        "last_used_at": time.monotonic(),
+    }
+
     with (
         patch("tools.browser_camofox._get_camofox_config", return_value={}),
         patch("tools.browser_camofox._camofox_identity_override", return_value=None),
         patch("tools.browser_camofox.get_camofox_identity", return_value=identity),
-        patch("tools.browser_camofox._release_local_server_lease", side_effect=lambda s=None: released.append(1)),
         patch("tools.browser_camofox._ensure_maintenance_worker", return_value=None),
+        patch("tools.browser_camofox.requests.post") as mock_post,
     ):
         assert camofox_soft_cleanup("turn-a") is True
-        assert released == [], "the other turn still holds this profile"
-        assert camofox_soft_cleanup("turn-b") is True
-        assert released == [1], "the last holder must release"
+        mock_post.assert_not_called()
+        assert mod._pending_lease_releases == [], "turn end must not schedule a release"
+        assert key in mod._sessions, "the entry stays for the idle sweep to judge"
     mod._sessions.clear()
 
 
@@ -1354,51 +1352,6 @@ def test_queued_release_is_dropped_when_the_profile_is_in_use_again():
     mod._sessions.clear()
 
 
-def test_release_waits_out_a_turn_that_shares_the_cache_entry():
-    """Two turns can share one session entry, so holders cannot be counted.
-
-    A turn calls _get_session many times but cleans up once, and two turns on
-    one session id collapse into the same cache key — there is no number to
-    count. Deferring the release and re-checking after a quiet window is what
-    makes "the last user is gone" true instead of guessed.
-    """
-    import tools.browser_camofox as mod
-    from tools.browser_camofox import camofox_soft_cleanup
-
-    owner = "profileA\x00digest"
-    identity = {"user_id": "profileA", "session_key": "sess"}
-    mod._sessions.clear()
-    mod._pending_lease_releases.clear()
-    mod._sessions["profileA\x00sess\x00shared"] = {
-        "user_id": "profileA", "session_key": "sess", "tab_id": "tab-1",
-        "managed": True, "local_server_managed": True, "task_id": "shared",
-        "release_url": "http://127.0.0.1:9377/x/_zettlab/release",
-        "release_headers": {}, "release_owner": owner,
-        "last_used_at": time.monotonic(),
-    }
-
-    with (
-        patch("tools.browser_camofox._get_camofox_config", return_value={}),
-        patch("tools.browser_camofox._camofox_identity_override", return_value=None),
-        patch("tools.browser_camofox.get_camofox_identity", return_value=identity),
-        patch("tools.browser_camofox._ensure_maintenance_worker", return_value=None),
-        patch("tools.browser_camofox.requests.post") as mock_post,
-    ):
-        # The first turn ends: the entry goes, the release is only scheduled.
-        assert camofox_soft_cleanup("shared") is True
-        mock_post.assert_not_called()
-
-        # The other turn is still working and re-registers before the window
-        # elapses; the scheduled release must be abandoned.
-        mod._sessions["profileA\x00sess\x00shared"] = {
-            "user_id": "profileA", "session_key": "sess", "tab_id": "tab-1",
-            "managed": True, "local_server_managed": True, "task_id": "shared",
-            "release_owner": owner, "last_used_at": time.monotonic(),
-        }
-        _run_pending_teardowns(force=True)
-        mock_post.assert_not_called()
-        assert mod._pending_lease_releases == []
-    mod._sessions.clear()
 
 
 def test_owner_lock_is_never_replaced_while_held():
@@ -1436,3 +1389,96 @@ def test_managed_tab_creation_without_epoch_fails_closed():
     resp.status_code = 200
     _adopt_epoch_from_response(session, resp, tab_operation=True)
     assert session["privacy_filter_after_handback"] is True
+
+
+def test_blocked_capture_url_wins_over_a_later_lookup():
+    """The URL the capture reports describes where the content came from.
+
+    A separate /tabs lookup can only say where the tab is now, so a page that
+    bounced back to a public address between capture and lookup would otherwise
+    let the restricted content through.
+    """
+    from tools.browser_camofox import camofox_snapshot
+
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
+        "privacy_filter_after_handback": False, "epoch": 3, "_lock": None,
+    }
+
+    def _get_with_handback(path, params=None, timeout=None, session=None, **kwargs):
+        if path == "/tabs":
+            # Already back on a public page by the time this is asked.
+            return {"tabs": [{"tabId": "tab-1", "listItemId": "s", "url": "https://example.com/"}]}
+        session["privacy_filter_after_handback"] = True
+        return {
+            "snapshot": "- text \"iam credentials\"",
+            "refsCount": 1,
+            "url": "http://169.254.169.254/latest/meta-data/",
+        }
+
+    with (
+        patch("tools.browser_camofox._get_session", return_value=session),
+        patch("tools.browser_camofox._session_lock", return_value=MagicMock()),
+        patch("tools.browser_camofox._get", side_effect=_get_with_handback),
+    ):
+        result = json.loads(camofox_snapshot(task_id="agent-task"))
+
+    assert result["success"] is False
+    assert "iam credentials" not in json.dumps(result)
+
+
+def test_teardown_retries_a_server_error():
+    """A 5xx is the server failing to answer, not an answer.
+
+    Treating an internal error as definitive drops a teardown whose runtime is
+    still alive, with nothing left to close it.
+    """
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import _queue_pending_teardown
+
+    mod._pending_lease_releases.clear()
+    failing = MagicMock()
+    failing.status_code = 500
+    failing.headers = {}
+    failing.json.return_value = {}
+
+    with patch("tools.browser_camofox._ensure_maintenance_worker", return_value=None):
+        _queue_pending_teardown("release", "http://127.0.0.1:9377/x/_zettlab/release", {})
+        with patch("tools.browser_camofox.requests.post", return_value=failing):
+            _run_pending_teardowns(force=True)
+        assert len(mod._pending_lease_releases) == 1, "a 5xx must stay queued"
+    mod._pending_lease_releases.clear()
+
+
+def test_teardown_queue_merges_repeats_instead_of_dropping_work():
+    """Repeat teardowns of one target are the same work.
+
+    Dropping the oldest entry to stay under a cap would throw away the only
+    handle that can close a runtime.
+    """
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import _queue_pending_teardown
+
+    mod._pending_lease_releases.clear()
+    with patch("tools.browser_camofox._ensure_maintenance_worker", return_value=None):
+        for _ in range(mod._MAX_PENDING_LEASE_RELEASES * 2):
+            _queue_pending_teardown("release", "http://127.0.0.1:9377/same/_zettlab/release", {})
+    assert len(mod._pending_lease_releases) == 1
+    mod._pending_lease_releases.clear()
+
+
+def test_owner_lock_survives_eviction_pressure_while_reserved():
+    """Between lookup and acquire the lock must not become evictable."""
+    import tools.browser_camofox as mod
+    from tools.browser_camofox import _held_owner_lock, _owner_lock
+
+    mod._owner_locks.clear()
+    mod._owner_lock_refs.clear()
+    mod._sessions.clear()
+    owner = "profileA\x00digest"
+    with _held_owner_lock(owner) as held:
+        for i in range(mod._MAX_OWNER_LOCKS + 5):
+            _owner_lock(f"filler-{i}")
+        assert _owner_lock(owner) is held
+    assert mod._owner_lock_refs == {}
+    mod._owner_locks.clear()
