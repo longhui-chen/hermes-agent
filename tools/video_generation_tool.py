@@ -359,6 +359,8 @@ def _handle_video_generate(args: Dict[str, Any], **_kw: Any) -> str:
         "audio": audio,
         "seed": seed,
     }
+    if getattr(provider, "name", "") == "zettlab" and _kw.get("task_id"):
+        kwargs["_task_id"] = _kw["task_id"]
     # Drop None entries so providers see clean defaults.
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
 

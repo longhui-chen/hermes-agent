@@ -49,13 +49,13 @@ CREATION_TYPES = {"agent", "skill", "task"}
 RECOMMENDATION_ACTIONS = {"create", "dismiss", "mute_session", "unmute_session"}
 SESSION_PREFERENCES_DB = "creation_governor.db"
 UNSUPPORTED_API_MODES = {"codex_app_server"}
-UNSUPPORTED_PLATFORMS = {"acp"}
+UNSUPPORTED_PLATFORMS = {"acp", "api_server"}
 _NONINTERACTIVE_PLATFORMS = {"cron", "subagent", "batch"}
 
 _recent_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
 _dismissed_proposals: OrderedDict[tuple[str, str], float] = OrderedDict()
 _session_states: OrderedDict[str, dict[str, Any]] = OrderedDict()
-_muted_sessions: set[str] = set()
+_muted_sessions: OrderedDict[str, float] = OrderedDict()
 _known_unmuted_sessions: OrderedDict[str, float] = OrderedDict()
 _state_lock = threading.Lock()
 _plugin_llm: Any = None
@@ -258,10 +258,10 @@ def _set_session_muted(session_id: str, muted: bool) -> bool:
         return False
     with _state_lock:
         if muted:
-            _muted_sessions.add(session_id)
+            _remember_muted_session(session_id, time.monotonic())
             _known_unmuted_sessions.pop(session_id, None)
         else:
-            _muted_sessions.discard(session_id)
+            _muted_sessions.pop(session_id, None)
             _remember_unmuted_session(session_id, time.monotonic())
     return True
 
@@ -270,7 +270,9 @@ def _is_session_muted(session_id: str) -> bool:
     now = time.monotonic()
     with _state_lock:
         _prune_known_unmuted_sessions(now)
+        _prune_muted_sessions(now)
         if session_id in _muted_sessions:
+            _remember_muted_session(session_id, now)
             return True
         if session_id in _known_unmuted_sessions:
             _remember_unmuted_session(session_id, now)
@@ -299,7 +301,7 @@ def _is_session_muted(session_id: str) -> bool:
     muted = bool(row and row[0])
     with _state_lock:
         if muted:
-            _muted_sessions.add(session_id)
+            _remember_muted_session(session_id, now)
             _known_unmuted_sessions.pop(session_id, None)
         else:
             _remember_unmuted_session(session_id, now)
@@ -312,6 +314,12 @@ def _remember_unmuted_session(session_id: str, now: float) -> None:
     _prune_known_unmuted_sessions(now)
 
 
+def _remember_muted_session(session_id: str, now: float) -> None:
+    _muted_sessions[session_id] = now
+    _muted_sessions.move_to_end(session_id)
+    _prune_muted_sessions(now)
+
+
 def _prune_known_unmuted_sessions(now: float) -> None:
     expired_before = now - SESSION_STATE_TTL_SECONDS
     for session_id, last_seen in tuple(_known_unmuted_sessions.items()):
@@ -321,8 +329,18 @@ def _prune_known_unmuted_sessions(now: float) -> None:
         _known_unmuted_sessions.popitem(last=False)
 
 
+def _prune_muted_sessions(now: float) -> None:
+    expired_before = now - SESSION_STATE_TTL_SECONDS
+    for session_id, last_seen in tuple(_muted_sessions.items()):
+        if last_seen < expired_before:
+            _muted_sessions.pop(session_id, None)
+    while len(_muted_sessions) > MAX_SESSION_STATES:
+        _muted_sessions.popitem(last=False)
+
+
 def _prune_session_states(now: float) -> None:
     _prune_known_unmuted_sessions(now)
+    _prune_muted_sessions(now)
     expired_before = now - SESSION_STATE_TTL_SECONDS
     for key, state in tuple(_session_states.items()):
         if float(state.get("last_seen", 0)) < expired_before:
@@ -398,10 +416,6 @@ def _is_unsupported_runtime(kwargs: dict[str, Any]) -> bool:
         _text(kwargs.get("api_mode"), 80).lower() in UNSUPPORTED_API_MODES
         or _text(kwargs.get("platform"), 40).lower() in UNSUPPORTED_PLATFORMS
         or kwargs.get("supports_followup_turns") is False
-        or (
-            _text(kwargs.get("platform"), 40).lower() == "api_server"
-            and kwargs.get("streaming_output")
-        )
     )
 
 
@@ -600,6 +614,7 @@ def _run_forced_evaluation(
             temperature=0.0,
             max_tokens=500,
             timeout=3.0,
+            fail_fast=True,
             purpose="creation_opportunity_checkpoint_json",
         )
         parsed = _parse_detector_json(result.text)

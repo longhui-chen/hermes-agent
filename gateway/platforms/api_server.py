@@ -563,6 +563,24 @@ def _tool_completion_payload(
         return payload
     decoded = _promote_connector_error_from_tool_output(decoded)
 
+    if function_name in {"image_generate", "video_generate"}:
+        artifact_output: Dict[str, Any] = {}
+        if isinstance(decoded.get("success"), bool):
+            artifact_output["success"] = decoded["success"]
+        for key in (
+            "host_image",
+            "image",
+            "agent_visible_image",
+            "host_video",
+            "video",
+            "agent_visible_video",
+        ):
+            value = decoded.get(key)
+            if isinstance(value, str) and 0 < len(value) <= 4096:
+                artifact_output[key] = value
+        if artifact_output:
+            payload["output"] = artifact_output
+
     has_error = _has_tool_error_value(decoded.get("error"))
     has_error_code = _has_tool_error_value(decoded.get("errorCode"))
     connector_error = decoded.get("connector_error")

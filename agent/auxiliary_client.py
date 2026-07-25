@@ -1951,11 +1951,11 @@ def _read_main_model() -> str:
 
     Runtime override: when an AIAgent is active with a CLI/gateway-provided
     model that differs from config.yaml, ``set_runtime_main()`` records the
-    override in a process-local global. This is consulted FIRST so tools
+    override in a turn-scoped ContextVar. This is consulted FIRST so tools
     that gate on "the active main model" (e.g. ``vision_analyze``'s native
     fast path) see the live runtime, not the persisted config default.
     """
-    override = _RUNTIME_MAIN_MODEL
+    override = _RUNTIME_MAIN_MODEL.get()
     if isinstance(override, str) and override.strip():
         return override.strip()
     try:
@@ -1982,7 +1982,7 @@ def _read_main_provider() -> str:
     Runtime override: see ``_read_main_model`` — same mechanism for the
     provider half of the runtime tuple.
     """
-    override = _RUNTIME_MAIN_PROVIDER
+    override = _RUNTIME_MAIN_PROVIDER.get()
     if isinstance(override, str) and override.strip():
         return override.strip().lower()
     try:
@@ -1998,13 +1998,13 @@ def _read_main_provider() -> str:
     return ""
 
 
-# Process-local override set by AIAgent at session/turn start. Single-threaded
-# per turn — no lock needed. Cleared by ``clear_runtime_main()``.
-_RUNTIME_MAIN_PROVIDER: str = ""
-_RUNTIME_MAIN_MODEL: str = ""
-_RUNTIME_MAIN_BASE_URL: str = ""
-_RUNTIME_MAIN_API_KEY: str = ""
-_RUNTIME_MAIN_API_MODE: str = ""
+# Turn-scoped overrides set by AIAgent at session/turn start. ContextVar keeps
+# concurrent turns from sharing a provider, model, endpoint, or credential.
+_RUNTIME_MAIN_PROVIDER: ContextVar[str] = ContextVar("runtime_main_provider", default="")
+_RUNTIME_MAIN_MODEL: ContextVar[str] = ContextVar("runtime_main_model", default="")
+_RUNTIME_MAIN_BASE_URL: ContextVar[str] = ContextVar("runtime_main_base_url", default="")
+_RUNTIME_MAIN_API_KEY: ContextVar[str] = ContextVar("runtime_main_api_key", default="")
+_RUNTIME_MAIN_API_MODE: ContextVar[str] = ContextVar("runtime_main_api_mode", default="")
 _RUNTIME_AUXILIARY_TASK_CONFIGS: ContextVar[Dict[str, Dict[str, Any]]] = ContextVar(
     "runtime_auxiliary_task_configs",
     default={},
@@ -2030,24 +2030,20 @@ def set_runtime_main(
     recorded so that ``_resolve_auto`` can construct a valid client in
     Step 1 instead of falling through to the aggregator chain.
     """
-    global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
-    global _RUNTIME_MAIN_BASE_URL, _RUNTIME_MAIN_API_KEY, _RUNTIME_MAIN_API_MODE
-    _RUNTIME_MAIN_PROVIDER = (provider or "").strip().lower()
-    _RUNTIME_MAIN_MODEL = (model or "").strip()
-    _RUNTIME_MAIN_BASE_URL = (base_url or "").strip()
-    _RUNTIME_MAIN_API_KEY = api_key.strip() if isinstance(api_key, str) else ""
-    _RUNTIME_MAIN_API_MODE = (api_mode or "").strip()
+    _RUNTIME_MAIN_PROVIDER.set((provider or "").strip().lower())
+    _RUNTIME_MAIN_MODEL.set((model or "").strip())
+    _RUNTIME_MAIN_BASE_URL.set((base_url or "").strip())
+    _RUNTIME_MAIN_API_KEY.set(api_key.strip() if isinstance(api_key, str) else "")
+    _RUNTIME_MAIN_API_MODE.set((api_mode or "").strip())
 
 
 def clear_runtime_main() -> None:
     """Clear the runtime override (e.g. on session end)."""
-    global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
-    global _RUNTIME_MAIN_BASE_URL, _RUNTIME_MAIN_API_KEY, _RUNTIME_MAIN_API_MODE
-    _RUNTIME_MAIN_PROVIDER = ""
-    _RUNTIME_MAIN_MODEL = ""
-    _RUNTIME_MAIN_BASE_URL = ""
-    _RUNTIME_MAIN_API_KEY = ""
-    _RUNTIME_MAIN_API_MODE = ""
+    _RUNTIME_MAIN_PROVIDER.set("")
+    _RUNTIME_MAIN_MODEL.set("")
+    _RUNTIME_MAIN_BASE_URL.set("")
+    _RUNTIME_MAIN_API_KEY.set("")
+    _RUNTIME_MAIN_API_MODE.set("")
     clear_runtime_auxiliary_task_configs()
 
 
@@ -3752,17 +3748,20 @@ def _resolve_auto(
     runtime_api_key = runtime.get("api_key", "")
     runtime_api_mode = str(runtime.get("api_mode") or "")
 
-    # Fall back to process-local globals when main_runtime dict was not
+    # Fall back to turn-scoped runtime values when main_runtime dict was not
     # provided or was incomplete.  ``set_runtime_main()`` now records
     # base_url/api_key/api_mode alongside provider/model, so custom:
     # providers get the full credential surface in Step 1 of the
     # auto-detect chain.
-    if not runtime_base_url and _RUNTIME_MAIN_BASE_URL:
-        runtime_base_url = _RUNTIME_MAIN_BASE_URL
-    if not runtime_api_key and _RUNTIME_MAIN_API_KEY:
-        runtime_api_key = _RUNTIME_MAIN_API_KEY
-    if not runtime_api_mode and _RUNTIME_MAIN_API_MODE:
-        runtime_api_mode = _RUNTIME_MAIN_API_MODE
+    runtime_main_base_url = _RUNTIME_MAIN_BASE_URL.get()
+    runtime_main_api_key = _RUNTIME_MAIN_API_KEY.get()
+    runtime_main_api_mode = _RUNTIME_MAIN_API_MODE.get()
+    if not runtime_base_url and runtime_main_base_url:
+        runtime_base_url = runtime_main_base_url
+    if not runtime_api_key and runtime_main_api_key:
+        runtime_api_key = runtime_main_api_key
+    if not runtime_api_mode and runtime_main_api_mode:
+        runtime_api_mode = runtime_main_api_mode
 
     # ── Warn once if OPENAI_BASE_URL is set but config.yaml uses a named
     #    provider (not 'custom').  This catches the common "env poisoning"
@@ -5899,6 +5898,7 @@ def call_llm(
     max_tokens: int = None,
     tools: list = None,
     timeout: float = None,
+    fail_fast: bool = False,
     extra_body: dict = None,
     api_mode: str = None,
     stream: bool = False,
@@ -5922,6 +5922,8 @@ def call_llm(
         max_tokens: Max output tokens (handles max_tokens vs max_completion_tokens).
         tools: Tool definitions (for function calling).
         timeout: Request timeout in seconds (None = read from auxiliary.{task}.timeout config).
+        fail_fast: Make one request to the resolved provider and return its result
+            or error without retries or provider fallback.
         extra_body: Additional request body fields.
         stream: When True, return the raw SDK streaming iterator instead of a
             validated complete response. The caller is responsible for consuming
@@ -5937,6 +5939,14 @@ def call_llm(
     Raises:
         RuntimeError: If no provider is configured.
     """
+    if fail_fast and provider is None:
+        provider = _RUNTIME_MAIN_PROVIDER.get() or _read_main_provider()
+        model = model or _RUNTIME_MAIN_MODEL.get() or _read_main_model()
+        base_url = base_url or _RUNTIME_MAIN_BASE_URL.get()
+        api_key = api_key or _RUNTIME_MAIN_API_KEY.get()
+        api_mode = api_mode or _RUNTIME_MAIN_API_MODE.get()
+        if not provider:
+            raise RuntimeError("No active main provider configured for fail-fast auxiliary call")
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     if api_mode:
@@ -5952,7 +5962,12 @@ def call_llm(
             api_key=resolved_api_key or api_key,
             async_mode=False,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if (
+            client is None
+            and not fail_fast
+            and resolved_provider != "auto"
+            and not resolved_base_url
+        ):
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -5978,6 +5993,11 @@ def call_llm(
             main_runtime=main_runtime,
         )
         if client is None:
+            if fail_fast:
+                raise RuntimeError(
+                    f"No LLM provider configured for task={task} provider={resolved_provider}. "
+                    "Run: hermes setup"
+                )
             # When the user explicitly chose a non-OpenRouter provider but no
             # credentials were found, honor the task fallback_chain before
             # raising.  Missing raw env keys are recoverable for auxiliary
@@ -6033,6 +6053,9 @@ def call_llm(
     _client_base = str(getattr(client, "base_url", "") or "")
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+
+    if fail_fast:
+        return _validate_llm_response(client.chat.completions.create(**kwargs), task)
 
     # Streaming path: return the raw SDK Stream iterator directly. This is used by
     # the MoA aggregator so its tokens stream to the user. It deliberately skips
