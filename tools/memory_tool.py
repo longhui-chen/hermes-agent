@@ -33,6 +33,7 @@ import secrets
 import stat
 import tempfile
 import time
+from collections import OrderedDict
 from contextvars import ContextVar
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
@@ -236,7 +237,7 @@ def portable_memory_import_supported() -> bool:
             key = _import_hardlink_cache_key(home_identity, mem_identity)
         except OSError:
             return False
-        if key in _IMPORT_HARDLINK_NEGATIVE_CACHE:
+        if _import_hardlink_negative_cache_contains(key):
             return False
     return True
 
@@ -258,9 +259,34 @@ _MEMORY_TRANSACTION_LOCK = ".curated-memory-transaction"
 _RESET_RECEIPT_PREFIX = ".reset_tx_"
 _RESET_STAGE_PREFIX = ".reset_stage_"
 _IMPORT_LINK_PROBE_PREFIX = ".import_link_probe_"
-_IMPORT_HARDLINK_NEGATIVE_CACHE: set[
-    tuple[str, tuple[int, int], tuple[int, int], int]
-] = set()
+_RESET_PREFLIGHT_MAX_ENTRIES = 10_000
+_IMPORT_HARDLINK_NEGATIVE_CACHE_MAX_ENTRIES = 256
+_IMPORT_HARDLINK_NEGATIVE_CACHE: "OrderedDict[tuple[str, tuple[int, int], tuple[int, int], int], None]" = (
+    OrderedDict()
+)
+
+
+def _import_hardlink_negative_cache_contains(
+    key: tuple[str, tuple[int, int], tuple[int, int], int]
+) -> bool:
+    """Membership check that also refreshes the entry's LRU recency."""
+    try:
+        _IMPORT_HARDLINK_NEGATIVE_CACHE.move_to_end(key)
+    except KeyError:
+        # A concurrent probe may evict between membership check and refresh;
+        # absence simply means "not cached", never an error.
+        return False
+    return True
+
+
+def _import_hardlink_negative_cache_add(
+    key: tuple[str, tuple[int, int], tuple[int, int], int]
+) -> None:
+    """Insert or refresh a key, evicting the least-recently-used entry."""
+    _IMPORT_HARDLINK_NEGATIVE_CACHE.pop(key, None)
+    _IMPORT_HARDLINK_NEGATIVE_CACHE[key] = None
+    while len(_IMPORT_HARDLINK_NEGATIVE_CACHE) > _IMPORT_HARDLINK_NEGATIVE_CACHE_MAX_ENTRIES:
+        _IMPORT_HARDLINK_NEGATIVE_CACHE.popitem(last=False)
 
 
 class MemoryImportConflict(ValueError):
@@ -531,7 +557,7 @@ class _ImportDirectoryHandles:
                 )
             except OSError as exc:
                 if exc.errno in _LINK_COPY_FALLBACK_ERRNOS:
-                    _IMPORT_HARDLINK_NEGATIVE_CACHE.add(
+                    _import_hardlink_negative_cache_add(
                         _import_hardlink_cache_key(
                             self.expected_home_identity,
                             self.expected_mem_identity,
@@ -631,17 +657,39 @@ class _ImportDirectoryHandles:
             return None
         return value if isinstance(value, dict) else None
 
+    @staticmethod
+    def _bounded_listdir(directory_fd: int, *, label: str) -> List[str]:
+        """List one directory's entries, failing closed past a sane budget.
+
+        A silently truncated listing would let reset believe a directory is
+        smaller than it is and report completion while leaves it never saw
+        remain on disk. Exceeding the budget must raise, not truncate.
+        """
+        names: List[str] = []
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                if len(names) >= _RESET_PREFLIGHT_MAX_ENTRIES:
+                    raise MemoryImportConflict(
+                        f"{label} has too many entries to preflight safely"
+                    )
+                names.append(entry.name)
+        return names
+
     def preflight_reset(
         self, *, parse_import_receipts: bool = True
     ) -> tuple[List[str], List[str], List[str], Dict[str, Optional[Dict[str, Any]]]]:
         """Snapshot all reset inputs before allowing the first unlink."""
         try:
-            memory_names = os.listdir(self.mem_fd)
+            memory_names = self._bounded_listdir(self.mem_fd, label="memories directory")
             imports_names = (
-                os.listdir(self.imports_fd) if self.imports_fd >= 0 else []
+                self._bounded_listdir(self.imports_fd, label=".imports directory")
+                if self.imports_fd >= 0
+                else []
             )
             backup_names = (
-                os.listdir(self.backup_fd) if self.backup_fd >= 0 else []
+                self._bounded_listdir(self.backup_fd, label=".imports/backups directory")
+                if self.backup_fd >= 0
+                else []
             )
             for directory_fd, names in (
                 (self.mem_fd, memory_names),
@@ -1521,6 +1569,10 @@ def _reset_copy_regular_no_follow(
     if not stat.S_ISREG(expected.st_mode):
         raise MemoryImportConflict(
             f"reset copy source {source_name} must be a regular file"
+        )
+    if expected.st_size > MAX_CURATED_MEMORY_FILE_BYTES:
+        raise MemoryImportConflict(
+            f"reset copy source {source_name} exceeds the memory file size limit"
         )
     read_flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):

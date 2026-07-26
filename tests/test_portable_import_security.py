@@ -96,6 +96,48 @@ def test_portable_credential_scanner_keeps_placeholders(value):
     assert portable_credential_finding(value) is None
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "client-key-data: LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1JSUV2UUlCQURBTg==",
+        "//registry.npmjs.org/:_auth=dXNlcjpwYXNzd29yZDEyMw==",
+        "_auth=dXNlcjpwYXNzd29yZDEyMw==",
+        '{"auths":{"registry.example.com":{"auth":"dXNlcjpwYXNzd29yZA=="}}}',
+        '{"identitytoken":"dXNlcjpwYXNzd29yZDEyMzQ1"}',
+        '{"registrytoken":"dXNlcjpwYXNzd29yZDEyMzQ1"}',
+    ],
+    ids=[
+        "kubeconfig-client-key-data",
+        "npmrc-scoped-registry-auth",
+        "npmrc-bare-auth",
+        "docker-config-auth",
+        "docker-config-identitytoken",
+        "docker-config-registrytoken",
+    ],
+)
+def test_portable_credential_scanner_rejects_encoded_credential_field_shapes(value):
+    assert portable_credential_finding(value) is not None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "auth: enabled",
+        "the auth mode discussion text continues here",
+        '{"auth": true}',
+        "_auth=${NPM_AUTH_TOKEN}",
+    ],
+    ids=[
+        "auth-enabled-prose",
+        "auth-mode-discussion-prose",
+        "auth-boolean-json",
+        "npmrc-auth-placeholder",
+    ],
+)
+def test_portable_credential_scanner_keeps_benign_auth_lookalikes(value):
+    assert portable_credential_finding(value) is None
+
+
 def test_portable_credential_scanner_bounds_long_non_matching_prose():
     value = ("ordinary words without credential assignments " * 2000)[:65_536]
 

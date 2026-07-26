@@ -313,10 +313,10 @@ def test_memory_reset_backup_preflight_error_happens_before_any_unlink(
     receipt.write_text(json.dumps({"target": "memory"}), encoding="utf-8")
     backup.write_text("backup", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
-    original_listdir = memory_tool.os.listdir
+    original_scandir = memory_tool.os.scandir
     backup_identity = os.stat(backups)
 
-    def fail_backup_listdir(path):
+    def fail_backup_scandir(path):
         if isinstance(path, int):
             opened = os.fstat(path)
             if (opened.st_dev, opened.st_ino) == (
@@ -324,9 +324,9 @@ def test_memory_reset_backup_preflight_error_happens_before_any_unlink(
                 backup_identity.st_ino,
             ):
                 raise OSError(errno.EIO, "simulated backup enumeration failure")
-        return original_listdir(path)
+        return original_scandir(path)
 
-    monkeypatch.setattr(memory_tool.os, "listdir", fail_backup_listdir)
+    monkeypatch.setattr(memory_tool.os, "scandir", fail_backup_scandir)
     with pytest.raises(MemoryImportConflict, match="preflight"):
         reset_curated_memory("memory")
 
@@ -1065,27 +1065,66 @@ def test_staging_recovery_never_deletes_new_user_file_that_is_stage_prefix(
     assert (memories / receipt_name).exists()
 
 
-@pytest.mark.parametrize("size", [(2 << 20) + 17, (65 << 20) + 1])
-def test_reset_copy_fallback_has_no_import_sized_or_total_copy_cap(
-    tmp_path, monkeypatch, size
+def test_reset_copy_fallback_rejects_oversized_source_without_leaving_partial_stage(
+    tmp_path, monkeypatch
 ):
     home = tmp_path / ".hermes"
     memories = home / "memories"
-    memories.mkdir(parents=True)
-    canonical = memories / "MEMORY.md"
-    with canonical.open("wb") as handle:
-        handle.truncate(size)
+    (memories / ".imports" / "backups").mkdir(parents=True)
+    source = memories / "MEMORY.md"
+    source.write_bytes(b"x" * (memory_tool.MAX_CURATED_MEMORY_FILE_BYTES + 1))
+    original = source.read_bytes()
+    stage_name = f"{memory_tool._RESET_STAGE_PREFIX}oversize"
     monkeypatch.setenv("HERMES_HOME", str(home))
 
     def hardlinks_unsupported(*_args, **_kwargs):
         raise OSError(errno.ENOTSUP, "hardlinks unsupported")
 
     monkeypatch.setattr(memory_tool.os, "link", hardlinks_unsupported)
-    result = reset_curated_memory("memory")
 
-    assert result["status"] == "completed"
-    assert not canonical.exists()
-    assert curated_memory_has_state("memory") is False
+    with memory_tool._anchored_import_directories(
+        memories, create_managed=False
+    ) as handles:
+        # Omitting stage_scope forces the same code path _reset_move_no_replace
+        # uses for cross-scope legacy entries: hardlink-or-copy, never rename.
+        with pytest.raises(MemoryImportConflict, match="size limit"):
+            memory_tool._reset_move_no_replace(
+                handles, "memory", source.name, stage_name
+            )
+
+    assert source.read_bytes() == original
+    assert not (memories / stage_name).exists()
+
+
+def test_reset_copy_fallback_rejects_oversized_source_before_reading_any_bytes(
+    tmp_path, monkeypatch
+):
+    """The size check must reject before streaming, not after a full copy."""
+    memories = tmp_path / ".hermes" / "memories"
+    (memories / ".imports" / "backups").mkdir(parents=True)
+    source = memories / "MEMORY.md"
+    source.write_bytes(b"x" * (memory_tool.MAX_CURATED_MEMORY_FILE_BYTES + 1))
+    stage_name = f"{memory_tool._RESET_STAGE_PREFIX}oversize-noread"
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+    def hardlinks_unsupported(*_args, **_kwargs):
+        raise OSError(errno.EXDEV, "hardlinks unavailable")
+
+    def unexpected_read(*_args, **_kwargs):
+        raise AssertionError("oversized source must be rejected before any read")
+
+    with memory_tool._anchored_import_directories(
+        memories, create_managed=False
+    ) as handles:
+        monkeypatch.setattr(memory_tool.os, "link", hardlinks_unsupported)
+        monkeypatch.setattr(memory_tool.os, "read", unexpected_read)
+        with pytest.raises(MemoryImportConflict, match="size limit"):
+            memory_tool._reset_move_no_replace(
+                handles, "memory", source.name, stage_name
+            )
+
+    assert source.exists()
+    assert not (memories / stage_name).exists()
 
 
 def test_memory_reset_cleanup_failure_is_explicit_and_retryable(tmp_path, monkeypatch):
@@ -2556,6 +2595,84 @@ def test_memory_import_no_clobber_preserves_edit_after_final_validation(
     assert receipt["state"] == "prepared"
     displaced_path = Path(receipt["displaced_path"])
     assert displaced_path.read_text(encoding="utf-8") == "old fact"
+
+
+def test_import_hardlink_negative_cache_evicts_least_recently_used(monkeypatch):
+    monkeypatch.setattr(
+        memory_tool, "_IMPORT_HARDLINK_NEGATIVE_CACHE", memory_tool.OrderedDict()
+    )
+    max_entries = memory_tool._IMPORT_HARDLINK_NEGATIVE_CACHE_MAX_ENTRIES
+
+    def key(i):
+        return (f"/mem-{i}", (1, i), (1, i), 1)
+
+    for i in range(max_entries + 50):
+        memory_tool._import_hardlink_negative_cache_add(key(i))
+
+    assert len(memory_tool._IMPORT_HARDLINK_NEGATIVE_CACHE) == max_entries
+    for i in range(50):
+        assert memory_tool._import_hardlink_negative_cache_contains(key(i)) is False
+    for i in range(50, max_entries + 50):
+        assert memory_tool._import_hardlink_negative_cache_contains(key(i)) is True
+
+
+def test_import_hardlink_negative_cache_lookup_refreshes_recency(monkeypatch):
+    monkeypatch.setattr(
+        memory_tool, "_IMPORT_HARDLINK_NEGATIVE_CACHE", memory_tool.OrderedDict()
+    )
+    max_entries = memory_tool._IMPORT_HARDLINK_NEGATIVE_CACHE_MAX_ENTRIES
+
+    def key(i):
+        return (f"/mem-{i}", (1, i), (1, i), 1)
+
+    for i in range(max_entries):
+        memory_tool._import_hardlink_negative_cache_add(key(i))
+
+    # Touching key 0 makes key 1 the least-recently-used entry instead.
+    assert memory_tool._import_hardlink_negative_cache_contains(key(0)) is True
+    memory_tool._import_hardlink_negative_cache_add(key(max_entries))
+
+    assert len(memory_tool._IMPORT_HARDLINK_NEGATIVE_CACHE) == max_entries
+    assert memory_tool._import_hardlink_negative_cache_contains(key(0)) is True
+    assert memory_tool._import_hardlink_negative_cache_contains(key(1)) is False
+    assert memory_tool._import_hardlink_negative_cache_contains(key(max_entries)) is True
+
+
+def test_reset_preflight_rejects_directory_over_entry_budget(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(memory_tool, "_RESET_PREFLIGHT_MAX_ENTRIES", 5)
+
+    for i in range(6):
+        (memories / f"leaf-{i}").write_bytes(b"x")
+
+    with memory_tool._anchored_import_directories(
+        memories, create_managed=False
+    ) as handles:
+        with pytest.raises(MemoryImportConflict, match="too many entries"):
+            handles.preflight_reset(parse_import_receipts=False)
+
+
+def test_reset_preflight_accepts_directory_at_entry_budget(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    memories = home / "memories"
+    memories.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(memory_tool, "_RESET_PREFLIGHT_MAX_ENTRIES", 5)
+
+    for i in range(5):
+        (memories / f"leaf-{i}").write_bytes(b"x")
+
+    with memory_tool._anchored_import_directories(
+        memories, create_managed=False
+    ) as handles:
+        memory_names, _imports_names, _backup_names, _receipts = (
+            handles.preflight_reset(parse_import_receipts=False)
+        )
+
+    assert len(memory_names) == 5
 
 
 @pytest.mark.parametrize(

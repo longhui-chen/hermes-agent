@@ -14,6 +14,7 @@ from pathlib import Path
 
 _RECURSIVE_IDENTITY_RETRIES = 3
 _MAX_RECURSIVE_DEPTH = 64
+_MAX_DIRECTORY_ENTRIES = 50_000
 _MANAGED_ROOT_LEAVES = {"config.yaml", ".managed", ".container-mode", "auth.json", ".env"}
 _MAX_MANAGED_LEAF_BYTES = 16 << 20
 _MAX_FDINFO_BYTES = 64 << 10
@@ -290,6 +291,33 @@ def _read_managed_leaf(home_fd: int, name: str) -> bytes:
         os.close(fd)
 
 
+def _read_bounded_content_file(path: Path, leaf_name: str) -> bytes:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise OSError(errno.EINVAL, f"managed profile leaf content is not a regular file: {path}")
+        if opened.st_size > _MAX_MANAGED_LEAF_BYTES:
+            raise OSError(errno.EFBIG, f"managed profile leaf is too large: {leaf_name}")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(64 << 10, _MAX_MANAGED_LEAF_BYTES + 1 - total))
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > _MAX_MANAGED_LEAF_BYTES:
+                raise OSError(errno.EFBIG, f"managed profile leaf is too large: {leaf_name}")
+    finally:
+        os.close(fd)
+
+
 def _write_managed_leaf(
     home_fd: int,
     name: str,
@@ -396,12 +424,23 @@ def _sync_plugin_links(
             ):
                 raise ValueError("unsafe managed plugin manifest entry")
             desired.append((f"nix-managed-{name}", target))
-        for name in os.listdir(plugins_fd):
-            if not name.startswith("nix-managed-"):
-                continue
-            current = os.stat(name, dir_fd=plugins_fd, follow_symlinks=False)
-            if stat.S_ISLNK(current.st_mode):
-                os.unlink(name, dir_fd=plugins_fd)
+        entries_seen = 0
+        with os.scandir(plugins_fd) as entries:
+            for entry in entries:
+                entries_seen += 1
+                if entries_seen > _MAX_DIRECTORY_ENTRIES:
+                    print(
+                        f"warning: skipping managed plugin entries beyond "
+                        f"{_MAX_DIRECTORY_ENTRIES} in one directory",
+                        file=sys.stderr,
+                    )
+                    break
+                name = entry.name
+                if not name.startswith("nix-managed-"):
+                    continue
+                current = os.stat(name, dir_fd=plugins_fd, follow_symlinks=False)
+                if stat.S_ISLNK(current.st_mode):
+                    os.unlink(name, dir_fd=plugins_fd)
         for name, target in desired:
             temp_name = f".managed-plugin-{secrets.token_hex(16)}.tmp"
             os.symlink(target, temp_name, dir_fd=plugins_fd)
@@ -484,65 +523,76 @@ def _normalize_tree(
     top_level: bool = False,
     depth: int = 0,
 ) -> None:
-    for name in os.listdir(directory_fd):
-        try:
-            visible = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            continue
-        if visible.st_dev != root_device:
-            continue
-        if stat.S_ISDIR(visible.st_mode):
-            if depth >= _MAX_RECURSIVE_DEPTH:
+    entries_seen = 0
+    with os.scandir(directory_fd) as entries:
+        for entry in entries:
+            entries_seen += 1
+            if entries_seen > _MAX_DIRECTORY_ENTRIES:
                 print(
-                    f"warning: skipping managed profile subtree deeper than "
-                    f"{_MAX_RECURSIVE_DEPTH}: {name}",
+                    f"warning: skipping managed profile entries beyond "
+                    f"{_MAX_DIRECTORY_ENTRIES} in one directory",
                     file=sys.stderr,
                 )
-                continue
-            opened_child = _open_recursive_directory(directory_fd, name, visible)
-            if opened_child is None:
-                continue
-            child_fd, opened = opened_child
+                break
+            name = entry.name
             try:
-                if opened.st_dev != root_device:
+                visible = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if visible.st_dev != root_device:
+                continue
+            if stat.S_ISDIR(visible.st_mode):
+                if depth >= _MAX_RECURSIVE_DEPTH:
+                    print(
+                        f"warning: skipping managed profile subtree deeper than "
+                        f"{_MAX_RECURSIVE_DEPTH}: {name}",
+                        file=sys.stderr,
+                    )
                     continue
-                if root_mount_id is not None and _mount_id(child_fd) != root_mount_id:
+                opened_child = _open_recursive_directory(directory_fd, name, visible)
+                if opened_child is None:
                     continue
-                if chown:
-                    os.fchown(child_fd, uid, gid)
-                _normalize_tree(
-                    child_fd,
+                child_fd, opened = opened_child
+                try:
+                    if opened.st_dev != root_device:
+                        continue
+                    if root_mount_id is not None and _mount_id(child_fd) != root_mount_id:
+                        continue
+                    if chown:
+                        os.fchown(child_fd, uid, gid)
+                    _normalize_tree(
+                        child_fd,
+                        uid,
+                        gid,
+                        root_device,
+                        root_mount_id,
+                        chown=chown,
+                        shared_file_modes=shared_file_modes,
+                        group_write_tree=(
+                            group_write_tree
+                            or top_level
+                            and name in {"cron", "sessions", "logs", "memories", "plugins"}
+                        ),
+                        depth=depth + 1,
+                    )
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(visible.st_mode):
+                root_shared = top_level and (
+                    name == "SOUL.md"
+                    or name.endswith((".db", ".db-wal", ".db-shm"))
+                )
+                _normalize_regular_file(
+                    directory_fd,
+                    name,
                     uid,
                     gid,
-                    root_device,
-                    root_mount_id,
                     chown=chown,
-                    shared_file_modes=shared_file_modes,
-                    group_write_tree=(
-                        group_write_tree
-                        or top_level
-                        and name in {"cron", "sessions", "logs", "memories", "plugins"}
-                    ),
-                    depth=depth + 1,
+                    group_write=shared_file_modes and (group_write_tree or root_shared),
+                    expected=visible,
+                    root_device=root_device,
+                    root_mount_id=root_mount_id,
                 )
-            finally:
-                os.close(child_fd)
-        elif stat.S_ISREG(visible.st_mode):
-            root_shared = top_level and (
-                name == "SOUL.md"
-                or name.endswith((".db", ".db-wal", ".db-shm"))
-            )
-            _normalize_regular_file(
-                directory_fd,
-                name,
-                uid,
-                gid,
-                chown=chown,
-                group_write=shared_file_modes and (group_write_tree or root_shared),
-                expected=visible,
-                root_device=root_device,
-                root_mount_id=root_mount_id,
-            )
 
 
 def ensure_transaction_directories(
@@ -662,7 +712,7 @@ def main() -> None:
                 _write_managed_leaf(
                     home_fd,
                     args.write_leaf,
-                    args.content_file.read_bytes(),
+                    _read_bounded_content_file(args.content_file, args.write_leaf),
                     args.uid,
                     args.gid,
                     args.leaf_mode,

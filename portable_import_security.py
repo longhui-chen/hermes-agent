@@ -14,11 +14,11 @@ _AUTHORIZATION_BEARER_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 _CREDENTIAL_ASSIGNMENT_RE = re.compile(
-    r"(?:^|[\s{,])[\"']?"
-    r"((?:[a-z0-9]+[._-])*(?:api[._ -]?key|client[._ -]?secret|"
+    r"(?:^|[\s{,:])[\"']?"
+    r"((?:[a-z0-9]+[._-])*(?:api[._ -]?key|client[._ -]?key[._ -]?data|client[._ -]?secret|"
     r"secret[._ -]?access[._ -]?key|access[._ -]?key[._ -]?id|"
     r"account[._ -]?key|subscription[._ -]?key|access[._ -]?token|refresh[._ -]?token|"
-    r"auth[._ -]?token|authorization|credentials?|secret|token|password|"
+    r"auth[._ -]?token|authorization|identitytoken|registrytoken|_?auth|credentials?|secret|token|password|"
     r"passwd|cookie|private[._ -]?key))"
     r"[\"']?\s*[:=]\s*(\"[^\"\r\n]+\"|'[^'\r\n]+'|"
     r"[^\s,}\]\r\n#]+)",
@@ -100,6 +100,21 @@ def _authorization_value_looks_real(raw: str) -> bool:
     return _credential_value_looks_real(value)
 
 
+_ENCODED_AUTH_VALUE_RE = re.compile(r"[A-Za-z0-9+/_-]+={0,2}")
+
+
+def _encoded_auth_value_looks_real(raw: str) -> bool:
+    # The bare "auth" key also matches innocuous prose (e.g. "auth: enabled"),
+    # so it requires the value to look like an encoded credential rather than
+    # just being non-placeholder and non-trivial in length.
+    value = raw.strip().strip("\"'")
+    if len(value) < 12 or _PLACEHOLDER_VALUE_RE.fullmatch(value) is not None:
+        return False
+    if _ENCODED_AUTH_VALUE_RE.fullmatch(value) is None:
+        return False
+    return re.search(r"[0-9+/=]|[A-Z]", value) is not None
+
+
 def portable_credential_finding(value: str) -> Optional[str]:
     """Return the first high-confidence credential violation in bounded text."""
     value, normalization_complete = _credential_scan_text(value)
@@ -127,11 +142,12 @@ def portable_credential_finding(value: str) -> Optional[str]:
             )
             if authorization_value:
                 raw_value = f"{authorization_scheme} {authorization_value.group(1)}"
-        value_looks_real = (
-            _authorization_value_looks_real(raw_value)
-            if key == "authorization"
-            else _credential_value_looks_real(raw_value)
-        )
+        if key == "authorization":
+            value_looks_real = _authorization_value_looks_real(raw_value)
+        elif key == "auth":
+            value_looks_real = _encoded_auth_value_looks_real(raw_value)
+        else:
+            value_looks_real = _credential_value_looks_real(raw_value)
         if value_looks_real:
             return "credential assignment"
     return None

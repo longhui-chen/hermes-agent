@@ -418,6 +418,45 @@ def test_recursive_profile_scan_skips_beyond_bounded_depth(
     assert stat.S_IMODE(deepest.stat().st_mode) == 0o600
 
 
+def test_recursive_profile_scan_bounds_directory_entries_and_warns(
+    tmp_path, monkeypatch, capsys
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    current = home.stat()
+    safe_profile_dirs.ensure_transaction_directories(
+        home, current.st_uid, current.st_gid
+    )
+    monkeypatch.setattr(safe_profile_dirs, "_MAX_DIRECTORY_ENTRIES", 5)
+    sessions = home / "sessions"
+    for index in range(15):
+        (sessions / f"file-{index}.txt").write_text("data")
+    processed = []
+    original_normalize_regular_file = safe_profile_dirs._normalize_regular_file
+
+    def record_normalize_regular_file(directory_fd, name, *args, **kwargs):
+        processed.append(name)
+        return original_normalize_regular_file(directory_fd, name, *args, **kwargs)
+
+    monkeypatch.setattr(
+        safe_profile_dirs, "_normalize_regular_file", record_normalize_regular_file
+    )
+
+    safe_profile_dirs.ensure_transaction_directories(
+        home,
+        current.st_uid,
+        current.st_gid,
+        recursive_ownership=True,
+        shared_file_modes=True,
+    )
+
+    assert len(processed) == 5
+    assert (
+        "skipping managed profile entries beyond 5 in one directory"
+        in capsys.readouterr().err
+    )
+
+
 @pytest.mark.parametrize("leaf", sorted(safe_profile_dirs._MANAGED_ROOT_LEAVES))
 @pytest.mark.parametrize("kind", ["symlink", "fifo"])
 def test_safe_profile_directory_flow_rejects_unsafe_managed_leaf(
@@ -477,6 +516,62 @@ def test_managed_leaf_write_is_anchored_and_replaces_symlink_not_target(tmp_path
     assert outside.read_text() == "do not touch"
     assert not (home / ".managed").is_symlink()
     assert (home / ".managed").read_bytes() == b"managed"
+
+
+def test_read_bounded_content_file_rejects_oversized_without_full_read(
+    tmp_path, monkeypatch
+):
+    oversized = tmp_path / "oversized-content"
+    with open(oversized, "wb") as handle:
+        handle.truncate(safe_profile_dirs._MAX_MANAGED_LEAF_BYTES + 1)
+
+    def fail_if_called(self):
+        pytest.fail("content file was fully read into memory before the size check")
+
+    monkeypatch.setattr(safe_profile_dirs.Path, "read_bytes", fail_if_called)
+
+    with pytest.raises(OSError, match="managed profile leaf is too large"):
+        safe_profile_dirs._read_bounded_content_file(oversized, ".managed")
+
+
+def test_safe_profile_cli_write_leaf_rejects_oversized_content(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    current = home.stat()
+    setup = subprocess.run(
+        [sys.executable, str(_SOURCE), str(home), str(current.st_uid), str(current.st_gid)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    identity = setup.stdout.strip()
+    oversized = tmp_path / "oversized-content"
+    with open(oversized, "wb") as handle:
+        handle.truncate(safe_profile_dirs._MAX_MANAGED_LEAF_BYTES + 1)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(_SOURCE),
+            "--expected-identity",
+            identity,
+            str(home),
+            str(current.st_uid),
+            str(current.st_gid),
+            "--write-leaf",
+            ".managed",
+            "--content-file",
+            str(oversized),
+            "--leaf-mode",
+            "0644",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "managed profile leaf is too large" in result.stderr
+    assert not (home / ".managed").exists()
 
 
 def test_managed_leaf_action_rejects_replaced_profile_identity(tmp_path):

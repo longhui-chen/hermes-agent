@@ -1797,3 +1797,54 @@ async def test_cancelled_unload_holds_barrier_until_staging_cleanup_exits(tmp_pa
     key = adapter._begin_runtime_import_operation(profile_home)
     assert key == adapter._profile_home_key(profile_home)
     adapter._end_runtime_import_operation(key)
+
+
+@pytest.mark.parametrize("sidecar_suffix", ["-wal", "-shm", "-journal"])
+def test_open_profile_session_db_rejects_symlinked_sidecar(tmp_path, sidecar_suffix):
+    profile_home = tmp_path / "victim"
+    profile_home.mkdir()
+    foreign = tmp_path / "other-profile-file"
+    foreign.write_bytes(b"")
+    (profile_home / f"state.db{sidecar_suffix}").symlink_to(foreign)
+
+    with pytest.raises(RuntimeError, match="private regular file"):
+        ZetAgentAdapter._open_profile_session_db(profile_home)
+
+
+def test_open_profile_session_db_rejects_hardlinked_sidecar(tmp_path):
+    profile_home = tmp_path / "victim"
+    profile_home.mkdir()
+    foreign = tmp_path / "other-profile-journal"
+    foreign.write_bytes(b"")
+    os.link(foreign, profile_home / "state.db-journal")
+
+    with pytest.raises(RuntimeError, match="private regular file"):
+        ZetAgentAdapter._open_profile_session_db(profile_home)
+
+
+def test_open_profile_session_db_accepts_stale_regular_sidecar(tmp_path):
+    profile_home = tmp_path / "victim"
+    profile_home.mkdir()
+    (profile_home / "state.db-wal").write_bytes(b"")
+
+    db = ZetAgentAdapter._open_profile_session_db(profile_home)
+    try:
+        assert db is not None
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_ensure_session_db_async_runs_off_event_loop():
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    seen = {}
+    sentinel = object()
+
+    def _record():
+        seen["thread"] = threading.get_ident()
+        return sentinel
+
+    adapter._ensure_session_db = _record
+    result = await adapter._ensure_session_db_async()
+    assert result is sentinel
+    assert seen["thread"] != threading.get_ident()
