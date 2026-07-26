@@ -2622,14 +2622,16 @@ def test_a_redirect_into_the_floor_is_not_read_back():
 
         with patch("tools.browser_camofox._post", return_value={"url": "https://ok.example/"}):
             assert json.loads(mod.camofox_navigate("https://ok.example/", task_id="t"))["success"] is True
-def test_a_navigation_that_reports_its_new_epoch_does_not_look_like_a_handback():
-    """local-server now advances the epoch on any document change.
+def test_an_epoch_this_side_never_held_switches_the_filter_on():
+    """local-server advances the epoch only when the Agent must re-read.
 
-    The navigating turn is handed the new value, because its response describes
-    the page it just created. If it were withheld instead, this side would read
-    a managed tab response with no epoch as a protocol failure — "assume a human
-    changed the page" — and switch the handback privacy filter on after every
-    navigation.
+    That is a human handback, or a runtime restart that reset control state —
+    never an ordinary navigate, which is why the filter can be cleared by a
+    navigate whose epoch did not move. So an epoch this side has not seen means
+    the page went somewhere this side did not take it, and the values on it are
+    not the Agent's to read. A managed response carrying no epoch at all is the
+    same conclusion reached with less information: the protocol failed, and the
+    page must be assumed to have moved.
     """
     import tools.browser_camofox as mod
 
@@ -2880,3 +2882,40 @@ def test_going_back_to_the_handback_page_filters_again():
         result = json.loads(mod.camofox_back(task_id="t"))
     assert mod._handback_privacy_filter_enabled(session), "back onto the human's page did not filter"
     assert "SECRET" not in json.dumps(result), "the handback URL's token was returned"
+
+
+def test_a_missing_epoch_baseline_only_stops_javascript():
+    """Without a baseline the epoch header cannot go out, but a click still runs.
+
+    A click or a type reaches exactly the ref it names, and refusing them made
+    the browser read-only whenever the inline snapshot failed or the device's
+    local-server did not report page state — a dead end, since the operation
+    that would establish the baseline is itself a read the model has to think
+    to retry. JavaScript is the one call whose reach is not bounded by a ref,
+    so it stays refused.
+    """
+    import tools.browser_camofox as mod
+    from tools.browser_tool import _camofox_eval
+
+    session = {
+        "user_id": "u", "tab_id": "tab-1", "session_key": "s", "task_id": "t",
+        "local_server_managed": True, "epoch": None,
+        "privacy_filter_after_handback": False, "_lock": None,
+    }
+
+    with (
+        patch("tools.browser_camofox._get_session", return_value=session),
+        patch("tools.browser_camofox._post", return_value={"url": "https://example.com/"}) as post,
+    ):
+        clicked = json.loads(mod.camofox_click("e3", task_id="t"))
+    assert clicked["success"] is True, clicked
+    assert post.called, "the click never reached the browser"
+
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=session),
+        patch("tools.browser_camofox._post") as eval_post,
+    ):
+        evaluated = json.loads(_camofox_eval("document.body.innerHTML", task_id="t"))
+    assert evaluated["success"] is False
+    assert evaluated["error"] == "browser_epoch_unavailable", evaluated
+    assert not eval_post.called, "unprotected JavaScript reached the page"

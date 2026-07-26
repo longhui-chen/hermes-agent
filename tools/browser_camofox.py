@@ -2339,9 +2339,9 @@ def _tool_error_from_exception(
             "success": False,
             "error": "browser_epoch_unavailable",
             "message": (
-                "This browser session has no page-state baseline yet, so writes are "
-                "refused. Take a snapshot first; if the device's local-server does not "
-                "report page state, the browser is read-only."
+                "This browser session has no page-state baseline yet, so running "
+                "JavaScript is refused. Take a snapshot first, or reach the page "
+                "through clicks and typing instead."
             ),
             "retryable": True,
         }
@@ -2436,33 +2436,32 @@ def _mutating_tab_call(session: Dict[str, Any], path_suffix: str, body: Dict[str
     # tab, and the request header is built from the shared session — so without
     # this check the proxy would see a current epoch attached to stale refs and
     # accept them, clicking or typing on a page the human just handed back.
-    # A managed session with no epoch yet has no handback protocol behind it:
-    # the request goes out with no X-Zettlab-Browser-Epoch, so nothing on either
-    # side would stop a stale ref — or arbitrary JavaScript — from acting on a
-    # page a human is in the middle of. Filtering the response cannot undo a
-    # write that already happened, so the mutation is refused instead. A read
-    # (snapshot) establishes the baseline, and against a local-server too old to
-    # send the header the browser tool degrades to reads only.
-    if session.get("local_server_managed") and session.get("epoch") is None:
-        raise CamofoxEpochUnavailable(
-            "this browser session has no page-state baseline yet; take a snapshot first"
-        )
     observed_epoch = session.get("epoch")
     with _held_owner_lock(_browser_identity_key(session)):
         if session.get("epoch") != observed_epoch:
             raise CamofoxEpochMoved(
                 "the page changed while this operation waited for the browser tab"
             )
-        # Re-checked here, not only by the caller: evaluate runs arbitrary
-        # JavaScript, so between a caller's check and this lock another turn's
-        # response can turn the filter on and this call would then run against
-        # the page a human is holding. Discarding the result afterwards cannot
-        # undo a location.href, a DOM write or a request the script made.
-        if path_suffix == "/evaluate" and _handback_privacy_filter_enabled(session):
-            raise CamofoxEvaluateBlocked(
-                "browser evaluation is blocked after human control until the Agent "
-                "navigates to a new page or closes the session"
-            )
+        # Only evaluate is held to the stricter bar. A click or a type names one
+        # ref and can only reach what that ref is; JavaScript names nothing and
+        # can read the whole document, rewrite it, or issue requests as the
+        # human's session, and discarding the result afterwards undoes none of
+        # that. Both checks below are re-evaluated here rather than trusted from
+        # the caller, because another turn's response can move the session
+        # between a caller's check and this lock.
+        if path_suffix == "/evaluate":
+            # Without a baseline no X-Zettlab-Browser-Epoch goes out, so neither
+            # side would stop this script from running on a page a human is in
+            # the middle of.
+            if session.get("local_server_managed") and session.get("epoch") is None:
+                raise CamofoxEpochUnavailable(
+                    "this browser session has no page-state baseline yet; take a snapshot first"
+                )
+            if _handback_privacy_filter_enabled(session):
+                raise CamofoxEvaluateBlocked(
+                    "browser evaluation is blocked after human control until the Agent "
+                    "navigates to a new page or closes the session"
+                )
         return _post(_tab_path(session, path_suffix), body, session=session)
 
 
