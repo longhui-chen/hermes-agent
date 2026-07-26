@@ -2622,3 +2622,86 @@ def test_a_full_session_cache_applies_backpressure():
     assert len(mod._sessions) == mod._MAX_TRACKED_SESSIONS
     assert all(not k.endswith("newcomer") for k in mod._sessions)
     mod._sessions.clear()
+
+
+def test_navigation_landing_on_a_blocked_page_is_not_read_back():
+    """browser_navigate checks where it aims; redirects decide where it lands.
+
+    The automatic snapshot would otherwise read back a cloud-metadata or
+    blocklisted page the Agent was never allowed to reach.
+    """
+    import tools.browser_camofox as mod
+
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
+    mod._stamp_ref_generation(session, "https://start.example/")
+    snapshot_taken = {"value": False}
+
+    def _get_stub(path, params=None, timeout=None, session=None, **kwargs):
+        if path.endswith("/snapshot"):
+            snapshot_taken["value"] = True
+            return {"snapshot": "- secret credentials", "refsCount": 1}
+        return {"tabs": [{"tabId": "tab-1", "listItemId": "s", "url": "https://start.example/"}]}
+
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=session),
+        patch("tools.browser_camofox._get_session", return_value=session),
+        patch("tools.browser_camofox._post", return_value={"url": "http://169.254.169.254/latest/meta-data/"}),
+        patch("tools.browser_camofox._get", side_effect=_get_stub),
+    ):
+        result = json.loads(mod.camofox_navigate("https://start.example/redirect", task_id="t"))
+
+    assert result["success"] is False
+    assert "not allowed to read" in result.get("error", "") + result.get("message", "")
+    assert snapshot_taken["value"] is False, "the blocked landing page was snapshotted anyway"
+    assert not mod._refs_are_current(session), "refs survived a navigation to a blocked page"
+
+
+def test_managed_mutations_need_an_epoch_baseline():
+    """No epoch means no handback protocol, and a write cannot be taken back."""
+    import tools.browser_camofox as mod
+
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t",
+               "epoch": None, "local_server_managed": True}
+    mod._stamp_ref_generation(session)
+    with pytest.raises(mod.CamofoxEpochUnavailable):
+        mod._mutating_tab_call(session, "/click", {"userId": "u", "ref": "e1"})
+    with pytest.raises(mod.CamofoxEpochUnavailable):
+        mod._mutating_tab_call(session, "/evaluate", {"userId": "u", "expression": "1"})
+
+    # A direct (unmanaged) session has no epoch protocol to be missing.
+    direct = {"user_id": "u", "session_key": "s2", "tab_id": "tab-2", "task_id": "t",
+              "epoch": None, "local_server_managed": False}
+    mod._stamp_ref_generation(direct)
+    with patch("tools.browser_camofox._post", return_value={"ok": True}) as mock_post:
+        mod._mutating_tab_call(direct, "/click", {"userId": "u", "ref": "e1"})
+    assert mock_post.called
+
+    # Once a read has established the baseline, writes resume.
+    session["epoch"] = 3
+    with patch("tools.browser_camofox._post", return_value={"ok": True}) as mock_post:
+        mod._mutating_tab_call(session, "/click", {"userId": "u", "ref": "e1"})
+    assert mock_post.called
+
+
+def test_the_recovery_snapshot_hands_back_usable_refs():
+    """The recovery message tells the Agent to retry with these refs.
+
+    They have to be stamped against the generation the capture describes, or the
+    very next call refuses them — and the handback that caused the refusal has
+    to invalidate everything taken before it.
+    """
+    import tools.browser_camofox as mod
+
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t",
+               "epoch": 2, "local_server_managed": True, "privacy_filter_after_handback": False}
+    mod._stamp_ref_generation(session, "https://a.example/before")
+
+    with (
+        patch("tools.browser_camofox._get_session", return_value=session),
+        patch("tools.browser_camofox._post", side_effect=_epoch_stale(5)),
+        patch("tools.browser_camofox._get", side_effect=_get_serving_tabs({"snapshot": '- button [e9]', "refsCount": 1})),
+    ):
+        result = json.loads(camofox_click("@e4", task_id="agent-task"))
+
+    assert result["resnapshot_completed"] is True
+    assert mod._refs_are_current(session), "the refs the recovery handed back were not usable"
