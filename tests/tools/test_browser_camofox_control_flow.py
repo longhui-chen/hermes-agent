@@ -2619,3 +2619,31 @@ def test_a_redirect_into_the_floor_is_not_read_back():
 
         with patch("tools.browser_camofox._post", return_value={"url": "https://ok.example/"}):
             assert json.loads(mod.camofox_navigate("https://ok.example/", task_id="t"))["success"] is True
+def test_a_navigation_that_reports_its_new_epoch_does_not_look_like_a_handback():
+    """local-server now advances the epoch on any document change.
+
+    The navigating turn is handed the new value, because its response describes
+    the page it just created. If it were withheld instead, this side would read
+    a managed tab response with no epoch as a protocol failure — "assume a human
+    changed the page" — and switch the handback privacy filter on after every
+    navigation.
+    """
+    import tools.browser_camofox as mod
+
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t",
+               "epoch": 4, "local_server_managed": True, "privacy_filter_after_handback": False}
+
+    # What local-server sends now: the epoch its own navigate produced.
+    reported = MagicMock(status_code=200, headers={mod._EPOCH_HEADER: "5"})
+    mod._adopt_epoch_from_response(session, reported, tab_operation=True)
+    assert session["epoch"] == 5
+    assert session["privacy_filter_after_handback"] is True, (
+        "an epoch the Agent did not previously hold still means the page moved"
+    )
+
+    # And the shape that must not happen: a successful managed tab response with
+    # no epoch at all is a protocol failure, which is why withholding it after a
+    # navigate would be wrong.
+    session["privacy_filter_after_handback"] = False
+    mod._adopt_epoch_from_response(session, MagicMock(status_code=200, headers={}), tab_operation=True)
+    assert session["privacy_filter_after_handback"] is True
