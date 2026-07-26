@@ -2446,3 +2446,43 @@ def test_two_profiles_do_not_share_remembered_tab_epochs():
     assert mod._remembered_tab_state(a, "tab-1") == (7, False)
     with mod._sessions_lock:
         mod._remembered_tab_epochs.clear()
+
+
+def test_a_handback_invalidates_refs_taken_before_it():
+    """The epoch only moves when a human took the tab and gave it back.
+
+    Turns sharing the physical tab keep their own session entry and their own
+    stamp, so the invalidation has to be by document: otherwise the turn that
+    did not observe the epoch change still acts on refs describing the page
+    from before the takeover, on the page the human left.
+    """
+    import tools.browser_camofox as mod
+
+    reader = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "reader", "epoch": 4}
+    other = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "other", "epoch": 4}
+    mod._stamp_ref_generation(reader, "https://a.example/form")
+    assert mod._refs_are_current(reader)
+
+    # A concurrent turn's response carries the post-handback epoch.
+    mod._adopt_session_epoch(other, 5)
+    assert other["privacy_filter_after_handback"] is True
+
+    assert not mod._refs_are_current(reader), "refs from before the takeover survived the handback"
+    with pytest.raises(mod.CamofoxRefsStale):
+        mod._mutating_tab_call(reader, "/click", {"userId": "u", "ref": "e1"})
+
+
+def test_evaluate_invalidates_outstanding_refs():
+    """Arbitrary JavaScript can replace the document or rebuild any subtree."""
+    import tools.browser_camofox as mod
+
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
+    mod._stamp_ref_generation(session, "https://a.example/list")
+    assert mod._refs_are_current(session)
+
+    with patch("tools.browser_camofox._post", return_value={"result": "ok"}):
+        mod._mutating_tab_call(session, "/evaluate", {"userId": "u", "expression": "location.href='/x'"})
+
+    assert not mod._refs_are_current(session), "refs survived arbitrary JavaScript"
+    with pytest.raises(mod.CamofoxRefsStale):
+        mod._mutating_tab_call(session, "/click", {"userId": "u", "ref": "e1"})

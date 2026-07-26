@@ -144,6 +144,13 @@ def _adopt_session_epoch(session: Optional[Dict[str, Any]], epoch: Any) -> None:
     previous = session.get("epoch")
     if previous is not None and previous != epoch:
         session["privacy_filter_after_handback"] = True
+        # The epoch only moves when a human took the tab and gave it back, so
+        # the document every outstanding ref describes is the one they left
+        # behind. Turns sharing this physical tab keep their own session entry
+        # and their own stamp, so invalidate by document rather than by
+        # clearing this session's — otherwise a concurrent turn would still
+        # act on refs from before the takeover.
+        _bump_document_generation(session)
     session["epoch"] = epoch
 
 
@@ -2099,8 +2106,10 @@ def _forget_surplus_documents_locked(keep: str) -> None:
             return
 
 
-# Suffixes whose whole purpose is to replace the document.
-_DOCUMENT_CHANGING_SUFFIXES = ("/navigate", "/back", "/forward", "/reload")
+# Suffixes after which no outstanding ref can be trusted. navigate/back/forward
+# /reload replace the document outright; evaluate runs arbitrary JavaScript,
+# which can set location.href, replace document.body, or rebuild any subtree.
+_DOCUMENT_CHANGING_SUFFIXES = ("/navigate", "/back", "/forward", "/reload", "/evaluate")
 
 
 def _mutating_tab_call(session: Dict[str, Any], path_suffix: str, body: Dict[str, Any]) -> Dict[str, Any]:
