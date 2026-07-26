@@ -6,6 +6,7 @@ mismatch returns 409 browser_epoch_stale and recovery is a single stateless
 step: adopt the new epoch, take one privacy-filtered snapshot, retry.
 """
 
+import contextlib
 import json
 import time
 from unittest.mock import MagicMock, patch
@@ -46,17 +47,24 @@ def _get_serving_tabs(snapshot_payload, url="https://example.com/page"):
 
 @pytest.fixture(autouse=True)
 def _clear_response_facts():
-    """Reset the per-response thread-locals around every test.
+    """Reset the per-response thread-locals and the per-tab registries.
 
-    Production resets them at the start of each transport call, but tests mock
-    that layer away — without this a test can pass on a neighbour's leftover.
+    Production resets the thread-locals at the start of each transport call,
+    but tests mock that layer away — without this a test can pass on a
+    neighbour's leftover. The document registry is process-wide and keyed by
+    tab identity, so tests using the same identity would otherwise inherit each
+    other's generations and blocked flags.
     """
     import tools.browser_camofox as mod
 
     for attr in ("started_handback", "epoch_verified"):
         if hasattr(mod._response_facts, attr):
             delattr(mod._response_facts, attr)
+    with mod._sessions_lock:
+        mod._document_generations.clear()
     yield
+    with mod._sessions_lock:
+        mod._document_generations.clear()
     for attr in ("started_handback", "epoch_verified"):
         if hasattr(mod._response_facts, attr):
             delattr(mod._response_facts, attr)
@@ -3103,3 +3111,106 @@ def test_direct_teardown_is_scoped_to_its_credential():
     assert len(mod._pending_lease_releases) == 2, "_teardown_session merged two profiles into one delete"
     assert {e["headers"]["Authorization"] for e in mod._pending_lease_releases} == {"Bearer a", "Bearer b"}
     mod._pending_lease_releases.clear()
+
+
+def test_a_capture_is_refused_by_a_block_that_landed_while_it_waited():
+    """The caller's check runs before the lock another turn is holding.
+
+    That turn can navigate the shared tab onto a refused page in between, and an
+    ordinary redirect turns no filter on, so nothing downstream would notice.
+    """
+    import tools.browser_camofox as mod
+
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
+    mod._mark_document_blocked(session, "http://169.254.169.254/")
+    with pytest.raises(mod.CamofoxDocumentBlocked):
+        with mod._capture_guard(session):
+            pytest.fail("the capture ran on a blocked page")
+
+    # vision's screenshot takes the same section, so it is refused too.
+    with patch("tools.browser_camofox._get_session", return_value=session):
+        with patch("tools.browser_camofox._get_raw") as raw:
+            result = json.loads(mod.camofox_vision("what is this", task_id="t"))
+    assert result["success"] is False
+    assert not raw.called, "the screenshot reached the blocked page"
+
+
+def test_a_refless_mutation_is_refused_when_the_document_moved_while_it_waited():
+    """evaluate, press, back and scroll carry no ref to be judged on.
+
+    Another turn's ordinary navigate does not move the epoch, so without the
+    document sample they would run on whatever landed.
+    """
+    import tools.browser_camofox as mod
+
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
+    mod._stamp_ref_generation(session, "https://a.example/")
+
+    real_lock = mod._held_owner_lock
+
+    @contextlib.contextmanager
+    def _navigating_lock(owner):
+        # Stands in for the other turn finishing its navigate while this
+        # operation was queued behind the identity lock.
+        mod._bump_document_generation(session)
+        with real_lock(owner):
+            yield
+
+    with patch("tools.browser_camofox._held_owner_lock", _navigating_lock):
+        with patch("tools.browser_camofox._post") as mock_post:
+            with pytest.raises(mod.CamofoxRefsStale):
+                mod._mutating_tab_call(session, "/press", {"userId": "u", "key": "Enter"})
+            assert not mock_post.called
+
+        # A navigate is the thing that changes the document, so it is judged on
+        # the epoch alone and still goes through.
+        with patch("tools.browser_camofox._post", return_value={"url": "https://b.example/"}) as mock_post:
+            mod._mutating_tab_call(session, "/navigate", {"userId": "u", "url": "https://b.example/"})
+        assert mock_post.called
+
+
+def test_shutdown_releases_every_tracked_session():
+    """A daemon worker is killed at interpreter exit, so nothing else would."""
+    import tools.browser_camofox as mod
+
+    mod._sessions.clear()
+    mod._pending_lease_releases.clear()
+    for tag in ("a", "b"):
+        mod._sessions[f"o\x00u\x00s\x00{tag}"] = {
+            "user_id": f"user-{tag}", "session_key": "s", "task_id": tag, "tab_id": f"tab-{tag}",
+            "managed": False, "local_server_managed": False,
+            "delete_base": "http://127.0.0.1:9377",
+            "delete_headers": {"Authorization": f"Bearer {tag}"},
+            "release_owner": f"o-{tag}",
+            "in_flight": 0, "last_used_at": time.monotonic(),
+        }
+
+    attempted = []
+    with patch("tools.browser_camofox._attempt_teardown", side_effect=lambda e: attempted.append(e["url"]) or True):
+        mod.shutdown_camofox_sessions()
+
+    assert mod._sessions == {}, "sessions survived shutdown"
+    assert len(attempted) == 2, f"not every session was released: {attempted}"
+    assert mod._pending_lease_releases == []
+
+
+def test_capacity_pressure_never_unblocks_a_tab():
+    """Dropping a blocked record turns every read on that tab back on.
+
+    Document records outlive individual calls, so ordinary churn is enough to
+    reach the ceiling; the blocked ones have to survive it.
+    """
+    import tools.browser_camofox as mod
+
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-blocked", "task_id": "t"}
+    mod._mark_document_blocked(session, "http://169.254.169.254/")
+    assert mod._document_is_blocked(session)
+
+    # Churn well past the ceiling with unrelated tabs.
+    for i in range(mod._MAX_TRACKED_DOCUMENTS * 2):
+        mod._bump_document_generation(
+            {"user_id": "u", "session_key": "s", "tab_id": f"churn-{i}"}
+        )
+
+    assert mod._document_is_blocked(session), "capacity pressure unblocked a refused page"
+    assert len(mod._document_generations) <= mod._MAX_TRACKED_DOCUMENTS + 1

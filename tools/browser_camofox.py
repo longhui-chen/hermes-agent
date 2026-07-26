@@ -14,6 +14,7 @@ the managed proxy endpoint; Hermes does not start or install Camofox itself.
 
 from __future__ import annotations
 
+import atexit
 import base64
 import json
 import logging
@@ -928,7 +929,11 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
             overflowing = True
     for expired in idle:
         _teardown_session(expired)
-    _run_pending_teardowns()
+    # Deliberately at most one, and only what is already due. A local-server
+    # that stopped answering leaves entries whose attempt can take seconds
+    # each, and draining the whole ready list here would put that wait in front
+    # of an ordinary browser call. Retrying is the maintenance worker's job.
+    _run_pending_teardowns(max_items=1)
     # A tracked session must be reclaimable even if this process never calls
     # into the browser again.
     _ensure_maintenance_worker()
@@ -1072,6 +1077,14 @@ def _capture_guard(session: Optional[Dict[str, Any]]):
         yield
         return
     with _held_owner_lock(_browser_identity_key(session)):
+        # Re-checked here, inside the critical section. The caller's check ran
+        # before this lock, and another turn holding it can navigate the shared
+        # tab onto a refused page in between — an ordinary redirect turns no
+        # filter on, so nothing downstream would notice.
+        if _document_is_blocked(session):
+            raise CamofoxDocumentBlocked(
+                "the browser is on a page this Agent is not allowed to read"
+            )
         yield
 
 
@@ -1270,7 +1283,13 @@ _MAX_PENDING_RELEASE_ATTEMPTS = 8
 _maintenance_worker: Optional[threading.Thread] = None
 
 
-def _run_pending_teardowns(force: bool = False, only_url: str = "", only_owner: str = "") -> None:
+def _run_pending_teardowns(
+    force: bool = False,
+    only_url: str = "",
+    only_owner: str = "",
+    max_items: int = 0,
+    deadline: float = 0.0,
+) -> None:
     """Drain scheduled teardowns.
 
     Releases are deliberately deferred: a profile's runtime is shared, and the
@@ -1289,9 +1308,15 @@ def _run_pending_teardowns(force: bool = False, only_url: str = "", only_owner: 
                 else (force or e["ready_at"] <= now)
             )
         ]
+        if max_items > 0:
+            ready = ready[:max_items]
         for entry in ready:
             _pending_lease_releases.remove(entry)
     for entry in ready:
+        if deadline and time.monotonic() >= deadline:
+            with _sessions_lock:
+                _pending_lease_releases.append(entry)
+            continue
         owner = entry.get("owner") or ""
         with _held_owner_lock(owner):
             if entry["kind"] == "release" and owner and _profile_still_in_use(owner):
@@ -1398,7 +1423,53 @@ def _ensure_maintenance_worker() -> None:
             daemon=True,
         )
         _maintenance_worker = worker
+    _ensure_shutdown_hook()
     worker.start()
+
+
+_shutdown_hook_registered = False
+
+# What a normal exit may spend releasing browser state. A daemon worker is
+# killed outright at interpreter exit, so without this every restart leaves the
+# profile's browser child or the direct Camofox session running until the
+# server side times out — on a 2 GB device that is a resident process nobody
+# asked for.
+_SHUTDOWN_DRAIN_BUDGET_SECONDS = 10.0
+
+
+def _ensure_shutdown_hook() -> None:
+    global _shutdown_hook_registered
+    with _sessions_lock:
+        if _shutdown_hook_registered:
+            return
+        _shutdown_hook_registered = True
+    atexit.register(shutdown_camofox_sessions)
+
+
+def shutdown_camofox_sessions() -> None:
+    """Release every tracked Camofox session, within a bounded budget.
+
+    Called from atexit, and safe to call directly from a gateway's own
+    shutdown. Sessions are taken atomically so a concurrent caller cannot
+    resurrect one halfway through, and the drain is forced rather than waiting
+    out the quiet window nobody will be here for.
+    """
+    deadline = time.monotonic() + _SHUTDOWN_DRAIN_BUDGET_SECONDS
+    with _sessions_lock:
+        taken = list(_sessions.values())
+        _sessions.clear()
+    for session in taken:
+        if time.monotonic() >= deadline:
+            logger.warning("Camofox shutdown budget spent; %d session(s) left to the server side", len(taken))
+            break
+        try:
+            _teardown_session(session)
+        except Exception as exc:
+            logger.debug("Camofox shutdown teardown failed: %s", exc)
+    try:
+        _run_pending_teardowns(force=True, deadline=deadline)
+    except Exception as exc:
+        logger.debug("Camofox shutdown drain failed: %s", exc)
 
 
 def _run_maintenance() -> None:
@@ -1520,6 +1591,15 @@ def _teardown_session(session: Optional[Dict[str, Any]]) -> None:
     """
     if not isinstance(session, dict):
         return
+    # The per-tab record dies with the session that named the tab: leaving it
+    # behind would accumulate blocked records that eviction may not touch.
+    with _sessions_lock:
+        key = _document_key(session)
+        if not any(
+            other is not session and _document_key(other) == key
+            for other in _sessions.values()
+        ):
+            _document_generations.pop(key, None)
     if session.get("local_server_managed"):
         owner = str(session.get("release_owner") or "")
         # The check and the release are one critical section: otherwise another
@@ -2212,6 +2292,8 @@ def _tool_error_from_exception(
         if extra:
             payload.update(extra)
         return json.dumps(payload, ensure_ascii=False)
+    if isinstance(exc, CamofoxDocumentBlocked):
+        return _blocked_document_error()
     if isinstance(exc, CamofoxEvaluateBlocked):
         payload = {
             "success": False,
@@ -2285,6 +2367,10 @@ class CamofoxEpochUnavailable(Exception):
 
 class CamofoxEvaluateBlocked(Exception):
     """Raised when arbitrary JavaScript is refused because a human held the tab."""
+
+
+class CamofoxDocumentBlocked(Exception):
+    """Raised when the tab is on a page no read may return."""
 
 
 # Document generation per physical tab. The epoch contract only advances on a
@@ -2411,20 +2497,23 @@ def _forget_surplus_documents_locked(keep: str) -> None:
         stamped = {s.get("ref_document") for s in _sessions.values()}
         victim = ""
         for key, entry in _document_generations.items():
-            if key == keep:
-                continue
-            # A record marking a tab unreadable goes last of all: dropping it
-            # would let every read on that tab through again.
-            if entry.get("blocked"):
-                if not victim:
-                    victim = key
+            if key == keep or entry.get("blocked"):
+                # A record marking a tab unreadable is never dropped: losing it
+                # turns _document_is_blocked false and every read on that tab
+                # goes through again. They are bounded by live tabs — teardown
+                # removes the record — so they cannot fill this on their own.
                 continue
             if key not in stamped:
                 victim = key
                 break
-            if not victim or _document_generations[victim].get("blocked"):
+            if not victim:
                 victim = key
         if not victim:
+            logger.warning(
+                "Camofox document registry is at %d entries and every candidate is "
+                "protecting a blocked tab; not evicting",
+                len(_document_generations),
+            )
             return
         _document_generations.pop(victim, None)
 
@@ -2463,10 +2552,22 @@ def _mutating_tab_call(session: Dict[str, Any], path_suffix: str, body: Dict[str
             "this browser session has no page-state baseline yet; take a snapshot first"
         )
     observed_epoch = session.get("epoch")
+    # The epoch only moves on a human handback, so it cannot see another turn's
+    # ordinary navigate — and a ref-less operation (evaluate, press, back,
+    # scroll) has no stamp to fall back on. Sample the document too, so a
+    # navigation that landed while this waited is not something it runs on top
+    # of. A navigate/back/forward/reload is itself the thing that changes the
+    # document, so it is judged on the epoch alone.
+    observed_document = _observed_document_generation(session)
     with _held_owner_lock(_browser_identity_key(session)):
         if session.get("epoch") != observed_epoch:
             raise CamofoxEpochMoved(
                 "the page changed while this operation waited for the browser tab"
+            )
+        if path_suffix not in _DOCUMENT_CHANGING_SUFFIXES and _observed_document_generation(session) != observed_document:
+            raise CamofoxRefsStale(
+                "this page changed while the operation waited for the browser "
+                "tab; take a new snapshot before continuing"
             )
         # Re-checked here, not only by the caller: evaluate runs arbitrary
         # JavaScript, so between a caller's check and this lock another turn's
@@ -3126,20 +3227,24 @@ def camofox_vision(question: str, annotate: bool = False,
 
         # Get screenshot as binary PNG
         screenshot_filtered_at_request = _handback_privacy_filter_enabled(session)
-        resp = _get_raw(
-            _tab_path(session, "/screenshot"),
-            params={"userId": session["user_id"]},
-            session=session,
-        )
-        # Judged on the state when the capture was issued as well as now: the
-        # epoch that turns the filter on arrives with this very response, and a
-        # concurrent navigate could clear the shared flag before this check —
-        # either way the image is of the human's screen.
-        if screenshot_filtered_at_request or _last_response_started_handback() or _handback_privacy_filter_enabled(session):
-            return tool_error(
-                "Browser vision is blocked after human control until the Agent navigates to a new page or closes the session.",
-                success=False,
+        # A screenshot is a capture like any other — it just returns pixels
+        # instead of a tree — so it takes the same critical section, which also
+        # re-checks the blocked-landing state under the lock.
+        with _capture_guard(session):
+            resp = _get_raw(
+                _tab_path(session, "/screenshot"),
+                params={"userId": session["user_id"]},
+                session=session,
             )
+            # Judged on the state when the capture was issued as well as now:
+            # the epoch that turns the filter on arrives with this very
+            # response, and a concurrent navigate could clear the shared flag
+            # before this check — either way the image is of the human's screen.
+            if screenshot_filtered_at_request or _last_response_started_handback() or _handback_privacy_filter_enabled(session):
+                return tool_error(
+                    "Browser vision is blocked after human control until the Agent navigates to a new page or closes the session.",
+                    success=False,
+                )
 
         # Save screenshot to cache
         from hermes_constants import get_hermes_home
