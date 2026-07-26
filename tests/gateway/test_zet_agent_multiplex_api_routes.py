@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import queue
+import threading
 from pathlib import Path
 
 import pytest
@@ -71,6 +73,191 @@ def _add_prefixed_zet_agent_routes(app: web.Application, adapter: ZetAgentAdapte
         "/p/{profile}/v1/sessions/{session_id}/interrupt",
         adapter._profile_handler(adapter._handle_session_interrupt),
     )
+
+
+@pytest.mark.asyncio
+async def test_clarify_id_is_stable_across_stream_pending_and_exact_response():
+    """The same Hermes-generated id must drive live, reconnect and response.
+
+    This exercises the real callback -> HTTP route path. A wrong id must not
+    consume the pending callback; the right id unblocks exactly that callback.
+    """
+    adapter = _make_adapter()
+    app = web.Application()
+    app.router.add_get(
+        "/v1/sessions/{session_id}/pending", adapter._handle_pending,
+    )
+    app.router.add_post(
+        "/v1/sessions/{session_id}/clarify/respond", adapter._handle_clarify_respond,
+    )
+    stream_q: queue.Queue = queue.Queue()
+    answered = []
+    ask = adapter._make_clarify_cb(stream_q, "sid-clarify-id")
+    thread = threading.Thread(
+        target=lambda: answered.append(ask("Choose a runtime", ["A", "B"])),
+        daemon=True,
+    )
+    thread.start()
+    event_name, streamed = stream_q.get(timeout=1)
+    assert event_name == "__tool_progress__"
+    clarify_id = streamed.get("clarify_id")
+    assert isinstance(clarify_id, str) and len(clarify_id) == 32
+
+    async with TestClient(TestServer(app)) as cli:
+        pending = await cli.get(
+            "/v1/sessions/sid-clarify-id/pending",
+            headers={"Authorization": "Bearer test-key"},
+        )
+        pending_data = await pending.json()
+        assert pending.status == 200
+        assert pending_data["clarify"]["clarify_id"] == clarify_id
+
+        wrong = await cli.post(
+            "/v1/sessions/sid-clarify-id/clarify/respond",
+            json={"clarify_id": "not-the-live-card", "response": "wrong"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+        assert wrong.status == 404
+        assert thread.is_alive(), "a mismatched id must not consume FIFO state"
+
+        resolved = await cli.post(
+            "/v1/sessions/sid-clarify-id/clarify/respond",
+            json={"clarify_id": clarify_id, "response": "B"},
+            headers={"Authorization": "Bearer test-key"},
+        )
+        assert resolved.status == 200
+        assert await resolved.json() == {"resolved": 1}
+
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert answered == ["B"]
+
+
+@pytest.mark.asyncio
+async def test_exact_clarify_response_keeps_pending_projection_on_fifo_head():
+    """Resolving a later exact id cannot replace /pending's oldest card."""
+    adapter = _make_adapter()
+    app = web.Application()
+    app.router.add_get(
+        "/v1/sessions/{session_id}/pending", adapter._handle_pending,
+    )
+    app.router.add_post(
+        "/v1/sessions/{session_id}/clarify/respond", adapter._handle_clarify_respond,
+    )
+    stream_q: queue.Queue = queue.Queue()
+    ask = adapter._make_clarify_cb(stream_q, "sid-two-clarifies")
+    answers = []
+    def ask_and_record(question):
+        answers.append((question, ask(question, None)))
+
+    first = threading.Thread(target=lambda: ask_and_record("first"), daemon=True)
+    second = threading.Thread(target=lambda: ask_and_record("second"), daemon=True)
+    first.start()
+    second.start()
+    _, first_payload = stream_q.get(timeout=1)
+    _, second_payload = stream_q.get(timeout=1)
+
+    headers = {"Authorization": "Bearer test-key"}
+    async with TestClient(TestServer(app)) as cli:
+        pending = await cli.get("/v1/sessions/sid-two-clarifies/pending", headers=headers)
+        assert (await pending.json())["clarify"]["clarify_id"] == first_payload["clarify_id"]
+
+        later = await cli.post(
+            "/v1/sessions/sid-two-clarifies/clarify/respond",
+            json={"clarify_id": second_payload["clarify_id"], "response": "later answer"},
+            headers=headers,
+        )
+        assert later.status == 200
+        pending_after_later = await cli.get("/v1/sessions/sid-two-clarifies/pending", headers=headers)
+        assert (await pending_after_later.json())["clarify"]["clarify_id"] == first_payload["clarify_id"]
+
+        first_reply = await cli.post(
+            "/v1/sessions/sid-two-clarifies/clarify/respond",
+            json={"clarify_id": first_payload["clarify_id"], "response": "first answer"},
+            headers=headers,
+        )
+        assert first_reply.status == 200
+
+    first.join(timeout=1)
+    second.join(timeout=1)
+    assert not first.is_alive() and not second.is_alive()
+    assert dict(answers) == {
+        first_payload["question"]: "first answer",
+        second_payload["question"]: "later answer",
+    }
+
+
+@pytest.mark.asyncio
+async def test_prefixed_profiles_isolate_same_named_clarify_session(profile_homes):
+    """A profile-local card cannot be read, answered, or interrupted by another profile."""
+    adapter = _make_adapter()
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+    same_session = "same-session-id"
+    main_stream: queue.Queue = queue.Queue()
+    coder_stream: queue.Queue = queue.Queue()
+    main_answers = []
+    coder_answers = []
+
+    # This is the same attachment-time scope used by the real chat-completion
+    # path. The callback later runs on a worker thread, so it proves we
+    # captured profile identity instead of consulting a thread-local value.
+    with adapter._profile_api_scope("main"):
+        ask_main = adapter._make_clarify_cb(main_stream, same_session)
+    with adapter._profile_api_scope("coder"):
+        ask_coder = adapter._make_clarify_cb(coder_stream, same_session)
+
+    main_thread = threading.Thread(target=lambda: main_answers.append(ask_main("main card", None)), daemon=True)
+    coder_thread = threading.Thread(target=lambda: coder_answers.append(ask_coder("coder card", None)), daemon=True)
+    main_thread.start()
+    coder_thread.start()
+    _, main_payload = main_stream.get(timeout=1)
+    _, coder_payload = coder_stream.get(timeout=1)
+    assert main_payload["clarify_id"] != coder_payload["clarify_id"]
+
+    headers = {"Authorization": "Bearer test-key"}
+    async with TestClient(TestServer(app)) as cli:
+        main_pending = await cli.get(f"/p/main/v1/sessions/{same_session}/pending", headers=headers)
+        coder_pending = await cli.get(f"/p/coder/v1/sessions/{same_session}/pending", headers=headers)
+        assert (await main_pending.json())["clarify"]["question"] == "main card"
+        assert (await coder_pending.json())["clarify"]["question"] == "coder card"
+
+        # A coder response carrying main's id must not cross the profile
+        # boundary or wake either callback.
+        crossed = await cli.post(
+            f"/p/coder/v1/sessions/{same_session}/clarify/respond",
+            json={"clarify_id": main_payload["clarify_id"], "response": "wrong profile"},
+            headers=headers,
+        )
+        assert crossed.status == 404
+        assert main_thread.is_alive() and coder_thread.is_alive()
+
+        # Interrupt uses the same scoped key as pending/respond. It may
+        # unblock coder's clarify but must leave main's same-named session
+        # untouched; timeout/push-failure cleanup reuses this exact discard
+        # helper and key shape.
+        coder_interrupt = await cli.post(
+            f"/p/coder/v1/sessions/{same_session}/interrupt",
+            headers=headers,
+        )
+        assert coder_interrupt.status == 200
+        coder_thread.join(timeout=1)
+        assert not coder_thread.is_alive()
+        assert coder_answers == [""]
+        main_still_pending = await cli.get(f"/p/main/v1/sessions/{same_session}/pending", headers=headers)
+        assert (await main_still_pending.json())["clarify"]["clarify_id"] == main_payload["clarify_id"]
+
+        main_reply = await cli.post(
+            f"/p/main/v1/sessions/{same_session}/clarify/respond",
+            json={"clarify_id": main_payload["clarify_id"], "response": "main answer"},
+            headers=headers,
+        )
+        assert main_reply.status == 200
+
+    main_thread.join(timeout=1)
+    assert not main_thread.is_alive() and not coder_thread.is_alive()
+    assert main_answers == ["main answer"]
+    assert coder_answers == [""]
 
 
 @pytest.fixture
@@ -267,7 +454,7 @@ async def test_prefixed_cron_fire_uses_scoped_profile_home(profile_homes, monkey
     seen = []
 
     class SpyProvider:
-        def fire_due(self, job_id, *, adapters=None, loop=None):
+        def fire_due(self, job_id, *, adapters=None, loop=None, fire_at=None):
             from hermes_constants import get_hermes_home
             seen.append((get_hermes_home(), job_id))
             return True
@@ -275,7 +462,7 @@ async def test_prefixed_cron_fire_uses_scoped_profile_home(profile_homes, monkey
     monkeypatch.setattr(api_server, "_CRON_AVAILABLE", True)
     monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: SpyProvider())
     monkeypatch.setattr(
-        "plugins.cron.chronos.verify.get_fire_verifier",
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
         lambda: (lambda **_kwargs: {"purpose": "cron_fire"}),
     )
 
@@ -286,7 +473,7 @@ async def test_prefixed_cron_fire_uses_scoped_profile_home(profile_homes, monkey
     async with TestClient(TestServer(app)) as cli:
         resp = await cli.post(
             "/p/coder/api/cron/fire",
-            json={"job_id": "nightly"},
+            json={"job_id": "nightly", "fire_at": "2026-07-21T09:00:00Z"},
             headers={"Authorization": "Bearer fire-token"},
         )
 

@@ -9,11 +9,13 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from tools.browser_camofox import (
     _drop_session,
     _get_session,
     _managed_persistence_enabled,
+    camofox_click,
     camofox_close,
     camofox_navigate,
     camofox_soft_cleanup,
@@ -99,6 +101,38 @@ class TestEphemeralMode:
 class TestManagedPersistenceMode:
     """With managed_persistence: stable userId derived from Hermes profile."""
 
+    def test_same_task_id_is_isolated_between_profile_identities(self):
+        config = {"browser": {"camofox": {"managed_persistence": True}}}
+        with (
+            patch("tools.browser_camofox.load_config", return_value=config),
+            patch("tools.browser_camofox.get_camofox_identity", side_effect=[
+                {"user_id": "profile-a", "session_key": "session-a"},
+                {"user_id": "profile-b", "session_key": "session-b"},
+            ]),
+        ):
+            first = _get_session("shared-task")
+            second = _get_session("shared-task")
+
+        assert first["user_id"] == "profile-a"
+        assert second["user_id"] == "profile-b"
+        assert first is not second
+
+    def test_same_profile_and_task_isolated_by_exact_session_key(self):
+        config = {"browser": {"camofox": {"managed_persistence": True}}}
+        with (
+            patch("tools.browser_camofox.load_config", return_value=config),
+            patch("tools.browser_camofox.get_camofox_identity", side_effect=[
+                {"user_id": "profile-a", "session_key": "session-a"},
+                {"user_id": "profile-a", "session_key": "session-b"},
+            ]),
+        ):
+            first = _get_session("same-task")
+            second = _get_session("same-task")
+
+        assert first["session_key"] == "session-a"
+        assert second["session_key"] == "session-b"
+        assert first is not second
+
     def test_session_gets_stable_user_id(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
@@ -151,7 +185,7 @@ class TestManagedPersistenceMode:
 
         requests_seen = []
 
-        def _capture_post(url, json=None, timeout=None, headers=None):
+        def _capture_post(url, json=None, timeout=None, headers=None, allow_redirects=None, proxies=None):
             requests_seen.append(json)
             return _mock_response(
                 json_data={"tabId": "tab-1", "url": "https://example.com"}
@@ -171,7 +205,7 @@ class TestManagedPersistenceMode:
 
         requests_seen = []
 
-        def _capture_post(url, json=None, timeout=None, headers=None):
+        def _capture_post(url, json=None, timeout=None, headers=None, allow_redirects=None, proxies=None):
             requests_seen.append(json)
             return _mock_response(
                 json_data={"tabId": f"tab-{len(requests_seen)}", "url": "https://example.com"}
@@ -188,9 +222,132 @@ class TestManagedPersistenceMode:
 
         assert first["success"] is True
         assert second["success"] is True
-        tab_requests = [req for req in requests_seen if "userId" in req]
+        tab_requests = [req for req in requests_seen if "listItemId" in req]
         assert len(tab_requests) == 2
         assert tab_requests[0]["userId"] == tab_requests[1]["userId"]
+
+
+class TestCamofoxHTTPFailures:
+    def test_runtime_error_keeps_blank_tab_for_takeover(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        monkeypatch.setenv("CAMOFOX_MANAGED_BY_LOCAL_SERVER", "true")
+        monkeypatch.setenv("ZET_AGENT_ID", "agent-42")
+        create = _mock_response(json_data={"tabId": "tab-blank"})
+        failed_navigation = _mock_response(
+            status=503,
+            json_data={
+                "error": "browser_runtime_start_timeout",
+                "message": "Local browser did not become ready in time",
+                "phase": "health_check",
+                "retryable": True,
+                "internal_path": "/private/runtime/path",
+            },
+        )
+
+        with patch(
+            "tools.browser_camofox.requests.post",
+            side_effect=[create, failed_navigation],
+        ) as mock_post:
+            result = json.loads(
+                camofox_navigate("https://example.com", task_id="task-1")
+            )
+
+        assert result == {
+            "success": False,
+            "error": "browser_runtime_start_timeout",
+            "message": "Local browser did not become ready in time",
+            "phase": "health_check",
+            "retryable": True,
+            "tabId": "tab-blank",
+            "ui_hint": {
+                "type": "takeover_browser",
+                "agent_id": "agent-42",
+                "browser_session_id": get_camofox_identity("task-1")["session_key"],
+                "tab_id": "tab-blank",
+            },
+        }
+        assert "url" not in mock_post.call_args_list[0].kwargs["json"]
+        assert mock_post.call_args_list[1].kwargs["json"]["url"] == "https://example.com"
+
+    def test_navigation_timeout_keeps_blank_tab_for_takeover(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        monkeypatch.setenv("CAMOFOX_MANAGED_BY_LOCAL_SERVER", "true")
+        monkeypatch.setenv("ZET_AGENT_ID", "agent-42")
+        create = _mock_response(json_data={"tabId": "tab-blank"})
+
+        with patch(
+            "tools.browser_camofox.requests.post",
+            side_effect=[create, requests.Timeout("navigation timed out")],
+        ):
+            result = json.loads(
+                camofox_navigate("https://example.com", task_id="task-1")
+            )
+
+        assert result["success"] is False
+        assert result["tabId"] == "tab-blank"
+        assert result["ui_hint"] == {
+            "type": "takeover_browser",
+            "agent_id": "agent-42",
+            "browser_session_id": get_camofox_identity("task-1")["session_key"],
+            "tab_id": "tab-blank",
+        }
+
+    def test_human_control_error_keeps_takeover_identifiers(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        create = _mock_response(json_data={"tabId": "tab-blank"})
+        controlled = _mock_response(
+            status=423,
+            json_data={
+                "error": "browser_human_controlled",
+                "message": "browser tab is controlled by the user",
+                "takeover_session_id": "takeover-1",
+            },
+        )
+
+        with patch(
+            "tools.browser_camofox.requests.post", side_effect=[create, controlled]
+        ):
+            result = json.loads(
+                camofox_navigate("https://example.com", task_id="task-1")
+            )
+
+        assert result["success"] is False
+        assert result["error"] == "browser_human_controlled"
+        assert result["takeover_session_id"] == "takeover-1"
+        assert result["tabId"] == "tab-blank"
+
+    def test_stale_tab_recovery_recreates_blank_then_navigates(self, monkeypatch):
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        session = {
+            "user_id": "profile-1",
+            "tab_id": "tab-stale",
+            "session_key": "task-1",
+        }
+        stale = _mock_response(status=404, json_data={"error": "tab_not_found"})
+        create = _mock_response(json_data={"tabId": "tab-new"})
+        navigated = _mock_response(
+            json_data={"url": "https://example.com", "title": "Example"}
+        )
+
+        with (
+            patch("tools.browser_camofox._get_session", return_value=session),
+            patch(
+                "tools.browser_camofox.requests.post",
+                side_effect=[stale, create, navigated],
+            ) as mock_post,
+            patch(
+                "tools.browser_camofox._get",
+                return_value={"snapshot": "", "refsCount": 0},
+            ),
+        ):
+            result = json.loads(
+                camofox_navigate("https://example.com", task_id="task-1")
+            )
+
+        assert result["success"] is True
+        assert result["tabId"] == "tab-new"
+        assert "url" not in mock_post.call_args_list[1].kwargs["json"]
+        assert mock_post.call_args_list[2].kwargs["json"]["url"] == "https://example.com"
 
 
 class TestConfiguredCamofoxIdentity:
@@ -215,6 +372,19 @@ class TestConfiguredCamofoxIdentity:
             params={"userId": "shared-camofox"},
             timeout=5,
         )
+
+    def test_missing_session_key_uses_hashed_session_context(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        monkeypatch.setenv("CAMOFOX_USER_ID", "shared-camofox")
+        monkeypatch.setenv("HERMES_SESSION_ID", "telegram:dm:private-user-42")
+
+        first = _get_session("tool-call-a")
+        _drop_session("tool-call-a")
+        second = _get_session("tool-call-b")
+
+        assert first["session_key"] == second["session_key"]
+        assert "private-user-42" not in first["session_key"]
 
     def test_config_identity_is_used_when_env_is_absent(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -277,6 +447,21 @@ class TestConfiguredCamofoxIdentity:
 
         assert session["tab_id"] == "tab-visible"
 
+    def test_does_not_adopt_nonmatching_existing_tab(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        monkeypatch.setenv("CAMOFOX_USER_ID", "shared-camofox")
+        monkeypatch.setenv("CAMOFOX_SESSION_KEY", "visible-tab")
+        monkeypatch.setenv("CAMOFOX_ADOPT_EXISTING_TAB", "true")
+
+        with patch(
+            "tools.browser_camofox._get",
+            return_value={"tabs": [{"tabId": "someone-elses-tab", "listItemId": "other"}]},
+        ):
+            session = _get_session("task-1")
+
+        assert session["tab_id"] is None
+
     def test_managed_persistence_can_opt_into_tab_adoption(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
@@ -284,11 +469,85 @@ class TestConfiguredCamofoxIdentity:
 
         with (
             patch("tools.browser_camofox.load_config", return_value=config),
-            patch("tools.browser_camofox._get", return_value={"tabs": [{"tabId": "tab-1"}]}),
+            patch(
+                "tools.browser_camofox._get",
+                return_value={
+                    "tabs": [
+                        {
+                            "tabId": "tab-1",
+                            "listItemId": get_camofox_identity("task-1")["session_key"],
+                        }
+                    ]
+                },
+            ),
         ):
             session = _get_session("task-1")
 
         assert session["tab_id"] == "tab-1"
+
+    def test_local_server_managed_close_only_releases_local_state(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        monkeypatch.setenv("CAMOFOX_MANAGED_BY_LOCAL_SERVER", "true")
+
+        _get_session("task-1")
+        with patch("tools.browser_camofox.requests.delete") as mock_delete:
+            result = json.loads(camofox_close("task-1"))
+
+        assert result == {
+            "success": True,
+            "closed": False,
+            "released": True,
+        }
+        mock_delete.assert_not_called()
+
+    def test_local_server_managed_mode_forces_stable_exact_tab_adoption(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SESSION_ID", "agent-conversation")
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        monkeypatch.setenv("CAMOFOX_MANAGED_BY_LOCAL_SERVER", "true")
+        monkeypatch.setenv("CAMOFOX_ADOPT_EXISTING_TAB", "false")
+        expected = get_camofox_identity("tool-task")
+
+        with patch(
+            "tools.browser_camofox._get",
+            return_value={
+                "tabs": [
+                    {"tabId": "wrong", "listItemId": "other"},
+                    {"tabId": "right", "listItemId": expected["session_key"]},
+                ]
+            },
+        ):
+            session = _get_session("tool-task")
+
+        assert session["managed"] is True
+        assert session["user_id"] == expected["user_id"]
+        assert session["tab_id"] == "right"
+        assert session["adopt_existing_tab"] is True
+
+    def test_local_server_managed_soft_cleanup_is_non_destructive(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        monkeypatch.setenv("CAMOFOX_MANAGED_BY_LOCAL_SERVER", "true")
+
+        _get_session("task-1")
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.headers = {}
+        from tools.browser_camofox import _run_pending_teardowns
+
+        with (
+            patch("tools.browser_camofox.requests.delete") as mock_delete,
+            patch("tools.browser_camofox.requests.post", return_value=ok) as mock_post,
+        ):
+            assert camofox_soft_cleanup("task-1") is True
+            # The release waits out a quiet window before it is sent, so that a
+            # concurrent turn on the same profile keeps its runtime.
+            mock_post.assert_not_called()
+            _run_pending_teardowns(force=True)
+
+        mock_delete.assert_not_called()
+        assert mock_post.call_args.args[0].endswith("/_zettlab/release")
 
     def test_soft_cleanup_preserves_externally_managed_session(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -302,7 +561,7 @@ class TestConfiguredCamofoxIdentity:
         assert result is True
         import tools.browser_camofox as mod
         with mod._sessions_lock:
-            assert "task-1" not in mod._sessions
+            assert not mod._sessions
 
 
 class TestVncUrlDiscovery:
@@ -369,7 +628,7 @@ class TestCamofoxSoftCleanup:
         # Session should have been dropped from in-memory store
         import tools.browser_camofox as mod
         with mod._sessions_lock:
-            assert "task-1" not in mod._sessions
+            assert not mod._sessions
 
     def test_returns_false_when_disabled(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -384,7 +643,7 @@ class TestCamofoxSoftCleanup:
         # Session should still be present — not dropped
         import tools.browser_camofox as mod
         with mod._sessions_lock:
-            assert "task-1" in mod._sessions
+            assert len(mod._sessions) == 1
 
     def test_does_not_call_server_delete(self, tmp_path, monkeypatch):
         """Soft cleanup must never hit the Camofox /sessions DELETE endpoint."""

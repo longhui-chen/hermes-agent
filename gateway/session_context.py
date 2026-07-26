@@ -108,6 +108,18 @@ _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNS
 # propagates that into this contextvar at session-bind time.
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
 
+# Zettlab local-server sends metadata.turn_id with each API request. This token
+# stays task-local so concurrent requests cannot overwrite one another.
+_ZETTLAB_TURN_ID: ContextVar = ContextVar("zettlab_turn_id", default="")
+
+
+def set_zettlab_turn_id(turn_id: str) -> None:
+    _ZETTLAB_TURN_ID.set(turn_id or "")
+
+
+def zettlab_turn_id() -> str:
+    return _ZETTLAB_TURN_ID.get().strip()
+
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
 _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
@@ -295,6 +307,25 @@ def reset_session_vars() -> None:
         clear_session_cwd()
     except Exception:
         pass
+
+
+def push_session_platform(platform: str):
+    """Bind ONLY the platform contextvar; returns a token for :func:`pop_session_platform`.
+
+    Unlike ``set_session_vars``/``clear_session_vars`` (not nestable — clearing
+    stamps every var to ``""``), this pair is token-based and restores the
+    prior value exactly, so it can wrap a narrow pre-session window. Used by
+    zet_agent's inbound skill invocation expansion (metadata.skill_slug),
+    which runs in the HTTP handler BEFORE the session is bound and must still
+    resolve platform-scoped skill config (``skills.platform_disabled``,
+    frontmatter ``platforms:`` filters).
+    """
+    return _SESSION_PLATFORM.set(platform or "")
+
+
+def pop_session_platform(token) -> None:
+    """Restore the platform contextvar bound by :func:`push_session_platform`."""
+    _SESSION_PLATFORM.reset(token)
 
 
 def get_session_env(name: str, default: str = "") -> str:

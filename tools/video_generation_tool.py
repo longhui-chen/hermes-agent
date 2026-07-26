@@ -197,17 +197,22 @@ def _read_configured_video_model() -> Optional[str]:
 
 
 def check_video_generation_requirements() -> bool:
-    """Return True when at least one registered provider reports available.
+    """Return True when the configured provider reports available.
 
     Triggers plugin discovery (idempotent) so user-installed plugins are
-    visible to the toolset gate.
+    visible to the toolset gate. Without an explicit provider, preserve the
+    legacy any-provider fallback.
     """
     try:
-        from agent.video_gen_registry import list_providers
+        from agent.video_gen_registry import get_provider, list_providers
         from hermes_cli.plugins import _ensure_plugins_discovered
 
         _ensure_plugins_discovered()
-        for provider in list_providers():
+        configured = _read_configured_video_provider()
+        providers = [get_provider(configured)] if configured else list_providers()
+        for provider in providers:
+            if provider is None:
+                continue
             try:
                 if provider.is_available():
                     return True
@@ -216,6 +221,9 @@ def check_video_generation_requirements() -> bool:
     except Exception:
         pass
     return False
+
+
+check_video_generation_requirements._profile_scope_sensitive = True  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -351,6 +359,8 @@ def _handle_video_generate(args: Dict[str, Any], **_kw: Any) -> str:
         "audio": audio,
         "seed": seed,
     }
+    if getattr(provider, "name", "") == "zettlab" and _kw.get("task_id"):
+        kwargs["_task_id"] = _kw["task_id"]
     # Drop None entries so providers see clean defaults.
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
 

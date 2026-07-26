@@ -198,7 +198,13 @@ def test_cli_get_tool_definitions_briefly_waits_for_fast_mcp_thread(monkeypatch)
     assert not thread.is_alive()
 
 
-def test_init_agent_waits_for_mcp_discovery_before_agent_build(monkeypatch):
+@pytest.mark.parametrize(
+    ("single_query_mode", "supports_followup_turns"),
+    [(False, True), (True, False)],
+)
+def test_init_agent_waits_for_mcp_discovery_before_agent_build(
+    monkeypatch, single_query_mode, supports_followup_turns
+):
     waited = {"done": False}
 
     cli = cli_mod.HermesCLI(compact=True)
@@ -208,6 +214,7 @@ def test_init_agent_waits_for_mcp_discovery_before_agent_build(monkeypatch):
     cli._install_tool_callbacks = lambda: None
     cli._ensure_tirith_security = lambda: None
     cli._ensure_runtime_credentials = lambda: True
+    cli._single_query_mode = single_query_mode
 
     monkeypatch.setattr(
         mcp_startup,
@@ -222,3 +229,4 @@ def test_init_agent_waits_for_mcp_discovery_before_agent_build(monkeypatch):
     monkeypatch.setattr(cli_mod, "AIAgent", _fake_agent)
 
     assert cli._init_agent() is True
+    assert cli.agent._supports_followup_turns is supports_followup_turns

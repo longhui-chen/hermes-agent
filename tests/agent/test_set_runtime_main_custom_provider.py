@@ -7,22 +7,22 @@ import pytest
 from unittest.mock import patch, MagicMock
 
 
-def _get_globals(mod):
-    """Read runtime globals without triggering redaction."""
+def _get_runtime_values(mod):
+    """Read turn-scoped runtime values without triggering redaction."""
     return {
-        "provider": mod._RUNTIME_MAIN_PROVIDER,
-        "model": mod._RUNTIME_MAIN_MODEL,
-        "base_url": mod._RUNTIME_MAIN_BASE_URL,
-        "cred": mod._RUNTIME_MAIN_API_KEY,  # renamed to avoid redaction
-        "api_mode": mod._RUNTIME_MAIN_API_MODE,
+        "provider": mod._RUNTIME_MAIN_PROVIDER.get(),
+        "model": mod._RUNTIME_MAIN_MODEL.get(),
+        "base_url": mod._RUNTIME_MAIN_BASE_URL.get(),
+        "cred": mod._RUNTIME_MAIN_API_KEY.get(),  # renamed to avoid redaction
+        "api_mode": mod._RUNTIME_MAIN_API_MODE.get(),
     }
 
 
 class TestSetRuntimeMainCustomProvider:
     """set_runtime_main must propagate base_url/api_key/api_mode for custom providers."""
 
-    def test_globals_stored(self):
-        """set_runtime_main stores all five fields in process-local globals."""
+    def test_runtime_values_stored(self):
+        """set_runtime_main stores all five fields for the current turn."""
         import agent.auxiliary_client as mod
 
         mod.clear_runtime_main()
@@ -34,7 +34,7 @@ class TestSetRuntimeMainCustomProvider:
                 api_key="sk-test-key",
                 api_mode="chat_completions",
             )
-            g = _get_globals(mod)
+            g = _get_runtime_values(mod)
             assert g["provider"] == "custom:my-router"
             assert g["model"] == "glm-5.1"
             assert g["base_url"] == "https://my-server.example.com/v1"
@@ -43,8 +43,8 @@ class TestSetRuntimeMainCustomProvider:
         finally:
             mod.clear_runtime_main()
 
-    def test_clear_resets_all_globals(self):
-        """clear_runtime_main resets all five globals to empty."""
+    def test_clear_resets_all_runtime_values(self):
+        """clear_runtime_main resets all five runtime values to empty."""
         import agent.auxiliary_client as mod
 
         mod.set_runtime_main(
@@ -54,12 +54,12 @@ class TestSetRuntimeMainCustomProvider:
             api_mode="chat_completions",
         )
         mod.clear_runtime_main()
-        g = _get_globals(mod)
+        g = _get_runtime_values(mod)
         for v in g.values():
             assert v == "", f"Expected empty, got {v!r}"
 
-    def test_resolve_auto_uses_globals_for_custom_provider(self):
-        """_resolve_auto reads base_url/api_key from globals when main_runtime is None."""
+    def test_resolve_auto_uses_runtime_values_for_custom_provider(self):
+        """_resolve_auto reads base_url/api_key when main_runtime is None."""
         import agent.auxiliary_client as mod
 
         mod.clear_runtime_main()
@@ -84,7 +84,7 @@ class TestSetRuntimeMainCustomProvider:
             mod.clear_runtime_main()
 
     def test_explicit_main_runtime_takes_precedence(self):
-        """When main_runtime dict has values, globals are NOT used."""
+        """When main_runtime dict has values, turn-scoped values are not used."""
         import agent.auxiliary_client as mod
 
         mod.clear_runtime_main()
@@ -119,7 +119,7 @@ class TestSetRuntimeMainCustomProvider:
         mod.clear_runtime_main()
         try:
             mod.set_runtime_main("openrouter", "gpt-4o")
-            g = _get_globals(mod)
+            g = _get_runtime_values(mod)
             assert g["provider"] == "openrouter"
             assert g["model"] == "gpt-4o"
             assert g["base_url"] == ""

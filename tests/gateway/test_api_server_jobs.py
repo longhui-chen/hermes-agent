@@ -55,6 +55,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     # Register only job routes (plus health for sanity)
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_get("/api/jobs", adapter._handle_list_jobs)
+    app.router.add_get("/api/jobs/occurrences", adapter._handle_list_job_occurrences)
     app.router.add_post("/api/jobs", adapter._handle_create_job)
     app.router.add_get("/api/jobs/{job_id}", adapter._handle_get_job)
     app.router.add_patch("/api/jobs/{job_id}", adapter._handle_update_job)
@@ -131,6 +132,66 @@ class TestListJobs:
                 mock_list.assert_called_once_with(include_disabled=False)
 
 
+class TestListJobOccurrences:
+    @pytest.mark.asyncio
+    async def test_occurrence_contract_uses_disabled_jobs_and_bounded_query(self, adapter):
+        app = _create_app(adapter)
+        occurrence = {
+            "id": "aabbccddeeff:scheduled:2026-07-21T01:00:00+00:00",
+            "job_id": VALID_JOB_ID,
+            "scheduled_at": "2026-07-21T01:00:00+00:00",
+            "status": "scheduled",
+        }
+        mock_list = MagicMock(return_value=[SAMPLE_JOB])
+        mock_projection = MagicMock(return_value={"occurrences": [occurrence], "history_truncated": False})
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_list", mock_list
+            ), patch(f"{_MOD}._cron_occurrence_projection", mock_projection):
+                resp = await cli.get(
+                    "/api/jobs/occurrences"
+                    "?from=2026-07-01T00:00:00Z&to=2026-08-01T00:00:00Z&limit=25"
+                )
+                assert resp.status == 200
+                assert (await resp.json())["occurrences"] == [occurrence]
+                mock_list.assert_called_once_with(include_disabled=True)
+                assert mock_projection.call_args.kwargs["limit"] == 25
+
+    @pytest.mark.asyncio
+    async def test_occurrence_contract_filters_jobs_before_projection(self, adapter):
+        app = _create_app(adapter)
+        other = {**SAMPLE_JOB, "id": "other-job"}
+        mock_list = MagicMock(return_value=[SAMPLE_JOB, other])
+        mock_projection = MagicMock(return_value={"occurrences": [], "history_truncated": False})
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_list", mock_list
+            ), patch(f"{_MOD}._cron_occurrence_projection", mock_projection):
+                resp = await cli.get(
+                    "/api/jobs/occurrences"
+                    f"?from=2026-07-01T00:00:00Z&to=2026-08-01T00:00:00Z&job_id={VALID_JOB_ID}"
+                )
+                assert resp.status == 200
+                assert mock_projection.call_args.args[0] == [SAMPLE_JOB]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "from=bad&to=2026-08-01T00:00:00Z",
+            "from=2026-08-01T00:00:00Z&to=2026-07-01T00:00:00Z",
+            "from=2026-01-01T00:00:00Z&to=2027-02-01T00:00:00Z",
+            "from=2026-07-01T00:00:00&to=2026-08-01T00:00:00Z",
+        ],
+    )
+    async def test_occurrence_contract_rejects_invalid_or_unbounded_windows(self, adapter, query):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.get(f"/api/jobs/occurrences?{query}")
+                assert resp.status == 400
+
+
 # ---------------------------------------------------------------------------
 # 3-7. test_create_job and validation
 # ---------------------------------------------------------------------------
@@ -167,6 +228,31 @@ class TestCreateJob:
                 assert call_kwargs["origin"]["chat_id"] == "api"
                 assert call_kwargs["origin"]["forwarded_for"] == "203.0.113.11"
                 assert call_kwargs["origin"]["user_agent"] == "cron-client"
+
+    @pytest.mark.asyncio
+    async def test_create_job_output_language_flow(self, adapter):
+        """REST/local-server proxy may pass the optional persisted tag."""
+        app = _create_app(adapter)
+        expected = {**SAMPLE_JOB, "output_language": "zh-CN"}
+        mock_create = MagicMock(return_value=expected)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post(
+                    "/api/jobs",
+                    json={
+                        "name": "localized",
+                        "schedule": "every 1h",
+                        "prompt": "https://example.com/report",
+                        "output_language": "zh-CN",
+                    },
+                )
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data["job"]["output_language"] == "zh-CN"
+        assert mock_create.call_args.kwargs["output_language"] == "zh-CN"
 
     @pytest.mark.asyncio
     async def test_create_job_missing_name(self, adapter):

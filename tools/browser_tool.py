@@ -3145,6 +3145,11 @@ def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
         result = None
         for _ in range(_SCROLL_REPEATS):
             result = camofox_scroll(direction, task_id)
+            try:
+                if json.loads(result).get("success") is not True:
+                    return result
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return result
         return result
 
     effective_task_id = _last_session_key(task_id or "default")
@@ -3690,11 +3695,44 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
 
 def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
     """Evaluate JS via Camofox's /tabs/{tab_id}/eval endpoint (if available)."""
-    from tools.browser_camofox import _ensure_tab, _post
+    from tools.browser_camofox import (
+        _end_session_call,
+        _ensure_tab,
+        _handback_privacy_filter_enabled,
+        _last_response_started_handback,
+        _mutating_tab_call,
+        _tool_error_from_exception,
+    )
+
+    def _blocked_after_handback() -> str:
+        return json.dumps({
+            "success": False,
+            "error": (
+                "Browser evaluation is blocked after human control until the "
+                "Agent navigates to a new page or closes the session."
+            ),
+        }, ensure_ascii=False)
+
     try:
         tab_info = _ensure_tab(task_id or "default")
-        tab_id = tab_info.get("tab_id") or tab_info.get("id")
-        resp = _post(f"/tabs/{tab_id}/evaluate", body={"expression": expression, "userId": tab_info["user_id"]})
+        filtered_at_request = _handback_privacy_filter_enabled(tab_info)
+        if filtered_at_request:
+            return _blocked_after_handback()
+        # Arbitrary JS can change the document as readily as a click, so it
+        # runs in the same per-identity critical section — and it inherits the
+        # stale-epoch check with it.
+        resp = _mutating_tab_call(tab_info, "/evaluate", {"expression": expression, "userId": tab_info["user_id"]})
+        # The epoch that enables the filter rides along with this response, so
+        # a handback landing mid-call must invalidate the result rather than
+        # hand the human's page data to the model. The request-time state is
+        # part of the test because concurrent turns share this session dict: a
+        # navigate finishing in between could clear the flag before this runs.
+        if (
+            filtered_at_request
+            or _last_response_started_handback()
+            or _handback_privacy_filter_enabled(tab_info)
+        ):
+            return _blocked_after_handback()
 
         # Camofox returns the result in a JSON envelope
         raw_result = resp.get("result") if isinstance(resp, dict) else resp
@@ -3719,7 +3757,13 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
                 "error": "JavaScript evaluation is not supported by this Camofox server. "
                          "Use browser_snapshot or browser_vision to inspect page state.",
             })
-        return tool_error(error_msg, success=False)
+        return _tool_error_from_exception(e, session=locals().get("tab_info"))
+    finally:
+        # _ensure_tab hands back a referenced cache entry and ownership with
+        # it. Every path here — success, the two handback refusals, the
+        # unsupported-eval degradation and any error — has to give it back, or
+        # the entry is skipped by the idle sweep and by eviction forever.
+        _end_session_call(locals().get("tab_info"))
 
 
 def _maybe_start_recording(task_id: str):
@@ -4252,13 +4296,20 @@ def _cleanup_single_browser_session(task_id: str) -> None:
     # Skip full close when managed persistence is enabled — the browser
     # profile (and its session cookies) must survive across agent tasks.
     # The inactivity reaper still frees idle resources.
-    if _is_camofox_mode():
-        try:
-            from tools.browser_camofox import camofox_close, camofox_soft_cleanup
+    try:
+        from tools.browser_camofox import (
+            camofox_close,
+            camofox_soft_cleanup,
+            has_camofox_session,
+        )
+        # The idle reaper and shutdown paths run without the request's profile
+        # and secret scope, so _is_camofox_mode() fails closed there. A tracked
+        # session is scope-independent evidence that teardown is still owed.
+        if _is_camofox_mode() or has_camofox_session(task_id):
             if not camofox_soft_cleanup(task_id):
                 camofox_close(task_id)
-        except Exception as e:
-            logger.debug("Camofox cleanup for task %s: %s", task_id, e)
+    except Exception as e:
+        logger.debug("Camofox cleanup for task %s: %s", task_id, e)
 
     logger.debug("cleanup_browser called for task_id: %s", task_id)
     logger.debug("Active sessions: %s", list(_active_sessions.keys()))
@@ -4614,6 +4665,13 @@ def check_browser_vision_requirements() -> bool:
     except ImportError:
         return False
     return check_vision_requirements()
+
+
+# These checks read profile-scoped browser secrets (including CAMOFOX_URL and
+# its action token). Shared multiplex gateways must not reuse another profile's
+# cached availability verdict.
+check_browser_requirements._profile_scope_sensitive = True
+check_browser_vision_requirements._profile_scope_sensitive = True
 
 
 # ============================================================================

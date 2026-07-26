@@ -105,6 +105,20 @@
 
 ---
 
+### 创建时派生字段：执行结果语言（`output_language`）
+
+Agent cron 会在触发时启动全新 session，创建对话不会自动带过去。调用 `cronjob(action=create)` 时必须单独保存本次任务的默认输出语言：
+
+- 使用你在当前创建对话中本应回复用户的语言，而不是 App 系统语言。
+- 用户明确要求任务用另一种语言输出时，以明确要求为准。
+- 只传标准 BCP 47 tag，例如 `zh-CN`、`zh-TW`、`en`、`ja`、`ko`、`de`、`fr`、`es`、`it`、`ar`、`sr-Latn-RS`。
+- URL、代码、引用、专有名词、skill 内容和 tool 返回数据都不是语言依据。
+- 对混合语言任务，保存默认叙述语言；prompt 中继续写清哪些部分需要使用其它语言。
+- 真正无法判断时 clarify，不要传 `und`、`mul`、`zxx` 或私有标签。
+- `no_agent=True` 的脚本任务不需要该字段。
+
+例：中文对话里创建一个 prompt 只有 URL 的摘要任务，也要传 `"output_language": "zh-CN"`。中文对话中用户明确说“结果请用英文”，则传 `"output_language": "en"`。
+
 ## 2. 创建预览卡片（APP 交互式路径优先）
 
 当用户正在 APP / zet_agent 里用自然语言创建任务，且还没有明确确认时，优先把 4 类信息提炼成结构化卡片让用户过目。卡片有**两部分**：
@@ -135,6 +149,7 @@
   "cronExpr": "<可选，cron 表达式形态>",
   "schedule_human": "<人话描述，与卡片"触发"一致>",
   "prompt": "<提炼后的 prompt 全文>",
+  "output_language": "<LLM 从当前创建对话推断的 BCP 47 tag；mode=create 必填>",
   "deliver": {
     "mode": "origin" | "new_session" | "specified",
     "chatName": "<对话名，origin/specified 模式必填>",
@@ -290,6 +305,7 @@
 | `cronExpr` | string | optional | optional | optional | 等价 cron 表达式（便于 APP 调试）|
 | `schedule_human` | string | ✅ | ✅ | ✅ | 人话描述，与 markdown 卡的"触发"行一致 |
 | `prompt` | string | ✅ | ✅ | ✅ | 提炼后的 prompt 全文 |
+| `output_language` | string | ✅ | optional | ❌ | LLM 从当前创建对话推断的 BCP 47 tag；APP 只透传，不得改用 App locale |
 | `deliver.mode` | string | ✅ | ✅ | ✅ | `"origin"` / `"new_session"` / `"specified"` |
 | `deliver.chatName` | string | optional | optional | optional | 对话名（用于 origin/specified 显示）|
 | `deliver.sendTo` | object | optional | optional | ❌ | 仅 specified 模式：`{channel, chatName, chatType}` |

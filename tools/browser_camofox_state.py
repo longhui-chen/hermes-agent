@@ -9,6 +9,7 @@ across restarts.
 
 from __future__ import annotations
 
+import os
 import uuid
 from pathlib import Path
 from typing import Dict, Optional
@@ -32,7 +33,19 @@ def get_camofox_identity(task_id: Optional[str] = None) -> Dict[str, str]:
     tabs within the same profile reuse the same identity contract.
     """
     scope_root = str(get_camofox_state_dir())
-    logical_scope = task_id or "default"
+    try:
+        from gateway.session_context import get_session_env
+
+        session_context = (
+            get_session_env("HERMES_SESSION_KEY", "")
+            or get_session_env("HERMES_SESSION_ID", "")
+        )
+    except Exception:
+        session_context = (
+            os.getenv("HERMES_SESSION_KEY", "")
+            or os.getenv("HERMES_SESSION_ID", "")
+        )
+    logical_scope = session_context or task_id or "default"
     user_digest = uuid.uuid5(
         uuid.NAMESPACE_URL,
         f"camofox-user:{scope_root}",

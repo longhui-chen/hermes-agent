@@ -48,6 +48,10 @@ def _plan_agent(tool_names: tuple[str, ...]) -> AIAgent:
     agent.tool_delay = 0
     agent.compression_enabled = False
     agent.save_trajectories = False
+    # 这些用例覆盖 manual 计划评审流程（present_plan 后停下等确认）；显式关掉
+    # 自动执行，与新默认 auto-execute 区分开，否则 run_conversation 不会在
+    # present_plan 后结束而是继续循环。
+    agent._zet_agent_plan_auto_execute = False
     return agent
 
 
@@ -488,3 +492,46 @@ def test_parallel_present_plan_calls_keep_only_the_first_call():
 
     assert _enforce_single_plan_interaction_tool_call(agent, assistant)
     assert assistant.tool_calls == [first]
+
+
+class _CapturingQ:
+    """Minimal stream_q stand-in that records pushed SSE extension events."""
+
+    def __init__(self):
+        self.puts = []
+
+    def put(self, item):
+        self.puts.append(item)
+
+
+def _last_plan_payload(q: "_CapturingQ") -> dict:
+    kind, payload = q.puts[-1]
+    assert kind == "__tool_progress__"
+    assert payload["type"] == "hermes.plan"
+    return payload
+
+
+def test_plan_emit_sse_payload_carries_auto_execute_true():
+    # SSE 契约：opt-in（auto flag True）→ hermes.plan.auto_execute=True，
+    # App 据此渲染只读自动执行卡、不弹确认。
+    from gateway.platforms.zet_agent import ZetAgentAdapter
+
+    q = _CapturingQ()
+    agent = SimpleNamespace(_zet_agent_plan_auto_execute=True)
+    emit = ZetAgentAdapter._make_plan_emit_cb(q, agent)
+    emit("减脂计划", [{"icon": "🏃", "label": "训练", "items": ["跑步"]}])
+    assert _last_plan_payload(q)["auto_execute"] is True
+
+
+def test_plan_emit_sse_payload_carries_auto_execute_false_and_defaults_manual():
+    # 未 opt-in（flag False 或缺失）→ auto_execute=False，退回 legacy 确认卡语义。
+    from gateway.platforms.zet_agent import ZetAgentAdapter
+
+    for agent in (
+        SimpleNamespace(_zet_agent_plan_auto_execute=False),
+        SimpleNamespace(),  # flag 缺失 → getattr 默认 False
+    ):
+        q = _CapturingQ()
+        emit = ZetAgentAdapter._make_plan_emit_cb(q, agent)
+        emit("减脂计划", [{"icon": "🏃", "label": "训练", "items": ["跑步"]}])
+        assert _last_plan_payload(q)["auto_execute"] is False

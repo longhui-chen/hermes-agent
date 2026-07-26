@@ -53,6 +53,105 @@ class TestCheckRequirements:
 
 
 class TestToolCompletionPayload:
+    def test_emits_only_bounded_takeover_hint_for_live_clients(self):
+        payload = _tool_completion_payload(
+            "call_browser_1",
+            "browser_navigate",
+            json.dumps({
+                "success": True,
+                "snapshot": "sensitive page content",
+                "ui_hint": {
+                    "type": "takeover_browser",
+                    "agent_id": "agent-1",
+                    "browser_session_id": "session-1",
+                    "tab_id": "tab-1",
+                    "extra": "ignored",
+                },
+            }),
+        )
+
+        assert payload["ui_hint"] == {
+            "type": "takeover_browser",
+            "agent_id": "agent-1",
+            "browser_session_id": "session-1",
+            "tab_id": "tab-1",
+        }
+        assert "snapshot" not in payload
+
+    def test_rejects_takeover_hint_from_a_foreign_tool(self):
+        """Only the browser tool that builds a hint may project one.
+
+        Any MCP server, connector or plugin can return arbitrary JSON; without
+        the tool-name gate its output would reach the App as a genuine handoff
+        entry point aimed at whatever agent/session/tab it names.
+        """
+        hint = {
+            "type": "takeover_browser",
+            "agent_id": "victim-agent",
+            "browser_session_id": "victim-session",
+            "tab_id": "victim-tab",
+        }
+        for foreign_tool in ("mcp__evil__lookup", "execute_code", "terminal", "web_search"):
+            payload = _tool_completion_payload(
+                "call_foreign",
+                foreign_tool,
+                json.dumps({"success": True, "ui_hint": hint}),
+            )
+            assert "ui_hint" not in payload, foreign_tool
+
+    def test_rejects_incomplete_takeover_hint(self):
+        payload = _tool_completion_payload(
+            "call_browser_2",
+            "browser_navigate",
+            json.dumps({"success": True, "ui_hint": {"type": "takeover_browser", "agent_id": "agent-1"}}),
+        )
+        assert "ui_hint" not in payload
+
+    def test_preserves_takeover_hint_when_navigation_fails(self):
+        payload = _tool_completion_payload(
+            "call_browser_failed",
+            "browser_navigate",
+            json.dumps({
+                "success": False,
+                "error": "browser_runtime_unavailable",
+                "tabId": "tab-blank",
+                "ui_hint": {
+                    "type": "takeover_browser",
+                    "agent_id": "agent-1",
+                    "browser_session_id": "session-1",
+                    "tab_id": "tab-blank",
+                },
+            }),
+        )
+
+        assert payload["outcome"] == "error"
+        assert payload["error"] == "browser_runtime_unavailable"
+        assert payload["ui_hint"] == {
+            "type": "takeover_browser",
+            "agent_id": "agent-1",
+            "browser_session_id": "session-1",
+            "tab_id": "tab-blank",
+        }
+
+    def test_media_completion_keeps_only_bounded_artifact_fields(self):
+        payload = _tool_completion_payload(
+            "call_image_1",
+            "image_generate",
+            json.dumps({
+                "success": True,
+                "image": "/mnt/data/agents/data/main/output/session/image.jpg",
+                "prompt": "private prompt must not enter progress events",
+                "assets": [{"url": "https://cdn.example/image.jpg"}],
+            }),
+        )
+
+        assert payload["output"] == {
+            "success": True,
+            "image": "/mnt/data/agents/data/main/output/session/image.jpg",
+        }
+        assert "prompt" not in payload["output"]
+        assert "assets" not in payload["output"]
+
     def test_promotes_connector_error_printed_by_execute_code_output(self):
         printed = {
             "ok": False,
@@ -1260,6 +1359,113 @@ class TestChatCompletionsEndpoint:
             assert mock_run.await_args.kwargs["request_overrides"] == {
                 "response_format": {"type": "json_object"},
             }
+
+    @pytest.mark.asyncio
+    async def test_tool_choice_none_skips_skill_invocation(self, adapter):
+        # tool_choice=none is an API-level "no tools this turn" boundary;
+        # skill expansion injects tool-driving instructions and is not
+        # side-effect-free (skills.inline_shell=true executes SKILL.md
+        # preprocessing at build time), so the hook must be bypassed entirely
+        # even when metadata.skill_slug is present.
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        usage = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run, \
+                 patch.object(adapter, "_expand_inbound_skill_invocation", new_callable=AsyncMock) as mock_expand:
+                mock_run.return_value = (mock_result, usage)
+                mock_expand.side_effect = lambda msg, slug, session_id=None, on_settled=None: (on_settled() if on_settled else None) or f"<<EXPANDED:{slug}:{msg}>>"
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "/deep-research 黄金"}],
+                        "stream": False,
+                        "tool_choice": "none",
+                        "metadata": {"skill_slug": "deep-research"},
+                    },
+                )
+                assert resp.status == 200
+                mock_expand.assert_not_awaited()
+                assert mock_run.await_args.kwargs["user_message"] == "/deep-research 黄金"
+
+                # Without the boundary the hook runs as usual.
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "/deep-research 黄金"}],
+                        "stream": False,
+                        "metadata": {"skill_slug": "deep-research"},
+                    },
+                )
+                assert resp.status == 200
+                mock_expand.assert_awaited_once()
+                assert mock_run.await_args.kwargs["user_message"] == "<<EXPANDED:deep-research:/deep-research 黄金>>"
+                # The hook receives the resolved session so skill templates
+                # can resolve ${HERMES_SESSION_ID} (builder task_id).
+                assert (
+                    mock_expand.await_args.kwargs["session_id"]
+                    == mock_run.await_args.kwargs["session_id"]
+                )
+
+    @pytest.mark.asyncio
+    async def test_slash_text_without_skill_slug_is_never_expanded(self, adapter):
+        # The explicit metadata.skill_slug field is the ONLY trigger: message
+        # text is never sniffed, so a literal "/<skill> ..." (e.g. the user
+        # ASKING about the command, or an old App without the field) reaches
+        # the agent verbatim and the hook is never consulted.
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        usage = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run, \
+                 patch.object(adapter, "_expand_inbound_skill_invocation", new_callable=AsyncMock) as mock_expand:
+                mock_run.return_value = (mock_result, usage)
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{"role": "user", "content": "/deep-research 是什么？"}],
+                        "stream": False,
+                    },
+                )
+                assert resp.status == 200
+                mock_expand.assert_not_awaited()
+                assert mock_run.await_args.kwargs["user_message"] == "/deep-research 是什么？"
+
+    @pytest.mark.asyncio
+    async def test_idempotency_key_dedupes_skill_invocation(self, adapter):
+        # Expansion lives INSIDE the idempotency-protected compute: a retried
+        # key must reuse the cached agent result WITHOUT re-running expansion —
+        # with skills.inline_shell=true the build step executes SKILL.md
+        # preprocessing, so re-expansion means re-running local scripts.
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        usage = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run, \
+                 patch.object(adapter, "_expand_inbound_skill_invocation", new_callable=AsyncMock) as mock_expand:
+                mock_run.return_value = (mock_result, usage)
+                mock_expand.side_effect = lambda msg, slug, session_id=None, on_settled=None: (on_settled() if on_settled else None) or f"<<EXPANDED:{slug}:{msg}>>"
+                payload = {
+                    "model": "hermes-agent",
+                    "messages": [{"role": "user", "content": "/deep-research 黄金"}],
+                    "stream": False,
+                    "metadata": {"skill_slug": "deep-research"},
+                }
+                for _ in range(2):
+                    resp = await cli.post(
+                        "/v1/chat/completions",
+                        json=payload,
+                        headers={"Idempotency-Key": "idem-slash-1"},
+                    )
+                    assert resp.status == 200
+                mock_run.assert_awaited_once()
+                mock_expand.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_meeting_summary_tool_choice_none_integration_flow_disables_agent_tools(self, adapter):
@@ -4451,3 +4657,82 @@ class TestSessionKeyHeader:
             assert resp.status == 200
             data = await resp.json()
             assert data["features"]["session_key_header"] == "X-Hermes-Session-Key"
+
+
+class TestTakeoverUIHintOverSSE:
+    """End-to-end coverage for the ui_hint field on the real streaming path.
+
+    The payload builder is unit-tested elsewhere, but that cannot catch the
+    field being dropped or mangled between the tool-complete callback, the
+    stream queue, and SSE serialization — nor a regression that breaks plain
+    conversational streaming for older clients.
+    """
+
+    @pytest.mark.asyncio
+    async def test_browser_takeover_hint_reaches_the_sse_stream(self, adapter):
+        app = _create_app(adapter)
+        hint_result = json.dumps({
+            "success": False,
+            "error": "browser_takeover_required",
+            "ui_hint": {
+                "type": "takeover_browser",
+                "agent_id": "agent-a",
+                "browser_session_id": "chat-1",
+                "tab_id": "tab-agent-1",
+            },
+        })
+
+        async with TestClient(TestServer(app)) as cli:
+            async def _mock_run_agent(**kwargs):
+                delta = kwargs.get("stream_delta_callback")
+                start = kwargs.get("tool_start_callback")
+                complete = kwargs.get("tool_complete_callback")
+                if delta:
+                    delta("Opening the browser.")
+                if start:
+                    start("call_1", "browser_navigate", {"url": "https://example.com"})
+                if complete:
+                    complete("call_1", "browser_navigate", {"url": "https://example.com"}, hint_result)
+                if delta:
+                    delta(None)
+                return (
+                    {"final_response": "Opening the browser.", "messages": [], "api_calls": 1},
+                    {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                )
+
+            with (
+                patch.object(adapter, "_response_format_transport_error", return_value=None),
+                patch.object(adapter, "_run_agent", side_effect=_mock_run_agent),
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "open example.com"}],
+                        "stream": True,
+                    },
+                )
+                assert resp.status == 200
+                body = await resp.text()
+
+        # Plain conversational streaming is untouched — an older client that
+        # ignores the custom event still gets its content and terminator.
+        assert "Opening the browser." in body
+        assert "[DONE]" in body
+
+        events = [
+            json.loads(line[len("data: "):])
+            for block in body.split("\n\n")
+            if "event: hermes.tool.progress" in block
+            for line in block.splitlines()
+            if line.startswith("data: ")
+        ]
+        completed = [e for e in events if e.get("status") == "completed"]
+        assert completed, f"no completed tool progress event in stream: {body}"
+        hint = completed[-1].get("ui_hint")
+        assert hint == {
+            "type": "takeover_browser",
+            "agent_id": "agent-a",
+            "browser_session_id": "chat-1",
+            "tab_id": "tab-agent-1",
+        }

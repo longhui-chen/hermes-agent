@@ -4,11 +4,11 @@ import contextlib
 import json
 import logging
 import os
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import ANY, AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_cron_execution_contract, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -1252,6 +1252,22 @@ class TestRunJobSessionPersistence:
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["enabled_toolsets"] == ["web", "terminal", "file"]
 
+    def test_run_job_passes_language_contract_as_ephemeral_system_prompt(self, tmp_path):
+        job = {
+            "id": "localized-job",
+            "name": "daily digest",
+            "prompt": "https://example.com/digest",
+            "output_language": "zh-CN",
+        }
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        contract = kwargs["ephemeral_system_prompt"]
+        assert contract == _build_cron_execution_contract(job)
+        assert "BCP 47 tag `zh-CN`" in contract
+        assert "directly deliverable final result" in contract
+
     def test_run_job_disabled_toolsets_layer_user_config_on_baseline(self, tmp_path):
         """agent.disabled_toolsets must be honoured in cron — issue #25752.
 
@@ -2451,7 +2467,7 @@ class TestSilentDelivery:
         deliver_mock.assert_not_called()
         assert any(SILENT_MARKER in r.message for r in caplog.records)
 
-    def test_silent_with_note_suppresses_delivery(self):
+    def test_silent_with_note_delivers_substantive_content(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[SILENT] No changes detected", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
@@ -2459,10 +2475,10 @@ class TestSilentDelivery:
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
-        deliver_mock.assert_not_called()
+        deliver_mock.assert_called_once()
 
-    def test_silent_trailing_suppresses_delivery(self):
-        """Agent appended [SILENT] after explanation text — must still suppress."""
+    def test_silent_trailing_delivers_substantive_content(self):
+        """An untrusted sentinel cannot erase the preceding result."""
         response = "2 deals filtered out (like<10, reply<15).\n\n[SILENT]"
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", response, None)), \
@@ -2471,9 +2487,9 @@ class TestSilentDelivery:
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
-        deliver_mock.assert_not_called()
+        deliver_mock.assert_called_once()
 
-    def test_silent_is_case_insensitive(self):
+    def test_silent_prefix_with_content_delivers(self):
         with patch("cron.scheduler.get_due_jobs", return_value=[self._make_job()]), \
              patch("cron.scheduler.run_job", return_value=(True, "# output", "[silent] nothing new", None)), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
@@ -2481,7 +2497,7 @@ class TestSilentDelivery:
              patch("cron.scheduler.mark_job_run"):
             from cron.scheduler import tick
             tick(verbose=False)
-        deliver_mock.assert_not_called()
+        deliver_mock.assert_called_once()
 
     def test_bracketless_silent_variants_suppress(self):
         """Bracketless near-markers the model emits when it drops brackets
@@ -2512,16 +2528,17 @@ class TestSilentDelivery:
     def test_is_cron_silence_response_contract(self):
         """Direct behavior contract for the cron silence matcher."""
         from cron.scheduler import _is_cron_silence_response as sil
-        # Suppress: bare/bracketed/bracketless tokens, prefix, trailing-line.
+        # Suppress only exact bare/bracketed/bracketless tokens.
         assert sil("[SILENT]")
-        assert sil("[silent] nothing new")
-        assert sil("[SILENT] No changes detected")
-        assert sil("2 deals filtered.\n\n[SILENT]")
         assert sil("SILENT")
         assert sil("NO_REPLY")
         assert sil("NO REPLY")
-        assert sil("Summary.\nSILENT")
-        # Deliver: real content, mid-sentence quotes, bare words, junk.
+        assert sil(" [silent] \n")
+        # Deliver: any substantive content beside a token, plus junk.
+        assert not sil("[silent] nothing new")
+        assert not sil("[SILENT] No changes detected")
+        assert not sil("2 deals filtered.\n\n[SILENT]")
+        assert not sil("Summary.\nSILENT")
         assert not sil("Daily report: 4 PRs merged.")
         assert not sil("I stayed [SILENT] but here is the report: 3 items.")
         assert not sil("Silent retry succeeded after 2 attempts.")
@@ -2568,6 +2585,8 @@ class TestSilentDelivery:
             False,
             "Agent completed but produced empty response (model error, timeout, or misconfiguration)",
             delivery_error=None,
+            scheduled_at=ANY,
+            output_filename="out.md",
         )
 
 
@@ -2611,39 +2630,38 @@ class TestOneShotDispatchClaim:
         mark_mock.assert_not_called()
 
 
-class TestBuildJobPromptSilentHint:
-    """Verify _build_job_prompt always injects [SILENT] guidance."""
+class TestCronExecutionContract:
+    """Scheduler rules belong to system context, not the user message."""
 
     def test_hint_always_present(self):
         job = {"prompt": "Check for updates"}
-        result = _build_job_prompt(job)
+        result = _build_cron_execution_contract(job)
         assert "[SILENT]" in result
-        assert "Check for updates" in result
+        assert "Check for updates" not in result
 
     def test_hint_present_even_without_prompt(self):
         job = {"prompt": ""}
-        result = _build_job_prompt(job)
+        result = _build_cron_execution_contract(job)
         assert "[SILENT]" in result
 
     def test_hint_present_when_legacy_prompt_is_null(self):
         job = {"id": "abc123deadbe", "name": None, "prompt": None}
-        result = _build_job_prompt(job)
+        result = _build_cron_execution_contract(job)
         assert "[SILENT]" in result
 
     def test_delivery_guidance_present(self):
         """Cron hint tells agents their final response is auto-delivered."""
         job = {"prompt": "Generate a report"}
-        result = _build_job_prompt(job)
-        assert "do NOT use send_message" in result
-        assert "automatically delivered" in result
+        result = _build_cron_execution_contract(job)
+        assert "Do not call send_message" in result
+        assert "delivered automatically" in result
 
-    def test_delivery_guidance_precedes_user_prompt(self):
-        """System guidance appears before the user's prompt text."""
+    def test_user_prompt_does_not_contain_scheduler_guidance(self):
         job = {"prompt": "My custom prompt"}
         result = _build_job_prompt(job)
-        system_pos = result.index("do NOT use send_message")
-        prompt_pos = result.index("My custom prompt")
-        assert system_pos < prompt_pos
+        assert result == "My custom prompt"
+        assert "send_message" not in result
+        assert "[SILENT]" not in result
 
 
 class TestParseWakeGate:

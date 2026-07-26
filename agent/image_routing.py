@@ -261,7 +261,7 @@ def _resolve_inference_base_url(
     try:
         from agent.auxiliary_client import _RUNTIME_MAIN_BASE_URL
 
-        runtime = str(_RUNTIME_MAIN_BASE_URL or "").strip()
+        runtime = _RUNTIME_MAIN_BASE_URL.get().strip()
         if runtime:
             return runtime
     except Exception:

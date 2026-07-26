@@ -9,6 +9,11 @@ All NAS calls are mocked — ZERO live network. These prove:
     (job gone) stops re-arming.
 """
 
+from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import threading
+import time
+
 import pytest
 
 
@@ -164,6 +169,804 @@ def test_reconcile_skips_already_armed_same_time(temp_home, chronos, monkeypatch
 
     prov.reconcile()
     assert fake.provisions == []  # already armed at the same time → no re-arm
+
+
+def test_calendar_reconcile_requires_remote_observation(temp_home, chronos):
+    from cron.jobs import save_jobs
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+    prov, fake = chronos
+    job = managed_job(next_run_at="2026-07-15T01:00:00Z")
+    save_jobs([job])
+    fake._armed = [{"job_id": job["id"], "fire_at": job["next_run_at"]}]
+    result = prov.reconcile_calendar_job(job["id"], "upsert", 2)
+    assert result["status"] == "armed"
+    assert result["observed_fire_at"] == job["next_run_at"]
+    fake._armed = [{"job_id": job["id"], "fire_at": "2026-07-15T02:00:00Z"}]
+    with pytest.raises(RuntimeError, match="durably observed"):
+        prov.reconcile_calendar_job(job["id"], "upsert", 2)
+
+
+def test_delayed_same_revision_upsert_preserves_authoritative_recovery_arm(
+    temp_home, chronos,
+):
+    from cron.jobs import get_job_raw, save_jobs
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+    prov, fake = chronos
+    job = managed_job(next_run_at="2026-07-15T01:00:00Z")
+    retry_at = "2026-07-15T01:02:03Z"
+    save_jobs([job])
+    original_provision = fake.provision
+
+    def provision_and_observe(**kwargs):
+        result = original_provision(**kwargs)
+        fake._armed = [{"job_id": kwargs["job_id"], "fire_at": kwargs["fire_at"]}]
+        return result
+
+    fake.provision = provision_and_observe
+    prov.reconcile_calendar_recovery_arm({
+        "job_id": job["id"], "projection_revision": 2,
+        "delivery_generation": 1, "attempt_sequence": 4, "dedupe_key": "d" * 64,
+        "retry_at": retry_at, "deadline_at": "2026-07-15T01:05:00Z",
+    })
+    fake.provisions.clear()
+
+    restarted = type(prov)()
+    restarted._client = fake
+    result = restarted.reconcile_calendar_job(job["id"], "upsert", 2)
+
+    assert result == {
+        "status": "recovery_preserved",
+        "provider": "chronos",
+        "observed_fire_at": retry_at,
+    }
+    assert fake.provisions == []
+    assert get_job_raw(job["id"])["provider_state"]["chronos"]["calendar_recovery"] == {
+        "projection_revision": 2,
+        "delivery_generation": 1,
+        "retry_at": retry_at,
+        "attempt_sequence": 4,
+    }
+
+
+def test_restart_rearms_durable_recovery_after_crash_before_nas_provision(
+    temp_home, chronos,
+):
+    from cron.jobs import get_job_raw, save_jobs
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+    prov, fake = chronos
+    job = managed_job(next_run_at="2026-07-15T01:00:00Z")
+    retry_at = "2026-07-15T01:02:03.123400Z"
+    save_jobs([job])
+    original_provision = fake.provision
+
+    def crash_before_nas(**_kwargs):
+        raise RuntimeError("simulated crash before NAS provision")
+
+    fake.provision = crash_before_nas
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        prov.reconcile_calendar_recovery_arm({
+            "job_id": job["id"], "projection_revision": 2,
+            "delivery_generation": 1, "attempt_sequence": 4, "dedupe_key": "d" * 64,
+            "retry_at": retry_at, "deadline_at": "2026-07-15T01:05:00Z",
+        })
+    marker = {
+        "projection_revision": 2,
+        "delivery_generation": 1,
+        "retry_at": retry_at,
+        "attempt_sequence": 4,
+    }
+    assert get_job_raw(job["id"])["provider_state"]["chronos"]["calendar_recovery"] == marker
+
+    restarted = type(prov)()
+    restarted._client = fake
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        restarted.reconcile_calendar_job(job["id"], "upsert", 2)
+    assert get_job_raw(job["id"])["provider_state"]["chronos"]["calendar_recovery"] == marker
+
+    def provision_and_observe(**kwargs):
+        result = original_provision(**kwargs)
+        fake._armed = [{"job_id": kwargs["job_id"], "fire_at": kwargs["fire_at"]}]
+        return result
+
+    fake.provision = provision_and_observe
+    result = restarted.reconcile_calendar_job(job["id"], "upsert", 2)
+
+    assert result["status"] == "recovery_preserved"
+    assert fake.provisions[-1]["fire_at"] == retry_at
+    assert fake.provisions[-1]["fire_at"] != job["next_run_at"]
+    assert fake.provisions[-1]["dedup_key"] == hashlib.sha256(
+        f"calendar-recovery\x00{job['id']}\x002\x001\x004\x00{retry_at}".encode()
+    ).hexdigest()
+    assert get_job_raw(job["id"])["provider_state"]["chronos"]["calendar_recovery"] == marker
+
+
+def test_new_revision_upsert_supersedes_older_recovery_arm(temp_home, chronos):
+    from cron.jobs import get_job_raw, save_jobs
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+    prov, fake = chronos
+    job = managed_job(next_run_at="2026-07-15T01:00:00Z")
+    save_jobs([job])
+    original_provision = fake.provision
+
+    def provision_and_observe(**kwargs):
+        result = original_provision(**kwargs)
+        fake._armed = [{"job_id": kwargs["job_id"], "fire_at": kwargs["fire_at"]}]
+        return result
+
+    fake.provision = provision_and_observe
+    prov.reconcile_calendar_recovery_arm({
+        "job_id": job["id"], "projection_revision": 2,
+        "delivery_generation": 1, "attempt_sequence": 4, "dedupe_key": "d" * 64,
+        "retry_at": "2026-07-15T01:02:03Z", "deadline_at": "2026-07-15T01:05:00Z",
+    })
+    current = get_job_raw(job["id"])
+    current["calendar_projection_revision"] = 3
+    current["next_run_at"] = "2026-07-15T02:00:00Z"
+    save_jobs([current])
+    fake.provisions.clear()
+
+    result = prov.reconcile_calendar_job(current["id"], "upsert", 3)
+
+    assert result["status"] == "armed"
+    assert fake.provisions[-1]["fire_at"] == current["next_run_at"]
+    assert "chronos" not in get_job_raw(job["id"]).get("provider_state", {})
+
+
+def test_older_upsert_revision_acks_superseded_and_future_revision_fails(
+    temp_home, chronos,
+):
+    from cron.jobs import save_jobs
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+    prov, fake = chronos
+    job = managed_job(calendar_projection_revision=3)
+    save_jobs([job])
+
+    assert prov.reconcile_calendar_job(job["id"], "upsert", 2) == {
+        "status": "superseded",
+        "provider": "chronos",
+    }
+    assert fake.provisions == []
+    with pytest.raises(RuntimeError, match="projection revision mismatch"):
+        prov.reconcile_calendar_job(job["id"], "upsert", 4)
+
+
+def test_calendar_cancel_requires_remote_absence(chronos):
+    prov, fake = chronos
+    fake._armed = []
+    assert prov.reconcile_calendar_job("cal-alert", "delete", 2)["status"] == "cancelled"
+    assert fake.cancels == ["cal-alert"]
+
+
+def test_stale_calendar_delete_flow_preserves_newer_projection(chronos, monkeypatch):
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+    prov, fake = chronos
+    monkeypatch.setattr(
+        "cron.jobs.get_job_raw",
+        lambda _jid: managed_job(calendar_projection_revision=3),
+    )
+
+    result = prov.reconcile_calendar_job("cal-alert-" + "a" * 32, "delete", 2)
+
+    assert result["status"] == "superseded"
+    assert fake.cancels == []
+
+
+def test_generic_reconcile_flow_preserves_managed_calendar_recovery_arm(
+    temp_home, chronos, monkeypatch,
+):
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+    prov, fake = chronos
+    job = managed_job(
+        enabled=True,
+        state="scheduled",
+        next_run_at="2026-07-15T01:00:00Z",
+        provider_state={"chronos": {"calendar_recovery": {
+            "projection_revision": 2,
+            "delivery_generation": 3,
+            "retry_at": "2026-07-15T01:02:03Z",
+            "attempt_sequence": 4,
+        }}},
+    )
+    retry_at = "2026-07-15T01:02:03Z"
+    fake._armed = [{"job_id": job["id"], "fire_at": retry_at}]
+    monkeypatch.setattr("cron.jobs.load_jobs", lambda: [job])
+
+    prov.reconcile()
+
+    assert fake.provisions == []
+    assert fake.cancels == []
+    assert fake._armed == [{"job_id": job["id"], "fire_at": retry_at}]
+
+
+@pytest.mark.parametrize("warm_cache", [False, True], ids=["cold-start", "warm-cache"])
+def test_generic_reconcile_restores_missing_active_managed_calendar_arm(
+    temp_home, chronos, monkeypatch, warm_cache,
+):
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+    prov, fake = chronos
+    job = managed_job(
+        enabled=True,
+        state="scheduled",
+        next_run_at="2026-07-15T01:00:00Z",
+    )
+    if warm_cache:
+        prov._armed = {job["id"]: job["next_run_at"]}
+    monkeypatch.setattr("cron.jobs.load_jobs", lambda: [job])
+    monkeypatch.setattr("cron.jobs.get_job", lambda _job_id: job)
+
+    prov.reconcile()
+
+    assert fake.provisions == [{
+        "job_id": job["id"],
+        "fire_at": job["next_run_at"],
+        "agent_callback_url": "https://agent.example/",
+        "dedup_key": f"{job['id']}:{job['next_run_at']}",
+    }]
+    assert fake.cancels == []
+
+
+def test_generic_reconcile_replays_missing_persisted_calendar_recovery_arm(
+    temp_home, chronos, monkeypatch,
+):
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+    prov, fake = chronos
+    retry_at = "2026-07-15T01:02:03Z"
+    job = managed_job(
+        enabled=True,
+        state="scheduled",
+        next_run_at="2026-07-15T01:00:00Z",
+        provider_state={"chronos": {"calendar_recovery": {
+            "projection_revision": 2,
+            "delivery_generation": 3,
+            "retry_at": retry_at,
+            "attempt_sequence": 4,
+        }}},
+    )
+    monkeypatch.setattr("cron.jobs.load_jobs", lambda: [job])
+
+    prov.reconcile()
+
+    assert fake.provisions == [{
+        "job_id": job["id"],
+        "fire_at": retry_at,
+        "agent_callback_url": "https://agent.example/",
+        "dedup_key": hashlib.sha256(
+            f"calendar-recovery\x00{job['id']}\x002\x003\x004\x00{retry_at}".encode()
+        ).hexdigest(),
+    }]
+    assert fake.cancels == []
+
+
+def test_generic_reconcile_cancels_paused_managed_calendar_arm(
+    temp_home, chronos, monkeypatch,
+):
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+    prov, fake = chronos
+    job = managed_job(
+        enabled=True,
+        state="paused",
+        next_run_at="2026-07-15T01:00:00Z",
+    )
+    fake._armed = [{"job_id": job["id"], "fire_at": job["next_run_at"]}]
+    monkeypatch.setattr("cron.jobs.load_jobs", lambda: [job])
+
+    prov.reconcile()
+
+    assert fake.cancels == [job["id"]]
+
+
+def test_calendar_recovery_arm_uses_attempt_dedupe_and_observed_time(
+    temp_home, chronos,
+):
+    from cron.jobs import get_job_raw, save_jobs
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+    prov, fake = chronos
+    job = managed_job(next_run_at="2026-07-15T01:00:00Z")
+    save_jobs([job])
+    original_provision = fake.provision
+
+    def provision_and_observe(**kwargs):
+        result = original_provision(**kwargs)
+        fake._armed = [{"job_id": kwargs["job_id"], "fire_at": kwargs["fire_at"]}]
+        return result
+
+    fake.provision = provision_and_observe
+    intent = {
+        "job_id": job["id"], "projection_revision": 2,
+        "delivery_generation": 1, "attempt_sequence": 4, "dedupe_key": "d" * 64,
+        "retry_at": "2026-07-15T01:02:03Z", "deadline_at": "2026-07-15T01:05:00Z",
+    }
+    result = prov.reconcile_calendar_recovery_arm(intent)
+    assert result["observed_fire_at"] == intent["retry_at"]
+    assert fake.provisions[-1]["dedup_key"] == "d" * 64
+    assert fake.provisions[-1]["fire_at"] == intent["retry_at"]
+    assert get_job_raw(job["id"])["provider_state"]["chronos"]["calendar_recovery"] == {
+        "projection_revision": 2,
+        "delivery_generation": intent["delivery_generation"],
+        "retry_at": intent["retry_at"],
+        "attempt_sequence": intent["attempt_sequence"],
+    }
+
+
+@pytest.mark.parametrize(
+    ("stored_overrides", "intent_revision", "expected_status", "expected_error"),
+    [
+        (None, 2, "cancelled", None),
+        ({"calendar_projection_revision": 3}, 2, "superseded", None),
+        ({"calendar_projection_revision": 1}, 2, None, "not materialized"),
+        ({"calendar_projection_revision": 2, "enabled": False}, 2, "cancelled", None),
+    ],
+    ids=["missing", "stored-newer", "future-not-materialized", "inactive"],
+)
+def test_calendar_recovery_projection_terminal_contract_behavior_matrix(
+    temp_home, chronos, stored_overrides, intent_revision, expected_status, expected_error,
+):
+    from cron.jobs import save_jobs
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+
+    provider, fake = chronos
+    save_jobs([] if stored_overrides is None else [managed_job(**stored_overrides)])
+    intent = {
+        "job_id": "cal-alert-" + "a" * 32,
+        "projection_revision": intent_revision,
+        "delivery_generation": 1,
+        "attempt_sequence": 1,
+        "dedupe_key": "d" * 64,
+        "retry_at": "2026-07-15T01:02:03Z",
+        "deadline_at": "2026-07-15T01:05:00Z",
+    }
+
+    if expected_error is not None:
+        with pytest.raises(RuntimeError, match=expected_error):
+            provider.reconcile_calendar_recovery_arm(intent)
+    else:
+        assert provider.reconcile_calendar_recovery_arm(intent)["status"] == expected_status
+    assert fake.provisions == []
+
+
+def test_restart_delayed_older_recovery_sequence_cannot_overwrite_newer_arm(
+    temp_home, chronos,
+):
+    from cron.jobs import get_job_raw, save_jobs
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+
+    provider, fake = chronos
+    job = managed_job(next_run_at="2026-07-15T01:00:00Z")
+    save_jobs([job])
+    original_provision = fake.provision
+
+    def provision_and_observe(**kwargs):
+        result = original_provision(**kwargs)
+        fake._armed = [{"job_id": kwargs["job_id"], "fire_at": kwargs["fire_at"]}]
+        return result
+
+    fake.provision = provision_and_observe
+    provider.reconcile_calendar_recovery_arm({
+        "job_id": job["id"], "projection_revision": 2,
+        "delivery_generation": 1, "attempt_sequence": 2, "dedupe_key": "2" * 64,
+        "retry_at": "2026-07-15T01:03:00Z",
+        "deadline_at": "2026-07-15T01:05:00Z",
+    })
+    expected_marker = {
+        "projection_revision": 2,
+        "delivery_generation": 1,
+        "retry_at": "2026-07-15T01:03:00Z",
+        "attempt_sequence": 2,
+    }
+    assert get_job_raw(job["id"])["provider_state"]["chronos"]["calendar_recovery"] == expected_marker
+    provision_count = len(fake.provisions)
+
+    restarted = type(provider)()
+    restarted._client = fake
+    result = restarted.reconcile_calendar_recovery_arm({
+        "job_id": job["id"], "projection_revision": 2,
+        "delivery_generation": 1, "attempt_sequence": 1, "dedupe_key": "1" * 64,
+        "retry_at": "2026-07-15T01:02:00Z",
+        "deadline_at": "2026-07-15T01:05:00Z",
+    })
+
+    assert result == {
+        "status": "superseded",
+        "provider": "chronos",
+    }
+    assert len(fake.provisions) == provision_count
+    assert fake._armed == [{"job_id": job["id"], "fire_at": expected_marker["retry_at"]}]
+    assert get_job_raw(job["id"])["provider_state"]["chronos"]["calendar_recovery"] == expected_marker
+
+
+def test_older_generation_high_sequence_cannot_overwrite_newer_generation(
+    temp_home, chronos,
+):
+    from cron.jobs import get_job_raw, save_jobs
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+
+    provider, fake = chronos
+    job = managed_job(next_run_at="2026-07-15T01:00:00Z")
+    save_jobs([job])
+    original_provision = fake.provision
+
+    def provision_and_observe(**kwargs):
+        result = original_provision(**kwargs)
+        fake._armed = [{"job_id": kwargs["job_id"], "fire_at": kwargs["fire_at"]}]
+        return result
+
+    fake.provision = provision_and_observe
+    provider.reconcile_calendar_recovery_arm({
+        "job_id": job["id"], "projection_revision": 2,
+        "delivery_generation": 2, "attempt_sequence": 1, "dedupe_key": "2" * 64,
+        "retry_at": "2026-07-15T01:03:00Z", "deadline_at": "2026-07-15T01:05:00Z",
+    })
+    marker = get_job_raw(job["id"])["provider_state"]["chronos"]["calendar_recovery"]
+    provision_count = len(fake.provisions)
+
+    result = provider.reconcile_calendar_recovery_arm({
+        "job_id": job["id"], "projection_revision": 2,
+        "delivery_generation": 1, "attempt_sequence": 99, "dedupe_key": "1" * 64,
+        "retry_at": "2026-07-15T01:02:00Z", "deadline_at": "2026-07-15T01:05:00Z",
+    })
+
+    assert result["status"] == "superseded"
+    assert len(fake.provisions) == provision_count
+    assert get_job_raw(job["id"])["provider_state"]["chronos"]["calendar_recovery"] == marker
+
+
+@pytest.mark.parametrize(
+    ("incoming_sequence", "expected_status", "expected_sequence", "expected_calls"),
+    [(4, "superseded", 5, 0), (5, "armed", 5, 0), (6, "armed", 6, 1)],
+)
+def test_same_generation_attempt_sequence_ordering_matrix(
+    temp_home, chronos, incoming_sequence, expected_status, expected_sequence, expected_calls,
+):
+    from cron.jobs import get_job_raw, save_jobs
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+
+    provider, fake = chronos
+    job = managed_job(next_run_at="2026-07-15T01:00:00Z")
+    save_jobs([job])
+    original_provision = fake.provision
+
+    def provision_and_observe(**kwargs):
+        result = original_provision(**kwargs)
+        fake._armed = [{"job_id": kwargs["job_id"], "fire_at": kwargs["fire_at"]}]
+        return result
+
+    fake.provision = provision_and_observe
+    provider.reconcile_calendar_recovery_arm({
+        "job_id": job["id"], "projection_revision": 2,
+        "delivery_generation": 7, "attempt_sequence": 5, "dedupe_key": "5" * 64,
+        "retry_at": "2026-07-15T01:02:00Z", "deadline_at": "2026-07-15T01:05:00Z",
+    })
+    fake.provisions.clear()
+    result = provider.reconcile_calendar_recovery_arm({
+        "job_id": job["id"], "projection_revision": 2,
+        "delivery_generation": 7, "attempt_sequence": incoming_sequence,
+        "dedupe_key": str(incoming_sequence) * 64,
+        "retry_at": "2026-07-15T01:03:00Z", "deadline_at": "2026-07-15T01:05:00Z",
+    })
+
+    marker = get_job_raw(job["id"])["provider_state"]["chronos"]["calendar_recovery"]
+    assert result["status"] == expected_status
+    assert marker["delivery_generation"] == 7
+    assert marker["attempt_sequence"] == expected_sequence
+    assert len(fake.provisions) == expected_calls
+
+
+def test_restart_same_recovery_sequence_rearms_durable_marker_time(
+    temp_home, chronos,
+):
+    from cron.jobs import get_job_raw, save_jobs
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+
+    provider, fake = chronos
+    job = managed_job(next_run_at="2026-07-15T01:00:00Z")
+    save_jobs([job])
+    original_provision = fake.provision
+
+    def provision_and_observe(**kwargs):
+        result = original_provision(**kwargs)
+        fake._armed = [{"job_id": kwargs["job_id"], "fire_at": kwargs["fire_at"]}]
+        return result
+
+    fake.provision = provision_and_observe
+    marker_retry = "2026-07-15T01:03:00Z"
+    intent = {
+        "job_id": job["id"], "projection_revision": 2,
+        "delivery_generation": 1, "attempt_sequence": 2, "dedupe_key": "2" * 64,
+        "retry_at": marker_retry, "deadline_at": "2026-07-15T01:05:00Z",
+    }
+    provider.reconcile_calendar_recovery_arm(intent)
+    marker = get_job_raw(job["id"])["provider_state"]["chronos"]["calendar_recovery"]
+
+    fake._armed = []
+    restarted = type(provider)()
+    restarted._client = fake
+    replay = dict(intent, retry_at="2026-07-15T01:02:00Z")
+    result = restarted.reconcile_calendar_recovery_arm(replay)
+
+    assert result == {
+        "status": "armed",
+        "provider": "chronos",
+        "observed_fire_at": marker_retry,
+    }
+    assert fake.provisions[-1]["fire_at"] == marker_retry
+    assert get_job_raw(job["id"])["provider_state"]["chronos"]["calendar_recovery"] == marker
+
+
+@pytest.mark.parametrize(
+    ("raw", "canonical"),
+    [
+        ("2026-07-22T04:34:56.123456789Z", "2026-07-22T04:34:56.123456Z"),
+        ("2026-07-22T04:34:56.123400Z", "2026-07-22T04:34:56.123400Z"),
+        ("2026-07-22T04:34:56Z", "2026-07-22T04:34:56Z"),
+    ],
+)
+def test_calendar_recovery_retry_at_uses_wire_microsecond_canonical(raw, canonical):
+    from plugins.cron_providers.chronos import (
+        _calendar_recovery_state,
+        _canonical_calendar_retry_at,
+    )
+    assert _canonical_calendar_retry_at(raw) == canonical
+    assert _calendar_recovery_state({
+        "provider_state": {"chronos": {"calendar_recovery": {
+            "projection_revision": 2,
+            "delivery_generation": 1,
+            "retry_at": raw,
+            "attempt_sequence": 4,
+        }}},
+    }) == (2, 1, canonical, 4)
+
+
+@pytest.mark.parametrize(
+    ("raw", "canonical"),
+    [
+        ("2026-07-22T04:34:56.123400+00:00", "2026-07-22T04:34:56.123400Z"),
+        ("2026-07-22T04:34:56.123400+08:00", None),
+        ("2026-07-22T04:34:56.123400", None),
+    ],
+)
+def test_calendar_recovery_retry_at_requires_utc_offset(raw, canonical):
+    from plugins.cron_providers.chronos import (
+        _calendar_recovery_state,
+        _canonical_calendar_retry_at,
+    )
+
+    assert _canonical_calendar_retry_at(raw) == canonical
+    state = _calendar_recovery_state({
+        "provider_state": {"chronos": {"calendar_recovery": {
+            "projection_revision": 2,
+            "delivery_generation": 1,
+            "retry_at": raw,
+            "attempt_sequence": 4,
+        }}},
+    })
+    assert state == ((2, 1, canonical, 4) if canonical is not None else None)
+
+
+@pytest.mark.parametrize("attempt_sequence", [None, 0, True, -1, 1.5, 2**64])
+def test_calendar_recovery_marker_requires_bounded_uint64_sequence(attempt_sequence):
+    from plugins.cron_providers.chronos import _calendar_recovery_state
+
+    assert _calendar_recovery_state({
+        "provider_state": {"chronos": {"calendar_recovery": {
+            "projection_revision": 2,
+            "delivery_generation": 1,
+            "retry_at": "2026-07-22T04:34:56Z",
+            "attempt_sequence": attempt_sequence,
+        }}},
+    }) is None
+
+
+@pytest.mark.parametrize("delivery_generation", [None, 0, True, -1, 1.5, 2**64])
+def test_calendar_recovery_marker_requires_bounded_uint64_generation(delivery_generation):
+    from plugins.cron_providers.chronos import _calendar_recovery_state
+
+    assert _calendar_recovery_state({
+        "provider_state": {"chronos": {"calendar_recovery": {
+            "projection_revision": 2,
+            "delivery_generation": delivery_generation,
+            "retry_at": "2026-07-22T04:34:56Z",
+            "attempt_sequence": 1,
+        }}},
+    }) is None
+
+
+def test_calendar_recovery_marker_accepts_uint64_max_and_rejects_extra_fields():
+    from plugins.cron_providers.chronos import _calendar_recovery_state
+
+    marker = {
+        "projection_revision": 2,
+        "delivery_generation": 2**64 - 1,
+        "retry_at": "2026-07-22T04:34:56Z",
+        "attempt_sequence": 2**64 - 1,
+    }
+    job = {"provider_state": {"chronos": {"calendar_recovery": marker}}}
+    assert _calendar_recovery_state(job) == (2, 2**64 - 1, marker["retry_at"], 2**64 - 1)
+    marker["unexpected"] = "reject"
+    assert _calendar_recovery_state(job) is None
+    marker.pop("unexpected")
+    marker.pop("delivery_generation")
+    assert _calendar_recovery_state(job) is None
+
+
+def test_resolved_chronos_instances_flow_serializes_same_revision_recovery_cas(
+    temp_home, monkeypatch,
+):
+    """Real resolve/load/register calls must share the recovery critical section."""
+    from cron.jobs import get_job_raw, save_jobs
+    from cron.scheduler_provider import resolve_cron_scheduler
+    from plugins.cron_providers.chronos import ChronosCronScheduler
+    from tests.cron.test_calendar_delivery_v2 import managed_job
+
+    config = {
+        "cron": {
+            "provider": "chronos",
+            "chronos": {
+                "portal_url": "https://portal.test",
+                "callback_url": "https://agent.example/",
+            },
+        },
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+    monkeypatch.setattr(ChronosCronScheduler, "_have_nous_token", lambda self: True)
+
+    class ConcurrentClient:
+        def __init__(self):
+            self._guard = threading.Lock()
+            self._active = 0
+            self.max_active = 0
+            self.provisions = []
+            self.armed = {}
+
+        def provision(self, *, job_id, fire_at, agent_callback_url, dedup_key):
+            with self._guard:
+                self._active += 1
+                self.max_active = max(self.max_active, self._active)
+                self.provisions.append({
+                    "job_id": job_id,
+                    "fire_at": fire_at,
+                    "dedup_key": dedup_key,
+                })
+            time.sleep(0.03)
+            with self._guard:
+                self.armed[job_id] = fire_at
+                self._active -= 1
+            return {"schedule_id": f"sched-{job_id}"}
+
+        def list_armed(self):
+            with self._guard:
+                return [
+                    {"job_id": job_id, "fire_at": fire_at}
+                    for job_id, fire_at in self.armed.items()
+                ]
+
+    client = ConcurrentClient()
+    monkeypatch.setattr(ChronosCronScheduler, "_get_client", lambda self: client)
+    job = managed_job(next_run_at="2026-07-22T04:30:00Z")
+    save_jobs([job])
+    retries = [
+        "2026-07-22T04:34:56.123400Z",
+        "2026-07-22T04:35:56.123400+00:00",
+    ]
+    barrier = threading.Barrier(len(retries))
+    provider_ids = []
+    provider_ids_guard = threading.Lock()
+
+    def reconcile(index):
+        provider = resolve_cron_scheduler()
+        with provider_ids_guard:
+            provider_ids.append(id(provider))
+        barrier.wait()
+        return provider.reconcile_calendar_recovery_arm({
+            "job_id": job["id"],
+            "projection_revision": 2,
+            "delivery_generation": 1,
+            "attempt_sequence": index + 1,
+            "dedupe_key": str(index + 1) * 64,
+            "retry_at": retries[index],
+            "deadline_at": "2026-07-22T04:40:00Z",
+        })
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(reconcile, range(2)))
+
+    assert len(set(provider_ids)) == 2
+    assert client.max_active == 1
+    assert results[1]["observed_fire_at"] == "2026-07-22T04:35:56.123400Z"
+    assert results[0]["status"] in {"armed", "superseded"}
+    assert client.provisions[-1]["dedup_key"] == "2" * 64
+    assert get_job_raw(job["id"])["provider_state"]["chronos"]["calendar_recovery"] == {
+        "projection_revision": 2,
+        "delivery_generation": 1,
+        "retry_at": client.provisions[-1]["fire_at"],
+        "attempt_sequence": 2,
+    }
+
+
+def test_provider_state_cas_caps_rebuilt_map_and_skips_malformed_siblings(
+    temp_home,
+):
+    from cron.jobs import load_jobs, save_jobs, update_job_provider_state
+    job_id = "cal-alert-" + "a" * 32
+    base = {"id": job_id, "calendar_projection_revision": 2}
+
+    sixteen = {f"provider_{i}": {"v": "x"} for i in range(16)}
+    save_jobs(["malformed-sibling", {**base, "provider_state": sixteen}])
+    with pytest.raises(ValueError, match="provider cap"):
+        update_job_provider_state(
+            job_id, "chronos", {"v": "x"},
+            revision_field="calendar_projection_revision", expected_revision=2,
+        )
+
+    near_cap = {f"provider_{i}": {"v": "x" * 850} for i in range(15)}
+    save_jobs(["malformed-sibling", {**base, "provider_state": near_cap}])
+    with pytest.raises(ValueError, match="total cap"):
+        update_job_provider_state(
+            job_id, "chronos", {"v": "y" * 4000},
+            revision_field="calendar_projection_revision", expected_revision=2,
+        )
+
+    save_jobs(["malformed-sibling", base])
+    assert update_job_provider_state(
+        job_id, "chronos", {"calendar_recovery": {
+            "projection_revision": 2,
+            "delivery_generation": 1,
+            "retry_at": "2026-07-22T04:34:56Z",
+            "attempt_sequence": 4,
+        }},
+        revision_field="calendar_projection_revision", expected_revision=2,
+    ) == "updated"
+    assert "chronos" in load_jobs()[1]["provider_state"]
+
+
+@pytest.mark.parametrize("suffix", ["recovery", "A" * 32, "a_b", "a-b"])
+def test_calendar_recovery_arm_rejects_noncanonical_planner_job_ids(
+    chronos, suffix,
+):
+    prov, _fake = chronos
+    with pytest.raises(ValueError, match="invalid recovery identity"):
+        prov.reconcile_calendar_recovery_arm({
+            "job_id": "cal-alert-" + suffix,
+            "projection_revision": 2,
+            "delivery_generation": 1,
+            "attempt_sequence": 4,
+            "dedupe_key": "d" * 64,
+            "retry_at": "2026-07-15T01:02:03Z",
+            "deadline_at": "2026-07-15T01:05:00Z",
+        })
+
+
+@pytest.mark.parametrize("attempt_sequence", [0, True, -1, 1.5, 2**64])
+def test_calendar_recovery_arm_rejects_unbounded_attempt_sequence(
+    chronos, attempt_sequence,
+):
+    provider, _fake = chronos
+    with pytest.raises(ValueError, match="invalid recovery identity"):
+        provider.reconcile_calendar_recovery_arm({
+            "job_id": "cal-alert-" + "a" * 32,
+            "projection_revision": 2,
+            "delivery_generation": 1,
+            "attempt_sequence": attempt_sequence,
+            "dedupe_key": "d" * 64,
+            "retry_at": "2026-07-15T01:02:03Z",
+            "deadline_at": "2026-07-15T01:05:00Z",
+        })
+
+
+@pytest.mark.parametrize("delivery_generation", [0, True, -1, 1.5, 2**64])
+def test_calendar_recovery_arm_rejects_unbounded_delivery_generation(
+    chronos, delivery_generation,
+):
+    provider, _fake = chronos
+    with pytest.raises(ValueError, match="invalid recovery identity"):
+        provider.reconcile_calendar_recovery_arm({
+            "job_id": "cal-alert-" + "a" * 32,
+            "projection_revision": 2,
+            "delivery_generation": delivery_generation,
+            "attempt_sequence": 1,
+            "dedupe_key": "d" * 64,
+            "retry_at": "2026-07-15T01:02:03Z",
+            "deadline_at": "2026-07-15T01:05:00Z",
+        })
 
 
 # -- fire_due re-arm ----------------------------------------------------------
