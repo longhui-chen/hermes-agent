@@ -2566,6 +2566,11 @@ def _navigate_within_identity(
         # Auto-take a compact snapshot so the model can act immediately
         try:
             snapshot_filtered_at_request = _handback_privacy_filter_enabled(session)
+            # No _capture_guard here: _navigate_locked already holds this tab's
+            # identity for the whole navigate, so this capture and the
+            # readability check below are inside the same critical section the
+            # guard would take. The lock is reentrant, so adding one would be
+            # harmless — just redundant.
             observed_document = _observed_document_generation(session)
             snap_data = _get(
                 _tab_path(session, "/snapshot"),
