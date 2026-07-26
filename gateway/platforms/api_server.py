@@ -585,6 +585,9 @@ def _tool_completion_payload(
     has_error_code = _has_tool_error_value(decoded.get("errorCode"))
     connector_error = decoded.get("connector_error")
     has_connector_error = _has_tool_error_value(connector_error)
+    ui_hint = _takeover_ui_hint(decoded, function_name)
+    if ui_hint is not None:
+        payload["ui_hint"] = ui_hint
     if not (has_error or has_error_code or has_connector_error):
         return payload
 
@@ -609,6 +612,35 @@ def _tool_completion_payload(
             if value is not None and wire_key not in payload:
                 payload[wire_key] = value
     return payload
+
+
+# Only the browser tool that actually builds a takeover hint may project one.
+# Tool output is attacker-influenced (any MCP server, connector or plugin can
+# return arbitrary JSON), and an unfiltered projection would let a foreign tool
+# hand the App a handoff entry point pointing at someone else's agent/tab.
+_TAKEOVER_UI_HINT_TOOLS = frozenset({"browser_navigate"})
+
+
+def _takeover_ui_hint(decoded: Dict[str, Any], function_name: str = "") -> Optional[Dict[str, str]]:
+    """Return only the exact, bounded App handoff contract from tool output."""
+    if function_name not in _TAKEOVER_UI_HINT_TOOLS:
+        return None
+    success = decoded.get("success")
+    if success is not True and success is not False:
+        return None
+    hint = decoded.get("ui_hint")
+    if not isinstance(hint, dict) or hint.get("type") != "takeover_browser":
+        return None
+    out = {"type": "takeover_browser"}
+    for key in ("agent_id", "browser_session_id", "tab_id"):
+        value = hint.get(key)
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        if not value or len(value) > 256:
+            return None
+        out[key] = value
+    return out
 
 
 def _promote_connector_error_from_tool_output(decoded: Dict[str, Any]) -> Dict[str, Any]:

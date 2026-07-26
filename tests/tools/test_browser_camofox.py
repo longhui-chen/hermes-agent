@@ -3,6 +3,7 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import requests
 
 from tools.browser_camofox import (
     camofox_back,
@@ -18,6 +19,7 @@ from tools.browser_camofox import (
     camofox_vision,
     check_camofox_available,
     is_camofox_mode,
+    _redact_handback_page_state,
     _rewrite_loopback_url_for_camofox,
 )
 
@@ -69,6 +71,21 @@ def _mock_response(status=200, json_data=None):
     resp.content = b"\x89PNG\r\n\x1a\nfake"
     resp.raise_for_status = MagicMock()
     return resp
+
+
+def test_handback_redaction_covers_root_editable_controls():
+    snapshot = (
+        'textbox "Email": root@example.com\n'
+        'searchbox "People": Alice Root\n'
+        '- button "Continue" [e1]'
+    )
+
+    redacted = _redact_handback_page_state(snapshot)
+
+    assert "root@example.com" not in redacted
+    assert "Alice Root" not in redacted
+    assert redacted.count("[REDACTED sensitive form control]") == 2
+    assert '- button "Continue" [e1]' in redacted
 
 
 # ---------------------------------------------------------------------------
@@ -173,9 +190,14 @@ class TestCamofoxNavigate:
 
     def test_connection_error_returns_helpful_message(self, monkeypatch):
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:19999")
-        result = json.loads(camofox_navigate("https://example.com", task_id="t_err"))
+        with patch("tools.browser_camofox.requests.post", side_effect=requests.ConnectionError("offline")):
+            result = json.loads(camofox_navigate("https://example.com", task_id="t_err"))
         assert result["success"] is False
-        assert "Cannot connect" in result["error"]
+        assert result["error"] == "browser_runtime_unavailable"
+        assert result["retryable"] is True
+        assert "Managed local browser service" in result["message"]
+        assert "npm" not in json.dumps(result)
+        assert "docker" not in json.dumps(result).lower()
 
 
 # ---------------------------------------------------------------------------
@@ -453,7 +475,10 @@ class TestBrowserToolRouting:
 
     def test_check_requirements_passes_with_camofox(self, monkeypatch):
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
-        from tools.browser_tool import check_browser_requirements
+        from tools.browser_tool import (
+            check_browser_requirements,
+            check_browser_vision_requirements,
+        )
         assert check_browser_requirements() is True
-
-
+        assert check_browser_requirements._profile_scope_sensitive is True
+        assert check_browser_vision_requirements._profile_scope_sensitive is True
