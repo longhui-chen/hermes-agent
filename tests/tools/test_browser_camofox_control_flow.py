@@ -2349,3 +2349,33 @@ def test_a_tab_rebound_mid_navigation_is_also_held():
 
     assert in_flight_during_navigate.get("value", 0) > 0, "the rebound tab was navigated with no reference held"
     assert int(replacement.get("in_flight") or 0) == 0, "the reference was never released"
+
+
+def test_a_refused_navigation_target_reaches_the_agent_verbatim():
+    """local-server refuses targets the Agent may not browse to; it must learn why.
+
+    The proxy answers 403 browser_target_not_allowed for a non-http scheme or a
+    private address. A generic "navigation failed" would have the model retry
+    the same URL; the reason and the fact that it is not retryable both have to
+    survive the error filter.
+    """
+    import tools.browser_camofox as mod
+
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
+    refused = MagicMock(status_code=403)
+    refused.json.return_value = {
+        "error": "browser_target_not_allowed",
+        "message": "only http and https browser targets are allowed",
+    }
+
+    with (
+        patch("tools.browser_camofox._get_session", return_value=session),
+        patch("tools.browser_camofox._ensure_tab", return_value=session),
+        patch("tools.browser_camofox.requests.post", return_value=refused),
+    ):
+        result = json.loads(mod.camofox_navigate("file:///etc/shadow", task_id="t"))
+
+    assert result["success"] is False
+    assert result["error"] == "browser_target_not_allowed"
+    assert "http and https" in result["message"]
+    assert result.get("retryable") is not True, "a policy refusal must not be advertised as retryable"
