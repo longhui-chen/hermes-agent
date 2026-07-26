@@ -248,6 +248,14 @@ _vnc_url_checked = False  # only probe once per single-profile process
 _cached_cmd_timeout: Optional[int] = None
 _cmd_timeout_resolved = False
 
+# Every request below carries X-Zettlab-Agent-Action-Token to a loopback
+# endpoint. requests would otherwise honour HTTP_PROXY / ALL_PROXY from the
+# environment whenever NO_PROXY does not cover loopback, handing this device's
+# Agent authority to whatever host that proxy points at. Validating the URL is
+# not enough — the transport has to refuse the proxy as well.
+_NO_ENV_PROXIES = {"http": None, "https": None, "all": None}
+
+
 _SAFE_HTTP_ERROR_STRING_FIELDS = {
     "error": 256,
     "message": 1_000,
@@ -415,7 +423,8 @@ def check_camofox_available() -> bool:
         # a misconfigured or compromised proxy answering /health with a 30x
         # would receive the Agent action token at another origin.
         resp = requests.get(
-            f"{url}/health", timeout=5, headers=_auth_headers(), allow_redirects=False
+            f"{url}/health", timeout=5, headers=_auth_headers(), allow_redirects=False,
+            proxies=_NO_ENV_PROXIES,
         )
         if resp.status_code == 200 and not _vnc_url_checked and not _local_server_managed():
             try:
@@ -668,7 +677,15 @@ _remembered_tab_epochs: Dict[str, tuple] = {}
 
 
 def _tab_epoch_memory_key(session: Dict[str, Any], tab_id: str) -> str:
-    return f"{session.get('user_id')}\x00{session.get('session_key')}\x00{tab_id}"
+    # Keyed by the credential-derived owner as well, like the session cache and
+    # the document registry. Two profiles in one multiplex gateway can be given
+    # the same explicit identity and be handed the same tab id by their own
+    # runtimes; sharing this record would let one profile's "filter was off"
+    # become the other's trusted state and clear a live handback filter.
+    return (
+        f"{session.get('release_owner') or ''}\x00{session.get('user_id')}"
+        f"\x00{session.get('session_key')}\x00{tab_id}"
+    )
 
 
 def _remembered_tab_state(session: Dict[str, Any], tab_id: str) -> Optional[tuple]:
@@ -1155,9 +1172,11 @@ def _attempt_teardown(entry: Dict[str, Any]) -> bool:
     url, headers = entry["url"], entry["headers"]
     try:
         if entry["kind"] == "delete":
-            resp = requests.delete(url, timeout=5, headers=headers, allow_redirects=False)
+            resp = requests.delete(url, timeout=5, headers=headers, allow_redirects=False,
+                                   proxies=_NO_ENV_PROXIES)
         else:
-            resp = requests.post(url, json={}, timeout=5, headers=headers, allow_redirects=False)
+            resp = requests.post(url, json={}, timeout=5, headers=headers, allow_redirects=False,
+                                 proxies=_NO_ENV_PROXIES)
         _raise_for_status(resp)
         return True
     except Exception as exc:
@@ -1608,7 +1627,8 @@ def _post(path: str, body: dict, timeout: Optional[int] = None, session: Optiona
     _response_facts.started_handback = False
     _begin_session_call(session)
     try:
-        resp = requests.post(url, json=body, timeout=timeout, headers=_request_headers(session), allow_redirects=False)
+        resp = requests.post(url, json=body, timeout=timeout, headers=_request_headers(session),
+                             allow_redirects=False, proxies=_NO_ENV_PROXIES)
     finally:
         _end_session_call(session)
     # POST /tabs establishes the baseline epoch for the new tab. Without it a
@@ -1645,7 +1665,8 @@ def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None, sess
     def _once() -> requests.Response:
         _begin_session_call(session)
         try:
-            resp = requests.get(url, params=params, timeout=timeout, headers=_request_headers(session), allow_redirects=False)
+            resp = requests.get(url, params=params, timeout=timeout, headers=_request_headers(session),
+                                allow_redirects=False, proxies=_NO_ENV_PROXIES)
         finally:
             _end_session_call(session)
         _adopt_epoch_from_response(session, resp, tab_operation=_is_tab_operation(path))
@@ -1660,7 +1681,8 @@ def _delete(path: str, body: dict = None, timeout: Optional[int] = None, session
     if timeout is None:
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
-    resp = requests.delete(url, json=body, timeout=timeout, headers=_request_headers(session), allow_redirects=False)
+    resp = requests.delete(url, json=body, timeout=timeout, headers=_request_headers(session),
+                           allow_redirects=False, proxies=_NO_ENV_PROXIES)
     _adopt_epoch_from_response(session, resp)
     _raise_for_status(resp)
     return resp.json()

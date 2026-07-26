@@ -219,6 +219,7 @@ class TestAuthHeadersSent:
             timeout=5,
             headers={"Authorization": "Bearer my-api-key"},
             allow_redirects=False,
+            proxies={"http": None, "https": None, "all": None},
         )
 
 

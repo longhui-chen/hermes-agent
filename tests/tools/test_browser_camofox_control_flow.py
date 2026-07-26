@@ -345,6 +345,7 @@ def test_managed_close_releases_lease_without_destroying_profile(managed_session
         timeout=5,
         headers={"X-Zettlab-Agent-Action-Token": "tok"},
         allow_redirects=False,
+        proxies={"http": None, "https": None, "all": None},
     )
     mock_delete.assert_not_called()
 
@@ -454,7 +455,7 @@ def test_internal_proxy_requests_reject_redirects(managed_session):
 
     captured = {}
 
-    def _capture(url, json=None, timeout=None, headers=None, allow_redirects=None):
+    def _capture(url, json=None, timeout=None, headers=None, allow_redirects=None, proxies=None):
         captured["allow_redirects"] = allow_redirects
         captured["token"] = headers.get("X-Zettlab-Agent-Action-Token") if headers else None
         return redirect
@@ -537,7 +538,7 @@ def test_health_check_refuses_to_follow_redirects():
 
     captured = {}
 
-    def _capture(url, timeout=None, headers=None, allow_redirects=None):
+    def _capture(url, timeout=None, headers=None, allow_redirects=None, proxies=None):
         captured["allow_redirects"] = allow_redirects
         resp = MagicMock()
         resp.status_code = 302
@@ -601,7 +602,7 @@ def test_reads_retry_transient_failures_but_mutations_do_not():
 
     get_calls = []
 
-    def _flaky_get(url, params=None, timeout=None, headers=None, allow_redirects=None):
+    def _flaky_get(url, params=None, timeout=None, headers=None, allow_redirects=None, **_kw):
         get_calls.append(url)
         return unavailable if len(get_calls) < 3 else ok
 
@@ -616,7 +617,7 @@ def test_reads_retry_transient_failures_but_mutations_do_not():
 
     post_calls = []
 
-    def _flaky_post(url, json=None, timeout=None, headers=None, allow_redirects=None):
+    def _flaky_post(url, json=None, timeout=None, headers=None, allow_redirects=None, **_kw):
         post_calls.append(url)
         return unavailable
 
@@ -1252,6 +1253,7 @@ def test_idle_direct_session_is_really_closed():
         timeout=5,
         headers={"Authorization": "Bearer direct-key"},
         allow_redirects=False,
+        proxies={"http": None, "https": None, "all": None},
     )
 
     # A managed-persistence profile must survive instead.
@@ -1953,7 +1955,7 @@ def test_retryable_failure_does_not_erase_a_revealed_handback():
     ok.headers = {}
     ok.json.return_value = {"snapshot": "ready"}
 
-    def _flaky(url, params=None, timeout=None, headers=None, allow_redirects=None):
+    def _flaky(url, params=None, timeout=None, headers=None, allow_redirects=None, **_kw):
         attempts["n"] += 1
         if attempts["n"] == 1:
             # This response revealed the handback, then failed retryably.
@@ -2379,3 +2381,68 @@ def test_a_refused_navigation_target_reaches_the_agent_verbatim():
     assert result["error"] == "browser_target_not_allowed"
     assert "http and https" in result["message"]
     assert result.get("retryable") is not True, "a policy refusal must not be advertised as retryable"
+
+
+def test_action_token_requests_never_use_an_environment_proxy(monkeypatch):
+    """Validating the URL is not enough; the transport has to refuse the proxy.
+
+    requests honours HTTP_PROXY / ALL_PROXY whenever NO_PROXY does not cover
+    loopback, so a device with a proxy configured would hand this device's Agent
+    authority to whatever host that proxy points at.
+    """
+    import tools.browser_camofox as mod
+
+    monkeypatch.setenv("HTTP_PROXY", "http://attacker.example:3128")
+    monkeypatch.setenv("HTTPS_PROXY", "http://attacker.example:3128")
+    monkeypatch.setenv("ALL_PROXY", "http://attacker.example:3128")
+    monkeypatch.delenv("NO_PROXY", raising=False)
+
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
+    seen = {}
+
+    def _record(url, **kwargs):
+        seen[url] = kwargs.get("proxies")
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"ok": True}
+        response.headers = {}
+        return response
+
+    with (
+        patch("tools.browser_camofox.requests.post", side_effect=_record),
+        patch("tools.browser_camofox.requests.get", side_effect=_record),
+        patch("tools.browser_camofox.requests.delete", side_effect=_record),
+    ):
+        mod._post("/tabs/tab-1/click", {"userId": "u"}, session=session)
+        mod._get("/tabs/tab-1/snapshot", params={"userId": "u"}, session=session)
+        mod._delete("/tabs/tab-1", {"userId": "u"}, session=session)
+
+    assert seen, "no request was made"
+    for url, proxies in seen.items():
+        assert proxies is not None, f"{url} inherited the environment proxy"
+        for scheme in ("http", "https", "all"):
+            assert proxies.get(scheme, "unset") is None, f"{url} left {scheme} proxying enabled"
+
+
+def test_two_profiles_do_not_share_remembered_tab_epochs():
+    """The epoch memory is the last per-process record keyed without the owner.
+
+    Two profiles handed the same explicit identity can be given the same tab id
+    by their own runtimes. Sharing this record would let one profile's
+    "filter was off" become the other's trusted state on adoption, clearing a
+    live handback filter over a page the other user just typed into.
+    """
+    import tools.browser_camofox as mod
+
+    a = {"user_id": "shared", "session_key": "sess", "release_owner": "shared\x00digest-a"}
+    b = {"user_id": "shared", "session_key": "sess", "release_owner": "shared\x00digest-b"}
+    assert mod._tab_epoch_memory_key(a, "tab-1") != mod._tab_epoch_memory_key(b, "tab-1")
+
+    with mod._sessions_lock:
+        mod._remembered_tab_epochs.clear()
+        mod._remembered_tab_epochs[mod._tab_epoch_memory_key(b, "tab-1")] = (7, True)
+        mod._remembered_tab_epochs[mod._tab_epoch_memory_key(a, "tab-1")] = (7, False)
+
+    assert mod._remembered_tab_state(b, "tab-1") == (7, True), "profile A overwrote profile B's privacy state"
+    assert mod._remembered_tab_state(a, "tab-1") == (7, False)
+    with mod._sessions_lock:
+        mod._remembered_tab_epochs.clear()
