@@ -145,6 +145,9 @@ def _adopt_session_epoch(session: Optional[Dict[str, Any]], epoch: Any) -> None:
     previous = session.get("epoch")
     if previous is not None and previous != epoch:
         session["privacy_filter_after_handback"] = True
+        # Which document it is for is not known here — the response that
+        # carried this epoch has no URL — so it is filled in by the first read
+        # that does establish it, and by _left_handback_document below.
         # The epoch only moves when a human took the tab and gave it back, so
         # the document every outstanding ref describes is the one they left
         # behind. Turns sharing this physical tab keep their own session entry
@@ -201,10 +204,32 @@ def _adopt_epoch_from_response(
     return False
 
 
-def _set_handback_privacy_filter(session: Dict[str, Any], enabled: bool) -> None:
-    """Persist handback privacy filtering for subsequent reads of this tab."""
+def _set_handback_privacy_filter(session: Dict[str, Any], enabled: bool, document: str = "") -> None:
+    """Persist handback privacy filtering for subsequent reads of this tab.
+
+    Turning it off does not forget which document it was for. Navigating away
+    clears the filter, but history and bfcache keep that page — including what
+    the human typed into it and a URL that may carry an OAuth code or a reset
+    token — so coming back to it has to filter again.
+    """
     with _session_lock(session):
         session["privacy_filter_after_handback"] = enabled
+        if enabled and document:
+            session["handback_document"] = document
+
+
+def _refilter_if_back_on_the_handback_document(session: Dict[str, Any], landed_url: Any) -> None:
+    """Re-enable the filter when a navigation lands back on the human's page."""
+    if not isinstance(session, dict):
+        return
+    with _session_lock(session):
+        remembered = str(session.get("handback_document") or "")
+    if not remembered:
+        return
+    if _document_identity(landed_url) != remembered:
+        return
+    with _session_lock(session):
+        session["privacy_filter_after_handback"] = True
 
 
 def _handback_privacy_filter_enabled(session: Dict[str, Any]) -> bool:
@@ -1252,6 +1277,13 @@ def _run_pending_teardowns(
             if entry["kind"] == "release" and owner and _profile_still_in_use(owner):
                 logger.debug("Camofox dropped a scheduled release: the profile is in use again")
                 continue
+            # Re-checked here, not only when it was queued. The delete runs
+            # later from the maintenance worker, and a new turn on the same
+            # browser identity can adopt this tab in between — deleting it then
+            # would 404 that turn's snapshot or click.
+            if entry["kind"] == "delete" and _tab_adopted_again(entry):
+                logger.debug("Camofox dropped a scheduled tab delete: the tab is in use again")
+                continue
             if _attempt_teardown(entry):
                 continue
         attempts = entry["attempts"] + 1
@@ -1267,6 +1299,21 @@ def _run_pending_teardowns(
         with _sessions_lock:
             if len(_pending_lease_releases) < _MAX_PENDING_LEASE_RELEASES:
                 _pending_lease_releases.append(entry)
+
+
+def _tab_adopted_again(entry: Dict[str, Any]) -> bool:
+    """Whether some entry has taken this queued-for-deletion tab back."""
+    identity = str(entry.get("identity") or "")
+    tab_id = str(entry.get("tab_id") or "")
+    if not identity or not tab_id:
+        # A direct session's DELETE closes the whole server-side session and
+        # carries no tab identity; nothing to re-check.
+        return False
+    with _sessions_lock:
+        return any(
+            str(other.get("tab_id") or "") == tab_id and _browser_identity_key(other) == identity
+            for other in _sessions.values()
+        )
 
 
 def _attempt_teardown(entry: Dict[str, Any]) -> bool:
@@ -1295,6 +1342,8 @@ def _queue_pending_teardown(
     headers: Dict[str, str],
     owner: str = "",
     delay: float = 0.0,
+    identity: str = "",
+    tab_id: str = "",
 ) -> None:
     with _sessions_lock:
         # Merge by target: repeat teardowns of the same thing are the same
@@ -1325,6 +1374,8 @@ def _queue_pending_teardown(
                 "url": url,
                 "headers": dict(headers),
                 "owner": owner,
+                "identity": identity,
+                "tab_id": tab_id,
                 "attempts": 0,
                 "ready_at": time.monotonic() + delay,
             })
@@ -1670,7 +1721,12 @@ def _queue_managed_tab_delete(session: Dict[str, Any]) -> bool:
         return False
     headers = session.get("release_headers")
     headers = dict(headers) if isinstance(headers, dict) else {}
-    _queue_pending_teardown("delete", url, headers, owner=str(session.get("release_owner") or ""))
+    _queue_pending_teardown(
+        "delete", url, headers,
+        owner=str(session.get("release_owner") or ""),
+        identity=_browser_identity_key(session),
+        tab_id=str(session.get("tab_id") or ""),
+    )
     return True
 
 
@@ -2563,7 +2619,11 @@ def _navigate_within_identity(
             and session.get("epoch") == epoch_before_navigate
             and _left_handback_document(session, document_before_navigate, data.get("url", browser_url))
         ):
-            _set_handback_privacy_filter(session, False)
+            _set_handback_privacy_filter(session, False, document_before_navigate)
+        # Landing back on it — history, bfcache, or simply navigating to the
+        # same URL again — puts the human's page in front of the Agent once
+        # more, so the filter comes back with it.
+        _refilter_if_back_on_the_handback_document(session, data.get("url", browser_url))
         # A handback that landed mid-navigation leaves the filter on, and the
         # page the human ended on is reported here: an OAuth callback, a reset
         # link or any URL with personal query parameters would otherwise reach
@@ -2826,7 +2886,13 @@ def camofox_back(task_id: Optional[str] = None) -> str:
 
         filtered_at_request = _handback_privacy_filter_enabled(session)
         data = _mutating_tab_call(session, "/back", {"userId": session["user_id"]})
-        result_handback_revealed = filtered_at_request or _last_response_started_handback()
+        # Going back is how the human's page most easily returns.
+        _refilter_if_back_on_the_handback_document(session, data.get("url", ""))
+        result_handback_revealed = (
+            filtered_at_request
+            or _last_response_started_handback()
+            or _handback_privacy_filter_enabled(session)
+        )
         return json.dumps({"success": True, "url": _filter_url_after_handback(session, data.get("url", ""), result_handback_revealed)})
     except Exception as e:
         return _tool_error_from_exception(e, session=locals().get("session"))

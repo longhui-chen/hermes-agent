@@ -2808,3 +2808,75 @@ def test_a_404_rebuild_repoints_the_other_turns_too():
         assert theirs["tab_id"] == "tab-new", "the other turn still points at the collected tab"
     finally:
         mod._sessions.clear()
+
+
+def test_a_queued_delete_is_dropped_when_the_tab_is_adopted_again():
+    """The check at enqueue time says nothing about execution time.
+
+    The DELETE runs later from the maintenance worker, and a new turn on the
+    same browser identity can adopt the tab in between — deleting it then 404s
+    that turn's snapshot or click.
+    """
+    import tools.browser_camofox as mod
+
+    mod._sessions.clear()
+    mod._pending_lease_releases.clear()
+    session = {
+        "user_id": "u", "session_key": "shared", "tab_id": "tab-7", "task_id": "old",
+        "managed": True, "local_server_managed": True, "release_owner": "o",
+        "release_url": "http://127.0.0.1:8080/x/_zettlab/release",
+        "release_headers": {"X-Zettlab-Agent-Action-Token": "tok"},
+    }
+    try:
+        assert mod._queue_managed_tab_delete(session) is True
+        # A new turn adopts the same tab before the worker gets to it.
+        mod._sessions["new"] = dict(session, task_id="new")
+        with patch("tools.browser_camofox._attempt_teardown", return_value=True) as attempt:
+            mod._run_pending_teardowns(force=True)
+        assert not attempt.called, "a tab that had been adopted again was deleted"
+
+        # With nobody using it the queued delete goes through.
+        mod._sessions.clear()
+        assert mod._queue_managed_tab_delete(session) is True
+        with patch("tools.browser_camofox._attempt_teardown", return_value=True) as attempt:
+            mod._run_pending_teardowns(force=True)
+        assert attempt.called
+    finally:
+        mod._sessions.clear()
+        mod._pending_lease_releases.clear()
+
+
+def test_going_back_to_the_handback_page_filters_again():
+    """Navigating away clears the filter; history brings the page back.
+
+    bfcache keeps what the human typed, and the URL may carry an OAuth code or
+    a reset token, so returning to that document has to filter again.
+    """
+    import tools.browser_camofox as mod
+
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 5}
+    handback_url = "https://idp.example/callback?code=SECRET"
+    mod._set_handback_privacy_filter(session, True, mod._document_identity(handback_url))
+    assert mod._handback_privacy_filter_enabled(session)
+
+    # The Agent navigates away: the filter goes, the memory of the page stays.
+    mod._set_handback_privacy_filter(session, False, mod._document_identity(handback_url))
+    assert not mod._handback_privacy_filter_enabled(session)
+
+    # Somewhere else is still unfiltered.
+    mod._refilter_if_back_on_the_handback_document(session, "https://ok.example/")
+    assert not mod._handback_privacy_filter_enabled(session)
+
+    # Back on it — by history or by navigating to it again — and it returns.
+    mod._refilter_if_back_on_the_handback_document(session, handback_url)
+    assert mod._handback_privacy_filter_enabled(session), "the human's page came back unfiltered"
+
+    # And browser_back goes through the same check.
+    session["privacy_filter_after_handback"] = False
+    with (
+        patch("tools.browser_camofox._get_session", return_value=session),
+        patch("tools.browser_camofox._post", return_value={"url": handback_url}),
+    ):
+        result = json.loads(mod.camofox_back(task_id="t"))
+    assert mod._handback_privacy_filter_enabled(session), "back onto the human's page did not filter"
+    assert "SECRET" not in json.dumps(result), "the handback URL's token was returned"
