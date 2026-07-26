@@ -2461,6 +2461,14 @@ def _mutating_tab_call(session: Dict[str, Any], path_suffix: str, body: Dict[str
                 "browser evaluation is blocked after human control until the Agent "
                 "navigates to a new page or closes the session"
             )
+        # Arbitrary JavaScript reads the page as surely as a snapshot does, so
+        # it is refused on a blocked landing page for the same reason the read
+        # paths are.
+        if path_suffix == "/evaluate" and _document_is_blocked(session):
+            raise CamofoxEvaluateBlocked(
+                "the browser is on a page this Agent is not allowed to read; "
+                "navigate to an allowed page before evaluating"
+            )
         # The epoch only moves on a human handback, so it cannot see another
         # turn's ordinary navigate on the shared tab. A ref is only valid for
         # the document version the snapshot that produced it described.
@@ -2627,7 +2635,12 @@ def _navigate_within_identity(
             # somewhere allowed.
             _mark_document_blocked(session, landed_url)
             return _blocked_document_error()
-        _mark_document_blocked(session, "")
+        if isinstance(landed_url, str) and landed_url:
+            # Cleared only against a landing URL that was actually checked. A
+            # response that reports none proves nothing, and treating it as a
+            # clean slate would let one unreported navigation unlock the page
+            # the previous one was refused for.
+            _mark_document_blocked(session, "")
         # Three things must hold before the page counts as left behind: this
         # response actually carried a verified epoch (a protocol downgrade must
         # not read as "nothing happened"), the epoch did not move, and the
@@ -2679,7 +2692,16 @@ def _navigate_within_identity(
                 "Share this link with the user so they can watch the browser live."
             )
 
-        # Auto-take a compact snapshot so the model can act immediately
+        # Auto-take a compact snapshot so the model can act immediately, unless
+        # the tab is still on a page a refused navigation left it on: this
+        # response reported no landing URL, so nothing has proven it moved.
+        if _document_is_blocked(session):
+            result["snapshot_withheld"] = True
+            result["warning"] = (
+                "The browser is still on a page this Agent is not allowed to read. "
+                "Page state was not captured."
+            )
+            return json.dumps(result)
         try:
             snapshot_filtered_at_request = _handback_privacy_filter_enabled(session)
             # No _capture_guard here: _navigate_locked already holds this tab's

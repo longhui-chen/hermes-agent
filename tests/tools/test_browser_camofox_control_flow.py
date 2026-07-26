@@ -3035,7 +3035,18 @@ def test_a_blocked_landing_page_stays_unreadable_until_the_agent_leaves():
             assert "not allowed to read" in json.dumps(result)
         assert reads["count"] == 0, "a read reached the blocked page"
 
-        # Navigating somewhere allowed clears it.
+        # Arbitrary JavaScript reads the page too.
+        with pytest.raises(mod.CamofoxEvaluateBlocked):
+            mod._mutating_tab_call(session, "/evaluate", {"userId": "u", "expression": "document.body.innerText"})
+
+        # A navigation that reports no landing URL proves nothing and must not
+        # unlock the page the refused one left behind.
+        with patch("tools.browser_camofox._post", return_value={"ok": True}):
+            json.loads(mod.camofox_navigate("https://ok.example/", task_id="t"))
+        assert json.loads(mod.camofox_snapshot(task_id="t"))["success"] is False
+        assert reads["count"] == 0
+
+        # Landing somewhere allowed clears it.
         with patch("tools.browser_camofox._post", return_value={"url": "https://ok.example/"}):
             moved = json.loads(mod.camofox_navigate("https://ok.example/", task_id="t"))
         assert moved["success"] is True
