@@ -2553,7 +2553,12 @@ def camofox_press(key: str, task_id: Optional[str] = None) -> str:
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
-        _mutating_tab_call(session, "/press", {"userId": session["user_id"], "key": key})
+        data = _mutating_tab_call(session, "/press", {"userId": session["user_id"], "key": key})
+        # Enter on a form submits it, and the page that answers is a different
+        # document. Same rule as click: the URL the tab reports settles it, so
+        # an in-page keystroke does not force a re-snapshot.
+        if isinstance(data, dict):
+            _observe_document_url(session, data.get("url", "") if isinstance(data.get("url"), str) else "")
         return json.dumps({"success": True, "pressed": key})
     except Exception as e:
         return _tool_error_from_exception(e, session=locals().get("session"))

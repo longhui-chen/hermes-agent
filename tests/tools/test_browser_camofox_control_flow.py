@@ -2486,3 +2486,21 @@ def test_evaluate_invalidates_outstanding_refs():
     assert not mod._refs_are_current(session), "refs survived arbitrary JavaScript"
     with pytest.raises(mod.CamofoxRefsStale):
         mod._mutating_tab_call(session, "/click", {"userId": "u", "ref": "e1"})
+
+
+def test_a_keystroke_that_submits_a_form_invalidates_refs():
+    """Enter on a form submits it, and the page that answers is a new document."""
+    import tools.browser_camofox as mod
+
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
+    mod._stamp_ref_generation(session, "https://a.example/form")
+
+    with patch("tools.browser_camofox._get_session", return_value=session):
+        # A keystroke that stays on the page must not force a re-snapshot.
+        with patch("tools.browser_camofox._post", return_value={"url": "https://a.example/form"}):
+            json.loads(mod.camofox_press("a", task_id="t"))
+        assert mod._refs_are_current(session)
+
+        with patch("tools.browser_camofox._post", return_value={"url": "https://a.example/results"}):
+            json.loads(mod.camofox_press("Enter", task_id="t"))
+        assert not mod._refs_are_current(session), "refs survived a form submission"
