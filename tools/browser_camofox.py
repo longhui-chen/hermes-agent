@@ -1942,20 +1942,30 @@ def _handback_page_readable(session: Dict[str, Any], snapshot_data: Any = None) 
 def _mark_document_blocked(session: Dict[str, Any], url: str) -> None:
     """Record that the tab is sitting on a page no read may return.
 
-    Cleared by a navigation that lands somewhere allowed — the only thing that
-    actually moves the tab off it.
+    Stored against the physical tab, not this task's session entry: turns
+    sharing a HERMES_SESSION_KEY keep their own entries but drive one tab, so a
+    per-session flag would leave every other turn free to read the page one of
+    them was refused. Cleared by a navigation that lands somewhere allowed —
+    the only thing that actually moves the tab off it.
     """
     if not isinstance(session, dict):
         return
-    with _session_lock(session):
+    key = _document_key(session)
+    with _sessions_lock:
+        entry = _document_generations.setdefault(key, {"generation": 0, "url": ""})
         if url:
-            session["blocked_document"] = True
+            entry["blocked"] = True
         else:
-            session.pop("blocked_document", None)
+            entry.pop("blocked", None)
+        _forget_surplus_documents_locked(key)
 
 
 def _document_is_blocked(session: Optional[Dict[str, Any]]) -> bool:
-    return isinstance(session, dict) and bool(session.get("blocked_document"))
+    if not isinstance(session, dict):
+        return False
+    with _sessions_lock:
+        entry = _document_generations.get(_document_key(session))
+        return bool(entry and entry.get("blocked"))
 
 
 def _blocked_document_error() -> str:
@@ -2305,12 +2315,13 @@ def _bump_document_generation(session: Dict[str, Any], url: str = "") -> None:
     """Declare the tab's document replaced, invalidating every outstanding ref."""
     key = _document_key(session)
     with _sessions_lock:
-        entry = _document_generations.get(key)
-        generation = _document_generation_locked(key) + 1
-        _document_generations[key] = {
-            "generation": generation,
-            "url": url or (entry or {}).get("url", ""),
-        }
+        # Updated in place rather than replaced: the record also carries the
+        # blocked-landing flag, and rebuilding it here would quietly unlock a
+        # page a refused navigation had marked.
+        entry = _document_generations.setdefault(key, {"generation": 0, "url": ""})
+        entry["generation"] = int(entry.get("generation") or 0) + 1
+        if url:
+            entry["url"] = url
         _forget_surplus_documents_locked(key)
 
 
@@ -2399,13 +2410,19 @@ def _forget_surplus_documents_locked(keep: str) -> None:
     while len(_document_generations) > _MAX_TRACKED_DOCUMENTS:
         stamped = {s.get("ref_document") for s in _sessions.values()}
         victim = ""
-        for key in _document_generations:
+        for key, entry in _document_generations.items():
             if key == keep:
+                continue
+            # A record marking a tab unreadable goes last of all: dropping it
+            # would let every read on that tab through again.
+            if entry.get("blocked"):
+                if not victim:
+                    victim = key
                 continue
             if key not in stamped:
                 victim = key
                 break
-            if not victim:
+            if not victim or _document_generations[victim].get("blocked"):
                 victim = key
         if not victim:
             return

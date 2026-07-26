@@ -3046,11 +3046,26 @@ def test_a_blocked_landing_page_stays_unreadable_until_the_agent_leaves():
         assert json.loads(mod.camofox_snapshot(task_id="t"))["success"] is False
         assert reads["count"] == 0
 
-        # Landing somewhere allowed clears it.
+        # Another turn shares the physical tab and has its own session entry.
+        # The refusal belongs to the tab, not to whoever happened to hit it.
+        other_turn = {"user_id": "u", "session_key": "s", "tab_id": "tab-1",
+                      "task_id": "other", "epoch": 2}
+        with patch("tools.browser_camofox._get_session", return_value=other_turn):
+            for call in (
+                lambda: mod.camofox_snapshot(task_id="other"),
+                lambda: mod.camofox_get_images(task_id="other"),
+                lambda: mod.camofox_vision("what is this", task_id="other"),
+            ):
+                assert json.loads(call())["success"] is False, "another turn read the blocked page"
+        assert reads["count"] == 0
+
+        # Landing somewhere allowed clears it, for every turn on that tab.
         with patch("tools.browser_camofox._post", return_value={"url": "https://ok.example/"}):
             moved = json.loads(mod.camofox_navigate("https://ok.example/", task_id="t"))
         assert moved["success"] is True
         assert json.loads(mod.camofox_snapshot(task_id="t"))["success"] is True
+        with patch("tools.browser_camofox._get_session", return_value=other_turn):
+            assert json.loads(mod.camofox_snapshot(task_id="other"))["success"] is True
 
 
 def test_direct_teardown_is_scoped_to_its_credential():
