@@ -2938,14 +2938,61 @@ def test_a_tab_a_human_is_holding_is_not_idle():
     assert plain in dropped
     assert handed_over not in dropped, "a tab a human is holding was reclaimed as idle"
 
-    # Bounded, not exempt: an App that never hands back must not pin it forever.
-    handed_over["last_used_at"] = now - (mod._TAKEOVER_IDLE_TTL_SECONDS + 60)
+    # An outstanding hint alone gets the modest window, not the long one: the
+    # hint rides along with every navigation, so treating it as proof of a
+    # takeover would keep a browser runtime alive for hours after one that was
+    # ignored.
+    handed_over["last_used_at"] = now - (mod._TAKEOVER_OFFERED_IDLE_TTL_SECONDS + 60)
+    mod._sessions["a"] = handed_over
     assert handed_over in mod._prune_idle_sessions_locked(now)
 
+    # A refusal naming human control is proof, and earns the long window.
+    observed = dict(handed_over)
+    observed["human_controlled_seen"] = True
+    observed["last_used_at"] = now - (mod._TAKEOVER_OFFERED_IDLE_TTL_SECONDS + 60)
+    mod._sessions["a"] = observed
+    assert observed not in mod._prune_idle_sessions_locked(now)
+
+    # Bounded, not exempt: an App that never hands back must not pin it forever.
+    observed["last_used_at"] = now - (mod._TAKEOVER_IDLE_TTL_SECONDS + 60)
+    assert observed in mod._prune_idle_sessions_locked(now)
+
     # And the handback puts it back on the ordinary window.
+    handed_over["takeover_offered"] = True
+    handed_over["human_controlled_seen"] = True
     mod._sessions["a"] = handed_over
     handed_over["last_used_at"] = now - (mod._SESSION_IDLE_TTL_SECONDS + 60)
     mod._adopt_session_epoch(handed_over, 7)
     assert "takeover_offered" not in handed_over
+    assert "human_controlled_seen" not in handed_over
     assert handed_over in mod._prune_idle_sessions_locked(now)
     mod._sessions.clear()
+
+
+def test_control_observations_come_from_the_responses_themselves():
+    """A refusal naming human control is proof; a success is proof of the opposite.
+
+    local-server refuses operations while a human holds the tab, so a 2xx says
+    nobody does — which is what lets an ignored takeover hint stop widening the
+    idle window.
+    """
+    import tools.browser_camofox as mod
+
+    session = {"user_id": "u", "session_key": "s", "takeover_offered": True}
+    refusal = MagicMock(status_code=409)
+    refusal.json.return_value = {"error": "browser_human_controlled"}
+    mod._note_human_control(session, refusal)
+    assert session.get("human_controlled_seen") is True
+
+    # A different 409 says nothing about who is holding it.
+    session.pop("human_controlled_seen", None)
+    stale = MagicMock(status_code=409)
+    stale.json.return_value = {"error": "browser_epoch_stale"}
+    mod._note_human_control(session, stale)
+    assert "human_controlled_seen" not in session
+
+    # A success clears both the observation and the outstanding hint.
+    session["human_controlled_seen"] = True
+    mod._note_human_control(session, MagicMock(status_code=200))
+    assert "human_controlled_seen" not in session
+    assert "takeover_offered" not in session

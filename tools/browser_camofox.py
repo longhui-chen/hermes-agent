@@ -146,6 +146,7 @@ def _adopt_session_epoch(session: Optional[Dict[str, Any]], epoch: Any) -> None:
         session["privacy_filter_after_handback"] = True
         # The takeover this session was widened for has ended.
         session.pop("takeover_offered", None)
+        session.pop("human_controlled_seen", None)
         # The epoch only moves when a human took the tab and gave it back, so
         # the document every outstanding ref describes is the one they left
         # behind. Turns sharing this physical tab keep their own session entry
@@ -1014,6 +1015,11 @@ _SESSION_IDLE_TTL_SECONDS = 30 * 60
 # entry or its runtime lease forever.
 _TAKEOVER_IDLE_TTL_SECONDS = 4 * 60 * 60
 
+# A takeover hint accompanies every navigation result, so most sessions carry
+# one. Long enough for the App to claim it and for the first refusal to prove
+# it, short enough that an ignored hint does not keep a browser runtime alive.
+_TAKEOVER_OFFERED_IDLE_TTL_SECONDS = 60 * 60
+
 
 def _session_key_for_task_locked(task_id: str) -> Optional[str]:
     """The cache key this task owns, or None when it cannot be established.
@@ -1145,6 +1151,31 @@ def _evict_surplus_sessions_locked(protect_key: str = "") -> list:
     return evicted
 
 
+def _note_human_control(session: Optional[Dict[str, Any]], resp: "requests.Response") -> None:
+    """Record what this response says about who is holding the tab.
+
+    A refusal naming human control is proof somebody has it; a mutation that
+    succeeded is proof nobody does, because local-server refuses those while a
+    human is in control. This is the only direct evidence available here — the
+    takeover itself runs between the App and local-server.
+    """
+    if not isinstance(session, dict) or resp is None:
+        return
+    status = getattr(resp, "status_code", None)
+    if isinstance(status, int) and 200 <= status < 300:
+        session.pop("human_controlled_seen", None)
+        session.pop("takeover_offered", None)
+        return
+    if status != 409:
+        return
+    try:
+        body = resp.json()
+    except Exception:
+        return
+    if isinstance(body, dict) and body.get("error") == "browser_human_controlled":
+        session["human_controlled_seen"] = True
+
+
 def _session_idle_ttl(session: Dict[str, Any]) -> float:
     """How long this entry may sit untouched before it is reclaimed.
 
@@ -1159,8 +1190,20 @@ def _session_idle_ttl(session: Dict[str, Any]) -> float:
     local-server would have to report control state or keep a lease heartbeat.
     Tracked separately; the wider window is the containment until then.
     """
-    if session.get("takeover_offered") and not session.get("privacy_filter_after_handback"):
+    if session.get("privacy_filter_after_handback"):
+        # The handback already arrived; this is an ordinary session again.
+        return _SESSION_IDLE_TTL_SECONDS
+    if session.get("human_controlled_seen"):
+        # Observed, not guessed: local-server refused an operation because a
+        # human holds this tab.
         return _TAKEOVER_IDLE_TTL_SECONDS
+    if session.get("takeover_offered"):
+        # A hint went out with the last result and nothing has been heard
+        # since. The App may be about to claim it, so do not reclaim on the
+        # ordinary window — but the hint rides along with every navigation, so
+        # this cannot be the long one or an ignored hint would keep the
+        # browser runtime alive for hours on a 2 GB device.
+        return _TAKEOVER_OFFERED_IDLE_TTL_SECONDS
     return _SESSION_IDLE_TTL_SECONDS
 
 
@@ -1746,6 +1789,7 @@ def _post(path: str, body: dict, timeout: Optional[int] = None, session: Optiona
     _response_facts.epoch_verified = _adopt_epoch_from_response(
         session, resp, tab_operation=_is_tab_operation(path) or path == "/tabs"
     )
+    _note_human_control(session, resp)
     _raise_for_status(resp)
     return resp.json()
 
