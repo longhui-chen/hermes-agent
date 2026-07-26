@@ -2342,8 +2342,11 @@ def test_a_tab_rebound_mid_navigation_is_also_held():
 
     original = {"user_id": "u", "session_key": "s", "tab_id": "tab-old", "task_id": "t",
                 "epoch": None, "in_flight": 0, "last_used_at": time.monotonic()}
+    # _ensure_tab goes through _get_session, which hands back an entry that
+    # already holds its reference — the replacement arrives referenced and this
+    # call has to release it.
     replacement = {"user_id": "u", "session_key": "s", "tab_id": "tab-new", "task_id": "t",
-                   "epoch": None, "in_flight": 0, "last_used_at": time.monotonic()}
+                   "epoch": None, "in_flight": 1, "last_used_at": time.monotonic()}
     in_flight_during_navigate = {}
 
     gone = requests.HTTPError()
@@ -2364,6 +2367,39 @@ def test_a_tab_rebound_mid_navigation_is_also_held():
 
     assert in_flight_during_navigate.get("value", 0) > 0, "the rebound tab was navigated with no reference held"
     assert int(replacement.get("in_flight") or 0) == 0, "the reference was never released"
+
+
+def test_every_session_handed_out_is_released():
+    """_get_session hands back a referenced entry, so every path must release it.
+
+    A leaked reference is permanent: the entry can never be evicted or reclaimed
+    by the idle sweep, and enough of them fill the cache and trigger the
+    backpressure refusal for everybody else.
+    """
+    import tools.browser_camofox as mod
+
+    calls = [
+        lambda: mod.camofox_snapshot(task_id="leak"),
+        lambda: mod.camofox_click("@e1", task_id="leak"),
+        lambda: mod.camofox_type("@e1", "x", task_id="leak"),
+        lambda: mod.camofox_scroll("down", task_id="leak"),
+        lambda: mod.camofox_back(task_id="leak"),
+        lambda: mod.camofox_press("Enter", task_id="leak"),
+        lambda: mod.camofox_get_images(task_id="leak"),
+        lambda: mod.camofox_vision("what is this", task_id="leak"),
+    ]
+    for call in calls:
+        session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "leak",
+                   "epoch": 2, "in_flight": 1, "last_used_at": time.monotonic()}
+        mod._stamp_ref_generation(session)
+        with (
+            patch("tools.browser_camofox._get_session", return_value=session),
+            patch("tools.browser_camofox._post", return_value={"url": "https://a.example/"}),
+            patch("tools.browser_camofox._get", return_value={"snapshot": "- x", "refsCount": 0}),
+            patch("tools.browser_camofox._get_raw", side_effect=requests.ConnectionError("boom")),
+        ):
+            call()
+        assert int(session.get("in_flight") or 0) == 0, "a reference leaked"
 
 
 def test_a_refused_navigation_target_reaches_the_agent_verbatim():
@@ -2550,3 +2586,39 @@ def test_a_refusal_never_hands_over_a_usable_epoch(managed_session):
     response = MagicMock(headers={mod._EPOCH_HEADER: "7"})
     mod._adopt_epoch_from_response(managed_session, response, tab_operation=True)
     assert managed_session["epoch"] == 7
+
+
+def test_a_full_session_cache_applies_backpressure():
+    """A cache full of work in flight must refuse, not grow.
+
+    Protecting only the entry being returned makes the ceiling soft again: with
+    every existing entry busy, each new key protects itself and the cache — and
+    the browser tabs behind it — grows with the number of concurrent sessions.
+    """
+    import tools.browser_camofox as mod
+
+    mod._sessions.clear()
+    base = time.monotonic()
+    for i in range(mod._MAX_TRACKED_SESSIONS):
+        mod._sessions[f"o\x00u\x00s\x00busy-{i:03d}"] = {
+            "user_id": "u", "session_key": "s", "task_id": f"busy-{i:03d}",
+            "in_flight": 1, "last_used_at": base + i,
+        }
+
+    with (
+        patch("tools.browser_camofox._get_camofox_config", return_value={}),
+        patch("tools.browser_camofox._camofox_identity_override", return_value=None),
+        patch("tools.browser_camofox.get_camofox_identity", return_value={"user_id": "u", "session_key": "s"}),
+        patch("tools.browser_camofox._release_owner_key", return_value="o"),
+        patch("tools.browser_camofox._local_server_managed", return_value=False),
+        patch("tools.browser_camofox.get_camofox_url", return_value="http://127.0.0.1:9377"),
+        patch("tools.browser_camofox._auth_headers", return_value={}),
+        patch("tools.browser_camofox._ensure_maintenance_worker", return_value=None),
+    ):
+        with pytest.raises(mod.CamofoxSessionsBusy):
+            mod._get_session("newcomer")
+
+    # The refused entry left nothing behind.
+    assert len(mod._sessions) == mod._MAX_TRACKED_SESSIONS
+    assert all(not k.endswith("newcomer") for k in mod._sessions)
+    mod._sessions.clear()

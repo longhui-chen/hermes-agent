@@ -819,6 +819,8 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
     # separates two profiles that were handed the same explicit identity.
     cache_key = _session_cache_key(task_id, cache_identity, release_owner)
     now = time.monotonic()
+    overflowing = False
+    created_entry = False
     with _held_owner_lock(release_owner), _sessions_lock:
         idle = _prune_idle_sessions_locked(now)
         if cache_key in _sessions:
@@ -896,21 +898,41 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
                     "_lock": threading.Lock(),
                 }
             _sessions[cache_key] = session
-        # This call's own entry is exempt. It has not been handed back yet, so
-        # its in_flight is still 0, and if every other entry is busy it would be
-        # the only evictable one — the caller would then receive a session that
-        # is no longer in the cache, tear it down mid-use, and (direct mode)
-        # lose track of the tab it is about to create.
-        idle.extend(_evict_surplus_sessions_locked(protect_key=cache_key))
+            created_entry = True
+        # The reference is taken here, under the same lock that admitted the
+        # entry, and released by the caller. Handing the entry back unreferenced
+        # left a window in which another _get_session could pick it as the one
+        # idle entry, evict it and tear it down while this call was still
+        # creating a tab on it.
+        session["in_flight"] = int(session.get("in_flight") or 0) + 1
+        session["last_used_at"] = now
+        idle.extend(_evict_surplus_sessions_locked())
+        # Backpressure, not a soft cap: if nothing could be evicted the cache is
+        # full of work in flight, and admitting more would grow the cache and the
+        # browser's tabs without bound. The caller sees a retryable failure.
+        if len(_sessions) > _MAX_TRACKED_SESSIONS:
+            session["in_flight"] = max(0, int(session.get("in_flight") or 0) - 1)
+            if created_entry:
+                _sessions.pop(cache_key, None)
+            overflowing = True
     for expired in idle:
         _teardown_session(expired)
     _run_pending_teardowns()
     # A tracked session must be reclaimable even if this process never calls
     # into the browser again.
     _ensure_maintenance_worker()
+    if overflowing:
+        raise CamofoxSessionsBusy(
+            "every tracked browser session is in use; retry when one finishes"
+        )
 
-    with _session_lock(session):
-        return _adopt_existing_tab(session)
+    try:
+        with _session_lock(session):
+            return _adopt_existing_tab(session)
+    except BaseException:
+        # The caller never receives the session, so it can never release it.
+        _end_session_call(session)
+        raise
 
 
 def _browser_identity_key(session: Dict[str, Any]) -> str:
@@ -1008,8 +1030,11 @@ def _session_operation(session: Optional[Dict[str, Any]]):
     has to span the gaps inside a composite operation — vision takes a
     screenshot, calls a model for up to two minutes, then takes an annotation
     snapshot.
+
+    The reference itself is taken by :func:`_get_session` under the cache lock,
+    so there is no unreferenced moment between admission and use. This adopts
+    that reference and releases it; every _get_session must be paired with one.
     """
-    _begin_session_call(session)
     try:
         yield session
     finally:
@@ -1951,6 +1976,31 @@ def _tool_error_from_exception(
 ) -> str:
     if isinstance(exc, CamofoxEpochMoved):
         return _epoch_moved_result(session)
+    if isinstance(exc, CamofoxSessionsBusy):
+        # Backpressure, not a failure of this request: the cache is full of work
+        # in flight, and one of those calls finishing frees a slot.
+        payload: Dict[str, Any] = {
+            "success": False,
+            "error": "browser_sessions_busy",
+            "message": (
+                "Every tracked browser session is in use. Retry shortly, or close a "
+                "browser session that is no longer needed."
+            ),
+            "retryable": True,
+        }
+        if extra:
+            payload.update(extra)
+        return json.dumps(payload, ensure_ascii=False)
+    if isinstance(exc, CamofoxRefsStale):
+        payload = {
+            "success": False,
+            "error": "browser_refs_stale",
+            "message": str(exc),
+            "retryable": True,
+        }
+        if extra:
+            payload.update(extra)
+        return json.dumps(payload, ensure_ascii=False)
     retryable = _retryable_control_result(exc, session)
     if retryable is not None:
         payload = json.loads(retryable)
@@ -1991,6 +2041,10 @@ class CamofoxEpochMoved(Exception):
 
 class CamofoxRefsStale(Exception):
     """Raised when a ref describes a page the tab no longer shows."""
+
+
+class CamofoxSessionsBusy(Exception):
+    """Raised when every tracked browser session is in use."""
 
 
 # Document generation per physical tab. The epoch contract only advances on a
@@ -2259,11 +2313,11 @@ def _navigate_within_identity(
                     )
                     session["tab_id"] = None
                     session = _ensure_tab(task_id)
-                    # The caller's _session_operation holds a reference to the
-                    # entry this call started with; the replacement needs its
-                    # own or capacity eviction could drop it mid-navigation.
+                    # _ensure_tab returns an entry that already holds its own
+                    # reference, and the caller's _session_operation only owns
+                    # the one this call started with — so this replacement has
+                    # to be released here.
                     rebound_session = session
-                    _begin_session_call(rebound_session)
                     data = _post(
                         _tab_path(session, "/navigate"),
                         {"userId": session["user_id"], "url": browser_url},
@@ -2451,6 +2505,10 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
         })
     except Exception as e:
         return _tool_error_from_exception(e, session=locals().get("session"))
+    finally:
+        # _get_session hands back a referenced entry; release it whichever
+        # way this call ends.
+        _end_session_call(locals().get("session"))
 
 
 def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
@@ -2481,6 +2539,10 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
         })
     except Exception as e:
         return _tool_error_from_exception(e, session=locals().get("session"))
+    finally:
+        # _get_session hands back a referenced entry; release it whichever
+        # way this call ends.
+        _end_session_call(locals().get("session"))
 
 
 def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
@@ -2519,6 +2581,10 @@ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
         )
         failure = redact_browser_typed_text_for_display(failure, text)
         return json.dumps(failure, ensure_ascii=False)
+    finally:
+        # _get_session hands back a referenced entry; release it whichever
+        # way this call ends.
+        _end_session_call(locals().get("session"))
 
 
 def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
@@ -2532,6 +2598,10 @@ def camofox_scroll(direction: str, task_id: Optional[str] = None) -> str:
         return json.dumps({"success": True, "scrolled": direction})
     except Exception as e:
         return _tool_error_from_exception(e, session=locals().get("session"))
+    finally:
+        # _get_session hands back a referenced entry; release it whichever
+        # way this call ends.
+        _end_session_call(locals().get("session"))
 
 
 def camofox_back(task_id: Optional[str] = None) -> str:
@@ -2547,6 +2617,10 @@ def camofox_back(task_id: Optional[str] = None) -> str:
         return json.dumps({"success": True, "url": _filter_url_after_handback(session, data.get("url", ""), result_handback_revealed)})
     except Exception as e:
         return _tool_error_from_exception(e, session=locals().get("session"))
+    finally:
+        # _get_session hands back a referenced entry; release it whichever
+        # way this call ends.
+        _end_session_call(locals().get("session"))
 
 
 def camofox_press(key: str, task_id: Optional[str] = None) -> str:
@@ -2565,6 +2639,10 @@ def camofox_press(key: str, task_id: Optional[str] = None) -> str:
         return json.dumps({"success": True, "pressed": key})
     except Exception as e:
         return _tool_error_from_exception(e, session=locals().get("session"))
+    finally:
+        # _get_session hands back a referenced entry; release it whichever
+        # way this call ends.
+        _end_session_call(locals().get("session"))
 
 
 def camofox_close(task_id: Optional[str] = None) -> str:
@@ -2667,6 +2745,10 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
         })
     except Exception as e:
         return _tool_error_from_exception(e, session=locals().get("session"))
+    finally:
+        # _get_session hands back a referenced entry; release it whichever
+        # way this call ends.
+        _end_session_call(locals().get("session"))
 
 
 def camofox_vision(question: str, annotate: bool = False,
@@ -2684,7 +2766,6 @@ def camofox_vision(question: str, annotate: bool = False,
         # Held for the whole call: the model round trip between the screenshot
         # and the annotation snapshot can run for minutes, and the session is
         # in use throughout. Released in the finally below.
-        _begin_session_call(session)
         vision_reference_held = True
 
         # Get screenshot as binary PNG
