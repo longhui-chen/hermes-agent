@@ -2647,3 +2647,64 @@ def test_a_navigation_that_reports_its_new_epoch_does_not_look_like_a_handback()
     session["privacy_filter_after_handback"] = False
     mod._adopt_epoch_from_response(session, MagicMock(status_code=200, headers={}), tab_operation=True)
     assert session["privacy_filter_after_handback"] is True
+
+
+def test_a_rotated_action_token_does_not_orphan_the_old_session(monkeypatch):
+    """The lease identity is the profile, not the credential.
+
+    A token rotation used to change release_owner, so the same profile looked
+    like two: the old entry kept the old owner, _profile_still_in_use() could
+    not see the new one, and the old entry's deferred profile-level release
+    would tear down the runtime the new one was using.
+    """
+    import tools.browser_camofox as mod
+
+    monkeypatch.setenv("ZET_AGENT_ID", "agent-a")
+    before = mod._release_owner_key("profile", {"Authorization": "Bearer old"}, "http://127.0.0.1:9377")
+    after = mod._release_owner_key("profile", {"Authorization": "Bearer new"}, "http://127.0.0.1:9377")
+    assert before == after, "rotating the token split one profile into two owners"
+
+    # Different profiles still separate, and so do different endpoints.
+    monkeypatch.setenv("ZET_AGENT_ID", "agent-b")
+    assert mod._release_owner_key("profile", {"Authorization": "Bearer new"}, "http://127.0.0.1:9377") != after
+    monkeypatch.setenv("ZET_AGENT_ID", "agent-a")
+    assert mod._release_owner_key("profile", {"Authorization": "Bearer new"}, "http://127.0.0.1:9999") != after
+
+    # Without a gateway-injected agent id the credential still distinguishes.
+    monkeypatch.delenv("ZET_AGENT_ID", raising=False)
+    a = mod._release_owner_key("profile", {"Authorization": "Bearer a"}, "http://127.0.0.1:9377")
+    b = mod._release_owner_key("profile", {"Authorization": "Bearer b"}, "http://127.0.0.1:9377")
+    assert a != b
+
+
+def test_evicting_a_managed_session_closes_its_tab():
+    """Dropping local tracking leaves the tab open in local-server.
+
+    A client rotating session keys would then hold this cache at its ceiling
+    while the tabs behind it accumulated without bound.
+    """
+    import tools.browser_camofox as mod
+
+    mod._pending_lease_releases.clear()
+    session = {
+        "user_id": "hermes_profile", "session_key": "s", "task_id": "t", "tab_id": "tab-7",
+        "managed": True, "local_server_managed": True, "release_owner": "o",
+        "release_url": "http://127.0.0.1:8080/api/v1/internal/browser/camofox/_zettlab/release",
+        "release_headers": {"X-Zettlab-Agent-Action-Token": "tok"},
+    }
+    # Another session still holds the profile, so the runtime release is skipped
+    # — the tab must still be closed.
+    mod._sessions["other"] = dict(session, task_id="other", tab_id="tab-8")
+    try:
+        mod._teardown_session(session)
+    finally:
+        mod._sessions.clear()
+
+    deletes = [e for e in mod._pending_lease_releases if e["kind"] == "delete"]
+    assert deletes, "the evicted session's tab was left open"
+    assert deletes[0]["url"].endswith("/tabs/tab-7?userId=hermes_profile"), deletes[0]["url"]
+    assert deletes[0]["headers"] == {"X-Zettlab-Agent-Action-Token": "tok"}
+    assert not any(e["kind"] == "release" for e in mod._pending_lease_releases), (
+        "the shared runtime was released while another session still held it"
+    )
+    mod._pending_lease_releases.clear()

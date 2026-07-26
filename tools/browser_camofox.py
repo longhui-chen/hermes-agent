@@ -1445,7 +1445,15 @@ def _release_owner_key(user_id: str, headers: Dict[str, str], base_url: str = ""
             credential = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
             break
     endpoint = _normalized_endpoint(base_url)
-    return f"{user_id}\x00{credential}\x00{endpoint}"
+    # The agent id is the profile's own name and does not rotate; the credential
+    # digest only stands in for it where it is unavailable (a direct session has
+    # no gateway-injected agent id). Using the credential here unconditionally
+    # made a token rotation look like a different profile: the old entry kept
+    # its old owner, _profile_still_in_use() could not see the new one, and the
+    # old entry's deferred profile-level release would tear down the runtime the
+    # new one was using.
+    profile = _runtime_value("ZET_AGENT_ID").strip() or credential
+    return f"{user_id}\x00{profile}\x00{endpoint}"
 
 
 def _normalized_endpoint(base_url: str) -> str:
@@ -1566,6 +1574,12 @@ def _teardown_session(session: Optional[Dict[str, Any]]) -> None:
         # The check and the release are one critical section: otherwise another
         # turn can register and start the runtime in between, and this release
         # tears it down under them.
+        # The tab goes whether or not the runtime does. Dropping only the local
+        # tracking left the tab open in local-server: a client rotating session
+        # keys would keep this cache at its 64-entry ceiling while the tabs
+        # behind it accumulated without bound, which is the real memory cost on
+        # a 2 GB device.
+        _queue_managed_tab_delete(session)
         with _held_owner_lock(owner):
             if _profile_still_in_use(owner):
                 logger.debug("Camofox lease kept: another session still holds this profile")
@@ -1587,6 +1601,35 @@ def _teardown_session(session: Optional[Dict[str, Any]]) -> None:
     _queue_pending_teardown(
         "delete",
         f"{base}/sessions/{quote(user_id, safe='')}",
+        headers,
+        owner=str(session.get("release_owner") or ""),
+    )
+
+
+def _queue_managed_tab_delete(session: Dict[str, Any]) -> None:
+    """Close the physical tab a managed session was using.
+
+    The profile-level release is about the shared runtime and is often skipped
+    because another turn still holds it. The tab is this session's own, so it is
+    closed either way — through the same proxy route the Agent uses, with the
+    endpoint and credential captured at creation, since this runs from the
+    scope-less maintenance thread.
+    """
+    tab_id = str(session.get("tab_id") or "").strip()
+    user_id = str(session.get("user_id") or "").strip()
+    base = str(session.get("release_url") or "")
+    if not tab_id or not user_id or not base:
+        return
+    # release_url is "<camofox base>/_zettlab/release"; the tab route is a
+    # sibling of it.
+    root = base[: -len("/_zettlab/release")] if base.endswith("/_zettlab/release") else ""
+    if not root:
+        return
+    headers = session.get("release_headers")
+    headers = dict(headers) if isinstance(headers, dict) else {}
+    _queue_pending_teardown(
+        "delete",
+        f"{root}/tabs/{quote(tab_id, safe='')}?userId={quote(user_id, safe='')}",
         headers,
         owner=str(session.get("release_owner") or ""),
     )
