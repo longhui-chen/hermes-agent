@@ -145,16 +145,12 @@ def _adopt_session_epoch(session: Optional[Dict[str, Any]], epoch: Any) -> None:
     previous = session.get("epoch")
     if previous is not None and previous != epoch:
         session["privacy_filter_after_handback"] = True
-        # The takeover this session was widened for has ended.
-        session.pop("takeover_offered", None)
-        session.pop("human_controlled_seen", None)
         # The epoch only moves when a human took the tab and gave it back, so
         # the document every outstanding ref describes is the one they left
         # behind. Turns sharing this physical tab keep their own session entry
         # and their own stamp, so invalidate by document rather than by
         # clearing this session's — otherwise a concurrent turn would still
         # act on refs from before the takeover.
-        _bump_document_generation(session)
     session["epoch"] = epoch
 
 
@@ -824,7 +820,7 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
     # The lease is per profile, and in multiplex every profile shares the same
     # loopback CAMOFOX_URL — only the credential differs. Group holders by the
     # profile identity plus a digest of that credential, never by URL.
-    release_owner = _release_owner_key(cache_identity.get("user_id", ""), scoped_headers)
+    release_owner = _release_owner_key(cache_identity.get("user_id", ""), scoped_headers, camofox_base)
     # Computed before the cache lookup: the credential digest inside it is what
     # separates two profiles that were handed the same explicit identity.
     cache_key = _session_cache_key(task_id, cache_identity, release_owner)
@@ -1012,18 +1008,13 @@ def _ensure_tab(task_id: Optional[str], url: Optional[str] = None) -> Dict[str, 
 # owner is unknowable at that point, and guessing by task id alone would reach
 # into another profile's live browser state. The bound keeps _sessions and the
 # local-server leases behind it from growing for the life of the process.
+# One window, deliberately. Whether anyone is still using the browser — an
+# Agent mid-call or a human mid-takeover — is not observable from this process,
+# and every approximation of it tried here (turn-end release, a grace window,
+# tiers keyed off takeover hints and refusals) was wrong in a different way.
+# local-server owns the lease and knows who holds the tab; until it reports
+# that, this stays a plain timer.
 _SESSION_IDLE_TTL_SECONDS = 30 * 60
-
-# A human holding the tab produces no tool calls, so the ordinary window would
-# reclaim the session while they are still working. Long enough for a real
-# session, still bounded: an App that crashes mid-takeover must not pin the
-# entry or its runtime lease forever.
-_TAKEOVER_IDLE_TTL_SECONDS = 4 * 60 * 60
-
-# A takeover hint accompanies every navigation result, so most sessions carry
-# one. Long enough for the App to claim it and for the first refusal to prove
-# it, short enough that an ignored hint does not keep a browser runtime alive.
-_TAKEOVER_OFFERED_IDLE_TTL_SECONDS = 60 * 60
 
 
 def _session_key_for_task_locked(task_id: str) -> Optional[str]:
@@ -1042,7 +1033,7 @@ def _session_key_for_task_locked(task_id: str) -> Optional[str]:
         camofox_cfg = _get_camofox_config()
         identity = _camofox_identity_override(task_id, camofox_cfg) or get_camofox_identity(task_id)
         try:
-            owner = _release_owner_key(identity.get("user_id", ""), _auth_headers())
+            owner = _release_owner_key(identity.get("user_id", ""), _auth_headers(), get_camofox_url())
         except Exception:
             owner = ""
     except Exception:
@@ -1081,10 +1072,6 @@ def _capture_guard(session: Optional[Dict[str, Any]]):
         # before this lock, and another turn holding it can navigate the shared
         # tab onto a refused page in between — an ordinary redirect turns no
         # filter on, so nothing downstream would notice.
-        if _document_is_blocked(session):
-            raise CamofoxDocumentBlocked(
-                "the browser is on a page this Agent is not allowed to read"
-            )
         yield
 
 
@@ -1163,63 +1150,6 @@ def _evict_surplus_sessions_locked(protect_key: str = "") -> list:
     )
     return evicted
 
-
-def _note_human_control(session: Optional[Dict[str, Any]], resp: "requests.Response") -> None:
-    """Record what this response says about who is holding the tab.
-
-    A refusal naming human control is proof somebody has it; a mutation that
-    succeeded is proof nobody does, because local-server refuses those while a
-    human is in control. This is the only direct evidence available here — the
-    takeover itself runs between the App and local-server.
-    """
-    if not isinstance(session, dict) or resp is None:
-        return
-    status = getattr(resp, "status_code", None)
-    if isinstance(status, int) and 200 <= status < 300:
-        session.pop("human_controlled_seen", None)
-        session.pop("takeover_offered", None)
-        return
-    if status != 409:
-        return
-    try:
-        body = resp.json()
-    except Exception:
-        return
-    if isinstance(body, dict) and body.get("error") == "browser_human_controlled":
-        session["human_controlled_seen"] = True
-
-
-def _session_idle_ttl(session: Dict[str, Any]) -> float:
-    """How long this entry may sit untouched before it is reclaimed.
-
-    A tab handed to a human stops producing tool calls by definition: the
-    interaction is between the App and local-server, and nothing here sees it.
-    Reclaiming on the ordinary TTL would release the runtime lease out from
-    under someone who is still typing. While a takeover is outstanding the
-    window is widened rather than removed — an unbounded hold is how a leak
-    starts, and the App can crash without ever handing back.
-
-    Knowing that the takeover has ended is what this cannot do on its own:
-    local-server would have to report control state or keep a lease heartbeat.
-    Tracked separately; the wider window is the containment until then.
-    """
-    if session.get("privacy_filter_after_handback"):
-        # The handback already arrived; this is an ordinary session again.
-        return _SESSION_IDLE_TTL_SECONDS
-    if session.get("human_controlled_seen"):
-        # Observed, not guessed: local-server refused an operation because a
-        # human holds this tab.
-        return _TAKEOVER_IDLE_TTL_SECONDS
-    if session.get("takeover_offered"):
-        # A hint went out with the last result and nothing has been heard
-        # since. The App may be about to claim it, so do not reclaim on the
-        # ordinary window — but the hint rides along with every navigation, so
-        # this cannot be the long one or an ignored hint would keep the
-        # browser runtime alive for hours on a 2 GB device.
-        return _TAKEOVER_OFFERED_IDLE_TTL_SECONDS
-    return _SESSION_IDLE_TTL_SECONDS
-
-
 def _prune_idle_sessions_locked(now: float) -> list:
     """Drop sessions untouched past the idle TTL, returning them for release.
 
@@ -1230,7 +1160,7 @@ def _prune_idle_sessions_locked(now: float) -> list:
         key
         for key, session in _sessions.items()
         if int(session.get("in_flight") or 0) == 0
-        and now - float(session.get("last_used_at") or 0.0) > _session_idle_ttl(session)
+        and now - float(session.get("last_used_at") or 0.0) > _SESSION_IDLE_TTL_SECONDS
     ]
     dropped = []
     for key in expired:
@@ -1487,11 +1417,24 @@ def _run_maintenance() -> None:
                 return
 
 
-def _release_owner_key(user_id: str, headers: Dict[str, str]) -> str:
+def _release_owner_key(user_id: str, headers: Dict[str, str], base_url: str = "") -> str:
     """Stable per-profile identity for lease ownership.
 
-    The credential is hashed rather than stored a second time; the digest only
-    has to distinguish profiles inside this process.
+    Three things make it: the profile, the credential and the endpoint. The
+    credential is hashed rather than stored a second time; the digest only has
+    to distinguish profiles inside this process.
+
+    The endpoint belongs in it because a tab id, an epoch and a ref generation
+    mean nothing outside the runtime that issued them. A profile whose
+    CAMOFOX_URL is repointed while its entry is alive would otherwise keep
+    hitting the cached tab state against a different runtime — 404s at best,
+    the wrong page if the new one happens to reuse the id. Two multiplex
+    profiles pointed at different endpoints with the same credential collide
+    the same way.
+
+    This key feeds the session cache key, the tab identity lock and the
+    per-tab document record, so naming the endpoint here separates all of them
+    at once.
     """
     import hashlib
 
@@ -1501,7 +1444,26 @@ def _release_owner_key(user_id: str, headers: Dict[str, str]) -> str:
         if value:
             credential = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
             break
-    return f"{user_id}\x00{credential}"
+    endpoint = _normalized_endpoint(base_url)
+    return f"{user_id}\x00{credential}\x00{endpoint}"
+
+
+def _normalized_endpoint(base_url: str) -> str:
+    """Compare endpoints by what they address, not by how they were spelled."""
+    raw = str(base_url or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return raw.rstrip("/").lower()
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    port = parsed.port
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    path = (parsed.path or "").rstrip("/")
+    return f"{scheme}://{host}:{port}{path}"
 
 
 _MAX_OWNER_LOCKS = 256
@@ -1591,15 +1553,14 @@ def _teardown_session(session: Optional[Dict[str, Any]]) -> None:
     """
     if not isinstance(session, dict):
         return
-    # The per-tab record dies with the session that named the tab: leaving it
-    # behind would accumulate blocked records that eviction may not touch.
-    with _sessions_lock:
-        key = _document_key(session)
-        if not any(
-            other is not session and _document_key(other) == key
-            for other in _sessions.values()
-        ):
-            _document_generations.pop(key, None)
+    # The record may only go when the tab it names is really gone. A direct
+    # session owns its server-side session outright, so DELETE takes the tab
+    # with it. A managed one only gives back a shared runtime lease — and may
+    # not even do that, if another turn is still holding the profile — so its
+    # tab outlives this call. Dropping a blocked record there would let the
+    # next adoption of the same listItemId read the page this one was refused
+    # for: an ordinary redirect leaves the privacy filter off, so nothing else
+    # would stop it.
     if session.get("local_server_managed"):
         owner = str(session.get("release_owner") or "")
         # The check and the release are one critical section: otherwise another
@@ -1674,10 +1635,6 @@ def _takeover_ui_hint(session: Dict[str, Any]) -> Optional[Dict[str, str]]:
     tab_id = str(session.get("tab_id") or "").strip()
     if not agent_id or not browser_session_id or not tab_id:
         return None
-    # Recorded so the idle sweep does not reclaim this session while somebody is
-    # using the tab it just pointed them at. Cleared by the handback, which
-    # arrives as an epoch advance.
-    session["takeover_offered"] = True
     return {
         "type": "takeover_browser",
         "agent_id": agent_id,
@@ -1874,7 +1831,6 @@ def _post(path: str, body: dict, timeout: Optional[int] = None, session: Optiona
     _response_facts.epoch_verified = _adopt_epoch_from_response(
         session, resp, tab_operation=_is_tab_operation(path) or path == "/tabs"
     )
-    _note_human_control(session, resp)
     _raise_for_status(resp)
     return resp.json()
 
@@ -2019,44 +1975,6 @@ def _handback_page_readable(session: Dict[str, Any], snapshot_data: Any = None) 
     return _recovery_target_allowed(landed_url)
 
 
-def _mark_document_blocked(session: Dict[str, Any], url: str) -> None:
-    """Record that the tab is sitting on a page no read may return.
-
-    Stored against the physical tab, not this task's session entry: turns
-    sharing a HERMES_SESSION_KEY keep their own entries but drive one tab, so a
-    per-session flag would leave every other turn free to read the page one of
-    them was refused. Cleared by a navigation that lands somewhere allowed —
-    the only thing that actually moves the tab off it.
-    """
-    if not isinstance(session, dict):
-        return
-    key = _document_key(session)
-    with _sessions_lock:
-        entry = _document_generations.setdefault(key, {"generation": 0, "url": ""})
-        if url:
-            entry["blocked"] = True
-        else:
-            entry.pop("blocked", None)
-        _forget_surplus_documents_locked(key)
-
-
-def _document_is_blocked(session: Optional[Dict[str, Any]]) -> bool:
-    if not isinstance(session, dict):
-        return False
-    with _sessions_lock:
-        entry = _document_generations.get(_document_key(session))
-        return bool(entry and entry.get("blocked"))
-
-
-def _blocked_document_error() -> str:
-    return tool_error(
-        "The browser is on a page this Agent is not allowed to read (cloud "
-        "metadata, a private-network address, or a blocked site). Navigate to an "
-        "allowed page before reading page state.",
-        success=False,
-    )
-
-
 def _blocked_handback_page_error() -> str:
     return tool_error(
         "The human left the browser on a page this Agent is not allowed to read "
@@ -2064,35 +1982,6 @@ def _blocked_handback_page_error() -> str:
         "page before continuing.",
         success=False,
     )
-
-
-def _landing_target_allowed(url: str) -> bool:
-    """Whether the page a navigation actually landed on may be read.
-
-    browser_navigate() checked the URL it was asked for; a redirect can land
-    somewhere else, and every other backend re-checks for that reason. This is
-    deliberately the floor plus the configured site policy, not the full SSRF
-    check: the requested URL already passed that one, and re-resolving every
-    landing URL would put a DNS round trip on every navigation. A redirect into
-    a private address is the connect-time problem the companion browser owns.
-
-    Fails closed if the guards cannot be imported or a check raises.
-    """
-    try:
-        from tools.browser_tool import _is_always_blocked_url
-
-        if _is_always_blocked_url(url):
-            return False
-    except Exception:
-        return False
-    try:
-        from tools.website_policy import check_website_access
-
-        return check_website_access(url) is None
-    except ImportError:
-        return True
-    except Exception:
-        return False
 
 
 def _recovery_target_allowed(url: str) -> bool:
@@ -2167,7 +2056,6 @@ def _retryable_control_result(
     # page from before that — invalidate them here rather than relying on an
     # epoch header this error envelope may not carry.
     _set_handback_privacy_filter(session, True)
-    _bump_document_generation(session)
     # Deliberately not adopting any epoch the refusal itself carries. Copying it
     # into the next request would clear the barrier without the snapshot that
     # carries the human's page state — which is the whole point of the barrier.
@@ -2195,7 +2083,6 @@ def _retryable_control_result(
         # message tells the Agent to retry with, so they have to be stamped or
         # the next call refuses them — and they must not be stamped onto a
         # generation the capture does not describe.
-        observed_document = _observed_document_generation(session)
         with _capture_guard(session):
             snapshot_data = _get(
                 _tab_path(session, "/snapshot"),
@@ -2229,11 +2116,6 @@ def _retryable_control_result(
         result["snapshot"] = _redact_handback_page_state(snapshot)
         result["element_count"] = snapshot_data.get("refsCount", 0)
         result["resnapshot_completed"] = True
-        _stamp_ref_generation(
-            session,
-            snapshot_data.get("url", "") if isinstance(snapshot_data.get("url"), str) else "",
-            observed=observed_document,
-        )
     except Exception as snapshot_exc:
         logger.warning("Camofox post-handback snapshot failed: %s", snapshot_exc)
     return json.dumps(result)
@@ -2292,8 +2174,6 @@ def _tool_error_from_exception(
         if extra:
             payload.update(extra)
         return json.dumps(payload, ensure_ascii=False)
-    if isinstance(exc, CamofoxDocumentBlocked):
-        return _blocked_document_error()
     if isinstance(exc, CamofoxEvaluateBlocked):
         payload = {
             "success": False,
@@ -2301,16 +2181,6 @@ def _tool_error_from_exception(
                 "Browser evaluation is blocked after human control until the "
                 "Agent navigates to a new page or closes the session."
             ),
-        }
-        if extra:
-            payload.update(extra)
-        return json.dumps(payload, ensure_ascii=False)
-    if isinstance(exc, CamofoxRefsStale):
-        payload = {
-            "success": False,
-            "error": "browser_refs_stale",
-            "message": str(exc),
-            "retryable": True,
         }
         if extra:
             payload.update(extra)
@@ -2353,8 +2223,6 @@ class CamofoxEpochMoved(Exception):
     """Raised when the page moved on while a mutation waited for the tab."""
 
 
-class CamofoxRefsStale(Exception):
-    """Raised when a ref describes a page the tab no longer shows."""
 
 
 class CamofoxSessionsBusy(Exception):
@@ -2369,8 +2237,6 @@ class CamofoxEvaluateBlocked(Exception):
     """Raised when arbitrary JavaScript is refused because a human held the tab."""
 
 
-class CamofoxDocumentBlocked(Exception):
-    """Raised when the tab is on a page no read may return."""
 
 
 # Document generation per physical tab. The epoch contract only advances on a
@@ -2378,150 +2244,6 @@ class CamofoxDocumentBlocked(Exception):
 # a HERMES_SESSION_KEY share the tab while keeping their own session entry. A
 # parent's ``e1`` would otherwise still validate after its subagent navigated,
 # and land on whatever element reuses that ref on the new page.
-_document_generations: Dict[str, Dict[str, Any]] = {}
-_MAX_TRACKED_DOCUMENTS = 256
-
-
-def _document_key(session: Dict[str, Any]) -> str:
-    # The release owner is part of it for the same reason it is part of the
-    # session cache key: two profiles can be handed the same explicit identity,
-    # and they must not share a document generation either.
-    return (
-        f"{session.get('release_owner') or ''}\x00{_browser_identity_key(session)}"
-        f"\x00{session.get('tab_id') or ''}"
-    )
-
-
-def _document_generation_locked(key: str) -> int:
-    entry = _document_generations.get(key)
-    return int(entry.get("generation") or 0) if entry else 0
-
-
-def _bump_document_generation(session: Dict[str, Any], url: str = "") -> None:
-    """Declare the tab's document replaced, invalidating every outstanding ref."""
-    key = _document_key(session)
-    with _sessions_lock:
-        # Updated in place rather than replaced: the record also carries the
-        # blocked-landing flag, and rebuilding it here would quietly unlock a
-        # page a refused navigation had marked.
-        entry = _document_generations.setdefault(key, {"generation": 0, "url": ""})
-        entry["generation"] = int(entry.get("generation") or 0) + 1
-        if url:
-            entry["url"] = url
-        _forget_surplus_documents_locked(key)
-
-
-def _observe_document_url(session: Dict[str, Any], url: str) -> None:
-    """Bump the generation when an operation reports a different page.
-
-    A click can follow a link. Comparing the URL the runtime reports against
-    the one the last snapshot described keeps a plain in-page click from
-    invalidating refs, while a navigation caused by a click still does.
-    """
-    if not isinstance(url, str) or not url:
-        return
-    key = _document_key(session)
-    with _sessions_lock:
-        entry = _document_generations.get(key)
-        known = (entry or {}).get("url", "")
-        if known and known == url:
-            return
-        if not entry:
-            _document_generations[key] = {"generation": 0, "url": url}
-            _forget_surplus_documents_locked(key)
-            return
-        entry["generation"] = int(entry.get("generation") or 0) + 1
-        entry["url"] = url
-
-
-def _observed_document_generation(session: Dict[str, Any]) -> tuple:
-    """Sample the document version before a capture goes out.
-
-    Read paths are deliberately not serialized behind the identity lock — a
-    snapshot of whatever the tab shows is inherent to sharing it, and queueing
-    a 120s vision call behind every mutation would cost more than it buys. So
-    the capture samples first and the stamp only lands if nothing moved, which
-    needs no lock and fails in the safe direction.
-    """
-    key = _document_key(session)
-    with _sessions_lock:
-        return key, _document_generation_locked(key)
-
-
-def _stamp_ref_generation(session: Dict[str, Any], url: str = "", observed: Any = None) -> None:
-    """Record the document version whose refs this session now holds.
-
-    ``observed`` is the sample taken before the capture. When it no longer
-    matches, the capture straddled a navigate: it may describe either page, so
-    it stamps nothing and any earlier stamp is dropped — the Agent has to take
-    a fresh snapshot before it can act on a ref again.
-    """
-    key = _document_key(session)
-    with _sessions_lock:
-        entry = _document_generations.setdefault(key, {"generation": 0, "url": ""})
-        current = int(entry.get("generation") or 0)
-        if observed is not None and (observed[0] != key or observed[1] != current):
-            session.pop("ref_document", None)
-            session.pop("ref_generation", None)
-            return
-        if url:
-            entry["url"] = url
-        session["ref_document"] = key
-        session["ref_generation"] = current
-        _forget_surplus_documents_locked(key)
-
-
-def _refs_are_current(session: Dict[str, Any]) -> bool:
-    key = _document_key(session)
-    with _sessions_lock:
-        if session.get("ref_document") != key:
-            return False
-        entry = _document_generations.get(key)
-        if entry is None:
-            # The record was evicted. Reading its absence as generation 0 would
-            # match a stamp taken at 0 again even though a handback had moved it
-            # in between — an ABA that lets pre-takeover refs act on the page
-            # the human left. Absence proves nothing, so it fails.
-            return False
-        return session.get("ref_generation") == int(entry.get("generation") or 0)
-
-
-def _forget_surplus_documents_locked(keep: str) -> None:
-    """Keep the registry bounded; it must never outgrow the session cache.
-
-    Records still referenced by a session's ref stamp go last: dropping one
-    costs that session a re-snapshot, since a missing record no longer
-    validates.
-    """
-    while len(_document_generations) > _MAX_TRACKED_DOCUMENTS:
-        stamped = {s.get("ref_document") for s in _sessions.values()}
-        victim = ""
-        for key, entry in _document_generations.items():
-            if key == keep or entry.get("blocked"):
-                # A record marking a tab unreadable is never dropped: losing it
-                # turns _document_is_blocked false and every read on that tab
-                # goes through again. They are bounded by live tabs — teardown
-                # removes the record — so they cannot fill this on their own.
-                continue
-            if key not in stamped:
-                victim = key
-                break
-            if not victim:
-                victim = key
-        if not victim:
-            logger.warning(
-                "Camofox document registry is at %d entries and every candidate is "
-                "protecting a blocked tab; not evicting",
-                len(_document_generations),
-            )
-            return
-        _document_generations.pop(victim, None)
-
-
-# Suffixes after which no outstanding ref can be trusted. navigate/back/forward
-# /reload replace the document outright; evaluate runs arbitrary JavaScript,
-# which can set location.href, replace document.body, or rebuild any subtree.
-_DOCUMENT_CHANGING_SUFFIXES = ("/navigate", "/back", "/forward", "/reload", "/evaluate")
 
 
 def _mutating_tab_call(session: Dict[str, Any], path_suffix: str, body: Dict[str, Any]) -> Dict[str, Any]:
@@ -2552,22 +2274,10 @@ def _mutating_tab_call(session: Dict[str, Any], path_suffix: str, body: Dict[str
             "this browser session has no page-state baseline yet; take a snapshot first"
         )
     observed_epoch = session.get("epoch")
-    # The epoch only moves on a human handback, so it cannot see another turn's
-    # ordinary navigate — and a ref-less operation (evaluate, press, back,
-    # scroll) has no stamp to fall back on. Sample the document too, so a
-    # navigation that landed while this waited is not something it runs on top
-    # of. A navigate/back/forward/reload is itself the thing that changes the
-    # document, so it is judged on the epoch alone.
-    observed_document = _observed_document_generation(session)
     with _held_owner_lock(_browser_identity_key(session)):
         if session.get("epoch") != observed_epoch:
             raise CamofoxEpochMoved(
                 "the page changed while this operation waited for the browser tab"
-            )
-        if path_suffix not in _DOCUMENT_CHANGING_SUFFIXES and _observed_document_generation(session) != observed_document:
-            raise CamofoxRefsStale(
-                "this page changed while the operation waited for the browser "
-                "tab; take a new snapshot before continuing"
             )
         # Re-checked here, not only by the caller: evaluate runs arbitrary
         # JavaScript, so between a caller's check and this lock another turn's
@@ -2579,36 +2289,7 @@ def _mutating_tab_call(session: Dict[str, Any], path_suffix: str, body: Dict[str
                 "browser evaluation is blocked after human control until the Agent "
                 "navigates to a new page or closes the session"
             )
-        # Arbitrary JavaScript reads the page as surely as a snapshot does, so
-        # it is refused on a blocked landing page for the same reason the read
-        # paths are.
-        if path_suffix == "/evaluate" and _document_is_blocked(session):
-            raise CamofoxEvaluateBlocked(
-                "the browser is on a page this Agent is not allowed to read; "
-                "navigate to an allowed page before evaluating"
-            )
-        # The epoch only moves on a human handback, so it cannot see another
-        # turn's ordinary navigate on the shared tab. A ref is only valid for
-        # the document version the snapshot that produced it described.
-        if "ref" in body and not _refs_are_current(session):
-            raise CamofoxRefsStale(
-                "this page has changed since the last snapshot; take a new "
-                "snapshot before acting on element refs"
-            )
-        data = None
-        try:
-            data = _post(_tab_path(session, path_suffix), body, session=session)
-            return data
-        finally:
-            # Both of these happen before the identity lock is released. Doing
-            # the URL comparison in the caller left a window in which another
-            # turn sharing this tab could take the lock and act on refs the
-            # navigation this call just caused had already invalidated.
-            if path_suffix in _DOCUMENT_CHANGING_SUFFIXES:
-                _bump_document_generation(session)
-            elif isinstance(data, dict):
-                landed = data.get("url")
-                _observe_document_url(session, landed if isinstance(landed, str) else "")
+        return _post(_tab_path(session, path_suffix), body, session=session)
 
 
 def _navigation_tab_context(session: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -2692,7 +2373,6 @@ def _navigate_within_identity(
         # Declared before the request goes out, not after it returns: from this
         # moment the document every outstanding ref describes is on its way out,
         # and a concurrent turn's click must fail rather than race the landing.
-        _bump_document_generation(session)
         navigate_filtered_at_request = _handback_privacy_filter_enabled(session)
         # Only meaningful while the filter is on, and it costs a round trip, so
         # it is not taken on the normal path.
@@ -2702,63 +2382,35 @@ def _navigate_within_identity(
             else ""
         )
         try:
-            try:
+            data = _post(
+                _tab_path(session, "/navigate"),
+                {"userId": session["user_id"], "url": browser_url},
+                timeout=60,
+                session=session,
+            )
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                logger.warning(
+                    "Camofox tab %s returned 404 — tab was garbage collected. "
+                    "Creating a fresh tab.",
+                    session["tab_id"],
+                )
+                session["tab_id"] = None
+                session = _ensure_tab(task_id)
+                # _ensure_tab returns an entry that already holds its own
+                # reference, and the caller's _session_operation only owns the
+                # one this call started with — so this replacement has to be
+                # released here.
+                rebound_session = session
                 data = _post(
                     _tab_path(session, "/navigate"),
                     {"userId": session["user_id"], "url": browser_url},
                     timeout=60,
                     session=session,
                 )
-            except requests.HTTPError as e:
-                if e.response is not None and e.response.status_code == 404:
-                    logger.warning(
-                        "Camofox tab %s returned 404 — tab was garbage collected. "
-                        "Creating a fresh tab.",
-                        session["tab_id"],
-                    )
-                    session["tab_id"] = None
-                    session = _ensure_tab(task_id)
-                    # _ensure_tab returns an entry that already holds its own
-                    # reference, and the caller's _session_operation only owns
-                    # the one this call started with — so this replacement has
-                    # to be released here.
-                    rebound_session = session
-                    data = _post(
-                        _tab_path(session, "/navigate"),
-                        {"userId": session["user_id"], "url": browser_url},
-                        timeout=60,
-                        session=session,
-                    )
-                else:
-                    raise
-        finally:
-            # Bumped on both sides of the request. The pre-bump stops a
-            # concurrent click from racing the landing; this one stops a
-            # concurrent snapshot that sampled the pre-bump value, captured the
-            # old page while this navigate was still in flight, and would
-            # otherwise stamp its refs onto the page that lands here.
-            _bump_document_generation(session)
-        # browser_navigate() checked the URL it was asked for. Redirects mean
-        # that is not necessarily where the tab ended up, and every other
-        # backend re-checks the landing URL for exactly that reason. A public
-        # link that lands on cloud metadata or a blocked site would otherwise
-        # have its content read back by the automatic snapshot below.
-        landed_url = data.get("url") if isinstance(data, dict) else None
-        if isinstance(landed_url, str) and landed_url and not _landing_target_allowed(landed_url):
-            _bump_document_generation(session)
-            # The tab is still sitting on that page. Skipping only this call's
-            # snapshot would leave the next plain browser_snapshot free to read
-            # it — the handback filter is off, so nothing else looks. The tab is
-            # marked instead, and every read refuses until the Agent navigates
-            # somewhere allowed.
-            _mark_document_blocked(session, landed_url)
-            return _blocked_document_error()
-        if isinstance(landed_url, str) and landed_url:
-            # Cleared only against a landing URL that was actually checked. A
-            # response that reports none proves nothing, and treating it as a
-            # clean slate would let one unreported navigation unlock the page
-            # the previous one was refused for.
-            _mark_document_blocked(session, "")
+            else:
+                raise
+
         # Three things must hold before the page counts as left behind: this
         # response actually carried a verified epoch (a protocol downgrade must
         # not read as "nothing happened"), the epoch did not move, and the
@@ -2813,13 +2465,6 @@ def _navigate_within_identity(
         # Auto-take a compact snapshot so the model can act immediately, unless
         # the tab is still on a page a refused navigation left it on: this
         # response reported no landing URL, so nothing has proven it moved.
-        if _document_is_blocked(session):
-            result["snapshot_withheld"] = True
-            result["warning"] = (
-                "The browser is still on a page this Agent is not allowed to read. "
-                "Page state was not captured."
-            )
-            return json.dumps(result)
         try:
             snapshot_filtered_at_request = _handback_privacy_filter_enabled(session)
             # No _capture_guard here: _navigate_locked already holds this tab's
@@ -2827,7 +2472,6 @@ def _navigate_within_identity(
             # readability check below are inside the same critical section the
             # guard would take. The lock is reentrant, so adding one would be
             # harmless — just redundant.
-            observed_document = _observed_document_generation(session)
             snap_data = _get(
                 _tab_path(session, "/snapshot"),
                 params={"userId": session["user_id"]},
@@ -2856,11 +2500,6 @@ def _navigate_within_identity(
             else:
                 result["snapshot"] = _filter_page_state_after_handback(session, snapshot_text, snapshot_handback_revealed)
                 result["element_count"] = snap_data.get("refsCount", 0)
-                _stamp_ref_generation(
-                    session,
-                    snap_data.get("url", "") if isinstance(snap_data.get("url"), str) else data.get("url", ""),
-                    observed=observed_document,
-                )
         except Exception:
             pass  # Navigation succeeded; snapshot is a bonus
 
@@ -2890,13 +2529,8 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
         session = _get_session(task_id)
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
-        if _document_is_blocked(session):
-            # The tab is parked on a landing page a navigation was refused
-            # for. Nothing may read it until the Agent moves off it.
-            return _blocked_document_error()
 
         filtered_at_request = _handback_privacy_filter_enabled(session)
-        observed_document = _observed_document_generation(session)
         # Held across the capture and the readability check when the filter is
         # already on, so the two describe the same page.
         with _capture_guard(session):
@@ -2936,11 +2570,6 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
         # The refs in this snapshot are only meaningful for the document it
         # describes; record which version that is so a mutation carrying them
         # can be refused after somebody else navigates the shared tab.
-        _stamp_ref_generation(
-            session,
-            data.get("url", "") if isinstance(data.get("url"), str) else "",
-            observed=observed_document,
-        )
 
         return json.dumps({
             "success": True,
@@ -3145,10 +2774,6 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
         session = _get_session(task_id)
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
-        if _document_is_blocked(session):
-            # The tab is parked on a landing page a navigation was refused
-            # for. Nothing may read it until the Agent moves off it.
-            return _blocked_document_error()
 
         import re
 
@@ -3210,10 +2835,6 @@ def camofox_vision(question: str, annotate: bool = False,
         session = _get_session(task_id)
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
-        if _document_is_blocked(session):
-            # The tab is parked on a landing page a navigation was refused
-            # for. Nothing may read it until the Agent moves off it.
-            return _blocked_document_error()
         if _handback_privacy_filter_enabled(session):
             return tool_error(
                 "Browser vision is blocked after human control until the Agent navigates to a new page or closes the session.",

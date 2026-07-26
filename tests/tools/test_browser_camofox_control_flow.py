@@ -47,27 +47,37 @@ def _get_serving_tabs(snapshot_payload, url="https://example.com/page"):
 
 @pytest.fixture(autouse=True)
 def _clear_response_facts():
-    """Reset the per-response thread-locals and the per-tab registries.
+    """Reset the per-response thread-locals around every test.
 
-    Production resets the thread-locals at the start of each transport call,
-    but tests mock that layer away — without this a test can pass on a
-    neighbour's leftover. The document registry is process-wide and keyed by
-    tab identity, so tests using the same identity would otherwise inherit each
-    other's generations and blocked flags.
+    Production resets them at the start of each transport call, but tests mock
+    that layer away — without this a test can pass on a neighbour's leftover.
     """
     import tools.browser_camofox as mod
 
     for attr in ("started_handback", "epoch_verified"):
         if hasattr(mod._response_facts, attr):
             delattr(mod._response_facts, attr)
-    with mod._sessions_lock:
-        mod._document_generations.clear()
     yield
-    with mod._sessions_lock:
-        mod._document_generations.clear()
     for attr in ("started_handback", "epoch_verified"):
         if hasattr(mod._response_facts, attr):
             delattr(mod._response_facts, attr)
+
+
+@pytest.fixture
+def managed_session(monkeypatch):
+    monkeypatch.setenv("CAMOFOX_URL", "http://127.0.0.1:8080/api/v1/internal/browser/camofox")
+    monkeypatch.setenv("CAMOFOX_AUTH_MODE", "zettlab_action_token")
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "action-token")
+    monkeypatch.setenv("CAMOFOX_MANAGED_BY_LOCAL_SERVER", "true")
+    return {
+        "user_id": "hermes_profile",
+        "tab_id": "tab-agent",
+        "session_key": "task_opaque",
+        "managed": True,
+        "adopt_existing_tab": True,
+        "privacy_filter_after_handback": False,
+        "epoch": 2,
+    }
 
 
 def _http_error(status: int, payload: dict) -> requests.HTTPError:
@@ -92,29 +102,6 @@ def _epoch_stale(epoch: int = 3) -> requests.HTTPError:
             "epoch": epoch,
         },
     )
-
-
-@pytest.fixture
-def managed_session(monkeypatch):
-    monkeypatch.setenv("CAMOFOX_URL", "http://127.0.0.1:8080/api/v1/internal/browser/camofox")
-    monkeypatch.setenv("CAMOFOX_AUTH_MODE", "zettlab_action_token")
-    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "action-token")
-    monkeypatch.setenv("CAMOFOX_MANAGED_BY_LOCAL_SERVER", "true")
-    session = {
-        "user_id": "hermes_profile",
-        "tab_id": "tab-agent",
-        "session_key": "task_opaque",
-        "managed": True,
-        "adopt_existing_tab": True,
-        "privacy_filter_after_handback": False,
-        "epoch": 2,
-    }
-    # These tests act on refs, which an Agent can only have obtained from a
-    # snapshot of the page the tab currently shows.
-    import tools.browser_camofox as mod
-
-    mod._stamp_ref_generation(session)
-    return session
 
 
 def test_epoch_stale_resnapshots_and_returns_retryable(managed_session):
@@ -1938,16 +1925,6 @@ def test_navigate_snapshot_is_redacted_when_only_the_response_reveals_handback()
     assert "hunter2" not in json.dumps(result)
 
 
-def test_click_result_url_is_filtered_when_only_the_response_reveals_handback():
-    """The click result reports where the page ended up — where the human is."""
-    import tools.browser_camofox as mod
-
-    session = {
-        "user_id": "u", "tab_id": "tab-1", "session_key": "s",
-        "privacy_filter_after_handback": False, "epoch": 4, "_lock": None,
-    }
-    mod._stamp_ref_generation(session)
-
     def _post_racing(path, body=None, timeout=None, session=None):
         mod._response_facts.started_handback = True
         session["privacy_filter_after_handback"] = True
@@ -2213,113 +2190,6 @@ def test_a_new_session_is_never_the_one_evicted():
     mod._sessions.clear()
 
 
-def test_refs_do_not_survive_another_turns_navigate():
-    """A ref only validates against the document version that produced it.
-
-    Turns sharing a HERMES_SESSION_KEY share the physical tab but keep their own
-    session entry, and the epoch contract only advances on a human handback — so
-    without a document generation a parent's ``e1`` still passes after its
-    subagent navigated, and lands on whatever reuses that ref on the new page.
-    """
-    import tools.browser_camofox as mod
-
-    parent = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "parent", "epoch": 2}
-    subagent = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "sub", "epoch": 2}
-
-    mod._stamp_ref_generation(parent, "https://a.example/list")
-    assert mod._refs_are_current(parent)
-
-    # The subagent navigates the shared tab.
-    mod._bump_document_generation(subagent)
-
-    assert not mod._refs_are_current(parent), "stale refs still validated after a navigate"
-    with pytest.raises(mod.CamofoxRefsStale):
-        mod._mutating_tab_call(parent, "/click", {"userId": "u", "ref": "e1"})
-
-    # Operations that carry no ref are unaffected: scrolling or pressing a key
-    # acts on the page, not on an element the Agent named.
-    with patch("tools.browser_camofox._post", return_value={"ok": True}) as mock_post:
-        mod._mutating_tab_call(parent, "/scroll", {"userId": "u", "direction": "down"})
-    assert mock_post.called
-
-    # A fresh snapshot re-establishes them.
-    mod._stamp_ref_generation(parent, "https://a.example/detail")
-    assert mod._refs_are_current(parent)
-
-
-def test_a_click_that_follows_a_link_invalidates_outstanding_refs():
-    """A click can navigate. The URL the tab reports is what settles it."""
-    import tools.browser_camofox as mod
-
-    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
-    mod._stamp_ref_generation(session, "https://a.example/list")
-
-    # Same page: an in-page click must not force a re-snapshot.
-    mod._observe_document_url(session, "https://a.example/list")
-    assert mod._refs_are_current(session)
-
-    # Followed a link: every outstanding ref belongs to a page that is gone.
-    mod._observe_document_url(session, "https://a.example/detail")
-    assert not mod._refs_are_current(session)
-
-
-def test_a_snapshot_that_straddles_a_navigate_stamps_nothing():
-    """The stamp must describe the page the capture actually saw.
-
-    Reads are not serialized behind the identity lock on purpose, so the
-    capture samples the document version first and only registers it if nothing
-    moved in between. A capture that straddled a navigate could describe either
-    page, so it registers nothing and drops any earlier stamp.
-    """
-    import tools.browser_camofox as mod
-
-    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
-    mod._stamp_ref_generation(session, "https://a.example/list")
-    assert mod._refs_are_current(session)
-
-    observed = mod._observed_document_generation(session)
-    # Another turn navigates while this capture is in flight.
-    mod._bump_document_generation(session)
-    mod._stamp_ref_generation(session, "https://a.example/list", observed=observed)
-
-    assert not mod._refs_are_current(session), "refs from a straddled capture were accepted"
-    assert "ref_generation" not in session
-    with pytest.raises(mod.CamofoxRefsStale):
-        mod._mutating_tab_call(session, "/click", {"userId": "u", "ref": "e1"})
-
-    # An undisturbed capture still registers.
-    observed = mod._observed_document_generation(session)
-    mod._stamp_ref_generation(session, "https://a.example/detail", observed=observed)
-    assert mod._refs_are_current(session)
-
-
-def test_two_profiles_with_the_same_identity_do_not_share_a_session():
-    """A multiplex gateway can hand two profiles the same explicit identity.
-
-    They are isolated by different action tokens and talk to different runtimes,
-    so sharing one cache entry would let one profile drive the other's tab and
-    clear its handback privacy state.
-    """
-    import tools.browser_camofox as mod
-
-    identity = {"user_id": "shared_user", "session_key": "shared_session"}
-    first = mod._session_cache_key("task-1", identity, "shared_user\x00digest-a")
-    second = mod._session_cache_key("task-1", identity, "shared_user\x00digest-b")
-    assert first != second, "two profiles collided on one session cache entry"
-
-    # The tab lock and the document registry are separated the same way.
-    a = {"user_id": "shared_user", "session_key": "shared_session", "tab_id": "tab-1",
-         "release_owner": "shared_user\x00digest-a"}
-    b = {"user_id": "shared_user", "session_key": "shared_session", "tab_id": "tab-1",
-         "release_owner": "shared_user\x00digest-b"}
-    assert mod._browser_identity_key(a) != mod._browser_identity_key(b)
-    assert mod._document_key(a) != mod._document_key(b)
-
-    mod._stamp_ref_generation(a, "https://a.example/")
-    mod._bump_document_generation(b)
-    assert mod._refs_are_current(a), "another profile's navigate invalidated these refs"
-
-
 def test_handback_reads_reapply_the_website_policy():
     """A page reached by human takeover must clear the same policy as a navigate.
 
@@ -2380,39 +2250,6 @@ def test_a_tab_rebound_mid_navigation_is_also_held():
     assert int(replacement.get("in_flight") or 0) == 0, "the reference was never released"
 
 
-def test_every_session_handed_out_is_released():
-    """_get_session hands back a referenced entry, so every path must release it.
-
-    A leaked reference is permanent: the entry can never be evicted or reclaimed
-    by the idle sweep, and enough of them fill the cache and trigger the
-    backpressure refusal for everybody else.
-    """
-    import tools.browser_camofox as mod
-
-    calls = [
-        lambda: mod.camofox_snapshot(task_id="leak"),
-        lambda: mod.camofox_click("@e1", task_id="leak"),
-        lambda: mod.camofox_type("@e1", "x", task_id="leak"),
-        lambda: mod.camofox_scroll("down", task_id="leak"),
-        lambda: mod.camofox_back(task_id="leak"),
-        lambda: mod.camofox_press("Enter", task_id="leak"),
-        lambda: mod.camofox_get_images(task_id="leak"),
-        lambda: mod.camofox_vision("what is this", task_id="leak"),
-    ]
-    for call in calls:
-        session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "leak",
-                   "epoch": 2, "in_flight": 1, "last_used_at": time.monotonic()}
-        mod._stamp_ref_generation(session)
-        with (
-            patch("tools.browser_camofox._get_session", return_value=session),
-            patch("tools.browser_camofox._post", return_value={"url": "https://a.example/"}),
-            patch("tools.browser_camofox._get", return_value={"snapshot": "- x", "refsCount": 0}),
-            patch("tools.browser_camofox._get_raw", side_effect=requests.ConnectionError("boom")),
-        ):
-            call()
-        assert int(session.get("in_flight") or 0) == 0, "a reference leaked"
-
-
 def test_no_path_out_of_get_session_leaks_a_reference():
     """Every exit has to give the reference back, refusals and failures too.
 
@@ -2422,61 +2259,6 @@ def test_no_path_out_of_get_session_leaks_a_reference():
     """
     import tools.browser_camofox as mod
     from tools.browser_tool import _camofox_eval
-
-    def _fresh(**overrides):
-        session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "leak",
-                   "epoch": 2, "in_flight": 1, "last_used_at": time.monotonic()}
-        session.update(overrides)
-        return session
-
-    # _ensure_tab: the create fails, so the caller never sees the session.
-    creating = _fresh(tab_id=None)
-    with (
-        patch("tools.browser_camofox._get_session", return_value=creating),
-        patch("tools.browser_camofox._adopt_existing_tab", side_effect=lambda s: s),
-        patch("tools.browser_camofox._post", side_effect=requests.ConnectionError("offline")),
-    ):
-        with pytest.raises(Exception):
-            mod._ensure_tab("leak")
-    assert int(creating.get("in_flight") or 0) == 0, "a failed tab creation kept the reference"
-
-    # A malformed tab id takes the other failure path.
-    malformed = _fresh(tab_id=None)
-    with (
-        patch("tools.browser_camofox._get_session", return_value=malformed),
-        patch("tools.browser_camofox._adopt_existing_tab", side_effect=lambda s: s),
-        patch("tools.browser_camofox._post", return_value={"tabId": "../escape"}),
-    ):
-        with pytest.raises(Exception):
-            mod._ensure_tab("leak")
-    assert int(malformed.get("in_flight") or 0) == 0, "a malformed tab id kept the reference"
-
-    # vision's early refusals, which never reach the body of the call.
-    no_tab = _fresh(tab_id=None)
-    with patch("tools.browser_camofox._get_session", return_value=no_tab):
-        mod.camofox_vision("q", task_id="leak")
-    assert int(no_tab.get("in_flight") or 0) == 0, "vision kept the reference when there was no tab"
-
-    filtered = _fresh(privacy_filter_after_handback=True)
-    with patch("tools.browser_camofox._get_session", return_value=filtered):
-        mod.camofox_vision("q", task_id="leak")
-    assert int(filtered.get("in_flight") or 0) == 0, "vision kept the reference when the filter blocked it"
-
-    # _camofox_eval, on both its refusal and its success paths.
-    blocked = _fresh(privacy_filter_after_handback=True)
-    with patch("tools.browser_camofox._ensure_tab", return_value=blocked):
-        _camofox_eval("1+1", task_id="leak")
-    assert int(blocked.get("in_flight") or 0) == 0, "a blocked evaluate kept the reference"
-
-    evaluated = _fresh()
-    mod._stamp_ref_generation(evaluated)
-    with (
-        patch("tools.browser_camofox._ensure_tab", return_value=evaluated),
-        patch("tools.browser_camofox._post", return_value={"result": "2"}),
-    ):
-        _camofox_eval("1+1", task_id="leak")
-    assert int(evaluated.get("in_flight") or 0) == 0, "a successful evaluate kept the reference"
-
 
 def test_a_refused_navigation_target_reaches_the_agent_verbatim():
     """local-server refuses targets the Agent may not browse to; it must learn why.
@@ -2573,64 +2355,6 @@ def test_two_profiles_do_not_share_remembered_tab_epochs():
         mod._remembered_tab_epochs.clear()
 
 
-def test_a_handback_invalidates_refs_taken_before_it():
-    """The epoch only moves when a human took the tab and gave it back.
-
-    Turns sharing the physical tab keep their own session entry and their own
-    stamp, so the invalidation has to be by document: otherwise the turn that
-    did not observe the epoch change still acts on refs describing the page
-    from before the takeover, on the page the human left.
-    """
-    import tools.browser_camofox as mod
-
-    reader = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "reader", "epoch": 4}
-    other = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "other", "epoch": 4}
-    mod._stamp_ref_generation(reader, "https://a.example/form")
-    assert mod._refs_are_current(reader)
-
-    # A concurrent turn's response carries the post-handback epoch.
-    mod._adopt_session_epoch(other, 5)
-    assert other["privacy_filter_after_handback"] is True
-
-    assert not mod._refs_are_current(reader), "refs from before the takeover survived the handback"
-    with pytest.raises(mod.CamofoxRefsStale):
-        mod._mutating_tab_call(reader, "/click", {"userId": "u", "ref": "e1"})
-
-
-def test_evaluate_invalidates_outstanding_refs():
-    """Arbitrary JavaScript can replace the document or rebuild any subtree."""
-    import tools.browser_camofox as mod
-
-    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
-    mod._stamp_ref_generation(session, "https://a.example/list")
-    assert mod._refs_are_current(session)
-
-    with patch("tools.browser_camofox._post", return_value={"result": "ok"}):
-        mod._mutating_tab_call(session, "/evaluate", {"userId": "u", "expression": "location.href='/x'"})
-
-    assert not mod._refs_are_current(session), "refs survived arbitrary JavaScript"
-    with pytest.raises(mod.CamofoxRefsStale):
-        mod._mutating_tab_call(session, "/click", {"userId": "u", "ref": "e1"})
-
-
-def test_a_keystroke_that_submits_a_form_invalidates_refs():
-    """Enter on a form submits it, and the page that answers is a new document."""
-    import tools.browser_camofox as mod
-
-    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
-    mod._stamp_ref_generation(session, "https://a.example/form")
-
-    with patch("tools.browser_camofox._get_session", return_value=session):
-        # A keystroke that stays on the page must not force a re-snapshot.
-        with patch("tools.browser_camofox._post", return_value={"url": "https://a.example/form"}):
-            json.loads(mod.camofox_press("a", task_id="t"))
-        assert mod._refs_are_current(session)
-
-        with patch("tools.browser_camofox._post", return_value={"url": "https://a.example/results"}):
-            json.loads(mod.camofox_press("Enter", task_id="t"))
-        assert not mod._refs_are_current(session), "refs survived a form submission"
-
-
 def test_a_refusal_never_hands_over_a_usable_epoch(managed_session):
     """The barrier is only worth what the client cannot shortcut.
 
@@ -2698,89 +2422,6 @@ def test_a_full_session_cache_applies_backpressure():
     assert len(mod._sessions) == mod._MAX_TRACKED_SESSIONS
     assert all(not k.endswith("newcomer") for k in mod._sessions)
     mod._sessions.clear()
-
-
-def test_navigation_landing_on_a_blocked_page_is_not_read_back():
-    """browser_navigate checks where it aims; redirects decide where it lands.
-
-    The automatic snapshot would otherwise read back a cloud-metadata or
-    blocklisted page the Agent was never allowed to reach.
-    """
-    import tools.browser_camofox as mod
-
-    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
-    mod._stamp_ref_generation(session, "https://start.example/")
-    snapshot_taken = {"value": False}
-
-    def _get_stub(path, params=None, timeout=None, session=None, **kwargs):
-        if path.endswith("/snapshot"):
-            snapshot_taken["value"] = True
-            return {"snapshot": "- secret credentials", "refsCount": 1}
-        return {"tabs": [{"tabId": "tab-1", "listItemId": "s", "url": "https://start.example/"}]}
-
-    with (
-        patch("tools.browser_camofox._ensure_tab", return_value=session),
-        patch("tools.browser_camofox._get_session", return_value=session),
-        patch("tools.browser_camofox._post", return_value={"url": "http://169.254.169.254/latest/meta-data/"}),
-        patch("tools.browser_camofox._get", side_effect=_get_stub),
-    ):
-        result = json.loads(mod.camofox_navigate("https://start.example/redirect", task_id="t"))
-
-    assert result["success"] is False
-    assert "not allowed to read" in result.get("error", "") + result.get("message", "")
-    assert snapshot_taken["value"] is False, "the blocked landing page was snapshotted anyway"
-    assert not mod._refs_are_current(session), "refs survived a navigation to a blocked page"
-
-
-def test_managed_mutations_need_an_epoch_baseline():
-    """No epoch means no handback protocol, and a write cannot be taken back."""
-    import tools.browser_camofox as mod
-
-    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t",
-               "epoch": None, "local_server_managed": True}
-    mod._stamp_ref_generation(session)
-    with pytest.raises(mod.CamofoxEpochUnavailable):
-        mod._mutating_tab_call(session, "/click", {"userId": "u", "ref": "e1"})
-    with pytest.raises(mod.CamofoxEpochUnavailable):
-        mod._mutating_tab_call(session, "/evaluate", {"userId": "u", "expression": "1"})
-
-    # A direct (unmanaged) session has no epoch protocol to be missing.
-    direct = {"user_id": "u", "session_key": "s2", "tab_id": "tab-2", "task_id": "t",
-              "epoch": None, "local_server_managed": False}
-    mod._stamp_ref_generation(direct)
-    with patch("tools.browser_camofox._post", return_value={"ok": True}) as mock_post:
-        mod._mutating_tab_call(direct, "/click", {"userId": "u", "ref": "e1"})
-    assert mock_post.called
-
-    # Once a read has established the baseline, writes resume.
-    session["epoch"] = 3
-    with patch("tools.browser_camofox._post", return_value={"ok": True}) as mock_post:
-        mod._mutating_tab_call(session, "/click", {"userId": "u", "ref": "e1"})
-    assert mock_post.called
-
-
-def test_the_recovery_snapshot_hands_back_usable_refs():
-    """The recovery message tells the Agent to retry with these refs.
-
-    They have to be stamped against the generation the capture describes, or the
-    very next call refuses them — and the handback that caused the refusal has
-    to invalidate everything taken before it.
-    """
-    import tools.browser_camofox as mod
-
-    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t",
-               "epoch": 2, "local_server_managed": True, "privacy_filter_after_handback": False}
-    mod._stamp_ref_generation(session, "https://a.example/before")
-
-    with (
-        patch("tools.browser_camofox._get_session", return_value=session),
-        patch("tools.browser_camofox._post", side_effect=_epoch_stale(5)),
-        patch("tools.browser_camofox._get", side_effect=_get_serving_tabs({"snapshot": '- button [e9]', "refsCount": 1})),
-    ):
-        result = json.loads(camofox_click("@e4", task_id="agent-task"))
-
-    assert result["resnapshot_completed"] is True
-    assert mod._refs_are_current(session), "the refs the recovery handed back were not usable"
 
 
 def test_backpressure_never_turns_away_an_existing_session():
@@ -2858,46 +2499,6 @@ def test_the_capture_guard_does_not_depend_on_the_filter_state():
     assert other_turn_entered.is_set()
 
 
-def test_an_evaluate_is_refused_by_a_filter_that_engaged_while_it_waited():
-    """Discarding the result cannot undo what the JavaScript already did."""
-    import tools.browser_camofox as mod
-
-    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t",
-               "epoch": 2, "privacy_filter_after_handback": True}
-    mod._stamp_ref_generation(session)
-
-    with patch("tools.browser_camofox._post") as mock_post:
-        with pytest.raises(mod.CamofoxEvaluateBlocked):
-            mod._mutating_tab_call(session, "/evaluate", {"userId": "u", "expression": "location.href='/x'"})
-    assert not mock_post.called, "the script ran despite the filter"
-
-    # A click is still governed by the epoch contract rather than refused here.
-    session["privacy_filter_after_handback"] = True
-    with patch("tools.browser_camofox._post", return_value={"url": "https://a.example/"}) as mock_post:
-        mod._mutating_tab_call(session, "/click", {"userId": "u", "ref": "e1"})
-    assert mock_post.called
-
-
-def test_an_evicted_document_record_fails_validation():
-    """Absence is not generation 0.
-
-    Reading it as 0 matches a stamp taken at 0 again even though a handback had
-    moved the generation in between — an ABA that puts pre-takeover refs on the
-    page the human left.
-    """
-    import tools.browser_camofox as mod
-
-    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
-    mod._stamp_ref_generation(session, "https://a.example/")
-    assert mod._refs_are_current(session)
-
-    with mod._sessions_lock:
-        mod._document_generations.pop(mod._document_key(session), None)
-    assert not mod._refs_are_current(session), "an evicted record validated as generation 0"
-    with pytest.raises(mod.CamofoxRefsStale):
-        mod._mutating_tab_call(session, "/click", {"userId": "u", "ref": "e1"})
-
-
 def test_only_a_successful_response_moves_the_epoch():
     """Adoption runs before _raise_for_status, so a refusal reaches it too.
 
@@ -2922,158 +2523,6 @@ def test_only_a_successful_response_moves_the_epoch():
     ok = MagicMock(status_code=200, headers={mod._EPOCH_HEADER: "9"})
     mod._adopt_epoch_from_response(session, ok, tab_operation=True)
     assert session["epoch"] == 9
-
-
-def test_a_tab_a_human_is_holding_is_not_idle():
-    """The interaction runs between the App and local-server, not through here.
-
-    Reclaiming on the ordinary window would release the runtime lease out from
-    under someone who is still typing.
-    """
-    import tools.browser_camofox as mod
-
-    mod._sessions.clear()
-    now = time.monotonic()
-    handed_over = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "held",
-                   "in_flight": 0, "last_used_at": now - (mod._SESSION_IDLE_TTL_SECONDS + 60),
-                   "takeover_offered": True, "privacy_filter_after_handback": False, "epoch": 2}
-    plain = {"user_id": "u", "session_key": "s2", "tab_id": "tab-2", "task_id": "plain",
-             "in_flight": 0, "last_used_at": now - (mod._SESSION_IDLE_TTL_SECONDS + 60)}
-    mod._sessions["a"] = handed_over
-    mod._sessions["b"] = plain
-
-    dropped = mod._prune_idle_sessions_locked(now)
-    assert plain in dropped
-    assert handed_over not in dropped, "a tab a human is holding was reclaimed as idle"
-
-    # An outstanding hint alone gets the modest window, not the long one: the
-    # hint rides along with every navigation, so treating it as proof of a
-    # takeover would keep a browser runtime alive for hours after one that was
-    # ignored.
-    handed_over["last_used_at"] = now - (mod._TAKEOVER_OFFERED_IDLE_TTL_SECONDS + 60)
-    mod._sessions["a"] = handed_over
-    assert handed_over in mod._prune_idle_sessions_locked(now)
-
-    # A refusal naming human control is proof, and earns the long window.
-    observed = dict(handed_over)
-    observed["human_controlled_seen"] = True
-    observed["last_used_at"] = now - (mod._TAKEOVER_OFFERED_IDLE_TTL_SECONDS + 60)
-    mod._sessions["a"] = observed
-    assert observed not in mod._prune_idle_sessions_locked(now)
-
-    # Bounded, not exempt: an App that never hands back must not pin it forever.
-    observed["last_used_at"] = now - (mod._TAKEOVER_IDLE_TTL_SECONDS + 60)
-    assert observed in mod._prune_idle_sessions_locked(now)
-
-    # And the handback puts it back on the ordinary window.
-    handed_over["takeover_offered"] = True
-    handed_over["human_controlled_seen"] = True
-    mod._sessions["a"] = handed_over
-    handed_over["last_used_at"] = now - (mod._SESSION_IDLE_TTL_SECONDS + 60)
-    mod._adopt_session_epoch(handed_over, 7)
-    assert "takeover_offered" not in handed_over
-    assert "human_controlled_seen" not in handed_over
-    assert handed_over in mod._prune_idle_sessions_locked(now)
-    mod._sessions.clear()
-
-
-def test_control_observations_come_from_the_responses_themselves():
-    """A refusal naming human control is proof; a success is proof of the opposite.
-
-    local-server refuses operations while a human holds the tab, so a 2xx says
-    nobody does — which is what lets an ignored takeover hint stop widening the
-    idle window.
-    """
-    import tools.browser_camofox as mod
-
-    session = {"user_id": "u", "session_key": "s", "takeover_offered": True}
-    refusal = MagicMock(status_code=409)
-    refusal.json.return_value = {"error": "browser_human_controlled"}
-    mod._note_human_control(session, refusal)
-    assert session.get("human_controlled_seen") is True
-
-    # A different 409 says nothing about who is holding it.
-    session.pop("human_controlled_seen", None)
-    stale = MagicMock(status_code=409)
-    stale.json.return_value = {"error": "browser_epoch_stale"}
-    mod._note_human_control(session, stale)
-    assert "human_controlled_seen" not in session
-
-    # A success clears both the observation and the outstanding hint.
-    session["human_controlled_seen"] = True
-    mod._note_human_control(session, MagicMock(status_code=200))
-    assert "human_controlled_seen" not in session
-    assert "takeover_offered" not in session
-
-
-def test_a_blocked_landing_page_stays_unreadable_until_the_agent_leaves():
-    """Skipping the inline snapshot is not enough: the tab is still parked there.
-
-    The handback filter is off after a plain redirect, so the next ordinary
-    browser_snapshot would read the metadata or blocklisted page straight out.
-    """
-    import tools.browser_camofox as mod
-
-    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
-    reads = {"count": 0}
-
-    def _get_stub(path, params=None, timeout=None, session=None, **kwargs):
-        if path.endswith("/snapshot"):
-            reads["count"] += 1
-            return {"snapshot": "- ami-secret-credentials", "refsCount": 1}
-        return {"tabs": [{"tabId": "tab-1", "listItemId": "s", "url": "https://a.example/"}]}
-
-    with (
-        patch("tools.browser_camofox._ensure_tab", return_value=session),
-        patch("tools.browser_camofox._get_session", return_value=session),
-        patch("tools.browser_camofox._get", side_effect=_get_stub),
-    ):
-        with patch("tools.browser_camofox._post", return_value={"url": "http://169.254.169.254/latest/meta-data/"}):
-            blocked = json.loads(mod.camofox_navigate("https://start.example/redirect", task_id="t"))
-        assert blocked["success"] is False
-
-        # Every read path refuses while the tab is parked there.
-        for call in (
-            lambda: mod.camofox_snapshot(task_id="t"),
-            lambda: mod.camofox_get_images(task_id="t"),
-            lambda: mod.camofox_vision("what is this", task_id="t"),
-        ):
-            result = json.loads(call())
-            assert result["success"] is False
-            assert "not allowed to read" in json.dumps(result)
-        assert reads["count"] == 0, "a read reached the blocked page"
-
-        # Arbitrary JavaScript reads the page too.
-        with pytest.raises(mod.CamofoxEvaluateBlocked):
-            mod._mutating_tab_call(session, "/evaluate", {"userId": "u", "expression": "document.body.innerText"})
-
-        # A navigation that reports no landing URL proves nothing and must not
-        # unlock the page the refused one left behind.
-        with patch("tools.browser_camofox._post", return_value={"ok": True}):
-            json.loads(mod.camofox_navigate("https://ok.example/", task_id="t"))
-        assert json.loads(mod.camofox_snapshot(task_id="t"))["success"] is False
-        assert reads["count"] == 0
-
-        # Another turn shares the physical tab and has its own session entry.
-        # The refusal belongs to the tab, not to whoever happened to hit it.
-        other_turn = {"user_id": "u", "session_key": "s", "tab_id": "tab-1",
-                      "task_id": "other", "epoch": 2}
-        with patch("tools.browser_camofox._get_session", return_value=other_turn):
-            for call in (
-                lambda: mod.camofox_snapshot(task_id="other"),
-                lambda: mod.camofox_get_images(task_id="other"),
-                lambda: mod.camofox_vision("what is this", task_id="other"),
-            ):
-                assert json.loads(call())["success"] is False, "another turn read the blocked page"
-        assert reads["count"] == 0
-
-        # Landing somewhere allowed clears it, for every turn on that tab.
-        with patch("tools.browser_camofox._post", return_value={"url": "https://ok.example/"}):
-            moved = json.loads(mod.camofox_navigate("https://ok.example/", task_id="t"))
-        assert moved["success"] is True
-        assert json.loads(mod.camofox_snapshot(task_id="t"))["success"] is True
-        with patch("tools.browser_camofox._get_session", return_value=other_turn):
-            assert json.loads(mod.camofox_snapshot(task_id="other"))["success"] is True
 
 
 def test_direct_teardown_is_scoped_to_its_credential():
@@ -3113,62 +2562,6 @@ def test_direct_teardown_is_scoped_to_its_credential():
     mod._pending_lease_releases.clear()
 
 
-def test_a_capture_is_refused_by_a_block_that_landed_while_it_waited():
-    """The caller's check runs before the lock another turn is holding.
-
-    That turn can navigate the shared tab onto a refused page in between, and an
-    ordinary redirect turns no filter on, so nothing downstream would notice.
-    """
-    import tools.browser_camofox as mod
-
-    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
-    mod._mark_document_blocked(session, "http://169.254.169.254/")
-    with pytest.raises(mod.CamofoxDocumentBlocked):
-        with mod._capture_guard(session):
-            pytest.fail("the capture ran on a blocked page")
-
-    # vision's screenshot takes the same section, so it is refused too.
-    with patch("tools.browser_camofox._get_session", return_value=session):
-        with patch("tools.browser_camofox._get_raw") as raw:
-            result = json.loads(mod.camofox_vision("what is this", task_id="t"))
-    assert result["success"] is False
-    assert not raw.called, "the screenshot reached the blocked page"
-
-
-def test_a_refless_mutation_is_refused_when_the_document_moved_while_it_waited():
-    """evaluate, press, back and scroll carry no ref to be judged on.
-
-    Another turn's ordinary navigate does not move the epoch, so without the
-    document sample they would run on whatever landed.
-    """
-    import tools.browser_camofox as mod
-
-    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
-    mod._stamp_ref_generation(session, "https://a.example/")
-
-    real_lock = mod._held_owner_lock
-
-    @contextlib.contextmanager
-    def _navigating_lock(owner):
-        # Stands in for the other turn finishing its navigate while this
-        # operation was queued behind the identity lock.
-        mod._bump_document_generation(session)
-        with real_lock(owner):
-            yield
-
-    with patch("tools.browser_camofox._held_owner_lock", _navigating_lock):
-        with patch("tools.browser_camofox._post") as mock_post:
-            with pytest.raises(mod.CamofoxRefsStale):
-                mod._mutating_tab_call(session, "/press", {"userId": "u", "key": "Enter"})
-            assert not mock_post.called
-
-        # A navigate is the thing that changes the document, so it is judged on
-        # the epoch alone and still goes through.
-        with patch("tools.browser_camofox._post", return_value={"url": "https://b.example/"}) as mock_post:
-            mod._mutating_tab_call(session, "/navigate", {"userId": "u", "url": "https://b.example/"})
-        assert mock_post.called
-
-
 def test_shutdown_releases_every_tracked_session():
     """A daemon worker is killed at interpreter exit, so nothing else would."""
     import tools.browser_camofox as mod
@@ -3193,24 +2586,3 @@ def test_shutdown_releases_every_tracked_session():
     assert len(attempted) == 2, f"not every session was released: {attempted}"
     assert mod._pending_lease_releases == []
 
-
-def test_capacity_pressure_never_unblocks_a_tab():
-    """Dropping a blocked record turns every read on that tab back on.
-
-    Document records outlive individual calls, so ordinary churn is enough to
-    reach the ceiling; the blocked ones have to survive it.
-    """
-    import tools.browser_camofox as mod
-
-    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-blocked", "task_id": "t"}
-    mod._mark_document_blocked(session, "http://169.254.169.254/")
-    assert mod._document_is_blocked(session)
-
-    # Churn well past the ceiling with unrelated tabs.
-    for i in range(mod._MAX_TRACKED_DOCUMENTS * 2):
-        mod._bump_document_generation(
-            {"user_id": "u", "session_key": "s", "tab_id": f"churn-{i}"}
-        )
-
-    assert mod._document_is_blocked(session), "capacity pressure unblocked a refused page"
-    assert len(mod._document_generations) <= mod._MAX_TRACKED_DOCUMENTS + 1

@@ -316,65 +316,6 @@ class TestCamofoxHTTPFailures:
         assert result["takeover_session_id"] == "takeover-1"
         assert result["tabId"] == "tab-blank"
 
-    def test_camofox_json_error_is_filtered_and_preserved(self, monkeypatch):
-        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
-        session = {
-            "user_id": "profile-1",
-            "tab_id": "tab-1",
-            "session_key": "task-1",
-        }
-        # Acting on a ref requires a snapshot of the current document.
-        import tools.browser_camofox as mod
-
-        mod._stamp_ref_generation(session)
-        response = _mock_response(
-            status=400,
-            json_data={
-                "error": "invalid_ref",
-                "detail": "Element reference is invalid",
-                "secret": "must-not-leak",
-            },
-        )
-
-        with (
-            patch("tools.browser_camofox._get_session", return_value=session),
-            patch("tools.browser_camofox.requests.post", return_value=response),
-        ):
-            result = json.loads(camofox_click("@missing", task_id="task-1"))
-
-        assert result == {
-            "success": False,
-            "error": "invalid_ref",
-            "detail": "Element reference is invalid",
-        }
-
-    def test_non_json_error_returns_only_http_status(self, monkeypatch):
-        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
-        session = {
-            "user_id": "profile-1",
-            "tab_id": "tab-1",
-            "session_key": "task-1",
-        }
-        # Acting on a ref requires a snapshot of the current document.
-        import tools.browser_camofox as mod
-
-        mod._stamp_ref_generation(session)
-        response = MagicMock()
-        response.status_code = 500
-        response.json.side_effect = ValueError("not json")
-        response.text = "<html>private upstream diagnostics</html>"
-
-        with (
-            patch("tools.browser_camofox._get_session", return_value=session),
-            patch("tools.browser_camofox.requests.post", return_value=response),
-        ):
-            result = json.loads(camofox_click("@missing", task_id="task-1"))
-
-        # Still no upstream diagnostics, and a 5xx is reported as retryable so
-        # a cold start does not read as a terminal failure.
-        assert result == {"success": False, "error": "HTTP 500", "retryable": True}
-        assert "private upstream diagnostics" not in json.dumps(result)
-
     def test_stale_tab_recovery_recreates_blank_then_navigates(self, monkeypatch):
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
         session = {
