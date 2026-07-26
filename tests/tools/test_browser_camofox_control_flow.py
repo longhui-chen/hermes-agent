@@ -2996,3 +2996,84 @@ def test_control_observations_come_from_the_responses_themselves():
     mod._note_human_control(session, MagicMock(status_code=200))
     assert "human_controlled_seen" not in session
     assert "takeover_offered" not in session
+
+
+def test_a_blocked_landing_page_stays_unreadable_until_the_agent_leaves():
+    """Skipping the inline snapshot is not enough: the tab is still parked there.
+
+    The handback filter is off after a plain redirect, so the next ordinary
+    browser_snapshot would read the metadata or blocklisted page straight out.
+    """
+    import tools.browser_camofox as mod
+
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
+    reads = {"count": 0}
+
+    def _get_stub(path, params=None, timeout=None, session=None, **kwargs):
+        if path.endswith("/snapshot"):
+            reads["count"] += 1
+            return {"snapshot": "- ami-secret-credentials", "refsCount": 1}
+        return {"tabs": [{"tabId": "tab-1", "listItemId": "s", "url": "https://a.example/"}]}
+
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=session),
+        patch("tools.browser_camofox._get_session", return_value=session),
+        patch("tools.browser_camofox._get", side_effect=_get_stub),
+    ):
+        with patch("tools.browser_camofox._post", return_value={"url": "http://169.254.169.254/latest/meta-data/"}):
+            blocked = json.loads(mod.camofox_navigate("https://start.example/redirect", task_id="t"))
+        assert blocked["success"] is False
+
+        # Every read path refuses while the tab is parked there.
+        for call in (
+            lambda: mod.camofox_snapshot(task_id="t"),
+            lambda: mod.camofox_get_images(task_id="t"),
+            lambda: mod.camofox_vision("what is this", task_id="t"),
+        ):
+            result = json.loads(call())
+            assert result["success"] is False
+            assert "not allowed to read" in json.dumps(result)
+        assert reads["count"] == 0, "a read reached the blocked page"
+
+        # Navigating somewhere allowed clears it.
+        with patch("tools.browser_camofox._post", return_value={"url": "https://ok.example/"}):
+            moved = json.loads(mod.camofox_navigate("https://ok.example/", task_id="t"))
+        assert moved["success"] is True
+        assert json.loads(mod.camofox_snapshot(task_id="t"))["success"] is True
+
+
+def test_direct_teardown_is_scoped_to_its_credential():
+    """Two profiles can share a URL and a user id and differ only by credential.
+
+    Merging their DELETEs would overwrite one profile's only credential, and a
+    targeted drain would fire the other profile's teardown as its own.
+    """
+    import tools.browser_camofox as mod
+
+    mod._pending_lease_releases.clear()
+    url = "http://127.0.0.1:9377/sessions/shared_user"
+    mod._queue_pending_teardown("delete", url, {"Authorization": "Bearer a"}, owner="shared\x00digest-a")
+    mod._queue_pending_teardown("delete", url, {"Authorization": "Bearer b"}, owner="shared\x00digest-b")
+
+    assert len(mod._pending_lease_releases) == 2, "two profiles' teardowns were merged into one"
+    creds = {e["headers"]["Authorization"] for e in mod._pending_lease_releases}
+    assert creds == {"Bearer a", "Bearer b"}, "one profile's credential was overwritten"
+
+    with patch("tools.browser_camofox._attempt_teardown", return_value=True) as attempt:
+        mod._run_pending_teardowns(only_url=url, only_owner="shared\x00digest-a")
+    assert attempt.call_count == 1, "a targeted drain fired another profile's teardown"
+    assert [e.get("owner") for e in mod._pending_lease_releases] == ["shared\x00digest-b"]
+
+    # And the queueing path itself has to carry the owner, not just this test.
+    mod._pending_lease_releases.clear()
+    for tag in ("a", "b"):
+        mod._teardown_session({
+            "user_id": "shared_user", "session_key": "s", "task_id": f"t-{tag}",
+            "managed": False, "local_server_managed": False,
+            "delete_base": "http://127.0.0.1:9377",
+            "delete_headers": {"Authorization": f"Bearer {tag}"},
+            "release_owner": f"shared\x00digest-{tag}",
+        })
+    assert len(mod._pending_lease_releases) == 2, "_teardown_session merged two profiles into one delete"
+    assert {e["headers"]["Authorization"] for e in mod._pending_lease_releases} == {"Bearer a", "Bearer b"}
+    mod._pending_lease_releases.clear()

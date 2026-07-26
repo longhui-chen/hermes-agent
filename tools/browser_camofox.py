@@ -1270,7 +1270,7 @@ _MAX_PENDING_RELEASE_ATTEMPTS = 8
 _maintenance_worker: Optional[threading.Thread] = None
 
 
-def _run_pending_teardowns(force: bool = False, only_url: str = "") -> None:
+def _run_pending_teardowns(force: bool = False, only_url: str = "", only_owner: str = "") -> None:
     """Drain scheduled teardowns.
 
     Releases are deliberately deferred: a profile's runtime is shared, and the
@@ -1283,7 +1283,11 @@ def _run_pending_teardowns(force: bool = False, only_url: str = "") -> None:
     with _sessions_lock:
         ready = [
             e for e in _pending_lease_releases
-            if (e["url"] == only_url if only_url else (force or e["ready_at"] <= now))
+            if (
+                (e["url"] == only_url and e.get("owner", "") == only_owner)
+                if only_url
+                else (force or e["ready_at"] <= now)
+            )
         ]
         for entry in ready:
             _pending_lease_releases.remove(entry)
@@ -1543,6 +1547,7 @@ def _teardown_session(session: Optional[Dict[str, Any]]) -> None:
         "delete",
         f"{base}/sessions/{quote(user_id, safe='')}",
         headers,
+        owner=str(session.get("release_owner") or ""),
     )
 
 
@@ -1932,6 +1937,34 @@ def _handback_page_readable(session: Dict[str, Any], snapshot_data: Any = None) 
     if not landed_url:
         return False
     return _recovery_target_allowed(landed_url)
+
+
+def _mark_document_blocked(session: Dict[str, Any], url: str) -> None:
+    """Record that the tab is sitting on a page no read may return.
+
+    Cleared by a navigation that lands somewhere allowed — the only thing that
+    actually moves the tab off it.
+    """
+    if not isinstance(session, dict):
+        return
+    with _session_lock(session):
+        if url:
+            session["blocked_document"] = True
+        else:
+            session.pop("blocked_document", None)
+
+
+def _document_is_blocked(session: Optional[Dict[str, Any]]) -> bool:
+    return isinstance(session, dict) and bool(session.get("blocked_document"))
+
+
+def _blocked_document_error() -> str:
+    return tool_error(
+        "The browser is on a page this Agent is not allowed to read (cloud "
+        "metadata, a private-network address, or a blocked site). Navigate to an "
+        "allowed page before reading page state.",
+        success=False,
+    )
 
 
 def _blocked_handback_page_error() -> str:
@@ -2587,12 +2620,14 @@ def _navigate_within_identity(
         landed_url = data.get("url") if isinstance(data, dict) else None
         if isinstance(landed_url, str) and landed_url and not _landing_target_allowed(landed_url):
             _bump_document_generation(session)
-            return tool_error(
-                "Navigation landed on a page this Agent is not allowed to read "
-                "(cloud metadata, a private-network address, or a blocked site). "
-                "Page state was not captured.",
-                success=False,
-            )
+            # The tab is still sitting on that page. Skipping only this call's
+            # snapshot would leave the next plain browser_snapshot free to read
+            # it — the handback filter is off, so nothing else looks. The tab is
+            # marked instead, and every read refuses until the Agent navigates
+            # somewhere allowed.
+            _mark_document_blocked(session, landed_url)
+            return _blocked_document_error()
+        _mark_document_blocked(session, "")
         # Three things must hold before the page counts as left behind: this
         # response actually carried a verified epoch (a protocol downgrade must
         # not read as "nothing happened"), the epoch did not move, and the
@@ -2715,6 +2750,10 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
         session = _get_session(task_id)
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
+        if _document_is_blocked(session):
+            # The tab is parked on a landing page a navigation was refused
+            # for. Nothing may read it until the Agent moves off it.
+            return _blocked_document_error()
 
         filtered_at_request = _handback_privacy_filter_enabled(session)
         observed_document = _observed_document_generation(session)
@@ -2934,16 +2973,21 @@ def camofox_close(task_id: Optional[str] = None) -> str:
         # state is already gone, so a transient failure here would otherwise
         # leave the server-side session running with nothing able to close it.
         base = str(session.get("delete_base") or "")
+        own_owner = str(session.get("release_owner") or "")
+        own_url = f"{base}/sessions/{quote(str(session.get('user_id') or ''), safe='')}"
         _teardown_session(session)
-        # Only this session's own teardown is forced. A blanket drain would
-        # also fire other profiles' releases while they are still inside their
-        # quiet window — one of them may be mid-takeover.
-        _run_pending_teardowns(only_url=f"{base}/sessions/{quote(str(session.get('user_id') or ''), safe='')}")
+        # Only this session's own teardown is forced, and "own" includes the
+        # credential: in multiplex two profiles can share a CAMOFOX_URL and an
+        # explicit CAMOFOX_USER_ID and differ only by Authorization, so matching
+        # on the URL alone would fire the other profile's delete under this
+        # one's quiet window. A blanket drain would do the same to every
+        # profile, one of which may be mid-takeover.
+        _run_pending_teardowns(only_url=own_url, only_owner=own_owner)
         with _sessions_lock:
             closed = not any(
-                entry["kind"] == "delete" and entry["url"].endswith(
-                    f"/sessions/{quote(str(session.get('user_id') or ''), safe='')}"
-                )
+                entry["kind"] == "delete"
+                and entry["url"] == own_url
+                and entry.get("owner", "") == own_owner
                 for entry in _pending_lease_releases
             )
         return json.dumps({"success": True, "closed": closed})
@@ -2961,6 +3005,10 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
         session = _get_session(task_id)
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
+        if _document_is_blocked(session):
+            # The tab is parked on a landing page a navigation was refused
+            # for. Nothing may read it until the Agent moves off it.
+            return _blocked_document_error()
 
         import re
 
@@ -3022,6 +3070,10 @@ def camofox_vision(question: str, annotate: bool = False,
         session = _get_session(task_id)
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
+        if _document_is_blocked(session):
+            # The tab is parked on a landing page a navigation was refused
+            # for. Nothing may read it until the Agent moves off it.
+            return _blocked_document_error()
         if _handback_privacy_filter_enabled(session):
             return tool_error(
                 "Browser vision is blocked after human control until the Agent navigates to a new page or closes the session.",
