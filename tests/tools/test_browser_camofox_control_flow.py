@@ -2314,3 +2314,38 @@ def test_handback_reads_reapply_the_website_policy():
     # The SSRF guards still run first and independently of the policy.
     with patch("tools.website_policy.check_website_access", return_value=None):
         assert not mod._recovery_target_allowed("http://169.254.169.254/latest/meta-data/")
+
+
+def test_a_tab_rebound_mid_navigation_is_also_held():
+    """A 404 mid-navigation replaces the session; the new one needs a reference.
+
+    The caller's _session_operation holds the entry the call started with, so
+    without this the replacement is the one entry capacity eviction can drop —
+    while the navigation it was created for is still running.
+    """
+    import tools.browser_camofox as mod
+
+    original = {"user_id": "u", "session_key": "s", "tab_id": "tab-old", "task_id": "t",
+                "epoch": None, "in_flight": 0, "last_used_at": time.monotonic()}
+    replacement = {"user_id": "u", "session_key": "s", "tab_id": "tab-new", "task_id": "t",
+                   "epoch": None, "in_flight": 0, "last_used_at": time.monotonic()}
+    in_flight_during_navigate = {}
+
+    gone = requests.HTTPError()
+    gone.response = MagicMock(status_code=404)
+
+    def _post(path, body=None, timeout=None, session=None):
+        if "tab-old" in path:
+            raise gone
+        in_flight_during_navigate["value"] = int(replacement.get("in_flight") or 0)
+        return {"url": "https://a.example/"}
+
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=replacement),
+        patch("tools.browser_camofox._post", side_effect=_post),
+        patch("tools.browser_camofox._get", side_effect=requests.HTTPError()),
+    ):
+        mod._navigate_within_identity(original, "t", "https://a.example/", "https://a.example/", None)
+
+    assert in_flight_during_navigate.get("value", 0) > 0, "the rebound tab was navigated with no reference held"
+    assert int(replacement.get("in_flight") or 0) == 0, "the reference was never released"

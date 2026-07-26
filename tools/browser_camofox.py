@@ -2188,6 +2188,7 @@ def _navigate_within_identity(
     browser_url: str,
     rewrite_info: Any,
 ) -> str:
+    rebound_session: Optional[Dict[str, Any]] = None
     try:
         # An epoch advance during this call means a human took over and handed
         # back while the navigation was in flight, so the page the Agent is
@@ -2224,6 +2225,11 @@ def _navigate_within_identity(
                     )
                     session["tab_id"] = None
                     session = _ensure_tab(task_id)
+                    # The caller's _session_operation holds a reference to the
+                    # entry this call started with; the replacement needs its
+                    # own or capacity eviction could drop it mid-navigation.
+                    rebound_session = session
+                    _begin_session_call(rebound_session)
                     data = _post(
                         _tab_path(session, "/navigate"),
                         {"userId": session["user_id"], "url": browser_url},
@@ -2344,6 +2350,9 @@ def _navigate_within_identity(
             session=session,
             extra=_navigation_tab_context(session),
         )
+    finally:
+        if rebound_session is not None:
+            _end_session_call(rebound_session)
 
 
 def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
