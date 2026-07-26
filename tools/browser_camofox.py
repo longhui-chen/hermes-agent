@@ -910,10 +910,12 @@ def _get_session(task_id: Optional[str]) -> Dict[str, Any]:
         # Backpressure, not a soft cap: if nothing could be evicted the cache is
         # full of work in flight, and admitting more would grow the cache and the
         # browser's tabs without bound. The caller sees a retryable failure.
-        if len(_sessions) > _MAX_TRACKED_SESSIONS:
+        # Only a new entry can push the cache past its ceiling, and only a new
+        # entry is refused: a turn coming back to a session that is already
+        # tracked must not be turned away because its neighbours are busy.
+        if created_entry and len(_sessions) > _MAX_TRACKED_SESSIONS:
             session["in_flight"] = max(0, int(session.get("in_flight") or 0) - 1)
-            if created_entry:
-                _sessions.pop(cache_key, None)
+            _sessions.pop(cache_key, None)
             overflowing = True
     for expired in idle:
         _teardown_session(expired)

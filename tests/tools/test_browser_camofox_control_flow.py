@@ -2770,3 +2770,43 @@ def test_the_recovery_snapshot_hands_back_usable_refs():
 
     assert result["resnapshot_completed"] is True
     assert mod._refs_are_current(session), "the refs the recovery handed back were not usable"
+
+
+def test_backpressure_never_turns_away_an_existing_session():
+    """Refusing is for admitting new work, not for work already tracked.
+
+    A turn coming back to a session the cache already holds adds nothing to it;
+    turning that call away because its neighbours are busy would break a session
+    that is behaving.
+    """
+    import tools.browser_camofox as mod
+
+    mod._sessions.clear()
+    base = time.monotonic()
+    identity = {"user_id": "u", "session_key": "s"}
+    for i in range(mod._MAX_TRACKED_SESSIONS - 1):
+        mod._sessions[f"o\x00u\x00s\x00busy-{i:03d}"] = {
+            "user_id": "u", "session_key": "s", "task_id": f"busy-{i:03d}",
+            "in_flight": 1, "last_used_at": base + i,
+        }
+    mine = mod._session_cache_key("mine", identity, "o")
+    mod._sessions[mine] = {
+        "user_id": "u", "session_key": "s", "task_id": "mine", "tab_id": "tab-1",
+        "in_flight": 1, "last_used_at": base,
+    }
+
+    with (
+        patch("tools.browser_camofox._get_camofox_config", return_value={}),
+        patch("tools.browser_camofox._camofox_identity_override", return_value=None),
+        patch("tools.browser_camofox.get_camofox_identity", return_value=identity),
+        patch("tools.browser_camofox._release_owner_key", return_value="o"),
+        patch("tools.browser_camofox._local_server_managed", return_value=False),
+        patch("tools.browser_camofox.get_camofox_url", return_value="http://127.0.0.1:9377"),
+        patch("tools.browser_camofox._auth_headers", return_value={}),
+        patch("tools.browser_camofox._ensure_maintenance_worker", return_value=None),
+        patch("tools.browser_camofox._adopt_existing_tab", side_effect=lambda s: s),
+    ):
+        session = mod._get_session("mine")
+    assert session is mod._sessions[mine]
+    mod._end_session_call(session)
+    mod._sessions.clear()
