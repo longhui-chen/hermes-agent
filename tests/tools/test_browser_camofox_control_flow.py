@@ -2586,3 +2586,36 @@ def test_shutdown_releases_every_tracked_session():
     assert len(attempted) == 2, f"not every session was released: {attempted}"
     assert mod._pending_lease_releases == []
 
+
+
+def test_a_redirect_into_the_floor_is_not_read_back():
+    """browser_navigate checks where it aims; a redirect decides where it lands.
+
+    The metadata floor and the site policy are what hermes applies whatever the
+    backend — even for a local one, where the ordinary SSRF check is skipped on
+    purpose — so the landing URL has to clear them too, or the automatic
+    snapshot hands the page to the model.
+    """
+    import tools.browser_camofox as mod
+
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
+    snapshots = {"count": 0}
+
+    def _get_stub(path, params=None, timeout=None, session=None, **kwargs):
+        if path.endswith("/snapshot"):
+            snapshots["count"] += 1
+            return {"snapshot": "- ami-secret", "refsCount": 1}
+        return {"tabs": [{"tabId": "tab-1", "listItemId": "s", "url": "https://a.example/"}]}
+
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=session),
+        patch("tools.browser_camofox._get_session", return_value=session),
+        patch("tools.browser_camofox._get", side_effect=_get_stub),
+    ):
+        with patch("tools.browser_camofox._post", return_value={"url": "http://169.254.169.254/latest/meta-data/"}):
+            blocked = json.loads(mod.camofox_navigate("https://start.example/redirect", task_id="t"))
+        assert blocked["success"] is False
+        assert snapshots["count"] == 0, "the landing page was snapshotted anyway"
+
+        with patch("tools.browser_camofox._post", return_value={"url": "https://ok.example/"}):
+            assert json.loads(mod.camofox_navigate("https://ok.example/", task_id="t"))["success"] is True

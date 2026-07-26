@@ -1984,6 +1984,31 @@ def _blocked_handback_page_error() -> str:
     )
 
 
+def _landing_floor_allows(url: str) -> bool:
+    """The two rules hermes applies to a navigation whatever the backend.
+
+    Not the full SSRF check: browser_navigate() skips that for a local backend
+    on purpose, and the requested URL already passed whatever did apply. This
+    only re-applies what is unconditional there, to the URL the tab actually
+    landed on. Fails closed if a guard cannot be imported or raises.
+    """
+    try:
+        from tools.browser_tool import _is_always_blocked_url
+
+        if _is_always_blocked_url(url):
+            return False
+    except Exception:
+        return False
+    try:
+        from tools.website_policy import check_website_access
+
+        return check_website_access(url) is None
+    except ImportError:
+        return True
+    except Exception:
+        return False
+
+
 def _recovery_target_allowed(url: str) -> bool:
     """Whether the Agent may read the page the human handed back.
 
@@ -2411,6 +2436,21 @@ def _navigate_within_identity(
             else:
                 raise
 
+        # browser_navigate() checks the URL it was asked for; a redirect decides
+        # where the tab actually ends up. The metadata floor and the site policy
+        # are the two rules hermes applies unconditionally — even for a local
+        # backend, where the ordinary SSRF check is deliberately skipped — so
+        # applying them to the landing URL closes an inconsistency rather than
+        # adding a layer. Deliberately no tab-level blocked state: that machinery
+        # is what this refactor removed, and the automatic snapshot below is the
+        # only read this call performs.
+        landed_url = data.get("url") if isinstance(data, dict) else None
+        if isinstance(landed_url, str) and landed_url and not _landing_floor_allows(landed_url):
+            return tool_error(
+                "Navigation landed on a page this Agent is not allowed to read "
+                "(cloud metadata or a blocked site). Page state was not captured.",
+                success=False,
+            )
         # Three things must hold before the page counts as left behind: this
         # response actually carried a verified epoch (a protocol downgrade must
         # not read as "nothing happened"), the epoch did not move, and the
