@@ -2810,3 +2810,78 @@ def test_backpressure_never_turns_away_an_existing_session():
     assert session is mod._sessions[mine]
     mod._end_session_call(session)
     mod._sessions.clear()
+
+
+def test_the_capture_guard_does_not_depend_on_the_filter_state():
+    """The first post-handback capture is the one that turns the filter on.
+
+    Deciding whether to hold the lock by the state before the request therefore
+    leaves exactly that capture unprotected, and a concurrent navigate can move
+    the tab to an allowed page before the readability check looks.
+    """
+    import threading
+
+    import tools.browser_camofox as mod
+
+    mod._owner_locks.clear()
+    mod._owner_lock_refs.clear()
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t",
+               "privacy_filter_after_handback": False, "epoch": 2}
+
+    held = threading.Event()
+    other_turn_entered = threading.Event()
+
+    def _other_turn():
+        held.wait(1)
+        with mod._held_owner_lock(mod._browser_identity_key(session)):
+            other_turn_entered.set()
+
+    worker = threading.Thread(target=_other_turn)
+    worker.start()
+    with mod._capture_guard(session):
+        held.set()
+        # The other turn must not be able to take the identity while this
+        # capture is judged, even though the filter was off on entry.
+        assert not other_turn_entered.wait(0.2), "the capture ran without the tab identity held"
+    worker.join(2)
+    assert other_turn_entered.is_set()
+
+
+def test_an_evaluate_is_refused_by_a_filter_that_engaged_while_it_waited():
+    """Discarding the result cannot undo what the JavaScript already did."""
+    import tools.browser_camofox as mod
+
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t",
+               "epoch": 2, "privacy_filter_after_handback": True}
+    mod._stamp_ref_generation(session)
+
+    with patch("tools.browser_camofox._post") as mock_post:
+        with pytest.raises(mod.CamofoxEvaluateBlocked):
+            mod._mutating_tab_call(session, "/evaluate", {"userId": "u", "expression": "location.href='/x'"})
+    assert not mock_post.called, "the script ran despite the filter"
+
+    # A click is still governed by the epoch contract rather than refused here.
+    session["privacy_filter_after_handback"] = True
+    with patch("tools.browser_camofox._post", return_value={"url": "https://a.example/"}) as mock_post:
+        mod._mutating_tab_call(session, "/click", {"userId": "u", "ref": "e1"})
+    assert mock_post.called
+
+
+def test_an_evicted_document_record_fails_validation():
+    """Absence is not generation 0.
+
+    Reading it as 0 matches a stamp taken at 0 again even though a handback had
+    moved the generation in between — an ABA that puts pre-takeover refs on the
+    page the human left.
+    """
+    import tools.browser_camofox as mod
+
+    session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "t", "epoch": 2}
+    mod._stamp_ref_generation(session, "https://a.example/")
+    assert mod._refs_are_current(session)
+
+    with mod._sessions_lock:
+        mod._document_generations.pop(mod._document_key(session), None)
+    assert not mod._refs_are_current(session), "an evicted record validated as generation 0"
+    with pytest.raises(mod.CamofoxRefsStale):
+        mod._mutating_tab_call(session, "/click", {"userId": "u", "ref": "e1"})

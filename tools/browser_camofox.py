@@ -1037,18 +1037,22 @@ _MAX_TRACKED_SESSIONS = 64
 def _capture_guard(session: Optional[Dict[str, Any]]):
     """Hold the tab identity across a read whose content must be judged.
 
-    Only while the handback filter is on. The capture and the URL check that
+    Unconditional, and that is the point. The capture and the URL check that
     decides whether the Agent may read it have to describe the same moment: a
     concurrent turn's navigate landing between them would let content captured
     on a page the Agent may not read pass, because the tab had since moved to
-    one it may. Ordinary reads stay unserialized — a snapshot of whatever the
-    tab currently shows is inherent to sharing it.
+    one it may. Deciding by the filter state before the request cannot work —
+    the first post-handback capture is the response that turns the filter on,
+    which is exactly the capture that needs protecting.
+
+    Only the HTTP capture is inside: vision's model round trip, which can run
+    for minutes, happens outside it.
     """
-    if isinstance(session, dict) and _handback_privacy_filter_enabled(session):
-        with _held_owner_lock(_browser_identity_key(session)):
-            yield
+    if not isinstance(session, dict):
+        yield
         return
-    yield
+    with _held_owner_lock(_browser_identity_key(session)):
+        yield
 
 
 @contextmanager
@@ -2084,6 +2088,17 @@ def _tool_error_from_exception(
         if extra:
             payload.update(extra)
         return json.dumps(payload, ensure_ascii=False)
+    if isinstance(exc, CamofoxEvaluateBlocked):
+        payload = {
+            "success": False,
+            "error": (
+                "Browser evaluation is blocked after human control until the "
+                "Agent navigates to a new page or closes the session."
+            ),
+        }
+        if extra:
+            payload.update(extra)
+        return json.dumps(payload, ensure_ascii=False)
     if isinstance(exc, CamofoxRefsStale):
         payload = {
             "success": False,
@@ -2142,6 +2157,10 @@ class CamofoxSessionsBusy(Exception):
 
 class CamofoxEpochUnavailable(Exception):
     """Raised when a managed session has no epoch baseline to mutate against."""
+
+
+class CamofoxEvaluateBlocked(Exception):
+    """Raised when arbitrary JavaScript is refused because a human held the tab."""
 
 
 # Document generation per physical tab. The epoch contract only advances on a
@@ -2246,18 +2265,37 @@ def _refs_are_current(session: Dict[str, Any]) -> bool:
     with _sessions_lock:
         if session.get("ref_document") != key:
             return False
-        return session.get("ref_generation") == _document_generation_locked(key)
+        entry = _document_generations.get(key)
+        if entry is None:
+            # The record was evicted. Reading its absence as generation 0 would
+            # match a stamp taken at 0 again even though a handback had moved it
+            # in between — an ABA that lets pre-takeover refs act on the page
+            # the human left. Absence proves nothing, so it fails.
+            return False
+        return session.get("ref_generation") == int(entry.get("generation") or 0)
 
 
 def _forget_surplus_documents_locked(keep: str) -> None:
-    """Keep the registry bounded; it must never outgrow the session cache."""
+    """Keep the registry bounded; it must never outgrow the session cache.
+
+    Records still referenced by a session's ref stamp go last: dropping one
+    costs that session a re-snapshot, since a missing record no longer
+    validates.
+    """
     while len(_document_generations) > _MAX_TRACKED_DOCUMENTS:
+        stamped = {s.get("ref_document") for s in _sessions.values()}
+        victim = ""
         for key in _document_generations:
-            if key != keep:
-                _document_generations.pop(key, None)
+            if key == keep:
+                continue
+            if key not in stamped:
+                victim = key
                 break
-        else:
+            if not victim:
+                victim = key
+        if not victim:
             return
+        _document_generations.pop(victim, None)
 
 
 # Suffixes after which no outstanding ref can be trusted. navigate/back/forward
@@ -2298,6 +2336,16 @@ def _mutating_tab_call(session: Dict[str, Any], path_suffix: str, body: Dict[str
         if session.get("epoch") != observed_epoch:
             raise CamofoxEpochMoved(
                 "the page changed while this operation waited for the browser tab"
+            )
+        # Re-checked here, not only by the caller: evaluate runs arbitrary
+        # JavaScript, so between a caller's check and this lock another turn's
+        # response can turn the filter on and this call would then run against
+        # the page a human is holding. Discarding the result afterwards cannot
+        # undo a location.href, a DOM write or a request the script made.
+        if path_suffix == "/evaluate" and _handback_privacy_filter_enabled(session):
+            raise CamofoxEvaluateBlocked(
+                "browser evaluation is blocked after human control until the Agent "
+                "navigates to a new page or closes the session"
             )
         # The epoch only moves on a human handback, so it cannot see another
         # turn's ordinary navigate on the shared tab. A ref is only valid for
