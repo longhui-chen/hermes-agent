@@ -15,6 +15,7 @@ Tests cover:
 import asyncio
 import json
 import os
+from pathlib import Path
 import stat
 import time
 import uuid
@@ -4427,6 +4428,18 @@ class TestSessionIdHeader:
         ]
         mock_db = MagicMock()
         mock_db.get_messages_as_conversation.return_value = db_history
+        # The cache gate (_profile_session_db_is_current) evicts any cached DB
+        # whose recorded home/state.db file identity no longer matches disk —
+        # give the mock a REAL identity from the isolated HERMES_HOME so it
+        # passes the gate the way a genuinely opened DB would.
+        home = Path(auth_adapter._profile_home_key())
+        home.mkdir(parents=True, exist_ok=True)
+        state_path = home / "state.db"
+        state_path.touch()
+        home_stat = os.stat(home)
+        state_stat = os.stat(state_path)
+        mock_db._profile_home_identity = (home_stat.st_dev, home_stat.st_ino)
+        mock_db._profile_state_identity = (state_stat.st_dev, state_stat.st_ino)
         auth_adapter._session_db = mock_db
         auth_adapter._session_dbs[auth_adapter._profile_home_key()] = mock_db
         app = _create_app(auth_adapter)
