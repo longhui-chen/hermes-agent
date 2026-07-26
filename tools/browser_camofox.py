@@ -1869,9 +1869,12 @@ def _retryable_control_result(
     # Human-entered values can remain in the page state. Filter every later
     # read until the Agent explicitly leaves this page.
     _set_handback_privacy_filter(session, True)
-    epoch = payload.get("epoch")
-    if isinstance(epoch, int) and not isinstance(epoch, bool):
-        session["epoch"] = epoch
+    # Deliberately not adopting any epoch the refusal itself carries. Copying it
+    # into the next request would clear the barrier without the snapshot that
+    # carries the human's page state — which is the whole point of the barrier.
+    # The recovery snapshot below reports the epoch through the response header
+    # like every other read, and if it fails this session keeps its old epoch
+    # and is refused again.
 
     # Where the human left the page is not where the Agent may follow. The
     # deleted resume handshake used to validate this before acking; without an

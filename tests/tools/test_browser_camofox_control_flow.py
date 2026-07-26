@@ -70,6 +70,12 @@ def _http_error(status: int, payload: dict) -> requests.HTTPError:
 
 
 def _epoch_stale(epoch: int = 3) -> requests.HTTPError:
+    """A refusal from local-server.
+
+    ``epoch`` is what an older proxy used to include and what a hostile one
+    could still send; nothing on this side may act on it, so the tests keep
+    sending it and assert it is ignored.
+    """
     return _http_error(
         409,
         {
@@ -120,8 +126,11 @@ def test_epoch_stale_resnapshots_and_returns_retryable(managed_session):
     assert result["resnapshot_completed"] is True
     assert result["snapshot"] == '- button "Continue" [e9]'
     assert result["element_count"] == 1
-    # The session adopted the new epoch and enabled the privacy filter.
-    assert managed_session["epoch"] == 3
+    # The privacy filter is on, and the epoch did NOT come from the refusal:
+    # this fixture patches _get, so no response header reaches the adoption
+    # path and the session keeps its own value. In production the recovery
+    # snapshot's header is what moves it.
+    assert managed_session["epoch"] == 2
     assert managed_session["privacy_filter_after_handback"] is True
     # The blocked-page guard queries /tabs before and after the snapshot, so
     # assert the snapshot happened rather than that it was last.
@@ -157,7 +166,11 @@ def test_epoch_stale_snapshot_failure_stays_retryable(managed_session):
     assert result["retryable"] is True
     assert result["resnapshot_completed"] is False
     assert managed_session["privacy_filter_after_handback"] is True
-    assert managed_session["epoch"] == 3
+    # The refusal's own epoch is never adopted: taking it would clear the
+    # barrier without the snapshot that carries the human's page state. The
+    # snapshot failed here, so this session stays on its old epoch and the next
+    # attempt is refused again.
+    assert managed_session["epoch"] == 2
 
 
 def test_epoch_stale_redacts_sensitive_human_page_state(managed_session):
@@ -2504,3 +2517,36 @@ def test_a_keystroke_that_submits_a_form_invalidates_refs():
         with patch("tools.browser_camofox._post", return_value={"url": "https://a.example/results"}):
             json.loads(mod.camofox_press("Enter", task_id="t"))
         assert not mod._refs_are_current(session), "refs survived a form submission"
+
+
+def test_a_refusal_never_hands_over_a_usable_epoch(managed_session):
+    """The barrier is only worth what the client cannot shortcut.
+
+    local-server no longer puts the current epoch in a browser_epoch_stale
+    body, but an older or hostile proxy still can. Adopting it would clear the
+    barrier without the snapshot that carries the human's page state, so this
+    side must ignore it whether the recovery snapshot succeeds or fails.
+    """
+    import tools.browser_camofox as mod
+
+    before = managed_session["epoch"]
+    with (
+        patch("tools.browser_camofox._get_session", return_value=managed_session),
+        patch("tools.browser_camofox._post", side_effect=_epoch_stale(99)),
+        patch("tools.browser_camofox._get", side_effect=requests.ConnectionError("boom")),
+    ):
+        json.loads(camofox_click("@e4", task_id="agent-task"))
+    assert managed_session["epoch"] == before, "the refusal's epoch was adopted"
+
+    with (
+        patch("tools.browser_camofox._get_session", return_value=managed_session),
+        patch("tools.browser_camofox._post", side_effect=_epoch_stale(99)),
+        patch("tools.browser_camofox._get", side_effect=_get_serving_tabs({"snapshot": "- button [e9]", "refsCount": 1})),
+    ):
+        json.loads(camofox_click("@e4", task_id="agent-task"))
+    assert managed_session["epoch"] == before, "the refusal's epoch was adopted after a successful re-snapshot"
+
+    # Only a response carrying the header moves it.
+    response = MagicMock(headers={mod._EPOCH_HEADER: "7"})
+    mod._adopt_epoch_from_response(managed_session, response, tab_operation=True)
+    assert managed_session["epoch"] == 7
