@@ -347,7 +347,10 @@ def test_managed_close_releases_lease_without_destroying_profile(managed_session
         # The release is scheduled behind a quiet window; run it now.
         _run_pending_teardowns(force=True)
 
-    assert result == {"success": True, "closed": False, "released": True}
+    # closed is True now: the tab belongs to this browser identity and nothing
+    # else is using it, so closing it is exactly what happened. The profile's
+    # shared runtime is a separate decision, reported by released.
+    assert result == {"success": True, "closed": True, "released": True}
     # The endpoint and credential captured at creation are used verbatim; the
     # teardown path cannot re-read them once the profile scope is gone.
     mock_post.assert_called_once_with(
@@ -2708,3 +2711,100 @@ def test_evicting_a_managed_session_closes_its_tab():
         "the shared runtime was released while another session still held it"
     )
     mod._pending_lease_releases.clear()
+
+
+def test_a_tab_two_turns_share_is_not_closed_by_one_of_them():
+    """The tab belongs to the browser identity, not to the cache entry.
+
+    Turns sharing a HERMES_SESSION_KEY get their own entry and adopt the same
+    tab, so deciding its lifetime per entry makes one turn's cleanup 404 the
+    other's next call.
+    """
+    import tools.browser_camofox as mod
+
+    mod._sessions.clear()
+    mod._pending_lease_releases.clear()
+    base = {
+        "user_id": "hermes_profile", "session_key": "shared", "tab_id": "tab-7",
+        "managed": True, "local_server_managed": True, "release_owner": "o",
+        "release_url": "http://127.0.0.1:8080/x/_zettlab/release",
+        "release_headers": {"X-Zettlab-Agent-Action-Token": "tok"},
+    }
+    mine = dict(base, task_id="mine")
+    theirs = dict(base, task_id="theirs")
+    mod._sessions["theirs"] = theirs
+
+    try:
+        assert mod._tab_still_shared(mine) is True
+        mod._teardown_session(mine)
+        assert not [e for e in mod._pending_lease_releases if e["kind"] == "delete"], (
+            "a tab another turn is still using was queued for deletion"
+        )
+
+        # Once the other turn is gone the tab is nobody's, and it goes.
+        mod._sessions.clear()
+        assert mod._tab_still_shared(mine) is False
+        mod._teardown_session(mine)
+        deletes = [e for e in mod._pending_lease_releases if e["kind"] == "delete"]
+        assert deletes and deletes[0]["url"].endswith("/tabs/tab-7?userId=hermes_profile")
+    finally:
+        mod._sessions.clear()
+        mod._pending_lease_releases.clear()
+
+
+def test_a_rebuilt_tab_id_reaches_every_turn_that_shared_it():
+    """A 404 rebuild is a fact about the browser identity, not one entry.
+
+    Entries keeping the collected tab id never re-adopt on their own — a
+    non-empty tab_id skips _adopt_existing_tab — so their next call keeps 404ing.
+    """
+    import tools.browser_camofox as mod
+
+    mod._sessions.clear()
+    mine = {"user_id": "u", "session_key": "shared", "tab_id": "tab-new", "task_id": "mine", "epoch": 9}
+    theirs = {"user_id": "u", "session_key": "shared", "tab_id": "tab-old", "task_id": "theirs", "epoch": 4}
+    elsewhere = {"user_id": "u", "session_key": "other", "tab_id": "tab-old", "task_id": "elsewhere", "epoch": 4}
+    mod._sessions.update({"a": mine, "b": theirs, "c": elsewhere})
+    try:
+        mod._repoint_shared_entries(mine, "tab-old")
+        assert theirs["tab_id"] == "tab-new", "a turn was left pointing at the collected tab"
+        assert theirs["epoch"] is None, "the old tab's epoch was carried onto the new one"
+        assert elsewhere["tab_id"] == "tab-old", "another browser identity was repointed"
+    finally:
+        mod._sessions.clear()
+
+
+def test_a_404_rebuild_repoints_the_other_turns_too():
+    """Exercised through navigate, not through the helper.
+
+    The rebuild happens inside camofox_navigate's 404 branch; a test that calls
+    the helper directly says nothing about whether that branch calls it.
+    """
+    import tools.browser_camofox as mod
+
+    mod._sessions.clear()
+    mine = {"user_id": "u", "session_key": "shared", "tab_id": "tab-old", "task_id": "mine", "epoch": 2}
+    theirs = {"user_id": "u", "session_key": "shared", "tab_id": "tab-old", "task_id": "theirs", "epoch": 2}
+    mod._sessions["b"] = theirs
+    replacement = dict(mine, tab_id="tab-new")
+
+    gone = requests.HTTPError()
+    gone.response = MagicMock(status_code=404)
+
+    def _post(path, body=None, timeout=None, session=None, **kwargs):
+        if "tab-old" in path:
+            raise gone
+        return {"url": "https://ok.example/"}
+
+    try:
+        with (
+            patch("tools.browser_camofox._get_session", return_value=mine),
+            # The first call is navigate's own; the second is the rebuild.
+            patch("tools.browser_camofox._ensure_tab", side_effect=[mine, replacement]),
+            patch("tools.browser_camofox._post", side_effect=_post),
+            patch("tools.browser_camofox._get", side_effect=requests.HTTPError()),
+        ):
+            mod.camofox_navigate("https://ok.example/", task_id="mine")
+        assert theirs["tab_id"] == "tab-new", "the other turn still points at the collected tab"
+    finally:
+        mod._sessions.clear()

@@ -1606,33 +1606,83 @@ def _teardown_session(session: Optional[Dict[str, Any]]) -> None:
     )
 
 
-def _queue_managed_tab_delete(session: Dict[str, Any]) -> None:
+def _repoint_shared_entries(session: Dict[str, Any], stale_tab_id: Any) -> None:
+    """Move every entry that held ``stale_tab_id`` onto this session's new one.
+
+    The tab belongs to the browser identity, so a rebuild is a fact about all of
+    them. Their ref stamps and epochs described the tab that is gone, so those
+    are cleared too — the next read re-establishes both.
+    """
+    stale = str(stale_tab_id or "")
+    fresh = str(session.get("tab_id") or "")
+    if not stale or not fresh or stale == fresh:
+        return
+    identity = _browser_identity_key(session)
+    with _sessions_lock:
+        for other in _sessions.values():
+            if other is session or str(other.get("tab_id") or "") != stale:
+                continue
+            if _browser_identity_key(other) != identity:
+                continue
+            other["tab_id"] = fresh
+            other["epoch"] = None
+
+
+def _tab_still_shared(session: Dict[str, Any]) -> bool:
+    """Whether another tracked entry is still using this session's tab.
+
+    The physical tab belongs to the browser identity, not to the cache entry:
+    turns sharing a HERMES_SESSION_KEY get their own entry and adopt the same
+    tab. Deciding its lifetime per entry is what makes one turn's cleanup pull
+    the tab out from under another.
+    """
+    identity = _browser_identity_key(session)
+    tab_id = str(session.get("tab_id") or "")
+    if not tab_id:
+        return False
+    with _sessions_lock:
+        return any(
+            other is not session
+            and str(other.get("tab_id") or "") == tab_id
+            and _browser_identity_key(other) == identity
+            for other in _sessions.values()
+        )
+
+
+def _queue_managed_tab_delete(session: Dict[str, Any]) -> bool:
     """Close the physical tab a managed session was using.
 
     The profile-level release is about the shared runtime and is often skipped
-    because another turn still holds it. The tab is this session's own, so it is
-    closed either way — through the same proxy route the Agent uses, with the
-    endpoint and credential captured at creation, since this runs from the
-    scope-less maintenance thread.
+    because another turn still holds it. The tab is narrower than that — it
+    belongs to one browser identity — so it is closed as soon as no entry is
+    using it any more, through the same proxy route the Agent uses, with the
+    endpoint and credential captured at creation (this runs from the scope-less
+    maintenance thread).
     """
+    if _tab_still_shared(session):
+        # Another turn on the same HERMES_SESSION_KEY adopted this tab. Deleting
+        # it here would 404 its next snapshot or click, mid-call.
+        return False
+    # release_url is "<camofox base>/_zettlab/release"; the tab route is a
+    # sibling of it.
+    url = _managed_tab_delete_url(session)
+    if not url:
+        return False
+    headers = session.get("release_headers")
+    headers = dict(headers) if isinstance(headers, dict) else {}
+    _queue_pending_teardown("delete", url, headers, owner=str(session.get("release_owner") or ""))
+    return True
+
+
+def _managed_tab_delete_url(session: Dict[str, Any]) -> str:
+    """The proxy route that closes this session's tab, or "" when unknown."""
     tab_id = str(session.get("tab_id") or "").strip()
     user_id = str(session.get("user_id") or "").strip()
     base = str(session.get("release_url") or "")
-    if not tab_id or not user_id or not base:
-        return
-    # release_url is "<camofox base>/_zettlab/release"; the tab route is a
-    # sibling of it.
-    root = base[: -len("/_zettlab/release")] if base.endswith("/_zettlab/release") else ""
-    if not root:
-        return
-    headers = session.get("release_headers")
-    headers = dict(headers) if isinstance(headers, dict) else {}
-    _queue_pending_teardown(
-        "delete",
-        f"{root}/tabs/{quote(tab_id, safe='')}?userId={quote(user_id, safe='')}",
-        headers,
-        owner=str(session.get("release_owner") or ""),
-    )
+    if not tab_id or not user_id or not base.endswith("/_zettlab/release"):
+        return ""
+    root = base[: -len("/_zettlab/release")]
+    return f"{root}/tabs/{quote(tab_id, safe='')}?userId={quote(user_id, safe='')}"
 
 
 def _release_local_server_lease(session: Optional[Dict[str, Any]] = None) -> None:
@@ -2463,8 +2513,15 @@ def _navigate_within_identity(
                     "Creating a fresh tab.",
                     session["tab_id"],
                 )
+                stale_tab_id = session.get("tab_id")
                 session["tab_id"] = None
                 session = _ensure_tab(task_id)
+                # Every entry sharing this browser identity adopted the tab the
+                # runtime just collected. They will not re-adopt on their own —
+                # a non-empty tab_id skips _adopt_existing_tab — so without this
+                # their next snapshot or click keeps 404ing against a tab that
+                # no longer exists.
+                _repoint_shared_entries(session, stale_tab_id)
                 # _ensure_tab returns an entry that already holds its own
                 # reference, and the caller's _session_operation only owns the
                 # one this call started with — so this replacement has to be
@@ -2811,14 +2868,27 @@ def camofox_close(task_id: Optional[str] = None) -> str:
         # run without the profile scope the live probe needs.
         if session.get("local_server_managed") or _local_server_managed():
             owner = str(session.get("release_owner") or "")
+            # Two different scopes, decided separately. The tab belongs to this
+            # browser identity and goes as soon as nobody is using it; the
+            # runtime is shared by the whole profile and only goes when nobody
+            # holds that. Returning early on the profile check used to skip the
+            # tab entirely, so a client cycling HERMES_SESSION_KEYs while keeping
+            # one session open grew tabs in local-server without bound —
+            # straight past this cache's 64-entry ceiling.
+            tab_url = _managed_tab_delete_url(session)
             with _held_owner_lock(owner):
-                if _profile_still_in_use(owner):
-                    return json.dumps({"success": True, "closed": False, "released": False})
-                _release_local_server_lease(session)
+                # "closed" reports what actually happened: a tab another turn on
+                # this browser identity is still using is not closed, and says so.
+                closed = _queue_managed_tab_delete(session)
+                still_in_use = _profile_still_in_use(owner)
+                if not still_in_use:
+                    _release_local_server_lease(session)
+            if closed:
+                _run_pending_teardowns(force=True, only_url=tab_url, only_owner=owner)
             return json.dumps({
                 "success": True,
-                "closed": False,
-                "released": True,
+                "closed": closed,
+                "released": not still_in_use,
             })
 
         # Queued with the context captured at creation, and retried: the local
