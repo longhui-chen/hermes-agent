@@ -235,6 +235,7 @@ def test_epoch_header_change_on_success_enables_privacy_filter(managed_session):
     only staleness signal, and it must flip the privacy filter on.
     """
     response = MagicMock()
+    response.status_code = 200
     response.headers = {_EPOCH_HEADER: "3"}
     _adopt_epoch_from_response(managed_session, response)
 
@@ -244,6 +245,7 @@ def test_epoch_header_change_on_success_enables_privacy_filter(managed_session):
 
 def test_epoch_header_same_value_keeps_filter_off(managed_session):
     response = MagicMock()
+    response.status_code = 200
     response.headers = {_EPOCH_HEADER: "2"}
     _adopt_epoch_from_response(managed_session, response)
 
@@ -254,6 +256,7 @@ def test_epoch_header_same_value_keeps_filter_off(managed_session):
 def test_first_epoch_sighting_does_not_enable_filter(managed_session):
     managed_session["epoch"] = None
     response = MagicMock()
+    response.status_code = 200
     response.headers = {_EPOCH_HEADER: "5"}
     _adopt_epoch_from_response(managed_session, response)
 
@@ -2648,7 +2651,7 @@ def test_a_refusal_never_hands_over_a_usable_epoch(managed_session):
     assert managed_session["epoch"] == before, "the refusal's epoch was adopted after a successful re-snapshot"
 
     # Only a response carrying the header moves it.
-    response = MagicMock(headers={mod._EPOCH_HEADER: "7"})
+    response = MagicMock(status_code=200, headers={mod._EPOCH_HEADER: "7"})
     mod._adopt_epoch_from_response(managed_session, response, tab_operation=True)
     assert managed_session["epoch"] == 7
 
@@ -2885,3 +2888,64 @@ def test_an_evicted_document_record_fails_validation():
     assert not mod._refs_are_current(session), "an evicted record validated as generation 0"
     with pytest.raises(mod.CamofoxRefsStale):
         mod._mutating_tab_call(session, "/click", {"userId": "u", "ref": "e1"})
+
+
+def test_only_a_successful_response_moves_the_epoch():
+    """Adoption runs before _raise_for_status, so a refusal reaches it too.
+
+    An older or hostile proxy putting an epoch header on its own 409 would
+    otherwise hand the Agent the value that refusal exists to withhold — and if
+    the recovery snapshot then failed, the next press or back would carry it.
+    """
+    import tools.browser_camofox as mod
+
+    session = {"epoch": 2, "local_server_managed": True, "privacy_filter_after_handback": False}
+    refusal = MagicMock(status_code=409, headers={mod._EPOCH_HEADER: "9"})
+    mod._adopt_epoch_from_response(session, refusal, tab_operation=True)
+    assert session["epoch"] == 2, "a refusal's epoch header was adopted"
+
+    for status in (400, 403, 500, 503):
+        session["epoch"] = 2
+        mod._adopt_epoch_from_response(
+            session, MagicMock(status_code=status, headers={mod._EPOCH_HEADER: "9"}), tab_operation=True
+        )
+        assert session["epoch"] == 2, f"a {status} epoch header was adopted"
+
+    ok = MagicMock(status_code=200, headers={mod._EPOCH_HEADER: "9"})
+    mod._adopt_epoch_from_response(session, ok, tab_operation=True)
+    assert session["epoch"] == 9
+
+
+def test_a_tab_a_human_is_holding_is_not_idle():
+    """The interaction runs between the App and local-server, not through here.
+
+    Reclaiming on the ordinary window would release the runtime lease out from
+    under someone who is still typing.
+    """
+    import tools.browser_camofox as mod
+
+    mod._sessions.clear()
+    now = time.monotonic()
+    handed_over = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "held",
+                   "in_flight": 0, "last_used_at": now - (mod._SESSION_IDLE_TTL_SECONDS + 60),
+                   "takeover_offered": True, "privacy_filter_after_handback": False, "epoch": 2}
+    plain = {"user_id": "u", "session_key": "s2", "tab_id": "tab-2", "task_id": "plain",
+             "in_flight": 0, "last_used_at": now - (mod._SESSION_IDLE_TTL_SECONDS + 60)}
+    mod._sessions["a"] = handed_over
+    mod._sessions["b"] = plain
+
+    dropped = mod._prune_idle_sessions_locked(now)
+    assert plain in dropped
+    assert handed_over not in dropped, "a tab a human is holding was reclaimed as idle"
+
+    # Bounded, not exempt: an App that never hands back must not pin it forever.
+    handed_over["last_used_at"] = now - (mod._TAKEOVER_IDLE_TTL_SECONDS + 60)
+    assert handed_over in mod._prune_idle_sessions_locked(now)
+
+    # And the handback puts it back on the ordinary window.
+    mod._sessions["a"] = handed_over
+    handed_over["last_used_at"] = now - (mod._SESSION_IDLE_TTL_SECONDS + 60)
+    mod._adopt_session_epoch(handed_over, 7)
+    assert "takeover_offered" not in handed_over
+    assert handed_over in mod._prune_idle_sessions_locked(now)
+    mod._sessions.clear()

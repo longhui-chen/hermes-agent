@@ -144,6 +144,8 @@ def _adopt_session_epoch(session: Optional[Dict[str, Any]], epoch: Any) -> None:
     previous = session.get("epoch")
     if previous is not None and previous != epoch:
         session["privacy_filter_after_handback"] = True
+        # The takeover this session was widened for has ended.
+        session.pop("takeover_offered", None)
         # The epoch only moves when a human took the tab and gave it back, so
         # the document every outstanding ref describes is the one they left
         # behind. Turns sharing this physical tab keep their own session entry
@@ -171,7 +173,14 @@ def _adopt_epoch_from_response(
     the safe reading of it is "assume the page changed".
     """
     before = bool(session.get("privacy_filter_after_handback")) if isinstance(session, dict) else False
-    value = resp.headers.get(_EPOCH_HEADER) if resp is not None else None
+    status = getattr(resp, "status_code", None)
+    succeeded = isinstance(status, int) and 200 <= status < 300
+    # Only a response that describes a completed operation may move the epoch.
+    # This runs before _raise_for_status, so an older or hostile proxy putting a
+    # header on its own 409 browser_epoch_stale would otherwise hand the Agent
+    # the very epoch that refusal was protecting — and if the recovery snapshot
+    # then failed, the next press or back would carry it and be accepted.
+    value = resp.headers.get(_EPOCH_HEADER) if (resp is not None and succeeded) else None
     if value is not None:
         try:
             _adopt_session_epoch(session, int(str(value).strip()))
@@ -182,8 +191,7 @@ def _adopt_epoch_from_response(
             pass
     if not tab_operation or not isinstance(session, dict):
         return False
-    status = getattr(resp, "status_code", None)
-    if not isinstance(status, int) or not (200 <= status < 300):
+    if not succeeded:
         # Error envelopes are generated before dispatch and carry no page data,
         # so a missing header there says nothing about the page.
         return False
@@ -1000,6 +1008,12 @@ def _ensure_tab(task_id: Optional[str], url: Optional[str] = None) -> Dict[str, 
 # local-server leases behind it from growing for the life of the process.
 _SESSION_IDLE_TTL_SECONDS = 30 * 60
 
+# A human holding the tab produces no tool calls, so the ordinary window would
+# reclaim the session while they are still working. Long enough for a real
+# session, still bounded: an App that crashes mid-takeover must not pin the
+# entry or its runtime lease forever.
+_TAKEOVER_IDLE_TTL_SECONDS = 4 * 60 * 60
+
 
 def _session_key_for_task_locked(task_id: str) -> Optional[str]:
     """The cache key this task owns, or None when it cannot be established.
@@ -1131,6 +1145,25 @@ def _evict_surplus_sessions_locked(protect_key: str = "") -> list:
     return evicted
 
 
+def _session_idle_ttl(session: Dict[str, Any]) -> float:
+    """How long this entry may sit untouched before it is reclaimed.
+
+    A tab handed to a human stops producing tool calls by definition: the
+    interaction is between the App and local-server, and nothing here sees it.
+    Reclaiming on the ordinary TTL would release the runtime lease out from
+    under someone who is still typing. While a takeover is outstanding the
+    window is widened rather than removed — an unbounded hold is how a leak
+    starts, and the App can crash without ever handing back.
+
+    Knowing that the takeover has ended is what this cannot do on its own:
+    local-server would have to report control state or keep a lease heartbeat.
+    Tracked separately; the wider window is the containment until then.
+    """
+    if session.get("takeover_offered") and not session.get("privacy_filter_after_handback"):
+        return _TAKEOVER_IDLE_TTL_SECONDS
+    return _SESSION_IDLE_TTL_SECONDS
+
+
 def _prune_idle_sessions_locked(now: float) -> list:
     """Drop sessions untouched past the idle TTL, returning them for release.
 
@@ -1141,7 +1174,7 @@ def _prune_idle_sessions_locked(now: float) -> list:
         key
         for key, session in _sessions.items()
         if int(session.get("in_flight") or 0) == 0
-        and now - float(session.get("last_used_at") or 0.0) > _SESSION_IDLE_TTL_SECONDS
+        and now - float(session.get("last_used_at") or 0.0) > _session_idle_ttl(session)
     ]
     dropped = []
     for key in expired:
@@ -1513,6 +1546,10 @@ def _takeover_ui_hint(session: Dict[str, Any]) -> Optional[Dict[str, str]]:
     tab_id = str(session.get("tab_id") or "").strip()
     if not agent_id or not browser_session_id or not tab_id:
         return None
+    # Recorded so the idle sweep does not reclaim this session while somebody is
+    # using the tab it just pointed them at. Cleared by the handback, which
+    # arrives as an epoch advance.
+    session["takeover_offered"] = True
     return {
         "type": "takeover_browser",
         "agent_id": agent_id,
