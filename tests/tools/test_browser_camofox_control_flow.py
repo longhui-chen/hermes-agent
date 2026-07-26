@@ -2402,6 +2402,71 @@ def test_every_session_handed_out_is_released():
         assert int(session.get("in_flight") or 0) == 0, "a reference leaked"
 
 
+def test_no_path_out_of_get_session_leaks_a_reference():
+    """Every exit has to give the reference back, refusals and failures too.
+
+    A leaked reference is permanent — the entry is skipped by the idle sweep and
+    by eviction — so enough of them make every later call fail with
+    browser_sessions_busy and strand the tabs behind them.
+    """
+    import tools.browser_camofox as mod
+    from tools.browser_tool import _camofox_eval
+
+    def _fresh(**overrides):
+        session = {"user_id": "u", "session_key": "s", "tab_id": "tab-1", "task_id": "leak",
+                   "epoch": 2, "in_flight": 1, "last_used_at": time.monotonic()}
+        session.update(overrides)
+        return session
+
+    # _ensure_tab: the create fails, so the caller never sees the session.
+    creating = _fresh(tab_id=None)
+    with (
+        patch("tools.browser_camofox._get_session", return_value=creating),
+        patch("tools.browser_camofox._adopt_existing_tab", side_effect=lambda s: s),
+        patch("tools.browser_camofox._post", side_effect=requests.ConnectionError("offline")),
+    ):
+        with pytest.raises(Exception):
+            mod._ensure_tab("leak")
+    assert int(creating.get("in_flight") or 0) == 0, "a failed tab creation kept the reference"
+
+    # A malformed tab id takes the other failure path.
+    malformed = _fresh(tab_id=None)
+    with (
+        patch("tools.browser_camofox._get_session", return_value=malformed),
+        patch("tools.browser_camofox._adopt_existing_tab", side_effect=lambda s: s),
+        patch("tools.browser_camofox._post", return_value={"tabId": "../escape"}),
+    ):
+        with pytest.raises(Exception):
+            mod._ensure_tab("leak")
+    assert int(malformed.get("in_flight") or 0) == 0, "a malformed tab id kept the reference"
+
+    # vision's early refusals, which never reach the body of the call.
+    no_tab = _fresh(tab_id=None)
+    with patch("tools.browser_camofox._get_session", return_value=no_tab):
+        mod.camofox_vision("q", task_id="leak")
+    assert int(no_tab.get("in_flight") or 0) == 0, "vision kept the reference when there was no tab"
+
+    filtered = _fresh(privacy_filter_after_handback=True)
+    with patch("tools.browser_camofox._get_session", return_value=filtered):
+        mod.camofox_vision("q", task_id="leak")
+    assert int(filtered.get("in_flight") or 0) == 0, "vision kept the reference when the filter blocked it"
+
+    # _camofox_eval, on both its refusal and its success paths.
+    blocked = _fresh(privacy_filter_after_handback=True)
+    with patch("tools.browser_camofox._ensure_tab", return_value=blocked):
+        _camofox_eval("1+1", task_id="leak")
+    assert int(blocked.get("in_flight") or 0) == 0, "a blocked evaluate kept the reference"
+
+    evaluated = _fresh()
+    mod._stamp_ref_generation(evaluated)
+    with (
+        patch("tools.browser_camofox._ensure_tab", return_value=evaluated),
+        patch("tools.browser_camofox._post", return_value={"result": "2"}),
+    ):
+        _camofox_eval("1+1", task_id="leak")
+    assert int(evaluated.get("in_flight") or 0) == 0, "a successful evaluate kept the reference"
+
+
 def test_a_refused_navigation_target_reaches_the_agent_verbatim():
     """local-server refuses targets the Agent may not browse to; it must learn why.
 

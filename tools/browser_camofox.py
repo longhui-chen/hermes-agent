@@ -948,37 +948,48 @@ def _browser_identity_key(session: Dict[str, Any]) -> str:
 
 
 def _ensure_tab(task_id: Optional[str], url: Optional[str] = None) -> Dict[str, Any]:
-    """Ensure a tab exists for the session, creating one if needed."""
+    """Ensure a tab exists for the session, creating one if needed.
+
+    Returns an entry that already holds its cache reference — ownership passes
+    to the caller, which must release it. A failure here never reaches the
+    caller, so this releases it itself: an entry left referenced is skipped by
+    both the idle sweep and eviction forever, and enough of them make every
+    later call fail with browser_sessions_busy.
+    """
     session = _get_session(task_id)
-    if session["tab_id"]:
-        return session
-    # Serialized by browser identity, so a concurrent turn sharing it cannot
-    # create a second tab for the same listItemId.
-    with _held_owner_lock(_browser_identity_key(session)), _session_lock(session):
+    try:
         if session["tab_id"]:
             return session
-        # Another turn may have created it while this one waited; adopt rather
-        # than duplicate.
-        _adopt_existing_tab(session)
-        if session["tab_id"]:
+        # Serialized by browser identity, so a concurrent turn sharing it
+        # cannot create a second tab for the same listItemId.
+        with _held_owner_lock(_browser_identity_key(session)), _session_lock(session):
+            if session["tab_id"]:
+                return session
+            # Another turn may have created it while this one waited; adopt
+            # rather than duplicate.
+            _adopt_existing_tab(session)
+            if session["tab_id"]:
+                return session
+            body = {
+                "userId": session["user_id"],
+                "listItemId": session["session_key"],
+            }
+            if url is not None:
+                body["url"] = url
+            data = _post(
+                "/tabs",
+                body,
+                timeout=max(_get_command_timeout(), _TAB_CREATION_TIMEOUT_FLOOR),
+                session=session,
+            )
+            tab_id = _validated_tab_id(data.get("tabId"))
+            if tab_id is None:
+                raise ValueError("browser runtime returned a malformed tab id")
+            session["tab_id"] = tab_id
             return session
-        body = {
-            "userId": session["user_id"],
-            "listItemId": session["session_key"],
-        }
-        if url is not None:
-            body["url"] = url
-        data = _post(
-            "/tabs",
-            body,
-            timeout=max(_get_command_timeout(), _TAB_CREATION_TIMEOUT_FLOOR),
-            session=session,
-        )
-        tab_id = _validated_tab_id(data.get("tabId"))
-        if tab_id is None:
-            raise ValueError("browser runtime returned a malformed tab id")
-        session["tab_id"] = tab_id
-        return session
+    except BaseException:
+        _end_session_call(session)
+        raise
 
 
 # A session whose profile scope is gone can only be reclaimed on a timer: the
@@ -2880,10 +2891,11 @@ def camofox_vision(question: str, annotate: bool = False,
                 "Browser vision is blocked after human control until the Agent navigates to a new page or closes the session.",
                 success=False,
             )
-        # Held for the whole call: the model round trip between the screenshot
-        # and the annotation snapshot can run for minutes, and the session is
-        # in use throughout. Released in the finally below.
-        vision_reference_held = True
+        # The reference _get_session took covers the whole call: the model round
+        # trip between the screenshot and the annotation snapshot can run for
+        # minutes, and the session is in use throughout. Released in the finally
+        # below, which must not be conditional — the early returns above (no
+        # tab, filter engaged) are ordinary outcomes, not exemptions.
 
         # Get screenshot as binary PNG
         screenshot_filtered_at_request = _handback_privacy_filter_enabled(session)
@@ -2993,8 +3005,7 @@ def camofox_vision(question: str, annotate: bool = False,
     except Exception as e:
         return _tool_error_from_exception(e, session=locals().get("session"))
     finally:
-        if locals().get("vision_reference_held"):
-            _end_session_call(locals().get("session"))
+        _end_session_call(locals().get("session"))
 
 
 def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:

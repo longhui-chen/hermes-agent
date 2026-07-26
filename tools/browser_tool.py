@@ -3696,6 +3696,7 @@ def _browser_eval(expression: str, task_id: Optional[str] = None) -> str:
 def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
     """Evaluate JS via Camofox's /tabs/{tab_id}/eval endpoint (if available)."""
     from tools.browser_camofox import (
+        _end_session_call,
         _ensure_tab,
         _handback_privacy_filter_enabled,
         _last_response_started_handback,
@@ -3757,6 +3758,12 @@ def _camofox_eval(expression: str, task_id: Optional[str] = None) -> str:
                          "Use browser_snapshot or browser_vision to inspect page state.",
             })
         return _tool_error_from_exception(e, session=locals().get("tab_info"))
+    finally:
+        # _ensure_tab hands back a referenced cache entry and ownership with
+        # it. Every path here — success, the two handback refusals, the
+        # unsupported-eval degradation and any error — has to give it back, or
+        # the entry is skipped by the idle sweep and by eviction forever.
+        _end_session_call(locals().get("tab_info"))
 
 
 def _maybe_start_recording(task_id: str):
