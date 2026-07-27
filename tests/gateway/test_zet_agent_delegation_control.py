@@ -24,7 +24,7 @@ class _FakeWeb:
 
 
 class _FakeRequest:
-    def __init__(self, match_info=None, auth="Bearer test-key"):
+    def __init__(self, match_info=None, auth="Bearer test-key", scope=None):
         self.headers = {"Authorization": auth} if auth else {}
         self.match_info = match_info or {}
         self.method = "GET"
@@ -32,6 +32,12 @@ class _FakeRequest:
         self.remote = "127.0.0.1"
         self.transport = None
         self.can_read_body = False
+        # aiohttp Request is a MutableMapping; _profile_handler stamps
+        # hermes_profile_home on it and the control plane reads it via .get.
+        self._scope = scope or {}
+
+    def get(self, key, default=None):
+        return self._scope.get(key, default)
 
 
 def _adapter(monkeypatch):
@@ -47,16 +53,43 @@ async def test_status_returns_both_registries(monkeypatch):
     adapter = _adapter(monkeypatch)
     monkeypatch.setattr(
         delegate_tool, "list_active_subagents",
-        lambda: [{"subagent_id": "sa_1", "goal": "g"}],
+        lambda profile_home="": [{"subagent_id": "sa_1", "goal": "g"}],
     )
     monkeypatch.setattr(
         async_delegation, "list_async_delegations",
-        lambda: [{"delegation_id": "deleg_x", "status": "running"}],
+        lambda profile_home="": [{"delegation_id": "deleg_x", "status": "running"}],
     )
     resp = await adapter._handle_delegations_status(_FakeRequest())
     assert resp.status == 200
     assert resp.payload["active"][0]["subagent_id"] == "sa_1"
     assert resp.payload["async"][0]["delegation_id"] == "deleg_x"
+
+
+@pytest.mark.asyncio
+async def test_status_scopes_to_route_profile(monkeypatch):
+    """/p/{profile} routes pass their profile home down to both registries —
+    one agent's goals/session keys must never leak into another's route."""
+    import tools.async_delegation as async_delegation
+    import tools.delegate_tool as delegate_tool
+
+    adapter = _adapter(monkeypatch)
+    seen = {}
+    monkeypatch.setattr(
+        delegate_tool, "list_active_subagents",
+        lambda profile_home="": seen.setdefault("active", profile_home) and [] or [],
+    )
+    monkeypatch.setattr(
+        async_delegation, "list_async_delegations",
+        lambda profile_home="": seen.setdefault("async", profile_home) and [] or [],
+    )
+    resp = await adapter._handle_delegations_status(
+        _FakeRequest(scope={"hermes_profile_home": "/hh/profiles/agent-a"})
+    )
+    assert resp.status == 200
+    assert seen == {
+        "active": "/hh/profiles/agent-a",
+        "async": "/hh/profiles/agent-a",
+    }
 
 
 @pytest.mark.asyncio
@@ -67,7 +100,8 @@ async def test_cancel_found_and_not_found(monkeypatch):
     calls = []
     monkeypatch.setattr(
         async_delegation, "interrupt_delegation",
-        lambda deleg_id, reason="user_cancel": calls.append(deleg_id) or deleg_id == "deleg_hit",
+        lambda deleg_id, reason="user_cancel", profile_home="":
+            calls.append(deleg_id) or deleg_id == "deleg_hit",
     )
     resp = await adapter._handle_delegation_cancel(
         _FakeRequest(match_info={"delegation_id": "deleg_hit"})
@@ -86,7 +120,8 @@ async def test_subagent_interrupt_found_and_not_found(monkeypatch):
 
     adapter = _adapter(monkeypatch)
     monkeypatch.setattr(
-        delegate_tool, "interrupt_subagent", lambda sid: sid == "sa_hit"
+        delegate_tool, "interrupt_subagent",
+        lambda sid, profile_home="": sid == "sa_hit",
     )
     resp = await adapter._handle_subagent_interrupt(
         _FakeRequest(match_info={"subagent_id": "sa_hit"})

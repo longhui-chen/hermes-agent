@@ -17204,6 +17204,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
 
+    async def _deliver_async_delegation_scoped(
+        self, synth_text: str, evt: dict,
+    ) -> "Optional[bool]":
+        """Deliver one async-delegation completion under its OWNING profile.
+
+        Dispatches run inside the caller's ``_profile_runtime_scope``, so the
+        durable row and the parent session live in the owning profile's
+        ``state.db``. This watcher itself runs UNscoped (process default): for
+        a non-default multiplexer profile, session validation
+        (``resolve_process_event_source``) and the durable claim/ack would
+        otherwise hit the DEFAULT profile's DB — the completion would be
+        judged "unknown session", never re-enqueued, and its durable row
+        would stay pending forever. Contextvars propagate through awaits and
+        ``asyncio.to_thread``, so scoping this call covers the whole delivery
+        chain. Single-profile events carry the default home (or none) and
+        skip the scope entirely.
+        """
+        profile_home = str(evt.get("profile_home") or "")
+        if profile_home:
+            try:
+                from hermes_constants import get_hermes_home as _ghh
+
+                if str(_ghh()) != profile_home:
+                    with _profile_runtime_scope(Path(profile_home)):
+                        return await self._deliver_completion_notification(
+                            synth_text, evt,
+                        )
+            except Exception:
+                logger.debug(
+                    "Async delegation profile scope failed for %s; delivering unscoped",
+                    profile_home, exc_info=True,
+                )
+        return await self._deliver_completion_notification(synth_text, evt)
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
 
@@ -17244,7 +17278,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if not synth_text:
                         continue
                     try:
-                        delivered = await self._deliver_completion_notification(synth_text, evt)
+                        delivered = await self._deliver_async_delegation_scoped(synth_text, evt)
                         if delivered is False:
                             _pr.completion_queue.put(evt)
                     except Exception as e:

@@ -873,3 +873,107 @@ def test_gateway_cli_origin_event_left_unrouted():
     assert "platform" not in evt
 
 
+
+
+# ---------------------------------------------------------------------------
+# Session-interrupt suppression + multiplexer profile isolation
+# ---------------------------------------------------------------------------
+
+
+def _blocking_child(ev):
+    def blocker():
+        ev.wait(timeout=60)
+        return {"status": "interrupted", "summary": None, "error": "cancelled"}
+
+    return blocker
+
+
+def test_interrupt_for_session_suppresses_completion(tmp_path, monkeypatch):
+    """User-stop kills must not re-enter the chat: no completion event, and
+    the durable row is dropped so a restart can't resurrect the delivery."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ev = threading.Event()
+    r = ad.dispatch_async_delegation(
+        goal="long task", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", parent_session_id="parent-sid",
+        runner=_blocking_child(ev), interrupt_fn=ev.set,
+    )
+    n = ad.interrupt_for_session(
+        parent_session_id="parent-sid", reason="user_cancel",
+        suppress_completion=True,
+    )
+    assert n == 1
+    deadline = time.monotonic() + 5.0
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert _drain_for(r["delegation_id"], timeout=0.3) is None
+    assert ad.get_durable_delegation(r["delegation_id"]) is None
+
+
+def test_interrupt_for_session_without_suppress_still_delivers(tmp_path, monkeypatch):
+    """Non-stop callers (session_end orphan sweep) keep today's behavior."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ev = threading.Event()
+    r = ad.dispatch_async_delegation(
+        goal="long task", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", parent_session_id="parent-sid",
+        runner=_blocking_child(ev), interrupt_fn=ev.set,
+    )
+    assert ad.interrupt_for_session(parent_session_id="parent-sid") == 1
+    evt = _drain_for(r["delegation_id"])
+    assert evt is not None
+    assert evt["status"] == "interrupted"
+
+
+def test_control_plane_filters_by_profile_home(tmp_path, monkeypatch):
+    """The zettlab control plane only sees/cancels its own profile's records."""
+    home_a = tmp_path / "profiles" / "agent-a"
+    home_b = tmp_path / "profiles" / "agent-b"
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    ev = threading.Event()
+    r = ad.dispatch_async_delegation(
+        goal="scoped", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", runner=_blocking_child(ev),
+        interrupt_fn=ev.set,
+    )
+    did = r["delegation_id"]
+    assert [x["delegation_id"] for x in ad.list_async_delegations(str(home_a))] == [did]
+    assert ad.list_async_delegations(str(home_b)) == []
+    # Empty filter keeps the legacy full view (TUI overlay, single-profile).
+    assert [x["delegation_id"] for x in ad.list_async_delegations()] == [did]
+    # Cross-profile cancel is invisible (404 semantics at the HTTP layer)…
+    assert ad.interrupt_delegation(did, profile_home=str(home_b)) is False
+    # …while the owning profile can cancel.
+    assert ad.interrupt_delegation(did, profile_home=str(home_a)) is True
+    _drain_for(did)
+
+
+def test_restore_sweeps_profile_state_dbs(tmp_path, monkeypatch):
+    """Durable rows under profiles/<id>/state.db are restored too, each event
+    stamped with its owning profile home for scoped delivery."""
+    default_home = tmp_path
+    profile_home = tmp_path / "profiles" / "agent-b"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    r_b = ad.dispatch_async_delegation(
+        goal="in-profile", context=None, toolsets=None, role="leaf",
+        model="m", session_key="",
+        runner=lambda: {"status": "completed", "summary": "b"},
+    )
+    assert _drain_for(r_b["delegation_id"]) is not None
+
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    r_a = ad.dispatch_async_delegation(
+        goal="in-default", context=None, toolsets=None, role="leaf",
+        model="m", session_key="",
+        runner=lambda: {"status": "completed", "summary": "a"},
+    )
+    assert _drain_for(r_a["delegation_id"]) is not None
+
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 2
+    events = {}
+    while not restored.empty():
+        evt = restored.get_nowait()
+        events[evt["delegation_id"]] = evt
+    assert events[r_a["delegation_id"]]["profile_home"] == str(default_home)
+    assert events[r_b["delegation_id"]]["profile_home"] == str(profile_home)

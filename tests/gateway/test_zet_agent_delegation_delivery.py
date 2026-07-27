@@ -17,6 +17,7 @@ Covers the zet_agent side of ``delegate_task(background=true)``:
 
 import asyncio
 import json
+import urllib.error
 import urllib.request
 
 import pytest
@@ -51,6 +52,11 @@ class _FakeRequest:
         self.remote = "127.0.0.1"
         self.transport = None
         self.can_read_body = body is not None
+
+    def get(self, key, default=None):
+        # aiohttp Request is a MutableMapping; profile routes stamp
+        # hermes_profile_home on it. Legacy /v1 routes have no stamp.
+        return default
 
     async def json(self):
         if isinstance(self._body, Exception):
@@ -257,6 +263,36 @@ async def test_deliver_raises_on_http_error_status(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_deliver_dead_letters_on_permanent_4xx(monkeypatch):
+    """404/400-class rejections can never succeed on retry: the delivery
+    returns normally (→ watcher acks the durable row) instead of feeding the
+    2s retry loop forever — across restarts too."""
+    monkeypatch.setenv(_ADVANCE_ENV, _ADVANCE_URL)
+    adapter = _adapter(monkeypatch)
+
+    def _gone(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 404, "session deleted", None, None)
+
+    monkeypatch.setattr(urllib.request, "urlopen", _gone)
+    # Must NOT raise: permanent rejection is dead-lettered (logged + acked).
+    await adapter._deliver_delegation_completion(_delegation_process_event(), "x")
+
+
+@pytest.mark.asyncio
+async def test_deliver_retries_transient_http_errors(monkeypatch):
+    """5xx / 408 / 429 stay retryable — local-server may just be restarting."""
+    monkeypatch.setenv(_ADVANCE_ENV, _ADVANCE_URL)
+    adapter = _adapter(monkeypatch)
+    for code in (503, 429, 408):
+        def _busy(req, timeout=None, _code=code):
+            raise urllib.error.HTTPError(req.full_url, _code, "busy", None, None)
+
+        monkeypatch.setattr(urllib.request, "urlopen", _busy)
+        with pytest.raises(RuntimeError, match=f"HTTP {code}"):
+            await adapter._deliver_delegation_completion(_delegation_process_event(), "x")
+
+
+@pytest.mark.asyncio
 async def test_deliver_raises_on_network_error(monkeypatch):
     monkeypatch.setenv(_ADVANCE_ENV, _ADVANCE_URL)
     adapter = _adapter(monkeypatch)
@@ -323,6 +359,10 @@ async def test_session_interrupt_cancels_async_delegations(monkeypatch):
     assert seen_sids == {"s1", "s1-rotated"}
     for c in calls:
         assert c.get("reason") == "user_cancel"
+        # User-stop kills suppress the completion turn: the interrupted turn
+        # itself carries the outcome card (local-server terminal hook), so the
+        # killed batch must not re-enter the chat afterwards.
+        assert c.get("suppress_completion") is True
 
 
 @pytest.mark.asyncio

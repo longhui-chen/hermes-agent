@@ -668,6 +668,7 @@ class ZetAgentAdapter(APIServerAdapter):
         }
 
         def _post() -> int:
+            import urllib.error
             import urllib.request
 
             req = urllib.request.Request(
@@ -676,17 +677,40 @@ class ZetAgentAdapter(APIServerAdapter):
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return int(getattr(resp, "status", 0) or 0)
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    return int(getattr(resp, "status", 0) or 0)
+            except urllib.error.HTTPError as http_exc:
+                # Non-2xx is a RESPONSE, not a transport failure — surface the
+                # status code so the caller can split permanent vs retryable.
+                return int(http_exc.code)
 
         try:
             status = await asyncio.to_thread(_post)
         except Exception as exc:
+            # Transport-level failure (connection refused / timeout): the
+            # local-server may just be restarting — keep the durable row
+            # claimable and let the watcher retry.
             raise RuntimeError(
                 f"delegation-advance delivery failed for "
                 f"{payload['delegation_id'] or '<no-id>'}: {exc}"
             ) from exc
+        if 400 <= status < 500 and status not in (408, 429):
+            # Permanent rejection (session deleted, payload judged invalid…):
+            # retrying can never succeed — dead-letter by logging the full
+            # identity and returning normally so the durable row is acked and
+            # the 2s watcher loop stops re-posting it (also across restarts).
+            logger.error(
+                "[zet_agent] delegation-advance delivery permanently rejected "
+                "with HTTP %d for %s (session_key=%s); dropping after "
+                "dead-letter log",
+                status,
+                payload["delegation_id"] or "<no-id>",
+                payload["session_key"] or "<none>",
+            )
+            return
         if not (200 <= status < 300):
+            # 5xx / 408 / 429: server-side transient — retryable.
             raise RuntimeError(
                 f"delegation-advance delivery rejected with HTTP {status} "
                 f"for {payload['delegation_id'] or '<no-id>'}"
@@ -2451,8 +2475,14 @@ class ZetAgentAdapter(APIServerAdapter):
 
             rotated_sid = str(getattr(agent, "session_id", "") or "") if agent else ""
             for psid in {session_id, rotated_sid} - {""}:
+                # suppress_completion: the user explicitly stopped this turn —
+                # local-server anchors the batch outcome card onto the
+                # interrupted turn itself, so the killed children must NOT
+                # re-enter the chat with a completion turn afterwards.
                 interrupt_for_session(
-                    parent_session_id=psid, reason="user_cancel"
+                    parent_session_id=psid,
+                    reason="user_cancel",
+                    suppress_completion=True,
                 )
         except Exception:
             logger.debug(
@@ -2486,12 +2516,16 @@ class ZetAgentAdapter(APIServerAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        # The registries are process-global; under a multiplexer the
+        # /p/{profile} route must only ever see (and cancel) ITS OWN
+        # records — an empty scope (legacy /v1 route) keeps the full view.
+        profile_home = str(request.get("hermes_profile_home", "") or "")
         try:
             from tools.async_delegation import list_async_delegations
             from tools.delegate_tool import list_active_subagents
 
-            active = list_active_subagents()
-            async_records = list_async_delegations()
+            active = list_active_subagents(profile_home)
+            async_records = list_async_delegations(profile_home)
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=500)
         return web.json_response({"active": active, "async": async_records})
@@ -2505,7 +2539,10 @@ class ZetAgentAdapter(APIServerAdapter):
         try:
             from tools.async_delegation import interrupt_delegation
 
-            ok = interrupt_delegation(delegation_id)
+            ok = interrupt_delegation(
+                delegation_id,
+                profile_home=str(request.get("hermes_profile_home", "") or ""),
+            )
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=500)
         return web.json_response(
@@ -2522,7 +2559,10 @@ class ZetAgentAdapter(APIServerAdapter):
         try:
             from tools.delegate_tool import interrupt_subagent
 
-            ok = interrupt_subagent(subagent_id)
+            ok = interrupt_subagent(
+                subagent_id,
+                profile_home=str(request.get("hermes_profile_home", "") or ""),
+            )
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=500)
         return web.json_response(
