@@ -2041,7 +2041,16 @@ def _run_single_child(
                 stream_callback=_relay_child_text,
             )
 
-        _child_future = _timeout_executor.submit(_run_with_thread_capture)
+        # The batch-level propagate wraps _run_single_child's thread, but the
+        # actual child.run_conversation runs one MORE hop away on the timeout
+        # executor — without re-propagating here the innermost thread loses
+        # the caller's ContextVars (profile HERMES_HOME / secret scope) and a
+        # non-default profile's child hits default-profile state paths.
+        from tools.thread_context import propagate_context_to_thread as _propagate_ctx
+
+        _child_future = _timeout_executor.submit(
+            _propagate_ctx(_run_with_thread_capture)
+        )
         try:
             result = _child_future.result(timeout=child_timeout)
         except Exception as _timeout_exc:

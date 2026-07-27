@@ -106,10 +106,11 @@ def _iter_state_db_homes():
     homes = [default_home]
     try:
         profiles_dir = default_home / "profiles"
-        if profiles_dir.is_dir():
+        if profiles_dir.is_dir() and not _is_symlink(profiles_dir):
             # No-follow discipline (mirrors _open_profile_session_db): a
-            # symlinked profile dir or state.db would make the sweep run
-            # WAL/schema writes against an out-of-tree target — skip both.
+            # symlinked profiles/ ROOT, profile dir, or state.db would make
+            # the sweep run WAL/schema writes against an out-of-tree target —
+            # skip all three (child checks can't see a linked ancestor).
             homes.extend(sorted(
                 p for p in profiles_dir.iterdir()
                 if p.is_dir() and not _is_symlink(p)
@@ -345,9 +346,14 @@ def restore_undelivered_completions(target_queue) -> int:
                     continue
                 if isinstance(evt, dict):
                     evt["restored"] = True
-                    # Rows written before profile stamping (or by legacy
-                    # dispatches) recover their owner from WHERE they live.
-                    evt.setdefault("profile_home", str(home))
+                    # The row's on-disk location is the AUTHORITATIVE owner:
+                    # a stamped profile_home goes stale after `hermes profile
+                    # rename` moves the directory (delivery would scope into
+                    # the old path's fresh/absent state.db and the completion
+                    # would vanish while the real row stays pending forever).
+                    # Overwrite unconditionally — for un-renamed profiles the
+                    # stamped value is identical anyway.
+                    evt["profile_home"] = str(home)
                 target_queue.put(evt)
                 restored += 1
         except Exception:

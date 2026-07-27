@@ -17250,6 +17250,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         return await self._deliver_completion_notification(
                             synth_text, evt,
                         )
+            except TransientRouteResolutionError:
+                # Owning profile's DB briefly busy/unreadable: propagate so the
+                # watcher requeues. Falling through to the UNscoped attempt
+                # would probe the DEFAULT profile's DB, judge the session
+                # unknown and drop the event as unroutable — the exact loss
+                # the transient marker exists to prevent.
+                raise
             except Exception:
                 logger.debug(
                     "Async delegation profile scope failed for %s; delivering unscoped",

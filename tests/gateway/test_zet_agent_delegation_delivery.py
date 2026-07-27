@@ -567,3 +567,44 @@ def test_turn_rebind_keeps_async_delivery_off_without_env(monkeypatch):
         assert async_delivery_supported() is False
     finally:
         clear_session_vars(tokens)
+
+
+@pytest.mark.asyncio
+async def test_scoped_delivery_propagates_transient(tmp_path):
+    """A transient probe failure inside the OWNING profile's scope must
+    propagate (watcher requeues) — falling through to the unscoped attempt
+    would probe the DEFAULT profile's DB, judge the session unknown and drop
+    the completion as unroutable."""
+    from gateway.run import GatewayRunner, TransientRouteResolutionError
+
+    runner = object.__new__(GatewayRunner)
+    profile_home = tmp_path / "profiles" / "agent-b"
+    profile_home.mkdir(parents=True)
+    calls = []
+
+    async def _deliver(synth, evt):
+        calls.append("attempt")
+        raise TransientRouteResolutionError("state.db busy")
+
+    runner._deliver_completion_notification = _deliver
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": "deleg_x",
+        "session_key": "zettlab:u1:agentB:1",
+        "profile_home": str(profile_home),
+    }
+    with pytest.raises(TransientRouteResolutionError):
+        await runner._deliver_async_delegation_scoped("synth", evt)
+    assert calls == ["attempt"], "must NOT retry unscoped after a transient scoped failure"
+
+
+def test_call_agent_only_in_zet_agent_toolset():
+    """call_agent's caller identity requires a zet_agent session — exposing
+    it on CLI/cron/messaging platforms shows the model a tool local-server
+    always rejects."""
+    from toolsets import TOOLSETS, _HERMES_CORE_TOOLS
+
+    assert "call_agent" not in _HERMES_CORE_TOOLS
+    assert "call_agent" in TOOLSETS["hermes-zet-agent"]["tools"]
+    for key in ("hermes-cli", "hermes-cron", "hermes-telegram", "hermes-discord"):
+        assert "call_agent" not in TOOLSETS[key]["tools"], key

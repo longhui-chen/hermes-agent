@@ -1047,3 +1047,58 @@ def test_restore_isolates_corrupt_profile_db(tmp_path, monkeypatch):
     evt = restored.get_nowait()
     assert evt["delegation_id"] == r["delegation_id"]
     assert evt["profile_home"] == str(profile_home)
+
+
+def test_restore_skips_symlinked_profiles_root(tmp_path, monkeypatch):
+    """The profiles/ ROOT itself being a symlink must also be rejected —
+    child-level _is_symlink checks cannot see a linked ancestor."""
+    import os
+
+    outside = tmp_path / "outside"
+    bait_home = outside / "agent-x"
+    bait_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(bait_home))
+    r = ad.dispatch_async_delegation(
+        goal="bait", context=None, toolsets=None, role="leaf",
+        model="m", session_key="",
+        runner=lambda: {"status": "completed", "summary": "x"},
+    )
+    assert _drain_for(r["delegation_id"]) is not None
+
+    home = tmp_path / "home"
+    home.mkdir()
+    os.symlink(str(outside), str(home / "profiles"))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    assert ad.restore_undelivered_completions(queue.Queue()) == 0
+
+
+def test_restore_overrides_stale_profile_home(tmp_path, monkeypatch):
+    """The durable row's on-disk location is the authoritative owner: a
+    profile_home stamped before `hermes profile rename` moved the directory
+    must be overwritten on restore, or delivery scopes into the old path and
+    the completion vanishes while the real row stays pending."""
+    profile_home = tmp_path / "profiles" / "agent-b"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    r = ad.dispatch_async_delegation(
+        goal="renamed", context=None, toolsets=None, role="leaf",
+        model="m", session_key="",
+        runner=lambda: {"status": "completed", "summary": "ok"},
+    )
+    assert _drain_for(r["delegation_id"]) is not None
+
+    db_path = profile_home / "state.db"
+    with ad._DB_LOCK, ad._connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT event_json FROM async_delegations WHERE delegation_id=?",
+            (r["delegation_id"],),
+        ).fetchone()
+        evt = json.loads(row[0])
+        evt["profile_home"] = str(tmp_path / "profiles" / "old-name-gone")
+        conn.execute(
+            "UPDATE async_delegations SET event_json=? WHERE delegation_id=?",
+            (json.dumps(evt), r["delegation_id"]),
+        )
+
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 1
+    assert restored.get_nowait()["profile_home"] == str(profile_home)

@@ -63,9 +63,11 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
-    # Agent-to-agent call (zettlab; schema-gated by ZET_AGENT_CALL_URL —
-    # invisible on deployments without local-server)
-    "call_agent",
+    # NOTE: call_agent is deliberately NOT in the core set. Its caller
+    # identity comes from _own_session_id(), which only zet_agent sessions
+    # can produce — on CLI/Telegram/cron the tool would pass the env schema
+    # gate yet every call would be rejected by local-server's owner check.
+    # It lives only in hermes-zet-agent below.
     # Cronjob management
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
@@ -461,7 +463,11 @@ TOOLSETS = {
         # full _HERMES_CORE_TOOLS set — including clarify, send_message,
         # and text_to_speech that hermes-api-server explicitly excludes.
         "description": "Zet Agent — APIServerAdapter + interactive SSE extension (reasoning/approval/clarify/title)",
-        "tools": _HERMES_CORE_TOOLS,
+        # call_agent on top of core: caller identity requires a zet_agent
+        # session (_own_session_id), so only THIS platform can use it — other
+        # platforms would show the model a tool local-server always rejects.
+        # Still schema-gated by ZET_AGENT_CALL_URL via check_fn.
+        "tools": _HERMES_CORE_TOOLS + ["call_agent"],
         "includes": []
     },
 
