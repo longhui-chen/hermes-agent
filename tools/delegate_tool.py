@@ -1433,6 +1433,14 @@ def _build_child_agent(
     if child_pool is not None:
         child._credential_pool = child_pool
 
+    # A child has no user to confirm a plan: clarify is blocked and no plan
+    # card reaches any UI (plan_emit_callback is never wired for children).
+    # Without this, present_plan returns "stop and wait for the user's
+    # confirmation" and the child burns iterations waiting for a reply that
+    # cannot come. Forcing the auto-execute branch keeps the plan text in the
+    # child's context and tells it to proceed immediately.
+    child._zet_agent_plan_auto_execute = True
+
     # Register child for interrupt propagation
     if hasattr(parent_agent, "_active_children"):
         lock = getattr(parent_agent, "_active_children_lock", None)

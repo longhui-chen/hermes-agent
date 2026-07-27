@@ -17031,6 +17031,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            # zettlab fork: expose the structured completion event so adapters
+            # that deliver externally (zet_agent → local-server) can forward
+            # machine-readable results instead of re-parsing synth_text.
+            metadata["process_event"] = dict(evt)
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,

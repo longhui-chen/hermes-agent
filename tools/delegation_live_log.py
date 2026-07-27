@@ -350,6 +350,38 @@ def _manifest_path(delegation_id: str) -> Path:
     return live_transcript_root() / delegation_id / "manifest.json"
 
 
+def _dispatch_context_fields() -> Dict[str, str]:
+    """Best-effort session/turn correlation captured at dispatch time.
+
+    The manifest is written on the dispatching tool thread, which carries the
+    gateway contextvars (the agent loop runs under ``ctx.run``). zettlab's
+    local-server tails these directories to attribute live transcripts to a
+    chat session/turn; without these fields it would have to correlate by
+    timing heuristics. Empty fields are omitted (CLI dispatches have no
+    gateway session).
+    """
+    fields: Dict[str, str] = {}
+    try:
+        from tools.approval import get_current_session_key
+
+        # Explicit empty default: the helper's own default is the literal
+        # string "default", which would stamp every CLI manifest.
+        session_key = str(get_current_session_key("") or "").strip()
+        if session_key:
+            fields["session_key"] = session_key
+    except Exception:
+        pass
+    try:
+        from gateway.session_context import zettlab_turn_id
+
+        turn_id = zettlab_turn_id()
+        if turn_id:
+            fields["turn_id"] = turn_id
+    except Exception:
+        pass
+    return fields
+
+
 def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
                     paths: List[str]) -> None:
     try:
@@ -357,6 +389,7 @@ def _write_manifest(delegation_id: str, task_list: List[Dict[str, Any]],
             "delegation_id": delegation_id,
             "started": time.strftime("%Y-%m-%d %H:%M:%S"),
             "task_count": len(task_list),
+            **_dispatch_context_fields(),
             "tasks": [
                 {
                     "index": i,
