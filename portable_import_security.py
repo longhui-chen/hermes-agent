@@ -39,6 +39,16 @@ _URL_QUERY_CREDENTIAL_RE = re.compile(
     r"x-amz-credential)=([^&#\s]+)",
     re.IGNORECASE,
 )
+# Credentials embedded in a URL's userinfo — scheme://user:password@host, as in
+# git remotes (https://user:token@github.com) and DB DSNs
+# (postgresql://admin:secret@host/db). The high-confidence bare-token scan
+# already catches structured tokens anywhere (including the user field), so this
+# only needs the password segment after the colon. A bare host:port (no '@') and
+# a userless authority never match.
+_URL_USERINFO_CREDENTIAL_RE = re.compile(
+    r"(?:[a-z][a-z0-9+.\-]*)://[^\s/:@]*:([^\s/@]+)@",
+    re.IGNORECASE,
+)
 _PLACEHOLDER_VALUE_RE = re.compile(
     r"(?:\$(?:\{[A-Z_][A-Z0-9_]*\}?|[A-Z_][A-Z0-9_]*)|<[^<>\r\n]+>|"
     r"env\.[A-Z_][A-Z0-9_]*|process\.env\.[A-Z_][A-Z0-9_]*|"
@@ -127,6 +137,9 @@ def portable_credential_finding(value: str) -> Optional[str]:
     for match in _URL_QUERY_CREDENTIAL_RE.finditer(value):
         if _credential_value_looks_real(match.group(1)):
             return "URL query credential"
+    for match in _URL_USERINFO_CREDENTIAL_RE.finditer(value):
+        if _credential_value_looks_real(match.group(1)):
+            return "URL userinfo credential"
     for match in _AUTHORIZATION_BEARER_RE.finditer(value):
         if _credential_value_looks_real(match.group(1)):
             return "bearer credential"

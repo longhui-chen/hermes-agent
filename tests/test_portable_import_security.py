@@ -192,3 +192,29 @@ def test_portable_credential_scanner_fails_closed_beyond_depth_limit():
 def test_portable_credential_scanner_keeps_nested_near_miss():
     value = _nested_ascii_escape(r"Authorization\u003a\u0020Bearer\u0020redacted", 2)
     assert portable_credential_finding(value) is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "clone https://alice:s3cr3t-pass@example.com/repo.git",
+        "remote add origin https://token:x-oauth-basic@github.com/x.git",
+        "DATABASE_URL=postgresql://admin:supersecret@db-host:5432/app",
+        "redis://:password123@cache:6379/0",
+    ],
+)
+def test_portable_credential_scanner_rejects_url_userinfo_passwords(value):
+    assert portable_credential_finding(value) is not None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://user:${DB_PASS}@host/db",
+        "connect to http://example.com:8080/health",
+        "docs at https://example.com/a/b?ref=main",
+        "https://alice@example.com/repo.git",
+    ],
+)
+def test_portable_credential_scanner_allows_url_without_userinfo_password(value):
+    assert portable_credential_finding(value) is None
