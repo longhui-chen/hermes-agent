@@ -168,3 +168,29 @@ def test_interrupt_delegation_helper_contract():
     finally:
         with async_delegation._records_lock:
             async_delegation._records.pop("deleg_unit", None)
+
+
+@pytest.mark.asyncio
+async def test_bare_route_scopes_to_default_profile_under_mux(monkeypatch):
+    """The bare /v1 control route carries no profile stamp: under an active
+    multiplexer it must scope to the DEFAULT profile, never 'no filter'."""
+    import agent.secret_scope as secret_scope
+    import tools.async_delegation as async_delegation
+    import tools.delegate_tool as delegate_tool
+
+    adapter = _adapter(monkeypatch)
+    monkeypatch.setattr(secret_scope, "is_multiplex_active", lambda: True)
+    monkeypatch.setenv("HERMES_HOME", "/hh/default")
+    seen = {}
+    monkeypatch.setattr(
+        delegate_tool, "list_active_subagents",
+        lambda profile_home="": seen.setdefault("active", profile_home) and [] or [],
+    )
+    monkeypatch.setattr(
+        async_delegation, "list_async_delegations",
+        lambda profile_home="": seen.setdefault("async", profile_home) and [] or [],
+    )
+    resp = await adapter._handle_delegations_status(_FakeRequest())
+    assert resp.status == 200
+    assert seen["active"].endswith("default")
+    assert seen["async"].endswith("default")

@@ -977,3 +977,27 @@ def test_restore_sweeps_profile_state_dbs(tmp_path, monkeypatch):
         events[evt["delegation_id"]] = evt
     assert events[r_a["delegation_id"]]["profile_home"] == str(default_home)
     assert events[r_b["delegation_id"]]["profile_home"] == str(profile_home)
+
+
+def test_restore_skips_symlinked_profile_homes(tmp_path, monkeypatch):
+    """No-follow discipline: a symlinked profile dir (or state.db) must not
+    pull an out-of-tree database into the WAL/schema-writing sweep."""
+    import os
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(outside))
+    r = ad.dispatch_async_delegation(
+        goal="bait", context=None, toolsets=None, role="leaf",
+        model="m", session_key="",
+        runner=lambda: {"status": "completed", "summary": "x"},
+    )
+    assert _drain_for(r["delegation_id"]) is not None
+
+    home = tmp_path / "home"
+    (home / "profiles").mkdir(parents=True)
+    os.symlink(str(outside), str(home / "profiles" / "evil"))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    # Only the default home is swept; the symlinked profile is skipped, so
+    # the bait row parked outside stays untouched/unrestored.
+    assert ad.restore_undelivered_completions(queue.Queue()) == 0

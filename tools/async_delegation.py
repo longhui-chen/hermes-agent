@@ -94,12 +94,26 @@ def _iter_state_db_homes():
     ``profiles/`` children with a state.db, so this degenerates to the
     default home only.
     """
+    import os as _os
+
+    def _is_symlink(p) -> bool:
+        try:
+            return _os.path.islink(str(p))
+        except OSError:  # pragma: no cover — treat unstatable as unsafe
+            return True
+
     default_home = get_hermes_home()
     homes = [default_home]
     try:
         profiles_dir = default_home / "profiles"
         if profiles_dir.is_dir():
-            homes.extend(sorted(p for p in profiles_dir.iterdir() if p.is_dir()))
+            # No-follow discipline (mirrors _open_profile_session_db): a
+            # symlinked profile dir or state.db would make the sweep run
+            # WAL/schema writes against an out-of-tree target — skip both.
+            homes.extend(sorted(
+                p for p in profiles_dir.iterdir()
+                if p.is_dir() and not _is_symlink(p)
+            ))
     except Exception:  # pragma: no cover — unreadable profiles dir
         pass
     seen = set()
@@ -108,6 +122,8 @@ def _iter_state_db_homes():
         if path in seen:
             continue
         seen.add(path)
+        if _is_symlink(path):
+            continue
         if home == default_home or path.exists():
             yield home, path
 

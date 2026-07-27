@@ -178,3 +178,13 @@ def test_contract_with_delegate_tool_child_relay():
         assert p["subagent_id"] == "sa_42"
     batch = [p for p in payloads if p["event"] == "subagent.progress"][0]
     assert "tool_0" in batch["preview"] and "tool_4" in batch["preview"]
+
+
+def test_backlog_cap_stops_writes_to_dead_queue():
+    """Background children keep the callback after the SSE writer exits —
+    the backlog must be bounded (HR#1), not grow with task lifetime."""
+    cb, q = _cb_and_queue()
+    cap = ZetAgentAdapter._DELEGATION_PROGRESS_BACKLOG_MAX
+    for _ in range(cap + 50):
+        cb("subagent.tool", "terminal", "ls")
+    assert q.qsize() <= cap + 1  # one in-flight put may land past the check

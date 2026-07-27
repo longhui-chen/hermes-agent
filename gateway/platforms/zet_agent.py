@@ -1404,6 +1404,9 @@ class ZetAgentAdapter(APIServerAdapter):
         "exit_reason",
     )
     _DELEGATION_PREVIEW_MAX = 200
+    # Cap for progress frames parked in a stream_q with no live SSE reader
+    # (background children outliving the parent turn). See _cb note.
+    _DELEGATION_PROGRESS_BACKLOG_MAX = 2000
 
     @classmethod
     def _make_delegation_progress_cb(cls, stream_q: Any):
@@ -1451,6 +1454,13 @@ class ZetAgentAdapter(APIServerAdapter):
                     value = kwargs.get(field)
                     if value is not None:
                         payload[field] = value
+                # Background children capture this callback at dispatch and
+                # keep pushing after the parent turn's SSE writer exits —
+                # nobody drains the queue then. Cap the backlog (HR#1);
+                # progress is best-effort UI signal, the live manifest is
+                # the authoritative record the App polls for terminal state.
+                if stream_q.qsize() > cls._DELEGATION_PROGRESS_BACKLOG_MAX:
+                    return
                 stream_q.put(("__tool_progress__", payload))
             except Exception:
                 logger.debug(
@@ -1848,11 +1858,15 @@ class ZetAgentAdapter(APIServerAdapter):
         # Wiring the parent tool_progress_callback is also what ENABLES
         # delegate_tool's child relay on this path (it returns no callback
         # when the parent has neither spinner nor progress callback).
+        # Rebind UNCONDITIONALLY each turn (mirrors plan_emit_callback):
+        # session agents are reused across turns, and a keep-if-set guard
+        # would leave the callback closed over the FIRST turn's dead
+        # stream_q — every later dispatch's progress would go to a queue
+        # nobody drains (invisible + unbounded backlog).
         try:
-            if getattr(agent, "tool_progress_callback", None) is None:
-                agent.tool_progress_callback = self._make_delegation_progress_cb(
-                    stream_q
-                )
+            agent.tool_progress_callback = self._make_delegation_progress_cb(
+                stream_q
+            )
         except Exception:
             logger.warning(
                 "[zet_agent] failed to attach delegation progress callback",
@@ -2505,6 +2519,34 @@ class ZetAgentAdapter(APIServerAdapter):
     # Delegation control plane (App banner: status / per-id cancel)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _delegation_control_scope(request: "web.Request") -> str:
+        """Resolve the profile filter for a delegation control-plane call.
+
+        /p/{profile} routes carry ``hermes_profile_home`` (stamped by
+        _profile_handler). The bare /v1 route has no stamp: under an ACTIVE
+        multiplexer it is scoped to the DEFAULT profile (the unscoped
+        ``get_hermes_home()``) so it can never read or cancel another
+        profile's work; single-profile processes return "" (legacy full
+        view — every record carries the same home anyway).
+        """
+        stamped = str(request.get("hermes_profile_home", "") or "")
+        if stamped:
+            return stamped
+        try:
+            from agent.secret_scope import is_multiplex_active
+
+            if is_multiplex_active():
+                from hermes_constants import get_hermes_home
+
+                return str(get_hermes_home())
+        except Exception:
+            logger.debug(
+                "[zet_agent] delegation control scope resolution failed",
+                exc_info=True,
+            )
+        return ""
+
     async def _handle_delegations_status(self, request: "web.Request") -> "web.Response":
         """GET /v1/delegations/status — sync tree + async records snapshot.
 
@@ -2518,8 +2560,13 @@ class ZetAgentAdapter(APIServerAdapter):
             return auth_err
         # The registries are process-global; under a multiplexer the
         # /p/{profile} route must only ever see (and cancel) ITS OWN
-        # records — an empty scope (legacy /v1 route) keeps the full view.
-        profile_home = str(request.get("hermes_profile_home", "") or "")
+        # records. The BARE /v1 route carries no profile stamp — under an
+        # active multiplexer it must fall back to the DEFAULT profile's
+        # scope (unscoped get_hermes_home()), not to "no filter": an empty
+        # filter would leak every profile's goals/session keys through the
+        # default route and let their ids be cancelled cross-profile.
+        # Single-profile processes keep the legacy full view.
+        profile_home = self._delegation_control_scope(request)
         try:
             from tools.async_delegation import list_async_delegations
             from tools.delegate_tool import list_active_subagents
@@ -2541,7 +2588,7 @@ class ZetAgentAdapter(APIServerAdapter):
 
             ok = interrupt_delegation(
                 delegation_id,
-                profile_home=str(request.get("hermes_profile_home", "") or ""),
+                profile_home=self._delegation_control_scope(request),
             )
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=500)
@@ -2561,7 +2608,7 @@ class ZetAgentAdapter(APIServerAdapter):
 
             ok = interrupt_subagent(
                 subagent_id,
-                profile_home=str(request.get("hermes_profile_home", "") or ""),
+                profile_home=self._delegation_control_scope(request),
             )
         except Exception as exc:
             return web.json_response({"error": str(exc)}, status=500)
