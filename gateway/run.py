@@ -16962,6 +16962,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         chat_type = str(evt.get("chat_type") or derived_chat_type or "").strip().lower()
         chat_id = str(evt.get("chat_id") or derived_chat_id or "").strip()
         if not platform_name or not chat_type or not chat_id:
+            # zettlab fork: adapter-owned opaque session keys (zet_agent binds
+            # the local-server session id verbatim, no "platform:chat_type:…"
+            # shape) never parse into routing fields — before declaring the
+            # event unroutable, let adapters claim sessions they own.
+            if session_key:
+                for _adapter in self.adapters.values():
+                    resolver = getattr(_adapter, "resolve_process_event_source", None)
+                    if not callable(resolver):
+                        continue
+                    try:
+                        resolved = resolver(session_key)
+                    except Exception:
+                        logger.debug(
+                            "Adapter process-event source resolver failed for %s",
+                            session_key,
+                            exc_info=True,
+                        )
+                        resolved = None
+                    if resolved is not None:
+                        return resolved
             logger.warning(
                 "Synthetic event source unresolvable: "
                 "session_key=%r platform=%r chat_type=%r chat_id=%r "

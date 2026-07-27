@@ -565,6 +565,40 @@ class ZetAgentAdapter(APIServerAdapter):
         """
         return bool(_delegation_advance_url())
 
+    def resolve_process_event_source(self, session_key: str):
+        """Claim synthetic process events whose session_key is a zet_agent
+        session id.
+
+        zet_agent binds the local-server session id verbatim as the gateway
+        session_key, so ``_build_process_event_source``'s generic
+        ``platform:chat_type:chat_id`` parse never matches and async
+        delegation completions would be dropped as unroutable. Ownership is
+        verified against Hermes SessionDB (fail-closed): only sessions this
+        gateway actually persisted are claimed, so foreign platforms' keys
+        stay unresolvable.
+        """
+        key = (session_key or "").strip()
+        if not key:
+            return None
+        try:
+            db = self._ensure_session_db()
+            if db is None or db.get_session(key) is None:
+                return None
+        except Exception:
+            logger.debug(
+                "[zet_agent] session ownership probe failed for %s",
+                key,
+                exc_info=True,
+            )
+            return None
+        from gateway.session import SessionSource
+
+        return SessionSource(
+            platform=Platform.ZET_AGENT,
+            chat_id=key,
+            chat_type="dm",
+        )
+
     async def handle_message(self, event) -> None:
         """Divert internal async-delegation completions to local-server.
 

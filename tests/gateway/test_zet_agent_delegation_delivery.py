@@ -347,3 +347,86 @@ async def test_session_interrupt_survives_delegation_cancel_failure(monkeypatch)
     assert resp.status == 200
     assert resp.payload["status"] == "stopping"
     assert agent.interrupted
+
+
+# ---------------------------------------------------------------------------
+# Synthetic-event source resolution (run.py adapter hook + zet_agent resolver)
+#
+# Real zet_agent turns bind the local-server session id verbatim as the
+# gateway session_key (no "agent:main:<platform>:…" shape), so run.py's
+# generic parse fails and — before the resolver hook — async delegation
+# completions were dropped as "Synthetic event source unresolvable".
+# ---------------------------------------------------------------------------
+
+
+class _FakeSessionDB:
+    def __init__(self, known):
+        self._known = set(known)
+
+    def get_session(self, session_id):
+        return {"session_id": session_id} if session_id in self._known else None
+
+
+def test_resolver_claims_own_session(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    monkeypatch.setattr(
+        adapter, "_ensure_session_db", lambda: _FakeSessionDB({"zettlab:u1:agentA:1"})
+    )
+    src = adapter.resolve_process_event_source("zettlab:u1:agentA:1")
+    assert src is not None
+    assert src.chat_id == "zettlab:u1:agentA:1"
+    assert src.platform.value == "zet_agent"
+    assert src.chat_type == "dm"
+
+
+def test_resolver_fail_closed(monkeypatch):
+    adapter = _adapter(monkeypatch)
+    # 不认识的会话 / 空 key / DB 探测异常，一律不认领。
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: _FakeSessionDB(set()))
+    assert adapter.resolve_process_event_source("zettlab:u1:agentA:1") is None
+    assert adapter.resolve_process_event_source("") is None
+
+    def _boom():
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(adapter, "_ensure_session_db", _boom)
+    assert adapter.resolve_process_event_source("zettlab:u1:agentA:1") is None
+
+
+def _fake_runner(adapter):
+    from types import SimpleNamespace
+
+    from gateway.config import Platform
+
+    return SimpleNamespace(
+        session_store=SimpleNamespace(_ensure_loaded=lambda: None, _entries={}),
+        _get_cached_session_source=lambda key: None,
+        adapters={Platform.ZET_AGENT: adapter},
+    )
+
+
+def test_build_process_event_source_falls_back_to_adapter_resolver(monkeypatch):
+    """Flow test: raw zet_agent session_key → adapter resolver claims it."""
+    from gateway.run import GatewayRunner
+
+    adapter = _adapter(monkeypatch)
+    monkeypatch.setattr(
+        adapter, "_ensure_session_db", lambda: _FakeSessionDB({"zettlab:u1:agentA:1"})
+    )
+    runner = _fake_runner(adapter)
+    evt = {"type": "async_delegation", "session_key": "zettlab:u1:agentA:1"}
+    src = GatewayRunner._build_process_event_source(runner, evt)
+    assert src is not None
+    assert src.platform.value == "zet_agent"
+    assert src.chat_id == "zettlab:u1:agentA:1"
+
+
+def test_build_process_event_source_still_unresolvable_for_foreign_keys(monkeypatch):
+    """Foreign / unknown keys keep the fail-closed None（不误认领）。"""
+    from gateway.run import GatewayRunner
+
+    adapter = _adapter(monkeypatch)
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: _FakeSessionDB(set()))
+    runner = _fake_runner(adapter)
+    evt = {"type": "async_delegation", "session_key": "zettlab:u1:agentA:1"}
+    assert GatewayRunner._build_process_event_source(runner, evt) is None
