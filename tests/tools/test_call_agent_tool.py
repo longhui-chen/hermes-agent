@@ -164,7 +164,7 @@ def test_http_error_body_surfaced(call_env, monkeypatch):
             "data": {
                 "error": "agent not found for caller's user",
                 "reason": "unauthorized",
-                "available_agents": ["Zettlab", "Zettlab Memo"],
+                "available_agents": [{"id": "840853ff", "name": "Zettlab Memo"}],
             },
         }).encode("utf-8")
         raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {}, io.BytesIO(body))
@@ -176,6 +176,6 @@ def test_http_error_body_surfaced(call_env, monkeypatch):
         reset_current_session_key(token)
 
     assert out["reason"] == "unauthorized"
-    assert out["available_agents"] == ["Zettlab", "Zettlab Memo"]
+    assert out["available_agents"] == [{"id": "840853ff", "name": "Zettlab Memo"}]
     assert "reply" not in out
     assert "error" in out
