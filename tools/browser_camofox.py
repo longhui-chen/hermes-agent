@@ -1713,7 +1713,14 @@ def _forget_stale_tab(session: Optional[Dict[str, Any]], stale_tab_id: Optional[
     if not stale:
         return
     identity = _browser_identity_key(session)
-    with _sessions_lock:
+    # Under the identity owner lock, not _sessions_lock alone: the rebuild
+    # path (navigate) holds the owner lock across _ensure_tab and
+    # _repoint_shared_entries, and a clear landing between those two steps
+    # would null peers still pinned to the dead tab before the repoint scans
+    # for them — the rebuilt tab loses them, and their next navigate forks a
+    # second live tab. The owner lock is an RLock, so an error handled inside
+    # another operation's identity section re-enters safely.
+    with _held_owner_lock(identity), _sessions_lock:
         if str(session.get("tab_id") or "") == stale:
             session["tab_id"] = None
             session["epoch"] = None

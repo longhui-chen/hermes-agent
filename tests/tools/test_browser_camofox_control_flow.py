@@ -2912,6 +2912,53 @@ def test_a_late_409_does_not_tear_down_a_concurrently_rebuilt_tab():
         mod._sessions.clear()
 
 
+def test_forget_stale_tab_waits_for_the_identity_lock():
+    """The clear must serialize with a rebuild in flight, not race it.
+
+    Navigate holds the identity owner lock across _ensure_tab and
+    _repoint_shared_entries. A clear that only takes _sessions_lock can land
+    between those steps and null peers the repoint is about to move — so the
+    clear has to queue behind the owner lock, not slip past it.
+    """
+    import threading
+
+    import tools.browser_camofox as mod
+
+    mod._sessions.clear()
+    session = {"user_id": "u", "session_key": "shared", "tab_id": "tab-old", "task_id": "t", "epoch": 1}
+    mod._sessions["a"] = session
+    identity = mod._browser_identity_key(session)
+    rebuild_entered = threading.Event()
+    rebuild_release = threading.Event()
+    cleared = threading.Event()
+
+    def rebuild_holds_lock():
+        with mod._held_owner_lock(identity):
+            rebuild_entered.set()
+            rebuild_release.wait(5)
+
+    def late_clear():
+        mod._forget_stale_tab(session, "tab-old")
+        cleared.set()
+
+    holder = threading.Thread(target=rebuild_holds_lock)
+    clearer = threading.Thread(target=late_clear)
+    try:
+        holder.start()
+        assert rebuild_entered.wait(5)
+        clearer.start()
+        assert not cleared.wait(0.3), "the clear ran while the rebuild held the identity lock"
+        assert session["tab_id"] == "tab-old"
+        rebuild_release.set()
+        assert cleared.wait(5), "the clear never ran after the lock was released"
+        assert session["tab_id"] is None
+    finally:
+        rebuild_release.set()
+        holder.join(5)
+        clearer.join(5)
+        mod._sessions.clear()
+
+
 def test_epoch_stale_is_not_mistaken_for_a_reclaimed_tab():
     """409 browser_epoch_stale means the tab is alive; rebuilding would lose it."""
     import tools.browser_camofox as mod
