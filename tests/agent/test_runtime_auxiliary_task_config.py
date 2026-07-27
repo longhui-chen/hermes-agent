@@ -50,3 +50,18 @@ def test_runtime_auxiliary_task_config_is_context_scoped():
 
     assert ctx_a.run(mod._get_auxiliary_task_config, "vision")["model"] == "session-a"
     assert ctx_b.run(mod._get_auxiliary_task_config, "vision")["model"] == "session-b"
+
+
+def test_runtime_main_is_context_scoped():
+    from agent import auxiliary_client as mod
+
+    ctx_a = contextvars.Context()
+    ctx_b = contextvars.Context()
+
+    ctx_a.run(mod.set_runtime_main, "provider-a", "model-a")
+    ctx_b.run(mod.set_runtime_main, "provider-b", "model-b")
+
+    assert ctx_a.run(mod._read_main_provider) == "provider-a"
+    assert ctx_a.run(mod._read_main_model) == "model-a"
+    assert ctx_b.run(mod._read_main_provider) == "provider-b"
+    assert ctx_b.run(mod._read_main_model) == "model-b"

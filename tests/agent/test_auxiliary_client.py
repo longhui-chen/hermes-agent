@@ -2076,6 +2076,56 @@ class TestCallLlmPaymentFallback:
                     messages=[{"role": "user", "content": "hello"}],
                 )
 
+    def test_fail_fast_uses_one_attempt_without_provider_fallback(self):
+        primary_client = MagicMock()
+        timeout_error = TimeoutError("main provider timed out")
+        primary_client.chat.completions.create.side_effect = timeout_error
+
+        with patch("agent.auxiliary_client._get_cached_client", return_value=(primary_client, "model")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("openrouter", "model", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain") as fallback:
+            with pytest.raises(TimeoutError, match="main provider timed out"):
+                call_llm(
+                    task="creation_opportunity_checkpoint_json",
+                    provider="openrouter",
+                    messages=[{"role": "user", "content": "private conversation"}],
+                    fail_fast=True,
+                )
+
+        assert primary_client.chat.completions.create.call_count == 1
+        fallback.assert_not_called()
+
+    def test_fail_fast_resolves_only_the_active_main_provider(self):
+        import agent.auxiliary_client as mod
+
+        client = MagicMock()
+        client.chat.completions.create.return_value = _DummyResponse("ok")
+        mod.clear_runtime_main()
+        try:
+            mod.set_runtime_main(
+                "custom:private",
+                "private-model",
+                base_url="http://127.0.0.1:11434/v1",
+                api_key="local-key",
+            )
+            with patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("custom:private", "private-model", "http://127.0.0.1:11434/v1", "local-key", None)) as resolve, \
+                 patch("agent.auxiliary_client._get_cached_client", return_value=(client, "private-model")):
+                call_llm(
+                    task="creation_opportunity_checkpoint_json",
+                    messages=[{"role": "user", "content": "private conversation"}],
+                    fail_fast=True,
+                )
+
+            assert resolve.call_args.args == (
+                "creation_opportunity_checkpoint_json",
+                "custom:private",
+                "private-model",
+                "http://127.0.0.1:11434/v1",
+                "local-key",
+            )
+        finally:
+            mod.clear_runtime_main()
+
     def test_429_rate_limit_triggers_fallback(self, monkeypatch):
         """429 rate-limit errors should trigger fallback to next provider."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")

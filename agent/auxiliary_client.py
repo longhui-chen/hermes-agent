@@ -2245,7 +2245,7 @@ def _read_main_model() -> str:
 
     Runtime override: when an AIAgent is active with a CLI/gateway-provided
     model that differs from config.yaml, ``set_runtime_main()`` records the
-    override in a process-local global. This is consulted FIRST so tools
+    override in a turn-scoped ContextVar. This is consulted FIRST so tools
     that gate on "the active main model" (e.g. ``vision_analyze``'s native
     fast path) see the live runtime, not the persisted config default.
     """
@@ -4468,7 +4468,6 @@ def _resolve_auto(
     runtime_base_url = str(runtime.get("base_url") or "")
     runtime_api_key = runtime.get("api_key", "")
     runtime_api_mode = str(runtime.get("api_mode") or "")
-
 
     # ── Warn once if OPENAI_BASE_URL is set but config.yaml uses a named
     #    provider (not 'custom').  This catches the common "env poisoning"
@@ -6997,6 +6996,7 @@ def call_llm(
     max_tokens: int = None,
     tools: list = None,
     timeout: float = None,
+    fail_fast: bool = False,
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
     api_mode: str = None,
@@ -7021,6 +7021,8 @@ def call_llm(
         max_tokens: Max output tokens (handles max_tokens vs max_completion_tokens).
         tools: Tool definitions (for function calling).
         timeout: Request timeout in seconds (None = read from auxiliary.{task}.timeout config).
+        fail_fast: Make one request to the resolved provider and return its result
+            or error without retries or provider fallback.
         extra_body: Additional request body fields.
         reasoning_config: Optional Hermes reasoning config for direct model calls
               such as MoA reference/aggregator slots.
@@ -7043,6 +7045,14 @@ def call_llm(
     # concurrent /model switch produce a key for one runtime and a client for
     # another.
     main_runtime = _normalize_main_runtime(main_runtime)
+    if fail_fast and provider is None:
+        provider = str(main_runtime.get("provider") or _read_main_provider())
+        model = model or str(main_runtime.get("model") or _read_main_model())
+        base_url = base_url or str(main_runtime.get("base_url") or "")
+        api_key = api_key or main_runtime.get("api_key") or ""
+        api_mode = api_mode or str(main_runtime.get("api_mode") or "")
+        if not provider:
+            raise RuntimeError("No active main provider configured for fail-fast auxiliary call")
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     if api_mode:
@@ -7059,7 +7069,12 @@ def call_llm(
             async_mode=False,
             main_runtime=main_runtime,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if (
+            client is None
+            and not fail_fast
+            and resolved_provider != "auto"
+            and not resolved_base_url
+        ):
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -7086,6 +7101,11 @@ def call_llm(
             main_runtime=main_runtime,
         )
         if client is None:
+            if fail_fast:
+                raise RuntimeError(
+                    f"No LLM provider configured for task={task} provider={resolved_provider}. "
+                    "Run: hermes setup"
+                )
             # When the user explicitly chose a non-OpenRouter provider but no
             # credentials were found, honor the task fallback_chain before
             # raising.  Missing raw env keys are recoverable for auxiliary
@@ -7142,6 +7162,9 @@ def call_llm(
     _client_base = str(getattr(client, "base_url", "") or "")
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+
+    if fail_fast:
+        return _validate_llm_response(client.chat.completions.create(**kwargs), task)
 
     # Streaming path: return the raw SDK Stream iterator directly. This is used by
     # the MoA aggregator so its tokens stream to the user. It deliberately skips

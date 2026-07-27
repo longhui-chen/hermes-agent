@@ -19,6 +19,37 @@ from agent.image_routing import (
 )
 
 
+def test_runtime_inference_base_url_is_context_scoped():
+    import contextvars
+    from agent import auxiliary_client
+    from agent.image_routing import _resolve_inference_base_url
+
+    cfg = {"model": {"base_url": "http://config.example/v1"}}
+    auxiliary_client.clear_runtime_main()
+    try:
+        assert _resolve_inference_base_url(cfg, "custom") == "http://config.example/v1"
+
+        ctx_a = contextvars.Context()
+        ctx_b = contextvars.Context()
+        ctx_a.run(
+            auxiliary_client.set_runtime_main,
+            "custom",
+            "model-a",
+            base_url="http://runtime-a.example/v1",
+        )
+        ctx_b.run(
+            auxiliary_client.set_runtime_main,
+            "custom",
+            "model-b",
+            base_url="http://runtime-b.example/v1",
+        )
+
+        assert ctx_a.run(_resolve_inference_base_url, cfg, "custom") == "http://runtime-a.example/v1"
+        assert ctx_b.run(_resolve_inference_base_url, cfg, "custom") == "http://runtime-b.example/v1"
+    finally:
+        auxiliary_client.clear_runtime_main()
+
+
 # ─── _coerce_mode ────────────────────────────────────────────────────────────
 
 

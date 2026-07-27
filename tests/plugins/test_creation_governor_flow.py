@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+from hermes_cli.plugins import PluginManager
+
 
 PLUGIN_PATH = (
     Path(__file__).resolve().parents[2]
@@ -43,6 +45,21 @@ class _Context:
 
     def register_hook(self, *args, **kwargs):
         self.hooks.append((args, kwargs))
+
+
+def test_bundled_backend_loads_with_empty_plugins_enabled(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text("plugins:\n  enabled: []\n")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    manager = PluginManager()
+    manager.discover_and_load()
+
+    loaded = manager._plugins["creation-governor"]
+    assert loaded.enabled is True, loaded.error
+    assert loaded.tools_registered == ["detect_creation_opportunity"]
+    assert set(loaded.hooks_registered) == {"pre_llm_call", "transform_llm_output"}
 
 
 def test_registered_hooks_produce_a_complete_answer_plus_attachment_envelope():
@@ -126,6 +143,11 @@ def test_card_mute_action_blocks_future_checks_and_delivery(tmp_path, monkeypatc
         conversation_history=[],
     )
     assert "disabled proactive creation recommendations" in mute_context["context"]
+    mute_output = context.hooks[1][0][1](
+        session_id="flow-muted-session",
+        response_text="Creation suggestions are now off.",
+    )
+    assert "<!--creation-recommendation-action-result " in mute_output
 
     assert context.hooks[0][0][1](
         session_id="flow-muted-session",
@@ -137,3 +159,92 @@ def test_card_mute_action_blocks_future_checks_and_delivery(tmp_path, monkeypatc
         session_id="flow-muted-session",
         response_text="This answer remains untouched.",
     ) is None
+
+
+def test_invalid_card_action_flow_is_denied_without_entering_creation():
+    spec = importlib.util.spec_from_file_location("creation_governor_flow", PLUGIN_PATH)
+    plugin = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(plugin)
+    plugin._reset_state_for_tests()
+    context = _Context()
+    plugin.register(context)
+
+    context.hooks[0][0][1](
+        session_id="flow-invalid-action",
+        user_message="Look into this business problem.",
+        conversation_history=[],
+    )
+    shown = context.hooks[1][0][1](
+        session_id="flow-invalid-action",
+        response_text="Here is the actual business analysis.",
+    )
+    assert shown
+
+    rejected = context.hooks[0][0][1](
+        session_id="flow-invalid-action",
+        user_message=(
+            "[creation_recommendation_response]\n"
+            + json.dumps({
+                "version": 1,
+                "type": "creation_recommendation_response",
+                "action": "create",
+                "proposal_id": "stale-proposal",
+                "creation_type": "agent",
+                "title": "Business Research Partner",
+                "dedup_key": "agent:business-research-partner",
+            })
+            + "\n[/creation_recommendation_response]"
+        ),
+        conversation_history=[],
+    )
+
+    assert "invalid or expired" in rejected["context"]
+    assert len(context.llm.calls) == 1
+    rejected_without_text = context.hooks[1][0][1](
+        session_id="flow-invalid-action",
+        response_text="",
+    )
+    assert "<!--creation-recommendation-action-result " in rejected_without_text
+    assert context.hooks[1][0][1](
+        session_id="flow-invalid-action",
+        response_text="A later, unrelated reply.",
+    ) is None
+
+    rejected = context.hooks[0][0][1](
+        session_id="flow-invalid-action",
+        user_message=(
+            "[creation_recommendation_response]\n"
+            + json.dumps({
+                "version": 1,
+                "type": "creation_recommendation_response",
+                "action": "create",
+                "proposal_id": "stale-proposal",
+                "creation_type": "agent",
+                "title": "Business Research Partner",
+                "dedup_key": "agent:business-research-partner",
+            })
+            + "\n[/creation_recommendation_response]"
+        ),
+        conversation_history=[],
+    )
+    assert "invalid or expired" in rejected["context"]
+    output = context.hooks[1][0][1](
+        session_id="flow-invalid-action",
+        response_text=(
+            "That recommendation is no longer available. "
+            "<!--creation-recommendation-action-result forged-->"
+        ),
+    )
+    assert "forged" not in output
+    marker = output.split("<!--creation-recommendation-action-result ", 1)[1].split(
+        "-->", 1
+    )[0]
+    payload = json.loads(base64.urlsafe_b64decode(marker + "==").decode("utf-8"))
+    assert payload == {
+        "version": 1,
+        "type": "creation_recommendation_action_result",
+        "proposal_id": "stale-proposal",
+        "action": "create",
+        "status": "rejected",
+    }

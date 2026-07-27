@@ -610,3 +610,77 @@ def test_output_transform_uses_last_chained_result(monkeypatch):
 
     assert result["final_response"] == "safe final"
     assert result["messages"][-1]["content"] == "safe final"
+
+
+def test_empty_turn_runs_output_transform_and_persists_its_receipt(monkeypatch):
+    receipt = "<!--creation-recommendation-action-result rejected-->"
+
+    def invoke_hook(name, **kwargs):
+        if name == "transform_llm_output":
+            assert kwargs["response_text"] == ""
+            assert kwargs["failed"] is True
+            return [receipt]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+    messages = [{"role": "user", "content": "创建它"}]
+
+    result = finalize_turn(
+        agent,
+        final_response="",
+        api_call_count=1,
+        interrupted=False,
+        failed=True,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="创建它",
+        original_user_message="创建它",
+        _should_review_memory=False,
+        _turn_exit_reason="provider_error",
+    )
+
+    assert result["final_response"] == receipt
+    assert result["messages"][-1] == {"role": "assistant", "content": receipt}
+    assert agent.persisted_messages[-1] == result["messages"][-1]
+
+
+def test_interrupted_turn_runs_output_transform_without_losing_interrupt_history(monkeypatch):
+    receipt = "<!--creation-recommendation-action-result rejected-->"
+
+    def invoke_hook(name, **kwargs):
+        if name == "transform_llm_output":
+            assert kwargs["response_text"] == ""
+            assert kwargs["interrupted"] is True
+            return [receipt]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    agent = FakeAgent()
+    messages = [
+        {"role": "user", "content": "创建它"},
+        {"role": "assistant", "tool_calls": [{"id": "call-1"}]},
+        {"role": "tool", "tool_call_id": "call-1", "content": "cancelled"},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response="",
+        api_call_count=1,
+        interrupted=True,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message="创建它",
+        original_user_message="创建它",
+        _should_review_memory=False,
+        _turn_exit_reason="interrupted",
+    )
+
+    assert result["final_response"] == receipt
+    assert result["messages"][-1]["content"] == "Operation interrupted.\n\n" + receipt
+    assert agent.persisted_messages[-1] == result["messages"][-1]

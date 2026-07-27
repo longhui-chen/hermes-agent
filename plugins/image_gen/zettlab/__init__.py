@@ -172,14 +172,16 @@ class ZettlabImageGenProvider(ImageGenProvider):
             resolutions = _capability_strings(model_capability, "resolutions")
             if resolutions:
                 payload["resolution"] = resolutions[0]
+            session_id = kwargs.get("_task_id")
             job = media_client.create_and_wait(
                 media_type="image",
                 model=model,
                 prompt=prompt,
                 timeout_seconds=media_client.timeout_from_model_capability("image", model_capability),
                 payload=payload,
+                session_id=session_id,
             )
-            image = media_client.first_asset_url(job)
+            image = media_client.first_asset_location(job, prefer_local=bool(session_id))
         except Exception as exc:
             return error_response(
                 error=f"Zettlab image generation failed: {exc}",

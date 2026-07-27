@@ -363,7 +363,12 @@ class TestCamofoxEvalFix:
         # Should NOT call _get_session at all — _ensure_tab handles it
         assert "_get_session" not in src, \
             "_camofox_eval should not call _get_session (removed unused import)"
-        # Should use body= not json_data=
         assert "json_data=" not in src, \
-            "_camofox_eval should use body= kwarg for _post, not json_data="
-        assert "body=" in src
+            "_camofox_eval must not use the json_data= kwarg"
+        # Evaluating arbitrary JS changes the document like any other mutation,
+        # so it goes through the per-identity critical section rather than
+        # posting directly.
+        assert "_mutating_tab_call(" in src, \
+            "_camofox_eval must run inside the browser identity lock"
+        assert "_post(" not in src, \
+            "_camofox_eval must not bypass _mutating_tab_call"

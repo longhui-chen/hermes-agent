@@ -281,10 +281,14 @@ def _disable_thinking_for_forced_tool_choice(api_kwargs: Dict[str, Any]) -> None
 
 
 def _should_end_after_present_plan(agent: Any) -> bool:
+    # App plan mode ends the turn right after present_plan ONLY when auto-execute
+    # is off (the manual confirmation card). With auto-execute on (the default)
+    # the turn keeps running so the plan is carried out in the same turn.
     return (
         (getattr(agent, "platform", "") or "") == "zet_agent"
         and bool(getattr(agent, "_zet_agent_plan_mode_active", False))
         and bool(getattr(agent, "_zet_agent_plan_presented", False))
+        and not bool(getattr(agent, "_zet_agent_plan_auto_execute", False))
     )
 
 

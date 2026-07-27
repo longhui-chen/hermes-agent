@@ -86,6 +86,20 @@ def _make_plugin_dir(base: Path, name: str, *, register_body: str = "pass",
     return plugin_dir
 
 
+def _disable_plugin(base: Path, name: str) -> None:
+    """Disable a bundled plugin when a test needs an isolated hook set."""
+    hermes_home = base.parent
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    cfg_path = hermes_home / "config.yaml"
+    cfg = yaml.safe_load(cfg_path.read_text()) if cfg_path.exists() else {}
+    cfg = cfg or {}
+    plugins_cfg = cfg.setdefault("plugins", {})
+    disabled = plugins_cfg.setdefault("disabled", [])
+    if name not in disabled:
+        disabled.append(name)
+    cfg_path.write_text(yaml.safe_dump(cfg))
+
+
 # ── TestPluginDiscovery ────────────────────────────────────────────────────
 
 
@@ -712,6 +726,7 @@ class TestPluginHooks:
     def test_hook_return_values_collected(self, tmp_path, monkeypatch):
         """invoke_hook() collects non-None return values from callbacks."""
         plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _disable_plugin(plugins_dir, "creation-governor")
         _make_plugin_dir(
             plugins_dir, "ctx_plugin",
             register_body=(
@@ -1676,6 +1691,7 @@ class TestPreLlmCallTargetRouting:
 
     def _make_pre_llm_plugin(self, plugins_dir, name, return_expr):
         """Create a plugin that returns a specific value from pre_llm_call."""
+        _disable_plugin(plugins_dir, "creation-governor")
         _make_plugin_dir(
             plugins_dir, name,
             register_body=(
