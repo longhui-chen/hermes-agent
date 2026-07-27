@@ -41,7 +41,7 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 # Live transcript directories older than this are pruned on new dispatches.
-LIVE_RETENTION_DAYS = 7
+LIVE_RETENTION_DAYS = 30  # zettlab: 30 天回放窗口（产品拍板 2026-07-27），过期后完成卡降级为纯摘要
 
 # Per-line truncation budgets (chars). The .log is a compact operational
 # view, not the full-fidelity record — the child's SessionDB transcript and
