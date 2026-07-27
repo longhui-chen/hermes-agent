@@ -2126,6 +2126,46 @@ class TestCallLlmPaymentFallback:
         finally:
             mod.clear_runtime_main()
 
+    def test_fail_fast_preserves_registered_auxiliary_task_route(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = _DummyResponse("ok")
+        task_config = {
+            "provider": "custom",
+            "model": "zettlab-creation-fast",
+            "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+            "api_key": "local-ai-proxy",
+        }
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value=task_config,
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=(
+                "custom",
+                "zettlab-creation-fast",
+                "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+                "local-ai-proxy",
+                None,
+            ),
+        ) as resolve, patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(client, "zettlab-creation-fast"),
+        ):
+            call_llm(
+                task="creation_governor_checkpoint",
+                messages=[{"role": "user", "content": "private conversation"}],
+                fail_fast=True,
+            )
+
+        assert resolve.call_args.args == (
+            "creation_governor_checkpoint",
+            None,
+            None,
+            None,
+            None,
+        )
+
     def test_429_rate_limit_triggers_fallback(self, monkeypatch):
         """429 rate-limit errors should trigger fallback to next provider."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")

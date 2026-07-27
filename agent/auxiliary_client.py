@@ -7045,7 +7045,20 @@ def call_llm(
     # concurrent /model switch produce a key for one runtime and a client for
     # another.
     main_runtime = _normalize_main_runtime(main_runtime)
-    if fail_fast and provider is None:
+    task_config = _get_auxiliary_task_config(task) if task else {}
+    has_configured_task_route = any(
+        str(task_config.get(key) or "").strip()
+        for key in (
+            "provider",
+            "model",
+            "base_url",
+            "api_key",
+            "key_env",
+            "api_key_env",
+            "api_mode",
+        )
+    )
+    if fail_fast and provider is None and not has_configured_task_route:
         provider = str(main_runtime.get("provider") or _read_main_provider())
         model = model or str(main_runtime.get("model") or _read_main_model())
         base_url = base_url or str(main_runtime.get("base_url") or "")

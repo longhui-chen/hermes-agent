@@ -39,12 +39,16 @@ class _Context:
         self.llm = _Llm()
         self.tools = []
         self.hooks = []
+        self.auxiliary_tasks = []
 
     def register_tool(self, **kwargs):
         self.tools.append(kwargs)
 
     def register_hook(self, *args, **kwargs):
         self.hooks.append((args, kwargs))
+
+    def register_auxiliary_task(self, **kwargs):
+        self.auxiliary_tasks.append(kwargs)
 
 
 def test_bundled_backend_loads_with_empty_plugins_enabled(tmp_path, monkeypatch):
@@ -60,6 +64,7 @@ def test_bundled_backend_loads_with_empty_plugins_enabled(tmp_path, monkeypatch)
     assert loaded.enabled is True, loaded.error
     assert loaded.tools_registered == ["detect_creation_opportunity"]
     assert set(loaded.hooks_registered) == {"pre_llm_call", "transform_llm_output"}
+    assert manager._aux_tasks["creation_governor_checkpoint"]["plugin"] == "creation-governor"
 
 
 def test_registered_hooks_produce_a_complete_answer_plus_attachment_envelope():
