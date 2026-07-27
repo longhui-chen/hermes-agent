@@ -3964,8 +3964,14 @@ class APIServerAdapter(BasePlatformAdapter):
             # final response rather than the pre-transform draft.
             if result_dict.get("response_transformed"):
                 final_response = result_dict.get("final_response") or ""
+                transform_suffix = result_dict.get("response_transform_suffix")
                 streamed_response = "".join(streamed_text_parts)
-                if final_response.startswith(streamed_response):
+                if isinstance(transform_suffix, str) and transform_suffix:
+                    # The finalizer computes this against the exact pre-hook
+                    # response. It remains valid even when the live stream also
+                    # contained interim assistant text from earlier tool steps.
+                    await _emit(transform_suffix)
+                elif final_response.startswith(streamed_response):
                     transformed_suffix = final_response[len(streamed_response):]
                     if transformed_suffix:
                         await _emit(transformed_suffix)

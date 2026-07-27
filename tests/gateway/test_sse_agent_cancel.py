@@ -389,6 +389,7 @@ class TestSSETransformedResponseDelivery:
     def test_append_only_transform_emits_missing_suffix_before_done(self):
         adapter = _make_adapter()
         stream_q = queue.Queue()
+        stream_q.put("interim tool-step text")
         stream_q.put("original answer")
         stream_q.put(None)
 
@@ -397,6 +398,7 @@ class TestSSETransformedResponseDelivery:
                 {
                     "final_response": "original answer\n\n[plugin envelope]",
                     "response_transformed": True,
+                    "response_transform_suffix": "\n\n[plugin envelope]",
                     "completed": True,
                 },
                 {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
@@ -431,5 +433,7 @@ class TestSSETransformedResponseDelivery:
             if "content" in delta:
                 content_deltas.append(delta["content"])
 
-        assert "".join(content_deltas) == "original answer\n\n[plugin envelope]"
+        assert "".join(content_deltas) == (
+            "interim tool-step textoriginal answer\n\n[plugin envelope]"
+        )
         assert sse.index("[plugin envelope]") < sse.index("data: [DONE]")
