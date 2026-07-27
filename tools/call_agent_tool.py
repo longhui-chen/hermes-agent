@@ -65,9 +65,15 @@ def _call_url() -> str:
 def _own_session_id() -> str:
     """The caller's hermes session id, parsed from the gateway session_key.
 
-    session_key shape: ``agent:main:zet_agent:<chat_type>:<chat_id>`` where
-    chat_id itself contains colons — strip the known prefix, keep the rest.
-    Empty for CLI contexts (the endpoint then rejects the call: no owner).
+    Two real-world shapes (mirrors local-server's
+    hermesSessionIDFromSessionKey):
+
+    - ``agent:main:zet_agent:<chat_type>:<chat_id>`` (cron-originated) —
+      strip the known prefix, keep the rest (chat_id itself has colons);
+    - ``zettlab:<user>:<agent>:<chat>`` — zet_agent chat turns bind the
+      local-server session id verbatim; use it as-is.
+
+    Empty for CLI/unknown contexts (the endpoint then rejects: no owner).
     """
     try:
         from tools.approval import get_current_session_key
@@ -78,6 +84,8 @@ def _own_session_id() -> str:
     marker = ":zet_agent:"
     idx = key.find(marker)
     if idx < 0:
+        if key.startswith("zettlab:") and key.count(":") >= 3:
+            return key
         return ""
     rest = key[idx + len(marker):]
     sep = rest.find(":")

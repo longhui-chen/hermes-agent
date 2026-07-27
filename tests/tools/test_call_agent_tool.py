@@ -119,3 +119,30 @@ def test_no_reply_and_no_error_normalised(call_env, monkeypatch):
     )
     out = json.loads(cat.call_agent(agent="B", message="x"))
     assert out["error"] == "agent call returned no reply"
+
+
+def test_own_session_id_shapes(call_env):
+    """真机两种 session_key 形状（镜像 LS hermesSessionIDFromSessionKey）。"""
+    from tools.approval import reset_current_session_key, set_current_session_key
+
+    # cron 形态：agent:main:zet_agent:<chat_type>:<chat_id>（chat_id 含冒号）
+    token = set_current_session_key("agent:main:zet_agent:dm:zettlab:u1:agentA:7")
+    try:
+        assert cat._own_session_id() == "zettlab:u1:agentA:7"
+    finally:
+        reset_current_session_key(token)
+
+    # 真机聊天形态：zet_agent 原样绑定裸 LS 会话 id（无 :zet_agent: 中缀）——
+    # 修复前这里返回 ""，导致 call_agent 一律 LS 400。
+    token = set_current_session_key("zettlab:local-dev:main:yt-qnbPfqzR-")
+    try:
+        assert cat._own_session_id() == "zettlab:local-dev:main:yt-qnbPfqzR-"
+    finally:
+        reset_current_session_key(token)
+
+    # CLI / 未知形状：fail-closed 空
+    token = set_current_session_key("default")
+    try:
+        assert cat._own_session_id() == ""
+    finally:
+        reset_current_session_key(token)
