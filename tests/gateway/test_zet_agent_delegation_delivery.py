@@ -421,16 +421,11 @@ def test_resolver_claims_own_session(monkeypatch):
 
 def test_resolver_fail_closed(monkeypatch):
     adapter = _adapter(monkeypatch)
-    # 不认识的会话 / 空 key / DB 探测异常，一律不认领。
+    # 不认识的会话 / 空 key 不认领；DB 探测异常改抛 transient（见下组测试）
+    # —— 折进 None 会把可重试的完成事件当「无路由」丢弃。
     monkeypatch.setattr(adapter, "_ensure_session_db", lambda: _FakeSessionDB(set()))
     assert adapter.resolve_process_event_source("zettlab:u1:agentA:1") is None
     assert adapter.resolve_process_event_source("") is None
-
-    def _boom():
-        raise RuntimeError("db unavailable")
-
-    monkeypatch.setattr(adapter, "_ensure_session_db", _boom)
-    assert adapter.resolve_process_event_source("zettlab:u1:agentA:1") is None
 
 
 def _fake_runner(adapter):
@@ -470,3 +465,105 @@ def test_build_process_event_source_still_unresolvable_for_foreign_keys(monkeypa
     runner = _fake_runner(adapter)
     evt = {"type": "async_delegation", "session_key": "zettlab:u1:agentA:1"}
     assert GatewayRunner._build_process_event_source(runner, evt) is None
+
+
+# ---------------------------------------------------------------------------
+# Transient vs definitive route resolution (completion delivery retry)
+# ---------------------------------------------------------------------------
+
+
+def test_resolver_returns_none_for_unknown_session(monkeypatch):
+    """Definitive "not ours" stays None — foreign keys remain unroutable."""
+    adapter = _adapter(monkeypatch)
+
+    class _DB:
+        @staticmethod
+        def get_session(key):
+            return None
+
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: _DB())
+    assert adapter.resolve_process_event_source("zettlab:u1:agentA:1") is None
+
+
+def test_resolver_raises_transient_on_probe_error(monkeypatch):
+    """SQLite busy / unreadable DB must NOT fold into "no route": the event
+    would leave the in-memory queue while its durable row is never rescanned
+    in this process — the user waits for a gateway restart. Raising the
+    transient marker lets delivery loops requeue and retry."""
+    import sqlite3
+
+    from gateway.run import TransientRouteResolutionError
+
+    adapter = _adapter(monkeypatch)
+
+    def _boom():
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(adapter, "_ensure_session_db", _boom)
+    with pytest.raises(TransientRouteResolutionError):
+        adapter.resolve_process_event_source("zettlab:u1:agentA:1")
+
+
+def test_build_process_event_source_propagates_transient(monkeypatch):
+    """GatewayRunner._build_process_event_source re-raises the transient
+    marker instead of swallowing it into the generic resolver except."""
+    from gateway.run import GatewayRunner, TransientRouteResolutionError
+
+    runner = object.__new__(GatewayRunner)
+
+    class _TransientResolver:
+        @staticmethod
+        def resolve_process_event_source(session_key):
+            raise TransientRouteResolutionError("probe failed")
+
+    runner.adapters = {object(): _TransientResolver()}
+    evt = {"type": "async_delegation", "session_key": "zettlab:u1:agentA:1"}
+    with pytest.raises(TransientRouteResolutionError):
+        runner._build_process_event_source(evt)
+
+
+# ---------------------------------------------------------------------------
+# Turn rebind carries the async-delivery capability (env-gated)
+# ---------------------------------------------------------------------------
+
+
+def _with_api_server_binding():
+    """Simulate _bind_api_server_session's False that the rebind overwrites."""
+    from gateway.session_context import set_session_vars
+
+    return set_session_vars(
+        platform="api_server",
+        chat_id="s1",
+        session_key="s1",
+        session_id="s1",
+        async_delivery=False,
+    )
+
+
+def test_turn_rebind_enables_async_delivery_with_env(monkeypatch):
+    from gateway.session_context import async_delivery_supported, clear_session_vars
+
+    monkeypatch.setenv(_ADVANCE_ENV, _ADVANCE_URL)
+    adapter = _adapter(monkeypatch)
+    tokens = _with_api_server_binding()
+    try:
+        adapter._bind_turn_session_context("zettlab:u1:agentA:1")
+        assert async_delivery_supported() is True
+    finally:
+        clear_session_vars(tokens)
+
+
+def test_turn_rebind_keeps_async_delivery_off_without_env(monkeypatch):
+    """Without ZET_DELEGATION_ADVANCE_URL the rebind must NOT flip the
+    contextvar back to default-True: delegate_task would promise background
+    delivery nobody can fulfil (#10760-style silent no-op)."""
+    from gateway.session_context import async_delivery_supported, clear_session_vars
+
+    monkeypatch.delenv(_ADVANCE_ENV, raising=False)
+    adapter = _adapter(monkeypatch)
+    tokens = _with_api_server_binding()
+    try:
+        adapter._bind_turn_session_context("zettlab:u1:agentA:1")
+        assert async_delivery_supported() is False
+    finally:
+        clear_session_vars(tokens)

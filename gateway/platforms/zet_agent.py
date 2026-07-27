@@ -565,6 +565,42 @@ class ZetAgentAdapter(APIServerAdapter):
         """
         return bool(_delegation_advance_url())
 
+    def _bind_turn_session_context(self, session_id: str) -> None:
+        """Rebind session contextvars for this turn's agent build.
+
+        ZettClaw — 让 cronjob tool 自动设 origin: 把当前 chat session_id 注入
+        contextvars，cronjob_tools._origin_from_env 会读到 platform/chat_id
+        自动填到 cron job.origin。否则 cron 触发时 OriginStrategy 找不到 chat
+        → 走 NewSession 兜底创 phantom session, APP 看不到推送。
+
+        tokens 不显式 reset — contextvars 是 task-local，task 结束自动清；
+        同 task 内多次 _create_agent 后 set 会覆盖前值，符合预期。
+
+        async_delivery 必须显式传：这次 set 覆盖了上游
+        _bind_api_server_session 刚写下的 False，而参数默认值是 True——不
+        显式绑定 supports_async_delivery（env 门控）的话，
+        ZET_DELEGATION_ADVANCE_URL 未配置的部署里 delegate_task 会承诺
+        background 却无处投递完成事件（#10760 型 silent no-op，durable 行
+        永远 claimable）；配置了则如实开闸。
+        """
+        if not session_id:
+            return
+        try:
+            from gateway.session_context import set_session_vars
+
+            set_session_vars(
+                platform="zet_agent",
+                chat_id=session_id,
+                chat_name="",  # 暂留空，APP 这边的 chat title 不通过这条路径来
+                thread_id="",
+                user_id="",
+                user_name="",
+                session_key=session_id,
+                async_delivery=self.supports_async_delivery,
+            )
+        except Exception as _e:
+            logger.warning("[zet_agent] set_session_vars failed (cron origin won't auto-populate): %s", _e)
+
     def resolve_process_event_source(self, session_key: str):
         """Claim synthetic process events whose session_key is a zet_agent
         session id.
@@ -584,13 +620,21 @@ class ZetAgentAdapter(APIServerAdapter):
             db = self._ensure_session_db()
             if db is None or db.get_session(key) is None:
                 return None
-        except Exception:
+        except Exception as exc:
+            # Probe ERROR ≠ "not ours". SQLite busy / briefly unreadable DB
+            # must surface as transient so the delivery loop requeues the
+            # event — folding it into None drops the completion from the
+            # in-memory queue while its durable row is never rescanned here.
             logger.debug(
                 "[zet_agent] session ownership probe failed for %s",
                 key,
                 exc_info=True,
             )
-            return None
+            from gateway.run import TransientRouteResolutionError
+
+            raise TransientRouteResolutionError(
+                f"session ownership probe failed for {key}"
+            ) from exc
         from gateway.session import SessionSource
 
         return SessionSource(
@@ -1635,26 +1679,8 @@ class ZetAgentAdapter(APIServerAdapter):
             + ("\n\n" + ephemeral_system_prompt if ephemeral_system_prompt else "")
         )
 
-        # ZettClaw — 让 cronjob tool 自动设 origin: 把当前 chat session_id 注入
-        # contextvars，cronjob_tools._origin_from_env 会读到 platform/chat_id
-        # 自动填到 cron job.origin。否则 cron 触发时 OriginStrategy 找不到 chat
-        # → 走 NewSession 兜底创 phantom session, APP 看不到推送。
-        if session_id:
-            try:
-                from gateway.session_context import set_session_vars
-                # tokens 不显式 reset — contextvars 是 task-local，task 结束自动清；
-                # 同 task 内多次 _create_agent 后 set 会覆盖前值，符合预期。
-                set_session_vars(
-                    platform="zet_agent",
-                    chat_id=session_id,
-                    chat_name="",  # 暂留空，APP 这边的 chat title 不通过这条路径来
-                    thread_id="",
-                    user_id="",
-                    user_name="",
-                    session_key=session_id,
-                )
-            except Exception as _e:
-                logger.warning("[zet_agent] set_session_vars failed (cron origin won't auto-populate): %s", _e)
+        # cron origin + async-delivery capability（见 helper docstring）。
+        self._bind_turn_session_context(session_id)
 
         from run_agent import AIAgent
         from gateway.run import (

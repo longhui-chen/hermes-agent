@@ -1023,3 +1023,27 @@ def test_interrupt_for_session_scoped_to_profile(tmp_path, monkeypatch):
         parent_session_id="shared-sid", profile_home=str(home_a),
     ) == 1
     _drain_for(r["delegation_id"])
+
+
+def test_restore_isolates_corrupt_profile_db(tmp_path, monkeypatch):
+    """Per-home fault isolation: a corrupt state.db earlier in the scan must
+    not abort restore — the outer caller catches once, so raising would skip
+    every remaining profile's pending completions on every boot."""
+    profile_home = tmp_path / "profiles" / "agent-b"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    r = ad.dispatch_async_delegation(
+        goal="survives-corruption", context=None, toolsets=None, role="leaf",
+        model="m", session_key="",
+        runner=lambda: {"status": "completed", "summary": "ok"},
+    )
+    assert _drain_for(r["delegation_id"]) is not None
+
+    # Default home enumerates FIRST and its state.db is garbage.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "state.db").write_bytes(b"not a sqlite database")
+
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 1
+    evt = restored.get_nowait()
+    assert evt["delegation_id"] == r["delegation_id"]
+    assert evt["profile_home"] == str(profile_home)

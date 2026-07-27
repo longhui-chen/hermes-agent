@@ -322,22 +322,39 @@ def restore_undelivered_completions(target_queue) -> int:
     """
     restored = 0
     for home, db_path in _iter_state_db_homes():
-        recover_abandoned_delegations(db_path, profile_home=str(home))
-        with _DB_LOCK, _connect(db_path) as conn:
-            rows = conn.execute(
-                """SELECT delegation_id, event_json FROM async_delegations
-                   WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
-                   ORDER BY completed_at, delegation_id"""
-            ).fetchall()
+        # Per-home fault isolation: one corrupted/locked state.db (or a single
+        # bad event_json row) must not abort the scan — the outer caller
+        # catches once, so raising here would silently skip every remaining
+        # profile's pending completions on every boot.
+        try:
+            recover_abandoned_delegations(db_path, profile_home=str(home))
+            with _DB_LOCK, _connect(db_path) as conn:
+                rows = conn.execute(
+                    """SELECT delegation_id, event_json FROM async_delegations
+                       WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
+                       ORDER BY completed_at, delegation_id"""
+                ).fetchall()
             for _delegation_id, payload in rows:
-                evt = json.loads(payload)
+                try:
+                    evt = json.loads(payload)
+                except Exception:
+                    logger.warning(
+                        "async_delegation restore: undecodable event_json for %s in %s; skipping row",
+                        _delegation_id, db_path,
+                    )
+                    continue
                 if isinstance(evt, dict):
                     evt["restored"] = True
                     # Rows written before profile stamping (or by legacy
                     # dispatches) recover their owner from WHERE they live.
                     evt.setdefault("profile_home", str(home))
                 target_queue.put(evt)
-            restored += len(rows)
+                restored += 1
+        except Exception:
+            logger.warning(
+                "async_delegation restore failed for %s; continuing with remaining profiles",
+                db_path, exc_info=True,
+            )
     return restored
 
 

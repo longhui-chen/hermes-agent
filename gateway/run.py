@@ -1588,6 +1588,19 @@ class SecondaryPortBindingConfigError(MultiplexConfigError):
     """A secondary profile conflicts with the multiplexer's shared listener."""
 
 
+class TransientRouteResolutionError(RuntimeError):
+    """Routing lookup for a completion event failed TRANSIENTLY.
+
+    Raised by adapter ``resolve_process_event_source`` implementations when
+    the ownership probe errored (SQLite busy, DB briefly unreadable) — as
+    opposed to a definitive "no route" ``None``. ``_build_process_event_source``
+    re-raises it so delivery loops requeue the event and retry later instead
+    of dropping it as unroutable: a dropped async-delegation completion's
+    durable row stays pending but is never rescanned in this process, so the
+    user would not see the result until the next gateway restart.
+    """
+
+
 @_contextmanager
 def _profile_runtime_scope(profile_home: "Path"):
     """Scope config/skills/memory AND credentials to a profile for one turn.
@@ -16973,6 +16986,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
                     try:
                         resolved = resolver(session_key)
+                    except TransientRouteResolutionError:
+                        # Transient probe failure: propagate so the delivery
+                        # loop requeues the event instead of dropping it as
+                        # unroutable (the durable row would stay pending but
+                        # never be rescanned in this process).
+                        raise
                     except Exception:
                         logger.debug(
                             "Adapter process-event source resolver failed for %s",
@@ -17387,9 +17406,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
                         break
-                    delivered = await self._deliver_completion_notification(
-                        synth_text, completion_evt,
-                    )
+                    try:
+                        delivered = await self._deliver_completion_notification(
+                            synth_text, completion_evt,
+                        )
+                    except TransientRouteResolutionError:
+                        # Same as delivered=False: the claim was released in
+                        # the finally block; retry on the next watcher tick
+                        # rather than letting the exception kill this task.
+                        delivered = False
                     if delivered is False:
                         # The process remains terminal; retry after failed
                         # adapter injection instead of suppressing the result.
