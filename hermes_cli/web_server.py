@@ -128,6 +128,26 @@ except ImportError:
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
 
+
+async def _to_thread_with_completion_barrier(func, /, *args, **kwargs):
+    """Offload a mutation without releasing its request on cancellation."""
+    worker = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError as cancelled:
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        try:
+            worker.result()
+        except BaseException:
+            pass
+        raise cancelled
+
 # ---------------------------------------------------------------------------
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
 # and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
@@ -3219,7 +3239,7 @@ async def delete_learning_node(body: LearningNodeRef):
     from agent.learning_mutations import delete_node
 
     with _profile_scope(body.profile):
-        res = delete_node(body.id)
+        res = await _to_thread_with_completion_barrier(delete_node, body.id)
     if not res.get("ok"):
         raise HTTPException(status_code=400, detail=res.get("message", "delete failed"))
     return res
@@ -3231,7 +3251,9 @@ async def update_learning_node(body: LearningNodeEdit):
     from agent.learning_mutations import edit_node
 
     with _profile_scope(body.profile):
-        res = edit_node(body.id, body.content)
+        res = await _to_thread_with_completion_barrier(
+            edit_node, body.id, body.content
+        )
     if not res.get("ok"):
         raise HTTPException(status_code=400, detail=res.get("message", "edit failed"))
     return res
@@ -13223,22 +13245,34 @@ async def reset_memory(body: MemoryReset):
     if target not in {"all", "memory", "user"}:
         raise HTTPException(status_code=400, detail="target must be all, memory, or user")
 
-    mem_dir = get_hermes_home() / "memories"
-    deleted = []
-    targets = []
-    if target in {"all", "memory"}:
-        targets.append("MEMORY.md")
-    if target in {"all", "user"}:
-        targets.append("USER.md")
-    for fname in targets:
-        path = mem_dir / fname
-        if path.exists():
-            try:
-                path.unlink()
-                deleted.append(fname)
-            except OSError as exc:
-                raise HTTPException(status_code=500, detail=f"Could not delete {fname}: {exc}")
-    return {"ok": True, "deleted": deleted}
+    from tools.memory_tool import (
+        MemoryImportConflict,
+        MemoryImportUnsupported,
+        reset_curated_memory,
+    )
+
+    try:
+        result = await asyncio.to_thread(reset_curated_memory, target)
+    except MemoryImportUnsupported as exc:
+        raise HTTPException(
+            status_code=501,
+            detail={
+                "code": "memory_reset_unsupported",
+                "message": str(exc),
+            },
+        )
+    except (OSError, MemoryImportConflict) as exc:
+        raise HTTPException(status_code=500, detail=f"Could not reset memory: {exc}")
+    if result.get("status") != "completed":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "memory_reset_cleanup_pending",
+                "message": "Memory cleanup is pending; retry reset to finish securely.",
+                "deleted": result["deleted"],
+            },
+        )
+    return {"ok": True, "deleted": result["deleted"], "status": "completed"}
 
 
 # ---------------------------------------------------------------------------

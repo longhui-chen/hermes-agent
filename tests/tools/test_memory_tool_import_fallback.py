@@ -4,6 +4,7 @@ import builtins
 import importlib
 import sys
 
+import tools as tools_package
 from tools.registry import registry
 
 
@@ -16,6 +17,9 @@ def test_memory_tool_imports_without_fcntl(monkeypatch, tmp_path):
         return original_import(name, globals, locals, fromlist, level)
 
     registry.deregister("memory")
+    # Keep the package attribute and sys.modules entry in sync across teardown;
+    # otherwise later tests can patch a stale module object after this reload.
+    monkeypatch.delattr(tools_package, "memory_tool", raising=False)
     monkeypatch.delitem(sys.modules, "tools.memory_tool", raising=False)
     monkeypatch.setattr(builtins, "__import__", fake_import)
 

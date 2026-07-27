@@ -28,6 +28,8 @@
 
   let
     cfg = config.services.hermes-agent;
+    profileHome = "${cfg.stateDir}/.hermes";
+    profileHomeShell = lib.escapeShellArg profileHome;
     effectivePackage =
       if cfg.extraPythonPackages == [ ] && cfg.extraDependencyGroups == [ ]
       then cfg.package
@@ -56,6 +58,13 @@
     configFile = if cfg.configFile != null then cfg.configFile else generatedConfigFile;
 
     configMergeScript = pkgs.callPackage ./configMergeScript.nix { };
+    safeProfileDirs = ./safeProfileDirs.py;
+    managedPluginsManifest = pkgs.writeText "hermes-managed-plugins.json" (
+      builtins.toJSON (map (plugin: {
+        name = lib.getName plugin;
+        target = toString plugin;
+      }) cfg.extraPlugins)
+    );
 
     # config.yaml mode: group-writable (0660) when interactive users share this
     # HERMES_HOME via addToSystemPackages, so they can save settings through the
@@ -131,14 +140,12 @@
       chown "$HERMES_UID:$HERMES_GID" "$TARGET_HOME"
       chmod 0750 "$TARGET_HOME"
 
-      # Ensure HERMES_HOME is owned by the target user.
-      # Use find instead of chown -R: chown strips the setgid bit (kernel
-      # behavior), destroying the 2770 permissions the NixOS activation
-      # script sets for group access by hostUsers.  Only touch files with
-      # wrong ownership so correctly-owned dirs keep their permission bits.
-      if [ -n "''${HERMES_HOME:-}" ] && [ -d "$HERMES_HOME" ]; then
-        find "$HERMES_HOME" \! -user "$HERMES_UID" -exec chown "$HERMES_UID:$HERMES_GID" {} +
-      fi
+      # Normalize the mounted profile and publish its exact opened identity.
+      install -d -o root -g root -m 0755 /run/hermes-agent
+      PROFILE_IDENTITY="$(${pkgs.python3}/bin/python3 ${safeProfileDirs} \
+        --recursive-ownership \
+        --trust-anchor /run/hermes-agent/profile-trust \
+        "$HERMES_HOME" "$HERMES_UID" "$HERMES_GID")"
 
       # ── Provision apt packages (first boot only, cached in writable layer) ──
       # sudo: agent self-modification
@@ -200,10 +207,12 @@
     # Package and entrypoint use stable symlinks (current-package, current-entrypoint)
     # so they can update without recreation. Env vars go through $HERMES_HOME/.env.
     containerIdentity = builtins.hashString "sha256" (builtins.toJSON {
-      schema = 4; # bump when identity inputs change (4: Node 18→22 via NodeSource)
+      schema = 6; # 6: identity also binds configured and resolved service uid/gid
       image = cfg.container.image;
       extraVolumes = cfg.container.extraVolumes;
       extraOptions = cfg.container.extraOptions;
+      user = cfg.user;
+      group = cfg.group;
     });
 
     identityFile = "${cfg.stateDir}/.container-identity";
@@ -709,12 +718,6 @@
       {
         systemd.tmpfiles.rules = [
           "d ${cfg.stateDir}                2770 ${cfg.user} ${cfg.group} - -"
-          "d ${cfg.stateDir}/.hermes        2770 ${cfg.user} ${cfg.group} - -"
-          "d ${cfg.stateDir}/.hermes/cron   2770 ${cfg.user} ${cfg.group} - -"
-          "d ${cfg.stateDir}/.hermes/sessions 2770 ${cfg.user} ${cfg.group} - -"
-          "d ${cfg.stateDir}/.hermes/logs   2770 ${cfg.user} ${cfg.group} - -"
-          "d ${cfg.stateDir}/.hermes/memories 2770 ${cfg.user} ${cfg.group} - -"
-          "d ${cfg.stateDir}/.hermes/plugins 2770 ${cfg.user} ${cfg.group} - -"
           "d ${cfg.stateDir}/home           0750 ${cfg.user} ${cfg.group} - -"
           "d ${cfg.workingDirectory}         2770 ${cfg.user} ${cfg.group} - -"
         ];
@@ -724,26 +727,29 @@
       {
         system.activationScripts."hermes-agent-setup" = lib.stringAfter ([ "users" ] ++ lib.optional (config.system.activationScripts ? setupSecrets) "setupSecrets") ''
           # Ensure directories exist (activation runs before tmpfiles)
-          mkdir -p ${cfg.stateDir}/.hermes
           mkdir -p ${cfg.stateDir}/home
           mkdir -p ${cfg.workingDirectory}
-          chown ${cfg.user}:${cfg.group} ${cfg.stateDir} ${cfg.stateDir}/.hermes ${cfg.stateDir}/home ${cfg.workingDirectory}
-          chmod 2770 ${cfg.stateDir} ${cfg.stateDir}/.hermes ${cfg.workingDirectory}
+          chown ${cfg.user}:${cfg.group} ${cfg.stateDir} ${cfg.stateDir}/home ${cfg.workingDirectory}
+          chmod 2770 ${cfg.workingDirectory}
+          chmod 2770 ${cfg.stateDir}
           chmod 0750 ${cfg.stateDir}/home
 
-          # Create subdirs, set setgid + group-writable, migrate existing files.
-          # Nix-managed .env/.managed stay 0640/0644; config.yaml uses
-          # configYamlMode (0660 under addToSystemPackages, else 0640).
-          find ${cfg.stateDir}/.hermes -maxdepth 1 \
-            \( -name "*.db" -o -name "*.db-wal" -o -name "*.db-shm" -o -name "SOUL.md" \) \
-            -exec chmod g+rw {} + 2>/dev/null || true
-          for _subdir in cron sessions logs memories plugins; do
-            mkdir -p "${cfg.stateDir}/.hermes/$_subdir"
-            chown ${cfg.user}:${cfg.group} "${cfg.stateDir}/.hermes/$_subdir"
-            chmod 2770 "${cfg.stateDir}/.hermes/$_subdir"
-            find "${cfg.stateDir}/.hermes/$_subdir" -type f \
-              -exec chmod g+rw {} + 2>/dev/null || true
-          done
+          PROFILE_UID="$(${pkgs.coreutils}/bin/id -u ${lib.escapeShellArg cfg.user})"
+          PROFILE_GID="$(${pkgs.glibc.bin}/bin/getent group ${lib.escapeShellArg cfg.group} | ${pkgs.coreutils}/bin/cut -d: -f3)"
+          PROFILE_HOME=${profileHomeShell}
+          install -d -o root -g root -m 0755 /run/hermes-agent
+          ACTIVATION_TMP="$(mktemp -d /run/hermes-agent/activation.XXXXXX)"
+          _cleanup_profile_activation() { rm -rf "$ACTIVATION_TMP"; }
+          trap _cleanup_profile_activation EXIT
+          PROFILE_IDENTITY="$(${pkgs.python3}/bin/python3 ${safeProfileDirs} \
+            --shared-file-modes \
+            --trust-anchor /run/hermes-agent/profile-trust \
+            "$PROFILE_HOME" "$PROFILE_UID" "$PROFILE_GID")"
+          _profile_leaf() {
+            ${pkgs.python3}/bin/python3 ${safeProfileDirs} \
+              --expected-identity "$PROFILE_IDENTITY" \
+              "$PROFILE_HOME" "$PROFILE_UID" "$PROFILE_GID" "$@"
+          }
 
           # Merge Nix settings into existing config.yaml.
           # Preserves user-added keys (skills, streaming, etc.); Nix keys win.
@@ -751,33 +757,36 @@
           # Mode is configYamlMode (0660 under addToSystemPackages so interactive
           # hermes-group users can save settings via the CLI/TUI, else 0640).
           ${if cfg.configFile != null then ''
-            install -o ${cfg.user} -g ${cfg.group} -m ${configYamlMode} -D ${configFile} ${cfg.stateDir}/.hermes/config.yaml
+            _profile_leaf --write-leaf config.yaml \
+              --content-file ${configFile} --leaf-mode ${configYamlMode}
           '' else ''
-            ${configMergeScript} ${generatedConfigFile} ${cfg.stateDir}/.hermes/config.yaml
-            chown ${cfg.user}:${cfg.group} ${cfg.stateDir}/.hermes/config.yaml
-            chmod ${configYamlMode} ${cfg.stateDir}/.hermes/config.yaml
+            _profile_leaf --read-leaf config.yaml > "$ACTIVATION_TMP/config.yaml"
+            ${configMergeScript} ${generatedConfigFile} "$ACTIVATION_TMP/config.yaml"
+            _profile_leaf --write-leaf config.yaml \
+              --content-file "$ACTIVATION_TMP/config.yaml" --leaf-mode ${configYamlMode}
           ''}
 
-          # Managed mode marker (so interactive shells also detect NixOS management)
-          touch ${cfg.stateDir}/.hermes/.managed
-          chown ${cfg.user}:${cfg.group} ${cfg.stateDir}/.hermes/.managed
-          chmod 0644 ${cfg.stateDir}/.hermes/.managed
+          # Managed mode marker (so interactive shells also detect NixOS management).
+          # The content source must be a regular file: _read_bounded_content_file
+          # rejects character devices like /dev/null with EINVAL.
+          : > "$ACTIVATION_TMP/managed-marker"
+          _profile_leaf --write-leaf .managed --content-file "$ACTIVATION_TMP/managed-marker" --leaf-mode 0644
 
           # Container mode metadata — tells the host CLI to exec into the
           # container instead of running locally. Removed when container mode
           # is disabled so the host CLI falls back to native execution.
           ${if cfg.container.enable then ''
-            cat > ${cfg.stateDir}/.hermes/.container-mode <<'HERMES_CONTAINER_MODE_EOF'
+            cat > "$ACTIVATION_TMP/container-mode" <<'HERMES_CONTAINER_MODE_EOF'
     # Written by NixOS activation script. Do not edit manually.
     backend=${cfg.container.backend}
     container_name=${containerName}
     exec_user=${cfg.user}
     hermes_bin=${containerDataDir}/current-package/bin/hermes
     HERMES_CONTAINER_MODE_EOF
-            chown ${cfg.user}:${cfg.group} ${cfg.stateDir}/.hermes/.container-mode
-            chmod 0644 ${cfg.stateDir}/.hermes/.container-mode
+            _profile_leaf --write-leaf .container-mode \
+              --content-file "$ACTIVATION_TMP/container-mode" --leaf-mode 0644
           '' else ''
-            rm -f ${cfg.stateDir}/.hermes/.container-mode
+            _profile_leaf --remove-leaf .container-mode
 
             # Remove symlink bridge for hostUsers
             ${lib.concatStringsSep "\n" (map (user:
@@ -819,11 +828,11 @@
           # Seed auth file if provided
           ${lib.optionalString (cfg.authFile != null) ''
             ${if cfg.authFileForceOverwrite then ''
-              install -o ${cfg.user} -g ${cfg.group} -m 0600 ${cfg.authFile} ${cfg.stateDir}/.hermes/auth.json
+              _profile_leaf --write-leaf auth.json \
+                --content-file ${cfg.authFile} --leaf-mode 0600
             '' else ''
-              if [ ! -f ${cfg.stateDir}/.hermes/auth.json ]; then
-                install -o ${cfg.user} -g ${cfg.group} -m 0600 ${cfg.authFile} ${cfg.stateDir}/.hermes/auth.json
-              fi
+              _profile_leaf --write-leaf auth.json --if-missing \
+                --content-file ${cfg.authFile} --leaf-mode 0600
             ''}
           ''}
 
@@ -831,8 +840,7 @@
           # Hermes reads $HERMES_HOME/.env at startup via load_hermes_dotenv(),
           # so this is the single source of truth for both native and container mode.
           ${lib.optionalString (cfg.environment != {} || cfg.environmentFiles != []) ''
-            ENV_FILE="${cfg.stateDir}/.hermes/.env"
-            install -o ${cfg.user} -g ${cfg.group} -m 0640 /dev/null "$ENV_FILE"
+            ENV_FILE="$ACTIVATION_TMP/env"
             cat > "$ENV_FILE" <<'HERMES_NIX_ENV_EOF'
     ${envFileContent}
     HERMES_NIX_ENV_EOF
@@ -842,6 +850,8 @@
                 cat "${f}" >> "$ENV_FILE"
               fi
             '') cfg.environmentFiles)}
+            _profile_leaf --write-leaf .env \
+              --content-file "$ENV_FILE" --leaf-mode 0640
           ''}
 
           # Link documents into workspace
@@ -850,20 +860,16 @@
           '') cfg.documents)}
 
         # ── Declarative plugins ─────────────────────────────────────────
-        # Remove stale managed symlinks (plugins removed from config)
-        find ${cfg.stateDir}/.hermes/plugins -maxdepth 1 -type l -name 'nix-managed-*' -delete 2>/dev/null || true
-
-        ${lib.concatStringsSep "\n" (map (plugin:
-          let
-            name = lib.getName plugin;
-          in ''
+          ${lib.concatStringsSep "\n" (map (plugin: ''
             if [ ! -f "${plugin}/plugin.yaml" ]; then
               echo "ERROR: extraPlugins entry '${plugin}' has no plugin.yaml" >&2
               exit 1
             fi
-            ln -sfn ${plugin} ${cfg.stateDir}/.hermes/plugins/nix-managed-${name}
-            chown -h ${cfg.user}:${cfg.group} ${cfg.stateDir}/.hermes/plugins/nix-managed-${name}
           '') cfg.extraPlugins)}
+          _profile_leaf --sync-plugins-manifest ${managedPluginsManifest}
+
+          _cleanup_profile_activation
+          trap - EXIT
         '';
       }
 
@@ -950,21 +956,23 @@
             ${pkgs.nix}/bin/nix-store --add-root ${cfg.stateDir}/.gc-root --indirect -r ${effectivePackage} 2>/dev/null || true
             ${pkgs.nix}/bin/nix-store --add-root ${cfg.stateDir}/.gc-root-entrypoint --indirect -r ${containerEntrypoint} 2>/dev/null || true
 
+            # Numeric mappings can drift even when the configured names stay the
+            # same, so they are part of the persisted container rebuild key.
+            HERMES_UID=$(${pkgs.coreutils}/bin/id -u ${lib.escapeShellArg cfg.user})
+            HERMES_GID=$(${pkgs.glibc.bin}/bin/getent group ${lib.escapeShellArg cfg.group} | ${pkgs.coreutils}/bin/cut -d: -f3)
+            EXPECTED_CONTAINER_IDENTITY="${containerIdentity}:$HERMES_UID:$HERMES_GID"
+
             # Check if container needs (re)creation
             NEED_CREATE=false
             if ! ${containerBin} inspect ${containerName} &>/dev/null; then
               NEED_CREATE=true
-            elif [ ! -f ${identityFile} ] || [ "$(cat ${identityFile})" != "${containerIdentity}" ]; then
+            elif [ ! -f ${identityFile} ] || [ "$(cat ${identityFile})" != "$EXPECTED_CONTAINER_IDENTITY" ]; then
               echo "Container config changed, recreating..."
               ${containerBin} rm -f ${containerName} || true
               NEED_CREATE=true
             fi
 
             if [ "$NEED_CREATE" = "true" ]; then
-              # Resolve numeric UID/GID — passed to entrypoint for in-container user setup
-              HERMES_UID=$(${pkgs.coreutils}/bin/id -u ${cfg.user})
-              HERMES_GID=$(${pkgs.coreutils}/bin/id -g ${cfg.user})
-
               echo "Creating container..."
               ${containerBin} create \
                 --name ${containerName} \
@@ -983,7 +991,7 @@
                 ${cfg.container.image} \
                 ${containerDataDir}/current-package/bin/hermes gateway run --replace ${lib.concatStringsSep " " cfg.extraArgs}
 
-              echo "${containerIdentity}" > ${identityFile}
+              echo "$EXPECTED_CONTAINER_IDENTITY" > ${identityFile}
             fi
           '';
 

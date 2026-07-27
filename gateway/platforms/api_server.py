@@ -51,7 +51,9 @@ import logging
 import os
 import re
 import sqlite3
+import stat
 import sys
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -1391,7 +1393,8 @@ class APIServerAdapter(BasePlatformAdapter):
         # is keyed by the scoped HERMES_HOME so profiles never share state.db.
         self._session_db: Optional[Any] = None
         self._session_dbs: Dict[str, Any] = {}
-        self._session_db_lock: Optional[asyncio.Lock] = None  # Single-flight for lazy init
+        self._session_db_lock: Optional[asyncio.Lock] = None  # Single-flight for lazy init (async)
+        self._session_db_init_lock = threading.Lock()  # Serializes cache read/open/publish
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
         # config.yaml gateway.api_server.max_concurrent_runs; 0 disables
@@ -2038,6 +2041,197 @@ class APIServerAdapter(BasePlatformAdapter):
     # Session DB helper
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _open_profile_session_db(profile_home: Path, *, create: bool = True):
+        """Open one profile's state DB without following an attacker link.
+
+        Linux production builds connect SQLite through ``/proc/self/fd`` so
+        schema setup and stale-import cleanup stay anchored to the exact inode
+        accepted by the no-follow check.  Other POSIX development platforms do
+        not provide a SQLite-compatible fd path, so they retain the before/after
+        identity checks; an active same-UID pathname race there is outside the
+        cross-profile boundary enforced by the Linux/Nix runtime.
+        """
+        from hermes_state import SessionDB
+
+        directory_flags = os.O_RDONLY
+        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_fd = os.open(profile_home, directory_flags)
+        try:
+            directory_stat = os.fstat(directory_fd)
+            if not stat.S_ISDIR(directory_stat.st_mode):
+                raise RuntimeError("profile home is not a directory")
+
+            leaf_flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+            leaf_flags |= getattr(os, "O_NOFOLLOW", 0)
+            if create:
+                leaf_flags |= os.O_CREAT
+            leaf_fd = os.open(
+                "state.db", leaf_flags, 0o600, dir_fd=directory_fd
+            )
+            try:
+                expected = os.fstat(leaf_fd)
+                if not stat.S_ISREG(expected.st_mode) or expected.st_nlink != 1:
+                    raise RuntimeError(
+                        "profile state.db must be a private regular file"
+                    )
+
+                # SQLite derives -wal/-shm/-journal names from the canonical
+                # pathname and opens them with ordinary follow-symlink open(),
+                # outside the /proc/self/fd anchor above. A pre-placed symlink
+                # or hardlink sidecar would redirect journal writes into
+                # another profile, so reject any sidecar that is not a private
+                # regular file on the profile's filesystem before connecting.
+                # (A racing swap after this check is not covered; closing that
+                # window needs a VFS-level no-follow open for sidecars.)
+                for sidecar_suffix in ("-wal", "-shm", "-journal"):
+                    sidecar_name = "state.db" + sidecar_suffix
+                    try:
+                        sidecar_fd = os.open(
+                            sidecar_name,
+                            os.O_RDONLY
+                            | getattr(os, "O_NOFOLLOW", 0)
+                            | getattr(os, "O_CLOEXEC", 0),
+                            dir_fd=directory_fd,
+                        )
+                    except FileNotFoundError:
+                        continue
+                    except OSError as sidecar_err:
+                        raise RuntimeError(
+                            f"profile {sidecar_name} must be a private regular file"
+                        ) from sidecar_err
+                    try:
+                        sidecar_stat = os.fstat(sidecar_fd)
+                        if (
+                            not stat.S_ISREG(sidecar_stat.st_mode)
+                            or sidecar_stat.st_nlink != 1
+                            or sidecar_stat.st_dev != directory_stat.st_dev
+                        ):
+                            raise RuntimeError(
+                                f"profile {sidecar_name} must be a private regular file"
+                            )
+                    finally:
+                        os.close(sidecar_fd)
+
+                db_path = profile_home / "state.db"
+                proc_fd_path = f"/proc/self/fd/{leaf_fd}"
+                if sys.platform.startswith("linux"):
+                    # Do not probe/fallback: an unlinked fd makes exists()
+                    # false even though the descriptor is still open. SQLite
+                    # must either connect through this anchor or fail closed.
+                    connection_path = proc_fd_path
+                else:
+                    connection_path = str(db_path)
+                # On Linux, SQLite resolves /proc/self/fd/N to the already-open
+                # inode. Keep leaf_fd alive through SessionDB construction so
+                # every schema/cleanup write remains bound to that inode even
+                # if the canonical pathname is swapped concurrently.
+                connection = sqlite3.connect(
+                    connection_path,
+                    check_same_thread=False,
+                    timeout=1.0,
+                    isolation_level=None,
+                )
+                try:
+                    current = os.stat(
+                        "state.db", dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    current_directory = os.stat(profile_home, follow_symlinks=False)
+                    if (
+                        not stat.S_ISREG(current.st_mode)
+                        or current.st_nlink != 1
+                        or (current.st_dev, current.st_ino)
+                        != (expected.st_dev, expected.st_ino)
+                        or (current_directory.st_dev, current_directory.st_ino)
+                        != (directory_stat.st_dev, directory_stat.st_ino)
+                    ):
+                        raise RuntimeError(
+                            "profile state.db changed while it was opened"
+                        )
+                    try:
+                        db = SessionDB(
+                            db_path,
+                            _preopened_connection=connection,
+                            _allow_path_reopen=False,
+                        )
+                    except BaseException:
+                        connection.close()
+                        raise
+                    # Re-check only to decide whether this connection may be
+                    # cached. On Linux a late rename cannot redirect the
+                    # procfd-anchored SQLite connection.
+                    current = os.stat(
+                        "state.db", dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    current_directory = os.stat(profile_home, follow_symlinks=False)
+                    if (
+                        not stat.S_ISREG(current.st_mode)
+                        or current.st_nlink != 1
+                        or (current.st_dev, current.st_ino)
+                        != (expected.st_dev, expected.st_ino)
+                        or (current_directory.st_dev, current_directory.st_ino)
+                        != (directory_stat.st_dev, directory_stat.st_ino)
+                    ):
+                        raise RuntimeError(
+                            "profile state.db changed during initialization"
+                        )
+                    db._profile_home_identity = (
+                        directory_stat.st_dev,
+                        directory_stat.st_ino,
+                    )
+                    db._profile_state_identity = (expected.st_dev, expected.st_ino)
+                    return db
+                except BaseException:
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
+                    raise
+            finally:
+                os.close(leaf_fd)
+        finally:
+            os.close(directory_fd)
+
+    @staticmethod
+    def _profile_session_db_is_current(profile_home: Path, db: Any) -> bool:
+        """Return whether a cached DB still belongs to this profile generation."""
+        expected_home = getattr(db, "_profile_home_identity", None)
+        expected_state = getattr(db, "_profile_state_identity", None)
+        if expected_home is None or expected_state is None:
+            return False
+
+        directory_flags = os.O_RDONLY
+        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_fd = None
+        leaf_fd = None
+        try:
+            directory_fd = os.open(profile_home, directory_flags)
+            directory_stat = os.fstat(directory_fd)
+            leaf_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            leaf_flags |= getattr(os, "O_NOFOLLOW", 0)
+            leaf_fd = os.open("state.db", leaf_flags, dir_fd=directory_fd)
+            state_stat = os.fstat(leaf_fd)
+            return (
+                stat.S_ISDIR(directory_stat.st_mode)
+                and stat.S_ISREG(state_stat.st_mode)
+                and state_stat.st_nlink == 1
+                and (directory_stat.st_dev, directory_stat.st_ino)
+                == tuple(expected_home)
+                and (state_stat.st_dev, state_stat.st_ino)
+                == tuple(expected_state)
+            )
+        except (OSError, TypeError, ValueError):
+            return False
+        finally:
+            if leaf_fd is not None:
+                os.close(leaf_fd)
+            if directory_fd is not None:
+                os.close(directory_fd)
+
     def _open_and_cache_session_db(self, home) -> Optional[Any]:
         """Sync core: return the cached SessionDB for ``home``, opening it once.
 
@@ -2047,20 +2241,35 @@ class APIServerAdapter(BasePlatformAdapter):
         — that stays reserved for an explicit test/manual override, so the first
         profile served can't pin every later request to its DB.
         """
-        from hermes_state import SessionDB
-
-        key = str(home)
-        cache = getattr(self, "_session_dbs", None)
-        if cache is None:
-            cache = {}
-            self._session_dbs = cache
-        db = cache.get(key)
-        if db is None:
-            db = SessionDB(db_path=home / "state.db")
+        # Lexical key: resolve() would follow a profile symlink before
+        # _open_profile_session_db can reject it with O_NOFOLLOW, and would
+        # also alias the cache entry to the link target.
+        key = os.path.abspath(os.fspath(home))
+        with self._session_db_init_lock:
+            cache = getattr(self, "_session_dbs", None)
+            if cache is None:
+                cache = {}
+                self._session_dbs = cache
+            existing = cache.get(key)
+            if existing is not None:
+                if self._profile_session_db_is_current(Path(key), existing):
+                    return existing
+                cache.pop(key, None)
+                if self._session_db is existing:
+                    self._session_db = None
+                try:
+                    existing.close()
+                except Exception:
+                    logger.warning("Invalidated SessionDB close failed", exc_info=True)
+            try:
+                db = self._open_profile_session_db(Path(key))
+            except Exception as e:
+                logger.debug("SessionDB unavailable for API server: %s", e)
+                return None
             cache[key] = db
-        return db
+            return db
 
-    def _ensure_session_db(self):
+    def _ensure_session_db(self, profile_home: Optional[Any] = None):
         """Lazily initialise and return the SessionDB for the active profile home.
 
         Sessions are persisted to ``state.db`` so that ``hermes sessions list``
@@ -2071,48 +2280,41 @@ class APIServerAdapter(BasePlatformAdapter):
         never the default profile's file. Synchronous: used by ``_create_agent``
         (itself sync, and run in both loop and worker contexts). Request
         handlers use ``_ensure_session_db_async`` to keep the SQLite open off
-        the event loop.
+        the event loop. ``profile_home`` may be passed explicitly (tests, and
+        callers that already resolved the scope); otherwise it is read from
+        ``get_hermes_home()``.
         """
         # Explicit override (tests / manual wiring) wins.
         if self._session_db is not None:
             return self._session_db
         try:
-            from hermes_constants import get_hermes_home
-
-            return self._open_and_cache_session_db(get_hermes_home())
+            if profile_home is None:
+                from hermes_constants import get_hermes_home
+                profile_home = get_hermes_home()
+            return self._open_and_cache_session_db(profile_home)
         except Exception as e:
             logger.debug("SessionDB unavailable for API server: %s", e)
             return None
 
-    async def _ensure_session_db_async(self):
-        """Async variant for request handlers: offload the SQLite open/schema
-        init off the single aiohttp event-loop thread.
+    async def _ensure_session_db_async(self, profile_home: Optional[Any] = None):
+        """Async entry for request handlers: run the synchronous resolver off
+        the shared aiohttp event-loop thread.
 
-        The active profile home is captured on the loop thread (its runtime
-        scope is not visible inside ``asyncio.to_thread``); only the blocking
-        construction runs in the worker. A single-flight lock prevents duplicate
-        concurrent construction for the same home.
+        The synchronous core (``_ensure_session_db`` ->
+        ``_open_and_cache_session_db``) owns the lexical cache key, the
+        generation check, the sidecar-anchored O_NOFOLLOW open and its threading
+        lock, so a single ``to_thread`` hop is enough and every cached-DB return
+        still passes the generation gate — unlike a lock-free ``cache[key]``
+        fast path, which could hand back a DB bound to a swapped-out profile
+        inode. ``asyncio.to_thread`` copies the context, so the profile-home
+        ContextVar scope resolves identically in the worker.
+
+        Cache publication happens on the worker thread; coordinating that
+        publish with the profile-unload barrier is tracked in hermes-agent#210.
         """
-        if self._session_db is not None:
-            return self._session_db
-        try:
-            from hermes_constants import get_hermes_home
-
-            home = get_hermes_home()
-            key = str(home)
-            cache = getattr(self, "_session_dbs", None)
-            if cache is not None and cache.get(key) is not None:
-                return cache[key]
-            if self._session_db_lock is None:
-                self._session_db_lock = asyncio.Lock()
-            async with self._session_db_lock:
-                cache = getattr(self, "_session_dbs", None)
-                if cache is not None and cache.get(key) is not None:
-                    return cache[key]
-                return await asyncio.to_thread(self._open_and_cache_session_db, home)
-        except Exception as e:
-            logger.debug("SessionDB unavailable for API server: %s", e)
-            return None
+        if profile_home is None:
+            return await asyncio.to_thread(self._ensure_session_db)
+        return await asyncio.to_thread(self._ensure_session_db, profile_home)
 
     @staticmethod
     def _profile_home_key(profile_home: Optional[Any] = None) -> str:

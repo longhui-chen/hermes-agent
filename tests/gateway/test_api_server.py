@@ -15,6 +15,7 @@ Tests cover:
 import asyncio
 import json
 import os
+from pathlib import Path
 import stat
 import time
 import uuid
@@ -4606,6 +4607,18 @@ class TestSessionIdHeader:
         ]
         mock_db = MagicMock()
         mock_db.get_messages_as_conversation.return_value = db_history
+        # The cache gate (_profile_session_db_is_current) evicts any cached DB
+        # whose recorded home/state.db file identity no longer matches disk —
+        # give the mock a REAL identity from the isolated HERMES_HOME so it
+        # passes the gate the way a genuinely opened DB would.
+        home = Path(auth_adapter._profile_home_key())
+        home.mkdir(parents=True, exist_ok=True)
+        state_path = home / "state.db"
+        state_path.touch()
+        home_stat = os.stat(home)
+        state_stat = os.stat(state_path)
+        mock_db._profile_home_identity = (home_stat.st_dev, home_stat.st_ino)
+        mock_db._profile_state_identity = (state_stat.st_dev, state_stat.st_ino)
         auth_adapter._session_db = mock_db
         auth_adapter._session_dbs[auth_adapter._profile_home_key()] = mock_db
         app = _create_app(auth_adapter)
@@ -5301,27 +5314,33 @@ class TestSessionDbOffEventLoop:
 
     @pytest.mark.asyncio
     async def test_ensure_session_db_first_request_path(self, auth_adapter):
-        """First /api/sessions request initializes SessionDB off the event loop."""
+        """First /api/sessions request opens the SessionDB off the event loop.
+
+        The open goes through the sidecar-anchored ``_open_profile_session_db``,
+        so we patch that (not the SessionDB class) and assert the open ran on a
+        worker thread, not the aiohttp event-loop thread.
+        """
         import threading
 
         captured = {}
+        loop_thread = threading.current_thread()
 
         class FakeDB:
-            def __init__(self, db_path=None):
-                captured["init_thread"] = threading.current_thread()
+            _profile_home_identity = None
+            _profile_state_identity = None
 
             def list_sessions_rich(self, **kwargs):
                 return []
 
+        def fake_open(profile_home, *, create=True):
+            captured["open_thread"] = threading.current_thread()
+            return FakeDB()
+
         # Simulate cold start -- no DB yet.
         auth_adapter._session_db = None
-        auth_adapter._session_db_lock = None
+        auth_adapter._session_dbs = {}
 
-        original_class = None
-        import hermes_state
-        original_class = hermes_state.SessionDB
-        hermes_state.SessionDB = FakeDB
-        try:
+        with patch.object(auth_adapter, "_open_profile_session_db", side_effect=fake_open):
             app = _create_app(auth_adapter)
             app.router.add_get("/api/sessions", auth_adapter._handle_list_sessions)
             async with TestClient(TestServer(app)) as cli:
@@ -5330,13 +5349,11 @@ class TestSessionDbOffEventLoop:
                     headers={"Authorization": "Bearer sk-secret"},
                 )
             assert resp.status == 200
-            # SessionDB() was constructed -- the init must NOT be on the event-loop thread.
-            assert "init_thread" in captured
-            assert captured["init_thread"] != threading.current_thread()
-        finally:
-            hermes_state.SessionDB = original_class
-            auth_adapter._session_db = None
-            auth_adapter._session_db_lock = None
+            # The open must NOT run on the event-loop thread.
+            assert "open_thread" in captured
+            assert captured["open_thread"] != loop_thread
+        auth_adapter._session_db = None
+        auth_adapter._session_dbs = {}
 class TestTakeoverUIHintOverSSE:
     """End-to-end coverage for the ui_hint field on the real streaming path.
 

@@ -112,8 +112,14 @@ class TestZetAgentProfileUnload:
 
         class _DB:
             closed = False
+            staging_discarded = False
+
+            def discard_runtime_import_staging(self):
+                self.staging_discarded = True
+                return 1
 
             def close(self):
+                assert self.staging_discarded is True
                 self.closed = True
 
         profile_home = tmp_path / "profiles" / "coder"
@@ -127,6 +133,7 @@ class TestZetAgentProfileUnload:
         )
 
         assert response.status == 200
+        assert db.staging_discarded is True
         assert db.closed is True
         assert adapter._session_dbs == {}
 

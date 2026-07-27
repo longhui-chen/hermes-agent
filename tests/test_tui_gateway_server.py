@@ -37,6 +37,47 @@ def _neuter_agent_prewarm_timer(request, monkeypatch):
     yield
 
 
+@pytest.mark.parametrize("method_name", ["learning.delete", "learning.edit"])
+def test_learning_mutations_use_non_cancellable_rpc_worker(
+    monkeypatch, method_name
+):
+    import agent.learning_mutations as mutations
+
+    started = threading.Event()
+    release = threading.Event()
+    written = threading.Event()
+    responses = []
+
+    def slow_mutation(*_args):
+        started.set()
+        assert release.wait(10)
+        return {"ok": True}
+
+    class _Transport:
+        def write(self, payload):
+            responses.append(payload)
+            written.set()
+            return True
+
+    operation = method_name.split(".", 1)[1]
+    monkeypatch.setattr(mutations, f"{operation}_node", slow_mutation)
+    params = {"id": "memory:memory:0"}
+    if operation == "edit":
+        params["content"] = "updated"
+    assert method_name in server._LONG_HANDLERS
+    assert server.dispatch(
+        {"id": "journey", "method": method_name, "params": params},
+        _Transport(),
+    ) is None
+    assert started.wait(2)
+    assert not written.is_set()
+    release.set()
+    assert written.wait(2)
+    assert responses == [
+        {"jsonrpc": "2.0", "id": "journey", "result": {"ok": True}}
+    ]
+
+
 def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()

@@ -113,6 +113,37 @@ _zet_agent_cron.install()
 logger = logging.getLogger(__name__)
 
 
+async def _to_thread_with_completion_barrier(func, /, *args, **kwargs):
+    """Keep a cancelled request alive until its non-cancellable worker exits.
+
+    ``asyncio.to_thread`` cancellation only cancels the asyncio wrapper. The
+    underlying thread keeps mutating profile state, so callers must not release
+    an unload barrier until that worker has actually finished. Cancellation is
+    still re-raised after the worker result/exception has been observed.
+    """
+    worker = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError as cancelled:
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                # A second cancellation request must not reopen the same race.
+                continue
+            except BaseException:
+                # The cancelled request must keep cancellation as its public
+                # outcome even when the worker finishes with an exception.
+                break
+        try:
+            worker.result()
+        except BaseException:
+            # Cancellation remains the externally visible outcome, but consume
+            # the worker exception so asyncio does not report it as unhandled.
+            pass
+        raise cancelled
+
+
 def _request_value(request: Any, key: str, default: Any = None) -> Any:
     """Read aiohttp request mapping values while tolerating simple test fakes."""
     getter = getattr(request, "get", None)
@@ -142,6 +173,11 @@ ZET_AGENT_DEFAULT_PORT = 7900
 # approval flow uses hermes' built-in timeout (``approval.gateway_timeout``,
 # default 300s) so we don't duplicate it here.
 CLARIFY_RESPONSE_TIMEOUT = 300.0
+
+# Expired runtime-import staging may contain complete source transcripts.
+# Sweep periodically even when no later import request arrives; each database
+# call deletes one bounded batch to avoid long write-lock holds on device.
+RUNTIME_IMPORT_CLEANUP_INTERVAL_SECONDS = 15 * 60
 
 # Default approval gateway timeout in seconds — must mirror the literal
 # default in tools/approval.py:1110. We read this independently so the
@@ -350,6 +386,150 @@ class ZetAgentAdapter(APIServerAdapter):
         # title generation so titles remain fully owned by Hermes SessionDB.
         self._session_lock = threading.Lock()
         self._approval_session_ids: set[str] = set()
+
+        # Portable imports mutate profile-owned state outside the chat-run
+        # path. Track them explicitly so a successful profile unload cannot
+        # race a worker that later recreates the deleted profile directory.
+        self._runtime_import_operation_lock = threading.Lock()
+        self._runtime_import_operations: Dict[str, int] = {}
+        self._runtime_import_unload_barriers: Dict[
+            str, Dict[int, tuple[Optional[tuple[int, int]], bool]]
+        ] = {}
+        self._runtime_import_barrier_generation = 0
+
+    @staticmethod
+    def _profile_directory_identity(key: str) -> Optional[tuple[int, int]]:
+        try:
+            stat = Path(key).stat()
+            return int(stat.st_dev), int(stat.st_ino)
+        except OSError:
+            return None
+
+    def _begin_runtime_import_operation(self, profile_home: Optional[Any]) -> Optional[str]:
+        key = self._profile_home_key(profile_home)
+        with self._runtime_import_operation_lock:
+            if self._runtime_import_barriers_locked(key):
+                return None
+            self._runtime_import_operations[key] = (
+                self._runtime_import_operations.get(key, 0) + 1
+            )
+        return key
+
+    def _end_runtime_import_operation(self, key: Optional[str]) -> None:
+        if not key:
+            return
+        with self._runtime_import_operation_lock:
+            remaining = self._runtime_import_operations.get(key, 0) - 1
+            if remaining > 0:
+                self._runtime_import_operations[key] = remaining
+            else:
+                self._runtime_import_operations.pop(key, None)
+
+    def _runtime_import_barriers_locked(
+        self, key: str
+    ) -> Dict[int, tuple[Optional[tuple[int, int]], bool]]:
+        barriers = self._runtime_import_unload_barriers.get(key)
+        if not barriers:
+            return {}
+        current = self._profile_directory_identity(key)
+        # An absent directory remains blocked: otherwise an import request can
+        # recreate the profile it is meant to protect. A different live inode
+        # is a new profile generation, so only owners acquired for that exact
+        # generation continue to apply.
+        if current is None:
+            return barriers
+        retained = {
+            owner: state
+            for owner, state in barriers.items()
+            if state[0] == current
+        }
+        if retained:
+            self._runtime_import_unload_barriers[key] = retained
+        else:
+            self._runtime_import_unload_barriers.pop(key, None)
+        return retained
+
+    def _block_runtime_import_profile(
+        self, profile_home: Optional[Any]
+    ) -> tuple[int, Optional[int]]:
+        key = self._profile_home_key(profile_home)
+        with self._runtime_import_operation_lock:
+            active = int(self._runtime_import_operations.get(key, 0) or 0)
+            if active:
+                return active, None
+            self._runtime_import_barriers_locked(key)
+            self._runtime_import_barrier_generation += 1
+            owner = self._runtime_import_barrier_generation
+            self._runtime_import_unload_barriers.setdefault(key, {})[owner] = (
+                self._profile_directory_identity(key), False
+            )
+            return 0, owner
+
+    def _complete_runtime_import_profile_unload(
+        self, profile_home: Optional[Any], owner: Optional[int]
+    ) -> None:
+        if owner is None:
+            return
+        key = self._profile_home_key(profile_home)
+        with self._runtime_import_operation_lock:
+            barriers = self._runtime_import_unload_barriers.get(key)
+            if barriers is None or owner not in barriers:
+                return
+            identity, _pending = barriers[owner]
+            # Completed owners collapse to the newest generation. Pending
+            # owners remain individually reference-counted so one failed
+            # request can release only itself without growing the durable
+            # successful barrier set on repeated unload calls.
+            for previous_owner, (_previous_identity, completed) in tuple(
+                barriers.items()
+            ):
+                if completed:
+                    barriers.pop(previous_owner, None)
+            barriers[owner] = (identity, True)
+
+    def _unblock_runtime_import_profile(
+        self, profile_home: Optional[Any], owner: Optional[int]
+    ) -> None:
+        if owner is None:
+            return
+        key = self._profile_home_key(profile_home)
+        with self._runtime_import_operation_lock:
+            barriers = self._runtime_import_unload_barriers.get(key)
+            if barriers is None:
+                return
+            barriers.pop(owner, None)
+            if not barriers:
+                self._runtime_import_unload_barriers.pop(key, None)
+
+    def _snapshot_runtime_import_reload_barriers(
+        self, profile_home: Optional[Any]
+    ) -> tuple[str, frozenset[int]]:
+        key = self._profile_home_key(profile_home)
+        with self._runtime_import_operation_lock:
+            barriers = self._runtime_import_barriers_locked(key)
+            return key, frozenset(
+                owner for owner, (_identity, completed) in barriers.items()
+                if completed
+            )
+
+    def _release_runtime_import_reload_barriers(
+        self, key: str, owners: frozenset[int]
+    ) -> None:
+        if not owners:
+            return
+        with self._runtime_import_operation_lock:
+            barriers = self._runtime_import_unload_barriers.get(key)
+            if barriers is None:
+                return
+            for owner in owners:
+                barriers.pop(owner, None)
+            if not barriers:
+                self._runtime_import_unload_barriers.pop(key, None)
+
+    def _runtime_import_profile_is_blocked(self, profile_home: Optional[Any]) -> bool:
+        key = self._profile_home_key(profile_home)
+        with self._runtime_import_operation_lock:
+            return bool(self._runtime_import_barriers_locked(key))
 
     # ------------------------------------------------------------------
     # _stream_q closure sniffing
@@ -715,7 +895,7 @@ class ZetAgentAdapter(APIServerAdapter):
         agent = agent_ref[0] if isinstance(agent_ref, list) and agent_ref else None
         session_db = getattr(agent, "_session_db", None)
         if session_db is None:
-            session_db = self._ensure_session_db()
+            session_db = await self._ensure_session_db_async()
         if session_db is None:
             return
 
@@ -2009,8 +2189,9 @@ class ZetAgentAdapter(APIServerAdapter):
         local-server does NOT gate chat.steer on this (it always advertises
         capabilities.steer=true on the WS and degrades via the 404 →
         steer_dropped path against an old hermes), but the endpoint contract
-        is that /v1/capabilities lists the callable surface truthfully —
-        external orchestrators discover features here.
+        is that /v1/capabilities lists platform/API availability for external
+        orchestrators. When a profile does not exist yet, target-filesystem
+        publish support is finalized before the first import state mutation.
         """
         resp = await super()._handle_capabilities(request)
         if getattr(resp, "status", 200) != 200:
@@ -2019,12 +2200,302 @@ class ZetAgentAdapter(APIServerAdapter):
             payload = json.loads(resp.body)
         except Exception:
             return resp
+        from tools.memory_tool import portable_memory_import_supported
+
+        operation_key = self._begin_runtime_import_operation(
+            _request_value(request, "hermes_profile_home")
+        )
+        if operation_key is None:
+            memory_import_supported = False
+        else:
+            try:
+                memory_import_supported = await _to_thread_with_completion_barrier(
+                    portable_memory_import_supported
+                )
+            finally:
+                self._end_runtime_import_operation(operation_key)
         payload.setdefault("features", {})["session_steer"] = True
+        payload["features"]["completed_transcript_import"] = True
+        payload["features"]["curated_memory_import"] = memory_import_supported
         payload.setdefault("endpoints", {})["session_steer"] = {
             "method": "POST",
             "path": "/v1/sessions/{session_id}/steer",
         }
+        payload["endpoints"]["completed_transcript_import"] = {
+            "method": "POST",
+            "path": "/api/sessions/import",
+            "operations": ["stage", "commit", "abort"],
+        }
+        payload["endpoints"]["curated_memory_import"] = {
+            "method": "POST", "path": "/api/memory/import",
+            "enabled": memory_import_supported,
+        }
         return web.json_response(payload)
+
+    async def _handle_session_import(self, request: "web.Request") -> "web.Response":
+        """Stage and atomically publish completed external transcripts.
+
+        This endpoint intentionally accepts only completed user/assistant text.
+        It never restores system prompts, tool calls, approvals, credentials, or
+        any other in-flight runtime state.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        operation_key = self._begin_runtime_import_operation(
+            _request_value(request, "hermes_profile_home")
+        )
+        if operation_key is None:
+            return web.json_response(
+                {"error": {"message": "profile is unloaded", "type": "invalid_request_error",
+                           "code": "runtime_import_profile_unloaded"}},
+                status=409,
+            )
+        try:
+            body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("request body must be an object")
+            operation = body.get("operation")
+            import_id = body.get("import_id")
+            # SessionDB construction opens SQLite, initializes schema and may
+            # run bounded stale-import cleanup. Keep all of that off the shared
+            # aiohttp loop, and retain the profile operation barrier even if
+            # the request is cancelled while the worker is still opening.
+            session_db = await _to_thread_with_completion_barrier(
+                self._ensure_session_db
+            )
+            if session_db is None:
+                raise RuntimeError("session db unavailable")
+            if operation == "stage":
+                result = await _to_thread_with_completion_barrier(
+                    session_db.stage_completed_transcript_import,
+                    import_id=import_id,
+                    source=body.get("source"),
+                    source_session_id=body.get("source_session_id"),
+                    target_session_id=body.get("target_session_id"),
+                    title=body.get("title"),
+                    payload_sha256=body.get("payload_sha256"),
+                    expected_message_count=body.get("expected_message_count"),
+                    chunk_index=body.get("chunk_index"),
+                    messages=body.get("messages"),
+                )
+            elif operation == "commit":
+                result = await _to_thread_with_completion_barrier(
+                    session_db.commit_completed_transcript_import, import_id
+                )
+            elif operation == "abort":
+                result = await _to_thread_with_completion_barrier(
+                    session_db.abort_completed_transcript_import, import_id
+                )
+            else:
+                raise ValueError("operation must be stage, commit, or abort")
+            return web.json_response(result)
+        except Exception as exc:
+            from hermes_state import RuntimeImportConflict, RuntimeImportIncomplete
+            if isinstance(exc, RuntimeImportConflict):
+                status, code = 409, "runtime_import_conflict"
+            elif isinstance(exc, RuntimeImportIncomplete):
+                status, code = 409, "runtime_import_incomplete"
+            elif isinstance(exc, (ValueError, TypeError, RecursionError)):
+                status, code = 400, "invalid_runtime_import"
+            else:
+                logger.exception("[zet_agent] completed transcript import failed")
+                status, code = 500, "runtime_import_failed"
+            return web.json_response(
+                {"error": {"message": str(exc), "type": "invalid_request_error", "code": code}},
+                status=status,
+            )
+        finally:
+            self._end_runtime_import_operation(operation_key)
+
+    async def _handle_memory_import(self, request: "web.Request") -> "web.Response":
+        """Replace one bounded curated-memory file; effective next session."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        from tools.memory_tool import portable_memory_import_supported
+
+        operation_key = self._begin_runtime_import_operation(
+            _request_value(request, "hermes_profile_home")
+        )
+        if operation_key is None:
+            return web.json_response(
+                {"error": {"message": "profile is unloaded", "type": "invalid_request_error",
+                           "code": "memory_import_profile_unloaded"}},
+                status=409,
+            )
+        try:
+            if not await _to_thread_with_completion_barrier(
+                portable_memory_import_supported
+            ):
+                return web.json_response(
+                    {"error": {
+                        "message": "curated memory import is unavailable on this platform",
+                        "type": "invalid_request_error",
+                        "code": "memory_import_unsupported",
+                    }},
+                    status=501,
+                )
+            body = await request.json()
+            if not isinstance(body, dict) or body.get("mode") != "replace":
+                raise ValueError("mode must be replace")
+            from tools.memory_tool import load_on_disk_store
+
+            def _import_memory():
+                return load_on_disk_store(bounded=True).import_replace(
+                    target=body.get("target"), entries=body.get("entries"),
+                    import_id=body.get("import_id"),
+                    payload_sha256=body.get("payload_sha256"),
+                )
+
+            result = await _to_thread_with_completion_barrier(
+                _import_memory,
+            )
+            return web.json_response(result)
+        except Exception as exc:
+            from tools.memory_tool import (
+                MemoryImportConflict,
+                MemoryImportUnsupported,
+            )
+            if isinstance(exc, MemoryImportUnsupported):
+                status, code = 501, "memory_import_unsupported"
+            elif isinstance(exc, MemoryImportConflict):
+                status, code = 409, "memory_import_conflict"
+            elif isinstance(exc, (ValueError, TypeError, RecursionError)):
+                status, code = 400, "invalid_memory_import"
+            else:
+                logger.exception("[zet_agent] curated memory import failed")
+                status, code = 500, "memory_import_failed"
+            return web.json_response(
+                {"error": {"message": str(exc), "type": "invalid_request_error", "code": code}},
+                status=status,
+            )
+        finally:
+            self._end_runtime_import_operation(operation_key)
+
+    async def _cleanup_stale_runtime_imports_once(self) -> int:
+        default_key = self._profile_home_key()
+        cached_candidates = [(default_key, None)]
+        cached_candidates.extend(tuple(self._session_dbs.items()))
+        cached_keys = {key for key, _db in cached_candidates}
+        seen = set()
+        deleted = 0
+
+        for key, cached_db in cached_candidates:
+            operation_key = self._begin_runtime_import_operation(key)
+            if operation_key is None:
+                continue
+            try:
+                session_db = cached_db
+                if key == default_key and session_db is None:
+                    session_db = await _to_thread_with_completion_barrier(
+                        self._ensure_session_db
+                    )
+                if session_db is None or id(session_db) in seen:
+                    continue
+                seen.add(id(session_db))
+                try:
+                    deleted += await _to_thread_with_completion_barrier(
+                        session_db.cleanup_stale_runtime_imports
+                    )
+                except Exception:
+                    logger.warning(
+                        "[zet_agent] runtime import staging cleanup failed for one profile",
+                        exc_info=True,
+                    )
+            finally:
+                self._end_runtime_import_operation(operation_key)
+
+        # After a gateway restart the per-profile DB cache is empty. Discover
+        # every served profile with an existing state.db so expired private
+        # transcript staging still converges without a foreground request.
+        try:
+            profile_homes = tuple(self._multiplex_profile_homes().values())
+        except Exception:
+            logger.warning(
+                "[zet_agent] runtime import profile discovery failed",
+                exc_info=True,
+            )
+            profile_homes = ()
+        for profile_home in profile_homes:
+            key = self._profile_home_key(profile_home)
+            if key in cached_keys:
+                continue
+            operation_key = self._begin_runtime_import_operation(key)
+            if operation_key is None:
+                continue
+            session_db = None
+            generation = self._profile_directory_identity(key)
+            try:
+                if generation is None:
+                    continue
+                session_db = await _to_thread_with_completion_barrier(
+                    self._open_profile_session_db,
+                    Path(profile_home),
+                    create=False,
+                )
+                if self._profile_directory_identity(key) != generation:
+                    logger.warning(
+                        "[zet_agent] runtime import profile changed while DB opened; skipping cleanup"
+                    )
+                    continue
+                deleted += await _to_thread_with_completion_barrier(
+                    session_db.cleanup_stale_runtime_imports
+                )
+            except Exception:
+                logger.warning(
+                    "[zet_agent] runtime import staging cleanup failed for one profile",
+                    exc_info=True,
+                )
+            finally:
+                cancelled = None
+                if session_db is not None:
+                    try:
+                        await _to_thread_with_completion_barrier(session_db.close)
+                    except asyncio.CancelledError as exc:
+                        # The helper has already waited for close to finish.
+                        # Release the operation barrier before propagating the
+                        # request cancellation.
+                        cancelled = exc
+                    except Exception:
+                        logger.warning(
+                            "[zet_agent] runtime import cleanup DB close failed",
+                            exc_info=True,
+                        )
+                self._end_runtime_import_operation(operation_key)
+                if cancelled is not None:
+                    raise cancelled
+        return deleted
+
+    async def _sweep_stale_runtime_imports(self) -> None:
+        while True:
+            try:
+                deleted = await self._cleanup_stale_runtime_imports_once()
+                if deleted:
+                    logger.info(
+                        "[zet_agent] removed %d expired runtime import staging row(s)",
+                        deleted,
+                    )
+                await asyncio.sleep(RUNTIME_IMPORT_CLEANUP_INTERVAL_SECONDS)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "[zet_agent] runtime import staging cleanup failed",
+                    exc_info=True,
+                )
+                await asyncio.sleep(RUNTIME_IMPORT_CLEANUP_INTERVAL_SECONDS)
+
+    def _register_profile_api_routes(self, router, *, chat_handler=None) -> None:
+        super()._register_profile_api_routes(router, chat_handler=chat_handler)
+        router.add_post(
+            "/p/{profile}/api/sessions/import",
+            self._profile_handler(self._handle_session_import),
+        )
+        router.add_post(
+            "/p/{profile}/api/memory/import",
+            self._profile_handler(self._handle_memory_import),
+        )
 
     async def _handle_session_steer(self, request: "web.Request") -> "web.Response":
         """POST /v1/sessions/{session_id}/steer — inject user text into the
@@ -2543,7 +3014,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 status=500,
             )
         if _request_value(request, "hermes_profile_home"):
-            session_db = self._ensure_session_db()
+            session_db = await self._ensure_session_db_async()
         else:
             session_db = getattr(gw, "_session_db", None)
         if session_db is None:
@@ -2726,6 +3197,11 @@ class ZetAgentAdapter(APIServerAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+        reload_barrier_key, reload_barrier_owners = (
+            self._snapshot_runtime_import_reload_barriers(
+                _request_value(request, "hermes_profile_home")
+            )
+        )
 
         gw = getattr(self, "gateway_runner", None)
         if gw is None:
@@ -2745,7 +3221,7 @@ class ZetAgentAdapter(APIServerAdapter):
         # so return 500 to let the local-server caller fall back to
         # ``registry.Stop`` (lazy respawn reads the new file fresh).
         if _request_value(request, "hermes_profile_home"):
-            session_db = self._ensure_session_db()
+            session_db = await self._ensure_session_db_async()
         else:
             session_db = getattr(gw, "_session_db", None)
         if session_db is None:
@@ -2800,6 +3276,9 @@ class ZetAgentAdapter(APIServerAdapter):
             "%d DB row(s) cleared",
             invalidated, db_rows_cleared,
         )
+        self._release_runtime_import_reload_barriers(
+            reload_barrier_key, reload_barrier_owners
+        )
         return web.json_response({
             "reloaded": True,
             "invalidated_sessions": invalidated,
@@ -2839,6 +3318,19 @@ class ZetAgentAdapter(APIServerAdapter):
                 },
                 status=409,
             )
+        active_imports, unload_barrier_owner = self._block_runtime_import_profile(
+            profile_home
+        )
+        if active_imports:
+            return web.json_response(
+                {
+                    "unloaded": False,
+                    "error": "profile has active imports",
+                    "active_sessions": active_imports,
+                    "active_imports": active_imports,
+                },
+                status=409,
+            )
 
         runtime_unload = {}
         gw = getattr(self, "gateway_runner", None)
@@ -2853,7 +3345,15 @@ class ZetAgentAdapter(APIServerAdapter):
                         "evicted_sessions": gw.invalidate_all_cached_agents(),
                         "disconnected_adapters": 0,
                     }
+            except asyncio.CancelledError:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                raise
             except Exception:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
                 logger.warning(
                     "[zet_agent] profile-unload: runtime unload failed",
                     exc_info=True,
@@ -2867,6 +3367,9 @@ class ZetAgentAdapter(APIServerAdapter):
                 )
 
         if runtime_unload.get("blocked"):
+            self._unblock_runtime_import_profile(
+                profile_home, unload_barrier_owner
+            )
             return web.json_response(
                 {
                     "unloaded": False,
@@ -2880,15 +3383,56 @@ class ZetAgentAdapter(APIServerAdapter):
         if profile_home:
             db = self._session_dbs.pop(self._profile_home_key(profile_home), None)
             if db is not None:
-                close = getattr(db, "close", None)
-                if callable(close):
+                if db is self._session_db:
+                    self._session_db = None
+
+                async def _close_detached_session_db() -> None:
+                    close = getattr(db, "close", None)
+                    if not callable(close):
+                        return
                     try:
-                        close()
+                        await _to_thread_with_completion_barrier(close)
                     except Exception:
                         logger.warning(
                             "[zet_agent] profile-unload: SessionDB close failed",
                             exc_info=True,
                         )
+
+                discard_staging = getattr(db, "discard_runtime_import_staging", None)
+                if callable(discard_staging):
+                    try:
+                        await _to_thread_with_completion_barrier(discard_staging)
+                    except asyncio.CancelledError as cancelled:
+                        # The discard worker has finished before this branch is
+                        # entered. Close in a second completion barrier, then
+                        # release the profile barrier and preserve cancellation.
+                        try:
+                            await _close_detached_session_db()
+                        except asyncio.CancelledError:
+                            # A repeated cancellation is delivered only after
+                            # the close worker has completed.
+                            pass
+                        self._unblock_runtime_import_profile(
+                            profile_home, unload_barrier_owner
+                        )
+                        raise cancelled
+                    except Exception:
+                        # Unload remains best-effort, but always attempt to
+                        # remove unpublished external transcripts before the
+                        # DB leaves the background sweeper's cache.
+                        logger.warning(
+                            "[zet_agent] profile-unload: runtime import staging cleanup failed",
+                            exc_info=True,
+                        )
+                try:
+                    await _close_detached_session_db()
+                except asyncio.CancelledError:
+                    # _to_thread_with_completion_barrier has already observed
+                    # close completion, so it is now safe to release unload.
+                    self._unblock_runtime_import_profile(
+                        profile_home, unload_barrier_owner
+                    )
+                    raise
                 closed_session_db = True
             # 该 profile 的 goal barrier timers 一并取消（codex P1）：daemon
             # Timer 携带旧 profile 的 runtime scope，卸载后触发会用内存旧
@@ -2912,6 +3456,9 @@ class ZetAgentAdapter(APIServerAdapter):
                         exc_info=True,
                     )
 
+        self._complete_runtime_import_profile_unload(
+            profile_home, unload_barrier_owner
+        )
         return web.json_response({
             "unloaded": True,
             "closed_session_db": closed_session_db,
@@ -3005,6 +3552,12 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_post("/api/jobs/{job_id}/pause", self._handle_pause_job)
             self._app.router.add_post("/api/jobs/{job_id}/resume", self._handle_resume_job)
             self._app.router.add_post("/api/jobs/{job_id}/run", self._handle_run_job)
+            self._app.router.add_post(
+                "/api/sessions/import", self._handle_session_import,
+            )
+            self._app.router.add_post(
+                "/api/memory/import", self._handle_memory_import,
+            )
             self._register_unprefixed_cron_control_routes(self._app.router)
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
@@ -3199,6 +3752,12 @@ class ZetAgentAdapter(APIServerAdapter):
                 "[%s] listening on http://%s:%d (interaction endpoints enabled)",
                 self.name, self._host, self._port,
             )
+
+            import_cleanup_task = asyncio.create_task(
+                self._sweep_stale_runtime_imports()
+            )
+            self._background_tasks.add(import_cleanup_task)
+            import_cleanup_task.add_done_callback(self._background_tasks.discard)
 
             # Goal reconcile-on-start: after a crash/OOM respawn (local-server
             # goal keepalive re-spawns us), re-report every indexed goal and
