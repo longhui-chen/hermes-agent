@@ -25,7 +25,7 @@ import time
 from contextlib import contextmanager
 import uuid
 from typing import Any, Dict, Optional
-from urllib.parse import SplitResult, quote, urlsplit, urlunsplit
+from urllib.parse import SplitResult, quote, unquote, urlsplit, urlunsplit
 
 import requests
 
@@ -1679,24 +1679,44 @@ def _repoint_shared_entries(session: Dict[str, Any], stale_tab_id: Any) -> None:
             other["epoch"] = None
 
 
-def _forget_stale_tab(session: Optional[Dict[str, Any]]) -> None:
-    """Drop the pinned tab id this session and its identity peers hold.
+def _tab_id_from_error(exc: BaseException) -> Optional[str]:
+    """The tab id the failed request was addressed to, from its request URL.
+
+    The exception is handled outside the identity lock, so the session's
+    current pin may already describe a tab rebuilt by a concurrent turn — the
+    only id this error is a fact about is the one in the request that failed.
+    """
+    resp = getattr(exc, "response", None)
+    url = getattr(resp, "url", None)
+    if not isinstance(url, str):
+        return None
+    match = re.search(r"/tabs/([^/?#]+)", url)
+    return unquote(match.group(1)) if match else None
+
+
+def _forget_stale_tab(session: Optional[Dict[str, Any]], stale_tab_id: Optional[str]) -> None:
+    """Drop the reclaimed tab's pin from this session and its identity peers.
 
     A non-empty tab_id short-circuits _ensure_tab, so an entry that keeps a
     reclaimed id replays the same tab-not-registered conflict on every later
-    call with no way out. Clearing it lets the next navigate rebuild; peers
-    sharing the browser identity held the same dead tab, so they are cleared
-    with it.
+    call with no way out. Clearing it lets the next navigate rebuild.
+
+    Compare-and-clear on the failed request's tab id, under the sessions lock:
+    a concurrent turn may have already rebuilt and repointed entries to a live
+    tab, and clearing whatever happens to be pinned now would tear that down
+    and leave the fresh tab orphaned. An entry pinned to something other than
+    the failed id is left alone.
     """
     if not session:
         return
-    stale = str(session.get("tab_id") or "")
+    stale = str(stale_tab_id or session.get("tab_id") or "")
     if not stale:
         return
-    session["tab_id"] = None
-    session["epoch"] = None
     identity = _browser_identity_key(session)
     with _sessions_lock:
+        if str(session.get("tab_id") or "") == stale:
+            session["tab_id"] = None
+            session["epoch"] = None
         for other in _sessions.values():
             if other is session or str(other.get("tab_id") or "") != stale:
                 continue
@@ -2422,7 +2442,7 @@ def _tool_error_from_exception(
         # points the model at a tool it does not have. Say what actually
         # recovers this: navigate, which rebuilds the tab now that the stale
         # pin is gone.
-        _forget_stale_tab(session)
+        _forget_stale_tab(session, _tab_id_from_error(exc))
         payload = {
             "success": False,
             "error": "browser_tab_not_registered",

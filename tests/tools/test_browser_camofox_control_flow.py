@@ -2812,8 +2812,9 @@ def test_a_404_rebuild_repoints_the_other_turns_too():
         mod._sessions.clear()
 
 
-def _tab_not_registered_error(mod):
+def _tab_not_registered_error(mod, tab_id="tab-old"):
     resp = MagicMock(status_code=409)
+    resp.url = f"http://127.0.0.1:19090/api/v1/internal/browser/camofox/tabs/{tab_id}/click"
     resp.json.return_value = {"error": "browser_tab_not_registered"}
     return mod.CamofoxHTTPError(resp, {"success": False, "error": "browser_tab_not_registered"})
 
@@ -2880,6 +2881,33 @@ def test_tab_not_registered_outside_navigate_clears_the_pin_and_says_navigate():
         assert mine["tab_id"] is None, "the stale pin survived"
         assert theirs["tab_id"] is None, "an identity peer kept the stale pin"
         assert elsewhere["tab_id"] == "tab-old", "another browser identity was cleared"
+    finally:
+        mod._sessions.clear()
+
+
+def test_a_late_409_does_not_tear_down_a_concurrently_rebuilt_tab():
+    """The error is a fact about the tab in the failed request, not the pin.
+
+    Two turns share the reclaimed tab; one rebuilds through navigate and
+    repoints everything to the fresh tab before the other's 409 is handled.
+    Clearing whatever is pinned at handling time would tear down the live tab
+    and leave it orphaned — the late error may only clear pins still holding
+    the id its own request failed against.
+    """
+    import tools.browser_camofox as mod
+
+    mod._sessions.clear()
+    mine = {"user_id": "u", "session_key": "shared", "tab_id": "tab-new", "task_id": "mine", "epoch": 7}
+    laggard = {"user_id": "u", "session_key": "shared", "tab_id": "tab-old", "task_id": "laggard", "epoch": 2}
+    mod._sessions.update({"a": mine, "b": laggard})
+    try:
+        result = json.loads(mod._tool_error_from_exception(
+            _tab_not_registered_error(mod, tab_id="tab-old"), session=mine,
+        ))
+        assert result["error"] == "browser_tab_not_registered"
+        assert mine["tab_id"] == "tab-new", "the rebuilt live tab was torn down by a late 409"
+        assert mine["epoch"] == 7, "the live tab's epoch was cleared"
+        assert laggard["tab_id"] is None, "a peer still pinned to the dead tab kept it"
     finally:
         mod._sessions.clear()
 
