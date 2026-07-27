@@ -114,6 +114,13 @@ def check_call_agent_requirements() -> bool:
     return bool(_call_url())
 
 
+# _call_url() resolves through the profile-scoped env: under a multiplexer
+# different profiles may (not) have ZET_AGENT_CALL_URL, so the registry must
+# re-evaluate per profile scope instead of caching the first profile's answer
+# process-wide (mirrors browser/calendar/video check fns).
+check_call_agent_requirements._profile_scope_sensitive = True  # type: ignore[attr-defined]
+
+
 def call_agent(agent: str = "", message: str = "", parent_agent=None) -> str:
     """Synchronously hand ``message`` to agent ``agent`` and return its reply."""
     agent = str(agent or "").strip()

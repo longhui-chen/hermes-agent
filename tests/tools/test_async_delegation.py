@@ -1001,3 +1001,25 @@ def test_restore_skips_symlinked_profile_homes(tmp_path, monkeypatch):
     # Only the default home is swept; the symlinked profile is skipped, so
     # the bait row parked outside stays untouched/unrestored.
     assert ad.restore_undelivered_completions(queue.Queue()) == 0
+
+
+def test_interrupt_for_session_scoped_to_profile(tmp_path, monkeypatch):
+    """mux 下 session interrupt 不得凭他人 session id 杀掉其他 profile 的批。"""
+    home_a = tmp_path / "profiles" / "agent-a"
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    ev = threading.Event()
+    r = ad.dispatch_async_delegation(
+        goal="scoped", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", parent_session_id="shared-sid",
+        runner=_blocking_child(ev), interrupt_fn=ev.set,
+    )
+    # 其他 profile 的路由带同一 session id：过滤后杀不到。
+    assert ad.interrupt_for_session(
+        parent_session_id="shared-sid",
+        profile_home=str(tmp_path / "profiles" / "agent-b"),
+    ) == 0
+    # owning profile 正常命中。
+    assert ad.interrupt_for_session(
+        parent_session_id="shared-sid", profile_home=str(home_a),
+    ) == 1
+    _drain_for(r["delegation_id"])

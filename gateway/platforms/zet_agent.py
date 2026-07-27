@@ -2493,10 +2493,14 @@ class ZetAgentAdapter(APIServerAdapter):
                 # local-server anchors the batch outcome card onto the
                 # interrupted turn itself, so the killed children must NOT
                 # re-enter the chat with a completion turn afterwards.
+                # profile scope: under a multiplexer this route must not be
+                # able to kill (and suppress-swallow) ANOTHER profile's batch
+                # by quoting its session id (same rule as the control plane).
                 interrupt_for_session(
                     parent_session_id=psid,
                     reason="user_cancel",
                     suppress_completion=True,
+                    profile_home=self._delegation_control_scope(request),
                 )
         except Exception:
             logger.debug(

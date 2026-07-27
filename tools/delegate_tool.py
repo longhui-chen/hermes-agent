@@ -2682,11 +2682,18 @@ def delegate_task(
             # normally, but if the parent is interrupted while a child is
             # wedged, the abandoned worker must not block interpreter exit.
             from tools.daemon_pool import DaemonThreadPoolExecutor
+            from tools.thread_context import propagate_context_to_thread
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
                 for i, t, child in children:
+                    # Propagate the dispatching profile's contextvars into the
+                    # inner worker: _run_single_child registers the subagent
+                    # (_register_subagent stamps profile_home via
+                    # get_hermes_home()) and resolves per-profile paths — an
+                    # unscoped worker would mislabel a multiplex profile's
+                    # child as the process default profile's.
                     future = executor.submit(
-                        _run_single_child,
+                        propagate_context_to_thread(_run_single_child),
                         task_index=i,
                         goal=t["goal"],
                         child=child,

@@ -1023,6 +1023,7 @@ def interrupt_for_session(
     parent_session_id: str = "",
     reason: str = "session_end",
     suppress_completion: bool = False,
+    profile_home: str = "",
 ) -> int:
     """Signal running async delegations owned by ONE session to stop.
 
@@ -1049,6 +1050,10 @@ def interrupt_for_session(
         targets = [
             r for r in _records.values()
             if r.get("status") == "running"
+            # profile_home（非空时）把选择面钳在 owning profile 内：mux 下
+            # /p/{profile} 的 session interrupt 不得凭他人 session id 杀掉
+            # （并因 suppress 吞掉）其他 profile 的后台批。
+            and _owned_by_profile(r, profile_home)
             and (
                 (origin_ui_session_id and str(r.get("origin_ui_session_id") or "") == origin_ui_session_id)
                 or (session_key and str(r.get("session_key") or "") == session_key)
