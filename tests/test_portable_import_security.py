@@ -226,6 +226,10 @@ def test_portable_credential_scanner_allows_url_without_userinfo_password(value)
         "client-key-data: |\n  LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0t\n  bW9yZWJhc2U2NA==\n",
         "password: >-\n  supersecretvalue123\n",
         "api_key: |\n  AKIA1234567890ABCDEF\n",
+        # value behind a leading blank line
+        "password: |\n\n  supersecretvalue123\n",
+        # placeholder first line, real secret on a later line
+        "password: |\n  ${SECRET_VALUE}\n  realsecretkey123\n",
     ],
 )
 def test_portable_credential_scanner_rejects_yaml_block_scalar_secrets(value):
