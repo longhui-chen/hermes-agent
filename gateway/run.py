@@ -1588,6 +1588,19 @@ class SecondaryPortBindingConfigError(MultiplexConfigError):
     """A secondary profile conflicts with the multiplexer's shared listener."""
 
 
+class TransientRouteResolutionError(RuntimeError):
+    """Routing lookup for a completion event failed TRANSIENTLY.
+
+    Raised by adapter ``resolve_process_event_source`` implementations when
+    the ownership probe errored (SQLite busy, DB briefly unreadable) — as
+    opposed to a definitive "no route" ``None``. ``_build_process_event_source``
+    re-raises it so delivery loops requeue the event and retry later instead
+    of dropping it as unroutable: a dropped async-delegation completion's
+    durable row stays pending but is never rescanned in this process, so the
+    user would not see the result until the next gateway restart.
+    """
+
+
 @_contextmanager
 def _profile_runtime_scope(profile_home: "Path"):
     """Scope config/skills/memory AND credentials to a profile for one turn.
@@ -16962,6 +16975,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         chat_type = str(evt.get("chat_type") or derived_chat_type or "").strip().lower()
         chat_id = str(evt.get("chat_id") or derived_chat_id or "").strip()
         if not platform_name or not chat_type or not chat_id:
+            # zettlab fork: adapter-owned opaque session keys (zet_agent binds
+            # the local-server session id verbatim, no "platform:chat_type:…"
+            # shape) never parse into routing fields — before declaring the
+            # event unroutable, let adapters claim sessions they own.
+            if session_key:
+                for _adapter in self.adapters.values():
+                    resolver = getattr(_adapter, "resolve_process_event_source", None)
+                    if not callable(resolver):
+                        continue
+                    try:
+                        resolved = resolver(session_key)
+                    except TransientRouteResolutionError:
+                        # Transient probe failure: propagate so the delivery
+                        # loop requeues the event instead of dropping it as
+                        # unroutable (the durable row would stay pending but
+                        # never be rescanned in this process).
+                        raise
+                    except Exception:
+                        logger.debug(
+                            "Adapter process-event source resolver failed for %s",
+                            session_key,
+                            exc_info=True,
+                        )
+                        resolved = None
+                    if resolved is not None:
+                        return resolved
             logger.warning(
                 "Synthetic event source unresolvable: "
                 "session_key=%r platform=%r chat_type=%r chat_id=%r "
@@ -17031,6 +17070,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            # zettlab fork: expose the structured completion event so adapters
+            # that deliver externally (zet_agent → local-server) can forward
+            # machine-readable results instead of re-parsing synth_text.
+            metadata["process_event"] = dict(evt)
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -17180,6 +17223,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
 
+    async def _deliver_async_delegation_scoped(
+        self, synth_text: str, evt: dict,
+    ) -> "Optional[bool]":
+        """Deliver one async-delegation completion under its OWNING profile.
+
+        Dispatches run inside the caller's ``_profile_runtime_scope``, so the
+        durable row and the parent session live in the owning profile's
+        ``state.db``. This watcher itself runs UNscoped (process default): for
+        a non-default multiplexer profile, session validation
+        (``resolve_process_event_source``) and the durable claim/ack would
+        otherwise hit the DEFAULT profile's DB — the completion would be
+        judged "unknown session", never re-enqueued, and its durable row
+        would stay pending forever. Contextvars propagate through awaits and
+        ``asyncio.to_thread``, so scoping this call covers the whole delivery
+        chain. Single-profile events carry the default home (or none) and
+        skip the scope entirely.
+        """
+        profile_home = str(evt.get("profile_home") or "")
+        if profile_home:
+            try:
+                from hermes_constants import get_hermes_home as _ghh
+
+                if str(_ghh()) != profile_home:
+                    with _profile_runtime_scope(Path(profile_home)):
+                        return await self._deliver_completion_notification(
+                            synth_text, evt,
+                        )
+            except TransientRouteResolutionError:
+                # Owning profile's DB briefly busy/unreadable: propagate so the
+                # watcher requeues. Falling through to the UNscoped attempt
+                # would probe the DEFAULT profile's DB, judge the session
+                # unknown and drop the event as unroutable — the exact loss
+                # the transient marker exists to prevent.
+                raise
+            except Exception:
+                logger.debug(
+                    "Async delegation profile scope failed for %s; delivering unscoped",
+                    profile_home, exc_info=True,
+                )
+        return await self._deliver_completion_notification(synth_text, evt)
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
 
@@ -17220,7 +17304,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if not synth_text:
                         continue
                     try:
-                        delivered = await self._deliver_completion_notification(synth_text, evt)
+                        delivered = await self._deliver_async_delegation_scoped(synth_text, evt)
                         if delivered is False:
                             _pr.completion_queue.put(evt)
                     except Exception as e:
@@ -17329,9 +17413,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
                         break
-                    delivered = await self._deliver_completion_notification(
-                        synth_text, completion_evt,
-                    )
+                    try:
+                        delivered = await self._deliver_completion_notification(
+                            synth_text, completion_evt,
+                        )
+                    except TransientRouteResolutionError:
+                        # Same as delivered=False: the claim was released in
+                        # the finally block; retry on the next watcher tick
+                        # rather than letting the exception kill this task.
+                        delivered = False
                     if delivered is False:
                         # The process remains terminal; retry after failed
                         # adapter injection instead of suppressing the result.

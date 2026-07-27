@@ -3252,3 +3252,38 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_run_single_child_propagates_context_to_inner_executor():
+    """The innermost timeout-executor hop (child.run_conversation's actual
+    thread) must inherit the caller's ContextVars — the batch-level propagate
+    only covers _run_single_child's own thread, one hop short (profile
+    HERMES_HOME / secret scope would fall back to the default profile)."""
+    from gateway.session_context import (
+        clear_session_vars,
+        get_session_env,
+        set_session_vars,
+    )
+    import tools.delegate_tool as dt
+
+    seen = {}
+
+    class _FakeChild:
+        model = "test-model"
+
+        def run_conversation(self, user_message, task_id=None, stream_callback=None):
+            seen["session_key"] = get_session_env("HERMES_SESSION_KEY", "")
+            return {"final_response": "ok", "messages": [], "api_calls": 1}
+
+    tokens = set_session_vars(
+        platform="zet_agent",
+        chat_id="c1",
+        session_key="propagated-key",
+        session_id="c1",
+    )
+    try:
+        result = dt._run_single_child(0, "check context", child=_FakeChild())
+    finally:
+        clear_session_vars(tokens)
+    assert seen["session_key"] == "propagated-key"
+    assert result.get("status") not in (None, "error"), result

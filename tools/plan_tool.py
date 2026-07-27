@@ -114,8 +114,19 @@ def present_plan(
 
     # 无 callback（CLI / messaging / api_server，无确认卡）：返回格式化计划文本，
     # 让 agent 能把计划完整呈现给用户，再停下等确认——否则计划内容丢失且 agent 空等。
+    plan_text = _format_plan_text(title, cleaned_groups)
+    if auto_execute:
+        # delegated child（delegate_tool 强制 _zet_agent_plan_auto_execute）等
+        # 无 UI 场景：没有用户可回复确认，返回「等确认」文案会让子 agent 空等
+        # 耗尽迭代预算——保留计划文本作上下文，指示立即继续执行。
+        return (
+            plan_text
+            + "\n\nAuto-execute is enabled and there is no user available to "
+            "confirm: start carrying out the plan now in this same turn. Do "
+            "NOT wait for a reply — just proceed."
+        )
     return (
-        _format_plan_text(title, cleaned_groups)
+        plan_text
         + "\n\nReview the plan above and reply to confirm (e.g. \"go\" / \"confirm\") before I proceed."
     )
 

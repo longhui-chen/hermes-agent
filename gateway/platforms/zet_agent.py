@@ -293,6 +293,26 @@ def _zettlab_workflow_addendum(auto_execute: bool) -> str:
     return "\n\n".join((_ZET_ADDENDUM_HEAD, plan_first, _ZET_ADDENDUM_TAIL)) + "\n"
 
 
+_DELEGATION_ADVANCE_ENV = "ZET_DELEGATION_ADVANCE_URL"
+
+
+def _delegation_advance_url() -> str:
+    """Resolve local-server's loopback delegation-advance endpoint.
+
+    Mirrors ZET_GOAL_ADVANCE_URL resolution: profile ``.env`` first so
+    multiplex profiles stay authoritative, then process env. The URL is
+    device-global (one local-server per device), so the os.environ fallback
+    cannot cross profiles the way a per-profile secret could.
+    """
+    try:
+        url = _zet_agent_cron._scoped_env(_DELEGATION_ADVANCE_ENV, "").strip()
+    except Exception:
+        url = ""
+    if url:
+        return url
+    return os.environ.get(_DELEGATION_ADVANCE_ENV, "").strip()
+
+
 def check_zet_agent_requirements() -> bool:
     """Return True iff this platform can be started in the current process."""
     return AIOHTTP_AVAILABLE
@@ -530,6 +550,220 @@ class ZetAgentAdapter(APIServerAdapter):
         key = self._profile_home_key(profile_home)
         with self._runtime_import_operation_lock:
             return bool(self._runtime_import_barriers_locked(key))
+
+    # ------------------------------------------------------------------
+    # Async delegation delivery (delegate_task background=true)
+    # ------------------------------------------------------------------
+
+    @property
+    def supports_async_delivery(self) -> bool:  # type: ignore[override]
+        """Background delegation is available only when local-server has
+        published its delegation-advance endpoint (ZET_DELEGATION_ADVANCE_URL
+        in the profile ``.env`` / process env). Without it delegate_task keeps
+        the upstream synchronous fallback, so rollout order is safe: new
+        hermes + old local-server behaves exactly like today.
+        """
+        return bool(_delegation_advance_url())
+
+    def _bind_turn_session_context(self, session_id: str) -> None:
+        """Rebind session contextvars for this turn's agent build.
+
+        ZettClaw — 让 cronjob tool 自动设 origin: 把当前 chat session_id 注入
+        contextvars，cronjob_tools._origin_from_env 会读到 platform/chat_id
+        自动填到 cron job.origin。否则 cron 触发时 OriginStrategy 找不到 chat
+        → 走 NewSession 兜底创 phantom session, APP 看不到推送。
+
+        tokens 不显式 reset — contextvars 是 task-local，task 结束自动清；
+        同 task 内多次 _create_agent 后 set 会覆盖前值，符合预期。
+
+        async_delivery 必须显式传：这次 set 覆盖了上游
+        _bind_api_server_session 刚写下的 False，而参数默认值是 True——不
+        显式绑定 supports_async_delivery（env 门控）的话，
+        ZET_DELEGATION_ADVANCE_URL 未配置的部署里 delegate_task 会承诺
+        background 却无处投递完成事件（#10760 型 silent no-op，durable 行
+        永远 claimable）；配置了则如实开闸。
+        """
+        if not session_id:
+            return
+        try:
+            from gateway.session_context import set_session_vars
+
+            set_session_vars(
+                platform="zet_agent",
+                chat_id=session_id,
+                chat_name="",  # 暂留空，APP 这边的 chat title 不通过这条路径来
+                thread_id="",
+                user_id="",
+                user_name="",
+                session_key=session_id,
+                async_delivery=self.supports_async_delivery,
+            )
+        except Exception as _e:
+            logger.warning("[zet_agent] set_session_vars failed (cron origin won't auto-populate): %s", _e)
+
+    def resolve_process_event_source(self, session_key: str):
+        """Claim synthetic process events whose session_key is a zet_agent
+        session id.
+
+        zet_agent binds the local-server session id verbatim as the gateway
+        session_key, so ``_build_process_event_source``'s generic
+        ``platform:chat_type:chat_id`` parse never matches and async
+        delegation completions would be dropped as unroutable. Ownership is
+        verified against Hermes SessionDB (fail-closed): only sessions this
+        gateway actually persisted are claimed, so foreign platforms' keys
+        stay unresolvable.
+        """
+        key = (session_key or "").strip()
+        if not key:
+            return None
+        try:
+            db = self._ensure_session_db()
+            if db is None or db.get_session(key) is None:
+                return None
+        except Exception as exc:
+            # Probe ERROR ≠ "not ours". SQLite busy / briefly unreadable DB
+            # must surface as transient so the delivery loop requeues the
+            # event — folding it into None drops the completion from the
+            # in-memory queue while its durable row is never rescanned here.
+            logger.debug(
+                "[zet_agent] session ownership probe failed for %s",
+                key,
+                exc_info=True,
+            )
+            from gateway.run import TransientRouteResolutionError
+
+            raise TransientRouteResolutionError(
+                f"session ownership probe failed for {key}"
+            ) from exc
+        from gateway.session import SessionSource
+
+        return SessionSource(
+            platform=Platform.ZET_AGENT,
+            chat_id=key,
+            chat_type="dm",
+        )
+
+    async def handle_message(self, event) -> None:
+        """Divert internal async-delegation completions to local-server.
+
+        Upstream's watcher forges a new internal turn via ``handle_message``
+        and relies on the adapter's outbound send path for the reply — the
+        api_server family has none, so that turn's output would be lost.
+        Instead POST the structured completion to local-server's loopback
+        delegation-advance endpoint; local-server starts a first-class turn
+        on the originating session and the App receives a normally streamed
+        reply. Raising is the retry signal: the watcher releases its durable
+        claim and redelivers later.
+        """
+        process_event = None
+        if getattr(event, "internal", False):
+            meta = getattr(event, "metadata", None)
+            if isinstance(meta, dict):
+                pe = meta.get("process_event")
+                if isinstance(pe, dict) and str(pe.get("type") or "") == "async_delegation":
+                    process_event = pe
+        if process_event is None:
+            await super().handle_message(event)
+            return
+        await self._deliver_delegation_completion(
+            process_event, str(getattr(event, "text", "") or "")
+        )
+
+    async def _deliver_delegation_completion(
+        self, evt: Dict[str, Any], synth_text: str
+    ) -> None:
+        """POST one async-delegation completion to local-server.
+
+        Contract with the watcher (``_deliver_completion_notification``):
+        returning normally means "accepted" (the durable row is acked);
+        raising means "retry later" (the claim is released). local-server's
+        endpoint is loopback-only (mirrors /api/v1/internal/goal/advance),
+        so no per-profile action token is attached.
+        """
+        url = _delegation_advance_url()
+        if not url:
+            # Unreachable in practice — supports_async_delivery gates dispatch
+            # on the same env — but raise rather than ack a completion nobody
+            # delivered; the durable row stays claimable for retry.
+            raise RuntimeError(
+                "ZET_DELEGATION_ADVANCE_URL unset; cannot deliver async "
+                "delegation completion"
+            )
+        payload = {
+            "schema": 1,
+            "kind": "delegation",
+            "session_key": str(evt.get("session_key") or ""),
+            "session_id": str(evt.get("parent_session_id") or ""),
+            "delegation_id": str(evt.get("delegation_id") or ""),
+            "status": evt.get("status"),
+            "goal": evt.get("goal"),
+            "goals": evt.get("goals"),
+            "is_batch": bool(evt.get("is_batch")),
+            "results": evt.get("results"),
+            "summary": evt.get("summary"),
+            "error": evt.get("error"),
+            "model": evt.get("model"),
+            "role": evt.get("role"),
+            "dispatched_at": evt.get("dispatched_at"),
+            "completed_at": evt.get("completed_at"),
+            "duration_seconds": evt.get("duration_seconds")
+            or evt.get("total_duration_seconds"),
+            "synth_text": synth_text,
+        }
+
+        def _post() -> int:
+            import urllib.error
+            import urllib.request
+
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    return int(getattr(resp, "status", 0) or 0)
+            except urllib.error.HTTPError as http_exc:
+                # Non-2xx is a RESPONSE, not a transport failure — surface the
+                # status code so the caller can split permanent vs retryable.
+                return int(http_exc.code)
+
+        try:
+            status = await asyncio.to_thread(_post)
+        except Exception as exc:
+            # Transport-level failure (connection refused / timeout): the
+            # local-server may just be restarting — keep the durable row
+            # claimable and let the watcher retry.
+            raise RuntimeError(
+                f"delegation-advance delivery failed for "
+                f"{payload['delegation_id'] or '<no-id>'}: {exc}"
+            ) from exc
+        if 400 <= status < 500 and status not in (408, 429):
+            # Permanent rejection (session deleted, payload judged invalid…):
+            # retrying can never succeed — dead-letter by logging the full
+            # identity and returning normally so the durable row is acked and
+            # the 2s watcher loop stops re-posting it (also across restarts).
+            logger.error(
+                "[zet_agent] delegation-advance delivery permanently rejected "
+                "with HTTP %d for %s (session_key=%s); dropping after "
+                "dead-letter log",
+                status,
+                payload["delegation_id"] or "<no-id>",
+                payload["session_key"] or "<none>",
+            )
+            return
+        if not (200 <= status < 300):
+            # 5xx / 408 / 429: server-side transient — retryable.
+            raise RuntimeError(
+                f"delegation-advance delivery rejected with HTTP {status} "
+                f"for {payload['delegation_id'] or '<no-id>'}"
+            )
+        logger.info(
+            "[zet_agent] delivered async delegation completion %s (session_key=%s)",
+            payload["delegation_id"] or "<no-id>",
+            payload["session_key"] or "<none>",
+        )
 
     # ------------------------------------------------------------------
     # _stream_q closure sniffing
@@ -1187,6 +1421,99 @@ class ZetAgentAdapter(APIServerAdapter):
         return _emit
 
     # ------------------------------------------------------------------
+    # Delegation progress — subagent lifecycle relayed onto the SSE lane
+    # ------------------------------------------------------------------
+
+    # Child-relay events forwarded to the App. subagent.text / .thinking are
+    # deliberately dropped: they stream the child's full prose (unbounded
+    # volume) and the drill-down view reads it from the live transcript files
+    # instead. The SSE lane carries status-level progress only.
+    _DELEGATION_PROGRESS_EVENTS = frozenset(
+        {"subagent.start", "subagent.tool", "subagent.progress", "subagent.complete"}
+    )
+    # Structured identity kwargs relayed by delegate_tool's child callback
+    # (_relay → parent_cb(..., **identity_kwargs)) that the App needs to
+    # address a row in the progress banner.
+    _DELEGATION_PROGRESS_FIELDS = (
+        "task_index",
+        "task_count",
+        "goal",
+        "subagent_id",
+        "parent_id",
+        "depth",
+        "child_session_id",
+        "tool_count",
+        "status",
+        "duration_seconds",
+        "exit_reason",
+    )
+    _DELEGATION_PREVIEW_MAX = 200
+    # Cap for progress frames parked in a stream_q with no live SSE reader
+    # (background children outliving the parent turn). See _cb note.
+    _DELEGATION_PROGRESS_BACKLOG_MAX = 2000
+
+    @classmethod
+    def _make_delegation_progress_cb(cls, stream_q: Any):
+        """Return a parent ``tool_progress_callback`` bridging child progress.
+
+        delegate_task's ``_build_child_progress_callback`` relays child
+        lifecycle events to ``parent_agent.tool_progress_callback`` — a
+        callback the chat-completions path never wired before, so gateway
+        children ran blind. This bridge forwards the status-level subset onto
+        the ``hermes.tool.progress`` SSE extension lane as
+        ``type=hermes.delegation.progress`` payloads (local-server translates
+        them into chatproto delegation events for the App).
+
+        Contract notes:
+        - signature mirrors the relay: ``(event, tool_name, preview, args,
+          **identity_kwargs)``;
+        - ``subagent_progress`` (nested-orchestrator pass-through, summary in
+          the tool_name slot) is normalised to ``subagent.progress``;
+        - never raises into the agent loop.
+        """
+
+        def _cb(event_type, tool_name=None, preview=None, args=None, **kwargs):
+            try:
+                event = str(event_type or "")
+                if event == "subagent_progress":
+                    event = "subagent.progress"
+                    if preview is None:
+                        preview = tool_name
+                        tool_name = None
+                if event not in cls._DELEGATION_PROGRESS_EVENTS:
+                    return
+                payload: Dict[str, Any] = {
+                    "type": "hermes.delegation.progress",
+                    "kind": "delegation",
+                    "event": event,
+                }
+                if tool_name:
+                    payload["tool"] = str(tool_name)
+                if preview:
+                    text = str(preview)
+                    if len(text) > cls._DELEGATION_PREVIEW_MAX:
+                        text = text[: cls._DELEGATION_PREVIEW_MAX] + "…"
+                    payload["preview"] = text
+                for field in cls._DELEGATION_PROGRESS_FIELDS:
+                    value = kwargs.get(field)
+                    if value is not None:
+                        payload[field] = value
+                # Background children capture this callback at dispatch and
+                # keep pushing after the parent turn's SSE writer exits —
+                # nobody drains the queue then. Cap the backlog (HR#1);
+                # progress is best-effort UI signal, the live manifest is
+                # the authoritative record the App polls for terminal state.
+                if stream_q.qsize() > cls._DELEGATION_PROGRESS_BACKLOG_MAX:
+                    return
+                stream_q.put(("__tool_progress__", payload))
+            except Exception:
+                logger.debug(
+                    "[zet_agent] delegation progress push failed", exc_info=True
+                )
+
+        return _cb
+
+    # ------------------------------------------------------------------
     # Plan emit — non-blocking, fires when agent calls present_plan
     # ------------------------------------------------------------------
 
@@ -1352,26 +1679,8 @@ class ZetAgentAdapter(APIServerAdapter):
             + ("\n\n" + ephemeral_system_prompt if ephemeral_system_prompt else "")
         )
 
-        # ZettClaw — 让 cronjob tool 自动设 origin: 把当前 chat session_id 注入
-        # contextvars，cronjob_tools._origin_from_env 会读到 platform/chat_id
-        # 自动填到 cron job.origin。否则 cron 触发时 OriginStrategy 找不到 chat
-        # → 走 NewSession 兜底创 phantom session, APP 看不到推送。
-        if session_id:
-            try:
-                from gateway.session_context import set_session_vars
-                # tokens 不显式 reset — contextvars 是 task-local，task 结束自动清；
-                # 同 task 内多次 _create_agent 后 set 会覆盖前值，符合预期。
-                set_session_vars(
-                    platform="zet_agent",
-                    chat_id=session_id,
-                    chat_name="",  # 暂留空，APP 这边的 chat title 不通过这条路径来
-                    thread_id="",
-                    user_id="",
-                    user_name="",
-                    session_key=session_id,
-                )
-            except Exception as _e:
-                logger.warning("[zet_agent] set_session_vars failed (cron origin won't auto-populate): %s", _e)
+        # cron origin + async-delivery capability（见 helper docstring）。
+        self._bind_turn_session_context(session_id)
 
         from run_agent import AIAgent
         from gateway.run import (
@@ -1569,6 +1878,26 @@ class ZetAgentAdapter(APIServerAdapter):
             agent.plan_emit_callback = self._make_plan_emit_cb(stream_q, agent)
         except Exception:
             logger.warning("[zet_agent] failed to attach plan_emit_callback", exc_info=True)
+
+        # 3d. Delegation progress: bridge delegate_task child lifecycle
+        # events onto the SSE lane (type=hermes.delegation.progress).
+        # Wiring the parent tool_progress_callback is also what ENABLES
+        # delegate_tool's child relay on this path (it returns no callback
+        # when the parent has neither spinner nor progress callback).
+        # Rebind UNCONDITIONALLY each turn (mirrors plan_emit_callback):
+        # session agents are reused across turns, and a keep-if-set guard
+        # would leave the callback closed over the FIRST turn's dead
+        # stream_q — every later dispatch's progress would go to a queue
+        # nobody drains (invisible + unbounded backlog).
+        try:
+            agent.tool_progress_callback = self._make_delegation_progress_cb(
+                stream_q
+            )
+        except Exception:
+            logger.warning(
+                "[zet_agent] failed to attach delegation progress callback",
+                exc_info=True,
+            )
 
         # 4. Approval: register a per-session notify callback.
         # We don't unregister here because chat.completions reuses the
@@ -2172,6 +2501,39 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception:
                 logger.debug("[zet_agent] session interrupt: agent.interrupt failed", exc_info=True)
 
+        # Also stop this session's in-flight background delegations.
+        # ``agent.interrupt()`` cannot reach them: delegate_task(background)
+        # deliberately detaches children from _active_children at dispatch
+        # (their lifecycle is owned by the async registry). Without this,
+        # "stop" looks honored in the App while subagents keep burning
+        # tokens in the background. parent_session_id is the selector the
+        # dispatch records (delegate_tool captures parent_agent.session_id);
+        # include the agent's current session_id too in case compaction
+        # rotated it since dispatch.
+        try:
+            from tools.async_delegation import interrupt_for_session
+
+            rotated_sid = str(getattr(agent, "session_id", "") or "") if agent else ""
+            for psid in {session_id, rotated_sid} - {""}:
+                # suppress_completion: the user explicitly stopped this turn —
+                # local-server anchors the batch outcome card onto the
+                # interrupted turn itself, so the killed children must NOT
+                # re-enter the chat with a completion turn afterwards.
+                # profile scope: under a multiplexer this route must not be
+                # able to kill (and suppress-swallow) ANOTHER profile's batch
+                # by quoting its session id (same rule as the control plane).
+                interrupt_for_session(
+                    parent_session_id=psid,
+                    reason="user_cancel",
+                    suppress_completion=True,
+                    profile_home=self._delegation_control_scope(request),
+                )
+        except Exception:
+            logger.debug(
+                "[zet_agent] session interrupt: async delegation interrupt failed",
+                exc_info=True,
+            )
+
         self._interrupt_pending_interactions(session_id, turn_key)
 
         if task is not None and not task.done():
@@ -2182,6 +2544,108 @@ class ZetAgentAdapter(APIServerAdapter):
 
         status = "stopping" if (agent is not None or task is not None) else "not_running"
         return web.json_response({"session_id": session_id, "status": status})
+
+    # ------------------------------------------------------------------
+    # Delegation control plane (App banner: status / per-id cancel)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _delegation_control_scope(request: "web.Request") -> str:
+        """Resolve the profile filter for a delegation control-plane call.
+
+        /p/{profile} routes carry ``hermes_profile_home`` (stamped by
+        _profile_handler). The bare /v1 route has no stamp: under an ACTIVE
+        multiplexer it is scoped to the DEFAULT profile (the unscoped
+        ``get_hermes_home()``) so it can never read or cancel another
+        profile's work; single-profile processes return "" (legacy full
+        view — every record carries the same home anyway).
+        """
+        stamped = str(request.get("hermes_profile_home", "") or "")
+        if stamped:
+            return stamped
+        try:
+            from agent.secret_scope import is_multiplex_active
+
+            if is_multiplex_active():
+                from hermes_constants import get_hermes_home
+
+                return str(get_hermes_home())
+        except Exception:
+            logger.debug(
+                "[zet_agent] delegation control scope resolution failed",
+                exc_info=True,
+            )
+        return ""
+
+    async def _handle_delegations_status(self, request: "web.Request") -> "web.Response":
+        """GET /v1/delegations/status — sync tree + async records snapshot.
+
+        Thin wrapper over the same module-level registries the TUI /agents
+        overlay reads (tui_gateway delegation.status). Consumed by
+        zettlab-local-server for reconcile-after-restart and the App's
+        control-plane proxy.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        # The registries are process-global; under a multiplexer the
+        # /p/{profile} route must only ever see (and cancel) ITS OWN
+        # records. The BARE /v1 route carries no profile stamp — under an
+        # active multiplexer it must fall back to the DEFAULT profile's
+        # scope (unscoped get_hermes_home()), not to "no filter": an empty
+        # filter would leak every profile's goals/session keys through the
+        # default route and let their ids be cancelled cross-profile.
+        # Single-profile processes keep the legacy full view.
+        profile_home = self._delegation_control_scope(request)
+        try:
+            from tools.async_delegation import list_async_delegations
+            from tools.delegate_tool import list_active_subagents
+
+            active = list_active_subagents(profile_home)
+            async_records = list_async_delegations(profile_home)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response({"active": active, "async": async_records})
+
+    async def _handle_delegation_cancel(self, request: "web.Request") -> "web.Response":
+        """POST /v1/delegations/{delegation_id}/cancel — stop ONE async batch."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        delegation_id = str(request.match_info.get("delegation_id", "")).strip()
+        try:
+            from tools.async_delegation import interrupt_delegation
+
+            ok = interrupt_delegation(
+                delegation_id,
+                profile_home=self._delegation_control_scope(request),
+            )
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response(
+            {"delegation_id": delegation_id, "interrupted": bool(ok)},
+            status=200 if ok else 404,
+        )
+
+    async def _handle_subagent_interrupt(self, request: "web.Request") -> "web.Response":
+        """POST /v1/subagents/{subagent_id}/interrupt — stop ONE sync child."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        subagent_id = str(request.match_info.get("subagent_id", "")).strip()
+        try:
+            from tools.delegate_tool import interrupt_subagent
+
+            ok = interrupt_subagent(
+                subagent_id,
+                profile_home=self._delegation_control_scope(request),
+            )
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response(
+            {"subagent_id": subagent_id, "interrupted": bool(ok)},
+            status=200 if ok else 404,
+        )
 
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """Extend the base capability surface with zet_agent-only endpoints.
@@ -3638,6 +4102,32 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_post(
                 "/v1/profile/unload",
                 self._handle_profile_unload,
+            )
+            # Delegation control plane (App banner status / cancel) — native
+            # + profile-scoped mirrors, ZET_AGENT_KEY Bearer auth like the
+            # rest of the surface.
+            self._app.router.add_get(
+                "/v1/delegations/status", self._handle_delegations_status
+            )
+            self._app.router.add_post(
+                "/v1/delegations/{delegation_id}/cancel",
+                self._handle_delegation_cancel,
+            )
+            self._app.router.add_post(
+                "/v1/subagents/{subagent_id}/interrupt",
+                self._handle_subagent_interrupt,
+            )
+            self._app.router.add_get(
+                "/p/{profile}/v1/delegations/status",
+                self._profile_handler(self._handle_delegations_status),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/delegations/{delegation_id}/cancel",
+                self._profile_handler(self._handle_delegation_cancel),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/subagents/{subagent_id}/interrupt",
+                self._profile_handler(self._handle_subagent_interrupt),
             )
             self._register_profile_api_routes(
                 self._app.router,

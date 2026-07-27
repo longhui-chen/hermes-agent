@@ -873,3 +873,232 @@ def test_gateway_cli_origin_event_left_unrouted():
     assert "platform" not in evt
 
 
+
+
+# ---------------------------------------------------------------------------
+# Session-interrupt suppression + multiplexer profile isolation
+# ---------------------------------------------------------------------------
+
+
+def _blocking_child(ev):
+    def blocker():
+        ev.wait(timeout=60)
+        return {"status": "interrupted", "summary": None, "error": "cancelled"}
+
+    return blocker
+
+
+def test_interrupt_for_session_suppresses_completion(tmp_path, monkeypatch):
+    """User-stop kills must not re-enter the chat: no completion event, and
+    the durable row is dropped so a restart can't resurrect the delivery."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ev = threading.Event()
+    r = ad.dispatch_async_delegation(
+        goal="long task", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", parent_session_id="parent-sid",
+        runner=_blocking_child(ev), interrupt_fn=ev.set,
+    )
+    n = ad.interrupt_for_session(
+        parent_session_id="parent-sid", reason="user_cancel",
+        suppress_completion=True,
+    )
+    assert n == 1
+    deadline = time.monotonic() + 5.0
+    while ad.active_count() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert _drain_for(r["delegation_id"], timeout=0.3) is None
+    assert ad.get_durable_delegation(r["delegation_id"]) is None
+
+
+def test_interrupt_for_session_without_suppress_still_delivers(tmp_path, monkeypatch):
+    """Non-stop callers (session_end orphan sweep) keep today's behavior."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ev = threading.Event()
+    r = ad.dispatch_async_delegation(
+        goal="long task", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", parent_session_id="parent-sid",
+        runner=_blocking_child(ev), interrupt_fn=ev.set,
+    )
+    assert ad.interrupt_for_session(parent_session_id="parent-sid") == 1
+    evt = _drain_for(r["delegation_id"])
+    assert evt is not None
+    assert evt["status"] == "interrupted"
+
+
+def test_control_plane_filters_by_profile_home(tmp_path, monkeypatch):
+    """The zettlab control plane only sees/cancels its own profile's records."""
+    home_a = tmp_path / "profiles" / "agent-a"
+    home_b = tmp_path / "profiles" / "agent-b"
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    ev = threading.Event()
+    r = ad.dispatch_async_delegation(
+        goal="scoped", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", runner=_blocking_child(ev),
+        interrupt_fn=ev.set,
+    )
+    did = r["delegation_id"]
+    assert [x["delegation_id"] for x in ad.list_async_delegations(str(home_a))] == [did]
+    assert ad.list_async_delegations(str(home_b)) == []
+    # Empty filter keeps the legacy full view (TUI overlay, single-profile).
+    assert [x["delegation_id"] for x in ad.list_async_delegations()] == [did]
+    # Cross-profile cancel is invisible (404 semantics at the HTTP layer)…
+    assert ad.interrupt_delegation(did, profile_home=str(home_b)) is False
+    # …while the owning profile can cancel.
+    assert ad.interrupt_delegation(did, profile_home=str(home_a)) is True
+    _drain_for(did)
+
+
+def test_restore_sweeps_profile_state_dbs(tmp_path, monkeypatch):
+    """Durable rows under profiles/<id>/state.db are restored too, each event
+    stamped with its owning profile home for scoped delivery."""
+    default_home = tmp_path
+    profile_home = tmp_path / "profiles" / "agent-b"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    r_b = ad.dispatch_async_delegation(
+        goal="in-profile", context=None, toolsets=None, role="leaf",
+        model="m", session_key="",
+        runner=lambda: {"status": "completed", "summary": "b"},
+    )
+    assert _drain_for(r_b["delegation_id"]) is not None
+
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    r_a = ad.dispatch_async_delegation(
+        goal="in-default", context=None, toolsets=None, role="leaf",
+        model="m", session_key="",
+        runner=lambda: {"status": "completed", "summary": "a"},
+    )
+    assert _drain_for(r_a["delegation_id"]) is not None
+
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 2
+    events = {}
+    while not restored.empty():
+        evt = restored.get_nowait()
+        events[evt["delegation_id"]] = evt
+    assert events[r_a["delegation_id"]]["profile_home"] == str(default_home)
+    assert events[r_b["delegation_id"]]["profile_home"] == str(profile_home)
+
+
+def test_restore_skips_symlinked_profile_homes(tmp_path, monkeypatch):
+    """No-follow discipline: a symlinked profile dir (or state.db) must not
+    pull an out-of-tree database into the WAL/schema-writing sweep."""
+    import os
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(outside))
+    r = ad.dispatch_async_delegation(
+        goal="bait", context=None, toolsets=None, role="leaf",
+        model="m", session_key="",
+        runner=lambda: {"status": "completed", "summary": "x"},
+    )
+    assert _drain_for(r["delegation_id"]) is not None
+
+    home = tmp_path / "home"
+    (home / "profiles").mkdir(parents=True)
+    os.symlink(str(outside), str(home / "profiles" / "evil"))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    # Only the default home is swept; the symlinked profile is skipped, so
+    # the bait row parked outside stays untouched/unrestored.
+    assert ad.restore_undelivered_completions(queue.Queue()) == 0
+
+
+def test_interrupt_for_session_scoped_to_profile(tmp_path, monkeypatch):
+    """mux 下 session interrupt 不得凭他人 session id 杀掉其他 profile 的批。"""
+    home_a = tmp_path / "profiles" / "agent-a"
+    monkeypatch.setenv("HERMES_HOME", str(home_a))
+    ev = threading.Event()
+    r = ad.dispatch_async_delegation(
+        goal="scoped", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", parent_session_id="shared-sid",
+        runner=_blocking_child(ev), interrupt_fn=ev.set,
+    )
+    # 其他 profile 的路由带同一 session id：过滤后杀不到。
+    assert ad.interrupt_for_session(
+        parent_session_id="shared-sid",
+        profile_home=str(tmp_path / "profiles" / "agent-b"),
+    ) == 0
+    # owning profile 正常命中。
+    assert ad.interrupt_for_session(
+        parent_session_id="shared-sid", profile_home=str(home_a),
+    ) == 1
+    _drain_for(r["delegation_id"])
+
+
+def test_restore_isolates_corrupt_profile_db(tmp_path, monkeypatch):
+    """Per-home fault isolation: a corrupt state.db earlier in the scan must
+    not abort restore — the outer caller catches once, so raising would skip
+    every remaining profile's pending completions on every boot."""
+    profile_home = tmp_path / "profiles" / "agent-b"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    r = ad.dispatch_async_delegation(
+        goal="survives-corruption", context=None, toolsets=None, role="leaf",
+        model="m", session_key="",
+        runner=lambda: {"status": "completed", "summary": "ok"},
+    )
+    assert _drain_for(r["delegation_id"]) is not None
+
+    # Default home enumerates FIRST and its state.db is garbage.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "state.db").write_bytes(b"not a sqlite database")
+
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 1
+    evt = restored.get_nowait()
+    assert evt["delegation_id"] == r["delegation_id"]
+    assert evt["profile_home"] == str(profile_home)
+
+
+def test_restore_skips_symlinked_profiles_root(tmp_path, monkeypatch):
+    """The profiles/ ROOT itself being a symlink must also be rejected —
+    child-level _is_symlink checks cannot see a linked ancestor."""
+    import os
+
+    outside = tmp_path / "outside"
+    bait_home = outside / "agent-x"
+    bait_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(bait_home))
+    r = ad.dispatch_async_delegation(
+        goal="bait", context=None, toolsets=None, role="leaf",
+        model="m", session_key="",
+        runner=lambda: {"status": "completed", "summary": "x"},
+    )
+    assert _drain_for(r["delegation_id"]) is not None
+
+    home = tmp_path / "home"
+    home.mkdir()
+    os.symlink(str(outside), str(home / "profiles"))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    assert ad.restore_undelivered_completions(queue.Queue()) == 0
+
+
+def test_restore_overrides_stale_profile_home(tmp_path, monkeypatch):
+    """The durable row's on-disk location is the authoritative owner: a
+    profile_home stamped before `hermes profile rename` moved the directory
+    must be overwritten on restore, or delivery scopes into the old path and
+    the completion vanishes while the real row stays pending."""
+    profile_home = tmp_path / "profiles" / "agent-b"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    r = ad.dispatch_async_delegation(
+        goal="renamed", context=None, toolsets=None, role="leaf",
+        model="m", session_key="",
+        runner=lambda: {"status": "completed", "summary": "ok"},
+    )
+    assert _drain_for(r["delegation_id"]) is not None
+
+    db_path = profile_home / "state.db"
+    with ad._DB_LOCK, ad._connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT event_json FROM async_delegations WHERE delegation_id=?",
+            (r["delegation_id"],),
+        ).fetchone()
+        evt = json.loads(row[0])
+        evt["profile_home"] = str(tmp_path / "profiles" / "old-name-gone")
+        conn.execute(
+            "UPDATE async_delegations SET event_json=? WHERE delegation_id=?",
+            (json.dumps(evt), r["delegation_id"]),
+        )
+
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 1
+    assert restored.get_nowait()["profile_home"] == str(profile_home)

@@ -53,7 +53,10 @@ def test_restore_stamps_restored_flag(tmp_path, monkeypatch):
     """Every durable completion re-enqueued at startup carries restored=True."""
     import tools.async_delegation as ad
 
-    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "async_delegations.db")
+    # Point the whole durable layer at tmp: restore now sweeps state.db homes
+    # via get_hermes_home() (multiplex profiles), so patching _db_path alone
+    # would leave the sweep reading the real home.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     record = {
         "delegation_id": "d-old",
         "goal": "old goal",
