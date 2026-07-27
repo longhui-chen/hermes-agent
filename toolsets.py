@@ -63,6 +63,9 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
+    # Agent-to-agent call (zettlab; schema-gated by ZET_AGENT_CALL_URL —
+    # invisible on deployments without local-server)
+    "call_agent",
     # Cronjob management
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
@@ -250,6 +253,12 @@ TOOLSETS = {
         "includes": []
     },
     
+    "agent_call": {
+        "description": "Hand tasks to other real agents on this device (zettlab)",
+        "tools": ["call_agent"],
+        "includes": []
+    },
+
     "delegation": {
         "description": "Spawn subagents with isolated context for complex subtasks",
         "tools": ["delegate_task"],

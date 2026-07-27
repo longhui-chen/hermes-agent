@@ -844,6 +844,36 @@ def list_async_delegations() -> List[Dict[str, Any]]:
         ]
 
 
+def interrupt_delegation(delegation_id: str, reason: str = "user_cancel") -> bool:
+    """Signal ONE running async delegation to stop (zettlab control plane).
+
+    Per-id counterpart to ``interrupt_for_session`` — backs the App's
+    "cancel this delegation" button via the zet_agent HTTP surface. Returns
+    True when a running record matched and its interrupt was invoked; the
+    children still emit a normal completion event (status='interrupted')
+    through the finalize path, so the caller session gets closure.
+    """
+    delegation_id = str(delegation_id or "").strip()
+    if not delegation_id:
+        return False
+    with _records_lock:
+        record = _records.get(delegation_id)
+        fn = (
+            record.get("interrupt_fn")
+            if record and record.get("status") == "running"
+            else None
+        )
+    if not callable(fn):
+        return False
+    try:
+        fn()
+    except Exception as exc:
+        logger.debug("interrupt_delegation %s failed: %s", delegation_id, exc)
+        return False
+    logger.info("Interrupted async delegation %s (%s)", delegation_id, reason)
+    return True
+
+
 def interrupt_all(reason: str = "shutdown") -> int:
     """Signal every running async delegation to stop. Returns how many.
 

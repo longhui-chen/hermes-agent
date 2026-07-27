@@ -2437,6 +2437,65 @@ class ZetAgentAdapter(APIServerAdapter):
         status = "stopping" if (agent is not None or task is not None) else "not_running"
         return web.json_response({"session_id": session_id, "status": status})
 
+    # ------------------------------------------------------------------
+    # Delegation control plane (App banner: status / per-id cancel)
+    # ------------------------------------------------------------------
+
+    async def _handle_delegations_status(self, request: "web.Request") -> "web.Response":
+        """GET /v1/delegations/status — sync tree + async records snapshot.
+
+        Thin wrapper over the same module-level registries the TUI /agents
+        overlay reads (tui_gateway delegation.status). Consumed by
+        zettlab-local-server for reconcile-after-restart and the App's
+        control-plane proxy.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            from tools.async_delegation import list_async_delegations
+            from tools.delegate_tool import list_active_subagents
+
+            active = list_active_subagents()
+            async_records = list_async_delegations()
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response({"active": active, "async": async_records})
+
+    async def _handle_delegation_cancel(self, request: "web.Request") -> "web.Response":
+        """POST /v1/delegations/{delegation_id}/cancel — stop ONE async batch."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        delegation_id = str(request.match_info.get("delegation_id", "")).strip()
+        try:
+            from tools.async_delegation import interrupt_delegation
+
+            ok = interrupt_delegation(delegation_id)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response(
+            {"delegation_id": delegation_id, "interrupted": bool(ok)},
+            status=200 if ok else 404,
+        )
+
+    async def _handle_subagent_interrupt(self, request: "web.Request") -> "web.Response":
+        """POST /v1/subagents/{subagent_id}/interrupt — stop ONE sync child."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        subagent_id = str(request.match_info.get("subagent_id", "")).strip()
+        try:
+            from tools.delegate_tool import interrupt_subagent
+
+            ok = interrupt_subagent(subagent_id)
+        except Exception as exc:
+            return web.json_response({"error": str(exc)}, status=500)
+        return web.json_response(
+            {"subagent_id": subagent_id, "interrupted": bool(ok)},
+            status=200 if ok else 404,
+        )
+
     async def _handle_capabilities(self, request: "web.Request") -> "web.Response":
         """Extend the base capability surface with zet_agent-only endpoints.
 
@@ -3892,6 +3951,32 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_post(
                 "/v1/profile/unload",
                 self._handle_profile_unload,
+            )
+            # Delegation control plane (App banner status / cancel) — native
+            # + profile-scoped mirrors, ZET_AGENT_KEY Bearer auth like the
+            # rest of the surface.
+            self._app.router.add_get(
+                "/v1/delegations/status", self._handle_delegations_status
+            )
+            self._app.router.add_post(
+                "/v1/delegations/{delegation_id}/cancel",
+                self._handle_delegation_cancel,
+            )
+            self._app.router.add_post(
+                "/v1/subagents/{subagent_id}/interrupt",
+                self._handle_subagent_interrupt,
+            )
+            self._app.router.add_get(
+                "/p/{profile}/v1/delegations/status",
+                self._profile_handler(self._handle_delegations_status),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/delegations/{delegation_id}/cancel",
+                self._profile_handler(self._handle_delegation_cancel),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/subagents/{subagent_id}/interrupt",
+                self._profile_handler(self._handle_subagent_interrupt),
             )
             self._register_profile_api_routes(
                 self._app.router,

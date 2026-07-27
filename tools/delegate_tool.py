@@ -51,6 +51,9 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "send_message",  # no cross-platform side effects
         "execute_code",  # children should reason step-by-step, not write scripts
         "cronjob",  # no scheduling more work in the parent's name
+        "call_agent",  # anonymous workers may not consult real agents — that
+        # would bypass the server-side call-chain/quota guardrails with a
+        # principal that has no identity to authorize
     ]
 )
 
