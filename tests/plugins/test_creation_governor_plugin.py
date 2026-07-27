@@ -98,12 +98,16 @@ class _Context:
         self.llm = llm
         self.tools = []
         self.hooks = []
+        self.auxiliary_tasks = []
 
     def register_tool(self, **kwargs):
         self.tools.append(kwargs)
 
     def register_hook(self, *args, **kwargs):
         self.hooks.append((args, kwargs))
+
+    def register_auxiliary_task(self, **kwargs):
+        self.auxiliary_tasks.append(kwargs)
 
 
 def _decode_envelope(text):
@@ -148,6 +152,14 @@ def test_first_turn_and_every_third_turn_run_bounded_json_checks():
         for call in llm.calls
     )
     assert all(call[1]["max_tokens"] == 500 for call in llm.calls)
+    assert all(
+        call[1]["timeout"] == plugin.EVALUATION_TIMEOUT_SECONDS
+        for call in llm.calls
+    )
+    assert all(
+        call[1]["auxiliary_task"] == plugin.AUXILIARY_TASK_NAME
+        for call in llm.calls
+    )
     assert all(call[1]["fail_fast"] is True for call in llm.calls)
     instructions = llm.calls[0][0][0]["content"]
     assert "high-recall zero-shot" in instructions
@@ -552,6 +564,27 @@ def test_tool_schema_is_zero_shot_and_supports_all_outcomes():
         "skill",
         "task",
         "none",
+    ]
+
+
+def test_registers_region_safe_fast_auxiliary_model_alias():
+    plugin = _load_plugin()
+    context = _Context()
+    plugin.register(context)
+
+    assert context.auxiliary_tasks == [
+        {
+            "key": plugin.AUXILIARY_TASK_NAME,
+            "display_name": "Creation opportunity checkpoint",
+            "description": "Fast bounded Agent, Skill, Task, or none classification.",
+            "defaults": {
+                "provider": "custom",
+                "model": "zettlab-creation-fast",
+                "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+                "api_key": "local-ai-proxy",
+                "timeout": 15.0,
+            },
+        }
     ]
 
 

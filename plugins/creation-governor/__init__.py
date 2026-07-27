@@ -35,8 +35,11 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 TOOL_NAME = "detect_creation_opportunity"
-PLUGIN_VERSION = "0.7.0"
+PLUGIN_VERSION = "0.8.0"
 MIN_CONFIDENCE = 0.55
+AUXILIARY_TASK_NAME = "creation_governor_checkpoint"
+AUXILIARY_MODEL_ALIAS = "zettlab-creation-fast"
+EVALUATION_TIMEOUT_SECONDS = 15.0
 PROPOSAL_TTL_SECONDS = 30 * 60
 DISMISS_TTL_SECONDS = 30 * 24 * 60 * 60
 MAX_RECENT_PROPOSALS = 128
@@ -613,9 +616,10 @@ def _run_forced_evaluation(
             ],
             temperature=0.0,
             max_tokens=500,
-            timeout=3.0,
+            timeout=EVALUATION_TIMEOUT_SECONDS,
             fail_fast=True,
             purpose="creation_opportunity_checkpoint_json",
+            auxiliary_task=AUXILIARY_TASK_NAME,
         )
         parsed = _parse_detector_json(result.text)
         logger.info(
@@ -1184,6 +1188,18 @@ def register(ctx: Any) -> None:
     except Exception:
         _plugin_llm = None
 
+    ctx.register_auxiliary_task(
+        key=AUXILIARY_TASK_NAME,
+        display_name="Creation opportunity checkpoint",
+        description="Fast bounded Agent, Skill, Task, or none classification.",
+        defaults={
+            "provider": "custom",
+            "model": AUXILIARY_MODEL_ALIAS,
+            "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+            "api_key": "local-ai-proxy",
+            "timeout": EVALUATION_TIMEOUT_SECONDS,
+        },
+    )
     ctx.register_hook("pre_llm_call", _on_pre_llm_call)
     ctx.register_hook("transform_llm_output", _transform_llm_output)
     ctx.register_tool(

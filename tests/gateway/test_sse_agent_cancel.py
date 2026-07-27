@@ -381,3 +381,55 @@ class TestSSEAgentFailureFinishReason:
         # No error/hermes pollution on the happy path.
         assert "error" not in finish
         assert "hermes" not in finish
+
+
+class TestSSETransformedResponseDelivery:
+    """Post-stream output transforms must reach HTTP streaming clients."""
+
+    def test_append_only_transform_emits_missing_suffix_before_done(self):
+        adapter = _make_adapter()
+        stream_q = queue.Queue()
+        stream_q.put("original answer")
+        stream_q.put(None)
+
+        async def transformed():
+            return (
+                {
+                    "final_response": "original answer\n\n[plugin envelope]",
+                    "response_transformed": True,
+                    "completed": True,
+                },
+                {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+            )
+
+        async def run():
+            agent_task = asyncio.ensure_future(transformed())
+            resp, chunks = _capturing_response()
+            with patch(
+                "gateway.platforms.api_server.web.StreamResponse",
+                return_value=resp,
+            ):
+                await adapter._write_sse_chat_completion(
+                    _make_request(),
+                    "cmpl-transform",
+                    "gpt-4",
+                    1234567890,
+                    stream_q,
+                    agent_task,
+                )
+            return "".join(chunks)
+
+        import json
+
+        sse = asyncio.run(run())
+        content_deltas = []
+        for line in sse.splitlines():
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            event = json.loads(line[6:])
+            delta = event.get("choices", [{}])[0].get("delta", {})
+            if "content" in delta:
+                content_deltas.append(delta["content"])
+
+        assert "".join(content_deltas) == "original answer\n\n[plugin envelope]"
+        assert sse.index("[plugin envelope]") < sse.index("data: [DONE]")
