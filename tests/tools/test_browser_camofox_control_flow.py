@@ -2812,6 +2812,164 @@ def test_a_404_rebuild_repoints_the_other_turns_too():
         mod._sessions.clear()
 
 
+def _tab_not_registered_error(mod, tab_id="tab-old"):
+    resp = MagicMock(status_code=409)
+    resp.url = f"http://127.0.0.1:19090/api/v1/internal/browser/camofox/tabs/{tab_id}/click"
+    resp.json.return_value = {"error": "browser_tab_not_registered"}
+    return mod.CamofoxHTTPError(resp, {"success": False, "error": "browser_tab_not_registered"})
+
+
+def test_a_proxy_tab_not_registered_rebuilds_like_a_404():
+    """The proxy spells a reclaimed tab 409, not 404; navigate must still rebuild.
+
+    The local-server registry forgets an idle-reaped tab and answers
+    409 browser_tab_not_registered. Keyed on 404 alone, the rebuild branch
+    never fires: the stale pin survives, and every later call replays the
+    same conflict with no way out.
+    """
+    import tools.browser_camofox as mod
+
+    mod._sessions.clear()
+    mine = {"user_id": "u", "session_key": "shared", "tab_id": "tab-old", "task_id": "mine", "epoch": 2}
+    theirs = {"user_id": "u", "session_key": "shared", "tab_id": "tab-old", "task_id": "theirs", "epoch": 2}
+    mod._sessions["b"] = theirs
+    replacement = dict(mine, tab_id="tab-new")
+
+    gone = _tab_not_registered_error(mod)
+
+    def _post(path, body=None, timeout=None, session=None, **kwargs):
+        if "tab-old" in path:
+            raise gone
+        return {"url": "https://ok.example/"}
+
+    try:
+        with (
+            patch("tools.browser_camofox._get_session", return_value=mine),
+            patch("tools.browser_camofox._ensure_tab", side_effect=[mine, replacement]),
+            patch("tools.browser_camofox._post", side_effect=_post),
+            patch("tools.browser_camofox._get", side_effect=requests.HTTPError()),
+        ):
+            result = json.loads(mod.camofox_navigate("https://ok.example/", task_id="mine"))
+        assert result.get("success") is True, f"navigate did not recover: {result}"
+        assert theirs["tab_id"] == "tab-new", "the other turn still points at the reclaimed tab"
+    finally:
+        mod._sessions.clear()
+
+
+def test_tab_not_registered_outside_navigate_clears_the_pin_and_says_navigate():
+    """A click or snapshot on a reclaimed tab must not strand the session.
+
+    Only navigate can rebuild, so the shared error funnel has two jobs here:
+    drop the stale pin (a non-empty tab_id skips _ensure_tab's rebuild) for
+    this entry and its identity peers, and tell the model to navigate — the
+    proxy's own "list tabs before continuing" names a tool the model does not
+    have.
+    """
+    import tools.browser_camofox as mod
+
+    mod._sessions.clear()
+    mine = {"user_id": "u", "session_key": "shared", "tab_id": "tab-old", "task_id": "mine", "epoch": 2}
+    theirs = {"user_id": "u", "session_key": "shared", "tab_id": "tab-old", "task_id": "theirs", "epoch": 2}
+    elsewhere = {"user_id": "u", "session_key": "other", "tab_id": "tab-old", "task_id": "elsewhere", "epoch": 2}
+    mod._sessions.update({"b": theirs, "c": elsewhere})
+    try:
+        result = json.loads(mod._tool_error_from_exception(_tab_not_registered_error(mod), session=mine))
+        assert result["success"] is False
+        assert result["error"] == "browser_tab_not_registered"
+        assert result["retryable"] is True
+        assert "browser_navigate" in result["message"]
+        assert mine["tab_id"] is None, "the stale pin survived"
+        assert theirs["tab_id"] is None, "an identity peer kept the stale pin"
+        assert elsewhere["tab_id"] == "tab-old", "another browser identity was cleared"
+    finally:
+        mod._sessions.clear()
+
+
+def test_a_late_409_does_not_tear_down_a_concurrently_rebuilt_tab():
+    """The error is a fact about the tab in the failed request, not the pin.
+
+    Two turns share the reclaimed tab; one rebuilds through navigate and
+    repoints everything to the fresh tab before the other's 409 is handled.
+    Clearing whatever is pinned at handling time would tear down the live tab
+    and leave it orphaned — the late error may only clear pins still holding
+    the id its own request failed against.
+    """
+    import tools.browser_camofox as mod
+
+    mod._sessions.clear()
+    mine = {"user_id": "u", "session_key": "shared", "tab_id": "tab-new", "task_id": "mine", "epoch": 7}
+    laggard = {"user_id": "u", "session_key": "shared", "tab_id": "tab-old", "task_id": "laggard", "epoch": 2}
+    mod._sessions.update({"a": mine, "b": laggard})
+    try:
+        result = json.loads(mod._tool_error_from_exception(
+            _tab_not_registered_error(mod, tab_id="tab-old"), session=mine,
+        ))
+        assert result["error"] == "browser_tab_not_registered"
+        assert mine["tab_id"] == "tab-new", "the rebuilt live tab was torn down by a late 409"
+        assert mine["epoch"] == 7, "the live tab's epoch was cleared"
+        assert laggard["tab_id"] is None, "a peer still pinned to the dead tab kept it"
+    finally:
+        mod._sessions.clear()
+
+
+def test_forget_stale_tab_waits_for_the_identity_lock():
+    """The clear must serialize with a rebuild in flight, not race it.
+
+    Navigate holds the identity owner lock across _ensure_tab and
+    _repoint_shared_entries. A clear that only takes _sessions_lock can land
+    between those steps and null peers the repoint is about to move — so the
+    clear has to queue behind the owner lock, not slip past it.
+    """
+    import threading
+
+    import tools.browser_camofox as mod
+
+    mod._sessions.clear()
+    session = {"user_id": "u", "session_key": "shared", "tab_id": "tab-old", "task_id": "t", "epoch": 1}
+    mod._sessions["a"] = session
+    identity = mod._browser_identity_key(session)
+    rebuild_entered = threading.Event()
+    rebuild_release = threading.Event()
+    cleared = threading.Event()
+
+    def rebuild_holds_lock():
+        with mod._held_owner_lock(identity):
+            rebuild_entered.set()
+            rebuild_release.wait(5)
+
+    def late_clear():
+        mod._forget_stale_tab(session, "tab-old")
+        cleared.set()
+
+    holder = threading.Thread(target=rebuild_holds_lock)
+    clearer = threading.Thread(target=late_clear)
+    try:
+        holder.start()
+        assert rebuild_entered.wait(5)
+        clearer.start()
+        assert not cleared.wait(0.3), "the clear ran while the rebuild held the identity lock"
+        assert session["tab_id"] == "tab-old"
+        rebuild_release.set()
+        assert cleared.wait(5), "the clear never ran after the lock was released"
+        assert session["tab_id"] is None
+    finally:
+        rebuild_release.set()
+        holder.join(5)
+        clearer.join(5)
+        mod._sessions.clear()
+
+
+def test_epoch_stale_is_not_mistaken_for_a_reclaimed_tab():
+    """409 browser_epoch_stale means the tab is alive; rebuilding would lose it."""
+    import tools.browser_camofox as mod
+
+    resp = MagicMock(status_code=409)
+    resp.json.return_value = {"error": "browser_epoch_stale"}
+    stale = mod.CamofoxHTTPError(resp, {"success": False, "error": "browser_epoch_stale"})
+    assert not mod._tab_gone_error(stale)
+    assert mod._tab_gone_error(_tab_not_registered_error(mod))
+
+
 def test_a_queued_delete_is_dropped_when_the_tab_is_adopted_again():
     """The check at enqueue time says nothing about execution time.
 

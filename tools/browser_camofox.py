@@ -25,7 +25,7 @@ import time
 from contextlib import contextmanager
 import uuid
 from typing import Any, Dict, Optional
-from urllib.parse import SplitResult, quote, urlsplit, urlunsplit
+from urllib.parse import SplitResult, quote, unquote, urlsplit, urlunsplit
 
 import requests
 
@@ -1679,6 +1679,60 @@ def _repoint_shared_entries(session: Dict[str, Any], stale_tab_id: Any) -> None:
             other["epoch"] = None
 
 
+def _tab_id_from_error(exc: BaseException) -> Optional[str]:
+    """The tab id the failed request was addressed to, from its request URL.
+
+    The exception is handled outside the identity lock, so the session's
+    current pin may already describe a tab rebuilt by a concurrent turn — the
+    only id this error is a fact about is the one in the request that failed.
+    """
+    resp = getattr(exc, "response", None)
+    url = getattr(resp, "url", None)
+    if not isinstance(url, str):
+        return None
+    match = re.search(r"/tabs/([^/?#]+)", url)
+    return unquote(match.group(1)) if match else None
+
+
+def _forget_stale_tab(session: Optional[Dict[str, Any]], stale_tab_id: Optional[str]) -> None:
+    """Drop the reclaimed tab's pin from this session and its identity peers.
+
+    A non-empty tab_id short-circuits _ensure_tab, so an entry that keeps a
+    reclaimed id replays the same tab-not-registered conflict on every later
+    call with no way out. Clearing it lets the next navigate rebuild.
+
+    Compare-and-clear on the failed request's tab id, under the sessions lock:
+    a concurrent turn may have already rebuilt and repointed entries to a live
+    tab, and clearing whatever happens to be pinned now would tear that down
+    and leave the fresh tab orphaned. An entry pinned to something other than
+    the failed id is left alone.
+    """
+    if not session:
+        return
+    stale = str(stale_tab_id or session.get("tab_id") or "")
+    if not stale:
+        return
+    identity = _browser_identity_key(session)
+    # Under the identity owner lock, not _sessions_lock alone: the rebuild
+    # path (navigate) holds the owner lock across _ensure_tab and
+    # _repoint_shared_entries, and a clear landing between those two steps
+    # would null peers still pinned to the dead tab before the repoint scans
+    # for them — the rebuilt tab loses them, and their next navigate forks a
+    # second live tab. The owner lock is an RLock, so an error handled inside
+    # another operation's identity section re-enters safely.
+    with _held_owner_lock(identity), _sessions_lock:
+        if str(session.get("tab_id") or "") == stale:
+            session["tab_id"] = None
+            session["epoch"] = None
+        for other in _sessions.values():
+            if other is session or str(other.get("tab_id") or "") != stale:
+                continue
+            if _browser_identity_key(other) != identity:
+                continue
+            other["tab_id"] = None
+            other["epoch"] = None
+
+
 def _tab_still_shared(session: Dict[str, Any]) -> bool:
     """Whether another tracked entry is still using this session's tab.
 
@@ -2044,6 +2098,31 @@ def _control_error_payload(exc: BaseException) -> Optional[Dict[str, Any]]:
     return payload
 
 
+def _tab_gone_error(exc: BaseException) -> bool:
+    """Whether the runtime says the pinned tab no longer exists.
+
+    Two spellings of the same fact: a direct Camofox runtime 404s an unknown
+    tab id, while the local-server proxy answers 409 browser_tab_not_registered
+    once its registry forgot the tab (idle reap, runtime restart, reassignment).
+    Distinct from 409 browser_epoch_stale, where the tab is alive and recovery
+    is a resynchronizing snapshot, not a rebuild.
+    """
+    if not isinstance(exc, requests.HTTPError) or exc.response is None:
+        return False
+    status = getattr(exc.response, "status_code", None)
+    if status == 404:
+        return True
+    if status != 409:
+        return False
+    payload = getattr(exc, "payload", None)
+    if not isinstance(payload, dict):
+        try:
+            payload = exc.response.json()
+        except (TypeError, ValueError):
+            return False
+    return isinstance(payload, dict) and payload.get("error") == "browser_tab_not_registered"
+
+
 def _current_tab_url(session: Dict[str, Any]) -> str:
     """The proxy's view of where this tab currently is, or "" when unknown.
 
@@ -2365,6 +2444,26 @@ def _tool_error_from_exception(
         if extra:
             payload.update(extra)
         return json.dumps(payload, ensure_ascii=False)
+    if _tab_gone_error(exc):
+        # Passing the proxy's "list tabs before continuing" through verbatim
+        # points the model at a tool it does not have. Say what actually
+        # recovers this: navigate, which rebuilds the tab now that the stale
+        # pin is gone.
+        _forget_stale_tab(session, _tab_id_from_error(exc))
+        payload = {
+            "success": False,
+            "error": "browser_tab_not_registered",
+            "retryable": True,
+            "message": (
+                "The browser tab this session was using has been closed "
+                "(idle tabs are reclaimed after a few minutes). Call "
+                "browser_navigate with the target URL to open a fresh tab "
+                "and continue."
+            ),
+        }
+        if extra:
+            payload.update(extra)
+        return json.dumps(payload, ensure_ascii=False)
     if isinstance(exc, CamofoxHTTPError):
         payload = dict(exc.payload)
         if extra:
@@ -2562,11 +2661,12 @@ def _navigate_within_identity(
                 session=session,
             )
         except requests.HTTPError as e:
-            if e.response is not None and e.response.status_code == 404:
+            if _tab_gone_error(e):
                 logger.warning(
-                    "Camofox tab %s returned 404 — tab was garbage collected. "
+                    "Camofox tab %s is gone (HTTP %s) — tab was reclaimed. "
                     "Creating a fresh tab.",
                     session["tab_id"],
+                    getattr(e.response, "status_code", "?"),
                 )
                 stale_tab_id = session.get("tab_id")
                 session["tab_id"] = None
