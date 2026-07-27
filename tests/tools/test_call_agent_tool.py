@@ -146,3 +146,36 @@ def test_own_session_id_shapes(call_env):
         assert cat._own_session_id() == ""
     finally:
         reset_current_session_key(token)
+
+
+def test_http_error_body_surfaced(call_env, monkeypatch):
+    """4xx 响应体是 LS 信封：结构化 reason + 可用名单要透传给模型自纠，
+    不能裸抛 "HTTP Error 403"（真机上模型会连猜三个不存在的名字）。"""
+    import io
+    import urllib.error
+
+    from tools.approval import reset_current_session_key, set_current_session_key
+
+    token = set_current_session_key("zettlab:u1:agentA:7")
+
+    def _fake_urlopen(req, timeout=None):
+        body = json.dumps({
+            "code": 403,
+            "data": {
+                "error": "agent not found for caller's user",
+                "reason": "unauthorized",
+                "available_agents": ["Zettlab", "Zettlab Memo"],
+            },
+        }).encode("utf-8")
+        raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", {}, io.BytesIO(body))
+
+    monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+    try:
+        out = json.loads(cat.call_agent(agent="ghost", message="hi"))
+    finally:
+        reset_current_session_key(token)
+
+    assert out["reason"] == "unauthorized"
+    assert out["available_agents"] == ["Zettlab", "Zettlab Memo"]
+    assert "reply" not in out
+    assert "error" in out

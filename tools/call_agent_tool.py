@@ -125,6 +125,7 @@ def call_agent(agent: str = "", message: str = "", parent_agent=None) -> str:
 
     started = time.time()
     try:
+        import urllib.error
         import urllib.request
 
         req = urllib.request.Request(
@@ -133,8 +134,15 @@ def call_agent(agent: str = "", message: str = "", parent_agent=None) -> str:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=_CALL_TIMEOUT_SECONDS) as resp:
-            body = resp.read()
+        try:
+            with urllib.request.urlopen(req, timeout=_CALL_TIMEOUT_SECONDS) as resp:
+                body = resp.read()
+        except urllib.error.HTTPError as http_exc:
+            # 4xx/5xx 的响应体就是 local-server 的信封（cycle/depth/quota/
+            # unauthorized/caller_cancelled + available_agents）。裸抛
+            # "HTTP Error 403" 模型无法自纠——真机上它会连猜三个不存在的
+            # agent 名字然后放弃。读出结构化原因走统一的字段透传。
+            body = http_exc.read()
         result = json.loads(body.decode("utf-8"))
     except Exception as exc:
         logger.warning("call_agent(%s) transport failure: %s", agent, exc)
@@ -161,6 +169,7 @@ def call_agent(agent: str = "", message: str = "", parent_agent=None) -> str:
         "reply",
         "error",
         "reason",
+        "available_agents",
         "agent_id",
         "agent_name",
         "session_id",
