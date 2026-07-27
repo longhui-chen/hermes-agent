@@ -75,3 +75,35 @@ class TestChildPlanAutoExecute(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPresentPlanNoCallbackAutoExecute(unittest.TestCase):
+    """Flow-level guard: the forced flag must actually change present_plan's
+    return path — children have callback=None, and the old code only honored
+    auto_execute inside the callback branch (the child parked on "reply to
+    confirm" forever)."""
+
+    def test_auto_execute_skips_confirmation_gate(self):
+        from tools.plan_tool import present_plan
+
+        out = present_plan(
+            title="T",
+            groups=[{"label": "Steps", "items": ["do the thing"]}],
+            callback=None,
+            auto_execute=True,
+        )
+        self.assertNotIn("reply to confirm", out)
+        self.assertIn("proceed", out.lower())
+        # The plan text itself must survive as context for the child.
+        self.assertIn("do the thing", out)
+
+    def test_default_still_waits_for_confirmation(self):
+        from tools.plan_tool import present_plan
+
+        out = present_plan(
+            title="T",
+            groups=[{"label": "Steps", "items": ["do the thing"]}],
+            callback=None,
+            auto_execute=False,
+        )
+        self.assertIn("reply to confirm", out)
