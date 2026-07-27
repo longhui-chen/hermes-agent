@@ -2232,6 +2232,81 @@ class APIServerAdapter(BasePlatformAdapter):
             if directory_fd is not None:
                 os.close(directory_fd)
 
+    @staticmethod
+    def _assert_profile_state_db_regular(profile_home: Path) -> None:
+        """Fail closed unless state.db is a private regular file on the profile's
+        own filesystem, checked without following symlinks.
+
+        Gates the pathname-based malformed-schema repair below so a symlink
+        swapped in after a malformed error cannot redirect it.
+        """
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        directory_fd = os.open(profile_home, directory_flags)
+        try:
+            directory_stat = os.fstat(directory_fd)
+            leaf_fd = os.open(
+                "state.db",
+                os.O_RDONLY
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                dir_fd=directory_fd,
+            )
+            try:
+                st = os.fstat(leaf_fd)
+            finally:
+                os.close(leaf_fd)
+            if (
+                not stat.S_ISDIR(directory_stat.st_mode)
+                or not stat.S_ISREG(st.st_mode)
+                or st.st_nlink != 1
+                or st.st_dev != directory_stat.st_dev
+            ):
+                raise RuntimeError("profile state.db is not a private regular file")
+        finally:
+            os.close(directory_fd)
+
+    def _open_profile_session_db_with_repair(self, profile_home: Path):
+        """Open the profile SessionDB, self-healing a malformed schema once.
+
+        The sidecar-anchored ``_open_profile_session_db`` opens with
+        ``_allow_path_reopen=False``, which disables SessionDB's built-in
+        malformed-schema recovery. Restore that recovery here so a corrupted
+        ``state.db`` does not leave a profile's sessions/chat/import permanently
+        unavailable: on a malformed error, re-assert (no-follow) that state.db
+        is a private regular file, back it up and repair ``sqlite_master`` in
+        place, then reopen through the same no-follow path. The
+        check-to-repair window is the same VFS-level TOCTOU tracked in #210.
+        """
+        from hermes_state import (
+            _claim_repair_attempt,
+            is_malformed_db_error,
+            repair_state_db_schema,
+        )
+
+        try:
+            return self._open_profile_session_db(profile_home)
+        except BaseException as exc:
+            if not is_malformed_db_error(exc):
+                raise
+            db_path = profile_home / "state.db"
+            if not _claim_repair_attempt(db_path):
+                raise
+            self._assert_profile_state_db_regular(profile_home)
+            logger.error(
+                "profile state.db schema is malformed (%s) — backing up and "
+                "repairing in place, then reopening.",
+                exc,
+            )
+            report = repair_state_db_schema(db_path)
+            if not report.get("repaired"):
+                raise
+            return self._open_profile_session_db(profile_home)
+
     def _open_and_cache_session_db(self, home) -> Optional[Any]:
         """Sync core: return the cached SessionDB for ``home``, opening it once.
 
@@ -2262,7 +2337,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     logger.warning("Invalidated SessionDB close failed", exc_info=True)
             try:
-                db = self._open_profile_session_db(Path(key))
+                db = self._open_profile_session_db_with_repair(Path(key))
             except Exception as e:
                 logger.debug("SessionDB unavailable for API server: %s", e)
                 return None

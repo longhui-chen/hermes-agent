@@ -13,15 +13,33 @@ _AUTHORIZATION_BEARER_RE = re.compile(
     r"(?:\\?[\"']\s*)?bearer\s+([A-Za-z0-9._~+/=-]{8,})",
     re.IGNORECASE | re.MULTILINE,
 )
-_CREDENTIAL_ASSIGNMENT_RE = re.compile(
-    r"(?:^|[\s{,:])[\"']?"
-    r"((?:[a-z0-9]+[._-])*(?:api[._ -]?key|client[._ -]?key[._ -]?data|client[._ -]?secret|"
+# Shared credential-field vocabulary, reused by the inline-assignment and the
+# YAML block-scalar matchers so both stay in sync.
+_CREDENTIAL_KEY_VOCAB = (
+    r"(?:[a-z0-9]+[._-])*(?:api[._ -]?key|client[._ -]?key[._ -]?data|client[._ -]?secret|"
     r"secret[._ -]?access[._ -]?key|access[._ -]?key[._ -]?id|"
     r"account[._ -]?key|subscription[._ -]?key|access[._ -]?token|refresh[._ -]?token|"
     r"auth[._ -]?token|authorization|identitytoken|registrytoken|_?auth|credentials?|secret|token|password|"
-    r"passwd|cookie|private[._ -]?key))"
+    r"passwd|cookie|private[._ -]?key)"
+)
+_CREDENTIAL_ASSIGNMENT_RE = re.compile(
+    r"(?:^|[\s{,:])[\"']?"
+    r"(" + _CREDENTIAL_KEY_VOCAB + r")"
     r"[\"']?\s*[:=]\s*(\"[^\"\r\n]+\"|'[^'\r\n]+'|"
     r"[^\s,}\]\r\n#]+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+# YAML block scalars carry the value on the following indented lines, so the
+# inline matcher above (which stops at the newline) only sees the `|`/`>`
+# indicator and misses the real secret, e.g.
+#   client-key-data: |
+#     LS0tLS1CRUdJTi...
+# Capture the indicator + the first indented block and check it as a value.
+_CREDENTIAL_BLOCK_SCALAR_RE = re.compile(
+    r"(?:^|[\s{,])[\"']?"
+    r"(" + _CREDENTIAL_KEY_VOCAB + r")"
+    r"[\"']?[ \t]*:[ \t]*[|>][+\-0-9]*[ \t]*\r?\n"
+    r"((?:[ \t]+\S[^\r\n]*(?:\r?\n|$))+)",
     re.IGNORECASE | re.MULTILINE,
 )
 _HIGH_CONFIDENCE_BARE_TOKEN_RE = re.compile(
@@ -140,6 +158,15 @@ def portable_credential_finding(value: str) -> Optional[str]:
     for match in _URL_USERINFO_CREDENTIAL_RE.finditer(value):
         if _credential_value_looks_real(match.group(1)):
             return "URL userinfo credential"
+    for match in _CREDENTIAL_BLOCK_SCALAR_RE.finditer(value):
+        block = match.group(2).strip()
+        first_line = block.splitlines()[0].strip() if block else ""
+        if (
+            len(block) >= 6
+            and first_line
+            and _PLACEHOLDER_VALUE_RE.fullmatch(first_line) is None
+        ):
+            return "credential block scalar"
     for match in _AUTHORIZATION_BEARER_RE.finditer(value):
         if _credential_value_looks_real(match.group(1)):
             return "bearer credential"

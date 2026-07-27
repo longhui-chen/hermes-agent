@@ -218,3 +218,27 @@ def test_portable_credential_scanner_rejects_url_userinfo_passwords(value):
 )
 def test_portable_credential_scanner_allows_url_without_userinfo_password(value):
     assert portable_credential_finding(value) is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "client-key-data: |\n  LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0t\n  bW9yZWJhc2U2NA==\n",
+        "password: >-\n  supersecretvalue123\n",
+        "api_key: |\n  AKIA1234567890ABCDEF\n",
+    ],
+)
+def test_portable_credential_scanner_rejects_yaml_block_scalar_secrets(value):
+    assert portable_credential_finding(value) is not None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "description: |\n  This is a normal multi-line note.\n",
+        "password: |\n  ${SECRET_VALUE}\n",
+        "notes: >-\n  wrap this long sentence across lines\n",
+    ],
+)
+def test_portable_credential_scanner_allows_benign_block_scalars(value):
+    assert portable_credential_finding(value) is None

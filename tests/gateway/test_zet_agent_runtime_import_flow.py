@@ -1832,3 +1832,41 @@ def test_open_profile_session_db_accepts_stale_regular_sidecar(tmp_path):
         assert db is not None
     finally:
         db.close()
+
+
+def test_malformed_profile_state_db_self_heals_on_open(tmp_path):
+    """A corrupted state.db must self-heal through the sidecar-anchored open,
+    not leave the profile's sessions/chat/import permanently unavailable."""
+    import sqlite3
+    from hermes_state import SessionDB
+
+    profile_home = tmp_path / "profiles" / "coder"
+    profile_home.mkdir(parents=True)
+    db_path = profile_home / "state.db"
+
+    db = SessionDB(db_path=db_path)
+    sid = db.create_session(session_id="s1", source="cli")
+    db.append_message(sid, role="user", content="hello world")
+    db.close()
+
+    # Corrupt: duplicate the messages_fts row in sqlite_master so every
+    # statement fails with the malformed-schema class.
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA writable_schema=ON")
+    conn.execute(
+        "INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) "
+        "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master "
+        "WHERE name='messages_fts'"
+    )
+    conn.commit()
+    conn.close()
+
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+    healed = adapter._open_and_cache_session_db(profile_home)
+    try:
+        assert healed is not None  # self-healed instead of returning None
+        assert healed.get_session("s1") is not None  # canonical data preserved
+    finally:
+        if healed is not None:
+            healed.close()
+    assert list(profile_home.glob("state.db.malformed-backup-*"))  # backed up first
