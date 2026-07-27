@@ -35,8 +35,9 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 TOOL_NAME = "detect_creation_opportunity"
-PLUGIN_VERSION = "0.7.0"
+PLUGIN_VERSION = "0.7.1"
 MIN_CONFIDENCE = 0.55
+EVALUATION_TIMEOUT_SECONDS = 8.0
 PROPOSAL_TTL_SECONDS = 30 * 60
 DISMISS_TTL_SECONDS = 30 * 24 * 60 * 60
 MAX_RECENT_PROPOSALS = 128
@@ -613,7 +614,7 @@ def _run_forced_evaluation(
             ],
             temperature=0.0,
             max_tokens=500,
-            timeout=3.0,
+            timeout=EVALUATION_TIMEOUT_SECONDS,
             fail_fast=True,
             purpose="creation_opportunity_checkpoint_json",
         )

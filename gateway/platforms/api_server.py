@@ -3853,6 +3853,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             last_activity = time.monotonic()
+            streamed_text_parts: list[str] = []
 
             # Role chunk
             role_chunk = {
@@ -3885,6 +3886,8 @@ class APIServerAdapter(BasePlatformAdapter):
                         f"event: hermes.error\ndata: {event_data}\n\n".encode()
                     )
                 else:
+                    if isinstance(item, str):
+                        streamed_text_parts.append(item)
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
@@ -3951,6 +3954,29 @@ class APIServerAdapter(BasePlatformAdapter):
             error_payload = _chat_stream_error_payload(result_dict, finish_reason)
             if error_payload:
                 await _emit(("__hermes_error__", error_payload))
+
+            # Output-transform hooks run after the model token stream has
+            # finished. Chat platforms can edit the streamed message in place,
+            # but OpenAI-compatible HTTP clients only understand additional
+            # content deltas. When a hook appended a suffix (for example the
+            # creation-recommendation envelope), emit that suffix before the
+            # terminal chunk so API consumers persist and render the actual
+            # final response rather than the pre-transform draft.
+            if result_dict.get("response_transformed"):
+                final_response = result_dict.get("final_response") or ""
+                streamed_response = "".join(streamed_text_parts)
+                if final_response.startswith(streamed_response):
+                    transformed_suffix = final_response[len(streamed_response):]
+                    if transformed_suffix:
+                        await _emit(transformed_suffix)
+                elif not streamed_response and final_response:
+                    await _emit(final_response)
+                else:
+                    logger.warning(
+                        "Cannot safely reconcile transformed SSE response for %s: "
+                        "final output is not an append-only transform",
+                        completion_id,
+                    )
 
             # Finish chunk
             finish_chunk = {

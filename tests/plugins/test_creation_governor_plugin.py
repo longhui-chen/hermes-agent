@@ -148,6 +148,10 @@ def test_first_turn_and_every_third_turn_run_bounded_json_checks():
         for call in llm.calls
     )
     assert all(call[1]["max_tokens"] == 500 for call in llm.calls)
+    assert all(
+        call[1]["timeout"] == plugin.EVALUATION_TIMEOUT_SECONDS
+        for call in llm.calls
+    )
     assert all(call[1]["fail_fast"] is True for call in llm.calls)
     instructions = llm.calls[0][0][0]["content"]
     assert "high-recall zero-shot" in instructions
