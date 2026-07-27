@@ -13,7 +13,7 @@ from hermes_state import SessionDB
 async def test_session_fork_flow_keeps_calendar_notification_hidden_from_model(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
-    adapter._ensure_session_db = lambda: db
+    adapter._session_db = db
     app = web.Application()
     app.router.add_post(
         "/api/sessions/{session_id}/fork", adapter._handle_fork_session,

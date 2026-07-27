@@ -9,8 +9,8 @@
 # 板子分工：
 #   board13 / board154 → 默认刷（不指定 targets 时就这俩）
 #   board4 → "模拟生产"板，须显式 targets 点名（或 all）才刷
-#   board229 / board28 等跨子网板 → 不在范围（board184 LAN 够不到；云 NAS 走
-#     deploy-cloudnas.yml）。注：板清单唯一真相源 = prepare job 的 HOSTS。
+#   board229 / board28 等跨子网板 → 不在本 workflow 范围（board184 LAN 够不到）。
+#   注：板清单唯一真相源 = prepare job 的 HOSTS。
 #
 # 部署语义（dev 源码覆盖，对称 local-server 的 infist-dev-deploy）：
 #   - 只换 OTA 板上 current/lib/hermes-agent 的源码（plugins/ skills/ 一并更新），

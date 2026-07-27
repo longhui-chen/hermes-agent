@@ -113,7 +113,8 @@ jobs:
 
           - [ ] \`hermes_cli/main.py\` — \`OFFICIAL_REPO_URLS\` / \`OFFICIAL_REPO_URL\` still point to \`zettlab/hermes-agent\`
           - [ ] \`scripts/install.sh\` — \`REPO_URL_SSH\` / \`REPO_URL_HTTPS\` still point to \`zettlab/hermes-agent\`
-          - [ ] \`.github/workflows/\` — only zettlab workflows present (no upstream tests/nix/docker/site reintroduced)
+          - [ ] \`.github/workflows/\` — only the approved Zettlab workflows remain: codex review notification, home guard, Infist deploy, seed policy, and upstream release sync
+          - [ ] \`.github/actions/\` — no unused upstream composite actions reintroduced
           - [ ] Tests still pass on a deploy target
           EOF
           )

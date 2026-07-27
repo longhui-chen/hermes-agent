@@ -7,11 +7,11 @@
 //   notifyFromActionResult / notifyFromActionFailure    —— 历史自托管 Action 兼容路径
 //
 // 由各 workflow 的 github-script 步骤 require 后调用。判定 + 卡片真源 =
-// scripts/codereview/report.js（本文件只做 IO 编排）。发送机制与 linearb-feishu-report 一致：
-// 同一只应用机器人 (cli_a97acaec84389cc0)，「每 PR 一话题」——首次不通过发根卡片并 @ 作者一次，
+// scripts/codereview/report.js（本文件只做 IO 编排）。使用应用机器人
+// (cli_a97acaec84389cc0) 按「每 PR 一话题」发送：首次不通过发根卡片并 @ 作者一次，
 // 把飞书 message_id 回写成 PR 隐藏标记评论 <!-- codex-review-feishu-thread:<mid> -->；后续复评
 // 不通过用 reply_in_thread 收进同话题，不重复 @。只处理 base=main、只在不通过时通知。
-// 用与 linearb 不同的话题锚点前缀，两套评审各自独立成话题，互不污染。
+// 话题锚点使用独立的 Codex review 前缀。
 
 const crypto = require('crypto');
 const FEISHU = 'https://open.feishu.cn/open-apis';

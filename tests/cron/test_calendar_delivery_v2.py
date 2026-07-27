@@ -338,7 +338,11 @@ def test_ordinary_cron_terminal_run_still_uses_patched_summary_mark(monkeypatch)
         "schedule": {"kind": "once", "run_at": "2026-07-15T01:00:00Z"},
     }
     monkeypatch.setattr(scheduler, "claim_dispatch", lambda _job_id: True)
-    monkeypatch.setattr(scheduler, "run_job", lambda _job: (True, "output", "done", None))
+    monkeypatch.setattr(
+        scheduler,
+        "run_job",
+        lambda _job, **_kwargs: (True, "output", "done", None),
+    )
     monkeypatch.setattr(scheduler, "save_job_output", lambda *_args: "/tmp/ordinary.md")
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
     marked = []

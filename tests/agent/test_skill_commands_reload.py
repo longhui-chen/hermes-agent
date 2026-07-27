@@ -153,14 +153,14 @@ class TestReloadSkillsHelper:
         monkeypatch.setenv("HERMES_PLATFORM", "telegram")
         assert set(get_skill_commands()) == {"/old"}
 
-        _write_skill(hermes_home / "skills", "new")
+        _write_skill(hermes_home / "skills", "fresh")
         result = reload_skills()
 
-        assert result["added"] == [{"name": "new", "description": "new skill"}]
-        assert set(get_skill_commands()) == {"/old", "/new"}
+        assert result["added"] == [{"name": "fresh", "description": "fresh skill"}]
+        assert set(get_skill_commands()) == {"/old", "/fresh"}
 
         monkeypatch.delenv("HERMES_PLATFORM")
-        assert set(get_skill_commands()) == {"/old", "/new"}
+        assert set(get_skill_commands()) == {"/old", "/fresh"}
 
     def test_reload_blocks_inflight_stale_scan_from_repopulating_other_scope(
         self, hermes_home, monkeypatch
@@ -214,12 +214,12 @@ class TestReloadSkillsHelper:
         bare_thread.start()
         assert bare_yielded_old.wait(5)
 
-        _write_skill(skills_dir, "new")
+        _write_skill(skills_dir, "fresh")
         monkeypatch.setenv("HERMES_PLATFORM", "telegram")
         result = reload_skills()
 
-        assert result["added"] == [{"name": "new", "description": "new skill"}]
-        assert set(get_skill_commands()) == {"/old", "/new"}
+        assert result["added"] == [{"name": "fresh", "description": "fresh skill"}]
+        assert set(get_skill_commands()) == {"/old", "/fresh"}
 
         release_bare_scan.set()
         bare_thread.join(5)
@@ -228,7 +228,7 @@ class TestReloadSkillsHelper:
         assert set(bare_result["commands"]) == {"/old"}
 
         monkeypatch.delenv("HERMES_PLATFORM")
-        assert set(get_skill_commands()) == {"/old", "/new"}
+        assert set(get_skill_commands()) == {"/old", "/fresh"}
 
     def test_concurrent_reload_returns_after_current_scope_cache_is_published(
         self, hermes_home, monkeypatch
@@ -240,7 +240,7 @@ class TestReloadSkillsHelper:
         skills_dir = hermes_home / "skills"
         _write_skill(skills_dir, "old")
         assert set(get_skill_commands()) == {"/old"}
-        _write_skill(skills_dir, "new")
+        _write_skill(skills_dir, "fresh")
 
         real_iter = skill_utils.iter_skill_index_files
         real_bump = sc_mod._bump_skill_command_generation
@@ -307,9 +307,9 @@ class TestReloadSkillsHelper:
         assert not a_thread.is_alive()
         assert errors == []
         assert a_result["result"]["added"] == [
-            {"name": "new", "description": "new skill"}
+            {"name": "fresh", "description": "fresh skill"}
         ]
-        assert set(get_skill_commands()) == {"/old", "/new"}
+        assert set(get_skill_commands()) == {"/old", "/fresh"}
 
         release_b.set()
         b_thread.join(5)

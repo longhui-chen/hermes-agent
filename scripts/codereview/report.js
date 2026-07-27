@@ -354,7 +354,7 @@ function classifyActionFailure(failure = {}) {
 }
 
 /**
- * 是否应该给飞书发报告。与 linearb 流程一致：只有 fail 才推；pass / skip 都不发（不打扰）。
+ * 是否应该给飞书发报告：只有 fail 才推；pass / skip 都不发（不打扰）。
  * @param {{verdict:string}} cls
  */
 function shouldNotify(cls) {
@@ -364,7 +364,7 @@ function shouldNotify(cls) {
 // GitHub 登录名 → 飞书 open_id（用于「不通过」卡片里 @ 出 PR 作者）。唯一真源 =
 // scripts/test-harness/feishu/feishu_openid_registry.json 的 at_by_github_active。
 //
-// ⚠️ open_id 按 app 维度隔离：本流程与 linearb-feishu-report 同一只应用机器人
+// ⚠️ open_id 按 app 维度隔离：本流程由应用机器人
 //   (cli_a97acaec84389cc0) 发送 + 起话题。必须用「该应用机器人维度」的 open_id——
 //   用错维度会被飞书判为 cross-app 整卡拒收。所以这里**只**读 at_by_github_active；
 //   映射缺失时退化为不 @、不报错（best-effort），补全走 build_registry.py。

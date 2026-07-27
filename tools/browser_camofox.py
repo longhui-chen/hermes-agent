@@ -2721,6 +2721,64 @@ def _navigate_within_identity(
             _end_session_call(rebound_session)
 
 
+def _camofox_private_page_block(session: Dict[str, Any], task_id: Optional[str], action: str) -> Optional[str]:
+    """Return a blocked payload when the current Camofox page is private/internal.
+
+    Mirrors the eval-path guard added for ``_camofox_eval`` (browser_tool.py):
+    Camofox snapshot / vision / image-extraction all read current page state, so
+    on a non-local backend they can leak the content of an intranet/metadata
+    page the terminal itself can't reach.  The gate matches ``browser_snapshot``
+    / ``browser_vision`` — only active when the SSRF guard applies (non-local
+    backend, not a local sidecar, ``allow_private_urls`` unset).  Fail-open on
+    probe failure, matching the sibling guards.
+
+    Imports are deferred to call time because ``browser_tool`` imports this
+    module; importing it at module load would create a circular import.
+    """
+    from tools.browser_tool import (
+        _camofox_current_page_private_url,
+        _eval_ssrf_guard_active,
+    )
+
+    if not _eval_ssrf_guard_active(task_id or "default"):
+        return None
+    if _handback_privacy_filter_enabled(session):
+        return _blocked_handback_page_error()
+    blocked_url = _camofox_current_page_private_url(session)
+    if _last_response_started_handback() or _handback_privacy_filter_enabled(session):
+        return _blocked_handback_page_error()
+    if not blocked_url:
+        return None
+    return json.dumps({
+        "success": False,
+        "error": (
+            "Blocked: page URL targets a private or internal address "
+            f"({blocked_url}). Refusing to {action} on this page in this "
+            "browser mode."
+        ),
+    }, ensure_ascii=False)
+
+
+def _private_page_guarded_mutating_call(
+    session: Dict[str, Any],
+    task_id: Optional[str],
+    action: str,
+    path_suffix: str,
+    body: Dict[str, Any],
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Probe and mutate one shared tab under the same identity lock."""
+    observed_epoch = session.get("epoch")
+    with _held_owner_lock(_browser_identity_key(session)):
+        if session.get("epoch") != observed_epoch:
+            raise CamofoxEpochMoved(
+                "the page changed while this operation waited for the browser tab"
+            )
+        blocked = _camofox_private_page_block(session, task_id, action)
+        if blocked:
+            return None, blocked
+        return _mutating_tab_call(session, path_suffix, body), None
+
+
 def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
                      user_task: Optional[str] = None) -> str:
     """Get accessibility tree snapshot from Camofox."""
@@ -2729,10 +2787,15 @@ def camofox_snapshot(full: bool = False, task_id: Optional[str] = None,
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
-        filtered_at_request = _handback_privacy_filter_enabled(session)
         # Held across the capture and the readability check when the filter is
         # already on, so the two describe the same page.
         with _capture_guard(session):
+            blocked = _camofox_private_page_block(
+                session, task_id, "read a page snapshot"
+            )
+            if blocked:
+                return blocked
+            filtered_at_request = _handback_privacy_filter_enabled(session)
             data = _get(
                 _tab_path(session, "/snapshot"),
                 params={"userId": session["user_id"]},
@@ -2794,7 +2857,15 @@ def camofox_click(ref: str, task_id: Optional[str] = None) -> str:
         clean_ref = ref.lstrip("@")
 
         filtered_at_request = _handback_privacy_filter_enabled(session)
-        data = _mutating_tab_call(session, "/click", {"userId": session["user_id"], "ref": clean_ref})
+        data, blocked = _private_page_guarded_mutating_call(
+            session,
+            task_id,
+            "click",
+            "/click",
+            {"userId": session["user_id"], "ref": clean_ref},
+        )
+        if blocked:
+            return blocked
         # The result reports where the click landed, which is where the human
         # is if one took over. Judged on the request-time state and this
         # response's own fact, not just the shared flag a concurrent turn can
@@ -2826,7 +2897,15 @@ def camofox_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
 
         clean_ref = ref.lstrip("@")
 
-        _mutating_tab_call(session, "/type", {"userId": session["user_id"], "ref": clean_ref, "text": text})
+        _, blocked = _private_page_guarded_mutating_call(
+            session,
+            task_id,
+            "type",
+            "/type",
+            {"userId": session["user_id"], "ref": clean_ref, "text": text},
+        )
+        if blocked:
+            return blocked
         from agent.display import (
             redact_browser_typed_text_for_display,
             redact_tool_args_for_display,
@@ -2908,7 +2987,15 @@ def camofox_press(key: str, task_id: Optional[str] = None) -> str:
         if not session["tab_id"]:
             return tool_error("No browser session. Call browser_navigate first.", success=False)
 
-        data = _mutating_tab_call(session, "/press", {"userId": session["user_id"], "key": key})
+        data, blocked = _private_page_guarded_mutating_call(
+            session,
+            task_id,
+            "press",
+            "/press",
+            {"userId": session["user_id"], "key": key},
+        )
+        if blocked:
+            return blocked
         # Enter on a form submits it, and the page that answers is a different
         # document — compared against the snapshot's URL inside
         # _mutating_tab_call, under the tab identity lock.
@@ -2995,8 +3082,13 @@ def camofox_get_images(task_id: Optional[str] = None) -> str:
 
         import re
 
-        images_filtered_at_request = _handback_privacy_filter_enabled(session)
         with _capture_guard(session):
+            blocked = _camofox_private_page_block(
+                session, task_id, "extract page images"
+            )
+            if blocked:
+                return blocked
+            images_filtered_at_request = _handback_privacy_filter_enabled(session)
             data = _get(
                 _tab_path(session, "/snapshot"),
                 params={"userId": session["user_id"]},
@@ -3065,11 +3157,16 @@ def camofox_vision(question: str, annotate: bool = False,
         # tab, filter engaged) are ordinary outcomes, not exemptions.
 
         # Get screenshot as binary PNG
-        screenshot_filtered_at_request = _handback_privacy_filter_enabled(session)
         # A screenshot is a capture like any other — it just returns pixels
         # instead of a tree — so it takes the same critical section, which also
         # re-checks the blocked-landing state under the lock.
         with _capture_guard(session):
+            blocked = _camofox_private_page_block(
+                session, task_id, "capture a screenshot"
+            )
+            if blocked:
+                return blocked
+            screenshot_filtered_at_request = _handback_privacy_filter_enabled(session)
             resp = _get_raw(
                 _tab_path(session, "/screenshot"),
                 params={"userId": session["user_id"]},
@@ -3101,8 +3198,13 @@ def camofox_vision(question: str, annotate: bool = False,
         annotation_context = ""
         if annotate:
             try:
-                annotation_filtered_at_request = _handback_privacy_filter_enabled(session)
                 with _capture_guard(session):
+                    blocked = _camofox_private_page_block(
+                        session, task_id, "read an annotated page snapshot"
+                    )
+                    if blocked:
+                        return blocked
+                    annotation_filtered_at_request = _handback_privacy_filter_enabled(session)
                     snap_data = _get(
                         _tab_path(session, "/snapshot"),
                         params={"userId": session["user_id"]},
