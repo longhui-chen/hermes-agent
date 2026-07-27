@@ -179,3 +179,27 @@ def test_http_error_body_surfaced(call_env, monkeypatch):
     assert out["available_agents"] == [{"id": "840853ff", "name": "Zettlab Memo"}]
     assert "reply" not in out
     assert "error" in out
+
+
+def test_scoped_env_fail_closed_under_mux(monkeypatch):
+    """Active multiplexer + profile missing the var: must NOT fall back to
+    os.environ — that env belongs to the boot profile and would let this
+    profile call out with ANOTHER agent's identity."""
+    import gateway.platforms.zet_agent_cron as cron
+    import agent.secret_scope as secret_scope
+
+    monkeypatch.setenv("ZET_AGENT_CALL_URL", "http://127.0.0.1:9999/leaked")
+    monkeypatch.setattr(cron, "_scoped_env", lambda name, default="": "")
+    monkeypatch.setattr(secret_scope, "is_multiplex_active", lambda: True)
+    assert cat._scoped_env("ZET_AGENT_CALL_URL", "") == ""
+
+
+def test_scoped_env_global_fallback_when_not_mux(monkeypatch):
+    """Legacy single-profile process keeps the os.environ fallback."""
+    import gateway.platforms.zet_agent_cron as cron
+    import agent.secret_scope as secret_scope
+
+    monkeypatch.setenv("ZET_AGENT_CALL_URL", "http://127.0.0.1:9999/local")
+    monkeypatch.setattr(cron, "_scoped_env", lambda name, default="": "")
+    monkeypatch.setattr(secret_scope, "is_multiplex_active", lambda: False)
+    assert cat._scoped_env("ZET_AGENT_CALL_URL", "") == "http://127.0.0.1:9999/local"

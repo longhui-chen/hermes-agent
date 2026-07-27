@@ -46,13 +46,28 @@ _CALL_TIMEOUT_SECONDS = 15 * 60 + 30
 
 
 def _scoped_env(name: str, default: str = "") -> str:
-    """Profile-scoped env resolution (mux-safe), os.environ fallback."""
+    """Profile-scoped env resolution (mux-safe).
+
+    Mirrors zet_agent_cron._scoped_env's fail-closed contract: under an
+    ACTIVE multiplexer, a profile missing this variable must NOT fall back
+    to os.environ — the process env belongs to the boot profile, so the
+    fallback would let one profile issue call_agent with ANOTHER profile's
+    identity (ZET_AGENT_ID / call URL). Only legacy single-profile
+    processes may read the global environment.
+    """
     try:
         from gateway.platforms.zet_agent_cron import _scoped_env as scoped
 
         value = scoped(name, "")
         if value:
             return value
+    except Exception:
+        pass
+    try:
+        from agent.secret_scope import is_multiplex_active
+
+        if is_multiplex_active():
+            return default
     except Exception:
         pass
     return os.environ.get(name, default)
