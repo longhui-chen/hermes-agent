@@ -1832,19 +1832,3 @@ def test_open_profile_session_db_accepts_stale_regular_sidecar(tmp_path):
         assert db is not None
     finally:
         db.close()
-
-
-@pytest.mark.asyncio
-async def test_ensure_session_db_async_runs_off_event_loop():
-    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
-    seen = {}
-    sentinel = object()
-
-    def _record():
-        seen["thread"] = threading.get_ident()
-        return sentinel
-
-    adapter._ensure_session_db = _record
-    result = await adapter._ensure_session_db_async()
-    assert result is sentinel
-    assert seen["thread"] != threading.get_ident()

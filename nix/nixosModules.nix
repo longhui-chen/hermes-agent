@@ -768,8 +768,11 @@
               --content-file "$ACTIVATION_TMP/config.yaml" --leaf-mode ${configYamlMode}
           ''}
 
-          # Managed mode marker (so interactive shells also detect NixOS management)
-          _profile_leaf --write-leaf .managed --content-file /dev/null --leaf-mode 0644
+          # Managed mode marker (so interactive shells also detect NixOS management).
+          # The content source must be a regular file: _read_bounded_content_file
+          # rejects character devices like /dev/null with EINVAL.
+          : > "$ACTIVATION_TMP/managed-marker"
+          _profile_leaf --write-leaf .managed --content-file "$ACTIVATION_TMP/managed-marker" --leaf-mode 0644
 
           # Container mode metadata — tells the host CLI to exec into the
           # container instead of running locally. Removed when container mode

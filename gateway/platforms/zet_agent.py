@@ -895,7 +895,7 @@ class ZetAgentAdapter(APIServerAdapter):
         agent = agent_ref[0] if isinstance(agent_ref, list) and agent_ref else None
         session_db = getattr(agent, "_session_db", None)
         if session_db is None:
-            session_db = await self._ensure_session_db_async()
+            session_db = self._ensure_session_db()
         if session_db is None:
             return
 
@@ -2953,7 +2953,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 status=500,
             )
         if _request_value(request, "hermes_profile_home"):
-            session_db = await self._ensure_session_db_async()
+            session_db = self._ensure_session_db()
         else:
             session_db = getattr(gw, "_session_db", None)
         if session_db is None:
@@ -3160,7 +3160,7 @@ class ZetAgentAdapter(APIServerAdapter):
         # so return 500 to let the local-server caller fall back to
         # ``registry.Stop`` (lazy respawn reads the new file fresh).
         if _request_value(request, "hermes_profile_home"):
-            session_db = await self._ensure_session_db_async()
+            session_db = self._ensure_session_db()
         else:
             session_db = getattr(gw, "_session_db", None)
         if session_db is None:

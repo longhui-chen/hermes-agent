@@ -149,19 +149,26 @@ class RuntimeImportIncomplete(ValueError):
     """A transcript import cannot commit until every declared message exists."""
 
 
-def _validate_runtime_import_identifier(field: str, value: Any) -> str:
+# Matches HermesAPIServer._MAX_SESSION_HEADER_LEN (gateway/platforms/api_server.py) —
+# the ceiling the API server already enforces on session ids reaching the
+# create/chat path. Session-file cleanup must accept everything that path
+# allows, not the tighter 128-char runtime-import default below.
+SESSION_ID_FILENAME_MAX_LEN = 256
+
+
+def _validate_runtime_import_identifier(field: str, value: Any, max_length: int = 128) -> str:
     """Validate IDs that can later reach session-derived filesystem paths."""
     from gateway.session import _is_path_unsafe
 
     if (
         not isinstance(value, str)
         or not value
-        or len(value) > 128
+        or len(value) > max_length
         or any(ord(char) < 0x20 for char in value)
         or any(char in "*?[]" for char in value)
         or _is_path_unsafe(value)
     ):
-        raise ValueError(f"{field} must be a path-safe 1..128 character identifier")
+        raise ValueError(f"{field} must be a path-safe 1..{max_length} character identifier")
     return value
 
 
@@ -5743,7 +5750,9 @@ class SessionDB:
         if sessions_dir is None:
             return
         try:
-            _validate_runtime_import_identifier("session_id", session_id)
+            _validate_runtime_import_identifier(
+                "session_id", session_id, max_length=SESSION_ID_FILENAME_MAX_LEN
+            )
         except ValueError:
             logger.warning(
                 "Refusing filesystem cleanup for unsafe session id: %r", session_id

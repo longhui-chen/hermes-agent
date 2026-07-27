@@ -1737,17 +1737,6 @@ class APIServerAdapter(BasePlatformAdapter):
                         logger.debug("SessionDB unavailable for API server: %s", e)
         return self._session_db
 
-    async def _ensure_session_db_async(self):
-        """Request-handler variant of ``_ensure_session_db``.
-
-        Even the warm path stats the profile directory and ``state.db`` to
-        validate the cached DB's generation, and a cold path pays the full
-        SQLite open — none of which belongs on the shared aiohttp event-loop
-        thread. ``asyncio.to_thread`` copies the current context, so the
-        profile-home ContextVar scope resolves identically in the worker.
-        """
-        return await asyncio.to_thread(self._ensure_session_db)
-
     @staticmethod
     def _profile_home_key(profile_home: Optional[Any] = None) -> str:
         """Return the canonical cache key for a profile home."""
@@ -2341,8 +2330,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return {}, web.json_response(_openai_error("Request body must be a JSON object"), status=400)
         return body, None
 
-    async def _get_existing_session_or_404(self, session_id: str) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
-        db = await self._ensure_session_db_async()
+    def _get_existing_session_or_404(self, session_id: str) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+        db = self._ensure_session_db()
         if db is None:
             return None, web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
         session = db.get_session(session_id)
@@ -2350,8 +2339,8 @@ class APIServerAdapter(BasePlatformAdapter):
             return None, web.json_response(_openai_error(f"Session not found: {session_id}", code="session_not_found"), status=404)
         return session, None
 
-    async def _conversation_history_for_session(self, session_id: str) -> List[Dict[str, Any]]:
-        db = await self._ensure_session_db_async()
+    def _conversation_history_for_session(self, session_id: str) -> List[Dict[str, Any]]:
+        db = self._ensure_session_db()
         if db is None:
             return []
         try:
@@ -2366,7 +2355,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
-        db = await self._ensure_session_db_async()
+        db = self._ensure_session_db()
         if db is None:
             return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
 
@@ -2398,7 +2387,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if err:
             return err
 
-        db = await self._ensure_session_db_async()
+        db = self._ensure_session_db()
         if db is None:
             return web.json_response(_openai_error("Session database unavailable", code="session_db_unavailable"), status=503)
 
@@ -2432,7 +2421,7 @@ class APIServerAdapter(BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
-        session, err = await self._get_existing_session_or_404(request.match_info["session_id"])
+        session, err = self._get_existing_session_or_404(request.match_info["session_id"])
         if err:
             return err
         return web.json_response({"object": "hermes.session", "session": self._session_response(session)})
@@ -2443,7 +2432,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
         session_id = request.match_info["session_id"]
-        session, err = await self._get_existing_session_or_404(session_id)
+        session, err = self._get_existing_session_or_404(session_id)
         if err:
             return err
         body, err = await self._read_json_body(request)
@@ -2454,7 +2443,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if unknown:
             return web.json_response(_openai_error(f"Unsupported session fields: {', '.join(unknown)}", code="unsupported_session_field"), status=400)
 
-        db = await self._ensure_session_db_async()
+        db = self._ensure_session_db()
         if "title" in body:
             try:
                 db.set_session_title(session_id, "" if body["title"] is None else str(body["title"]))
@@ -2471,10 +2460,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
         session_id = request.match_info["session_id"]
-        session, err = await self._get_existing_session_or_404(session_id)
+        session, err = self._get_existing_session_or_404(session_id)
         if err:
             return err
-        db = await self._ensure_session_db_async()
+        db = self._ensure_session_db()
         deleted = db.delete_session(session_id)
         return web.json_response({"object": "hermes.session.deleted", "id": session_id, "deleted": bool(deleted)})
 
@@ -2484,10 +2473,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
         session_id = request.match_info["session_id"]
-        _, err = await self._get_existing_session_or_404(session_id)
+        _, err = self._get_existing_session_or_404(session_id)
         if err:
             return err
-        db = await self._ensure_session_db_async()
+        db = self._ensure_session_db()
         resolved_id = db.resolve_resume_session_id(session_id)
         messages = db.get_messages(resolved_id)
         return web.json_response({
@@ -2502,13 +2491,13 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
         source_id = request.match_info["session_id"]
-        source, err = await self._get_existing_session_or_404(source_id)
+        source, err = self._get_existing_session_or_404(source_id)
         if err:
             return err
         body, err = await self._read_json_body(request)
         if err:
             return err
-        db = await self._ensure_session_db_async()
+        db = self._ensure_session_db()
         fork_id = str(body.get("id") or body.get("session_id") or f"api_{int(time.time())}_{uuid.uuid4().hex[:8]}").strip()
         if not fork_id or re.search(r'[\r\n\x00]', fork_id):
             return web.json_response(_openai_error("Invalid session ID", code="invalid_session_id"), status=400)
@@ -2552,7 +2541,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
         session_id = request.match_info["session_id"]
-        _, err = await self._get_existing_session_or_404(session_id)
+        _, err = self._get_existing_session_or_404(session_id)
         if err:
             return err
         body, err = await self._read_json_body(request)
@@ -2564,7 +2553,7 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
-        history = await self._conversation_history_for_session(session_id)
+        history = self._conversation_history_for_session(session_id)
         result, usage = await self._run_agent(
             user_message=user_message,
             conversation_history=history,
@@ -2596,7 +2585,7 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
         session_id = request.match_info["session_id"]
-        _, err = await self._get_existing_session_or_404(session_id)
+        _, err = self._get_existing_session_or_404(session_id)
         if err:
             return err
         body, err = await self._read_json_body(request)
@@ -2653,7 +2642,7 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
-                history = await self._conversation_history_for_session(session_id)
+                history = self._conversation_history_for_session(session_id)
                 result, usage = await self._run_agent(
                     user_message=user_message,
                     conversation_history=history,
@@ -2873,7 +2862,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             session_id = provided_session_id
             try:
-                db = await self._ensure_session_db_async()
+                db = self._ensure_session_db()
                 if db is not None:
                     history = db.get_messages_as_conversation(session_id)
             except Exception as e:

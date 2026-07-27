@@ -534,6 +534,77 @@ def test_read_bounded_content_file_rejects_oversized_without_full_read(
         safe_profile_dirs._read_bounded_content_file(oversized, ".managed")
 
 
+def test_read_bounded_content_file_accepts_empty_regular_file(tmp_path):
+    marker = tmp_path / "managed-marker"
+    marker.touch()
+
+    assert safe_profile_dirs._read_bounded_content_file(marker, ".managed") == b""
+
+
+def test_read_bounded_content_file_rejects_character_device():
+    dev_null = Path("/dev/null")
+    if not dev_null.exists():
+        pytest.skip("/dev/null unavailable")
+
+    with pytest.raises(OSError) as raised:
+        safe_profile_dirs._read_bounded_content_file(dev_null, ".managed")
+
+    assert raised.value.errno == errno.EINVAL
+
+
+def test_safe_profile_cli_write_leaf_accepts_empty_regular_file_marker(tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    current = home.stat()
+    setup = subprocess.run(
+        [sys.executable, str(_SOURCE), str(home), str(current.st_uid), str(current.st_gid)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    identity = setup.stdout.strip()
+    marker = tmp_path / "managed-marker"
+    marker.touch()
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(_SOURCE),
+            "--expected-identity",
+            identity,
+            str(home),
+            str(current.st_uid),
+            str(current.st_gid),
+            "--write-leaf",
+            ".managed",
+            "--content-file",
+            str(marker),
+            "--leaf-mode",
+            "0644",
+        ],
+        check=True,
+    )
+
+    read_back = subprocess.run(
+        [
+            sys.executable,
+            str(_SOURCE),
+            "--expected-identity",
+            identity,
+            str(home),
+            str(current.st_uid),
+            str(current.st_gid),
+            "--read-leaf",
+            ".managed",
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    assert read_back.stdout == b""
+    assert (home / ".managed").is_file()
+
+
 def test_safe_profile_cli_write_leaf_rejects_oversized_content(tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()

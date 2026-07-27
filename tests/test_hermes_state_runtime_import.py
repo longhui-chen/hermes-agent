@@ -657,6 +657,65 @@ def test_delete_legacy_glob_session_id_cannot_remove_other_request_dumps(tmp_pat
         db.close()
 
 
+def test_delete_session_with_long_legit_id_removes_transcript_files(tmp_path):
+    """The API server accepts session ids up to 256 chars
+    (HermesAPIServer._MAX_SESSION_HEADER_LEN in gateway/platforms/api_server.py),
+    well past the 128-char default that guards the runtime-import identifiers.
+    Cleanup must not silently skip real, glob-free ids in that 129..256
+    range — a prior fix reused the 128-char validator here and regressed
+    long-id cleanup: the DB row deleted but transcript files (.json /
+    .jsonl / request_dump_*) leaked on disk forever."""
+    db = SessionDB(tmp_path / "state.db")
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    long_id = "s" * 200
+    try:
+        db.create_session(long_id, "cli")
+        (sessions_dir / f"{long_id}.json").write_text("{}", encoding="utf-8")
+        (sessions_dir / f"{long_id}.jsonl").write_text("", encoding="utf-8")
+        dump = sessions_dir / f"request_dump_{long_id}_001.json"
+        dump.write_text("{}", encoding="utf-8")
+
+        assert db.delete_session(long_id, sessions_dir=sessions_dir) is True
+
+        assert not (sessions_dir / f"{long_id}.json").exists()
+        assert not (sessions_dir / f"{long_id}.jsonl").exists()
+        assert not dump.exists()
+    finally:
+        db.close()
+
+
+def test_remove_session_files_rejects_id_past_api_server_ceiling(tmp_path):
+    """An id longer than the API server ever admits (>256) falls outside
+    every real entry point. Cleanup must refuse it rather than trust an
+    unbounded-length string into a filesystem path/glob, and must not
+    raise — a filesystem hiccup or a malformed legacy row should never
+    block the DB-side delete. The validator rejects before touching the
+    filesystem, so no 300+ char path component is ever created."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    too_long_id = "s" * 300
+
+    hermes_state.SessionDB._remove_session_files(sessions_dir, too_long_id)
+
+
+@pytest.mark.parametrize(
+    "unsafe", ["../auth", "nested/session", "win\\session", "..", "*", "?", "[session]"]
+)
+def test_remove_session_files_rejects_unsafe_id_regardless_of_length(tmp_path, unsafe):
+    """Glob metacharacters and path traversal must stay rejected for
+    session-file cleanup even after widening the accepted length range —
+    the length ceiling moved, the character-class checks did not."""
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    other_dump = sessions_dir / "request_dump_sentinel_001.json"
+    other_dump.write_text("must survive", encoding="utf-8")
+
+    hermes_state.SessionDB._remove_session_files(sessions_dir, unsafe)
+
+    assert other_dump.read_text(encoding="utf-8") == "must survive"
+
+
 def test_runtime_import_chunk_iterator_never_calls_fetchall():
     rows = iter([{"messages_json": "[]"}, None])
 
