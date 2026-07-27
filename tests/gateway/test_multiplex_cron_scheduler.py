@@ -91,6 +91,96 @@ def test_multiplex_cron_scheduler_runs_each_profile_under_profile_home(tmp_path,
     )
 
 
+def test_multiplex_inprocess_cron_pauses_dispatch_while_gateway_drains(
+    tmp_path, monkeypatch
+):
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    main_home = tmp_path / ".hermes" / "profiles" / "main"
+    dispatch_states = []
+    started = threading.Event()
+
+    class RecordingScheduler(InProcessCronScheduler):
+        def start(
+            self,
+            stop_event,
+            *,
+            adapters=None,
+            loop=None,
+            interval=60,
+            can_dispatch=None,
+        ):
+            dispatch_states.append(can_dispatch())
+            runner._external_drain_active = True
+            dispatch_states.append(can_dispatch())
+            started.set()
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda multiplex: [("main", main_home)],
+    )
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "main")
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler",
+        lambda: RecordingScheduler(),
+    )
+
+    runner = SimpleNamespace(
+        config=GatewayConfig(multiplex_profiles=True),
+        adapters={},
+        _profile_adapters={},
+        _draining=False,
+        _external_drain_active=False,
+    )
+    stop_event = threading.Event()
+    threads = _start_gateway_cron_schedulers(runner, stop_event, reconcile_interval=0.05)
+    try:
+        assert started.wait(timeout=2)
+    finally:
+        stop_event.set()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert dispatch_states == [True, False]
+
+
+def test_nonmultiplex_inprocess_cron_pauses_dispatch_while_gateway_drains(monkeypatch):
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    dispatch_states = []
+
+    class RecordingScheduler(InProcessCronScheduler):
+        def start(
+            self,
+            stop_event,
+            *,
+            adapters=None,
+            loop=None,
+            interval=60,
+            can_dispatch=None,
+        ):
+            dispatch_states.append(can_dispatch())
+            runner._draining = True
+            dispatch_states.append(can_dispatch())
+
+    monkeypatch.setattr(
+        "cron.scheduler_provider.resolve_cron_scheduler",
+        lambda: RecordingScheduler(),
+    )
+
+    runner = SimpleNamespace(
+        config=GatewayConfig(multiplex_profiles=False),
+        adapters={},
+        _draining=False,
+        _external_drain_active=False,
+    )
+    threads = _start_gateway_cron_schedulers(runner, threading.Event())
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert dispatch_states == [True, False]
+
+
 def test_multiplex_cron_reconciler_starts_new_profiles(tmp_path, monkeypatch):
     from hermes_constants import get_hermes_home
 

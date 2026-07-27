@@ -334,6 +334,7 @@ def test_plan_mode_suppresses_provisional_plain_text_streaming():
         _zet_agent_plan_presented=False,
         stream_delta_callback=streamed.append,
         _stream_callback=None,
+        _stream_writer_superseded=lambda: False,
     )
     agent._should_suppress_plan_stream_text = lambda: AIAgent._should_suppress_plan_stream_text(agent)
 
@@ -349,6 +350,7 @@ def test_plan_mode_suppresses_provisional_reasoning_streaming():
         _zet_agent_plan_mode_active=True,
         _zet_agent_plan_presented=False,
         reasoning_callback=streamed.append,
+        _stream_writer_superseded=lambda: False,
     )
     agent._should_suppress_plan_stream_text = lambda: AIAgent._should_suppress_plan_stream_text(agent)
 

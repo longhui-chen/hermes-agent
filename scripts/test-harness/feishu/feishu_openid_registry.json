@@ -1,6 +1,6 @@
 {
   "_meta": {
-    "note": "飞书 open_id 权威注册表。open_id 为 CURRENT_APP 维度，@人首选；open_id_legacy 为旧 webhook 机器人维度，仅当用旧机器人发送时兜底。linearb-feishu-report 应使用 at_by_github_active（应用机器人 cli_a97 维度）；旧 at_by_github 仅供旧 webhook 流程兜底。",
+    "note": "飞书 open_id 权威注册表。open_id 为 CURRENT_APP 维度，@人首选；open_id_legacy 为旧 webhook 机器人维度，仅当用旧机器人发送时兜底。Codex review 飞书通知使用 at_by_github_active（应用机器人 cli_a97 维度）；旧 at_by_github 仅供旧 webhook 流程兜底。",
     "current_app_id": "cli_a98867442059900c",
     "people_count": 58,
     "legacy_only_count": 28,
@@ -8,7 +8,7 @@
     "at_by_github_active_count": 37,
     "regenerate": "python3 scripts/test-harness/feishu/build_registry.py",
     "active_app_id": "cli_a97acaec84389cc0",
-    "active_app_note": "at_by_github_active = 应用机器人 cli_a97 维度的 GitHub login->open_id，供 linearb-feishu-report（应用机器人/话题模式）@作者使用。旧 at_by_github 为 webhook 维度，仅旧流程兜底。"
+    "active_app_note": "at_by_github_active = 应用机器人 cli_a97 维度的 GitHub login->open_id，供 Codex review 飞书通知（应用机器人/话题模式）@作者使用。旧 at_by_github 为 webhook 维度，仅旧流程兜底。"
   },
   "people": [
     {

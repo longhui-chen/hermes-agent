@@ -67,6 +67,22 @@ hermes webhook subscribe <name> \
 
 Returns the webhook URL and HMAC secret. The user configures their service to POST to that URL.
 
+### Filter or transform payloads before the agent runs
+
+Two mechanisms narrow broad event streams (for example, Todoist or GitHub firing on every update) so only relevant payloads wake the agent:
+
+- **Declarative `filters`** (config.yaml routes only): a list of conditions on payload fields, event type, or headers. Supported operators are `equals`, `not_equals`, `contains`, `exists`, `missing`, `in`, `in_file`, and `regex`, with `all`/`any`/`not` grouping. Non-matching events are ignored with HTTP 200.
+- **Route scripts** (`--script` on subscribe, or `script:` on a config route): a script under `~/.hermes/scripts/` receives the payload as JSON on stdin. JSON stdout replaces the payload before prompt templating; empty stdout, `[SILENT]`, or a nonzero exit ignores the webhook. `.sh` and `.bash` files run with bash; everything else runs with Python. Scripts cannot live outside `~/.hermes/scripts/` because path traversal is blocked.
+
+```bash
+hermes webhook subscribe todoist-memo \
+  --prompt "Task changed: {payload.content}" \
+  --script "todoist-memo-label.py" \
+  --deliver telegram --deliver-chat-id "12345"
+```
+
+See the messaging webhook documentation for the full filter syntax.
+
 ### List subscriptions
 ```bash
 hermes webhook list

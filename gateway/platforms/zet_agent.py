@@ -1134,6 +1134,7 @@ class ZetAgentAdapter(APIServerAdapter):
         tool_start_callback=None,
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
+        route: Optional[Dict[str, Any]] = None,
         request_overrides: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """Build the agent for the zet_agent platform, then attach extra callbacks.
@@ -1155,10 +1156,11 @@ class ZetAgentAdapter(APIServerAdapter):
         # stamps the resolved per-turn flag here so the Plan-First addendum section
         # matches the turn's confirm/auto behaviour. Absent (async /v1/runs path,
         # or non-plan callers) → None → manual (safe default).
-        plan_auto_execute = None
-        if isinstance(request_overrides, dict) and "_zet_plan_auto_execute" in request_overrides:
-            request_overrides = dict(request_overrides)
-            plan_auto_execute = request_overrides.pop("_zet_plan_auto_execute", None)
+        agent_request_overrides = dict(request_overrides or {})
+        plan_auto_execute = agent_request_overrides.pop(
+            "_zet_plan_auto_execute", None
+        )
+        disable_tools = agent_request_overrides.pop("tool_choice", None) == "none"
 
         # 在 ephemeral_system_prompt 头部接 zettlab 工作风格 addendum。
         # 上游传进来的 ephemeral 通常是 SOUL.md / IDENTITY.md 的拼接（per-agent
@@ -1205,6 +1207,13 @@ class ZetAgentAdapter(APIServerAdapter):
         reasoning_config = GatewayRunner._load_reasoning_config()
         model = _resolve_gateway_model()
 
+        # Keep parity with APIServerAdapter: a fallback runtime may carry its
+        # own model, and passing it alongside the explicit model argument would
+        # otherwise raise "multiple values for keyword argument 'model'".
+        runtime_model = runtime_kwargs.pop("model", None)
+        if runtime_model:
+            model = runtime_model
+
         # ZET-576: apply session-level model override if present.
         # _resolve_gateway_model reads config.yaml (agent default), but
         # session overrides live in gateway_runner._session_model_overrides
@@ -1213,27 +1222,73 @@ class ZetAgentAdapter(APIServerAdapter):
         override_key = gateway_session_key or session_id
         runtime_auxiliary_task_configs = None
         runtime_supports_vision = None
+        override = None
         if gw is not None and override_key:
-            override = getattr(gw, "_session_model_overrides", {}).get(override_key)
-            if override:
-                model = override.get("model", model)
-                for k in ("provider", "api_key", "base_url", "api_mode"):
-                    v = override.get(k)
-                    if v is not None:
-                        runtime_kwargs[k] = v
-                context_length = override.get("context_length")
-                if context_length is not None:
-                    runtime_kwargs["config_context_length"] = context_length
-                auxiliary = override.get("auxiliary")
-                if isinstance(auxiliary, dict):
-                    runtime_auxiliary_task_configs = auxiliary
-                supports_vision = override.get("supports_vision")
-                if isinstance(supports_vision, bool):
-                    runtime_supports_vision = supports_vision
-                logger.info(
-                    "session-model-override applied: session=%s model=%s",
-                    override_key, model,
-                )
+            candidate = getattr(gw, "_session_model_overrides", {}).get(override_key)
+            if isinstance(candidate, dict):
+                override = dict(candidate)
+        if override is None:
+            override = self._session_model_override_for(override_key)
+
+        # Per-client route sits between the global runtime and an explicit
+        # session /model override, matching the base API adapter precedence.
+        if route and not override:
+            if route.get("provider"):
+                try:
+                    from gateway.run import _resolve_runtime_agent_kwargs_for_provider
+
+                    provider_kwargs = _resolve_runtime_agent_kwargs_for_provider(
+                        route["provider"]
+                    )
+                    provider_kwargs.pop("model", None)
+                    runtime_kwargs.update(provider_kwargs)
+                except Exception:
+                    for key in (
+                        "api_key",
+                        "base_url",
+                        "api_mode",
+                        "command",
+                        "args",
+                        "credential_pool",
+                    ):
+                        runtime_kwargs.pop(key, None)
+                    runtime_kwargs["provider"] = route["provider"]
+            if route.get("model"):
+                model = route["model"]
+            if route.get("api_key"):
+                runtime_kwargs["api_key"] = route["api_key"]
+            if route.get("base_url"):
+                runtime_kwargs["base_url"] = route["base_url"]
+            logger.debug(
+                "zet_agent model route applied: model=%s provider=%s",
+                model,
+                runtime_kwargs.get("provider"),
+            )
+        elif route and override:
+            logger.debug(
+                "zet_agent model route skipped: session /model override wins for %s",
+                override_key,
+            )
+
+        if override:
+            model = override.get("model", model)
+            for k in ("provider", "api_key", "base_url", "api_mode"):
+                v = override.get(k)
+                if v is not None:
+                    runtime_kwargs[k] = v
+            context_length = override.get("context_length")
+            if context_length is not None:
+                runtime_kwargs["config_context_length"] = context_length
+            auxiliary = override.get("auxiliary")
+            if isinstance(auxiliary, dict):
+                runtime_auxiliary_task_configs = auxiliary
+            supports_vision = override.get("supports_vision")
+            if isinstance(supports_vision, bool):
+                runtime_supports_vision = supports_vision
+            logger.info(
+                "session-model-override applied: session=%s model=%s",
+                override_key, model,
+            )
 
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
@@ -1259,8 +1314,12 @@ class ZetAgentAdapter(APIServerAdapter):
             fallback_model=fallback_model,
             reasoning_config=reasoning_config,
             gateway_session_key=gateway_session_key,
-            request_overrides=request_overrides,
+            request_overrides=agent_request_overrides or None,
         )
+        if disable_tools:
+            agent.tools = []
+            agent.valid_tool_names = set()
+            agent._skip_mcp_refresh = True
         agent.runtime_auxiliary_task_configs = runtime_auxiliary_task_configs
         agent.runtime_supports_vision = runtime_supports_vision
 
@@ -1361,6 +1420,7 @@ class ZetAgentAdapter(APIServerAdapter):
         tool_complete_callback=None,
         agent_ref=None,
         gateway_session_key: Optional[str] = None,
+        route: Optional[Dict[str, Any]] = None,
         response_mode: Optional[str] = None,
         plan_ack: Optional[Dict[str, Any]] = None,
         plan_auto_execute: Optional[bool] = None,
@@ -1435,6 +1495,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 tool_complete_callback=tool_complete_callback,
                 agent_ref=agent_ref,
                 gateway_session_key=gateway_session_key,
+                route=route,
                 response_mode=response_mode,
                 plan_ack=plan_ack,
                 plan_auto_execute=plan_auto_execute,
