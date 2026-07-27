@@ -78,6 +78,22 @@ class _FakeLlm:
         return SimpleNamespace(text=json.dumps(parsed))
 
 
+class _FailingFastRouteLlm:
+    def __init__(self, fallback_result):
+        self.fallback_result = fallback_result
+        self.calls = []
+
+    def complete(self, messages, **kwargs):
+        self.calls.append((messages, kwargs))
+        if kwargs.get("auxiliary_task"):
+            raise RuntimeError("404 route is not in public manifest")
+        return SimpleNamespace(
+            text=json.dumps(self.fallback_result),
+            provider="custom",
+            model="active-main-model",
+        )
+
+
 class _PlainFailureStructuredFallbackLlm:
     def __init__(self, result):
         self.result = result
@@ -166,6 +182,32 @@ def test_first_turn_and_every_third_turn_run_bounded_json_checks():
     assert "ongoing external work domain" in instructions
     assert "today" in instructions
     assert "not by itself a future trigger" in instructions
+
+
+def test_missing_fast_route_retries_once_on_active_main_model():
+    plugin = _load_plugin()
+    llm = _FailingFastRouteLlm(_candidate())
+    plugin.register(_Context(llm))
+
+    context = plugin._on_pre_llm_call(
+        session_id="fast-route-fallback",
+        user_message="Analyze which campaign is performing best.",
+        conversation_history=[],
+    )
+
+    assert "already completed" in context["context"]
+    assert len(llm.calls) == 2
+    assert llm.calls[0][1]["auxiliary_task"] == plugin.AUXILIARY_TASK_NAME
+    assert llm.calls[0][1]["timeout"] == plugin.EVALUATION_TIMEOUT_SECONDS
+    assert "auxiliary_task" not in llm.calls[1][1]
+    assert (
+        llm.calls[1][1]["timeout"]
+        == plugin.MAIN_MODEL_FALLBACK_TIMEOUT_SECONDS
+    )
+    assert (
+        llm.calls[1][1]["purpose"]
+        == "creation_opportunity_checkpoint_main_fallback"
+    )
 
 
 def test_api_server_never_evaluates_or_transforms_recommendations():
@@ -578,11 +620,8 @@ def test_registers_region_safe_fast_auxiliary_model_alias():
             "display_name": "Creation opportunity checkpoint",
             "description": "Fast bounded Agent, Skill, Task, or none classification.",
             "defaults": {
-                "provider": "custom",
                 "model": "zettlab-creation-fast",
-                "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
-                "api_key": "local-ai-proxy",
-                "timeout": 15.0,
+                "timeout": 25.0,
             },
         }
     ]

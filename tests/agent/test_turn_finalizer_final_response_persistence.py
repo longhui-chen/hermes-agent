@@ -403,6 +403,7 @@ def test_transformed_response_is_persisted_for_existing_final_delivery(monkeypat
     assert agent.persisted_messages[-1]["content"] == expected
     assert agent.streamed_deltas == []
     assert result["response_transformed"] is True
+    assert result["response_transform_suffix"] == proposal
 
 
 def test_transformed_response_survives_cold_session_db_readback(monkeypatch, tmp_path):

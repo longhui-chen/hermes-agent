@@ -452,6 +452,7 @@ def finalize_turn(
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
     _response_transformed = False
+    _response_transform_suffix = ""
     _structured_output = False
 
     # Plugin hook: transform_llm_output
@@ -495,6 +496,15 @@ def finalize_turn(
             if isinstance(_hook_result, str) and _hook_result:
                 final_response = _hook_result
         _response_transformed = final_response != _pre_transform_response
+        if (
+            _response_transformed
+            and isinstance(final_response, str)
+            and isinstance(_pre_transform_response, str)
+            and final_response.startswith(_pre_transform_response)
+        ):
+            _response_transform_suffix = final_response[
+                len(_pre_transform_response) :
+            ]
 
         if _response_transformed:
             # Keep transformed output durable. Delivery remains the responsibility
@@ -620,6 +630,7 @@ def finalize_turn(
         "partial": False,  # True only when stopped due to invalid tool calls
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
+        "response_transform_suffix": _response_transform_suffix,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
         "model": agent.model,
         "provider": agent.provider,

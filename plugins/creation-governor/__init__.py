@@ -35,11 +35,12 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 TOOL_NAME = "detect_creation_opportunity"
-PLUGIN_VERSION = "0.8.0"
+PLUGIN_VERSION = "0.9.0"
 MIN_CONFIDENCE = 0.55
 AUXILIARY_TASK_NAME = "creation_governor_checkpoint"
 AUXILIARY_MODEL_ALIAS = "zettlab-creation-fast"
-EVALUATION_TIMEOUT_SECONDS = 15.0
+EVALUATION_TIMEOUT_SECONDS = 25.0
+MAIN_MODEL_FALLBACK_TIMEOUT_SECONDS = 15.0
 PROPOSAL_TTL_SECONDS = 30 * 60
 DISMISS_TTL_SECONDS = 30 * 24 * 60 * 60
 MAX_RECENT_PROPOSALS = 128
@@ -69,6 +70,11 @@ _invocation_scope: ContextVar[tuple[str, str, str | None, str] | None] = Context
 
 _SELF_QUERY_RE = re.compile(
     r"(?:creation[\s_-]*governor|detect_creation_opportunity|propose_creation)",
+    re.IGNORECASE,
+)
+_FAST_ROUTE_UNAVAILABLE_RE = re.compile(
+    r"(?:404|not found|not in public manifest|unknown (?:model|route)|"
+    r"model .+ does not exist|invalid model)",
     re.IGNORECASE,
 )
 _CJK_RE = re.compile(r"[\u3400-\u9fff]")
@@ -600,20 +606,21 @@ def _run_forced_evaluation(
     # materially better zero-shot classifications when asked for JSON in the
     # prompt, and the candidate still passes strict local normalization before
     # it can be displayed.
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                _DETECTOR_INSTRUCTIONS
+                + "\n\nReturn only one compact JSON object with exactly these keys: "
+                "decision, suggested_name, reason, evidence_turn_ids, confidence, "
+                "dedup_key, proposal_text. Do not use Markdown fences."
+            ),
+        },
+        {"role": "user", "content": evidence},
+    ]
     try:
         result = llm.complete(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        _DETECTOR_INSTRUCTIONS
-                        + "\n\nReturn only one compact JSON object with exactly these keys: "
-                        "decision, suggested_name, reason, evidence_turn_ids, confidence, "
-                        "dedup_key, proposal_text. Do not use Markdown fences."
-                    ),
-                },
-                {"role": "user", "content": evidence},
-            ],
+            messages,
             temperature=0.0,
             max_tokens=500,
             timeout=EVALUATION_TIMEOUT_SECONDS,
@@ -621,17 +628,49 @@ def _run_forced_evaluation(
             purpose="creation_opportunity_checkpoint_json",
             auxiliary_task=AUXILIARY_TASK_NAME,
         )
+    except Exception as fast_error:
+        if not _FAST_ROUTE_UNAVAILABLE_RE.search(str(fast_error)):
+            logger.warning(
+                "creation opportunity fast-model checkpoint failed",
+                exc_info=True,
+            )
+            return None
+        logger.warning(
+            "creation opportunity fast-model route unavailable; retrying once "
+            "on the active main model: %s",
+            fast_error,
+        )
+        try:
+            result = llm.complete(
+                messages,
+                temperature=0.0,
+                max_tokens=500,
+                timeout=MAIN_MODEL_FALLBACK_TIMEOUT_SECONDS,
+                fail_fast=True,
+                purpose="creation_opportunity_checkpoint_main_fallback",
+            )
+        except Exception:
+            logger.warning(
+                "creation opportunity main-model fallback failed",
+                exc_info=True,
+            )
+            return None
+
+    try:
         parsed = _parse_detector_json(result.text)
         logger.info(
-            "creation opportunity JSON decision=%s confidence=%s title=%s",
+            "creation opportunity JSON decision=%s confidence=%s title=%s "
+            "provider=%s model=%s",
             parsed.get("decision") if parsed else None,
             parsed.get("confidence") if parsed else None,
             _text(parsed.get("suggested_name"), 80) if parsed else "",
+            getattr(result, "provider", ""),
+            getattr(result, "model", ""),
         )
         if parsed is not None:
             return parsed
     except Exception:
-        logger.warning("creation opportunity JSON checkpoint failed", exc_info=True)
+        logger.warning("creation opportunity JSON checkpoint parse failed", exc_info=True)
         return None
 
 
@@ -1102,7 +1141,7 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
         return None
     response_without_action_results = _ACTION_RESULT_ENVELOPE_RE.sub("", response_text)
     stripped_forged_action_result = response_without_action_results != response_text
-    response_text = response_without_action_results.rstrip()
+    response_text = response_without_action_results
     now = time.monotonic()
     with _state_lock:
         state = _state_locked(session_id, now)
@@ -1121,7 +1160,7 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
         if isinstance(action_result, dict)
         else ""
     )
-    response_with_result = response_text.rstrip() + result_suffix
+    response_with_result = response_text + result_suffix
     # Transform hooks use ``None``/empty to mean "leave the original response
     # unchanged". Return whitespace when a forged marker was the entire
     # response, so the finalizer can still replace (and therefore remove) it.
@@ -1193,10 +1232,7 @@ def register(ctx: Any) -> None:
         display_name="Creation opportunity checkpoint",
         description="Fast bounded Agent, Skill, Task, or none classification.",
         defaults={
-            "provider": "custom",
             "model": AUXILIARY_MODEL_ALIAS,
-            "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
-            "api_key": "local-ai-proxy",
             "timeout": EVALUATION_TIMEOUT_SECONDS,
         },
     )
