@@ -2812,6 +2812,89 @@ def test_a_404_rebuild_repoints_the_other_turns_too():
         mod._sessions.clear()
 
 
+def _tab_not_registered_error(mod):
+    resp = MagicMock(status_code=409)
+    resp.json.return_value = {"error": "browser_tab_not_registered"}
+    return mod.CamofoxHTTPError(resp, {"success": False, "error": "browser_tab_not_registered"})
+
+
+def test_a_proxy_tab_not_registered_rebuilds_like_a_404():
+    """The proxy spells a reclaimed tab 409, not 404; navigate must still rebuild.
+
+    The local-server registry forgets an idle-reaped tab and answers
+    409 browser_tab_not_registered. Keyed on 404 alone, the rebuild branch
+    never fires: the stale pin survives, and every later call replays the
+    same conflict with no way out.
+    """
+    import tools.browser_camofox as mod
+
+    mod._sessions.clear()
+    mine = {"user_id": "u", "session_key": "shared", "tab_id": "tab-old", "task_id": "mine", "epoch": 2}
+    theirs = {"user_id": "u", "session_key": "shared", "tab_id": "tab-old", "task_id": "theirs", "epoch": 2}
+    mod._sessions["b"] = theirs
+    replacement = dict(mine, tab_id="tab-new")
+
+    gone = _tab_not_registered_error(mod)
+
+    def _post(path, body=None, timeout=None, session=None, **kwargs):
+        if "tab-old" in path:
+            raise gone
+        return {"url": "https://ok.example/"}
+
+    try:
+        with (
+            patch("tools.browser_camofox._get_session", return_value=mine),
+            patch("tools.browser_camofox._ensure_tab", side_effect=[mine, replacement]),
+            patch("tools.browser_camofox._post", side_effect=_post),
+            patch("tools.browser_camofox._get", side_effect=requests.HTTPError()),
+        ):
+            result = json.loads(mod.camofox_navigate("https://ok.example/", task_id="mine"))
+        assert result.get("success") is True, f"navigate did not recover: {result}"
+        assert theirs["tab_id"] == "tab-new", "the other turn still points at the reclaimed tab"
+    finally:
+        mod._sessions.clear()
+
+
+def test_tab_not_registered_outside_navigate_clears_the_pin_and_says_navigate():
+    """A click or snapshot on a reclaimed tab must not strand the session.
+
+    Only navigate can rebuild, so the shared error funnel has two jobs here:
+    drop the stale pin (a non-empty tab_id skips _ensure_tab's rebuild) for
+    this entry and its identity peers, and tell the model to navigate — the
+    proxy's own "list tabs before continuing" names a tool the model does not
+    have.
+    """
+    import tools.browser_camofox as mod
+
+    mod._sessions.clear()
+    mine = {"user_id": "u", "session_key": "shared", "tab_id": "tab-old", "task_id": "mine", "epoch": 2}
+    theirs = {"user_id": "u", "session_key": "shared", "tab_id": "tab-old", "task_id": "theirs", "epoch": 2}
+    elsewhere = {"user_id": "u", "session_key": "other", "tab_id": "tab-old", "task_id": "elsewhere", "epoch": 2}
+    mod._sessions.update({"b": theirs, "c": elsewhere})
+    try:
+        result = json.loads(mod._tool_error_from_exception(_tab_not_registered_error(mod), session=mine))
+        assert result["success"] is False
+        assert result["error"] == "browser_tab_not_registered"
+        assert result["retryable"] is True
+        assert "browser_navigate" in result["message"]
+        assert mine["tab_id"] is None, "the stale pin survived"
+        assert theirs["tab_id"] is None, "an identity peer kept the stale pin"
+        assert elsewhere["tab_id"] == "tab-old", "another browser identity was cleared"
+    finally:
+        mod._sessions.clear()
+
+
+def test_epoch_stale_is_not_mistaken_for_a_reclaimed_tab():
+    """409 browser_epoch_stale means the tab is alive; rebuilding would lose it."""
+    import tools.browser_camofox as mod
+
+    resp = MagicMock(status_code=409)
+    resp.json.return_value = {"error": "browser_epoch_stale"}
+    stale = mod.CamofoxHTTPError(resp, {"success": False, "error": "browser_epoch_stale"})
+    assert not mod._tab_gone_error(stale)
+    assert mod._tab_gone_error(_tab_not_registered_error(mod))
+
+
 def test_a_queued_delete_is_dropped_when_the_tab_is_adopted_again():
     """The check at enqueue time says nothing about execution time.
 
