@@ -2233,54 +2233,55 @@ class APIServerAdapter(BasePlatformAdapter):
                 os.close(directory_fd)
 
     @staticmethod
-    def _assert_profile_state_db_regular(profile_home: Path) -> None:
-        """Fail closed unless state.db is a private regular file on the profile's
-        own filesystem, checked without following symlinks.
+    def _backup_state_db_via_fd(directory_fd: int, leaf_fd: int, leaf_stat) -> None:
+        """Copy the open state.db inode to a private backup beside it, using only
+        the already-validated directory/leaf descriptors (no pathname reopen).
 
-        Gates the pathname-based malformed-schema repair below so a symlink
-        swapped in after a malformed error cannot redirect it.
+        Named by inode so a retry for the same corrupt file is idempotent
+        (O_EXCL means a second attempt is a no-op).
         """
-        directory_flags = (
-            os.O_RDONLY
-            | getattr(os, "O_DIRECTORY", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-        )
-        directory_fd = os.open(profile_home, directory_flags)
+        backup_name = f"state.db.malformed-backup-{leaf_stat.st_ino}"
         try:
-            directory_stat = os.fstat(directory_fd)
-            leaf_fd = os.open(
-                "state.db",
-                os.O_RDONLY
+            backup_fd = os.open(
+                backup_name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
                 | getattr(os, "O_NOFOLLOW", 0)
                 | getattr(os, "O_CLOEXEC", 0),
+                0o600,
                 dir_fd=directory_fd,
             )
-            try:
-                st = os.fstat(leaf_fd)
-            finally:
-                os.close(leaf_fd)
-            if (
-                not stat.S_ISDIR(directory_stat.st_mode)
-                or not stat.S_ISREG(st.st_mode)
-                or st.st_nlink != 1
-                or st.st_dev != directory_stat.st_dev
-            ):
-                raise RuntimeError("profile state.db is not a private regular file")
+        except FileExistsError:
+            return
+        try:
+            offset = 0
+            while True:
+                chunk = os.pread(leaf_fd, 1 << 20, offset)
+                if not chunk:
+                    break
+                os.write(backup_fd, chunk)
+                offset += len(chunk)
         finally:
-            os.close(directory_fd)
+            os.close(backup_fd)
 
     def _open_profile_session_db_with_repair(self, profile_home: Path):
         """Open the profile SessionDB, self-healing a malformed schema once.
 
         The sidecar-anchored ``_open_profile_session_db`` opens with
-        ``_allow_path_reopen=False``, which disables SessionDB's built-in
+        ``_allow_path_reopen=False``, disabling SessionDB's built-in
         malformed-schema recovery. Restore that recovery here so a corrupted
         ``state.db`` does not leave a profile's sessions/chat/import permanently
-        unavailable: on a malformed error, re-assert (no-follow) that state.db
-        is a private regular file, back it up and repair ``sqlite_master`` in
-        place, then reopen through the same no-follow path. The
-        check-to-repair window is the same VFS-level TOCTOU tracked in #210.
+        unavailable — but keep it anchored to the exact inode the no-follow
+        open validated, so a same-UID process cannot swap state.db (or the
+        profile dir) for another profile's path between check and repair and
+        have the repair corrupt that other database.
+
+        The repair connection and the backup both go through the held
+        descriptors: the SQLite connection via ``/proc/self/fd/<leaf_fd>`` and
+        the backup via ``_backup_state_db_via_fd``. That anchor only exists on
+        Linux; on other platforms we refuse to self-heal (raise) rather than
+        repair through a followable pathname.
         """
         from hermes_state import (
             _claim_repair_attempt,
@@ -2296,15 +2297,52 @@ class APIServerAdapter(BasePlatformAdapter):
             db_path = profile_home / "state.db"
             if not _claim_repair_attempt(db_path):
                 raise
-            self._assert_profile_state_db_regular(profile_home)
-            logger.error(
-                "profile state.db schema is malformed (%s) — backing up and "
-                "repairing in place, then reopening.",
-                exc,
-            )
-            report = repair_state_db_schema(db_path)
-            if not report.get("repaired"):
+            if not sys.platform.startswith("linux"):
+                # No /proc/self/fd anchor — refuse to repair through a pathname.
                 raise
+
+            directory_flags = (
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0)
+            )
+            directory_fd = os.open(profile_home, directory_flags)
+            try:
+                directory_stat = os.fstat(directory_fd)
+                leaf_fd = os.open(
+                    "state.db",
+                    os.O_RDWR
+                    | getattr(os, "O_NOFOLLOW", 0)
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=directory_fd,
+                )
+                try:
+                    leaf_stat = os.fstat(leaf_fd)
+                    if (
+                        not stat.S_ISDIR(directory_stat.st_mode)
+                        or not stat.S_ISREG(leaf_stat.st_mode)
+                        or leaf_stat.st_nlink != 1
+                        or leaf_stat.st_dev != directory_stat.st_dev
+                    ):
+                        raise RuntimeError(
+                            "profile state.db is not a private regular file"
+                        )
+                    logger.error(
+                        "profile state.db schema is malformed (%s) — backing up "
+                        "and repairing the fd-anchored inode, then reopening.",
+                        exc,
+                    )
+                    self._backup_state_db_via_fd(directory_fd, leaf_fd, leaf_stat)
+                    report = repair_state_db_schema(
+                        Path(f"/proc/self/fd/{leaf_fd}"), backup=False
+                    )
+                    if not report.get("repaired"):
+                        raise
+                finally:
+                    os.close(leaf_fd)
+            finally:
+                os.close(directory_fd)
             return self._open_profile_session_db(profile_home)
 
     def _open_and_cache_session_db(self, home) -> Optional[Any]:
