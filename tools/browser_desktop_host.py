@@ -8,11 +8,12 @@ the authenticated PC Browser Host.
 
 from __future__ import annotations
 
+import ipaddress
 import json
-import os
 import threading
 from collections import OrderedDict
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 import requests
 
@@ -27,12 +28,47 @@ _active_sessions: "OrderedDict[str, None]" = OrderedDict()
 _active_lock = threading.Lock()
 
 
+def _runtime_value(name: str) -> str:
+    """Read the active profile's managed Browser Host configuration.
+
+    Multiplex gateways keep each profile's action token and endpoint in a
+    context-local secret scope. Reading ``os.environ`` here would either miss
+    the active profile entirely or reuse another profile's stale credential.
+    ``get_secret`` preserves the legacy process-env behavior outside multiplex.
+    """
+    from agent.secret_scope import get_secret
+
+    return str(get_secret(name, "") or "").strip()
+
+
+def _trusted_loopback_endpoint(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    if parsed.scheme != "http" or not port:
+        return False
+    host = (parsed.hostname or "").strip().lower()
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def _endpoint() -> str:
-    return os.environ.get(_URL_ENV, "").strip()
+    value = _runtime_value(_URL_ENV)
+    return value if _trusted_loopback_endpoint(value) else ""
+
+
+def _action_token() -> str:
+    return _runtime_value(_TOKEN_ENV)
 
 
 def is_desktop_browser_configured() -> bool:
-    return bool(_endpoint() and os.environ.get(_TOKEN_ENV, "").strip())
+    return bool(_endpoint() and _action_token())
 
 
 def _session_id() -> str:
@@ -75,7 +111,7 @@ def has_desktop_browser_session(task_id: Optional[str] = None) -> bool:
 
 def _call(action: str, params: Optional[dict[str, Any]] = None) -> tuple[str, dict[str, Any]]:
     endpoint = _endpoint()
-    token = os.environ.get(_TOKEN_ENV, "").strip()
+    token = _action_token()
     session_id = _session_id()
     if not endpoint or not token or not session_id:
         return "unavailable", {

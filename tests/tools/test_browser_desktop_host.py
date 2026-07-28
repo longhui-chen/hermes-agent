@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from agent import secret_scope
 from gateway.session_context import clear_session_vars, set_session_vars
 from tools import browser_desktop_host as desktop, browser_tool
 
@@ -148,3 +149,54 @@ def test_browser_tools_route_a_pinned_session_through_desktop(monkeypatch):
     snapshot = json.loads(browser_tool.browser_snapshot())
     assert snapshot["success"] is True
     assert actions == ["navigate", "snapshot"]
+
+
+def test_multiplex_browser_config_uses_active_profile_secret_scope(monkeypatch):
+    monkeypatch.setenv(
+        "ZETTLAB_DESKTOP_BROWSER_HOST_URL",
+        "http://127.0.0.1:1/stale-browser-host",
+    )
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "stale-profile-token")
+    scoped_url = "http://127.0.0.1:19090/api/v1/internal/browser-host/action"
+    seen = {}
+
+    def post(url, **kwargs):
+        seen.update(url=url, **kwargs)
+        return FakeResponse(200, {
+            "success": True,
+            "result": {"url": "https://example.com/", "title": "Example"},
+        })
+
+    patch_post(monkeypatch, post)
+    was_multiplex = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    token = secret_scope.set_secret_scope({
+        "ZETTLAB_DESKTOP_BROWSER_HOST_URL": scoped_url,
+        "ZETTLAB_AGENT_ACTION_TOKEN": "active-profile-token",
+    })
+    try:
+        assert desktop.is_desktop_browser_configured() is True
+        result = json.loads(desktop.desktop_browser_navigate("https://example.com"))
+    finally:
+        secret_scope.reset_secret_scope(token)
+        secret_scope.set_multiplex_active(was_multiplex)
+
+    assert result["success"] is True
+    assert seen["url"] == scoped_url
+    assert seen["headers"]["X-Zettlab-Agent-Action-Token"] == "active-profile-token"
+
+
+def test_desktop_browser_rejects_non_loopback_action_endpoint(monkeypatch):
+    monkeypatch.setenv(
+        "ZETTLAB_DESKTOP_BROWSER_HOST_URL",
+        "https://attacker.example/api/v1/internal/browser-host/action",
+    )
+    assert desktop.is_desktop_browser_configured() is False
+
+
+def test_desktop_browser_rejects_invalid_action_endpoint_port(monkeypatch):
+    monkeypatch.setenv(
+        "ZETTLAB_DESKTOP_BROWSER_HOST_URL",
+        "http://127.0.0.1:not-a-port/api/v1/internal/browser-host/action",
+    )
+    assert desktop.is_desktop_browser_configured() is False
