@@ -259,6 +259,157 @@ def test_prepare_claw_service_config_set_flow_normalizes_disabled_inline_gateway
     assert f"ZETTLAB_PRESETS_DIR={presets_dir}\n" in env_text
 
 
+def test_prepare_claw_service_removes_persisted_multiplex_env_override(
+    tmp_path: Path,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
+    hermes_home.mkdir(parents=True)
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text(
+        "gateway:\n  multiplex_profiles: false\n",
+        encoding="utf-8",
+    )
+    env_path.parent.mkdir(parents=True)
+    env_path.write_text(
+        "GATEWAY_MULTIPLEX_PROFILES=false\nCUSTOM_SAFE=keep-me\n",
+        encoding="utf-8",
+    )
+
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(),
+    )
+
+    assert "  multiplex_profiles: true\n" in config_path.read_text(encoding="utf-8")
+    env_text = env_path.read_text(encoding="utf-8")
+    assert "GATEWAY_MULTIPLEX_PROFILES=" not in env_text
+    assert "CUSTOM_SAFE=keep-me\n" in env_text
+    assert _hermes_invocations(app_root) == [
+        ["config", "set", "gateway.multiplex_profiles", "true"]
+    ]
+
+
+def test_prepare_claw_service_removes_hermes_dotenv_multiplex_override(
+    tmp_path: Path,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
+    hermes_home.mkdir(parents=True)
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text(
+        "gateway:\n  multiplex_profiles: false\n",
+        encoding="utf-8",
+    )
+    dotenv_path = hermes_home / ".env"
+    dotenv_path.write_text(
+        "GATEWAY_MULTIPLEX_PROFILES=false\nOPENAI_API_KEY=keep-me\n",
+        encoding="utf-8",
+    )
+
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(),
+    )
+
+    dotenv_text = dotenv_path.read_text(encoding="utf-8")
+    assert "GATEWAY_MULTIPLEX_PROFILES=" not in dotenv_text
+    assert "OPENAI_API_KEY=keep-me\n" in dotenv_text
+    runtime_probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "from hermes_cli.env_loader import load_hermes_dotenv; "
+                "load_hermes_dotenv(); "
+                "from gateway.config import load_gateway_config; "
+                "print(load_gateway_config().multiplex_profiles)"
+            ),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=_script_env(HERMES_HOME=str(hermes_home)),
+    )
+    assert runtime_probe.stdout.strip() == "True"
+
+
+def test_prepare_claw_service_rejects_managed_dotenv_multiplex_false(
+    tmp_path: Path,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
+    hermes_home.mkdir(parents=True)
+    (hermes_home / "config.yaml").write_text(
+        "gateway:\n  multiplex_profiles: true\n",
+        encoding="utf-8",
+    )
+    managed_dir = tmp_path / "managed"
+    managed_dir.mkdir()
+    (managed_dir / ".env").write_text(
+        "GATEWAY_MULTIPLEX_PROFILES=false\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=False,
+        cwd=str(app_root),
+        env=_script_env(HERMES_MANAGED_DIR=str(managed_dir)),
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "managed GATEWAY_MULTIPLEX_PROFILES=false" in result.stderr
+    assert _hermes_invocations(app_root) == []
+
+
+def test_prepare_claw_service_ignores_managed_dotenv_multiplex_without_value(
+    tmp_path: Path,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
+    hermes_home.mkdir(parents=True)
+    (hermes_home / "config.yaml").write_text(
+        "gateway:\n  multiplex_profiles: true\n",
+        encoding="utf-8",
+    )
+    (hermes_home / ".env").write_text(
+        "GATEWAY_MULTIPLEX_PROFILES=false\n",
+        encoding="utf-8",
+    )
+    managed_dir = tmp_path / "managed"
+    managed_dir.mkdir()
+    (managed_dir / ".env").write_text(
+        "GATEWAY_MULTIPLEX_PROFILES\n",
+        encoding="utf-8",
+    )
+
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(HERMES_MANAGED_DIR=str(managed_dir)),
+    )
+
+    assert "GATEWAY_MULTIPLEX_PROFILES=" not in (hermes_home / ".env").read_text(
+        encoding="utf-8"
+    )
+
+
 def test_prepare_claw_service_skips_config_set_when_multiplex_is_enabled(
     tmp_path: Path,
 ):
@@ -1279,6 +1430,7 @@ def test_start_claw_service_loads_managed_env_before_prepare_without_overriding_
     env_path.parent.mkdir(parents=True)
     env_path.write_text(
         f'HERMES_MANAGED_DIR="{persisted_managed}"\n'
+        "GATEWAY_MULTIPLEX_PROFILES=false\n"
         'CUSTOM_SAFE="keep "\'me\'\n'
         r"CUSTOM_UNQUOTED=one\ two" "\n"
         r'CUSTOM_DOUBLE="literal\nvalue"' "\n",
@@ -1301,6 +1453,7 @@ Path({str(gateway_log)!r}).write_text(
         "custom": os.environ.get("CUSTOM_SAFE"),
         "unquoted": os.environ.get("CUSTOM_UNQUOTED"),
         "double": os.environ.get("CUSTOM_DOUBLE"),
+        "multiplex": os.environ.get("GATEWAY_MULTIPLEX_PROFILES"),
     }}),
     encoding="utf-8",
 )
@@ -1309,11 +1462,9 @@ Path({str(gateway_log)!r}).write_text(
     )
     hermes_entry.chmod(0o755)
 
-    overrides = (
-        {"HERMES_MANAGED_DIR": str(explicit_managed)}
-        if with_explicit_override
-        else {}
-    )
+    overrides = {"GATEWAY_MULTIPLEX_PROFILES": "false"}
+    if with_explicit_override:
+        overrides["HERMES_MANAGED_DIR"] = str(explicit_managed)
     subprocess.run(
         [str(start_script)],
         check=True,
@@ -1329,6 +1480,8 @@ Path({str(gateway_log)!r}).write_text(
     assert gateway_env["custom"] == "keep me"
     assert gateway_env["unquoted"] == "one two"
     assert gateway_env["double"] == r"literal\nvalue"
+    assert gateway_env["multiplex"] is None
+    assert "GATEWAY_MULTIPLEX_PROFILES=" not in env_path.read_text(encoding="utf-8")
     assert _hermes_invocations(app_root) == []
 
 

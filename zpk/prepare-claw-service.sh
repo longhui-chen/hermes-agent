@@ -237,7 +237,7 @@ load_persisted_user_env() {
             break
         fi
         case "$key" in
-            ZET_AGENT_KEY|ZET_AGENT_ENABLED|ZET_AGENT_HOST|ZET_AGENT_PORT|ZETTLAB_PRESETS_DIR)
+            ZET_AGENT_KEY|ZET_AGENT_ENABLED|ZET_AGENT_HOST|ZET_AGENT_PORT|ZETTLAB_PRESETS_DIR|GATEWAY_MULTIPLEX_PROFILES)
                 continue
                 ;;
         esac
@@ -303,7 +303,8 @@ write_agent_env() {
             "$HERMES_PYTHON" "$APP_ROOT/parse-environment-file.py" \
                 --filter-excluding "$ENV_FILE" \
                 ZET_AGENT_KEY ZET_AGENT_ENABLED ZET_AGENT_HOST \
-                ZET_AGENT_PORT ZETTLAB_PRESETS_DIR
+                ZET_AGENT_PORT ZETTLAB_PRESETS_DIR \
+                GATEWAY_MULTIPLEX_PROFILES
         fi
     } > "$ENV_FILE.tmp.$$"
     if ! "$HERMES_PYTHON" "$APP_ROOT/parse-environment-file.py" \
@@ -320,6 +321,58 @@ write_agent_env() {
     else
         mv "$ENV_FILE.tmp.$$" "$ENV_FILE"
     fi
+}
+
+reconcile_multiplex_env_overrides() {
+    HERMES_HOME="$HERMES_HOME" "$HERMES_PYTHON" - <<'PY'
+import os
+import sys
+
+from dotenv import dotenv_values
+
+from gateway.config import GatewayConfig
+from hermes_cli import managed_scope
+from hermes_cli.config import get_env_path, remove_env_value
+
+key = "GATEWAY_MULTIPLEX_PROFILES"
+
+
+def read_dotenv(path):
+    if not path.is_file():
+        return {}
+    try:
+        return dotenv_values(path, encoding="utf-8")
+    except UnicodeDecodeError:
+        return dotenv_values(path, encoding="latin-1")
+
+
+managed_dir = managed_scope.get_managed_dir()
+managed_env = (managed_dir / ".env") if managed_dir else None
+managed_values = read_dotenv(managed_env) if managed_env else {}
+value = managed_values.get(key)
+if value is not None:
+    os.environ[key] = value
+    if not GatewayConfig.from_dict(
+        {"gateway": {"multiplex_profiles": True}}
+    ).multiplex_profiles:
+        print(
+            f"managed {key}={value} disables required multiplex mode: "
+            f"{managed_env}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    raise SystemExit(0)
+
+try:
+    remove_env_value(key)
+except Exception as exc:
+    print(f"failed to remove legacy {key} from {get_env_path()}: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+if key in read_dotenv(get_env_path()):
+    print(f"failed to remove legacy {key} from {get_env_path()}", file=sys.stderr)
+    raise SystemExit(1)
+PY
 }
 
 required_multiplex_config_key() {
@@ -507,6 +560,11 @@ fi
 secure_state_directories
 acquire_prepare_lock
 load_persisted_user_env
+# This device package owns multiplex enablement through config.yaml. Drop the
+# hosted-deployment environment override so a legacy persisted or inherited
+# false value cannot mask the config that the Hermes CLI validates below.
+unset GATEWAY_MULTIPLEX_PROFILES
+reconcile_multiplex_env_overrides
 ZETTLAB_PRESETS_DIR="$(detect_zettlab_presets_dir || true)"
 ZETTLAB_PRESETS_DIR="$(printf '%s' "$ZETTLAB_PRESETS_DIR" | tr -d '\r\n')"
 write_agent_env

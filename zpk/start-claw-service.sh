@@ -34,5 +34,9 @@ load_env_after_prepare() {
 # systemd/manual values; package-owned fields always use the generated values.
 "$APP_ROOT/prepare-claw-service.sh"
 load_env_after_prepare
+# prepare-claw-service.sh migrates this legacy override out of the persisted
+# environment file. Also remove an inherited service/manual value so runtime
+# uses the package-reconciled config.yaml setting.
+unset GATEWAY_MULTIPLEX_PROFILES
 
 exec "$APP_ROOT/bin/hermes" gateway run --force --accept-hooks
