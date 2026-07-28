@@ -237,6 +237,9 @@ def test_portable_credential_scanner_allows_url_without_userinfo_password(value)
         # block header preceded by a YAML tag / anchor
         "password: !!str |\n  supersecretvalue123\n",
         "client-key-data: &pw |\n  LS0tLS1CRUdJTiBQUklWQVRF\n",
+        # indent/chomp indicators in either order (|2-, |-2, >2+)
+        "password: |2-\n  supersecretvalue123\n",
+        "password: >2+\n  supersecretvalue123\n",
     ],
 )
 def test_portable_credential_scanner_rejects_yaml_block_scalar_secrets(value):

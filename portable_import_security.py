@@ -46,7 +46,8 @@ _CREDENTIAL_BLOCK_SCALAR_RE = re.compile(
     # the |/> indicator with optional chomp/indent, and an optional trailing
     # comment — all before the newline that starts the indented block.
     r"(?:(?:!!?[\w./+-]*|&[\w-]+)[ \t]+)*"
-    r"[|>][+\-]?[0-9]?[ \t]*(?:\#[^\r\n]*)?\r?\n"
+    # |/> then chomp(+/-) and indent(1-9) in EITHER order (|2-, |-2, >2+, ...)
+    r"[|>][+\-0-9]*[ \t]*(?:\#[^\r\n]*)?\r?\n"
     r"((?:[ \t]*\r?\n|[ \t]+\S[^\r\n]*(?:\r?\n|$))+)",
     re.IGNORECASE | re.MULTILINE,
 )
