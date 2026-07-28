@@ -494,16 +494,40 @@ def install() -> None:
 
             def _wrapped_run_job(job, *, defer_agent_teardown=None):
                 # Upstream scheduler.run_one_job() passes this holder so agent
-                # async resources stay alive through delivery. Preserve that
-                # contract across every retry attempt; the scheduler tears
-                # down every appended agent after delivery completes.
+                # async resources stay alive through delivery. A retry does not
+                # need the previous failed attempt's agent, though: release it
+                # immediately before the next attempt, and hand only the final
+                # attempt back for post-delivery teardown.
+                attempt_agents = [] if defer_agent_teardown is not None else None
+
                 def _run_once(retry_job):
                     return _orig_run_job(
                         retry_job,
-                        defer_agent_teardown=defer_agent_teardown,
+                        defer_agent_teardown=attempt_agents,
                     )
 
-                return _run_job_with_retry(_run_once, job)
+                def _release_failed_attempt():
+                    while attempt_agents:
+                        _sched._teardown_cron_agent(
+                            attempt_agents.pop(),
+                            job.get("id", ""),
+                        )
+
+                try:
+                    return _run_job_with_retry(
+                        _run_once,
+                        job,
+                        before_retry=(
+                            _release_failed_attempt
+                            if attempt_agents is not None
+                            else None
+                        ),
+                    )
+                finally:
+                    # Success, terminal failure, or an exception: preserve the
+                    # upstream contract for whichever attempt is still live.
+                    if attempt_agents:
+                        defer_agent_teardown.extend(attempt_agents)
 
             setattr(_wrapped_run_job, _PATCH_SENTINEL, True)
             _sched.run_job = _wrapped_run_job
@@ -1171,9 +1195,15 @@ def _is_retryable_failure_result(result) -> bool:
     return not result[0] and _is_retryable_error(result[3])
 
 
-def _run_job_with_retry(orig_run_job, job):
+def _run_job_with_retry(orig_run_job, job, *, before_retry=None):
     """Re-run a transient failure, but only while this run has produced zero
-    tool activity (vs a fixed pre-run baseline) so side effects never repeat."""
+    tool activity (vs a fixed pre-run baseline) so side effects never repeat.
+
+    ``before_retry`` runs only after the backoff completes and a new attempt is
+    definitely about to start. The installed scheduler wrapper uses it to
+    release the previous failed attempt's deferred agent while retaining the
+    final attempt through delivery.
+    """
     job_id = job.get("id", "")
     state = _new_retry_state()
     _LAST_RETRY_STATE.pop(job_id, None)
@@ -1227,6 +1257,8 @@ def _run_job_with_retry(orig_run_job, job):
             state["skipped_reason"] = "shutdown"
             _dbg(f"run_job: shutdown during backoff — abort retry job={job_id}")
             break
+        if before_retry is not None:
+            before_retry()
         result = orig_run_job(job)
     if _is_retryable_failure_result(result):
         state["retryable"] = True

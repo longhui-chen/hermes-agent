@@ -853,6 +853,52 @@ def test_run_job_with_retry_retries_clean_transient(monkeypatch):
     assert calls["n"] == 2  # retried once
 
 
+def test_installed_retry_wrapper_releases_only_failed_attempt_agents(monkeypatch):
+    from cron import scheduler
+
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(zc, "_MAX_RUN_RETRIES", 2)
+    monkeypatch.setattr(zc, "_RETRY_BACKOFF_S", 0)
+    monkeypatch.setattr(zc, "_list_cron_session_ids", lambda _jid: set())
+    monkeypatch.setattr(zc, "_attempt_tool_activity", lambda _jid, _before: 0)
+
+    calls = {"n": 0}
+    released = []
+
+    def fake_run_job(job, *, defer_agent_teardown=None):
+        calls["n"] += 1
+        defer_agent_teardown.append(f"agent-{calls['n']}")
+        if calls["n"] == 1:
+            return (False, "out", "", _RAW_502)
+        return (True, "ok", "done", None)
+
+    # install() uses mark_job_run's sentinel as its global idempotency guard.
+    # Replace it together with run_job so this test installs a fresh wrapper
+    # around the controlled fake without disturbing the already-installed
+    # process-global wrappers after monkeypatch teardown.
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(scheduler, "save_job_output", lambda _job_id, output: output)
+    monkeypatch.setattr(scheduler, "run_job", fake_run_job)
+    monkeypatch.setattr(
+        scheduler,
+        "_teardown_cron_agent",
+        lambda agent, job_id: released.append((agent, job_id)),
+    )
+    zc.install()
+
+    deferred = []
+    result = scheduler.run_job(
+        {"id": "resource-job"},
+        defer_agent_teardown=deferred,
+    )
+
+    assert result == (True, "ok", "done", None)
+    assert calls["n"] == 2
+    assert released == [("agent-1", "resource-job")]
+    assert deferred == ["agent-2"]
+
+
 def test_run_job_with_retry_caps_attempts(monkeypatch):
     import gateway.platforms.zet_agent_cron as zc
 
