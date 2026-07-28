@@ -1113,6 +1113,9 @@ def check_image_generation_requirements() -> bool:
     return False
 
 
+check_image_generation_requirements._profile_scope_sensitive = True  # type: ignore[attr-defined]
+
+
 # ---------------------------------------------------------------------------
 # Demo / CLI entry point
 # ---------------------------------------------------------------------------

@@ -164,6 +164,47 @@ class TestPluginDispatch:
         assert image_generation_tool.check_image_generation_requirements() is False
         assert discovery_calls == [False]
 
+    def test_requirements_are_rechecked_across_multiplex_profiles(
+        self, monkeypatch
+    ):
+        from tools import image_generation_tool
+        from tools import registry as tool_registry
+        from hermes_cli import plugins as plugins_module
+        from agent import image_gen_registry as registry_module
+
+        selected_profile = {"name": "profile-a"}
+        providers = {
+            "profile-a": type(
+                "UnavailableProvider", (), {"is_available": lambda self: False}
+            )(),
+            "profile-b": type(
+                "AvailableProvider", (), {"is_available": lambda self: True}
+            )(),
+        }
+        monkeypatch.setattr(
+            image_generation_tool,
+            "_read_configured_image_provider",
+            lambda: selected_profile["name"],
+        )
+        monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", lambda: None)
+        monkeypatch.setattr(
+            registry_module,
+            "get_provider",
+            lambda name: providers[name],
+        )
+        monkeypatch.setattr("agent.secret_scope.is_multiplex_active", lambda: True)
+
+        tool_registry._check_fn_cache.clear()
+        tool_registry._check_fn_last_good.clear()
+        assert tool_registry._check_fn_cached(
+            image_generation_tool.check_image_generation_requirements
+        ) is False
+
+        selected_profile["name"] = "profile-b"
+        assert tool_registry._check_fn_cached(
+            image_generation_tool.check_image_generation_requirements
+        ) is True
+
     def test_handler_does_not_fallback_to_fal_when_selected_plugin_discovery_fails(
         self, monkeypatch
     ):
