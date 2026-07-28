@@ -986,6 +986,77 @@ def test_prepare_claw_service_refuses_writable_ota_data_symlink_target(
     assert expected_target.stat().st_mode & 0o777 == 0o770
 
 
+def test_prepare_claw_service_refuses_writable_data_symlink_ancestor(
+    tmp_path: Path,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
+    data_link = hermes_home.parent
+    data_parent = tmp_path / "zettos" / "main" / "data"
+    expected_target = data_parent / "com.zettlab.claw"
+    expected_target.mkdir(parents=True)
+    expected_target.chmod(0o750)
+    data_parent.chmod(0o770)
+    data_link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(expected_target, data_link)
+
+    result = subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=False,
+        cwd=str(app_root),
+        env=_script_env(),
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "refusing untrusted data symlink" in result.stderr
+    assert not (expected_target / "secrets").exists()
+
+
+def test_prepare_claw_service_pins_validated_data_symlink_target(
+    tmp_path: Path,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
+    data_link = hermes_home.parent
+    expected_target = tmp_path / "zettos" / "main" / "data" / "com.zettlab.claw"
+    replacement_target = tmp_path / "replacement-data"
+    expected_target.mkdir(parents=True)
+    replacement_target.mkdir()
+    expected_target.chmod(0o750)
+    replacement_target.chmod(0o750)
+    data_link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(expected_target, data_link)
+
+    process = subprocess.Popen(
+        [str(app_root / "prepare-claw-service.sh")],
+        cwd=str(app_root),
+        env=_script_env(HERMES_TEST_HERMES_DELAY="1"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    invocation_log = app_root / "hermes-invocations.jsonl"
+    deadline = time.monotonic() + 10
+    while not invocation_log.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert invocation_log.exists()
+
+    data_link.unlink()
+    os.symlink(replacement_target, data_link)
+    stdout, stderr = process.communicate(timeout=30)
+
+    assert process.returncode == 0, (stdout, stderr)
+    assert (expected_target / "hermes_home" / "config.yaml").is_file()
+    assert (expected_target / "secrets" / "zettlab-claw.env").is_file()
+    assert list(replacement_target.iterdir()) == []
+
+
 @pytest.mark.parametrize("managed_name", ["zet_agent.key", "zettlab-claw.env"])
 def test_prepare_claw_service_refuses_symlinked_managed_secret_files(
     tmp_path: Path,

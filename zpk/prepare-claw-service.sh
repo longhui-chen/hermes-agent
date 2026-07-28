@@ -75,38 +75,71 @@ detect_zettlab_presets_dir() {
 }
 
 trusted_data_symlink_target() {
-    local resolved candidate expected="" uid mode group other
+    local resolved candidate expected="" trust_root=""
     resolved="$(readlink -f "$DATA_DIR" 2>/dev/null || true)"
     [ -n "$resolved" ] && [ -d "$resolved" ] || return 1
     for candidate in "$OTA_DATA_TARGET" "$VOLUME_DATA_TARGET"; do
         candidate="$(readlink -f "$candidate" 2>/dev/null || true)"
         if [ -n "$candidate" ] && [ "$resolved" = "$candidate" ]; then
             expected="$candidate"
+            trust_root="$(dirname "$(dirname "$candidate")")"
             break
         fi
     done
     [ -n "$expected" ] || return 1
 
-    uid="$(stat -c '%u' "$resolved" 2>/dev/null || stat -f '%u' "$resolved" 2>/dev/null || true)"
-    mode="$(stat -c '%a' "$resolved" 2>/dev/null || stat -f '%Lp' "$resolved" 2>/dev/null || true)"
-    [ "$uid" = "$(id -u)" ] && [ -n "$mode" ] || return 1
-    group="${mode: -2:1}"
-    other="${mode: -1}"
-    (( (10#$group & 2) == 0 )) || return 1
-    (( (10#$other & 2) == 0 )) || return 1
+    trusted_data_path_chain "$resolved" "$trust_root" || return 1
     printf '%s\n' "$resolved"
+}
+
+trusted_data_path_chain() {
+    local current="$1" trust_root="$2" process_uid uid mode group other
+    process_uid="$(id -u)"
+    while :; do
+        uid="$(stat -c '%u' "$current" 2>/dev/null || stat -f '%u' "$current" 2>/dev/null || true)"
+        mode="$(stat -c '%a' "$current" 2>/dev/null || stat -f '%Lp' "$current" 2>/dev/null || true)"
+        [ -n "$uid" ] && [ -n "$mode" ] || return 1
+        if [ "$process_uid" -eq 0 ]; then
+            [ "$uid" = "0" ] || return 1
+        else
+            [ "$uid" = "0" ] || [ "$uid" = "$process_uid" ] || return 1
+        fi
+        group="${mode: -2:1}"
+        other="${mode: -1}"
+        (( (10#$group & 2) == 0 )) || return 1
+        (( (10#$other & 2) == 0 )) || return 1
+        [ "$current" = "/" ] && break
+        if [ "$process_uid" -ne 0 ] && [ "$current" = "$trust_root" ]; then
+            break
+        fi
+        current="$(dirname "$current")"
+    done
+}
+
+pin_trusted_data_symlink() {
+    local resolved_path
+    [ -L "$DATA_DIR" ] || return 0
+    resolved_path="$(trusted_data_symlink_target || true)"
+    if [ -z "$resolved_path" ]; then
+        echo "refusing untrusted data symlink: $DATA_DIR" >&2
+        exit 1
+    fi
+
+    # Stop following the mutable app-level symlink after validation. All
+    # prepare-time state writes below use this fixed canonical target.
+    DATA_DIR="$resolved_path"
+    HERMES_HOME="$DATA_DIR/hermes_home"
+    SECRET_DIR="$DATA_DIR/secrets"
+    LOCK_FILE="$SECRET_DIR/prepare-claw-service.lock"
+    KEY_FILE="$SECRET_DIR/zet_agent.key"
+    ENV_FILE="$SECRET_DIR/zettlab-claw.env"
 }
 
 secure_state_directories() {
     local path resolved_path mode expected_mode uid
+    pin_trusted_data_symlink
     for path in "$DATA_DIR" "$SECRET_DIR"; do
-        if [ "$path" = "$DATA_DIR" ] && [ -L "$path" ]; then
-            resolved_path="$(trusted_data_symlink_target || true)"
-            if [ -z "$resolved_path" ]; then
-                echo "refusing untrusted data symlink: $path" >&2
-                exit 1
-            fi
-        elif [ -L "$path" ] || { [ -e "$path" ] && [ ! -d "$path" ]; }; then
+        if [ -L "$path" ] || { [ -e "$path" ] && [ ! -d "$path" ]; }; then
             echo "refusing non-directory state path: $path" >&2
             exit 1
         else
@@ -429,6 +462,7 @@ if [ ! -x "$HERMES_PYTHON" ]; then
     exit 127
 fi
 if [ "${1:-}" = "--dump-env" ]; then
+    pin_trusted_data_symlink
     dump_persisted_env
     exit
 fi
