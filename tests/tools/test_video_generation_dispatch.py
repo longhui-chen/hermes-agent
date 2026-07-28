@@ -88,6 +88,21 @@ class TestUnifiedDispatch:
         assert result["success"] is False
         assert result["error_type"] == "provider_not_registered"
 
+    def test_missing_provider_does_not_force_refresh_plugins(self, monkeypatch):
+        from tools import video_generation_tool
+        import hermes_cli.plugins as plugins_module
+
+        discovery_calls = []
+
+        def discover(force=False):
+            discovery_calls.append(force)
+
+        monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", discover)
+        monkeypatch.setattr(video_gen_registry, "get_active_provider", lambda: None)
+
+        assert video_generation_tool._resolve_active_provider() is None
+        assert discovery_calls == [False]
+
     def test_text_to_video_routes_without_image_url(self):
         provider = _RecordingProvider("rec")
         video_gen_registry.register_provider(provider)

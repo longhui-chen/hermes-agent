@@ -234,19 +234,16 @@ check_video_generation_requirements._profile_scope_sensitive = True  # type: ign
 def _resolve_active_provider():
     """Return the active provider object or None.
 
-    Forces plugin discovery before checking the registry — handles cases
-    where a long-lived session was started before a plugin was installed.
+    Ensures the normal idempotent discovery pass has run before checking the
+    registry. Missing providers fail closed; explicit install/config commands
+    own any destructive refresh needed to expose newly installed plugins.
     """
     try:
         from agent.video_gen_registry import get_active_provider
         from hermes_cli.plugins import _ensure_plugins_discovered
 
         _ensure_plugins_discovered()
-        provider = get_active_provider()
-        if provider is None:
-            _ensure_plugins_discovered(force=True)
-            provider = get_active_provider()
-        return provider
+        return get_active_provider()
     except Exception as exc:
         logger.debug("video_gen provider resolution failed: %s", exc)
         return None
