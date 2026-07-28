@@ -497,6 +497,18 @@ def build_turn_context(
 
     # Preserve the original user message (no nudge injection).
     original_user_message = persist_user_message if persist_user_message is not None else user_message
+    agent._current_user_message = (
+        original_user_message if isinstance(original_user_message, str) else ""
+    )
+    agent._previous_assistant_message = ""
+    for historical_message in reversed(messages[:current_turn_user_idx]):
+        if (
+            isinstance(historical_message, dict)
+            and historical_message.get("role") == "assistant"
+            and isinstance(historical_message.get("content"), str)
+        ):
+            agent._previous_assistant_message = historical_message["content"]
+            break
 
     # Track memory nudge trigger (turn-based, checked here).
     should_review_memory = False

@@ -180,6 +180,27 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
+def test_records_trusted_current_user_and_previous_assistant_messages():
+    agent = _FakeAgent()
+    _build(
+        agent,
+        user_message="确认安装",
+        conversation_history=[
+            {"role": "user", "content": "帮我找技能"},
+            {
+                "role": "assistant",
+                "content": "候选是 owner/repo/example，是否安装？",
+            },
+        ],
+    )
+
+    assert agent._current_user_message == "确认安装"
+    assert (
+        agent._previous_assistant_message
+        == "候选是 owner/repo/example，是否安装？"
+    )
+
+
 def test_applies_agent_side_effects():
     agent = _FakeAgent()
     _build(agent)

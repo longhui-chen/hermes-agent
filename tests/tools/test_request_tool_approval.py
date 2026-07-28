@@ -165,3 +165,87 @@ class TestRequestToolApproval:
         )
         res = request_tool_approval("terminal", "curl PUT", rule_key="ext")
         assert res == {"approved": True, "message": None}
+
+    def test_operation_specific_risk_can_disable_yolo_bypass(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            approval, "is_current_session_yolo_enabled", lambda: True
+        )
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(
+            approval, "_is_gateway_approval_context", lambda: False
+        )
+        prompts = []
+
+        def deny(*args, **kwargs):
+            prompts.append((args, kwargs))
+            return "deny"
+
+        monkeypatch.setattr(approval, "prompt_dangerous_approval", deny)
+        res = request_tool_approval(
+            "skillhub_install",
+            "resolved scan findings",
+            rule_key="external-skill-risk:owner/repo/example:sha256:test",
+            one_shot=True,
+            allow_yolo_bypass=False,
+        )
+
+        assert res["approved"] is False
+        assert len(prompts) == 1
+
+    def test_one_shot_ignores_cached_approval_and_cannot_persist(self, monkeypatch):
+        monkeypatch.setattr(approval, "is_approved", lambda sk, pk: True)
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: True)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)
+        prompts = []
+        persisted = []
+
+        def approve_always(*args, **kwargs):
+            prompts.append((args, kwargs))
+            return "always"
+
+        monkeypatch.setattr(approval, "prompt_dangerous_approval", approve_always)
+        monkeypatch.setattr(
+            approval, "approve_session", lambda *args: persisted.append(("session", args))
+        )
+        monkeypatch.setattr(
+            approval, "approve_permanent", lambda *args: persisted.append(("always", args))
+        )
+
+        first = request_tool_approval(
+            "skillhub_install",
+            "identifier owner/repo/a hash aaa",
+            rule_key="external-skill:owner/repo/a:aaa",
+            one_shot=True,
+        )
+        second = request_tool_approval(
+            "skillhub_install",
+            "identifier owner/repo/a hash aaa",
+            rule_key="external-skill:owner/repo/a:aaa",
+            one_shot=True,
+        )
+
+        assert first["approved"] is True
+        assert second["approved"] is True
+        assert len(prompts) == 2
+        assert all(call[1]["allow_permanent"] is False for call in prompts)
+        assert persisted == []
+
+    def test_one_shot_gateway_payload_disables_permanent_choice(self, monkeypatch):
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+        submitted = {}
+        monkeypatch.setattr(
+            approval, "submit_pending", lambda sk, data: submitted.update(data)
+        )
+
+        result = request_tool_approval(
+            "skillhub_install",
+            "identifier owner/repo/a hash aaa",
+            rule_key="external-skill:owner/repo/a:aaa",
+            one_shot=True,
+        )
+
+        assert result["status"] == "approval_required"
+        assert submitted["allow_permanent"] is False

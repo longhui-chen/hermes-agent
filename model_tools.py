@@ -1099,6 +1099,7 @@ def handle_function_call(
     turn_id: Optional[str] = None,
     api_request_id: Optional[str] = None,
     user_task: Optional[str] = None,
+    previous_assistant_message: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
     skip_pre_tool_call_hook: bool = False,
     skip_tool_request_middleware: bool = False,
@@ -1202,7 +1203,10 @@ def handle_function_call(
                 task_id=task_id,
                 tool_call_id=tool_call_id,
                 session_id=session_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
                 user_task=user_task,
+                previous_assistant_message=previous_assistant_message,
                 enabled_tools=enabled_tools,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
                 skip_tool_request_middleware=skip_tool_request_middleware,
@@ -1335,6 +1339,10 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
+                        turn_id=turn_id,
+                        tool_call_id=tool_call_id,
+                        user_task=user_task,
+                        previous_assistant_message=previous_assistant_message,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
@@ -1343,6 +1351,9 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
+                        previous_assistant_message=previous_assistant_message,
+                        turn_id=turn_id,
+                        tool_call_id=tool_call_id,
                     )
             from hermes_cli.middleware import run_tool_execution_middleware
 
