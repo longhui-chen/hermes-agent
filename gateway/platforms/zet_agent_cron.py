@@ -492,8 +492,42 @@ def install() -> None:
         if not getattr(_sched.run_job, _PATCH_SENTINEL, False):
             _orig_run_job = _sched.run_job
 
-            def _wrapped_run_job(job):
-                return _run_job_with_retry(_orig_run_job, job)
+            def _wrapped_run_job(job, *, defer_agent_teardown=None):
+                # Upstream scheduler.run_one_job() passes this holder so agent
+                # async resources stay alive through delivery. A retry does not
+                # need the previous failed attempt's agent, though: release it
+                # immediately before the next attempt, and hand only the final
+                # attempt back for post-delivery teardown.
+                attempt_agents = [] if defer_agent_teardown is not None else None
+
+                def _run_once(retry_job):
+                    return _orig_run_job(
+                        retry_job,
+                        defer_agent_teardown=attempt_agents,
+                    )
+
+                def _release_failed_attempt():
+                    while attempt_agents:
+                        _sched._teardown_cron_agent(
+                            attempt_agents.pop(),
+                            job.get("id", ""),
+                        )
+
+                try:
+                    return _run_job_with_retry(
+                        _run_once,
+                        job,
+                        before_retry=(
+                            _release_failed_attempt
+                            if attempt_agents is not None
+                            else None
+                        ),
+                    )
+                finally:
+                    # Success, terminal failure, or an exception: preserve the
+                    # upstream contract for whichever attempt is still live.
+                    if attempt_agents:
+                        defer_agent_teardown.extend(attempt_agents)
 
             setattr(_wrapped_run_job, _PATCH_SENTINEL, True)
             _sched.run_job = _wrapped_run_job
@@ -936,11 +970,35 @@ def _is_silent_run(job_id: str) -> bool:
 
 
 # ── Failure classification / friendly messaging ────────────────────
-# Transient upstream errors (gateway timeout / 5xx / connection) — retryable.
-_RETRYABLE_ERROR_RE = re.compile(
-    r"(?:\b50[234]\b|context deadline exceeded|Client\.Timeout"
-    r"|timeout|timed out|temporarily unavailable|overloaded|rate.?limit"
-    r"|connection (?:reset|refused|aborted|error)|read tcp|\bEOF\b)",
+# Stable user-facing categories. Retryability is derived from the category,
+# rather than from one broad regex, so clients can explain the actual problem
+# without exposing provider error strings.
+_NETWORK_ERROR_RE = re.compile(
+    r"(?:temporary failure in name resolution|name or service not known"
+    r"|nodename nor servname|connecterror|getaddrinfo|\bdns\b"
+    r"|network is unreachable|connection (?:reset|refused|aborted|error)"
+    r"|read tcp|^\s*EOF\s*$"
+    r"|(?:http|response|connection|socket|tcp)[^;\n]{0,80}\bEOF\b)",
+    re.IGNORECASE,
+)
+_TIMEOUT_ERROR_RE = re.compile(
+    r"(?:context deadline exceeded|Client\.Timeout|timeout|timed out)",
+    re.IGNORECASE,
+)
+_RATE_LIMIT_ERROR_RE = re.compile(
+    r"(?:rate[ _-]?limit|\b429\b|too many requests)",
+    re.IGNORECASE,
+)
+_UPSTREAM_ERROR_RE = re.compile(
+    r"(?:\b50[234]\b|temporarily unavailable|overloaded)",
+    re.IGNORECASE,
+)
+_INSUFFICIENT_CREDITS_RE = re.compile(
+    r"(?:\b402\b|insufficient_credits|insufficient credits"
+    r"|credit balance[^;\n]{0,40}"
+    r"(?:insufficient|empty|exhausted|zero|too low|not enough)"
+    r"|(?:insufficient|empty|exhausted|zero|too low|not enough)"
+    r"[^;\n]{0,40}credit balance)",
     re.IGNORECASE,
 )
 # Ran but produced nothing usable (#8585 / fake-success).
@@ -988,7 +1046,11 @@ def _warn_if_failure_template_drifted(scheduler_source: str) -> bool:
 
 # code → default-locale reason (clients localize off the code).
 _FAILURE_REASON = {
+    "network_unavailable": "暂时无法连接服务，请检查网络后重试",
     "upstream_unavailable": "AI 服务暂时繁忙",
+    "timeout": "任务执行超时",
+    "rate_limited": "AI 服务请求过于频繁",
+    "insufficient_credits": "积分不足，无法生成内容",
     "empty_response": "本次未产出有效结果",
     "agent_error": "执行出错",
     "unknown": "执行失败",
@@ -1036,12 +1098,17 @@ def _failure_metadata(job_id: str, error: Optional[str]) -> Dict[str, Any]:
 
 
 def _is_retryable_error(error: Optional[str]) -> bool:
-    return bool(error and _RETRYABLE_ERROR_RE.search(error))
+    code, retryable = _classify_failure(error)
+    return retryable and code in {
+        "network_unavailable",
+        "upstream_unavailable",
+        "timeout",
+        "rate_limited",
+    }
 
 
 def _classify_failure(error: Optional[str]) -> tuple[str, bool]:
-    """Raw error → stable (code, retryable). Codes: upstream_unavailable,
-    empty_response, agent_error, unknown."""
+    """Raw error → stable user-facing code plus retryability."""
     if not error or not error.strip():
         return ("unknown", False)
     # Empty-result BEFORE retryable: upstream's #8585 sentinel ("...produced
@@ -1049,8 +1116,16 @@ def _classify_failure(error: Optional[str]) -> tuple[str, bool]:
     # "timeout", which would otherwise be misread as transient/retryable.
     if _EMPTY_RESULT_RE.search(error):
         return ("empty_response", False)
-    if _is_retryable_error(error):
+    if _INSUFFICIENT_CREDITS_RE.search(error):
+        return ("insufficient_credits", False)
+    if _NETWORK_ERROR_RE.search(error):
+        return ("network_unavailable", True)
+    if _RATE_LIMIT_ERROR_RE.search(error):
+        return ("rate_limited", True)
+    if _UPSTREAM_ERROR_RE.search(error):
         return ("upstream_unavailable", True)
+    if _TIMEOUT_ERROR_RE.search(error):
+        return ("timeout", True)
     return ("agent_error", False)
 
 
@@ -1063,21 +1138,26 @@ def _friendly_failure(
     name = (job_name or "").strip() or "定时任务"
     code, _ = _classify_failure(error)
     reason = _FAILURE_REASON[code]
-    if code == "upstream_unavailable" and retry_state:
+    if retry_state and code in {
+        "network_unavailable",
+        "upstream_unavailable",
+        "timeout",
+        "rate_limited",
+    }:
         skipped = retry_state.get("skipped_reason")
         attempts = int(retry_state.get("attempts") or 0)
         if skipped == "tool_activity":
-            reason = "AI 服务暂时繁忙。本次已执行部分步骤，为避免重复操作未自动重试"
+            reason = f"{reason}。本次可能已执行部分步骤，为避免重复操作未自动重试"
         elif skipped == "activity_unknown":
-            reason = "AI 服务暂时繁忙。无法确认本次是否已执行操作，已跳过自动重试"
+            reason = f"{reason}。无法确认本次是否已执行操作，已跳过自动重试"
         elif skipped == "retry_exhausted":
-            reason = f"AI 服务暂时繁忙。已自动重试 {attempts} 次仍失败"
+            reason = f"{reason}。已自动重试 {attempts} 次仍失败"
         elif skipped in {"no_agent", "job_script"}:
-            reason = "AI 服务暂时繁忙。该任务包含脚本步骤，为避免重复副作用未自动重试"
+            reason = f"{reason}。该任务包含脚本步骤，为避免重复副作用未自动重试"
         elif skipped == "retries_disabled":
-            reason = "AI 服务暂时繁忙。自动重试当前已关闭"
+            reason = f"{reason}。自动重试当前已关闭"
         elif skipped == "shutdown":
-            reason = "AI 服务暂时繁忙。系统正在停止，已取消自动重试"
+            reason = f"{reason}。系统正在停止，已取消自动重试"
     return f"⚠️ 定时任务「{name}」执行失败：{reason}。"
 
 
@@ -1115,9 +1195,15 @@ def _is_retryable_failure_result(result) -> bool:
     return not result[0] and _is_retryable_error(result[3])
 
 
-def _run_job_with_retry(orig_run_job, job):
+def _run_job_with_retry(orig_run_job, job, *, before_retry=None):
     """Re-run a transient failure, but only while this run has produced zero
-    tool activity (vs a fixed pre-run baseline) so side effects never repeat."""
+    tool activity (vs a fixed pre-run baseline) so side effects never repeat.
+
+    ``before_retry`` runs only after the backoff completes and a new attempt is
+    definitely about to start. The installed scheduler wrapper uses it to
+    release the previous failed attempt's deferred agent while retaining the
+    final attempt through delivery.
+    """
     job_id = job.get("id", "")
     state = _new_retry_state()
     _LAST_RETRY_STATE.pop(job_id, None)
@@ -1171,6 +1257,8 @@ def _run_job_with_retry(orig_run_job, job):
             state["skipped_reason"] = "shutdown"
             _dbg(f"run_job: shutdown during backoff — abort retry job={job_id}")
             break
+        if before_retry is not None:
+            before_retry()
         result = orig_run_job(job)
     if _is_retryable_failure_result(result):
         state["retryable"] = True

@@ -34,6 +34,8 @@ def test_install_normalizes_legacy_zettlab_origin():
     signature = inspect.signature(scheduler.mark_job_run)
     assert "scheduled_at" in signature.parameters
     assert "output_filename" in signature.parameters
+    run_signature = inspect.signature(scheduler.run_job)
+    assert "defer_agent_teardown" in run_signature.parameters
 
     job = {
         "origin": {
@@ -851,6 +853,52 @@ def test_run_job_with_retry_retries_clean_transient(monkeypatch):
     assert calls["n"] == 2  # retried once
 
 
+def test_installed_retry_wrapper_releases_only_failed_attempt_agents(monkeypatch):
+    from cron import scheduler
+
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(zc, "_MAX_RUN_RETRIES", 2)
+    monkeypatch.setattr(zc, "_RETRY_BACKOFF_S", 0)
+    monkeypatch.setattr(zc, "_list_cron_session_ids", lambda _jid: set())
+    monkeypatch.setattr(zc, "_attempt_tool_activity", lambda _jid, _before: 0)
+
+    calls = {"n": 0}
+    released = []
+
+    def fake_run_job(job, *, defer_agent_teardown=None):
+        calls["n"] += 1
+        defer_agent_teardown.append(f"agent-{calls['n']}")
+        if calls["n"] == 1:
+            return (False, "out", "", _RAW_502)
+        return (True, "ok", "done", None)
+
+    # install() uses mark_job_run's sentinel as its global idempotency guard.
+    # Replace it together with run_job so this test installs a fresh wrapper
+    # around the controlled fake without disturbing the already-installed
+    # process-global wrappers after monkeypatch teardown.
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(scheduler, "save_job_output", lambda _job_id, output: output)
+    monkeypatch.setattr(scheduler, "run_job", fake_run_job)
+    monkeypatch.setattr(
+        scheduler,
+        "_teardown_cron_agent",
+        lambda agent, job_id: released.append((agent, job_id)),
+    )
+    zc.install()
+
+    deferred = []
+    result = scheduler.run_job(
+        {"id": "resource-job"},
+        defer_agent_teardown=deferred,
+    )
+
+    assert result == (True, "ok", "done", None)
+    assert calls["n"] == 2
+    assert released == [("agent-1", "resource-job")]
+    assert deferred == ["agent-2"]
+
+
 def test_run_job_with_retry_caps_attempts(monkeypatch):
     import gateway.platforms.zet_agent_cron as zc
 
@@ -1308,15 +1356,94 @@ def test_classify_failure_codes():
 
     assert zc._classify_failure(_RAW_502) == ("upstream_unavailable", True)
     assert zc._classify_failure("HTTP 503") == ("upstream_unavailable", True)
+    assert zc._classify_failure(
+        "httpx.ConnectError: [Errno -3] Temporary failure in name resolution"
+    ) == ("network_unavailable", True)
+    assert zc._classify_failure(
+        "socket.gaierror: [Errno -2] Name or service not known"
+    ) == ("network_unavailable", True)
+    assert zc._classify_failure("transport connection error") == (
+        "network_unavailable",
+        True,
+    )
+    assert zc._classify_failure(
+        "read tcp 10.0.0.1:443: connection reset by peer"
+    ) == ("network_unavailable", True)
+    assert zc._classify_failure("EOF") == ("network_unavailable", True)
+    assert zc._classify_failure("response ended with EOF") == (
+        "network_unavailable",
+        True,
+    )
+    assert zc._classify_failure("unexpected EOF while parsing JSON") == (
+        "agent_error",
+        False,
+    )
+    assert zc._classify_failure("file stream ended with EOF") == (
+        "agent_error",
+        False,
+    )
+    assert zc._classify_failure("context deadline exceeded") == ("timeout", True)
+    assert zc._classify_failure("HTTP 429: rate limit exceeded") == ("rate_limited", True)
+    assert zc._classify_failure("rate_limit exceeded") == ("rate_limited", True)
+    assert zc._classify_failure(
+        "HTTP 402: insufficient_credits"
+    ) == ("insufficient_credits", False)
+    assert zc._classify_failure("credit balance exhausted") == (
+        "insufficient_credits",
+        False,
+    )
+    assert zc._classify_failure("failed to fetch credit balance") == (
+        "agent_error",
+        False,
+    )
     # Real upstream #8585 sentinel — note it embeds "timeout"; empty-result must
     # win over the retryable-keyword match, else it's mislabeled retryable.
     assert zc._classify_failure(
         "Agent completed but produced empty response "
         "(model error, timeout, or misconfiguration)"
     ) == ("empty_response", False)
+    assert zc._classify_failure("Agent produced no usable output") == (
+        "empty_response",
+        False,
+    )
+    assert zc._classify_failure("No response generated") == ("empty_response", False)
     assert zc._classify_failure("ValueError: bad config") == ("agent_error", False)
+    assert zc._classify_failure("request quota exceeded") == ("agent_error", False)
+    assert zc._classify_failure("model not configured") == ("agent_error", False)
     assert zc._classify_failure(None) == ("unknown", False)
     assert zc._classify_failure("") == ("unknown", False)
+
+
+def test_dns_failure_retries_and_carries_specific_metadata(monkeypatch):
+    import json as _json
+    import gateway.platforms.zet_agent_cron as zc
+
+    monkeypatch.setattr(zc, "_RETRY_BACKOFF_S", 0)
+    monkeypatch.setattr(zc, "_list_cron_session_ids", lambda _jid: set())
+    monkeypatch.setattr(zc, "_attempt_tool_activity", lambda _jid, _before: 0)
+    dns_error = "httpx.ConnectError: [Errno -3] Temporary failure in name resolution"
+    calls = {"n": 0}
+
+    def orig(job):
+        calls["n"] += 1
+        return (False, "out", "", dns_error)
+
+    zc._run_job_with_retry(orig, {"id": "dns-job"})
+    content = zc._build_typed_message_content(
+        {"id": "dns-job", "name": "网络验收", "schedule": {"display": "每天"}},
+        "dns-job",
+        False,
+        dns_error,
+        None,
+    )
+    meta = _json.loads(content.split("```cron-summary\n", 1)[1].split("\n```", 1)[0])
+
+    assert calls["n"] == 1 + zc._MAX_RUN_RETRIES
+    assert meta["failure"]["code"] == "network_unavailable"
+    assert meta["failure"]["retryable"] is True
+    assert meta["failure"]["retry"]["skipped_reason"] == "retry_exhausted"
+    assert "暂时无法连接服务" in content
+    assert "Temporary failure in name resolution" not in content
 
 
 def test_failure_metadata_carries_structured_code():
