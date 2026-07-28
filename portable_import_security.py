@@ -168,7 +168,27 @@ def portable_credential_finding(value: str) -> Optional[str]:
         if _credential_value_looks_real(match.group(1)):
             return "URL userinfo credential"
     for match in _CREDENTIAL_BLOCK_SCALAR_RE.finditer(value):
-        lines = [ln.strip() for ln in match.group(2).splitlines() if ln.strip()]
+        # The regex greedily grabs every following indented line, but a YAML
+        # block scalar ends when indentation dedents back to a sibling/parent
+        # mapping key. Trim to the real block: the first non-blank line fixes
+        # the content indent; stop at the first non-blank line shallower than
+        # it. Without this, a nested `password: |` whose value is a placeholder
+        # would swallow a following `username: admin` sibling and false-reject
+        # a credential-free import.
+        content_indent = None
+        block_lines = []
+        for line in match.group(2).splitlines():
+            if not line.strip():
+                block_lines.append(line)
+                continue
+            indent = len(line) - len(line.lstrip(" \t"))
+            if content_indent is None:
+                content_indent = indent
+            elif indent < content_indent:
+                break
+            block_lines.append(line)
+
+        lines = [ln.strip() for ln in block_lines if ln.strip()]
         # Check each physical line (a literal `|` block puts a full secret on
         # each line, e.g. base64) AND the space-joined value (a folded `>`
         # block splits one secret across short lines that only exceed the

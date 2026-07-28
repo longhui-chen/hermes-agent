@@ -240,6 +240,8 @@ def test_portable_credential_scanner_allows_url_without_userinfo_password(value)
         # indent/chomp indicators in either order (|2-, |-2, >2+)
         "password: |2-\n  supersecretvalue123\n",
         "password: >2+\n  supersecretvalue123\n",
+        # nested mapping: real secret in the block still rejected
+        "stringData:\n  password: |\n    realsecretvalue123\n  username: admin\n",
     ],
 )
 def test_portable_credential_scanner_rejects_yaml_block_scalar_secrets(value):
@@ -254,6 +256,8 @@ def test_portable_credential_scanner_rejects_yaml_block_scalar_secrets(value):
         "notes: >-\n  wrap this long sentence across lines\n",
         "description: | # a note\n  normal text goes here\n",
         "password: run some cmd | grep pattern",
+        # nested mapping: placeholder block must not swallow the sibling field
+        "stringData:\n  password: |\n    ${PASSWORD}\n  username: admin\n",
     ],
 )
 def test_portable_credential_scanner_allows_benign_block_scalars(value):
