@@ -271,11 +271,15 @@ import os
 import json
 import sys
 
+import yaml
+from yaml.nodes import MappingNode, ScalarNode
+
 from gateway.config import GatewayConfig
 from utils import fast_safe_load
 
 path = sys.argv[1]
 config_exists = os.path.exists(path)
+source = ""
 
 try:
     if config_exists:
@@ -293,6 +297,37 @@ if config is None:
 if not isinstance(config, dict):
     print(f"invalid Hermes config {path}: expected a mapping", file=sys.stderr)
     raise SystemExit(1)
+
+
+def mapping_values(node, key):
+    if not isinstance(node, MappingNode):
+        return []
+    return [
+        value_node
+        for key_node, value_node in node.value
+        if isinstance(key_node, ScalarNode) and key_node.value == key
+    ]
+
+
+# PyYAML intentionally accepts duplicate mapping keys and keeps the last value.
+# That makes the effective setting correct but leaves an invalid, confusing
+# config behind. Ask the Hermes CLI to rewrite only when this specific key is
+# duplicated; ordinary enabled configs remain byte-for-byte untouched.
+duplicate_multiplex_key = False
+if source:
+    document = yaml.compose(
+        source,
+        Loader=getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader,
+    )
+    root_multiplex = mapping_values(document, "multiplex_profiles")
+    nested_multiplex = []
+    for gateway_node in mapping_values(document, "gateway"):
+        nested_multiplex.extend(
+            mapping_values(gateway_node, "multiplex_profiles")
+        )
+    duplicate_multiplex_key = (
+        len(root_multiplex) > 1 or len(nested_multiplex) > 1
+    )
 
 gateway_defaults = {}
 gateway_json_path = os.path.join(os.path.dirname(path), "gateway.json")
@@ -312,6 +347,7 @@ if not isinstance(gateway_defaults, dict):
 # config.yaml. Match that behavior exactly rather than making prepare's view
 # broader than the gateway's.
 effective_config = config
+managed_scope = None
 managed_dir_override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
 managed_scope_present = (
     os.path.isdir(managed_dir_override)
@@ -333,6 +369,14 @@ if "multiplex_profiles" in effective_config:
     gateway_data["multiplex_profiles"] = effective_config["multiplex_profiles"]
 
 if GatewayConfig.from_dict(gateway_data).multiplex_profiles:
+    if duplicate_multiplex_key:
+        config_key = (
+            "multiplex_profiles"
+            if "multiplex_profiles" in config
+            else "gateway.multiplex_profiles"
+        )
+        if managed_scope is None or not managed_scope.is_key_managed(config_key):
+            print(config_key)
     raise SystemExit(0)
 
 # The legacy top-level key has runtime precedence over gateway.*. Update that

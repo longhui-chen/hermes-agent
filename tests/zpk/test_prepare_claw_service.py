@@ -288,6 +288,52 @@ def test_prepare_claw_service_skips_config_set_when_multiplex_is_enabled(
     assert _hermes_invocations(app_root) == []
 
 
+def test_prepare_claw_service_normalizes_duplicate_enabled_multiplex_key(
+    tmp_path: Path,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
+    hermes_home.mkdir(parents=True)
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text(
+        "gateway:\n"
+        "  multiplex_profiles: true\n"
+        "  multiplex_profiles: true\n"
+        "skills:\n"
+        "  external_dirs:\n"
+        "    - /opt/zettlab/skills\n",
+        encoding="utf-8",
+    )
+
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(),
+    )
+    normalized = config_path.read_text(encoding="utf-8")
+
+    assert normalized.count("multiplex_profiles: true\n") == 1
+    assert "/opt/zettlab/skills" in normalized
+    assert _hermes_invocations(app_root) == [
+        ["config", "set", "gateway.multiplex_profiles", "true"]
+    ]
+
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(),
+    )
+
+    assert config_path.read_text(encoding="utf-8") == normalized
+    assert _hermes_invocations(app_root) == [
+        ["config", "set", "gateway.multiplex_profiles", "true"]
+    ]
+
+
 def test_prepare_claw_service_fails_closed_on_invalid_config_yaml(tmp_path: Path):
     if not _readlink_f_available(tmp_path):
         pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
