@@ -160,8 +160,20 @@ _DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin",
 
 def _uses_zettlab_video_generation(config: dict, platform: str) -> bool:
     video_config = config.get("video_gen")
+    platform_toolsets = config.get("platform_toolsets")
+    configured_toolsets = (
+        platform_toolsets.get(platform)
+        if isinstance(platform_toolsets, dict)
+        else None
+    )
+    read_only_vault = (
+        isinstance(configured_toolsets, list)
+        and "markdown_vault" in configured_toolsets
+        and "no_mcp" in configured_toolsets
+    )
     return (
         platform == "zet_agent"
+        and not read_only_vault
         and isinstance(video_config, dict)
         and str(video_config.get("provider") or "").strip() == "zettlab"
     )

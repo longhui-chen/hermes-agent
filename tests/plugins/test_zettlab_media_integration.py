@@ -402,6 +402,55 @@ def test_zet_agent_exposes_video_tool_when_gateway_capability_is_enabled(monkeyp
     assert "video_generate" in {item["function"]["name"] for item in definitions}
 
 
+def test_read_only_vault_hides_zettlab_video_even_when_capability_is_enabled(monkeypatch):
+    from agent import video_gen_registry
+    from hermes_cli.tools_config import _get_platform_tools
+    import model_tools
+    from plugins import zettlab_media_client as client
+    from plugins.video_gen.zettlab import ZettlabVideoGenProvider
+    from tools import video_generation_tool as video_tool
+
+    video_gen_registry._reset_for_tests()
+    video_gen_registry.register_provider(ZettlabVideoGenProvider())
+    monkeypatch.setattr(
+        "hermes_cli.plugins._ensure_plugins_discovered", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        video_tool, "_read_configured_video_provider", lambda: "zettlab"
+    )
+    monkeypatch.setattr(
+        client._SESSION,
+        "get",
+        lambda *args, **kwargs: _Resp({
+            "video": {
+                "enabled": True,
+                "default_model": "seedance-v1",
+                "models": [{"id": "seedance-v1"}],
+            },
+        }),
+    )
+
+    enabled = _get_platform_tools(
+        {
+            "video_gen": {"provider": "zettlab"},
+            "platform_toolsets": {
+                "zet_agent": ["markdown_vault", "todo", "clarify", "no_mcp"]
+            },
+        },
+        "zet_agent",
+        include_default_mcp_servers=False,
+    )
+    model_tools._clear_tool_defs_cache()
+    definitions = model_tools.get_tool_definitions(
+        enabled_toolsets=sorted(enabled),
+        quiet_mode=True,
+    )
+
+    assert "video_generate" not in {
+        item["function"]["name"] for item in definitions
+    }
+
+
 def test_zet_agent_hides_video_tool_when_zettlab_is_disabled_even_if_another_provider_is_available(monkeypatch):
     from agent import video_gen_registry
     from agent.video_gen_provider import VideoGenProvider
