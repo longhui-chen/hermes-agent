@@ -162,11 +162,18 @@ def portable_credential_finding(value: str) -> Optional[str]:
         if _credential_value_looks_real(match.group(1)):
             return "URL userinfo credential"
     for match in _CREDENTIAL_BLOCK_SCALAR_RE.finditer(value):
-        for line in match.group(2).splitlines():
-            stripped = line.strip()
+        lines = [ln.strip() for ln in match.group(2).splitlines() if ln.strip()]
+        # Check each physical line (a literal `|` block puts a full secret on
+        # each line, e.g. base64) AND the space-joined value (a folded `>`
+        # block splits one secret across short lines that only exceed the
+        # threshold once folded).
+        candidates = list(lines)
+        if len(lines) > 1:
+            candidates.append(" ".join(lines))
+        for candidate in candidates:
             if (
-                len(stripped) >= 6
-                and _PLACEHOLDER_VALUE_RE.fullmatch(stripped) is None
+                len(candidate) >= 6
+                and _PLACEHOLDER_VALUE_RE.fullmatch(candidate) is None
             ):
                 return "credential block scalar"
     for match in _AUTHORIZATION_BEARER_RE.finditer(value):

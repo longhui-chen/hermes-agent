@@ -1835,10 +1835,6 @@ def test_open_profile_session_db_accepts_stale_regular_sidecar(tmp_path):
         db.close()
 
 
-@pytest.mark.skipif(
-    not sys.platform.startswith("linux"),
-    reason="malformed-schema repair anchors the connection via /proc/self/fd (Linux only)",
-)
 def test_malformed_profile_state_db_self_heals_on_open(tmp_path):
     """A corrupted state.db must self-heal through the sidecar-anchored open,
     not leave the profile's sessions/chat/import permanently unavailable."""
