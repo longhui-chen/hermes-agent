@@ -5,7 +5,6 @@ After=network.target
 
 [Service]
 Type=simple
-EnvironmentFile=-__APP_BASE__/data/secrets/zettlab-claw.env
 Environment=HERMES_HOME=__APP_BASE__/data/hermes_home
 Environment=HERMES_BUNDLED_SKILLS=__APP_BASE__/current/lib/hermes-agent/skills
 Environment=HERMES_BUNDLED_PLUGINS=__APP_BASE__/current/lib/hermes-agent/plugins

@@ -5,59 +5,161 @@ APP_ROOT=$(dirname "$(readlink -f "$0")")
 APP_BASE=$(dirname "$APP_ROOT")
 HERMES_SRC="$APP_ROOT/lib/hermes-agent"
 HERMES_PYTHON="$HERMES_SRC/venv/bin/python"
+HERMES_BIN="$APP_ROOT/bin/hermes"
 HERMES_HOME="$APP_BASE/data/hermes_home"
+DATA_DIR="$APP_BASE/data"
 SECRET_DIR="$APP_BASE/data/secrets"
+LOCK_FILE="$SECRET_DIR/prepare-claw-service.lock"
 KEY_FILE="$SECRET_DIR/zet_agent.key"
 ENV_FILE="$SECRET_DIR/zettlab-claw.env"
 DEFAULT_ZETTLAB_PRESETS_DIR="/volume1/subvol/agents/zettlab-presets/current"
 LEGACY_ZETTLAB_PRESETS_DIR="/volume1/agents/zettlab-presets/current"
 
 env_file_value() {
-    [ -f "$ENV_FILE" ] || return 1
-    local name value
-    while IFS='=' read -r name value; do
-        [ "$name" = "$1" ] || continue
+    local wanted="$1" name value
+    while IFS= read -r -d '' name && IFS= read -r -d '' value; do
+        [ -n "$name" ] || break
+        [ "$name" = "$wanted" ] || continue
         printf '%s\n' "$value"
         return 0
-    done < "$ENV_FILE"
+    done < <(dump_persisted_env)
     return 1
 }
 
 presets_dir_is_trusted() {
-    local candidate="$1" resolved uid mode other
+    local candidate="$1" resolved current uid mode group other
     [ -n "$candidate" ] || return 1
     resolved="$(readlink -f "$candidate" 2>/dev/null || true)"
     [ -n "$resolved" ] && [ -d "$resolved" ] || return 1
 
     # zettlab-claw normally runs as root. Require the resolved version directory
-    # to be root-owned and not world-writable before exposing it to Hermes. Local
-    # non-root test/dev runs retain the world-writable rejection but cannot assert
-    # device ownership.
-    mode="$(stat -c '%a' "$resolved" 2>/dev/null || stat -f '%Lp' "$resolved" 2>/dev/null || true)"
-    [ -n "$mode" ] || return 1
-    other="${mode: -1}"
-    (( (10#$other & 2) == 0 )) || return 1
+    # to be root-owned and not group/world-writable before exposing it to Hermes.
+    # Local non-root test/dev runs retain the write-bit rejection but cannot
+    # assert device ownership.
     if [ "$(id -u)" -eq 0 ]; then
-        uid="$(stat -c '%u' "$resolved" 2>/dev/null || stat -f '%u' "$resolved" 2>/dev/null || true)"
-        [ "$uid" = "0" ] || return 1
+        current="$resolved"
+        while :; do
+            uid="$(stat -c '%u' "$current" 2>/dev/null || stat -f '%u' "$current" 2>/dev/null || true)"
+            mode="$(stat -c '%a' "$current" 2>/dev/null || stat -f '%Lp' "$current" 2>/dev/null || true)"
+            [ "$uid" = "0" ] && [ -n "$mode" ] || return 1
+            group="${mode: -2:1}"
+            other="${mode: -1}"
+            (( (10#$group & 2) == 0 )) || return 1
+            (( (10#$other & 2) == 0 )) || return 1
+            [ "$current" = "/" ] && break
+            current="$(dirname "$current")"
+        done
+    else
+        mode="$(stat -c '%a' "$resolved" 2>/dev/null || stat -f '%Lp' "$resolved" 2>/dev/null || true)"
+        [ -n "$mode" ] || return 1
+        group="${mode: -2:1}"
+        other="${mode: -1}"
+        (( (10#$group & 2) == 0 )) || return 1
+        (( (10#$other & 2) == 0 )) || return 1
     fi
-    return 0
+    printf '%s\n' "$resolved"
 }
 
 detect_zettlab_presets_dir() {
-    local existing candidate
+    local existing candidate trusted
     existing="$(env_file_value ZETTLAB_PRESETS_DIR || true)"
-    for candidate in "${ZETTLAB_PRESETS_DIR:-}" "$existing" "$DEFAULT_ZETTLAB_PRESETS_DIR" "$LEGACY_ZETTLAB_PRESETS_DIR"; do
-        if presets_dir_is_trusted "$candidate"; then
-            printf '%s\n' "$candidate"
+    for candidate in "${ZETTLAB_PRESETS_DIR:-}" "$DEFAULT_ZETTLAB_PRESETS_DIR" "$LEGACY_ZETTLAB_PRESETS_DIR" "$existing"; do
+        if trusted="$(presets_dir_is_trusted "$candidate")"; then
+            printf '%s\n' "$trusted"
             return 0
         fi
     done
     return 1
 }
 
-ZETTLAB_PRESETS_DIR="$(detect_zettlab_presets_dir || true)"
-ZETTLAB_PRESETS_DIR="$(printf '%s' "$ZETTLAB_PRESETS_DIR" | tr -d '\r\n')"
+secure_state_directories() {
+    local path mode expected_mode uid
+    for path in "$DATA_DIR" "$SECRET_DIR"; do
+        if [ -L "$path" ] || { [ -e "$path" ] && [ ! -d "$path" ]; }; then
+            echo "refusing non-directory state path: $path" >&2
+            exit 1
+        fi
+        mkdir -p "$path"
+        if [ -L "$path" ] || [ ! -d "$path" ]; then
+            echo "state path changed while preparing it: $path" >&2
+            exit 1
+        fi
+        if [ "$(id -u)" -eq 0 ]; then
+            uid="$(stat -c '%u' "$path" 2>/dev/null || stat -f '%u' "$path" 2>/dev/null || true)"
+            if [ "$uid" != "0" ]; then
+                echo "refusing non-root-owned state directory: $path" >&2
+                exit 1
+            fi
+        fi
+        if [ "$path" = "$SECRET_DIR" ]; then
+            expected_mode=0700
+        else
+            mode="$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null || true)"
+            [ -n "$mode" ] || {
+                echo "cannot verify state directory mode: $path" >&2
+                exit 1
+            }
+            printf -v expected_mode '%04o' "$(( (8#$mode | 0700) & 0755 ))"
+        fi
+        chmod "$expected_mode" "$path"
+        mode="$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null || true)"
+        [ -n "$mode" ] || {
+            echo "cannot verify state directory mode: $path" >&2
+            exit 1
+        }
+    done
+}
+
+acquire_prepare_lock() {
+    if [ -L "$LOCK_FILE" ] || { [ -e "$LOCK_FILE" ] && [ ! -f "$LOCK_FILE" ]; }; then
+        echo "refusing non-regular prepare lock file: $LOCK_FILE" >&2
+        exit 1
+    fi
+    exec 9> "$LOCK_FILE"
+    chmod 0600 "$LOCK_FILE"
+    HERMES_PREPARE_LOCK_FD=9 "$HERMES_PYTHON" - <<'PY'
+import fcntl
+import os
+
+fd = int(os.environ["HERMES_PREPARE_LOCK_FD"])
+fcntl.flock(fd, fcntl.LOCK_EX)
+PY
+}
+
+dump_persisted_env() {
+    if [ ! -e "$ENV_FILE" ] && [ ! -L "$ENV_FILE" ]; then
+        printf '\000\000'
+        return 0
+    fi
+    if [ -L "$ENV_FILE" ] || [ ! -f "$ENV_FILE" ]; then
+        echo "refusing non-regular environment file: $ENV_FILE" >&2
+        return 1
+    fi
+
+    "$HERMES_PYTHON" "$APP_ROOT/parse-environment-file.py" "$ENV_FILE"
+}
+
+load_persisted_user_env() {
+    local key value complete=0
+    while IFS= read -r -d '' key && IFS= read -r -d '' value; do
+        if [ -z "$key" ]; then
+            complete=1
+            break
+        fi
+        case "$key" in
+            ZET_AGENT_KEY|ZET_AGENT_ENABLED|ZET_AGENT_HOST|ZET_AGENT_PORT|ZETTLAB_PRESETS_DIR)
+                continue
+                ;;
+        esac
+        if [ "${!key+x}" != "x" ]; then
+            export "$key=$value"
+        fi
+    done < <(dump_persisted_env)
+    if [ "$complete" != "1" ]; then
+        echo "failed to parse environment file: $ENV_FILE" >&2
+        exit 1
+    fi
+}
 
 generate_key() {
     if command -v openssl >/dev/null 2>&1; then
@@ -71,14 +173,21 @@ PY
 }
 
 write_agent_env() {
-    mkdir -p "$SECRET_DIR"
-    chmod 0700 "$SECRET_DIR"
+    if [ -L "$KEY_FILE" ] || { [ -e "$KEY_FILE" ] && [ ! -f "$KEY_FILE" ]; }; then
+        echo "refusing non-regular ZET_AGENT_KEY file: $KEY_FILE" >&2
+        exit 1
+    fi
+    if [ -L "$ENV_FILE" ] || { [ -e "$ENV_FILE" ] && [ ! -f "$ENV_FILE" ]; }; then
+        echo "refusing non-regular environment file: $ENV_FILE" >&2
+        exit 1
+    fi
 
     if [ ! -s "$KEY_FILE" ]; then
         generate_key > "$KEY_FILE.tmp.$$"
         chmod 0600 "$KEY_FILE.tmp.$$"
         mv "$KEY_FILE.tmp.$$" "$KEY_FILE"
     fi
+    chmod 0600 "$KEY_FILE"
 
     key="$(tr -d '\r\n' < "$KEY_FILE")"
     if [ -z "$key" ]; then
@@ -87,19 +196,6 @@ write_agent_env() {
     fi
 
     {
-        # Preserve user-managed EnvironmentFile entries verbatim while replacing
-        # only the fields owned by this package. Do not source the file: shell
-        # evaluation would let a malformed user value execute during service boot.
-        if [ -f "$ENV_FILE" ]; then
-            while IFS= read -r line || [ -n "$line" ]; do
-                case "$line" in
-                    ZET_AGENT_KEY=*|ZET_AGENT_ENABLED=*|ZET_AGENT_HOST=*|ZET_AGENT_PORT=*|ZETTLAB_PRESETS_DIR=*)
-                        continue
-                        ;;
-                esac
-                printf '%s\n' "$line"
-            done < "$ENV_FILE"
-        fi
         printf 'ZET_AGENT_KEY=%s\n' "$key"
         printf 'ZET_AGENT_ENABLED=true\n'
         printf 'ZET_AGENT_HOST=127.0.0.1\n'
@@ -107,100 +203,130 @@ write_agent_env() {
         if [ -n "$ZETTLAB_PRESETS_DIR" ]; then
             printf 'ZETTLAB_PRESETS_DIR=%s\n' "$ZETTLAB_PRESETS_DIR"
         fi
+
+        # Preserve user-managed EnvironmentFile entries verbatim while replacing
+        # complete logical assignments owned by this package. Physical-line
+        # filtering is unsafe because systemd permits multiline quoted values.
+        # Generated assignments come first so an accepted EOF-unclosed user value
+        # cannot swallow package-owned fields appended after it.
+        if [ -f "$ENV_FILE" ]; then
+            "$HERMES_PYTHON" "$APP_ROOT/parse-environment-file.py" \
+                --filter-excluding "$ENV_FILE" \
+                ZET_AGENT_KEY ZET_AGENT_ENABLED ZET_AGENT_HOST \
+                ZET_AGENT_PORT ZETTLAB_PRESETS_DIR
+        fi
     } > "$ENV_FILE.tmp.$$"
+    if ! "$HERMES_PYTHON" "$APP_ROOT/parse-environment-file.py" \
+        "$ENV_FILE.tmp.$$" >/dev/null; then
+        rm -f "$ENV_FILE.tmp.$$"
+        echo "refusing invalid generated environment file" >&2
+        return 1
+    fi
     chmod 0600 "$ENV_FILE.tmp.$$"
-    mv "$ENV_FILE.tmp.$$" "$ENV_FILE"
+    if [ -f "$ENV_FILE" ] && [ ! -L "$ENV_FILE" ] \
+        && cmp -s "$ENV_FILE.tmp.$$" "$ENV_FILE"; then
+        chmod 0600 "$ENV_FILE"
+        rm -f "$ENV_FILE.tmp.$$"
+    else
+        mv "$ENV_FILE.tmp.$$" "$ENV_FILE"
+    fi
+}
+
+required_multiplex_config_key() {
+    HERMES_HOME="$HERMES_HOME" "$HERMES_PYTHON" - "$HERMES_HOME/config.yaml" <<'PY'
+import os
+import json
+import sys
+
+from gateway.config import GatewayConfig
+from utils import fast_safe_load
+
+path = sys.argv[1]
+config_exists = os.path.exists(path)
+
+try:
+    if config_exists:
+        with open(path, "r", encoding="utf-8") as f:
+            source = f.read()
+        config = fast_safe_load(source)
+    else:
+        config = {}
+except Exception as exc:
+    print(f"invalid Hermes config {path}: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+if config is None:
+    config = {}
+if not isinstance(config, dict):
+    print(f"invalid Hermes config {path}: expected a mapping", file=sys.stderr)
+    raise SystemExit(1)
+
+gateway_defaults = {}
+gateway_json_path = os.path.join(os.path.dirname(path), "gateway.json")
+try:
+    with open(gateway_json_path, "r", encoding="utf-8") as f:
+        gateway_defaults = json.load(f) or {}
+except FileNotFoundError:
+    pass
+except Exception:
+    # Match gateway startup: malformed legacy gateway.json is a warning/fallback,
+    # while malformed primary config.yaml above fails closed.
+    gateway_defaults = {}
+if not isinstance(gateway_defaults, dict):
+    gateway_defaults = {}
+
+# Runtime currently applies the managed overlay while loading an existing
+# config.yaml. Match that behavior exactly rather than making prepare's view
+# broader than the gateway's.
+effective_config = config
+managed_dir_override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
+managed_scope_present = (
+    os.path.isdir(managed_dir_override)
+    if managed_dir_override
+    else os.path.isdir("/etc/hermes")
+)
+if config_exists and managed_scope_present:
+    from hermes_cli import managed_scope
+
+    effective_config = managed_scope.apply_managed_overlay(dict(config))
+gateway_data = dict(gateway_defaults)
+nested_gateway = effective_config.get("gateway")
+if (
+    isinstance(nested_gateway, dict)
+    and "multiplex_profiles" in nested_gateway
+):
+    gateway_data["multiplex_profiles"] = nested_gateway["multiplex_profiles"]
+if "multiplex_profiles" in effective_config:
+    gateway_data["multiplex_profiles"] = effective_config["multiplex_profiles"]
+
+if GatewayConfig.from_dict(gateway_data).multiplex_profiles:
+    raise SystemExit(0)
+
+# The legacy top-level key has runtime precedence over gateway.*. Update that
+# key when present; otherwise use the canonical nested form.
+if "multiplex_profiles" in effective_config:
+    print("multiplex_profiles")
+else:
+    print("gateway.multiplex_profiles")
+PY
 }
 
 enable_agent_gateway_config() {
     mkdir -p "$HERMES_HOME"
-    "$HERMES_PYTHON" - "$HERMES_HOME/config.yaml" <<'PY'
-import os
-import sys
-import tempfile
 
-path = sys.argv[1]
-if os.path.exists(path):
-    with open(path, "r", encoding="utf-8") as f:
-        lines = f.readlines()
-else:
-    lines = []
+    config_key="$(required_multiplex_config_key)"
+    if [ -z "$config_key" ]; then
+        return 0
+    fi
 
-def indent_of(line: str) -> int:
-    return len(line) - len(line.lstrip(" "))
+    HERMES_HOME="$HERMES_HOME" "$HERMES_BIN" \
+        config set "$config_key" true
 
-def inline_gateway_items(value: str) -> list[str]:
-    value = value.strip()
-    if not (value.startswith("{") and value.endswith("}")):
-        return []
-    body = value[1:-1].strip()
-    if not body:
-        return []
-    out = []
-    for item in body.split(","):
-        if ":" not in item:
-            continue
-        key, val = item.split(":", 1)
-        key = key.strip()
-        val = val.strip()
-        if key:
-            out.append(f"  {key}: {val}\n")
-    return out
-
-gateway_idx = None
-for i, line in enumerate(lines):
-    stripped = line.strip()
-    if stripped == "gateway:" and indent_of(line) == 0:
-        gateway_idx = i
-        break
-    if stripped in {"gateway: {}", "gateway: null"} and indent_of(line) == 0:
-        lines[i] = "gateway:\n"
-        gateway_idx = i
-        break
-    if stripped.startswith("gateway:") and indent_of(line) == 0:
-        inline_items = inline_gateway_items(stripped.split(":", 1)[1])
-        lines[i:i + 1] = ["gateway:\n", *inline_items]
-        gateway_idx = i
-        break
-
-if gateway_idx is None:
-    if lines and lines[-1].strip():
-        lines.append("\n")
-    lines.extend(["gateway:\n", "  multiplex_profiles: true\n"])
-else:
-    gateway_end = len(lines)
-    for i in range(gateway_idx + 1, len(lines)):
-        stripped = lines[i].strip()
-        if stripped and indent_of(lines[i]) == 0 and not stripped.startswith("#"):
-            gateway_end = i
-            break
-
-    updated = False
-    for i in range(gateway_idx + 1, gateway_end):
-        stripped = lines[i].strip()
-        if stripped.startswith("multiplex_profiles:") and indent_of(lines[i]) == 2:
-            comment = ""
-            if "#" in lines[i]:
-                comment = "  #" + lines[i].split("#", 1)[1].rstrip("\n")
-            lines[i] = f"  multiplex_profiles: true{comment}\n"
-            updated = True
-            break
-    if not updated:
-        lines.insert(gateway_end, "  multiplex_profiles: true\n")
-
-directory = os.path.dirname(path) or "."
-fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path) + ".", dir=directory)
-try:
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, path)
-finally:
-    try:
-        os.unlink(tmp)
-    except FileNotFoundError:
-        pass
-PY
+    remaining_key="$(required_multiplex_config_key)"
+    if [ -n "$remaining_key" ]; then
+        echo "failed to enable Hermes $remaining_key" >&2
+        return 1
+    fi
 }
 
 stop_legacy_per_profile_gateways() {
@@ -225,7 +351,20 @@ if [ ! -x "$HERMES_PYTHON" ]; then
     echo "hermes python is not ready: $HERMES_PYTHON" >&2
     exit 127
 fi
+if [ "${1:-}" = "--dump-env" ]; then
+    dump_persisted_env
+    exit
+fi
+if [ ! -x "$HERMES_BIN" ]; then
+    echo "hermes CLI is not ready: $HERMES_BIN" >&2
+    exit 127
+fi
 
+secure_state_directories
+acquire_prepare_lock
+load_persisted_user_env
+ZETTLAB_PRESETS_DIR="$(detect_zettlab_presets_dir || true)"
+ZETTLAB_PRESETS_DIR="$(printf '%s' "$ZETTLAB_PRESETS_DIR" | tr -d '\r\n')"
 write_agent_env
 enable_agent_gateway_config
 if [ "${HERMES_STOP_LEGACY_GATEWAYS:-0}" = "1" ]; then
