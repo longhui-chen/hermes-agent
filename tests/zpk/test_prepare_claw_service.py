@@ -1,6 +1,7 @@
 import fcntl
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -22,7 +23,11 @@ def _readlink_f_available(tmp_path: Path) -> bool:
     ).returncode == 0
 
 
-def _prepare_script_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
+def _prepare_script_fixture(
+    tmp_path: Path,
+    *,
+    default_presets_dir: Path | None = None,
+) -> tuple[Path, Path, Path]:
     repo_root = Path(__file__).resolve().parents[2]
     app_base = tmp_path / "zettos" / "main" / "apps" / "com.zettlab.claw"
     app_root = app_base / "current"
@@ -63,7 +68,20 @@ runpy.run_module("hermes_cli.main", run_name="__main__")
     hermes_wrapper_path.parent.mkdir(parents=True)
     shutil.copy2(repo_root / "zpk" / "bin" / "hermes", hermes_wrapper_path)
     hermes_wrapper_path.chmod(0o755)
-    shutil.copy2(repo_root / "zpk" / "prepare-claw-service.sh", script)
+    prepare_source = (repo_root / "zpk" / "prepare-claw-service.sh").read_text(
+        encoding="utf-8"
+    )
+    if default_presets_dir is not None:
+        default_assignment = (
+            'DEFAULT_ZETTLAB_PRESETS_DIR="/volume1/subvol/agents/'
+            'zettlab-presets/current"'
+        )
+        assert default_assignment in prepare_source
+        prepare_source = prepare_source.replace(
+            default_assignment,
+            f"DEFAULT_ZETTLAB_PRESETS_DIR={shlex.quote(str(default_presets_dir))}",
+        )
+    script.write_text(prepare_source, encoding="utf-8")
     script.chmod(0o755)
     shutil.copy2(
         repo_root / "zpk" / "parse-environment-file.py",
@@ -620,6 +638,38 @@ def test_prepare_claw_service_preserves_existing_presets_dir(tmp_path: Path):
     env_text = env_path.read_text(encoding="utf-8")
     assert f"ZETTLAB_PRESETS_DIR={presets_dir}\n" in env_text
     assert "CUSTOM_SAFE=keep-me\n" in env_text
+
+
+def test_prepare_claw_service_existing_presets_dir_beats_available_default(
+    tmp_path: Path,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    default_dir = tmp_path / "presets" / "default"
+    existing_dir = tmp_path / "presets" / "custom"
+    default_dir.mkdir(parents=True)
+    existing_dir.mkdir()
+    app_root, _hermes_home, env_path = _prepare_script_fixture(
+        tmp_path,
+        default_presets_dir=default_dir,
+    )
+    env_path.parent.mkdir(parents=True)
+    env_path.write_text(
+        f"ZETTLAB_PRESETS_DIR={existing_dir}\n",
+        encoding="utf-8",
+    )
+
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(),
+    )
+
+    env_text = env_path.read_text(encoding="utf-8")
+    assert f"ZETTLAB_PRESETS_DIR={existing_dir}\n" in env_text
+    assert f"ZETTLAB_PRESETS_DIR={default_dir}\n" not in env_text
 
 
 def test_prepare_claw_service_distinct_presets_override_beats_existing_value(

@@ -64,7 +64,7 @@ presets_dir_is_trusted() {
 detect_zettlab_presets_dir() {
     local existing candidate trusted
     existing="$(env_file_value ZETTLAB_PRESETS_DIR || true)"
-    for candidate in "${ZETTLAB_PRESETS_DIR:-}" "$DEFAULT_ZETTLAB_PRESETS_DIR" "$LEGACY_ZETTLAB_PRESETS_DIR" "$existing"; do
+    for candidate in "${ZETTLAB_PRESETS_DIR:-}" "$existing" "$DEFAULT_ZETTLAB_PRESETS_DIR" "$LEGACY_ZETTLAB_PRESETS_DIR"; do
         if trusted="$(presets_dir_is_trusted "$candidate")"; then
             printf '%s\n' "$trusted"
             return 0
