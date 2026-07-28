@@ -2232,6 +2232,61 @@ class APIServerAdapter(BasePlatformAdapter):
             if directory_fd is not None:
                 os.close(directory_fd)
 
+    def _open_profile_session_db_with_repair(self, profile_home: Path):
+        """Open the profile SessionDB, restoring the malformed-schema self-heal
+        that predates the fd-anchored open.
+
+        The fd-anchored _open_profile_session_db opens with
+        _allow_path_reopen=False, which disabled SessionDB's long-standing
+        pathname self-heal (backup + repair + reopen) that main used on every
+        open before this feature added fd-anchoring to the normal path. On a
+        malformed error, fall back to that same baseline recovery: a plain
+        SessionDB(state.db) whose default _allow_path_reopen=True heals
+        in place. The fd anchor is a hardening of the normal open path; this
+        rare recovery path stays at main's pre-existing pathname safety level
+        rather than leaving the profile permanently unavailable.
+        """
+        from hermes_state import (
+            SessionDB,
+            _claim_repair_attempt,
+            is_malformed_db_error,
+            repair_state_db_schema,
+        )
+
+        try:
+            return self._open_profile_session_db(profile_home)
+        except BaseException as exc:
+            if not is_malformed_db_error(exc):
+                raise
+            db_path = profile_home / "state.db"
+            # Guard against a repair loop on a genuinely unrecoverable file.
+            if not _claim_repair_attempt(db_path):
+                raise
+            logger.error(
+                "profile state.db schema is malformed (%s) — falling back to "
+                "the baseline pathname repair (backs up main + WAL sidecars "
+                "first), then reopening.",
+                exc,
+            )
+            # repair_state_db_schema is the same pathname recovery main has run
+            # on every open since before the fd-anchored open path existed; it
+            # backs up state.db and its -wal/-shm sidecars, then de-dups
+            # sqlite_master / rebuilds FTS in place. Call it explicitly (rather
+            # than via SessionDB's _allow_path_reopen self-heal, which reuses a
+            # closed connection after repair) and reopen a clean handle.
+            report = repair_state_db_schema(db_path)
+            if not report.get("repaired"):
+                raise
+            db = SessionDB(db_path)
+            try:
+                home_stat = os.stat(profile_home)
+                state_stat = os.stat(db_path)
+                db._profile_home_identity = (home_stat.st_dev, home_stat.st_ino)
+                db._profile_state_identity = (state_stat.st_dev, state_stat.st_ino)
+            except OSError:
+                pass
+            return db
+
     def _open_and_cache_session_db(self, home) -> Optional[Any]:
         """Sync core: return the cached SessionDB for ``home``, opening it once.
 
@@ -2262,7 +2317,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     logger.warning("Invalidated SessionDB close failed", exc_info=True)
             try:
-                db = self._open_profile_session_db(Path(key))
+                db = self._open_profile_session_db_with_repair(Path(key))
             except Exception as e:
                 logger.debug("SessionDB unavailable for API server: %s", e)
                 return None

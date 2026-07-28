@@ -13,15 +13,42 @@ _AUTHORIZATION_BEARER_RE = re.compile(
     r"(?:\\?[\"']\s*)?bearer\s+([A-Za-z0-9._~+/=-]{8,})",
     re.IGNORECASE | re.MULTILINE,
 )
-_CREDENTIAL_ASSIGNMENT_RE = re.compile(
-    r"(?:^|[\s{,:])[\"']?"
-    r"((?:[a-z0-9]+[._-])*(?:api[._ -]?key|client[._ -]?key[._ -]?data|client[._ -]?secret|"
+# Shared credential-field vocabulary, reused by the inline-assignment and the
+# YAML block-scalar matchers so both stay in sync.
+_CREDENTIAL_KEY_VOCAB = (
+    r"(?:[a-z0-9]+[._-])*(?:api[._ -]?key|client[._ -]?key[._ -]?data|client[._ -]?secret|"
     r"secret[._ -]?access[._ -]?key|access[._ -]?key[._ -]?id|"
     r"account[._ -]?key|subscription[._ -]?key|access[._ -]?token|refresh[._ -]?token|"
     r"auth[._ -]?token|authorization|identitytoken|registrytoken|_?auth|credentials?|secret|token|password|"
-    r"passwd|cookie|private[._ -]?key))"
+    r"passwd|cookie|private[._ -]?key)"
+)
+_CREDENTIAL_ASSIGNMENT_RE = re.compile(
+    r"(?:^|[\s{,:])[\"']?"
+    r"(" + _CREDENTIAL_KEY_VOCAB + r")"
     r"[\"']?\s*[:=]\s*(\"[^\"\r\n]+\"|'[^'\r\n]+'|"
     r"[^\s,}\]\r\n#]+)",
+    re.IGNORECASE | re.MULTILINE,
+)
+# YAML block scalars carry the value on the following lines, so the inline
+# matcher above (which stops at the newline) only sees the `|`/`>` indicator
+# and misses the real secret, e.g.
+#   client-key-data: |
+#     LS0tLS1CRUdJTi...
+# Capture the whole block — including leading/interior blank lines a YAML
+# scalar allows — up to the first dedented non-blank line, and check EVERY
+# content line, so neither a blank first line nor a placeholder first line
+# followed by the real key can slip through.
+_CREDENTIAL_BLOCK_SCALAR_RE = re.compile(
+    r"(?:^|[\s{,])[\"']?"
+    r"(" + _CREDENTIAL_KEY_VOCAB + r")"
+    r"[\"']?[ \t]*:[ \t]*"
+    # Full block-scalar header: optional tag(s)/anchor(s) (e.g. !!str, &a),
+    # the |/> indicator with optional chomp/indent, and an optional trailing
+    # comment — all before the newline that starts the indented block.
+    r"(?:(?:!!?[\w./+-]*|&[\w-]+)[ \t]+)*"
+    # |/> then chomp(+/-) and indent(1-9) in EITHER order (|2-, |-2, >2+, ...)
+    r"[|>][+\-0-9]*[ \t]*(?:\#[^\r\n]*)?\r?\n"
+    r"((?:[ \t]*\r?\n|[ \t]+\S[^\r\n]*(?:\r?\n|$))+)",
     re.IGNORECASE | re.MULTILINE,
 )
 _HIGH_CONFIDENCE_BARE_TOKEN_RE = re.compile(
@@ -140,6 +167,41 @@ def portable_credential_finding(value: str) -> Optional[str]:
     for match in _URL_USERINFO_CREDENTIAL_RE.finditer(value):
         if _credential_value_looks_real(match.group(1)):
             return "URL userinfo credential"
+    for match in _CREDENTIAL_BLOCK_SCALAR_RE.finditer(value):
+        # The regex greedily grabs every following indented line, but a YAML
+        # block scalar ends when indentation dedents back to a sibling/parent
+        # mapping key. Trim to the real block: the first non-blank line fixes
+        # the content indent; stop at the first non-blank line shallower than
+        # it. Without this, a nested `password: |` whose value is a placeholder
+        # would swallow a following `username: admin` sibling and false-reject
+        # a credential-free import.
+        content_indent = None
+        block_lines = []
+        for line in match.group(2).splitlines():
+            if not line.strip():
+                block_lines.append(line)
+                continue
+            indent = len(line) - len(line.lstrip(" \t"))
+            if content_indent is None:
+                content_indent = indent
+            elif indent < content_indent:
+                break
+            block_lines.append(line)
+
+        lines = [ln.strip() for ln in block_lines if ln.strip()]
+        # Check each physical line (a literal `|` block puts a full secret on
+        # each line, e.g. base64) AND the space-joined value (a folded `>`
+        # block splits one secret across short lines that only exceed the
+        # threshold once folded).
+        candidates = list(lines)
+        if len(lines) > 1:
+            candidates.append(" ".join(lines))
+        for candidate in candidates:
+            if (
+                len(candidate) >= 6
+                and _PLACEHOLDER_VALUE_RE.fullmatch(candidate) is None
+            ):
+                return "credential block scalar"
     for match in _AUTHORIZATION_BEARER_RE.finditer(value):
         if _credential_value_looks_real(match.group(1)):
             return "bearer credential"
