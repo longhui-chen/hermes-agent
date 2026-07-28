@@ -105,23 +105,13 @@ def _script_env(**overrides: str) -> dict[str, str]:
     repo_root = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env.pop("ZETTLAB_PRESETS_DIR", None)
+    env.pop("ZETTLAB_CLAW_PRESETS_DIR", None)
     env.pop("HERMES_MANAGED_DIR", None)
     # The fixture's packaged Python must import this checkout, not an unrelated
     # editable Hermes installation that happens to exist in the test venv.
     env["PYTHONPATH"] = str(repo_root)
     env.update(overrides)
     return env
-
-
-def _hermes_invocations(app_root: Path) -> list[list[str]]:
-    path = app_root / "hermes-invocations.jsonl"
-    if not path.exists():
-        return []
-    return [
-        json.loads(line)
-        for line in path.read_text(encoding="utf-8").splitlines()
-        if line
-    ]
 
 
 def test_environment_file_parser_matches_systemd_quoting_rules(tmp_path: Path):
@@ -213,53 +203,7 @@ def test_environment_file_parser_matches_systemd_quoting_rules(tmp_path: Path):
     ]
 
 
-def test_prepare_claw_service_config_set_flow_normalizes_disabled_inline_gateway(
-    tmp_path: Path,
-):
-    if not _readlink_f_available(tmp_path):
-        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
-
-    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
-
-    hermes_home.mkdir(parents=True)
-    config_path = hermes_home / "config.yaml"
-    config_path.write_text(
-        "gateway: {host: 127.0.0.1, multiplex_profiles: false}\n"
-        "skills:\n"
-        "  external_dirs:\n"
-        "    - /opt/zettlab/skills\n",
-        encoding="utf-8",
-    )
-    config_path.chmod(0o640)
-
-    presets_dir = tmp_path / "presets" / "v0.7.12"
-    presets_dir.mkdir(parents=True)
-
-    subprocess.run(
-        [str(app_root / "prepare-claw-service.sh")],
-        check=True,
-        cwd=str(app_root),
-        env=_script_env(ZETTLAB_PRESETS_DIR=str(presets_dir)),
-    )
-
-    config = config_path.read_text(encoding="utf-8")
-
-    assert config.count("gateway:") == 1
-    assert "gateway:\n" in config
-    assert "  host: 127.0.0.1\n" in config
-    assert "  multiplex_profiles: true\n" in config
-    assert "/opt/zettlab/skills" in config
-    assert config_path.stat().st_mode & 0o777 == 0o640
-    assert _hermes_invocations(app_root) == [
-        ["config", "set", "gateway.multiplex_profiles", "true"]
-    ]
-    assert env_path.exists()
-    env_text = env_path.read_text(encoding="utf-8")
-    assert "ZET_AGENT_KEY=" in env_text
-    assert f"ZETTLAB_PRESETS_DIR={presets_dir}\n" in env_text
-
-
-def test_prepare_claw_service_removes_persisted_multiplex_env_override(
+def test_prepare_claw_service_leaves_config_untouched_and_removes_legacy_multiplex_env(
     tmp_path: Path,
 ):
     if not _readlink_f_available(tmp_path):
@@ -268,10 +212,8 @@ def test_prepare_claw_service_removes_persisted_multiplex_env_override(
     app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
     hermes_home.mkdir(parents=True)
     config_path = hermes_home / "config.yaml"
-    config_path.write_text(
-        "gateway:\n  multiplex_profiles: false\n",
-        encoding="utf-8",
-    )
+    original_config = "gateway:\n    multiplex_profiles: false\ninvalid: [\n"
+    config_path.write_text(original_config, encoding="utf-8")
     env_path.parent.mkdir(parents=True)
     env_path.write_text(
         "GATEWAY_MULTIPLEX_PROFILES=false\nCUSTOM_SAFE=keep-me\n",
@@ -282,36 +224,22 @@ def test_prepare_claw_service_removes_persisted_multiplex_env_override(
         [str(app_root / "prepare-claw-service.sh")],
         check=True,
         cwd=str(app_root),
-        env=_script_env(),
+        env=_script_env(GATEWAY_MULTIPLEX_PROFILES="false"),
     )
 
-    assert "  multiplex_profiles: true\n" in config_path.read_text(encoding="utf-8")
+    assert config_path.read_text(encoding="utf-8") == original_config
     env_text = env_path.read_text(encoding="utf-8")
     assert "GATEWAY_MULTIPLEX_PROFILES=" not in env_text
     assert "CUSTOM_SAFE=keep-me\n" in env_text
-    assert _hermes_invocations(app_root) == [
-        ["config", "set", "gateway.multiplex_profiles", "true"]
-    ]
+    assert not (app_root / "hermes-invocations.jsonl").exists()
 
 
-def test_prepare_claw_service_removes_hermes_dotenv_multiplex_override(
-    tmp_path: Path,
-):
+def test_prepare_claw_service_does_not_require_hermes_cli(tmp_path: Path):
     if not _readlink_f_available(tmp_path):
         pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
 
-    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
-    hermes_home.mkdir(parents=True)
-    config_path = hermes_home / "config.yaml"
-    config_path.write_text(
-        "gateway:\n  multiplex_profiles: false\n",
-        encoding="utf-8",
-    )
-    dotenv_path = hermes_home / ".env"
-    dotenv_path.write_text(
-        "GATEWAY_MULTIPLEX_PROFILES=false\nOPENAI_API_KEY=keep-me\n",
-        encoding="utf-8",
-    )
+    app_root, _hermes_home, env_path = _prepare_script_fixture(tmp_path)
+    (app_root / "bin" / "hermes").unlink()
 
     subprocess.run(
         [str(app_root / "prepare-claw-service.sh")],
@@ -320,193 +248,7 @@ def test_prepare_claw_service_removes_hermes_dotenv_multiplex_override(
         env=_script_env(),
     )
 
-    dotenv_text = dotenv_path.read_text(encoding="utf-8")
-    assert "GATEWAY_MULTIPLEX_PROFILES=" not in dotenv_text
-    assert "OPENAI_API_KEY=keep-me\n" in dotenv_text
-    runtime_probe = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            (
-                "from hermes_cli.env_loader import load_hermes_dotenv; "
-                "load_hermes_dotenv(); "
-                "from gateway.config import load_gateway_config; "
-                "print(load_gateway_config().multiplex_profiles)"
-            ),
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-        env=_script_env(HERMES_HOME=str(hermes_home)),
-    )
-    assert runtime_probe.stdout.strip() == "True"
-
-
-def test_prepare_claw_service_rejects_managed_dotenv_multiplex_false(
-    tmp_path: Path,
-):
-    if not _readlink_f_available(tmp_path):
-        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
-
-    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
-    hermes_home.mkdir(parents=True)
-    (hermes_home / "config.yaml").write_text(
-        "gateway:\n  multiplex_profiles: true\n",
-        encoding="utf-8",
-    )
-    managed_dir = tmp_path / "managed"
-    managed_dir.mkdir()
-    (managed_dir / ".env").write_text(
-        "GATEWAY_MULTIPLEX_PROFILES=false\n",
-        encoding="utf-8",
-    )
-
-    result = subprocess.run(
-        [str(app_root / "prepare-claw-service.sh")],
-        check=False,
-        cwd=str(app_root),
-        env=_script_env(HERMES_MANAGED_DIR=str(managed_dir)),
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode != 0
-    assert "managed GATEWAY_MULTIPLEX_PROFILES=false" in result.stderr
-    assert _hermes_invocations(app_root) == []
-
-
-def test_prepare_claw_service_ignores_managed_dotenv_multiplex_without_value(
-    tmp_path: Path,
-):
-    if not _readlink_f_available(tmp_path):
-        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
-
-    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
-    hermes_home.mkdir(parents=True)
-    (hermes_home / "config.yaml").write_text(
-        "gateway:\n  multiplex_profiles: true\n",
-        encoding="utf-8",
-    )
-    (hermes_home / ".env").write_text(
-        "GATEWAY_MULTIPLEX_PROFILES=false\n",
-        encoding="utf-8",
-    )
-    managed_dir = tmp_path / "managed"
-    managed_dir.mkdir()
-    (managed_dir / ".env").write_text(
-        "GATEWAY_MULTIPLEX_PROFILES\n",
-        encoding="utf-8",
-    )
-
-    subprocess.run(
-        [str(app_root / "prepare-claw-service.sh")],
-        check=True,
-        cwd=str(app_root),
-        env=_script_env(HERMES_MANAGED_DIR=str(managed_dir)),
-    )
-
-    assert "GATEWAY_MULTIPLEX_PROFILES=" not in (hermes_home / ".env").read_text(
-        encoding="utf-8"
-    )
-
-
-def test_prepare_claw_service_skips_config_set_when_multiplex_is_enabled(
-    tmp_path: Path,
-):
-    if not _readlink_f_available(tmp_path):
-        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
-
-    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
-    hermes_home.mkdir(parents=True)
-    config_path = hermes_home / "config.yaml"
-    original = (
-        "# Keep this user formatting unchanged.\n"
-        "gateway:\n"
-        "  multiplex_profiles: true\n"
-    )
-    config_path.write_text(original, encoding="utf-8")
-    config_path.chmod(0o600)
-
-    subprocess.run(
-        [str(app_root / "prepare-claw-service.sh")],
-        check=True,
-        cwd=str(app_root),
-        env=_script_env(),
-    )
-
-    assert config_path.read_text(encoding="utf-8") == original
-    assert config_path.stat().st_mode & 0o777 == 0o600
-    assert _hermes_invocations(app_root) == []
-
-
-def test_prepare_claw_service_normalizes_duplicate_enabled_multiplex_key(
-    tmp_path: Path,
-):
-    if not _readlink_f_available(tmp_path):
-        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
-
-    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
-    hermes_home.mkdir(parents=True)
-    config_path = hermes_home / "config.yaml"
-    config_path.write_text(
-        "gateway:\n"
-        "  multiplex_profiles: true\n"
-        "  multiplex_profiles: true\n"
-        "skills:\n"
-        "  external_dirs:\n"
-        "    - /opt/zettlab/skills\n",
-        encoding="utf-8",
-    )
-
-    subprocess.run(
-        [str(app_root / "prepare-claw-service.sh")],
-        check=True,
-        cwd=str(app_root),
-        env=_script_env(),
-    )
-    normalized = config_path.read_text(encoding="utf-8")
-
-    assert normalized.count("multiplex_profiles: true\n") == 1
-    assert "/opt/zettlab/skills" in normalized
-    assert _hermes_invocations(app_root) == [
-        ["config", "set", "gateway.multiplex_profiles", "true"]
-    ]
-
-    subprocess.run(
-        [str(app_root / "prepare-claw-service.sh")],
-        check=True,
-        cwd=str(app_root),
-        env=_script_env(),
-    )
-
-    assert config_path.read_text(encoding="utf-8") == normalized
-    assert _hermes_invocations(app_root) == [
-        ["config", "set", "gateway.multiplex_profiles", "true"]
-    ]
-
-
-def test_prepare_claw_service_fails_closed_on_invalid_config_yaml(tmp_path: Path):
-    if not _readlink_f_available(tmp_path):
-        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
-
-    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
-    hermes_home.mkdir(parents=True)
-    config_path = hermes_home / "config.yaml"
-    original = "gateway:\n  multiplex_profiles: false\ninvalid: [\n"
-    config_path.write_text(original, encoding="utf-8")
-
-    result = subprocess.run(
-        [str(app_root / "prepare-claw-service.sh")],
-        check=False,
-        cwd=str(app_root),
-        env=_script_env(),
-        capture_output=True,
-        text=True,
-    )
-
-    assert result.returncode != 0
-    assert config_path.read_text(encoding="utf-8") == original
-    assert _hermes_invocations(app_root) == []
+    assert env_path.is_file()
 
 
 def test_prepare_claw_service_fails_closed_on_oversized_environment_file(
@@ -562,251 +304,6 @@ def test_prepare_claw_service_does_not_generate_oversized_environment_file(
     assert list(env_path.parent.glob("zettlab-claw.env.tmp.*")) == []
 
 
-def test_prepare_claw_service_updates_legacy_top_level_multiplex_override(
-    tmp_path: Path,
-):
-    if not _readlink_f_available(tmp_path):
-        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
-
-    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
-    hermes_home.mkdir(parents=True)
-    config_path = hermes_home / "config.yaml"
-    config_path.write_text(
-        "multiplex_profiles: false\n"
-        "gateway:\n"
-        "  multiplex_profiles: true\n",
-        encoding="utf-8",
-    )
-
-    subprocess.run(
-        [str(app_root / "prepare-claw-service.sh")],
-        check=True,
-        cwd=str(app_root),
-        env=_script_env(),
-    )
-
-    assert _hermes_invocations(app_root) == [
-        ["config", "set", "multiplex_profiles", "true"]
-    ]
-
-
-def test_prepare_claw_service_flow_honors_runtime_top_level_null_precedence(
-    tmp_path: Path,
-):
-    if not _readlink_f_available(tmp_path):
-        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
-
-    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
-    hermes_home.mkdir(parents=True)
-    config_path = hermes_home / "config.yaml"
-    config_path.write_text(
-        "multiplex_profiles:\n"
-        "gateway:\n"
-        "  multiplex_profiles: true\n",
-        encoding="utf-8",
-    )
-
-    subprocess.run(
-        [str(app_root / "prepare-claw-service.sh")],
-        check=True,
-        cwd=str(app_root),
-        env=_script_env(),
-    )
-
-    assert _hermes_invocations(app_root) == [
-        ["config", "set", "multiplex_profiles", "true"]
-    ]
-    assert "multiplex_profiles: true\n" in config_path.read_text(encoding="utf-8")
-
-
-def test_prepare_claw_service_flow_honors_managed_multiplex_config(
-    tmp_path: Path,
-):
-    if not _readlink_f_available(tmp_path):
-        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
-
-    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
-    hermes_home.mkdir(parents=True)
-    config_path = hermes_home / "config.yaml"
-    config_path.write_text("{}\n", encoding="utf-8")
-    managed_dir = tmp_path / "managed"
-    managed_dir.mkdir()
-    (managed_dir / "config.yaml").write_text(
-        "gateway:\n"
-        "  multiplex_profiles: true\n",
-        encoding="utf-8",
-    )
-
-    subprocess.run(
-        [str(app_root / "prepare-claw-service.sh")],
-        check=True,
-        cwd=str(app_root),
-        env=_script_env(HERMES_MANAGED_DIR=str(managed_dir)),
-    )
-
-    assert config_path.read_text(encoding="utf-8") == "{}\n"
-    assert _hermes_invocations(app_root) == []
-
-
-@pytest.mark.parametrize("with_explicit_override", [False, True])
-def test_prepare_claw_service_loads_persisted_managed_env_without_overriding_explicit(
-    tmp_path: Path,
-    with_explicit_override: bool,
-):
-    if not _readlink_f_available(tmp_path):
-        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
-
-    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
-    hermes_home.mkdir(parents=True)
-    config_path = hermes_home / "config.yaml"
-    config_path.write_text("{}\n", encoding="utf-8")
-
-    persisted_managed = tmp_path / "managed persisted"
-    explicit_managed = tmp_path / "managed-explicit"
-    persisted_managed.mkdir()
-    explicit_managed.mkdir()
-    (persisted_managed / "config.yaml").write_text(
-        "gateway:\n  multiplex_profiles: true\n",
-        encoding="utf-8",
-    )
-    (explicit_managed / "config.yaml").write_text(
-        "gateway:\n  multiplex_profiles: false\n",
-        encoding="utf-8",
-    )
-    env_path.parent.mkdir(parents=True)
-    env_path.write_text(
-        f'HERMES_MANAGED_DIR="{persisted_managed}"\n',
-        encoding="utf-8",
-    )
-
-    overrides = (
-        {"HERMES_MANAGED_DIR": str(explicit_managed)}
-        if with_explicit_override
-        else {}
-    )
-    result = subprocess.run(
-        [str(app_root / "prepare-claw-service.sh")],
-        check=False,
-        cwd=str(app_root),
-        env=_script_env(**overrides),
-        capture_output=True,
-        text=True,
-    )
-
-    if with_explicit_override:
-        assert result.returncode != 0
-        assert "managed by your administrator" in result.stderr
-        assert _hermes_invocations(app_root) == [
-            ["config", "set", "gateway.multiplex_profiles", "true"]
-        ]
-        assert config_path.read_text(encoding="utf-8") == "{}\n"
-    else:
-        assert result.returncode == 0, result.stderr
-        assert _hermes_invocations(app_root) == []
-        assert config_path.read_text(encoding="utf-8") == "{}\n"
-
-
-def test_prepare_claw_service_bootstraps_config_for_managed_multiplex(
-    tmp_path: Path,
-):
-    if not _readlink_f_available(tmp_path):
-        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
-
-    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
-    managed_dir = tmp_path / "managed"
-    managed_dir.mkdir()
-    (managed_dir / "config.yaml").write_text(
-        "gateway:\n  multiplex_profiles: true\n",
-        encoding="utf-8",
-    )
-
-    subprocess.run(
-        [str(app_root / "prepare-claw-service.sh")],
-        check=True,
-        cwd=str(app_root),
-        env=_script_env(HERMES_MANAGED_DIR=str(managed_dir)),
-    )
-
-    config_path = hermes_home / "config.yaml"
-    assert json.loads(config_path.read_text(encoding="utf-8")) == {}
-    assert _hermes_invocations(app_root) == []
-
-
-@pytest.mark.parametrize(
-    "gateway_json",
-    [
-        {"multiplex_profiles": True},
-        {"gateway": {"multiplex_profiles": True}},
-    ],
-)
-def test_prepare_claw_service_flow_honors_legacy_gateway_json_default(
-    tmp_path: Path,
-    gateway_json: dict,
-):
-    if not _readlink_f_available(tmp_path):
-        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
-
-    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
-    hermes_home.mkdir(parents=True)
-    (hermes_home / "gateway.json").write_text(
-        json.dumps(gateway_json) + "\n",
-        encoding="utf-8",
-    )
-
-    subprocess.run(
-        [str(app_root / "prepare-claw-service.sh")],
-        check=True,
-        cwd=str(app_root),
-        env=_script_env(),
-    )
-
-    assert not (hermes_home / "config.yaml").exists()
-    assert _hermes_invocations(app_root) == []
-
-
-@pytest.mark.parametrize("managed_null", [False, True])
-def test_prepare_claw_service_preserves_legacy_nested_true_through_null_override(
-    tmp_path: Path,
-    managed_null: bool,
-):
-    if not _readlink_f_available(tmp_path):
-        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
-
-    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
-    hermes_home.mkdir(parents=True)
-    (hermes_home / "gateway.json").write_text(
-        '{"gateway": {"multiplex_profiles": true}}\n',
-        encoding="utf-8",
-    )
-    config_path = hermes_home / "config.yaml"
-    config_path.write_text(
-        "{}\n" if managed_null else "multiplex_profiles:\n",
-        encoding="utf-8",
-    )
-
-    overrides: dict[str, str] = {}
-    if managed_null:
-        managed_dir = tmp_path / "managed"
-        managed_dir.mkdir()
-        (managed_dir / "config.yaml").write_text(
-            "gateway:\n  multiplex_profiles:\n",
-            encoding="utf-8",
-        )
-        overrides["HERMES_MANAGED_DIR"] = str(managed_dir)
-
-    subprocess.run(
-        [str(app_root / "prepare-claw-service.sh")],
-        check=True,
-        cwd=str(app_root),
-        env=_script_env(**overrides),
-    )
-
-    assert _hermes_invocations(app_root) == []
-    assert config_path.read_text(encoding="utf-8") == (
-        "{}\n" if managed_null else "multiplex_profiles:\n"
-    )
-
-
 def test_prepare_claw_service_respects_presets_dir_override(tmp_path: Path):
     if not _readlink_f_available(tmp_path):
         pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
@@ -827,15 +324,19 @@ def test_prepare_claw_service_respects_presets_dir_override(tmp_path: Path):
     assert f"ZETTLAB_PRESETS_DIR={presets_dir}\n" in env_text
 
 
-def test_prepare_claw_service_pins_resolved_presets_version(tmp_path: Path):
+def test_prepare_claw_service_preserves_presets_selection_across_version_flips(
+    tmp_path: Path,
+):
     if not _readlink_f_available(tmp_path):
         pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
 
     app_root, _hermes_home, env_path = _prepare_script_fixture(tmp_path)
-    version_dir = tmp_path / "presets" / "v0.7.12"
-    version_dir.mkdir(parents=True)
-    current = version_dir.parent / "current"
-    os.symlink(version_dir.name, current)
+    version_one = tmp_path / "presets" / "v0.7.12"
+    version_two = version_one.parent / "v0.7.13"
+    version_one.mkdir(parents=True)
+    version_two.mkdir()
+    current = version_one.parent / "current"
+    os.symlink(version_one.name, current)
 
     subprocess.run(
         [str(app_root / "prepare-claw-service.sh")],
@@ -844,9 +345,24 @@ def test_prepare_claw_service_pins_resolved_presets_version(tmp_path: Path):
         env=_script_env(ZETTLAB_PRESETS_DIR=str(current)),
     )
 
-    env_text = env_path.read_text(encoding="utf-8")
-    assert f"ZETTLAB_PRESETS_DIR={version_dir}\n" in env_text
-    assert f"ZETTLAB_PRESETS_DIR={current}\n" not in env_text
+    assert f"ZETTLAB_PRESETS_DIR={current}\n" in env_path.read_text(
+        encoding="utf-8"
+    )
+
+    current.unlink()
+    os.symlink(version_two.name, current)
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(),
+    )
+
+    assert current.resolve() == version_two
+    assert f"ZETTLAB_PRESETS_DIR={current}\n" in env_path.read_text(
+        encoding="utf-8"
+    )
+    assert str(version_one) not in env_path.read_text(encoding="utf-8")
 
 
 def test_prepare_claw_service_preserves_existing_presets_dir(tmp_path: Path):
@@ -979,7 +495,8 @@ def test_prepare_claw_service_removes_complete_multiline_package_assignments(
         "export BAD=x\n"
         "BAD-NAME=y\n"
         "CUSTOM_SAFE='keep\nthis'\n"
-        "ZET_AGENT_KEY='stale\nEVIL=1'\n",
+        "ZET_AGENT_KEY='stale\nEVIL=1'\n"
+        "GATEWAY_MULTIPLEX_PROFILES='false\nEVIL_MULTIPLEX=1'\n",
         encoding="utf-8",
     )
 
@@ -996,7 +513,9 @@ def test_prepare_claw_service_removes_complete_multiline_package_assignments(
     assert "CUSTOM_SAFE='keep\nthis'\n" in env_text
     assert "stale" not in env_text
     assert "EVIL=1" not in env_text
+    assert "EVIL_MULTIPLEX=1" not in env_text
     assert env_text.count("ZET_AGENT_KEY=") == 1
+    assert "GATEWAY_MULTIPLEX_PROFILES=" not in env_text
 
 
 @pytest.mark.parametrize(
@@ -1014,14 +533,8 @@ def test_prepare_claw_service_keeps_package_env_before_eof_unclosed_user_value(
     env_path.parent.mkdir(parents=True)
     env_path.write_text(custom_tail, encoding="utf-8")
 
-    subprocess.run(
-        [str(app_root / "prepare-claw-service.sh")],
-        check=True,
-        cwd=str(app_root),
-        env=_script_env(),
-    )
     dumped = subprocess.run(
-        [str(app_root / "prepare-claw-service.sh"), "--dump-env"],
+        [str(app_root / "prepare-claw-service.sh"), "--emit-env"],
         check=True,
         cwd=str(app_root),
         env=_script_env(),
@@ -1030,6 +543,7 @@ def test_prepare_claw_service_keeps_package_env_before_eof_unclosed_user_value(
 
     assert b"ZET_AGENT_KEY\0" in dumped
     assert b"ZET_AGENT_ENABLED\0true\0" in dumped
+    assert b"GATEWAY_MULTIPLEX_PROFILES\0" not in dumped
     assert env_path.read_text(encoding="utf-8").startswith("ZET_AGENT_KEY=")
 
 
@@ -1041,7 +555,11 @@ def test_prepare_claw_service_filters_package_assignments_in_cr_only_env(
 
     app_root, _hermes_home, env_path = _prepare_script_fixture(tmp_path)
     env_path.parent.mkdir(parents=True)
-    env_path.write_bytes(b"ZET_AGENT_KEY=stale\rCUSTOM_SAFE=keep\r")
+    env_path.write_bytes(
+        b"ZET_AGENT_KEY=stale\r"
+        b"GATEWAY_MULTIPLEX_PROFILES=false\r"
+        b"CUSTOM_SAFE=keep\r"
+    )
 
     subprocess.run(
         [str(app_root / "prepare-claw-service.sh")],
@@ -1054,6 +572,7 @@ def test_prepare_claw_service_filters_package_assignments_in_cr_only_env(
     assert b"stale" not in env_bytes
     assert b"CUSTOM_SAFE=keep\r" in env_bytes
     assert env_bytes.count(b"ZET_AGENT_KEY=") == 1
+    assert b"GATEWAY_MULTIPLEX_PROFILES=" not in env_bytes
 
 
 def test_prepare_claw_service_preserves_restrictive_data_directory_mode(
@@ -1210,26 +729,39 @@ def test_prepare_claw_service_pins_validated_data_symlink_target(
     data_link.parent.mkdir(parents=True, exist_ok=True)
     os.symlink(expected_target, data_link)
 
+    secret_dir = expected_target / "secrets"
+    secret_dir.mkdir()
+    lock_path = secret_dir / "prepare-claw-service.lock"
+    lock_file = lock_path.open("w", encoding="utf-8")
+    lock_file.write("held")
+    lock_file.flush()
+    os.fsync(lock_file.fileno())
+    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
     process = subprocess.Popen(
         [str(app_root / "prepare-claw-service.sh")],
         cwd=str(app_root),
-        env=_script_env(HERMES_TEST_HERMES_DELAY="1"),
+        env=_script_env(HERMES_PREPARE_LOCK_TIMEOUT_SECONDS="5"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
     )
-    invocation_log = app_root / "hermes-invocations.jsonl"
-    deadline = time.monotonic() + 10
-    while not invocation_log.exists() and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert invocation_log.exists()
-
-    data_link.unlink()
-    os.symlink(replacement_target, data_link)
+    try:
+        deadline = time.monotonic() + 5
+        while lock_path.stat().st_size != 0 and time.monotonic() < deadline:
+            assert process.poll() is None
+            time.sleep(0.01)
+        assert lock_path.stat().st_size == 0
+        assert process.poll() is None
+        data_link.unlink()
+        os.symlink(replacement_target, data_link)
+    finally:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
     stdout, stderr = process.communicate(timeout=30)
 
     assert process.returncode == 0, (stdout, stderr)
-    assert (expected_target / "hermes_home" / "config.yaml").is_file()
+    assert (expected_target / "hermes_home").is_dir()
     assert (expected_target / "secrets" / "zettlab-claw.env").is_file()
     assert list(replacement_target.iterdir()) == []
 
@@ -1395,15 +927,15 @@ def test_prepare_claw_service_concurrent_runs_keep_key_and_env_consistent(
 
     for process, output in zip(processes, results):
         assert process.returncode == 0, output
-    assert _hermes_invocations(app_root) == [
-        ["config", "set", "gateway.multiplex_profiles", "true"]
-    ]
+    env_text = env_path.read_text(encoding="utf-8")
+    assert "GATEWAY_MULTIPLEX_PROFILES=" not in env_text
+    assert not (app_root / "hermes-invocations.jsonl").exists()
     key = env_path.with_name("zet_agent.key").read_text(encoding="utf-8").strip()
     assert f"ZET_AGENT_KEY={key}\n" in env_path.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("with_explicit_override", [False, True])
-def test_start_claw_service_loads_managed_env_before_prepare_without_overriding_explicit(
+def test_start_claw_service_loads_reconciled_env_without_overriding_explicit(
     tmp_path: Path,
     with_explicit_override: bool,
 ):
@@ -1426,10 +958,18 @@ def test_start_claw_service_loads_managed_env_before_prepare_without_overriding_
             "gateway:\n  multiplex_profiles: true\n",
             encoding="utf-8",
         )
+    persisted_presets = tmp_path / "presets-persisted"
+    explicit_presets = tmp_path / "presets-explicit"
+    persisted_presets.mkdir()
+    explicit_presets.mkdir()
 
     env_path.parent.mkdir(parents=True)
     env_path.write_text(
         f'HERMES_MANAGED_DIR="{persisted_managed}"\n'
+        "HERMES_HOME=/stale/hermes-home\n"
+        "HERMES_BUNDLED_SKILLS=/stale/skills\n"
+        "HERMES_BUNDLED_PLUGINS=/stale/plugins\n"
+        f"ZETTLAB_PRESETS_DIR={persisted_presets}\n"
         "GATEWAY_MULTIPLEX_PROFILES=false\n"
         'CUSTOM_SAFE="keep "\'me\'\n'
         r"CUSTOM_UNQUOTED=one\ two" "\n"
@@ -1454,6 +994,11 @@ Path({str(gateway_log)!r}).write_text(
         "unquoted": os.environ.get("CUSTOM_UNQUOTED"),
         "double": os.environ.get("CUSTOM_DOUBLE"),
         "multiplex": os.environ.get("GATEWAY_MULTIPLEX_PROFILES"),
+        "home": os.environ.get("HERMES_HOME"),
+        "skills": os.environ.get("HERMES_BUNDLED_SKILLS"),
+        "plugins": os.environ.get("HERMES_BUNDLED_PLUGINS"),
+        "presets": os.environ.get("ZETTLAB_PRESETS_DIR"),
+        "presets_override": os.environ.get("ZETTLAB_CLAW_PRESETS_DIR"),
     }}),
     encoding="utf-8",
 )
@@ -1462,7 +1007,15 @@ Path({str(gateway_log)!r}).write_text(
     )
     hermes_entry.chmod(0o755)
 
-    overrides = {"GATEWAY_MULTIPLEX_PROFILES": "false"}
+    # Simulate a legacy shared EnvironmentFile value overriding the unit's
+    # Environment= value before ExecStart. The wrapper must reassert true.
+    overrides = {
+        "GATEWAY_MULTIPLEX_PROFILES": "false",
+        "HERMES_HOME": "/stale/hermes-home",
+        "HERMES_BUNDLED_SKILLS": "/stale/skills",
+        "HERMES_BUNDLED_PLUGINS": "/stale/plugins",
+        "ZETTLAB_CLAW_PRESETS_DIR": str(explicit_presets),
+    }
     if with_explicit_override:
         overrides["HERMES_MANAGED_DIR"] = str(explicit_managed)
     subprocess.run(
@@ -1480,9 +1033,24 @@ Path({str(gateway_log)!r}).write_text(
     assert gateway_env["custom"] == "keep me"
     assert gateway_env["unquoted"] == "one two"
     assert gateway_env["double"] == r"literal\nvalue"
-    assert gateway_env["multiplex"] is None
-    assert "GATEWAY_MULTIPLEX_PROFILES=" not in env_path.read_text(encoding="utf-8")
-    assert _hermes_invocations(app_root) == []
+    assert gateway_env["multiplex"] == "true"
+    assert gateway_env["home"] == str(hermes_home)
+    assert gateway_env["skills"] == str(app_root / "lib" / "hermes-agent" / "skills")
+    assert gateway_env["plugins"] == str(
+        app_root / "lib" / "hermes-agent" / "plugins"
+    )
+    assert gateway_env["presets"] == str(explicit_presets)
+    assert gateway_env["presets_override"] is None
+    env_text = env_path.read_text(encoding="utf-8")
+    for removed in (
+        "GATEWAY_MULTIPLEX_PROFILES=",
+        "HERMES_HOME=",
+        "HERMES_BUNDLED_SKILLS=",
+        "HERMES_BUNDLED_PLUGINS=",
+        "ZETTLAB_CLAW_PRESETS_DIR=",
+    ):
+        assert removed not in env_text
+    assert not (app_root / "hermes-invocations.jsonl").exists()
 
 
 def test_prepare_claw_service_omits_untrusted_world_writable_presets_dir(tmp_path: Path):
@@ -1525,7 +1093,7 @@ def test_prepare_claw_service_omits_untrusted_group_writable_presets_dir(
     assert "ZETTLAB_PRESETS_DIR=" not in env_path.read_text(encoding="utf-8")
 
 
-def test_prepare_claw_service_strips_newlines_from_presets_dir(tmp_path: Path):
+def test_prepare_claw_service_rejects_newlines_in_presets_dir(tmp_path: Path):
     if not _readlink_f_available(tmp_path):
         pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
 
@@ -1536,6 +1104,29 @@ def test_prepare_claw_service_strips_newlines_from_presets_dir(tmp_path: Path):
         check=True,
         cwd=str(app_root),
         env=_script_env(ZETTLAB_PRESETS_DIR="/custom/presets/current\nEVIL=1\r\n"),
+    )
+
+    env_text = env_path.read_text(encoding="utf-8")
+    assert "ZETTLAB_PRESETS_DIR=" not in env_text
+    assert "\nEVIL=1" not in env_text
+
+
+def test_prepare_claw_service_rejects_existing_presets_path_with_newline(
+    tmp_path: Path,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, _hermes_home, env_path = _prepare_script_fixture(tmp_path)
+    presets_dir = tmp_path / "presets\nEVIL=1"
+    presets_dir.mkdir()
+    presets_dir.chmod(0o755)
+
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(ZETTLAB_PRESETS_DIR=str(presets_dir)),
     )
 
     env_text = env_path.read_text(encoding="utf-8")
@@ -1556,11 +1147,15 @@ def test_zpk_agent_service_names_are_device_facing():
 
     meta = json.loads(package_meta)
 
-    assert "EnvironmentFile=" not in service
+    assert (
+        "EnvironmentFile=-__APP_BASE__/data/secrets/zettlab-claw.env" in service
+    )
+    assert "Environment=GATEWAY_MULTIPLEX_PROFILES=true" in service
     assert "ExecStart=__APP_BASE__/current/start-claw-service.sh" in service
-    assert '"$APP_ROOT/prepare-claw-service.sh"' in start_wrapper
-    prepare_call = start_wrapper.index('\n"$APP_ROOT/prepare-claw-service.sh"\n')
-    assert start_wrapper.index("\nload_env_after_prepare\n") > prepare_call
+    assert '"$APP_ROOT/prepare-claw-service.sh" --emit-env' in start_wrapper
+    assert "load_reconciled_env" in start_wrapper
+    assert "export GATEWAY_MULTIPLEX_PROFILES=true" in start_wrapper
+    assert '"$APP_ROOT/prepare-claw-service.sh"\n' not in start_wrapper
     assert ". \"$ENV_FILE\"" not in start_wrapper
     assert meta["service_name"] == "zettlab-claw"
     assert "restart" not in meta

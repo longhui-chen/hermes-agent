@@ -5,7 +5,7 @@ APP_ROOT=$(dirname "$(readlink -f "$0")")
 APP_BASE=$(dirname "$APP_ROOT")
 ENV_FILE="$APP_BASE/data/secrets/zettlab-claw.env"
 
-load_env_after_prepare() {
+load_reconciled_env() {
     local key value complete=0
     while IFS= read -r -d '' key && IFS= read -r -d '' value; do
         if [ -z "$key" ]; then
@@ -22,21 +22,30 @@ load_env_after_prepare() {
                 fi
                 ;;
         esac
-    done < <("$APP_ROOT/prepare-claw-service.sh" --dump-env)
+    done < <("$APP_ROOT/prepare-claw-service.sh" --emit-env)
     if [ "$complete" != "1" ]; then
         echo "failed to load reconciled environment: $ENV_FILE" >&2
         exit 1
     fi
 }
 
-# Prepare safely loads persisted user-managed values for its own process. Then
-# load the reconciled values for the gateway without replacing real
-# systemd/manual values; package-owned fields always use the generated values.
-"$APP_ROOT/prepare-claw-service.sh"
-load_env_after_prepare
-# prepare-claw-service.sh migrates this legacy override out of the persisted
-# environment file. Also remove an inherited service/manual value so runtime
-# uses the package-reconciled config.yaml setting.
-unset GATEWAY_MULTIPLEX_PROFILES
+# Reconcile and load the shared runtime environment in one locked operation.
+# Package-owned fields use the generated values; persisted user fields only
+# fill values not already supplied by systemd or a manual operator environment.
+load_reconciled_env
+
+# The shared EnvironmentFile is also consumed by local-server and may contain
+# legacy values for these Claw-owned paths. Reassert the current package slot
+# after loading it so stale persisted values cannot redirect runtime state or
+# bundled code.
+export HERMES_HOME="$APP_BASE/data/hermes_home"
+export HERMES_BUNDLED_SKILLS="$APP_ROOT/lib/hermes-agent/skills"
+export HERMES_BUNDLED_PLUGINS="$APP_ROOT/lib/hermes-agent/plugins"
+
+# systemd EnvironmentFile values override Environment= values regardless of
+# their textual order in the unit. Reassert the package-required live override
+# after removing a possible legacy assignment from the shared env file.
+export GATEWAY_MULTIPLEX_PROFILES=true
+unset ZETTLAB_CLAW_PRESETS_DIR
 
 exec "$APP_ROOT/bin/hermes" gateway run --force --accept-hooks
