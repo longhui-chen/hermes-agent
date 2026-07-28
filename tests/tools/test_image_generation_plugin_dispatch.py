@@ -122,3 +122,22 @@ class TestPluginDispatch:
             image_generation_tool, "_read_configured_image_provider", lambda: None
         )
         assert image_generation_tool.check_image_generation_requirements() is False
+
+    def test_requirements_do_not_fallback_to_fal_for_unavailable_selected_plugin(
+        self, monkeypatch
+    ):
+        from tools import image_generation_tool
+        from hermes_cli import plugins as plugins_module
+        from agent import image_gen_registry as registry_module
+
+        unavailable = _FakeCodexProvider()
+        monkeypatch.setattr(unavailable, "is_available", lambda: False)
+        monkeypatch.setattr(
+            image_generation_tool, "_read_configured_image_provider", lambda: "codex"
+        )
+        monkeypatch.setattr(image_generation_tool, "check_fal_api_key", lambda: True)
+        monkeypatch.setattr(image_generation_tool, "_load_fal_client", lambda: object())
+        monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", lambda: None)
+        monkeypatch.setattr(registry_module, "get_provider", lambda name: unavailable)
+
+        assert image_generation_tool.check_image_generation_requirements() is False

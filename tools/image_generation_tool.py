@@ -1085,32 +1085,32 @@ def _build_no_backend_setup_message() -> str:
 
 def check_image_generation_requirements() -> bool:
     """True if FAL or the explicitly configured image backend is available."""
+    configured = _read_configured_image_provider()
+    if configured and configured != "fal":
+        # An explicit plugin selection is authoritative. A leftover FAL key
+        # must not expose the tool when the selected backend is unavailable,
+        # because dispatch will not fall back to FAL either.
+        try:
+            from agent.image_gen_registry import get_provider
+            from hermes_cli.plugins import _ensure_plugins_discovered
+
+            _ensure_plugins_discovered()
+            provider = get_provider(configured)
+            return bool(provider and provider.is_available())
+        except Exception:
+            return False
+
     try:
         if check_fal_api_key():
             # Trigger the lazy fal_client import here as the SDK presence
             # check. Raises ImportError if the optional ``fal-client``
             # package isn't installed; the caller's except ImportError
-            # below catches that and continues to plugin probing.
+            # below treats the legacy FAL path as unavailable.
             _load_fal_client()
             return True
     except ImportError:
         pass
-
-    configured = _read_configured_image_provider()
-    if not configured or configured == "fal":
-        return False
-
-    # Probe only the explicitly selected plugin. Merely possessing a cloud
-    # provider key must not opt a user into a paid image-generation backend.
-    try:
-        from agent.image_gen_registry import get_provider
-        from hermes_cli.plugins import _ensure_plugins_discovered
-
-        _ensure_plugins_discovered()
-        provider = get_provider(configured)
-        return bool(provider and provider.is_available())
-    except Exception:
-        return False
+    return False
 
 
 # ---------------------------------------------------------------------------

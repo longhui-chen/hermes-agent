@@ -60,6 +60,36 @@ def test_image_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
     assert captured["json"]["model"] == "seedream-v4"
 
 
+def test_image_tool_hidden_when_selected_zettlab_capability_is_disabled(monkeypatch):
+    from agent import image_gen_registry
+    from plugins import zettlab_media_client as client
+    from plugins.image_gen.zettlab import ZettlabImageGenProvider
+    from tools import image_generation_tool as image_tool
+
+    image_gen_registry._reset_for_tests()
+    image_gen_registry.register_provider(ZettlabImageGenProvider())
+    monkeypatch.setenv("FAL_KEY", "legacy-fal-key")
+    monkeypatch.setattr(
+        image_tool, "_read_configured_image_provider", lambda: "zettlab"
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins._ensure_plugins_discovered", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        client._SESSION,
+        "get",
+        lambda *args, **kwargs: _Resp({
+            "image": {
+                "enabled": False,
+                "default_model": None,
+                "models": [],
+            },
+        }),
+    )
+
+    assert image_tool.check_image_generation_requirements() is False
+
+
 def test_image_only_model_requires_input_through_generation_tool(monkeypatch):
     from agent import image_gen_registry
     from plugins import zettlab_media_client as client
