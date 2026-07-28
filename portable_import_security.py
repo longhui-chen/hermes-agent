@@ -41,7 +41,12 @@ _CREDENTIAL_ASSIGNMENT_RE = re.compile(
 _CREDENTIAL_BLOCK_SCALAR_RE = re.compile(
     r"(?:^|[\s{,])[\"']?"
     r"(" + _CREDENTIAL_KEY_VOCAB + r")"
-    r"[\"']?[ \t]*:[ \t]*[|>][+\-0-9]*[ \t]*\r?\n"
+    r"[\"']?[ \t]*:[ \t]*"
+    # Full block-scalar header: optional tag(s)/anchor(s) (e.g. !!str, &a),
+    # the |/> indicator with optional chomp/indent, and an optional trailing
+    # comment — all before the newline that starts the indented block.
+    r"(?:(?:!!?[\w./+-]*|&[\w-]+)[ \t]+)*"
+    r"[|>][+\-]?[0-9]?[ \t]*(?:\#[^\r\n]*)?\r?\n"
     r"((?:[ \t]*\r?\n|[ \t]+\S[^\r\n]*(?:\r?\n|$))+)",
     re.IGNORECASE | re.MULTILINE,
 )

@@ -230,6 +230,13 @@ def test_portable_credential_scanner_allows_url_without_userinfo_password(value)
         "password: |\n\n  supersecretvalue123\n",
         # placeholder first line, real secret on a later line
         "password: |\n  ${SECRET_VALUE}\n  realsecretkey123\n",
+        # folded scalar split across short lines (joins to > threshold)
+        "password: >-\n  abcde\n  fghij\n",
+        # block header with a trailing comment
+        "password: | # inline note\n  supersecretvalue123\n",
+        # block header preceded by a YAML tag / anchor
+        "password: !!str |\n  supersecretvalue123\n",
+        "client-key-data: &pw |\n  LS0tLS1CRUdJTiBQUklWQVRF\n",
     ],
 )
 def test_portable_credential_scanner_rejects_yaml_block_scalar_secrets(value):
@@ -242,6 +249,8 @@ def test_portable_credential_scanner_rejects_yaml_block_scalar_secrets(value):
         "description: |\n  This is a normal multi-line note.\n",
         "password: |\n  ${SECRET_VALUE}\n",
         "notes: >-\n  wrap this long sentence across lines\n",
+        "description: | # a note\n  normal text goes here\n",
+        "password: run some cmd | grep pattern",
     ],
 )
 def test_portable_credential_scanner_allows_benign_block_scalars(value):
