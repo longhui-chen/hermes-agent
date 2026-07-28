@@ -24,14 +24,15 @@ def _readlink_f_available(tmp_path: Path) -> bool:
 
 def _prepare_script_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
     repo_root = Path(__file__).resolve().parents[2]
-    app_root = tmp_path / "current"
+    app_base = tmp_path / "zettos" / "main" / "apps" / "com.zettlab.claw"
+    app_root = app_base / "current"
     script = app_root / "prepare-claw-service.sh"
     python_path = app_root / "lib" / "hermes-agent" / "venv" / "bin" / "python"
     hermes_path = python_path.with_name("hermes")
     hermes_wrapper_path = app_root / "bin" / "hermes"
     invocation_log = app_root / "hermes-invocations.jsonl"
-    hermes_home = tmp_path / "data" / "hermes_home"
-    env_path = tmp_path / "data" / "secrets" / "zettlab-claw.env"
+    hermes_home = app_base / "data" / "hermes_home"
+    env_path = app_base / "data" / "secrets" / "zettlab-claw.env"
 
     python_path.parent.mkdir(parents=True)
     os.symlink(sys.executable, python_path)
@@ -72,9 +73,13 @@ runpy.run_module("hermes_cli.main", run_name="__main__")
 
 
 def _script_env(**overrides: str) -> dict[str, str]:
+    repo_root = Path(__file__).resolve().parents[2]
     env = os.environ.copy()
     env.pop("ZETTLAB_PRESETS_DIR", None)
     env.pop("HERMES_MANAGED_DIR", None)
+    # The fixture's packaged Python must import this checkout, not an unrelated
+    # editable Hermes installation that happens to exist in the test venv.
+    env["PYTHONPATH"] = str(repo_root)
     env.update(overrides)
     return env
 
@@ -774,7 +779,7 @@ def test_prepare_claw_service_preserves_restrictive_data_directory_mode(
         pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
 
     app_root, _hermes_home, _env_path = _prepare_script_fixture(tmp_path)
-    data_dir = tmp_path / "data"
+    data_dir = _hermes_home.parent
     data_dir.mkdir()
     data_dir.chmod(0o700)
 
@@ -786,6 +791,63 @@ def test_prepare_claw_service_preserves_restrictive_data_directory_mode(
     )
 
     assert data_dir.stat().st_mode & 0o777 == 0o700
+
+
+def test_prepare_claw_service_allows_trusted_ota_data_symlink(tmp_path: Path):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
+    data_link = hermes_home.parent
+    expected_target = tmp_path / "zettos" / "main" / "data" / "com.zettlab.claw"
+    expected_target.mkdir(parents=True)
+    expected_target.chmod(0o750)
+    data_link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(expected_target, data_link)
+
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(),
+    )
+
+    assert data_link.is_symlink()
+    assert data_link.resolve() == expected_target.resolve()
+    assert hermes_home.is_dir()
+    assert env_path.is_file()
+    assert expected_target.stat().st_mode & 0o777 == 0o750
+
+
+def test_prepare_claw_service_refuses_writable_ota_data_symlink_target(
+    tmp_path: Path,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
+    data_link = hermes_home.parent
+    expected_target = tmp_path / "zettos" / "main" / "data" / "com.zettlab.claw"
+    expected_target.mkdir(parents=True)
+    expected_target.chmod(0o770)
+    marker = expected_target / "marker"
+    marker.write_text("do-not-touch\n", encoding="utf-8")
+    data_link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(expected_target, data_link)
+
+    result = subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=False,
+        cwd=str(app_root),
+        env=_script_env(),
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "refusing untrusted data symlink" in result.stderr
+    assert marker.read_text(encoding="utf-8") == "do-not-touch\n"
+    assert expected_target.stat().st_mode & 0o777 == 0o770
 
 
 @pytest.mark.parametrize("managed_name", ["zet_agent.key", "zettlab-claw.env"])
@@ -834,7 +896,7 @@ def test_prepare_claw_service_refuses_symlinked_state_directories(
         pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
 
     app_root, _hermes_home, _env_path = _prepare_script_fixture(tmp_path)
-    data_dir = tmp_path / "data"
+    data_dir = _hermes_home.parent
     target = tmp_path / f"{state_path}.target"
     target.mkdir()
     target.chmod(0o777)
@@ -856,7 +918,10 @@ def test_prepare_claw_service_refuses_symlinked_state_directories(
     )
 
     assert result.returncode != 0
-    assert "refusing non-directory state path" in result.stderr
+    if state_path == "data":
+        assert "refusing untrusted data symlink" in result.stderr
+    else:
+        assert "refusing non-directory state path" in result.stderr
     assert (target / "marker").read_text(encoding="utf-8") == "do-not-touch\n"
     assert target.stat().st_mode & 0o777 == 0o777
 

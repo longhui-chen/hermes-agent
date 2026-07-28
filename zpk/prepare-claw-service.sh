@@ -9,6 +9,7 @@ HERMES_BIN="$APP_ROOT/bin/hermes"
 HERMES_HOME="$APP_BASE/data/hermes_home"
 DATA_DIR="$APP_BASE/data"
 SECRET_DIR="$APP_BASE/data/secrets"
+EXPECTED_DATA_TARGET="$(dirname "$(dirname "$APP_BASE")")/data/$(basename "$APP_BASE")"
 LOCK_FILE="$SECRET_DIR/prepare-claw-service.lock"
 KEY_FILE="$SECRET_DIR/zet_agent.key"
 ENV_FILE="$SECRET_DIR/zettlab-claw.env"
@@ -72,20 +73,44 @@ detect_zettlab_presets_dir() {
     return 1
 }
 
+trusted_data_symlink_target() {
+    local resolved expected uid mode group other
+    resolved="$(readlink -f "$DATA_DIR" 2>/dev/null || true)"
+    expected="$(readlink -f "$EXPECTED_DATA_TARGET" 2>/dev/null || true)"
+    [ -n "$resolved" ] && [ "$resolved" = "$expected" ] && [ -d "$resolved" ] || return 1
+
+    uid="$(stat -c '%u' "$resolved" 2>/dev/null || stat -f '%u' "$resolved" 2>/dev/null || true)"
+    mode="$(stat -c '%a' "$resolved" 2>/dev/null || stat -f '%Lp' "$resolved" 2>/dev/null || true)"
+    [ "$uid" = "$(id -u)" ] && [ -n "$mode" ] || return 1
+    group="${mode: -2:1}"
+    other="${mode: -1}"
+    (( (10#$group & 2) == 0 )) || return 1
+    (( (10#$other & 2) == 0 )) || return 1
+    printf '%s\n' "$resolved"
+}
+
 secure_state_directories() {
-    local path mode expected_mode uid
+    local path resolved_path mode expected_mode uid
     for path in "$DATA_DIR" "$SECRET_DIR"; do
-        if [ -L "$path" ] || { [ -e "$path" ] && [ ! -d "$path" ]; }; then
+        if [ "$path" = "$DATA_DIR" ] && [ -L "$path" ]; then
+            resolved_path="$(trusted_data_symlink_target || true)"
+            if [ -z "$resolved_path" ]; then
+                echo "refusing untrusted data symlink: $path" >&2
+                exit 1
+            fi
+        elif [ -L "$path" ] || { [ -e "$path" ] && [ ! -d "$path" ]; }; then
             echo "refusing non-directory state path: $path" >&2
             exit 1
-        fi
-        mkdir -p "$path"
-        if [ -L "$path" ] || [ ! -d "$path" ]; then
-            echo "state path changed while preparing it: $path" >&2
-            exit 1
+        else
+            mkdir -p "$path"
+            if [ -L "$path" ] || [ ! -d "$path" ]; then
+                echo "state path changed while preparing it: $path" >&2
+                exit 1
+            fi
+            resolved_path="$path"
         fi
         if [ "$(id -u)" -eq 0 ]; then
-            uid="$(stat -c '%u' "$path" 2>/dev/null || stat -f '%u' "$path" 2>/dev/null || true)"
+            uid="$(stat -c '%u' "$resolved_path" 2>/dev/null || stat -f '%u' "$resolved_path" 2>/dev/null || true)"
             if [ "$uid" != "0" ]; then
                 echo "refusing non-root-owned state directory: $path" >&2
                 exit 1
@@ -94,15 +119,15 @@ secure_state_directories() {
         if [ "$path" = "$SECRET_DIR" ]; then
             expected_mode=0700
         else
-            mode="$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null || true)"
+            mode="$(stat -c '%a' "$resolved_path" 2>/dev/null || stat -f '%Lp' "$resolved_path" 2>/dev/null || true)"
             [ -n "$mode" ] || {
                 echo "cannot verify state directory mode: $path" >&2
                 exit 1
             }
             printf -v expected_mode '%04o' "$(( (8#$mode | 0700) & 0755 ))"
         fi
-        chmod "$expected_mode" "$path"
-        mode="$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null || true)"
+        chmod "$expected_mode" "$resolved_path"
+        mode="$(stat -c '%a' "$resolved_path" 2>/dev/null || stat -f '%Lp' "$resolved_path" 2>/dev/null || true)"
         [ -n "$mode" ] || {
             echo "cannot verify state directory mode: $path" >&2
             exit 1
