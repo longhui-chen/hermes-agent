@@ -1680,7 +1680,11 @@ class ZetAgentAdapter(APIServerAdapter):
         )
 
         # cron origin + async-delivery capability（见 helper docstring）。
-        self._bind_turn_session_context(session_id)
+        # local-server sends the stable App session as X-Hermes-Session-Key.
+        # Prefer it over the lineage tip so task-local browser ownership keeps
+        # its zettlab:<user>:<agent> scope after Hermes compaction rotates the
+        # continuation id to api-*.
+        self._bind_turn_session_context(gateway_session_key or session_id)
 
         from run_agent import AIAgent
         from gateway.run import (

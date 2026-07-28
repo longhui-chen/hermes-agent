@@ -148,6 +148,15 @@ try:
 except ImportError:
     _is_camofox_mode = lambda: False  # noqa: E731
 
+try:
+    from tools.browser_desktop_host import (
+        has_desktop_browser_session as _has_desktop_browser_session,
+        is_desktop_browser_configured as _is_desktop_browser_configured,
+    )
+except ImportError:
+    _has_desktop_browser_session = lambda _task_id=None: False  # noqa: E731
+    _is_desktop_browser_configured = lambda: False  # noqa: E731
+
 logger = logging.getLogger(__name__)
 
 # Standard PATH entries for environments with minimal PATH (e.g. systemd services).
@@ -2894,6 +2903,16 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
             "blocked_by_policy": {"host": blocked["host"], "rule": blocked["rule"], "source": blocked["source"]},
         })
 
+    # Prefer the authenticated PC Browser Host when one is connected for this
+    # user/session. No host is an additive-capability miss and falls through to
+    # the existing Camofox/local backend.
+    if _is_desktop_browser_configured():
+        from tools.browser_desktop_host import desktop_browser_navigate
+
+        desktop_result = desktop_browser_navigate(url, task_id)
+        if desktop_result is not None:
+            return desktop_result
+
     # Camofox backend — delegate after safety checks pass
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_navigate
@@ -3044,6 +3063,10 @@ def browser_snapshot(
     Returns:
         JSON string with page snapshot
     """
+    if _has_desktop_browser_session(task_id):
+        from tools.browser_desktop_host import desktop_browser_snapshot
+        return desktop_browser_snapshot(full, task_id, user_task)
+
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_snapshot
         return camofox_snapshot(full, task_id, user_task)
@@ -3139,6 +3162,10 @@ def browser_click(ref: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with click result
     """
+    if _has_desktop_browser_session(task_id):
+        from tools.browser_desktop_host import desktop_browser_click
+        return desktop_browser_click(ref, task_id)
+
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_click
         return camofox_click(ref, task_id)
@@ -3180,6 +3207,10 @@ def browser_type(ref: str, text: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with type result
     """
+    if _has_desktop_browser_session(task_id):
+        from tools.browser_desktop_host import desktop_browser_type
+        return desktop_browser_type(ref, text, task_id)
+
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_type
         return camofox_type(ref, text, task_id)
@@ -3237,6 +3268,10 @@ def browser_scroll(direction: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with scroll result
     """
+    if _has_desktop_browser_session(task_id):
+        from tools.browser_desktop_host import desktop_browser_unsupported
+        return desktop_browser_unsupported("browser_scroll")
+
     # Validate direction
     if direction not in {"up", "down"}:
         return json.dumps({
@@ -3290,6 +3325,10 @@ def browser_back(task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with navigation result
     """
+    if _has_desktop_browser_session(task_id):
+        from tools.browser_desktop_host import desktop_browser_unsupported
+        return desktop_browser_unsupported("browser_back")
+
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_back
         return camofox_back(task_id)
@@ -3342,6 +3381,10 @@ def browser_press(key: str, task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with key press result
     """
+    if _has_desktop_browser_session(task_id):
+        from tools.browser_desktop_host import desktop_browser_unsupported
+        return desktop_browser_unsupported("browser_press")
+
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_press
         return camofox_press(key, task_id)
@@ -3398,6 +3441,10 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
     Returns:
         JSON string with console messages/errors, or eval result
     """
+    if _has_desktop_browser_session(task_id):
+        from tools.browser_desktop_host import desktop_browser_unsupported
+        return desktop_browser_unsupported("browser_console")
+
     # --- JS evaluation mode ---
     if expression is not None:
         policy_error = _enforce_browser_eval_policy(expression)
@@ -4030,6 +4077,10 @@ def browser_get_images(task_id: Optional[str] = None) -> str:
     Returns:
         JSON string with list of images (src and alt)
     """
+    if _has_desktop_browser_session(task_id):
+        from tools.browser_desktop_host import desktop_browser_unsupported
+        return desktop_browser_unsupported("browser_get_images")
+
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_get_images
         return camofox_get_images(task_id)
@@ -4117,6 +4168,10 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         A JSON string with vision analysis results and screenshot_path, or a
         multimodal tool-result envelope carrying the screenshot and metadata.
     """
+    if _has_desktop_browser_session(task_id):
+        from tools.browser_desktop_host import desktop_browser_unsupported
+        return desktop_browser_unsupported("browser_vision")
+
     if _is_camofox_mode():
         from tools.browser_camofox import camofox_vision
         return camofox_vision(question, annotate, task_id)
@@ -4497,6 +4552,14 @@ def _cleanup_single_browser_session(task_id: str) -> None:
     # before the backend tears down the underlying CDP endpoint.
     _stop_cdp_supervisor(task_id)
 
+    try:
+        if _has_desktop_browser_session(task_id):
+            from tools.browser_desktop_host import desktop_browser_close
+
+            desktop_browser_close(task_id)
+    except Exception as e:
+        logger.debug("Desktop browser cleanup for task %s: %s", task_id, e)
+
     # Also clean up Camofox session if running in Camofox mode.
     # Skip full close when managed persistence is enabled — the browser
     # profile (and its session cookies) must survive across agent tasks.
@@ -4808,6 +4871,12 @@ def check_browser_requirements() -> bool:
     Returns:
         True if all requirements are met, False otherwise
     """
+    # The action-level desktop bridge is provided by local-server and needs no
+    # browser binary on the 2 GB device. It falls back at navigation time when
+    # no authenticated PC host is connected.
+    if _is_desktop_browser_configured():
+        return True
+
     # Camofox backend — only needs the server URL, no agent-browser CLI
     if _is_camofox_mode():
         return True
