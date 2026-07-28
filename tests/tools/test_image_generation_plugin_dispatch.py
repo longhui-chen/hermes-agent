@@ -69,7 +69,9 @@ class TestPluginDispatch:
         assert payload["error_type"] == "provider_not_registered"
         assert "image_gen.provider='missing-codex'" in payload["error"]
 
-    def test_dispatch_force_refreshes_plugins_when_provider_initially_missing(self, monkeypatch, tmp_path):
+    def test_dispatch_does_not_force_refresh_when_provider_is_missing(
+        self, monkeypatch, tmp_path
+    ):
         from tools import image_generation_tool
         from hermes_cli import plugins as plugins_module
         from agent import image_gen_registry as registry_module
@@ -80,23 +82,19 @@ class TestPluginDispatch:
         monkeypatch.setattr(image_generation_tool, "_read_configured_image_provider", lambda: "codex")
 
         calls = []
-        provider_state = {"provider": None}
 
         def fake_ensure_plugins_discovered(force=False):
             calls.append(force)
-            if force:
-                provider_state["provider"] = _FakeCodexProvider()
 
         monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", fake_ensure_plugins_discovered)
-        monkeypatch.setattr(registry_module, "get_provider", lambda name: provider_state["provider"])
+        monkeypatch.setattr(registry_module, "get_provider", lambda name: None)
 
         dispatched = image_generation_tool._dispatch_to_plugin_provider("draw hammy", "portrait")
         payload = json.loads(dispatched)
 
-        assert calls == [False, True]
-        assert payload["success"] is True
-        assert payload["provider"] == "codex"
-        assert payload["aspect_ratio"] == "portrait"
+        assert calls == [False]
+        assert payload["success"] is False
+        assert payload["error_type"] == "provider_not_registered"
 
     def test_unset_provider_keeps_legacy_fal_path(self, monkeypatch):
         """An unrelated API key must not opt the user into paid image generation."""
