@@ -555,6 +555,32 @@ def test_prepare_claw_service_loads_persisted_managed_env_without_overriding_exp
         assert config_path.read_text(encoding="utf-8") == "{}\n"
 
 
+def test_prepare_claw_service_bootstraps_config_for_managed_multiplex(
+    tmp_path: Path,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
+    managed_dir = tmp_path / "managed"
+    managed_dir.mkdir()
+    (managed_dir / "config.yaml").write_text(
+        "gateway:\n  multiplex_profiles: true\n",
+        encoding="utf-8",
+    )
+
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(HERMES_MANAGED_DIR=str(managed_dir)),
+    )
+
+    config_path = hermes_home / "config.yaml"
+    assert json.loads(config_path.read_text(encoding="utf-8")) == {}
+    assert _hermes_invocations(app_root) == []
+
+
 @pytest.mark.parametrize(
     "gateway_json",
     [
@@ -1163,6 +1189,36 @@ def test_prepare_claw_service_waits_for_cross_process_lock(tmp_path: Path):
         stdout, stderr = process.communicate(timeout=30)
 
     assert process.returncode == 0, (stdout, stderr)
+
+
+def test_prepare_claw_service_times_out_waiting_for_cross_process_lock(
+    tmp_path: Path,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, _hermes_home, env_path = _prepare_script_fixture(tmp_path)
+    secret_dir = env_path.parent
+    secret_dir.mkdir(parents=True)
+    lock_path = secret_dir / "prepare-claw-service.lock"
+
+    with lock_path.open("w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        started = time.monotonic()
+        result = subprocess.run(
+            [str(app_root / "prepare-claw-service.sh")],
+            check=False,
+            cwd=str(app_root),
+            env=_script_env(HERMES_PREPARE_LOCK_TIMEOUT_SECONDS="0.2"),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        elapsed = time.monotonic() - started
+
+    assert result.returncode != 0
+    assert elapsed < 2
+    assert "timed out waiting for Claw prepare lock" in result.stderr
 
 
 def test_prepare_claw_service_concurrent_runs_keep_key_and_env_consistent(

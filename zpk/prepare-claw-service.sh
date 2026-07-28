@@ -184,11 +184,35 @@ acquire_prepare_lock() {
     exec 9> "$LOCK_FILE"
     chmod 0600 "$LOCK_FILE"
     HERMES_PREPARE_LOCK_FD=9 "$HERMES_PYTHON" - <<'PY'
+import errno
 import fcntl
 import os
+import sys
+import time
 
 fd = int(os.environ["HERMES_PREPARE_LOCK_FD"])
-fcntl.flock(fd, fcntl.LOCK_EX)
+try:
+    timeout = float(os.environ.get("HERMES_PREPARE_LOCK_TIMEOUT_SECONDS", "30"))
+except ValueError:
+    timeout = 30.0
+timeout = max(0.1, min(timeout, 60.0))
+deadline = time.monotonic() + timeout
+
+while True:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        break
+    except OSError as exc:
+        if exc.errno not in (errno.EACCES, errno.EAGAIN):
+            raise
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            print(
+                f"timed out waiting for Claw prepare lock after {timeout:g}s",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        time.sleep(min(0.1, remaining))
 PY
 }
 
@@ -303,16 +327,34 @@ required_multiplex_config_key() {
 import os
 import json
 import sys
+from pathlib import Path
 
 import yaml
 from yaml.nodes import MappingNode, ScalarNode
 
 from gateway.config import GatewayConfig
+from hermes_cli import managed_scope
+from hermes_cli.config import atomic_config_write
 from utils import fast_safe_load
 
 path = sys.argv[1]
 config_exists = os.path.exists(path)
 source = ""
+
+managed_dir = managed_scope.get_managed_dir()
+managed_scope_present = managed_dir is not None
+managed_config_path = (managed_dir / "config.yaml") if managed_dir else None
+if (
+    not config_exists
+    and managed_config_path is not None
+    and managed_config_path.is_file()
+):
+    # Gateway's dedicated loader applies managed configuration only after it
+    # finds the user config file. Bootstrap an empty base through Hermes'
+    # atomic writer so a managed-only fresh device has the same effective
+    # configuration during prepare and runtime.
+    atomic_config_write(Path(path), {}, sort_keys=False)
+    config_exists = True
 
 try:
     if config_exists:
@@ -380,16 +422,7 @@ if not isinstance(gateway_defaults, dict):
 # config.yaml. Match that behavior exactly rather than making prepare's view
 # broader than the gateway's.
 effective_config = config
-managed_scope = None
-managed_dir_override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
-managed_scope_present = (
-    os.path.isdir(managed_dir_override)
-    if managed_dir_override
-    else os.path.isdir("/etc/hermes")
-)
 if config_exists and managed_scope_present:
-    from hermes_cli import managed_scope
-
     effective_config = managed_scope.apply_managed_overlay(dict(config))
 gateway_data = dict(gateway_defaults)
 nested_gateway = effective_config.get("gateway")
@@ -408,7 +441,7 @@ if GatewayConfig.from_dict(gateway_data).multiplex_profiles:
             if "multiplex_profiles" in config
             else "gateway.multiplex_profiles"
         )
-        if managed_scope is None or not managed_scope.is_key_managed(config_key):
+        if not managed_scope.is_key_managed(config_key):
             print(config_key)
     raise SystemExit(0)
 
