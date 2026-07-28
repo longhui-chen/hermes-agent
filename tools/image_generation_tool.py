@@ -1096,9 +1096,6 @@ def check_image_generation_requirements() -> bool:
 
             _ensure_plugins_discovered()
             provider = get_provider(configured)
-            if provider is None:
-                _ensure_plugins_discovered(force=True)
-                provider = get_provider(configured)
             return bool(provider and provider.is_available())
         except Exception:
             return False

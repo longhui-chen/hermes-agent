@@ -158,22 +158,26 @@ def gui_toolset_label(label: str) -> str:
 _DEFAULT_OFF_TOOLSETS = {"homeassistant", "spotify", "discord", "discord_admin", "video", "video_gen", "x_search", "markdown_vault_write"}
 
 
-def _uses_zettlab_video_generation(config: dict, platform: str) -> bool:
-    video_config = config.get("video_gen")
+def _is_zettlab_read_only_vault(config: dict, platform: str) -> bool:
     platform_toolsets = config.get("platform_toolsets")
     configured_toolsets = (
         platform_toolsets.get(platform)
         if isinstance(platform_toolsets, dict)
         else None
     )
-    read_only_vault = (
-        isinstance(configured_toolsets, list)
+    return (
+        platform == "zet_agent"
+        and isinstance(configured_toolsets, list)
         and "markdown_vault" in configured_toolsets
         and "no_mcp" in configured_toolsets
     )
+
+
+def _uses_zettlab_video_generation(config: dict, platform: str) -> bool:
+    video_config = config.get("video_gen")
     return (
         platform == "zet_agent"
-        and not read_only_vault
+        and not _is_zettlab_read_only_vault(config, platform)
         and isinstance(video_config, dict)
         and str(video_config.get("provider") or "").strip() == "zettlab"
     )
@@ -1906,7 +1910,11 @@ def _get_platform_tools(
     # the local opt-in used by paid third-party providers. It cannot be
     # reverse-mapped from the core composite because the shared toolset also
     # contains provider-specific edit/extend tools.
-    if _uses_zettlab_video_generation(config, platform):
+    if _is_zettlab_read_only_vault(config, platform):
+        # The read-only marker is a final fail-closed gate. A stale or manually
+        # added explicit entry must not re-expose paid/network video generation.
+        enabled_toolsets.discard("video_gen")
+    elif _uses_zettlab_video_generation(config, platform):
         enabled_toolsets.add("video_gen")
 
     # Recover non-configurable platform toolsets (e.g. discord, feishu_doc,

@@ -142,21 +142,17 @@ class TestPluginDispatch:
 
         assert image_generation_tool.check_image_generation_requirements() is False
 
-    def test_requirements_force_refresh_selected_plugin_when_initially_missing(
+    def test_requirements_do_not_force_refresh_when_selected_plugin_is_missing(
         self, monkeypatch
     ):
         from tools import image_generation_tool
         from hermes_cli import plugins as plugins_module
         from agent import image_gen_registry as registry_module
 
-        available = _FakeCodexProvider()
-        provider_state = {"provider": None}
         discovery_calls = []
 
         def discover(force=False):
             discovery_calls.append(force)
-            if force:
-                provider_state["provider"] = available
 
         monkeypatch.setattr(
             image_generation_tool, "_read_configured_image_provider", lambda: "codex"
@@ -164,11 +160,11 @@ class TestPluginDispatch:
         monkeypatch.setattr(image_generation_tool, "check_fal_api_key", lambda: True)
         monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", discover)
         monkeypatch.setattr(
-            registry_module, "get_provider", lambda name: provider_state["provider"]
+            registry_module, "get_provider", lambda name: None
         )
 
-        assert image_generation_tool.check_image_generation_requirements() is True
-        assert discovery_calls == [False, True]
+        assert image_generation_tool.check_image_generation_requirements() is False
+        assert discovery_calls == [False]
 
     def test_handler_does_not_fallback_to_fal_when_selected_plugin_discovery_fails(
         self, monkeypatch

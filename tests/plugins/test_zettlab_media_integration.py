@@ -434,7 +434,13 @@ def test_read_only_vault_hides_zettlab_video_even_when_capability_is_enabled(mon
         {
             "video_gen": {"provider": "zettlab"},
             "platform_toolsets": {
-                "zet_agent": ["markdown_vault", "todo", "clarify", "no_mcp"]
+                "zet_agent": [
+                    "markdown_vault",
+                    "todo",
+                    "clarify",
+                    "no_mcp",
+                    "video_gen",
+                ]
             },
         },
         "zet_agent",
@@ -446,6 +452,7 @@ def test_read_only_vault_hides_zettlab_video_even_when_capability_is_enabled(mon
         quiet_mode=True,
     )
 
+    assert "video_gen" not in enabled
     assert "video_generate" not in {
         item["function"]["name"] for item in definitions
     }
