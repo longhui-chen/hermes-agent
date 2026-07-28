@@ -27,6 +27,7 @@ def _prepare_script_fixture(
     tmp_path: Path,
     *,
     default_presets_dir: Path | None = None,
+    volume_data_target: Path | None = None,
 ) -> tuple[Path, Path, Path]:
     repo_root = Path(__file__).resolve().parents[2]
     app_base = tmp_path / "zettos" / "main" / "apps" / "com.zettlab.claw"
@@ -80,6 +81,16 @@ runpy.run_module("hermes_cli.main", run_name="__main__")
         prepare_source = prepare_source.replace(
             default_assignment,
             f"DEFAULT_ZETTLAB_PRESETS_DIR={shlex.quote(str(default_presets_dir))}",
+        )
+    if volume_data_target is not None:
+        volume_assignment = (
+            'VOLUME_DATA_TARGET="/volume1/subvol/apps/'
+            '$(basename "$APP_BASE")/data"'
+        )
+        assert volume_assignment in prepare_source
+        prepare_source = prepare_source.replace(
+            volume_assignment,
+            f"VOLUME_DATA_TARGET={shlex.quote(str(volume_data_target))}",
         )
     script.write_text(prepare_source, encoding="utf-8")
     script.chmod(0o755)
@@ -867,6 +878,35 @@ def test_prepare_claw_service_allows_trusted_ota_data_symlink(tmp_path: Path):
     assert hermes_home.is_dir()
     assert env_path.is_file()
     assert expected_target.stat().st_mode & 0o777 == 0o750
+
+
+def test_prepare_claw_service_allows_trusted_volume_data_symlink(tmp_path: Path):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    volume_target = tmp_path / "volume1" / "subvol" / "apps" / "com.zettlab.claw" / "data"
+    app_root, hermes_home, env_path = _prepare_script_fixture(
+        tmp_path,
+        volume_data_target=volume_target,
+    )
+    data_link = hermes_home.parent
+    volume_target.mkdir(parents=True)
+    volume_target.chmod(0o750)
+    data_link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(volume_target, data_link)
+
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(),
+    )
+
+    assert data_link.is_symlink()
+    assert data_link.resolve() == volume_target.resolve()
+    assert hermes_home.is_dir()
+    assert env_path.is_file()
+    assert volume_target.stat().st_mode & 0o777 == 0o750
 
 
 def test_prepare_claw_service_refuses_writable_ota_data_symlink_target(

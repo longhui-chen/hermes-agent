@@ -9,7 +9,8 @@ HERMES_BIN="$APP_ROOT/bin/hermes"
 HERMES_HOME="$APP_BASE/data/hermes_home"
 DATA_DIR="$APP_BASE/data"
 SECRET_DIR="$APP_BASE/data/secrets"
-EXPECTED_DATA_TARGET="$(dirname "$(dirname "$APP_BASE")")/data/$(basename "$APP_BASE")"
+OTA_DATA_TARGET="$(dirname "$(dirname "$APP_BASE")")/data/$(basename "$APP_BASE")"
+VOLUME_DATA_TARGET="/volume1/subvol/apps/$(basename "$APP_BASE")/data"
 LOCK_FILE="$SECRET_DIR/prepare-claw-service.lock"
 KEY_FILE="$SECRET_DIR/zet_agent.key"
 ENV_FILE="$SECRET_DIR/zettlab-claw.env"
@@ -74,10 +75,17 @@ detect_zettlab_presets_dir() {
 }
 
 trusted_data_symlink_target() {
-    local resolved expected uid mode group other
+    local resolved candidate expected="" uid mode group other
     resolved="$(readlink -f "$DATA_DIR" 2>/dev/null || true)"
-    expected="$(readlink -f "$EXPECTED_DATA_TARGET" 2>/dev/null || true)"
-    [ -n "$resolved" ] && [ "$resolved" = "$expected" ] && [ -d "$resolved" ] || return 1
+    [ -n "$resolved" ] && [ -d "$resolved" ] || return 1
+    for candidate in "$OTA_DATA_TARGET" "$VOLUME_DATA_TARGET"; do
+        candidate="$(readlink -f "$candidate" 2>/dev/null || true)"
+        if [ -n "$candidate" ] && [ "$resolved" = "$candidate" ]; then
+            expected="$candidate"
+            break
+        fi
+    done
+    [ -n "$expected" ] || return 1
 
     uid="$(stat -c '%u' "$resolved" 2>/dev/null || stat -f '%u' "$resolved" 2>/dev/null || true)"
     mode="$(stat -c '%a' "$resolved" 2>/dev/null || stat -f '%Lp' "$resolved" 2>/dev/null || true)"
