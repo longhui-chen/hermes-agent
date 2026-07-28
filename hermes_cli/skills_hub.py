@@ -499,10 +499,17 @@ def do_browse(page: int = 1, page_size: int = 20, source: str = "all",
             "'hermes skills search <query>' to search deeper[/]\n")
 
 
+_AGENT_INSTALL_REQUEST = object()
+_DIRECT_USER_INSTALL_REQUEST = object()
+
+
 def do_install(identifier: str, category: str = "", force: bool = False,
                console: Optional[Console] = None, skip_confirm: bool = False,
                invalidate_cache: bool = True,
-               name_override: str = "") -> None:
+               name_override: str = "",
+               _agent_request=None,
+               _agent_intent_confirmed: bool = False,
+               _expected_agent_candidate: Optional[dict] = None):
     """Fetch, quarantine, scan, confirm, and install a skill.
 
     ``name_override`` lets non-interactive callers (slash commands, gateway,
@@ -515,6 +522,7 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     from tools.skills_hub import (
         GitHubAuth, create_source_router, ensure_hub_dirs,
         quarantine_bundle, install_from_quarantine, HubLockFile,
+        _issue_install_mutation_authorization,
     )
     from tools.skills_guard import scan_skill_cached, should_allow_install, format_scan_report
 
@@ -667,17 +675,116 @@ def do_install(identifier: str, category: str = "", force: bool = False,
         f"{scan_provenance['scanned_at']}; rules: {rules}[/]"
     )
 
-    # Check install policy
-    allowed, reason = should_allow_install(result, force=force)
-    if not allowed:
-        c.print(f"\n[bold red]Installation blocked:[/] {reason}")
-        # Clean up quarantine
-        shutil.rmtree(q_path, ignore_errors=True)
-        from tools.skills_hub import append_audit_log
-        append_audit_log("BLOCKED", bundle.name, bundle.source,
-                         bundle.trust_level, result.verdict,
-                         f"{len(result.findings)}_findings")
-        return
+    is_external = bundle.source != "official"
+    is_agent_request = is_external and _agent_request is _AGENT_INSTALL_REQUEST
+    resolved_identifier = (
+        getattr(bundle, "identifier", "")
+        or getattr(meta, "identifier", "")
+        or identifier
+    )
+    source_url = scan_provenance.get("source_url", "") or resolved_identifier
+    bundle_hash = scan_provenance.get("bundle_hash", "")
+    candidate = {
+        "identifier": resolved_identifier,
+        "skill_name": bundle.name,
+        "source": bundle.source,
+        "source_url": source_url,
+        "content_hash": bundle_hash,
+        "trust_level": bundle.trust_level,
+        "scan_verdict": result.verdict,
+        "finding_count": len(result.findings),
+        "findings": [
+            {
+                "severity": finding.severity,
+                "category": finding.category,
+                "file": finding.file,
+                "description": finding.description,
+            }
+            for finding in result.findings[:10]
+        ],
+    }
+
+    # External installs initiated by the Agent must carry a runtime-verified
+    # user intent. Preparing/scanning a candidate is read-only and returns the
+    # exact identity that a later user-authored turn must confirm.
+    if is_external:
+        if _agent_request not in {
+            _AGENT_INSTALL_REQUEST,
+            _DIRECT_USER_INSTALL_REQUEST,
+        }:
+            c.print(
+                "\n[bold red]Installation blocked:[/] Non-interactive external "
+                "skill installation requires the native skillhub_install "
+                "approval flow.\n"
+            )
+            shutil.rmtree(q_path, ignore_errors=True)
+            return
+
+        if is_agent_request:
+            if _expected_agent_candidate is not None and any(
+                _expected_agent_candidate.get(field) != candidate[field]
+                for field in ("identifier", "source_url", "content_hash")
+            ):
+                shutil.rmtree(q_path, ignore_errors=True)
+                return {"status": "candidate_changed", "candidate": candidate}
+
+            if not _agent_intent_confirmed:
+                shutil.rmtree(q_path, ignore_errors=True)
+                return {"status": "confirmation_required", "candidate": candidate}
+
+            # The user's natural-language install choice is already the
+            # authorization for a clean scan. Only a non-safe verdict needs
+            # another, risk-specific decision.
+            approval = {"approved": True}
+            if result.verdict != "safe":
+                from tools.approval import request_tool_approval
+
+                finding_summary = "; ".join(
+                    (
+                        f"{finding.severity}/{finding.category} "
+                        f"{finding.file}: {finding.description[:160]}"
+                    )
+                    for finding in result.findings[:5]
+                ) or "scanner returned a non-safe verdict"
+                approval_reason = (
+                    "The external skill selected by the user has scan findings. "
+                    f"Identifier: {resolved_identifier}; source: {source_url}; "
+                    f"resolved content hash: {bundle_hash}; scan verdict: "
+                    f"{result.verdict}; findings: {finding_summary}. "
+                    "Installing it can influence Agent behavior or run scripts "
+                    "with Agent access."
+                )
+                approval = request_tool_approval(
+                    "skillhub_install",
+                    approval_reason,
+                    rule_key=f"external-skill-risk:{resolved_identifier}:{bundle_hash}",
+                    one_shot=True,
+                    allow_yolo_bypass=False,
+                )
+        else:
+            approval = {"approved": True}
+
+        if not approval.get("approved", False):
+            c.print(
+                "\n[bold red]Installation blocked:[/] "
+                f"{approval.get('message') or 'User approval was not granted.'}\n"
+            )
+            shutil.rmtree(q_path, ignore_errors=True)
+            return {"status": "risk_denied", "candidate": candidate}
+
+    # Preserve the existing CLI/slash policy. The Agent-owned native path above
+    # is the only path where an explicit runtime-bound user choice can override
+    # caution/dangerous policy after a one-shot risk confirmation.
+    if not is_agent_request:
+        allowed, reason = should_allow_install(result, force=force)
+        if not allowed:
+            c.print(f"\n[bold red]Installation blocked:[/] {reason}")
+            shutil.rmtree(q_path, ignore_errors=True)
+            from tools.skills_hub import append_audit_log
+            append_audit_log("BLOCKED", bundle.name, bundle.source,
+                             bundle.trust_level, result.verdict,
+                             f"{len(result.findings)}_findings")
+            return
 
     if extra_metadata:
         metadata_lines = _format_extra_metadata_lines(extra_metadata)
@@ -719,7 +826,20 @@ def do_install(identifier: str, category: str = "", force: bool = False,
 
     # Install
     try:
-        install_dir = install_from_quarantine(q_path, bundle.name, category, bundle, result)
+        mutation_authorization = _issue_install_mutation_authorization(
+            bundle.name,
+            bundle,
+            approved_source_url=scan_provenance["source_url"],
+            approved_quarantine_hash=scan_provenance["bundle_hash"],
+        )
+        install_dir = install_from_quarantine(
+            q_path,
+            bundle.name,
+            category,
+            bundle,
+            result,
+            _authorization=mutation_authorization,
+        )
     except ValueError as exc:
         c.print(f"[bold red]Installation blocked:[/] {exc}\n")
         shutil.rmtree(q_path, ignore_errors=True)
@@ -782,6 +902,30 @@ def do_install(identifier: str, category: str = "", force: bool = False,
     else:
         c.print("[dim]Skill will be available in your next session.[/]")
         c.print("[dim]Use /reset to start a new session now, or --now to activate immediately (invalidates prompt cache).[/]\n")
+    if is_agent_request:
+        return {"status": "installed", "candidate": candidate}
+
+
+def do_agent_install(
+    identifier: str,
+    console: Optional[Console] = None,
+    *,
+    intent_confirmed: bool = False,
+    expected_candidate: Optional[dict] = None,
+):
+    """Prepare or install one exact external candidate for the native tool.
+
+    A clean candidate with runtime-confirmed user intent installs without
+    another prompt. Non-safe scans still require a fresh one-shot risk choice.
+    """
+    return do_install(
+        identifier,
+        console=console,
+        skip_confirm=True,
+        _agent_request=_AGENT_INSTALL_REQUEST,
+        _agent_intent_confirmed=intent_confirmed,
+        _expected_agent_candidate=expected_candidate,
+    )
 
 
 def do_inspect(identifier: str, console: Optional[Console] = None) -> None:
@@ -1043,7 +1187,8 @@ def do_check(name: Optional[str] = None, console: Optional[Console] = None) -> N
     c.print(f"[dim]{update_count} update(s) available across {len(results)} checked skill(s)[/]\n")
 
 
-def do_update(name: Optional[str] = None, console: Optional[Console] = None) -> None:
+def do_update(name: Optional[str] = None, console: Optional[Console] = None,
+              _install_request=None) -> None:
     """Update hub-installed skills with upstream changes."""
     from tools.skills_hub import HubLockFile, check_for_skill_updates
 
@@ -1058,7 +1203,13 @@ def do_update(name: Optional[str] = None, console: Optional[Console] = None) -> 
         installed = lock.get_installed(entry["name"])
         category = _derive_category_from_install_path(installed.get("install_path", "")) if installed else ""
         c.print(f"[bold]Updating:[/] {entry['name']}")
-        do_install(entry["identifier"], category=category, force=True, console=c)
+        do_install(
+            entry["identifier"],
+            category=category,
+            force=True,
+            console=c,
+            _agent_request=_install_request,
+        )
 
     c.print(f"[bold green]Updated {len(updates)} skill(s).[/]\n")
 
@@ -1657,7 +1808,8 @@ def do_snapshot_export(output_path: str, console: Optional[Console] = None) -> N
 
 
 def do_snapshot_import(input_path: str, force: bool = False,
-                       console: Optional[Console] = None) -> None:
+                       console: Optional[Console] = None,
+                       _install_request=None) -> None:
     """Re-install skills from a snapshot file."""
     from tools.skills_hub import TapsManager
 
@@ -1698,7 +1850,13 @@ def do_snapshot_import(input_path: str, force: bool = False,
             continue
 
         c.print(f"[bold]--- {entry.get('name', identifier)} ---[/]")
-        do_install(identifier, category=category, force=force, console=c)
+        do_install(
+            identifier,
+            category=category,
+            force=force,
+            console=c,
+            _agent_request=_install_request,
+        )
 
     c.print("[bold green]Snapshot import complete.[/]\n")
 
@@ -1719,7 +1877,8 @@ def skills_command(args) -> None:
     elif action == "install":
         do_install(args.identifier, category=args.category, force=args.force,
                    skip_confirm=getattr(args, "yes", False),
-                   name_override=getattr(args, "name", "") or "")
+                   name_override=getattr(args, "name", "") or "",
+                   _agent_request=_DIRECT_USER_INSTALL_REQUEST)
     elif action == "inspect":
         do_inspect(args.identifier)
     elif action == "list":
@@ -1730,7 +1889,10 @@ def skills_command(args) -> None:
     elif action == "check":
         do_check(name=getattr(args, "name", None))
     elif action == "update":
-        do_update(name=getattr(args, "name", None))
+        do_update(
+            name=getattr(args, "name", None),
+            _install_request=_DIRECT_USER_INSTALL_REQUEST,
+        )
     elif action == "audit":
         do_audit(name=getattr(args, "name", None),
                  deep=getattr(args, "deep", False))
@@ -1762,7 +1924,11 @@ def skills_command(args) -> None:
         if snap_action == "export":
             do_snapshot_export(args.output)
         elif snap_action == "import":
-            do_snapshot_import(args.input, force=getattr(args, "force", False))
+            do_snapshot_import(
+                args.input,
+                force=getattr(args, "force", False),
+                _install_request=_DIRECT_USER_INSTALL_REQUEST,
+            )
         else:
             _console.print("Usage: hermes skills snapshot [export|import]\n")
     elif action == "tap":
@@ -1892,7 +2058,8 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
                 name_override = args[i + 1]
         do_install(identifier, category=category, force=force,
                    skip_confirm=skip_confirm, invalidate_cache=invalidate_cache,
-                   name_override=name_override, console=c)
+                   name_override=name_override, console=c,
+                   _agent_request=_DIRECT_USER_INSTALL_REQUEST)
 
     elif action == "inspect":
         if not args:
@@ -1915,7 +2082,11 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
 
     elif action == "update":
         name = args[0] if args else None
-        do_update(name=name, console=c)
+        do_update(
+            name=name,
+            console=c,
+            _install_request=_DIRECT_USER_INSTALL_REQUEST,
+        )
 
     elif action == "audit":
         name = args[0] if args and not args[0].startswith("--") else None
@@ -1977,7 +2148,12 @@ def handle_skills_slash(cmd: str, console: Optional[Console] = None) -> None:
             do_snapshot_export(args[1], console=c)
         elif snap_action == "import" and len(args) > 1:
             force = "--force" in args
-            do_snapshot_import(args[1], force=force, console=c)
+            do_snapshot_import(
+                args[1],
+                force=force,
+                console=c,
+                _install_request=_DIRECT_USER_INSTALL_REQUEST,
+            )
         else:
             c.print("[bold red]Usage:[/] /skills snapshot export <file> | /skills snapshot import <file>\n")
 

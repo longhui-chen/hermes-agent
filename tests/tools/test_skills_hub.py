@@ -2,6 +2,7 @@
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 from unittest.mock import patch, MagicMock
 
@@ -1356,6 +1357,37 @@ class TestHubLockFile:
         assert entry["trust_level"] == "trusted"
         assert entry["content_hash"] == "abc123"
         assert "installed_at" in entry
+
+    def test_concurrent_record_install_preserves_every_entry(
+        self, monkeypatch, tmp_path
+    ):
+        lock_path = tmp_path / "lock.json"
+        original_load = HubLockFile.load
+
+        def slow_load(lock):
+            data = original_load(lock)
+            time.sleep(0.01)
+            return data
+
+        monkeypatch.setattr(HubLockFile, "load", slow_load)
+
+        def record(index):
+            HubLockFile(path=lock_path).record_install(
+                name=f"skill-{index}",
+                source="github",
+                identifier=f"owner/repo/skill-{index}",
+                trust_level="community",
+                scan_verdict="safe",
+                skill_hash=f"hash-{index}",
+                install_path=f"skill-{index}",
+                files=["SKILL.md"],
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(record, range(12)))
+
+        installed = original_load(HubLockFile(path=lock_path))["installed"]
+        assert set(installed) == {f"skill-{index}" for index in range(12)}
 
     def test_record_uninstall(self, tmp_path):
         lock = HubLockFile(path=tmp_path / "lock.json")

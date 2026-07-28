@@ -3,9 +3,17 @@ from unittest.mock import patch
 
 import pytest
 from rich.console import Console
+from types import SimpleNamespace
 
 from cli import ChatConsole
-from hermes_cli.skills_hub import do_check, do_install, do_list, do_update, handle_skills_slash
+from hermes_cli.skills_hub import (
+    _DIRECT_USER_INSTALL_REQUEST,
+    do_check,
+    do_install,
+    do_list,
+    do_update,
+    handle_skills_slash,
+)
 
 
 class _DummyLockFile:
@@ -92,7 +100,12 @@ def _capture_update(monkeypatch, results) -> tuple[str, list[tuple[str, str, boo
     monkeypatch.setattr(hub, "HubLockFile", lambda: type("L", (), {
         "get_installed": lambda self, name: {"install_path": "category/" + name}
     })())
-    monkeypatch.setattr(cli_hub, "do_install", lambda identifier, category="", force=False, console=None: installs.append((identifier, category, force)))
+    monkeypatch.setattr(
+        cli_hub,
+        "do_install",
+        lambda identifier, category="", force=False, console=None, **_kwargs:
+            installs.append((identifier, category, force)),
+    )
 
     do_update(console=console)
     return sink.getvalue(), installs
@@ -436,7 +449,13 @@ def _make_url_bundle_fetcher(name="", awaiting_name=True, url="https://example.c
     return _UrlSource
 
 
-def _install_mocks(monkeypatch, tmp_path, source_factory, category_hint=""):
+def _install_mocks(
+    monkeypatch,
+    tmp_path,
+    source_factory,
+    category_hint="",
+    verdict="safe",
+):
     """Wire the minimum set of monkeypatches for a do_install dry run."""
     import tools.skills_hub as hub
     import tools.skills_guard as guard
@@ -446,7 +465,7 @@ def _install_mocks(monkeypatch, tmp_path, source_factory, category_hint=""):
 
     install_calls: list = []
 
-    def _install_from_quarantine(q, name, category, bundle, result):
+    def _install_from_quarantine(q, name, category, bundle, result, **_kwargs):
         install_calls.append({"name": name, "category": category})
         install_dir = tmp_path / "skills" / (f"{category}/" if category else "") / name
         install_dir.mkdir(parents=True, exist_ok=True)
@@ -460,15 +479,262 @@ def _install_mocks(monkeypatch, tmp_path, source_factory, category_hint=""):
         hub, "HubLockFile",
         lambda: type("Lock", (), {"get_installed": lambda self, n: None})(),
     )
-    monkeypatch.setattr(
-        guard, "scan_skill",
-        lambda skill_path, source="community": guard.ScanResult(
-            skill_name="pending", source=source, trust_level="community", verdict="safe",
-        ),
-    )
+    def scan(skill_path, source="community"):
+        findings = []
+        if verdict != "safe":
+            findings.append(
+                guard.Finding(
+                    pattern_id="test-risk",
+                    severity="high",
+                    category="network",
+                    file="scripts/run.py",
+                    line=1,
+                    match="requests.post",
+                    description="sends data to an external endpoint",
+                )
+            )
+        return guard.ScanResult(
+            skill_name="pending",
+            source=source,
+            trust_level="community",
+            verdict=verdict,
+            findings=findings,
+        )
+
+    monkeypatch.setattr(guard, "scan_skill", scan)
     monkeypatch.setattr(guard, "format_scan_report", lambda result: "scan ok")
     monkeypatch.setattr(guard, "should_allow_install", lambda result, force=False: (True, "ok"))
     return install_calls
+
+
+class _ExternalRegistrySource:
+    def inspect(self, identifier):
+        return type("Meta", (), {
+            "extra": {"source_url": "https://github.com/owner/repo/tree/main/example"},
+            "identifier": "owner/repo/example",
+            "name": "example",
+            "path": "example",
+        })()
+
+    def fetch(self, identifier):
+        return type("Bundle", (), {
+            "name": "example",
+            "files": {"SKILL.md": "---\nname: example\n---\n# Example\n"},
+            "source": "github",
+            "identifier": "owner/repo/example",
+            "trust_level": "community",
+            "metadata": {
+                "source_url": "https://github.com/owner/repo/tree/main/example",
+            },
+        })()
+
+
+def test_agent_install_prepares_candidate_without_install_or_approval(
+    monkeypatch, tmp_path, hub_env
+):
+    from hermes_cli.skills_hub import do_agent_install
+
+    installs = _install_mocks(monkeypatch, tmp_path, _ExternalRegistrySource)
+    approvals = []
+
+    def approve(tool_name, reason, **kwargs):
+        approvals.append((tool_name, reason, kwargs))
+        return {"approved": True, "message": None}
+
+    monkeypatch.setattr("tools.approval.request_tool_approval", approve)
+    sink = StringIO()
+    do_agent_install(
+        "owner/repo/example",
+        console=Console(file=sink, force_terminal=False, color_system=None),
+    )
+
+    assert installs == []
+    assert approvals == []
+
+
+def test_safe_agent_install_with_confirmed_intent_has_no_second_approval(
+    monkeypatch, tmp_path, hub_env
+):
+    from hermes_cli.skills_hub import do_agent_install
+
+    installs = _install_mocks(monkeypatch, tmp_path, _ExternalRegistrySource)
+    monkeypatch.setattr(
+        "tools.approval.request_tool_approval",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("safe confirmed candidate must not prompt again")
+        ),
+    )
+
+    result = do_agent_install(
+        "owner/repo/example",
+        console=Console(file=StringIO(), force_terminal=False, color_system=None),
+        intent_confirmed=True,
+    )
+
+    assert result["status"] == "installed"
+    assert installs == [{"name": "example", "category": ""}]
+
+
+def test_changed_candidate_requires_new_user_confirmation(
+    monkeypatch, tmp_path, hub_env
+):
+    from hermes_cli.skills_hub import do_agent_install
+
+    installs = _install_mocks(monkeypatch, tmp_path, _ExternalRegistrySource)
+    monkeypatch.setattr(
+        "tools.approval.request_tool_approval",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("changed candidate must stop before risk approval")
+        ),
+    )
+
+    result = do_agent_install(
+        "owner/repo/example",
+        console=Console(file=StringIO(), force_terminal=False, color_system=None),
+        intent_confirmed=True,
+        expected_candidate={
+            "identifier": "owner/repo/example",
+            "source_url": "https://github.com/owner/repo/tree/main/example",
+            "content_hash": "sha256:older-content",
+        },
+    )
+
+    assert result["status"] == "candidate_changed"
+    assert result["candidate"]["content_hash"] != "sha256:older-content"
+    assert installs == []
+
+
+@pytest.mark.parametrize("verdict", ["caution", "dangerous"])
+def test_non_safe_agent_install_requires_risk_specific_one_shot_approval(
+    monkeypatch, tmp_path, hub_env, verdict
+):
+    from hermes_cli.skills_hub import do_agent_install
+
+    installs = _install_mocks(
+        monkeypatch,
+        tmp_path,
+        _ExternalRegistrySource,
+        verdict=verdict,
+    )
+    approvals = []
+
+    def approve(tool_name, reason, **kwargs):
+        approvals.append((tool_name, reason, kwargs))
+        return {"approved": True, "message": None}
+
+    monkeypatch.setattr("tools.approval.request_tool_approval", approve)
+    result = do_agent_install(
+        "owner/repo/example",
+        console=Console(file=StringIO(), force_terminal=False, color_system=None),
+        intent_confirmed=True,
+    )
+
+    assert result["status"] == "installed"
+    assert installs == [{"name": "example", "category": ""}]
+    assert len(approvals) == 1
+    tool_name, reason, kwargs = approvals[0]
+    assert tool_name == "skillhub_install"
+    assert "Identifier: owner/repo/example" in reason
+    assert "https://github.com/owner/repo/tree/main/example" in reason
+    assert "resolved content hash:" in reason
+    assert f"scan verdict: {verdict}" in reason
+    assert "high/network scripts/run.py" in reason
+    assert kwargs["one_shot"] is True
+    assert kwargs["allow_yolo_bypass"] is False
+    assert kwargs["rule_key"].startswith(
+        "external-skill-risk:owner/repo/example:"
+    )
+
+
+def test_denied_risk_decision_does_not_install(
+    monkeypatch, tmp_path, hub_env
+):
+    from hermes_cli.skills_hub import do_agent_install
+
+    installs = _install_mocks(
+        monkeypatch,
+        tmp_path,
+        _ExternalRegistrySource,
+        verdict="dangerous",
+    )
+    monkeypatch.setattr(
+        "tools.approval.request_tool_approval",
+        lambda *args, **kwargs: {
+            "approved": False,
+            "message": "user denied risk",
+        },
+    )
+
+    result = do_agent_install(
+        "owner/repo/example",
+        console=Console(file=StringIO(), force_terminal=False, color_system=None),
+        intent_confirmed=True,
+    )
+
+    assert result["status"] == "risk_denied"
+    assert installs == []
+
+
+def test_cli_install_preserves_direct_user_install_policy(monkeypatch):
+    from hermes_cli.skills_hub import skills_command
+
+    observed = {}
+
+    def capture(identifier, **kwargs):
+        observed["identifier"] = identifier
+        observed.update(kwargs)
+
+    monkeypatch.setattr("hermes_cli.skills_hub.do_install", capture)
+    skills_command(
+        SimpleNamespace(
+            skills_action="install",
+            identifier="owner/repo/example",
+            category="",
+            force=False,
+            yes=False,
+            name="",
+        )
+    )
+
+    assert observed["identifier"] == "owner/repo/example"
+    assert observed["_agent_request"] is _DIRECT_USER_INSTALL_REQUEST
+
+
+def test_raw_noninteractive_external_install_is_blocked_at_mutation_boundary(
+    monkeypatch, tmp_path, hub_env
+):
+    installs = _install_mocks(monkeypatch, tmp_path, _ExternalRegistrySource)
+    sink = StringIO()
+
+    do_install(
+        "owner/repo/example",
+        console=Console(file=sink, force_terminal=False, color_system=None),
+        skip_confirm=True,
+    )
+
+    assert installs == []
+    assert "native skillhub_install approval flow" in sink.getvalue()
+
+
+def test_direct_library_call_cannot_fake_interactive_confirmation(
+    monkeypatch, tmp_path, hub_env
+):
+    installs = _install_mocks(monkeypatch, tmp_path, _ExternalRegistrySource)
+    monkeypatch.setattr(
+        "builtins.input",
+        lambda *_args, **_kwargs: pytest.fail(
+            "untrusted library caller must not reach interactive confirmation"
+        ),
+    )
+    sink = StringIO()
+
+    do_install(
+        "owner/repo/example",
+        console=Console(file=sink, force_terminal=False, color_system=None),
+    )
+
+    assert installs == []
+    assert "native skillhub_install approval flow" in sink.getvalue()
 
 
 def test_url_install_uses_name_override_on_non_interactive_surface(monkeypatch, tmp_path, hub_env):
@@ -480,6 +746,7 @@ def test_url_install_uses_name_override_on_non_interactive_surface(monkeypatch, 
         "https://example.com/SKILL.md",
         console=console, skip_confirm=True,
         name_override="my-url-skill",
+        _agent_request=_DIRECT_USER_INSTALL_REQUEST,
     )
 
     assert installs == [{"name": "my-url-skill", "category": ""}]
@@ -530,6 +797,7 @@ def test_url_install_prompts_interactively_when_tty(monkeypatch, tmp_path, hub_e
         "https://example.com/SKILL.md",
         console=console, skip_confirm=False,  # interactive
         force=True,  # skip the final confirm prompt (tested elsewhere)
+        _agent_request=_DIRECT_USER_INSTALL_REQUEST,
     )
 
     assert installs == [{"name": "my-interactive", "category": ""}]
@@ -555,6 +823,7 @@ def test_url_install_prompts_category_and_uses_typed_value(monkeypatch, tmp_path
     do_install(
         "https://example.com/sharethis-chat/SKILL.md",
         console=console, skip_confirm=False, force=True,
+        _agent_request=_DIRECT_USER_INSTALL_REQUEST,
     )
 
     assert installs == [{"name": "sharethis-chat", "category": "productivity"}]
@@ -780,4 +1049,3 @@ def test_do_search_json_flag_emits_full_identifiers(capsys):
     assert payload[0]["source"] == "browse-sh"
     # Table render must be suppressed — sink should be empty (no "Searching for:" header).
     assert "Searching for:" not in sink.getvalue()
-
