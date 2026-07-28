@@ -1268,8 +1268,9 @@ def _dispatch_to_plugin_provider(
 ):
     """Route the call to a plugin-registered provider when one is selected.
 
-    Returns a JSON string on dispatch, or ``None`` to fall through to the
-    in-tree FAL fallback in ``image_generate_tool``.
+    Returns a JSON string whenever a non-FAL provider is selected. ``None`` is
+    reserved for an unset provider or explicit FAL selection so plugin failures
+    cannot silently route prompts or billing to a backend the user did not pick.
 
     Dispatch fires when ``image_gen.provider`` is explicitly set — including
     ``"fal"`` itself, which now resolves to the
@@ -1297,8 +1298,17 @@ def _dispatch_to_plugin_provider(
         _ensure_plugins_discovered()
         provider = get_provider(configured)
     except Exception as exc:
-        logger.debug("image_gen plugin dispatch skipped: %s", exc)
-        return None
+        logger.warning(
+            "Image gen provider '%s' could not be initialized: %s",
+            configured,
+            exc,
+        )
+        return json.dumps({
+            "success": False,
+            "image": None,
+            "error": f"Provider '{configured}' could not be initialized: {exc}",
+            "error_type": "provider_exception",
+        })
 
     if provider is None:
         try:

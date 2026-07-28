@@ -141,3 +141,40 @@ class TestPluginDispatch:
         monkeypatch.setattr(registry_module, "get_provider", lambda name: unavailable)
 
         assert image_generation_tool.check_image_generation_requirements() is False
+
+    def test_handler_does_not_fallback_to_fal_when_selected_plugin_discovery_fails(
+        self, monkeypatch
+    ):
+        from tools import image_generation_tool
+        from hermes_cli import plugins as plugins_module
+
+        monkeypatch.setattr(
+            image_generation_tool, "_read_configured_image_provider", lambda: "codex"
+        )
+        monkeypatch.setattr(
+            image_generation_tool, "_read_configured_image_model", lambda: None
+        )
+        monkeypatch.setattr(
+            plugins_module,
+            "_ensure_plugins_discovered",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("plugin discovery failed")
+            ),
+        )
+        monkeypatch.setattr(
+            image_generation_tool,
+            "image_generate_tool",
+            lambda **kwargs: json.dumps({
+                "success": True,
+                "provider": "fal",
+                "image": "https://fal.example/fallback.png",
+            }),
+        )
+
+        result = json.loads(
+            image_generation_tool._handle_image_generate({"prompt": "draw a cat"})
+        )
+
+        assert result["success"] is False
+        assert result["error_type"] == "provider_exception"
+        assert "codex" in result["error"]
