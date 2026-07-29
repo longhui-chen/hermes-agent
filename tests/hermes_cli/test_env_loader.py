@@ -108,6 +108,50 @@ def test_presets_dir_operator_env_survives_stale_user_env(tmp_path, monkeypatch)
     assert os.getenv("ZETTLAB_PRESETS_DIR") == "/volume1/subvol/agents/zettlab-presets/current"
 
 
+def test_multiplex_operator_env_survives_stale_user_env(tmp_path, monkeypatch):
+    from gateway.config import GatewayConfig
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    env_file = home / ".env"
+    env_file.write_text("GATEWAY_MULTIPLEX_PROFILES=false\n", encoding="utf-8")
+
+    _reset_env_loader_operator_snapshot(monkeypatch)
+    monkeypatch.setenv("GATEWAY_MULTIPLEX_PROFILES", "true")
+
+    loaded = load_hermes_dotenv(hermes_home=home)
+
+    assert loaded == [env_file]
+    assert os.getenv("GATEWAY_MULTIPLEX_PROFILES") == "true"
+    assert GatewayConfig.from_dict({"multiplex_profiles": False}).multiplex_profiles
+
+
+def test_multiplex_managed_env_remains_final_authority(tmp_path, monkeypatch):
+    from gateway.config import GatewayConfig
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    user_env = home / ".env"
+    project_env = tmp_path / ".env"
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    user_env.write_text("GATEWAY_MULTIPLEX_PROFILES=false\n", encoding="utf-8")
+    project_env.write_text("GATEWAY_MULTIPLEX_PROFILES=false\n", encoding="utf-8")
+    (managed / ".env").write_text(
+        "GATEWAY_MULTIPLEX_PROFILES=false\n", encoding="utf-8"
+    )
+
+    _reset_env_loader_operator_snapshot(monkeypatch)
+    monkeypatch.setenv("GATEWAY_MULTIPLEX_PROFILES", "true")
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+
+    loaded = load_hermes_dotenv(hermes_home=home, project_env=project_env)
+
+    assert loaded == [user_env, project_env]
+    assert os.getenv("GATEWAY_MULTIPLEX_PROFILES") == "false"
+    assert not GatewayConfig.from_dict({"multiplex_profiles": True}).multiplex_profiles
+
+
 def test_main_import_applies_user_env_over_shell_values(tmp_path, monkeypatch):
     home = tmp_path / "hermes"
     home.mkdir()

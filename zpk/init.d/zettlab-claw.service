@@ -9,6 +9,7 @@ EnvironmentFile=-__APP_BASE__/data/secrets/zettlab-claw.env
 Environment=HERMES_HOME=__APP_BASE__/data/hermes_home
 Environment=HERMES_BUNDLED_SKILLS=__APP_BASE__/current/lib/hermes-agent/skills
 Environment=HERMES_BUNDLED_PLUGINS=__APP_BASE__/current/lib/hermes-agent/plugins
+Environment=GATEWAY_MULTIPLEX_PROFILES=true
 Environment=ZET_AGENT_ENABLED=true
 Environment=ZET_AGENT_HOST=127.0.0.1
 Environment=ZET_AGENT_PORT=7900
