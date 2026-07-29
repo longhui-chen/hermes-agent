@@ -99,6 +99,22 @@ def test_long_text_chunked_into_multiple_posts(monkeypatch):
     assert all(len(p) < 4000 for p in posts), [len(p) for p in posts]
 
 
+def test_check_flips_per_missing_scope_secret(monkeypatch):
+    """Scope-authoritative gate test (see the list_my_channels twin for why a
+    poison-only construction cannot catch an os.environ-reading regression)."""
+    from tests.tools._profile_scope import mux_profile_scope
+
+    full = {
+        "ZET_CHAT_APPEND_URL": "http://127.0.0.1:9420/api/v1/internal/chat/append",
+        "ZETTLAB_AGENT_ACTION_TOKEN": "profile-token",
+    }
+    with mux_profile_scope(monkeypatch, full):
+        assert _check_send_channel_message() is True
+    for missing in full:
+        with mux_profile_scope(monkeypatch, {**full, missing: ""}):
+            assert _check_send_channel_message() is False, f"gate stayed open without {missing}"
+
+
 def test_profile_scope_flow_works_with_poisoned_environ(monkeypatch):
     """Shared gateway mode: values live only in the profile secret scope while
     os.environ holds another profile's stale decoys — the send must be built

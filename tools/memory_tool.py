@@ -2644,6 +2644,13 @@ def _zettlab_user_profile_language_enabled() -> bool:
     Resolved via the profile secret scope (get_secret) so the shared
     multiplexing gateway — where these values live in the profile ``.env``,
     not the process env — is detected too.
+
+    ZET_AGENT_ENABLED is currently NOT written to the profile ``.env`` (only
+    to the process env), so with a scope installed this read comes back empty
+    by design — the fallback branch below carries the verdict, because
+    ZET_AGENT_ID and the action token ARE in the profile ``.env``. Keep that
+    in mind before touching the fallback: it is what keeps this gate's result
+    unchanged across both deployment modes.
     """
     enabled = str(get_secret("ZET_AGENT_ENABLED", "") or "").strip().lower()
     if enabled in {"1", "true", "yes", "on"}:

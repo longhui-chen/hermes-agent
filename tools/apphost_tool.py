@@ -41,6 +41,12 @@ _LONG_TIMEOUT = 120.0
 # status=200 + transport_error, which the skill reads as a transient outage
 # and retries forever.
 _MAX_RESPONSE_BYTES = 1024 * 1024
+# Delivery-layer cap for text payloads (logs): the transport cap above keeps
+# the fetch from failing, but half a megabyte of log text poured into the
+# model's context is its own harm — the model needs the tail (errors are
+# usually at the end), not the whole window. 64 KiB comfortably holds the
+# default tail=200 lines while staying a small fraction of any context.
+_MAX_TEXT_PAYLOAD_CHARS = 64 * 1024
 _DEFAULT_LOG_TAIL = 200
 _MAX_STAGING_DIR_CHARS = 1024
 _SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -315,6 +321,23 @@ def _parse_upstream_error(raw_body):
     return parsed if isinstance(parsed, dict) else None
 
 
+def _text_payload(text):
+    """Non-JSON 2xx payload (logs), truncation-aware.
+
+    Always the same shape — ``text`` (tail-truncated when over the cap),
+    ``truncated``, ``total_chars`` — so the caller can tell it saw a partial
+    window and, if needed, re-fetch with a smaller ``tail``.
+    """
+    total = len(text)
+    if total <= _MAX_TEXT_PAYLOAD_CHARS:
+        return {"text": text, "truncated": False, "total_chars": total}
+    return {
+        "text": text[-_MAX_TEXT_PAYLOAD_CHARS:],
+        "truncated": True,
+        "total_chars": total,
+    }
+
+
 def _build_env_result():
     vendor_dir = _secret("ZETTLAB_GO_VENDOR_DIR")
     ready = bool(vendor_dir) and os.path.isdir(vendor_dir)
@@ -396,9 +419,9 @@ def app_host_tool(args, **_kw):
             except Exception:
                 # Declared JSON but unparseable: still a 2xx success at the
                 # HTTP layer — hand the raw text back rather than erroring.
-                return _ok({"text": text})
+                return _ok(_text_payload(text))
         # Non-JSON 2xx payload (logs is text/plain): the text IS the payload.
-        return _ok({"text": text})
+        return _ok(_text_payload(text))
 
     # Defensive: urllib raises HTTPError for non-2xx, so this is unreachable
     # in practice — keep the failure explicit rather than mislabeling.

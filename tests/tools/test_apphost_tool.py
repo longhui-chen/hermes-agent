@@ -240,7 +240,8 @@ def test_2xx_text_plain_body_is_success_with_text_payload(monkeypatch):
         with patch("tools.apphost_tool._urlopen", return_value=resp):
             out = json.loads(app_host_tool({"action": "logs", "slug": "app1"}))
     assert out["ok"] is True
-    assert out["data"] == {"text": log_text}
+    assert out["data"] == {"text": log_text, "truncated": False,
+                           "total_chars": len(log_text)}
 
 
 def test_2xx_declared_json_but_unparseable_is_still_success(monkeypatch):
@@ -249,7 +250,32 @@ def test_2xx_declared_json_but_unparseable_is_still_success(monkeypatch):
         with patch("tools.apphost_tool._urlopen", return_value=resp):
             out = json.loads(app_host_tool({"action": "probe"}))
     assert out["ok"] is True
-    assert out["data"] == {"text": "{not json"}
+    assert out["data"]["text"] == "{not json"
+    assert out["data"]["truncated"] is False
+
+
+def test_oversized_text_payload_is_tail_truncated_and_labeled(monkeypatch):
+    """Delivery-layer cap: the transport cap keeps a long-log fetch from
+    failing, but the text handed to the model is tail-truncated (errors are
+    usually at the end) and labeled so the model knows it saw a partial
+    window (and how big the original was)."""
+    from tools.apphost_tool import _MAX_TEXT_PAYLOAD_CHARS
+
+    head = "EARLY " * 4000
+    tail = "TAIL-MARKER " * 8000
+    log_text = head + tail
+    assert len(log_text) > _MAX_TEXT_PAYLOAD_CHARS
+    resp = _RawResp(200, log_text.encode("utf-8"), content_type="text/plain")
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", return_value=resp):
+            out = json.loads(app_host_tool({"action": "logs", "slug": "app1"}))
+    assert out["ok"] is True
+    data = out["data"]
+    assert data["truncated"] is True
+    assert data["total_chars"] == len(log_text)
+    assert len(data["text"]) == _MAX_TEXT_PAYLOAD_CHARS
+    assert data["text"] == log_text[-_MAX_TEXT_PAYLOAD_CHARS:]  # the TAIL
+    assert data["text"].endswith("TAIL-MARKER ")
 
 
 # --- upstream error-body pass-through & leak guarantees ----------------------
@@ -667,14 +693,17 @@ def test_response_cap_exceeds_server_logs_cap(monkeypatch):
     from tools.apphost_tool import _MAX_RESPONSE_BYTES
 
     assert _MAX_RESPONSE_BYTES > 512 * 1024
-    # Behavior-level: a server-cap-sized text body must come back as success.
+    # Behavior-level: a server-cap-sized text body must come back as success
+    # (the delivery layer then tail-truncates it — that is labeled, not an
+    # error; see test_oversized_text_payload_is_tail_truncated_and_labeled).
     big_log = ("L" * 1024 + "\n") * 512  # ~512 KiB
     resp = _RawResp(200, big_log.encode("utf-8"), content_type="text/plain")
     with mux_profile_scope(monkeypatch, _scope()):
         with patch("tools.apphost_tool._urlopen", return_value=resp):
             out = json.loads(app_host_tool({"action": "logs", "slug": "app1"}))
     assert out["ok"] is True
-    assert out["data"]["text"] == big_log
+    assert out["data"]["truncated"] is True
+    assert out["data"]["total_chars"] == len(big_log)
 
 
 # --- results are attacker-influenced data ------------------------------------

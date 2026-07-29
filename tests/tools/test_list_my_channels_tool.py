@@ -65,6 +65,26 @@ def test_tool_errors_when_env_missing(monkeypatch):
     assert "error" in json.loads(out)
 
 
+def test_check_flips_per_missing_scope_secret(monkeypatch):
+    """Scope-authoritative gate test: scope filled + os.environ purged, then
+    each secret removed in turn must close the gate. A poison-style test
+    asserting only `check() is True` cannot tell "read the scope" from "read
+    a non-empty poison value in os.environ" — this construction can: with the
+    environ purged, an os.environ-reading regression sees nothing and the
+    full-scope case goes False."""
+    from tests.tools._profile_scope import mux_profile_scope
+
+    full = {
+        "ZET_CHAT_APPEND_URL": "http://127.0.0.1:9420/api/v1/internal/chat/append",
+        "ZETTLAB_AGENT_ACTION_TOKEN": "profile-token",
+    }
+    with mux_profile_scope(monkeypatch, full):
+        assert _check_list_my_channels() is True
+    for missing in full:
+        with mux_profile_scope(monkeypatch, {**full, missing: ""}):
+            assert _check_list_my_channels() is False, f"gate stayed open without {missing}"
+
+
 def test_profile_scope_flow_works_with_poisoned_environ(monkeypatch):
     """Shared gateway mode: values live only in the profile secret scope while
     os.environ holds another profile's stale decoys — the tool must build its
