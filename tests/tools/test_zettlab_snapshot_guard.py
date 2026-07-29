@@ -211,7 +211,7 @@ def test_created_tracking_is_bounded(monkeypatch, tmp_path):
         guard.maybe_require_snapshot(
             "write_file", {"path": str(tmp_path / f"f{i}.txt")}, turn_id="turn_1"
         )
-    state = guard._state
+    state = guard._states.get("turn_1")
     assert state is not None
     assert len(state.created) <= limit
     assert state.created_overflowed is True
@@ -352,6 +352,124 @@ def test_block_logging_records_outcome_without_leaking_paths(monkeypatch, tmp_pa
     assert "duration_ms=" in logged
     assert secret_name not in logged
     assert str(tmp_path) not in logged
+
+
+def test_missing_turn_id_passes_through_outside_device_env(monkeypatch, tmp_path):
+    """非设备环境的嵌套 dispatch / MCP bridge 不带 turn_id，也绝不能被挡。"""
+    monkeypatch.delenv("ZET_CHAT_APPEND_URL", raising=False)
+    monkeypatch.delenv("ZETTLAB_AGENT_SHARE_ACTION_URL", raising=False)
+    rec = _install(monkeypatch)
+    target = tmp_path / "a.txt"
+    target.write_text("x")
+
+    assert guard.maybe_require_snapshot("write_file", {"path": str(target)}, turn_id="") is None
+    assert rec.requests == []
+
+
+def test_nested_dispatch_inherits_turn_via_task(monkeypatch, tmp_path):
+    """execute_code 沙箱 RPC 二次进入时只带 task_id：凭映射回落到外层轮。"""
+    rec = _install(monkeypatch)
+    nested = tmp_path / "nested.txt"
+    nested.write_text("y")
+
+    # 外层 execute_code dispatch 不设防，但会登记 task → turn。
+    assert guard.maybe_require_snapshot(
+        "execute_code", {"code": "print(1)"}, turn_id="turn_1", task_id="task_9"
+    ) is None
+    assert rec.requests == []
+
+    # 沙箱里 hermes_tools.write_file 回流：turn_id 为空、task_id 相同。
+    assert guard.maybe_require_snapshot(
+        "write_file", {"path": str(nested)}, turn_id="", task_id="task_9"
+    ) is None
+    assert len(rec.requests) == 1
+    assert rec.requests[0]["body"]["turnId"] == "turn_1"
+
+
+def test_non_loopback_callback_url_never_receives_token(monkeypatch, tmp_path):
+    """回调地址被注入成外部主机时，token 与路径一个字节都不能发出去。"""
+    monkeypatch.setenv("ZET_CHAT_APPEND_URL", "http://evil.example.com:9090/api/append")
+    monkeypatch.delenv("ZETTLAB_AGENT_SHARE_ACTION_URL", raising=False)
+    rec = _install(monkeypatch)
+    target = tmp_path / "a.txt"
+    target.write_text("x")
+
+    assert guard.maybe_require_snapshot("write_file", {"path": str(target)}, turn_id="turn_1") is None
+    assert rec.requests == []
+
+
+def test_concurrent_turns_are_tracked_and_finished_independently(monkeypatch, tmp_path):
+    """并发轮互不覆盖；finish 指名收自己的轮，不动别人的 pin。"""
+    rec = _install(monkeypatch)
+    a = tmp_path / "a.txt"
+    b = tmp_path / "b.txt"
+    a.write_text("x")
+    b.write_text("y")
+
+    guard.maybe_require_snapshot("write_file", {"path": str(a)}, turn_id="turn_a")
+    guard.maybe_require_snapshot("write_file", {"path": str(b)}, turn_id="turn_b")
+    assert len(rec.requests) == 2
+
+    guard.finish_turn("completed", turn_id="turn_a")
+    assert len(rec.requests) == 3
+    assert rec.requests[2]["body"]["turnId"] == "turn_a"
+
+    # turn_b 的状态不受影响，仍能正常收尾。
+    guard.finish_turn("failed", turn_id="turn_b")
+    assert len(rec.requests) == 4
+    assert rec.requests[3]["body"] == {
+        "turnId": "turn_b", "state": "failed", "errorCode": "", "errorStage": "",
+    }
+
+
+def test_ambiguous_finish_leaves_concurrent_turns_to_ttl(monkeypatch, tmp_path):
+    """多轮并发时不带 turn_id 的 finish 宁可不收——错收会提前解掉别人的 pin。"""
+    rec = _install(monkeypatch)
+    a = tmp_path / "a.txt"
+    b = tmp_path / "b.txt"
+    a.write_text("x")
+    b.write_text("y")
+    guard.maybe_require_snapshot("write_file", {"path": str(a)}, turn_id="turn_a")
+    guard.maybe_require_snapshot("write_file", {"path": str(b)}, turn_id="turn_b")
+
+    guard.finish_turn("completed")
+    assert len(rec.requests) == 2  # 没有 finish 请求发出
+
+    guard.finish_turn("completed", turn_id="turn_a")
+    guard.finish_turn("completed", turn_id="turn_b")
+    assert len(rec.requests) == 4
+
+
+def test_single_tracked_turn_finishes_without_explicit_id(monkeypatch, tmp_path):
+    """cron 拿不到 agent 实例时兜底：只剩一轮在跟踪就收它。"""
+    rec = _install(monkeypatch)
+    target = tmp_path / "a.txt"
+    target.write_text("x")
+    guard.maybe_require_snapshot("write_file", {"path": str(target)}, turn_id="turn_1")
+
+    guard.finish_turn("completed")
+    assert rec.requests[-1]["body"]["turnId"] == "turn_1"
+
+
+def test_write_paths_resolved_via_task_registry(monkeypatch, tmp_path):
+    """相对路径按 task 会话注册的 cwd 解析，与文件工具的实际落点一致。"""
+    file_tools = pytest.importorskip("tools.file_tools")
+    session_dir = tmp_path / "session-cwd"
+    session_dir.mkdir()
+    resolved = session_dir / "notes.md"
+    resolved.write_text("x")
+
+    def fake_resolver(path, task_id="default"):
+        assert task_id == "task_9"
+        return session_dir / path
+
+    monkeypatch.setattr(file_tools, "_resolve_path_for_task", fake_resolver)
+    rec = _install(monkeypatch)
+
+    guard.maybe_require_snapshot(
+        "write_file", {"path": "notes.md"}, turn_id="turn_1", task_id="task_9"
+    )
+    assert rec.requests[0]["body"]["paths"] == [str(resolved)]
 
 
 def test_env_is_read_through_secret_scope(monkeypatch, tmp_path):

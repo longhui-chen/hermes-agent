@@ -1307,7 +1307,10 @@ def handle_function_call(
             from tools.zettlab_snapshot_guard import maybe_require_snapshot
 
             snapshot_block = maybe_require_snapshot(
-                function_name, function_args, turn_id=turn_id or ""
+                function_name,
+                function_args,
+                turn_id=turn_id or "",
+                task_id=task_id or "",
             )
             if snapshot_block is not None:
                 return snapshot_block

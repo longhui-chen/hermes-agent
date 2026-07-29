@@ -2137,7 +2137,15 @@ class ZetAgentAdapter(APIServerAdapter):
 
                 from tools.zettlab_snapshot_guard import finish_turn
 
-                finish_turn("failed" if _sys.exc_info()[0] is not None else "completed")
+                # guard 按 agent 运行时的 _current_turn_id 键控轮状态（与工具
+                # dispatch 传下去的是同一个值）；并发轮时必须指名收自己的轮。
+                guard_turn = ""
+                if agent_ref and agent_ref[0] is not None:
+                    guard_turn = str(getattr(agent_ref[0], "_current_turn_id", "") or "")
+                finish_turn(
+                    "failed" if _sys.exc_info()[0] is not None else "completed",
+                    turn_id=guard_turn,
+                )
             except Exception:
                 logger.debug("[zet_agent] snapshot guard finish failed", exc_info=True)
             if old_session_key is None:

@@ -537,7 +537,17 @@ def install() -> None:
                             and len(run_result) > 0
                             and bool(run_result[0])
                         )
-                        finish_turn("completed" if succeeded else "failed")
+                        # 指名收本次 run 的轮（agent 运行时的 _current_turn_id）；
+                        # 拿不到时 guard 只在恰好只剩一轮时才收，避免错收并发轮。
+                        guard_turn = ""
+                        if attempt_agents:
+                            guard_turn = str(
+                                getattr(attempt_agents[-1], "_current_turn_id", "") or ""
+                            )
+                        finish_turn(
+                            "completed" if succeeded else "failed",
+                            turn_id=guard_turn,
+                        )
                     except Exception:
                         _dbg("snapshot guard finish failed")
                     # Success, terminal failure, or an exception: preserve the

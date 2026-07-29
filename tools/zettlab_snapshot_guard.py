@@ -10,13 +10,18 @@
   全部由 local-server 按真实文件状态复核。这里只负责把涉及的绝对路径报上去。
 * **一轮任务 × 一个主文件夹最多一张快照**，同轮复用。轮标识取 tool 调度层传下来
   的 ``turn_id``（chat 与 cron 都有值），服务端按 agent × turn × target 幂等。
+* **轮状态按 turn_id 键控**（上限 8 个并发轮）：同一 gateway 进程里多轮并发时
+  互不覆盖，finish 只收自己的轮；溢出被逐出的轮由服务端 pin TTL 自愈。
+* **嵌套 dispatch 的轮继承**：execute_code 沙箱 RPC / MCP bridge 二次进入
+  ``handle_function_call`` 时不带 ``turn_id``，靠 task_id → turn_id 映射回落到
+  外层轮；映射在每次带 turn 的 dispatch 时登记。
 * **同轮自建文件豁免**：本轮由 Agent 自己创建的文件，其后续修改不再触发快照——
   它的原始状态就是「不存在」，恢复手段是删掉。集合有上限，溢出即回退到正常拍
   快照。
 * **老设备降级**：local-server 上没有这个接口（404）时放行并记一次日志，不假装
-  已经建过快照。
+  已经建过快照。非设备环境（无回调地址 / token）完全不介入。
 * 通道是 loopback + registry 注入的 per-agent action token，URL 从既有的回调地址
-  派生，不新引任何环境变量。
+  派生，且**只信任 loopback origin**——非 loopback 的回调地址一律不发 token。
 
 跨仓合同见 zettlab-local-server ``docs/agent-file-protection-internal-api.md``。
 """
@@ -54,6 +59,12 @@ _MAX_RESPONSE_BYTES = 256 * 1024
 # 宁可多拍，也不让这个集合无界增长。
 _MAX_CREATED_TRACKED = 512
 
+# 同时追踪的轮状态上限。溢出逐出最老的轮：它的 finish 变成 no-op，pin 由服务端
+# TTL + 周期自愈释放——退化方向是「晚一点解 pin」，不是丢保护。
+_MAX_TRACKED_TURNS = 8
+
+# task_id → turn_id 映射的上限（嵌套 dispatch 的轮继承用）。
+_MAX_TASK_TURNS = 64
 
 
 # 需要保护的工具。execute_code 沙箱里的 hermes_tools.write_file 也回流到
@@ -63,7 +74,7 @@ _GUARDED_TOOLS = _FILE_MUTATING_TOOLS | {"terminal"}
 
 
 class _TurnState:
-    """当前这一轮的追踪状态。turn 变了就整体丢弃。"""
+    """一轮任务的追踪状态。"""
 
     def __init__(self, turn_id: str) -> None:
         self.turn_id = turn_id
@@ -73,8 +84,14 @@ class _TurnState:
 
 
 _lock = threading.Lock()
-_state: Optional[_TurnState] = None
+# 轮状态按 turn_id 键控（插入序），并发轮互不覆盖（Codex review P1）。
+_states: dict[str, _TurnState] = {}
+# task_id → turn_id：嵌套 dispatch（execute_code 沙箱 RPC / MCP bridge）不带
+# turn_id，凭它们携带的 task_id 回落到外层轮（Codex review P1）。
+_task_turns: dict[str, str] = {}
 _degraded_logged = False
+_nonloopback_logged = False
+
 
 def _scoped_env(name: str, default: str = "") -> str:
     """读环境变量。multiplex 下必须走 profile scope，否则会串到别的 agent。"""
@@ -96,7 +113,21 @@ def _scoped_env(name: str, default: str = "") -> str:
     return os.environ.get(name, default)
 
 
+def _is_loopback_host(host: Optional[str]) -> bool:
+    if not host:
+        return False
+    h = host.strip("[]").lower()
+    return h == "localhost" or h == "::1" or h.startswith("127.")
+
+
 def _local_server_origin() -> str:
+    """从注入的回调地址派生 local-server origin，只信任 loopback。
+
+    action token 和待保护路径会随请求发往这个 origin：如果环境变量被注入 / 残留
+    了非 loopback 地址，第一次写文件就会把 token 泄漏出去，所以这里必须显式校验
+    host（Codex review P1）。校验不过按「非设备环境」处置。
+    """
+    global _nonloopback_logged
     for env_key in _ORIGIN_ANCHOR_ENVS:
         raw = _scoped_env(env_key, "").strip()
         if not raw:
@@ -104,6 +135,15 @@ def _local_server_origin() -> str:
         parts = urlsplit(raw)
         if not parts.scheme or not parts.netloc:
             logger.debug("zettlab snapshot guard: malformed %s: %r", env_key, raw)
+            continue
+        if parts.scheme not in ("http", "https") or not _is_loopback_host(parts.hostname):
+            if not _nonloopback_logged:
+                _nonloopback_logged = True
+                logger.warning(
+                    "zettlab snapshot guard: %s is not a loopback URL; "
+                    "refusing to send the action token there",
+                    env_key,
+                )
             continue
         return urlunsplit((parts.scheme, parts.netloc, "", "", "")).rstrip("/")
     return ""
@@ -121,6 +161,27 @@ def _abs_path(path: Any) -> str:
     return os.path.normpath(expanded)
 
 
+def _resolve_write_path(path: Any, task_id: str) -> str:
+    """解析 write_file / patch 的目标路径，与文件工具自己的口径对齐。
+
+    实际写入按 task_id 走 ``tools.file_tools._resolve_path_for_task``（会话注册
+    的 cwd 优先于进程 env）；guard 若用进程级 cwd 解析相对路径，会给错误目录拍
+    快照而真正被写的文件没有恢复点（Codex review P1）。没有 task_id 或解析器不
+    可用时退回进程级解析。
+    """
+    raw = str(path or "").strip()
+    if not raw:
+        return ""
+    if task_id:
+        try:
+            from tools.file_tools import _resolve_path_for_task
+
+            return os.path.normpath(str(_resolve_path_for_task(raw, task_id)))
+        except Exception:
+            pass
+    return _abs_path(raw)
+
+
 def _terminal_workdir(arguments: dict[str, Any]) -> str:
     """破坏性 shell 命令报工作目录而不是解析命令行里的路径。
 
@@ -130,15 +191,15 @@ def _terminal_workdir(arguments: dict[str, Any]) -> str:
     return _abs_path(arguments.get("workdir") or os.getenv("TERMINAL_CWD") or os.getcwd())
 
 
-def _paths_for(tool_name: str, arguments: dict[str, Any]) -> list[str]:
+def _paths_for(tool_name: str, arguments: dict[str, Any], task_id: str) -> list[str]:
     """列出这次调用可能改动的绝对路径；返回空表示不需要保护。"""
     if tool_name == "write_file":
-        return [p for p in (_abs_path(arguments.get("path")),) if p]
+        return [p for p in (_resolve_write_path(arguments.get("path"), task_id),) if p]
 
     if tool_name == "patch":
         mode = str(arguments.get("mode") or "replace").strip()
         if mode == "replace":
-            return [p for p in (_abs_path(arguments.get("path")),) if p]
+            return [p for p in (_resolve_write_path(arguments.get("path"), task_id),) if p]
         # V4A patch 是唯一能触发删除 / 移动的模型路径，一次可能涉及多个文件。
         try:
             from acp_adapter.edit_approval import _extract_v4a_patch_paths
@@ -148,7 +209,7 @@ def _paths_for(tool_name: str, arguments: dict[str, Any]) -> list[str]:
             logger.debug("zettlab snapshot guard: V4A path extraction failed: %s", exc)
             # 抽不出路径不等于安全：退回工作目录，让整个主文件夹进保护。
             return [_terminal_workdir(arguments)]
-        resolved = [_abs_path(p) for p in raw_paths]
+        resolved = [_resolve_write_path(p, task_id) for p in raw_paths]
         return [p for p in resolved if p] or [_terminal_workdir(arguments)]
 
     if tool_name == "terminal":
@@ -240,11 +301,30 @@ def _blocked(message: str, *, outcome: str = "unknown", tool: str = "", started:
     return json.dumps({"error": message}, ensure_ascii=False)
 
 
-def _reset_turn_locked(turn_id: str) -> _TurnState:
-    global _state
-    if _state is None or _state.turn_id != turn_id:
-        _state = _TurnState(turn_id)
-    return _state
+def _note_task_turn_locked(task_id: str, turn_id: str) -> None:
+    """登记 task → turn 映射（调用方须持锁）。有上限，溢出逐出最老的。"""
+    if _task_turns.get(task_id) == turn_id:
+        return
+    _task_turns.pop(task_id, None)
+    while len(_task_turns) >= _MAX_TASK_TURNS:
+        _task_turns.pop(next(iter(_task_turns)), None)
+    _task_turns[task_id] = turn_id
+
+
+def _state_for_locked(turn_id: str) -> _TurnState:
+    """取（或建）该轮的状态（调用方须持锁）。溢出逐出最老的轮。"""
+    state = _states.get(turn_id)
+    if state is None:
+        while len(_states) >= _MAX_TRACKED_TURNS:
+            evicted = next(iter(_states))
+            _states.pop(evicted, None)
+            logger.info(
+                "zettlab snapshot guard: evicted turn state over the cap; "
+                "its pin will be released by the server-side TTL"
+            )
+        state = _TurnState(turn_id)
+        _states[turn_id] = state
+    return state
 
 
 def maybe_require_snapshot(
@@ -252,24 +332,41 @@ def maybe_require_snapshot(
     arguments: dict[str, Any],
     *,
     turn_id: str = "",
+    task_id: str = "",
 ) -> Optional[str]:
     """破坏性文件操作前确保保护快照就绪。
 
     返回 ``None`` 表示放行；返回 JSON 错误字符串表示**不要执行这次操作**，该字符
-    串会作为工具结果回给模型。任何不确定的情况一律阻断（fail-closed）：没有恢复
-    点就动用户文件，是这套机制唯一不能接受的失败方式。
+    串会作为工具结果回给模型。设备环境里任何不确定的情况一律阻断（fail-closed）：
+    没有恢复点就动用户文件，是这套机制唯一不能接受的失败方式。
     """
     global _degraded_logged
+
+    turn = str(turn_id or "").strip()
+    task = str(task_id or "").strip()
+    # 每次带 turn 的 dispatch 都登记 task → turn（包括不设防的 execute_code）：
+    # 它孵化的沙箱 RPC 二次进入时只带 task_id，凭这里的映射回落到外层轮。
+    if turn and task:
+        with _lock:
+            _note_task_turn_locked(task, turn)
 
     if tool_name not in _GUARDED_TOOLS:
         return None
 
-    paths = _paths_for(tool_name, arguments)
+    paths = _paths_for(tool_name, arguments, task)
     if not paths:
         return None
 
+    # 设备环境判定先于一切：非设备环境（CLI / 单测 / 未注入回调与 token 的部署）
+    # 完全不介入，嵌套 dispatch 与 MCP bridge 不该在这里被 turn 契约挡住
+    # （Codex review P1）。
+    if not _local_server_origin() or not _scoped_env(_ACTION_TOKEN_ENV, "").strip():
+        return None
+
     started = time.monotonic()
-    turn = str(turn_id or "").strip()
+    if not turn and task:
+        with _lock:
+            turn = _task_turns.get(task, "")
     if not turn:
         # 没有轮标识就无法做幂等，会把每次写入都变成一张新快照。这属于调度层
         # 契约被破坏，放行比拍一堆快照更糟，所以阻断。
@@ -279,7 +376,7 @@ def maybe_require_snapshot(
         )
 
     with _lock:
-        state = _reset_turn_locked(turn)
+        state = _state_for_locked(turn)
         # 本轮自己创建的文件，后续修改不再触发快照。
         if tool_name in _FILE_MUTATING_TOOLS and not state.created_overflowed:
             remaining = [p for p in paths if p not in state.created]
@@ -325,7 +422,7 @@ def maybe_require_snapshot(
     _log_unprotected(data, tool_name)
 
     with _lock:
-        state = _reset_turn_locked(turn)
+        state = _state_for_locked(turn)
         state.ensured = True
         if tool_name in _FILE_MUTATING_TOOLS:
             for p in pending_new:
@@ -365,16 +462,37 @@ def _log_unprotected(data: dict, tool_name: str) -> None:
     )
 
 
-def finish_turn(state: str = "completed", *, error_code: str = "", error_stage: str = "") -> None:
-    """一轮任务收尾：上报终态并解除保护快照的 pin。
+def finish_turn(
+    state: str = "completed",
+    *,
+    turn_id: str = "",
+    error_code: str = "",
+    error_stage: str = "",
+) -> None:
+    """一轮任务收尾：上报终态并解除该轮保护快照的 pin。
 
-    本轮没发生过保护快照时是纯 no-op（不发任何请求）。上报失败只记日志：服务端
-    的 pin 有 TTL，且有周期性自愈兜底，不能因为收尾失败就影响这一轮的结果。
+    ``turn_id`` 指明收哪一轮（agent 的 ``_current_turn_id``）。不给或对不上时，
+    只有恰好只剩一轮在跟踪才收它；多轮并发时宁可不收——错收别人的轮会提前解掉
+    还在写的那轮的 pin（Codex review P1），而不收的代价只是等服务端 TTL 自愈。
+    本轮没发生过保护快照时是纯 no-op（不发任何请求）。上报失败只记日志。
     """
-    global _state
+    turn = str(turn_id or "").strip()
     with _lock:
-        current = _state
-        _state = None
+        current: Optional[_TurnState] = None
+        if turn:
+            current = _states.pop(turn, None)
+            if current is None and len(_states) == 1:
+                # zet 层的轮标识与 agent 运行时生成的可能不一致：唯一在跟踪的
+                # 那一轮就是本轮。
+                _, current = _states.popitem()
+        elif len(_states) == 1:
+            _, current = _states.popitem()
+        elif _states:
+            logger.info(
+                "zettlab snapshot guard: ambiguous finish for %d concurrent turn(s); "
+                "leaving their pins to the server-side TTL",
+                len(_states),
+            )
     if current is None or not current.ensured:
         return
 
@@ -392,7 +510,9 @@ def finish_turn(state: str = "completed", *, error_code: str = "", error_stage: 
 
 def reset_for_test() -> None:
     """测试钩子：丢弃进程内的轮状态。"""
-    global _state, _degraded_logged
+    global _degraded_logged, _nonloopback_logged
     with _lock:
-        _state = None
+        _states.clear()
+        _task_turns.clear()
         _degraded_logged = False
+        _nonloopback_logged = False
