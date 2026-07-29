@@ -269,11 +269,15 @@ def test_default_timeout_on_other_actions(monkeypatch):
 
 @pytest.mark.parametrize("bad_slug", ["", "a/b", "../up", "a b", "a?x=1", "a#f"])
 def test_bad_slug_rejected_without_http(monkeypatch, bad_slug):
+    # NOTE: a raising urlopen would be swallowed by the handler's generic
+    # network-error path and still yield ok=False — capture instead, and
+    # assert the request was never even attempted.
+    seen = {}
     with mux_profile_scope(monkeypatch, _scope()):
-        with patch("urllib.request.urlopen",
-                   side_effect=AssertionError("must not reach the network")):
+        with patch("urllib.request.urlopen", _capture_urlopen(seen)):
             out = json.loads(app_host_tool({"action": "delete", "slug": bad_slug}))
     assert out["ok"] is False
+    assert "req" not in seen, f"bad slug {bad_slug!r} reached the network"
 
 
 @pytest.mark.parametrize("action,args", [
@@ -285,11 +289,12 @@ def test_bad_slug_rejected_without_http(monkeypatch, bad_slug):
     ("lifecycle", {"slug": "app1", "lifecycle_action": "explode"}),
 ])
 def test_missing_required_params_rejected_without_http(monkeypatch, action, args):
+    seen = {}
     with mux_profile_scope(monkeypatch, _scope()):
-        with patch("urllib.request.urlopen",
-                   side_effect=AssertionError("must not reach the network")):
+        with patch("urllib.request.urlopen", _capture_urlopen(seen)):
             out = json.loads(app_host_tool({"action": action, **args}))
     assert out["ok"] is False
+    assert "req" not in seen, f"{action} with {args} reached the network"
 
 
 def test_schema_actions_match_handler():
