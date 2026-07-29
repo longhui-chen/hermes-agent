@@ -83,10 +83,31 @@ _GUARDED_TOOLS = _FILE_MUTATING_TOOLS | {"terminal", "execute_code"}
 _V4A_FILE_RE = re.compile(r"^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$", re.MULTILINE)
 _V4A_MOVE_RE = re.compile(r"^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$", re.MULTILINE)
 
-# terminal 破坏性分类的 guard 侧补充：共享的 _is_destructive_command 只认覆盖
-# 重定向（单个 >），追加写入（>>、tee）同样修改已有用户文件，必须触发保护
-# （Codex review P1）。方向是宁可多拍——误判只多一张快照，漏判丢恢复点。
-_APPEND_WRITE_RE = re.compile(r">>|\btee\b")
+# terminal 的保护判定是**只读安全清单**而不是破坏性黑名单：`python -c`、
+# `git apply`、`tar -xf`、`unzip -o` 这类写文件的命令数不胜数，黑名单永远列不
+# 全（Codex review P1）。无法证明只读的命令一律按 cwd 保护——同轮同 target
+# 幂等，多判的代价只是每轮多一张快照。
+_WRITEISH_SHELL_RE = re.compile(r">|<\(|\$\(|`|\btee\b")
+_SHELL_CHAIN_SPLIT_RE = re.compile(r"&&|\|\||;|\||\n")
+_ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_READONLY_FIRST_TOKENS = frozenset({
+    "ls", "cat", "grep", "rg", "egrep", "fgrep", "find", "head", "tail",
+    "less", "more", "wc", "pwd", "echo", "printf", "stat", "file", "which",
+    "type", "env", "printenv", "ps", "df", "du", "date", "whoami", "id",
+    "uname", "md5sum", "sha1sum", "sha256sum", "sort", "uniq", "cut", "tr",
+    "diff", "cmp", "readlink", "basename", "dirname", "hostname", "uptime",
+    "free", "tree", "realpath", "test", "true", "false", "sleep",
+})
+_READONLY_GIT_SUBCOMMANDS = frozenset({
+    "status", "log", "diff", "show", "branch", "remote", "rev-parse",
+    "describe", "shortlog", "blame", "ls-files",
+})
+
+# 命令文本里的绝对路径 token：cwd 之外的写入目标（rm /home/alice/... 或脚本里
+# 的 Path("/home/...").write_text）也要尽力保护（Codex review P1）。这些路径走
+# **附加** ensure：范围外（403）只跳过、不阻断——它们是 cwd 保护之外的加餐。
+_ABS_PATH_TOKEN_RE = re.compile(r"(?<![\w.-])/(?:[\w.+@%-]+/)*[\w.+@%-]+")
+_MAX_ANCILLARY_PATHS = 16
 
 
 class _TurnState:
@@ -216,22 +237,62 @@ def _terminal_workdir(arguments: dict[str, Any], task_id: str) -> str:
 
     cwd 的优先级与 terminal 的 _resolve_command_cwd 同源：显式 workdir 参数 >
     会话自己的 cwd 记录（get_session_cwd，即该会话的 `cd` 状态）> 进程 env。
-    多会话 gateway 里会话 cwd 与进程 env 不同时，报错目录会让真正被改的文件
-    失去恢复点（Codex review P1）。
+    每一级都要求目录在 host 上真实存在：Docker backend 挂载 cwd 时会话记录是
+    容器内的 `/workspace/...`，原样上报会让快照落在不存在的路径、真正被改的
+    host 目录失去恢复点（Codex review P1）——不存在就退回下一级。
     """
     explicit = str(arguments.get("workdir") or "").strip()
     if explicit:
-        return _abs_path(explicit)
+        p = _abs_path(explicit)
+        if os.path.isdir(p):
+            return p
     if task_id:
         try:
             from tools.terminal_tool import get_session_cwd
 
             recorded = get_session_cwd(task_id)
             if recorded:
-                return _abs_path(recorded)
+                p = _abs_path(recorded)
+                if os.path.isdir(p):
+                    return p
         except Exception:
             pass
     return _abs_path(os.getenv("TERMINAL_CWD") or os.getcwd())
+
+
+def _command_is_probably_readonly(command: str) -> bool:
+    """报告一条 shell 命令是否**可证明**只读。证明不了就按需要保护处理。"""
+    if not command.strip():
+        return True
+    if _WRITEISH_SHELL_RE.search(command):
+        return False
+    for segment in _SHELL_CHAIN_SPLIT_RE.split(command):
+        tokens = [t for t in segment.strip().split() if not _ENV_ASSIGN_RE.match(t)]
+        if not tokens:
+            continue
+        head = os.path.basename(tokens[0])
+        if head == "git":
+            if len(tokens) < 2 or tokens[1] not in _READONLY_GIT_SUBCOMMANDS:
+                return False
+            continue
+        if head not in _READONLY_FIRST_TOKENS:
+            return False
+    return True
+
+
+def _ancillary_abs_paths(text: str, primary: list[str]) -> list[str]:
+    """从命令 / 脚本文本里抽出**已存在**的绝对路径，作为 cwd 之外的附加保护。"""
+    out: list[str] = []
+    seen = set(primary)
+    for m in _ABS_PATH_TOKEN_RE.finditer(text or ""):
+        p = os.path.normpath(m.group(0))
+        if p in seen or not os.path.lexists(p):
+            continue
+        seen.add(p)
+        out.append(p)
+        if len(out) >= _MAX_ANCILLARY_PATHS:
+            break
+    return out
 
 
 def _execute_code_workdir(arguments: dict[str, Any], task_id: str) -> str:
@@ -286,14 +347,7 @@ def _paths_for(tool_name: str, arguments: dict[str, Any], task_id: str) -> list[
 
     if tool_name == "terminal":
         command = str(arguments.get("command") or "")
-        destructive = bool(_APPEND_WRITE_RE.search(command))
-        if not destructive:
-            try:
-                from agent.tool_dispatch_helpers import _is_destructive_command
-            except Exception:
-                return []
-            destructive = _is_destructive_command(command)
-        if not destructive:
+        if _command_is_probably_readonly(command):
             return []
         return [p for p in (_terminal_workdir(arguments, task_id),) if p]
 
@@ -301,6 +355,21 @@ def _paths_for(tool_name: str, arguments: dict[str, Any], task_id: str) -> list[
         return [p for p in (_execute_code_workdir(arguments, task_id),) if p]
 
     return []
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """拒绝跟随任何重定向。
+
+    urllib 默认会带着非 Content-* 的请求头（包括 action token）跟到 3xx 指向
+    的任意地址——loopback 端口被劫持或返回外部重定向时，token 会直接出设备
+    （Codex review P1）。3xx 一律按 HTTPError 走 fail-closed。
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirectHandler())
 
 
 def _post(path_suffix: str, payload: dict[str, Any], timeout: float) -> tuple[Optional[dict], str]:
@@ -326,7 +395,7 @@ def _post(path_suffix: str, payload: dict[str, Any], timeout: float) -> tuple[Op
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
             raw = resp.read(_MAX_RESPONSE_BYTES + 1)
         payload_out = json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as exc:
@@ -442,6 +511,18 @@ def maybe_require_snapshot(
         return None
 
     started = time.monotonic()
+
+    if tool_name == "terminal" and bool(arguments.get("background")):
+        # 后台破坏性命令会跑到 turn 结束、pin 释放之后，恢复点可能在写入完成前
+        # 就被清理；保护窗口对不上就不放行，让模型改用前台执行
+        # （Codex review P1）。
+        return _blocked(
+            "Background terminal commands that modify files are not covered by "
+            "protection snapshots. Re-run the command in the foreground "
+            "(background=false). The command was NOT executed.",
+            outcome="background_write", tool=tool_name, started=started,
+        )
+
     if not turn and task:
         with _lock:
             turn = _task_turns.get(task, "")
@@ -508,6 +589,24 @@ def maybe_require_snapshot(
                     state.created_overflowed = True
                     break
                 state.created.add(p)
+
+    # cwd 之外的绝对路径目标（`rm /home/...`、脚本里的 Path("/home/...")）走
+    # **附加** ensure：尽力给它们也建恢复点，但任何失败（含范围外 403）只记
+    # 日志不阻断——cwd 主保护已就绪，这是加餐；把 /tmp 一类范围外路径判成
+    # 硬拒绝反而会把整条命令误杀（Codex review P1）。
+    if tool_name in ("terminal", "execute_code"):
+        extras = _ancillary_abs_paths(
+            str(arguments.get("command") or arguments.get("code") or ""), paths)
+        if extras:
+            extra_data, extra_err = _post(
+                _ENSURE_PATH,
+                {"turnId": turn, "paths": extras, "title": _title_for(extras)},
+                _ENSURE_TIMEOUT,
+            )
+            if extra_err:
+                logger.info("zettlab snapshot guard: ancillary ensure skipped (%s)", extra_err)
+            elif isinstance(extra_data, dict):
+                _log_unprotected(extra_data, tool_name)
     return None
 
 

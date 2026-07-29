@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import io
 import json
+import types
 import urllib.error
 
 import pytest
@@ -57,7 +58,8 @@ def _device_env(monkeypatch, tmp_path):
 
 def _install(monkeypatch, *replies):
     rec = _Recorder(replies)
-    monkeypatch.setattr(guard.urllib.request, "urlopen", rec)
+    # 实现走禁用重定向的 _OPENER.open（不是裸 urlopen），mock 也挂在这一层。
+    monkeypatch.setattr(guard, "_OPENER", types.SimpleNamespace(open=rec))
     return rec
 
 

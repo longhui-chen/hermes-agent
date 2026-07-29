@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import types
 import urllib.error
 
 import pytest
@@ -56,7 +57,8 @@ def _device_env(monkeypatch, tmp_path):
 
 def _install(monkeypatch, *replies):
     rec = _Recorder(replies)
-    monkeypatch.setattr(guard.urllib.request, "urlopen", rec)
+    # 实现走禁用重定向的 _OPENER.open（不是裸 urlopen），mock 也挂在这一层。
+    monkeypatch.setattr(guard, "_OPENER", types.SimpleNamespace(open=rec))
     return rec
 
 
@@ -150,6 +152,9 @@ def test_unprotected_paths_are_allowed_and_logged(monkeypatch, tmp_path, caplog)
     "failure",
     [
         urllib.error.HTTPError("http://x", 500, "boom", {}, io.BytesIO(b"{}")),
+        # 重定向被 _NoRedirectHandler 拒绝后以 HTTPError 浮出——带 token 的请求
+        # 绝不跟去 3xx 指向的地址，fail-closed（Codex review P1）。
+        urllib.error.HTTPError("http://x", 302, "moved", {}, io.BytesIO(b"")),
         urllib.error.URLError("connection refused"),
         TimeoutError("timed out"),
     ],
@@ -598,3 +603,84 @@ def test_env_is_read_through_secret_scope(monkeypatch, tmp_path):
     guard.maybe_require_snapshot("write_file", {"path": str(target)}, turn_id="turn_1")
     assert "ZETTLAB_AGENT_ACTION_TOKEN" in seen
     assert len(rec.requests) == 1
+
+
+def test_terminal_defaults_to_protection_when_not_provably_readonly(monkeypatch, tmp_path):
+    """黑名单列不全会写文件的命令（python -c / git apply / tar / unzip…）：
+    证明不了只读就按 cwd 保护。"""
+    rec = _install(monkeypatch)
+    for cmd in (
+        "python -c \"open('x','w').write('1')\"",
+        "git apply change.patch",
+        "tar -xf archive.tar",
+        "unzip -o bundle.zip",
+    ):
+        guard.reset_for_test()
+        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
+    assert len(rec.requests) == 4
+
+
+def test_provably_readonly_commands_skip_protection(monkeypatch, tmp_path):
+    rec = _install(monkeypatch)
+    for cmd in ("ls -la", "cat a.txt | grep foo", "git status", "find . -name x"):
+        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
+    assert rec.requests == []
+
+
+def test_background_destructive_terminal_is_blocked(monkeypatch, tmp_path):
+    """后台破坏性命令会跑到 turn 结束、pin 释放之后：保护窗口对不上就不放行。"""
+    rec = _install(monkeypatch)
+    blocked = guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -rf data", "background": True}, turn_id="turn_1"
+    )
+    assert blocked is not None
+    assert "foreground" in json.loads(blocked)["error"]
+    assert rec.requests == []
+
+    # 只读后台命令不受影响。
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "ls -la", "background": True}, turn_id="turn_1"
+    ) is None
+    assert rec.requests == []
+
+
+def test_absolute_targets_outside_cwd_get_ancillary_protection(monkeypatch, tmp_path):
+    """命令里的绝对路径目标（rm /home/...）也要尽力保护，不只 cwd。"""
+    rec = _install(monkeypatch)
+    outside = tmp_path / "outside-cwd" / "photo.jpg"
+    outside.parent.mkdir()
+    outside.write_text("x")
+
+    guard.maybe_require_snapshot(
+        "terminal", {"command": f"rm -f {outside}"}, turn_id="turn_1"
+    )
+    assert len(rec.requests) == 2
+    assert rec.requests[0]["body"]["paths"] == [str(tmp_path)]
+    assert rec.requests[1]["body"]["paths"] == [str(outside)]
+
+
+def test_ancillary_ensure_failure_does_not_block(monkeypatch, tmp_path):
+    """附加保护是加餐：范围外 403 / 服务错误只跳过，不影响已就绪的 cwd 保护。"""
+    outside = tmp_path / "other" / "f.txt"
+    outside.parent.mkdir()
+    outside.write_text("x")
+    rec = _install(
+        monkeypatch,
+        {"ready": True, "operations": []},
+        urllib.error.HTTPError("http://x", 403, "scope", {}, io.BytesIO(b"{}")),
+    )
+
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": f"rm -f {outside}"}, turn_id="turn_1"
+    ) is None
+    assert len(rec.requests) == 2
+
+
+def test_nonexistent_workdir_falls_back_to_host_cwd(monkeypatch, tmp_path):
+    """Docker 容器路径（/workspace/...）在 host 上不存在：退回 host env cwd，
+    不能把快照拍到不存在的目录上。"""
+    rec = _install(monkeypatch)
+    guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -f x", "workdir": "/workspace/proj"}, turn_id="turn_1"
+    )
+    assert rec.requests[0]["body"]["paths"] == [str(tmp_path)]
