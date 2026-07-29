@@ -23,6 +23,9 @@ _URL_ENV = "ZETTLAB_BROWSER_ACTION_URL"
 _TOKEN_ENV = "ZETTLAB_AGENT_ACTION_TOKEN"
 _MAX_RESPONSE_BYTES = 8 << 20
 _TIMEOUT_SECONDS = 35
+# Availability probes gate tool advertisement, so they must stay snappy even
+# when local-server is wedged.
+_HOST_STATUS_TIMEOUT_SECONDS = 2
 
 
 @dataclass(frozen=True)
@@ -73,6 +76,51 @@ def _action_token() -> str:
 
 def is_managed_browser_configured() -> bool:
     return bool(_endpoint() and _action_token())
+
+
+def is_desktop_host_online() -> bool:
+    """Whether local-server currently has a PC Browser Host connected.
+
+    local-server injects the router endpoint whenever it runs, so
+    configuration alone must not advertise the browser tools. This probe sends
+    the lightweight ``host_status`` action, which the broker answers locally
+    (no PC round-trip, no session binding side effects) with
+    ``{"ok": true, "result": {"host_online": bool}}``. Anything else — network
+    error, non-200, or an older local-server that rejects the unknown action —
+    reads as offline so callers fall back to the Camofox/local checks.
+    """
+    endpoint = _endpoint()
+    token = _action_token()
+    session_id = _session_id()
+    if not endpoint or not token or not session_id:
+        return False
+    try:
+        with requests.Session() as client:
+            # Same loopback-only endpoint as route_browser_action; user proxy
+            # settings must never receive the per-agent action token.
+            client.trust_env = False
+            response = client.post(
+                endpoint,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Zettlab-Agent-Action-Token": token,
+                },
+                json={
+                    "session_id": session_id,
+                    "action": "host_status",
+                    "params": {},
+                },
+                timeout=_HOST_STATUS_TIMEOUT_SECONDS,
+            )
+        if response.status_code != 200:
+            return False
+        payload = response.json()
+    except Exception:
+        return False
+    if not isinstance(payload, dict) or payload.get("ok") is not True:
+        return False
+    result = payload.get("result")
+    return isinstance(result, dict) and result.get("host_online") is True
 
 
 def _session_id() -> str:

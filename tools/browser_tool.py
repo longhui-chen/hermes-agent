@@ -150,10 +150,12 @@ except ImportError:
 
 try:
     from tools.browser_backend_router import (
+        is_desktop_host_online as _is_desktop_host_online,
         is_managed_browser_configured as _is_managed_browser_configured,
         route_browser_action as _route_browser_action,
     )
 except ImportError:
+    _is_desktop_host_online = lambda: False  # noqa: E731
     _is_managed_browser_configured = lambda: False  # noqa: E731
     _route_browser_action = lambda _action, _params=None: None  # noqa: E731
 
@@ -4905,9 +4907,12 @@ def check_browser_requirements() -> bool:
         True if all requirements are met, False otherwise
     """
     # The managed browser router is provided by local-server and needs no
-    # browser binary inside Hermes. It selects Electron or device-side Camofox
-    # once for each Zettlab session.
-    if _is_managed_browser_configured():
+    # browser binary inside Hermes. But local-server injects the router
+    # endpoint whenever it runs, so configuration alone proves nothing about a
+    # usable backend. Desktop only counts as available while a PC Browser Host
+    # is actually connected (``host_status`` probe); otherwise fall through to
+    # the Camofox/local checks below.
+    if _is_managed_browser_configured() and _is_desktop_host_online():
         return True
 
     # Camofox backend — only needs the server URL, no agent-browser CLI

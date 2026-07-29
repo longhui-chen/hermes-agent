@@ -1,7 +1,9 @@
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
+import requests
 
 from agent import secret_scope
 from gateway.session_context import clear_session_vars, set_session_vars
@@ -245,3 +247,85 @@ def test_multiplex_config_uses_active_profile_secret_scope(monkeypatch):
 def test_router_rejects_untrusted_action_endpoint(monkeypatch, url):
     monkeypatch.setenv("ZETTLAB_BROWSER_ACTION_URL", url)
     assert router.is_managed_browser_configured() is False
+
+
+def test_session_id_falls_back_to_process_env_on_import_failure(monkeypatch):
+    monkeypatch.setitem(sys.modules, "gateway.session_context", None)
+    monkeypatch.setenv("HERMES_SESSION_KEY", "zettlab:alice:agent-1:chat-9")
+    assert router._session_id() == "zettlab:alice:agent-1:chat-9"
+
+
+def test_session_id_falls_back_to_process_env_when_session_context_raises(monkeypatch):
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("session context unavailable")
+
+    monkeypatch.setattr("gateway.session_context.get_session_env", boom)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_ID", "zettlab:alice:agent-1:chat-9")
+    assert router._session_id() == "zettlab:alice:agent-1:chat-9"
+
+
+def _deny_local_browser(monkeypatch):
+    """Pin every non-desktop availability source to unavailable."""
+
+    def missing(*_args, **_kwargs):
+        raise FileNotFoundError("agent-browser not installed")
+
+    monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: False)
+    monkeypatch.setattr(browser_tool, "_get_cdp_override", lambda: None)
+    monkeypatch.setattr(browser_tool, "_find_agent_browser", missing)
+
+
+def test_check_browser_requirements_probes_host_status(monkeypatch):
+    seen = {}
+
+    def post(url, **kwargs):
+        seen.update(url=url, **kwargs)
+        return FakeResponse(200, {"ok": True, "result": {"host_online": True}})
+
+    patch_post(monkeypatch, post)
+    _deny_local_browser(monkeypatch)
+    assert browser_tool.check_browser_requirements() is True
+    assert seen["json"] == {
+        "session_id": "zettlab:alice:agent-1:chat-1",
+        "action": "host_status",
+        "params": {},
+    }
+    assert seen["headers"]["X-Zettlab-Agent-Action-Token"] == "agent-token"
+    assert seen["timeout"] <= 2
+
+
+def _probe_network_error(_url, **_kwargs):
+    raise requests.RequestException("router unreachable")
+
+
+@pytest.mark.parametrize(
+    "post",
+    [
+        pytest.param(
+            lambda _url, **_kwargs: FakeResponse(
+                200, {"ok": True, "result": {"host_online": False}}
+            ),
+            id="host-offline",
+        ),
+        pytest.param(_probe_network_error, id="probe-network-error"),
+        pytest.param(
+            lambda _url, **_kwargs: FakeResponse(
+                404, {"success": False, "error": "unknown action: host_status"}
+            ),
+            id="legacy-ls-unknown-action",
+        ),
+        pytest.param(
+            lambda _url, **_kwargs: FakeResponse(200, {"success": True, "backend": "desktop"}),
+            id="legacy-ls-no-ok-envelope",
+        ),
+    ],
+)
+def test_check_browser_requirements_falls_back_without_live_host(monkeypatch, post):
+    patch_post(monkeypatch, post)
+    _deny_local_browser(monkeypatch)
+    # Desktop configuration alone must not advertise the browser tools…
+    assert browser_tool.check_browser_requirements() is False
+    # …while the existing Camofox check still applies unchanged.
+    monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: True)
+    assert browser_tool.check_browser_requirements() is True
