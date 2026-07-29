@@ -759,6 +759,44 @@ def test_response_cap_exceeds_server_logs_cap(monkeypatch):
     assert out["data"]["total_chars"] == len(big_log)
 
 
+# --- delegated children never inherit device-state verbs ---------------------
+
+def test_delegated_children_never_get_app_host(monkeypatch):
+    """Delegated workers propagate the parent's secret scope, so without a
+    block an anonymous child could install/delete/restart device applications
+    with the parent's action token. Real path, with a control: the SAME
+    enabled set and credentials expose app_host to the parent, and the
+    child-assembly deny toolsets strip exactly it — proving the absence below
+    is the blocklist's doing, not a closed gate."""
+    import model_tools
+    from hermes_cli.tools_config import _get_platform_tools
+    from tools.delegate_tool import DELEGATE_BLOCKED_TOOLS, _blocked_toolsets_for_role
+
+    assert "app_host" in DELEGATE_BLOCKED_TOOLS  # structural aid, not the proof
+
+    device_config = {"platform_toolsets": {"zet_agent": ["hermes-zet-agent", "cronjob"]}}
+    enabled = sorted(_get_platform_tools(
+        device_config, "zet_agent", include_default_mcp_servers=False
+    ))
+    with mux_profile_scope(monkeypatch, _scope()):
+        parent_names = {
+            d["function"]["name"]
+            for d in model_tools.get_tool_definitions(
+                enabled_toolsets=enabled, quiet_mode=True
+            )
+        }
+        child_names = {
+            d["function"]["name"]
+            for d in model_tools.get_tool_definitions(
+                enabled_toolsets=enabled,
+                disabled_toolsets=_blocked_toolsets_for_role("worker"),
+                quiet_mode=True,
+            )
+        }
+    assert "app_host" in parent_names  # control: reachable before the block
+    assert "app_host" not in child_names
+
+
 # --- results are attacker-influenced data ------------------------------------
 
 def test_app_host_results_are_marked_untrusted():

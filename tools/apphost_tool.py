@@ -51,26 +51,12 @@ _DEFAULT_LOG_TAIL = 200
 _MAX_STAGING_DIR_CHARS = 1024
 _SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
-class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
-    """Refuse to follow ANY redirect. The loopback check constrains only the
-    FIRST hop; following a 3xx would replay the action token against whatever
-    target the Location header names. The upstream is this machine's own
-    server and never legitimately redirects, so a 3xx is an anomaly: returning
-    None here makes urllib raise the original 3xx as an HTTPError, which the
-    handler reports as transport_error."""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
-
-
-# Loopback call carrying the agent action token: never route via environment
-# proxies, never follow redirects. HTTP_PROXY/ALL_PROXY (when NO_PROXY doesn't
-# cover loopback) would forward the request — credential included — to
-# whatever host the proxy points at, and a followed redirect would do the same
-# one hop later. Validating the URL is not enough; the transport itself must
-# refuse both (proxy rationale shared with tools/browser_camofox.py).
-_NO_PROXY_OPENER = urllib.request.build_opener(
-    urllib.request.ProxyHandler({}), _RefuseRedirect()
+# Credentialed loopback transport (no env proxies, no redirects) — shared
+# with the other action-token call sites via tools.loopback_transport; the
+# local alias keeps this module's patch point stable.
+from tools.loopback_transport import (  # noqa: E402
+    HARDENED_OPENER as _NO_PROXY_OPENER,
+    is_trusted_loopback_http as _is_trusted_loopback_http,
 )
 
 
@@ -152,29 +138,12 @@ def _secret(name):
     return str(get_secret(name, "") or "").strip()
 
 
-def _is_trusted_apphost_endpoint(parts):
-    """Whether the split URL is the loopback internal face this credential
-    belongs to. Mirrors browser_camofox._is_trusted_action_token_endpoint:
-    the internal face is plain HTTP on loopback only, so anything else means
-    the value was repointed somewhere the action token must not go — fail
-    closed rather than hand the credential to whoever answers."""
-    if parts.scheme != "http":
-        return False
-    host = (parts.hostname or "").strip().lower()
-    if host == "localhost":
-        return True
-    # Must be a literal loopback address. A prefix test would accept names
-    # like `127.attacker.example`, which resolve wherever their owner points.
-    import ipaddress
-
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
 def _base_url():
-    """Validated App Host base URL from the profile secret scope, or None."""
+    """Validated App Host base URL from the profile secret scope, or None.
+
+    The internal face is plain HTTP on loopback only; anything else means the
+    value was repointed somewhere the action token must not go — fail closed
+    rather than hand the credential to whoever answers."""
     raw = _secret("ZET_APPHOST_BASE_URL")
     if not raw:
         return None
@@ -182,7 +151,7 @@ def _base_url():
         parts = urlsplit(raw)
     except ValueError:
         return None
-    if not parts.netloc or not _is_trusted_apphost_endpoint(parts):
+    if not parts.netloc or not _is_trusted_loopback_http(parts):
         return None
     return raw.rstrip("/")
 

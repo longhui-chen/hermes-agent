@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, ClassVar
 from pathlib import Path
 from agent.secret_scope import get_secret
+from tools.loopback_transport import is_trusted_loopback_http, urlopen_hardened
 from tools.binary_extensions import BINARY_EXTENSIONS
 from gateway.session_context import set_zettlab_turn_id, zettlab_turn_id
 
@@ -2098,6 +2099,10 @@ class ShellFileOperations(FileOperations):
         parts = urlsplit(raw)
         if not parts.scheme or not parts.netloc:
             return None
+        # The request below carries the action token: refuse anything that is
+        # not the plain-http loopback face the credential belongs to.
+        if not is_trusted_loopback_http(parts):
+            return None
         return urlunsplit((parts.scheme, parts.netloc, "/api/v1/file/index/agent-search", "", ""))
 
     @staticmethod
@@ -2149,7 +2154,7 @@ class ShellFileOperations(FileOperations):
             headers=headers,
         )
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urlopen_hardened(req, timeout=10) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             # Parse inside the try so any malformed reply (non-dict payload,
             # non-dict items, non-numeric total_count) degrades to None rather
