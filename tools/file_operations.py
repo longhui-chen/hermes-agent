@@ -35,6 +35,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, ClassVar
 from pathlib import Path
+from agent.secret_scope import get_secret
 from tools.binary_extensions import BINARY_EXTENSIONS
 from gateway.session_context import set_zettlab_turn_id, zettlab_turn_id
 
@@ -2070,7 +2071,7 @@ class ShellFileOperations(FileOperations):
         # also has total_count == 0, but routing it to NAS would mask the real
         # error behind an unrelated NAS hit — surface the workspace error.
         if (result.total_count == 0 and not result.error
-                and os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN")):
+                and get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "")):
             nas = self._zettlab_nas_fallback(pattern, limit)
             if nas is not None and nas.total_count > 0:
                 return nas
@@ -2086,9 +2087,12 @@ class ShellFileOperations(FileOperations):
         send_channel_message. Deriving from the registry-injected URL (instead of
         a standalone ZETTLAB_LOCAL_SERVER_URL env) keeps the per-agent action
         token loopback-only: a stale/hostile env can no longer redirect it to an
-        external host. Returns None when the env var is absent or malformed.
+        external host. Resolved via the profile secret scope (get_secret) so
+        the shared multiplexing gateway — where the value lives in the profile
+        ``.env``, not the process env — works too. Returns None when absent or
+        malformed.
         """
-        raw = os.environ.get("ZET_CHAT_APPEND_URL", "").strip()
+        raw = str(get_secret("ZET_CHAT_APPEND_URL", "") or "").strip()
         if not raw:
             return None
         parts = urlsplit(raw)
@@ -2112,7 +2116,7 @@ class ShellFileOperations(FileOperations):
         would (a) be misread as content matches and (b) duplicate the cards the
         user already sees.
         """
-        token = os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN")
+        token = str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "")
         query = (pattern or "").strip()
         url = self._zettlab_agent_search_url()
         if not token or not query or not url:

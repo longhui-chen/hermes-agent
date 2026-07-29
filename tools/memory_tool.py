@@ -40,6 +40,7 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional
 
+from agent.secret_scope import get_secret
 from utils import atomic_replace
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
@@ -2638,11 +2639,18 @@ _LATIN_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_'-]*")
 
 
 def _zettlab_user_profile_language_enabled() -> bool:
-    """True in the Zettlab per-agent gateway runtime."""
-    enabled = os.getenv("ZET_AGENT_ENABLED", "").strip().lower()
+    """True in the Zettlab per-agent gateway runtime.
+
+    Resolved via the profile secret scope (get_secret) so the shared
+    multiplexing gateway — where these values live in the profile ``.env``,
+    not the process env — is detected too.
+    """
+    enabled = str(get_secret("ZET_AGENT_ENABLED", "") or "").strip().lower()
     if enabled in {"1", "true", "yes", "on"}:
         return True
-    return bool(os.getenv("ZET_AGENT_ID") or os.getenv("ZETTLAB_AGENT_ACTION_TOKEN"))
+    return bool(
+        get_secret("ZET_AGENT_ID", "") or get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "")
+    )
 
 
 def _validate_user_profile_language(target: str, content: str) -> Optional[str]:

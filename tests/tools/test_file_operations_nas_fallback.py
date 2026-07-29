@@ -182,6 +182,49 @@ def test_fallback_no_callback_url_returns_none(monkeypatch, file_ops):
         assert file_ops._zettlab_nas_fallback("q", 50) is None
 
 
+# --- shared-gateway profile scope flow ---------------------------------------
+
+def test_profile_scope_flow_fallback_works_with_poisoned_environ(monkeypatch, file_ops):
+    """Shared gateway mode: token + callback URL live only in the profile
+    secret scope while os.environ holds another profile's stale decoys — the
+    NAS request must be built entirely from the scope."""
+    from tests.tools._profile_scope import mux_profile_scope, request_fingerprint
+
+    scope = {
+        "ZET_CHAT_APPEND_URL": "http://127.0.0.1:9420/api/v1/internal/chat/append",
+        "ZETTLAB_AGENT_ACTION_TOKEN": "profile-token",
+    }
+    captured = {}
+    payload = {"data": {"items": [{"path": "/nas/a.pdf"}], "total_count": 1}}
+    with mux_profile_scope(monkeypatch, scope, poison_environ=True):
+        with patch("urllib.request.urlopen", _fake_urlopen(payload, captured)):
+            result = file_ops._zettlab_nas_fallback("report", 50)
+
+    assert result is not None and result.total_count == 1
+    req = captured["req"]
+    assert req.full_url == "http://127.0.0.1:9420/api/v1/file/index/agent-search"
+    assert req.headers.get("X-zettlab-agent-action-token") == scope["ZETTLAB_AGENT_ACTION_TOKEN"]
+    assert "stale-" not in request_fingerprint(req)
+
+
+def test_profile_scope_flow_search_gate_reads_scope(monkeypatch, file_ops):
+    """search() must decide 'is this a Zettlab device' from the profile scope,
+    not from os.environ (empty here)."""
+    from tests.tools._profile_scope import mux_profile_scope
+
+    scope = {
+        "ZET_CHAT_APPEND_URL": _APPEND_URL,
+        "ZETTLAB_AGENT_ACTION_TOKEN": "profile-token",
+    }
+    empty = SearchResult(total_count=0)
+    nas = SearchResult(total_count=3, note="cards rendered")
+    with mux_profile_scope(monkeypatch, scope):  # scope keys purged from env
+        with patch.object(file_ops, "_search_workspace", return_value=empty), \
+             patch.object(file_ops, "_zettlab_nas_fallback", return_value=nas):
+            out = file_ops.search("x")
+    assert out is nas
+
+
 # --- search() wrapper gating ------------------------------------------------
 
 def test_search_returns_workspace_hit_without_fallback(monkeypatch, file_ops):

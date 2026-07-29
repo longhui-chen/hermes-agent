@@ -63,3 +63,39 @@ def test_tool_errors_when_env_missing(monkeypatch):
     out = list_my_channels_tool({})
     assert isinstance(out, str)
     assert "error" in json.loads(out)
+
+
+def test_profile_scope_flow_works_with_poisoned_environ(monkeypatch):
+    """Shared gateway mode: values live only in the profile secret scope while
+    os.environ holds another profile's stale decoys — the tool must build its
+    request entirely from the scope."""
+    from tests.tools._profile_scope import mux_profile_scope, request_fingerprint
+
+    scope = {
+        "ZET_CHAT_APPEND_URL": "http://127.0.0.1:9420/api/v1/internal/chat/append",
+        "ZETTLAB_AGENT_ACTION_TOKEN": "profile-token",
+    }
+    fake = {"code": 200, "data": {"installed_channels": [{"kind": "wechat"}]}}
+    seen = {}
+
+    class FakeResp:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return json.dumps(fake).encode("utf-8")
+
+    def fake_urlopen(req, timeout=None):
+        seen["req"] = req
+        return FakeResp()
+
+    with mux_profile_scope(monkeypatch, scope, poison_environ=True):
+        assert _check_list_my_channels() is True
+        with patch("urllib.request.urlopen", fake_urlopen):
+            out = list_my_channels_tool({})
+
+    parsed = json.loads(out)
+    assert parsed["installed_channels"][0]["kind"] == "wechat"
+    req = seen["req"]
+    assert req.full_url == "http://127.0.0.1:9420/api/v1/internal/agent/channels"
+    assert req.get_header("X-zettlab-agent-action-token") == scope["ZETTLAB_AGENT_ACTION_TOKEN"]
+    assert "stale-" not in request_fingerprint(req)
+    assert getattr(_check_list_my_channels, "_profile_scope_sensitive") is True
