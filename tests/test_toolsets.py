@@ -309,6 +309,20 @@ class TestZetAgentDeviceToolReachability:
     # The shipped device config for the zet_agent platform (verified live).
     _DEVICE_CONFIG = {"platform_toolsets": {"zet_agent": ["hermes-zet-agent", "cronjob"]}}
 
+    # Verbatim enabled-toolsets list dumped from a real device's gateway
+    # ([E2E_TOOLDUMP] instrumentation, 2026-07-30) — the exact input the
+    # gateway passed to get_tool_definitions before the catalog fix. The
+    # gateway recomputes this list per session via _get_platform_tools
+    # (gateway/platforms/zet_agent.py:1783); it is not persisted state, so
+    # after the catalog fix a restarted gateway computes it WITH
+    # zettlab_apphost added.
+    _DEVICE_DUMP_ENABLED = [
+        "agent_call", "browser", "clarify", "code_execution", "computer_use",
+        "creation_governor", "cronjob", "delegation", "file", "image_gen",
+        "kanban", "memory", "session_search", "skills", "terminal", "todo",
+        "tts", "video_gen", "vision", "web",
+    ]
+
     @staticmethod
     def _real_path_tool_names(config, platform):
         from hermes_cli.tools_config import _get_platform_tools
@@ -340,6 +354,43 @@ class TestZetAgentDeviceToolReachability:
             defs = get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True)
         names = {d["function"]["name"] for d in defs}
         assert "app_host" in names
+
+    def test_device_dump_fixture_plus_catalog_entry_exposes_app_host(self, monkeypatch):
+        """Live-dump boundary test: feed the exact enabled list a real device's
+        gateway passes to get_tool_definitions — plus the catalog entry the
+        fixed generator now appends — and assert app_host reaches the final
+        model schema. Complements the generator test below: this one proves
+        'once the list carries zettlab_apphost the schema has app_host', the
+        generator test proves 'the recomputed list does carry it'."""
+        from model_tools import get_tool_definitions
+        from tests.tools._profile_scope import mux_profile_scope
+
+        scope = {
+            "ZET_APPHOST_BASE_URL": "http://127.0.0.1:18080/api/v1/internal/apphost",
+            "ZETTLAB_AGENT_ACTION_TOKEN": "t",
+        }
+        with mux_profile_scope(monkeypatch, scope):
+            defs = get_tool_definitions(
+                enabled_toolsets=[*self._DEVICE_DUMP_ENABLED, "zettlab_apphost"],
+                quiet_mode=True,
+            )
+        assert "app_host" in {d["function"]["name"] for d in defs}
+
+    def test_generator_output_covers_device_dump_plus_apphost(self):
+        """The enabled list is recomputed per session, so the dump fixture
+        stays honest only if the generator's output covers it (minus entries
+        that are device-conditional) and now includes zettlab_apphost."""
+        from hermes_cli.tools_config import _get_platform_tools
+
+        enabled = set(_get_platform_tools(
+            self._DEVICE_CONFIG, "zet_agent", include_default_mcp_servers=False
+        ))
+        # video_gen on the device comes from the ai-gateway capability probe,
+        # which this environment doesn't have — exempt it from the coverage
+        # comparison, nothing else.
+        device_conditional = {"video_gen"}
+        assert set(self._DEVICE_DUMP_ENABLED) - device_conditional <= enabled
+        assert "zettlab_apphost" in enabled
 
     def test_catalog_entry_and_composite_are_both_load_bearing(self):
         # Both halves are required by the recovery walk: the catalog entry is
