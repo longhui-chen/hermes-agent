@@ -333,6 +333,7 @@ class TestClassifyApiError:
         result = classify_api_error(e, provider="xai-oauth")
 
         assert result.reason == FailoverReason.billing
+        assert result.provider_error_code == "personal-team-blocked:spending-limit"
         assert result.retryable is False
         assert result.should_rotate_credential is True
         assert result.should_fallback is True
