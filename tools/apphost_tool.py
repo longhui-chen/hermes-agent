@@ -362,7 +362,11 @@ def app_host_tool(args, **_kw):
     try:
         with _urlopen(req, timeout=timeout) as resp:
             status = resp.status
-            content_type = (resp.headers.get_content_type() or "").lower()
+            # Raw header, NOT headers.get_content_type(): that helper answers
+            # a default of text/plain when the server sent no Content-Type at
+            # all (a real 204), which would make "genuinely content-free" and
+            # "declared text" indistinguishable.
+            content_type = (resp.headers.get("Content-Type") or "").lower()
             raw = resp.read(_MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         # Same read cap as the success path — an oversized error body must
@@ -395,7 +399,16 @@ def app_host_tool(args, **_kw):
     # the 2xx range, never an enumeration of specific codes.
     if 200 <= status < 300:
         text = raw.decode("utf-8", errors="replace")
+        if content_type.startswith("text/"):
+            # Declared text (logs): the response SHAPE follows the declared
+            # type, never the accident of emptiness — a fresh app's empty log
+            # still answers with the full text-payload contract
+            # (text/truncated/total_chars), which the skill reads without
+            # existence checks.
+            return _ok(_text_payload(text))
         if not text.strip():
+            # Genuinely content-free answers (204 from release_slot/delete
+            # carry no Content-Type at all): nothing to shape.
             return _ok({})
         if "json" in content_type:
             try:
@@ -404,7 +417,6 @@ def app_host_tool(args, **_kw):
                 # Declared JSON but unparseable: still a 2xx success at the
                 # HTTP layer — hand the raw text back rather than erroring.
                 return _ok(_text_payload(text))
-        # Non-JSON 2xx payload (logs is text/plain): the text IS the payload.
         return _ok(_text_payload(text))
 
     # Defensive: urllib raises HTTPError for non-2xx, so this is unreachable

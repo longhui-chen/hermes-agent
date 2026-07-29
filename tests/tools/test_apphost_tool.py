@@ -36,11 +36,17 @@ def _scope(**extra):
 
 
 class _Headers:
+    """Raw-header semantics: get("Content-Type") is None when the server sent
+    none (a real 204), unlike email.Message.get_content_type() which would
+    default to text/plain."""
+
     def __init__(self, content_type):
         self._content_type = content_type
 
-    def get_content_type(self):
-        return self._content_type
+    def get(self, name, default=None):
+        if name.lower() == "content-type" and self._content_type is not None:
+            return self._content_type
+        return default
 
 
 class _Resp:
@@ -61,9 +67,10 @@ class _Resp:
 
 class _RawResp:
     """A 2xx response with a verbatim byte body and content type — the shape
-    the upstream really uses for 204 No Content and text/plain logs."""
+    the upstream really uses for 204 No Content (no Content-Type header at
+    all) and text/plain logs."""
 
-    def __init__(self, status, body=b"", content_type="text/plain"):
+    def __init__(self, status, body=b"", content_type=None):
         self.status = status
         self._body = body
         self.headers = _Headers(content_type)
@@ -252,6 +259,31 @@ def test_2xx_declared_json_but_unparseable_is_still_success(monkeypatch):
     assert out["ok"] is True
     assert out["data"]["text"] == "{not json"
     assert out["data"]["truncated"] is False
+
+
+def test_empty_text_body_keeps_full_text_payload_shape(monkeypatch):
+    """A fresh app's log is empty: 200 + text/plain + empty body. The shape
+    follows the DECLARED type, not the accident of emptiness — the skill
+    reads text/truncated/total_chars without existence checks, so all three
+    must be present with total_chars 0 (found live: empty logs answered {}
+    and the fields the skill was promised vanished)."""
+    resp = _RawResp(200, b"", content_type="text/plain; charset=utf-8")
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", return_value=resp):
+            out = json.loads(app_host_tool({"action": "logs", "slug": "app1"}))
+    assert out["ok"] is True
+    assert out["data"] == {"text": "", "truncated": False, "total_chars": 0}
+
+
+def test_content_free_204_still_answers_empty_object(monkeypatch):
+    # A real 204 (release_slot/delete) carries no Content-Type at all —
+    # genuinely content-free stays {}, distinct from an empty text body.
+    resp = _RawResp(204, b"", content_type=None)
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", return_value=resp):
+            out = json.loads(app_host_tool({"action": "release_slot", "slot_token": "s1"}))
+    assert out["ok"] is True
+    assert out["data"] == {}
 
 
 def test_oversized_text_payload_is_tail_truncated_and_labeled(monkeypatch):
