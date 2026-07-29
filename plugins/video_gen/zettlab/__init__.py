@@ -52,7 +52,7 @@ class ZettlabVideoGenProvider(VideoGenProvider):
 
     def capabilities(self) -> Dict[str, Any]:
         try:
-            cap, model = media_client.selected_model_capability("video")
+            _cap, model = media_client.selected_model_capability("video")
         except Exception:
             return super().capabilities()
         modalities: List[str] = []
@@ -72,10 +72,6 @@ class ZettlabVideoGenProvider(VideoGenProvider):
             for value in model.get("durations") or []:
                 if isinstance(value, int) and value not in durations:
                     durations.append(value)
-        limits = cap.get("limits") if isinstance(cap, dict) else {}
-        max_refs = 0
-        if isinstance(limits, dict):
-            max_refs = int(limits.get("max_remote_media_inputs") or 0)
         return {
             "modalities": modalities or ["text"],
             "aspect_ratios": aspect_ratios or [DEFAULT_ASPECT_RATIO],
@@ -84,7 +80,7 @@ class ZettlabVideoGenProvider(VideoGenProvider):
             "min_duration": min(durations) if durations else 1,
             "supports_audio": False,
             "supports_negative_prompt": False,
-            "max_reference_images": max(0, max_refs - 1),
+            "max_reference_images": 0,
         }
 
     def generate(
@@ -157,36 +153,21 @@ class ZettlabVideoGenProvider(VideoGenProvider):
                         allowed_durations,
                         key=lambda candidate: (abs(candidate - effective_duration), candidate),
                     )
-            inputs = media_client.remote_inputs(image_url, reference_image_urls)
+            input_image = media_client.inline_image_input(
+                image_url,
+                reference_image_urls,
+                model_capability,
+            )
             configured_modalities = (
                 model_capability.get("modalities")
                 if isinstance(model_capability, dict)
                 else None
             )
-            type_limits = model_capability.get("_type_limits") if isinstance(model_capability, dict) else None
-            max_remote_inputs = None
-            if isinstance(type_limits, dict):
-                declared_limit = type_limits.get("max_remote_media_inputs")
-                if isinstance(declared_limit, int) and not isinstance(declared_limit, bool) and declared_limit >= 0:
-                    max_remote_inputs = declared_limit
-            if inputs and (
-                not isinstance(configured_modalities, list)
-                or "image" not in configured_modalities
-                or (max_remote_inputs is not None and max_remote_inputs < len(inputs))
-            ):
-                return error_response(
-                    error="Image inputs are not enabled for this Zettlab video generation model.",
-                    error_type="unsupported_input",
-                    provider="zettlab",
-                    model=resolved_model,
-                    prompt=prompt,
-                    aspect_ratio=effective_aspect_ratio,
-                )
             if (
                 isinstance(configured_modalities, list)
                 and "image" in configured_modalities
                 and "text" not in configured_modalities
-                and not inputs
+                and not input_image
             ):
                 return error_response(
                     error="An image input is required for this Zettlab video generation model.",
@@ -209,8 +190,9 @@ class ZettlabVideoGenProvider(VideoGenProvider):
                 "output_count": 1,
                 "aspect_ratio": effective_aspect_ratio,
                 "resolution": effective_resolution,
-                "remote_media_inputs": inputs,
             }
+            if input_image:
+                payload["input_image"] = input_image
             if effective_duration is not None:
                 payload["duration"] = effective_duration
             session_id = kwargs.get("_task_id")
@@ -237,7 +219,7 @@ class ZettlabVideoGenProvider(VideoGenProvider):
             video=video,
             model=resolved_model,
             prompt=prompt,
-            modality="image" if image_url or reference_image_urls else "text",
+            modality="image" if input_image else "text",
             aspect_ratio=effective_aspect_ratio,
             duration=effective_duration or 0,
             provider="zettlab",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import io
 import multiprocessing
 import os
@@ -13,6 +14,11 @@ import pytest
 import requests
 
 from plugins.image_gen.zettlab import ZettlabImageGenProvider, _gateway_aspect_ratio, register
+
+
+PNG_DATA_URI = "data:image/png;base64," + base64.b64encode(
+    b"\x89PNG\r\n\x1a\nsource"
+).decode("ascii")
 
 
 def _spawn_parent_watchdog_probe(output):
@@ -62,7 +68,7 @@ def test_zettlab_image_provider_reads_capabilities(monkeypatch):
                     "display_name": "Seedream V4",
                     "modalities": ["text", "image"],
                 }],
-                "limits": {"max_remote_media_inputs": 4},
+                "limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
             },
             "video": {"enabled": False, "models": []},
         })
@@ -73,7 +79,7 @@ def test_zettlab_image_provider_reads_capabilities(monkeypatch):
     assert provider.is_available() is True
     assert provider.default_model() == "seedream-v4"
     assert provider.list_models()[0]["display"] == "Seedream V4"
-    assert provider.capabilities()["max_reference_images"] == 3
+    assert provider.capabilities()["max_reference_images"] == 0
 
 
 def test_zettlab_capabilities_response_is_bounded_and_closed(monkeypatch):
@@ -184,6 +190,7 @@ def test_zettlab_image_generate_creates_media_job(monkeypatch):
                 "limits": {
                     "provider_timeout_seconds": 300,
                     "finalization_timeout_seconds": 600,
+                    "max_inline_image_bytes": 5 * 1024 * 1024,
                 },
             },
         })
@@ -211,8 +218,7 @@ def test_zettlab_image_generate_creates_media_job(monkeypatch):
     got = ZettlabImageGenProvider().generate(
         "make a product shot",
         aspect_ratio="square",
-        image_url="https://example.com/source.png",
-        reference_image_urls=["https://example.com/ref.png"],
+        image_url=PNG_DATA_URI,
         model="seedream-v4",
         num_images=2,
     )
@@ -231,10 +237,8 @@ def test_zettlab_image_generate_creates_media_job(monkeypatch):
     assert captured["json"]["output_count"] == 1
     assert captured["json"]["aspect_ratio"] == "1:1"
     assert captured["json"]["resolution"] == "2K"
-    assert captured["json"]["remote_media_inputs"] == [
-        {"url": "https://example.com/source.png", "role": "source"},
-        {"url": "https://example.com/ref.png", "role": "reference"},
-    ]
+    assert captured["json"]["input_image"] == PNG_DATA_URI
+    assert "remote_media_inputs" not in captured["json"]
 
 
 @pytest.mark.parametrize(
@@ -274,18 +278,25 @@ def test_zettlab_image_generate_uses_gateway_default_when_model_is_omitted(monke
     assert captured["model"] == "seedream-default"
 
 
-def test_zettlab_image_rejects_non_https_remote_input(monkeypatch):
+def test_zettlab_image_rejects_remote_input(monkeypatch):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setattr(
         client,
         "resolve_model_with_capability",
-        lambda media_type, requested=None: ("seedream-v4", {"id": "seedream-v4", "modalities": ["text", "image"]}),
+        lambda media_type, requested=None: (
+            "seedream-v4",
+            {
+                "id": "seedream-v4",
+                "modalities": ["text", "image"],
+                "_type_limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
+            },
+        ),
     )
     got = ZettlabImageGenProvider().generate("make image", image_url="http://example.com/a.png")
     assert got["success"] is False
     assert got["error_type"] == "ZettlabMediaError"
-    assert "https URL" in got["error"]
+    assert "local image path or data URI" in got["error"]
 
 
 def test_zettlab_image_only_model_requires_image_input(monkeypatch):

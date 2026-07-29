@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import base64
 from types import SimpleNamespace
 
 import pytest
 
 from plugins.video_gen.zettlab import ZettlabVideoGenProvider, register
+
+
+PNG_DATA_URI = "data:image/png;base64," + base64.b64encode(
+    b"\x89PNG\r\n\x1a\nsource"
+).decode("ascii")
 
 
 class _Resp:
@@ -33,6 +39,7 @@ def _capabilities():
             "limits": {
                 "provider_timeout_seconds": 1200,
                 "finalization_timeout_seconds": 600,
+                "max_inline_image_bytes": 5 * 1024 * 1024,
             },
         },
     }
@@ -123,7 +130,7 @@ def test_zettlab_video_generate_creates_media_job(monkeypatch):
         duration=5,
         aspect_ratio="16:9",
         resolution="720p",
-        image_url="https://example.com/source.png",
+        image_url=PNG_DATA_URI,
     )
 
     assert got["success"] is True
@@ -137,9 +144,8 @@ def test_zettlab_video_generate_creates_media_job(monkeypatch):
     assert captured["json"]["model"] == "seedance-v1"
     assert captured["json"]["duration"] == 5
     assert "parameters" not in captured["json"]
-    assert captured["json"]["remote_media_inputs"] == [
-        {"url": "https://example.com/source.png", "role": "source"},
-    ]
+    assert captured["json"]["input_image"] == PNG_DATA_URI
+    assert "remote_media_inputs" not in captured["json"]
 
 
 def test_zettlab_video_rejects_disabled_custom_parameters(monkeypatch):
@@ -276,18 +282,26 @@ def test_zettlab_video_image_only_model_requires_image_input(monkeypatch):
     assert got["error_type"] == "missing_image"
 
 
-def test_zettlab_video_rejects_non_https_remote_input(monkeypatch):
+def test_zettlab_video_rejects_remote_input(monkeypatch):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setattr(
         client,
         "resolve_model_with_capability",
-        lambda media_type, requested=None: ("seedance-v1", {"id": "seedance-v1", "durations": [5]}),
+        lambda media_type, requested=None: (
+            "seedance-v1",
+            {
+                "id": "seedance-v1",
+                "modalities": ["text", "image"],
+                "durations": [5],
+                "_type_limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
+            },
+        ),
     )
-    got = ZettlabVideoGenProvider().generate("make video", image_url="/tmp/source.png")
+    got = ZettlabVideoGenProvider().generate("make video", image_url="https://example.com/source.png")
     assert got["success"] is False
     assert got["error_type"] == "ZettlabMediaError"
-    assert "https URL" in got["error"]
+    assert "local image path or data URI" in got["error"]
 
 
 def test_first_asset_url_accepts_legacy_top_level_shortcut_without_assets():
