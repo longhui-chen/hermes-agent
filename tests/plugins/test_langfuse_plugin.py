@@ -291,11 +291,17 @@ class TestTurnTraceIsolation:
                 return False
 
         class _Client:
+            def __init__(self):
+                self._next_trace_id = 0
+
             def create_trace_id(self, seed=None):
+                if seed is None:
+                    self._next_trace_id += 1
+                    return f"trace::random::{self._next_trace_id}"
                 return f"trace::{seed}"
 
             def start_as_current_observation(self, **kw):
-                started.append(kw.get("trace_context", {}).get("trace_id"))
+                started.append(dict(kw.get("trace_context", {})))
                 return _RootCM()
 
             def flush(self):
@@ -341,7 +347,8 @@ class TestTurnTraceIsolation:
         """A turn that never finalizes must not absorb the following turn."""
         mod = self._fresh_plugin()
         started: list = []
-        monkeypatch.setattr(mod, "_get_langfuse", lambda: self._fake_client(started))
+        client = self._fake_client(started)
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
         monkeypatch.setattr(mod, "_end_observation", lambda *a, **k: None)
         mod._TRACE_STATE.clear()
 
@@ -353,6 +360,11 @@ class TestTurnTraceIsolation:
         # Each turn opened its OWN root trace.  On the pre-fix code the second
         # turn reused turn 1's lingering state and only one trace was opened.
         assert len(started) == 2
+        # Opening two roots is not enough: Langfuse merges observations when
+        # both roots carry the same deterministic trace ID.  A stable
+        # session_id must group the turns without collapsing their trace IDs.
+        assert len({context["trace_id"] for context in started}) == 2
+        assert {context["session_id"] for context in started} == {"sess-iso"}
 
         # Turn 2 finalized and was popped by _finish_trace; only turn 1's
         # (non-finalizing) state lingers.  Assert the surviving key is turn 1's
@@ -1125,7 +1137,7 @@ class _FakeRootCtx:
 
 
 class _FakeRootClient:
-    def create_trace_id(self, *, seed):
+    def create_trace_id(self, *, seed=None):
         return f"tid::{seed}"
 
     def start_as_current_observation(self, **kwargs):

@@ -659,7 +659,10 @@ def _root_trace_attributes(
 def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform: str, provider: str, model: str,
                       api_mode: str, messages: Any, client: Langfuse,
                       turn_id: str = "", api_request_id: str = "") -> TraceState:
-    trace_id = client.create_trace_id(seed=f"{session_id or 'sessionless'}::{task_id or task_key}")
+    # A Langfuse session groups many turn-level traces.  Do not derive the
+    # trace ID from session/task identity: those values are stable across
+    # turns, so a deterministic seed collapses every turn into one trace.
+    trace_id = client.create_trace_id()
     trace_input = _extract_last_user_message(messages)
     metadata, trace_tags, user_id = _root_trace_attributes(
         task_id=task_id,
