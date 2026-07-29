@@ -253,6 +253,27 @@ def test_missing_config_returns_error(monkeypatch):
     assert parsed["error"]["code"] == "unsupported"
 
 
+def test_local_rejection_status_is_zero_not_null(monkeypatch):
+    """status is a three-way retry contract: HTTP code = server answered;
+    null = request went out but outcome unknown (idempotent resend); 0 = not
+    a single byte was sent (local rejection — resending verbatim is pointless).
+    Skills branch "status is null → resend"; a local rejection reported as
+    null would spin that branch forever."""
+    # Local rejection form 1: validation failure (never builds a request).
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("urllib.request.urlopen",
+                   side_effect=AssertionError("must not reach the network")):
+            validation = json.loads(app_host_tool({"action": "release_slot"}))
+            bad_slug = json.loads(app_host_tool({"action": "delete", "slug": "a/b"}))
+    # Local rejection form 2: credentials/base URL not configured.
+    with mux_profile_scope(monkeypatch, {k: "" for k in _scope()}):
+        unconfigured = json.loads(app_host_tool({"action": "probe"}))
+    for parsed in (validation, bad_slug, unconfigured):
+        assert parsed["ok"] is False
+        assert parsed["status"] is not None
+        assert parsed["status"] == 0 and isinstance(parsed["status"], int)
+
+
 # --- build_env ---------------------------------------------------------------
 
 def test_build_env_flow_ready_when_dir_exists(monkeypatch, tmp_path):

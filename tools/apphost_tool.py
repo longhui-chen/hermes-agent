@@ -147,6 +147,15 @@ def _ok(data):
     return json.dumps({"ok": True, "data": data}, ensure_ascii=False)
 
 
+# The `status` field is a three-way contract for the caller's retry decision:
+# an HTTP code means the server answered; null means the request WENT OUT but
+# the outcome is unknown (timeout / dropped connection — may have succeeded,
+# retry per idempotent semantics); 0 means the tool rejected the call locally
+# and not a single byte was sent — retrying verbatim is pointless, the call
+# must be corrected first.
+_STATUS_NOT_SENT = 0
+
+
 def _fail(error, status=None):
     """Failure envelope. ``error`` is the upstream {code, message} error body
     verbatim — skills branch on the ``code`` string (never the HTTP status),
@@ -263,12 +272,16 @@ def app_host_tool(args, **_kw):
     try:
         method, path, body, timeout = _build_request(action, args)
     except _BadRequest as exc:
-        return _local_error("invalid_request", str(exc))
+        return _local_error("invalid_request", str(exc), status=_STATUS_NOT_SENT)
 
     base = _base_url()
     token = _secret("ZETTLAB_AGENT_ACTION_TOKEN")
     if not base or not token:
-        return _local_error("unsupported", "App Host 未配置或不可用，这台设备暂不支持生成应用")
+        return _local_error(
+            "unsupported",
+            "App Host 未配置或不可用，这台设备暂不支持生成应用",
+            status=_STATUS_NOT_SENT,
+        )
 
     data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
     headers = {_ACTION_TOKEN_HEADER: token, "Accept": "application/json"}
