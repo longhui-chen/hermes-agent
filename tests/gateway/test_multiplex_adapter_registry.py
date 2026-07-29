@@ -18,6 +18,40 @@ class _FakeAdapter:
         self.config = config
 
 
+class _DirectProfileAdapter:
+    platform = Platform.TELEGRAM
+
+    def set_message_handler(self, handler):
+        self.message_handler = handler
+
+    def set_fatal_error_handler(self, handler):
+        self.fatal_error_handler = handler
+
+    def set_session_store(self, store):
+        self.session_store = store
+
+    def set_busy_session_handler(self, handler):
+        self.busy_session_handler = handler
+
+    def set_topic_recovery_fn(self, handler):
+        self.topic_recovery_fn = handler
+
+    def set_authorization_check(self, handler):
+        self.authorization_check = handler
+
+
+def _multiplex_profile_runner():
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._profile_adapters = {}
+    runner.session_store = object()
+    runner._handle_active_session_busy_message = object()
+    runner._recover_telegram_topic_thread_id = object()
+    runner._busy_text_mode = "queue"
+    runner._make_adapter_auth_check = lambda platform, profile_name=None: object()
+    return runner
+
+
 class TestCredentialFingerprint:
     def test_none_without_token(self):
         assert GatewayRunner._adapter_credential_fingerprint(_FakeAdapter()) is None
@@ -664,6 +698,142 @@ class TestPortBindingSkip:
         }
 
     @pytest.mark.asyncio
+    async def test_multiplex_secondary_skips_shared_zet_listener_but_starts_direct_adapter(
+        self, monkeypatch
+    ):
+        """Zet ingress is process-shared; direct adapters remain per-profile."""
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+        runner = _multiplex_profile_runner()
+
+        reviewer_cfg = GatewayConfig(multiplex_profiles=True)
+        reviewer_cfg.platforms = {
+            Platform.ZET_AGENT: PlatformConfig(
+                enabled=True,
+                extra={"host": "127.0.0.1", "port": 7900},
+            ),
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="reviewer-token",
+            ),
+        }
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: reviewer_cfg)
+
+        direct = _DirectProfileAdapter()
+        factory_calls = []
+
+        def _create_adapter(platform, config):
+            factory_calls.append(platform)
+            return direct
+
+        connect_calls = []
+
+        async def _connect(adapter, platform):
+            connect_calls.append((adapter, platform))
+            return True
+
+        monkeypatch.setattr(runner, "_create_adapter", _create_adapter)
+        monkeypatch.setattr(runner, "_connect_adapter_with_timeout", _connect)
+
+        connected = await runner._start_one_profile_adapters(
+            "reviewer", "/tmp/x", {}
+        )
+
+        assert connected == 1
+        assert factory_calls == [Platform.TELEGRAM]
+        assert connect_calls == [(direct, Platform.TELEGRAM)]
+        assert runner._profile_adapters["reviewer"] == {
+            Platform.TELEGRAM: direct,
+        }
+
+    @pytest.mark.asyncio
+    async def test_global_zet_env_keeps_secondary_served_without_second_listener(
+        self, tmp_path, monkeypatch
+    ):
+        """Process-wide Zet config must not become a per-profile listener."""
+        from gateway.config import GatewayConfig, Platform, load_gateway_config
+
+        default_home = tmp_path / "default"
+        worker_home = tmp_path / "worker"
+        default_home.mkdir()
+        worker_home.mkdir()
+        (worker_home / ".env").write_text(
+            "TELEGRAM_BOT_TOKEN=worker-token\n",
+            encoding="utf-8",
+        )
+        (worker_home / "config.yaml").write_text(
+            "multiplex_profiles: true\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("ZET_AGENT_ENABLED", "true")
+        monkeypatch.setenv("ZET_AGENT_HOST", "127.0.0.1")
+        monkeypatch.setenv("ZET_AGENT_PORT", "7900")
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            lambda multiplex: [
+                ("default", default_home),
+                ("worker", worker_home),
+            ],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name",
+            lambda: "default",
+        )
+        resolved_configs = []
+
+        def _load_profile_config():
+            config = load_gateway_config()
+            resolved_configs.append(config)
+            return config
+
+        monkeypatch.setattr("gateway.config.load_gateway_config", _load_profile_config)
+
+        runner = _multiplex_profile_runner()
+        shared_zet_adapter = object()
+        runner.adapters = {Platform.ZET_AGENT: shared_zet_adapter}
+        runner.pairing_stores = {"default": object(), "worker": object()}
+
+        direct = _DirectProfileAdapter()
+        factory_calls = []
+
+        def _create_adapter(platform, config):
+            factory_calls.append(platform)
+            return direct
+
+        connect_calls = []
+
+        async def _connect(adapter, platform):
+            connect_calls.append((adapter, platform))
+            return True
+
+        monkeypatch.setattr(runner, "_create_adapter", _create_adapter)
+        monkeypatch.setattr(runner, "_connect_adapter_with_timeout", _connect)
+        status_updates = []
+        monkeypatch.setattr(
+            "gateway.status.write_runtime_status",
+            lambda **kwargs: status_updates.append(kwargs),
+        )
+
+        connected = await runner._start_secondary_profile_adapters()
+
+        assert connected == 1
+        assert len(resolved_configs) == 1
+        injected_zet = resolved_configs[0].platforms[Platform.ZET_AGENT]
+        assert injected_zet.enabled is True
+        assert injected_zet.extra["port"] == 7900
+        assert runner.adapters == {Platform.ZET_AGENT: shared_zet_adapter}
+        assert factory_calls == [Platform.TELEGRAM]
+        assert connect_calls == [(direct, Platform.TELEGRAM)]
+        assert runner._profile_adapters["worker"] == {
+            Platform.TELEGRAM: direct,
+        }
+        assert status_updates[-1] == {
+            "served_profiles": ["default", "worker"],
+        }
+        assert all("platform" not in update for update in status_updates)
+
+    @pytest.mark.asyncio
     async def test_non_multiplex_profile_adapter_start_keeps_relay(self, monkeypatch):
         """The Relay skip is gated to multiplex mode."""
         from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -782,6 +952,7 @@ class TestPortBindingSkip:
         for p in (
             "webhook",
             "api_server",
+            "zet_agent",
             "msgraph_webhook",
             "feishu",
             "wecom_callback",

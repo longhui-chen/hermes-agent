@@ -2672,6 +2672,7 @@ async def git_branch_switch_route(body: GitBranchSwitchBody):
 _PORT_BINDING_PLATFORM_PORTS: Dict[str, Tuple[str, int]] = {
     "webhook": ("port", 8644),
     "api_server": ("port", 8642),
+    "zet_agent": ("port", 7900),
     "msgraph_webhook": ("port", 8646),
     "feishu": ("webhook_port", 8765),
     "wecom_callback": ("port", 8645),
