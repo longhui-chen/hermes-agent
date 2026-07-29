@@ -153,6 +153,11 @@ def _ok(data):
 # retry per idempotent semantics); 0 means the tool rejected the call locally
 # and not a single byte was sent — retrying verbatim is pointless, the call
 # must be corrected first.
+#
+# 0 is falsy: any consumer distinguishing the tiers must compare strictly
+# (`is None` / `== 0`), never truthiness — `if not status` conflates the two
+# tiers whose handling is opposite. This module itself never branches on the
+# envelope's status (it is output-only here); keep it that way.
 _STATUS_NOT_SENT = 0
 
 

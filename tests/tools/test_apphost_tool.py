@@ -263,15 +263,20 @@ def test_local_rejection_status_is_zero_not_null(monkeypatch):
     with mux_profile_scope(monkeypatch, _scope()):
         with patch("urllib.request.urlopen",
                    side_effect=AssertionError("must not reach the network")):
-            validation = json.loads(app_host_tool({"action": "release_slot"}))
-            bad_slug = json.loads(app_host_tool({"action": "delete", "slug": "a/b"}))
+            raw_validation = app_host_tool({"action": "release_slot"})
+            raw_bad_slug = app_host_tool({"action": "delete", "slug": "a/b"})
     # Local rejection form 2: credentials/base URL not configured.
     with mux_profile_scope(monkeypatch, {k: "" for k in _scope()}):
-        unconfigured = json.loads(app_host_tool({"action": "probe"}))
-    for parsed in (validation, bad_slug, unconfigured):
+        raw_unconfigured = app_host_tool({"action": "probe"})
+    for raw in (raw_validation, raw_bad_slug, raw_unconfigured):
+        parsed = json.loads(raw)
         assert parsed["ok"] is False
+        # Strict tier separation: 0 is falsy, so `is not None` (not
+        # truthiness) is the only valid way to tell it from null — assert at
+        # both the parsed and the serialized level.
         assert parsed["status"] is not None
         assert parsed["status"] == 0 and isinstance(parsed["status"], int)
+        assert '"status": 0' in raw and '"status": null' not in raw
 
 
 # --- build_env ---------------------------------------------------------------
