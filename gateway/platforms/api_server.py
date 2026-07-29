@@ -260,6 +260,25 @@ def _extract_turn_id(body: Dict[str, Any]) -> str:
     return tid
 
 
+def _extract_connector_route_capability(body: Dict[str, Any]) -> str:
+    """Extract local-server's opaque per-turn Connector routing capability.
+
+    The fixed 32-byte base64url shape keeps malformed or oversized metadata
+    out of the dedicated runner environment. It is transport-only and never
+    becomes a general session variable or model-visible instruction.
+    """
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("connector_route_capability")
+    if not isinstance(raw, str):
+        return ""
+    capability = raw.strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{43}", capability) is None:
+        return ""
+    return capability
+
+
 def _extract_skill_slug(body: Dict[str, Any]) -> str:
     """Extract metadata.skill_slug — the App quick-pick's EXPLICIT skill
     invocation signal (ZET fork).
@@ -3633,6 +3652,7 @@ class APIServerAdapter(BasePlatformAdapter):
         plan_ack = _extract_plan_ack(body)
         plan_auto_execute = _extract_plan_auto_execute(body)
         turn_id = _extract_turn_id(body)
+        connector_route_capability = _extract_connector_route_capability(body)
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -3904,6 +3924,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 plan_ack=plan_ack,
                 plan_auto_execute=plan_auto_execute,
                 turn_id=turn_id,
+                connector_route_capability=connector_route_capability,
                 request_overrides=request_overrides or None,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
@@ -3954,6 +3975,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     plan_ack=plan_ack,
                     plan_auto_execute=plan_auto_execute,
                     turn_id=turn_id,
+                    connector_route_capability=connector_route_capability,
                     request_overrides=request_overrides or None,
                 )
             finally:
@@ -6105,6 +6127,7 @@ class APIServerAdapter(BasePlatformAdapter):
         plan_ack: Optional[Dict[str, Any]] = None,
         plan_auto_execute: Optional[bool] = None,
         turn_id: Optional[str] = None,
+        connector_route_capability: Optional[str] = None,
         request_overrides: Optional[Dict[str, Any]] = None,
     ) -> tuple:
         """
@@ -6129,7 +6152,11 @@ class APIServerAdapter(BasePlatformAdapter):
         request_profile = _api_request_profile.get()
 
         def _run():
-            from gateway.session_context import clear_session_vars, set_zettlab_turn_id
+            from gateway.session_context import (
+                clear_session_vars,
+                set_zettlab_connector_route_capability,
+                set_zettlab_turn_id,
+            )
 
             with self._profile_scope(request_profile):
                 tokens = self._bind_api_server_session(
@@ -6141,6 +6168,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 # terminal skill subprocesses. Keep it in its own contextvar and
                 # clear it with the session vars on reused executor threads.
                 set_zettlab_turn_id(turn_id or "")
+                set_zettlab_connector_route_capability(
+                    connector_route_capability or ""
+                )
                 try:
                     # Resolve the auto-execute flag once so the Plan-First
                     # system prompt and the turn-level execution policy agree.
@@ -6184,6 +6214,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 finally:
                     clear_session_vars(tokens)
                     set_zettlab_turn_id("")
+                    set_zettlab_connector_route_capability("")
 
         self._activate_admitted_request()
         from contextvars import copy_context

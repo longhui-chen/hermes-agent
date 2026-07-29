@@ -31,6 +31,7 @@ from gateway.platforms.api_server import (
     ResponseStore,
     _IdempotencyCache,
     _derive_chat_session_id,
+    _extract_connector_route_capability,
     _redact_api_error_text,
     _tool_completion_payload,
     check_api_server_requirements,
@@ -937,6 +938,23 @@ class TestAgentExecution:
             conversation_history=[],
             task_id="session-123",
         )
+
+
+@pytest.mark.parametrize(
+    ("raw", "want"),
+    [
+        ("a" * 43, "a" * 43),
+        ("A-_0" * 10 + "abc", "A-_0" * 10 + "abc"),
+        ("short", ""),
+        ("a" * 44, ""),
+        ("a" * 42 + "=", ""),
+        (123, ""),
+    ],
+)
+def test_extract_connector_route_capability_accepts_only_fixed_base64url(raw, want):
+    assert _extract_connector_route_capability(
+        {"metadata": {"connector_route_capability": raw}}
+    ) == want
 
 
 # ---------------------------------------------------------------------------
@@ -4976,6 +4994,28 @@ class TestModelRoutesHandlers:
                 assert kwargs.get("route") == {
                     "model": "minimax/minimax-m1", "provider": "openrouter",
                 }
+
+    @pytest.mark.asyncio
+    async def test_chat_completions_passes_connector_route_capability_to_run_agent(self):
+        adapter = _make_routing_adapter({})
+        app = _create_app(adapter)
+        capability = "c" * 43
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+                mock_run.return_value = (
+                    {"final_response": "hi", "messages": [], "api_calls": 1},
+                    {"input_tokens": 5, "output_tokens": 5, "total_tokens": 10},
+                )
+                resp = await cli.post("/v1/chat/completions", json={
+                    "model": "hermes-agent",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "metadata": {"connector_route_capability": capability},
+                })
+                assert resp.status == 200
+                assert (
+                    mock_run.call_args.kwargs.get("connector_route_capability")
+                    == capability
+                )
 
     @pytest.mark.asyncio
     async def test_chat_completions_no_route_for_unknown_model(self):
