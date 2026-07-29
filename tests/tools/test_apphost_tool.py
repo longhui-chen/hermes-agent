@@ -35,10 +35,19 @@ def _scope(**extra):
     return scope
 
 
+class _Headers:
+    def __init__(self, content_type):
+        self._content_type = content_type
+
+    def get_content_type(self):
+        return self._content_type
+
+
 class _Resp:
     def __init__(self, payload, status=200):
         self._payload = payload
         self.status = status
+        self.headers = _Headers("application/json")
 
     def __enter__(self):
         return self
@@ -48,6 +57,25 @@ class _Resp:
 
     def read(self, *_):
         return json.dumps(self._payload).encode("utf-8")
+
+
+class _RawResp:
+    """A 2xx response with a verbatim byte body and content type — the shape
+    the upstream really uses for 204 No Content and text/plain logs."""
+
+    def __init__(self, status, body=b"", content_type="text/plain"):
+        self.status = status
+        self._body = body
+        self.headers = _Headers(content_type)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        return False
+
+    def read(self, *_):
+        return self._body
 
 
 def _capture_urlopen(seen, payload=None):
@@ -163,6 +191,67 @@ def test_handler_always_returns_json_string(monkeypatch):
     for out in (success, unknown, missing):
         assert isinstance(out, str) and not isinstance(out, dict)
         json.loads(out)  # must be valid JSON
+
+
+# --- 2xx is success regardless of body ---------------------------------------
+
+# Every HTTP action with the minimal args to reach the network layer.
+_ALL_HTTP_ACTION_ARGS = [
+    ("probe", {}),
+    ("list", {}),
+    ("acquire_slot", {}),
+    ("release_slot", {"slot_token": "s1"}),
+    ("install", {"staging_dir": "/tmp/s", "slug": "app1"}),
+    ("reload", {"slug": "app1", "staging_dir": "/tmp/s"}),
+    ("delete", {"slug": "app1"}),
+    ("recover", {"slug": "app1"}),
+    ("lifecycle", {"slug": "app1", "lifecycle_action": "restart"}),
+    ("logs", {"slug": "app1"}),
+]
+
+
+@pytest.mark.parametrize("action,args", _ALL_HTTP_ACTION_ARGS)
+def test_2xx_empty_body_is_success_for_every_action(monkeypatch, action, args):
+    """The upstream deliberately answers 204 with no body (release_slot
+    always; delete idempotently). A 2xx must never fall into the error
+    branch — flagging it as transport_error reported every successful
+    release/delete as a failure on a real device."""
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("urllib.request.urlopen", return_value=_RawResp(204)):
+            out = json.loads(app_host_tool({"action": action, **args}))
+    assert out["ok"] is True
+    assert out["data"] == {}
+
+
+@pytest.mark.parametrize("status", [200, 201, 202, 204])
+def test_2xx_success_tier_is_the_range_not_specific_codes(monkeypatch, status):
+    # The tier test must be "status is 2xx", not an enumeration of codes:
+    # a future 200-empty-body or 202 must not degrade into an error.
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("urllib.request.urlopen", return_value=_RawResp(status)):
+            out = json.loads(app_host_tool({"action": "release_slot", "slot_token": "s1"}))
+    assert out["ok"] is True
+
+
+def test_2xx_text_plain_body_is_success_with_text_payload(monkeypatch):
+    """logs answers 200 text/plain (internal.go GetLogs) — the text IS the
+    payload and must come back, not be flattened to an empty object."""
+    log_text = "2026-07-30 01:00:00 INFO app started\n2026-07-30 01:00:01 INFO ready\n"
+    resp = _RawResp(200, log_text.encode("utf-8"), content_type="text/plain")
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("urllib.request.urlopen", return_value=resp):
+            out = json.loads(app_host_tool({"action": "logs", "slug": "app1"}))
+    assert out["ok"] is True
+    assert out["data"] == {"text": log_text}
+
+
+def test_2xx_declared_json_but_unparseable_is_still_success(monkeypatch):
+    resp = _RawResp(200, b"{not json", content_type="application/json")
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("urllib.request.urlopen", return_value=resp):
+            out = json.loads(app_host_tool({"action": "probe"}))
+    assert out["ok"] is True
+    assert out["data"] == {"text": "{not json"}
 
 
 # --- upstream error-body pass-through & leak guarantees ----------------------

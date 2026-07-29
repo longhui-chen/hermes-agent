@@ -306,6 +306,7 @@ def app_host_tool(args, **_kw):
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             status = resp.status
+            content_type = (resp.headers.get_content_type() or "").lower()
             raw = resp.read(_MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
         upstream = _parse_upstream_error(exc.read() or b"")
@@ -327,11 +328,32 @@ def app_host_tool(args, **_kw):
 
     if len(raw) > _MAX_RESPONSE_BYTES:
         return _local_error("transport_error", "App Host 返回内容过大", status=status)
-    try:
-        parsed = json.loads(raw.decode("utf-8"))
-    except Exception:
-        return _local_error("transport_error", "App Host 返回了无法解析的内容", status=status)
-    return _ok(parsed)
+
+    # Any 2xx is success by HTTP semantics — regardless of body. The upstream
+    # deliberately answers 204 with no body (release_slot always; delete is
+    # idempotent, a retried DELETE must also get 204), and logs answers 2xx
+    # with text/plain. Treating "2xx but body isn't JSON" as transport_error
+    # reported every successful release/delete as a failure. The tier test is
+    # the 2xx range, never an enumeration of specific codes.
+    if 200 <= status < 300:
+        text = raw.decode("utf-8", errors="replace")
+        if not text.strip():
+            return _ok({})
+        if "json" in content_type:
+            try:
+                return _ok(json.loads(text))
+            except Exception:
+                # Declared JSON but unparseable: still a 2xx success at the
+                # HTTP layer — hand the raw text back rather than erroring.
+                return _ok({"text": text})
+        # Non-JSON 2xx payload (logs is text/plain): the text IS the payload.
+        return _ok({"text": text})
+
+    # Defensive: urllib raises HTTPError for non-2xx, so this is unreachable
+    # in practice — keep the failure explicit rather than mislabeling.
+    return _local_error(
+        "transport_error", f"App Host 返回了意外状态（HTTP {status}）", status=status
+    )
 
 
 from tools.registry import registry  # noqa: E402
