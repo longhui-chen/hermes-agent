@@ -467,7 +467,12 @@ TOOLSETS = {
         # session (_own_session_id), so only THIS platform can use it — other
         # platforms would show the model a tool local-server always rejects.
         # Still schema-gated by ZET_AGENT_CALL_URL via check_fn.
-        "tools": _HERMES_CORE_TOOLS + ["call_agent"],
+        # app_host likewise: local-server's App Host internal face (base URL +
+        # action token) only exists in a zet_agent profile, and installing
+        # generated applications on the device is a device-agent capability —
+        # not something telegram/slack/cron schemas should ever advertise.
+        # Still gated by ZET_APPHOST_BASE_URL + the action token via check_fn.
+        "tools": _HERMES_CORE_TOOLS + ["call_agent", "app_host"],
         "includes": []
     },
 

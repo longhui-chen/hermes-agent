@@ -291,3 +291,51 @@ class TestResolveToolsetIncludeRegistry:
 
     def test_registry_only_toolset_static_view_is_empty(self):
         assert resolve_toolset("__definitely_not_a_real_toolset__", include_registry=False) == []
+
+
+class TestZetAgentDeviceToolReachability:
+    """Registration alone does not make a tool reachable: the zet_agent
+    platform's schema comes from the hermes-zet-agent explicit tool-name list,
+    so a device tool missing from it silently vanishes for the model (found on
+    a real device: app_host registered, gate open, yet the model never saw it).
+    """
+
+    def test_zet_agent_platform_resolves_app_host(self):
+        assert "app_host" in resolve_toolset("hermes-zet-agent")
+
+    def test_app_host_stays_out_of_shared_platform_lists(self):
+        # Deliberate scoping, same as call_agent: the App Host credentials
+        # only exist in a zet_agent profile, and installing applications on
+        # the device is a device-agent capability — messaging/cron schemas
+        # must not advertise it. Changing this is a decision, not a drive-by.
+        from toolsets import _HERMES_CORE_TOOLS
+        assert "app_host" not in _HERMES_CORE_TOOLS
+        assert "app_host" not in resolve_toolset("hermes-cron")
+
+    def test_profile_scope_sensitive_tools_all_reachable_on_zet_agent(self):
+        """Generalized guard for this class of omission: a tool whose check_fn
+        is profile-scope-sensitive depends on device-profile credentials that
+        only a zet_agent turn can resolve — registering one without adding it
+        to the zet_agent platform list makes it silently unreachable exactly
+        where it is meant to work. Tools in opt-in toolsets (hermes tools →
+        enable, _DEFAULT_OFF_TOOLSETS) are exempt: they are injected via
+        platform config when the user enables them — deliberately absent from
+        the default list, not silently lost (e.g. video_generate)."""
+        from hermes_cli.tools_config import _DEFAULT_OFF_TOOLSETS
+        from tools.registry import discover_builtin_tools, registry
+
+        discover_builtin_tools()
+        scope_sensitive = {
+            entry.name
+            for entry in registry._tools.values()
+            if getattr(entry.check_fn, "_profile_scope_sensitive", False)
+            and entry.toolset not in _DEFAULT_OFF_TOOLSETS
+        }
+        # Sanity: the guard must be looking at a non-empty set, otherwise a
+        # marker rename would silently turn this test into a no-op.
+        assert "app_host" in scope_sensitive
+        reachable = set(resolve_toolset("hermes-zet-agent"))
+        missing = scope_sensitive - reachable
+        assert not missing, (
+            f"profile-scope-sensitive tools not reachable on zet_agent: {missing}"
+        )
