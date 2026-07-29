@@ -19,6 +19,7 @@ from tests.tools._profile_scope import mux_profile_scope, request_fingerprint
 from tools.apphost_tool import (
     APP_HOST_SCHEMA,
     _check_app_host,
+    _local_error,
     app_host_tool,
 )
 
@@ -277,6 +278,21 @@ def test_local_rejection_status_is_zero_not_null(monkeypatch):
         assert parsed["status"] is not None
         assert parsed["status"] == 0 and isinstance(parsed["status"], int)
         assert '"status": 0' in raw and '"status": null' not in raw
+
+
+def test_local_error_requires_explicit_status():
+    """A forgotten status must be a TypeError at the call site, not a silent
+    null: null tells the caller "request went out, outcome unknown — resend
+    idempotently", which is exactly the wrong handling for a local rejection.
+    The default may not lean toward the dangerous tier."""
+    with pytest.raises(TypeError):
+        _local_error("invalid_request", "缺参数")  # no status → must blow up
+    with pytest.raises(TypeError):
+        _local_error("invalid_request", "缺参数", 0)  # positional → keyword-only
+    # The three legitimate tiers all pass explicitly.
+    assert json.loads(_local_error("invalid_request", "x", status=0))["status"] == 0
+    assert json.loads(_local_error("transport_error", "x", status=None))["status"] is None
+    assert json.loads(_local_error("transport_error", "x", status=502))["status"] == 502
 
 
 # --- build_env ---------------------------------------------------------------

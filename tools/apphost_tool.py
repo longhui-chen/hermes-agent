@@ -169,10 +169,19 @@ def _fail(error, status=None):
     return json.dumps({"ok": False, "error": error, "status": status}, ensure_ascii=False)
 
 
-def _local_error(code, message, status=None):
+def _local_error(code, message, *, status):
     """A locally-produced failure in the upstream error-body shape, so skills
     need only one set of branches. The message must never contain the token
-    or the full base URL."""
+    or the full base URL.
+
+    ``status`` is deliberately REQUIRED, with no default: a default of None
+    would make a forgotten argument silently report a local rejection as
+    "request went out, outcome unknown" — the tier whose handling (idempotent
+    resend) is exactly wrong for a call that never left the tool. Forgetting
+    must be a TypeError at the call site, not a wrong retry downstream. Pass
+    ``_STATUS_NOT_SENT`` when nothing was sent, ``None`` only for a request
+    that went out without an answer, or the HTTP code when the server spoke.
+    """
     return _fail({"code": code, "message": message}, status=status)
 
 
@@ -312,8 +321,9 @@ def app_host_tool(args, **_kw):
         )
     except Exception:
         # Never echo the exception: URLError/timeout messages can embed the
-        # request URL.
-        return _local_error("transport_error", "无法连接 App Host 服务")
+        # request URL. status=None is deliberate — the request DID go out and
+        # the outcome is unknown, so the caller may resend idempotently.
+        return _local_error("transport_error", "无法连接 App Host 服务", status=None)
 
     if len(raw) > _MAX_RESPONSE_BYTES:
         return _local_error("transport_error", "App Host 返回内容过大", status=status)
