@@ -372,18 +372,18 @@ def test_nested_dispatch_inherits_turn_via_task(monkeypatch, tmp_path):
     nested = tmp_path / "nested.txt"
     nested.write_text("y")
 
-    # 外层 execute_code dispatch 不设防，但会登记 task → turn。
+    # 外层 execute_code dispatch 登记 task → turn（它本身是否触发 ensure 取决
+    # 于 execution mode，这里不作假设）。
     assert guard.maybe_require_snapshot(
         "execute_code", {"code": "print(1)"}, turn_id="turn_1", task_id="task_9"
     ) is None
-    assert rec.requests == []
 
     # 沙箱里 hermes_tools.write_file 回流：turn_id 为空、task_id 相同。
     assert guard.maybe_require_snapshot(
         "write_file", {"path": str(nested)}, turn_id="", task_id="task_9"
     ) is None
-    assert len(rec.requests) == 1
-    assert rec.requests[0]["body"]["turnId"] == "turn_1"
+    assert rec.requests, "嵌套写入必须触发 ensure"
+    assert all(r["body"]["turnId"] == "turn_1" for r in rec.requests)
 
 
 def test_non_loopback_callback_url_never_receives_token(monkeypatch, tmp_path):
@@ -470,6 +470,116 @@ def test_write_paths_resolved_via_task_registry(monkeypatch, tmp_path):
         "write_file", {"path": "notes.md"}, turn_id="turn_1", task_id="task_9"
     )
     assert rec.requests[0]["body"]["paths"] == [str(resolved)]
+
+
+def test_dns_spoofed_loopback_host_is_rejected(monkeypatch, tmp_path):
+    """127. 开头的 DNS hostname 不是 loopback，token 一个字节都不能发出去。"""
+    for url in (
+        "http://127.evil.example:9090/api/append",
+        "http://127.0.0.1.attacker:9090/api/append",
+    ):
+        monkeypatch.setenv("ZET_CHAT_APPEND_URL", url)
+        monkeypatch.delenv("ZETTLAB_AGENT_SHARE_ACTION_URL", raising=False)
+        guard.reset_for_test()
+        rec = _install(monkeypatch)
+        target = tmp_path / "a.txt"
+        target.write_text("x")
+        assert guard.maybe_require_snapshot("write_file", {"path": str(target)}, turn_id="t1") is None
+        assert rec.requests == [], url
+
+
+def test_finish_with_unknown_turn_does_not_steal_other_turns(monkeypatch, tmp_path):
+    """带明确 turn_id 却未命中（该轮没写过文件）时，绝不错收唯一余轮的 pin。"""
+    rec = _install(monkeypatch)
+    target = tmp_path / "a.txt"
+    target.write_text("x")
+    guard.maybe_require_snapshot("write_file", {"path": str(target)}, turn_id="turn_writer")
+    assert len(rec.requests) == 1
+
+    guard.finish_turn("completed", turn_id="turn_reader_only")
+    assert len(rec.requests) == 1  # 没有 finish 请求发出
+
+    guard.finish_turn("completed", turn_id="turn_writer")
+    assert len(rec.requests) == 2
+    assert rec.requests[1]["body"]["turnId"] == "turn_writer"
+
+
+def test_terminal_append_redirect_triggers_protection(monkeypatch, tmp_path):
+    """>> 追加与 tee 同样修改已有文件，必须触发保护。"""
+    rec = _install(monkeypatch)
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "printf 'x' >> notes.md"}, turn_id="turn_1"
+    ) is None
+    assert len(rec.requests) == 1
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "echo hi | tee -a notes.md"}, turn_id="turn_1"
+    ) is None
+    assert len(rec.requests) == 2
+
+
+def test_v4a_no_space_header_and_move_are_extracted(monkeypatch, tmp_path):
+    """***Update File:（无空格）与 Move File 的两个端点都要被抽出来。"""
+    rec = _install(monkeypatch)
+    a = tmp_path / "a.py"
+    a.write_text("x")
+    src = tmp_path / "old.py"
+    src.write_text("y")
+    dst = tmp_path / "new.py"
+    patch_body = (
+        "*** Begin Patch\n"
+        f"***Update File: {a}\n"
+        f"*** Move File: {src} -> {dst}\n"
+        "*** End Patch\n"
+    )
+    guard.maybe_require_snapshot("patch", {"mode": "patch", "patch": patch_body}, turn_id="turn_1")
+    assert sorted(rec.requests[0]["body"]["paths"]) == sorted([str(a), str(src), str(dst)])
+
+
+def test_terminal_workdir_prefers_session_cwd(monkeypatch, tmp_path):
+    """destructive terminal 按会话自己的 cwd 记录上报，而不是进程 env。"""
+    terminal_tool = pytest.importorskip("tools.terminal_tool")
+    session_dir = tmp_path / "session-cwd"
+    session_dir.mkdir()
+    monkeypatch.setattr(
+        terminal_tool, "get_session_cwd",
+        lambda key: str(session_dir) if key == "task_9" else None,
+    )
+    rec = _install(monkeypatch)
+
+    guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -f old.txt"}, turn_id="turn_1", task_id="task_9"
+    )
+    assert rec.requests[0]["body"]["paths"] == [str(session_dir)]
+
+
+def test_project_execute_code_protects_session_cwd(monkeypatch, tmp_path):
+    """project 模式 execute_code 启动前保护实际 session cwd——脚本能用 Python
+    直接改用户文件而不经过任何文件工具。"""
+    code_tool = pytest.importorskip("tools.code_execution_tool")
+    session_dir = tmp_path / "proj"
+    session_dir.mkdir()
+    monkeypatch.setattr(code_tool, "_get_execution_mode", lambda: "project")
+    monkeypatch.setattr(
+        code_tool, "_resolve_child_cwd",
+        lambda mode, staging, task_id="": str(session_dir),
+    )
+    rec = _install(monkeypatch)
+
+    assert guard.maybe_require_snapshot(
+        "execute_code", {"code": "open('x','w')"}, turn_id="turn_1", task_id="task_9"
+    ) is None
+    assert rec.requests[0]["body"]["paths"] == [str(session_dir)]
+
+
+def test_strict_execute_code_is_not_guarded(monkeypatch, tmp_path):
+    """strict 模式的脚本只能经沙箱 RPC 写文件（那条路已被 write_file/patch 覆盖）。"""
+    code_tool = pytest.importorskip("tools.code_execution_tool")
+    monkeypatch.setattr(code_tool, "_get_execution_mode", lambda: "strict")
+    rec = _install(monkeypatch)
+    assert guard.maybe_require_snapshot(
+        "execute_code", {"code": "print(1)"}, turn_id="turn_1", task_id="task_9"
+    ) is None
+    assert rec.requests == []
 
 
 def test_env_is_read_through_secret_scope(monkeypatch, tmp_path):

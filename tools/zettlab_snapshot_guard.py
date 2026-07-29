@@ -28,9 +28,11 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -68,9 +70,23 @@ _MAX_TASK_TURNS = 64
 
 
 # 需要保护的工具。execute_code 沙箱里的 hermes_tools.write_file 也回流到
-# handle_function_call，因此同样被这三个名字覆盖。
+# handle_function_call 被前三个名字覆盖；project 模式的 execute_code 还能用
+# Python open()/Path.write_text() 直接改 session cwd 里的用户文件而不经过任何
+# 文件工具，所以 execute_code 本体也要在启动前保护实际 cwd（Codex review P1）。
 _FILE_MUTATING_TOOLS = frozenset({"write_file", "patch"})
-_GUARDED_TOOLS = _FILE_MUTATING_TOOLS | {"terminal"}
+_GUARDED_TOOLS = _FILE_MUTATING_TOOLS | {"terminal", "execute_code"}
+
+# V4A patch 的 header 提取，与 tools/patch_parser.py 的规则同源：`***` 后空格
+# 可选（parser 用 \s*，接受 `***Update File:`），Move 有 src 与 dst 两个端点。
+# 规则不一致会让抽不到的路径退回「只保护工作目录」，跨目录的 patch 目标失去
+# 恢复点（Codex review P1）。
+_V4A_FILE_RE = re.compile(r"^\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*(.+)$", re.MULTILINE)
+_V4A_MOVE_RE = re.compile(r"^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$", re.MULTILINE)
+
+# terminal 破坏性分类的 guard 侧补充：共享的 _is_destructive_command 只认覆盖
+# 重定向（单个 >），追加写入（>>、tee）同样修改已有用户文件，必须触发保护
+# （Codex review P1）。方向是宁可多拍——误判只多一张快照，漏判丢恢复点。
+_APPEND_WRITE_RE = re.compile(r">>|\btee\b")
 
 
 class _TurnState:
@@ -114,10 +130,20 @@ def _scoped_env(name: str, default: str = "") -> str:
 
 
 def _is_loopback_host(host: Optional[str]) -> bool:
+    """只认字面量 loopback IP 与 localhost。
+
+    不能按字符串前缀判断：`127.evil.example` / `127.0.0.1.attacker` 是普通
+    DNS hostname，前缀匹配会把 token 发去外部主机（Codex review P1）。
+    """
     if not host:
         return False
     h = host.strip("[]").lower()
-    return h == "localhost" or h == "::1" or h.startswith("127.")
+    if h == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
 
 
 def _local_server_origin() -> str:
@@ -182,13 +208,65 @@ def _resolve_write_path(path: Any, task_id: str) -> str:
     return _abs_path(raw)
 
 
-def _terminal_workdir(arguments: dict[str, Any]) -> str:
+def _terminal_workdir(arguments: dict[str, Any], task_id: str) -> str:
     """破坏性 shell 命令报工作目录而不是解析命令行里的路径。
 
     从任意 shell 命令里可靠地抽出被改动的文件是做不到的；而快照本来就是主文件
     夹级的，报 cwd 足以让服务端定位到正确的 snapshot_target 并拍下整个目录。
+
+    cwd 的优先级与 terminal 的 _resolve_command_cwd 同源：显式 workdir 参数 >
+    会话自己的 cwd 记录（get_session_cwd，即该会话的 `cd` 状态）> 进程 env。
+    多会话 gateway 里会话 cwd 与进程 env 不同时，报错目录会让真正被改的文件
+    失去恢复点（Codex review P1）。
     """
-    return _abs_path(arguments.get("workdir") or os.getenv("TERMINAL_CWD") or os.getcwd())
+    explicit = str(arguments.get("workdir") or "").strip()
+    if explicit:
+        return _abs_path(explicit)
+    if task_id:
+        try:
+            from tools.terminal_tool import get_session_cwd
+
+            recorded = get_session_cwd(task_id)
+            if recorded:
+                return _abs_path(recorded)
+        except Exception:
+            pass
+    return _abs_path(os.getenv("TERMINAL_CWD") or os.getcwd())
+
+
+def _execute_code_workdir(arguments: dict[str, Any], task_id: str) -> str:
+    """project 模式 execute_code 的实际运行目录；非 project 模式返回空。
+
+    strict 模式的脚本只能经沙箱 RPC 的 hermes_tools 写文件——那条路已被
+    write_file / patch 覆盖；project 模式脚本能用 Python 直接改 session cwd
+    里的用户文件，必须在启动前保护该目录（Codex review P1）。
+    """
+    try:
+        from tools.code_execution_tool import _get_execution_mode, _resolve_child_cwd
+
+        if _get_execution_mode() != "project":
+            return ""
+        cwd = str(_resolve_child_cwd("project", "", task_id or "") or "").strip()
+        if cwd:
+            return _abs_path(cwd)
+    except Exception as exc:
+        logger.debug("zettlab snapshot guard: execute_code cwd resolution failed: %s", exc)
+        # 判定不了就按 project 处置，保护回退 cwd——宁可多拍。
+    return _terminal_workdir(arguments, task_id)
+
+
+def _extract_v4a_paths(patch_body: str) -> list[str]:
+    """按 patch_parser 的等价规则抽取 V4A patch 触达的所有路径。"""
+    paths: list[str] = []
+    for m in _V4A_FILE_RE.finditer(patch_body):
+        p = m.group(1).strip()
+        if p:
+            paths.append(p)
+    for m in _V4A_MOVE_RE.finditer(patch_body):
+        for p in (m.group(1).strip(), m.group(2).strip()):
+            if p:
+                paths.append(p)
+    return paths
 
 
 def _paths_for(tool_name: str, arguments: dict[str, Any], task_id: str) -> list[str]:
@@ -201,26 +279,26 @@ def _paths_for(tool_name: str, arguments: dict[str, Any], task_id: str) -> list[
         if mode == "replace":
             return [p for p in (_resolve_write_path(arguments.get("path"), task_id),) if p]
         # V4A patch 是唯一能触发删除 / 移动的模型路径，一次可能涉及多个文件。
-        try:
-            from acp_adapter.edit_approval import _extract_v4a_patch_paths
-
-            raw_paths = _extract_v4a_patch_paths(str(arguments.get("patch") or ""))
-        except Exception as exc:
-            logger.debug("zettlab snapshot guard: V4A path extraction failed: %s", exc)
-            # 抽不出路径不等于安全：退回工作目录，让整个主文件夹进保护。
-            return [_terminal_workdir(arguments)]
+        # 抽不出路径不等于安全：退回工作目录，让整个主文件夹进保护。
+        raw_paths = _extract_v4a_paths(str(arguments.get("patch") or ""))
         resolved = [_resolve_write_path(p, task_id) for p in raw_paths]
-        return [p for p in resolved if p] or [_terminal_workdir(arguments)]
+        return [p for p in resolved if p] or [_terminal_workdir(arguments, task_id)]
 
     if tool_name == "terminal":
         command = str(arguments.get("command") or "")
-        try:
-            from agent.tool_dispatch_helpers import _is_destructive_command
-        except Exception:
+        destructive = bool(_APPEND_WRITE_RE.search(command))
+        if not destructive:
+            try:
+                from agent.tool_dispatch_helpers import _is_destructive_command
+            except Exception:
+                return []
+            destructive = _is_destructive_command(command)
+        if not destructive:
             return []
-        if not _is_destructive_command(command):
-            return []
-        return [p for p in (_terminal_workdir(arguments),) if p]
+        return [p for p in (_terminal_workdir(arguments, task_id),) if p]
+
+    if tool_name == "execute_code":
+        return [p for p in (_execute_code_workdir(arguments, task_id),) if p]
 
     return []
 
@@ -471,20 +549,18 @@ def finish_turn(
 ) -> None:
     """一轮任务收尾：上报终态并解除该轮保护快照的 pin。
 
-    ``turn_id`` 指明收哪一轮（agent 的 ``_current_turn_id``）。不给或对不上时，
-    只有恰好只剩一轮在跟踪才收它；多轮并发时宁可不收——错收别人的轮会提前解掉
-    还在写的那轮的 pin（Codex review P1），而不收的代价只是等服务端 TTL 自愈。
-    本轮没发生过保护快照时是纯 no-op（不发任何请求）。上报失败只记日志。
+    ``turn_id`` 指明收哪一轮（agent 的 ``_current_turn_id``），**只做精确匹配**：
+    没有受保护写入的轮本来就没有状态条目，未命中时去收「唯一余轮」会把另一个
+    还在写的轮的 pin 提前解掉（Codex review P1）。不带 ``turn_id`` 时只有恰好
+    只剩一轮在跟踪才收它（cron 拿不到 agent 实例的兜底）；其余情况宁可不收，
+    代价只是等服务端 TTL 自愈。本轮没发生过保护快照时是纯 no-op。上报失败只
+    记日志。
     """
     turn = str(turn_id or "").strip()
     with _lock:
         current: Optional[_TurnState] = None
         if turn:
             current = _states.pop(turn, None)
-            if current is None and len(_states) == 1:
-                # zet 层的轮标识与 agent 运行时生成的可能不一致：唯一在跟踪的
-                # 那一轮就是本轮。
-                _, current = _states.popitem()
         elif len(_states) == 1:
             _, current = _states.popitem()
         elif _states:
