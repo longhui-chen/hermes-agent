@@ -31,19 +31,38 @@ _DEFAULT_TIMEOUT = 30.0
 # cancels the request and triggers rollbackInstall — deleting an app that was
 # about to install fine. Never auto-retry these here; retry semantics belong
 # to the calling skill (reload is idempotent per commit, this layer is not the
-# place to judge).
+# place to judge). acquire_slot shares this tier: the server answers a queued
+# caller immediately (queue_ahead), but a GRANTED slot pays the shared
+# build-environment integrity walk (~25k files) before responding — slow on a
+# busy 1-core board, and a client-side cut here leaks the slot until its TTL.
 _LONG_TIMEOUT = 120.0
-# acquire_slot may queue behind other builds; the model may ask for a longer
-# bounded wait, but never an unbounded one.
-_MAX_WAIT_SECONDS = 300
-_MAX_RESPONSE_BYTES = 256 * 1024
+# Must exceed the server's single-logs-response cap (512 KiB,
+# apphost/service.go); a smaller cap makes every long-log fetch fail as
+# status=200 + transport_error, which the skill reads as a transient outage
+# and retries forever.
+_MAX_RESPONSE_BYTES = 1024 * 1024
 _DEFAULT_LOG_TAIL = 200
+_MAX_STAGING_DIR_CHARS = 1024
 _SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
+# Loopback call carrying the agent action token: never route via environment
+# proxies. HTTP_PROXY/ALL_PROXY (when NO_PROXY doesn't cover loopback) would
+# forward the request — credential included — to whatever host the proxy
+# points at. Validating the URL is not enough; the transport itself must
+# refuse the proxy (same rationale as tools/browser_camofox.py).
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _urlopen(req, timeout):
+    return _NO_PROXY_OPENER.open(req, timeout=timeout)
+
 _LIFECYCLE_ACTIONS = ("start", "stop", "restart")
+# NOTE: no "recover" — the internal (agent) face deliberately does not expose
+# it (an action token authenticates one agent, not the device); recovery from
+# the recycle bin lives on the JWT member face, i.e. the client app's list.
 _HTTP_ACTIONS = (
     "probe", "list", "acquire_slot", "release_slot", "install", "reload",
-    "delete", "recover", "lifecycle", "logs",
+    "delete", "lifecycle", "logs",
 )
 _ACTIONS = _HTTP_ACTIONS + ("build_env",)
 
@@ -54,14 +73,15 @@ APP_HOST_SCHEMA = {
         "Hermes holds the credentials and performs the HTTP calls — never try "
         "to reach App Host endpoints from shell. Actions: probe (capability + "
         "storage headroom check), list (installed apps), acquire_slot / "
-        "release_slot (build-slot admission before compiling; acquire returns "
-        "a slot token, or queue_ahead while queued), install (register an app "
-        "staged on disk), reload (rebuild + restart from a staging dir; "
-        "idempotent — resending the same commit returns current state), delete "
-        "(soft-delete into the recycle bin), recover, lifecycle "
-        "(start/stop/restart), logs (recent log tail), build_env (local check "
-        "of the shared Go vendor dir to copy into the staging area; makes no "
-        "HTTP request)."
+        "release_slot (build-slot admission before compiling; acquire answers "
+        "immediately with a slot token, or queue_ahead while queued — poll by "
+        "calling again), install (register an app staged on disk), reload "
+        "(rebuild + restart from a staging dir; idempotent — resending the "
+        "same commit returns current state), delete (soft-delete into the "
+        "recycle bin; recovery is done from the client app's list, there is "
+        "no recover action here), lifecycle (start/stop/restart), logs "
+        "(recent log tail), build_env (local check of the shared Go vendor "
+        "dir to copy into the staging area; makes no HTTP request)."
     ),
     "parameters": {
         "type": "object",
@@ -75,7 +95,7 @@ APP_HOST_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Application slug. Required for install, reload, delete, "
-                    "recover, lifecycle, and logs."
+                    "lifecycle, and logs."
                 ),
             },
             "staging_dir": {
@@ -101,15 +121,6 @@ APP_HOST_SCHEMA = {
                 "type": "string",
                 "description": "Required for release_slot: the token returned by acquire_slot.",
             },
-            "wait_seconds": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": _MAX_WAIT_SECONDS,
-                "description": (
-                    "For acquire_slot only: bounded wait for a build slot "
-                    f"(default {int(_DEFAULT_TIMEOUT)}, max {_MAX_WAIT_SECONDS})."
-                ),
-            },
         },
         "required": ["action"],
     },
@@ -120,13 +131,37 @@ def _secret(name):
     return str(get_secret(name, "") or "").strip()
 
 
+def _is_trusted_apphost_endpoint(parts):
+    """Whether the split URL is the loopback internal face this credential
+    belongs to. Mirrors browser_camofox._is_trusted_action_token_endpoint:
+    the internal face is plain HTTP on loopback only, so anything else means
+    the value was repointed somewhere the action token must not go — fail
+    closed rather than hand the credential to whoever answers."""
+    if parts.scheme != "http":
+        return False
+    host = (parts.hostname or "").strip().lower()
+    if host == "localhost":
+        return True
+    # Must be a literal loopback address. A prefix test would accept names
+    # like `127.attacker.example`, which resolve wherever their owner points.
+    import ipaddress
+
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def _base_url():
     """Validated App Host base URL from the profile secret scope, or None."""
     raw = _secret("ZET_APPHOST_BASE_URL")
     if not raw:
         return None
-    parts = urlsplit(raw)
-    if parts.scheme not in ("http", "https") or not parts.netloc:
+    try:
+        parts = urlsplit(raw)
+    except ValueError:
+        return None
+    if not parts.netloc or not _is_trusted_apphost_endpoint(parts):
         return None
     return raw.rstrip("/")
 
@@ -199,9 +234,25 @@ def _require_slug(args):
 
 
 def _require_staging_dir(args):
+    """String-level precheck of the model-supplied staging path.
+
+    The server is the authoritative gate (validateStagingPath: direct child
+    of its staging root, Lstat symlink refusal — checks only it can make with
+    the real filesystem view). This layer rejects the obviously-malformed
+    forms locally so they never ride a credentialed request: relative paths,
+    parent-directory traversal, embedded NUL/newlines, absurd length.
+    """
     staging_dir = str(args.get("staging_dir", "") or "").strip()
     if not staging_dir:
         raise _BadRequest("该动作需要提供 staging_dir 参数")
+    if len(staging_dir) > _MAX_STAGING_DIR_CHARS:
+        raise _BadRequest("staging_dir 过长")
+    if any(ch in staging_dir for ch in ("\x00", "\n", "\r")):
+        raise _BadRequest("staging_dir 含非法字符")
+    if not staging_dir.startswith("/"):
+        raise _BadRequest("staging_dir 必须是绝对路径")
+    if ".." in staging_dir.split("/"):
+        raise _BadRequest("staging_dir 不允许包含上级目录段")
     return staging_dir
 
 
@@ -211,15 +262,15 @@ def _build_request(action, args):
     if action == "probe":
         return "GET", "/storage", None, timeout
     if action == "list":
-        return "GET", "", None, timeout
+        # Owner-scoped on purpose: the unfiltered device-wide list shows apps
+        # the owner gates on reload/delete/lifecycle/logs would then 404 —
+        # the model must only see what it can act on.
+        return "GET", "?mine=1", None, timeout
     if action == "acquire_slot":
-        wait = args.get("wait_seconds")
-        if wait is not None:
-            try:
-                timeout = float(min(max(int(wait), 1), _MAX_WAIT_SECONDS))
-            except (TypeError, ValueError):
-                raise _BadRequest("wait_seconds 必须是整数")
-        return "POST", "/buildslot", None, timeout
+        # Non-blocking on the server (queued → immediate queue_ahead; poll by
+        # calling again), but a GRANTED slot pays the integrity walk before
+        # the response — long tier, see _LONG_TIMEOUT.
+        return "POST", "/buildslot", None, _LONG_TIMEOUT
     if action == "release_slot":
         slot_token = str(args.get("slot_token", "") or "").strip()
         if not slot_token:
@@ -235,8 +286,6 @@ def _build_request(action, args):
         return "POST", f"/{slug}/reload", {"staging_dir": _require_staging_dir(args)}, _LONG_TIMEOUT
     if action == "delete":
         return "DELETE", f"/{_require_slug(args)}", None, timeout
-    if action == "recover":
-        return "POST", f"/{_require_slug(args)}/recover", None, timeout
     if action == "lifecycle":
         slug = _require_slug(args)
         lifecycle_action = str(args.get("lifecycle_action", "") or "").strip()
@@ -304,12 +353,14 @@ def app_host_tool(args, **_kw):
     req = urllib.request.Request(base + path, data=data, headers=headers, method=method)
 
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _urlopen(req, timeout=timeout) as resp:
             status = resp.status
             content_type = (resp.headers.get_content_type() or "").lower()
             raw = resp.read(_MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
-        upstream = _parse_upstream_error(exc.read() or b"")
+        # Same read cap as the success path — an oversized error body must
+        # not balloon memory on a 2 GB shared device.
+        upstream = _parse_upstream_error(exc.read(_MAX_RESPONSE_BYTES + 1) or b"")
         if upstream is not None:
             # Verbatim pass-through: skills branch on the upstream `code`
             # string (slug_conflict / storage_full / ...), never the HTTP

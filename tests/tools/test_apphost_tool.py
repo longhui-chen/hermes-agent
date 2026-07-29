@@ -128,13 +128,13 @@ def test_profile_scope_flow_works_with_poisoned_environ(monkeypatch):
     scope = _scope()
     seen = {}
     with mux_profile_scope(monkeypatch, scope, poison_environ=True):
-        with patch("urllib.request.urlopen", _capture_urlopen(seen, {"apps": []})):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen, {"apps": []})):
             out = app_host_tool({"action": "list"})
     assert isinstance(out, str)
     parsed = json.loads(out)
     assert parsed["ok"] is True and parsed["data"] == {"apps": []}
     req = seen["req"]
-    assert req.full_url == _BASE_URL
+    assert req.full_url == _BASE_URL + "?mine=1"
     assert req.get_header("X-zettlab-agent-action-token") == scope["ZETTLAB_AGENT_ACTION_TOKEN"]
     assert "stale-" not in request_fingerprint(req)
 
@@ -143,7 +143,7 @@ def test_profile_scope_flow_works_with_empty_environ(monkeypatch):
     scope = _scope()
     seen = {}
     with mux_profile_scope(monkeypatch, scope):  # scope keys purged from env
-        with patch("urllib.request.urlopen", _capture_urlopen(seen)):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
             out = json.loads(app_host_tool({"action": "probe"}))
     assert out["ok"] is True
     assert seen["req"].full_url == _BASE_URL + "/storage"
@@ -151,7 +151,7 @@ def test_profile_scope_flow_works_with_empty_environ(monkeypatch):
 
 @pytest.mark.parametrize("action,args,method,path,body", [
     ("probe", {}, "GET", "/storage", None),
-    ("list", {}, "GET", "", None),
+    ("list", {}, "GET", "?mine=1", None),
     ("acquire_slot", {}, "POST", "/buildslot", None),
     ("release_slot", {"slot_token": "s1"}, "DELETE", "/buildslot/s1", None),
     ("install", {"staging_dir": "/tmp/stage", "slug": "app1"}, "POST", "/install",
@@ -159,7 +159,6 @@ def test_profile_scope_flow_works_with_empty_environ(monkeypatch):
     ("reload", {"slug": "app1", "staging_dir": "/tmp/stage"}, "POST", "/app1/reload",
      {"staging_dir": "/tmp/stage"}),
     ("delete", {"slug": "app1"}, "DELETE", "/app1", None),
-    ("recover", {"slug": "app1"}, "POST", "/app1/recover", None),
     ("lifecycle", {"slug": "app1", "lifecycle_action": "restart"}, "POST",
      "/app1/lifecycle", {"action": "restart"}),
     ("logs", {"slug": "app1", "tail": 50}, "GET", "/app1/logs?tail=50", None),
@@ -167,7 +166,7 @@ def test_profile_scope_flow_works_with_empty_environ(monkeypatch):
 def test_action_routing_flow(monkeypatch, action, args, method, path, body):
     seen = {}
     with mux_profile_scope(monkeypatch, _scope(), poison_environ=True):
-        with patch("urllib.request.urlopen", _capture_urlopen(seen)):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
             out = json.loads(app_host_tool({"action": action, **args}))
     assert out["ok"] is True
     req = seen["req"]
@@ -184,7 +183,7 @@ def test_action_routing_flow(monkeypatch, action, args, method, path, body):
 
 def test_handler_always_returns_json_string(monkeypatch):
     with mux_profile_scope(monkeypatch, _scope()):
-        with patch("urllib.request.urlopen", _capture_urlopen({})):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen({})):
             success = app_host_tool({"action": "list"})
     unknown = app_host_tool({"action": "definitely_not_an_action"})
     missing = app_host_tool({"action": "release_slot"})
@@ -204,7 +203,6 @@ _ALL_HTTP_ACTION_ARGS = [
     ("install", {"staging_dir": "/tmp/s", "slug": "app1"}),
     ("reload", {"slug": "app1", "staging_dir": "/tmp/s"}),
     ("delete", {"slug": "app1"}),
-    ("recover", {"slug": "app1"}),
     ("lifecycle", {"slug": "app1", "lifecycle_action": "restart"}),
     ("logs", {"slug": "app1"}),
 ]
@@ -217,7 +215,7 @@ def test_2xx_empty_body_is_success_for_every_action(monkeypatch, action, args):
     branch — flagging it as transport_error reported every successful
     release/delete as a failure on a real device."""
     with mux_profile_scope(monkeypatch, _scope()):
-        with patch("urllib.request.urlopen", return_value=_RawResp(204)):
+        with patch("tools.apphost_tool._urlopen", return_value=_RawResp(204)):
             out = json.loads(app_host_tool({"action": action, **args}))
     assert out["ok"] is True
     assert out["data"] == {}
@@ -228,7 +226,7 @@ def test_2xx_success_tier_is_the_range_not_specific_codes(monkeypatch, status):
     # The tier test must be "status is 2xx", not an enumeration of codes:
     # a future 200-empty-body or 202 must not degrade into an error.
     with mux_profile_scope(monkeypatch, _scope()):
-        with patch("urllib.request.urlopen", return_value=_RawResp(status)):
+        with patch("tools.apphost_tool._urlopen", return_value=_RawResp(status)):
             out = json.loads(app_host_tool({"action": "release_slot", "slot_token": "s1"}))
     assert out["ok"] is True
 
@@ -239,7 +237,7 @@ def test_2xx_text_plain_body_is_success_with_text_payload(monkeypatch):
     log_text = "2026-07-30 01:00:00 INFO app started\n2026-07-30 01:00:01 INFO ready\n"
     resp = _RawResp(200, log_text.encode("utf-8"), content_type="text/plain")
     with mux_profile_scope(monkeypatch, _scope()):
-        with patch("urllib.request.urlopen", return_value=resp):
+        with patch("tools.apphost_tool._urlopen", return_value=resp):
             out = json.loads(app_host_tool({"action": "logs", "slug": "app1"}))
     assert out["ok"] is True
     assert out["data"] == {"text": log_text}
@@ -248,7 +246,7 @@ def test_2xx_text_plain_body_is_success_with_text_payload(monkeypatch):
 def test_2xx_declared_json_but_unparseable_is_still_success(monkeypatch):
     resp = _RawResp(200, b"{not json", content_type="application/json")
     with mux_profile_scope(monkeypatch, _scope()):
-        with patch("urllib.request.urlopen", return_value=resp):
+        with patch("tools.apphost_tool._urlopen", return_value=resp):
             out = json.loads(app_host_tool({"action": "probe"}))
     assert out["ok"] is True
     assert out["data"] == {"text": "{not json"}
@@ -276,7 +274,7 @@ def test_http_error_passes_upstream_error_body_verbatim(monkeypatch):
         )
 
     with mux_profile_scope(monkeypatch, scope):
-        with patch("urllib.request.urlopen", _boom):
+        with patch("tools.apphost_tool._urlopen", _boom):
             out = app_host_tool({"action": "install", "slug": "a1", "staging_dir": "/tmp/s"})
     parsed = json.loads(out)
     assert parsed["ok"] is False and parsed["status"] == 507
@@ -293,7 +291,7 @@ def test_http_error_without_json_body_degrades_to_transport_error(monkeypatch):
         )
 
     with mux_profile_scope(monkeypatch, scope):
-        with patch("urllib.request.urlopen", _boom):
+        with patch("tools.apphost_tool._urlopen", _boom):
             out = app_host_tool({"action": "probe"})
     parsed = json.loads(out)
     assert parsed["ok"] is False and parsed["status"] == 502
@@ -310,7 +308,7 @@ def test_connection_error_does_not_leak_url_or_token(monkeypatch):
         )
 
     with mux_profile_scope(monkeypatch, scope):
-        with patch("urllib.request.urlopen", _boom):
+        with patch("tools.apphost_tool._urlopen", _boom):
             out = app_host_tool({"action": "probe"})
     parsed = json.loads(out)
     assert parsed["ok"] is False and parsed["status"] is None
@@ -329,7 +327,7 @@ def test_install_failure_is_never_auto_retried(monkeypatch):
         raise urllib.error.URLError("timed out")
 
     with mux_profile_scope(monkeypatch, scope):
-        with patch("urllib.request.urlopen", _boom):
+        with patch("tools.apphost_tool._urlopen", _boom):
             out = json.loads(app_host_tool({"action": "install", "slug": "a1", "staging_dir": "/tmp/s"}))
     assert out["ok"] is False
     assert len(attempts) == 1, f"install must be attempted exactly once, got {attempts}"
@@ -351,7 +349,7 @@ def test_local_rejection_status_is_zero_not_null(monkeypatch):
     null would spin that branch forever."""
     # Local rejection form 1: validation failure (never builds a request).
     with mux_profile_scope(monkeypatch, _scope()):
-        with patch("urllib.request.urlopen",
+        with patch("tools.apphost_tool._urlopen",
                    side_effect=AssertionError("must not reach the network")):
             raw_validation = app_host_tool({"action": "release_slot"})
             raw_bad_slug = app_host_tool({"action": "delete", "slug": "a/b"})
@@ -391,7 +389,7 @@ def test_build_env_flow_ready_when_dir_exists(monkeypatch, tmp_path):
     vendor.mkdir()
     with mux_profile_scope(monkeypatch, _scope(ZETTLAB_GO_VENDOR_DIR=str(vendor)),
                            poison_environ=True):
-        with patch("urllib.request.urlopen",
+        with patch("tools.apphost_tool._urlopen",
                    side_effect=AssertionError("build_env must not make HTTP requests")):
             out = json.loads(app_host_tool({"action": "build_env"}))
     assert out["ok"] is True
@@ -417,38 +415,39 @@ def test_build_env_not_ready_when_unset(monkeypatch):
 @pytest.mark.parametrize("action,args,expected_timeout", [
     # install/reload need headroom over the server pipeline (Start 30s +
     # selfCheck 5s); a client-side timeout cancels the request context and
-    # triggers rollbackInstall on the server.
+    # triggers rollbackInstall on the server. acquire_slot pays the granted
+    # slot's integrity walk before the response.
     ("install", {"slug": "a1", "staging_dir": "/tmp/s"}, 120.0),
     ("reload", {"slug": "a1", "staging_dir": "/tmp/s"}, 120.0),
+    ("acquire_slot", {}, 120.0),
     ("probe", {}, 30.0),
     ("delete", {"slug": "a1"}, 30.0),
 ])
 def test_timeout_is_tiered_per_action(monkeypatch, action, args, expected_timeout):
     seen = {}
     with mux_profile_scope(monkeypatch, _scope()):
-        with patch("urllib.request.urlopen", _capture_urlopen(seen)):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
             app_host_tool({"action": action, **args})
     assert seen["timeout"] == expected_timeout
 
 
 # --- bounded waits -----------------------------------------------------------
 
-def test_acquire_slot_wait_is_bounded(monkeypatch):
+def test_acquire_slot_uses_long_timeout_and_is_bounded(monkeypatch):
+    # The server answers a queued caller immediately, but a granted slot pays
+    # the ~25k-file integrity walk before responding — long tier, still
+    # bounded (never unlimited).
     seen = {}
     with mux_profile_scope(monkeypatch, _scope()):
-        with patch("urllib.request.urlopen", _capture_urlopen(seen)):
-            app_host_tool({"action": "acquire_slot", "wait_seconds": 99999})
-    assert seen["timeout"] == 300  # capped, never unbounded
-    with mux_profile_scope(monkeypatch, _scope()):
-        with patch("urllib.request.urlopen", _capture_urlopen(seen)):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
             app_host_tool({"action": "acquire_slot"})
-    assert seen["timeout"] == 30.0  # default
+    assert seen["timeout"] == 120.0
 
 
 def test_default_timeout_on_other_actions(monkeypatch):
     seen = {}
     with mux_profile_scope(monkeypatch, _scope()):
-        with patch("urllib.request.urlopen", _capture_urlopen(seen)):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
             app_host_tool({"action": "probe"})
     assert seen["timeout"] == 30.0
 
@@ -462,7 +461,7 @@ def test_bad_slug_rejected_without_http(monkeypatch, bad_slug):
     # assert the request was never even attempted.
     seen = {}
     with mux_profile_scope(monkeypatch, _scope()):
-        with patch("urllib.request.urlopen", _capture_urlopen(seen)):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
             out = json.loads(app_host_tool({"action": "delete", "slug": bad_slug}))
     assert out["ok"] is False
     assert "req" not in seen, f"bad slug {bad_slug!r} reached the network"
@@ -479,10 +478,210 @@ def test_bad_slug_rejected_without_http(monkeypatch, bad_slug):
 def test_missing_required_params_rejected_without_http(monkeypatch, action, args):
     seen = {}
     with mux_profile_scope(monkeypatch, _scope()):
-        with patch("urllib.request.urlopen", _capture_urlopen(seen)):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
             out = json.loads(app_host_tool({"action": action, **args}))
     assert out["ok"] is False
     assert "req" not in seen, f"{action} with {args} reached the network"
+
+
+# --- server route table is the fixture ---------------------------------------
+
+# Verbatim route table of the internal face (RegisterInternalRoutes,
+# zettlab-local-server internal/apphost/handler/internal.go). Path params are
+# templated. This is the source of truth the action map must stay inside —
+# the recover action shipped against a route that only exists on the JWT
+# member face, and the tests were blind to it because fixture and
+# implementation encoded the same wrong assumption.
+_SERVER_INTERNAL_ROUTES = {
+    ("GET", "/storage"),
+    ("POST", "/buildslot"),
+    ("DELETE", "/buildslot/{token}"),
+    ("POST", "/install"),
+    ("GET", ""),
+    ("POST", "/{name}/reload"),
+    ("DELETE", "/{name}"),
+    ("POST", "/{name}/lifecycle"),
+    ("GET", "/{name}/logs"),
+}
+
+
+def _route_template(method, path):
+    """Normalize a concrete request path back to its route template."""
+    path = path.split("?", 1)[0]
+    parts = path.split("/")
+    if len(parts) >= 2 and parts[1] == "buildslot" and len(parts) == 3:
+        parts[2] = "{token}"
+    elif len(parts) >= 2 and parts[1] not in ("storage", "buildslot", "install", ""):
+        parts[1] = "{name}"
+    return method, "/".join(parts)
+
+
+def test_every_action_routes_inside_server_route_table(monkeypatch):
+    """Generalized guard: each HTTP action's (method, path) must land on a
+    route the server actually registers. Catches the next wrong-path action
+    at authoring time instead of as a live 404."""
+    for action, args in _ALL_HTTP_ACTION_ARGS:
+        seen = {}
+        with mux_profile_scope(monkeypatch, _scope()):
+            with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+                out = json.loads(app_host_tool({"action": action, **args}))
+        assert out["ok"] is True, action
+        req = seen["req"]
+        rel = req.full_url[len(_BASE_URL):]
+        assert _route_template(req.get_method(), rel) in _SERVER_INTERNAL_ROUTES, (
+            f"{action} -> {req.get_method()} {rel} is not a server route"
+        )
+
+
+def test_recover_is_not_an_action():
+    # The internal face deliberately has no recover route (an action token
+    # authenticates one agent, not the device); recovery lives on the client.
+    advertised = APP_HOST_SCHEMA["parameters"]["properties"]["action"]["enum"]
+    assert "recover" not in advertised
+    out = json.loads(app_host_tool({"action": "recover", "slug": "app1"}))
+    assert out["ok"] is False
+    assert out["error"]["code"] == "invalid_request"
+
+
+# --- credential never leaves loopback ----------------------------------------
+
+@pytest.mark.parametrize("bad_base", [
+    "https://127.0.0.1:18080/api/v1/internal/apps",  # internal face is plain http
+    "http://192.168.1.10:18080/api/v1/internal/apps",  # not loopback
+    "http://evil.example/api/v1/internal/apps",
+    "http://127.attacker.example/api/v1/internal/apps",  # prefix trick
+])
+def test_non_loopback_base_url_closes_gate_and_refuses_calls(monkeypatch, bad_base):
+    """The action token must never ride to a non-loopback endpoint: a
+    repointed base URL closes the gate and every call fails locally (status
+    0) without any request being attempted."""
+    seen = {}
+    with mux_profile_scope(monkeypatch, _scope(ZET_APPHOST_BASE_URL=bad_base)):
+        assert _check_app_host() is False
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+            out = json.loads(app_host_tool({"action": "probe"}))
+    assert out["ok"] is False and out["status"] == 0
+    assert "req" not in seen
+
+
+@pytest.mark.parametrize("good_base", [
+    "http://127.0.0.1:18080/api/v1/internal/apps",
+    "http://localhost:18080/api/v1/internal/apps",
+    "http://[::1]:18080/api/v1/internal/apps",
+])
+def test_loopback_base_urls_pass_the_gate(monkeypatch, good_base):
+    with mux_profile_scope(monkeypatch, _scope(ZET_APPHOST_BASE_URL=good_base)):
+        assert _check_app_host() is True
+
+
+def test_requests_bypass_environment_proxies(monkeypatch):
+    """The transport must refuse env proxies (HTTP_PROXY/ALL_PROXY would
+    forward the credentialed loopback request off-box): the tool goes through
+    the no-proxy opener, never the global urlopen."""
+    import urllib.request as _ur
+    from tools.apphost_tool import _NO_PROXY_OPENER
+
+    # build_opener(ProxyHandler({})) displaces the DEFAULT ProxyHandler (which
+    # reads HTTP_PROXY/ALL_PROXY from the environment); the empty one defines
+    # no <scheme>_open methods so it never joins the handler chain. Net
+    # effect, and the property asserted here: no proxy handler at all.
+    assert not [h for h in _NO_PROXY_OPENER.handlers
+                if isinstance(h, _ur.ProxyHandler)]
+
+    # Behavior-level: the global urlopen (which honours env proxies) must not
+    # be reachable from the tool's request path.
+    seen = {}
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("urllib.request.urlopen",
+                   side_effect=AssertionError("must not use proxy-honouring urlopen")), \
+             patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+            out = json.loads(app_host_tool({"action": "probe"}))
+    assert out["ok"] is True and "req" in seen
+
+
+# --- staging_dir precheck ----------------------------------------------------
+
+@pytest.mark.parametrize("bad_staging", [
+    "relative/path",
+    "/tmp/stage/../../../etc",
+    "/tmp/stage\nX-Injected: 1",
+    "/tmp/stage\x00",
+    "/" + "a" * 2000,
+])
+def test_malformed_staging_dir_rejected_without_http(monkeypatch, bad_staging):
+    """String-level precheck: obviously-malformed staging paths never ride a
+    credentialed request (the server's validateStagingPath stays the
+    authoritative gate for containment and symlinks)."""
+    seen = {}
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+            out = json.loads(app_host_tool(
+                {"action": "install", "slug": "app1", "staging_dir": bad_staging}
+            ))
+    assert out["ok"] is False and out["status"] == 0
+    assert out["error"]["code"] == "invalid_request"
+    assert "req" not in seen
+
+
+# --- response-size caps ------------------------------------------------------
+
+def test_error_body_read_is_capped(monkeypatch):
+    """The error path must read with the same cap as the success path — an
+    oversized error body degrades to transport_error instead of ballooning
+    memory on a 2 GB shared device. Asserting the outcome alone would go
+    green even without the cap (an over-long body degrades either way), so
+    the read AMOUNTS are recorded and bounded."""
+    from tools.apphost_tool import _MAX_RESPONSE_BYTES
+
+    read_amounts = []
+
+    class _RecordingBody(io.BytesIO):
+        def read(self, amt=None):
+            read_amounts.append(amt)
+            return super().read(amt)
+
+    huge = b"x" * (_MAX_RESPONSE_BYTES + 4096)
+
+    def _boom(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 507, "Insufficient Storage",
+                                     None, _RecordingBody(huge))
+
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", _boom):
+            out = json.loads(app_host_tool({"action": "probe"}))
+    assert out["ok"] is False and out["status"] == 507
+    assert out["error"]["code"] == "transport_error"
+    assert read_amounts, "error body was never read"
+    assert all(amt is not None and amt <= _MAX_RESPONSE_BYTES + 1
+               for amt in read_amounts), read_amounts
+
+
+def test_response_cap_exceeds_server_logs_cap(monkeypatch):
+    """The server caps a single logs response at 512 KiB; a smaller client
+    cap makes every long-log fetch fail as status=200 + transport_error,
+    which the skill reads as a transient outage and retries forever."""
+    from tools.apphost_tool import _MAX_RESPONSE_BYTES
+
+    assert _MAX_RESPONSE_BYTES > 512 * 1024
+    # Behavior-level: a server-cap-sized text body must come back as success.
+    big_log = ("L" * 1024 + "\n") * 512  # ~512 KiB
+    resp = _RawResp(200, big_log.encode("utf-8"), content_type="text/plain")
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("tools.apphost_tool._urlopen", return_value=resp):
+            out = json.loads(app_host_tool({"action": "logs", "slug": "app1"}))
+    assert out["ok"] is True
+    assert out["data"]["text"] == big_log
+
+
+# --- results are attacker-influenced data ------------------------------------
+
+def test_app_host_results_are_marked_untrusted():
+    # App logs (and app-shaped error messages) can carry third-party content;
+    # the dispatch layer must wrap app_host output in the untrusted-result
+    # delimiters like web_search/browser_* results.
+    from agent.tool_dispatch_helpers import _is_untrusted_tool
+
+    assert _is_untrusted_tool("app_host") is True
 
 
 def test_schema_actions_match_handler():
