@@ -51,12 +51,27 @@ _DEFAULT_LOG_TAIL = 200
 _MAX_STAGING_DIR_CHARS = 1024
 _SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuse to follow ANY redirect. The loopback check constrains only the
+    FIRST hop; following a 3xx would replay the action token against whatever
+    target the Location header names. The upstream is this machine's own
+    server and never legitimately redirects, so a 3xx is an anomaly: returning
+    None here makes urllib raise the original 3xx as an HTTPError, which the
+    handler reports as transport_error."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 # Loopback call carrying the agent action token: never route via environment
-# proxies. HTTP_PROXY/ALL_PROXY (when NO_PROXY doesn't cover loopback) would
-# forward the request — credential included — to whatever host the proxy
-# points at. Validating the URL is not enough; the transport itself must
-# refuse the proxy (same rationale as tools/browser_camofox.py).
-_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# proxies, never follow redirects. HTTP_PROXY/ALL_PROXY (when NO_PROXY doesn't
+# cover loopback) would forward the request — credential included — to
+# whatever host the proxy points at, and a followed redirect would do the same
+# one hop later. Validating the URL is not enough; the transport itself must
+# refuse both (proxy rationale shared with tools/browser_camofox.py).
+_NO_PROXY_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}), _RefuseRedirect()
+)
 
 
 def _urlopen(req, timeout):

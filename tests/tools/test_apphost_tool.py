@@ -629,6 +629,59 @@ def test_requests_bypass_environment_proxies(monkeypatch):
     assert out["data"] == {"via": "no-proxy-opener"}
 
 
+def test_redirects_are_not_followed_and_token_stays_home(monkeypatch):
+    """Real-socket reproduction of the redirect leak: base (loopback) answers
+    302 pointing at another origin. The loopback check only constrains the
+    first hop, so the transport itself must refuse to follow — the redirect
+    target must receive NOTHING (no request, no token), and the tool must
+    report the 3xx as a transport_error. Deliberately unmocked: the redirect
+    decision lives inside the opener, which a patched _urlopen would bypass."""
+    import http.server
+    import threading
+
+    target_hits = []
+
+    class Target(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            target_hits.append(dict(self.headers))
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b"{}")
+
+        def log_message(self, *_):
+            pass
+
+    target_srv = http.server.HTTPServer(("127.0.0.1", 0), Target)
+    target_url = f"http://127.0.0.1:{target_srv.server_port}"
+
+    class Redirector(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(302)
+            self.send_header("Location", target_url + "/steal")
+            self.end_headers()
+
+        def log_message(self, *_):
+            pass
+
+    redirect_srv = http.server.HTTPServer(("127.0.0.1", 0), Redirector)
+    base = f"http://127.0.0.1:{redirect_srv.server_port}/api/v1/internal/apps"
+    for srv in (target_srv, redirect_srv):
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        with mux_profile_scope(monkeypatch, _scope(ZET_APPHOST_BASE_URL=base)):
+            out = json.loads(app_host_tool({"action": "probe"}))
+    finally:
+        for srv in (target_srv, redirect_srv):
+            srv.shutdown()
+            srv.server_close()
+
+    assert out["ok"] is False
+    assert out["status"] == 302
+    assert out["error"]["code"] == "transport_error"
+    assert target_hits == [], f"redirect target was contacted: {target_hits}"
+
+
 # --- staging_dir precheck ----------------------------------------------------
 
 @pytest.mark.parametrize("bad_staging", [
