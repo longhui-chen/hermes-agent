@@ -386,6 +386,7 @@ _BUILTIN_PLATFORM_VALUES = frozenset(m.value for m in Platform.__members__.value
 PORT_BINDING_PLATFORM_VALUES = frozenset({
     "webhook",
     "api_server",
+    "zet_agent",
     "msgraph_webhook",
     "feishu",
     "wecom_callback",
@@ -393,6 +394,15 @@ PORT_BINDING_PLATFORM_VALUES = frozenset({
     "sms",
     "whatsapp_cloud",
     "line",
+})
+
+# Adapters initialized once by the multiplexed gateway process. Their inbound
+# traffic already carries a target profile (URL prefix or connector stamp), so
+# creating another adapter inside a secondary profile would duplicate the
+# process-wide ingress instead of adding profile-specific connectivity.
+MULTIPLEX_PROCESS_SHARED_PLATFORM_VALUES = frozenset({
+    "relay",
+    "zet_agent",
 })
 
 # Platforms whose port-binding status depends on connection mode. Feishu in

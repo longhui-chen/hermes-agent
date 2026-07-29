@@ -1570,6 +1570,7 @@ from contextlib import contextmanager as _contextmanager
 # take down the whole multiplexer. The set lives in gateway.config so the
 # dashboard's pre-write validation enforces the same policy.
 from gateway.config import (
+    MULTIPLEX_PROCESS_SHARED_PLATFORM_VALUES as _MULTIPLEX_PROCESS_SHARED_PLATFORM_VALUES,
     PORT_BINDING_PLATFORM_VALUES as _PORT_BINDING_PLATFORM_VALUES,
     platform_binds_port as _platform_binds_port,
 )
@@ -9531,6 +9532,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             platform.value
             for platform, platform_config in profile_cfg.platforms.items()
             if platform_config.enabled
+            and platform.value not in _MULTIPLEX_PROCESS_SHARED_PLATFORM_VALUES
             and _platform_binds_port(platform.value, platform_config.extra)
         )
         if port_binding_platforms:
@@ -9549,13 +9551,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         for platform, platform_config in profile_cfg.platforms.items():
             if not platform_config.enabled:
                 continue
-            # Relay is shared process-level ingress in multiplex mode. The
-            # active profile owns the one connection; connector-stamped
-            # source.profile routes inbound turns to secondary profiles.
+            # Process-shared ingress is owned by the active gateway instance.
+            # URL prefixes / connector stamps route inbound turns to the
+            # secondary profile without another listener or relay connection.
             if (
                 getattr(self.config, "multiplex_profiles", False)
-                and platform is Platform.RELAY
+                and platform.value in _MULTIPLEX_PROCESS_SHARED_PLATFORM_VALUES
             ):
+                logger.info(
+                    "Skipping process-shared platform %s for secondary profile %s",
+                    platform.value,
+                    profile_name,
+                )
                 continue
             # A secondary profile must not bind a listener: the active
             # profile's shared listener serves multiplex-prefixed requests.
