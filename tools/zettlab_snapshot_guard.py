@@ -1,0 +1,398 @@
+"""Zettlab Agent 文件变更保护快照的 pre-mutation hook（fork-only 模块）。
+
+在 Agent 对用户文件做破坏性操作**之前**，先让设备端的 local-server 为受影响的
+主文件夹建一张 btrfs 保护快照；拿不到快照就不执行操作（fail-closed）。这样用户
+永远有一个「Agent 动手之前」的恢复点。
+
+设计要点：
+
+* **调用方不做语义判定**。哪些路径算破坏性、属于哪个受保护目录、要不要拍快照，
+  全部由 local-server 按真实文件状态复核。这里只负责把涉及的绝对路径报上去。
+* **一轮任务 × 一个主文件夹最多一张快照**，同轮复用。轮标识取 tool 调度层传下来
+  的 ``turn_id``（chat 与 cron 都有值），服务端按 agent × turn × target 幂等。
+* **同轮自建文件豁免**：本轮由 Agent 自己创建的文件，其后续修改不再触发快照——
+  它的原始状态就是「不存在」，恢复手段是删掉。集合有上限，溢出即回退到正常拍
+  快照。
+* **老设备降级**：local-server 上没有这个接口（404）时放行并记一次日志，不假装
+  已经建过快照。
+* 通道是 loopback + registry 注入的 per-agent action token，URL 从既有的回调地址
+  派生，不新引任何环境变量。
+
+跨仓合同见 zettlab-local-server ``docs/agent-file-protection-internal-api.md``。
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import threading
+import time
+import urllib.error
+import urllib.request
+from typing import Any, Optional
+from urllib.parse import urlsplit, urlunsplit
+
+logger = logging.getLogger(__name__)
+
+# local-server 注入 hermes 子进程的回调地址，用来反推 origin。故意不引入独立的
+# ZETTLAB_LOCAL_SERVER_URL：从既有回调派生可以保证 action token 只发往 loopback。
+_ORIGIN_ANCHOR_ENVS = ("ZET_CHAT_APPEND_URL", "ZETTLAB_AGENT_SHARE_ACTION_URL")
+_ACTION_TOKEN_ENV = "ZETTLAB_AGENT_ACTION_TOKEN"
+
+_ENSURE_PATH = "/api/v1/internal/snapshot/agent-protection/ensure"
+_FINISH_PATH = "/api/v1/internal/snapshot/agent-protection/finish"
+
+# 服务端 ensure 的同步上限是 30s，客户端留一点余量再放弃。
+_ENSURE_TIMEOUT = 35.0
+_FINISH_TIMEOUT = 10.0
+
+# 响应体上限：正常载荷只有几个 ID 和状态字符串。
+_MAX_RESPONSE_BYTES = 256 * 1024
+
+# 同轮自建文件的追踪上限（PRD §7.3）。溢出后放弃豁免、回退为正常触发快照——
+# 宁可多拍，也不让这个集合无界增长。
+_MAX_CREATED_TRACKED = 512
+
+
+
+# 需要保护的工具。execute_code 沙箱里的 hermes_tools.write_file 也回流到
+# handle_function_call，因此同样被这三个名字覆盖。
+_FILE_MUTATING_TOOLS = frozenset({"write_file", "patch"})
+_GUARDED_TOOLS = _FILE_MUTATING_TOOLS | {"terminal"}
+
+
+class _TurnState:
+    """当前这一轮的追踪状态。turn 变了就整体丢弃。"""
+
+    def __init__(self, turn_id: str) -> None:
+        self.turn_id = turn_id
+        self.created: set[str] = set()
+        self.created_overflowed = False
+        self.ensured = False
+
+
+_lock = threading.Lock()
+_state: Optional[_TurnState] = None
+_degraded_logged = False
+
+def _scoped_env(name: str, default: str = "") -> str:
+    """读环境变量。multiplex 下必须走 profile scope，否则会串到别的 agent。"""
+    try:
+        from agent.secret_scope import get_secret
+
+        value = get_secret(name, "")
+        if value:
+            return str(value)
+    except Exception:
+        pass
+    try:
+        from agent.secret_scope import is_multiplex_active
+
+        if is_multiplex_active():
+            return default
+    except Exception:
+        pass
+    return os.environ.get(name, default)
+
+
+def _local_server_origin() -> str:
+    for env_key in _ORIGIN_ANCHOR_ENVS:
+        raw = _scoped_env(env_key, "").strip()
+        if not raw:
+            continue
+        parts = urlsplit(raw)
+        if not parts.scheme or not parts.netloc:
+            logger.debug("zettlab snapshot guard: malformed %s: %r", env_key, raw)
+            continue
+        return urlunsplit((parts.scheme, parts.netloc, "", "", "")).rstrip("/")
+    return ""
+
+
+def _abs_path(path: Any) -> str:
+    """把工具参数里的路径归一成绝对路径。服务端只接受绝对路径。"""
+    raw = str(path or "").strip()
+    if not raw:
+        return ""
+    expanded = os.path.expanduser(raw)
+    if not os.path.isabs(expanded):
+        base = os.getenv("TERMINAL_CWD") or os.getcwd()
+        expanded = os.path.join(base, expanded)
+    return os.path.normpath(expanded)
+
+
+def _terminal_workdir(arguments: dict[str, Any]) -> str:
+    """破坏性 shell 命令报工作目录而不是解析命令行里的路径。
+
+    从任意 shell 命令里可靠地抽出被改动的文件是做不到的；而快照本来就是主文件
+    夹级的，报 cwd 足以让服务端定位到正确的 snapshot_target 并拍下整个目录。
+    """
+    return _abs_path(arguments.get("workdir") or os.getenv("TERMINAL_CWD") or os.getcwd())
+
+
+def _paths_for(tool_name: str, arguments: dict[str, Any]) -> list[str]:
+    """列出这次调用可能改动的绝对路径；返回空表示不需要保护。"""
+    if tool_name == "write_file":
+        return [p for p in (_abs_path(arguments.get("path")),) if p]
+
+    if tool_name == "patch":
+        mode = str(arguments.get("mode") or "replace").strip()
+        if mode == "replace":
+            return [p for p in (_abs_path(arguments.get("path")),) if p]
+        # V4A patch 是唯一能触发删除 / 移动的模型路径，一次可能涉及多个文件。
+        try:
+            from acp_adapter.edit_approval import _extract_v4a_patch_paths
+
+            raw_paths = _extract_v4a_patch_paths(str(arguments.get("patch") or ""))
+        except Exception as exc:
+            logger.debug("zettlab snapshot guard: V4A path extraction failed: %s", exc)
+            # 抽不出路径不等于安全：退回工作目录，让整个主文件夹进保护。
+            return [_terminal_workdir(arguments)]
+        resolved = [_abs_path(p) for p in raw_paths]
+        return [p for p in resolved if p] or [_terminal_workdir(arguments)]
+
+    if tool_name == "terminal":
+        command = str(arguments.get("command") or "")
+        try:
+            from agent.tool_dispatch_helpers import _is_destructive_command
+        except Exception:
+            return []
+        if not _is_destructive_command(command):
+            return []
+        return [p for p in (_terminal_workdir(arguments),) if p]
+
+    return []
+
+
+def _post(path_suffix: str, payload: dict[str, Any], timeout: float) -> tuple[Optional[dict], str]:
+    """向 local-server internal 面发一次请求。
+
+    返回 ``(data, error_kind)``：``error_kind`` 为空表示成功；``unconfigured``
+    表示这不是设备环境（CLI / 单测），``not_supported`` 表示老 local-server 上
+    没有这个接口。两者都不构成阻断理由，其余都构成。
+    """
+    origin = _local_server_origin()
+    token = _scoped_env(_ACTION_TOKEN_ENV, "").strip()
+    if not origin or not token:
+        return None, "unconfigured"
+
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        origin + path_suffix,
+        data=body,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "X-Zettlab-Agent-Action-Token": token,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(_MAX_RESPONSE_BYTES + 1)
+        payload_out = json.loads(raw.decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            # 老 local-server 没有这个路由：设备不具备该能力。
+            return None, "not_supported"
+        detail = ""
+        try:
+            detail = exc.read(_MAX_RESPONSE_BYTES).decode("utf-8", "replace")
+        except Exception:
+            pass
+        logger.warning("zettlab snapshot guard: HTTP %s from %s: %s", exc.code, path_suffix, detail[:512])
+        return _error_payload(detail), "http_error"
+    except Exception as exc:
+        logger.warning("zettlab snapshot guard: request to %s failed: %s", path_suffix, exc)
+        return None, "transport_error"
+
+    if not isinstance(payload_out, dict):
+        return None, "bad_response"
+    data = payload_out.get("data")
+    if not isinstance(data, dict):
+        return None, "bad_response"
+    return data, ""
+
+
+def _error_payload(detail: str) -> Optional[dict]:
+    try:
+        parsed = json.loads(detail)
+    except Exception:
+        return None
+    if isinstance(parsed, dict) and isinstance(parsed.get("error"), dict):
+        return {"_error": parsed["error"]}
+    return None
+
+
+def _blocked(message: str, *, outcome: str = "unknown", tool: str = "", started: float = 0.0) -> str:
+    """阻断一次破坏性操作，并留下一条结构化日志。
+
+    这条日志是这套 fail-closed 机制在板子上唯一的可观测出口：被挡住的写入，用户
+    的体感只是「Agent 突然不肯改文件了」，基本不会有人提单。只记枚举、工具名和耗
+    时——**不记路径**（路径只进 local-server 受权限控制的审计表）。
+    """
+    elapsed_ms = int((time.monotonic() - started) * 1000) if started else -1
+    logger.warning(
+        "zettlab snapshot guard blocked a write: outcome=%s tool=%s duration_ms=%d",
+        outcome,
+        tool or "unknown",
+        elapsed_ms,
+    )
+    return json.dumps({"error": message}, ensure_ascii=False)
+
+
+def _reset_turn_locked(turn_id: str) -> _TurnState:
+    global _state
+    if _state is None or _state.turn_id != turn_id:
+        _state = _TurnState(turn_id)
+    return _state
+
+
+def maybe_require_snapshot(
+    tool_name: str,
+    arguments: dict[str, Any],
+    *,
+    turn_id: str = "",
+) -> Optional[str]:
+    """破坏性文件操作前确保保护快照就绪。
+
+    返回 ``None`` 表示放行；返回 JSON 错误字符串表示**不要执行这次操作**，该字符
+    串会作为工具结果回给模型。任何不确定的情况一律阻断（fail-closed）：没有恢复
+    点就动用户文件，是这套机制唯一不能接受的失败方式。
+    """
+    global _degraded_logged
+
+    if tool_name not in _GUARDED_TOOLS:
+        return None
+
+    paths = _paths_for(tool_name, arguments)
+    if not paths:
+        return None
+
+    started = time.monotonic()
+    turn = str(turn_id or "").strip()
+    if not turn:
+        # 没有轮标识就无法做幂等，会把每次写入都变成一张新快照。这属于调度层
+        # 契约被破坏，放行比拍一堆快照更糟，所以阻断。
+        return _blocked(
+            "File protection snapshot unavailable: missing turn id. The file was not modified.",
+            outcome="missing_turn_id", tool=tool_name, started=started,
+        )
+
+    with _lock:
+        state = _reset_turn_locked(turn)
+        # 本轮自己创建的文件，后续修改不再触发快照。
+        if tool_name in _FILE_MUTATING_TOOLS and not state.created_overflowed:
+            remaining = [p for p in paths if p not in state.created]
+            if not remaining:
+                return None
+            paths = remaining
+        pending_new = [p for p in paths if not os.path.lexists(p)]
+
+    data, err = _post(
+        _ENSURE_PATH,
+        {"turnId": turn, "paths": paths, "title": _title_for(paths)},
+        _ENSURE_TIMEOUT,
+    )
+
+    if err == "unconfigured":
+        return None  # 不是设备环境（CLI / 测试），本机制不适用
+    if err == "not_supported":
+        if not _degraded_logged:
+            _degraded_logged = True
+            logger.info(
+                "zettlab snapshot guard: local-server has no agent file protection endpoint; "
+                "proceeding without protection snapshots"
+            )
+        return None
+    if err or data is None:
+        detail = ""
+        if isinstance(data, dict) and isinstance(data.get("_error"), dict):
+            detail = str(data["_error"].get("message") or "")
+        return _blocked(
+            "Could not create a protection snapshot before modifying files"
+            + (f" ({detail})" if detail else "")
+            + ". The file was NOT modified. Tell the user the change did not happen; do not retry blindly.",
+            outcome=f"ensure_{err or 'bad_response'}", tool=tool_name, started=started,
+        )
+
+    if not data.get("ready"):
+        # 服务端只在真正失败时才会给 ready=false（无保护路径它自己就放行了）。
+        return _blocked(
+            "The protection snapshot is not ready. The file was NOT modified.",
+            outcome="not_ready", tool=tool_name, started=started,
+        )
+
+    _log_unprotected(data, tool_name)
+
+    with _lock:
+        state = _reset_turn_locked(turn)
+        state.ensured = True
+        if tool_name in _FILE_MUTATING_TOOLS:
+            for p in pending_new:
+                if len(state.created) >= _MAX_CREATED_TRACKED:
+                    state.created_overflowed = True
+                    break
+                state.created.add(p)
+    return None
+
+
+def _title_for(paths: list[str]) -> str:
+    """快照标题：首个文件名，多文件时带上数量。服务端会按 32 code point 截断。"""
+    if not paths:
+        return ""
+    first = os.path.basename(paths[0]) or paths[0]
+    if len(paths) == 1:
+        return first
+    return f"{first} 等 {len(paths)} 个文件"
+
+
+def _log_unprotected(data: dict, tool_name: str) -> None:
+    """无保护放行：改动没有恢复点，用户当场不知情，这条日志是唯一的现场记录。
+
+    服务端已经把路径写进受权限控制的审计表；这里只记原因枚举，不记路径。
+    """
+    reasons = {
+        str(op.get("unprotectedReason"))
+        for op in (data.get("operations") or [])
+        if isinstance(op, dict) and op.get("unprotected") and op.get("unprotectedReason")
+    }
+    if not reasons:
+        return
+    logger.info(
+        "zettlab snapshot guard: allowing a write with no recovery point (reason=%s tool=%s)",
+        ",".join(sorted(reasons)),
+        tool_name or "unknown",
+    )
+
+
+def finish_turn(state: str = "completed", *, error_code: str = "", error_stage: str = "") -> None:
+    """一轮任务收尾：上报终态并解除保护快照的 pin。
+
+    本轮没发生过保护快照时是纯 no-op（不发任何请求）。上报失败只记日志：服务端
+    的 pin 有 TTL，且有周期性自愈兜底，不能因为收尾失败就影响这一轮的结果。
+    """
+    global _state
+    with _lock:
+        current = _state
+        _state = None
+    if current is None or not current.ensured:
+        return
+
+    _post(
+        _FINISH_PATH,
+        {
+            "turnId": current.turn_id,
+            "state": state,
+            "errorCode": error_code,
+            "errorStage": error_stage,
+        },
+        _FINISH_TIMEOUT,
+    )
+
+
+def reset_for_test() -> None:
+    """测试钩子：丢弃进程内的轮状态。"""
+    global _state, _degraded_logged
+    with _lock:
+        _state = None
+        _degraded_logged = False

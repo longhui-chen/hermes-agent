@@ -1299,6 +1299,30 @@ def handle_function_call(
             if function_name in {"write_file", "patch"}:
                 return json.dumps({"error": "Edit approval denied: approval guard failed"}, ensure_ascii=False)
 
+        # Zettlab file-change protection: make the device create a btrfs recovery
+        # point before the agent touches existing user files, and refuse to run
+        # the tool when it cannot.  No-ops outside Zettlab devices (no local-server
+        # callback URL / action token in the environment).
+        try:
+            from tools.zettlab_snapshot_guard import maybe_require_snapshot
+
+            snapshot_block = maybe_require_snapshot(
+                function_name, function_args, turn_id=turn_id or ""
+            )
+            if snapshot_block is not None:
+                return snapshot_block
+        except Exception as _snapshot_guard_err:
+            logger.debug("Zettlab snapshot guard error: %s", _snapshot_guard_err)
+            # Fail closed for the file tools only.  `terminal` is mostly read-only
+            # traffic and its destructive classification is a best-effort regex, so
+            # blocking every shell call on an import-level guard failure would take
+            # the agent down for a defect it cannot act on.
+            if function_name in {"write_file", "patch"}:
+                return json.dumps(
+                    {"error": "File protection snapshot guard failed; the file was not modified."},
+                    ensure_ascii=False,
+                )
+
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).
         if function_name not in _READ_SEARCH_TOOLS:

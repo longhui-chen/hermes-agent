@@ -2126,6 +2126,20 @@ class ZetAgentAdapter(APIServerAdapter):
                     logger.debug("[zet_agent] native auto-title hook failed", exc_info=True)
             return result
         finally:
+            # Zettlab file-change protection: release this turn's protection
+            # snapshot pin.  This lives in `finally` because several
+            # run_conversation error/early-return paths never reach
+            # finalize_turn; reporting is idempotent and a no-op when the turn
+            # never took a protection snapshot.  A missed report is not fatal
+            # either — the pin carries a TTL and a periodic reconciler.
+            try:
+                import sys as _sys
+
+                from tools.zettlab_snapshot_guard import finish_turn
+
+                finish_turn("failed" if _sys.exc_info()[0] is not None else "completed")
+            except Exception:
+                logger.debug("[zet_agent] snapshot guard finish failed", exc_info=True)
             if old_session_key is None:
                 os.environ.pop("HERMES_SESSION_KEY", None)
             else:

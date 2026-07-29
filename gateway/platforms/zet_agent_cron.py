@@ -513,8 +513,9 @@ def install() -> None:
                             job.get("id", ""),
                         )
 
+                run_result = None
                 try:
-                    return _run_job_with_retry(
+                    run_result = _run_job_with_retry(
                         _run_once,
                         job,
                         before_retry=(
@@ -523,7 +524,22 @@ def install() -> None:
                             else None
                         ),
                     )
+                    return run_result
                 finally:
+                    # Zettlab file-change protection: a cron run is one turn, so
+                    # release its protection snapshot pin here. No-op when the
+                    # run never touched protected files.
+                    try:
+                        from tools.zettlab_snapshot_guard import finish_turn
+
+                        succeeded = (
+                            isinstance(run_result, tuple)
+                            and len(run_result) > 0
+                            and bool(run_result[0])
+                        )
+                        finish_turn("completed" if succeeded else "failed")
+                    except Exception:
+                        _dbg("snapshot guard finish failed")
                     # Success, terminal failure, or an exception: preserve the
                     # upstream contract for whichever attempt is still live.
                     if attempt_agents:
