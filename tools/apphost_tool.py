@@ -25,6 +25,14 @@ from agent.secret_scope import get_secret
 
 _ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
 _DEFAULT_TIMEOUT = 30.0
+# install/reload need headroom over the server's own pipeline (Start alone is
+# capped at 30s, selfCheck adds 5s), and the stakes are asymmetric: the server
+# derives its work context from the REQUEST context, so a client-side timeout
+# cancels the request and triggers rollbackInstall — deleting an app that was
+# about to install fine. Never auto-retry these here; retry semantics belong
+# to the calling skill (reload is idempotent per commit, this layer is not the
+# place to judge).
+_LONG_TIMEOUT = 120.0
 # acquire_slot may queue behind other builds; the model may ask for a longer
 # bounded wait, but never an unbounded one.
 _MAX_WAIT_SECONDS = 300
@@ -139,8 +147,19 @@ def _ok(data):
     return json.dumps({"ok": True, "data": data}, ensure_ascii=False)
 
 
-def _fail(message, status=None):
-    return json.dumps({"ok": False, "error": message, "status": status}, ensure_ascii=False)
+def _fail(error, status=None):
+    """Failure envelope. ``error`` is the upstream {code, message} error body
+    verbatim — skills branch on the ``code`` string (never the HTTP status),
+    so it must never be flattened into prose. Locally-produced errors mimic
+    the same shape."""
+    return json.dumps({"ok": False, "error": error, "status": status}, ensure_ascii=False)
+
+
+def _local_error(code, message, status=None):
+    """A locally-produced failure in the upstream error-body shape, so skills
+    need only one set of branches. The message must never contain the token
+    or the full base URL."""
+    return _fail({"code": code, "message": message}, status=status)
 
 
 class _BadRequest(ValueError):
@@ -187,10 +206,10 @@ def _build_request(action, args):
         return "POST", "/install", {
             "staging_dir": _require_staging_dir(args),
             "slug": _require_slug(args),
-        }, timeout
+        }, _LONG_TIMEOUT
     if action == "reload":
         slug = _require_slug(args)
-        return "POST", f"/{slug}/reload", {"staging_dir": _require_staging_dir(args)}, timeout
+        return "POST", f"/{slug}/reload", {"staging_dir": _require_staging_dir(args)}, _LONG_TIMEOUT
     if action == "delete":
         return "DELETE", f"/{_require_slug(args)}", None, timeout
     if action == "recover":
@@ -212,27 +231,16 @@ def _build_request(action, args):
     raise _BadRequest(f"未知动作：{action}")
 
 
-def _scrub(text, secrets):
-    """Redact credential/URL material from model-facing error text."""
-    out = str(text)
-    for value in secrets:
-        if value:
-            out = out.replace(value, "[已隐去]")
-    return out
-
-
-def _upstream_detail(raw_body):
-    """Short, safe detail string from an upstream error body ('' when none)."""
+def _parse_upstream_error(raw_body):
+    """The upstream JSON error body ({code, message}) verbatim, or None when
+    the body is absent / not a JSON object (degrade to transport_error)."""
+    if not raw_body or len(raw_body) > _MAX_RESPONSE_BYTES:
+        return None
     try:
         parsed = json.loads(raw_body.decode("utf-8", errors="replace"))
     except Exception:
-        return ""
-    if not isinstance(parsed, dict):
-        return ""
-    data = parsed.get("data")
-    detail = data.get("detail") if isinstance(data, dict) else None
-    detail = detail or parsed.get("message") or parsed.get("error") or ""
-    return str(detail)[:300]
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _build_env_result():
@@ -255,13 +263,12 @@ def app_host_tool(args, **_kw):
     try:
         method, path, body, timeout = _build_request(action, args)
     except _BadRequest as exc:
-        return _fail(str(exc))
+        return _local_error("invalid_request", str(exc))
 
     base = _base_url()
     token = _secret("ZETTLAB_AGENT_ACTION_TOKEN")
     if not base or not token:
-        return _fail("App Host 未配置或不可用，这台设备暂不支持生成应用")
-    secrets = (token, base)
+        return _local_error("unsupported", "App Host 未配置或不可用，这台设备暂不支持生成应用")
 
     data = json.dumps(body, ensure_ascii=False).encode("utf-8") if body is not None else None
     headers = {_ACTION_TOKEN_HEADER: token, "Accept": "application/json"}
@@ -274,22 +281,28 @@ def app_host_tool(args, **_kw):
             status = resp.status
             raw = resp.read(_MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as exc:
-        detail = _upstream_detail(exc.read() or b"")
-        message = f"App Host 请求失败（HTTP {exc.code}）"
-        if detail:
-            message += f"：{_scrub(detail, secrets)}"
-        return _fail(message, status=exc.code)
+        upstream = _parse_upstream_error(exc.read() or b"")
+        if upstream is not None:
+            # Verbatim pass-through: skills branch on the upstream `code`
+            # string (slug_conflict / storage_full / ...), never the HTTP
+            # status. Do not flatten into prose.
+            return _fail(upstream, status=exc.code)
+        return _local_error(
+            "transport_error",
+            f"App Host 请求失败（HTTP {exc.code}），未返回可解析的错误体",
+            status=exc.code,
+        )
     except Exception:
         # Never echo the exception: URLError/timeout messages can embed the
         # request URL.
-        return _fail("无法连接 App Host 服务")
+        return _local_error("transport_error", "无法连接 App Host 服务")
 
     if len(raw) > _MAX_RESPONSE_BYTES:
-        return _fail("App Host 返回内容过大", status=status)
+        return _local_error("transport_error", "App Host 返回内容过大", status=status)
     try:
         parsed = json.loads(raw.decode("utf-8"))
     except Exception:
-        return _fail("App Host 返回了无法解析的内容", status=status)
+        return _local_error("transport_error", "App Host 返回了无法解析的内容", status=status)
     return _ok(parsed)
 
 

@@ -164,7 +164,7 @@ def test_handler_always_returns_json_string(monkeypatch):
         json.loads(out)  # must be valid JSON
 
 
-# --- error paths never leak secrets -----------------------------------------
+# --- upstream error-body pass-through & leak guarantees ----------------------
 
 def _assert_no_secret_leak(out, scope):
     for value in scope.values():
@@ -172,16 +172,17 @@ def _assert_no_secret_leak(out, scope):
     assert "127.0.0.1:18080" not in out  # netloc of the base URL
 
 
-def test_http_error_reports_status_without_leaking(monkeypatch):
+def test_http_error_passes_upstream_error_body_verbatim(monkeypatch):
+    """Skills branch on the upstream `code` string (slug_conflict /
+    storage_full / ...), so the {code, message} body must arrive untouched —
+    not flattened into prose."""
     scope = _scope()
-    upstream = json.dumps({
-        "code": 507,
-        "data": {"detail": f"insufficient storage at {_BASE_URL}/install"},
-    }).encode("utf-8")
+    upstream_body = {"code": "storage_full", "message": "app data volume has 12MiB free"}
 
     def _boom(req, timeout=None):
         raise urllib.error.HTTPError(
-            req.full_url, 507, "Insufficient Storage", None, io.BytesIO(upstream)
+            req.full_url, 507, "Insufficient Storage", None,
+            io.BytesIO(json.dumps(upstream_body).encode("utf-8")),
         )
 
     with mux_profile_scope(monkeypatch, scope):
@@ -189,6 +190,24 @@ def test_http_error_reports_status_without_leaking(monkeypatch):
             out = app_host_tool({"action": "install", "slug": "a1", "staging_dir": "/tmp/s"})
     parsed = json.loads(out)
     assert parsed["ok"] is False and parsed["status"] == 507
+    assert parsed["error"] == upstream_body  # verbatim, key for key
+    _assert_no_secret_leak(out, scope)
+
+
+def test_http_error_without_json_body_degrades_to_transport_error(monkeypatch):
+    scope = _scope()
+
+    def _boom(req, timeout=None):
+        raise urllib.error.HTTPError(
+            req.full_url, 502, "Bad Gateway", None, io.BytesIO(b"<html>bad gateway</html>")
+        )
+
+    with mux_profile_scope(monkeypatch, scope):
+        with patch("urllib.request.urlopen", _boom):
+            out = app_host_tool({"action": "probe"})
+    parsed = json.loads(out)
+    assert parsed["ok"] is False and parsed["status"] == 502
+    assert parsed["error"]["code"] == "transport_error"  # same shape as upstream
     _assert_no_secret_leak(out, scope)
 
 
@@ -205,7 +224,25 @@ def test_connection_error_does_not_leak_url_or_token(monkeypatch):
             out = app_host_tool({"action": "probe"})
     parsed = json.loads(out)
     assert parsed["ok"] is False and parsed["status"] is None
+    assert parsed["error"]["code"] == "transport_error"
     _assert_no_secret_leak(out, scope)
+
+
+def test_install_failure_is_never_auto_retried(monkeypatch):
+    """Retry semantics belong to the calling skill; a blind tool-level retry
+    would race the server's rollback-on-cancel logic."""
+    scope = _scope()
+    attempts = []
+
+    def _boom(req, timeout=None):
+        attempts.append(req.full_url)
+        raise urllib.error.URLError("timed out")
+
+    with mux_profile_scope(monkeypatch, scope):
+        with patch("urllib.request.urlopen", _boom):
+            out = json.loads(app_host_tool({"action": "install", "slug": "a1", "staging_dir": "/tmp/s"}))
+    assert out["ok"] is False
+    assert len(attempts) == 1, f"install must be attempted exactly once, got {attempts}"
 
 
 def test_missing_config_returns_error(monkeypatch):
@@ -213,6 +250,7 @@ def test_missing_config_returns_error(monkeypatch):
         out = app_host_tool({"action": "probe"})
     parsed = json.loads(out)
     assert parsed["ok"] is False
+    assert parsed["error"]["code"] == "unsupported"
 
 
 # --- build_env ---------------------------------------------------------------
@@ -241,6 +279,25 @@ def test_build_env_not_ready_when_unset(monkeypatch):
     with mux_profile_scope(monkeypatch, _scope()):
         out = json.loads(app_host_tool({"action": "build_env"}))
     assert out["data"] == {"vendor_dir": "", "ready": False}
+
+
+# --- per-action timeouts -----------------------------------------------------
+
+@pytest.mark.parametrize("action,args,expected_timeout", [
+    # install/reload need headroom over the server pipeline (Start 30s +
+    # selfCheck 5s); a client-side timeout cancels the request context and
+    # triggers rollbackInstall on the server.
+    ("install", {"slug": "a1", "staging_dir": "/tmp/s"}, 120.0),
+    ("reload", {"slug": "a1", "staging_dir": "/tmp/s"}, 120.0),
+    ("probe", {}, 30.0),
+    ("delete", {"slug": "a1"}, 30.0),
+])
+def test_timeout_is_tiered_per_action(monkeypatch, action, args, expected_timeout):
+    seen = {}
+    with mux_profile_scope(monkeypatch, _scope()):
+        with patch("urllib.request.urlopen", _capture_urlopen(seen)):
+            app_host_tool({"action": action, **args})
+    assert seen["timeout"] == expected_timeout
 
 
 # --- bounded waits -----------------------------------------------------------
@@ -303,4 +360,5 @@ def test_schema_actions_match_handler():
     advertised = APP_HOST_SCHEMA["parameters"]["properties"]["action"]["enum"]
     for action in advertised:
         out = json.loads(app_host_tool({"action": action}))
-        assert "未知动作" not in (out.get("error") or ""), action
+        error = out.get("error") or {}
+        assert "未知动作" not in str(error.get("message", "")), action
