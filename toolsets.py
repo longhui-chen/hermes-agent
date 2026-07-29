@@ -261,6 +261,19 @@ TOOLSETS = {
         "includes": []
     },
 
+    # Catalog entry is load-bearing for reachability, not just organization:
+    # _get_platform_tools reverse-maps a platform's composite into CATALOG
+    # toolset names (its non-configurable recovery walks TOOLSETS), and
+    # get_tool_definitions then resolves those names back to tools. A tool
+    # registered under a toolset with no catalog entry is an orphan the
+    # reverse-mapping silently drops — registered, gate open, yet absent from
+    # the model's schema (found on a real device).
+    "zettlab_apphost": {
+        "description": "Manage device-hosted generated applications via the local App Host (zettlab)",
+        "tools": ["app_host"],
+        "includes": []
+    },
+
     "delegation": {
         "description": "Spawn subagents with isolated context for complex subtasks",
         "tools": ["delegate_task"],
