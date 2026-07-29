@@ -588,15 +588,19 @@ def test_requests_bypass_environment_proxies(monkeypatch):
     assert not [h for h in _NO_PROXY_OPENER.handlers
                 if isinstance(h, _ur.ProxyHandler)]
 
-    # Behavior-level: the global urlopen (which honours env proxies) must not
-    # be reachable from the tool's request path.
-    seen = {}
+    # Behavior-level: plant a distinguishable response on each transport and
+    # assert the result came through the no-proxy opener. Deliberately does
+    # NOT patch _urlopen itself (that would replace the very code under test)
+    # and does NOT use a raising sentinel (the handler's generic except would
+    # translate it into an ordinary failure).
     with mux_profile_scope(monkeypatch, _scope()):
         with patch("urllib.request.urlopen",
-                   side_effect=AssertionError("must not use proxy-honouring urlopen")), \
-             patch("tools.apphost_tool._urlopen", _capture_urlopen(seen)):
+                   return_value=_Resp({"via": "global-urlopen"})), \
+             patch.object(_NO_PROXY_OPENER, "open",
+                          return_value=_Resp({"via": "no-proxy-opener"})):
             out = json.loads(app_host_tool({"action": "probe"}))
-    assert out["ok"] is True and "req" in seen
+    assert out["ok"] is True
+    assert out["data"] == {"via": "no-proxy-opener"}
 
 
 # --- staging_dir precheck ----------------------------------------------------
