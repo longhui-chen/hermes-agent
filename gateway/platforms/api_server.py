@@ -2102,7 +2102,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 # outside the /proc/self/fd anchor above. A pre-placed symlink
                 # or hardlink sidecar would redirect journal writes into
                 # another profile, so reject any sidecar that is not a private
-                # regular file on the profile's filesystem before connecting.
+                # regular file on the same filesystem as state.db itself.
+                # Compare st_dev against the main file, not the profile
+                # directory: on btrfs the profile home is a subvolume whose
+                # directory inode reports the parent filesystem's st_dev while
+                # every file inside reports the subvolume's, so a directory
+                # comparison rejects all legitimate sidecars. A sidecar on a
+                # different filesystem than state.db still fails closed.
                 # (A racing swap after this check is not covered; closing that
                 # window needs a VFS-level no-follow open for sidecars.)
                 for sidecar_suffix in ("-wal", "-shm", "-journal"):
@@ -2126,7 +2132,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         if (
                             not stat.S_ISREG(sidecar_stat.st_mode)
                             or sidecar_stat.st_nlink != 1
-                            or sidecar_stat.st_dev != directory_stat.st_dev
+                            or sidecar_stat.st_dev != expected.st_dev
                         ):
                             raise RuntimeError(
                                 f"profile {sidecar_name} must be a private regular file"
@@ -2338,7 +2344,7 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 db = self._open_profile_session_db_with_repair(Path(key))
             except Exception as e:
-                logger.debug("SessionDB unavailable for API server: %s", e)
+                logger.warning("SessionDB unavailable for API server: %s", e)
                 return None
             cache[key] = db
             return db
