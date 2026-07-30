@@ -99,14 +99,18 @@ _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # -o、env 可以执行任意命令（Codex review P1）。宁可让它们多触发一次 cwd 保护。
 # 只读安全清单：**只收行为不受配置 / 环境驱动的命令**。
 #
-# git 与 less/more 已被整体移出（Codex review P1 ×N）：它们的行为由用户配置与
-# 环境变量驱动，能挂上任意外部命令——git 有 diff.external、diff.<drv>.textconv、
+# git、less/more、rg 已被整体移出（Codex review P1 ×N）：它们的行为由用户配置
+# 与环境变量驱动，能挂上任意外部命令——git 有 diff.external、diff.<drv>.textconv、
 # core.fsmonitor、core.pager、alias.*、hooks；less/more 有 LESSOPEN / LESSCLOSE
-# 预处理器。逐个子命令 / flag 去堵是无穷尽的（本 PR 已为此迭代四轮），而它们本
-# 就不该出现在「可证明只读」的清单里。代价只是这些命令会按 cwd 拍一张幂等快照
-# （每轮每目录一张），不是阻断。
+# 预处理器；rg 有 RIPGREP_CONFIG_PATH，配置文件里的 --pre 会对每个候选文件执行
+# 任意命令（只有 --no-config 才忽略它）。逐个子命令 / flag 去堵是无穷尽的，而
+# 它们本就不该出现在「可证明只读」的清单里。代价只是这些命令会按 cwd 拍一张幂
+# 等快照（每轮每目录一张），不是阻断。
+#
+# grep / egrep / fgrep 保留：它们没有「配置文件里挂外部命令」的等价面
+# （GREP_OPTIONS 早已移除，且从不执行命令）。
 _READONLY_FIRST_TOKENS = frozenset({
-    "ls", "cat", "grep", "rg", "egrep", "fgrep", "head", "tail",
+    "ls", "cat", "grep", "egrep", "fgrep", "head", "tail",
     "wc", "pwd", "echo", "printf", "stat", "file", "which",
     "type", "printenv", "ps", "df", "du", "date", "whoami", "id",
     "uname", "md5sum", "sha1sum", "sha256sum", "uniq", "cut", "tr",
@@ -116,7 +120,7 @@ _READONLY_FIRST_TOKENS = frozenset({
 # 命令文本里的绝对路径 token：cwd 之外的写入目标（rm /home/alice/... 或脚本里
 # 的 Path("/home/...").write_text）也要尽力保护（Codex review P1）。这些路径走
 # **附加** ensure：范围外（403）只跳过、不阻断——它们是 cwd 保护之外的加餐。
-_ABS_PATH_TOKEN_RE = re.compile(r"(?<![\w.+@%*?\[\]-])/(?:[\w.+@%*?\[\]-]+/)*[\w.+@%*?\[\]-]+")
+_ABS_PATH_TOKEN_RE = re.compile(r"(?<![\w.+@%*?{}\[\]-])/(?:[\w.+@%*?{},\[\]-]+/)*[\w.+@%*?{},\[\]-]+")
 # 引号字面量里的路径可以含空格（`rm -f '/home/a/My Documents/x'`、
 # `open("/home/a/My Documents/x","w")`），裸 token 正则会在空格处截断而漏掉
 # 真实目标（Codex review P1）。shell 与 Python 文本统一按引号对提取。除绝对
@@ -129,11 +133,47 @@ _QUOTED_PATHISH_RES = (
 # home / parent 裸 token 同样要带 glob 字符：`rm -rf ~/Doc*` 截成 `~/Doc` 后
 # lexists 不到，整条附加保护会静默漏掉（Codex review P1）。
 _BARE_HOME_TOKEN_RE = re.compile(
-    r"(?<![\w.-])(?:~|\$HOME|\$\{HOME\})/(?:[\w.+@%*?\[\]-]+/)*[\w.+@%*?\[\]-]+")
+    r"(?<![\w.-])(?:~|\$HOME|\$\{HOME\})/(?:[\w.+@%*?{},\[\]-]+/)*[\w.+@%*?{},\[\]-]+")
 _BARE_PARENT_TOKEN_RE = re.compile(
-    r"(?<![\w.-])\.\.(?:/(?:\.\.|[\w.+@%*?\[\]-]+))+")
+    r"(?<![\w.-])\.\.(?:/(?:\.\.|[\w.+@%*?{},\[\]-]+))+")
 _GLOB_CHARS = ("*", "?", "[")
 _MAX_ANCILLARY_PATHS = 16
+
+# shell 会把引号变量与后缀拼成同一个路径词：`rm -f "$HOME"/Documents/a.txt`
+# 删的是 HOME 下的真实文件，但正则要求 $HOME/ 出现在同一个匹配里就抽不到它
+# （Codex review P1）。提取前先把引号包裹的 HOME 归一成裸 $HOME。
+_QUOTED_HOME_RE = re.compile(r"""["']\$\{?HOME\}?["']""")
+# brace expansion：`rm -f /home/a/Doc{1,2}.txt` 真会删两个文件，静态可确定的
+# 形态要展开后再过滤（Codex review P1）。只处理不含嵌套的简单组，结果有上限。
+_BRACE_GROUP_RE = re.compile(r"\{([^{}]*,[^{}]*)\}")
+
+
+def _expand_braces(tok: str, limit: int = _MAX_ANCILLARY_PATHS) -> list[str]:
+    """展开静态可确定的 brace 组（{a,b}），最多 limit 个结果。
+
+    不支持嵌套与序列（{1..9}）：那些形态展开成本高、收益低，展不开时原样返回，
+    由 lexists 过滤掉——退化方向是「少保护一个附加目标」，与其它无法界定的
+    shell 形态一致（PRD §2 Phase 1 边界）。
+    """
+    out = [tok]
+    while True:
+        m = _BRACE_GROUP_RE.search(out[0])
+        if m is None:
+            return out[:limit]
+        alts = m.group(1).split(",")
+        expanded: list[str] = []
+        for item in out:
+            hit = _BRACE_GROUP_RE.search(item)
+            if hit is None:
+                expanded.append(item)
+                continue
+            for alt in alts:
+                expanded.append(item[:hit.start()] + alt + item[hit.end():])
+                if len(expanded) >= limit:
+                    break
+            if len(expanded) >= limit:
+                break
+        out = expanded or [tok]
 
 
 def _subprocess_home() -> str:
@@ -543,10 +583,6 @@ def _command_is_probably_readonly(command: str) -> bool:
             # 且随 env 一路传进 terminal 子进程——它在这里是可见的，命中即不
             # 判只读（Codex review P1）。会话内 alias / function 见函数注释。
             return False
-        if head == "rg" and any(a == "--pre" or a.startswith("--pre=") for a in tokens[1:]):
-            # rg --pre 会对每个候选文件执行指定命令（`rg --pre rm foo f` 真会
-            # 删 f）：带 --pre 的搜索不是只读（Codex review P1）。
-            return False
     return True
 
 
@@ -556,13 +592,22 @@ def _ancillary_abs_paths(text: str, primary: list[str], base_dir: str = "") -> l
     覆盖绝对路径、home 前缀（~ / $HOME / ${HOME}，按当前 profile 的 home 展
     开）与 `../` 相对目标（锚到 base_dir，即主保护用的工作目录）。引号字面量
     优先（能带空格、更精确），裸 token 正则兜底；lexists 过滤截断碎片。
+    提取前先把 `"$HOME"/x` 这类引号拼接归一成 `$HOME/x`，候选再过 brace 展开
+    （Codex review P1 ×2）。
     """
-    candidates: list[str] = []
+    text = _QUOTED_HOME_RE.sub("$HOME", text or "")
+    raw: list[str] = []
     for rx in _QUOTED_PATHISH_RES:
-        candidates.extend(m.group(1) for m in rx.finditer(text or ""))
-    candidates.extend(m.group(0) for m in _ABS_PATH_TOKEN_RE.finditer(text or ""))
-    candidates.extend(m.group(0) for m in _BARE_HOME_TOKEN_RE.finditer(text or ""))
-    candidates.extend(m.group(0) for m in _BARE_PARENT_TOKEN_RE.finditer(text or ""))
+        raw.extend(m.group(1) for m in rx.finditer(text))
+    raw.extend(m.group(0) for m in _ABS_PATH_TOKEN_RE.finditer(text))
+    raw.extend(m.group(0) for m in _BARE_HOME_TOKEN_RE.finditer(text))
+    raw.extend(m.group(0) for m in _BARE_PARENT_TOKEN_RE.finditer(text))
+    candidates: list[str] = []
+    for tok in raw:
+        if "{" in tok and "," in tok:
+            candidates.extend(_expand_braces(tok))
+        else:
+            candidates.append(tok)
     out: list[str] = []
     seen = set(primary)
     for cand in candidates:

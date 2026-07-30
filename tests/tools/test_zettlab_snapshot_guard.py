@@ -1087,26 +1087,6 @@ def test_env_prefixed_commands_are_not_provably_readonly(monkeypatch, tmp_path):
     assert len(rec.requests) == 2, "无 env 前缀的可证明只读命令仍免保护"
 
 
-def test_rg_pre_and_git_external_command_args_are_protected(monkeypatch, tmp_path):
-    """rg --pre 与 git diff --ext-diff / --textconv 都会执行外部命令：不能按只读
-    放行（Codex review P1）。"""
-    rec = _install(monkeypatch)
-    for cmd in (
-        "rg --pre rm foo f",
-        "rg --pre=rm foo f",
-        "git diff --ext-diff",
-        "git log --textconv",
-    ):
-        guard.reset_for_test()
-        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
-    assert len(rec.requests) == 4
-
-    guard.reset_for_test()
-    for cmd in ("rg foo f", "grep -r foo ."):
-        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
-    assert len(rec.requests) == 4, "不带 --pre 的搜索仍然只读"
-
-
 def test_extra_args_bind_mounts_map_back_to_host(monkeypatch, tmp_path):
     """docker_extra_args 里的 -v / --mount type=bind 会被原样追加进 docker run：
     这些挂载也要进反解表（Codex review P1）。"""
@@ -1378,3 +1358,66 @@ def test_glob_expansion_is_streamed_and_capped(monkeypatch, tmp_path):
     assert str(big) in ensured, "父目录必须纳保（覆盖面最大）"
     assert len(ensured) <= guard._MAX_ANCILLARY_PATHS + 1
     assert calls["n"] <= guard._MAX_ANCILLARY_PATHS, "不该枚举完整结果集"
+
+
+def test_rg_is_no_longer_readonly(monkeypatch, tmp_path):
+    """rg 的 --pre 可以来自 RIPGREP_CONFIG_PATH 指向的配置文件（只有 --no-config
+    忽略它）：与 git / less 同理，配置驱动的命令整体移出只读清单
+    （Codex review P1）。grep 族没有等价面，保留。"""
+    rec = _install(monkeypatch)
+    for cmd in ("rg needle victim.txt", "rg --no-config needle f"):
+        guard.reset_for_test()
+        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
+    assert len(rec.requests) == 2
+
+    guard.reset_for_test()
+    for cmd in ("grep -r foo .", "egrep bar f", "fgrep baz f"):
+        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
+    assert len(rec.requests) == 2, "grep 族仍然只读"
+
+
+def test_brace_expansion_targets_are_protected(monkeypatch, tmp_path):
+    """`rm -f /home/a/Doc{1,2}.txt` 真会删两个文件：静态可确定的 brace 组要展开
+    后再过滤，否则截成不存在的字面量被丢掉（Codex review P1）。"""
+    docs = tmp_path / "Documents"
+    docs.mkdir()
+    one = docs / "Doc1.txt"
+    two = docs / "Doc2.txt"
+    one.write_text("a")
+    two.write_text("b")
+    cwd = tmp_path / "Work"
+    cwd.mkdir()
+
+    rec = _install(monkeypatch)
+    guard.maybe_require_snapshot(
+        "terminal", {"command": f"rm -f {docs}/Doc{{1,2}}.txt", "workdir": str(cwd)},
+        turn_id="turn_1", task_id="task_9",
+    )
+    ensured = [p for r in rec.requests for p in (r["body"].get("paths") or [])]
+    assert str(one) in ensured and str(two) in ensured
+
+
+def test_quoted_home_concatenation_is_resolved(monkeypatch, tmp_path):
+    """shell 把 `"$HOME"/Documents/a.txt` 拼成一个路径词——这是常见的安全写法，
+    提取前要归一化，否则整条附加保护抽不到（Codex review P1）。"""
+    home = tmp_path / "home"
+    (home / "Documents").mkdir(parents=True)
+    doc = home / "Documents" / "a.txt"
+    doc.write_text("x")
+    monkeypatch.setenv("HOME", str(home))
+    cwd = tmp_path / "Work"
+    cwd.mkdir()
+
+    rec = _install(monkeypatch)
+    for cmd in (
+        'rm -f "$HOME"/Documents/a.txt',
+        'rm -f "${HOME}"/Documents/a.txt',
+    ):
+        guard.reset_for_test()
+        rec.requests.clear()
+        guard.maybe_require_snapshot(
+            "terminal", {"command": cmd, "workdir": str(cwd)},
+            turn_id="turn_1", task_id="task_9",
+        )
+        ensured = [p for r in rec.requests for p in (r["body"].get("paths") or [])]
+        assert str(doc) in ensured, cmd
