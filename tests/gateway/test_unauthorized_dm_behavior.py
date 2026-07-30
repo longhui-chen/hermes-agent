@@ -644,7 +644,10 @@ async def test_unauthorized_dm_pairs_by_default(monkeypatch):
         "tester",
     )
     adapter.send.assert_awaited_once()
-    assert "ABC12DEF" in adapter.send.await_args.args[1]
+    assert (
+        "`hermes pairing approve whatsapp ABC12DEF`"
+        in adapter.send.await_args.args[1]
+    )
 
 
 @pytest.mark.asyncio
@@ -682,7 +685,10 @@ async def test_default_profile_pairing_flow_uses_canonical_profile_store(monkeyp
     )
     runner.pairing_store.generate_code.assert_not_called()
     adapter.send.assert_awaited_once()
-    assert "ROOTCODE" in adapter.send.await_args.args[1]
+    assert (
+        "`hermes -p default pairing approve whatsapp ROOTCODE`"
+        in adapter.send.await_args.args[1]
+    )
 
 
 @pytest.mark.asyncio

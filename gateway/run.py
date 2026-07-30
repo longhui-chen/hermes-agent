@@ -10227,6 +10227,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     platform_name, source.user_id, source.user_name or ""
                 )
                 if code:
+                    approval_args = ["hermes"]
+                    if source.profile:
+                        approval_args.extend(["-p", source.profile])
+                    approval_args.extend(
+                        ["pairing", "approve", platform_name, code]
+                    )
+                    approval_command = shlex.join(approval_args)
                     adapter = self._adapter_for_source(source)
                     if adapter:
                         await adapter.send(
@@ -10234,7 +10241,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             f"Hi~ I don't recognize you yet!\n\n"
                             f"Here's your pairing code: `{code}`\n\n"
                             f"Ask the bot owner to run:\n"
-                            f"`hermes pairing approve {platform_name} {code}`"
+                            f"`{approval_command}`"
                         )
                 else:
                     adapter = self._adapter_for_source(source)
