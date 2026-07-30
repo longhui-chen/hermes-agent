@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import threading
 import time
 import urllib.error
@@ -333,6 +334,19 @@ def _abs_path(path: Any) -> str:
 _CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona"})
 
 
+def _bridge_terminal_env() -> None:
+    """触发 terminal_tool 的懒桥接，把 config.yaml 的 terminal.* 灌进环境变量。
+
+    幂等；桥接不可用（非 hermes 环境 / 单测桩缺失）时静默降级，读到什么算什么。
+    """
+    try:
+        from tools.terminal_tool import _ensure_terminal_env_bridged
+
+        _ensure_terminal_env_bridged()
+    except Exception as exc:
+        logger.debug("zettlab snapshot guard: terminal env bridge unavailable: %s", exc)
+
+
 def _json_env_list(name: str) -> list:
     raw = (os.getenv(name) or "").strip()
     if not raw:
@@ -413,12 +427,7 @@ def _container_path_maps() -> list[tuple[str, str]]:
     # terminal_tool._get_env_config() 才把 config.yaml 的 terminal.backend /
     # cwd / docker_volumes 灌进环境变量。不先触发桥接就读 env，会在 Docker 会
     # 话里按 local backend 判定、给错路径建快照（Codex review P1）。
-    try:
-        from tools.terminal_tool import _ensure_terminal_env_bridged
-
-        _ensure_terminal_env_bridged()
-    except Exception as exc:
-        logger.debug("zettlab snapshot guard: terminal env bridge unavailable: %s", exc)
+    _bridge_terminal_env()
 
     env_type = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
     if env_type not in _CONTAINER_BACKENDS:
@@ -495,6 +504,13 @@ def _terminal_workdir(arguments: dict[str, Any], task_id: str) -> str:
     容器内的 `/workspace/...`，原样上报会让快照落在不存在的路径、真正被改的
     host 目录失去恢复点（Codex review P1）——不存在就退回下一级。
     """
+    # TERMINAL_CWD 是懒桥接的：local backend 且没有 session_cwd / 显式 workdir
+    # 时直接读它兜底，此前若没有任何调用触发过 _get_env_config()，config.yaml
+    # 的 terminal.cwd 根本不在环境里——真实 terminal_tool 会先桥接再跑命令，
+    # guard 不桥接就会给 Hermes 进程 cwd 建快照，命令实际跑在 terminal.cwd
+    # （Codex review P1）。
+    _bridge_terminal_env()
+
     session_cwd = ""
     if task_id:
         try:
@@ -508,7 +524,14 @@ def _terminal_workdir(arguments: dict[str, Any], task_id: str) -> str:
 
     explicit = str(arguments.get("workdir") or "").strip()
     if explicit:
-        expanded = os.path.expanduser(explicit)
+        # `~` 按工具子进程实际生效的 HOME 展开：workdir 的 `cd` 由 shell 按子
+        # 进程 $HOME 解释，home_mode=profile / 缺 HOME fallback 时它是
+        # {HERMES_HOME}/home，用 Hermes 进程的 expanduser 会给真实 OS HOME 建
+        # 快照、实际被写的 profile home 没有恢复点（Codex review P1）。
+        if explicit == "~" or explicit.startswith("~/"):
+            expanded = _subprocess_home() + explicit[1:]
+        else:
+            expanded = os.path.expanduser(explicit)
         if os.path.isabs(expanded):
             p = _map_container_path(os.path.normpath(expanded))
         else:
@@ -526,16 +549,77 @@ def _terminal_workdir(arguments: dict[str, Any], task_id: str) -> str:
 # 单个 `&`（非 `&&` / `2>&1` / `&>`）把命令甩到后台。
 _SHELL_AMP_BACKGROUND_RE = re.compile(r"(?<![&>|])&(?![&>])")
 
+# nohup / setsid 把子进程甩出保护窗口；env / command / exec / nice 一类包裹层
+# 不改变「最终执行谁」，判定时逐层剥掉再看真正的命令头。值集合列出的 flag 会
+# 吃掉后面一个参数词（nice -n 10、env -u VAR）。
+_DAEMONIZE_HEADS = frozenset({"nohup", "setsid"})
+_WRAPPER_VALUE_FLAGS: dict[str, frozenset[str]] = {
+    "env": frozenset({"-u", "-C", "-S"}),
+    "command": frozenset(),
+    "exec": frozenset({"-a"}),
+    "nice": frozenset({"-n"}),
+    "ionice": frozenset({"-c", "-n", "-p"}),
+    "stdbuf": frozenset({"-i", "-o", "-e"}),
+    "time": frozenset({"-f", "-o"}),
+}
+# shlex punctuation_chars 模式下会单独成 token 的 shell 操作符字符。
+_SHELL_PUNCT_CHARS = frozenset("();<>|&")
+
+
+def _segment_daemonizes(words: list[str]) -> bool:
+    """报告一个链段（已按 shell word 语义分好词）是否经 nohup / setsid 自后台化。"""
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if _ENV_ASSIGN_RE.match(word):
+            i += 1
+            continue
+        name = os.path.basename(word)
+        if name in _DAEMONIZE_HEADS:
+            return True
+        if name in _WRAPPER_VALUE_FLAGS:
+            # `command -v xxx` 只查名字不执行，不是包裹层。
+            if name == "command" and i + 1 < len(words) and words[i + 1] in ("-v", "-V"):
+                return False
+            value_flags = _WRAPPER_VALUE_FLAGS[name]
+            i += 1
+            while i < len(words) and words[i].startswith("-"):
+                flag = words[i]
+                i += 1
+                if flag in value_flags and i < len(words) and not words[i].startswith("-"):
+                    i += 1
+            continue
+        return False
+    return False
+
 
 def _shell_self_backgrounds(command: str) -> bool:
-    """报告一条 shell 命令是否会自行后台化（`cmd &`、nohup / setsid 包裹）。"""
+    """报告一条 shell 命令是否会自行后台化（`cmd &`、nohup / setsid 包裹）。
+
+    必须按 shell word 语义解析：`'setsid' -f ...` 的引号在执行时会被 shell 剥
+    掉、跑的仍是 setsid，朴素空格 split 把引号留在 token 里就漏判（Codex
+    review P1）；链接符也要引号感知——`LESSOPEN='|rm %s' less` 的 `|` 在引号
+    里，不是管道。用 shlex 的 punctuation_chars 模式一次拿到词与操作符，按操
+    作符重新分段判定。引号不配对等解析不了的形态 fail-closed 按自后台化处理
+    ——识别不准就不放行。
+    """
     if _SHELL_AMP_BACKGROUND_RE.search(command):
         return True
-    for segment in _SHELL_CHAIN_SPLIT_RE.split(command):
-        tokens = [t for t in segment.strip().split() if not _ENV_ASSIGN_RE.match(t)]
-        if tokens and os.path.basename(tokens[0]) in {"nohup", "setsid"}:
-            return True
-    return False
+    try:
+        lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        words = list(lex)
+    except ValueError:
+        return True
+    segment: list[str] = []
+    segments = [segment]
+    for word in words:
+        if word and all(ch in _SHELL_PUNCT_CHARS for ch in word):
+            segment = []
+            segments.append(segment)
+            continue
+        segment.append(word)
+    return any(_segment_daemonizes(seg) for seg in segments)
 
 
 def _shell_function_shadows(name: str) -> bool:
@@ -602,6 +686,17 @@ def _ancillary_abs_paths(text: str, primary: list[str], base_dir: str = "") -> l
     raw.extend(m.group(0) for m in _ABS_PATH_TOKEN_RE.finditer(text))
     raw.extend(m.group(0) for m in _BARE_HOME_TOKEN_RE.finditer(text))
     raw.extend(m.group(0) for m in _BARE_PARENT_TOKEN_RE.finditer(text))
+    # shell 会把相邻的 quoted / unquoted 段拼成同一个 word：
+    # `rm "$HOME"/"Documents"/a.txt` 与 `rm $HOME/Documents/a.txt` 同义，逐段
+    # 正则在引号处断开、抽不到整体。再按 shell word 语义切一遍，凡是路径形态的
+    # word 整词入候选（Codex review P1）。解析不了（引号不配对 / 非 shell 文
+    # 本）就只靠上面的正则，提取是加餐、正则仍在。
+    try:
+        for word in shlex.split(text, posix=True):
+            if word.startswith(("/", "~", "$HOME", "${HOME}", "../")):
+                raw.append(word)
+    except ValueError:
+        pass
     candidates: list[str] = []
     for tok in raw:
         if "{" in tok and "," in tok:

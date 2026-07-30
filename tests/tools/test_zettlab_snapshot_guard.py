@@ -1421,3 +1421,102 @@ def test_quoted_home_concatenation_is_resolved(monkeypatch, tmp_path):
         )
         ensured = [p for r in rec.requests for p in (r["body"].get("paths") or [])]
         assert str(doc) in ensured, cmd
+
+
+def test_quoted_or_wrapped_daemonizers_are_blocked(monkeypatch, tmp_path):
+    """引号 / 包裹层里的 setsid、nohup 在 shell 剥引号后照常执行——朴素空格
+    split 会漏判，让写入跑到 finish 解 pin 之后（Codex review P1）。引号不配对
+    等解析不了的形态 fail-closed。"""
+    rec = _install(monkeypatch)
+    for cmd in (
+        "'setsid' -f sh -c 'sleep 1; rm -f victim'",
+        '"nohup" rm -f victim',
+        "env setsid rm -f victim",
+        "command setsid rm -f victim",
+        "nice -n 10 setsid rm -f victim",
+        "rm -f 'victim",  # 引号不配对：识别不准即不放行
+    ):
+        guard.reset_for_test()
+        blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
+        assert blocked is not None and "NOT executed" in blocked, cmd
+    assert rec.requests == []
+
+    # `command -v setsid` 只查名字不执行；普通写入命令照常走保护。
+    guard.reset_for_test()
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "command -v setsid && rm -f x"}, turn_id="turn_1") is None
+    assert len(rec.requests) == 1, "非后台写入命令照常走保护"
+
+
+def test_adjacent_quoted_path_segments_are_concatenated(monkeypatch, tmp_path):
+    """shell 会把相邻 quoted / unquoted 段拼成一个 word：`"$HOME"/"Documents"/a`
+    删的是 HOME 下的真实文件，逐段正则在引号处断开就抽不到附加目标
+    （Codex review P1）。"""
+    home = tmp_path / "home"
+    (home / "Documents").mkdir(parents=True)
+    doc_a = home / "Documents" / "a.txt"
+    doc_a.write_text("x")
+    doc_b = home / "Documents" / "b.txt"
+    doc_b.write_text("y")
+    monkeypatch.setenv("HOME", str(home))
+    cwd = tmp_path / "Work"
+    cwd.mkdir()
+
+    rec = _install(monkeypatch)
+    for cmd, target in (
+        ('rm -f "$HOME"/"Documents/a.txt"', doc_a),
+        ('rm -f "$HOME"/"Documents"/b.txt', doc_b),
+        ("rm -f '%s'/'Documents'/a.txt" % home, doc_a),
+    ):
+        guard.reset_for_test()
+        rec.requests.clear()
+        guard.maybe_require_snapshot(
+            "terminal", {"command": cmd, "workdir": str(cwd)},
+            turn_id="turn_1", task_id="task_9",
+        )
+        ensured = [p for r in rec.requests for p in (r["body"].get("paths") or [])]
+        assert str(target) in ensured, cmd
+
+
+def test_terminal_workdir_bridges_lazy_terminal_cwd(monkeypatch, tmp_path):
+    """local backend 无 session_cwd / 显式 workdir 时兜底读 TERMINAL_CWD——它
+    是懒桥接的，不先触发 _get_env_config()，config.yaml 的 terminal.cwd 根本不
+    在环境里，guard 会给 Hermes 进程 cwd 建快照而命令实际跑在 terminal.cwd
+    （Codex review P1）。"""
+    terminal_tool = pytest.importorskip("tools.terminal_tool")
+    proj = tmp_path / "proj"
+    proj.mkdir()
+
+    def fake_bridge():
+        os.environ["TERMINAL_CWD"] = str(proj)
+
+    monkeypatch.setattr(terminal_tool, "_ensure_terminal_env_bridged", fake_bridge)
+    monkeypatch.setattr(terminal_tool, "get_session_cwd", lambda key: None)
+    monkeypatch.delenv("TERMINAL_CWD", raising=False)
+
+    rec = _install(monkeypatch)
+    guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -f x"}, turn_id="turn_1", task_id="task_9"
+    )
+    assert rec.requests[0]["body"]["paths"] == [str(proj)]
+
+
+def test_terminal_workdir_tilde_uses_subprocess_home(monkeypatch, tmp_path):
+    """workdir="~/Documents" 的 `cd` 由 shell 按子进程 $HOME 展开——home_mode=
+    profile 时那是 {HERMES_HOME}/home，用 Hermes 进程的 expanduser 会给真实 OS
+    HOME 建快照、实际被写的 profile home 没有恢复点（Codex review P1）。"""
+    import hermes_constants
+
+    proc_home = tmp_path / "proc-home"
+    sub_home = tmp_path / "profile-home"
+    (proc_home / "Documents").mkdir(parents=True)
+    (sub_home / "Documents").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(proc_home))
+    monkeypatch.setattr(hermes_constants, "get_subprocess_home", lambda env=None: str(sub_home))
+
+    rec = _install(monkeypatch)
+    guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -f a.txt", "workdir": "~/Documents"},
+        turn_id="turn_1", task_id="task_9",
+    )
+    assert rec.requests[0]["body"]["paths"] == [str(sub_home / "Documents")]
