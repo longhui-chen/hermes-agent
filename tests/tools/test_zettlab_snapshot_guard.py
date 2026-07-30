@@ -1520,3 +1520,64 @@ def test_terminal_workdir_tilde_uses_subprocess_home(monkeypatch, tmp_path):
         turn_id="turn_1", task_id="task_9",
     )
     assert rec.requests[0]["body"]["paths"] == [str(sub_home / "Documents")]
+
+
+def test_uniq_and_file_are_no_longer_readonly(monkeypatch, tmp_path):
+    """uniq 的第二个位置参数是 OUTPUT（`uniq in out` 直接覆盖 out），file 的
+    `-C -m` 会编译写出 .mgc：参数就能写文件的命令与配置驱动命令同理，整体移出
+    只读清单（Codex review P1）。"""
+    rec = _install(monkeypatch)
+    for cmd in (
+        "uniq in.txt /home/alice/Documents/notes.txt",
+        "uniq notes.txt",
+        "file -C -m magic",
+    ):
+        guard.reset_for_test()
+        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
+    assert len(rec.requests) == 3, "uniq / file 要走 cwd 保护"
+
+    guard.reset_for_test()
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "cut -d: -f1 /etc/passwd"}, turn_id="turn_1") is None
+    assert len(rec.requests) == 3, "无写入面的命令仍然只读"
+
+
+def test_env_split_string_daemonizers_are_blocked(monkeypatch, tmp_path):
+    """env -S/--split-string 会把字符串重新拆成命令词执行，藏在里面的
+    setsid/nohup 不能当不透明参数跳过（Codex review P1）。"""
+    rec = _install(monkeypatch)
+    for cmd in (
+        "env -S \"setsid -f sh -c 'sleep 1; rm -f victim'\"",
+        'env -vS "setsid rm -f victim"',
+        "env '-Ssetsid -f' sh -c 'rm -f victim'",
+        'env --split-string="setsid rm -f victim"',
+    ):
+        guard.reset_for_test()
+        blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
+        assert blocked is not None and "NOT executed" in blocked, cmd
+    assert rec.requests == []
+
+    # -S 里没有 daemonizer 的照常走保护。
+    guard.reset_for_test()
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": 'env -S "sh -c" \'rm -f x\''}, turn_id="turn_1") is None
+    assert len(rec.requests) == 1, "无 daemonizer 的 env -S 命令照常走保护"
+
+
+def test_ssh_backend_write_commands_fail_closed(monkeypatch, tmp_path):
+    """terminal.backend=ssh 的命令在远端主机执行：本机快照护不住远端文件，按
+    本机路径 ensure 出来的是假恢复点；远端还可能就是设备自己（ssh 到
+    loopback）。写入 fail-closed，只读命令不受影响（Codex review P1）。"""
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    rec = _install(monkeypatch)
+
+    blocked = guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -f ~/Documents/a.txt"}, turn_id="turn_1"
+    )
+    assert blocked is not None and "NOT executed" in blocked
+    assert rec.requests == [], "ssh backend 不该向本机 ensure"
+
+    guard.reset_for_test()
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "cat a.txt"}, turn_id="turn_1") is None
+    assert rec.requests == [], "只读命令在 ssh backend 下照常放行"

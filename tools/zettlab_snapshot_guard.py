@@ -110,11 +110,16 @@ _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 #
 # grep / egrep / fgrep 保留：它们没有「配置文件里挂外部命令」的等价面
 # （GREP_OPTIONS 早已移除，且从不执行命令）。
+#
+# 同理不收**参数就能写文件**的命令：uniq 的第二个位置参数是 OUTPUT
+# （`uniq in.txt out.txt` 直接覆盖 out.txt，Codex review P1）；file 的
+# `-C -m` 会编译写出 .mgc。数「非 option 操作数」需要维护每个命令的带值
+# flag 表，与逐 flag 堵配置驱动命令是同一条不归路——直接移出清单。
 _READONLY_FIRST_TOKENS = frozenset({
     "ls", "cat", "grep", "egrep", "fgrep", "head", "tail",
-    "wc", "pwd", "echo", "printf", "stat", "file", "which",
+    "wc", "pwd", "echo", "printf", "stat", "which",
     "type", "printenv", "ps", "df", "du", "date", "whoami", "id",
-    "uname", "md5sum", "sha1sum", "sha256sum", "uniq", "cut", "tr",
+    "uname", "md5sum", "sha1sum", "sha256sum", "cut", "tr",
     "diff", "cmp", "readlink", "basename", "dirname", "hostname", "uptime",
     "free", "realpath", "test", "true", "false", "sleep",
 })
@@ -347,6 +352,16 @@ def _bridge_terminal_env() -> None:
         logger.debug("zettlab snapshot guard: terminal env bridge unavailable: %s", exc)
 
 
+def _terminal_backend_is_remote() -> bool:
+    """报告 terminal 的有效 backend 是否在远端主机执行命令（ssh）。
+
+    远端文件系统不在本机快照的覆盖面内，按本机路径 ensure 只会造出假恢复点
+    （Codex review P1）。
+    """
+    _bridge_terminal_env()
+    return (os.getenv("TERMINAL_ENV") or "local").strip().lower() == "ssh"
+
+
 def _json_env_list(name: str) -> list:
     raw = (os.getenv(name) or "").strip()
     if not raw:
@@ -554,7 +569,7 @@ _SHELL_AMP_BACKGROUND_RE = re.compile(r"(?<![&>|])&(?![&>])")
 # 吃掉后面一个参数词（nice -n 10、env -u VAR）。
 _DAEMONIZE_HEADS = frozenset({"nohup", "setsid"})
 _WRAPPER_VALUE_FLAGS: dict[str, frozenset[str]] = {
-    "env": frozenset({"-u", "-C", "-S"}),
+    "env": frozenset({"-u", "-C", "--unset", "--chdir"}),
     "command": frozenset(),
     "exec": frozenset({"-a"}),
     "nice": frozenset({"-n"}),
@@ -562,8 +577,29 @@ _WRAPPER_VALUE_FLAGS: dict[str, frozenset[str]] = {
     "stdbuf": frozenset({"-i", "-o", "-e"}),
     "time": frozenset({"-f", "-o"}),
 }
+# env 短选项簇里的 S（-S / -vS / -Sxxx）：--split-string 会把值重新拆成真正的
+# 命令词，不能当不透明参数跳过。
+_ENV_SPLIT_STRING_RE = re.compile(r"^-[a-zA-Z]*S")
 # shlex punctuation_chars 模式下会单独成 token 的 shell 操作符字符。
 _SHELL_PUNCT_CHARS = frozenset("();<>|&")
+
+
+def _env_split_string_value(flag: str, words: list[str], i: int) -> tuple[Optional[str], int]:
+    """取出 env -S / --split-string 携带的字符串；不是该形态返回 (None, i)。"""
+    if flag == "--split-string":
+        if i < len(words):
+            return words[i], i + 1
+        return "", i
+    if flag.startswith("--split-string="):
+        return flag.split("=", 1)[1], i
+    if _ENV_SPLIT_STRING_RE.match(flag):
+        rest = flag.split("S", 1)[1]
+        if rest:
+            return rest, i
+        if i < len(words):
+            return words[i], i + 1
+        return "", i
+    return None, i
 
 
 def _segment_daemonizes(words: list[str]) -> bool:
@@ -586,6 +622,20 @@ def _segment_daemonizes(words: list[str]) -> bool:
             while i < len(words) and words[i].startswith("-"):
                 flag = words[i]
                 i += 1
+                if name == "env":
+                    # `env -S "setsid ..."` 会把字符串重新拆成命令词执行——按
+                    # 不透明参数跳过就漏掉了里面的 daemonizer（Codex review
+                    # P1）。递归按 shell word 拆开、拼回词流继续判定；拆不了
+                    # fail-closed。env 自身的 ${VAR} 展开属于 Phase 1 的静态
+                    # 判定边界（等价于 sh -c "$CMD" 间接层）。
+                    value, ni = _env_split_string_value(flag, words, i)
+                    if value is not None:
+                        i = ni
+                        try:
+                            words[i:i] = shlex.split(value, posix=True)
+                        except ValueError:
+                            return True
+                        break
                 if flag in value_flags and i < len(words) and not words[i].startswith("-"):
                     i += 1
             continue
@@ -1036,6 +1086,19 @@ def maybe_require_snapshot(
             outcome="unbound_scope", tool=tool_name, started=started,
         )
 
+    if tool_name == "terminal" and _terminal_backend_is_remote():
+        # ssh backend 的命令在**远端主机**执行：本机快照护不住远端文件，按本机
+        # 路径 ensure 出来的是一个看似成功的假恢复点；远端还可能就是设备自己
+        # （ssh 到 loopback），那更是绕开保护直改用户文件（Codex review P1）。
+        # 设备形态只用 local / docker，这里 fail-closed；只读命令不受影响（在
+        # _paths_for 已放行）。
+        return _blocked(
+            "Terminal commands on the ssh backend run on a remote host; the "
+            "device cannot create a recovery point for remote files. Use a "
+            "local/docker terminal backend for file modifications. The command "
+            "was NOT executed.",
+            outcome="remote_backend", tool=tool_name, started=started,
+        )
     if tool_name == "terminal" and bool(arguments.get("background")):
         # 后台破坏性命令会跑到 turn 结束、pin 释放之后，恢复点可能在写入完成前
         # 就被清理；保护窗口对不上就不放行，让模型改用前台执行
