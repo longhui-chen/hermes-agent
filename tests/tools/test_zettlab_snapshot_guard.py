@@ -918,8 +918,10 @@ def test_git_provably_readonly_forms_still_skip_protection(monkeypatch, tmp_path
         "git remote -v",
         "git remote show origin",
         "git remote get-url origin",
-        "git diff --stat",
-        "git log --oneline",
+        # diff 族要显式 --no-ext-diff 才算可证明只读（diff.external 是既有用户
+        # 配置就可能带的，Codex review P1）。
+        "git diff --no-ext-diff --stat",
+        "git log --no-ext-diff --oneline",
     ):
         assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
     assert rec.requests == []
@@ -1098,8 +1100,9 @@ def test_env_prefixed_commands_are_not_provably_readonly(monkeypatch, tmp_path):
     assert len(rec.requests) == 2, "带 env 前缀的命令要走保护"
 
     guard.reset_for_test()
-    assert guard.maybe_require_snapshot("terminal", {"command": "git diff"}, turn_id="turn_1") is None
-    assert len(rec.requests) == 2, "裸 git diff 仍然免保护"
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "git diff --no-ext-diff"}, turn_id="turn_1") is None
+    assert len(rec.requests) == 2, "无 env 前缀的可证明只读 git diff 仍免保护"
 
 
 def test_rg_pre_and_git_external_command_args_are_protected(monkeypatch, tmp_path):
@@ -1217,3 +1220,83 @@ def test_home_expansion_uses_subprocess_home(monkeypatch, tmp_path):
     ensured = [p for r in rec.requests for p in (r["body"].get("paths") or [])]
     assert str(real_target) in ensured, "要按子进程 HOME 展开"
     assert str(proc_home / "Documents" / "a.txt") not in ensured
+
+
+def test_path_qualified_executables_are_not_readonly(monkeypatch, tmp_path):
+    """`./ls`、/tmp/cat 执行的是任意程序，与同名系统命令无关：只对无路径分隔符
+    的命令名做只读放行（Codex review P1）。"""
+    rec = _install(monkeypatch)
+    for cmd in ("./ls", "/tmp/cat a.txt", "../bin/grep foo f", "bin/less x"):
+        guard.reset_for_test()
+        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
+    assert len(rec.requests) == 4
+
+    guard.reset_for_test()
+    for cmd in ("ls -la", "cat a.txt"):
+        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
+    assert len(rec.requests) == 4, "无路径的系统命令仍免保护"
+
+
+def test_less_log_file_and_bare_git_diff_are_protected(monkeypatch, tmp_path):
+    """less -O 会覆盖写日志文件；裸 git diff 在配了 diff.external（difftastic /
+    delta 等既有用户配置）时会执行外部命令——两者都不能按只读放行
+    （Codex review P1）。"""
+    rec = _install(monkeypatch)
+    for cmd in (
+        "printf data | less -O /tmp/notes.txt",
+        "less --LOG-FILE=/tmp/notes.txt a.txt",
+        "git diff",
+        "git show HEAD",
+    ):
+        guard.reset_for_test()
+        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
+    assert len(rec.requests) == 4
+
+    guard.reset_for_test()
+    for cmd in ("less a.txt", "git diff --no-ext-diff", "git status", "git rev-parse HEAD"):
+        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
+    assert len(rec.requests) == 4, "显式 --no-ext-diff 与非 diff 族仍免保护"
+
+
+def test_glob_write_targets_are_expanded_before_protection(monkeypatch, tmp_path):
+    """glob 目标（rm -rf /home/a/Doc*）要按 shell 语义展开后逐个保护，不展开会
+    让真实目标静默漏掉（Codex review P1）。"""
+    docs = tmp_path / "Documents"
+    docs.mkdir()
+    a = docs / "a.txt"
+    b = docs / "b.txt"
+    a.write_text("x")
+    b.write_text("y")
+    sub = tmp_path / "cwd"
+    sub.mkdir()
+
+    rec = _install(monkeypatch)
+    guard.maybe_require_snapshot(
+        "terminal", {"command": f"rm -rf {docs}/*", "workdir": str(sub)},
+        turn_id="turn_1", task_id="task_9",
+    )
+    ensured = [p for r in rec.requests for p in (r["body"].get("paths") or [])]
+    assert str(a) in ensured and str(b) in ensured
+    assert str(docs) in ensured, "父目录一并纳保（展开结果被删后目录本身也变了）"
+
+
+def test_tts_output_path_uses_main_process_semantics(monkeypatch, tmp_path):
+    """TTS 在主进程里 Path(output_path).expanduser() 落盘：相对路径锚进程 cwd、
+    不做容器反解——guard 必须用同一套语义（Codex review P1）。"""
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_VOLUMES", json.dumps([f"{tmp_path}:/mnt/audio"]))
+    monkeypatch.chdir(tmp_path)
+    rec = _install(monkeypatch)
+
+    guard.maybe_require_snapshot(
+        "text_to_speech", {"text": "hi", "output_path": "voice.mp3"},
+        turn_id="turn_1", task_id="task_9",
+    )
+    assert rec.requests[0]["body"]["paths"] == [str(tmp_path / "voice.mp3")]
+
+    # 容器口径的字面路径也按主进程语义（不反解到 volume host 侧）。
+    guard.maybe_require_snapshot(
+        "text_to_speech", {"text": "hi", "output_path": "/mnt/audio/x.mp3"},
+        turn_id="turn_1", task_id="task_9",
+    )
+    assert rec.requests[1]["body"]["paths"] == ["/mnt/audio/x.mp3"]

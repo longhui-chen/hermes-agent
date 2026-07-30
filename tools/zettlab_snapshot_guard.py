@@ -28,6 +28,7 @@
 
 from __future__ import annotations
 
+import glob
 import ipaddress
 import json
 import logging
@@ -112,6 +113,8 @@ _READONLY_GIT_SUBCOMMANDS = frozenset({
 # `remote remove/set-url` 改配置、diff 族 `--output` 写文件（Codex review P1）。
 # 按参数二次甄别：branch 只放行可证明只读的 flag 组合，remote 只放行只读动作，
 # 其余子命令拦 `--output`。证明不了只读就按需要保护处理（不是阻断）。
+# 会走 diff 机器（因而可能触发 diff.external / textconv 外部命令）的子命令。
+_GIT_EXTERNAL_CAPABLE_SUBCOMMANDS = frozenset({"diff", "show", "log", "blame"})
 _GIT_BRANCH_READONLY_FLAGS = frozenset({
     "-a", "-r", "-v", "-vv", "--all", "--remotes", "--list", "--verbose",
     "--show-current", "--contains", "--no-contains", "--merged", "--no-merged",
@@ -129,6 +132,13 @@ def _git_tokens_are_readonly(tokens: list[str]) -> bool:
     if any(a in ("--ext-diff", "--textconv") for a in args):
         # 两者都会执行 config 里配置的外部命令（Codex review P1）。
         return False
+    if sub in _GIT_EXTERNAL_CAPABLE_SUBCOMMANDS and "--no-ext-diff" not in args:
+        # diff.external / diff.<driver>.textconv 是**既有用户配置**就可能带的
+        # （difftastic / delta 用户常配），配上之后裸 `git diff` 会改为执行那
+        # 条外部命令——guard 不 spawn git 就证明不了它不存在（Codex review
+        # P1）。只有显式 --no-ext-diff 才算可证明只读；否则按 cwd 保护（不是
+        # 阻断，代价是每轮每目录多一张幂等快照）。
+        return False
     if sub == "branch":
         return all(
             a in _GIT_BRANCH_READONLY_FLAGS
@@ -145,7 +155,7 @@ def _git_tokens_are_readonly(tokens: list[str]) -> bool:
 # 命令文本里的绝对路径 token：cwd 之外的写入目标（rm /home/alice/... 或脚本里
 # 的 Path("/home/...").write_text）也要尽力保护（Codex review P1）。这些路径走
 # **附加** ensure：范围外（403）只跳过、不阻断——它们是 cwd 保护之外的加餐。
-_ABS_PATH_TOKEN_RE = re.compile(r"(?<![\w.-])/(?:[\w.+@%-]+/)*[\w.+@%-]+")
+_ABS_PATH_TOKEN_RE = re.compile(r"(?<![\w.+@%*?\[\]-])/(?:[\w.+@%*?\[\]-]+/)*[\w.+@%*?\[\]-]+")
 # 引号字面量里的路径可以含空格（`rm -f '/home/a/My Documents/x'`、
 # `open("/home/a/My Documents/x","w")`），裸 token 正则会在空格处截断而漏掉
 # 真实目标（Codex review P1）。shell 与 Python 文本统一按引号对提取。除绝对
@@ -157,6 +167,7 @@ _QUOTED_PATHISH_RES = (
 )
 _BARE_HOME_TOKEN_RE = re.compile(r"(?<![\w.-])(?:~|\$HOME|\$\{HOME\})/(?:[\w.+@%-]+/)*[\w.+@%-]+")
 _BARE_PARENT_TOKEN_RE = re.compile(r"(?<![\w.-])\.\.(?:/(?:\.\.|[\w.+@%-]+))+")
+_GLOB_CHARS = ("*", "?", "[")
 _MAX_ANCILLARY_PATHS = 16
 
 
@@ -516,7 +527,12 @@ def _command_is_probably_readonly(command: str) -> bool:
             # 个 diff 路径执行 rm（Codex review P1）。带 env 前缀的命令一律不
             # 判只读，按需要保护处理（代价只是多拍一张快照）。
             return False
-        head = os.path.basename(tokens[0])
+        head = tokens[0]
+        if "/" in head or "\\" in head:
+            # 带路径的可执行文件（./ls、/tmp/cat）是项目 / 临时目录里的任意程
+            # 序，与同名系统命令毫无关系——只对无路径分隔符的命令名做只读放行
+            # （Codex review P1）。
+            return False
         if head == "git":
             if not _git_tokens_are_readonly(tokens):
                 return False
@@ -526,6 +542,14 @@ def _command_is_probably_readonly(command: str) -> bool:
         if head == "rg" and any(a == "--pre" or a.startswith("--pre=") for a in tokens[1:]):
             # rg --pre 会对每个候选文件执行指定命令（`rg --pre rm foo f` 真会
             # 删 f）：带 --pre 的搜索不是只读（Codex review P1）。
+            return False
+        if head == "less" and any(
+            a in ("-o", "-O", "--log-file", "--LOG-FILE")
+            or a.startswith(("-o", "-O", "--log-file=", "--LOG-FILE="))
+            for a in tokens[1:]
+        ):
+            # less -O/--LOG-FILE 会把输入写进指定文件且不确认覆盖
+            # （Codex review P1）。
             return False
     return True
 
@@ -552,12 +576,29 @@ def _ancillary_abs_paths(text: str, primary: list[str], base_dir: str = "") -> l
             # 再做存在性过滤，否则挂载目录下的目标在 host 上 lexists 不到、
             # 整条附加保护静默漏掉（Codex review P1）。
             p = _map_container_path(p)
-        if not p or p in seen or not os.path.lexists(p):
+        if not p:
             continue
-        seen.add(p)
-        out.append(p)
-        if len(out) >= _MAX_ANCILLARY_PATHS:
-            break
+        # glob 目标（rm -rf /home/a/Doc*）按 shell 语义展开后逐个保护——不展
+        # 开的话字面量 lexists 不到、整条命令的写入目标静默漏掉
+        # （Codex review P1）。glob 只读磁盘、无副作用；父目录同时纳保，覆盖
+        # 「展开结果被删掉后目录本身也变了」的情形。
+        expanded = [p]
+        if any(ch in p for ch in _GLOB_CHARS):
+            try:
+                matches = sorted(glob.glob(p))[:_MAX_ANCILLARY_PATHS]
+            except Exception:
+                matches = []
+            prefix = re.split(r"[*?\[]", p, 1)[0]
+            parent = prefix if prefix.endswith("/") else os.path.dirname(prefix)
+            parent = parent.rstrip("/")
+            expanded = matches + ([parent] if parent else [])
+        for item in expanded:
+            if not item or item in seen or not os.path.lexists(item):
+                continue
+            seen.add(item)
+            out.append(item)
+            if len(out) >= _MAX_ANCILLARY_PATHS:
+                return out
     return out
 
 
@@ -629,7 +670,11 @@ def _paths_for(tool_name: str, arguments: dict[str, Any], task_id: str) -> list[
         out = str(arguments.get("output_path") or "").strip()
         if not out:
             return []
-        resolved = _resolve_write_path(os.path.expanduser(out), task_id)
+        # TTS 在 Hermes **主进程**里 Path(output_path).expanduser() 落盘：相对
+        # 路径锚进程 cwd、不走 session cwd，也不做容器 volume 反解——这里必须
+        # 用同一套语义，否则在 Docker 会话 / 有 session cwd 时会给错路径建快照
+        # （Codex review P1）。
+        resolved = os.path.abspath(os.path.expanduser(out))
         if not resolved:
             return []
         paths = [resolved]
