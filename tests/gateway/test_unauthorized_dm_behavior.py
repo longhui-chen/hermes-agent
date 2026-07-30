@@ -648,6 +648,44 @@ async def test_unauthorized_dm_pairs_by_default(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_default_profile_pairing_flow_uses_canonical_profile_store(monkeypatch):
+    _clear_auth_env(monkeypatch)
+    config = GatewayConfig(
+        platforms={Platform.WHATSAPP: PlatformConfig(enabled=True)},
+    )
+    runner, adapter = _make_runner(Platform.WHATSAPP, config)
+    default_store = MagicMock()
+    default_store.is_approved.return_value = False
+    default_store._is_rate_limited.return_value = False
+    default_store.generate_code.return_value = "ROOTCODE"
+    runner.pairing_stores = {"default": default_store}
+
+    event = MessageEvent(
+        text="hello",
+        message_id="m1",
+        source=SessionSource(
+            platform=Platform.WHATSAPP,
+            user_id="15551234567@s.whatsapp.net",
+            chat_id="15551234567@s.whatsapp.net",
+            user_name="tester",
+            chat_type="dm",
+            profile="default",
+        ),
+    )
+    result = await runner._handle_message(event)
+
+    assert result is None
+    default_store.generate_code.assert_called_once_with(
+        "whatsapp",
+        "15551234567@s.whatsapp.net",
+        "tester",
+    )
+    runner.pairing_store.generate_code.assert_not_called()
+    adapter.send.assert_awaited_once()
+    assert "ROOTCODE" in adapter.send.await_args.args[1]
+
+
+@pytest.mark.asyncio
 async def test_unauthorized_whatsapp_dm_can_be_ignored(monkeypatch):
     _clear_auth_env(monkeypatch)
     config = GatewayConfig(
