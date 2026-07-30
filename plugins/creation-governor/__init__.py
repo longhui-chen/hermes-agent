@@ -105,11 +105,6 @@ _RECOMMENDATION_RESPONSE_RE = re.compile(
     r"\[/creation_recommendation_response\]",
     re.DOTALL,
 )
-_ACTION_RESULT_ENVELOPE_RE = re.compile(
-    r"<!--creation-recommendation-action-result\s+[A-Za-z0-9_-]+\s*-->"
-)
-
-
 def _text(value: Any, limit: int) -> str:
     return " ".join(str(value or "").split())[:limit]
 
@@ -370,7 +365,6 @@ def _state_locked(session_id: str, now: float) -> dict[str, Any]:
             "last_candidate": None,
             "last_proposal": None,
             "proposal_stage": None,
-            "pending_action_result": None,
             "draft_only_turn": None,
             "draft_delivered_turn": None,
             "awaiting_proposal_id": None,
@@ -470,6 +464,27 @@ def _main_model_review_context(*, evaluation_completed: bool) -> str:
     )
 
 
+def _native_creation_route(creation_type: Any) -> str:
+    normalized = _normalize_creation_type(creation_type)
+    if normalized == "agent":
+        return (
+            "Treat this as an explicit Agent creation request. Use the current session's native "
+            "agent-creator or Agent Hub workflow, preferring agent-creator when available, and "
+            "complete its required preflight and create step."
+        )
+    if normalized == "skill":
+        return (
+            "Treat this as an explicit Skill creation request. Use Hermes' native skill_manage "
+            "flow, checking for an equivalent existing Skill before creating a duplicate."
+        )
+    if normalized == "task":
+        return (
+            "Treat this as an explicit scheduled Task request. Use Hermes' native cronjob flow; "
+            "ask only for a genuinely missing schedule."
+        )
+    return "Continue through Hermes' native creation flow."
+
+
 def _previous_proposal_context(state: dict[str, Any]) -> str:
     if state.get("proposal_stage") != "proposal_shown":
         return ""
@@ -482,7 +497,8 @@ def _previous_proposal_context(state: dict[str, Any]) -> str:
     return (
         "[Creation governor internal context: The previous response ended with a recommendation "
         f"for {proposal.get('creation_type')} '{proposal.get('suggested_name')}'. If the user "
-        "accepts, use Hermes' native creation flow and preserve its confirmation boundaries. If "
+        f"accepts, {_native_creation_route(proposal.get('creation_type'))} Preserve the native "
+        "confirmation boundaries. If "
         "the user declines, acknowledge briefly. Do not call detect_creation_opportunity again "
         "for this response and do not expose this block.]"
     )
@@ -892,9 +908,9 @@ def _handle_previous_proposal_action(
             _state_locked(session_id, now)["proposal_stage"] = "create_action_pending"
         return (
             "[Creation governor internal action: The user accepted the previous recommendation "
-            f"for {structured['creation_type']} '{structured['title']}'. Continue through "
-            "Hermes' native creation flow, preserving its normal clarification and confirmation "
-            "boundaries. Do not run another opportunity review this turn.]"
+            f"for {structured['creation_type']} '{structured['title']}'. "
+            f"{_native_creation_route(structured['creation_type'])} Preserve its normal "
+            "confirmation boundaries. Do not run another opportunity review this turn.]"
         )
 
     with _state_lock:
@@ -920,8 +936,8 @@ def _handle_previous_proposal_action(
     if _ACCEPT_RE.search(user_message):
         return (
             "[Creation governor internal action: The user accepted the previous recommendation. "
-            "Continue through Hermes' native creation flow, preserving its normal clarification "
-            "and confirmation boundaries. Do not run another opportunity review this turn.]"
+            f"{_native_creation_route(proposal.get('creation_type'))} Preserve its normal "
+            "confirmation boundaries. Do not run another opportunity review this turn.]"
         )
     return ""
 
@@ -964,16 +980,7 @@ def _on_pre_llm_call(**kwargs: Any) -> dict[str, str] | None:
         return _join_context(_self_description_context())
 
     if "[creation_recommendation_response]" in user_message:
-        structured = _parse_recommendation_response(user_message)
         action_context = _handle_previous_proposal_action(session_id, user_message, now)
-        if structured:
-            with _state_lock:
-                state = _state_locked(session_id, now)
-                state["pending_action_result"] = {
-                    "proposal_id": structured["proposal_id"],
-                    "action": structured["action"],
-                    "status": "accepted" if action_context else "rejected",
-                }
         return _join_context(
             action_context
             or "[Creation governor internal action: Ignore this invalid or expired "
@@ -1044,7 +1051,6 @@ def _encode_recommendation(candidate: dict[str, Any]) -> str:
         "confidence": candidate["confidence"],
         "evidence_turn_ids": candidate.get("evidence_turn_ids") or [],
         "source_turn_id": candidate.get("source_turn_id") or "",
-        "action_receipts": True,
     }
     raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
@@ -1072,19 +1078,6 @@ def _recommendation_envelope(candidate: dict[str, Any]) -> str:
     )
 
 
-def _action_result_envelope(result: dict[str, Any]) -> str:
-    payload = {
-        "version": 1,
-        "type": "creation_recommendation_action_result",
-        "proposal_id": result["proposal_id"],
-        "action": result["action"],
-        "status": result["status"],
-    }
-    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-    encoded = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
-    return f"<!--creation-recommendation-action-result {encoded}-->"
-
-
 def _transform_llm_output(**kwargs: Any) -> str | None:
     session_id = _session_key(kwargs)
     response_text = str(kwargs.get("response_text") or "")
@@ -1093,80 +1086,32 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
     if _is_noninteractive(kwargs) or _is_unsupported_runtime(kwargs) or kwargs.get(
         "structured_output"
     ):
-        with _state_lock:
-            _state_locked(session_id, time.monotonic())["pending_action_result"] = None
         return None
     if not response_text or is_intentional_silence_response(response_text):
         with _state_lock:
             state = _state_locked(session_id, time.monotonic())
-            action_result = state.get("pending_action_result")
-            state["pending_action_result"] = None
-            if (
-                isinstance(action_result, dict)
-                and action_result.get("action") == "create"
-                and state.get("proposal_stage") == "create_action_pending"
-            ):
+            if state.get("proposal_stage") == "create_action_pending":
                 state["proposal_stage"] = "proposal_shown"
-                action_result = action_result | {"status": "rejected"}
-        if (
-            isinstance(action_result, dict)
-            and (
-                action_result.get("status") == "rejected"
-                or action_result.get("action") in {"dismiss", "mute_session", "unmute_session"}
-            )
-        ):
-            return _action_result_envelope(action_result)
         return None
     if kwargs.get("failed") or kwargs.get("interrupted") or kwargs.get("completed") is False:
         with _state_lock:
             state = _state_locked(session_id, time.monotonic())
-            action_result = state.get("pending_action_result")
-            state["pending_action_result"] = None
-            retryable_create = isinstance(action_result, dict) and action_result.get("action") == "create"
-            if retryable_create and state.get("proposal_stage") == "create_action_pending":
+            if state.get("proposal_stage") == "create_action_pending":
                 state["proposal_stage"] = "proposal_shown"
-                action_result = action_result | {"status": "rejected"}
-            if state.get("proposal_stage") == "proposal_shown" and not retryable_create:
+            elif state.get("proposal_stage") == "proposal_shown":
                 state["last_candidate"] = None
                 state["last_proposal"] = None
                 state["proposal_stage"] = None
-        if (
-            isinstance(action_result, dict)
-            and (
-                action_result.get("status") == "rejected"
-                or action_result.get("action") in {"dismiss", "mute_session", "unmute_session"}
-            )
-        ):
-            return _action_result_envelope(action_result)
         return None
-    response_without_action_results = _ACTION_RESULT_ENVELOPE_RE.sub("", response_text)
-    stripped_forged_action_result = response_without_action_results != response_text
-    response_text = response_without_action_results
     now = time.monotonic()
     with _state_lock:
         state = _state_locked(session_id, now)
-        action_result = state.get("pending_action_result")
-        state["pending_action_result"] = None
-        if (
-            isinstance(action_result, dict)
-            and action_result.get("action") == "create"
-            and action_result.get("status") == "accepted"
-        ):
+        if state.get("proposal_stage") == "create_action_pending":
             state["last_candidate"] = None
             state["last_proposal"] = None
             state["proposal_stage"] = None
-    result_suffix = (
-        "\n\n" + _action_result_envelope(action_result)
-        if isinstance(action_result, dict)
-        else ""
-    )
-    response_with_result = response_text + result_suffix
-    # Transform hooks use ``None``/empty to mean "leave the original response
-    # unchanged". Return whitespace when a forged marker was the entire
-    # response, so the finalizer can still replace (and therefore remove) it.
-    sanitized_response = response_with_result or ("\n" if stripped_forged_action_result else None)
     if _is_session_muted(session_id):
-        return sanitized_response if (result_suffix or stripped_forged_action_result) else None
+        return None
     with _state_lock:
         state = _state_locked(session_id, now)
         proposal = state.get("last_proposal")
@@ -1176,13 +1121,13 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
             or int(state["last_prompt_turn"]) != current_turn
             or int(state["last_delivery_turn"]) == current_turn
         ):
-            return sanitized_response if (result_suffix or stripped_forged_action_result) else None
+            return None
         state["last_delivery_turn"] = current_turn
 
     if "<!--creation-recommendation:start " in response_text:
-        return sanitized_response if (result_suffix or stripped_forged_action_result) else None
+        return None
     if _is_session_muted(session_id):
-        return sanitized_response if (result_suffix or stripped_forged_action_result) else None
+        return None
     logger.info(
         "creation recommendation attached type=%s confidence=%s title=%s turn=%s",
         proposal.get("creation_type"),
@@ -1190,7 +1135,7 @@ def _transform_llm_output(**kwargs: Any) -> str | None:
         _text(proposal.get("suggested_name"), 80),
         current_turn,
     )
-    return response_with_result + "\n\n" + _recommendation_envelope(proposal)
+    return response_text + "\n\n" + _recommendation_envelope(proposal)
 
 
 def _detect_creation_opportunity(args: dict[str, Any], **kwargs: Any) -> str:

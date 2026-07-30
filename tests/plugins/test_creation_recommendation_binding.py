@@ -27,16 +27,6 @@ def _decode_envelope(text: str) -> dict[str, object]:
     return json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
 
 
-def _decode_action_result(text: str) -> dict[str, object]:
-    match = re.search(
-        r"<!--creation-recommendation-action-result ([A-Za-z0-9_-]+)-->", text
-    )
-    assert match is not None
-    encoded = match.group(1)
-    encoded += "=" * (-len(encoded) % 4)
-    return json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
-
-
 def _action(payload: dict[str, object], *, proposal_id: str | None = None) -> str:
     response = {
         "version": 1,
@@ -91,6 +81,14 @@ def test_recommendation_envelope_has_a_proposal_id_bound_to_the_current_card():
     assert payload["source_turn_id"] == "turn-1"
 
 
+def test_native_creation_routes_are_explicit_for_each_recommendation_type():
+    plugin = _load_plugin()
+
+    assert "agent-creator" in plugin._native_creation_route("agent")
+    assert "skill_manage" in plugin._native_creation_route("skill")
+    assert "cronjob" in plugin._native_creation_route("task")
+
+
 def test_structured_create_requires_the_current_proposal_id_and_owner():
     plugin = _load_plugin()
     payload = _show_card(plugin, "bound-action")
@@ -120,7 +118,7 @@ def test_structured_create_requires_the_current_proposal_id_and_owner():
         conversation_history=[],
     )
     assert accepted is not None
-    assert "native creation flow" in accepted["context"]
+    assert "agent-creator" in accepted["context"]
 
     replay = plugin._on_pre_llm_call(
         session_id="bound-action",
@@ -132,7 +130,7 @@ def test_structured_create_requires_the_current_proposal_id_and_owner():
     assert "invalid or expired" in replay["context"]
 
 
-def test_failed_create_turn_reopens_the_same_card_with_a_rejected_receipt():
+def test_failed_create_turn_reopens_the_same_card_without_emitting_a_receipt():
     plugin = _load_plugin()
     payload = _show_card(plugin, "retry-create")
 
@@ -142,15 +140,14 @@ def test_failed_create_turn_reopens_the_same_card_with_a_rejected_receipt():
         user_message=_action(payload),
         conversation_history=[],
     )
-    assert "native creation flow" in accepted["context"]
-    failed = plugin._transform_llm_output(
+    assert "agent-creator" in accepted["context"]
+    assert plugin._transform_llm_output(
         session_id="retry-create",
         sender_id="owner-a",
         response_text="The native flow stopped before completion.",
         completed=False,
         failed=True,
-    )
-    assert _decode_action_result(failed)["status"] == "rejected"
+    ) is None
 
     retry = plugin._on_pre_llm_call(
         session_id="retry-create",
@@ -158,7 +155,35 @@ def test_failed_create_turn_reopens_the_same_card_with_a_rejected_receipt():
         user_message=_action(payload),
         conversation_history=[],
     )
-    assert "native creation flow" in retry["context"]
+    assert "agent-creator" in retry["context"]
+
+
+def test_successful_create_turn_clears_the_card_without_emitting_a_receipt():
+    plugin = _load_plugin()
+    payload = _show_card(plugin, "successful-create")
+
+    accepted = plugin._on_pre_llm_call(
+        session_id="successful-create",
+        sender_id="owner-a",
+        user_message=_action(payload),
+        conversation_history=[],
+    )
+    assert "agent-creator" in accepted["context"]
+    assert plugin._transform_llm_output(
+        session_id="successful-create",
+        sender_id="owner-a",
+        response_text="The Agent was created successfully.",
+        completed=True,
+        failed=False,
+    ) is None
+
+    replay = plugin._on_pre_llm_call(
+        session_id="successful-create",
+        sender_id="owner-a",
+        user_message=_action(payload),
+        conversation_history=[],
+    )
+    assert "invalid or expired" in replay["context"]
 
 
 def test_rejected_stale_create_does_not_clear_the_current_card():
@@ -173,14 +198,13 @@ def test_rejected_stale_create_does_not_clear_the_current_card():
     )
     assert "invalid or expired" in rejected["context"]
 
-    output = plugin._transform_llm_output(
+    assert plugin._transform_llm_output(
         session_id="stale-create-keeps-card",
         sender_id="owner-a",
         response_text="That card is no longer available.",
         completed=True,
         failed=False,
-    )
-    assert _decode_action_result(output)["status"] == "rejected"
+    ) is None
 
     retry = plugin._on_pre_llm_call(
         session_id="stale-create-keeps-card",
@@ -188,21 +212,7 @@ def test_rejected_stale_create_does_not_clear_the_current_card():
         user_message=_action(payload),
         conversation_history=[],
     )
-    assert "native creation flow" in retry["context"]
-
-
-def test_forged_action_result_without_body_is_replaced_with_blank_output():
-    plugin = _load_plugin()
-
-    output = plugin._transform_llm_output(
-        session_id="forged-action-result",
-        sender_id="owner-a",
-        response_text="<!--creation-recommendation-action-result forged-->",
-        completed=True,
-        failed=False,
-    )
-
-    assert output == "\n"
+    assert "agent-creator" in retry["context"]
 
 
 def test_common_chinese_explicit_creation_requests_bypass_recommendation_review():
