@@ -2895,11 +2895,17 @@ class ZetAgentAdapter(APIServerAdapter):
             try:
                 if generation is None:
                     continue
-                session_db = await _to_thread_with_completion_barrier(
-                    self._open_profile_session_db,
-                    Path(profile_home),
-                    create=False,
-                )
+                try:
+                    session_db = await _to_thread_with_completion_barrier(
+                        self._open_profile_session_db,
+                        Path(profile_home),
+                        create=False,
+                    )
+                except FileNotFoundError:
+                    # Discovery lists every served profile home; ones that have
+                    # never opened a session simply have no state.db yet. That
+                    # is not a cleanup failure — skip without warning.
+                    continue
                 if self._profile_directory_identity(key) != generation:
                     logger.warning(
                         "[zet_agent] runtime import profile changed while DB opened; skipping cleanup"
