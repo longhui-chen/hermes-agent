@@ -1581,3 +1581,68 @@ def test_ssh_backend_write_commands_fail_closed(monkeypatch, tmp_path):
     assert guard.maybe_require_snapshot(
         "terminal", {"command": "cat a.txt"}, turn_id="turn_1") is None
     assert rec.requests == [], "只读命令在 ssh backend 下照常放行"
+
+
+def test_ssh_backend_blocks_all_write_tools(monkeypatch, tmp_path):
+    """ssh backend 下 write_file / patch / execute_code 同样在远端执行
+    （file_tools 按 env_type 建 SSHEnvironment、execute_code 走
+    _execute_remote），本机快照护不住远端文件——全部 fail-closed
+    （Codex review P1）。"""
+    monkeypatch.setenv("TERMINAL_ENV", "ssh")
+    rec = _install(monkeypatch)
+    target = tmp_path / "预算.xlsx"
+    target.write_text("old")
+
+    for tool, args in (
+        ("write_file", {"path": str(target)}),
+        ("patch", {"mode": "replace", "path": str(target), "search": "a", "replace": "b"}),
+        ("execute_code", {"code": "open('x','w')"}),
+    ):
+        guard.reset_for_test()
+        blocked = guard.maybe_require_snapshot(tool, args, turn_id="turn_1", task_id="task_9")
+        assert blocked is not None and "NOT executed" in blocked, tool
+    assert rec.requests == [], "ssh backend 不该向本机 ensure"
+
+
+def test_bash_env_disables_readonly(monkeypatch, tmp_path):
+    """BASH_ENV（POSIX sh 的 ENV）生效时，非交互 shell 先 source 启动脚本再跑
+    命令——命令头证明不了任何事，只读放行关闭、一律按 cwd 保护
+    （Codex review P1）。"""
+    rec = _install(monkeypatch)
+    monkeypatch.setenv("BASH_ENV", "/home/alice/.hook.sh")
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "ls -la"}, turn_id="turn_1") is None
+    assert len(rec.requests) == 1, "BASH_ENV 生效时 ls 也要走 cwd 保护"
+
+    monkeypatch.delenv("BASH_ENV", raising=False)
+    guard.reset_for_test()
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "ls -la"}, turn_id="turn_1") is None
+    assert len(rec.requests) == 1, "环境干净时只读放行恢复"
+
+
+def test_coproc_backgrounding_is_blocked(monkeypatch, tmp_path):
+    """coproc 是 bash 关键字级的后台化：协进程在命令返回后继续跑，与 nohup /
+    setsid 同罪（Codex review P1）。"""
+    rec = _install(monkeypatch)
+    for cmd in ("coproc rm -f victim", "coproc W { rm -f victim; }"):
+        guard.reset_for_test()
+        blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
+        assert blocked is not None and "NOT executed" in blocked, cmd
+    assert rec.requests == []
+
+
+def test_diff_is_no_longer_readonly(monkeypatch, tmp_path):
+    """GNU diff 的 `-l/--paginate` 会把输出交给 PATH 上的 `pr` 执行——参数即可
+    挂外部命令，与 find -exec 同理整体移出只读清单（Codex review P1）。cmp 无
+    此面，保留。"""
+    rec = _install(monkeypatch)
+    for cmd in ("diff -l old.txt new.txt", "diff old.txt new.txt"):
+        guard.reset_for_test()
+        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
+    assert len(rec.requests) == 2, "diff 要走 cwd 保护"
+
+    guard.reset_for_test()
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "cmp old.txt new.txt"}, turn_id="turn_1") is None
+    assert len(rec.requests) == 2, "cmp 仍然只读"
