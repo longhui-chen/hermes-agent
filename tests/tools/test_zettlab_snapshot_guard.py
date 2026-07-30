@@ -722,7 +722,11 @@ def test_opener_disables_proxies_and_redirects(monkeypatch):
 
 
 def test_container_workspace_paths_map_back_to_host(monkeypatch, tmp_path):
-    """Docker 挂载会话下 file_tools 解析出的 /workspace/... 要反解回 host 路径。"""
+    """Docker 挂载会话下 file_tools 解析出的 /workspace/... 要反解回 host 路径。
+    判定按 terminal 后端配置（容器后端 + 挂载开关），host 上是否恰好存在
+    /workspace 不影响结果（Codex review P1）。"""
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
     rec = _install(monkeypatch)
     (tmp_path / "notes.md").write_text("x")
 
@@ -730,6 +734,20 @@ def test_container_workspace_paths_map_back_to_host(monkeypatch, tmp_path):
         "write_file", {"path": "/workspace/notes.md"}, turn_id="turn_1"
     )
     assert rec.requests[0]["body"]["paths"] == [str(tmp_path / "notes.md")]
+
+
+def test_local_backend_keeps_workspace_path_literal(monkeypatch, tmp_path):
+    """local 后端（或挂载开关未开）下 /workspace 就是字面 host 路径，不反解
+    ——用 host 存在性做判定会在 host 恰好有 /workspace 时把挂载会话的写入
+    错报、在 local 会话里把真实 /workspace 误改写（Codex review P1）。"""
+    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+    monkeypatch.delenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", raising=False)
+    rec = _install(monkeypatch)
+
+    guard.maybe_require_snapshot(
+        "write_file", {"path": "/workspace/notes.md"}, turn_id="turn_1"
+    )
+    assert rec.requests[0]["body"]["paths"] == ["/workspace/notes.md"]
 
 
 def test_relative_workdir_resolves_against_session_cwd(monkeypatch, tmp_path):
@@ -905,3 +923,33 @@ def test_git_provably_readonly_forms_still_skip_protection(monkeypatch, tmp_path
     ):
         assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
     assert rec.requests == []
+
+
+def test_shared_collapsed_key_with_concurrent_turns_fails_closed(monkeypatch, tmp_path):
+    """共享容器把并发轮折叠到同一个 key：归属不可判定时受保护写入必须
+    fail-closed（覆盖式登记会把 ensure 归错轮、随对方 finish 提前解 pin，
+    Codex review P1）；一轮结束后剩下的那轮重新可归属。"""
+    fake_terminal = types.SimpleNamespace(_resolve_container_task_id=lambda t: "default")
+    monkeypatch.setitem(sys.modules, "tools.terminal_tool", fake_terminal)
+    rec = _install(monkeypatch)
+    a = tmp_path / "a.txt"
+    b = tmp_path / "b.txt"
+    c = tmp_path / "c.txt"
+    for f in (a, b, c):
+        f.write_text("x")
+
+    assert guard.maybe_require_snapshot(
+        "write_file", {"path": str(a)}, turn_id="turn_1", task_id="task_a",
+    ) is None
+    assert guard.maybe_require_snapshot(
+        "write_file", {"path": str(b)}, turn_id="turn_2", task_id="task_b",
+    ) is None
+
+    # 两轮都在册：折叠 key 分不清归属，嵌套写入 fail-closed。
+    blocked = guard.maybe_require_snapshot("write_file", {"path": str(c)}, task_id="default")
+    assert blocked is not None and "cannot be attributed" in blocked
+
+    # 一轮结束后恢复可归属：写入归到仍在进行的那一轮。
+    guard.finish_turn("completed", turn_id="turn_1")
+    assert guard.maybe_require_snapshot("write_file", {"path": str(c)}, task_id="default") is None
+    assert rec.requests[-1]["body"]["turnId"] == "turn_2"

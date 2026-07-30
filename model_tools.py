@@ -1303,28 +1303,36 @@ def handle_function_call(
         # point before the agent touches existing user files, and refuse to run
         # the tool when it cannot.  No-ops outside Zettlab devices (no local-server
         # callback URL / action token in the environment).
-        try:
-            from tools.zettlab_snapshot_guard import maybe_require_snapshot
+        #
+        # The gate MUST run on the FINAL tool arguments: execution middleware can
+        # rewrite the payload via next_call(next_payload), and ensuring on the
+        # pre-middleware args would snapshot the wrong paths while the real user
+        # file is modified unprotected (Codex review P1).  It is therefore
+        # invoked inside `_dispatch` below — the innermost step of the
+        # middleware chain, right before the tool actually executes.
+        def _zettlab_snapshot_gate(next_args: Dict[str, Any]) -> Optional[str]:
+            try:
+                from tools.zettlab_snapshot_guard import maybe_require_snapshot
 
-            snapshot_block = maybe_require_snapshot(
-                function_name,
-                function_args,
-                turn_id=turn_id or "",
-                task_id=task_id or "",
-            )
-            if snapshot_block is not None:
-                return snapshot_block
-        except Exception as _snapshot_guard_err:
-            logger.debug("Zettlab snapshot guard error: %s", _snapshot_guard_err)
-            # Fail closed for the file tools only.  `terminal` is mostly read-only
-            # traffic and its destructive classification is a best-effort regex, so
-            # blocking every shell call on an import-level guard failure would take
-            # the agent down for a defect it cannot act on.
-            if function_name in {"write_file", "patch"}:
-                return json.dumps(
-                    {"error": "File protection snapshot guard failed; the file was not modified."},
-                    ensure_ascii=False,
+                return maybe_require_snapshot(
+                    function_name,
+                    next_args,
+                    turn_id=turn_id or "",
+                    task_id=task_id or "",
                 )
+            except Exception as _snapshot_guard_err:
+                logger.debug("Zettlab snapshot guard error: %s", _snapshot_guard_err)
+                # Fail closed for the file tools only.  `terminal` is mostly
+                # read-only traffic and its destructive classification is a
+                # best-effort regex, so blocking every shell call on an
+                # import-level guard failure would take the agent down for a
+                # defect it cannot act on.
+                if function_name in {"write_file", "patch"}:
+                    return json.dumps(
+                        {"error": "File protection snapshot guard failed; the file was not modified."},
+                        ensure_ascii=False,
+                    )
+                return None
 
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).
@@ -1361,6 +1369,9 @@ def handle_function_call(
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    snapshot_block = _zettlab_snapshot_gate(next_args)
+                    if snapshot_block is not None:
+                        return snapshot_block
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
@@ -1373,6 +1384,9 @@ def handle_function_call(
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
+                    snapshot_block = _zettlab_snapshot_gate(next_args)
+                    if snapshot_block is not None:
+                        return snapshot_block
                     return registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,

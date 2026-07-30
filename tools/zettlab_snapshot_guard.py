@@ -165,6 +165,12 @@ _states: dict[str, _TurnState] = {}
 # task_id → turn_id：嵌套 dispatch（execute_code 沙箱 RPC / MCP bridge）不带
 # turn_id，凭它们携带的 task_id 回落到外层轮（Codex review P1）。
 _task_turns: dict[str, str] = {}
+# 折叠容器 key（共享容器把并发轮折叠到同一个 key，通常 "default"）单独建帐：
+# key → 仍在进行的轮集合（有序）。恰好一轮时嵌套 RPC 回落到它；多轮并发时归
+# 属不可判定，受保护写入 fail-closed——直接覆盖登记会把 ensure 归错轮、随对
+# 方 finish 提前解 pin（Codex review P1）。finish 时把轮从集合里摘除。
+_collapsed_task_turns: dict[str, dict[str, None]] = {}
+_MAX_COLLAPSED_KEYS = 64
 _degraded_logged = False
 _nonloopback_logged = False
 
@@ -247,17 +253,34 @@ def _abs_path(path: Any) -> str:
     return os.path.normpath(expanded)
 
 
+# 与 terminal_tool._get_env_config 同源的后端判定（都从环境变量派生）：只有
+# 容器后端 + 挂载开关打开时，/workspace 才是 host cwd 的 bind 视图。
+_CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona"})
+
+
+def _workspace_is_container_mount() -> bool:
+    env_type = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
+    if env_type not in _CONTAINER_BACKENDS:
+        return False
+    flag = (os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE") or "false").strip().lower()
+    return flag in {"true", "1", "yes"}
+
+
 def _map_container_path(p: str) -> str:
     """把 Docker 挂载会话的容器路径（/workspace[/...]）反解回 host 路径。
 
     docker_mount_cwd_to_workspace 打开时，terminal 把 host 的 TERMINAL_CWD bind
     成容器 /workspace，file_tools / 会话 cwd 记录随之落在容器口径上；原样上报
     会让快照落在 host 上不存在（或错误）的 /workspace，真正被改的 host 目录
-    没有恢复点（Codex review P1）。host 上真实存在 /workspace 时不做映射。
+    没有恢复点（Codex review P1）。是否映射按 terminal 的后端配置判定（容器
+    后端 + 挂载开关，与 _get_env_config 同源），不看 host 上有没有 /workspace
+    ——host 恰好存在 /workspace 时挂载会话的写入仍发生在 TERMINAL_CWD
+    （Codex review P1）；反之 local 后端里 /workspace 就是字面 host 路径，
+    不做映射。
     """
     if p != "/workspace" and not p.startswith("/workspace/"):
         return p
-    if os.path.exists("/workspace"):
+    if not _workspace_is_container_mount():
         return p
     host = os.path.abspath(os.path.expanduser(os.getenv("TERMINAL_CWD") or os.getcwd()))
     if not os.path.isdir(host):
@@ -539,6 +562,16 @@ def _note_task_turn_locked(task_id: str, turn_id: str) -> None:
     _task_turns[task_id] = turn_id
 
 
+def _note_collapsed_turn_locked(key: str, turn_id: str) -> None:
+    """把轮记进折叠容器 key 的在册集合（调用方须持锁）。"""
+    turns = _collapsed_task_turns.get(key)
+    if turns is None:
+        while len(_collapsed_task_turns) >= _MAX_COLLAPSED_KEYS:
+            _collapsed_task_turns.pop(next(iter(_collapsed_task_turns)), None)
+        turns = _collapsed_task_turns.setdefault(key, {})
+    turns[turn_id] = None
+
+
 def _state_for_locked(turn_id: str) -> _TurnState:
     """取（或建）该轮的状态（调用方须持锁）。溢出逐出最老的轮。"""
     state = _states.get(turn_id)
@@ -575,21 +608,21 @@ def maybe_require_snapshot(
     # 每次带 turn 的 dispatch 都登记 task → turn（包括不设防的 execute_code）：
     # 它孵化的沙箱 RPC 二次进入时只带 task_id，凭这里的映射回落到外层轮。
     # Docker/SSH 后端的 RPC 带的是**折叠后**的容器 task key（共享容器把
-    # delegate 子任务折叠回 "default"），原始 key 和折叠 key 都要登记，否则
-    # 嵌套 hermes_tools 写入查不到轮、被 missing_turn_id 误拒
+    # delegate 子任务折叠回 "default"），折叠 key 单独按「在册轮集合」建帐——
+    # 不能直接覆盖进 _task_turns，并发轮会把彼此的映射踩掉、ensure 归错轮
     # （Codex review P1）。
     if turn and task:
-        keys = {task}
+        collapsed = ""
         try:
             from tools.terminal_tool import _resolve_container_task_id
 
-            keys.add(str(_resolve_container_task_id(task) or ""))
+            collapsed = str(_resolve_container_task_id(task) or "")
         except Exception:
-            pass
-        keys.discard("")
+            collapsed = ""
         with _lock:
-            for k in keys:
-                _note_task_turn_locked(k, turn)
+            _note_task_turn_locked(task, turn)
+            if collapsed and collapsed != task:
+                _note_collapsed_turn_locked(collapsed, turn)
 
     if tool_name not in _GUARDED_TOOLS:
         return None
@@ -621,12 +654,28 @@ def maybe_require_snapshot(
             outcome="background_write", tool=tool_name, started=started,
         )
 
+    ambiguous_turn = False
     if not turn and task:
         with _lock:
             turn = _task_turns.get(task, "")
+            if not turn:
+                live = _collapsed_task_turns.get(task) or {}
+                if len(live) == 1:
+                    turn = next(iter(live))
+                elif len(live) > 1:
+                    ambiguous_turn = True
     if not turn:
         if ancillary_only:
             return None  # 加餐保护做不了幂等就不做，不阻断
+        if ambiguous_turn:
+            # 共享容器里多轮并发：折叠 key 分不清这次写入属于哪一轮，归错轮
+            # 会随对方 finish 提前解 pin。不确定就不放行（Codex review P1）。
+            return _blocked(
+                "File protection snapshot unavailable: multiple concurrent turns "
+                "share this sandbox, so this write cannot be attributed to a turn. "
+                "Re-run after the other turn finishes. The file was NOT modified.",
+                outcome="ambiguous_turn", tool=tool_name, started=started,
+            )
         # 没有轮标识就无法做幂等，会把每次写入都变成一张新快照。这属于调度层
         # 契约被破坏，放行比拍一堆快照更糟，所以阻断。
         return _blocked(
@@ -832,6 +881,13 @@ def finish_turn(
         current: Optional[_TurnState] = None
         if turn:
             current = _states.pop(turn, None)
+            # 轮结束即从折叠容器 key 的在册集合摘除：剩下的那一轮重新变得
+            # 可归属（Codex review P1）。
+            for key in list(_collapsed_task_turns):
+                turns = _collapsed_task_turns[key]
+                turns.pop(turn, None)
+                if not turns:
+                    _collapsed_task_turns.pop(key, None)
         elif _states:
             logger.info(
                 "zettlab snapshot guard: finish without a turn id while %d turn(s) "
@@ -859,5 +915,6 @@ def reset_for_test() -> None:
     with _lock:
         _states.clear()
         _task_turns.clear()
+        _collapsed_task_turns.clear()
         _degraded_logged = False
         _nonloopback_logged = False

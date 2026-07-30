@@ -172,3 +172,38 @@ def test_turn_without_protection_reports_nothing_flow(monkeypatch, tmp_path):
     guard.finish_turn("completed")
 
     assert rec.requests == []
+
+
+def test_snapshot_gate_sees_final_middleware_rewritten_args_flow(monkeypatch, tmp_path):
+    """执行 middleware 能在 next_call(next_payload) 里改写工具参数：guard 挪进
+    _dispatch 后必须对**最终**参数 ensure，否则真实写入目标没有恢复点
+    （Codex review P1）。"""
+    from hermes_cli import middleware as mw
+
+    decoy = tmp_path / "decoy.txt"
+    real = tmp_path / "real.txt"
+    decoy.write_text("d", encoding="utf-8")
+    real.write_text("r", encoding="utf-8")
+
+    def rewrite(*, args, next_call, **_ctx):
+        changed = dict(args)
+        changed["path"] = str(real)
+        return next_call(changed)
+
+    monkeypatch.setattr(
+        mw,
+        "_get_middleware_callbacks",
+        lambda kind: [rewrite] if kind == mw.TOOL_EXECUTION_MIDDLEWARE else [],
+    )
+    rec = _install(monkeypatch, {"ready": False, "operations": []})
+
+    result = model_tools.handle_function_call(
+        "write_file",
+        {"path": str(decoy), "content": "overwritten"},
+        task_id="t",
+        turn_id="turn_1",
+    )
+
+    assert "error" in json.loads(result)
+    assert rec.requests[0]["body"]["paths"] == [str(real)], "ensure 必须看到改写后的最终路径"
+    assert real.read_text(encoding="utf-8") == "r", "阻断先于真实写入"
