@@ -71,6 +71,9 @@ class TestGuidanceConstants:
         assert positions == sorted(positions)
         assert 'placeholder="true"' in guidance
         assert "Do not invent unconfigured product facts" in guidance
+        assert "Zettlab Agent Computer (AC)" in guidance
+        assert "personal computer" not in guidance.lower()
+        assert "NAS" not in guidance
         assert "# Conversation protocol" not in guidance
 
     def test_zettlab_agent_kernel_guidance_chinese_matches_poke_style_xml_layers(self):
@@ -97,6 +100,9 @@ class TestGuidanceConstants:
         assert positions == sorted(positions)
         assert 'placeholder="true"' in guidance
         assert "不要编造未配置的产品事实" in guidance
+        assert "Zettlab Agent Computer（简称 AC）" in guidance
+        assert "个人电脑" not in guidance
+        assert "NAS" not in guidance
         assert "# 对话协议" not in guidance
 
     def test_zettlab_agent_kernel_wraps_custom_identity(self):
