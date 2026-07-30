@@ -561,9 +561,14 @@ def _terminal_workdir(arguments: dict[str, Any], task_id: str) -> str:
             p = _map_container_path(os.path.normpath(expanded))
         else:
             # 相对 workdir 是「在会话 cwd 下 cd」的语义，必须先锚到会话自己的
-            # cwd，进程 env 里同名目录会指向错误位置（Codex review P1）。
+            # cwd，进程 env 里同名目录会指向错误位置（Codex review P1）。锚点
+            # 若来自 TERMINAL_CWD（容器口径，如 /workspace/Project），join 出
+            # 的结果也仍是容器口径，要反解后再做 host 存在性检查——否则
+            # `workdir=\"../Documents\"` 会在 host 上 isdir 失败、错退回保护
+            # cwd，真实被写的 host Documents 没有恢复点（Codex review P1）；
+            # session_cwd 已是 host 口径，再过一次映射是 no-op。
             base = session_cwd or _abs_path(os.getenv("TERMINAL_CWD") or os.getcwd())
-            p = os.path.normpath(os.path.join(base, expanded))
+            p = _map_container_path(os.path.normpath(os.path.join(base, expanded)))
         if os.path.isdir(p):
             return p
     if session_cwd and os.path.isdir(session_cwd):
@@ -595,6 +600,9 @@ _WRAPPER_VALUE_FLAGS: dict[str, frozenset[str]] = {
 # env 短选项簇里的 S（-S / -vS / -Sxxx）：--split-string 会把值重新拆成真正的
 # 命令词，不能当不透明参数跳过。
 _ENV_SPLIT_STRING_RE = re.compile(r"^-[a-zA-Z]*S")
+# sh/bash 的 -c（含 -lc / -ec 短选项簇）：后面的字面命令串会重新进入 shell 解析。
+_SHELL_HEADS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+_SHELL_DASH_C_RE = re.compile(r"^-[a-zA-Z]*c$")
 # shlex punctuation_chars 模式下会单独成 token 的 shell 操作符字符。
 _SHELL_PUNCT_CHARS = frozenset("();<>|&")
 
@@ -628,6 +636,21 @@ def _segment_daemonizes(words: list[str]) -> bool:
         name = os.path.basename(word)
         if name in _DAEMONIZE_HEADS:
             return True
+        if name in _SHELL_HEADS:
+            # `sh -c '字面命令串'` 会重新进入 shell 解析，与 env -S 同类：递归
+            # 跑同一套自后台化判定（Codex review P1）。变量间接
+            # （sh -c \"$CMD\"）在 shlex 展开后只剩 $CMD 字面量、`sh script.sh`
+            # 裸脚本执行，均属 PRD §2 Phase 1 静态判定边界。
+            j = i + 1
+            while j < len(words):
+                flag = words[j]
+                if _SHELL_DASH_C_RE.match(flag):
+                    return j + 1 < len(words) and _shell_self_backgrounds(words[j + 1])
+                if flag.startswith("-"):
+                    j += 1
+                    continue
+                break
+            return False
         if name in _WRAPPER_VALUE_FLAGS:
             # `command -v xxx` 只查名字不执行，不是包裹层。
             if name == "command" and i + 1 < len(words) and words[i + 1] in ("-v", "-V"):
@@ -706,12 +729,28 @@ def _shell_function_shadows(name: str) -> bool:
 def _shell_init_hooks_present() -> bool:
     """报告终端会话会加载的 shell init 文件是否存在且非空。
 
-    LocalEnvironment 建会话时显式 source ~/.profile / ~/.bash_profile /
-    ~/.bashrc 并把 alias 快照进会话：rc 文件里的 `alias ls='rm ...'` / 同名
-    function 不需要模型在会话内定义就已生效，命令头证明不了任何事（Codex
-    review P1）。按工具子进程实际生效的 HOME 检查（home_mode=profile 时 rc
-    也在 profile home 下）。
+    LocalEnvironment 建会话时显式 source init 文件并把 alias 快照进会话：rc
+    文件里的 `alias ls='rm ...'` / 同名 function 不需要模型在会话内定义就已生
+    效，命令头证明不了任何事（Codex review P1）。**优先复用 terminal 自己的
+    `_resolve_shell_init_files()`**：它覆盖 `terminal.shell_init_files` 自定义
+    列表与 auto_source_bashrc 的登录链，和真实会话 source 的是同一份清单
+    （Codex review P1）。解析器不可用时退回固定三件套 + 子进程 HOME。
     """
+    _bridge_terminal_env()
+    try:
+        from tools.environments.local import _resolve_shell_init_files
+
+        files = _resolve_shell_init_files()
+    except Exception:
+        files = None
+    if files is not None:
+        for path in files:
+            try:
+                if os.path.getsize(path) > 0:
+                    return True
+            except OSError:
+                continue
+        return False
     home = _subprocess_home()
     for name in (".profile", ".bash_profile", ".bashrc"):
         try:
@@ -785,17 +824,19 @@ def _ancillary_abs_paths(text: str, primary: list[str], base_dir: str = "") -> l
     # 本）就只靠上面的正则，提取是加餐、正则仍在。
     try:
         base = os.path.normpath(base_dir) if base_dir else ""
+        rbase = os.path.realpath(base) if base else ""
         for word in shlex.split(text, posix=True):
             if word.startswith(("/", "~", "$HOME", "${HOME}", "../")):
                 raw.append(word)
-            elif base and "/" in word and ".." in word.split("/"):
-                # 内部 `..` 段的相对路径（sub/../../x、./../x）归一后可能跳出
-                # 主保护目录，前缀正则与 `../` 开头判定都接不住（Codex review
-                # P1）。锚到 base_dir 归一：仍在主目录内的交给 cwd 快照，跳出
-                # 去的整词入候选。
-                p = os.path.normpath(os.path.join(base, word))
-                if p != base and not p.startswith(base.rstrip("/") + "/"):
-                    raw.append(p)
+            elif base and "/" in word and not word.startswith("-"):
+                # 相对路径可能经内部 `..` 段（sub/../../x）**或目录 symlink**
+                # （docs/a.txt，docs → ~/Documents）跳出主保护目录，前缀正则
+                # 与 `../` 开头判定都接不住（Codex review P1 ×2）。锚到
+                # base_dir 后按 realpath 判逃逸：仍在主目录内的交给 cwd 快
+                # 照，跳出去的按真实目标整词入候选。
+                real = os.path.realpath(os.path.normpath(os.path.join(base, word)))
+                if real != rbase and not real.startswith(rbase.rstrip("/") + "/"):
+                    raw.append(real)
     except ValueError:
         pass
     candidates: list[str] = []

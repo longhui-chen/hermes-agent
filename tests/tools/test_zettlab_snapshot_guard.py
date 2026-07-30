@@ -1716,3 +1716,83 @@ def test_shell_init_hooks_disable_readonly(monkeypatch, tmp_path):
     assert guard.maybe_require_snapshot(
         "terminal", {"command": "ls -la"}, turn_id="turn_1") is None
     assert len(rec.requests) == 1, "存在非空 rc 时 ls 也要走 cwd 保护"
+
+
+def test_custom_shell_init_files_disable_readonly(monkeypatch, tmp_path):
+    """rc 遮蔽检测要复用 terminal 自己的 init 文件解析：terminal.shell_init_files
+    配置的自定义文件同样会被会话 source（Codex review P1）。"""
+    local_env = pytest.importorskip("tools.environments.local")
+    custom = tmp_path / "init.sh"
+    custom.write_text("alias ls='rm -f victim'\n")
+    monkeypatch.setattr(local_env, "_resolve_shell_init_files", lambda: [str(custom)])
+
+    rec = _install(monkeypatch)
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "ls -la"}, turn_id="turn_1") is None
+    assert len(rec.requests) == 1, "自定义 init 文件生效时 ls 也要走 cwd 保护"
+
+    monkeypatch.setattr(local_env, "_resolve_shell_init_files", lambda: [])
+    guard.reset_for_test()
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "ls -la"}, turn_id="turn_1") is None
+    assert len(rec.requests) == 1, "解析结果为空时只读放行恢复"
+
+
+def test_docker_relative_workdir_maps_to_host(monkeypatch, tmp_path):
+    """相对 workdir 锚在容器口径的 TERMINAL_CWD 上时，join 结果也要先容器反解
+    再做 host 存在性检查，否则错退回保护 cwd（Codex review P1）。"""
+    vol_host = tmp_path / "vol"
+    (vol_host / "Project").mkdir(parents=True)
+    (vol_host / "Documents").mkdir()
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_VOLUMES", json.dumps([f"{vol_host}:/workspace"]))
+    monkeypatch.setenv("TERMINAL_CWD", "/workspace/Project")
+    rec = _install(monkeypatch)
+
+    guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -f a.txt", "workdir": "../Documents"},
+        turn_id="turn_1",
+    )
+    assert rec.requests[0]["body"]["paths"] == [str(vol_host / "Documents")]
+
+
+def test_symlinked_relative_targets_are_protected(monkeypatch, tmp_path):
+    """cwd 内的目录 symlink 指向另一个受保护目录时，`rm -f docs/a.txt` 实际
+    删的是链接目标——相对词按 realpath 判逃逸后按真实目标加餐（Codex review
+    P1）。"""
+    docs = tmp_path / "Documents"
+    docs.mkdir()
+    target = docs / "a.txt"
+    target.write_text("x")
+    cwd = tmp_path / "Work"
+    cwd.mkdir()
+    os.symlink(str(docs), str(cwd / "docs"))
+
+    rec = _install(monkeypatch)
+    guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -f docs/a.txt", "workdir": str(cwd)},
+        turn_id="turn_1", task_id="task_9",
+    )
+    ensured = [p for r in rec.requests for p in (r["body"].get("paths") or [])]
+    assert str(target) in ensured, ensured
+
+
+def test_sh_dash_c_daemonizers_are_blocked(monkeypatch, tmp_path):
+    """sh/bash -c 的字面命令串会重新进入 shell 解析，与 env -S 同类：藏在里面
+    的 setsid/nohup 递归判定后照样阻断（Codex review P1）。"""
+    rec = _install(monkeypatch)
+    for cmd in (
+        "sh -c 'setsid -f sh -c \"sleep 1; rm -f victim\"'",
+        'bash -lc "setsid rm -f victim"',
+        "zsh -c 'nohup rm -f victim'",
+    ):
+        guard.reset_for_test()
+        blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
+        assert blocked is not None and "NOT executed" in blocked, cmd
+    assert rec.requests == []
+
+    # 没有 daemonizer 的 sh -c 照常走保护。
+    guard.reset_for_test()
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "sh -c 'rm -f x'"}, turn_id="turn_1") is None
+    assert len(rec.requests) == 1
