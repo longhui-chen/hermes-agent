@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
@@ -98,6 +99,27 @@ class ClassifiedError:
         return self.reason in {FailoverReason.auth, FailoverReason.auth_permanent}
 
 
+def content_policy_fallback_disabled() -> bool:
+    """True when a content-policy block must end the turn instead of failing over.
+
+    Default is off, preserving the general-purpose behaviour where a second
+    model may legitimately answer what the first refused.
+
+    A compliance deployment must turn this on. When an upstream moderation
+    gateway is what refused the prompt, failing over is wrong twice: every
+    cloud model sits behind the same gateway so the verdict is identical (the
+    retry only buys a second billed moderation call), and a user-configured
+    custom model does *not* sit behind it — so the fallback would answer
+    exactly the content the gateway just rejected.
+    """
+    return os.getenv("HERMES_CONTENT_POLICY_NO_FALLBACK", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def normalized_provider_error_code(classified: ClassifiedError) -> str:
     """Return the stable Zettlab chat error code for a provider failure."""
 
@@ -135,6 +157,8 @@ def normalized_provider_error_code(classified: ClassifiedError) -> str:
         return "provider_forbidden" if status == 403 else "provider_auth"
     if reason == FailoverReason.provider_policy_blocked:
         return "provider_policy_blocked"
+    if reason == FailoverReason.content_policy_blocked:
+        return "content_blocked"
     if reason == FailoverReason.model_not_found:
         return "provider_model_not_found"
     if reason == FailoverReason.timeout:
@@ -489,6 +513,16 @@ _CONTENT_POLICY_BLOCKED_PATTERNS = [
     # echo back; the underscore form is provider-specific enough.
     "content_filter",
     "responsibleaipolicyviolation",
+    # Zettlab CN content-moderation gateway. ``moderation_input_blocked`` is
+    # the error code the gateway returns (HTTP 400) when the mainland-China
+    # compliance scan rejects the prompt or an attached image; the paired
+    # ``content_policy_violation`` is its error ``type``. Both tokens are
+    # verbatim from our own gateway, so they cannot collide with a provider's
+    # billing/auth/format strings. Without them the 400 falls through to the
+    # status-based default and surfaces as ``provider_bad_request``, which
+    # tells the user nothing about why the message was refused.
+    "moderation_input_blocked",
+    "content_policy_violation",
     # MiniMax output-layer safety filter. The error string is surfaced
     # verbatim by MiniMax SDK / OpenAI-compatible endpoints, usually in the
     # form "output new_sensitive (1027)" when the model's *output* (often a
@@ -748,11 +782,16 @@ def classify_api_error(
     # downgraded to a generic ``format_error`` and a status-less block
     # (OpenAI Codex SDK can raise without one) isn't left in the retryable
     # ``unknown`` bucket. See issue #18028.
-    if any(p in error_msg for p in _CONTENT_POLICY_BLOCKED_PATTERNS):
+    # ``error_code`` is searched alongside the message because a gateway may
+    # carry the machine token only in ``error.code`` and put a localized,
+    # pattern-free sentence in ``error.message`` (the Zettlab CN moderation
+    # gateway returns code=moderation_input_blocked with message="内容不合规").
+    _policy_haystack = f"{error_msg} {(error_code or '').lower()}"
+    if any(p in _policy_haystack for p in _CONTENT_POLICY_BLOCKED_PATTERNS):
         return _result(
             FailoverReason.content_policy_blocked,
             retryable=False,
-            should_fallback=True,
+            should_fallback=not content_policy_fallback_disabled(),
         )
 
     # Anthropic thinking block recovery (400).  Two distinct failure modes,

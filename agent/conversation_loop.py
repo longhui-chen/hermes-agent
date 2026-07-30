@@ -30,7 +30,11 @@ from typing import Any, Dict, List, Optional
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import conversation_history_after_compression
 from agent.display import KawaiiSpinner
-from agent.error_classifier import FailoverReason, classify_api_error
+from agent.error_classifier import (
+    FailoverReason,
+    classify_api_error,
+    content_policy_fallback_disabled,
+)
 from agent.iteration_budget import IterationBudget
 from agent.turn_context import (
     build_turn_context,
@@ -887,6 +891,7 @@ def _content_policy_blocked_result(
     *,
     final_response: str,
     error_detail: str,
+    provider_error: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build the terminal turn result for a content-policy block.
 
@@ -895,8 +900,13 @@ def _content_policy_blocked_result(
     exception-path handler return the identical shape — a failed, non-completed
     turn carrying the user-facing message and a ``content_policy_blocked:``
     prefixed error — so they funnel through this one builder.
+
+    ``provider_error`` must be supplied whenever the caller can build one: the
+    chat gateway reads ``result["provider_error"]["code"]`` to pick the wire
+    error code, and without it the turn degrades to a bare ``agent_error`` that
+    downstream clients cannot map to a "your content was refused" message.
     """
-    return {
+    result: Dict[str, Any] = {
         "final_response": final_response,
         "messages": messages,
         "api_calls": api_call_count,
@@ -904,6 +914,9 @@ def _content_policy_blocked_result(
         "failed": True,
         "error": f"content_policy_blocked: {error_detail}",
     }
+    if provider_error:
+        result["provider_error"] = provider_error
+    return result
 
 
 def _sync_failover_system_message(agent, api_messages, active_system_prompt):
@@ -2199,11 +2212,14 @@ def run_conversation(
                     # Deterministic for the unchanged prompt — never retry.
                     # Try a configured fallback once (a different model may not
                     # refuse); otherwise surface the refusal terminally.
-                    if agent._has_pending_fallback():
+                    # Compliance deployments opt out of the failover entirely —
+                    # see content_policy_fallback_disabled().
+                    _may_failover = not content_policy_fallback_disabled()
+                    if _may_failover and agent._has_pending_fallback():
                         agent._buffer_status(
                             "⚠️ Model declined to respond (safety refusal) — trying fallback..."
                         )
-                    if agent._try_activate_fallback():
+                    if _may_failover and agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -2241,11 +2257,30 @@ def run_conversation(
 
                     agent._cleanup_task_resources(effective_task_id)
                     agent._persist_session(messages, conversation_history)
+                    # No ClassifiedError here — this refusal arrived as a
+                    # well-formed HTTP 200 whose finish_reason is
+                    # ``content_filter``, so there is no exception to classify.
+                    # Build the equivalent payload by hand and keep ``code`` in
+                    # sync with normalized_provider_error_code's mapping for
+                    # FailoverReason.content_policy_blocked.
+                    _refusal_provider_error: Dict[str, Any] = {
+                        "code": "content_blocked",
+                        "reason": FailoverReason.content_policy_blocked.value,
+                        "retryable": False,
+                        "recoverable": False,
+                    }
+                    if getattr(agent, "provider", None):
+                        _refusal_provider_error["provider"] = agent.provider
+                    if getattr(agent, "model", None):
+                        _refusal_provider_error["model"] = agent.model
+                    if _refusal_text:
+                        _refusal_provider_error["provider_message"] = _refusal_text[:500]
                     return _content_policy_blocked_result(
                         messages,
                         api_call_count,
                         final_response=_refusal_response,
                         error_detail=_refusal_text or "model declined (content_filter)",
+                        provider_error=_refusal_provider_error,
                     )
 
                 if finish_reason == "length":
@@ -4567,6 +4602,9 @@ def run_conversation(
                             api_call_count,
                             final_response=_policy_response,
                             error_detail=_nonretryable_summary,
+                            provider_error=agent._provider_error_payload(
+                                classified, api_error
+                            ),
                         )
                     return {
                         "final_response": _nonretryable_summary,
