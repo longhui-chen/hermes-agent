@@ -68,7 +68,7 @@ def test_fallback_success_returns_note_not_files(monkeypatch, file_ops):
     captured = {}
     payload = {"data": {"items": [{"path": "/nas/a.pdf"}, {"filename": "b.txt"}],
                         "total_count": 2}}
-    with patch("urllib.request.urlopen", _fake_urlopen(payload, captured)):
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload, captured)):
         result = file_ops._zettlab_nas_fallback("report", 50)
 
     assert isinstance(result, SearchResult)
@@ -103,7 +103,7 @@ def test_fallback_sends_turn_id_header_when_present(monkeypatch, file_ops):
     # local-server injects the card into THIS exact turn (ByTurnIDForAgent).
     set_zettlab_turn_id("t_abc-123")
     try:
-        with patch("urllib.request.urlopen", _fake_urlopen(payload, captured)):
+        with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload, captured)):
             result = file_ops._zettlab_nas_fallback("report", 50)
     finally:
         set_zettlab_turn_id("")
@@ -122,7 +122,7 @@ def test_fallback_omits_turn_id_header_when_absent(monkeypatch, file_ops):
     # No turn_id this turn (local-server sent none): header absent, not empty.
     set_zettlab_turn_id("")
     try:
-        with patch("urllib.request.urlopen", _fake_urlopen(payload, captured)):
+        with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload, captured)):
             file_ops._zettlab_nas_fallback("report", 50)
     finally:
         set_zettlab_turn_id("")
@@ -134,7 +134,7 @@ def test_fallback_omits_turn_id_header_when_absent(monkeypatch, file_ops):
 
 def test_fallback_empty_items_returns_none(monkeypatch, file_ops):
     _zettlab_env(monkeypatch)
-    with patch("urllib.request.urlopen", _fake_urlopen({"data": {"items": []}})):
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen({"data": {"items": []}})):
         assert file_ops._zettlab_nas_fallback("nothing", 50) is None
 
 
@@ -151,7 +151,7 @@ def test_fallback_empty_items_returns_none(monkeypatch, file_ops):
 ])
 def test_fallback_malformed_payload_returns_none(monkeypatch, file_ops, payload):
     _zettlab_env(monkeypatch)
-    with patch("urllib.request.urlopen", _fake_urlopen(payload)):
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload)):
         assert file_ops._zettlab_nas_fallback("q", 50) is None
 
 
@@ -161,7 +161,7 @@ def test_fallback_network_error_returns_none(monkeypatch, file_ops):
     def _boom(req, timeout=None):
         raise OSError("connection refused")
 
-    with patch("urllib.request.urlopen", _boom):
+    with patch("tools.file_operations.urlopen_hardened", _boom):
         assert file_ops._zettlab_nas_fallback("q", 50) is None
 
 
@@ -171,15 +171,58 @@ def test_fallback_no_token_returns_none(monkeypatch, file_ops):
     monkeypatch.delenv("ZETTLAB_AGENT_ACTION_TOKEN", raising=False)
     monkeypatch.setenv("ZET_CHAT_APPEND_URL", _APPEND_URL)
     # Must not even attempt the request without a token.
-    with patch("urllib.request.urlopen", side_effect=AssertionError("should not call")):
+    with patch("tools.file_operations.urlopen_hardened", side_effect=AssertionError("should not call")):
         assert file_ops._zettlab_nas_fallback("q", 50) is None
 
 
 def test_fallback_no_callback_url_returns_none(monkeypatch, file_ops):
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "tok")
     monkeypatch.delenv("ZET_CHAT_APPEND_URL", raising=False)
-    with patch("urllib.request.urlopen", side_effect=AssertionError("should not call")):
+    with patch("tools.file_operations.urlopen_hardened", side_effect=AssertionError("should not call")):
         assert file_ops._zettlab_nas_fallback("q", 50) is None
+
+
+# --- shared-gateway profile scope flow ---------------------------------------
+
+def test_profile_scope_flow_fallback_works_with_poisoned_environ(monkeypatch, file_ops):
+    """Shared gateway mode: token + callback URL live only in the profile
+    secret scope while os.environ holds another profile's stale decoys — the
+    NAS request must be built entirely from the scope."""
+    from tests.tools._profile_scope import mux_profile_scope, request_fingerprint
+
+    scope = {
+        "ZET_CHAT_APPEND_URL": "http://127.0.0.1:9420/api/v1/internal/chat/append",
+        "ZETTLAB_AGENT_ACTION_TOKEN": "profile-token",
+    }
+    captured = {}
+    payload = {"data": {"items": [{"path": "/nas/a.pdf"}], "total_count": 1}}
+    with mux_profile_scope(monkeypatch, scope, poison_environ=True):
+        with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload, captured)):
+            result = file_ops._zettlab_nas_fallback("report", 50)
+
+    assert result is not None and result.total_count == 1
+    req = captured["req"]
+    assert req.full_url == "http://127.0.0.1:9420/api/v1/file/index/agent-search"
+    assert req.headers.get("X-zettlab-agent-action-token") == scope["ZETTLAB_AGENT_ACTION_TOKEN"]
+    assert "stale-" not in request_fingerprint(req)
+
+
+def test_profile_scope_flow_search_gate_reads_scope(monkeypatch, file_ops):
+    """search() must decide 'is this a Zettlab device' from the profile scope,
+    not from os.environ (empty here)."""
+    from tests.tools._profile_scope import mux_profile_scope
+
+    scope = {
+        "ZET_CHAT_APPEND_URL": _APPEND_URL,
+        "ZETTLAB_AGENT_ACTION_TOKEN": "profile-token",
+    }
+    empty = SearchResult(total_count=0)
+    nas = SearchResult(total_count=3, note="cards rendered")
+    with mux_profile_scope(monkeypatch, scope):  # scope keys purged from env
+        with patch.object(file_ops, "_search_workspace", return_value=empty), \
+             patch.object(file_ops, "_zettlab_nas_fallback", return_value=nas):
+            out = file_ops.search("x")
+    assert out is nas
 
 
 # --- search() wrapper gating ------------------------------------------------
@@ -224,3 +267,36 @@ def test_search_skips_fallback_on_workspace_error(monkeypatch, file_ops):
         out = file_ops.search("x", path="/missing")
     assert out is errored
     fb.assert_not_called()
+
+
+# --- credential never leaves loopback (shared hardened transport) ------------
+
+@pytest.mark.parametrize("bad_url", [
+    "https://127.0.0.1:9090/api/v1/internal/chat/append",  # face is plain http
+    "http://192.168.1.10:9090/api/v1/internal/chat/append",  # not loopback
+    "http://127.attacker.example/api/v1/internal/chat/append",  # prefix trick
+])
+def test_non_loopback_callback_url_refused_without_request(monkeypatch, file_ops, bad_url):
+    """The NAS request carries the action token: a repointed callback URL must
+    yield no derived endpoint and no request at all (graceful None — the
+    workspace result stands, same as any other fallback unavailability).
+    NOTE: a raising sentinel would be swallowed by the fallback's blanket
+    except and still return None — capture calls and assert none happened."""
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "tok")
+    monkeypatch.setenv("ZET_CHAT_APPEND_URL", bad_url)
+    assert ShellFileOperations._zettlab_agent_search_url() is None
+    captured = {}
+    payload = {"data": {"items": [{"path": "/nas/a.pdf"}], "total_count": 1}}
+    with patch("tools.file_operations.urlopen_hardened", _fake_urlopen(payload, captured)):
+        assert file_ops._zettlab_nas_fallback("q", 50) is None
+    assert "req" not in captured, f"token was sent off loopback: {captured}"
+
+
+def test_nas_fallback_uses_shared_hardened_transport():
+    """The NAS request must go through the shared no-proxy/no-redirect opener
+    (tools.loopback_transport), not the proxy-honouring global urlopen — one
+    shared primitive so the constraint cannot drift per call site."""
+    import tools.file_operations as fo
+    from tools.loopback_transport import urlopen_hardened as shared
+
+    assert fo.urlopen_hardened is shared
