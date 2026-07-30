@@ -51,6 +51,9 @@ def _device_env(monkeypatch, tmp_path):
     monkeypatch.setenv("ZET_CHAT_APPEND_URL", "http://127.0.0.1:19090/api/v1/internal/chat/append")
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "tok123")
     monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    # HOME 隔离到 tmp：开发机真实 HOME 里的 .bashrc 会触发 rc 遮蔽检测，把
+    # 只读放行整体关掉，污染与之无关的用例。
+    monkeypatch.setenv("HOME", str(tmp_path))
     guard.reset_for_test()
     yield
     guard.reset_for_test()
@@ -1646,3 +1649,70 @@ def test_diff_is_no_longer_readonly(monkeypatch, tmp_path):
     assert guard.maybe_require_snapshot(
         "terminal", {"command": "cmp old.txt new.txt"}, turn_id="turn_1") is None
     assert len(rec.requests) == 2, "cmp 仍然只读"
+
+
+def test_internal_parent_relative_targets_are_protected(monkeypatch, tmp_path):
+    """内部 `..` 段的相对路径（sub/../../x、./../x）归一后跳出主保护目录，
+    前缀正则接不住——按 shell word 归一后逃逸的整词入候选（Codex review P1）。"""
+    docs = tmp_path / "Documents"
+    docs.mkdir()
+    target = docs / "a.txt"
+    target.write_text("x")
+    cwd = tmp_path / "Work"
+    cwd.mkdir()
+    (cwd / "sub").mkdir()
+
+    rec = _install(monkeypatch)
+    for cmd in (
+        "rm -f ./../Documents/a.txt",
+        "rm -f sub/../../Documents/a.txt",
+    ):
+        guard.reset_for_test()
+        rec.requests.clear()
+        guard.maybe_require_snapshot(
+            "terminal", {"command": cmd, "workdir": str(cwd)},
+            turn_id="turn_1", task_id="task_9",
+        )
+        ensured = [p for r in rec.requests for p in (r["body"].get("paths") or [])]
+        assert str(target) in ensured, cmd
+
+    # 主目录内的相对路径不额外加餐（cwd 快照已覆盖）。
+    guard.reset_for_test()
+    rec.requests.clear()
+    guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -f sub/../notes.txt", "workdir": str(cwd)},
+        turn_id="turn_1", task_id="task_9",
+    )
+    ensured = [p for r in rec.requests for p in (r["body"].get("paths") or [])]
+    assert ensured == [str(cwd)], ensured
+
+
+def test_terminal_cwd_container_fallback_maps_to_host(monkeypatch, tmp_path):
+    """fallback 的 TERMINAL_CWD 本身可能是容器口径（config 把 cwd 写成
+    /workspace）：与显式 workdir / session_cwd 一样要做容器反解，否则给本机
+    字面 /workspace 建快照而真实被写的是 bind 的 host 目录（Codex review P1）。"""
+    vol_host = tmp_path / "proj"
+    vol_host.mkdir()
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_VOLUMES", json.dumps([f"{vol_host}:/workspace"]))
+    monkeypatch.setenv("TERMINAL_CWD", "/workspace")
+    rec = _install(monkeypatch)
+
+    guard.maybe_require_snapshot("terminal", {"command": "rm -f a.txt"}, turn_id="turn_1")
+    assert rec.requests[0]["body"]["paths"] == [str(vol_host)]
+
+
+def test_shell_init_hooks_disable_readonly(monkeypatch, tmp_path):
+    """LocalEnvironment 建会话时 source ~/.profile / ~/.bash_profile /
+    ~/.bashrc 并快照 alias：rc 里的 `alias ls='rm ...'` 不需要会话内定义就已
+    生效，rc 文件存在且非空时关闭只读放行（Codex review P1）。"""
+    rec = _install(monkeypatch)
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "ls -la"}, turn_id="turn_1") is None
+    assert rec.requests == [], "干净 HOME 下 ls 只读放行"
+
+    (tmp_path / ".bashrc").write_text("alias ls='rm -f victim'\n")
+    guard.reset_for_test()
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "ls -la"}, turn_id="turn_1") is None
+    assert len(rec.requests) == 1, "存在非空 rc 时 ls 也要走 cwd 保护"

@@ -568,7 +568,10 @@ def _terminal_workdir(arguments: dict[str, Any], task_id: str) -> str:
             return p
     if session_cwd and os.path.isdir(session_cwd):
         return session_cwd
-    return _abs_path(os.getenv("TERMINAL_CWD") or os.getcwd())
+    # TERMINAL_CWD 本身可能就是容器口径（config 把 cwd 写成 /workspace）：显式
+    # workdir 与 session_cwd 都做了反解，fallback 不反解会给本机字面 /workspace
+    # 建快照，真实被写的是 bind 到它的 host 目录（Codex review P1）。
+    return _map_container_path(_abs_path(os.getenv("TERMINAL_CWD") or os.getcwd()))
 
 
 # 单个 `&`（非 `&&` / `2>&1` / `&>`）把命令甩到后台。
@@ -700,15 +703,36 @@ def _shell_function_shadows(name: str) -> bool:
     )
 
 
+def _shell_init_hooks_present() -> bool:
+    """报告终端会话会加载的 shell init 文件是否存在且非空。
+
+    LocalEnvironment 建会话时显式 source ~/.profile / ~/.bash_profile /
+    ~/.bashrc 并把 alias 快照进会话：rc 文件里的 `alias ls='rm ...'` / 同名
+    function 不需要模型在会话内定义就已生效，命令头证明不了任何事（Codex
+    review P1）。按工具子进程实际生效的 HOME 检查（home_mode=profile 时 rc
+    也在 profile home 下）。
+    """
+    home = _subprocess_home()
+    for name in (".profile", ".bash_profile", ".bashrc"):
+        try:
+            if os.path.getsize(os.path.join(home, name)) > 0:
+                return True
+        except OSError:
+            continue
+    return False
+
+
 def _command_is_probably_readonly(command: str) -> bool:
     """报告一条 shell 命令是否**可证明**只读。证明不了就按需要保护处理。"""
     if not command.strip():
         return True
-    if os.environ.get("BASH_ENV") or os.environ.get("ENV"):
-        # 非交互 bash 启动时会先 source BASH_ENV（POSIX sh 用 ENV）指向的脚本
-        # ——命令头还没执行，环境钩子先跑任意代码。这种环境下没有「可证明只
-        # 读」的命令，与 BASH_FUNC_ 导出函数遮蔽同款处置（Codex review P1）。
-        # 代价只是被污染的环境里所有命令都按 cwd 保护，不是阻断。
+    if os.environ.get("BASH_ENV") or os.environ.get("ENV") or _shell_init_hooks_present():
+        # 非交互 bash 启动时会先 source BASH_ENV（POSIX sh 用 ENV）指向的脚
+        # 本；LocalEnvironment 的会话初始化还会 source 用户 rc 文件并快照
+        # alias——命令头还没执行，环境钩子先跑任意代码 / 同名 alias 已生效。
+        # 这种环境下没有「可证明只读」的命令，与 BASH_FUNC_ 导出函数遮蔽同款
+        # 处置（Codex review P1 ×2）。代价只是这些环境里所有命令都按 cwd 拍
+        # 幂等快照，不是阻断。
         return False
     if _WRITEISH_SHELL_RE.search(command):
         return False
@@ -760,9 +784,18 @@ def _ancillary_abs_paths(text: str, primary: list[str], base_dir: str = "") -> l
     # word 整词入候选（Codex review P1）。解析不了（引号不配对 / 非 shell 文
     # 本）就只靠上面的正则，提取是加餐、正则仍在。
     try:
+        base = os.path.normpath(base_dir) if base_dir else ""
         for word in shlex.split(text, posix=True):
             if word.startswith(("/", "~", "$HOME", "${HOME}", "../")):
                 raw.append(word)
+            elif base and "/" in word and ".." in word.split("/"):
+                # 内部 `..` 段的相对路径（sub/../../x、./../x）归一后可能跳出
+                # 主保护目录，前缀正则与 `../` 开头判定都接不住（Codex review
+                # P1）。锚到 base_dir 归一：仍在主目录内的交给 cwd 快照，跳出
+                # 去的整词入候选。
+                p = os.path.normpath(os.path.join(base, word))
+                if p != base and not p.startswith(base.rstrip("/") + "/"):
+                    raw.append(p)
     except ValueError:
         pass
     candidates: list[str] = []

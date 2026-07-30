@@ -51,6 +51,8 @@ def _device_env(monkeypatch, tmp_path):
     monkeypatch.setenv("ZET_CHAT_APPEND_URL", "http://127.0.0.1:19090/api/v1/internal/chat/append")
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "tok123")
     monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
+    # HOME 隔离到 tmp：开发机真实 HOME 里的 .bashrc 会触发 rc 遮蔽检测。
+    monkeypatch.setenv("HOME", str(tmp_path))
     guard.reset_for_test()
     yield
     guard.reset_for_test()
