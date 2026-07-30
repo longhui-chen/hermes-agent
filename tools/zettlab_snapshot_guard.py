@@ -97,61 +97,22 @@ _SHELL_CHAIN_SPLIT_RE = re.compile(r"&&|\|\||;|\||\n|&")
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # 注意不收这些「看似只读」的命令：find 有 -delete / -exec、sort 有 -o、tree 有
 # -o、env 可以执行任意命令（Codex review P1）。宁可让它们多触发一次 cwd 保护。
+# 只读安全清单：**只收行为不受配置 / 环境驱动的命令**。
+#
+# git 与 less/more 已被整体移出（Codex review P1 ×N）：它们的行为由用户配置与
+# 环境变量驱动，能挂上任意外部命令——git 有 diff.external、diff.<drv>.textconv、
+# core.fsmonitor、core.pager、alias.*、hooks；less/more 有 LESSOPEN / LESSCLOSE
+# 预处理器。逐个子命令 / flag 去堵是无穷尽的（本 PR 已为此迭代四轮），而它们本
+# 就不该出现在「可证明只读」的清单里。代价只是这些命令会按 cwd 拍一张幂等快照
+# （每轮每目录一张），不是阻断。
 _READONLY_FIRST_TOKENS = frozenset({
     "ls", "cat", "grep", "rg", "egrep", "fgrep", "head", "tail",
-    "less", "more", "wc", "pwd", "echo", "printf", "stat", "file", "which",
+    "wc", "pwd", "echo", "printf", "stat", "file", "which",
     "type", "printenv", "ps", "df", "du", "date", "whoami", "id",
     "uname", "md5sum", "sha1sum", "sha256sum", "uniq", "cut", "tr",
     "diff", "cmp", "readlink", "basename", "dirname", "hostname", "uptime",
     "free", "realpath", "test", "true", "false", "sleep",
 })
-_READONLY_GIT_SUBCOMMANDS = frozenset({
-    "status", "log", "diff", "show", "branch", "remote", "rev-parse",
-    "describe", "shortlog", "blame", "ls-files",
-})
-# 只读子命令里仍可能藏着写形态：`branch -D` 删分支、`branch <name>` 建分支、
-# `remote remove/set-url` 改配置、diff 族 `--output` 写文件（Codex review P1）。
-# 按参数二次甄别：branch 只放行可证明只读的 flag 组合，remote 只放行只读动作，
-# 其余子命令拦 `--output`。证明不了只读就按需要保护处理（不是阻断）。
-# 会走 diff 机器（因而可能触发 diff.external / textconv 外部命令）的子命令。
-_GIT_EXTERNAL_CAPABLE_SUBCOMMANDS = frozenset({"diff", "show", "log", "blame"})
-_GIT_BRANCH_READONLY_FLAGS = frozenset({
-    "-a", "-r", "-v", "-vv", "--all", "--remotes", "--list", "--verbose",
-    "--show-current", "--contains", "--no-contains", "--merged", "--no-merged",
-})
-_GIT_BRANCH_READONLY_KV_FLAGS = frozenset({
-    "--contains", "--no-contains", "--merged", "--no-merged",
-    "--format", "--sort", "--color", "--points-at",
-})
-def _git_tokens_are_readonly(tokens: list[str]) -> bool:
-    if len(tokens) < 2 or tokens[1] not in _READONLY_GIT_SUBCOMMANDS:
-        return False
-    sub, args = tokens[1], tokens[2:]
-    if any(a == "-o" or a.startswith("--output") for a in args):
-        return False  # diff / log / show 族的 --output[-*] 会写文件
-    if any(a in ("--ext-diff", "--textconv") for a in args):
-        # 两者都会执行 config 里配置的外部命令（Codex review P1）。
-        return False
-    if sub in _GIT_EXTERNAL_CAPABLE_SUBCOMMANDS and "--no-ext-diff" not in args:
-        # diff.external / diff.<driver>.textconv 是**既有用户配置**就可能带的
-        # （difftastic / delta 用户常配），配上之后裸 `git diff` 会改为执行那
-        # 条外部命令——guard 不 spawn git 就证明不了它不存在（Codex review
-        # P1）。只有显式 --no-ext-diff 才算可证明只读；否则按 cwd 保护（不是
-        # 阻断，代价是每轮每目录多一张幂等快照）。
-        return False
-    if sub == "branch":
-        return all(
-            a in _GIT_BRANCH_READONLY_FLAGS
-            or ("=" in a and a.split("=", 1)[0] in _GIT_BRANCH_READONLY_KV_FLAGS)
-            for a in args
-        )
-    if sub == "remote":
-        # -v/--verbose 是全局 flag，能放在动作前（`git remote -v update` 会真
-        # 更新远端引用）：先剥掉 flag 再校验实际动作（Codex review P1）。
-        actions = [a for a in args if a not in ("-v", "--verbose")]
-        return not actions or actions[0] in ("show", "get-url")
-    return True
-
 # 命令文本里的绝对路径 token：cwd 之外的写入目标（rm /home/alice/... 或脚本里
 # 的 Path("/home/...").write_text）也要尽力保护（Codex review P1）。这些路径走
 # **附加** ensure：范围外（403）只跳过、不阻断——它们是 cwd 保护之外的加餐。
@@ -165,8 +126,12 @@ _QUOTED_PATHISH_RES = (
     re.compile(r"'((?:/|~/|\$HOME/|\$\{HOME\}/|\.\./)[^'\n]+)'"),
     re.compile(r'"((?:/|~/|\$HOME/|\$\{HOME\}/|\.\./)[^"\n]+)"'),
 )
-_BARE_HOME_TOKEN_RE = re.compile(r"(?<![\w.-])(?:~|\$HOME|\$\{HOME\})/(?:[\w.+@%-]+/)*[\w.+@%-]+")
-_BARE_PARENT_TOKEN_RE = re.compile(r"(?<![\w.-])\.\.(?:/(?:\.\.|[\w.+@%-]+))+")
+# home / parent 裸 token 同样要带 glob 字符：`rm -rf ~/Doc*` 截成 `~/Doc` 后
+# lexists 不到，整条附加保护会静默漏掉（Codex review P1）。
+_BARE_HOME_TOKEN_RE = re.compile(
+    r"(?<![\w.-])(?:~|\$HOME|\$\{HOME\})/(?:[\w.+@%*?\[\]-]+/)*[\w.+@%*?\[\]-]+")
+_BARE_PARENT_TOKEN_RE = re.compile(
+    r"(?<![\w.-])\.\.(?:/(?:\.\.|[\w.+@%*?\[\]-]+))+")
 _GLOB_CHARS = ("*", "?", "[")
 _MAX_ANCILLARY_PATHS = 16
 
@@ -511,6 +476,22 @@ def _shell_self_backgrounds(command: str) -> bool:
     return False
 
 
+def _shell_function_shadows(name: str) -> bool:
+    """报告某个命令名是否被**导出的** bash function 取代。
+
+    bash 用 ``BASH_FUNC_<name>%%`` 形式的环境变量传递导出函数，terminal 子进程
+    继承同一份 env，所以这里看得见（Codex review P1）。**看不见**的是会话内用
+    ``alias`` / ``function`` 定义、或 rc 文件里定义的同名符号——那是 shell 进程
+    的内部状态，纯判定函数拿不到，要拿只能在会话里执行 `type -a`（每条命令一次
+    额外往返 + 副作用面）。这属于 PRD §2 Phase 1 的静态判定边界；缓解在于：定
+    义 alias 的命令本身（`alias`/`function`/`source`）不在只读清单里，会先触发
+    一次 cwd 保护。
+    """
+    return any(
+        key.startswith(f"BASH_FUNC_{name}") for key in os.environ
+    )
+
+
 def _command_is_probably_readonly(command: str) -> bool:
     """报告一条 shell 命令是否**可证明**只读。证明不了就按需要保护处理。"""
     if not command.strip():
@@ -533,23 +514,16 @@ def _command_is_probably_readonly(command: str) -> bool:
             # 序，与同名系统命令毫无关系——只对无路径分隔符的命令名做只读放行
             # （Codex review P1）。
             return False
-        if head == "git":
-            if not _git_tokens_are_readonly(tokens):
-                return False
-            continue
         if head not in _READONLY_FIRST_TOKENS:
+            return False
+        if _shell_function_shadows(head):
+            # 导出的 bash function（BASH_FUNC_ls%%=...）会取代同名系统命令，
+            # 且随 env 一路传进 terminal 子进程——它在这里是可见的，命中即不
+            # 判只读（Codex review P1）。会话内 alias / function 见函数注释。
             return False
         if head == "rg" and any(a == "--pre" or a.startswith("--pre=") for a in tokens[1:]):
             # rg --pre 会对每个候选文件执行指定命令（`rg --pre rm foo f` 真会
             # 删 f）：带 --pre 的搜索不是只读（Codex review P1）。
-            return False
-        if head == "less" and any(
-            a in ("-o", "-O", "--log-file", "--LOG-FILE")
-            or a.startswith(("-o", "-O", "--log-file=", "--LOG-FILE="))
-            for a in tokens[1:]
-        ):
-            # less -O/--LOG-FILE 会把输入写进指定文件且不确认覆盖
-            # （Codex review P1）。
             return False
     return True
 

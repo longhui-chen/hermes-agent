@@ -628,7 +628,7 @@ def test_terminal_defaults_to_protection_when_not_provably_readonly(monkeypatch,
 
 def test_provably_readonly_commands_skip_protection(monkeypatch, tmp_path):
     rec = _install(monkeypatch)
-    for cmd in ("ls -la", "cat a.txt | grep foo", "git status", "head -n 5 a.txt"):
+    for cmd in ("ls -la", "cat a.txt | grep foo", "head -n 5 a.txt", "wc -l a.txt"):
         assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
     assert rec.requests == []
 
@@ -888,43 +888,25 @@ def test_container_collapsed_task_key_maps_back_to_turn(monkeypatch, tmp_path):
     assert rec.requests[-1]["body"]["turnId"] == "turn_1"
 
 
-def test_git_readonly_subcommands_with_write_capable_args_are_protected(monkeypatch, tmp_path):
-    """`git branch -D` 删分支、`git branch <name>` 建分支、`git remote
-    remove/set-url` 改配置、diff/log 族 `--output` 写文件（Codex review P1）：
-    只读子命令按参数二次甄别，证明不了只读就按 cwd 保护。"""
+def test_all_git_commands_are_protected(monkeypatch, tmp_path):
+    """git 整体移出只读清单（Codex review P1 ×N）：它的行为由用户配置驱动，
+    diff.external / textconv / core.fsmonitor / core.pager / alias / hooks 都能
+    挂上任意外部命令，逐个子命令 flag 去堵是无穷尽的。代价只是 git 命令按 cwd
+    拍一张幂等快照（每轮每目录一张），不是阻断。"""
     rec = _install(monkeypatch)
     cmds = (
-        "git branch -D work",
-        "git branch newname",
-        "git remote set-url origin https://example.com/x.git",
-        "git remote remove origin",
-        "git diff --output=/tmp/a.patch",
-        "git log --output=/tmp/b.txt",
+        "git status",
+        "git diff",
+        "git diff --no-ext-diff --no-textconv",
+        "git log --oneline",
+        "git branch",
+        "git remote -v",
+        "git rev-parse HEAD",
     )
     for cmd in cmds:
         guard.reset_for_test()
         assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
     assert len(rec.requests) == len(cmds)
-
-
-def test_git_provably_readonly_forms_still_skip_protection(monkeypatch, tmp_path):
-    rec = _install(monkeypatch)
-    for cmd in (
-        "git status",
-        "git branch",
-        "git branch -a -v",
-        "git branch --show-current",
-        "git branch --merged --format=%(refname)",
-        "git remote -v",
-        "git remote show origin",
-        "git remote get-url origin",
-        # diff 族要显式 --no-ext-diff 才算可证明只读（diff.external 是既有用户
-        # 配置就可能带的，Codex review P1）。
-        "git diff --no-ext-diff --stat",
-        "git log --no-ext-diff --oneline",
-    ):
-        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
-    assert rec.requests == []
 
 
 def test_shared_collapsed_key_with_concurrent_turns_fails_closed(monkeypatch, tmp_path):
@@ -1101,8 +1083,8 @@ def test_env_prefixed_commands_are_not_provably_readonly(monkeypatch, tmp_path):
 
     guard.reset_for_test()
     assert guard.maybe_require_snapshot(
-        "terminal", {"command": "git diff --no-ext-diff"}, turn_id="turn_1") is None
-    assert len(rec.requests) == 2, "无 env 前缀的可证明只读 git diff 仍免保护"
+        "terminal", {"command": "cat a.txt"}, turn_id="turn_1") is None
+    assert len(rec.requests) == 2, "无 env 前缀的可证明只读命令仍免保护"
 
 
 def test_rg_pre_and_git_external_command_args_are_protected(monkeypatch, tmp_path):
@@ -1120,9 +1102,9 @@ def test_rg_pre_and_git_external_command_args_are_protected(monkeypatch, tmp_pat
     assert len(rec.requests) == 4
 
     guard.reset_for_test()
-    for cmd in ("rg foo f", "git diff --no-ext-diff"):
+    for cmd in ("rg foo f", "grep -r foo ."):
         assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
-    assert len(rec.requests) == 4, "普通 rg / --no-ext-diff 仍然只读"
+    assert len(rec.requests) == 4, "不带 --pre 的搜索仍然只读"
 
 
 def test_extra_args_bind_mounts_map_back_to_host(monkeypatch, tmp_path):
@@ -1176,24 +1158,9 @@ def test_amp_separated_write_segment_is_not_readonly(monkeypatch, tmp_path):
     assert rec.requests == []
 
     # 纯只读的管道 / 链不受影响。
-    for cmd in ("cat a.txt | grep foo", "ls -la && git status"):
+    for cmd in ("cat a.txt | grep foo", "ls -la && wc -l a.txt"):
         assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
     assert rec.requests == []
-
-
-def test_git_remote_verbose_prefixed_actions_are_protected(monkeypatch, tmp_path):
-    """`git remote -v update` / `--verbose prune` 会更新远端引用：剥掉全局 flag
-    后按实际动作校验（Codex review P1）。"""
-    rec = _install(monkeypatch)
-    for cmd in ("git remote -v update", "git remote --verbose prune origin"):
-        guard.reset_for_test()
-        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
-    assert len(rec.requests) == 2
-
-    guard.reset_for_test()
-    for cmd in ("git remote -v", "git remote show origin", "git remote get-url origin"):
-        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
-    assert len(rec.requests) == 2, "真正只读的 remote 形态仍免保护"
 
 
 def test_home_expansion_uses_subprocess_home(monkeypatch, tmp_path):
@@ -1237,25 +1204,22 @@ def test_path_qualified_executables_are_not_readonly(monkeypatch, tmp_path):
     assert len(rec.requests) == 4, "无路径的系统命令仍免保护"
 
 
-def test_less_log_file_and_bare_git_diff_are_protected(monkeypatch, tmp_path):
-    """less -O 会覆盖写日志文件；裸 git diff 在配了 diff.external（difftastic /
-    delta 等既有用户配置）时会执行外部命令——两者都不能按只读放行
-    （Codex review P1）。"""
+def test_config_driven_commands_are_always_protected(monkeypatch, tmp_path):
+    """less/more 与 git 一样整体移出只读清单：LESSOPEN / LESSCLOSE 预处理器、
+    diff.external / core.fsmonitor 等既有用户配置都能让「看起来只读」的命令执行
+    任意外部程序（Codex review P1 ×N）。"""
     rec = _install(monkeypatch)
-    for cmd in (
+    cmds = (
+        "less a.txt",
         "printf data | less -O /tmp/notes.txt",
-        "less --LOG-FILE=/tmp/notes.txt a.txt",
+        "more a.txt",
+        "git status",
         "git diff",
-        "git show HEAD",
-    ):
+    )
+    for cmd in cmds:
         guard.reset_for_test()
         assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
-    assert len(rec.requests) == 4
-
-    guard.reset_for_test()
-    for cmd in ("less a.txt", "git diff --no-ext-diff", "git status", "git rev-parse HEAD"):
-        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
-    assert len(rec.requests) == 4, "显式 --no-ext-diff 与非 diff 族仍免保护"
+    assert len(rec.requests) == len(cmds)
 
 
 def test_glob_write_targets_are_expanded_before_protection(monkeypatch, tmp_path):
@@ -1300,3 +1264,41 @@ def test_tts_output_path_uses_main_process_semantics(monkeypatch, tmp_path):
         turn_id="turn_1", task_id="task_9",
     )
     assert rec.requests[1]["body"]["paths"] == ["/mnt/audio/x.mp3"]
+
+
+def test_exported_shell_function_shadow_disables_readonly(monkeypatch, tmp_path):
+    """导出的 bash function（BASH_FUNC_ls%%=...）会取代同名系统命令，且随 env
+    传进 terminal 子进程——命中即不判只读（Codex review P1）。"""
+    rec = _install(monkeypatch)
+    assert guard.maybe_require_snapshot("terminal", {"command": "ls -la"}, turn_id="turn_1") is None
+    assert rec.requests == []
+
+    guard.reset_for_test()
+    monkeypatch.setenv("BASH_FUNC_ls%%", "() { rm -f victim; }")
+    assert guard.maybe_require_snapshot("terminal", {"command": "ls -la"}, turn_id="turn_1") is None
+    assert len(rec.requests) == 1, "被导出函数遮蔽的命令要走 cwd 保护"
+
+
+def test_home_and_parent_globs_are_expanded(monkeypatch, tmp_path):
+    """`rm -rf ~/Doc*` / `rm -rf ../Doc*` 的裸 token 也要带 glob 字符并展开，
+    否则截断成不存在的字面量后被静默丢掉（Codex review P1）。"""
+    home = tmp_path / "home"
+    (home / "Documents").mkdir(parents=True)
+    home_doc = home / "Documents" / "a.txt"
+    home_doc.write_text("x")
+    monkeypatch.setenv("HOME", str(home))
+
+    sibling = tmp_path / "Docs-sibling"
+    sibling.mkdir()
+    (sibling / "b.txt").write_text("y")
+    cwd = tmp_path / "Work"
+    cwd.mkdir()
+
+    rec = _install(monkeypatch)
+    guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -rf ~/Doc* ../Docs-sib*", "workdir": str(cwd)},
+        turn_id="turn_1", task_id="task_9",
+    )
+    ensured = [p for r in rec.requests for p in (r["body"].get("paths") or [])]
+    assert str(home / "Documents") in ensured, "~ glob 要展开"
+    assert str(sibling) in ensured, "../ glob 要展开"
