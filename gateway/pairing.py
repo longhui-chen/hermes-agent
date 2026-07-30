@@ -197,11 +197,9 @@ def _merge_pairing_dir(active_dir: Path, alternate_dir: Path) -> None:
             _secure_write(dest, json.dumps(merged, indent=2, ensure_ascii=False))
 
 
-def _migrate_split_pairing_dirs() -> None:
-    home = get_hermes_home()
+def _migrate_split_pairing_dirs(home: Path, active: Path) -> None:
     old_dir = home / "pairing"
     new_dir = home / "platforms" / "pairing"
-    active = PAIRING_DIR
     alternate = new_dir if active.resolve() == old_dir.resolve() else old_dir
     _merge_pairing_dir(active, alternate)
 
@@ -241,9 +239,11 @@ class PairingStore:
       - {platform}-approved.json  : approved (paired) users
       - _rate_limits.json         : rate limit tracking
 
-    When constructed with ``profile="<name>"``, storage lives under
-    ``<HERMES_HOME>/profiles/<name>/pairing/`` (per-profile, used by
-    multiplexing gateways so each profile has its own whitelist).
+    When constructed with ``profile="<name>"``, storage lives under the
+    canonical profile home returned by ``hermes_cli.profiles.get_profile_dir``
+    (per-profile, used by multiplexing gateways so each profile has its own
+    whitelist). The built-in ``default`` profile maps to ``<HERMES_HOME>``
+    itself; it is never materialized as ``profiles/default``.
     Without a profile, storage is the global ``<HERMES_HOME>/pairing/``
     directory (backward-compat for the ``hermes pairing`` CLI).
     """
@@ -251,17 +251,35 @@ class PairingStore:
     def __init__(self, profile: Optional[str] = None):
         # Resolve storage directory lazily — tests use a temp HERMES_HOME
         # and PairingStore may be constructed before the env is set.
+        is_builtin_default = False
+        migration_home: Optional[Path] = None
         if profile:
-            from hermes_constants import get_hermes_home
-            self._dir = get_hermes_home() / "profiles" / profile / "pairing"
+            from hermes_cli.profiles import get_profile_dir, normalize_profile_name
+
+            canonical_profile = normalize_profile_name(profile)
+            is_builtin_default = canonical_profile == "default"
+            profile_home = get_profile_dir(canonical_profile)
+            if is_builtin_default:
+                # PAIRING_DIR is bound at module import time and may point at
+                # the currently active named profile. Resolve the built-in
+                # default against its canonical root instead.
+                migration_home = profile_home
+                self._dir = get_hermes_dir(
+                    "platforms/pairing",
+                    "pairing",
+                    home=profile_home,
+                )
+            else:
+                self._dir = profile_home / "pairing"
         else:
             self._dir = PAIRING_DIR
+            migration_home = get_hermes_home()
         self._dir.mkdir(parents=True, exist_ok=True)
-        if not profile:
+        if migration_home is not None:
             # Heal installs whose global pairing data ended up split across
             # the legacy and new directories (per-profile stores never had
             # the legacy/new split).
-            _migrate_split_pairing_dirs()
+            _migrate_split_pairing_dirs(migration_home, self._dir)
         # Protects all read-modify-write cycles. The gateway runs multiple
         # platform adapters concurrently in threads sharing one PairingStore.
         self._lock = threading.RLock()

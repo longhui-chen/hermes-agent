@@ -789,8 +789,7 @@ class TestProfileScopedStorage:
     def test_profile_store_uses_profiles_subdir(self, tmp_path, monkeypatch):
         """PairingStore(profile="yangyang") puts files under
         <HERMES_HOME>/profiles/yangyang/pairing/."""
-        from hermes_constants import get_hermes_home
-        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         store = PairingStore(profile="yangyang")
         assert store.profile == "yangyang"
         expected = tmp_path / "profiles" / "yangyang" / "pairing"
@@ -799,11 +798,38 @@ class TestProfileScopedStorage:
         # Auto-creates the directory
         assert expected.is_dir()
 
+    def test_builtin_default_profile_uses_canonical_root(
+        self, tmp_path, monkeypatch
+    ):
+        """An explicit default store must not inherit the active named
+        profile's module-level PAIRING_DIR."""
+        root = tmp_path / ".hermes"
+        active_home = root / "profiles" / "coder"
+        canonical_pairing_dir = root / "pairing"
+        active_pairing_dir = active_home / "pairing"
+        canonical_pairing_dir.mkdir(parents=True)
+        active_pairing_dir.mkdir(parents=True)
+        (canonical_pairing_dir / "feishu-approved.json").write_text(
+            json.dumps({"default-user": {"approved_at": 1.0}})
+        )
+        (active_pairing_dir / "feishu-approved.json").write_text(
+            json.dumps({"coder-user": {"approved_at": 1.0}})
+        )
+        monkeypatch.setenv("HERMES_HOME", str(active_home))
+
+        with patch("gateway.pairing.PAIRING_DIR", active_pairing_dir):
+            store = PairingStore(profile="default")
+
+        assert store.profile == "default"
+        assert store._dir == canonical_pairing_dir
+        assert store.is_approved("feishu", "default-user") is True
+        assert store.is_approved("feishu", "coder-user") is False
+        assert not (root / "profiles" / "default").exists()
+
     def test_profile_approval_does_not_leak_to_global(self, tmp_path, monkeypatch):
         """Approving in a profile-scoped store must not appear in the global
         store — and vice versa. This is the whole point of the fix."""
-        from hermes_constants import get_hermes_home
-        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         with patch("gateway.pairing.PAIRING_DIR", tmp_path):
             global_store = PairingStore()
             profile_store = PairingStore(profile="yangyang")
@@ -822,8 +848,7 @@ class TestProfileScopedStorage:
     def test_profile_uses_distinct_rate_limit_file(self, tmp_path, monkeypatch):
         """Rate-limit state is per-profile, not shared globally — otherwise
         one profile's flood would lock out the other profile's users."""
-        from hermes_constants import get_hermes_home
-        monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         with patch("gateway.pairing.PAIRING_DIR", tmp_path):
             global_store = PairingStore()
             profile_store = PairingStore(profile="yangyang")
@@ -868,4 +893,3 @@ class TestProfileScopedStorage:
         # source with an unknown profile → fallback (defensive)
         s_unknown = SessionSource(platform=Platform.WEIXIN, chat_id="c", profile="ghost")
         assert g._pairing_store_for(s_unknown) is g.pairing_store
-
