@@ -118,6 +118,9 @@ _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY"
 # Zettlab local-server sends metadata.turn_id with each API request. This token
 # stays task-local so concurrent requests cannot overwrite one another.
 _ZETTLAB_TURN_ID: ContextVar = ContextVar("zettlab_turn_id", default="")
+_ZETTLAB_CONNECTOR_ROUTE_CAPABILITY: ContextVar = ContextVar(
+    "zettlab_connector_route_capability", default=""
+)
 
 # local-server signs the exact authenticated user/agent/session scope for each
 # Hermes request. Keep that capability task-local and out of os.environ so a
@@ -148,6 +151,14 @@ def pop_zettlab_browser_session_token(token) -> None:
 def zettlab_browser_session_token() -> str:
     """Return the current request's managed-browser scope capability."""
     return _ZETTLAB_BROWSER_SESSION_TOKEN.get().strip()
+
+
+def set_zettlab_connector_route_capability(capability: str) -> None:
+    _ZETTLAB_CONNECTOR_ROUTE_CAPABILITY.set(capability or "")
+
+
+def zettlab_connector_route_capability() -> str:
+    return _ZETTLAB_CONNECTOR_ROUTE_CAPABILITY.get().strip()
 
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.

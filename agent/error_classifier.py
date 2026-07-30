@@ -1737,14 +1737,14 @@ def _extract_error_code(body: dict) -> str:
             if nested_code:
                 return nested_code
 
-    if isinstance(error_obj, str) and error_obj.strip():
-        return error_obj.strip()
     # Top-level code
     code = body.get("code") or body.get("error_code") or ""
     if isinstance(code, (str, int)):
         text = str(code).strip()
         if text and text != "400":
             return text
+    if isinstance(error_obj, str) and error_obj.strip():
+        return error_obj.strip()
     return ""
 
 

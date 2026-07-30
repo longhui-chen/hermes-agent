@@ -264,7 +264,12 @@ def get_bundled_skills_dir(default: Path | None = None) -> Path:
     return get_hermes_home() / "skills"
 
 
-def get_hermes_dir(new_subpath: str, old_name: str) -> Path:
+def get_hermes_dir(
+    new_subpath: str,
+    old_name: str,
+    *,
+    home: Path | None = None,
+) -> Path:
     """Resolve a Hermes subdirectory with backward compatibility.
 
     New installs get the consolidated layout (e.g. ``cache/images``).
@@ -282,16 +287,18 @@ def get_hermes_dir(new_subpath: str, old_name: str) -> Path:
     Args:
         new_subpath: Preferred path relative to HERMES_HOME (e.g. ``"cache/images"``).
         old_name: Legacy path relative to HERMES_HOME (e.g. ``"image_cache"``).
+        home: Optional explicit Hermes home. Defaults to the current
+            :func:`get_hermes_home` scope.
 
     Returns:
         Absolute ``Path`` — legacy location if it exists with content,
         otherwise the new location.
     """
-    home = get_hermes_home()
-    old_path = home / old_name
+    resolved_home = home if home is not None else get_hermes_home()
+    old_path = resolved_home / old_name
     if _legacy_path_has_content(old_path):
         return old_path
-    return home / new_subpath
+    return resolved_home / new_subpath
 
 
 def iter_hermes_node_dirs(home: Path | None = None) -> list[Path]:

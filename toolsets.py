@@ -261,6 +261,19 @@ TOOLSETS = {
         "includes": []
     },
 
+    # Catalog entry is load-bearing for reachability, not just organization:
+    # _get_platform_tools reverse-maps a platform's composite into CATALOG
+    # toolset names (its non-configurable recovery walks TOOLSETS), and
+    # get_tool_definitions then resolves those names back to tools. A tool
+    # registered under a toolset with no catalog entry is an orphan the
+    # reverse-mapping silently drops — registered, gate open, yet absent from
+    # the model's schema (found on a real device).
+    "zettlab_apphost": {
+        "description": "Manage device-hosted generated applications via the local App Host (zettlab)",
+        "tools": ["app_host"],
+        "includes": []
+    },
+
     "delegation": {
         "description": "Spawn subagents with isolated context for complex subtasks",
         "tools": ["delegate_task"],
@@ -467,7 +480,12 @@ TOOLSETS = {
         # session (_own_session_id), so only THIS platform can use it — other
         # platforms would show the model a tool local-server always rejects.
         # Still schema-gated by ZET_AGENT_CALL_URL via check_fn.
-        "tools": _HERMES_CORE_TOOLS + ["call_agent"],
+        # app_host likewise: local-server's App Host internal face (base URL +
+        # action token) only exists in a zet_agent profile, and installing
+        # generated applications on the device is a device-agent capability —
+        # not something telegram/slack/cron schemas should ever advertise.
+        # Still gated by ZET_APPHOST_BASE_URL + the action token via check_fn.
+        "tools": _HERMES_CORE_TOOLS + ["call_agent", "app_host"],
         "includes": []
     },
 

@@ -46,6 +46,25 @@ def _tui_session(agent=None, session_key="session-key-old", **extra):
     }
 
 
+def _run_server_threads_inline(monkeypatch, server):
+    """Run server-owned workers inline without replacing global threading."""
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None, **_kw):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    class _ThreadingProxy:
+        def __getattr__(self, name):
+            return getattr(threading, name)
+
+    proxy = _ThreadingProxy()
+    proxy.Thread = _ImmediateThread
+    monkeypatch.setattr(server, "threading", proxy)
+
+
 # ===========================================================================
 # Bug #20001: _finalize_session uses stale session_key
 # ===========================================================================
@@ -170,15 +189,8 @@ class TestSyncSessionKeyAfterAutoCompress:
         monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
         monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
 
-        # Use _ImmediateThread pattern to run synchronously
-        class _ImmediateThread:
-            def __init__(self, target=None, daemon=None, **kw):
-                self._target = target
-            def start(self):
-                self._target()
-
         server._sessions["test-sid"] = session
-        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        _run_server_threads_inline(monkeypatch, server)
 
         try:
             server.handle_request({
@@ -239,14 +251,8 @@ class TestPendingTitleValueError:
             server, "_sync_session_key_after_compress", lambda *a, **kw: None
         )
 
-        class _ImmediateThread:
-            def __init__(self, target=None, daemon=None, **kw):
-                self._target = target
-            def start(self):
-                self._target()
-
         server._sessions["sid"] = session
-        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        _run_server_threads_inline(monkeypatch, server)
 
         try:
             server.handle_request({
@@ -293,14 +299,8 @@ class TestPendingTitleValueError:
             server, "_sync_session_key_after_compress", lambda *a, **kw: None
         )
 
-        class _ImmediateThread:
-            def __init__(self, target=None, daemon=None, **kw):
-                self._target = target
-            def start(self):
-                self._target()
-
         server._sessions["sid"] = session
-        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        _run_server_threads_inline(monkeypatch, server)
 
         try:
             server.handle_request({

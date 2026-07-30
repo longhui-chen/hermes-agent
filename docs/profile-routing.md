@@ -115,3 +115,8 @@ activates the per-profile runtime scope (per-profile `HERMES_HOME`, secret scope
 profile-namespaced session keys); routing is the decision layer that picks *which*
 profile a given guild/channel/thread lands in. With multiplexing off, `profile_routes`
 is ignored entirely — behavior is byte-identical to a single-profile gateway.
+
+Process-shared ingress such as `zet_agent` is started once by the multiplexed gateway.
+Its `/p/<profile>/...` routes select the profile runtime scope; secondary profiles do
+not create another listener, but their independent messaging adapters still connect
+with profile-scoped credentials.
