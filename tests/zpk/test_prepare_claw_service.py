@@ -690,13 +690,19 @@ def test_prepare_claw_service_tightens_writable_ota_data_symlink_target(
     assert env_path.is_file()
 
 
-def test_prepare_claw_service_tightens_writable_data_symlink_ancestor(
+def test_prepare_claw_service_refuses_writable_shared_data_parent(
     tmp_path: Path,
 ):
+    """Shared ancestors (the firmware data root) are diagnosed, never chmodded.
+
+    Only the app-owned symlink target itself is auto-tightened; a
+    group-writable shared parent still refuses startup, now naming the
+    exact directory and mode instead of a bare refusal line.
+    """
     if not _readlink_f_available(tmp_path):
         pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
 
-    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
+    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
     data_link = hermes_home.parent
     data_parent = tmp_path / "zettos" / "main" / "data"
     expected_target = data_parent / "com.zettlab.claw"
@@ -708,18 +714,21 @@ def test_prepare_claw_service_tightens_writable_data_symlink_ancestor(
 
     result = subprocess.run(
         [str(app_root / "prepare-claw-service.sh")],
-        check=True,
+        check=False,
         cwd=str(app_root),
         env=_script_env(),
         capture_output=True,
         text=True,
     )
 
-    assert "tightened group/other-writable data path" in result.stderr
-    assert data_parent.stat().st_mode & 0o777 == 0o750
-    assert expected_target.stat().st_mode & 0o777 == 0o750
-    assert hermes_home.is_dir()
-    assert env_path.is_file()
+    assert result.returncode != 0
+    assert "refusing untrusted data symlink" in result.stderr
+    assert (
+        f"untrusted data path: {data_parent} mode 770 is group/other-writable"
+        in result.stderr
+    )
+    assert data_parent.stat().st_mode & 0o777 == 0o770
+    assert not (expected_target / "secrets").exists()
 
 
 def test_prepare_claw_service_refuses_writable_directory_above_trust_root(
