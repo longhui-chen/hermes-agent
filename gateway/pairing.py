@@ -241,9 +241,11 @@ class PairingStore:
       - {platform}-approved.json  : approved (paired) users
       - _rate_limits.json         : rate limit tracking
 
-    When constructed with ``profile="<name>"``, storage lives under
-    ``<HERMES_HOME>/profiles/<name>/pairing/`` (per-profile, used by
-    multiplexing gateways so each profile has its own whitelist).
+    When constructed with ``profile="<name>"``, storage lives under the
+    canonical profile home returned by ``hermes_cli.profiles.get_profile_dir``
+    (per-profile, used by multiplexing gateways so each profile has its own
+    whitelist). The built-in ``default`` profile maps to ``<HERMES_HOME>``
+    itself; it is never materialized as ``profiles/default``.
     Without a profile, storage is the global ``<HERMES_HOME>/pairing/``
     directory (backward-compat for the ``hermes pairing`` CLI).
     """
@@ -251,13 +253,21 @@ class PairingStore:
     def __init__(self, profile: Optional[str] = None):
         # Resolve storage directory lazily — tests use a temp HERMES_HOME
         # and PairingStore may be constructed before the env is set.
+        is_builtin_default = False
         if profile:
-            from hermes_constants import get_hermes_home
-            self._dir = get_hermes_home() / "profiles" / profile / "pairing"
+            from hermes_cli.profiles import get_profile_dir, normalize_profile_name
+
+            canonical_profile = normalize_profile_name(profile)
+            is_builtin_default = canonical_profile == "default"
+            self._dir = (
+                PAIRING_DIR
+                if is_builtin_default
+                else get_profile_dir(canonical_profile) / "pairing"
+            )
         else:
             self._dir = PAIRING_DIR
         self._dir.mkdir(parents=True, exist_ok=True)
-        if not profile:
+        if not profile or is_builtin_default:
             # Heal installs whose global pairing data ended up split across
             # the legacy and new directories (per-profile stores never had
             # the legacy/new split).

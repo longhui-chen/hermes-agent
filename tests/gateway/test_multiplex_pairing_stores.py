@@ -57,6 +57,11 @@ def test_secondary_profile_pairing_stores_created(tmp_path, monkeypatch):
     assert "coder" in runner.pairing_stores, (
         "secondary profile PairingStore missing — the NameError swallow is back"
     )
+    assert runner.pairing_stores["default"]._dir in {
+        tmp_path / ".hermes" / "pairing",
+        tmp_path / ".hermes" / "platforms" / "pairing",
+    }
+    assert not (tmp_path / ".hermes" / "profiles" / "default").exists()
 
 
 def test_pairing_store_scoped_to_profile_dir(tmp_path, monkeypatch):
