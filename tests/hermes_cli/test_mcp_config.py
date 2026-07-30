@@ -850,7 +850,7 @@ class TestMcpRemoveEvictsManager:
         )
         monkeypatch.setattr(
             "tools.mcp_oauth._configure_callback_port",
-            lambda cfg: cfg.setdefault("_resolved_port", 45123),
+            lambda cfg, storage=None: cfg.setdefault("_resolved_port", 45123),
         )
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         _set_interactive_stdin(monkeypatch)
