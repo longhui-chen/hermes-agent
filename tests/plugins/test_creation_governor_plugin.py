@@ -133,13 +133,6 @@ def _decode_envelope(text):
     return json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
 
 
-def _decode_action_result(text):
-    prefix = "<!--creation-recommendation-action-result "
-    encoded = text.split(prefix, 1)[1].split("-->", 1)[0].strip()
-    encoded += "=" * (-len(encoded) % 4)
-    return json.loads(base64.urlsafe_b64decode(encoded).decode("utf-8"))
-
-
 def test_first_turn_and_every_third_turn_run_bounded_json_checks():
     plugin = _load_plugin()
     none = _candidate(
@@ -262,7 +255,6 @@ def test_positive_checkpoint_preserves_answer_and_appends_card_envelope_once():
         "confidence": 0.82,
         "evidence_turn_ids": ["evidence-1"],
         "source_turn_id": "turn-1",
-        "action_receipts": True,
     }
     assert (
         plugin._transform_llm_output(
@@ -481,7 +473,7 @@ def test_mute_is_rejected_when_its_preference_cannot_be_persisted(monkeypatch):
         session_id="unpersisted-mute",
         response_text="I could not save that preference.",
     )
-    assert _decode_action_result(result)["status"] == "rejected"
+    assert result is None
     state_key = plugin._session_key({"session_id": "unpersisted-mute"})
     assert plugin._is_session_muted(state_key) is False
 
