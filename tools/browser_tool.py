@@ -180,6 +180,42 @@ def _managed_route_result(route: Any) -> Optional[str]:
         "error": "Managed browser router returned no action result.",
     }, ensure_ascii=False)
 
+
+def _managed_desktop_payload(route: Any) -> Optional[Dict[str, Any]]:
+    """Decode a desktop result while preserving router errors as tool output."""
+    if route is None or route.backend != "desktop":
+        return None
+    try:
+        payload = json.loads(route.result or "")
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        return payload
+    return {
+        "success": False,
+        "code": "invalid_browser_router_response",
+        "error": "Managed browser router returned an invalid desktop result.",
+    }
+
+
+def _managed_page_safety_error(url: str) -> Optional[str]:
+    """Apply the browser's post-navigation network boundary to PC pages."""
+    if not url:
+        return None
+    if _is_always_blocked_url(url):
+        return "Blocked: page URL targets a cloud metadata endpoint"
+    if not _allow_private_urls() and not _is_safe_url(url):
+        return "Blocked: page URL targets a private or internal address"
+    return None
+
+
+def _close_unsafe_managed_page() -> None:
+    """Best-effort blanking after a desktop page crosses the network boundary."""
+    try:
+        _route_browser_action("close")
+    except Exception as exc:
+        logger.debug("Managed browser safety close failed: %s", exc)
+
 # Standard PATH entries for environments with minimal PATH (e.g. systemd services).
 # Includes Android/Termux and macOS Homebrew locations needed for agent-browser,
 # npx, node, and Android's glibc runner (grun).
@@ -2925,6 +2961,18 @@ def browser_navigate(url: str, task_id: Optional[str] = None) -> str:
         })
 
     managed_route = _route_browser_action("navigate", {"url": url})
+    managed_payload = _managed_desktop_payload(managed_route)
+    if managed_payload is not None:
+        final_url = str(managed_payload.get("url") or "").strip()
+        safety_error = (
+            _managed_page_safety_error(final_url)
+            if managed_payload.get("success") is True
+            else None
+        )
+        if safety_error:
+            _close_unsafe_managed_page()
+            return json.dumps({"success": False, "error": safety_error}, ensure_ascii=False)
+        return json.dumps(_redact_browser_output(managed_payload), ensure_ascii=False)
     managed_result = _managed_route_result(managed_route)
     if managed_result is not None:
         return managed_result
@@ -3080,6 +3128,26 @@ def browser_snapshot(
         JSON string with page snapshot
     """
     managed_route = _route_browser_action("snapshot", {"full": bool(full)})
+    managed_payload = _managed_desktop_payload(managed_route)
+    if managed_payload is not None:
+        current_url = str(managed_payload.get("url") or "").strip()
+        safety_error = (
+            _managed_page_safety_error(current_url)
+            if managed_payload.get("success") is True
+            else None
+        )
+        if safety_error:
+            _close_unsafe_managed_page()
+            return json.dumps({"success": False, "error": safety_error}, ensure_ascii=False)
+        snapshot_text = managed_payload.get("snapshot", "")
+        if isinstance(snapshot_text, str) and len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
+            snapshot_text = (
+                _extract_relevant_content(snapshot_text, user_task)
+                if user_task
+                else _truncate_snapshot(snapshot_text)
+            )
+            managed_payload["snapshot"] = snapshot_text
+        return json.dumps(_redact_browser_output(managed_payload), ensure_ascii=False)
     managed_result = _managed_route_result(managed_route)
     if managed_result is not None:
         return managed_result
@@ -4196,21 +4264,55 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         A JSON string with vision analysis results and screenshot_path, or a
         multimodal tool-result envelope carrying the screenshot and metadata.
     """
-    managed_route = _route_browser_action("vision", {
-        "question": question,
-        "annotate": bool(annotate),
-    })
-    managed_result = _managed_route_result(managed_route)
-    if managed_result is not None:
-        return managed_result
-
-    if _is_camofox_mode():
-        from tools.browser_camofox import camofox_vision
-        return camofox_vision(question, annotate, task_id)
-
     import base64
+    import binascii
     import uuid as uuid_mod
     from hermes_constants import get_hermes_dir
+
+    managed_screenshot_bytes: Optional[bytes] = None
+    managed_route = _route_browser_action("screenshot", {
+        "annotate": bool(annotate),
+    })
+    managed_payload = _managed_desktop_payload(managed_route)
+    if managed_payload is not None:
+        if managed_payload.get("success") is not True:
+            return json.dumps(_redact_browser_output(managed_payload), ensure_ascii=False)
+        current_url = str(managed_payload.get("url") or "").strip()
+        safety_error = _managed_page_safety_error(current_url)
+        if safety_error:
+            _close_unsafe_managed_page()
+            return json.dumps({"success": False, "error": safety_error}, ensure_ascii=False)
+        encoded = managed_payload.get("data")
+        mime_type = str(managed_payload.get("mime_type") or "").lower()
+        if not isinstance(encoded, str) or mime_type != "image/png":
+            return json.dumps({
+                "success": False,
+                "code": "invalid_browser_router_response",
+                "error": "Managed browser returned an invalid PNG screenshot.",
+            }, ensure_ascii=False)
+        try:
+            managed_screenshot_bytes = base64.b64decode(encoded, validate=True)
+        except (binascii.Error, ValueError):
+            return json.dumps({
+                "success": False,
+                "code": "invalid_browser_router_response",
+                "error": "Managed browser returned invalid screenshot data.",
+            }, ensure_ascii=False)
+        if not managed_screenshot_bytes:
+            return json.dumps({
+                "success": False,
+                "code": "invalid_browser_router_response",
+                "error": "Managed browser returned an empty screenshot.",
+            }, ensure_ascii=False)
+    if managed_payload is None:
+        managed_result = _managed_route_result(managed_route)
+        if managed_result is not None:
+            return managed_result
+
+        if _is_camofox_mode():
+            from tools.browser_camofox import camofox_vision
+            return camofox_vision(question, annotate, task_id)
+
     screenshots_dir = get_hermes_dir("cache/screenshots", "browser_screenshots")
     screenshot_path = screenshots_dir / f"browser_screenshot_{uuid_mod.uuid4().hex}.png"
     effective_task_id = _last_session_key(task_id or "default")
@@ -4220,7 +4322,8 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     # private/internal address, the screenshot would expose private page content
     # to the vision model.  Re-check the current URL before capturing anything.
     if (
-        not _is_local_backend()
+        managed_screenshot_bytes is None
+        and not _is_local_backend()
         and not _is_local_sidecar_key(effective_task_id)
         and not _allow_private_urls()
     ):
@@ -4254,7 +4357,11 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
     engine = _get_browser_engine()
     _lp_prerouted = False
     _lp_fallback_warning = None
-    if engine == "lightpanda" and _should_inject_engine(engine):
+    if (
+        managed_screenshot_bytes is None
+        and engine == "lightpanda"
+        and _should_inject_engine(engine)
+    ):
         logger.debug("browser_vision: pre-routing screenshot to Chrome (engine=lightpanda)")
         screenshot_args = []
         if annotate:
@@ -4288,7 +4395,13 @@ def browser_vision(question: str, annotate: bool = False, task_id: Optional[str]
         # Prune old screenshots (older than 24 hours) to prevent unbounded disk growth
         _cleanup_old_screenshots(screenshots_dir, max_age_hours=24)
 
-        if _lp_prerouted and screenshot_path.exists():
+        if managed_screenshot_bytes is not None:
+            screenshot_path.write_bytes(managed_screenshot_bytes)
+            result = {
+                "success": True,
+                "data": {"path": str(screenshot_path)},
+            }
+        elif _lp_prerouted and screenshot_path.exists():
             result = {
                 "success": True,
                 "data": {

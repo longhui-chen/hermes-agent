@@ -565,6 +565,26 @@ class ZetAgentAdapter(APIServerAdapter):
         """
         return bool(_delegation_advance_url())
 
+    async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
+        """Bind local-server's browser scope capability for this API request.
+
+        The base handler creates the agent task while this context is active,
+        so ContextVar propagation carries the token into synchronous tool
+        workers without exposing it through process-global environment state.
+        """
+        from gateway.session_context import (
+            pop_zettlab_browser_session_token,
+            push_zettlab_browser_session_token,
+        )
+
+        token = push_zettlab_browser_session_token(
+            request.headers.get("X-Zettlab-Browser-Session-Token", "")
+        )
+        try:
+            return await super()._handle_chat_completions(request)
+        finally:
+            pop_zettlab_browser_session_token(token)
+
     def _bind_turn_session_context(self, session_id: str) -> None:
         """Rebind session contextvars for this turn's agent build.
 

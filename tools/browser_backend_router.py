@@ -74,8 +74,25 @@ def _action_token() -> str:
     return _runtime_value(_TOKEN_ENV)
 
 
+def _session_token() -> str:
+    try:
+        from gateway.session_context import zettlab_browser_session_token
+
+        return zettlab_browser_session_token()
+    except Exception:
+        return ""
+
+
+def _request_headers(action_token: str, session_token: str) -> dict[str, str]:
+    return {
+        "Content-Type": "application/json",
+        "X-Zettlab-Agent-Action-Token": action_token,
+        "X-Zettlab-Browser-Session-Token": session_token,
+    }
+
+
 def is_managed_browser_configured() -> bool:
-    return bool(_endpoint() and _action_token())
+    return bool(_endpoint() and _action_token() and _session_token() and _session_id())
 
 
 def is_desktop_host_online() -> bool:
@@ -91,8 +108,9 @@ def is_desktop_host_online() -> bool:
     """
     endpoint = _endpoint()
     token = _action_token()
+    session_token = _session_token()
     session_id = _session_id()
-    if not endpoint or not token or not session_id:
+    if not endpoint or not token or not session_token or not session_id:
         return False
     try:
         with requests.Session() as client:
@@ -101,10 +119,7 @@ def is_desktop_host_online() -> bool:
             client.trust_env = False
             response = client.post(
                 endpoint,
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Zettlab-Agent-Action-Token": token,
-                },
+                headers=_request_headers(token, session_token),
                 json={
                     "session_id": session_id,
                     "action": "host_status",
@@ -158,8 +173,9 @@ def route_browser_action(
     """Route one browser action, or return ``None`` outside managed sessions."""
     endpoint = _endpoint()
     token = _action_token()
+    session_token = _session_token()
     session_id = _session_id()
-    if not endpoint or not token or not session_id:
+    if not endpoint or not token or not session_token or not session_id:
         return None
     try:
         with requests.Session() as client:
@@ -168,10 +184,7 @@ def route_browser_action(
             client.trust_env = False
             response = client.post(
                 endpoint,
-                headers={
-                    "Content-Type": "application/json",
-                    "X-Zettlab-Agent-Action-Token": token,
-                },
+                headers=_request_headers(token, session_token),
                 json={
                     "session_id": session_id,
                     "action": action,

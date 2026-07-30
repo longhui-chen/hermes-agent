@@ -6,7 +6,12 @@ import pytest
 import requests
 
 from agent import secret_scope
-from gateway.session_context import clear_session_vars, set_session_vars
+from gateway.session_context import (
+    clear_session_vars,
+    pop_zettlab_browser_session_token,
+    push_zettlab_browser_session_token,
+    set_session_vars,
+)
 from tools import browser_backend_router as router, browser_tool
 
 
@@ -52,7 +57,9 @@ def managed_browser_context(monkeypatch):
         chat_id="zettlab:alice:agent-1:chat-1",
         session_key="zettlab:alice:agent-1:chat-1",
     )
+    browser_token = push_zettlab_browser_session_token("browser-scope-token")
     yield
+    pop_zettlab_browser_session_token(browser_token)
     clear_session_vars(tokens)
 
 
@@ -71,6 +78,7 @@ def test_router_delegates_to_camofox_without_keeping_local_state(monkeypatch):
     route = router.route_browser_action("navigate", {"url": "https://example.com"})
     assert route == router.BrowserRoute("camofox")
     assert seen["headers"]["X-Zettlab-Agent-Action-Token"] == "agent-token"
+    assert seen["headers"]["X-Zettlab-Browser-Session-Token"] == "browser-scope-token"
     assert seen["json"] == {
         "session_id": "zettlab:alice:agent-1:chat-1",
         "action": "navigate",
@@ -160,7 +168,7 @@ def test_manual_page_snapshot_uses_desktop_without_ai_navigate(monkeypatch):
         (lambda: browser_tool.browser_press("Enter"), "press"),
         (lambda: browser_tool.browser_console(), "console"),
         (lambda: browser_tool.browser_get_images(), "get_images"),
-        (lambda: browser_tool.browser_vision("what is shown?"), "vision"),
+        (lambda: browser_tool.browser_vision("what is shown?"), "screenshot"),
     ],
 )
 def test_followup_tools_ask_authoritative_router(monkeypatch, invoke, action):
@@ -235,6 +243,7 @@ def test_multiplex_config_uses_active_profile_secret_scope(monkeypatch):
     assert route.backend == "desktop"
     assert seen["url"] == scoped_url
     assert seen["headers"]["X-Zettlab-Agent-Action-Token"] == "active-profile-token"
+    assert seen["headers"]["X-Zettlab-Browser-Session-Token"] == "browser-scope-token"
 
 
 @pytest.mark.parametrize(
@@ -292,7 +301,137 @@ def test_check_browser_requirements_probes_host_status(monkeypatch):
         "params": {},
     }
     assert seen["headers"]["X-Zettlab-Agent-Action-Token"] == "agent-token"
+    assert seen["headers"]["X-Zettlab-Browser-Session-Token"] == "browser-scope-token"
     assert seen["timeout"] <= 2
+
+
+def test_router_fails_closed_without_request_scope_token(monkeypatch):
+    called = False
+
+    def post(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("request must not be sent")
+
+    patch_post(monkeypatch, post)
+    reset = push_zettlab_browser_session_token("")
+    try:
+        assert router.is_managed_browser_configured() is False
+        assert router.route_browser_action("snapshot") is None
+    finally:
+        pop_zettlab_browser_session_token(reset)
+    assert called is False
+
+
+def test_managed_navigate_blocks_private_redirect_and_closes_page(monkeypatch):
+    actions = []
+
+    def route(action, _params=None):
+        actions.append(action)
+        if action == "navigate":
+            return SimpleNamespace(
+                backend="desktop",
+                result=json.dumps({
+                    "success": True,
+                    "url": "http://127.0.0.1/admin",
+                    "title": "Internal",
+                }),
+            )
+        return SimpleNamespace(
+            backend="desktop",
+            result=json.dumps({"success": True, "closed": True}),
+        )
+
+    monkeypatch.setattr(browser_tool, "_route_browser_action", route)
+    monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: True)
+    monkeypatch.setattr(browser_tool, "_is_local_sidecar_key", lambda _key: False)
+    monkeypatch.setattr(browser_tool, "_is_always_blocked_url", lambda _url: False)
+    monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
+    monkeypatch.setattr(
+        browser_tool,
+        "_is_safe_url",
+        lambda candidate: candidate == "https://example.com/redirect",
+    )
+    monkeypatch.setattr(browser_tool, "check_website_access", lambda _url: None)
+
+    result = json.loads(browser_tool.browser_navigate("https://example.com/redirect"))
+    assert result["success"] is False
+    assert "private or internal" in result["error"]
+    assert actions == ["navigate", "close"]
+
+
+def test_managed_snapshot_truncates_and_redacts_before_return(monkeypatch):
+    monkeypatch.setattr(browser_tool, "SNAPSHOT_SUMMARIZE_THRESHOLD", 8)
+    monkeypatch.setattr(browser_tool, "_truncate_snapshot", lambda _value: "trimmed-secret")
+    monkeypatch.setattr(
+        browser_tool,
+        "_redact_browser_output",
+        lambda value: {
+            **value,
+            "snapshot": "redacted",
+        } if isinstance(value, dict) else value,
+    )
+    monkeypatch.setattr(
+        browser_tool,
+        "_route_browser_action",
+        lambda _action, _params=None: SimpleNamespace(
+            backend="desktop",
+            result=json.dumps({
+                "success": True,
+                "snapshot": "a very long snapshot",
+                "element_count": 3,
+                "url": "https://example.com",
+            }),
+        ),
+    )
+    monkeypatch.setattr(browser_tool, "_is_always_blocked_url", lambda _url: False)
+    monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
+    monkeypatch.setattr(browser_tool, "_is_safe_url", lambda _url: True)
+
+    result = json.loads(browser_tool.browser_snapshot())
+    assert result["snapshot"] == "redacted"
+    assert result["element_count"] == 3
+
+
+def test_managed_vision_uses_native_multimodal_pipeline(monkeypatch, tmp_path):
+    import base64
+    from tools import vision_tools
+
+    png = b"\x89PNG\r\n\x1a\nmanaged"
+    monkeypatch.setattr(
+        browser_tool,
+        "_route_browser_action",
+        lambda _action, _params=None: SimpleNamespace(
+            backend="desktop",
+            result=json.dumps({
+                "success": True,
+                "data": base64.b64encode(png).decode("ascii"),
+                "mime_type": "image/png",
+                "url": "https://example.com",
+            }),
+        ),
+    )
+    monkeypatch.setattr(browser_tool, "_is_always_blocked_url", lambda _url: False)
+    monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
+    monkeypatch.setattr(browser_tool, "_is_safe_url", lambda _url: True)
+    monkeypatch.setattr(browser_tool, "_get_browser_engine", lambda: "chromium")
+    monkeypatch.setattr("hermes_constants.get_hermes_dir", lambda *_args: tmp_path)
+    monkeypatch.setattr(vision_tools, "_should_use_native_vision_fast_path", lambda: True)
+    monkeypatch.setattr(
+        vision_tools,
+        "_build_native_vision_tool_result",
+        lambda **kwargs: {
+            "type": "multimodal",
+            "text_summary": kwargs["question"],
+            "meta": {"image_size_bytes": kwargs["image_size_bytes"]},
+        },
+    )
+
+    result = browser_tool.browser_vision("what is shown?")
+    assert isinstance(result, dict)
+    assert result["type"] == "multimodal"
+    assert result["meta"]["image_size_bytes"] == len(png)
+    assert result["meta"]["screenshot_path"].endswith(".png")
 
 
 def _probe_network_error(_url, **_kwargs):
