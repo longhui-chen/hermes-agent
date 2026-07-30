@@ -127,6 +127,9 @@ def _git_tokens_are_readonly(tokens: list[str]) -> bool:
     sub, args = tokens[1], tokens[2:]
     if any(a == "-o" or a.startswith("--output") for a in args):
         return False  # diff / log / show 族的 --output[-*] 会写文件
+    if any(a in ("--ext-diff", "--textconv") for a in args):
+        # 两者都会执行 config 里配置的外部命令（Codex review P1）。
+        return False
     if sub == "branch":
         return all(
             a in _GIT_BRANCH_READONLY_FLAGS
@@ -282,20 +285,23 @@ def _abs_path(path: Any) -> str:
 _CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona"})
 
 
-def _workspace_host_base() -> str:
-    """/workspace 在 host 侧的真实落点；空串 = 不映射。
+def _container_path_maps() -> list[tuple[str, str]]:
+    """容器路径前缀 → host 路径的映射表（最长前缀优先）。
 
-    镜像 DockerEnvironment 的挂载优先级（Codex review P1）：docker_volumes 里
-    显式挂到 /workspace 的 volume **优先于** docker_mount_cwd_to_workspace 的
-    cwd bind（后者在显式挂载存在时被跳过）；/workspace 被非常规 volume 占用
-    （如挂到 /workspace/sub）时映射不可判定——保留容器路径，让服务端 scope
-    校验 fail-closed。local 后端 /workspace 是字面 host 路径，不映射。
+    镜像 DockerEnvironment 的挂载语义（Codex review P1）：docker_volumes 里
+    每一条 host 侧为绝对路径的 bind 都会把 host 目录暴露进容器（不止
+    /workspace——`/home/a/Pictures:/mnt/pics` 下写 /mnt/pics 动的是 host 的
+    Pictures）；显式挂到 /workspace 的 volume 优先于
+    docker_mount_cwd_to_workspace 的 cwd bind（后者在显式挂载存在时被跳过）。
+    named volume（host 侧非路径）不进表——那不是 host 用户文件，保留容器路径
+    交给服务端 scope 校验。local 后端不做任何映射。
     """
     env_type = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
     if env_type not in _CONTAINER_BACKENDS:
-        return ""
-    raw = (os.getenv("TERMINAL_DOCKER_VOLUMES") or "").strip()
+        return []
+    maps: list[tuple[str, str]] = []
     workspace_taken = False
+    raw = (os.getenv("TERMINAL_DOCKER_VOLUMES") or "").strip()
     if raw:
         try:
             volumes = json.loads(raw)
@@ -305,34 +311,39 @@ def _workspace_host_base() -> str:
             if not isinstance(vol, str) or ":" not in vol:
                 continue
             host, _, rest = vol.strip().partition(":")
-            if rest == "/workspace" or rest.startswith("/workspace:"):
-                return os.path.abspath(os.path.expanduser(host))
-            if ":/workspace" in vol:
+            container = rest.split(":", 1)[0].strip()
+            if not container.startswith("/"):
+                continue
+            container = os.path.normpath(container)
+            if container == "/workspace" or container.startswith("/workspace/"):
                 workspace_taken = True
-    if workspace_taken:
-        return ""
+            if host.startswith(("/", "~")):
+                maps.append((container, os.path.abspath(os.path.expanduser(host))))
     flag = (os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE") or "false").strip().lower()
-    if flag not in {"true", "1", "yes"}:
-        return ""
-    host = os.path.abspath(os.path.expanduser(os.getenv("TERMINAL_CWD") or os.getcwd()))
-    return host if os.path.isdir(host) else ""
+    if not workspace_taken and flag in {"true", "1", "yes"}:
+        host = os.path.abspath(os.path.expanduser(os.getenv("TERMINAL_CWD") or os.getcwd()))
+        if os.path.isdir(host):
+            maps.append(("/workspace", host))
+    maps.sort(key=lambda m: len(m[0]), reverse=True)
+    return maps
 
 
 def _map_container_path(p: str) -> str:
-    """把容器路径（/workspace[/...]）反解回 host 路径。
+    """把容器路径按 volume 映射表反解回 host 路径。
 
     挂载会话里 file_tools / 会话 cwd 记录落在容器口径上；原样上报会让快照落
-    在 host 上不存在（或错误）的 /workspace，真正被改的 host 目录没有恢复点
-    （Codex review P1）。host 落点见 _workspace_host_base——按 terminal 的
-    volume / 挂载配置判定，不看 host 上有没有 /workspace（Codex review P1）。
+    在 host 上不存在（或错误）的容器路径上，真正被改的 host 目录没有恢复点
+    （Codex review P1）。映射按 terminal 的 volume / 挂载配置判定（最长前缀
+    优先），不看 host 上是否恰好存在同名目录（Codex review P1）；映射不到的
+    容器路径原样保留，由服务端 scope 校验 fail-closed。
     """
-    if p != "/workspace" and not p.startswith("/workspace/"):
+    if not p.startswith("/"):
         return p
-    host = _workspace_host_base()
-    if not host:
-        return p
-    tail = p[len("/workspace"):].lstrip("/")
-    return os.path.normpath(os.path.join(host, tail)) if tail else host
+    for container, host in _container_path_maps():
+        if p == container or p.startswith(container + "/"):
+            tail = p[len(container):].lstrip("/")
+            return os.path.normpath(os.path.join(host, tail)) if tail else host
+    return p
 
 
 def _resolve_write_path(path: Any, task_id: str) -> str:
@@ -418,15 +429,25 @@ def _command_is_probably_readonly(command: str) -> bool:
     if _WRITEISH_SHELL_RE.search(command):
         return False
     for segment in _SHELL_CHAIN_SPLIT_RE.split(command):
-        tokens = [t for t in segment.strip().split() if not _ENV_ASSIGN_RE.match(t)]
+        raw_tokens = segment.strip().split()
+        tokens = [t for t in raw_tokens if not _ENV_ASSIGN_RE.match(t)]
         if not tokens:
             continue
+        if len(tokens) != len(raw_tokens):
+            # env 赋值能改写命令行为——`GIT_EXTERNAL_DIFF=rm git diff` 会对每
+            # 个 diff 路径执行 rm（Codex review P1）。带 env 前缀的命令一律不
+            # 判只读，按需要保护处理（代价只是多拍一张快照）。
+            return False
         head = os.path.basename(tokens[0])
         if head == "git":
             if not _git_tokens_are_readonly(tokens):
                 return False
             continue
         if head not in _READONLY_FIRST_TOKENS:
+            return False
+        if head == "rg" and any(a == "--pre" or a.startswith("--pre=") for a in tokens[1:]):
+            # rg --pre 会对每个候选文件执行指定命令（`rg --pre rm foo f` 真会
+            # 删 f）：带 --pre 的搜索不是只读（Codex review P1）。
             return False
     return True
 
@@ -518,11 +539,23 @@ def _paths_for(tool_name: str, arguments: dict[str, Any], task_id: str) -> list[
 
     if tool_name == "text_to_speech":
         # 默认输出走工具自己的生成目录，不涉用户文件；只有自定义 output_path
-        # 需要保护（tts 会先删已存在的目标，Codex review P1）。
+        # 需要保护（tts 会先删已存在的目标，Codex review P1）。command provider
+        # 会把后缀改写成配置的 output_format 再删 / 写（_configured_command_
+        # tts_output_path），最终落点可能不是参数原样——原路径 + 四种合法格式
+        # （COMMAND_TTS_OUTPUT_FORMATS）的同名变体一并纳保（Codex review P1）。
         out = str(arguments.get("output_path") or "").strip()
         if not out:
             return []
-        return [p for p in (_resolve_write_path(os.path.expanduser(out), task_id),) if p]
+        resolved = _resolve_write_path(os.path.expanduser(out), task_id)
+        if not resolved:
+            return []
+        paths = [resolved]
+        stem, _ = os.path.splitext(resolved)
+        for fmt in ("mp3", "wav", "ogg", "flac"):
+            variant = f"{stem}.{fmt}"
+            if variant != resolved and os.path.lexists(variant):
+                paths.append(variant)
+        return paths
 
     return []
 

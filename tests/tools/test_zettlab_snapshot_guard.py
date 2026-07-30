@@ -1044,3 +1044,79 @@ def test_self_backgrounding_write_commands_are_blocked(monkeypatch, tmp_path):
     assert guard.maybe_require_snapshot(
         "terminal", {"command": "ls -la &"}, turn_id="turn_1") is None
     assert len(rec.requests) == 2, "非后台写入命令照常走保护"
+
+
+def test_docker_volume_paths_map_back_to_host_longest_prefix(monkeypatch, tmp_path):
+    """docker_volumes 的每一条 host bind 都要能反解（不止 /workspace）：容器内
+    写 /mnt/pics 动的是 host 侧挂载源；嵌套挂载按最长前缀取（Codex review P1）。"""
+    pics = tmp_path / "Pictures"
+    nested = tmp_path / "Nested"
+    pics.mkdir()
+    nested.mkdir()
+    (pics / "a.jpg").write_text("x")
+    (nested / "b.jpg").write_text("y")
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_VOLUMES", json.dumps([
+        f"{pics}:/mnt/pics",
+        f"{nested}:/mnt/pics/nested",
+    ]))
+    rec = _install(monkeypatch)
+
+    guard.maybe_require_snapshot("write_file", {"path": "/mnt/pics/a.jpg"}, turn_id="turn_1")
+    assert rec.requests[0]["body"]["paths"] == [str(pics / "a.jpg")]
+
+    guard.maybe_require_snapshot("write_file", {"path": "/mnt/pics/nested/b.jpg"}, turn_id="turn_1")
+    assert rec.requests[1]["body"]["paths"] == [str(nested / "b.jpg")], "嵌套挂载要按最长前缀反解"
+
+
+def test_tts_format_realigned_sibling_is_protected(monkeypatch, tmp_path):
+    """command TTS provider 会把 output_path 后缀改写成配置的 output_format 再
+    删 / 写：同名的四种合法格式变体一并纳保（Codex review P1）。"""
+    rec = _install(monkeypatch)
+    voice_mp3 = tmp_path / "voice.mp3"
+    voice_wav = tmp_path / "voice.wav"
+    voice_mp3.write_text("m")
+    voice_wav.write_text("w")
+
+    guard.maybe_require_snapshot(
+        "text_to_speech", {"text": "hi", "output_path": str(voice_mp3)}, turn_id="turn_1"
+    )
+    paths = rec.requests[0]["body"]["paths"]
+    assert str(voice_mp3) in paths and str(voice_wav) in paths
+
+
+def test_env_prefixed_commands_are_not_provably_readonly(monkeypatch, tmp_path):
+    """env 赋值能改写命令行为（GIT_EXTERNAL_DIFF=rm git diff 会对 diff 路径执行
+    rm）：带 env 前缀的命令不再证明只读，按 cwd 保护（Codex review P1）。"""
+    rec = _install(monkeypatch)
+    for cmd in (
+        "GIT_EXTERNAL_DIFF=rm git diff",
+        "PAGER=x LESSOPEN='|rm %s' less a.txt",
+    ):
+        guard.reset_for_test()
+        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
+    assert len(rec.requests) == 2, "带 env 前缀的命令要走保护"
+
+    guard.reset_for_test()
+    assert guard.maybe_require_snapshot("terminal", {"command": "git diff"}, turn_id="turn_1") is None
+    assert len(rec.requests) == 2, "裸 git diff 仍然免保护"
+
+
+def test_rg_pre_and_git_external_command_args_are_protected(monkeypatch, tmp_path):
+    """rg --pre 与 git diff --ext-diff / --textconv 都会执行外部命令：不能按只读
+    放行（Codex review P1）。"""
+    rec = _install(monkeypatch)
+    for cmd in (
+        "rg --pre rm foo f",
+        "rg --pre=rm foo f",
+        "git diff --ext-diff",
+        "git log --textconv",
+    ):
+        guard.reset_for_test()
+        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
+    assert len(rec.requests) == 4
+
+    guard.reset_for_test()
+    for cmd in ("rg foo f", "git diff --no-ext-diff"):
+        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
+    assert len(rec.requests) == 4, "普通 rg / --no-ext-diff 仍然只读"
