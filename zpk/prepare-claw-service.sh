@@ -44,8 +44,8 @@ presets_dir_is_trusted() {
     # per process, so an OTA flip is visible after restart without permanently
     # pinning future starts to an old version directory.
     if [ "$(id -u)" -eq 0 ]; then
-        trusted_data_path_chain "$resolved" "/" || return 1
-        trusted_data_path_chain "$(dirname "$candidate")" "/" || return 1
+        trusted_presets_path_chain "$resolved" "/" || return 1
+        trusted_presets_path_chain "$(dirname "$candidate")" "/" || return 1
     else
         mode="$(stat -c '%a' "$resolved" 2>/dev/null || stat -f '%Lp' "$resolved" 2>/dev/null || true)"
         [ -n "$mode" ] || return 1
@@ -74,96 +74,46 @@ detect_zettlab_presets_dir() {
 }
 
 trusted_data_symlink_target() {
-    local resolved candidate expected="" trust_root=""
+    local resolved candidate expected=""
     resolved="$(readlink -f "$DATA_DIR" 2>/dev/null || true)"
     [ -n "$resolved" ] && [ -d "$resolved" ] || return 1
     for candidate in "$OTA_DATA_TARGET" "$VOLUME_DATA_TARGET"; do
         candidate="$(readlink -f "$candidate" 2>/dev/null || true)"
         if [ -n "$candidate" ] && [ "$resolved" = "$candidate" ]; then
             expected="$candidate"
-            trust_root="$(dirname "$(dirname "$candidate")")"
             break
         fi
     done
     [ -n "$expected" ] || return 1
 
-    trusted_data_path_chain "$resolved" "$trust_root" "$resolved" || return 1
     printf '%s\n' "$resolved"
 }
 
-# Validate every directory from $1 up the path chain: owned by root (or the
-# process user when unprivileged) and not group/other-writable. With a
-# non-empty $3 (repair target) two behaviors are added for the data chain:
-# refusals name the exact directory and failing attribute on stderr, and the
-# app-owned data directory itself — exactly the validated symlink target,
-# never a shared ancestor — is tightened with chmod g-w,o-w instead of
-# refused when the process owns it: legacy deploys left app data directories
-# at 777, which otherwise turns into a service crash loop after an OTA
-# upgrade. Every other level, shared parents like the firmware data root
-# included, is validate-only and never modified.
-trusted_data_path_chain() {
-    local current="$1" trust_root="$2" repair_target="${3:-}"
-    local process_uid uid mode group other
+# Presets are executable content selected from a configurable path, so keep the
+# ownership and mode checks for that input. Device data symlinks use the fixed
+# OTA/volume target allowlist above and deliberately do not inherit this gate.
+trusted_presets_path_chain() {
+    local current="$1" trust_root="$2" process_uid uid mode group other
     process_uid="$(id -u)"
     while :; do
         uid="$(stat -c '%u' "$current" 2>/dev/null || stat -f '%u' "$current" 2>/dev/null || true)"
         mode="$(stat -c '%a' "$current" 2>/dev/null || stat -f '%Lp' "$current" 2>/dev/null || true)"
-        if [ -z "$uid" ] || [ -z "$mode" ]; then
-            if [ -n "$repair_target" ]; then
-                echo "untrusted data path: cannot stat $current" >&2
-            fi
-            return 1
-        fi
+        [ -n "$uid" ] && [ -n "$mode" ] || return 1
         if [ "$process_uid" -eq 0 ]; then
-            if [ "$uid" != "0" ]; then
-                if [ -n "$repair_target" ]; then
-                    echo "untrusted data path: $current owned by uid $uid, expected root" >&2
-                fi
-                return 1
-            fi
-        elif [ "$uid" != "0" ] && [ "$uid" != "$process_uid" ]; then
-            if [ -n "$repair_target" ]; then
-                echo "untrusted data path: $current owned by uid $uid, expected root or uid $process_uid" >&2
-            fi
-            return 1
+            [ "$uid" = "0" ] || return 1
+        else
+            [ "$uid" = "0" ] || [ "$uid" = "$process_uid" ] || return 1
         fi
         group="${mode: -2:1}"
         other="${mode: -1}"
-        if (( (10#$group & 2) != 0 || (10#$other & 2) != 0 )); then
-            if ! tighten_writable_data_path "$current" "$uid" "$mode" "$repair_target"; then
-                if [ -n "$repair_target" ]; then
-                    echo "untrusted data path: $current mode $mode is group/other-writable" >&2
-                fi
-                return 1
-            fi
-        fi
+        (( (10#$group & 2) == 0 )) || return 1
+        (( (10#$other & 2) == 0 )) || return 1
         [ "$current" = "/" ] && break
         if [ "$process_uid" -ne 0 ] && [ "$current" = "$trust_root" ]; then
             break
         fi
         current="$(dirname "$current")"
     done
-}
-
-tighten_writable_data_path() {
-    local current="$1" uid="$2" mode="$3" repair_target="$4" new_mode group other
-    [ -n "$repair_target" ] || return 1
-    # Only the app-owned data directory itself is repairable; shared
-    # ancestors stay validate-only so one app's startup can never change
-    # permissions other packages may rely on.
-    [ "$current" = "$repair_target" ] || return 1
-    # chmod requires ownership; the uid checks above already pinned root
-    # ownership for the root process, so this only excludes the unprivileged
-    # case where the level belongs to root but the process cannot fix it.
-    [ "$uid" = "$(id -u)" ] || return 1
-    chmod g-w,o-w "$current" 2>/dev/null || return 1
-    new_mode="$(stat -c '%a' "$current" 2>/dev/null || stat -f '%Lp' "$current" 2>/dev/null || true)"
-    [ -n "$new_mode" ] || return 1
-    group="${new_mode: -2:1}"
-    other="${new_mode: -1}"
-    (( (10#$group & 2) == 0 )) || return 1
-    (( (10#$other & 2) == 0 )) || return 1
-    echo "tightened group/other-writable data path: $current (mode $mode -> $new_mode)" >&2
 }
 
 pin_trusted_data_symlink() {
