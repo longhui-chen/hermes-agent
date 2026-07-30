@@ -798,18 +798,33 @@ class TestProfileScopedStorage:
         # Auto-creates the directory
         assert expected.is_dir()
 
-    def test_builtin_default_profile_uses_global_dir(self, tmp_path, monkeypatch):
-        """The virtual default profile is the root Hermes home, not a named
-        profile directory that local-server could mistake for an Agent."""
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        pairing_dir = tmp_path / "pairing"
-        with patch("gateway.pairing.PAIRING_DIR", pairing_dir):
+    def test_builtin_default_profile_uses_canonical_root(
+        self, tmp_path, monkeypatch
+    ):
+        """An explicit default store must not inherit the active named
+        profile's module-level PAIRING_DIR."""
+        root = tmp_path / ".hermes"
+        active_home = root / "profiles" / "coder"
+        canonical_pairing_dir = root / "pairing"
+        active_pairing_dir = active_home / "pairing"
+        canonical_pairing_dir.mkdir(parents=True)
+        active_pairing_dir.mkdir(parents=True)
+        (canonical_pairing_dir / "feishu-approved.json").write_text(
+            json.dumps({"default-user": {"approved_at": 1.0}})
+        )
+        (active_pairing_dir / "feishu-approved.json").write_text(
+            json.dumps({"coder-user": {"approved_at": 1.0}})
+        )
+        monkeypatch.setenv("HERMES_HOME", str(active_home))
+
+        with patch("gateway.pairing.PAIRING_DIR", active_pairing_dir):
             store = PairingStore(profile="default")
 
         assert store.profile == "default"
-        assert store._dir == pairing_dir
-        assert pairing_dir.is_dir()
-        assert not (tmp_path / "profiles" / "default").exists()
+        assert store._dir == canonical_pairing_dir
+        assert store.is_approved("feishu", "default-user") is True
+        assert store.is_approved("feishu", "coder-user") is False
+        assert not (root / "profiles" / "default").exists()
 
     def test_profile_approval_does_not_leak_to_global(self, tmp_path, monkeypatch):
         """Approving in a profile-scoped store must not appear in the global
