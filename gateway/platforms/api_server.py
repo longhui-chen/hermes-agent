@@ -2078,145 +2078,187 @@ class APIServerAdapter(BasePlatformAdapter):
         directory_flags |= getattr(os, "O_NOFOLLOW", 0)
         directory_flags |= getattr(os, "O_CLOEXEC", 0)
         directory_fd = os.open(profile_home, directory_flags)
+        leaf_fd = None
+        leaf_fd_owned = False
         try:
             directory_stat = os.fstat(directory_fd)
             if not stat.S_ISDIR(directory_stat.st_mode):
                 raise RuntimeError("profile home is not a directory")
 
-            leaf_flags = os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
-            leaf_flags |= getattr(os, "O_NOFOLLOW", 0)
-            if create:
-                leaf_flags |= os.O_CREAT
-            leaf_fd = os.open(
-                "state.db", leaf_flags, 0o600, dir_fd=directory_fd
+            # POSIX record locks are per (process, inode): closing ANY fd of a
+            # file releases every lock this process holds on it, including the
+            # locks live SQLite connections depend on. A transient
+            # open()+close() here would let another process's closing RW
+            # connection pass SQLite's last-closer probe and checkpoint-delete
+            # the active WAL/SHM (sqlite.org/howtocorrupt.html §2.3), splitting
+            # connections across WAL generations. All identity/shape checks
+            # below therefore use fstatat (os.stat with dir_fd), never a
+            # throwaway fd.
+            def _stat_leaf():
+                return os.stat(
+                    "state.db", dir_fd=directory_fd, follow_symlinks=False
+                )
+
+            try:
+                expected = _stat_leaf()
+            except FileNotFoundError:
+                if not create:
+                    raise
+                create_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+                create_flags |= getattr(os, "O_NOFOLLOW", 0)
+                create_flags |= getattr(os, "O_CLOEXEC", 0)
+                try:
+                    created_fd = os.open(
+                        "state.db", create_flags, 0o600, dir_fd=directory_fd
+                    )
+                except FileExistsError:
+                    pass
+                else:
+                    # A freshly created inode has no SQLite connections yet,
+                    # so there are no locks for this close to drop.
+                    os.close(created_fd)
+                expected = _stat_leaf()
+            if not stat.S_ISREG(expected.st_mode) or expected.st_nlink != 1:
+                raise RuntimeError(
+                    "profile state.db must be a private regular file"
+                )
+
+            # SQLite derives -wal/-shm/-journal names from the canonical
+            # pathname and opens them with ordinary follow-symlink open(),
+            # outside the /proc/self/fd anchor below. A pre-placed symlink
+            # or hardlink sidecar would redirect journal writes into
+            # another profile, so reject any sidecar that is not a private
+            # regular file on the same filesystem as state.db itself.
+            # Compare st_dev against the main file, not the profile
+            # directory: on btrfs the profile home is a subvolume whose
+            # directory inode reports the parent filesystem's st_dev while
+            # every file inside reports the subvolume's, so a directory
+            # comparison rejects all legitimate sidecars. A sidecar on a
+            # different filesystem than state.db still fails closed.
+            # (A racing swap after this check is not covered; closing that
+            # window needs a VFS-level no-follow open for sidecars.)
+            for sidecar_suffix in ("-wal", "-shm", "-journal"):
+                sidecar_name = "state.db" + sidecar_suffix
+                try:
+                    sidecar_stat = os.stat(
+                        sidecar_name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                except FileNotFoundError:
+                    continue
+                except OSError as sidecar_err:
+                    raise RuntimeError(
+                        f"profile {sidecar_name} must be a private regular file"
+                    ) from sidecar_err
+                if (
+                    not stat.S_ISREG(sidecar_stat.st_mode)
+                    or sidecar_stat.st_nlink != 1
+                    or sidecar_stat.st_dev != expected.st_dev
+                ):
+                    raise RuntimeError(
+                        f"profile {sidecar_name} must be a private regular file"
+                    )
+
+            db_path = profile_home / "state.db"
+            if sys.platform.startswith("linux"):
+                # Do not probe/fallback: an unlinked fd makes exists()
+                # false even though the descriptor is still open. SQLite
+                # must either connect through this anchor or fail closed.
+                leaf_flags = os.O_RDWR
+                leaf_flags |= getattr(os, "O_NOFOLLOW", 0)
+                leaf_flags |= getattr(os, "O_CLOEXEC", 0)
+                leaf_fd = os.open("state.db", leaf_flags, dir_fd=directory_fd)
+                leaf_fd_owned = True
+                anchored = os.fstat(leaf_fd)
+                if (anchored.st_dev, anchored.st_ino) != (
+                    expected.st_dev,
+                    expected.st_ino,
+                ):
+                    raise RuntimeError(
+                        "profile state.db changed while it was opened"
+                    )
+                connection_path = f"/proc/self/fd/{leaf_fd}"
+            else:
+                connection_path = str(db_path)
+            # On Linux, SQLite resolves /proc/self/fd/N to the already-open
+            # inode. leaf_fd stays open for the life of the SessionDB (see the
+            # ownership transfer below) so every schema/cleanup write remains
+            # bound to that inode even if the canonical pathname is swapped
+            # concurrently.
+            connection = sqlite3.connect(
+                connection_path,
+                check_same_thread=False,
+                timeout=1.0,
+                isolation_level=None,
             )
             try:
-                expected = os.fstat(leaf_fd)
-                if not stat.S_ISREG(expected.st_mode) or expected.st_nlink != 1:
-                    raise RuntimeError(
-                        "profile state.db must be a private regular file"
-                    )
-
-                # SQLite derives -wal/-shm/-journal names from the canonical
-                # pathname and opens them with ordinary follow-symlink open(),
-                # outside the /proc/self/fd anchor above. A pre-placed symlink
-                # or hardlink sidecar would redirect journal writes into
-                # another profile, so reject any sidecar that is not a private
-                # regular file on the same filesystem as state.db itself.
-                # Compare st_dev against the main file, not the profile
-                # directory: on btrfs the profile home is a subvolume whose
-                # directory inode reports the parent filesystem's st_dev while
-                # every file inside reports the subvolume's, so a directory
-                # comparison rejects all legitimate sidecars. A sidecar on a
-                # different filesystem than state.db still fails closed.
-                # (A racing swap after this check is not covered; closing that
-                # window needs a VFS-level no-follow open for sidecars.)
-                for sidecar_suffix in ("-wal", "-shm", "-journal"):
-                    sidecar_name = "state.db" + sidecar_suffix
-                    try:
-                        sidecar_fd = os.open(
-                            sidecar_name,
-                            os.O_RDONLY
-                            | getattr(os, "O_NOFOLLOW", 0)
-                            | getattr(os, "O_CLOEXEC", 0),
-                            dir_fd=directory_fd,
-                        )
-                    except FileNotFoundError:
-                        continue
-                    except OSError as sidecar_err:
-                        raise RuntimeError(
-                            f"profile {sidecar_name} must be a private regular file"
-                        ) from sidecar_err
-                    try:
-                        sidecar_stat = os.fstat(sidecar_fd)
-                        if (
-                            not stat.S_ISREG(sidecar_stat.st_mode)
-                            or sidecar_stat.st_nlink != 1
-                            or sidecar_stat.st_dev != expected.st_dev
-                        ):
-                            raise RuntimeError(
-                                f"profile {sidecar_name} must be a private regular file"
-                            )
-                    finally:
-                        os.close(sidecar_fd)
-
-                db_path = profile_home / "state.db"
-                proc_fd_path = f"/proc/self/fd/{leaf_fd}"
-                if sys.platform.startswith("linux"):
-                    # Do not probe/fallback: an unlinked fd makes exists()
-                    # false even though the descriptor is still open. SQLite
-                    # must either connect through this anchor or fail closed.
-                    connection_path = proc_fd_path
-                else:
-                    connection_path = str(db_path)
-                # On Linux, SQLite resolves /proc/self/fd/N to the already-open
-                # inode. Keep leaf_fd alive through SessionDB construction so
-                # every schema/cleanup write remains bound to that inode even
-                # if the canonical pathname is swapped concurrently.
-                connection = sqlite3.connect(
-                    connection_path,
-                    check_same_thread=False,
-                    timeout=1.0,
-                    isolation_level=None,
+                current = os.stat(
+                    "state.db", dir_fd=directory_fd, follow_symlinks=False
                 )
+                current_directory = os.stat(profile_home, follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or current.st_nlink != 1
+                    or (current.st_dev, current.st_ino)
+                    != (expected.st_dev, expected.st_ino)
+                    or (current_directory.st_dev, current_directory.st_ino)
+                    != (directory_stat.st_dev, directory_stat.st_ino)
+                ):
+                    raise RuntimeError(
+                        "profile state.db changed while it was opened"
+                    )
                 try:
-                    current = os.stat(
-                        "state.db", dir_fd=directory_fd, follow_symlinks=False
+                    db = SessionDB(
+                        db_path,
+                        _preopened_connection=connection,
+                        _allow_path_reopen=False,
                     )
-                    current_directory = os.stat(profile_home, follow_symlinks=False)
-                    if (
-                        not stat.S_ISREG(current.st_mode)
-                        or current.st_nlink != 1
-                        or (current.st_dev, current.st_ino)
-                        != (expected.st_dev, expected.st_ino)
-                        or (current_directory.st_dev, current_directory.st_ino)
-                        != (directory_stat.st_dev, directory_stat.st_ino)
-                    ):
-                        raise RuntimeError(
-                            "profile state.db changed while it was opened"
-                        )
-                    try:
-                        db = SessionDB(
-                            db_path,
-                            _preopened_connection=connection,
-                            _allow_path_reopen=False,
-                        )
-                    except BaseException:
-                        connection.close()
-                        raise
-                    # Re-check only to decide whether this connection may be
-                    # cached. On Linux a late rename cannot redirect the
-                    # procfd-anchored SQLite connection.
-                    current = os.stat(
-                        "state.db", dir_fd=directory_fd, follow_symlinks=False
-                    )
-                    current_directory = os.stat(profile_home, follow_symlinks=False)
-                    if (
-                        not stat.S_ISREG(current.st_mode)
-                        or current.st_nlink != 1
-                        or (current.st_dev, current.st_ino)
-                        != (expected.st_dev, expected.st_ino)
-                        or (current_directory.st_dev, current_directory.st_ino)
-                        != (directory_stat.st_dev, directory_stat.st_ino)
-                    ):
-                        raise RuntimeError(
-                            "profile state.db changed during initialization"
-                        )
-                    db._profile_home_identity = (
-                        directory_stat.st_dev,
-                        directory_stat.st_ino,
-                    )
-                    db._profile_state_identity = (expected.st_dev, expected.st_ino)
-                    return db
                 except BaseException:
-                    try:
-                        connection.close()
-                    except Exception:
-                        pass
+                    connection.close()
                     raise
-            finally:
-                os.close(leaf_fd)
+                # Re-check only to decide whether this connection may be
+                # cached. On Linux a late rename cannot redirect the
+                # procfd-anchored SQLite connection.
+                current = os.stat(
+                    "state.db", dir_fd=directory_fd, follow_symlinks=False
+                )
+                current_directory = os.stat(profile_home, follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or current.st_nlink != 1
+                    or (current.st_dev, current.st_ino)
+                    != (expected.st_dev, expected.st_ino)
+                    or (current_directory.st_dev, current_directory.st_ino)
+                    != (directory_stat.st_dev, directory_stat.st_ino)
+                ):
+                    raise RuntimeError(
+                        "profile state.db changed during initialization"
+                    )
+                db._profile_home_identity = (
+                    directory_stat.st_dev,
+                    directory_stat.st_ino,
+                )
+                db._profile_state_identity = (expected.st_dev, expected.st_ino)
+                if leaf_fd is not None:
+                    # The anchor fd must never be closed while this process
+                    # holds SQLite connections on the inode — closing it would
+                    # drop their POSIX locks (see above). Ownership moves to
+                    # the SessionDB: one fd kept per profile-DB generation.
+                    db._profile_state_anchor_fd = leaf_fd
+                    leaf_fd_owned = False
+                return db
+            except BaseException:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+                raise
         finally:
+            if leaf_fd is not None and leaf_fd_owned:
+                # Failure path only: ownership normally moves to the SessionDB
+                # above. Closing here can still drop sibling connections'
+                # locks, but leaking one fd per failed open would be unbounded
+                # under a persistent fault.
+                os.close(leaf_fd)
             os.close(directory_fd)
 
     @staticmethod
@@ -2232,14 +2274,16 @@ class APIServerAdapter(BasePlatformAdapter):
         directory_flags |= getattr(os, "O_NOFOLLOW", 0)
         directory_flags |= getattr(os, "O_CLOEXEC", 0)
         directory_fd = None
-        leaf_fd = None
         try:
             directory_fd = os.open(profile_home, directory_flags)
             directory_stat = os.fstat(directory_fd)
-            leaf_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
-            leaf_flags |= getattr(os, "O_NOFOLLOW", 0)
-            leaf_fd = os.open("state.db", leaf_flags, dir_fd=directory_fd)
-            state_stat = os.fstat(leaf_fd)
+            # fstatat, never open()+close(): this runs on every cache hit, and
+            # closing a transient fd on state.db would drop every POSIX lock
+            # this process's SQLite connections hold on it (see
+            # _open_profile_session_db).
+            state_stat = os.stat(
+                "state.db", dir_fd=directory_fd, follow_symlinks=False
+            )
             return (
                 stat.S_ISDIR(directory_stat.st_mode)
                 and stat.S_ISREG(state_stat.st_mode)
@@ -2252,8 +2296,6 @@ class APIServerAdapter(BasePlatformAdapter):
         except (OSError, TypeError, ValueError):
             return False
         finally:
-            if leaf_fd is not None:
-                os.close(leaf_fd)
             if directory_fd is not None:
                 os.close(directory_fd)
 
