@@ -953,3 +953,94 @@ def test_shared_collapsed_key_with_concurrent_turns_fails_closed(monkeypatch, tm
     guard.finish_turn("completed", turn_id="turn_1")
     assert guard.maybe_require_snapshot("write_file", {"path": str(c)}, task_id="default") is None
     assert rec.requests[-1]["body"]["turnId"] == "turn_2"
+
+
+def test_home_and_parent_relative_write_targets_get_ancillary_protection(monkeypatch, tmp_path):
+    """`$HOME/...`、`~/...`、`../...` 都能指到 cwd 之外的用户文件：附加保护要
+    按 profile home / 会话工作目录展开后接住（Codex review P1）。"""
+    home = tmp_path / "home"
+    (home / "Documents").mkdir(parents=True)
+    home_doc = home / "Documents" / "a.txt"
+    home_doc.write_text("x")
+    monkeypatch.setenv("HOME", str(home))
+
+    outside = tmp_path / "outside.txt"
+    outside.write_text("y")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+
+    rec = _install(monkeypatch)
+    guard.maybe_require_snapshot(
+        "terminal",
+        {"command": 'rm -f "$HOME/Documents/a.txt" ../outside.txt', "workdir": str(sub)},
+        turn_id="turn_1", task_id="task_9",
+    )
+    ensured = [p for r in rec.requests for p in (r["body"].get("paths") or [])]
+    assert str(home_doc) in ensured, "HOME 前缀目标要展开后保护"
+    assert str(outside) in ensured, "../ 相对目标要按工作目录展开后保护"
+
+
+def test_explicit_workspace_volume_maps_to_volume_host(monkeypatch, tmp_path):
+    """docker_volumes 显式挂 /workspace 时优先于 cwd bind（DockerEnvironment
+    同序）：/workspace 要反解到该 volume 的 host 侧（Codex review P1）。"""
+    vol_host = tmp_path / "vol"
+    vol_host.mkdir()
+    (vol_host / "notes.md").write_text("x")
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
+    monkeypatch.setenv("TERMINAL_DOCKER_VOLUMES", json.dumps([f"{vol_host}:/workspace"]))
+    rec = _install(monkeypatch)
+
+    guard.maybe_require_snapshot(
+        "write_file", {"path": "/workspace/notes.md"}, turn_id="turn_1"
+    )
+    assert rec.requests[0]["body"]["paths"] == [str(vol_host / "notes.md")]
+
+
+def test_text_to_speech_custom_output_path_is_protected(monkeypatch, tmp_path):
+    """text_to_speech 的自定义 output_path 会先删再写：已存在的用户文件要有
+    恢复点；默认输出（无 output_path）不涉用户文件、零请求（Codex review P1）。"""
+    rec = _install(monkeypatch)
+    target = tmp_path / "Documents"
+    target.mkdir()
+    doc = target / "a.txt"
+    doc.write_text("x")
+
+    assert guard.maybe_require_snapshot(
+        "text_to_speech", {"text": "hi", "output_path": str(doc)}, turn_id="turn_1"
+    ) is None
+    assert rec.requests[0]["body"]["paths"] == [str(doc)]
+
+    guard.reset_for_test()
+    assert guard.maybe_require_snapshot(
+        "text_to_speech", {"text": "hi"}, turn_id="turn_1"
+    ) is None
+    assert len(rec.requests) == 1, "默认输出不该发起保护请求"
+
+
+def test_self_backgrounding_write_commands_are_blocked(monkeypatch, tmp_path):
+    """shell 自行后台化的写入（结尾 &、nohup / setsid）与 background=true 同罪：
+    finish 解 pin 时子进程可能仍在写（Codex review P1）。"""
+    rec = _install(monkeypatch)
+    for cmd in (
+        "rm -rf data &",
+        "nohup sh -c 'rm -f x'",
+        "setsid rm -f x",
+        "cp a b & cp c d",
+    ):
+        guard.reset_for_test()
+        blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
+        assert blocked is not None and "NOT executed" in blocked, cmd
+    assert rec.requests == []
+
+    # `&&` / `2>&1` / `&>` 不是后台化；只读命令带 & 也不进这条路。
+    guard.reset_for_test()
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -f x && rm -f y"}, turn_id="turn_1") is None
+    guard.reset_for_test()
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -f x 2>&1"}, turn_id="turn_1") is None
+    guard.reset_for_test()
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "ls -la &"}, turn_id="turn_1") is None
+    assert len(rec.requests) == 2, "非后台写入命令照常走保护"

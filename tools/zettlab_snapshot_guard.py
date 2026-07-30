@@ -73,7 +73,9 @@ _MAX_TASK_TURNS = 64
 # handle_function_call 被前三个名字覆盖；project 模式的 execute_code 还能用
 # Python open()/Path.write_text() 直接改 session cwd 里的用户文件而不经过任何
 # 文件工具，所以 execute_code 本体也要在启动前保护实际 cwd（Codex review P1）。
-_FILE_MUTATING_TOOLS = frozenset({"write_file", "patch"})
+# text_to_speech 也是文件写入面：自定义 output_path 会先删再写任意路径
+# （tts_tool），已存在的用户文件必须先有恢复点（Codex review P1）。
+_FILE_MUTATING_TOOLS = frozenset({"write_file", "patch", "text_to_speech"})
 _GUARDED_TOOLS = _FILE_MUTATING_TOOLS | {"terminal", "execute_code"}
 
 # V4A patch 的 header 提取，与 tools/patch_parser.py 的规则同源：`***` 后空格
@@ -139,14 +141,36 @@ def _git_tokens_are_readonly(tokens: list[str]) -> bool:
 # 的 Path("/home/...").write_text）也要尽力保护（Codex review P1）。这些路径走
 # **附加** ensure：范围外（403）只跳过、不阻断——它们是 cwd 保护之外的加餐。
 _ABS_PATH_TOKEN_RE = re.compile(r"(?<![\w.-])/(?:[\w.+@%-]+/)*[\w.+@%-]+")
-# 引号字面量里以 / 开头的串可以含空格（`rm -f '/home/a/My Documents/x'`、
+# 引号字面量里的路径可以含空格（`rm -f '/home/a/My Documents/x'`、
 # `open("/home/a/My Documents/x","w")`），裸 token 正则会在空格处截断而漏掉
-# 真实目标（Codex review P1）。shell 与 Python 文本统一按引号对提取。
-_QUOTED_ABS_PATH_RES = (
-    re.compile(r"'(/[^'\n]+)'"),
-    re.compile(r'"(/[^"\n]+)"'),
+# 真实目标（Codex review P1）。shell 与 Python 文本统一按引号对提取。除绝对
+# 路径外，home 前缀（~ / $HOME / ${HOME}）与 `../` 相对目标也要接住——它们
+# 同样能指到 cwd 之外的用户文件（Codex review P1）。
+_QUOTED_PATHISH_RES = (
+    re.compile(r"'((?:/|~/|\$HOME/|\$\{HOME\}/|\.\./)[^'\n]+)'"),
+    re.compile(r'"((?:/|~/|\$HOME/|\$\{HOME\}/|\.\./)[^"\n]+)"'),
 )
+_BARE_HOME_TOKEN_RE = re.compile(r"(?<![\w.-])(?:~|\$HOME|\$\{HOME\})/(?:[\w.+@%-]+/)*[\w.+@%-]+")
+_BARE_PARENT_TOKEN_RE = re.compile(r"(?<![\w.-])\.\.(?:/(?:\.\.|[\w.+@%-]+))+")
 _MAX_ANCILLARY_PATHS = 16
+
+
+def _normalize_pathish(tok: str, base_dir: str) -> str:
+    """把提取出的路径样 token 归一成绝对路径；归一不了返回空串。"""
+    tok = tok.strip()
+    if tok.startswith(("~", "$HOME", "${HOME}")):
+        home = os.environ.get("HOME") or os.path.expanduser("~")
+        for prefix in ("${HOME}", "$HOME", "~"):
+            if tok == prefix or tok.startswith(prefix + "/"):
+                tok = home + tok[len(prefix):]
+                break
+    elif tok.startswith(".."):
+        if not base_dir:
+            return ""
+        tok = os.path.join(base_dir, tok)
+    if not tok.startswith("/"):
+        return ""
+    return os.path.normpath(tok)
 
 
 class _TurnState:
@@ -254,36 +278,58 @@ def _abs_path(path: Any) -> str:
 
 
 # 与 terminal_tool._get_env_config 同源的后端判定（都从环境变量派生）：只有
-# 容器后端 + 挂载开关打开时，/workspace 才是 host cwd 的 bind 视图。
+# 容器后端里 /workspace 才可能是 host 路径的 bind 视图。
 _CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona"})
 
 
-def _workspace_is_container_mount() -> bool:
+def _workspace_host_base() -> str:
+    """/workspace 在 host 侧的真实落点；空串 = 不映射。
+
+    镜像 DockerEnvironment 的挂载优先级（Codex review P1）：docker_volumes 里
+    显式挂到 /workspace 的 volume **优先于** docker_mount_cwd_to_workspace 的
+    cwd bind（后者在显式挂载存在时被跳过）；/workspace 被非常规 volume 占用
+    （如挂到 /workspace/sub）时映射不可判定——保留容器路径，让服务端 scope
+    校验 fail-closed。local 后端 /workspace 是字面 host 路径，不映射。
+    """
     env_type = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
     if env_type not in _CONTAINER_BACKENDS:
-        return False
+        return ""
+    raw = (os.getenv("TERMINAL_DOCKER_VOLUMES") or "").strip()
+    workspace_taken = False
+    if raw:
+        try:
+            volumes = json.loads(raw)
+        except Exception:
+            volumes = []
+        for vol in volumes if isinstance(volumes, list) else []:
+            if not isinstance(vol, str) or ":" not in vol:
+                continue
+            host, _, rest = vol.strip().partition(":")
+            if rest == "/workspace" or rest.startswith("/workspace:"):
+                return os.path.abspath(os.path.expanduser(host))
+            if ":/workspace" in vol:
+                workspace_taken = True
+    if workspace_taken:
+        return ""
     flag = (os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE") or "false").strip().lower()
-    return flag in {"true", "1", "yes"}
+    if flag not in {"true", "1", "yes"}:
+        return ""
+    host = os.path.abspath(os.path.expanduser(os.getenv("TERMINAL_CWD") or os.getcwd()))
+    return host if os.path.isdir(host) else ""
 
 
 def _map_container_path(p: str) -> str:
-    """把 Docker 挂载会话的容器路径（/workspace[/...]）反解回 host 路径。
+    """把容器路径（/workspace[/...]）反解回 host 路径。
 
-    docker_mount_cwd_to_workspace 打开时，terminal 把 host 的 TERMINAL_CWD bind
-    成容器 /workspace，file_tools / 会话 cwd 记录随之落在容器口径上；原样上报
-    会让快照落在 host 上不存在（或错误）的 /workspace，真正被改的 host 目录
-    没有恢复点（Codex review P1）。是否映射按 terminal 的后端配置判定（容器
-    后端 + 挂载开关，与 _get_env_config 同源），不看 host 上有没有 /workspace
-    ——host 恰好存在 /workspace 时挂载会话的写入仍发生在 TERMINAL_CWD
-    （Codex review P1）；反之 local 后端里 /workspace 就是字面 host 路径，
-    不做映射。
+    挂载会话里 file_tools / 会话 cwd 记录落在容器口径上；原样上报会让快照落
+    在 host 上不存在（或错误）的 /workspace，真正被改的 host 目录没有恢复点
+    （Codex review P1）。host 落点见 _workspace_host_base——按 terminal 的
+    volume / 挂载配置判定，不看 host 上有没有 /workspace（Codex review P1）。
     """
     if p != "/workspace" and not p.startswith("/workspace/"):
         return p
-    if not _workspace_is_container_mount():
-        return p
-    host = os.path.abspath(os.path.expanduser(os.getenv("TERMINAL_CWD") or os.getcwd()))
-    if not os.path.isdir(host):
+    host = _workspace_host_base()
+    if not host:
         return p
     tail = p[len("/workspace"):].lstrip("/")
     return os.path.normpath(os.path.join(host, tail)) if tail else host
@@ -350,6 +396,21 @@ def _terminal_workdir(arguments: dict[str, Any], task_id: str) -> str:
     return _abs_path(os.getenv("TERMINAL_CWD") or os.getcwd())
 
 
+# 单个 `&`（非 `&&` / `2>&1` / `&>`）把命令甩到后台。
+_SHELL_AMP_BACKGROUND_RE = re.compile(r"(?<![&>|])&(?![&>])")
+
+
+def _shell_self_backgrounds(command: str) -> bool:
+    """报告一条 shell 命令是否会自行后台化（`cmd &`、nohup / setsid 包裹）。"""
+    if _SHELL_AMP_BACKGROUND_RE.search(command):
+        return True
+    for segment in _SHELL_CHAIN_SPLIT_RE.split(command):
+        tokens = [t for t in segment.strip().split() if not _ENV_ASSIGN_RE.match(t)]
+        if tokens and os.path.basename(tokens[0]) in {"nohup", "setsid"}:
+            return True
+    return False
+
+
 def _command_is_probably_readonly(command: str) -> bool:
     """报告一条 shell 命令是否**可证明**只读。证明不了就按需要保护处理。"""
     if not command.strip():
@@ -370,21 +431,24 @@ def _command_is_probably_readonly(command: str) -> bool:
     return True
 
 
-def _ancillary_abs_paths(text: str, primary: list[str]) -> list[str]:
-    """从命令 / 脚本文本里抽出**已存在**的绝对路径，作为 cwd 之外的附加保护。
+def _ancillary_abs_paths(text: str, primary: list[str], base_dir: str = "") -> list[str]:
+    """从命令 / 脚本文本里抽出**已存在**的写入目标，作为 cwd 之外的附加保护。
 
-    引号字面量优先（能带空格、更精确），裸 token 正则兜底；lexists 过滤掉
-    截断产生的碎片。
+    覆盖绝对路径、home 前缀（~ / $HOME / ${HOME}，按当前 profile 的 home 展
+    开）与 `../` 相对目标（锚到 base_dir，即主保护用的工作目录）。引号字面量
+    优先（能带空格、更精确），裸 token 正则兜底；lexists 过滤截断碎片。
     """
     candidates: list[str] = []
-    for rx in _QUOTED_ABS_PATH_RES:
+    for rx in _QUOTED_PATHISH_RES:
         candidates.extend(m.group(1) for m in rx.finditer(text or ""))
     candidates.extend(m.group(0) for m in _ABS_PATH_TOKEN_RE.finditer(text or ""))
+    candidates.extend(m.group(0) for m in _BARE_HOME_TOKEN_RE.finditer(text or ""))
+    candidates.extend(m.group(0) for m in _BARE_PARENT_TOKEN_RE.finditer(text or ""))
     out: list[str] = []
     seen = set(primary)
     for cand in candidates:
-        p = os.path.normpath(cand)
-        if p in seen or not os.path.lexists(p):
+        p = _normalize_pathish(cand, base_dir)
+        if not p or p in seen or not os.path.lexists(p):
             continue
         seen.add(p)
         out.append(p)
@@ -451,6 +515,14 @@ def _paths_for(tool_name: str, arguments: dict[str, Any], task_id: str) -> list[
 
     if tool_name == "execute_code":
         return [p for p in (_execute_code_workdir(arguments, task_id),) if p]
+
+    if tool_name == "text_to_speech":
+        # 默认输出走工具自己的生成目录，不涉用户文件；只有自定义 output_path
+        # 需要保护（tts 会先删已存在的目标，Codex review P1）。
+        out = str(arguments.get("output_path") or "").strip()
+        if not out:
+            return []
+        return [p for p in (_resolve_write_path(os.path.expanduser(out), task_id),) if p]
 
     return []
 
@@ -653,6 +725,16 @@ def maybe_require_snapshot(
             "(background=false). The command was NOT executed.",
             outcome="background_write", tool=tool_name, started=started,
         )
+    if tool_name == "terminal" and _shell_self_backgrounds(str(arguments.get("command") or "")):
+        # shell 自行后台化（结尾 `&`、nohup / setsid 包裹）与 background=true
+        # 同罪：finish 解 pin 时子进程可能仍在写（Codex review P1）。只对非只
+        # 读命令生效——只读命令在 _paths_for 就被放行了。
+        return _blocked(
+            "Commands that background themselves ('&', nohup, setsid) are not "
+            "covered by protection snapshots. Re-run the command in the "
+            "foreground. The command was NOT executed.",
+            outcome="background_write", tool=tool_name, started=started,
+        )
 
     ambiguous_turn = False
     if not turn and task:
@@ -688,7 +770,7 @@ def maybe_require_snapshot(
         # 点必须阻断（required=True，fail-closed），不能保护失败还放行写入
         # （Codex review P1）。
         return _ensure_ancillary(
-            tool_name, arguments, turn, [], required=True, started=started)
+            tool_name, arguments, turn, [], task=task, required=True, started=started)
 
     with _lock:
         state = _state_for_locked(turn)
@@ -747,7 +829,7 @@ def maybe_require_snapshot(
                 state.created.add(p)
 
     if tool_name in ("terminal", "execute_code"):
-        _ensure_ancillary(tool_name, arguments, turn, paths)
+        _ensure_ancillary(tool_name, arguments, turn, paths, task=task)
     return None
 
 
@@ -795,6 +877,7 @@ def _ensure_ancillary(
     turn: str,
     exclude: list[str],
     *,
+    task: str = "",
     required: bool = False,
     started: float = 0.0,
 ) -> Optional[str]:
@@ -809,7 +892,8 @@ def _ensure_ancillary(
     才会释放这些 operation 的 pin。
     """
     extras = _ancillary_abs_paths(
-        str(arguments.get("command") or arguments.get("code") or ""), exclude)
+        str(arguments.get("command") or arguments.get("code") or ""), exclude,
+        base_dir=_terminal_workdir(arguments, task))
     if not extras:
         return None
     data, err = _post(
