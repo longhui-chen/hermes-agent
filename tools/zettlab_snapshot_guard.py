@@ -90,13 +90,15 @@ _V4A_MOVE_RE = re.compile(r"^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$", re.MUL
 _WRITEISH_SHELL_RE = re.compile(r">|<\(|\$\(|`|\btee\b")
 _SHELL_CHAIN_SPLIT_RE = re.compile(r"&&|\|\||;|\||\n")
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# 注意不收这些「看似只读」的命令：find 有 -delete / -exec、sort 有 -o、tree 有
+# -o、env 可以执行任意命令（Codex review P1）。宁可让它们多触发一次 cwd 保护。
 _READONLY_FIRST_TOKENS = frozenset({
-    "ls", "cat", "grep", "rg", "egrep", "fgrep", "find", "head", "tail",
+    "ls", "cat", "grep", "rg", "egrep", "fgrep", "head", "tail",
     "less", "more", "wc", "pwd", "echo", "printf", "stat", "file", "which",
-    "type", "env", "printenv", "ps", "df", "du", "date", "whoami", "id",
-    "uname", "md5sum", "sha1sum", "sha256sum", "sort", "uniq", "cut", "tr",
+    "type", "printenv", "ps", "df", "du", "date", "whoami", "id",
+    "uname", "md5sum", "sha1sum", "sha256sum", "uniq", "cut", "tr",
     "diff", "cmp", "readlink", "basename", "dirname", "hostname", "uptime",
-    "free", "tree", "realpath", "test", "true", "false", "sleep",
+    "free", "realpath", "test", "true", "false", "sleep",
 })
 _READONLY_GIT_SUBCOMMANDS = frozenset({
     "status", "log", "diff", "show", "branch", "remote", "rev-parse",
@@ -208,6 +210,25 @@ def _abs_path(path: Any) -> str:
     return os.path.normpath(expanded)
 
 
+def _map_container_path(p: str) -> str:
+    """把 Docker 挂载会话的容器路径（/workspace[/...]）反解回 host 路径。
+
+    docker_mount_cwd_to_workspace 打开时，terminal 把 host 的 TERMINAL_CWD bind
+    成容器 /workspace，file_tools / 会话 cwd 记录随之落在容器口径上；原样上报
+    会让快照落在 host 上不存在（或错误）的 /workspace，真正被改的 host 目录
+    没有恢复点（Codex review P1）。host 上真实存在 /workspace 时不做映射。
+    """
+    if p != "/workspace" and not p.startswith("/workspace/"):
+        return p
+    if os.path.exists("/workspace"):
+        return p
+    host = os.path.abspath(os.path.expanduser(os.getenv("TERMINAL_CWD") or os.getcwd()))
+    if not os.path.isdir(host):
+        return p
+    tail = p[len("/workspace"):].lstrip("/")
+    return os.path.normpath(os.path.join(host, tail)) if tail else host
+
+
 def _resolve_write_path(path: Any, task_id: str) -> str:
     """解析 write_file / patch 的目标路径，与文件工具自己的口径对齐。
 
@@ -223,10 +244,10 @@ def _resolve_write_path(path: Any, task_id: str) -> str:
         try:
             from tools.file_tools import _resolve_path_for_task
 
-            return os.path.normpath(str(_resolve_path_for_task(raw, task_id)))
+            return _map_container_path(os.path.normpath(str(_resolve_path_for_task(raw, task_id))))
         except Exception:
             pass
-    return _abs_path(raw)
+    return _map_container_path(_abs_path(raw))
 
 
 def _terminal_workdir(arguments: dict[str, Any], task_id: str) -> str:
@@ -241,22 +262,31 @@ def _terminal_workdir(arguments: dict[str, Any], task_id: str) -> str:
     容器内的 `/workspace/...`，原样上报会让快照落在不存在的路径、真正被改的
     host 目录失去恢复点（Codex review P1）——不存在就退回下一级。
     """
-    explicit = str(arguments.get("workdir") or "").strip()
-    if explicit:
-        p = _abs_path(explicit)
-        if os.path.isdir(p):
-            return p
+    session_cwd = ""
     if task_id:
         try:
             from tools.terminal_tool import get_session_cwd
 
-            recorded = get_session_cwd(task_id)
-            if recorded:
-                p = _abs_path(recorded)
-                if os.path.isdir(p):
-                    return p
+            session_cwd = str(get_session_cwd(task_id) or "")
         except Exception:
-            pass
+            session_cwd = ""
+    if session_cwd:
+        session_cwd = _map_container_path(_abs_path(session_cwd))
+
+    explicit = str(arguments.get("workdir") or "").strip()
+    if explicit:
+        expanded = os.path.expanduser(explicit)
+        if os.path.isabs(expanded):
+            p = _map_container_path(os.path.normpath(expanded))
+        else:
+            # 相对 workdir 是「在会话 cwd 下 cd」的语义，必须先锚到会话自己的
+            # cwd，进程 env 里同名目录会指向错误位置（Codex review P1）。
+            base = session_cwd or _abs_path(os.getenv("TERMINAL_CWD") or os.getcwd())
+            p = os.path.normpath(os.path.join(base, expanded))
+        if os.path.isdir(p):
+            return p
+    if session_cwd and os.path.isdir(session_cwd):
+        return session_cwd
     return _abs_path(os.getenv("TERMINAL_CWD") or os.getcwd())
 
 
@@ -309,7 +339,7 @@ def _execute_code_workdir(arguments: dict[str, Any], task_id: str) -> str:
             return ""
         cwd = str(_resolve_child_cwd("project", "", task_id or "") or "").strip()
         if cwd:
-            return _abs_path(cwd)
+            return _map_container_path(_abs_path(cwd))
     except Exception as exc:
         logger.debug("zettlab snapshot guard: execute_code cwd resolution failed: %s", exc)
         # 判定不了就按 project 处置，保护回退 cwd——宁可多拍。
@@ -369,7 +399,13 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+# ProxyHandler({}) 显式禁用代理：build_opener 默认会按 HTTP(S)_PROXY 环境变量
+# 装代理，而 Python 不会自动豁免 loopback——没配 NO_PROXY 时带 token 的请求会
+# 先发去外部代理（Codex review P1）。internal 面只走本机直连。
+_OPENER = urllib.request.build_opener(
+    urllib.request.ProxyHandler({}),
+    _NoRedirectHandler(),
+)
 
 
 def _post(path_suffix: str, payload: dict[str, Any], timeout: float) -> tuple[Optional[dict], str]:
@@ -501,7 +537,11 @@ def maybe_require_snapshot(
         return None
 
     paths = _paths_for(tool_name, arguments, task)
-    if not paths:
+    # strict 模式 execute_code 没有可界定的主保护目录，但它只是换了子进程 cwd、
+    # 没有文件系统隔离，脚本仍能写任意绝对路径：走 ancillary-only，对代码里
+    # **已存在**的绝对路径尽力建恢复点（Codex review P1）。
+    ancillary_only = not paths and tool_name == "execute_code"
+    if not paths and not ancillary_only:
         return None
 
     # 设备环境判定先于一切：非设备环境（CLI / 单测 / 未注入回调与 token 的部署）
@@ -527,12 +567,18 @@ def maybe_require_snapshot(
         with _lock:
             turn = _task_turns.get(task, "")
     if not turn:
+        if ancillary_only:
+            return None  # 加餐保护做不了幂等就不做，不阻断
         # 没有轮标识就无法做幂等，会把每次写入都变成一张新快照。这属于调度层
         # 契约被破坏，放行比拍一堆快照更糟，所以阻断。
         return _blocked(
             "File protection snapshot unavailable: missing turn id. The file was not modified.",
             outcome="missing_turn_id", tool=tool_name, started=started,
         )
+
+    if ancillary_only:
+        _ensure_ancillary(tool_name, arguments, turn, [])
+        return None
 
     with _lock:
         state = _state_for_locked(turn)
@@ -590,23 +636,8 @@ def maybe_require_snapshot(
                     break
                 state.created.add(p)
 
-    # cwd 之外的绝对路径目标（`rm /home/...`、脚本里的 Path("/home/...")）走
-    # **附加** ensure：尽力给它们也建恢复点，但任何失败（含范围外 403）只记
-    # 日志不阻断——cwd 主保护已就绪，这是加餐；把 /tmp 一类范围外路径判成
-    # 硬拒绝反而会把整条命令误杀（Codex review P1）。
     if tool_name in ("terminal", "execute_code"):
-        extras = _ancillary_abs_paths(
-            str(arguments.get("command") or arguments.get("code") or ""), paths)
-        if extras:
-            extra_data, extra_err = _post(
-                _ENSURE_PATH,
-                {"turnId": turn, "paths": extras, "title": _title_for(extras)},
-                _ENSURE_TIMEOUT,
-            )
-            if extra_err:
-                logger.info("zettlab snapshot guard: ancillary ensure skipped (%s)", extra_err)
-            elif isinstance(extra_data, dict):
-                _log_unprotected(extra_data, tool_name)
+        _ensure_ancillary(tool_name, arguments, turn, paths)
     return None
 
 
@@ -637,6 +668,31 @@ def _log_unprotected(data: dict, tool_name: str) -> None:
         ",".join(sorted(reasons)),
         tool_name or "unknown",
     )
+
+
+def _ensure_ancillary(tool_name: str, arguments: dict[str, Any], turn: str, exclude: list[str]) -> None:
+    """给命令 / 脚本文本里 cwd 之外的绝对路径目标尽力建恢复点。
+
+    任何失败（含范围外 403）只记日志不阻断——这是主保护之外的加餐；把 /tmp
+    一类范围外路径判成硬拒绝反而会把整条命令误杀（Codex review P1）。成功后
+    标记本轮 ensured，finish 才会释放这些 operation 的 pin。
+    """
+    extras = _ancillary_abs_paths(
+        str(arguments.get("command") or arguments.get("code") or ""), exclude)
+    if not extras:
+        return
+    data, err = _post(
+        _ENSURE_PATH,
+        {"turnId": turn, "paths": extras, "title": _title_for(extras)},
+        _ENSURE_TIMEOUT,
+    )
+    if err:
+        logger.info("zettlab snapshot guard: ancillary ensure skipped (%s)", err)
+        return
+    if isinstance(data, dict):
+        _log_unprotected(data, tool_name)
+    with _lock:
+        _state_for_locked(turn).ensured = True
 
 
 def finish_turn(

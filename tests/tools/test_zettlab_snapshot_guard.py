@@ -622,9 +622,24 @@ def test_terminal_defaults_to_protection_when_not_provably_readonly(monkeypatch,
 
 def test_provably_readonly_commands_skip_protection(monkeypatch, tmp_path):
     rec = _install(monkeypatch)
-    for cmd in ("ls -la", "cat a.txt | grep foo", "git status", "find . -name x"):
+    for cmd in ("ls -la", "cat a.txt | grep foo", "git status", "head -n 5 a.txt"):
         assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
     assert rec.requests == []
+
+
+def test_pseudo_readonly_commands_with_write_actions_are_protected(monkeypatch, tmp_path):
+    """find -delete / find -exec / sort -o / env <cmd> 都能写文件——这些名字不进
+    只读安全清单（Codex review P1）。"""
+    rec = _install(monkeypatch)
+    for cmd in (
+        "find . -delete",
+        "find . -name '*.tmp' -exec rm {} +",
+        "sort -o sorted.txt input.txt",
+        "env FOO=1 python do_write.py",
+    ):
+        guard.reset_for_test()
+        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
+    assert len(rec.requests) == 4
 
 
 def test_background_destructive_terminal_is_blocked(monkeypatch, tmp_path):
@@ -684,3 +699,71 @@ def test_nonexistent_workdir_falls_back_to_host_cwd(monkeypatch, tmp_path):
         "terminal", {"command": "rm -f x", "workdir": "/workspace/proj"}, turn_id="turn_1"
     )
     assert rec.requests[0]["body"]["paths"] == [str(tmp_path)]
+
+
+def test_opener_disables_proxies_and_redirects(monkeypatch):
+    """带 token 的请求既不跟随重定向、也不经代理（Codex review P1）。
+
+    传入 ProxyHandler({}) 会把默认的 env 代理 handler 从 build_opener 里挤掉，
+    而空 dict 的 ProxyHandler 自身没有任何协议方法、不会被注册——净效果是
+    opener 里**没有任何**代理 handler。
+    """
+    handlers = list(getattr(guard._OPENER, "handlers", []))
+    assert not any(
+        isinstance(h, guard.urllib.request.ProxyHandler) for h in handlers
+    ), "不该存在任何代理 handler（含按 HTTP(S)_PROXY 环境变量装的默认项）"
+    assert any(isinstance(h, guard._NoRedirectHandler) for h in handlers)
+
+
+def test_container_workspace_paths_map_back_to_host(monkeypatch, tmp_path):
+    """Docker 挂载会话下 file_tools 解析出的 /workspace/... 要反解回 host 路径。"""
+    rec = _install(monkeypatch)
+    (tmp_path / "notes.md").write_text("x")
+
+    guard.maybe_require_snapshot(
+        "write_file", {"path": "/workspace/notes.md"}, turn_id="turn_1"
+    )
+    assert rec.requests[0]["body"]["paths"] == [str(tmp_path / "notes.md")]
+
+
+def test_relative_workdir_resolves_against_session_cwd(monkeypatch, tmp_path):
+    """相对 workdir 是「在会话 cwd 下 cd」的语义，必须锚到会话 cwd 而不是进程 env。"""
+    terminal_tool = pytest.importorskip("tools.terminal_tool")
+    session_dir = tmp_path / "session-cwd"
+    sub = session_dir / "subdir"
+    sub.mkdir(parents=True)
+    # 进程 env 下也有同名目录——错误锚点会解析到这里。
+    (tmp_path / "subdir").mkdir()
+    monkeypatch.setattr(
+        terminal_tool, "get_session_cwd",
+        lambda key: str(session_dir) if key == "task_9" else None,
+    )
+    rec = _install(monkeypatch)
+
+    guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -f x", "workdir": "subdir"},
+        turn_id="turn_1", task_id="task_9",
+    )
+    assert rec.requests[0]["body"]["paths"] == [str(sub)]
+
+
+def test_strict_execute_code_gets_ancillary_absolute_path_protection(monkeypatch, tmp_path):
+    """strict 只换 cwd、无文件系统隔离：脚本里已存在的绝对路径目标要尽力保护，
+    且 finish 能释放这些 operation 的 pin。"""
+    code_tool = pytest.importorskip("tools.code_execution_tool")
+    monkeypatch.setattr(code_tool, "_get_execution_mode", lambda: "strict")
+    target = tmp_path / "Documents" / "a.txt"
+    target.parent.mkdir()
+    target.write_text("x")
+    rec = _install(monkeypatch)
+
+    assert guard.maybe_require_snapshot(
+        "execute_code", {"code": f"open('{target}','w').write('y')"},
+        turn_id="turn_1", task_id="task_9",
+    ) is None
+    assert len(rec.requests) == 1
+    assert rec.requests[0]["body"]["paths"] == [str(target)]
+
+    guard.finish_turn("completed", turn_id="turn_1")
+    assert len(rec.requests) == 2
+    assert rec.requests[1]["url"].endswith("/agent-protection/finish")
