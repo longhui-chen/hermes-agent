@@ -90,7 +90,9 @@ _V4A_MOVE_RE = re.compile(r"^\*\*\*\s*Move\s+File:\s*(.+?)\s*->\s*(.+)$", re.MUL
 # 全（Codex review P1）。无法证明只读的命令一律按 cwd 保护——同轮同 target
 # 幂等，多判的代价只是每轮多一张快照。
 _WRITEISH_SHELL_RE = re.compile(r">|<\(|\$\(|`|\btee\b")
-_SHELL_CHAIN_SPLIT_RE = re.compile(r"&&|\|\||;|\||\n")
+# 单个 & 也是 control operator：`ls & rm x` 是两段命令，漏拆会让 & 后的写入段
+# 藏进只读判定（Codex review P1）。&& 在前保证优先整体匹配。
+_SHELL_CHAIN_SPLIT_RE = re.compile(r"&&|\|\||;|\||\n|&")
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # 注意不收这些「看似只读」的命令：find 有 -delete / -exec、sort 有 -o、tree 有
 # -o、env 可以执行任意命令（Codex review P1）。宁可让它们多触发一次 cwd 保护。
@@ -118,9 +120,6 @@ _GIT_BRANCH_READONLY_KV_FLAGS = frozenset({
     "--contains", "--no-contains", "--merged", "--no-merged",
     "--format", "--sort", "--color", "--points-at",
 })
-_GIT_REMOTE_READONLY_ACTIONS = frozenset({"-v", "--verbose", "show", "get-url"})
-
-
 def _git_tokens_are_readonly(tokens: list[str]) -> bool:
     if len(tokens) < 2 or tokens[1] not in _READONLY_GIT_SUBCOMMANDS:
         return False
@@ -137,7 +136,10 @@ def _git_tokens_are_readonly(tokens: list[str]) -> bool:
             for a in args
         )
     if sub == "remote":
-        return not args or args[0] in _GIT_REMOTE_READONLY_ACTIONS
+        # -v/--verbose 是全局 flag，能放在动作前（`git remote -v update` 会真
+        # 更新远端引用）：先剥掉 flag 再校验实际动作（Codex review P1）。
+        actions = [a for a in args if a not in ("-v", "--verbose")]
+        return not actions or actions[0] in ("show", "get-url")
     return True
 
 # 命令文本里的绝对路径 token：cwd 之外的写入目标（rm /home/alice/... 或脚本里
@@ -158,11 +160,30 @@ _BARE_PARENT_TOKEN_RE = re.compile(r"(?<![\w.-])\.\.(?:/(?:\.\.|[\w.+@%-]+))+")
 _MAX_ANCILLARY_PATHS = 16
 
 
+def _subprocess_home() -> str:
+    """工具子进程实际生效的 HOME。
+
+    terminal / execute_code 子进程经 apply_subprocess_home_env 处理，
+    home_mode=profile / 容器 / 缺 HOME fallback 时 HOME 会被换成
+    {HERMES_HOME}/home——按进程 HOME 展开会保护错目标（Codex review P1）。
+    与其同源的 get_subprocess_home 返回 None 表示沿用当前 HOME。
+    """
+    try:
+        from hermes_constants import get_subprocess_home
+
+        home = get_subprocess_home(dict(os.environ))
+        if home:
+            return home
+    except Exception:
+        pass
+    return os.environ.get("HOME") or os.path.expanduser("~")
+
+
 def _normalize_pathish(tok: str, base_dir: str) -> str:
     """把提取出的路径样 token 归一成绝对路径；归一不了返回空串。"""
     tok = tok.strip()
     if tok.startswith(("~", "$HOME", "${HOME}")):
-        home = os.environ.get("HOME") or os.path.expanduser("~")
+        home = _subprocess_home()
         for prefix in ("${HOME}", "$HOME", "~"):
             if tok == prefix or tok.startswith(prefix + "/"):
                 tok = home + tok[len(prefix):]
@@ -285,6 +306,71 @@ def _abs_path(path: Any) -> str:
 _CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona"})
 
 
+def _json_env_list(name: str) -> list:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return []
+    return parsed if isinstance(parsed, list) else []
+
+
+def _mount_to_bind_spec(val: str) -> str:
+    """把 --mount 的 csv 形式转成 host:container；非 bind 返回空串。"""
+    kv: dict[str, str] = {}
+    for field in val.split(","):
+        k, _, v = field.partition("=")
+        kv[k.strip().lower()] = v.strip()
+    if kv.get("type", "bind") != "bind":
+        return ""
+    src = kv.get("source") or kv.get("src") or ""
+    dst = kv.get("target") or kv.get("destination") or kv.get("dst") or ""
+    return f"{src}:{dst}" if src and dst else ""
+
+
+def _bind_mount_specs() -> list[str]:
+    """全部 bind 挂载的 host:container[:opts] 规格。
+
+    两个来源：TERMINAL_DOCKER_VOLUMES，以及 TERMINAL_DOCKER_EXTRA_ARGS 里的
+    -v / --volume / --mount type=bind——extra_args 会被 DockerEnvironment 原样
+    追加进 docker run，漏掉它们会让这些挂载下的写入按容器字面路径建快照
+    （Codex review P1）。
+    """
+    specs = [v for v in _json_env_list("TERMINAL_DOCKER_VOLUMES")
+             if isinstance(v, str) and ":" in v]
+    extra = [str(a) for a in _json_env_list("TERMINAL_DOCKER_EXTRA_ARGS")]
+    i = 0
+    while i < len(extra):
+        arg = extra[i]
+        nxt = extra[i + 1] if i + 1 < len(extra) else ""
+        if arg in ("-v", "--volume") and ":" in nxt:
+            specs.append(nxt)
+            i += 2
+            continue
+        if arg.startswith(("-v=", "--volume=")):
+            val = arg.split("=", 1)[1]
+            if ":" in val:
+                specs.append(val)
+            i += 1
+            continue
+        if arg == "--mount" and nxt:
+            spec = _mount_to_bind_spec(nxt)
+            if spec:
+                specs.append(spec)
+            i += 2
+            continue
+        if arg.startswith("--mount="):
+            spec = _mount_to_bind_spec(arg.split("=", 1)[1])
+            if spec:
+                specs.append(spec)
+            i += 1
+            continue
+        i += 1
+    return specs
+
+
 def _container_path_maps() -> list[tuple[str, str]]:
     """容器路径前缀 → host 路径的映射表（最长前缀优先）。
 
@@ -301,24 +387,16 @@ def _container_path_maps() -> list[tuple[str, str]]:
         return []
     maps: list[tuple[str, str]] = []
     workspace_taken = False
-    raw = (os.getenv("TERMINAL_DOCKER_VOLUMES") or "").strip()
-    if raw:
-        try:
-            volumes = json.loads(raw)
-        except Exception:
-            volumes = []
-        for vol in volumes if isinstance(volumes, list) else []:
-            if not isinstance(vol, str) or ":" not in vol:
-                continue
-            host, _, rest = vol.strip().partition(":")
-            container = rest.split(":", 1)[0].strip()
-            if not container.startswith("/"):
-                continue
-            container = os.path.normpath(container)
-            if container == "/workspace" or container.startswith("/workspace/"):
-                workspace_taken = True
-            if host.startswith(("/", "~")):
-                maps.append((container, os.path.abspath(os.path.expanduser(host))))
+    for spec in _bind_mount_specs():
+        host, _, rest = spec.strip().partition(":")
+        container = rest.split(":", 1)[0].strip()
+        if not container.startswith("/"):
+            continue
+        container = os.path.normpath(container)
+        if container == "/workspace" or container.startswith("/workspace/"):
+            workspace_taken = True
+        if host.startswith(("/", "~")):
+            maps.append((container, os.path.abspath(os.path.expanduser(host))))
     flag = (os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE") or "false").strip().lower()
     if not workspace_taken and flag in {"true", "1", "yes"}:
         host = os.path.abspath(os.path.expanduser(os.getenv("TERMINAL_CWD") or os.getcwd()))
@@ -469,6 +547,11 @@ def _ancillary_abs_paths(text: str, primary: list[str], base_dir: str = "") -> l
     seen = set(primary)
     for cand in candidates:
         p = _normalize_pathish(cand, base_dir)
+        if p:
+            # 容器会话里命令 / 脚本引用的是容器口径路径：先按 volume 表反解
+            # 再做存在性过滤，否则挂载目录下的目标在 host 上 lexists 不到、
+            # 整条附加保护静默漏掉（Codex review P1）。
+            p = _map_container_path(p)
         if not p or p in seen or not os.path.lexists(p):
             continue
         seen.add(p)

@@ -1120,3 +1120,100 @@ def test_rg_pre_and_git_external_command_args_are_protected(monkeypatch, tmp_pat
     for cmd in ("rg foo f", "git diff --no-ext-diff"):
         assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
     assert len(rec.requests) == 4, "普通 rg / --no-ext-diff 仍然只读"
+
+
+def test_extra_args_bind_mounts_map_back_to_host(monkeypatch, tmp_path):
+    """docker_extra_args 里的 -v / --mount type=bind 会被原样追加进 docker run：
+    这些挂载也要进反解表（Codex review P1）。"""
+    host_v = tmp_path / "Pictures"
+    host_m = tmp_path / "Music"
+    host_v.mkdir()
+    host_m.mkdir()
+    (host_v / "a.jpg").write_text("x")
+    (host_m / "b.mp3").write_text("y")
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_EXTRA_ARGS", json.dumps([
+        "-v", f"{host_v}:/mnt/pics",
+        "--mount", f"type=bind,source={host_m},target=/mnt/music,readonly",
+    ]))
+    rec = _install(monkeypatch)
+
+    guard.maybe_require_snapshot("write_file", {"path": "/mnt/pics/a.jpg"}, turn_id="turn_1")
+    assert rec.requests[0]["body"]["paths"] == [str(host_v / "a.jpg")]
+    guard.maybe_require_snapshot("write_file", {"path": "/mnt/music/b.mp3"}, turn_id="turn_1")
+    assert rec.requests[1]["body"]["paths"] == [str(host_m / "b.mp3")]
+
+
+def test_ancillary_container_paths_are_mapped_before_filtering(monkeypatch, tmp_path):
+    """命令文本里的容器口径绝对路径要先反解再做 lexists 过滤：按 host 字面量
+    过滤会把挂载目录下的目标静默漏掉（Codex review P1）。"""
+    pics = tmp_path / "Pictures"
+    pics.mkdir()
+    target = pics / "a.jpg"
+    target.write_text("x")
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_VOLUMES", json.dumps([f"{pics}:/mnt/pics"]))
+    rec = _install(monkeypatch)
+
+    guard.maybe_require_snapshot(
+        "terminal", {"command": "rm -f /mnt/pics/a.jpg"}, turn_id="turn_1", task_id="task_9",
+    )
+    ensured = [p for r in rec.requests for p in (r["body"].get("paths") or [])]
+    assert str(target) in ensured, "容器路径要反解到 host 后纳入附加保护"
+
+
+def test_amp_separated_write_segment_is_not_readonly(monkeypatch, tmp_path):
+    """单个 & 是 control operator：`ls & rm x` 的写入段不能藏进只读判定
+    （Codex review P1）。混有后台段的写入命令按自后台化阻断。"""
+    rec = _install(monkeypatch)
+    for cmd in ("ls & rm -f old.txt", "true & rm -rf data"):
+        guard.reset_for_test()
+        blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
+        assert blocked is not None and "NOT executed" in blocked, cmd
+    assert rec.requests == []
+
+    # 纯只读的管道 / 链不受影响。
+    for cmd in ("cat a.txt | grep foo", "ls -la && git status"):
+        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
+    assert rec.requests == []
+
+
+def test_git_remote_verbose_prefixed_actions_are_protected(monkeypatch, tmp_path):
+    """`git remote -v update` / `--verbose prune` 会更新远端引用：剥掉全局 flag
+    后按实际动作校验（Codex review P1）。"""
+    rec = _install(monkeypatch)
+    for cmd in ("git remote -v update", "git remote --verbose prune origin"):
+        guard.reset_for_test()
+        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
+    assert len(rec.requests) == 2
+
+    guard.reset_for_test()
+    for cmd in ("git remote -v", "git remote show origin", "git remote get-url origin"):
+        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
+    assert len(rec.requests) == 2, "真正只读的 remote 形态仍免保护"
+
+
+def test_home_expansion_uses_subprocess_home(monkeypatch, tmp_path):
+    """home 目标要按工具子进程实际生效的 HOME 展开（home_mode=profile / 容器
+    fallback 时 HOME 被换成 {HERMES_HOME}/home），进程 HOME 会指错目标
+    （Codex review P1）。"""
+    import hermes_constants
+
+    proc_home = tmp_path / "proc-home"
+    sub_home = tmp_path / "profile-home"
+    (proc_home / "Documents").mkdir(parents=True)
+    (sub_home / "Documents").mkdir(parents=True)
+    (proc_home / "Documents" / "a.txt").write_text("proc")
+    real_target = sub_home / "Documents" / "a.txt"
+    real_target.write_text("sub")
+    monkeypatch.setenv("HOME", str(proc_home))
+    monkeypatch.setattr(hermes_constants, "get_subprocess_home", lambda env=None: str(sub_home))
+
+    rec = _install(monkeypatch)
+    guard.maybe_require_snapshot(
+        "terminal", {"command": 'rm -f "$HOME/Documents/a.txt"'},
+        turn_id="turn_1", task_id="task_9",
+    )
+    ensured = [p for r in rec.requests for p in (r["body"].get("paths") or [])]
+    assert str(real_target) in ensured, "要按子进程 HOME 展开"
+    assert str(proc_home / "Documents" / "a.txt") not in ensured
