@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import sys
 import types
 import urllib.error
 
@@ -277,7 +278,7 @@ def test_finish_turn_reports_once_and_only_after_a_snapshot(monkeypatch, tmp_pat
     guard.maybe_require_snapshot("write_file", {"path": str(target)}, turn_id="turn_1")
     assert len(rec.requests) == 1
 
-    guard.finish_turn("completed")
+    guard.finish_turn("completed", turn_id="turn_1")
     assert len(rec.requests) == 2
     finish = rec.requests[1]
     assert finish["url"].endswith("/agent-protection/finish")
@@ -289,7 +290,7 @@ def test_finish_turn_reports_once_and_only_after_a_snapshot(monkeypatch, tmp_pat
     }
 
     # Repeat finish is a no-op — the turn state was consumed.
-    guard.finish_turn("completed")
+    guard.finish_turn("completed", turn_id="turn_1")
     assert len(rec.requests) == 2
 
 
@@ -300,7 +301,7 @@ def test_finish_turn_failure_does_not_raise(monkeypatch, tmp_path):
     _install(monkeypatch, {"ready": True, "operations": []}, urllib.error.URLError("down"))
 
     guard.maybe_require_snapshot("write_file", {"path": str(target)}, turn_id="turn_1")
-    guard.finish_turn("completed")  # must not raise
+    guard.finish_turn("completed", turn_id="turn_1")  # must not raise
 
 
 def test_action_token_is_never_sent_off_loopback(monkeypatch, tmp_path):
@@ -445,15 +446,20 @@ def test_ambiguous_finish_leaves_concurrent_turns_to_ttl(monkeypatch, tmp_path):
     assert len(rec.requests) == 4
 
 
-def test_single_tracked_turn_finishes_without_explicit_id(monkeypatch, tmp_path):
-    """cron 拿不到 agent 实例时兜底：只剩一轮在跟踪就收它。"""
+def test_finish_without_turn_id_never_pops_sole_tracked_turn(monkeypatch, tmp_path):
+    """空 id 一律不收：无写入轮（拿不到 agent 实例）收尾时，进程里唯一的状态
+    可能属于另一个还在写的轮，「唯一余轮」兜底会提前解掉对方的 pin
+    （Codex review P1）。宁可留给服务端 TTL。"""
     rec = _install(monkeypatch)
     target = tmp_path / "a.txt"
     target.write_text("x")
-    guard.maybe_require_snapshot("write_file", {"path": str(target)}, turn_id="turn_1")
+    guard.maybe_require_snapshot("write_file", {"path": str(target)}, turn_id="turn_writer")
 
-    guard.finish_turn("completed")
-    assert rec.requests[-1]["body"]["turnId"] == "turn_1"
+    guard.finish_turn("completed")  # 另一个无写入轮的空 id 收尾
+    assert len([r for r in rec.requests if r["url"].endswith("/finish")]) == 0
+
+    guard.finish_turn("completed", turn_id="turn_writer")
+    assert rec.requests[-1]["body"]["turnId"] == "turn_writer"
 
 
 def test_write_paths_resolved_via_task_registry(monkeypatch, tmp_path):
@@ -767,3 +773,135 @@ def test_strict_execute_code_gets_ancillary_absolute_path_protection(monkeypatch
     guard.finish_turn("completed", turn_id="turn_1")
     assert len(rec.requests) == 2
     assert rec.requests[1]["url"].endswith("/agent-protection/finish")
+
+
+def _scope_denied_error():
+    body = json.dumps({
+        "error": {"code": "SNAPSHOT_AGENT_PATH_OUT_OF_SCOPE", "message": "path out of scope"},
+    }).encode("utf-8")
+    return urllib.error.HTTPError(
+        "http://127.0.0.1:19090/api/v1/internal/snapshot/agent-protection/ensure",
+        403, "Forbidden", None, io.BytesIO(body),
+    )
+
+
+def test_strict_execute_code_blocks_when_ancillary_ensure_fails(monkeypatch, tmp_path):
+    """strict 的唯一保护建不成必须 fail-closed：local-server 断连时不放行写入
+    （Codex review P1）。"""
+    code_tool = pytest.importorskip("tools.code_execution_tool")
+    monkeypatch.setattr(code_tool, "_get_execution_mode", lambda: "strict")
+    target = tmp_path / "Documents" / "a.txt"
+    target.parent.mkdir()
+    target.write_text("x")
+    _install(monkeypatch, urllib.error.URLError("down"))
+
+    out = guard.maybe_require_snapshot(
+        "execute_code", {"code": f"open('{target}','w').write('y')"},
+        turn_id="turn_1", task_id="task_9",
+    )
+    assert out is not None and "NOT executed" in out
+
+
+def test_strict_execute_code_skips_out_of_scope_but_requires_in_scope(monkeypatch, tmp_path):
+    """批量 403（范围外路径混入）时逐路径重试：范围外只跳过（/etc 只读引用不
+    误杀脚本），范围内必须建成恢复点（Codex review P1）。"""
+    code_tool = pytest.importorskip("tools.code_execution_tool")
+    monkeypatch.setattr(code_tool, "_get_execution_mode", lambda: "strict")
+    in_scope = tmp_path / "Documents" / "a.txt"
+    in_scope.parent.mkdir()
+    in_scope.write_text("x")
+    out_scope = tmp_path / "etc-hosts"
+    out_scope.write_text("127.0.0.1")
+    rec = _install(
+        monkeypatch,
+        _scope_denied_error(),               # 批量：整批 403
+        {"ready": True, "operations": []},   # 逐路径：in_scope 建成
+        _scope_denied_error(),               # 逐路径：out_scope 范围外跳过
+    )
+
+    code = f"open('{in_scope}','w').write('y'); print(open('{out_scope}').read())"
+    assert guard.maybe_require_snapshot(
+        "execute_code", {"code": code}, turn_id="turn_1", task_id="task_9",
+    ) is None
+    assert len(rec.requests) == 3
+    assert sorted(rec.requests[0]["body"]["paths"]) == sorted([str(in_scope), str(out_scope)])
+    assert rec.requests[1]["body"]["paths"] == [str(in_scope)]
+    assert rec.requests[2]["body"]["paths"] == [str(out_scope)]
+
+    # in_scope 建成过恢复点：finish 要释放它的 pin。
+    guard.finish_turn("completed", turn_id="turn_1")
+    assert rec.requests[-1]["url"].endswith("/agent-protection/finish")
+
+
+def test_quoted_absolute_paths_with_spaces_are_protected(monkeypatch, tmp_path):
+    """引号里带空格的绝对路径要完整抽出——裸 token 正则在空格处截断，会漏掉
+    真实写入目标（Codex review P1）。"""
+    rec = _install(monkeypatch)
+    spaced = tmp_path / "My Documents"
+    spaced.mkdir()
+    doc = spaced / "a.txt"
+    doc.write_text("x")
+
+    guard.maybe_require_snapshot(
+        "terminal", {"command": f"rm -f '{doc}'"}, turn_id="turn_1", task_id="task_9",
+    )
+    ensured = [p for r in rec.requests for p in (r["body"].get("paths") or [])]
+    assert str(doc) in ensured
+
+
+def test_container_collapsed_task_key_maps_back_to_turn(monkeypatch, tmp_path):
+    """Docker/SSH 后端把 dispatch 的 task_id 折叠成容器 key（通常 default）；
+    折叠 key 也要登记，否则沙箱 RPC 二次进入查不到轮、被 missing_turn_id 误拒
+    （Codex review P1）。"""
+    fake_terminal = types.SimpleNamespace(_resolve_container_task_id=lambda t: "default")
+    monkeypatch.setitem(sys.modules, "tools.terminal_tool", fake_terminal)
+    rec = _install(monkeypatch)
+    a = tmp_path / "a.txt"
+    b = tmp_path / "b.txt"
+    a.write_text("x")
+    b.write_text("y")
+
+    # 外层 dispatch 带原始 task_id + turn，登记原始与折叠两个 key。
+    assert guard.maybe_require_snapshot(
+        "write_file", {"path": str(a)}, turn_id="turn_1", task_id="task_outer",
+    ) is None
+    # 沙箱 RPC 二次进入：只带折叠后的容器 key，也必须回落到外层轮。
+    assert guard.maybe_require_snapshot("write_file", {"path": str(b)}, task_id="default") is None
+    assert rec.requests[-1]["body"]["turnId"] == "turn_1"
+
+
+def test_git_readonly_subcommands_with_write_capable_args_are_protected(monkeypatch, tmp_path):
+    """`git branch -D` 删分支、`git branch <name>` 建分支、`git remote
+    remove/set-url` 改配置、diff/log 族 `--output` 写文件（Codex review P1）：
+    只读子命令按参数二次甄别，证明不了只读就按 cwd 保护。"""
+    rec = _install(monkeypatch)
+    cmds = (
+        "git branch -D work",
+        "git branch newname",
+        "git remote set-url origin https://example.com/x.git",
+        "git remote remove origin",
+        "git diff --output=/tmp/a.patch",
+        "git log --output=/tmp/b.txt",
+    )
+    for cmd in cmds:
+        guard.reset_for_test()
+        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
+    assert len(rec.requests) == len(cmds)
+
+
+def test_git_provably_readonly_forms_still_skip_protection(monkeypatch, tmp_path):
+    rec = _install(monkeypatch)
+    for cmd in (
+        "git status",
+        "git branch",
+        "git branch -a -v",
+        "git branch --show-current",
+        "git branch --merged --format=%(refname)",
+        "git remote -v",
+        "git remote show origin",
+        "git remote get-url origin",
+        "git diff --stat",
+        "git log --oneline",
+    ):
+        assert guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1") is None
+    assert rec.requests == []

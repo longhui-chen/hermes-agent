@@ -104,11 +104,48 @@ _READONLY_GIT_SUBCOMMANDS = frozenset({
     "status", "log", "diff", "show", "branch", "remote", "rev-parse",
     "describe", "shortlog", "blame", "ls-files",
 })
+# 只读子命令里仍可能藏着写形态：`branch -D` 删分支、`branch <name>` 建分支、
+# `remote remove/set-url` 改配置、diff 族 `--output` 写文件（Codex review P1）。
+# 按参数二次甄别：branch 只放行可证明只读的 flag 组合，remote 只放行只读动作，
+# 其余子命令拦 `--output`。证明不了只读就按需要保护处理（不是阻断）。
+_GIT_BRANCH_READONLY_FLAGS = frozenset({
+    "-a", "-r", "-v", "-vv", "--all", "--remotes", "--list", "--verbose",
+    "--show-current", "--contains", "--no-contains", "--merged", "--no-merged",
+})
+_GIT_BRANCH_READONLY_KV_FLAGS = frozenset({
+    "--contains", "--no-contains", "--merged", "--no-merged",
+    "--format", "--sort", "--color", "--points-at",
+})
+_GIT_REMOTE_READONLY_ACTIONS = frozenset({"-v", "--verbose", "show", "get-url"})
+
+
+def _git_tokens_are_readonly(tokens: list[str]) -> bool:
+    if len(tokens) < 2 or tokens[1] not in _READONLY_GIT_SUBCOMMANDS:
+        return False
+    sub, args = tokens[1], tokens[2:]
+    if any(a == "-o" or a.startswith("--output") for a in args):
+        return False  # diff / log / show 族的 --output[-*] 会写文件
+    if sub == "branch":
+        return all(
+            a in _GIT_BRANCH_READONLY_FLAGS
+            or ("=" in a and a.split("=", 1)[0] in _GIT_BRANCH_READONLY_KV_FLAGS)
+            for a in args
+        )
+    if sub == "remote":
+        return not args or args[0] in _GIT_REMOTE_READONLY_ACTIONS
+    return True
 
 # 命令文本里的绝对路径 token：cwd 之外的写入目标（rm /home/alice/... 或脚本里
 # 的 Path("/home/...").write_text）也要尽力保护（Codex review P1）。这些路径走
 # **附加** ensure：范围外（403）只跳过、不阻断——它们是 cwd 保护之外的加餐。
 _ABS_PATH_TOKEN_RE = re.compile(r"(?<![\w.-])/(?:[\w.+@%-]+/)*[\w.+@%-]+")
+# 引号字面量里以 / 开头的串可以含空格（`rm -f '/home/a/My Documents/x'`、
+# `open("/home/a/My Documents/x","w")`），裸 token 正则会在空格处截断而漏掉
+# 真实目标（Codex review P1）。shell 与 Python 文本统一按引号对提取。
+_QUOTED_ABS_PATH_RES = (
+    re.compile(r"'(/[^'\n]+)'"),
+    re.compile(r'"(/[^"\n]+)"'),
+)
 _MAX_ANCILLARY_PATHS = 16
 
 
@@ -302,7 +339,7 @@ def _command_is_probably_readonly(command: str) -> bool:
             continue
         head = os.path.basename(tokens[0])
         if head == "git":
-            if len(tokens) < 2 or tokens[1] not in _READONLY_GIT_SUBCOMMANDS:
+            if not _git_tokens_are_readonly(tokens):
                 return False
             continue
         if head not in _READONLY_FIRST_TOKENS:
@@ -311,11 +348,19 @@ def _command_is_probably_readonly(command: str) -> bool:
 
 
 def _ancillary_abs_paths(text: str, primary: list[str]) -> list[str]:
-    """从命令 / 脚本文本里抽出**已存在**的绝对路径，作为 cwd 之外的附加保护。"""
+    """从命令 / 脚本文本里抽出**已存在**的绝对路径，作为 cwd 之外的附加保护。
+
+    引号字面量优先（能带空格、更精确），裸 token 正则兜底；lexists 过滤掉
+    截断产生的碎片。
+    """
+    candidates: list[str] = []
+    for rx in _QUOTED_ABS_PATH_RES:
+        candidates.extend(m.group(1) for m in rx.finditer(text or ""))
+    candidates.extend(m.group(0) for m in _ABS_PATH_TOKEN_RE.finditer(text or ""))
     out: list[str] = []
     seen = set(primary)
-    for m in _ABS_PATH_TOKEN_RE.finditer(text or ""):
-        p = os.path.normpath(m.group(0))
+    for cand in candidates:
+        p = os.path.normpath(cand)
         if p in seen or not os.path.lexists(p):
             continue
         seen.add(p)
@@ -529,9 +574,22 @@ def maybe_require_snapshot(
     task = str(task_id or "").strip()
     # 每次带 turn 的 dispatch 都登记 task → turn（包括不设防的 execute_code）：
     # 它孵化的沙箱 RPC 二次进入时只带 task_id，凭这里的映射回落到外层轮。
+    # Docker/SSH 后端的 RPC 带的是**折叠后**的容器 task key（共享容器把
+    # delegate 子任务折叠回 "default"），原始 key 和折叠 key 都要登记，否则
+    # 嵌套 hermes_tools 写入查不到轮、被 missing_turn_id 误拒
+    # （Codex review P1）。
     if turn and task:
+        keys = {task}
+        try:
+            from tools.terminal_tool import _resolve_container_task_id
+
+            keys.add(str(_resolve_container_task_id(task) or ""))
+        except Exception:
+            pass
+        keys.discard("")
         with _lock:
-            _note_task_turn_locked(task, turn)
+            for k in keys:
+                _note_task_turn_locked(k, turn)
 
     if tool_name not in _GUARDED_TOOLS:
         return None
@@ -577,8 +635,11 @@ def maybe_require_snapshot(
         )
 
     if ancillary_only:
-        _ensure_ancillary(tool_name, arguments, turn, [])
-        return None
+        # strict execute_code 的唯一保护就是这次 ancillary ensure：建不起恢复
+        # 点必须阻断（required=True，fail-closed），不能保护失败还放行写入
+        # （Codex review P1）。
+        return _ensure_ancillary(
+            tool_name, arguments, turn, [], required=True, started=started)
 
     with _lock:
         state = _state_for_locked(turn)
@@ -670,29 +731,84 @@ def _log_unprotected(data: dict, tool_name: str) -> None:
     )
 
 
-def _ensure_ancillary(tool_name: str, arguments: dict[str, Any], turn: str, exclude: list[str]) -> None:
-    """给命令 / 脚本文本里 cwd 之外的绝对路径目标尽力建恢复点。
+def _is_out_of_scope(data: Optional[dict]) -> bool:
+    """报告一次 ensure 失败是否为范围外路径（403 SNAPSHOT_AGENT_PATH_OUT_OF_SCOPE）。"""
+    return (
+        isinstance(data, dict)
+        and isinstance(data.get("_error"), dict)
+        and str(data["_error"].get("code") or "") == "SNAPSHOT_AGENT_PATH_OUT_OF_SCOPE"
+    )
 
-    任何失败（含范围外 403）只记日志不阻断——这是主保护之外的加餐；把 /tmp
-    一类范围外路径判成硬拒绝反而会把整条命令误杀（Codex review P1）。成功后
-    标记本轮 ensured，finish 才会释放这些 operation 的 pin。
+
+def _ensure_ancillary(
+    tool_name: str,
+    arguments: dict[str, Any],
+    turn: str,
+    exclude: list[str],
+    *,
+    required: bool = False,
+    started: float = 0.0,
+) -> Optional[str]:
+    """给命令 / 脚本文本里 cwd 之外的绝对路径目标建恢复点。
+
+    terminal 下这是主保护（cwd）之外的加餐：任何失败只记日志不阻断。strict
+    execute_code 下（required=True）这是**唯一**的保护：传输失败 / ready=false
+    时必须阻断——否则恢复点没建成脚本仍会覆盖用户文件，违背 fail-closed 底线
+    （Codex review P1）。范围外路径（403）在两种模式下都只跳过：脚本引用
+    /etc 一类范围外文件多是只读，硬拒绝会把整条命令误杀（Codex review P1）；
+    范围外的**写入**本就不在保护范围承诺内。成功后标记本轮 ensured，finish
+    才会释放这些 operation 的 pin。
     """
     extras = _ancillary_abs_paths(
         str(arguments.get("command") or arguments.get("code") or ""), exclude)
     if not extras:
-        return
+        return None
     data, err = _post(
         _ENSURE_PATH,
         {"turnId": turn, "paths": extras, "title": _title_for(extras)},
         _ENSURE_TIMEOUT,
     )
-    if err:
-        logger.info("zettlab snapshot guard: ancillary ensure skipped (%s)", err)
-        return
-    if isinstance(data, dict):
+    if not err and isinstance(data, dict) and data.get("ready"):
         _log_unprotected(data, tool_name)
-    with _lock:
-        _state_for_locked(turn).ensured = True
+        with _lock:
+            _state_for_locked(turn).ensured = True
+        return None
+    if err in ("unconfigured", "not_supported"):
+        return None  # 不是设备环境 / 老 local-server：本机制不适用
+    if not required:
+        logger.info("zettlab snapshot guard: ancillary ensure skipped (%s)", err or "not_ready")
+        return None
+    if _is_out_of_scope(data):
+        # 批量里混了范围外路径会整批 403：逐路径重试，范围外跳过，其余必须建成。
+        ensured_any = False
+        for p in extras:
+            d2, e2 = _post(
+                _ENSURE_PATH,
+                {"turnId": turn, "paths": [p], "title": _title_for([p])},
+                _ENSURE_TIMEOUT,
+            )
+            if not e2 and isinstance(d2, dict) and d2.get("ready"):
+                ensured_any = True
+                _log_unprotected(d2, tool_name)
+                continue
+            if e2 in ("unconfigured", "not_supported") or _is_out_of_scope(d2):
+                continue
+            return _blocked(
+                "Could not create a protection snapshot for the file paths this "
+                "script modifies. The script was NOT executed. Tell the user the "
+                "change did not happen; do not retry blindly.",
+                outcome=f"ancillary_{e2 or 'not_ready'}", tool=tool_name, started=started,
+            )
+        if ensured_any:
+            with _lock:
+                _state_for_locked(turn).ensured = True
+        return None
+    return _blocked(
+        "Could not create a protection snapshot for the file paths this "
+        "script modifies. The script was NOT executed. Tell the user the "
+        "change did not happen; do not retry blindly.",
+        outcome=f"ancillary_{err or 'not_ready'}", tool=tool_name, started=started,
+    )
 
 
 def finish_turn(
@@ -704,24 +820,22 @@ def finish_turn(
 ) -> None:
     """一轮任务收尾：上报终态并解除该轮保护快照的 pin。
 
-    ``turn_id`` 指明收哪一轮（agent 的 ``_current_turn_id``），**只做精确匹配**：
-    没有受保护写入的轮本来就没有状态条目，未命中时去收「唯一余轮」会把另一个
-    还在写的轮的 pin 提前解掉（Codex review P1）。不带 ``turn_id`` 时只有恰好
-    只剩一轮在跟踪才收它（cron 拿不到 agent 实例的兜底）；其余情况宁可不收，
-    代价只是等服务端 TTL 自愈。本轮没发生过保护快照时是纯 no-op。上报失败只
-    记日志。
+    ``turn_id`` 指明收哪一轮（agent 的 ``_current_turn_id``），**只做精确匹配**；
+    不带 ``turn_id`` 一律不收。曾经的「唯一余轮」兜底并不安全：一个无写入的轮
+    （拿不到 agent 实例的调用方）收尾时，若进程里唯一的状态恰好属于另一个还在
+    写的轮，会把对方的 pin 提前解掉（Codex review P1）。真实的受保护写入必然
+    有 agent 实例、拿得到 ``_current_turn_id``；空 id 宁可不收，代价只是等服务
+    端 TTL 自愈。本轮没发生过保护快照时是纯 no-op。上报失败只记日志。
     """
     turn = str(turn_id or "").strip()
     with _lock:
         current: Optional[_TurnState] = None
         if turn:
             current = _states.pop(turn, None)
-        elif len(_states) == 1:
-            _, current = _states.popitem()
         elif _states:
             logger.info(
-                "zettlab snapshot guard: ambiguous finish for %d concurrent turn(s); "
-                "leaving their pins to the server-side TTL",
+                "zettlab snapshot guard: finish without a turn id while %d turn(s) "
+                "tracked; leaving their pins to the server-side TTL",
                 len(_states),
             )
     if current is None or not current.ensured:

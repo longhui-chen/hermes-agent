@@ -1951,6 +1951,13 @@ class ZetAgentAdapter(APIServerAdapter):
         webui uses the same pattern (api/streaming.py) and the
         contention window is short enough in practice.
         """
+        # 非流式等调用方不传 agent_ref 时本地补一个：base _run_agent 会把构造
+        # 出的 AIAgent 填进 agent_ref[0]，finally 里的 guard finish 才能拿到本
+        # 轮 _current_turn_id 做精确收尾——否则空 turn_id 收不了尾，写入轮的
+        # pin 只能等服务端 TTL（Codex review P1）。
+        if agent_ref is None:
+            agent_ref = [None]
+
         stream_q = self._sniff_stream_q(tool_start_callback, stream_delta_callback)
         title_user_message = self._title_user_message(user_message)
 

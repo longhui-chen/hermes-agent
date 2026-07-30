@@ -538,7 +538,8 @@ def install() -> None:
                             and bool(run_result[0])
                         )
                         # 指名收本次 run 的轮（agent 运行时的 _current_turn_id）；
-                        # 拿不到时 guard 只在恰好只剩一轮时才收，避免错收并发轮。
+                        # 拿不到时 guard 一律不收（空 id 收「唯一余轮」会错收并发
+                        # 轮的 pin），留给服务端 TTL 自愈。
                         guard_turn = ""
                         if attempt_agents:
                             guard_turn = str(

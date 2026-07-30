@@ -143,7 +143,7 @@ def test_one_turn_takes_one_snapshot_then_reports_terminal_state_flow(monkeypatc
     ensure_calls = [r for r in rec.requests if r["url"].endswith("/ensure")]
     assert len(ensure_calls) == 3, "server-side idempotency dedupes; the client only skips self-created files"
 
-    guard.finish_turn("completed")
+    guard.finish_turn("completed", turn_id="turn_1")
     finish_calls = [r for r in rec.requests if r["url"].endswith("/finish")]
     assert len(finish_calls) == 1
     assert finish_calls[0]["body"]["turnId"] == "turn_1"
@@ -156,7 +156,7 @@ def test_failed_turn_reports_failed_state_flow(monkeypatch, tmp_path):
     target.write_text("x")
 
     guard.maybe_require_snapshot("write_file", {"path": str(target)}, turn_id="turn_1")
-    guard.finish_turn("failed", error_code="tool_error", error_stage="mutate")
+    guard.finish_turn("failed", turn_id="turn_1", error_code="tool_error", error_stage="mutate")
 
     finish = [r for r in rec.requests if r["url"].endswith("/finish")][0]
     assert finish["body"]["state"] == "failed"
