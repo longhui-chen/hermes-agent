@@ -1302,3 +1302,79 @@ def test_home_and_parent_globs_are_expanded(monkeypatch, tmp_path):
     ensured = [p for r in rec.requests for p in (r["body"].get("paths") or [])]
     assert str(home / "Documents") in ensured, "~ glob 要展开"
     assert str(sibling) in ensured, "../ glob 要展开"
+
+
+def test_unbound_profile_scope_fails_closed(monkeypatch, tmp_path):
+    """multiplex 下 profile scope 未绑定 = 判定不了，不是「不是设备环境」：
+    放行会让该 profile 的用户文件无恢复点被改（Codex review P1）。"""
+    class _Unscoped(RuntimeError):
+        pass
+    _Unscoped.__name__ = "UnscopedSecretError"
+
+    fake_scope = types.SimpleNamespace(
+        get_secret=lambda name, default=None: (_ for _ in ()).throw(_Unscoped("no scope bound")),
+        is_multiplex_active=lambda: True,
+    )
+    monkeypatch.setitem(sys.modules, "agent.secret_scope", fake_scope)
+    rec = _install(monkeypatch)
+    target = tmp_path / "a.txt"
+    target.write_text("x")
+
+    blocked = guard.maybe_require_snapshot(
+        "write_file", {"path": str(target)}, turn_id="turn_1")
+    assert blocked is not None and "NOT modified" in json.loads(blocked)["error"]
+    assert rec.requests == []
+
+
+def test_terminal_ancillary_failure_blocks_the_command(monkeypatch, tmp_path):
+    """terminal 从一个 cwd 写另一个受保护目录时，附加路径建不出恢复点要阻断
+    ——只记日志放行等于让写入无恢复点发生（Codex review P1）。"""
+    outside = tmp_path / "Documents"
+    outside.mkdir()
+    doc = outside / "a.txt"
+    doc.write_text("x")
+    cwd = tmp_path / "Work"
+    cwd.mkdir()
+
+    # 主 cwd ensure 成功，附加路径 ensure 传输失败。
+    rec = _install(
+        monkeypatch,
+        {"ready": True, "operations": []},
+        urllib.error.URLError("down"),
+    )
+    blocked = guard.maybe_require_snapshot(
+        "terminal", {"command": f"rm -f {doc}", "workdir": str(cwd)},
+        turn_id="turn_1", task_id="task_9",
+    )
+    assert blocked is not None and "NOT executed" in blocked
+    assert len(rec.requests) == 2
+
+
+def test_glob_expansion_is_streamed_and_capped(monkeypatch, tmp_path):
+    """海量匹配的 glob 要流式截断，不能先构造完整列表——端侧 2GB 预算下 guard
+    自己会卡住或 OOM（HR1 / Codex review P1）。父目录优先保住。"""
+    big = tmp_path / "Pictures"
+    big.mkdir()
+    for i in range(200):
+        (big / f"p{i:03d}.jpg").write_text("x")
+    cwd = tmp_path / "Work"
+    cwd.mkdir()
+
+    calls = {"n": 0}
+    real_iglob = guard.glob.iglob
+
+    def counting_iglob(pattern, *a, **kw):
+        for item in real_iglob(pattern, *a, **kw):
+            calls["n"] += 1
+            yield item
+
+    monkeypatch.setattr(guard.glob, "iglob", counting_iglob)
+    rec = _install(monkeypatch)
+    guard.maybe_require_snapshot(
+        "terminal", {"command": f"rm -rf {big}/*", "workdir": str(cwd)},
+        turn_id="turn_1", task_id="task_9",
+    )
+    ensured = [p for r in rec.requests for p in (r["body"].get("paths") or [])]
+    assert str(big) in ensured, "父目录必须纳保（覆盖面最大）"
+    assert len(ensured) <= guard._MAX_ANCILLARY_PATHS + 1
+    assert calls["n"] <= guard._MAX_ANCILLARY_PATHS, "不该枚举完整结果集"

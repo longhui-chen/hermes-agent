@@ -199,16 +199,27 @@ _degraded_logged = False
 _nonloopback_logged = False
 
 
+class _UnresolvableScope(Exception):
+    """multiplex 下 profile scope 未绑定：读不到配置 ≠ 不是设备环境。"""
+
+
 def _scoped_env(name: str, default: str = "") -> str:
-    """读环境变量。multiplex 下必须走 profile scope，否则会串到别的 agent。"""
+    """读环境变量。multiplex 下必须走 profile scope，否则会串到别的 agent。
+
+    scope 未绑定（UnscopedSecretError）时抛 _UnresolvableScope 而不是回落到
+    默认值：那样 guard 会把「读不到 token」当成「不是设备环境」而放行写入，
+    用户文件在没有恢复点的情况下被改（Codex review P1）。这是调度层契约被破
+    坏，fail-closed。
+    """
     try:
         from agent.secret_scope import get_secret
 
         value = get_secret(name, "")
         if value:
             return str(value)
-    except Exception:
-        pass
+    except Exception as exc:
+        if type(exc).__name__ == "UnscopedSecretError":
+            raise _UnresolvableScope(str(exc)) from exc
     try:
         from agent.secret_scope import is_multiplex_active
 
@@ -358,6 +369,17 @@ def _container_path_maps() -> list[tuple[str, str]]:
     named volume（host 侧非路径）不进表——那不是 host 用户文件，保留容器路径
     交给服务端 scope 校验。local 后端不做任何映射。
     """
+    # TERMINAL_* 是懒桥接的：`hermes serve` / Desktop / ACP 等路径要等
+    # terminal_tool._get_env_config() 才把 config.yaml 的 terminal.backend /
+    # cwd / docker_volumes 灌进环境变量。不先触发桥接就读 env，会在 Docker 会
+    # 话里按 local backend 判定、给错路径建快照（Codex review P1）。
+    try:
+        from tools.terminal_tool import _ensure_terminal_env_bridged
+
+        _ensure_terminal_env_bridged()
+    except Exception as exc:
+        logger.debug("zettlab snapshot guard: terminal env bridge unavailable: %s", exc)
+
     env_type = (os.getenv("TERMINAL_ENV") or "local").strip().lower()
     if env_type not in _CONTAINER_BACKENDS:
         return []
@@ -558,14 +580,22 @@ def _ancillary_abs_paths(text: str, primary: list[str], base_dir: str = "") -> l
         # 「展开结果被删掉后目录本身也变了」的情形。
         expanded = [p]
         if any(ch in p for ch in _GLOB_CHARS):
+            # 流式取前 N 个匹配：`rm -rf /home/a/Pictures/*` 可能命中几万个条
+            # 目，glob.glob + sorted 会先把整份列表读进内存再截断，在 2GB 端侧
+            # 预算下 guard 自己就可能卡住或 OOM（HR1 / Codex review P1）。
+            matches: list[str] = []
             try:
-                matches = sorted(glob.glob(p))[:_MAX_ANCILLARY_PATHS]
+                for m in glob.iglob(p):
+                    matches.append(m)
+                    if len(matches) >= _MAX_ANCILLARY_PATHS:
+                        break
             except Exception:
                 matches = []
             prefix = re.split(r"[*?\[]", p, 1)[0]
             parent = prefix if prefix.endswith("/") else os.path.dirname(prefix)
             parent = parent.rstrip("/")
-            expanded = matches + ([parent] if parent else [])
+            # 父目录放前面：截断时它最该保住——整个目录的恢复点覆盖面最大。
+            expanded = ([parent] if parent else []) + matches
         for item in expanded:
             if not item or item in seen or not os.path.lexists(item):
                 continue
@@ -719,6 +749,11 @@ def _post(path_suffix: str, payload: dict[str, Any], timeout: float) -> tuple[Op
         except Exception:
             pass
         logger.warning("zettlab snapshot guard: HTTP %s from %s: %s", exc.code, path_suffix, detail[:512])
+        if exc.code == 403:
+            # 这个端点上的 403 就是「路径不在 Agent 可写范围内」，按状态码识别
+            # ——错误体解析不出 code 时也不能退化成「未知失败」而阻断整条命令
+            # （Codex review P1 的既有语义）。
+            return _error_payload(detail), "out_of_scope"
         return _error_payload(detail), "http_error"
     except Exception as exc:
         logger.warning("zettlab snapshot guard: request to %s failed: %s", path_suffix, exc)
@@ -842,13 +877,24 @@ def maybe_require_snapshot(
     if not paths and not ancillary_only:
         return None
 
+    started = time.monotonic()
+
     # 设备环境判定先于一切：非设备环境（CLI / 单测 / 未注入回调与 token 的部署）
     # 完全不介入，嵌套 dispatch 与 MCP bridge 不该在这里被 turn 契约挡住
-    # （Codex review P1）。
-    if not _local_server_origin() or not _scoped_env(_ACTION_TOKEN_ENV, "").strip():
-        return None
-
-    started = time.monotonic()
+    # （Codex review P1）。但 multiplex 下 profile scope 未绑定属于**判定不
+    # 了**，不是「不是设备环境」——放行会让该 profile 的用户文件在无恢复点的
+    # 情况下被改，所以 fail-closed（Codex review P1）。
+    try:
+        if not _local_server_origin() or not _scoped_env(_ACTION_TOKEN_ENV, "").strip():
+            return None
+    except _UnresolvableScope as exc:
+        logger.warning("zettlab snapshot guard: profile scope unbound: %s", exc)
+        return _blocked(
+            "File protection is unavailable: this tool call is not bound to an "
+            "agent profile, so the device cannot create a recovery point. The "
+            "file was NOT modified.",
+            outcome="unbound_scope", tool=tool_name, started=started,
+        )
 
     if tool_name == "terminal" and bool(arguments.get("background")):
         # 后台破坏性命令会跑到 turn 结束、pin 释放之后，恢复点可能在写入完成前
@@ -964,7 +1010,11 @@ def maybe_require_snapshot(
                 state.created.add(p)
 
     if tool_name in ("terminal", "execute_code"):
-        _ensure_ancillary(tool_name, arguments, turn, paths, task=task)
+        # 主 cwd 之外的目标同样 fail-closed（required=True）：范围外路径逐个跳
+        # 过，范围内的建不出恢复点就阻断——它们是货真价实的用户文件，只记日志
+        # 放行等于让写入无恢复点发生（Codex review P1）。
+        return _ensure_ancillary(
+            tool_name, arguments, turn, paths, task=task, required=True, started=started)
     return None
 
 
@@ -997,8 +1047,14 @@ def _log_unprotected(data: dict, tool_name: str) -> None:
     )
 
 
-def _is_out_of_scope(data: Optional[dict]) -> bool:
-    """报告一次 ensure 失败是否为范围外路径（403 SNAPSHOT_AGENT_PATH_OUT_OF_SCOPE）。"""
+def _is_out_of_scope(data: Optional[dict], err: str = "") -> bool:
+    """报告一次 ensure 失败是否为范围外路径。
+
+    两种识别：_post 把该端点上的 403 归一成 err="out_of_scope"（错误体解析不出
+    code 时的兜底），或错误体里带 SNAPSHOT_AGENT_PATH_OUT_OF_SCOPE。
+    """
+    if err == "out_of_scope":
+        return True
     return (
         isinstance(data, dict)
         and isinstance(data.get("_error"), dict)
@@ -1046,7 +1102,9 @@ def _ensure_ancillary(
     if not required:
         logger.info("zettlab snapshot guard: ancillary ensure skipped (%s)", err or "not_ready")
         return None
-    if _is_out_of_scope(data):
+    if _is_out_of_scope(data, err):
+        if len(extras) == 1:
+            return None  # 单路径批次：批量结果就是它自己的结果，无需重试
         # 批量里混了范围外路径会整批 403：逐路径重试，范围外跳过，其余必须建成。
         ensured_any = False
         for p in extras:
@@ -1059,7 +1117,7 @@ def _ensure_ancillary(
                 ensured_any = True
                 _log_unprotected(d2, tool_name)
                 continue
-            if e2 in ("unconfigured", "not_supported") or _is_out_of_scope(d2):
+            if e2 in ("unconfigured", "not_supported") or _is_out_of_scope(d2, e2):
                 continue
             return _blocked(
                 "Could not create a protection snapshot for the file paths this "

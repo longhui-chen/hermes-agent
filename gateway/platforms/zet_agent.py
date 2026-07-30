@@ -2140,19 +2140,32 @@ class ZetAgentAdapter(APIServerAdapter):
             # never took a protection snapshot.  A missed report is not fatal
             # either — the pin carries a TTL and a periodic reconciler.
             try:
+                import asyncio as _asyncio
                 import sys as _sys
 
                 from tools.zettlab_snapshot_guard import finish_turn
 
-                # guard 按 agent 运行时的 _current_turn_id 键控轮状态（与工具
-                # dispatch 传下去的是同一个值）；并发轮时必须指名收自己的轮。
-                guard_turn = ""
-                if agent_ref and agent_ref[0] is not None:
-                    guard_turn = str(getattr(agent_ref[0], "_current_turn_id", "") or "")
-                finish_turn(
-                    "failed" if _sys.exc_info()[0] is not None else "completed",
-                    turn_id=guard_turn,
-                )
+                _exc_type = _sys.exc_info()[0]
+                # 断流取消：base writer 先 interrupt() 再 cancel()，但
+                # run_conversation 跑在 executor 线程里，取消这个 asyncio
+                # wrapper 不会立刻停住它——此刻解 pin，恢复点的保护窗口会早于
+                # 前台 terminal / execute_code 的真实写入结束（Codex review
+                # P1）。取消路径一律**不收尾**，把 pin 留给服务端 TTL +
+                # reconcile 自愈：晚一点解 pin 是安全方向，早解不是。
+                if _exc_type is not None and issubclass(_exc_type, _asyncio.CancelledError):
+                    logger.debug(
+                        "[zet_agent] turn cancelled; leaving the protection pin to the server TTL"
+                    )
+                else:
+                    # guard 按 agent 运行时的 _current_turn_id 键控轮状态（与工具
+                    # dispatch 传下去的是同一个值）；并发轮时必须指名收自己的轮。
+                    guard_turn = ""
+                    if agent_ref and agent_ref[0] is not None:
+                        guard_turn = str(getattr(agent_ref[0], "_current_turn_id", "") or "")
+                    finish_turn(
+                        "failed" if _exc_type is not None else "completed",
+                        turn_id=guard_turn,
+                    )
             except Exception:
                 logger.debug("[zet_agent] snapshot guard finish failed", exc_info=True)
             if old_session_key is None:
