@@ -1934,6 +1934,7 @@ class ZetAgentAdapter(APIServerAdapter):
         plan_ack: Optional[Dict[str, Any]] = None,
         plan_auto_execute: Optional[bool] = None,
         turn_id: Optional[str] = None,
+        connector_route_capability: Optional[str] = None,
         request_overrides: Optional[Dict[str, Any]] = None,
     ):
         """Wrap base ``_run_agent`` to bind the session-scoped env
@@ -2009,6 +2010,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 plan_ack=plan_ack,
                 plan_auto_execute=plan_auto_execute,
                 turn_id=turn_id,
+                connector_route_capability=connector_route_capability,
                 request_overrides=request_overrides,
             )
             # Early-return steer salvage: many conversation_loop retry/error
