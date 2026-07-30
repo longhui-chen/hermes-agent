@@ -87,32 +87,82 @@ trusted_data_symlink_target() {
     done
     [ -n "$expected" ] || return 1
 
-    trusted_data_path_chain "$resolved" "$trust_root" || return 1
+    trusted_data_path_chain "$resolved" "$trust_root" "$trust_root" || return 1
     printf '%s\n' "$resolved"
 }
 
+# Validate every directory from $1 up the path chain: owned by root (or the
+# process user when unprivileged) and not group/other-writable. With a
+# non-empty $3 (repair scope) two behaviors are added for the data chain:
+# refusals name the exact directory and failing attribute on stderr, and a
+# too-permissive directory strictly below the repair scope that the process
+# itself owns is tightened with chmod g-w,o-w instead of refused — legacy
+# deploys left app data directories at 777, which otherwise turns into a
+# service crash loop after an OTA upgrade. Directories at or above the
+# repair scope (system paths) are never modified.
 trusted_data_path_chain() {
-    local current="$1" trust_root="$2" process_uid uid mode group other
+    local current="$1" trust_root="$2" repair_scope="${3:-}"
+    local process_uid uid mode group other
     process_uid="$(id -u)"
     while :; do
         uid="$(stat -c '%u' "$current" 2>/dev/null || stat -f '%u' "$current" 2>/dev/null || true)"
         mode="$(stat -c '%a' "$current" 2>/dev/null || stat -f '%Lp' "$current" 2>/dev/null || true)"
-        [ -n "$uid" ] && [ -n "$mode" ] || return 1
+        if [ -z "$uid" ] || [ -z "$mode" ]; then
+            if [ -n "$repair_scope" ]; then
+                echo "untrusted data path: cannot stat $current" >&2
+            fi
+            return 1
+        fi
         if [ "$process_uid" -eq 0 ]; then
-            [ "$uid" = "0" ] || return 1
-        else
-            [ "$uid" = "0" ] || [ "$uid" = "$process_uid" ] || return 1
+            if [ "$uid" != "0" ]; then
+                if [ -n "$repair_scope" ]; then
+                    echo "untrusted data path: $current owned by uid $uid, expected root" >&2
+                fi
+                return 1
+            fi
+        elif [ "$uid" != "0" ] && [ "$uid" != "$process_uid" ]; then
+            if [ -n "$repair_scope" ]; then
+                echo "untrusted data path: $current owned by uid $uid, expected root or uid $process_uid" >&2
+            fi
+            return 1
         fi
         group="${mode: -2:1}"
         other="${mode: -1}"
-        (( (10#$group & 2) == 0 )) || return 1
-        (( (10#$other & 2) == 0 )) || return 1
+        if (( (10#$group & 2) != 0 || (10#$other & 2) != 0 )); then
+            if ! tighten_writable_data_path "$current" "$uid" "$mode" "$repair_scope"; then
+                if [ -n "$repair_scope" ]; then
+                    echo "untrusted data path: $current mode $mode is group/other-writable" >&2
+                fi
+                return 1
+            fi
+        fi
         [ "$current" = "/" ] && break
         if [ "$process_uid" -ne 0 ] && [ "$current" = "$trust_root" ]; then
             break
         fi
         current="$(dirname "$current")"
     done
+}
+
+tighten_writable_data_path() {
+    local current="$1" uid="$2" mode="$3" repair_scope="$4" new_mode group other
+    [ -n "$repair_scope" ] || return 1
+    case "$current" in
+        "$repair_scope"/*) ;;
+        *) return 1 ;;
+    esac
+    # chmod requires ownership; the uid checks above already pinned root
+    # ownership for the root process, so this only excludes the unprivileged
+    # case where the level belongs to root but the process cannot fix it.
+    [ "$uid" = "$(id -u)" ] || return 1
+    chmod g-w,o-w "$current" 2>/dev/null || return 1
+    new_mode="$(stat -c '%a' "$current" 2>/dev/null || stat -f '%Lp' "$current" 2>/dev/null || true)"
+    [ -n "$new_mode" ] || return 1
+    group="${new_mode: -2:1}"
+    other="${new_mode: -1}"
+    (( (10#$group & 2) == 0 )) || return 1
+    (( (10#$other & 2) == 0 )) || return 1
+    echo "tightened group/other-writable data path: $current (mode $mode -> $new_mode)" >&2
 }
 
 pin_trusted_data_symlink() {

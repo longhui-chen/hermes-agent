@@ -651,17 +651,24 @@ def test_prepare_claw_service_allows_trusted_volume_data_symlink(tmp_path: Path)
     assert volume_target.stat().st_mode & 0o777 == 0o750
 
 
-def test_prepare_claw_service_refuses_writable_ota_data_symlink_target(
+def test_prepare_claw_service_tightens_writable_ota_data_symlink_target(
     tmp_path: Path,
 ):
+    """A legacy-deploy 777 data directory is tightened, not crash-looped.
+
+    Firmware 0.0.52 boards with a hand-deployed
+    /zettos/main/data/com.zettlab.claw at mode 777 used to hit
+    "refusing untrusted data symlink" and restart forever; the prepare
+    script now removes the group/other write bits itself and proceeds.
+    """
     if not _readlink_f_available(tmp_path):
         pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
 
-    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
+    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
     data_link = hermes_home.parent
     expected_target = tmp_path / "zettos" / "main" / "data" / "com.zettlab.claw"
     expected_target.mkdir(parents=True)
-    expected_target.chmod(0o770)
+    expected_target.chmod(0o777)
     marker = expected_target / "marker"
     marker.write_text("do-not-touch\n", encoding="utf-8")
     data_link.parent.mkdir(parents=True, exist_ok=True)
@@ -669,26 +676,27 @@ def test_prepare_claw_service_refuses_writable_ota_data_symlink_target(
 
     result = subprocess.run(
         [str(app_root / "prepare-claw-service.sh")],
-        check=False,
+        check=True,
         cwd=str(app_root),
         env=_script_env(),
         capture_output=True,
         text=True,
     )
 
-    assert result.returncode != 0
-    assert "refusing untrusted data symlink" in result.stderr
+    assert "tightened group/other-writable data path" in result.stderr
     assert marker.read_text(encoding="utf-8") == "do-not-touch\n"
-    assert expected_target.stat().st_mode & 0o777 == 0o770
+    assert expected_target.stat().st_mode & 0o777 == 0o755
+    assert hermes_home.is_dir()
+    assert env_path.is_file()
 
 
-def test_prepare_claw_service_refuses_writable_data_symlink_ancestor(
+def test_prepare_claw_service_tightens_writable_data_symlink_ancestor(
     tmp_path: Path,
 ):
     if not _readlink_f_available(tmp_path):
         pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
 
-    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
+    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
     data_link = hermes_home.parent
     data_parent = tmp_path / "zettos" / "main" / "data"
     expected_target = data_parent / "com.zettlab.claw"
@@ -700,15 +708,53 @@ def test_prepare_claw_service_refuses_writable_data_symlink_ancestor(
 
     result = subprocess.run(
         [str(app_root / "prepare-claw-service.sh")],
-        check=False,
+        check=True,
         cwd=str(app_root),
         env=_script_env(),
         capture_output=True,
         text=True,
     )
 
+    assert "tightened group/other-writable data path" in result.stderr
+    assert data_parent.stat().st_mode & 0o777 == 0o750
+    assert expected_target.stat().st_mode & 0o777 == 0o750
+    assert hermes_home.is_dir()
+    assert env_path.is_file()
+
+
+def test_prepare_claw_service_refuses_writable_directory_above_trust_root(
+    tmp_path: Path,
+):
+    """System-path levels are diagnosed precisely but never chmodded."""
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
+    data_link = hermes_home.parent
+    trust_root = tmp_path / "zettos" / "main"
+    expected_target = trust_root / "data" / "com.zettlab.claw"
+    expected_target.mkdir(parents=True)
+    expected_target.chmod(0o750)
+    trust_root.chmod(0o770)
+    data_link.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(expected_target, data_link)
+
+    result = subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=False,
+        cwd=str(app_root),
+        env=_script_env(),
+        capture_output=True,
+        text=True,
+    )
+    trust_root.chmod(0o755)
+
     assert result.returncode != 0
     assert "refusing untrusted data symlink" in result.stderr
+    assert (
+        f"untrusted data path: {trust_root} mode 770 is group/other-writable"
+        in result.stderr
+    )
     assert not (expected_target / "secrets").exists()
 
 
