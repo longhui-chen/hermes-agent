@@ -153,5 +153,9 @@ def test_resolve_last_session_not_limited_to_newest_started_20(tmp_path, monkeyp
     finally:
         db.close()
 
-    monkeypatch.setattr("hermes_state.SessionDB", lambda: real_session_db(db_path=state_db))
+    class _TestSessionDB(real_session_db):
+        def __init__(self):
+            super().__init__(db_path=state_db)
+
+    monkeypatch.setattr("hermes_state.SessionDB", _TestSessionDB)
     assert _resolve_last_session("cli") == target
