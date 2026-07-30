@@ -2060,6 +2060,117 @@ class APIServerAdapter(BasePlatformAdapter):
     # Session DB helper
     # ------------------------------------------------------------------
 
+    # (st_dev, st_ino) -> {"fd": int, "refs": int, "home": str}. One shared
+    # /proc/self/fd anchor per profile-DB inode (Linux only); class-level so
+    # zet_agent's subclass shares the same process-wide registry.
+    _profile_db_anchors: dict = {}
+    _profile_db_anchor_lock = threading.Lock()
+
+    @staticmethod
+    def _profile_db_anchor_points_at(key, home: str) -> bool:
+        """Whether ``home``'s state.db path still resolves to inode ``key``."""
+        try:
+            st = os.stat(os.path.join(home, "state.db"), follow_symlinks=False)
+        except OSError:
+            return False
+        return (st.st_dev, st.st_ino) == tuple(key)
+
+    @staticmethod
+    def _gc_retired_profile_db_anchors_locked() -> None:
+        """Close parked anchors whose inode was rotated away.
+
+        Caller holds ``_profile_db_anchor_lock``.
+        """
+        anchors = APIServerAdapter._profile_db_anchors
+        for key, entry in list(anchors.items()):
+            if entry["refs"] <= 0 and not (
+                APIServerAdapter._profile_db_anchor_points_at(key, entry["home"])
+            ):
+                anchors.pop(key, None)
+                try:
+                    os.close(entry["fd"])
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _acquire_profile_db_anchor(directory_fd: int, expected, profile_home):
+        """Return ``(fd, key)`` of the shared /proc anchor for an inode.
+
+        POSIX record locks forbid closing any fd of an inode that live SQLite
+        connections hold locks on (see _open_profile_session_db), so anchor
+        fds cannot simply be closed per-open. Instead they are refcounted per
+        inode: every open of the same inode shares one fd, so hot repeat
+        opens (e.g. the runtime-import sweep) add zero net fds. Release parks
+        the fd while the inode is still what the profile path resolves to —
+        sibling connections opened outside this helper may still hold locks
+        on it — and closes it only after the path rotates to a new
+        generation, when no other process can reach the inode by path and
+        dropping this process's remaining locks on it is harmless.
+        """
+        key = (expected.st_dev, expected.st_ino)
+        anchors = APIServerAdapter._profile_db_anchors
+        with APIServerAdapter._profile_db_anchor_lock:
+            APIServerAdapter._gc_retired_profile_db_anchors_locked()
+            entry = anchors.get(key)
+            if entry is None:
+                flags = os.O_RDWR
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                flags |= getattr(os, "O_CLOEXEC", 0)
+                fd = os.open("state.db", flags, dir_fd=directory_fd)
+                anchored = os.fstat(fd)
+                if (anchored.st_dev, anchored.st_ino) != key:
+                    os.close(fd)
+                    raise RuntimeError(
+                        "profile state.db changed while it was opened"
+                    )
+                entry = {"fd": fd, "refs": 0, "home": os.fspath(profile_home)}
+                anchors[key] = entry
+            entry["refs"] += 1
+            entry["home"] = os.fspath(profile_home)
+            return entry["fd"], key
+
+    @staticmethod
+    def _release_profile_db_anchor(key) -> None:
+        """Drop one anchor reference; close the fd only for retired inodes."""
+        anchors = APIServerAdapter._profile_db_anchors
+        with APIServerAdapter._profile_db_anchor_lock:
+            entry = anchors.get(key)
+            if entry is None:
+                return
+            entry["refs"] = max(0, entry["refs"] - 1)
+            if entry["refs"] > 0:
+                return
+            if not APIServerAdapter._profile_db_anchor_points_at(
+                key, entry["home"]
+            ):
+                anchors.pop(key, None)
+                try:
+                    os.close(entry["fd"])
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _bind_profile_db_anchor_to_close(db, key) -> None:
+        """Release the anchor exactly once when ``db.close()`` runs.
+
+        The release happens after the SQLite connection is closed. Without
+        this binding every cache invalidation / explicit close would leak one
+        anchor reference and the fd could never be reclaimed.
+        """
+        original_close = db.close
+        released = False
+
+        def _close_releasing_anchor(*args, **kwargs):
+            nonlocal released
+            try:
+                return original_close(*args, **kwargs)
+            finally:
+                if not released:
+                    released = True
+                    APIServerAdapter._release_profile_db_anchor(key)
+
+        db.close = _close_releasing_anchor
+
     @staticmethod
     def _open_profile_session_db(profile_home: Path, *, create: bool = True):
         """Open one profile's state DB without following an attacker link.
@@ -2078,8 +2189,8 @@ class APIServerAdapter(BasePlatformAdapter):
         directory_flags |= getattr(os, "O_NOFOLLOW", 0)
         directory_flags |= getattr(os, "O_CLOEXEC", 0)
         directory_fd = os.open(profile_home, directory_flags)
-        leaf_fd = None
-        leaf_fd_owned = False
+        anchor_key = None
+        anchor_owned = False
         try:
             directory_stat = os.fstat(directory_fd)
             if not stat.S_ISDIR(directory_stat.st_mode):
@@ -2163,27 +2274,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 # Do not probe/fallback: an unlinked fd makes exists()
                 # false even though the descriptor is still open. SQLite
                 # must either connect through this anchor or fail closed.
-                leaf_flags = os.O_RDWR
-                leaf_flags |= getattr(os, "O_NOFOLLOW", 0)
-                leaf_flags |= getattr(os, "O_CLOEXEC", 0)
-                leaf_fd = os.open("state.db", leaf_flags, dir_fd=directory_fd)
-                leaf_fd_owned = True
-                anchored = os.fstat(leaf_fd)
-                if (anchored.st_dev, anchored.st_ino) != (
-                    expected.st_dev,
-                    expected.st_ino,
-                ):
-                    raise RuntimeError(
-                        "profile state.db changed while it was opened"
+                anchor_fd, anchor_key = (
+                    APIServerAdapter._acquire_profile_db_anchor(
+                        directory_fd, expected, profile_home
                     )
-                connection_path = f"/proc/self/fd/{leaf_fd}"
+                )
+                anchor_owned = True
+                connection_path = f"/proc/self/fd/{anchor_fd}"
             else:
                 connection_path = str(db_path)
             # On Linux, SQLite resolves /proc/self/fd/N to the already-open
-            # inode. leaf_fd stays open for the life of the SessionDB (see the
-            # ownership transfer below) so every schema/cleanup write remains
-            # bound to that inode even if the canonical pathname is swapped
-            # concurrently.
+            # inode. The refcounted anchor keeps that fd open for as long as
+            # this inode has SessionDBs on it, so every schema/cleanup write
+            # remains bound to that inode even if the canonical pathname is
+            # swapped concurrently.
             connection = sqlite3.connect(
                 connection_path,
                 check_same_thread=False,
@@ -2238,13 +2342,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     directory_stat.st_ino,
                 )
                 db._profile_state_identity = (expected.st_dev, expected.st_ino)
-                if leaf_fd is not None:
-                    # The anchor fd must never be closed while this process
-                    # holds SQLite connections on the inode — closing it would
-                    # drop their POSIX locks (see above). Ownership moves to
-                    # the SessionDB: one fd kept per profile-DB generation.
-                    db._profile_state_anchor_fd = leaf_fd
-                    leaf_fd_owned = False
+                if anchor_key is not None:
+                    # Anchor lifetime is refcounted per inode; db.close()
+                    # drops this open's reference after the SQLite connection
+                    # is gone (see _acquire_profile_db_anchor).
+                    APIServerAdapter._bind_profile_db_anchor_to_close(
+                        db, anchor_key
+                    )
+                    anchor_owned = False
                 return db
             except BaseException:
                 try:
@@ -2253,12 +2358,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
                 raise
         finally:
-            if leaf_fd is not None and leaf_fd_owned:
-                # Failure path only: ownership normally moves to the SessionDB
-                # above. Closing here can still drop sibling connections'
-                # locks, but leaking one fd per failed open would be unbounded
-                # under a persistent fault.
-                os.close(leaf_fd)
+            if anchor_key is not None and anchor_owned:
+                # Failure path only: on success the release is bound to
+                # db.close() above.
+                APIServerAdapter._release_profile_db_anchor(anchor_key)
             os.close(directory_fd)
 
     @staticmethod
