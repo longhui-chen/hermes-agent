@@ -177,6 +177,26 @@ def test_first_turn_and_every_third_turn_run_bounded_json_checks():
     assert "not by itself a future trigger" in instructions
 
 
+def test_freshness_maintenance_prefers_task_without_topic_keywords():
+    plugin = _load_plugin()
+    context = _Context()
+    plugin.register(context)
+
+    instructions = plugin._DETECTOR_INSTRUCTIONS
+    description = context.tools[0]["schema"]["description"]
+
+    assert "Freshness-over-method rule" in instructions
+    assert "An explicit cadence is not required to recommend task" in instructions
+    assert "keeping one persistent result" in instructions
+    assert "Never\ninvent a daily, weekly, or other schedule" in instructions
+    assert "keeping a derived result current as its source changes" in description
+    assert "An explicit cadence is not required" in description
+    assert "must not be invented" in description
+    assert "keep one persistent result fresh" in description
+    assert "Flomo" not in instructions
+    assert "user.md" not in instructions
+
+
 def test_missing_fast_route_retries_once_on_active_main_model():
     plugin = _load_plugin()
     llm = _FailingFastRouteLlm(_candidate())

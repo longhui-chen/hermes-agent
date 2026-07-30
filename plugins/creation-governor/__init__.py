@@ -35,7 +35,7 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 TOOL_NAME = "detect_creation_opportunity"
-PLUGIN_VERSION = "0.9.0"
+PLUGIN_VERSION = "0.9.1"
 MIN_CONFIDENCE = 0.55
 AUXILIARY_TASK_NAME = "creation_governor_checkpoint"
 AUXILIARY_MODEL_ALIAS = "zettlab-creation-fast"
@@ -565,13 +565,14 @@ the next time a related need appears.
 
 Definitions and conflict order:
 1. task: the desired future value depends on a recurring time trigger, event trigger, background
-   monitoring, or repeated refresh of new information. A word such as 'today' that merely scopes
-   the current data is not by itself a future trigger.
+   monitoring, repeated refresh of new information, or keeping a derived result current as its
+   source changes. A word such as 'today' merely scopes the current data; it is not by itself a future trigger.
 2. agent: future work needs a long-lived responsible role, retained domain context, judgment,
    autonomous choice among tools, decisions about the next step, or repeated interpretation of a
    changing real-world business domain, account, operation, project, or body of evidence.
 3. skill: future inputs vary but a stable input-to-output method can be reused without an
-   independent identity or durable state.
+   independent identity or durable state. Do not choose skill when the primary future value is
+   keeping one persistent result, profile, summary, index, report, or state up to date.
 4. none: small talk, a trivial transformation, a low-value closed-world fact lookup, an explicit
    request to create/configure/schedule something through Hermes' native flow, or no reasonable
    reuse value.
@@ -581,13 +582,22 @@ make a judgment about an ongoing external work domain should normally be agent r
 even on the first request and even when the requested snapshot is scoped to today/current/latest.
 Choose none only when reuse value is genuinely absent, not merely unstated.
 
+Freshness-over-method rule: prefer task over skill when at least two of these semantic properties
+are clearly supported by the conversation: (a) the source, account, file, feed, or evidence changes
+over time; (b) the generated result becomes stale when the source changes; (c) automatic refresh
+would remove repeated manual work. An explicit cadence is not required to recommend task. Never
+invent a daily, weekly, or other schedule in the recommendation. After the user confirms creation,
+Hermes' native task/cronjob flow must ask for any missing schedule or event trigger. Stable refresh
+steps do not make the opportunity a skill when freshness is the core value.
+
 Apply this semantic gate before returning none. Ask, in order: (a) will the underlying information,
 account, project, or operating environment change after this turn; (b) would a responsible role with
 retained context make a future judgment better; (c) would a stable method save meaningful effort on
 a different future input? If any answer is yes, none is forbidden: choose task for a future trigger,
-otherwise agent for continuing ownership/judgment, otherwise skill for the reusable method. Ambiguity
-about whether the user will repeat the request is not evidence for none. Do not reduce an analytical
-request to a fact lookup merely because the current data or connector is unavailable.
+background refresh, or freshness maintenance; otherwise agent for continuing ownership/judgment,
+otherwise skill for the reusable method. Ambiguity about whether the user will repeat the request is
+not evidence for none. Do not reduce an analytical request to a fact lookup merely because the
+current data or connector is unavailable.
 
 Judge reuse value separately from current execution availability. Missing authorization,
 connectors, data, or tools may block today's execution but is not a reason to ignore a clear
@@ -597,11 +607,19 @@ one-sentence optional proposal_text asking whether to create it, confidence, a s
 dedup_key, and evidence_turn_ids chosen only from the supplied labels. For none, use empty strings,
 an empty evidence list, and confidence 0. Never claim anything was created.
 
+For a task recommendation, name the ongoing outcome that should stay current instead of naming a
+generic method. Explain what changing source would make the current result stale, but do not claim
+or imply a cadence the user did not provide.
+
 中文请求必须按同一套语义规则判断，不要因为用户没有说“重复”“以后”“保存”或“创建”就返回
 none。先判断需求所涉及的账户、项目、业务环境或信息是否会继续变化；如果会变化且后续判断需要
-保留背景、综合数据或自主选择工具，选择 agent。如果价值来自未来的时间、事件、后台监控或提醒，
-选择 task。如果输入会变化但处理方法相对稳定，选择 skill。只有寒暄、低价值封闭事实、微小的一次性
-转换、用户已经明确要求创建，或 Agent/Skill/Task 三种长期价值都确实不存在时，才选择 none。
+保留背景、综合数据或自主选择工具，选择 agent。如果价值来自未来的时间、事件、后台监控、提醒，
+或让一个随来源变化而过期的画像、摘要、索引、报告或状态持续保持最新，选择 task。只要“来源会
+变化”“结果会过期”“自动刷新能减少反复手工操作”中至少两项在语义上成立，就可以优先 task，
+不要求用户先说每天、每周或具体频率；推荐时不得虚构周期，用户确认后再由 Hermes 原生 cronjob
+流程补问缺失的时间或事件条件。如果价值只是对不同输入重复使用一套稳定方法，且不存在保持结果
+新鲜的需求，才选择 skill。只有寒暄、低价值封闭事实、微小的一次性转换、用户已经明确要求创建，
+或 Agent/Skill/Task 三种长期价值都确实不存在时，才选择 none。
 “今天”“最近”“当前”只是本次数据范围，不等于没有长期价值。缺少授权、连接器或数据只影响本次
 执行，不能作为返回 none 的理由。名称、原因和询问是否创建的 proposal_text 使用用户的语言。"""
 
@@ -1193,14 +1211,20 @@ def register(ctx: Any) -> None:
                 "none. A single substantive request is enough; never require the user to mention "
                 "repetition, saving, or creation. Use "
                 "meaning and conversation context, never topic keyword matching or memorized "
-                "examples. Task means desired future time/event/background execution; a current "
-                "data range such as today is not by itself a trigger. Agent means a long-lived "
+                "examples. Task means desired future time/event/background execution or keeping "
+                "a derived result current as its source changes; a current data range such as "
+                "today is not by itself a trigger. Prefer Task over Skill when at least two are "
+                "true: the source changes over time, the result becomes stale, and automatic "
+                "refresh removes repeated manual work. An explicit cadence is not required for "
+                "the recommendation, must not be invented, and is collected by Hermes' native "
+                "task flow after confirmation. Agent means a long-lived "
                 "responsible role with retained context, judgment, autonomous tool choice, or "
                 "interpretation of a changing real-world work domain. A substantive first request "
                 "to inspect, compare, diagnose, research, optimize, or make a judgment about an "
                 "ongoing external work domain should normally be Agent rather than none. "
                 "Skill means a stable reusable input-to-output method without an independent "
-                "identity. Missing connectors or authorization affect current execution, not "
+                "identity or a need to keep one persistent result fresh. Missing connectors or "
+                "authorization affect current execution, not "
                 "reuse value. Explicit creation requests use Hermes' native flow and return none. "
                 "Call only between scheduled checkpoints when one unusually clear opportunity "
                 "emerges. The tool never creates and may return none. The plugin owns cooldown, "
