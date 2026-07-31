@@ -677,19 +677,24 @@ def _effective_inline_image_limit(limits: Any) -> Optional[int]:
     return min(limit, MAX_INLINE_IMAGE_BYTES)
 
 
-def supported_modalities(
-    type_section: Optional[Dict[str, Any]],
-    model_capability: Optional[Dict[str, Any]],
-) -> List[str]:
+def normalized_modalities(model_capability: Optional[Dict[str, Any]]) -> List[str]:
     raw = model_capability.get("modalities") if isinstance(model_capability, dict) else None
     modalities: List[str] = []
     if isinstance(raw, list):
         for value in raw:
-            normalized = value.strip() if isinstance(value, str) else ""
+            normalized = value.strip().casefold() if isinstance(value, str) else ""
             if normalized and normalized not in modalities:
                 modalities.append(normalized)
     elif raw is None:
         modalities.append("text")
+    return modalities
+
+
+def supported_modalities(
+    type_section: Optional[Dict[str, Any]],
+    model_capability: Optional[Dict[str, Any]],
+) -> List[str]:
+    modalities = normalized_modalities(model_capability)
     limits = type_section.get("limits") if isinstance(type_section, dict) else None
     if "image" in modalities and _effective_inline_image_limit(limits) is None:
         modalities.remove("image")
@@ -697,10 +702,9 @@ def supported_modalities(
 
 
 def _inline_image_limit(model_capability: Optional[Dict[str, Any]]) -> int:
-    modalities = model_capability.get("modalities") if isinstance(model_capability, dict) else None
     limits = model_capability.get("_type_limits") if isinstance(model_capability, dict) else None
     limit = _effective_inline_image_limit(limits)
-    if not isinstance(modalities, list) or "image" not in modalities or limit is None:
+    if "image" not in normalized_modalities(model_capability) or limit is None:
         raise ZettlabMediaError(
             "Inline image input is not enabled for this Zettlab media generation model"
         )

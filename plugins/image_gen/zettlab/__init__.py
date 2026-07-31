@@ -123,14 +123,9 @@ class ZettlabImageGenProvider(ImageGenProvider):
         try:
             refs = normalize_reference_images(reference_image_urls)
             input_image = media_client.inline_image_input(image_url, refs, model_capability)
-            configured_modalities = (
-                model_capability.get("modalities")
-                if isinstance(model_capability, dict)
-                else None
-            )
+            configured_modalities = media_client.normalized_modalities(model_capability)
             if (
-                isinstance(configured_modalities, list)
-                and "image" in configured_modalities
+                "image" in configured_modalities
                 and "text" not in configured_modalities
                 and not input_image
             ):

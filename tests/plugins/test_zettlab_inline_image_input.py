@@ -44,6 +44,16 @@ def test_inline_image_input_accepts_matching_data_uri():
     assert client.inline_image_input(value, None, _capability()) == value
 
 
+def test_inline_image_input_normalizes_gateway_modality():
+    from plugins import zettlab_media_client as client
+
+    value = f"data:image/png;base64,{base64.b64encode(PNG).decode('ascii')}"
+    capability = _capability()
+    capability["modalities"] = [" IMAGE "]
+
+    assert client.inline_image_input(value, None, capability) == value
+
+
 @pytest.mark.parametrize(
     ("value", "message"),
     [

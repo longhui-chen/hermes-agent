@@ -91,21 +91,25 @@ def test_zettlab_video_capabilities_preserve_image_only_modality(monkeypatch):
         "limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
     }, {
         "id": "image-only",
-        "modalities": ["image"],
+        "modalities": [" IMAGE "],
         "durations": [5],
     }))
 
     assert ZettlabVideoGenProvider().capabilities()["modalities"] == ["image"]
 
 
-def test_zettlab_video_capabilities_hide_image_without_inline_limit(monkeypatch):
+@pytest.mark.parametrize("invalid_limit", [None, 0, -1, True, "5242880"])
+def test_zettlab_video_capabilities_hide_image_with_invalid_inline_limit(
+    monkeypatch,
+    invalid_limit,
+):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setattr(client, "selected_model_capability", lambda media_type: ({
-        "limits": {},
+        "limits": {"max_inline_image_bytes": invalid_limit},
     }, {
         "id": "image-only",
-        "modalities": ["image"],
+        "modalities": [" IMAGE "],
         "durations": [5],
     }))
 
@@ -280,8 +284,9 @@ def test_zettlab_video_image_only_model_requires_image_input(monkeypatch):
         "resolve_model_with_capability",
         lambda media_type, requested=None: ("image-only", {
             "id": "image-only",
-            "modalities": ["image"],
+            "modalities": [" IMAGE "],
             "durations": [5],
+            "_type_limits": {"max_inline_image_bytes": True},
         }),
     )
     monkeypatch.setattr(
