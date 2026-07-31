@@ -749,6 +749,50 @@ def test_managed_runner_fails_before_popen_when_identity_pool_is_occupied(
         )
 
 
+def test_managed_runner_does_not_hold_identity_lock_during_execution(
+    monkeypatch,
+    tmp_path,
+):
+    script = _write_script(tmp_path, "print('ok')\n")
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setattr(
+        trusted_direct_runner,
+        "_reserve_managed_runner_identity",
+        lambda: (60001, 60001),
+    )
+    released = []
+
+    def execute_without_global_lock(**_kwargs):
+        acquired = trusted_direct_runner._MANAGED_RUNNER_LOCK.acquire(
+            blocking=False
+        )
+        assert acquired is True
+        trusted_direct_runner._MANAGED_RUNNER_LOCK.release()
+        return trusted_direct_runner.TrustedPythonResult("", 0)
+
+    monkeypatch.setattr(
+        trusted_direct_runner,
+        "_run_trusted_python_script_unlocked",
+        execute_without_global_lock,
+    )
+    monkeypatch.setattr(
+        trusted_direct_runner,
+        "_release_managed_runner_identity",
+        lambda identity: released.append(identity),
+    )
+
+    result = trusted_direct_runner.run_trusted_python_script(
+        script=script,
+        argv=[str(script)],
+        cwd=tmp_path,
+        base_env=os.environ,
+        injected_env={},
+        timeout=5,
+    )
+    assert result.returncode == 0
+    assert released == [(60001, 60001)]
+
+
 def test_managed_popen_failure_cleans_new_cgroup(monkeypatch, tmp_path):
     script = _write_script(tmp_path, "print('must not run')\n")
     cgroup = trusted_direct_runner._ManagedInvocationCgroup(

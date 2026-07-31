@@ -197,6 +197,7 @@ _MANAGED_RUNNER_IDENTITY_ATTEMPTS = 128
 _PROC_ROOT = Path("/proc")
 _PROC_STATUS_MAX_BYTES = 16 * 1024
 _MANAGED_RUNNER_LOCK = threading.Lock()
+_MANAGED_RUNNER_ACTIVE_UIDS: set[int] = set()
 _MANAGED_CGROUP_PREFIX = "agentcomputer"
 _MANAGED_SUPERVISOR_CGROUP = "agentcomputer-supervisor"
 _MANAGED_CGROUP_ROOT_ENV = "HERMES_MANAGED_CGROUP_ROOT"
@@ -627,7 +628,7 @@ def _occupied_process_uids() -> set[int]:
 
 
 def _select_managed_runner_identity() -> tuple[int, int]:
-    occupied = _occupied_process_uids()
+    occupied = _occupied_process_uids() | _MANAGED_RUNNER_ACTIVE_UIDS
     population = _MANAGED_RUNNER_UID_MAX - _MANAGED_RUNNER_UID_MIN + 1
     for _attempt in range(_MANAGED_RUNNER_IDENTITY_ATTEMPTS):
         candidate = (
@@ -636,6 +637,18 @@ def _select_managed_runner_identity() -> tuple[int, int]:
         if candidate not in occupied:
             return candidate, candidate
     raise OSError("managed runner has no isolated process identity")
+
+
+def _reserve_managed_runner_identity() -> tuple[int, int]:
+    with _MANAGED_RUNNER_LOCK:
+        identity = _select_managed_runner_identity()
+        _MANAGED_RUNNER_ACTIVE_UIDS.add(identity[0])
+        return identity
+
+
+def _release_managed_runner_identity(identity: tuple[int, int]) -> None:
+    with _MANAGED_RUNNER_LOCK:
+        _MANAGED_RUNNER_ACTIVE_UIDS.discard(identity[0])
 
 
 def _cgroup_is_populated(cgroup: _ManagedInvocationCgroup) -> bool:
@@ -1279,9 +1292,11 @@ def run_trusted_python_script(
     }
     if os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
         return _run_trusted_python_script_unlocked(**arguments)
-    with _MANAGED_RUNNER_LOCK:
-        identity = _select_managed_runner_identity()
+    identity = _reserve_managed_runner_identity()
+    try:
         return _run_trusted_python_script_unlocked(
             **arguments,
             managed_identity=identity,
         )
+    finally:
+        _release_managed_runner_identity(identity)

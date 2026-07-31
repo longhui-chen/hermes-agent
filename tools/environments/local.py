@@ -55,6 +55,14 @@ def _managed_terminal_privilege_drop_prefix() -> list[str]:
     ]
 
 
+def _managed_terminal_argv(argv: list[str]) -> list[str]:
+    """Apply the managed capability boundary to every local terminal path."""
+
+    if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
+        return list(argv)
+    return _managed_terminal_privilege_drop_prefix() + list(argv)
+
+
 def _msys_to_windows_path(cwd: str) -> str:
     """Translate a Git Bash / MSYS-style POSIX path (``/c/Users/x``) to the
     native Windows form (``C:\\Users\\x``) so ``os.path.isdir`` and
@@ -1525,11 +1533,7 @@ class LocalEnvironment(BaseEnvironment):
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
-        if (
-            not _IS_WINDOWS
-            and os.environ.get(_MANAGED_GATEWAY_ENV) == "1"
-        ):
-            args = _managed_terminal_privilege_drop_prefix() + args
+        args = _managed_terminal_argv(args)
         run_env = _make_run_env(self.env)
 
         # Recover when the cwd has been deleted out from under us — usually by

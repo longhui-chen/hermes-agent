@@ -1,12 +1,15 @@
 import os
 import stat
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import tools.environments.local as local_module
+import tools.process_registry as process_registry_module
 from tools.environments.local import LocalEnvironment
+from tools.process_registry import ProcessRegistry
 
 
 def test_managed_terminal_drops_identity_changing_capabilities(monkeypatch):
@@ -65,3 +68,104 @@ def test_managed_service_mounts_system_read_only_with_scoped_writes():
     assert "ReadWritePaths=-/volume1/subvol/agents/data" in service
     assert "ReadWritePaths=-/volume1/agents/data" in service
     assert "ReadOnlyPaths=-/volume1/subvol/agents/zettlab-presets" in service
+    assert (
+        "Environment=HERMES_LAZY_INSTALL_TARGET="
+        "__APP_BASE__/data/lazy-packages"
+    ) in service
+    assert "Environment=HERMES_DISABLE_LAZY_INSTALLS=1" in service
+
+
+def _background_registry(monkeypatch):
+    registry = ProcessRegistry()
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    monkeypatch.setattr(
+        registry,
+        "_safe_host_start_time",
+        lambda _pid: 1,
+    )
+    monkeypatch.setattr(
+        process_registry_module.threading.Thread,
+        "start",
+        lambda _thread: None,
+    )
+    monkeypatch.setattr(
+        process_registry_module,
+        "_sanitize_subprocess_env",
+        lambda _base, _extra: {},
+    )
+    monkeypatch.setattr(
+        process_registry_module,
+        "_find_shell",
+        lambda: "/bin/bash",
+    )
+    monkeypatch.setattr(
+        process_registry_module,
+        "_resolve_safe_cwd",
+        lambda cwd: cwd,
+    )
+    return registry
+
+
+def test_managed_background_pipe_drops_identity_capabilities(monkeypatch):
+    captured = {}
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setattr(
+        local_module,
+        "_managed_terminal_privilege_drop_prefix",
+        lambda: ["/usr/bin/setpriv", "--bounding-set=-setuid,-setgid", "--"],
+    )
+    registry = _background_registry(monkeypatch)
+
+    class Process:
+        pid = 42
+        stdout = None
+
+        def poll(self):
+            return None
+
+    def fake_popen(argv, **_kwargs):
+        captured["argv"] = argv
+        return Process()
+
+    monkeypatch.setattr(
+        process_registry_module.subprocess,
+        "Popen",
+        fake_popen,
+    )
+    registry.spawn_local("sleep 1", cwd="/tmp")
+    assert captured["argv"][:3] == [
+        "/usr/bin/setpriv",
+        "--bounding-set=-setuid,-setgid",
+        "--",
+    ]
+
+
+def test_managed_background_pty_drops_identity_capabilities(monkeypatch):
+    captured = {}
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setattr(
+        local_module,
+        "_managed_terminal_privilege_drop_prefix",
+        lambda: ["/usr/bin/setpriv", "--bounding-set=-setuid,-setgid", "--"],
+    )
+    registry = _background_registry(monkeypatch)
+
+    class PtyProcess:
+        pid = 43
+
+        @classmethod
+        def spawn(cls, argv, **_kwargs):
+            captured["argv"] = argv
+            return cls()
+
+    monkeypatch.setitem(
+        sys.modules,
+        "ptyprocess",
+        SimpleNamespace(PtyProcess=PtyProcess),
+    )
+    registry.spawn_local("sleep 1", cwd="/tmp", use_pty=True)
+    assert captured["argv"][:3] == [
+        "/usr/bin/setpriv",
+        "--bounding-set=-setuid,-setgid",
+        "--",
+    ]
