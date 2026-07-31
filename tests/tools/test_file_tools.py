@@ -688,6 +688,45 @@ class TestSensitivePathCheck:
 
         assert "managed runtime import path" in result["error"]
 
+    @pytest.mark.parametrize("tool_name", ["write", "patch"])
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "/zettos/main/data/com.zettlab.claw/secrets/zettlab-claw.env",
+            "/volume1/subvol/apps/com.zettlab.claw/data/secrets/zet_agent.key",
+            (
+                "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home/"
+                "profiles/agent-a/.env"
+            ),
+        ],
+    )
+    def test_managed_service_and_profile_secrets_are_not_model_writable(
+        self,
+        monkeypatch,
+        tool_name,
+        target,
+    ):
+        monkeypatch.setenv(
+            "HERMES_HOME",
+            "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home",
+        )
+
+        if tool_name == "write":
+            from tools.file_tools import write_file_tool
+
+            result = json.loads(write_file_tool(target, "TOKEN=attacker\n"))
+        else:
+            from tools.file_tools import patch_tool
+
+            result = json.loads(patch_tool(
+                mode="replace",
+                path=target,
+                old_string="TOKEN=safe",
+                new_string="TOKEN=attacker",
+            ))
+
+        assert "managed secret path" in result["error"]
+
     @patch("tools.file_tools._get_file_ops")
     def test_normal_file_not_blocked(self, mock_get, monkeypatch):
         monkeypatch.setattr("tools.file_tools._hermes_config_resolved", "/home/user/.hermes/config.yaml")

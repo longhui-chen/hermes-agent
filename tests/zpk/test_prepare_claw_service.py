@@ -1118,6 +1118,7 @@ def test_start_claw_service_loads_reconciled_env_without_overriding_explicit(
         "HERMES_HOME=/stale/hermes-home\n"
         "HERMES_BUNDLED_SKILLS=/stale/skills\n"
         "HERMES_BUNDLED_PLUGINS=/stale/plugins\n"
+        "HERMES_LAZY_INSTALL_TARGET=/stale/lazy-packages\n"
         f"ZETTLAB_PRESETS_DIR={persisted_presets}\n"
         "GATEWAY_MULTIPLEX_PROFILES=false\n"
         "HERMES_MANAGED_GATEWAY=0\n"
@@ -1152,6 +1153,7 @@ Path({str(gateway_log)!r}).write_text(
         "home": os.environ.get("HERMES_HOME"),
         "skills": os.environ.get("HERMES_BUNDLED_SKILLS"),
         "plugins": os.environ.get("HERMES_BUNDLED_PLUGINS"),
+        "lazy_target": os.environ.get("HERMES_LAZY_INSTALL_TARGET"),
         "presets": os.environ.get("ZETTLAB_PRESETS_DIR"),
         "presets_override": os.environ.get("ZETTLAB_CLAW_PRESETS_DIR"),
     }}),
@@ -1172,6 +1174,7 @@ Path({str(gateway_log)!r}).write_text(
         "HERMES_HOME": "/stale/hermes-home",
         "HERMES_BUNDLED_SKILLS": "/stale/skills",
         "HERMES_BUNDLED_PLUGINS": "/stale/plugins",
+        "HERMES_LAZY_INSTALL_TARGET": "/stale/lazy-packages",
         "ZETTLAB_CLAW_PRESETS_DIR": str(explicit_presets),
     }
     if with_explicit_override:
@@ -1200,6 +1203,9 @@ Path({str(gateway_log)!r}).write_text(
     assert gateway_env["plugins"] == str(
         app_root / "lib" / "hermes-agent" / "plugins"
     )
+    assert gateway_env["lazy_target"] == str(
+        app_root.parent / "data" / "lazy-packages"
+    )
     assert gateway_env["presets"] == str(explicit_presets)
     assert gateway_env["presets_override"] is None
     env_text = env_path.read_text(encoding="utf-8")
@@ -1211,6 +1217,7 @@ Path({str(gateway_log)!r}).write_text(
         "HERMES_HOME=",
         "HERMES_BUNDLED_SKILLS=",
         "HERMES_BUNDLED_PLUGINS=",
+        "HERMES_LAZY_INSTALL_TARGET=",
         "ZETTLAB_CLAW_PRESETS_DIR=",
     ):
         assert removed not in env_text
@@ -1346,6 +1353,7 @@ def test_zpk_agent_service_names_are_device_facing():
     assert "load_reconciled_env" in start_wrapper
     assert "export GATEWAY_MULTIPLEX_PROFILES=true" in start_wrapper
     assert "export HERMES_MANAGED_GATEWAY=1" in start_wrapper
+    assert 'export HERMES_LAZY_INSTALL_TARGET="$APP_BASE/data/lazy-packages"' in start_wrapper
     assert (
         "export HERMES_MANAGED_CGROUP_UNIT=zettlab-claw.service"
         in start_wrapper

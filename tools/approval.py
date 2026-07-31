@@ -3253,6 +3253,16 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     notify callback raised.  Persistence of an approved choice and building
     the final tool-facing result dict remain the caller's responsibility.
     """
+    # Every live approval needs an opaque identity before it is observable.
+    # Some callers historically supplied one while terminal, execute_code,
+    # and MCP paths did not.  Generate centrally so queue matching and the
+    # user-facing notification can never drift.
+    approval_data = dict(approval_data)
+    approval_id = str(approval_data.get("approval_id") or "").strip()
+    if not approval_id:
+        approval_id = secrets.token_urlsafe(24)
+        approval_data["approval_id"] = approval_id
+
     command = approval_data.get("command", "")
     description = approval_data.get("description", "")
     primary_key = approval_data.get("pattern_key", "")
@@ -3288,7 +3298,12 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
         _drop_entry()
-        return {"resolved": False, "choice": None, "notify_failed": True}
+        return {
+            "resolved": False,
+            "choice": None,
+            "notify_failed": True,
+            "approval_id": approval_id,
+        }
 
     # Block until the user responds or the canonical approval timeout elapses
     # (default 60s). Poll in short slices so we can fire activity heartbeats
@@ -3350,7 +3365,12 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         surface=surface,
         choice=_outcome,
     )
-    return {"resolved": resolved, "choice": choice, "reason": entry.reason}
+    return {
+        "resolved": resolved,
+        "choice": choice,
+        "reason": entry.reason,
+        "approval_id": approval_id,
+    }
 
 
 def check_all_command_guards(command: str, env_type: str,
@@ -3716,9 +3736,24 @@ def check_all_command_guards(command: str, env_type: str,
         }
         if smart_denied_for_owner:
             pending_data.update(smart_denied=True, allow_permanent=False)
-        submit_pending(session_key, pending_data)
+        approval_id = submit_pending(session_key, pending_data)
+        if approval_id is None:
+            return {
+                "approved": False,
+                "pattern_key": primary_key,
+                "status": "approval_queue_full",
+                "approval_pending": False,
+                "command": _disp_command,
+                "description": _disp_combined_desc,
+                "message": (
+                    "BLOCKED: Too many approval requests are already pending "
+                    "for this session. Resolve or expire an existing request "
+                    "before retrying."
+                ),
+            }
         result = {
             "approved": False,
+            "approval_id": approval_id,
             "pattern_key": primary_key,
             "status": "pending_approval",
             "approval_pending": True,
@@ -3939,9 +3974,24 @@ def check_execute_code_guard(code: str, env_type: str,
         }
         if smart_denied_for_owner:
             pending_data.update(smart_denied=True, allow_permanent=False)
-        submit_pending(session_key, pending_data)
+        approval_id = submit_pending(session_key, pending_data)
+        if approval_id is None:
+            return {
+                "approved": False,
+                "pattern_key": pattern_key,
+                "status": "approval_queue_full",
+                "approval_pending": False,
+                "command": display_command,
+                "description": display_description,
+                "message": (
+                    "BLOCKED: Too many approval requests are already pending "
+                    "for this session. Resolve or expire an existing request "
+                    "before retrying."
+                ),
+            }
         result = {
             "approved": False,
+            "approval_id": approval_id,
             "pattern_key": pattern_key,
             "status": "pending_approval",
             "approval_pending": True,

@@ -572,6 +572,22 @@ _SENSITIVE_PATH_PREFIXES = (
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
+# Managed Claw secrets are consumed by a privileged, long-running gateway.
+# File tools run in-process and therefore must never be able to rewrite the
+# service EnvironmentFile/key or a multiplex profile's credential file.  Keep
+# both lexical device layouts and their durable resolved targets here because
+# deployments may expose app data through either symlink chain.
+_MANAGED_CLAW_SECRET_ROOTS = (
+    "/zettos/main/apps/com.zettlab.claw/data/secrets",
+    "/zettos/main/data/com.zettlab.claw/secrets",
+    "/volume1/subvol/apps/com.zettlab.claw/data/secrets",
+)
+_MANAGED_CLAW_HERMES_ROOTS = (
+    "/zettos/main/apps/com.zettlab.claw/data/hermes_home",
+    "/zettos/main/data/com.zettlab.claw/hermes_home",
+    "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home",
+)
+
 _hermes_config_resolved: str | None = None
 _hermes_config_resolved_loaded = False
 
@@ -609,6 +625,37 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             return _err
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
         return _err
+    candidates = (resolved, normalized)
+    managed_secret_roots = list(_MANAGED_CLAW_SECRET_ROOTS)
+    managed_hermes_roots = list(_MANAGED_CLAW_HERMES_ROOTS)
+    configured_home = os.environ.get("HERMES_HOME", "").strip()
+    if configured_home and "\x00" not in configured_home:
+        try:
+            managed_hermes_roots.append(
+                str(Path(_expand_tilde(configured_home)).resolve())
+            )
+        except (OSError, ValueError):
+            pass
+
+    def _within(candidate: str, root: str) -> bool:
+        try:
+            return os.path.commonpath((candidate, root)) == root
+        except (OSError, ValueError):
+            return False
+
+    if any(
+        _within(candidate, root)
+        for candidate in candidates
+        for root in managed_secret_roots
+    ) or any(
+        os.path.basename(candidate) == ".env" and _within(candidate, root)
+        for candidate in candidates
+        for root in managed_hermes_roots
+    ):
+        return (
+            f"Refusing to write to managed secret path: {filepath}\n"
+            "Agent file tools cannot modify service or profile credentials."
+        )
     # The managed gateway adds HERMES_LAZY_INSTALL_TARGET to sys.path during
     # bootstrap.  A model-controlled .pth file or importable module below that
     # root would execute in the privileged gateway process on a later import or
