@@ -731,7 +731,8 @@ class ProcessRegistry:
                 pty_env["PYTHONUNBUFFERED"] = "1"
                 pty_proc = _PtyProcessCls.spawn(
                     _managed_terminal_argv(
-                        [user_shell, "-lic", f"set +m; {command}"]
+                        [user_shell, "-lic", f"set +m; {command}"],
+                        env=pty_env,
                     ),
                     cwd=session.cwd,
                     env=pty_env,
@@ -777,7 +778,8 @@ class ProcessRegistry:
 
         proc = subprocess.Popen(
             _managed_terminal_argv(
-                [user_shell, "-lic", f"set +m; {command}"]
+                [user_shell, "-lic", f"set +m; {command}"],
+                env=bg_env,
             ),
             text=True,
             cwd=session.cwd,

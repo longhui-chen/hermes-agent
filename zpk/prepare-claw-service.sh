@@ -195,6 +195,46 @@ secure_state_directories() {
     done
 }
 
+secure_profile_secret_files() {
+    local profiles_root="$HERMES_HOME/profiles" path uid mode group other
+    for path in "$profiles_root" "$profiles_root"/*; do
+        if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+            continue
+        fi
+        if [ -L "$path" ] || [ ! -d "$path" ]; then
+            echo "refusing non-directory profile path: $path" >&2
+            exit 1
+        fi
+        uid="$(stat -c '%u' "$path" 2>/dev/null || stat -f '%u' "$path" 2>/dev/null || true)"
+        mode="$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null || true)"
+        [ "$uid" = "0" ] && [ -n "$mode" ] || {
+            echo "refusing untrusted profile directory: $path" >&2
+            exit 1
+        }
+        group="${mode: -2:1}"
+        other="${mode: -1}"
+        if (( (10#$group & 2) != 0 || (10#$other & 2) != 0 )); then
+            chmod go-w "$path"
+        fi
+    done
+
+    for path in "$HERMES_HOME/.env" "$profiles_root"/*/.env; do
+        if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+            continue
+        fi
+        if [ -L "$path" ] || [ ! -f "$path" ]; then
+            echo "refusing non-regular profile secret file: $path" >&2
+            exit 1
+        fi
+        uid="$(stat -c '%u' "$path" 2>/dev/null || stat -f '%u' "$path" 2>/dev/null || true)"
+        if [ "$uid" != "0" ]; then
+            echo "refusing non-root-owned profile secret file: $path" >&2
+            exit 1
+        fi
+        chmod 0600 "$path"
+    done
+}
+
 acquire_prepare_lock() {
     if [ -L "$LOCK_FILE" ] || { [ -e "$LOCK_FILE" ] && [ ! -f "$LOCK_FILE" ]; }; then
         echo "refusing non-regular prepare lock file: $LOCK_FILE" >&2
@@ -339,6 +379,7 @@ esac
 
 secure_state_directories
 acquire_prepare_lock
+secure_profile_secret_files
 ZETTLAB_PRESETS_DIR="$(detect_zettlab_presets_dir || true)"
 write_agent_env
 

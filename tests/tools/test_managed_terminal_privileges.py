@@ -18,6 +18,11 @@ def test_managed_terminal_drops_identity_changing_capabilities(monkeypatch):
     info = SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=0)
     monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
     monkeypatch.setattr(local_module.os, "lstat", lambda _path: info)
+    monkeypatch.setattr(
+        local_module,
+        "_managed_terminal_identity",
+        lambda _env=None: (65534, 65534),
+    )
     monkeypatch.setattr(local_module, "_find_bash", lambda: "/bin/bash")
     monkeypatch.setattr(local_module, "_make_run_env", lambda _env: {})
     monkeypatch.setattr(local_module, "_resolve_safe_cwd", lambda cwd: cwd)
@@ -39,7 +44,10 @@ def test_managed_terminal_drops_identity_changing_capabilities(monkeypatch):
 
     assert captured["argv"] == [
         "/usr/bin/setpriv",
-        "--bounding-set=-setuid,-setgid",
+        "--reuid=65534",
+        "--regid=65534",
+        "--clear-groups",
+        "--bounding-set=-all",
         "--inh-caps=-all",
         "--ambient-caps=-all",
         "--no-new-privs",
@@ -65,17 +73,28 @@ def test_managed_execute_code_drops_identity_capabilities(monkeypatch):
     monkeypatch.setattr(
         local_module,
         "_managed_terminal_privilege_drop_prefix",
-        lambda: ["/usr/bin/setpriv", "--bounding-set=-setuid,-setgid", "--"],
+        lambda _env=None: [
+            "/usr/bin/setpriv",
+            "--reuid=65534",
+            "--regid=65534",
+            "--clear-groups",
+            "--bounding-set=-all",
+            "--",
+        ],
     )
 
     argv = code_execution_module._managed_execute_code_argv(
         "/app/venv/bin/python",
         "/tmp/hermes-execute/script.py",
+        env={},
     )
 
     assert argv == [
         "/usr/bin/setpriv",
-        "--bounding-set=-setuid,-setgid",
+        "--reuid=65534",
+        "--regid=65534",
+        "--clear-groups",
+        "--bounding-set=-all",
         "--",
         "/app/venv/bin/python",
         "/tmp/hermes-execute/script.py",
@@ -96,11 +115,27 @@ def test_managed_service_mounts_system_read_only_with_scoped_writes():
         "__APP_BASE__/data/lazy-packages"
     ) in service
     assert "Environment=HERMES_DISABLE_LAZY_INSTALLS=1" in service
+    assert "MemoryHigh=768M" in service
+    assert "MemoryMax=1G" in service
+    assert "MemorySwapMax=0" in service
+    assert "TasksMax=512" in service
+    assert "OOMPolicy=continue" in service
     assert (
         "Environment=PATH="
         "/zettos/main/apps/com.zettlab.local-server/current/sbin:"
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     ) in service
+    launcher = Path("zpk/libexec/hermes-secure-launcher.py").read_text(
+        encoding="utf-8"
+    )
+    assert '"memory.high": "805306368"' in launcher
+    assert '"memory.max": "1073741824"' in launcher
+    assert '"memory.swap.max": "0"' in launcher
+    assert '"pids.max": "512"' in launcher
+    assert "_verify_managed_service_limits(service)" in launcher
+    prepare = Path("zpk/prepare-claw-service.sh").read_text(encoding="utf-8")
+    assert "secure_profile_secret_files" in prepare
+    assert 'chmod 0600 "$path"' in prepare
 
 
 def _background_registry(monkeypatch):
@@ -140,7 +175,14 @@ def test_managed_background_pipe_drops_identity_capabilities(monkeypatch):
     monkeypatch.setattr(
         local_module,
         "_managed_terminal_privilege_drop_prefix",
-        lambda: ["/usr/bin/setpriv", "--bounding-set=-setuid,-setgid", "--"],
+        lambda _env=None: [
+            "/usr/bin/setpriv",
+            "--reuid=65534",
+            "--regid=65534",
+            "--clear-groups",
+            "--bounding-set=-all",
+            "--",
+        ],
     )
     registry = _background_registry(monkeypatch)
 
@@ -161,9 +203,12 @@ def test_managed_background_pipe_drops_identity_capabilities(monkeypatch):
         fake_popen,
     )
     registry.spawn_local("sleep 1", cwd="/tmp")
-    assert captured["argv"][:3] == [
+    assert captured["argv"][:6] == [
         "/usr/bin/setpriv",
-        "--bounding-set=-setuid,-setgid",
+        "--reuid=65534",
+        "--regid=65534",
+        "--clear-groups",
+        "--bounding-set=-all",
         "--",
     ]
 
@@ -174,7 +219,14 @@ def test_managed_background_pty_drops_identity_capabilities(monkeypatch):
     monkeypatch.setattr(
         local_module,
         "_managed_terminal_privilege_drop_prefix",
-        lambda: ["/usr/bin/setpriv", "--bounding-set=-setuid,-setgid", "--"],
+        lambda _env=None: [
+            "/usr/bin/setpriv",
+            "--reuid=65534",
+            "--regid=65534",
+            "--clear-groups",
+            "--bounding-set=-all",
+            "--",
+        ],
     )
     registry = _background_registry(monkeypatch)
 
@@ -192,8 +244,44 @@ def test_managed_background_pty_drops_identity_capabilities(monkeypatch):
         SimpleNamespace(PtyProcess=PtyProcess),
     )
     registry.spawn_local("sleep 1", cwd="/tmp", use_pty=True)
-    assert captured["argv"][:3] == [
+    assert captured["argv"][:6] == [
         "/usr/bin/setpriv",
-        "--bounding-set=-setuid,-setgid",
+        "--reuid=65534",
+        "--regid=65534",
+        "--clear-groups",
+        "--bounding-set=-all",
         "--",
     ]
+
+
+def test_managed_terminal_identity_is_profile_scoped(monkeypatch):
+    monkeypatch.setattr(local_module.os, "geteuid", lambda: 0)
+    monkeypatch.setenv("ZET_AGENT_KEY", "device-key")
+    local_module._MANAGED_TERMINAL_SCOPE_BY_UID.clear()
+    first = local_module._managed_terminal_identity(
+        {"HERMES_HOME": "/profiles/first"}
+    )
+    repeated = local_module._managed_terminal_identity(
+        {"HERMES_HOME": "/profiles/first"}
+    )
+    second = local_module._managed_terminal_identity(
+        {"HERMES_HOME": "/profiles/second"}
+    )
+    assert first == repeated
+    assert first[0] == first[1]
+    assert second[0] == second[1]
+    assert first != second
+    assert first[0] >= local_module._MANAGED_TERMINAL_UID_MIN
+
+
+def test_generic_subprocess_scrubs_managed_gateway_key(monkeypatch):
+    monkeypatch.setattr(
+        "tools.env_passthrough.is_env_passthrough",
+        lambda _key: False,
+    )
+    sanitized = local_module._sanitize_subprocess_env({
+        "PATH": "/usr/bin",
+        "ZET_AGENT_KEY": "never-inherit",
+    })
+    assert sanitized["PATH"] == "/usr/bin"
+    assert "ZET_AGENT_KEY" not in sanitized

@@ -1,5 +1,7 @@
 """Local execution environment — spawn-per-call with session snapshot."""
 
+import hashlib
+import hmac
 import logging
 import ntpath
 import os
@@ -12,6 +14,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -25,10 +28,64 @@ logger = logging.getLogger(__name__)
 
 _MANAGED_GATEWAY_ENV = "HERMES_MANAGED_GATEWAY"
 _MANAGED_SETPRIV_PATH = "/usr/bin/setpriv"
-_MANAGED_TERMINAL_DROPPED_CAPABILITIES = ("setuid", "setgid")
+_MANAGED_TERMINAL_UID_MIN = 100_000
+_MANAGED_TERMINAL_UID_MAX = 2_000_000_000
+_MANAGED_TERMINAL_IDENTITY_ATTEMPTS = 64
+_MANAGED_TERMINAL_IDENTITY_CACHE_MAX = 4096
+_MANAGED_TERMINAL_IDENTITY_LOCK = threading.Lock()
+_MANAGED_TERMINAL_SCOPE_BY_UID: dict[int, str] = {}
 
 
-def _managed_terminal_privilege_drop_prefix() -> list[str]:
+def _managed_terminal_identity(
+    env: Mapping[str, str] | None = None,
+) -> tuple[int, int]:
+    """Derive one device-keyed non-root identity per multiplex profile."""
+
+    if _IS_WINDOWS or os.geteuid() != 0:
+        raise OSError("managed terminal requires a root identity broker")
+    secret = os.environ.get("ZET_AGENT_KEY", "")
+    scope = str((env or {}).get("HERMES_HOME") or "").strip()
+    if (
+        not secret
+        or not scope
+        or "\x00" in secret
+        or "\x00" in scope
+        or len(secret.encode("utf-8")) > 4096
+        or len(scope.encode("utf-8")) > 4096
+    ):
+        raise OSError("managed terminal profile identity is unavailable")
+
+    import pwd
+
+    registered = {entry.pw_uid for entry in pwd.getpwall()}
+    population = _MANAGED_TERMINAL_UID_MAX - _MANAGED_TERMINAL_UID_MIN + 1
+    with _MANAGED_TERMINAL_IDENTITY_LOCK:
+        for counter in range(_MANAGED_TERMINAL_IDENTITY_ATTEMPTS):
+            digest = hmac.new(
+                secret.encode("utf-8"),
+                f"{scope}\0{counter}".encode("utf-8"),
+                hashlib.sha256,
+            ).digest()
+            uid = _MANAGED_TERMINAL_UID_MIN + (
+                int.from_bytes(digest[:8], "big") % population
+            )
+            owner = _MANAGED_TERMINAL_SCOPE_BY_UID.get(uid)
+            if uid in registered or (owner is not None and owner != scope):
+                continue
+            if owner is None:
+                if (
+                    len(_MANAGED_TERMINAL_SCOPE_BY_UID)
+                    >= _MANAGED_TERMINAL_IDENTITY_CACHE_MAX
+                ):
+                    raise OSError("managed terminal identity cache is full")
+                _MANAGED_TERMINAL_SCOPE_BY_UID[uid] = scope
+            return uid, uid
+    raise OSError("managed terminal profile identity collision")
+
+
+def _managed_terminal_privilege_drop_prefix(
+    env: Mapping[str, str] | None = None,
+) -> list[str]:
     """Return the fixed fail-closed capability drop for model shell commands."""
 
     try:
@@ -41,13 +98,13 @@ def _managed_terminal_privilege_drop_prefix() -> list[str]:
         or info.st_mode & 0o022
     ):
         raise OSError("managed terminal privilege drop is not trusted")
-    dropped = ",".join(
-        f"-{capability}"
-        for capability in _MANAGED_TERMINAL_DROPPED_CAPABILITIES
-    )
+    uid, gid = _managed_terminal_identity(env)
     return [
         _MANAGED_SETPRIV_PATH,
-        f"--bounding-set={dropped}",
+        f"--reuid={uid}",
+        f"--regid={gid}",
+        "--clear-groups",
+        "--bounding-set=-all",
         "--inh-caps=-all",
         "--ambient-caps=-all",
         "--no-new-privs",
@@ -55,12 +112,48 @@ def _managed_terminal_privilege_drop_prefix() -> list[str]:
     ]
 
 
-def _managed_terminal_argv(argv: list[str]) -> list[str]:
+def _managed_terminal_argv(
+    argv: list[str],
+    *,
+    env: Mapping[str, str] | None = None,
+) -> list[str]:
     """Apply the managed capability boundary to every local terminal path."""
 
     if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
         return list(argv)
-    return _managed_terminal_privilege_drop_prefix() + list(argv)
+    return _managed_terminal_privilege_drop_prefix(env) + list(argv)
+
+
+def _prepare_managed_terminal_workspace(
+    directory: str,
+    paths: list[str],
+    *,
+    env: Mapping[str, str],
+) -> None:
+    """Transfer one generated scratch workspace to its profile identity."""
+
+    if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
+        return
+    uid, gid = _managed_terminal_identity(env)
+    root = os.lstat(directory)
+    if (
+        not stat.S_ISDIR(root.st_mode)
+        or root.st_uid != 0
+        or root.st_mode & 0o022
+    ):
+        raise OSError("managed terminal workspace is not trusted")
+    for path in paths:
+        info = os.lstat(path)
+        if (
+            not (stat.S_ISREG(info.st_mode) or stat.S_ISSOCK(info.st_mode))
+            or info.st_uid != 0
+            or info.st_mode & 0o022
+        ):
+            raise OSError("managed terminal workspace entry is not trusted")
+        os.chown(path, uid, gid)
+        os.chmod(path, 0o600)
+    os.chown(directory, uid, gid)
+    os.chmod(directory, 0o700)
 
 
 def _msys_to_windows_path(cwd: str) -> str:
@@ -516,11 +609,16 @@ CONNECTOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
 AGENT_CREATOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_AGENT_ACTION_TOKEN",
 })
+MANAGED_SERVICE_SECRET_ENV_KEYS: frozenset[str] = frozenset({
+    "ZET_AGENT_KEY",
+})
 _AGENT_CREATOR_ACTION_TOKEN_MAX_BYTES = 4 * 1024
 _AGENT_CREATOR_TURN_ID_MAX_BYTES = 256
 
 PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset(
-    CONNECTOR_RUNTIME_ENV_KEYS | AGENT_CREATOR_RUNTIME_ENV_KEYS
+    CONNECTOR_RUNTIME_ENV_KEYS
+    | AGENT_CREATOR_RUNTIME_ENV_KEYS
+    | MANAGED_SERVICE_SECRET_ENV_KEYS
 )
 
 
@@ -691,6 +789,7 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
     "SLACK_BOT_TOKEN",
     "SLACK_APP_TOKEN",
     "SLACK_SIGNING_SECRET",
+    "ZET_AGENT_KEY",
     "GATEWAY_ALLOWED_USERS",
     "GATEWAY_ALLOW_ALL_USERS",
     # Gateway relay auth — the ID/secret/delivery-key triplet the gateway
@@ -1532,9 +1631,9 @@ class LocalEnvironment(BaseEnvironment):
             init_files = _resolve_shell_init_files()
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
-        args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
-        args = _managed_terminal_argv(args)
         run_env = _make_run_env(self.env)
+        args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
+        args = _managed_terminal_argv(args, env=run_env)
 
         # Recover when the cwd has been deleted out from under us — usually by
         # a previous tool call that ran ``rm -rf`` on its own working dir

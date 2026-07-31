@@ -305,11 +305,16 @@ def check_sandbox_requirements() -> bool:
     return True
 
 
-def _managed_execute_code_argv(python: str, script_path: str) -> List[str]:
+def _managed_execute_code_argv(
+    python: str,
+    script_path: str,
+    *,
+    env: Dict[str, str],
+) -> List[str]:
     """Apply the managed local-process capability boundary to execute_code."""
     from tools.environments.local import _managed_terminal_argv
 
-    return _managed_terminal_argv([python, script_path])
+    return _managed_terminal_argv([python, script_path], env=env)
 
 
 # ---------------------------------------------------------------------------
@@ -1384,6 +1389,9 @@ def execute_code(
         # or spawn a subprocess.  See ``_scrub_child_env`` for the rules.
         child_env = _scrub_child_env(os.environ)
         _inject_execute_code_session_context_env(child_env)
+        from tools.environments.local import _inject_context_hermes_home
+
+        _inject_context_hermes_home(child_env)
         child_env["HERMES_RPC_SOCKET"] = rpc_endpoint
         child_env["HERMES_RPC_TOKEN"] = rpc_token
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -1434,13 +1442,36 @@ def execute_code(
         #   - project: user's venv python + session's working directory, so
         #              project deps like pandas and user files resolve.
         # Env scrubbing and tool whitelist apply identically in both modes.
-        _mode = _get_execution_mode()
+        _managed_gateway = os.environ.get("HERMES_MANAGED_GATEWAY") == "1"
+        _mode = "strict" if _managed_gateway else _get_execution_mode()
         _child_python = _resolve_child_python(_mode)
         _child_cwd = _resolve_child_cwd(_mode, tmpdir, task_id=task_id or "")
         _script_path = os.path.join(tmpdir, "script.py")
+        if _managed_gateway:
+            from tools.environments.local import (
+                _prepare_managed_terminal_workspace,
+            )
+
+            if sock_path is None:
+                raise OSError("managed execute_code requires a Unix RPC socket")
+            _prepare_managed_terminal_workspace(
+                tmpdir,
+                [
+                    os.path.join(tmpdir, "hermes_tools.py"),
+                    _script_path,
+                    sock_path,
+                ],
+                env=child_env,
+            )
+            child_env["HOME"] = tmpdir
+            _child_cwd = tmpdir
 
         proc = subprocess.Popen(
-            _managed_execute_code_argv(_child_python, _script_path),
+            _managed_execute_code_argv(
+                _child_python,
+                _script_path,
+                env=child_env,
+            ),
             cwd=_child_cwd,
             env=child_env,
             stdout=subprocess.PIPE,

@@ -20,6 +20,12 @@ _MANAGED_SUPERVISOR_CGROUP = "agentcomputer-supervisor"
 _CGROUP2_ROOT = Path("/sys/fs/cgroup")
 _PROC_SELF_CGROUP = Path("/proc/self/cgroup")
 _CGROUP_METADATA_MAX_BYTES = 4096
+_MANAGED_SERVICE_LIMITS = {
+    "memory.high": "805306368",
+    "memory.max": "1073741824",
+    "memory.swap.max": "0",
+    "pids.max": "512",
+}
 
 
 def _read_bounded_ascii(path: Path, *, limit: int) -> str:
@@ -74,6 +80,18 @@ def _current_unified_cgroup() -> str:
     return relative.rstrip("/")
 
 
+def _verify_managed_service_limits(service: Path) -> None:
+    for control, expected in _MANAGED_SERVICE_LIMITS.items():
+        actual = _read_bounded_ascii(
+            service / control,
+            limit=_CGROUP_METADATA_MAX_BYTES,
+        ).strip()
+        if actual != expected:
+            raise OSError(
+                f"managed gateway service limit mismatch: {control}"
+            )
+
+
 def _prepare_managed_service_cgroup() -> None:
     if not sys.platform.startswith("linux") or os.geteuid() != 0:
         raise OSError("managed gateway requires Linux root cgroup delegation")
@@ -117,6 +135,7 @@ def _prepare_managed_service_cgroup() -> None:
         or not (service / "cgroup.subtree_control").is_file()
     ):
         raise OSError("managed gateway service cgroup is invalid")
+    _verify_managed_service_limits(service)
 
     controllers = set(
         _read_bounded_ascii(
