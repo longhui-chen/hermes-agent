@@ -239,6 +239,33 @@ def invalidate_check_fn_cache() -> None:
         _check_fn_last_good.clear()
 
 
+def _zettlab_snapshot_gate(name: str, args: dict, kwargs: dict) -> Optional[str]:
+    """破坏性文件工具执行前的 Zettlab 设备保护快照 gate。
+
+    返回 ``None`` 放行；返回 JSON 错误串表示不执行该工具（guard 已 fail-closed
+    拦下）。guard 是 fork-only 懒加载模块，非 Zettlab 设备环境内部直接 no-op。
+    guard 自身故障时：文件工具 fail-closed；terminal 大多是只读流量、破坏性
+    判定本身是 best-effort，不因 guard 缺陷放倒整个 shell 面。
+    """
+    try:
+        from tools.zettlab_snapshot_guard import maybe_require_snapshot
+
+        return maybe_require_snapshot(
+            name,
+            args if isinstance(args, dict) else {},
+            turn_id=str(kwargs.get("turn_id") or ""),
+            task_id=str(kwargs.get("task_id") or ""),
+        )
+    except Exception as exc:
+        logger.debug("Zettlab snapshot guard error: %s", exc)
+        if name in {"write_file", "patch"}:
+            return json.dumps(
+                {"error": "File protection snapshot guard failed; the file was not modified."},
+                ensure_ascii=False,
+            )
+        return None
+
+
 class ToolRegistry:
     """Singleton registry that collects tool schemas + handlers from tool files."""
 
@@ -645,6 +672,17 @@ class ToolRegistry:
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
         """
+        # Zettlab file-change protection：registry.dispatch 是所有工具执行的
+        # 统一汇聚点，gate 必须在这里——除 model_tools.handle_function_call
+        # 外，插件公开 API ctx.dispatch_tool()（slash command / hook）也直连
+        # 这里，只包 model_tools 内层会让那条路完全绕过 ensure（Codex review
+        # P1）。middleware 改写后的最终 args 正是本方法收到的 args，语义与原
+        # 内层 gate 等价。放在 get_entry 之前：受保护工具名是固定集合，未注
+        # 册名 gate 内部即刻放行，而「工具存在与否」不影响 fail-closed 判定。
+        # 非设备环境（无回调地址 / token）内部直接放行。
+        blocked = _zettlab_snapshot_gate(name, args, kwargs)
+        if blocked is not None:
+            return blocked
         entry = self.get_entry(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})

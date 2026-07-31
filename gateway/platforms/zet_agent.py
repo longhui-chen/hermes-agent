@@ -1976,6 +1976,13 @@ class ZetAgentAdapter(APIServerAdapter):
         webui uses the same pattern (api/streaming.py) and the
         contention window is short enough in practice.
         """
+        # 非流式等调用方不传 agent_ref 时本地补一个：base _run_agent 会把构造
+        # 出的 AIAgent 填进 agent_ref[0]，finally 里的 guard finish 才能拿到本
+        # 轮 _current_turn_id 做精确收尾——否则空 turn_id 收不了尾，写入轮的
+        # pin 只能等服务端 TTL（Codex review P1）。
+        if agent_ref is None:
+            agent_ref = [None]
+
         stream_q = self._sniff_stream_q(tool_start_callback, stream_delta_callback)
         title_user_message = self._title_user_message(user_message)
 
@@ -2152,6 +2159,41 @@ class ZetAgentAdapter(APIServerAdapter):
                     logger.debug("[zet_agent] native auto-title hook failed", exc_info=True)
             return result
         finally:
+            # Zettlab file-change protection: release this turn's protection
+            # snapshot pin.  This lives in `finally` because several
+            # run_conversation error/early-return paths never reach
+            # finalize_turn; reporting is idempotent and a no-op when the turn
+            # never took a protection snapshot.  A missed report is not fatal
+            # either — the pin carries a TTL and a periodic reconciler.
+            try:
+                import asyncio as _asyncio
+                import sys as _sys
+
+                from tools.zettlab_snapshot_guard import finish_turn
+
+                _exc_type = _sys.exc_info()[0]
+                # 断流取消：base writer 先 interrupt() 再 cancel()，但
+                # run_conversation 跑在 executor 线程里，取消这个 asyncio
+                # wrapper 不会立刻停住它——此刻解 pin，恢复点的保护窗口会早于
+                # 前台 terminal / execute_code 的真实写入结束（Codex review
+                # P1）。取消路径一律**不收尾**，把 pin 留给服务端 TTL +
+                # reconcile 自愈：晚一点解 pin 是安全方向，早解不是。
+                if _exc_type is not None and issubclass(_exc_type, _asyncio.CancelledError):
+                    logger.debug(
+                        "[zet_agent] turn cancelled; leaving the protection pin to the server TTL"
+                    )
+                else:
+                    # guard 按 agent 运行时的 _current_turn_id 键控轮状态（与工具
+                    # dispatch 传下去的是同一个值）；并发轮时必须指名收自己的轮。
+                    guard_turn = ""
+                    if agent_ref and agent_ref[0] is not None:
+                        guard_turn = str(getattr(agent_ref[0], "_current_turn_id", "") or "")
+                    finish_turn(
+                        "failed" if _exc_type is not None else "completed",
+                        turn_id=guard_turn,
+                    )
+            except Exception:
+                logger.debug("[zet_agent] snapshot guard finish failed", exc_info=True)
             if old_session_key is None:
                 os.environ.pop("HERMES_SESSION_KEY", None)
             else:
