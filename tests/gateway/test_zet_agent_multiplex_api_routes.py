@@ -721,3 +721,57 @@ async def test_prefixed_reset_and_unload_return_ok(profile_homes):
     assert reset_resp.status == 200
     assert unload_resp.status == 200
     assert unload_data["unloaded"] is True
+
+
+@pytest.mark.asyncio
+async def test_deferred_approval_response_requires_matching_id(monkeypatch):
+    from tools import approval
+
+    session_id = "sid-deferred-approval-id"
+    approval.clear_session(session_id)
+    approval_id = approval.submit_pending(session_id, {
+        "command": "agentcomputer file.delete notes/a.txt",
+        "pattern_key": "plugin_rule:agentcomputer:file.delete:a",
+        "description": "delete notes/a.txt",
+        "allow_permanent": False,
+        "one_shot": True,
+    })
+    assert approval_id
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(
+        adapter,
+        "_goals",
+        lambda: type("Goals", (), {"on_interaction_resolved": lambda self, sid: None})(),
+    )
+    app = web.Application()
+    app.router.add_post(
+        "/v1/sessions/{session_id}/approval/respond",
+        adapter._handle_approval_respond,
+    )
+    headers = {"Authorization": "Bearer test-key"}
+
+    async with TestClient(TestServer(app)) as cli:
+        missing = await cli.post(
+            f"/v1/sessions/{session_id}/approval/respond",
+            json={"choice": "once"},
+            headers=headers,
+        )
+        wrong = await cli.post(
+            f"/v1/sessions/{session_id}/approval/respond",
+            json={"choice": "once", "approval_id": "A" * 32},
+            headers=headers,
+        )
+        matched = await cli.post(
+            f"/v1/sessions/{session_id}/approval/respond",
+            json={"choice": "once", "approval_id": approval_id},
+            headers=headers,
+        )
+        missing_data = await missing.json()
+        wrong_data = await wrong.json()
+        matched_data = await matched.json()
+
+    assert missing_data == {"resolved": 0}
+    assert wrong_data == {"resolved": 0}
+    assert matched_data == {"resolved": 1}
+    approval.clear_session(session_id)

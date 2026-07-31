@@ -503,7 +503,11 @@ def test_agentcomputer_mkdir_deferred_approval_replays_exactly_once(
         assert pending["approval_pending"] is True
         assert token_acquisitions == []
 
-        assert approval.resolve_gateway_approval(session_key, "once") == 1
+        assert approval.resolve_gateway_approval(
+            session_key,
+            "once",
+            approval_id=pending["approval_id"],
+        ) == 1
         with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
             approved = json.loads(terminal_tool_module.terminal_tool(
                 command,
@@ -1443,3 +1447,58 @@ def test_timeout_kills_child_spawned_by_sigterm_handler(monkeypatch, tmp_path):
     assert elapsed < 2.5
     time.sleep(1.0)
     assert not marker.exists()
+
+
+def test_mutation_approval_shows_bounded_argv_and_binds_stdin(monkeypatch):
+    import hashlib
+    from tools import approval as approval_module
+
+    captured = {}
+
+    def require_approval(_tool_name, _reason, **kwargs):
+        captured.update(kwargs)
+        return {
+            "approved": False,
+            "status": "approval_required",
+            "approval_id": "opaque-approval-id-1234567890",
+        }
+
+    monkeypatch.setattr(approval_module, "request_tool_approval", require_approval)
+    parsed = terminal_tool_module._AgentCreatorCommand(
+        argv=[
+            "/usr/bin/python3",
+            "/trusted/create_agent.py",
+            "file.write",
+            "notes/quarterly plan.txt",
+            "--stdin",
+        ],
+        root_identity=(1, 2),
+        script_identity=(3, 4),
+        stdin_text="private body",
+        approval_operation="file.write",
+    )
+
+    result = json.loads(
+        terminal_tool_module._request_agentcomputer_mutation_approval(parsed)
+    )
+    fingerprint = hashlib.sha256()
+    for value in parsed.argv[2:]:
+        encoded = value.encode("utf-8")
+        fingerprint.update(len(encoded).to_bytes(8, "big"))
+        fingerprint.update(encoded)
+    stdin_bytes = parsed.stdin_text.encode("utf-8")
+    fingerprint.update(len(stdin_bytes).to_bytes(8, "big"))
+    fingerprint.update(stdin_bytes)
+    fingerprint_hex = fingerprint.hexdigest()
+
+    assert "agentcomputer file.write 'notes/quarterly plan.txt' --stdin" in captured["display_target"]
+    assert "private body" not in captured["display_target"]
+    assert f"stdin: bytes={len(stdin_bytes)} sha256={hashlib.sha256(stdin_bytes).hexdigest()}" in captured["display_target"]
+    assert f"approval fingerprint: sha256={fingerprint_hex}" in captured["display_target"]
+    assert captured["rule_key"].endswith(fingerprint_hex)
+    assert result["approval_id"] == "opaque-approval-id-1234567890"
+
+    parsed.argv[3] = "x" * 5000
+    terminal_tool_module._request_agentcomputer_mutation_approval(parsed)
+    assert "argv display truncated" in captured["display_target"]
+    assert len(captured["display_target"]) < 2400

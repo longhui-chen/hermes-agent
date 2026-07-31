@@ -15,6 +15,7 @@ import hashlib
 import logging
 import os
 import re
+import secrets
 import shlex
 import sys
 import tempfile
@@ -2013,8 +2014,9 @@ def detect_dangerous_command(command: str) -> tuple:
 # =========================================================================
 
 _lock = threading.Lock()
-_pending: dict[str, dict] = {}
-_one_shot_approved: dict[str, dict[str, float]] = {}
+_MAX_DEFERRED_APPROVALS_PER_SESSION = 16
+_pending: dict[str, list[dict]] = {}
+_one_shot_approved: dict[str, dict[str, list[float]]] = {}
 _session_approved: dict[str, set] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
@@ -2073,7 +2075,8 @@ def unregister_gateway_notify(session_key: str) -> None:
 
 def resolve_gateway_approval(session_key: str, choice: str,
                              resolve_all: bool = False,
-                             reason: Optional[str] = None) -> int:
+                             reason: Optional[str] = None,
+                             approval_id: Optional[str] = None) -> int:
     """Called by the gateway's /approve or /deny handler to unblock
     waiting agent thread(s).
 
@@ -2095,16 +2098,60 @@ def resolve_gateway_approval(session_key: str, choice: str,
             if resolve_all:
                 targets = list(queue)
                 queue.clear()
+            elif approval_id:
+                target_index = next(
+                    (
+                        index
+                        for index, entry in enumerate(queue)
+                        if secrets.compare_digest(
+                            str(entry.data.get("approval_id", "")),
+                            approval_id,
+                        )
+                    ),
+                    None,
+                )
+                if target_index is None:
+                    return 0
+                targets = [queue.pop(target_index)]
             else:
+                # Backward-compatible path for chat commands and older App
+                # clients. New HTTP clients receive approval_id and should
+                # bind their response to that exact live card.
                 targets = [queue.pop(0)]
             if not queue:
                 _gateway_queues.pop(session_key, None)
         else:
             # API/dashboard sessions without a live notify callback return an
             # approval_required result instead of blocking the agent thread.
-            # Resolve that deferred request here so an explicit /approve can
-            # authorize one exact replay.
-            pending = _pending.pop(session_key, None)
+            # Deferred requests MUST be resolved by opaque identity: a stale
+            # response may never authorize whichever operation was queued
+            # later under the same session key.
+            deferred = _pending.get(session_key, [])
+            now = time.monotonic()
+            deferred[:] = [
+                item for item in deferred
+                if float(item.get("expires_at_monotonic", 0.0)) >= now
+            ]
+            if not deferred:
+                _pending.pop(session_key, None)
+                return 0
+            if not approval_id:
+                return 0
+            target_index = next(
+                (
+                    index
+                    for index, item in enumerate(deferred)
+                    if secrets.compare_digest(
+                        str(item.get("approval_id", "")), approval_id
+                    )
+                ),
+                None,
+            )
+            if target_index is None:
+                return 0
+            pending = deferred.pop(target_index)
+            if not deferred:
+                _pending.pop(session_key, None)
 
     if targets:
         for entry in targets:
@@ -2137,19 +2184,50 @@ def has_blocking_approval(session_key: str) -> bool:
         return bool(_gateway_queues.get(session_key))
 
 
-def submit_pending(session_key: str, approval: dict):
-    """Store a pending approval request for a session."""
+def submit_pending(session_key: str, approval: dict) -> Optional[str]:
+    """Queue one bounded deferred request and return its opaque identity."""
+    now = time.monotonic()
+    approval_id = secrets.token_urlsafe(24)
+    queued = dict(approval)
+    queued.update({
+        "approval_id": approval_id,
+        "created_at_monotonic": now,
+        "expires_at_monotonic": (
+            now + max(float(_get_approval_timeout()), 1.0)
+        ),
+    })
     with _lock:
-        _pending[session_key] = approval
+        queue = _pending.setdefault(session_key, [])
+        queue[:] = [
+            item for item in queue
+            if float(item.get("expires_at_monotonic", 0.0)) >= now
+        ]
+        if len(queue) >= _MAX_DEFERRED_APPROVALS_PER_SESSION:
+            return None
+        queue.append(queued)
+    return approval_id
 
 
 def _grant_one_shot_approval(session_key: str, pattern_key: str) -> None:
     """Issue one bounded, exact-pattern replay grant for a deferred request."""
     expires_at = time.monotonic() + max(float(_get_approval_timeout()), 1.0)
     with _lock:
-        # A no-notifier session has at most one deferred approval card. Keep
-        # the replay store equally bounded and replace any abandoned grant.
-        _one_shot_approved[session_key] = {pattern_key: expires_at}
+        grants = _one_shot_approved.setdefault(session_key, {})
+        now = time.monotonic()
+        for key in list(grants):
+            grants[key] = [expiry for expiry in grants[key] if expiry >= now]
+            if not grants[key]:
+                grants.pop(key, None)
+        grant_count = sum(len(expiries) for expiries in grants.values())
+        if grant_count >= _MAX_DEFERRED_APPROVALS_PER_SESSION:
+            oldest_key = min(
+                grants,
+                key=lambda key: grants[key][0],
+            )
+            grants[oldest_key].pop(0)
+            if not grants[oldest_key]:
+                grants.pop(oldest_key, None)
+        grants.setdefault(pattern_key, []).append(expires_at)
 
 
 def _consume_one_shot_approval(session_key: str, pattern_key: str) -> bool:
@@ -2159,14 +2237,16 @@ def _consume_one_shot_approval(session_key: str, pattern_key: str) -> bool:
         grants = _one_shot_approved.get(session_key)
         if not grants:
             return False
-        expires_at = grants.get(pattern_key)
-        if expires_at is None or expires_at < now:
-            if expires_at is not None:
-                grants.pop(pattern_key, None)
+        expiries = grants.get(pattern_key, [])
+        expiries[:] = [expiry for expiry in expiries if expiry >= now]
+        if not expiries:
+            grants.pop(pattern_key, None)
             if not grants:
                 _one_shot_approved.pop(session_key, None)
             return False
-        grants.pop(pattern_key, None)
+        expiries.pop(0)
+        if not expiries:
+            grants.pop(pattern_key, None)
         if not grants:
             _one_shot_approved.pop(session_key, None)
         return True
@@ -2827,6 +2907,7 @@ def _run_approval_gate(
         if notify_cb is not None:
             from agent.redact import redact_sensitive_text
             approval_data = {
+                "approval_id": secrets.token_urlsafe(24),
                 "command": redact_sensitive_text(display_target),
                 "pattern_key": pattern_key,
                 "pattern_keys": [pattern_key],
@@ -2880,15 +2961,29 @@ def _run_approval_gate(
 
         # No notify callback (e.g. API server without an attached chat):
         # queue for /approve /deny review, agent sees approval_required.
-        submit_pending(session_key, {
+        approval_id = submit_pending(session_key, {
             "command": display_target,
             "pattern_key": pattern_key,
             "description": description,
             "allow_permanent": not one_shot,
             "one_shot": one_shot,
         })
+        if approval_id is None:
+            return {
+                "approved": False,
+                "pattern_key": pattern_key,
+                "status": "approval_queue_full",
+                "command": display_target,
+                "description": description,
+                "message": (
+                    "BLOCKED: Too many approval requests are already pending "
+                    "for this session. Resolve or expire an existing request "
+                    "before retrying."
+                ),
+            }
         return {
             "approved": False,
+            "approval_id": approval_id,
             "pattern_key": pattern_key,
             "status": "approval_required",
             "command": display_target,
@@ -3020,6 +3115,7 @@ def request_tool_approval(
     approval_callback=None,
     one_shot: bool = False,
     allow_yolo_bypass: bool = True,
+    display_target: str = "",
 ) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
@@ -3051,6 +3147,10 @@ def request_tool_approval(
             session/permanent persistence.
         allow_yolo_bypass: Whether process/session yolo can auto-approve this
             gate. Set False when the user must see newly discovered risk.
+        display_target: Optional bounded, human-readable operation record.
+            Callers gating a structured operation should include escaped
+            arguments and a digest that is derived from the same bytes as
+            ``rule_key``. Empty keeps the generic plugin label.
 
     Returns:
         ``{"approved": True, "message": None}`` when allowed, or
@@ -3079,7 +3179,7 @@ def request_tool_approval(
     pattern_key = f"plugin_rule:{key_suffix}"
     # A synthetic "command" string for the display/allowlist layer. It never
     # executes; it only labels the gate. Namespaced identically.
-    display_target = f"<{tool_name}> (plugin approval rule)"
+    display_target = display_target or f"<{tool_name}> (plugin approval rule)"
 
     return _run_approval_gate(
         pattern_key=pattern_key,

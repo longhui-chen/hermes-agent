@@ -2252,15 +2252,35 @@ def _request_agentcomputer_mutation_approval(
     fingerprint.update(len(stdin_bytes).to_bytes(8, "big"))
     fingerprint.update(stdin_bytes)
 
+    fingerprint_hex = fingerprint.hexdigest()
+    shell_argv = shlex.join(["agentcomputer", *parsed.argv[2:]])
+    shell_argv_sha256 = hashlib.sha256(shell_argv.encode("utf-8")).hexdigest()
+    max_argv_display_chars = 2048
+    if len(shell_argv) > max_argv_display_chars:
+        shell_argv_display = (
+            shell_argv[:max_argv_display_chars]
+            + "\n[argv display truncated: "
+            + f"chars={len(shell_argv)} sha256={shell_argv_sha256}]"
+        )
+    else:
+        shell_argv_display = shell_argv
+    stdin_sha256 = hashlib.sha256(stdin_bytes).hexdigest()
+    display_target = (
+        f"argv: {shell_argv_display}\n"
+        f"stdin: bytes={len(stdin_bytes)} sha256={stdin_sha256}\n"
+        f"approval fingerprint: sha256={fingerprint_hex}"
+    )
+
     approval = request_tool_approval(
         "agentcomputer_cli",
         f"AgentComputer {operation} modifies AgentComputer user data.",
         rule_key=(
-            f"agentcomputer:{operation}:{fingerprint.hexdigest()}"
+            f"agentcomputer:{operation}:{fingerprint_hex}"
         ),
         approval_callback=_get_approval_callback(),
         one_shot=True,
         allow_yolo_bypass=False,
+        display_target=display_target,
     )
     if approval.get("approved"):
         return None
@@ -2278,6 +2298,7 @@ def _request_agentcomputer_mutation_approval(
         ),
         "status": "pending_approval" if pending else "blocked",
         "approval_pending": pending,
+        "approval_id": approval.get("approval_id"),
         "command": approval.get("command", f"agentcomputer {operation}"),
         "description": approval.get(
             "description",

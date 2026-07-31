@@ -1300,9 +1300,10 @@ class ZetAgentAdapter(APIServerAdapter):
         loop) emits it, then return immediately — the agent's wait()
         is what actually blocks the run.
 
-        Plan-E rev4 payload: ``{command, description, pattern_key,
-        pattern_keys, expires_at_ms}`` — no request_id (per-session
-        FIFO; oldest pending wins). expires_at_ms is stamped here from
+        Payload: ``{approval_id, command, description, pattern_key,
+        pattern_keys, expires_at_ms}``. ``approval_id`` binds a response to
+        the exact card; legacy clients may still use FIFO for live prompts.
+        expires_at_ms is stamped here from
         the same approval config the wait loop in tools/approval.py
         reads, so the App's countdown matches the agent's actual deadline.
 
@@ -1319,6 +1320,7 @@ class ZetAgentAdapter(APIServerAdapter):
             expires_at_ms = int((time.time() + _approval_timeout_seconds()) * 1000)
             payload = {
                 "type": "hermes.approval",
+                "approval_id": approval_data.get("approval_id", ""),
                 "command": approval_data.get("command", ""),
                 "description": approval_data.get("description", ""),
                 "pattern_key": approval_data.get("pattern_key", ""),
@@ -2284,10 +2286,11 @@ class ZetAgentAdapter(APIServerAdapter):
         """POST /v1/sessions/{session_id}/approval/respond — resolve the
         oldest pending gateway approval for the session.
 
-        Body: ``{"choice": "once"|"session"|"always"|"deny"}``.
-        Plan-E rev4: no approval_id — oldest pending wins. Returns
-        ``resolved`` count (0 means nothing was pending; APP can show
-        a "request expired" hint).
+        Body: ``{"choice": "once"|"session"|"always"|"deny",
+        "approval_id": "..."}``. New clients bind responses to the opaque
+        id. Omitting it preserves FIFO compatibility for a live blocking
+        prompt, but cannot resolve deferred no-notifier requests. Returns
+        ``resolved`` count (0 means nothing matched or was pending).
         """
         auth_err = self._check_auth(request)
         if auth_err:
@@ -2305,6 +2308,20 @@ class ZetAgentAdapter(APIServerAdapter):
                 _openai_error('choice must be one of "once","session","always","deny"'),
                 status=400,
             )
+        approval_id = body.get("approval_id")
+        if approval_id is not None:
+            if (
+                not isinstance(approval_id, str)
+                or not 24 <= len(approval_id) <= 128
+                or any(
+                    char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+                    for char in approval_id
+                )
+            ):
+                return web.json_response(
+                    _openai_error("approval_id must be an opaque URL-safe token"),
+                    status=400,
+                )
 
         try:
             from tools.approval import resolve_gateway_approval
@@ -2315,9 +2332,22 @@ class ZetAgentAdapter(APIServerAdapter):
                 status=500,
             )
 
-        resolved = resolve_gateway_approval(session_id, choice)
-        with self._pending_lock:
-            self._pending_approval.pop(session_id, None)
+        resolved = resolve_gateway_approval(
+            session_id,
+            choice,
+            approval_id=approval_id,
+        )
+        if resolved:
+            with self._pending_lock:
+                pending = self._pending_approval.get(session_id)
+                if (
+                    pending is not None
+                    and (
+                        approval_id is None
+                        or pending.get("approval_id") == approval_id
+                    )
+                ):
+                    self._pending_approval.pop(session_id, None)
         # Goal projection: the loop is no longer blocked on the user — flip
         # the App banner back from "waiting". No-op for non-goal sessions.
         # 仅在真的解析了 approval（resolved > 0）时才清等待标记（codex P1）：
