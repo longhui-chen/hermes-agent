@@ -152,7 +152,8 @@ zpk-venv:
 		$(ZPK_UV_ENV) UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT="$(CURDIR)/venv" \
 			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-install-project --no-build $(ZPK_UV_SYNC_EXTRAS) && \
 		$(ZPK_UV_ENV) UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT="$(CURDIR)/venv" \
-			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-build-isolation $(ZPK_UV_SYNC_EXTRAS); \
+			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-build-isolation \
+				--reinstall-package hermes-agent $(ZPK_UV_SYNC_EXTRAS); \
 	else \
 		$(ZPK_UV_ENV) UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT="$(CURDIR)/venv" \
 			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-install-project --no-build $(ZPK_UV_SYNC_EXTRAS) >"$(ZPK_UV_INSTALL_LOG)" 2>&1 || { \
@@ -161,7 +162,8 @@ zpk-venv:
 			exit 1; \
 		}; \
 		$(ZPK_UV_ENV) UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT="$(CURDIR)/venv" \
-			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-build-isolation $(ZPK_UV_SYNC_EXTRAS) >>"$(ZPK_UV_INSTALL_LOG)" 2>&1 || { \
+			"$(UV)" --no-progress sync --locked --no-dev --no-editable --no-build-isolation \
+				--reinstall-package hermes-agent $(ZPK_UV_SYNC_EXTRAS) >>"$(ZPK_UV_INSTALL_LOG)" 2>&1 || { \
 			echo "uv locked project sync failed; showing last 160 log lines from $(ZPK_UV_INSTALL_LOG)"; \
 			tail -n 160 "$(ZPK_UV_INSTALL_LOG)" 2>/dev/null || true; \
 			exit 1; \

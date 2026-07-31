@@ -39,6 +39,7 @@ import shutil
 import subprocess
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -125,6 +126,38 @@ def test_zpk_project_build_uses_exact_locked_backend() -> None:
     assert "setuptools==81.0.0" in pyproject["project"][
         "optional-dependencies"
     ]["zpk-runtime"]
+
+
+def test_zpk_payload_checker_rejects_cached_project_wheel(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from scripts import check_zpk_payload
+
+    source_root = tmp_path / "source"
+    source = source_root / "tools" / "runtime.py"
+    installed = tmp_path / "site-packages" / "tools" / "runtime.py"
+    source.parent.mkdir(parents=True)
+    installed.parent.mkdir(parents=True)
+    source.write_text("VALUE = 'current'\n", encoding="utf-8")
+    installed.write_bytes(source.read_bytes())
+
+    monkeypatch.setattr(check_zpk_payload, "PROJECT_ROOT", source_root)
+    monkeypatch.setattr(
+        check_zpk_payload,
+        "PROJECT_RUNTIME_MODULES",
+        {"tools.runtime": Path("tools/runtime.py")},
+    )
+    monkeypatch.setattr(
+        check_zpk_payload.importlib.util,
+        "find_spec",
+        lambda _module: SimpleNamespace(origin=str(installed)),
+    )
+
+    check_zpk_payload._check_project_source_parity()
+    installed.write_text("VALUE = 'cached'\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="wheel/source parity"):
+        check_zpk_payload._check_project_source_parity()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="ZPK Makefile is POSIX-only")
@@ -248,6 +281,8 @@ if (
     assert "--no-install-project" not in project_sync
     assert "--no-build" not in project_sync
     assert "--no-build-isolation" in project_sync
+    reinstall_index = project_sync.index("--reinstall-package")
+    assert project_sync[reinstall_index + 1] == "hermes-agent"
 
     for call in calls:
         assert call["uv_env"]["UV_NO_CONFIG"] == "1"
