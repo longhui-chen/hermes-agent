@@ -34,7 +34,23 @@ _MANAGED_TERMINAL_IDENTITY_ATTEMPTS = 64
 _MANAGED_TERMINAL_IDENTITY_CACHE_MAX = 4096
 _MANAGED_TERMINAL_IDENTITY_LOCK = threading.Lock()
 _MANAGED_TERMINAL_SCOPE_BY_UID: dict[int, str] = {}
+_MANAGED_TERMINAL_RETIRED_UIDS: set[int] = set()
+_MANAGED_TERMINAL_RETIRED_SCOPES: set[str] = set()
+_MANAGED_TERMINAL_RETIRED_MAX = 4096
 _MANAGED_TERMINAL_HOME_ROOT = Path("/run/zettlab-claw/terminal-homes")
+
+
+def _managed_terminal_profile_scope(
+    env: Mapping[str, str] | None = None,
+) -> str:
+    raw_scope = str((env or {}).get("HERMES_HOME") or "").strip()
+    if (
+        not raw_scope
+        or "\x00" in raw_scope
+        or len(raw_scope.encode("utf-8")) > 4096
+    ):
+        raise OSError("managed terminal profile identity is unavailable")
+    return str(Path(raw_scope).expanduser().resolve())
 
 
 def _managed_terminal_identity(
@@ -45,14 +61,11 @@ def _managed_terminal_identity(
     if _IS_WINDOWS or os.geteuid() != 0:
         raise OSError("managed terminal requires a root identity broker")
     secret = os.environ.get("ZET_AGENT_KEY", "")
-    scope = str((env or {}).get("HERMES_HOME") or "").strip()
+    scope = _managed_terminal_profile_scope(env)
     if (
         not secret
-        or not scope
         or "\x00" in secret
-        or "\x00" in scope
         or len(secret.encode("utf-8")) > 4096
-        or len(scope.encode("utf-8")) > 4096
     ):
         raise OSError("managed terminal profile identity is unavailable")
 
@@ -71,7 +84,11 @@ def _managed_terminal_identity(
                 int.from_bytes(digest[:8], "big") % population
             )
             owner = _MANAGED_TERMINAL_SCOPE_BY_UID.get(uid)
-            if uid in registered or (owner is not None and owner != scope):
+            if (
+                uid in registered
+                or uid in _MANAGED_TERMINAL_RETIRED_UIDS
+                or (owner is not None and owner != scope)
+            ):
                 continue
             if owner is None:
                 if (
@@ -80,6 +97,7 @@ def _managed_terminal_identity(
                 ):
                     raise OSError("managed terminal identity cache is full")
                 _MANAGED_TERMINAL_SCOPE_BY_UID[uid] = scope
+                _MANAGED_TERMINAL_RETIRED_SCOPES.discard(scope)
             return uid, uid
     raise OSError("managed terminal profile identity collision")
 
@@ -122,16 +140,13 @@ def _managed_execute_code_identity(
     if _IS_WINDOWS or os.geteuid() != 0:
         raise OSError("managed execute_code requires a root identity broker")
     secret = os.environ.get("ZET_AGENT_KEY", "")
-    profile_scope = str(env.get("HERMES_HOME") or "").strip()
+    profile_scope = _managed_terminal_profile_scope(env)
     if (
         not secret
-        or not profile_scope
         or not execution_scope
         or "\x00" in secret
-        or "\x00" in profile_scope
         or "\x00" in execution_scope
         or len(secret.encode("utf-8")) > 4096
-        or len(profile_scope.encode("utf-8")) > 4096
         or len(execution_scope.encode("utf-8")) > 128
     ):
         raise OSError("managed execute_code identity is unavailable")
@@ -152,7 +167,11 @@ def _managed_execute_code_identity(
                 int.from_bytes(digest[:8], "big") % population
             )
             owner = _MANAGED_TERMINAL_SCOPE_BY_UID.get(uid)
-            if uid in registered or (owner is not None and owner != owner_scope):
+            if (
+                uid in registered
+                or uid in _MANAGED_TERMINAL_RETIRED_UIDS
+                or (owner is not None and owner != owner_scope)
+            ):
                 continue
             if owner is None:
                 if (
@@ -173,7 +192,7 @@ def _release_managed_execute_code_identity(
     """Release an invocation UID after its process tree and RPC socket are gone."""
 
     owner_scope = (
-        f"execute-code\0{str(env.get('HERMES_HOME') or '').strip()}\0"
+        f"execute-code\0{_managed_terminal_profile_scope(env)}\0"
         f"{execution_scope}"
     )
     with _MANAGED_TERMINAL_IDENTITY_LOCK:
@@ -344,6 +363,117 @@ def _prepare_managed_terminal_home(env: dict[str, str]) -> str:
     env["HOME"] = home_text
     env["TMPDIR"] = home_text
     return home_text
+
+
+def _managed_uid_processes(uid: int) -> set[int]:
+    """Return Linux processes whose effective UID is the managed identity."""
+    if _IS_WINDOWS or not Path("/proc").is_dir():
+        return set()
+    processes: set[int] = set()
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            status = (entry / "status").read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        for line in status.splitlines():
+            if not line.startswith("Uid:"):
+                continue
+            fields = line.split()
+            if len(fields) >= 3 and int(fields[2]) == uid:
+                processes.add(int(entry.name))
+            break
+    return processes
+
+
+def _terminate_managed_uid(uid: int, timeout: float = 2.0) -> int:
+    """Terminate every process in a managed identity and verify it is empty."""
+    killed: set[int] = set()
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        live = _managed_uid_processes(uid)
+        if not live:
+            return len(killed)
+        for pid in live:
+            try:
+                os.kill(pid, sig)
+                killed.add(pid)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not _managed_uid_processes(uid):
+                return len(killed)
+            time.sleep(0.05)
+    live = _managed_uid_processes(uid)
+    if live:
+        raise OSError(
+            "managed terminal processes survived identity retirement: "
+            + ",".join(str(pid) for pid in sorted(live))
+        )
+    return len(killed)
+
+
+def retire_managed_terminal_profile(profile_home: str) -> dict[str, object]:
+    """Destroy a profile UID domain before that profile can be recreated."""
+    if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
+        return {
+            "killed_uid_processes": 0,
+            "terminal_home_removed": False,
+            "identity_retired": False,
+        }
+    scope = _managed_terminal_profile_scope({"HERMES_HOME": profile_home})
+    with _MANAGED_TERMINAL_IDENTITY_LOCK:
+        matches = [
+            uid
+            for uid, owner in _MANAGED_TERMINAL_SCOPE_BY_UID.items()
+            if owner == scope
+        ]
+        if not matches:
+            return {
+                "killed_uid_processes": 0,
+                "terminal_home_removed": False,
+                "identity_retired": scope in _MANAGED_TERMINAL_RETIRED_SCOPES,
+            }
+        if len(matches) != 1:
+            raise OSError("managed terminal profile has ambiguous identities")
+        uid = matches[0]
+        if (
+            uid not in _MANAGED_TERMINAL_RETIRED_UIDS
+            and len(_MANAGED_TERMINAL_RETIRED_UIDS)
+            >= _MANAGED_TERMINAL_RETIRED_MAX
+        ):
+            raise OSError("managed terminal retired identity cache is full")
+
+        killed = _terminate_managed_uid(uid)
+        home = _MANAGED_TERMINAL_HOME_ROOT / str(uid)
+        removed = False
+        try:
+            info = os.lstat(home)
+        except FileNotFoundError:
+            pass
+        else:
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != uid
+                or info.st_gid != uid
+                or info.st_mode & 0o077
+            ):
+                raise OSError("managed terminal profile home is not trusted")
+            shutil.rmtree(home)
+            removed = True
+        if _managed_uid_processes(uid):
+            raise OSError("managed terminal identity is still active")
+        _MANAGED_TERMINAL_SCOPE_BY_UID.pop(uid, None)
+        _MANAGED_TERMINAL_RETIRED_UIDS.add(uid)
+        _MANAGED_TERMINAL_RETIRED_SCOPES.add(scope)
+        return {
+            "killed_uid_processes": killed,
+            "terminal_home_removed": removed,
+            "identity_retired": True,
+        }
 
 
 def _managed_identity_can_traverse(

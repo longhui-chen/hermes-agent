@@ -2168,7 +2168,10 @@ def resolve_gateway_approval(session_key: str, choice: str,
         pattern_key = pending.get("pattern_key", "")
         if pattern_key:
             if pending.get("one_shot") or choice == "once":
-                _grant_one_shot_approval(session_key, pattern_key)
+                _grant_one_shot_approval(
+                    session_key,
+                    pending.get("one_shot_pattern_key") or pattern_key,
+                )
             elif choice == "session":
                 approve_session(session_key, pattern_key)
             elif choice == "always":
@@ -2250,6 +2253,41 @@ def _consume_one_shot_approval(session_key: str, pattern_key: str) -> bool:
         if not grants:
             _one_shot_approved.pop(session_key, None)
         return True
+
+
+def _deferred_operation_key(surface: str, payload: str) -> str:
+    """Return an exact, non-reversible key for one deferred operation."""
+    digest = hashlib.sha256(
+        surface.encode("utf-8") + b"\0" + payload.encode("utf-8")
+    ).hexdigest()
+    return f"deferred:{surface}:{digest}"
+
+
+def cancel_session_approvals(
+    session_key: str,
+    *,
+    reason: str = "session interrupted",
+) -> int:
+    """Atomically revoke every live or replayable approval for one run.
+
+    Persistent session/permanent allow-list choices are deliberately retained;
+    only pending consent and bounded replay grants are run-lifetime state.
+    """
+    if not session_key:
+        return 0
+    with _lock:
+        entries = _gateway_queues.pop(session_key, [])
+        pending = _pending.pop(session_key, [])
+        grants = _one_shot_approved.pop(session_key, {})
+    for entry in entries:
+        entry.result = "deny"
+        entry.reason = reason
+        entry.event.set()
+    return (
+        len(entries)
+        + len(pending)
+        + sum(len(expiries) for expiries in grants.values())
+    )
 
 
 def approve_session(session_key: str, pattern_key: str):
@@ -3555,6 +3593,7 @@ def check_all_command_guards(command: str, env_type: str,
     warnings = []  # list of (pattern_key, description, is_tirith)
 
     session_key = get_current_session_key()
+    one_shot_pattern_key = _deferred_operation_key("terminal", command)
 
     # Tirith block/warn → approvable warning with rich findings.
     # Previously, tirith "block" was a hard block with no approval prompt.
@@ -3571,6 +3610,15 @@ def check_all_command_guards(command: str, env_type: str,
     if is_dangerous:
         if not is_approved(session_key, pattern_key):
             warnings.append((pattern_key, description, False))
+
+    if warnings and _consume_one_shot_approval(
+        session_key, one_shot_pattern_key
+    ):
+        return {
+            "approved": True,
+            "message": None,
+            "one_shot_approved": True,
+        }
 
     # Nothing to warn about
     if not warnings:
@@ -3731,6 +3779,7 @@ def check_all_command_guards(command: str, env_type: str,
         pending_data = {
             "command": _disp_command,
             "pattern_key": primary_key,
+            "one_shot_pattern_key": one_shot_pattern_key,
             "pattern_keys": all_keys,
             "description": _disp_combined_desc,
         }
@@ -3905,6 +3954,14 @@ def check_execute_code_guard(code: str, env_type: str,
     # Built only now (past the early-return gates) so the common non-approval
     # paths don't pay to copy a potentially-large script into this string.
     command = f"execute_code <<'PY'\n{code}\nPY"
+    one_shot_pattern_key = _deferred_operation_key("execute_code", code)
+
+    if _consume_one_shot_approval(session_key, one_shot_pattern_key):
+        return {
+            "approved": True,
+            "message": None,
+            "one_shot_approved": True,
+        }
 
     # Check session/permanent approval — same gate as check_all_command_guards.
     # Without this, "Approve session" / "Always" choices are stored but never
@@ -3969,6 +4026,7 @@ def check_execute_code_guard(code: str, env_type: str,
         pending_data = {
             "command": display_command,
             "pattern_key": pattern_key,
+            "one_shot_pattern_key": one_shot_pattern_key,
             "pattern_keys": [pattern_key],
             "description": display_description,
         }

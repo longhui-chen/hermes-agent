@@ -3136,12 +3136,14 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception:
                 pass
 
-        # Approval gate: tell hermes the pending approval was denied
-        # so its run loop bails. tools.approval.resolve_gateway_approval
-        # is the same path /v1/sessions/{sid}/approval/respond uses.
+        # Approval gate: atomically revoke queued requests and one-shot replay
+        # grants. A stale approval card must never authorize work after the
+        # interrupted run has ended.
         try:
-            from tools.approval import resolve_gateway_approval
-            resolve_gateway_approval(session_id, "deny")
+            from tools.approval import cancel_session_approvals
+            cancel_session_approvals(session_id)
+            if scoped_session_key != session_id:
+                cancel_session_approvals(scoped_session_key)
         except Exception:
             logger.debug("[zet_agent] session interrupt: approval cleanup failed", exc_info=True)
 
@@ -3905,6 +3907,51 @@ class ZetAgentAdapter(APIServerAdapter):
                 status=409,
             )
 
+        killed_profile_processes = 0
+        terminal_cleanup = {
+            "killed_uid_processes": 0,
+            "terminal_home_removed": False,
+            "identity_retired": False,
+        }
+        if profile_home:
+            try:
+                from tools.environments.local import (
+                    retire_managed_terminal_profile,
+                )
+                from tools.process_registry import process_registry
+
+                killed_profile_processes = await _to_thread_with_completion_barrier(
+                    lambda: process_registry.kill_all(
+                        profile_owner=profile_home
+                    )
+                )
+                terminal_cleanup = await _to_thread_with_completion_barrier(
+                    retire_managed_terminal_profile,
+                    profile_home,
+                )
+                if process_registry.has_active_for_profile(profile_home):
+                    raise OSError("profile process registry is still active")
+            except asyncio.CancelledError:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                raise
+            except Exception:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                logger.warning(
+                    "[zet_agent] profile-unload: process identity cleanup failed",
+                    exc_info=True,
+                )
+                return web.json_response(
+                    _openai_error(
+                        "profile unload failed: managed processes could not be released",
+                        err_type="server_error",
+                    ),
+                    status=500,
+                )
+
         closed_session_db = False
         if profile_home:
             db = self._session_dbs.pop(self._profile_home_key(profile_home), None)
@@ -3988,6 +4035,8 @@ class ZetAgentAdapter(APIServerAdapter):
         return web.json_response({
             "unloaded": True,
             "closed_session_db": closed_session_db,
+            "killed_profile_processes": killed_profile_processes,
+            **terminal_cleanup,
             "evicted_sessions": int(runtime_unload.get("evicted_sessions", 0) or 0),
             "disconnected_adapters": int(runtime_unload.get("disconnected_adapters", 0) or 0),
         })

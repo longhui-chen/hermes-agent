@@ -1,7 +1,9 @@
 import os
 import stat
 import struct
+import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +13,7 @@ import tools.code_execution_tool as code_execution_module
 import tools.environments.local as local_module
 import tools.process_registry as process_registry_module
 from tools.environments.local import LocalEnvironment
-from tools.process_registry import ProcessRegistry
+from tools.process_registry import ProcessRegistry, ProcessSession
 
 
 def test_managed_terminal_drops_identity_changing_capabilities(monkeypatch):
@@ -355,6 +357,8 @@ def test_managed_terminal_identity_is_profile_scoped(monkeypatch):
     monkeypatch.setattr(local_module.os, "geteuid", lambda: 0)
     monkeypatch.setenv("ZET_AGENT_KEY", "device-key")
     local_module._MANAGED_TERMINAL_SCOPE_BY_UID.clear()
+    local_module._MANAGED_TERMINAL_RETIRED_UIDS.clear()
+    local_module._MANAGED_TERMINAL_RETIRED_SCOPES.clear()
     first = local_module._managed_terminal_identity(
         {"HERMES_HOME": "/profiles/first"}
     )
@@ -369,6 +373,77 @@ def test_managed_terminal_identity_is_profile_scoped(monkeypatch):
     assert second[0] == second[1]
     assert first != second
     assert first[0] >= local_module._MANAGED_TERMINAL_UID_MIN
+
+
+def test_process_registry_kill_all_is_scoped_to_immutable_profile(monkeypatch):
+    registry = ProcessRegistry()
+    first = str(Path("/profiles/first").resolve())
+    second = str(Path("/profiles/second").resolve())
+    registry._running = {
+        "first": ProcessSession(
+            id="first", command="sleep 1", profile_owner=first
+        ),
+        "second": ProcessSession(
+            id="second", command="sleep 1", profile_owner=second
+        ),
+    }
+    killed = []
+
+    def kill_process(session_id, **_kwargs):
+        killed.append(session_id)
+        registry._running[session_id].exited = True
+        return {"status": "killed"}
+
+    monkeypatch.setattr(registry, "kill_process", kill_process)
+    assert registry.kill_all(profile_owner=first) == 1
+    assert killed == ["first"]
+    assert registry._running["second"].exited is False
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux" or os.geteuid() != 0,
+    reason="requires Linux root identity broker",
+)
+def test_profile_retirement_kills_background_and_rotates_identity(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setenv("ZET_AGENT_KEY", "profile-retirement-test-key")
+    monkeypatch.setattr(
+        local_module, "_MANAGED_TERMINAL_HOME_ROOT", tmp_path / "homes"
+    )
+    local_module._MANAGED_TERMINAL_SCOPE_BY_UID.clear()
+    local_module._MANAGED_TERMINAL_RETIRED_UIDS.clear()
+    local_module._MANAGED_TERMINAL_RETIRED_SCOPES.clear()
+    profile_home = str(tmp_path / "profile")
+    env = {"HERMES_HOME": profile_home}
+    uid, gid = local_module._managed_terminal_identity(env)
+    homes = tmp_path / "homes"
+    homes.mkdir(mode=0o711)
+    home = homes / str(uid)
+    home.mkdir(mode=0o700)
+    os.chown(home, uid, gid)
+    process = subprocess.Popen(
+        local_module._managed_terminal_argv(
+            ["/bin/sh", "-c", "sleep 60"], env=env
+        ),
+        start_new_session=True,
+    )
+    deadline = time.monotonic() + 2
+    while process.poll() is None and process.pid not in local_module._managed_uid_processes(uid):
+        if time.monotonic() >= deadline:
+            process.kill()
+            pytest.fail("managed process did not enter its UID domain")
+        time.sleep(0.02)
+
+    result = local_module.retire_managed_terminal_profile(profile_home)
+    process.wait(timeout=2)
+    new_uid, _ = local_module._managed_terminal_identity(env)
+    assert result["identity_retired"] is True
+    assert result["terminal_home_removed"] is True
+    assert result["killed_uid_processes"] >= 1
+    assert not home.exists()
+    assert new_uid != uid
 
 
 def test_generic_subprocess_scrubs_managed_gateway_key(monkeypatch):

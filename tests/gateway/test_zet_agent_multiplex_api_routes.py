@@ -729,14 +729,25 @@ async def test_deferred_approval_response_requires_matching_id(monkeypatch):
 
     session_id = "sid-deferred-approval-id"
     approval.clear_session(session_id)
-    approval_id = approval.submit_pending(session_id, {
-        "command": "agentcomputer file.delete notes/a.txt",
-        "pattern_key": "plugin_rule:agentcomputer:file.delete:a",
-        "description": "delete notes/a.txt",
-        "allow_permanent": False,
-        "one_shot": True,
-    })
-    assert approval_id
+    token = approval.set_current_session_key(session_id)
+    monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(
+        approval, "_command_matches_permanent_allowlist", lambda _command: False
+    )
+    monkeypatch.setattr(
+        approval,
+        "detect_dangerous_command",
+        lambda command: (True, "agentcomputer:file.delete", f"risk:{command}"),
+    )
+    monkeypatch.setattr(
+        "tools.tirith_security.check_command_security",
+        lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        raising=False,
+    )
+    command = "agentcomputer file.delete notes/a.txt"
+    first = approval.check_all_command_guards(command, "local")
+    approval_id = first["approval_id"]
 
     adapter = _make_adapter()
     monkeypatch.setattr(
@@ -774,4 +785,53 @@ async def test_deferred_approval_response_requires_matching_id(monkeypatch):
     assert missing_data == {"resolved": 0}
     assert wrong_data == {"resolved": 0}
     assert matched_data == {"resolved": 1}
+    exact_retry = approval.check_all_command_guards(command, "local")
+    consumed_retry = approval.check_all_command_guards(command, "local")
+    different_retry = approval.check_all_command_guards(
+        "agentcomputer file.delete notes/b.txt", "local"
+    )
+    assert exact_retry["approved"] is True
+    assert exact_retry["one_shot_approved"] is True
+    assert consumed_retry["status"] == "pending_approval"
+    assert different_retry["status"] == "pending_approval"
+    approval.clear_session(session_id)
+    approval.reset_current_session_key(token)
+
+
+@pytest.mark.asyncio
+async def test_interrupt_revokes_deferred_approval_before_stale_response():
+    from tools import approval
+
+    session_id = "sid-interrupt-stale-approval"
+    approval.clear_session(session_id)
+    approval_id = approval.submit_pending(
+        session_id,
+        {
+            "command": "agentcomputer file.delete notes/a.txt",
+            "pattern_key": "agentcomputer:file.delete",
+            "one_shot_pattern_key": "deferred:terminal:exact-a",
+            "description": "delete notes/a.txt",
+        },
+    )
+    assert approval_id
+
+    adapter = _make_adapter()
+    adapter._interrupt_pending_interactions(session_id, session_id)
+    app = web.Application()
+    app.router.add_post(
+        "/v1/sessions/{session_id}/approval/respond",
+        adapter._handle_approval_respond,
+    )
+    async with TestClient(TestServer(app)) as cli:
+        stale = await cli.post(
+            f"/v1/sessions/{session_id}/approval/respond",
+            json={"choice": "once", "approval_id": approval_id},
+            headers={"Authorization": "Bearer test-key"},
+        )
+        stale_data = await stale.json()
+
+    assert stale_data == {"resolved": 0}
+    assert approval._consume_one_shot_approval(
+        session_id, "deferred:terminal:exact-a"
+    ) is False
     approval.clear_session(session_id)

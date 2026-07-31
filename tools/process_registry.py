@@ -39,6 +39,7 @@ import subprocess
 import threading
 import time
 import uuid
+from pathlib import Path
 
 _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import (
@@ -100,6 +101,7 @@ class ProcessSession:
     command: str                                 # Original command string
     task_id: str = ""                           # Task/sandbox isolation key
     session_key: str = ""                       # Gateway session key (for reset protection)
+    profile_owner: str = ""                     # Immutable canonical HERMES_HOME owner
     pid: Optional[int] = None                   # OS process ID
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
     env_ref: Any = None                         # Reference to the environment object
@@ -716,6 +718,7 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            profile_owner=str(get_hermes_home().expanduser().resolve()),
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
@@ -870,6 +873,7 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            profile_owner=str(get_hermes_home().expanduser().resolve()),
             cwd=cwd,
             started_at=time.time(),
             env_ref=env,
@@ -1841,12 +1845,43 @@ class ProcessRegistry:
         with self._lock:
             return any(not s.exited for s in self._running.values())
 
-    def kill_all(self, task_id: str = None) -> int:
-        """Kill all running processes, optionally filtered by task_id. Returns count killed."""
+    def has_active_for_profile(self, profile_owner: str) -> bool:
+        """Whether an immutable profile owner still has a live process."""
+        canonical_owner = str(Path(profile_owner).expanduser().resolve())
+        with self._lock:
+            sessions = [
+                session
+                for session in self._running.values()
+                if session.profile_owner == canonical_owner
+            ]
+        for session in sessions:
+            self._refresh_detached_session(session)
+        with self._lock:
+            return any(
+                session.profile_owner == canonical_owner and not session.exited
+                for session in self._running.values()
+            )
+
+    def kill_all(
+        self,
+        task_id: str = None,
+        profile_owner: str = None,
+    ) -> int:
+        """Kill running processes filtered by task and/or immutable profile."""
+        canonical_owner = (
+            str(Path(profile_owner).expanduser().resolve())
+            if profile_owner is not None
+            else None
+        )
         with self._lock:
             targets = [
                 s for s in self._running.values()
-                if (task_id is None or s.task_id == task_id) and not s.exited
+                if (task_id is None or s.task_id == task_id)
+                and (
+                    canonical_owner is None
+                    or s.profile_owner == canonical_owner
+                )
+                and not s.exited
             ]
 
         killed = 0
@@ -1919,6 +1954,7 @@ class ProcessRegistry:
                             "started_at": s.started_at,
                             "task_id": s.task_id,
                             "session_key": s.session_key,
+                            "profile_owner": s.profile_owner,
                             "watcher_platform": s.watcher_platform,
                             "watcher_chat_id": s.watcher_chat_id,
                             "watcher_user_id": s.watcher_user_id,
@@ -1991,6 +2027,7 @@ class ProcessRegistry:
                 command=entry.get("command", "unknown"),
                 task_id=entry.get("task_id", ""),
                 session_key=entry.get("session_key", ""),
+                profile_owner=entry.get("profile_owner", ""),
                 pid=pid,
                 host_start_time=recorded_start,
                 pid_scope=pid_scope,

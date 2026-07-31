@@ -400,7 +400,7 @@ def test_terminal_smart_deny_pending_payload_is_one_operation(gw_session, monkey
     assert result["smart_denied"] is True
     assert result["allow_permanent"] is False
     with A._lock:
-        pending = dict(A._pending[gw_session])
+        pending = dict(A._pending[gw_session][-1])
     assert pending["smart_denied"] is True
     assert pending["allow_permanent"] is False
 
@@ -415,9 +415,29 @@ def test_execute_code_smart_deny_pending_payload_is_one_operation(gw_session, mo
     assert result["smart_denied"] is True
     assert result["allow_permanent"] is False
     with A._lock:
-        pending = dict(A._pending[gw_session])
+        pending = dict(A._pending[gw_session][-1])
     assert pending["smart_denied"] is True
     assert pending["allow_permanent"] is False
+
+
+def test_execute_code_deferred_once_is_exact_and_consumed(gw_session, monkeypatch):
+    monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
+
+    first = A.check_execute_code_guard("print('exact')", "local")
+    assert first["status"] == "pending_approval"
+    assert A.resolve_gateway_approval(
+        gw_session,
+        "once",
+        approval_id=first["approval_id"],
+    ) == 1
+
+    exact = A.check_execute_code_guard("print('exact')", "local")
+    consumed = A.check_execute_code_guard("print('exact')", "local")
+    different = A.check_execute_code_guard("print('different')", "local")
+    assert exact["approved"] is True
+    assert exact["one_shot_approved"] is True
+    assert consumed["status"] == "pending_approval"
+    assert different["status"] == "pending_approval"
 
 
 def test_terminal_serializes_smart_deny_pending_capabilities(monkeypatch):
