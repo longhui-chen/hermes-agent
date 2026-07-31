@@ -96,6 +96,11 @@ def test_managed_service_mounts_system_read_only_with_scoped_writes():
         "__APP_BASE__/data/lazy-packages"
     ) in service
     assert "Environment=HERMES_DISABLE_LAZY_INSTALLS=1" in service
+    assert (
+        "Environment=PATH="
+        "/zettos/main/apps/com.zettlab.local-server/current/sbin:"
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    ) in service
 
 
 def _background_registry(monkeypatch):
