@@ -781,6 +781,55 @@ class TestSensitivePathCheck:
         assert "managed hook code path" in result["error"]
 
     @pytest.mark.parametrize("tool_name", ["write", "patch"])
+    @pytest.mark.parametrize(
+        "target, expected_kind",
+        [
+            (
+                "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home/"
+                "profiles/agent-a/agent-hooks/audit.sh",
+                "shell hook",
+            ),
+            (
+                "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home/"
+                "profiles/agent-a/scripts/cron.py",
+                "script",
+            ),
+        ],
+    )
+    def test_managed_gateway_privileged_scripts_are_not_model_writable(
+        self, monkeypatch, tool_name, target, expected_kind
+    ):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from tools import file_tools
+
+        monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+        monkeypatch.setenv(
+            "HERMES_HOME",
+            "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home",
+        )
+        token = set_hermes_home_override(Path(target).parents[1])
+        try:
+            if tool_name == "write":
+                result = json.loads(
+                    file_tools.write_file_tool(target, "#!/bin/sh\nid\n")
+                )
+            else:
+                result = json.loads(
+                    file_tools.patch_tool(
+                        mode="replace",
+                        path=target,
+                        old_string="safe",
+                        new_string="payload",
+                    )
+                )
+        finally:
+            reset_hermes_home_override(token)
+        assert f"managed {expected_kind} code path" in result["error"]
+
+    @pytest.mark.parametrize("tool_name", ["write", "patch"])
     @pytest.mark.parametrize("via_symlink", [False, True])
     def test_managed_terminal_homes_are_not_model_writable(
         self, tmp_path, monkeypatch, tool_name, via_symlink

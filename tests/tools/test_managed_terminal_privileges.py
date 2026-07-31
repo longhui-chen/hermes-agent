@@ -176,6 +176,72 @@ def test_managed_execute_code_gets_unique_identity_from_terminal(monkeypatch):
     assert len({terminal_uid, first_uid, second_uid}) == 3
 
 
+def test_managed_execute_code_uses_per_invocation_cgroup(monkeypatch):
+    import tools.trusted_direct_runner as trusted_runner
+
+    cgroup = SimpleNamespace(path=Path("/sys/fs/cgroup/unit/execute-code-test"))
+    cleaned = []
+    calls = []
+    info = SimpleNamespace(st_mode=stat.S_IFREG | 0o755, st_uid=0)
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setattr(local_module.os, "lstat", lambda _path: info)
+    monkeypatch.setattr(
+        local_module,
+        "_managed_execute_code_identity",
+        lambda _env, _scope: (61001, 61001),
+    )
+    monkeypatch.setattr(
+        local_module, "_trusted_managed_python", lambda: "/usr/bin/python3"
+    )
+    monkeypatch.setattr(
+        trusted_runner, "_create_managed_invocation_cgroup", lambda: cgroup
+    )
+    monkeypatch.setattr(
+        trusted_runner,
+        "_kill_and_remove_managed_cgroup",
+        lambda got, process: cleaned.append((got, process)),
+    )
+    local_module._MANAGED_EXECUTE_CODE_CGROUP_BY_UID.clear()
+
+    argv = local_module._managed_execute_code_sandbox_argv(
+        ["/usr/bin/python3", "/tmp/script.py"],
+        env={"HERMES_HOME": "/profiles/main"},
+        execution_scope="scope-1",
+    )
+
+    assert argv[:6] == [
+        "/usr/bin/python3",
+        "-I",
+        "-c",
+        local_module._MANAGED_TERMINAL_CGROUP_ENTER,
+        str(cgroup.path),
+        "/usr/bin/setpriv",
+    ]
+    assert argv[6:9] == [
+        "--reuid=61001",
+        "--regid=61001",
+        "--clear-groups",
+    ]
+    monkeypatch.setattr(
+        local_module,
+        "_terminate_managed_uid",
+        lambda uid: calls.append(("kill", uid)) or 0,
+    )
+    monkeypatch.setattr(
+        local_module,
+        "_release_managed_execute_code_identity",
+        lambda uid, _env, scope: calls.append(("release", uid, scope)),
+    )
+    local_module.retire_managed_execute_code_identity(
+        61001,
+        {"HERMES_HOME": "/profiles/main"},
+        "scope-1",
+    )
+    assert cleaned == [(cgroup, None)]
+    assert calls == [("kill", 61001), ("release", 61001, "scope-1")]
+    assert local_module._MANAGED_EXECUTE_CODE_CGROUP_BY_UID == {}
+
+
 def test_rpc_peer_must_match_expected_pid_and_uid():
     class Connection:
         def __init__(self, pid, uid):

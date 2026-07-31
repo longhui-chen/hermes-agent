@@ -1502,7 +1502,7 @@ def test_mutation_approval_shows_bounded_argv_and_binds_stdin(monkeypatch):
     fingerprint_hex = fingerprint.hexdigest()
 
     assert "agentcomputer file.write 'notes/quarterly plan.txt' --stdin" in captured["display_target"]
-    assert "private body" not in captured["display_target"]
+    assert 'stdin preview: "private body"' in captured["display_target"]
     assert f"stdin: bytes={len(stdin_bytes)} sha256={hashlib.sha256(stdin_bytes).hexdigest()}" in captured["display_target"]
     assert f"approval fingerprint: sha256={fingerprint_hex}" in captured["display_target"]
     assert captured["rule_key"].endswith(fingerprint_hex)
@@ -1512,3 +1512,23 @@ def test_mutation_approval_shows_bounded_argv_and_binds_stdin(monkeypatch):
     terminal_tool_module._request_agentcomputer_mutation_approval(parsed)
     assert "argv display truncated" in captured["display_target"]
     assert len(captured["display_target"]) < 2400
+
+    long_stdin_parsed = terminal_tool_module._AgentCreatorCommand(
+        argv=[
+            "/usr/bin/python3",
+            "/trusted/create_agent.py",
+            "file.write",
+            "notes/bounded.txt",
+            "--stdin",
+        ],
+        root_identity=(1, 2),
+        script_identity=(3, 4),
+        stdin_text="visible-head\n\t" + ("x" * 1000) + "\nvisible-tail",
+        approval_operation="file.write",
+    )
+    terminal_tool_module._request_agentcomputer_mutation_approval(long_stdin_parsed)
+    preview = captured["display_target"]
+    assert "stdin preview truncated" in preview
+    assert "visible-head\\n\\t" in preview
+    assert "visible-tail" in preview
+    assert len(preview) < 1300

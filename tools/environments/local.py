@@ -45,6 +45,8 @@ _MANAGED_TERMINAL_CGROUP_PIDS_MAX = 64
 _MANAGED_TERMINAL_CGROUP_LOCK = threading.Lock()
 _MANAGED_TERMINAL_CGROUP_CLEANUP_TIMEOUT_SECONDS = 2.0
 _MANAGED_TERMINAL_CGROUP_POLL_SECONDS = 0.05
+_MANAGED_EXECUTE_CODE_CGROUP_LOCK = threading.Lock()
+_MANAGED_EXECUTE_CODE_CGROUP_BY_UID: dict[int, object] = {}
 _MANAGED_TERMINAL_CGROUP_ENTER = (
     "import os,sys\n"
     "path=os.path.join(sys.argv[1],'cgroup.procs')\n"
@@ -239,7 +241,27 @@ def _managed_execute_code_sandbox_argv(
     ):
         raise OSError("managed execute_code privilege drop is not trusted")
     uid, gid = _managed_execute_code_identity(env, execution_scope)
+    launcher = _trusted_managed_python()
+    from tools.trusted_direct_runner import (
+        _create_managed_invocation_cgroup,
+        _kill_and_remove_managed_cgroup,
+    )
+
+    cgroup = _create_managed_invocation_cgroup()
+    try:
+        with _MANAGED_EXECUTE_CODE_CGROUP_LOCK:
+            if uid in _MANAGED_EXECUTE_CODE_CGROUP_BY_UID:
+                raise OSError("managed execute_code cgroup identity collision")
+            _MANAGED_EXECUTE_CODE_CGROUP_BY_UID[uid] = cgroup
+    except Exception:
+        _kill_and_remove_managed_cgroup(cgroup, None)
+        raise
     return [
+        launcher,
+        "-I",
+        "-c",
+        _MANAGED_TERMINAL_CGROUP_ENTER,
+        str(cgroup.path),
         _MANAGED_SETPRIV_PATH,
         f"--reuid={uid}",
         f"--regid={gid}",
@@ -599,6 +621,16 @@ def retire_managed_execute_code_identity(
     is released.  If termination fails, the reservation deliberately remains
     live and the caller fails closed.
     """
+
+    with _MANAGED_EXECUTE_CODE_CGROUP_LOCK:
+        cgroup = _MANAGED_EXECUTE_CODE_CGROUP_BY_UID.get(uid)
+    if cgroup is not None:
+        from tools.trusted_direct_runner import _kill_and_remove_managed_cgroup
+
+        _kill_and_remove_managed_cgroup(cgroup, None)
+        with _MANAGED_EXECUTE_CODE_CGROUP_LOCK:
+            if _MANAGED_EXECUTE_CODE_CGROUP_BY_UID.get(uid) is cgroup:
+                _MANAGED_EXECUTE_CODE_CGROUP_BY_UID.pop(uid, None)
 
     killed = _terminate_managed_uid(uid)
     _release_managed_execute_code_identity(uid, env, execution_scope)

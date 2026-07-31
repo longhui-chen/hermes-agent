@@ -2265,9 +2265,24 @@ def _request_agentcomputer_mutation_approval(
     else:
         shell_argv_display = shell_argv
     stdin_sha256 = hashlib.sha256(stdin_bytes).hexdigest()
+    stdin_text = parsed.stdin_text or ""
+    max_preview_chars = 512
+    if len(stdin_text) <= max_preview_chars:
+        stdin_preview = json.dumps(stdin_text, ensure_ascii=True)
+    else:
+        head_chars = 320
+        tail_chars = 128
+        omitted_chars = len(stdin_text) - head_chars - tail_chars
+        stdin_preview = (
+            json.dumps(stdin_text[:head_chars], ensure_ascii=True)
+            + "\n[stdin preview truncated: "
+            + f"chars={len(stdin_text)} omitted={omitted_chars}]\n"
+            + json.dumps(stdin_text[-tail_chars:], ensure_ascii=True)
+        )
     display_target = (
         f"argv: {shell_argv_display}\n"
         f"stdin: bytes={len(stdin_bytes)} sha256={stdin_sha256}\n"
+        f"stdin preview: {stdin_preview}\n"
         f"approval fingerprint: sha256={fingerprint_hex}"
     )
 

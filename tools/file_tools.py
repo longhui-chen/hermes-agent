@@ -717,6 +717,15 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             )
         except (OSError, ValueError):
             pass
+    if os.environ.get("HERMES_MANAGED_GATEWAY") == "1":
+        try:
+            from hermes_constants import get_hermes_home
+
+            managed_hermes_roots.append(
+                str(get_hermes_home().expanduser().resolve())
+            )
+        except (OSError, ValueError):
+            pass
 
     if any(
         _path_within(candidate, root)
@@ -771,8 +780,18 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
                     (kind for kind in ("plugins", "hooks") if kind in relative_parts),
                     "",
                 )
+                if not blocked_kind and relative_parts:
+                    if relative_parts[0] == "agent-hooks":
+                        blocked_kind = "agent-hooks"
+                    elif relative_parts[0] == "scripts":
+                        blocked_kind = "scripts"
                 if blocked_kind:
-                    code_kind = "plugin" if blocked_kind == "plugins" else "hook"
+                    code_kind = {
+                        "plugins": "plugin",
+                        "hooks": "hook",
+                        "agent-hooks": "shell hook",
+                        "scripts": "script",
+                    }[blocked_kind]
                     return (
                         f"Refusing to write to managed {code_kind} code path: {filepath}\n"
                         "Agent file tools cannot modify code loaded by the gateway."
