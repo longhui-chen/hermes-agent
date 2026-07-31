@@ -587,6 +587,9 @@ _MANAGED_CLAW_HERMES_ROOTS = (
     "/zettos/main/data/com.zettlab.claw/hermes_home",
     "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home",
 )
+_MANAGED_TERMINAL_HOME_ROOTS = (
+    "/run/zettlab-claw/terminal-homes",
+)
 
 _hermes_config_resolved: str | None = None
 _hermes_config_resolved_loaded = False
@@ -663,6 +666,16 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     # but write_file/patch execute in-process, so enforce this as a hard file-tool
     # boundary rather than relying on filesystem ownership alone.
     if os.environ.get("HERMES_MANAGED_GATEWAY") == "1":
+        if any(
+            _within(candidate, root)
+            for candidate in candidates
+            for root in _MANAGED_TERMINAL_HOME_ROOTS
+        ):
+            return (
+                f"Refusing to write to managed terminal home path: {filepath}\n"
+                "Agent file tools cannot modify terminal runtime identities."
+            )
+
         # User/project plugins execute inside the privileged gateway and may
         # register model or memory providers. File tools also run in-process,
         # so they may not rewrite any plugin code root, including a sibling

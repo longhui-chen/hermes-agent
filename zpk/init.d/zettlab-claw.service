@@ -35,11 +35,12 @@ NoNewPrivileges=true
 PrivateTmp=true
 RuntimeDirectory=zettlab-claw
 RuntimeDirectoryMode=0755
-# trusted_direct_runner audits all process UIDs before reserving an ephemeral
-# worker identity. Keep procfs visible while retaining the ptrace capability ban.
-ProtectProc=default
+# Only the root gateway audits process UIDs before reserving an ephemeral worker
+# identity. CAP_SYS_PTRACE lets that broker see hidden procfs entries; every
+# model-controlled child drops its full capability bounding set before exec.
+ProtectProc=invisible
 ProtectSystem=strict
-CapabilityBoundingSet=~CAP_SYS_PTRACE CAP_SYS_ADMIN
+CapabilityBoundingSet=~CAP_SYS_ADMIN
 Delegate=pids memory
 ReadOnlyPaths=/zettos/main/apps
 ReadWritePaths=__APP_BASE__/data

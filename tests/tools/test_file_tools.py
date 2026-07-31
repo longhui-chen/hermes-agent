@@ -733,6 +733,46 @@ class TestSensitivePathCheck:
         assert "managed plugin code path" in result["error"]
 
     @pytest.mark.parametrize("tool_name", ["write", "patch"])
+    @pytest.mark.parametrize("via_symlink", [False, True])
+    def test_managed_terminal_homes_are_not_model_writable(
+        self, tmp_path, monkeypatch, tool_name, via_symlink
+    ):
+        from tools import file_tools
+
+        runtime_root = tmp_path / "terminal-homes"
+        runtime_root.mkdir()
+        visible_root = runtime_root
+        if via_symlink:
+            visible_root = tmp_path / "terminal-homes-alias"
+            visible_root.symlink_to(runtime_root, target_is_directory=True)
+
+        monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+        monkeypatch.setattr(
+            file_tools,
+            "_MANAGED_TERMINAL_HOME_ROOTS",
+            (str(runtime_root.resolve()),),
+        )
+        # Keep this test focused on the managed runtime boundary on macOS,
+        # where tmp_path resolves below /private/var.
+        monkeypatch.setattr(file_tools, "_SENSITIVE_PATH_PREFIXES", ())
+        monkeypatch.setattr(file_tools, "_SENSITIVE_EXACT_PATHS", set())
+        target = visible_root / "60001" / ".bashrc"
+
+        if tool_name == "write":
+            result = json.loads(file_tools.write_file_tool(str(target), "payload\n"))
+        else:
+            result = json.loads(
+                file_tools.patch_tool(
+                    mode="replace",
+                    path=str(target),
+                    old_string="safe",
+                    new_string="payload",
+                )
+            )
+
+        assert "managed terminal home path" in result["error"]
+
+    @pytest.mark.parametrize("tool_name", ["write", "patch"])
     @pytest.mark.parametrize(
         "target",
         [

@@ -749,6 +749,28 @@ def test_managed_runner_fails_before_popen_when_identity_pool_is_occupied(
         )
 
 
+def test_occupied_process_uids_ignores_non_ascii_process_name(
+    monkeypatch,
+    tmp_path,
+):
+    proc_root = tmp_path / "proc"
+    process_root = proc_root / "4242"
+    process_root.mkdir(parents=True)
+    (process_root / "status").write_bytes(
+        b"Name:\tmodel-\xff\n"
+        b"State:\tS (sleeping)\n"
+        b"Uid:\t60001\t60002\t60003\t60004\n"
+    )
+    monkeypatch.setattr(trusted_direct_runner, "_PROC_ROOT", proc_root)
+
+    assert trusted_direct_runner._occupied_process_uids() == {
+        60001,
+        60002,
+        60003,
+        60004,
+    }
+
+
 def test_managed_runner_does_not_hold_identity_lock_during_execution(
     monkeypatch,
     tmp_path,

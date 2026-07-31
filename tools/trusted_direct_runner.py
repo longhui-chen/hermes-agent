@@ -607,23 +607,17 @@ def _occupied_process_uids() -> set[int]:
             ) from exc
         if len(raw) > _PROC_STATUS_MAX_BYTES:
             raise OSError("managed runner process metadata is oversized")
-        uid_line = next(
-            (
-                line
-                for line in raw.decode("ascii", errors="strict").splitlines()
-                if line.startswith("Uid:")
-            ),
-            "",
-        )
-        fields = uid_line.split()
-        if len(fields) != 5:
+        uid_lines = [line for line in raw.splitlines() if line.startswith(b"Uid:")]
+        if len(uid_lines) != 1:
             raise OSError("managed runner process identity is malformed")
-        try:
-            occupied.update(int(value) for value in fields[1:])
-        except ValueError as exc:
-            raise OSError(
-                "managed runner process identity is malformed"
-            ) from exc
+        fields = uid_lines[0].split()
+        if (
+            len(fields) != 5
+            or fields[0] != b"Uid:"
+            or any(not value.isdigit() for value in fields[1:])
+        ):
+            raise OSError("managed runner process identity is malformed")
+        occupied.update(int(value) for value in fields[1:])
     return occupied
 
 
