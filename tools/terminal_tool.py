@@ -2593,6 +2593,7 @@ Do NOT use vim/nano/interactive tools without pty=true — they hang without a p
 # Global state for environment lifecycle management
 _active_environments: Dict[str, Any] = {}
 _last_activity: Dict[str, float] = {}
+_environment_profile_owners: Dict[str, str] = {}
 _env_lock = threading.Lock()
 _creation_locks: Dict[str, threading.Lock] = {}  # Per-task locks for sandbox creation
 _creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
@@ -3304,7 +3305,14 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     try:
         from tools.process_registry import process_registry
         for task_id in list(_last_activity.keys()):
-            if process_registry.has_active_processes(task_id):
+            profile_owner = _environment_profile_owners.get(task_id)
+            if profile_owner:
+                has_active = process_registry.has_active_processes_for_profile(
+                    task_id, profile_owner
+                )
+            else:
+                has_active = process_registry.has_active_processes(task_id)
+            if has_active:
                 _last_activity[task_id] = current_time  # Keep sandbox alive
     except ImportError:
         pass
@@ -3320,6 +3328,7 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
             if current_time - last_time > lifetime_seconds:
                 env = _active_environments.pop(task_id, None)
                 _last_activity.pop(task_id, None)
+                _environment_profile_owners.pop(task_id, None)
                 if env is not None:
                     envs_to_stop.append((task_id, env))
 
@@ -3482,6 +3491,7 @@ def cleanup_vm(
     with _env_lock:
         env = _active_environments.pop(registry_key, None)
         _last_activity.pop(registry_key, None)
+        _environment_profile_owners.pop(registry_key, None)
 
     # Clean up per-task creation lock
     with _creation_locks_lock:
@@ -3859,6 +3869,9 @@ def terminal_tool(
         # a registered env override (RL benchmarks) get isolated sandboxes.
         effective_task_id = _resolve_container_task_id(task_id)
         raw_task_key = _managed_profile_registry_key(task_id)
+        environment_profile_owner = None
+        if os.environ.get("HERMES_MANAGED_GATEWAY") == "1":
+            environment_profile_owner = _canonical_managed_profile_home()
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config. ``resolve_task_overrides``
@@ -3981,6 +3994,10 @@ def terminal_tool(
             )
             if _existing_key is not None:
                 _last_activity[_existing_key] = time.time()
+                if environment_profile_owner:
+                    _environment_profile_owners[_existing_key] = (
+                        environment_profile_owner
+                    )
                 env = _active_environments[_existing_key]
                 needs_creation = False
             else:
@@ -4002,6 +4019,10 @@ def terminal_tool(
                     )
                     if _existing_key is not None:
                         _last_activity[_existing_key] = time.time()
+                        if environment_profile_owner:
+                            _environment_profile_owners[_existing_key] = (
+                                environment_profile_owner
+                            )
                         env = _active_environments[_existing_key]
                         needs_creation = False
 
@@ -4067,6 +4088,10 @@ def terminal_tool(
                     with _env_lock:
                         _active_environments[effective_task_id] = new_env
                         _last_activity[effective_task_id] = time.time()
+                        if environment_profile_owner:
+                            _environment_profile_owners[effective_task_id] = (
+                                environment_profile_owner
+                            )
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
 

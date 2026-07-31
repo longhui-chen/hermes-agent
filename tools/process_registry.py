@@ -1909,6 +1909,18 @@ class ProcessRegistry:
 
     def has_active_processes(self, task_id: str) -> bool:
         """Check if there are active (running) processes for a task_id."""
+        return self.has_active_processes_for_profile(
+            task_id, _current_profile_owner()
+        )
+
+    def has_active_processes_for_profile(
+        self, task_id: str, profile_owner: str
+    ) -> bool:
+        """Check activity against an explicit immutable profile owner."""
+
+        expected_owner = _canonical_profile_owner(profile_owner)
+        if not expected_owner:
+            return False
         with self._lock:
             sessions = list(self._running.values())
 
@@ -1918,7 +1930,7 @@ class ProcessRegistry:
         with self._lock:
             return any(
                 s.task_id == task_id
-                and s.profile_owner == _current_profile_owner()
+                and s.profile_owner == expected_owner
                 and not s.exited
                 for s in self._running.values()
             )
@@ -1990,6 +2002,98 @@ class ProcessRegistry:
                 session.profile_owner == canonical_owner and not session.exited
                 for session in self._running.values()
             )
+
+    def purge_profile_state(self, profile_owner: str) -> Dict[str, int]:
+        """Atomically discard completed process state for an unloaded profile."""
+
+        canonical_owner = _canonical_profile_owner(profile_owner)
+        if not canonical_owner:
+            raise ValueError("profile owner is required")
+        removed_running = 0
+        removed_finished = 0
+        removed_watchers = 0
+        removed_completions = 0
+        with self._lock:
+            live = [
+                session.id
+                for session in self._running.values()
+                if session.profile_owner == canonical_owner and not session.exited
+            ]
+            if live:
+                raise RuntimeError("profile still has active processes")
+
+            session_ids = {
+                session.id
+                for session in (
+                    list(self._running.values()) + list(self._finished.values())
+                )
+                if session.profile_owner == canonical_owner
+            }
+            for session_id in list(self._running):
+                session = self._running[session_id]
+                if session.profile_owner == canonical_owner:
+                    self._running.pop(session_id, None)
+                    removed_running += 1
+            for session_id in list(self._finished):
+                session = self._finished[session_id]
+                if session.profile_owner == canonical_owner:
+                    self._finished.pop(session_id, None)
+                    removed_finished += 1
+            self._completion_consumed.difference_update(session_ids)
+            self._poll_observed.difference_update(session_ids)
+
+            retained_watchers = []
+            for watcher in self.pending_watchers:
+                watcher_owner = _canonical_profile_owner(
+                    watcher.get("profile_owner")
+                )
+                if (
+                    watcher_owner == canonical_owner
+                    or watcher.get("session_id") in session_ids
+                ):
+                    removed_watchers += 1
+                else:
+                    retained_watchers.append(watcher)
+            self.pending_watchers[:] = retained_watchers
+
+            queue = self.completion_queue
+            with queue.mutex:
+                retained_events = []
+                for event in queue.queue:
+                    event_owner = (
+                        _canonical_profile_owner(event.get("profile_owner"))
+                        if isinstance(event, dict)
+                        else ""
+                    )
+                    event_session = (
+                        event.get("session_id")
+                        if isinstance(event, dict)
+                        else None
+                    )
+                    if (
+                        event_owner == canonical_owner
+                        or event_session in session_ids
+                    ):
+                        removed_completions += 1
+                    else:
+                        retained_events.append(event)
+                queue.queue.clear()
+                queue.queue.extend(retained_events)
+                if removed_completions:
+                    queue.unfinished_tasks = max(
+                        0, queue.unfinished_tasks - removed_completions
+                    )
+                    if queue.unfinished_tasks == 0:
+                        queue.all_tasks_done.notify_all()
+                    queue.not_full.notify_all()
+
+        self._write_checkpoint()
+        return {
+            "running_records": removed_running,
+            "finished_records": removed_finished,
+            "pending_watchers": removed_watchers,
+            "completion_events": removed_completions,
+        }
 
     def kill_all(
         self,

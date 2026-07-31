@@ -232,6 +232,17 @@ def test_managed_execute_code_uses_per_invocation_cgroup(monkeypatch):
         local_module, "_trusted_managed_python", lambda: "/usr/bin/python3"
     )
     monkeypatch.setattr(
+        local_module, "_trusted_managed_unshare", lambda: "/usr/bin/unshare"
+    )
+    monkeypatch.setattr(
+        local_module,
+        "_managed_execute_code_private_tmp_paths",
+        lambda _env, _uid: (
+            Path("/run/zettlab-claw/execute-code/61001/tmp"),
+            Path("/run/zettlab-claw/execute-code/61001/var-tmp"),
+        ),
+    )
+    monkeypatch.setattr(
         trusted_runner, "_create_managed_invocation_cgroup", lambda: cgroup
     )
     monkeypatch.setattr(
@@ -260,6 +271,22 @@ def test_managed_execute_code_uses_per_invocation_cgroup(monkeypatch):
         "--regid=61001",
         "--clear-groups",
     ]
+    assert argv[14:27] == [
+        "/usr/bin/unshare",
+        "--user",
+        "--map-root-user",
+        "--mount",
+        "--fork",
+        "--kill-child=KILL",
+        "--",
+        "/usr/bin/python3",
+        "-I",
+        "-c",
+        local_module._MANAGED_TERMINAL_PRIVATE_TMP_ENTER,
+        "/run/zettlab-claw/execute-code/61001/tmp",
+        "/run/zettlab-claw/execute-code/61001/var-tmp",
+    ]
+    assert argv[27:] == ["/usr/bin/python3", "/tmp/script.py"]
     monkeypatch.setattr(
         local_module,
         "_terminate_managed_uid",

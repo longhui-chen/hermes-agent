@@ -1,5 +1,7 @@
+import queue
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import tools.process_registry as process_module
 from tools.process_registry import ProcessRegistry, ProcessSession
@@ -13,7 +15,9 @@ def _registry() -> ProcessRegistry:
     registry._completion_consumed = set()
     registry._poll_observed = set()
     registry.pending_watchers = []
+    registry.completion_queue = queue.Queue()
     registry.on_close = lambda _session, _session_id: None
+    registry._write_checkpoint = lambda: None
     return registry
 
 
@@ -115,3 +119,84 @@ def test_global_cleanup_uses_only_preselected_registry_objects(monkeypatch, tmp_
     monkeypatch.setattr(registry, "kill_process", fake_kill)
     assert registry.kill_all(all_profiles=True) == 2
     assert selected == [(session.id, session) for session in sessions]
+
+
+def test_explicit_profile_activity_and_purge_are_owner_scoped(tmp_path):
+    registry = _registry()
+    main = (tmp_path / "main").resolve()
+    coder = (tmp_path / "coder").resolve()
+    main.mkdir()
+    coder.mkdir()
+    main_session = ProcessSession(
+        id="proc_main", command="main", task_id="shared-task",
+        profile_owner=str(main), started_at=1.0,
+    )
+    coder_session = ProcessSession(
+        id="proc_coder", command="coder", task_id="shared-task",
+        profile_owner=str(coder), started_at=1.0,
+    )
+    coder_session.exited = True
+    registry._running = {main_session.id: main_session}
+    registry._finished = {coder_session.id: coder_session}
+    registry._completion_consumed = {main_session.id, coder_session.id}
+    registry._poll_observed = {main_session.id, coder_session.id}
+    registry.pending_watchers = [
+        {"session_id": main_session.id, "profile_owner": str(main)},
+        {"session_id": coder_session.id, "profile_owner": str(coder)},
+    ]
+    registry.completion_queue.put(
+        {"session_id": main_session.id, "profile_owner": str(main)}
+    )
+    registry.completion_queue.put(
+        {"session_id": coder_session.id, "profile_owner": str(coder)}
+    )
+
+    assert registry.has_active_processes_for_profile("shared-task", str(main))
+    assert not registry.has_active_processes_for_profile("shared-task", str(coder))
+    removed = registry.purge_profile_state(str(coder))
+
+    assert removed == {
+        "running_records": 0,
+        "finished_records": 1,
+        "pending_watchers": 1,
+        "completion_events": 1,
+    }
+    assert list(registry._running) == [main_session.id]
+    assert registry._finished == {}
+    assert registry._completion_consumed == {main_session.id}
+    assert registry._poll_observed == {main_session.id}
+    assert registry.pending_watchers == [
+        {"session_id": main_session.id, "profile_owner": str(main)}
+    ]
+    assert registry.completion_queue.get_nowait()["session_id"] == main_session.id
+
+
+def test_idle_reaper_uses_recorded_profile_owner(monkeypatch, tmp_path):
+    import tools.terminal_tool as terminal_tool
+
+    owner = str((tmp_path / "coder").resolve())
+    key = "profile-key:default"
+    cleaned = []
+    environment = SimpleNamespace(cleanup=lambda: cleaned.append(True))
+    monkeypatch.setattr(terminal_tool, "_active_environments", {key: environment})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {key: 0.0})
+    monkeypatch.setattr(
+        terminal_tool, "_environment_profile_owners", {key: owner}
+    )
+    monkeypatch.setattr(terminal_tool.time, "time", lambda: 100.0)
+    calls = []
+
+    def has_active(task_id, profile_owner):
+        calls.append((task_id, profile_owner))
+        return True
+
+    monkeypatch.setattr(
+        process_module.process_registry,
+        "has_active_processes_for_profile",
+        has_active,
+    )
+    terminal_tool._cleanup_inactive_envs(lifetime_seconds=10)
+
+    assert calls == [(key, owner)]
+    assert terminal_tool._last_activity[key] == 100.0
+    assert cleaned == []

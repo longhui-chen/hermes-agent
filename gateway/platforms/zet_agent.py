@@ -4198,6 +4198,11 @@ class ZetAgentAdapter(APIServerAdapter):
                 )
                 if process_registry.has_active_for_profile(profile_home):
                     raise OSError("profile process registry is still active")
+                purged_process_state = await _to_thread_with_completion_barrier(
+                    process_registry.purge_profile_state,
+                    profile_home,
+                )
+                terminal_cleanup["purged_process_state"] = purged_process_state
             except asyncio.CancelledError:
                 self._unblock_runtime_import_profile(
                     profile_home, unload_barrier_owner

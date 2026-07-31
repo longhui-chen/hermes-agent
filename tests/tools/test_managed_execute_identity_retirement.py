@@ -2,8 +2,10 @@
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 import pytest
@@ -62,9 +64,18 @@ def test_retirement_kills_detached_descendant(tmp_path, monkeypatch):
     monkeypatch.setenv("ZET_AGENT_KEY", "managed-execute-retirement-test")
     env = {"HERMES_HOME": str(tmp_path / "profile")}
     scope = "detached-descendant"
-    uid, _ = local._managed_execute_code_identity(env, scope)
+    workspace = Path(
+        tempfile.mkdtemp(prefix="hermes-execute-private-", dir="/tmp")
+    )
+    uid = local._prepare_managed_execute_code_workspace(
+        str(workspace), [], env=env, execution_scope=scope
+    )
+    env["HOME"] = str(workspace)
+    marker_name = f"hermes-private-tmp-{os.getpid()}-{uid}"
+    host_marker = Path("/tmp") / marker_name
     child_code = (
-        "import subprocess,sys;"
+        "import pathlib,subprocess,sys;"
+        f"pathlib.Path('/tmp/{marker_name}').write_text('isolated');"
         "subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],"
         "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,"
         "stderr=subprocess.DEVNULL,start_new_session=True)"
@@ -77,6 +88,8 @@ def test_retirement_kills_detached_descendant(tmp_path, monkeypatch):
 
     try:
         subprocess.run(argv, check=True, timeout=10)
+        assert (workspace / "tmp" / marker_name).read_text() == "isolated"
+        assert not host_marker.exists()
         deadline = time.monotonic() + 2
         while not local._managed_uid_processes(uid) and time.monotonic() < deadline:
             time.sleep(0.05)
@@ -94,3 +107,7 @@ def test_retirement_kills_detached_descendant(tmp_path, monkeypatch):
                     os.kill(pid, 9)
                 except ProcessLookupError:
                     pass
+        local._MANAGED_TERMINAL_SCOPE_BY_UID.pop(uid, None)
+        local._MANAGED_EXECUTE_CODE_CGROUP_BY_UID.pop(uid, None)
+        host_marker.unlink(missing_ok=True)
+        shutil.rmtree(workspace, ignore_errors=True)
