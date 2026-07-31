@@ -418,6 +418,17 @@ def test_execute_code_smart_deny_pending_payload_is_one_operation(gw_session, mo
         pending = dict(A._pending[gw_session][-1])
     assert pending["smart_denied"] is True
     assert pending["allow_permanent"] is False
+    assert A.resolve_gateway_approval(
+        gw_session,
+        "always",
+        approval_id=result["approval_id"],
+    ) == 1
+    replay = A.check_execute_code_guard("print('pending')", "local")
+    assert replay["approved"] is True
+    assert replay["one_shot_approved"] is True
+    assert A.is_approved(gw_session, "execute_code") is False
+    with A._lock:
+        assert "execute_code" not in A._permanent_approved
 
 
 def test_execute_code_deferred_once_is_exact_and_consumed(gw_session, monkeypatch):

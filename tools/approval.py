@@ -2167,7 +2167,12 @@ def resolve_gateway_approval(session_key: str, choice: str,
     if choice in {"once", "session", "always"}:
         pattern_key = pending.get("pattern_key", "")
         if pattern_key:
-            if pending.get("one_shot") or choice == "once":
+            force_one_shot = (
+                pending.get("one_shot")
+                or pending.get("smart_denied")
+                or pending.get("allow_permanent") is False
+            )
+            if force_one_shot or choice == "once":
                 _grant_one_shot_approval(
                     session_key,
                     pending.get("one_shot_pattern_key") or pattern_key,

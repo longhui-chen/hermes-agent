@@ -663,6 +663,36 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     # but write_file/patch execute in-process, so enforce this as a hard file-tool
     # boundary rather than relying on filesystem ownership alone.
     if os.environ.get("HERMES_MANAGED_GATEWAY") == "1":
+        # User/project plugins execute inside the privileged gateway and may
+        # register model or memory providers. File tools also run in-process,
+        # so they may not rewrite any plugin code root, including a sibling
+        # multiplex profile that could be activated later.
+        plugin_roots = list(managed_hermes_roots)
+        project_plugins_enabled = os.environ.get(
+            "HERMES_ENABLE_PROJECT_PLUGINS", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        project_plugin_root = (
+            str((Path.cwd() / ".hermes" / "plugins").resolve())
+            if project_plugins_enabled
+            else ""
+        )
+        for candidate in candidates:
+            for root in plugin_roots:
+                try:
+                    relative_parts = Path(candidate).relative_to(root).parts
+                except (OSError, ValueError):
+                    continue
+                if "plugins" in relative_parts:
+                    return (
+                        f"Refusing to write to managed plugin code path: {filepath}\n"
+                        "Agent file tools cannot modify code loaded by the gateway."
+                    )
+            if project_plugin_root and _within(candidate, project_plugin_root):
+                return (
+                    f"Refusing to write to managed plugin code path: {filepath}\n"
+                    "Agent file tools cannot modify code loaded by the gateway."
+                )
+
         lazy_target = os.environ.get("HERMES_LAZY_INSTALL_TARGET", "").strip()
         if lazy_target and "\x00" not in lazy_target:
             try:

@@ -692,6 +692,50 @@ class TestSensitivePathCheck:
     @pytest.mark.parametrize(
         "target",
         [
+            (
+                "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home/"
+                "profiles/agent-a/plugins/enabled/__init__.py"
+            ),
+            (
+                "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home/"
+                "profiles/agent-b/plugins/model-provider/__init__.py"
+            ),
+            (
+                "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home/"
+                "plugins/memory-provider/__init__.py"
+            ),
+        ],
+    )
+    def test_managed_gateway_plugin_code_is_not_model_writable(
+        self, monkeypatch, tool_name, target
+    ):
+        monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+        monkeypatch.setenv(
+            "HERMES_HOME",
+            "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home/"
+            "profiles/agent-a",
+        )
+        if tool_name == "write":
+            from tools.file_tools import write_file_tool
+
+            result = json.loads(write_file_tool(target, "def register(ctx): pass\n"))
+        else:
+            from tools.file_tools import patch_tool
+
+            result = json.loads(
+                patch_tool(
+                    mode="replace",
+                    path=target,
+                    old_string="safe",
+                    new_string="payload",
+                )
+            )
+        assert "managed plugin code path" in result["error"]
+
+    @pytest.mark.parametrize("tool_name", ["write", "patch"])
+    @pytest.mark.parametrize(
+        "target",
+        [
             "/zettos/main/data/com.zettlab.claw/secrets/zettlab-claw.env",
             "/volume1/subvol/apps/com.zettlab.claw/data/secrets/zet_agent.key",
             (
