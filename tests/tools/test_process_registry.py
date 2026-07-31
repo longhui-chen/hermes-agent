@@ -974,6 +974,7 @@ class TestCheckpoint:
             "session_id": "proc_live",
             "command": "sleep 999",
             "pid": os.getpid(),  # current process — guaranteed alive
+            "host_start_time": registry._safe_host_start_time(os.getpid()),
             "task_id": "t1",
             "session_key": "sk1",
             "profile_owner": str(get_hermes_home().expanduser().resolve()),
@@ -1003,6 +1004,7 @@ class TestCheckpoint:
             "session_id": "proc_live",
             "command": "sleep 999",
             "pid": os.getpid(),
+            "host_start_time": registry._safe_host_start_time(os.getpid()),
             "task_id": "t1",
             "profile_owner": str(get_hermes_home().expanduser().resolve()),
             "watcher_interval": 0,
@@ -1018,6 +1020,7 @@ class TestCheckpoint:
             "session_id": "proc_live",
             "command": "sleep 999",
             "pid": os.getpid(),
+            "host_start_time": registry._safe_host_start_time(os.getpid()),
             "task_id": "t1",
             "session_key": "sk1",
             "profile_owner": str(get_hermes_home().expanduser().resolve()),
@@ -1061,6 +1064,7 @@ class TestCheckpoint:
             "session_id": "proc_live",
             "command": "python -c 'import time; time.sleep(0.4)'",
             "pid": proc.pid,
+            "host_start_time": registry._safe_host_start_time(proc.pid),
             "task_id": "t1",
             "session_key": "sk1",
             "profile_owner": str(get_hermes_home().expanduser().resolve()),
@@ -1982,8 +1986,8 @@ class TestPidReuseGuard:
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             assert registry.recover_from_checkpoint() == 1
 
-    def test_legacy_checkpoint_without_start_time_still_recovers(self, registry, tmp_path):
-        """Entries written before host_start_time existed degrade to liveness."""
+    def test_checkpoint_without_start_time_fails_closed(self, registry, tmp_path):
+        """A bare live PID is never adopted without an immutable baseline."""
         checkpoint = tmp_path / "procs.json"
         checkpoint.write_text(json.dumps([{
             "session_id": "proc_legacy",
@@ -1994,7 +1998,7 @@ class TestPidReuseGuard:
             "profile_owner": str(get_hermes_home().expanduser().resolve()),
         }]))
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
-            assert registry.recover_from_checkpoint() == 1
+            assert registry.recover_from_checkpoint() == 0
 
     def test_write_checkpoint_backfills_host_start_time(self, registry, tmp_path):
         """A host session is checkpointed with a kernel start time recorded."""

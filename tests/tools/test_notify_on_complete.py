@@ -270,12 +270,14 @@ class TestCheckpointNotify:
         from hermes_constants import get_hermes_home
 
         checkpoint = tmp_path / "procs.json"
+        start_time = registry._safe_host_start_time(os.getpid())
         checkpoint.write_text(json.dumps([{
             "session_id": "proc_live",
             "command": "sleep 999",
             "pid": os.getpid(),
             "task_id": "t1",
             "profile_owner": str(get_hermes_home().resolve()),
+            "host_start_time": start_time,
             "notify_on_complete": True,
         }]))
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
@@ -288,12 +290,14 @@ class TestCheckpointNotify:
         from hermes_constants import get_hermes_home
 
         checkpoint = tmp_path / "procs.json"
+        start_time = registry._safe_host_start_time(os.getpid())
         checkpoint.write_text(json.dumps([{
             "session_id": "proc_live",
             "command": "sleep 999",
             "pid": os.getpid(),
             "task_id": "t1",
             "profile_owner": str(get_hermes_home().resolve()),
+            "host_start_time": start_time,
             "session_key": "sk1",
             "watcher_platform": "telegram",
             "watcher_chat_id": "123",

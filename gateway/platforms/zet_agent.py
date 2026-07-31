@@ -4179,6 +4179,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 )
                 from tools.terminal_tool import cleanup_managed_profile_environments
                 from tools.process_registry import process_registry
+                from tools.approval import purge_profile_approval_state
 
                 killed_profile_processes = await _to_thread_with_completion_barrier(
                     lambda: process_registry.kill_all(
@@ -4203,6 +4204,11 @@ class ZetAgentAdapter(APIServerAdapter):
                     profile_home,
                 )
                 terminal_cleanup["purged_process_state"] = purged_process_state
+                purged_approval_state = await _to_thread_with_completion_barrier(
+                    purge_profile_approval_state,
+                    profile_home,
+                )
+                terminal_cleanup["purged_approval_state"] = purged_approval_state
             except asyncio.CancelledError:
                 self._unblock_runtime_import_profile(
                     profile_home, unload_barrier_owner

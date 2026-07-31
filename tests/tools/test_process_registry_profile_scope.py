@@ -88,6 +88,46 @@ def test_recovery_without_profile_owner_fails_closed(monkeypatch, tmp_path):
     assert registry._running == {}
 
 
+def test_managed_checkpoint_uses_broker_runtime_path(monkeypatch):
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    assert process_module._checkpoint_path() == Path(
+        "/run/zettlab-claw/processes.json"
+    )
+    assert process_module._checkpoint_path() != process_module.CHECKPOINT_PATH
+
+
+def test_managed_recovery_rejects_wrong_uid_or_cgroup(monkeypatch, tmp_path):
+    registry = _registry()
+    checkpoint = tmp_path / "processes.json"
+    owner = str((tmp_path / "profiles" / "coder").resolve())
+    checkpoint.write_text(
+        __import__("json").dumps([{
+            "session_id": "proc_forged",
+            "command": "sleep",
+            "pid": 123,
+            "pid_scope": "host",
+            "host_start_time": 456,
+            "profile_owner": owner,
+        }]),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setattr(process_module, "_checkpoint_path", lambda: checkpoint)
+    monkeypatch.setattr(
+        process_module, "_validate_managed_checkpoint_path", lambda _path: None
+    )
+    monkeypatch.setattr(
+        process_module, "_managed_profile_owner_allowed", lambda _owner: True
+    )
+    monkeypatch.setattr(registry, "_host_pid_is_ours", lambda *_args: True)
+    monkeypatch.setattr(
+        registry, "_managed_pid_matches_profile", lambda *_args: False
+    )
+
+    assert registry.recover_from_checkpoint() == 0
+    assert registry._running == {}
+
+
 def test_global_cleanup_uses_only_preselected_registry_objects(monkeypatch, tmp_path):
     registry = _registry()
     main = (tmp_path / "main").resolve()

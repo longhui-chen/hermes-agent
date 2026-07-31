@@ -36,11 +36,13 @@ import platform
 import shlex
 import signal
 import secrets
+import stat
 import subprocess
+import sys
 import threading
 import time
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import (
@@ -61,6 +63,70 @@ logger = logging.getLogger(__name__)
 
 # Checkpoint file for crash recovery (gateway only)
 CHECKPOINT_PATH = get_hermes_home() / "processes.json"
+_MANAGED_CHECKPOINT_PATH = Path("/run/zettlab-claw/processes.json")
+_MANAGED_PROFILE_ROOTS = (
+    Path("/volume1/subvol/agents/data"),
+    Path("/volume1/agents/data"),
+)
+
+
+def _managed_gateway_active() -> bool:
+    return os.environ.get("HERMES_MANAGED_GATEWAY") == "1"
+
+
+def _checkpoint_path() -> Path:
+    """Keep managed checkpoints outside every model-writable profile home."""
+
+    return _MANAGED_CHECKPOINT_PATH if _managed_gateway_active() else CHECKPOINT_PATH
+
+
+def _validate_managed_checkpoint_path(path: Path) -> None:
+    """Require a root-owned runtime parent and a non-symlink checkpoint."""
+
+    if not sys.platform.startswith("linux") or os.geteuid() != 0:
+        raise OSError("managed process checkpoint requires Linux root")
+    parent = path.parent
+    parent_info = os.lstat(parent)
+    if (
+        not stat.S_ISDIR(parent_info.st_mode)
+        or parent_info.st_uid != 0
+        or parent_info.st_gid != 0
+        or parent_info.st_mode & 0o022
+    ):
+        raise OSError("managed process checkpoint parent is not trusted")
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or info.st_mode & 0o022
+    ):
+        raise OSError("managed process checkpoint is not trusted")
+
+
+def _managed_profile_owner_allowed(profile_owner: str) -> bool:
+    """Accept only the service profile or a child of an Agent data root."""
+
+    owner = Path(profile_owner).expanduser().resolve()
+    try:
+        from hermes_constants import get_process_hermes_home
+
+        if owner == get_process_hermes_home().expanduser().resolve():
+            return True
+    except Exception:
+        pass
+    for raw_root in _MANAGED_PROFILE_ROOTS:
+        try:
+            root = raw_root.expanduser().resolve()
+            relative = owner.relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if relative.parts:
+            return True
+    return False
 
 # Limits
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
@@ -547,6 +613,53 @@ class ProcessRegistry:
         if expected_start is None:
             return True
         return cls._safe_host_start_time(pid) == expected_start
+
+    @staticmethod
+    def _managed_pid_matches_profile(pid: int, profile_owner: str) -> bool:
+        """Bind a recovered PID to the profile's UID and delegated cgroup."""
+
+        try:
+            from tools.environments.local import (
+                _MANAGED_TERMINAL_CGROUP_PREFIX,
+                _managed_terminal_identity,
+            )
+
+            uid, _gid = _managed_terminal_identity(
+                {"HERMES_HOME": profile_owner}
+            )
+            status = (Path("/proc") / str(pid) / "status").read_text(
+                encoding="utf-8", errors="replace"
+            )
+            effective_uid = None
+            for line in status.splitlines():
+                if line.startswith("Uid:"):
+                    fields = line.split()
+                    if len(fields) >= 3:
+                        effective_uid = int(fields[2])
+                    break
+            if effective_uid != uid:
+                return False
+
+            cgroup_root = os.environ.get("HERMES_MANAGED_CGROUP_ROOT", "")
+            parsed_root = PurePosixPath(cgroup_root)
+            if (
+                not cgroup_root.startswith("/")
+                or cgroup_root == "/"
+                or ".." in parsed_root.parts
+                or "\x00" in cgroup_root
+            ):
+                return False
+            expected = (
+                f"{cgroup_root.rstrip('/')}/"
+                f"{_MANAGED_TERMINAL_CGROUP_PREFIX}-{uid}"
+            )
+            memberships = (Path("/proc") / str(pid) / "cgroup").read_text(
+                encoding="ascii", errors="strict"
+            ).splitlines()
+            unified = [line[3:] for line in memberships if line.startswith("0::")]
+            return len(unified) == 1 and unified[0].rstrip("/") == expected
+        except Exception:
+            return False
 
     def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
         """Update recovered host-PID sessions when the underlying process has exited."""
@@ -2205,9 +2318,17 @@ class ProcessRegistry:
                             "watch_patterns": s.watch_patterns,
                         })
             
-            # Atomic write to avoid corruption on crash
+            checkpoint_path = _checkpoint_path()
+            if _managed_gateway_active():
+                _validate_managed_checkpoint_path(checkpoint_path)
+            # Atomic write to avoid corruption on crash. Managed metadata can
+            # contain commands and profile ownership, so keep it root-only.
             from utils import atomic_json_write
-            atomic_json_write(CHECKPOINT_PATH, entries)
+            atomic_json_write(
+                checkpoint_path,
+                entries,
+                mode=0o600 if _managed_gateway_active() else None,
+            )
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
@@ -2217,16 +2338,27 @@ class ProcessRegistry:
 
         Returns the number of processes recovered as detached.
         """
-        if not CHECKPOINT_PATH.exists():
+        checkpoint_path = _checkpoint_path()
+        if _managed_gateway_active():
+            try:
+                _validate_managed_checkpoint_path(checkpoint_path)
+            except OSError as exc:
+                logger.warning("Ignoring untrusted managed checkpoint: %s", exc)
+                return 0
+        if not checkpoint_path.exists():
             return 0
 
         try:
-            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+            entries = json.loads(checkpoint_path.read_text(encoding="utf-8"))
         except Exception:
+            return 0
+        if not isinstance(entries, list):
             return 0
 
         recovered = 0
         for entry in entries:
+            if not isinstance(entry, dict):
+                continue
             raw_profile_owner = entry.get("profile_owner")
             if (
                 not isinstance(raw_profile_owner, str)
@@ -2239,8 +2371,17 @@ class ProcessRegistry:
                 )
                 continue
             profile_owner = str(Path(raw_profile_owner).expanduser().resolve())
+            if (
+                _managed_gateway_active()
+                and not _managed_profile_owner_allowed(profile_owner)
+            ):
+                logger.warning(
+                    "Skipping recovered process outside managed profile roots: %s",
+                    entry.get("session_id", "?"),
+                )
+                continue
             pid = entry.get("pid")
-            if not pid:
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
                 continue
 
             pid_scope = entry.get("pid_scope", "host")
@@ -2263,6 +2404,16 @@ class ProcessRegistry:
             # watcher tree-kill a stranger (e.g. a browser). Re-validate the
             # kernel start time recorded in the checkpoint.
             recorded_start = entry.get("host_start_time")
+            if (
+                not isinstance(recorded_start, int)
+                or isinstance(recorded_start, bool)
+                or recorded_start <= 0
+            ):
+                logger.warning(
+                    "Skipping recovered process without a valid start time: %s",
+                    entry.get("session_id", "?"),
+                )
+                continue
             if not self._host_pid_is_ours(pid, recorded_start):
                 if self._is_host_pid_alive(pid):
                     logger.info(
@@ -2271,6 +2422,15 @@ class ProcessRegistry:
                         "an unrelated process; refusing to adopt it.",
                         entry.get("session_id", "?"), pid,
                     )
+                continue
+            if (
+                _managed_gateway_active()
+                and not self._managed_pid_matches_profile(pid, profile_owner)
+            ):
+                logger.warning(
+                    "Skipping recovered process outside its managed identity: %s",
+                    entry.get("session_id", "?"),
+                )
                 continue
 
             session = ProcessSession(

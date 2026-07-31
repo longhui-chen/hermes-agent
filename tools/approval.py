@@ -2649,6 +2649,75 @@ def clear_session(session_key: str) -> None:
         entry.event.set()
 
 
+def purge_profile_approval_state(profile_owner: str) -> dict[str, int]:
+    """Revoke every approval capability owned by an unloaded profile."""
+
+    raw_owner = str(profile_owner or "").strip()
+    if (
+        not raw_owner
+        or not os.path.isabs(raw_owner)
+        or "\x00" in raw_owner
+        or len(raw_owner.encode("utf-8")) > 4096
+    ):
+        raise ValueError("profile owner is required")
+    owner = os.path.realpath(raw_owner)
+
+    def owned(state_key: _ApprovalStateKey) -> bool:
+        return (
+            isinstance(state_key, tuple)
+            and len(state_key) == 2
+            and secrets.compare_digest(os.path.realpath(state_key[0]), owner)
+        )
+
+    removed = {
+        "pending": 0,
+        "one_shot_grants": 0,
+        "session_allowlists": 0,
+        "session_yolo": 0,
+        "gateway_waiters": 0,
+        "gateway_callbacks": 0,
+        "permanent_allowlist": 0,
+    }
+    rejected_entries = []
+    with _lock:
+        for state_key in list(_pending):
+            if owned(state_key):
+                removed["pending"] += len(_pending.pop(state_key, []))
+        for state_key in list(_one_shot_approved):
+            if owned(state_key):
+                grants = _one_shot_approved.pop(state_key, {})
+                removed["one_shot_grants"] += sum(
+                    len(expiries) for expiries in grants.values()
+                )
+        for state_key in list(_session_approved):
+            if owned(state_key):
+                _session_approved.pop(state_key, None)
+                removed["session_allowlists"] += 1
+        for state_key in list(_session_yolo):
+            if owned(state_key):
+                _session_yolo.discard(state_key)
+                removed["session_yolo"] += 1
+        for state_key in list(_gateway_queues):
+            if owned(state_key):
+                entries = _gateway_queues.pop(state_key, [])
+                rejected_entries.extend(entries)
+                removed["gateway_waiters"] += len(entries)
+        for state_key in list(_gateway_notify_cbs):
+            if owned(state_key):
+                _gateway_notify_cbs.pop(state_key, None)
+                removed["gateway_callbacks"] += 1
+        approvals = _permanent_approved_by_profile.pop(owner, None)
+        if approvals is not None:
+            removed["permanent_allowlist"] = len(approvals)
+        _permanent_loaded_profiles.discard(owner)
+
+    for entry in rejected_entries:
+        entry.result = "deny"
+        entry.reason = "profile unloaded"
+        entry.event.set()
+    return removed
+
+
 def is_session_yolo_enabled(session_key: str) -> bool:
     """Return True when YOLO bypass is enabled for a specific session."""
     if not session_key:

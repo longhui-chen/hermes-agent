@@ -104,3 +104,54 @@ def test_multiplex_permanent_approvals_are_loaded_and_saved_per_profile(monkeypa
     }
     approval._permanent_approved_by_profile.clear()
     approval._permanent_loaded_profiles.clear()
+
+
+def test_profile_unload_revokes_all_approval_state_before_same_path_reuse(monkeypatch):
+    scope = ["/profiles/reused"]
+    config = [{"command_allowlist": ["old-permanent"]}]
+    monkeypatch.setattr(secret_scope, "is_multiplex_active", lambda: True)
+    monkeypatch.setattr(approval, "_approval_profile_scope", lambda: scope[0])
+    monkeypatch.setattr(config_module, "load_config", lambda: dict(config[0]))
+    monkeypatch.setattr(config_module, "save_config", lambda _config: None)
+    for state in (
+        approval._pending,
+        approval._one_shot_approved,
+        approval._session_approved,
+        approval._gateway_queues,
+        approval._gateway_notify_cbs,
+        approval._permanent_approved_by_profile,
+        approval._permanent_loaded_profiles,
+    ):
+        state.clear()
+    approval._session_yolo.clear()
+
+    session_key = "same-session"
+    assert approval.is_approved(session_key, "old-permanent")
+    approval.approve_session(session_key, "old-session")
+    approval.enable_session_yolo(session_key)
+    approval._grant_one_shot_approval(session_key, "old-once")
+    approval.register_gateway_notify(session_key, lambda _data: None)
+    approval_id = approval.submit_pending(
+        session_key, {"pattern_key": "old-pending", "one_shot": True}
+    )
+    state_key = (scope[0], session_key)
+    live_entry = approval._ApprovalEntry({"approval_id": "live"})
+    approval._gateway_queues[state_key] = [live_entry]
+
+    removed = approval.purge_profile_approval_state(scope[0])
+    assert removed["pending"] == 1
+    assert removed["one_shot_grants"] == 1
+    assert removed["session_allowlists"] == 1
+    assert removed["session_yolo"] == 1
+    assert removed["gateway_waiters"] == 1
+    assert removed["gateway_callbacks"] == 1
+    assert removed["permanent_allowlist"] == 1
+    assert live_entry.event.is_set()
+    assert live_entry.result == "deny"
+    assert approval.approval_session_key_for_id(approval_id) is None
+
+    config[0] = {"command_allowlist": ["new-permanent"]}
+    assert approval.is_approved(session_key, "new-permanent")
+    assert not approval.is_approved(session_key, "old-permanent")
+    assert not approval.is_approved(session_key, "old-session")
+    assert not approval.is_session_yolo_enabled(session_key)

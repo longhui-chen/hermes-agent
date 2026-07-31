@@ -719,6 +719,12 @@ def test_generic_subprocess_scrubs_managed_gateway_key(monkeypatch):
     sanitized = local_module._sanitize_subprocess_env({
         "PATH": "/usr/bin",
         "ZET_AGENT_KEY": "never-inherit",
+        "HERMES_MANAGED_GATEWAY": "1",
+        "HERMES_MANAGED_CGROUP_UNIT": "zettlab-claw.service",
+        "HERMES_MANAGED_CGROUP_ROOT": "/system.slice/zettlab-claw.service",
     })
     assert sanitized["PATH"] == "/usr/bin"
     assert "ZET_AGENT_KEY" not in sanitized
+    assert "HERMES_MANAGED_GATEWAY" not in sanitized
+    assert "HERMES_MANAGED_CGROUP_UNIT" not in sanitized
+    assert "HERMES_MANAGED_CGROUP_ROOT" not in sanitized

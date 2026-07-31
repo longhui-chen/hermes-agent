@@ -27,6 +27,11 @@ _IS_WINDOWS = platform.system() == "Windows"
 logger = logging.getLogger(__name__)
 
 _MANAGED_GATEWAY_ENV = "HERMES_MANAGED_GATEWAY"
+_MANAGED_BOOTSTRAP_ENV_KEYS = frozenset({
+    _MANAGED_GATEWAY_ENV,
+    "HERMES_MANAGED_CGROUP_UNIT",
+    "HERMES_MANAGED_CGROUP_ROOT",
+})
 _MANAGED_SETPRIV_PATH = "/usr/bin/setpriv"
 _MANAGED_UNSHARE_PATH = "/usr/bin/unshare"
 _MANAGED_TERMINAL_UID_MIN = 100_000
@@ -1534,6 +1539,11 @@ def _sanitize_subprocess_env(
     _apply_profile_secret_scope_env(sanitized, inject=False)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
+        sanitized.pop(_marker, None)
+    # These values authorize only the root gateway's ExecStart bootstrap.
+    # Model-controlled terminal/background/PTY children are already placed in
+    # their profile UID+cgroup boundary and must never re-enter that bootstrap.
+    for _marker in _MANAGED_BOOTSTRAP_ENV_KEYS:
         sanitized.pop(_marker, None)
 
     _apply_windows_msys_bash_env_defaults(sanitized)
