@@ -316,7 +316,19 @@ def test_zettlab_image_rejects_remote_input(monkeypatch):
     assert "local image path or data URI" in got["error"]
 
 
-def test_zettlab_image_only_model_requires_image_input(monkeypatch):
+@pytest.mark.parametrize(
+    ("modalities", "expected_error"),
+    [
+        ([" IMAGE "], "missing_image"),
+        (["future-mode"], "unsupported_capability"),
+        ([], "unsupported_capability"),
+    ],
+)
+def test_zettlab_image_model_without_text_input_never_sends(
+    monkeypatch,
+    modalities,
+    expected_error,
+):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setattr(
@@ -326,7 +338,7 @@ def test_zettlab_image_only_model_requires_image_input(monkeypatch):
             "image-only",
             {
                 "id": "image-only",
-                "modalities": [" IMAGE "],
+                "modalities": modalities,
                 "_type_limits": {"max_inline_image_bytes": True},
             },
         ),
@@ -340,7 +352,7 @@ def test_zettlab_image_only_model_requires_image_input(monkeypatch):
     got = ZettlabImageGenProvider().generate("edit this image")
 
     assert got["success"] is False
-    assert got["error_type"] == "missing_image"
+    assert got["error_type"] == expected_error
 
 
 @pytest.mark.parametrize("value", [

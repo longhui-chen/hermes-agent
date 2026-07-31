@@ -54,6 +54,13 @@ def test_inline_image_input_normalizes_gateway_modality():
     assert client.inline_image_input(value, None, capability) == value
 
 
+@pytest.mark.parametrize("modalities", [[], ["future-mode"], [" FUTURE-MODE "]])
+def test_normalized_modalities_ignore_unknown_values(modalities):
+    from plugins import zettlab_media_client as client
+
+    assert client.normalized_modalities({"modalities": modalities}) == []
+
+
 @pytest.mark.parametrize(
     ("value", "message"),
     [

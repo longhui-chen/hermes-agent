@@ -683,7 +683,7 @@ def normalized_modalities(model_capability: Optional[Dict[str, Any]]) -> List[st
     if isinstance(raw, list):
         for value in raw:
             normalized = value.strip().casefold() if isinstance(value, str) else ""
-            if normalized and normalized not in modalities:
+            if normalized in {"text", "image"} and normalized not in modalities:
                 modalities.append(normalized)
     elif raw is None:
         modalities.append("text")

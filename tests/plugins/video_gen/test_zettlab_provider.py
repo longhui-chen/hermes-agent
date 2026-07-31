@@ -276,7 +276,19 @@ def test_zettlab_video_omits_unspecified_duration_and_normalizes_model_options(m
     assert got["aspect_ratio"] == "9:16"
 
 
-def test_zettlab_video_image_only_model_requires_image_input(monkeypatch):
+@pytest.mark.parametrize(
+    ("modalities", "expected_error"),
+    [
+        ([" IMAGE "], "missing_image"),
+        (["future-mode"], "unsupported_capability"),
+        ([], "unsupported_capability"),
+    ],
+)
+def test_zettlab_video_model_without_text_input_never_sends(
+    monkeypatch,
+    modalities,
+    expected_error,
+):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setattr(
@@ -284,7 +296,7 @@ def test_zettlab_video_image_only_model_requires_image_input(monkeypatch):
         "resolve_model_with_capability",
         lambda media_type, requested=None: ("image-only", {
             "id": "image-only",
-            "modalities": [" IMAGE "],
+            "modalities": modalities,
             "durations": [5],
             "_type_limits": {"max_inline_image_bytes": True},
         }),
@@ -298,7 +310,7 @@ def test_zettlab_video_image_only_model_requires_image_input(monkeypatch):
     got = ZettlabVideoGenProvider().generate("animate this")
 
     assert got["success"] is False
-    assert got["error_type"] == "missing_image"
+    assert got["error_type"] == expected_error
 
 
 def test_zettlab_video_rejects_remote_input(monkeypatch):

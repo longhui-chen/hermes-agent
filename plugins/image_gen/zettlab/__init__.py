@@ -124,14 +124,19 @@ class ZettlabImageGenProvider(ImageGenProvider):
             refs = normalize_reference_images(reference_image_urls)
             input_image = media_client.inline_image_input(image_url, refs, model_capability)
             configured_modalities = media_client.normalized_modalities(model_capability)
-            if (
-                "image" in configured_modalities
-                and "text" not in configured_modalities
-                and not input_image
-            ):
+            if not input_image and "text" not in configured_modalities:
+                if "image" in configured_modalities:
+                    return error_response(
+                        error="An image input is required for this Zettlab image generation model.",
+                        error_type="missing_image",
+                        provider="zettlab",
+                        model=model,
+                        prompt=prompt,
+                        aspect_ratio=aspect,
+                    )
                 return error_response(
-                    error="An image input is required for this Zettlab image generation model.",
-                    error_type="missing_image",
+                    error="The Zettlab image model exposes no supported input modality.",
+                    error_type="unsupported_capability",
                     provider="zettlab",
                     model=model,
                     prompt=prompt,
