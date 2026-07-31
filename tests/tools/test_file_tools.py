@@ -656,6 +656,38 @@ class TestSensitivePathCheck:
         assert "error" in result
         assert "sensitive system path" in result["error"]
 
+    @pytest.mark.parametrize("tool_name", ["write", "patch"])
+    def test_managed_runtime_import_root_is_not_model_writable(
+        self,
+        monkeypatch,
+        tool_name,
+    ):
+        monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+        monkeypatch.setenv(
+            "HERMES_LAZY_INSTALL_TARGET",
+            "/volume1/subvol/apps/zettlab-claw/data/lazy-packages",
+        )
+        target = (
+            "/volume1/subvol/apps/zettlab-claw/data/lazy-packages/"
+            "persist.pth"
+        )
+
+        if tool_name == "write":
+            from tools.file_tools import write_file_tool
+
+            result = json.loads(write_file_tool(target, "import payload\n"))
+        else:
+            from tools.file_tools import patch_tool
+
+            result = json.loads(patch_tool(
+                mode="replace",
+                path=target,
+                old_string="safe",
+                new_string="import payload",
+            ))
+
+        assert "managed runtime import path" in result["error"]
+
     @patch("tools.file_tools._get_file_ops")
     def test_normal_file_not_blocked(self, mock_get, monkeypatch):
         monkeypatch.setattr("tools.file_tools._hermes_config_resolved", "/home/user/.hermes/config.yaml")

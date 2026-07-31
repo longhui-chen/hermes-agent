@@ -113,6 +113,111 @@ def _managed_terminal_privilege_drop_prefix(
     ]
 
 
+def _managed_execute_code_identity(
+    env: Mapping[str, str],
+    execution_scope: str,
+) -> tuple[int, int]:
+    """Reserve a per-execution UID distinct from every persistent terminal."""
+
+    if _IS_WINDOWS or os.geteuid() != 0:
+        raise OSError("managed execute_code requires a root identity broker")
+    secret = os.environ.get("ZET_AGENT_KEY", "")
+    profile_scope = str(env.get("HERMES_HOME") or "").strip()
+    if (
+        not secret
+        or not profile_scope
+        or not execution_scope
+        or "\x00" in secret
+        or "\x00" in profile_scope
+        or "\x00" in execution_scope
+        or len(secret.encode("utf-8")) > 4096
+        or len(profile_scope.encode("utf-8")) > 4096
+        or len(execution_scope.encode("utf-8")) > 128
+    ):
+        raise OSError("managed execute_code identity is unavailable")
+
+    import pwd
+
+    owner_scope = f"execute-code\0{profile_scope}\0{execution_scope}"
+    registered = {entry.pw_uid for entry in pwd.getpwall()}
+    population = _MANAGED_TERMINAL_UID_MAX - _MANAGED_TERMINAL_UID_MIN + 1
+    with _MANAGED_TERMINAL_IDENTITY_LOCK:
+        for counter in range(_MANAGED_TERMINAL_IDENTITY_ATTEMPTS):
+            digest = hmac.new(
+                secret.encode("utf-8"),
+                f"{owner_scope}\0{counter}".encode("utf-8"),
+                hashlib.sha256,
+            ).digest()
+            uid = _MANAGED_TERMINAL_UID_MIN + (
+                int.from_bytes(digest[:8], "big") % population
+            )
+            owner = _MANAGED_TERMINAL_SCOPE_BY_UID.get(uid)
+            if uid in registered or (owner is not None and owner != owner_scope):
+                continue
+            if owner is None:
+                if (
+                    len(_MANAGED_TERMINAL_SCOPE_BY_UID)
+                    >= _MANAGED_TERMINAL_IDENTITY_CACHE_MAX
+                ):
+                    raise OSError("managed identity cache is full")
+                _MANAGED_TERMINAL_SCOPE_BY_UID[uid] = owner_scope
+            return uid, uid
+    raise OSError("managed execute_code identity collision")
+
+
+def _release_managed_execute_code_identity(
+    uid: int,
+    env: Mapping[str, str],
+    execution_scope: str,
+) -> None:
+    """Release an invocation UID after its process tree and RPC socket are gone."""
+
+    owner_scope = (
+        f"execute-code\0{str(env.get('HERMES_HOME') or '').strip()}\0"
+        f"{execution_scope}"
+    )
+    with _MANAGED_TERMINAL_IDENTITY_LOCK:
+        if _MANAGED_TERMINAL_SCOPE_BY_UID.get(uid) == owner_scope:
+            _MANAGED_TERMINAL_SCOPE_BY_UID.pop(uid, None)
+
+
+def _managed_execute_code_sandbox_argv(
+    argv: list[str],
+    *,
+    env: Mapping[str, str],
+    execution_scope: str | None,
+) -> list[str]:
+    """Drop one execute_code invocation into its non-shared identity domain."""
+
+    if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
+        return list(argv)
+    if execution_scope is None:
+        raise OSError("managed execute_code scope is unavailable")
+    try:
+        info = os.lstat(_MANAGED_SETPRIV_PATH)
+    except OSError as exc:
+        raise OSError("managed execute_code privilege drop is unavailable") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_mode & 0o022
+    ):
+        raise OSError("managed execute_code privilege drop is not trusted")
+    uid, gid = _managed_execute_code_identity(env, execution_scope)
+    return [
+        _MANAGED_SETPRIV_PATH,
+        f"--reuid={uid}",
+        f"--regid={gid}",
+        "--clear-groups",
+        "--bounding-set=-all",
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        "--no-new-privs",
+        "--",
+        *argv,
+    ]
+
+
 def _managed_terminal_argv(
     argv: list[str],
     *,
@@ -155,6 +260,38 @@ def _prepare_managed_terminal_workspace(
         os.chmod(path, 0o600)
     os.chown(directory, uid, gid)
     os.chmod(directory, 0o700)
+
+
+def _prepare_managed_execute_code_workspace(
+    directory: str,
+    paths: list[str],
+    *,
+    env: Mapping[str, str],
+    execution_scope: str,
+) -> int:
+    """Transfer one scratch workspace to a per-invocation execute_code UID."""
+
+    uid, gid = _managed_execute_code_identity(env, execution_scope)
+    root = os.lstat(directory)
+    if (
+        not stat.S_ISDIR(root.st_mode)
+        or root.st_uid != 0
+        or root.st_mode & 0o022
+    ):
+        raise OSError("managed execute_code workspace is not trusted")
+    for path in paths:
+        info = os.lstat(path)
+        if (
+            not (stat.S_ISREG(info.st_mode) or stat.S_ISSOCK(info.st_mode))
+            or info.st_uid != 0
+            or info.st_mode & 0o022
+        ):
+            raise OSError("managed execute_code workspace entry is not trusted")
+        os.chown(path, uid, gid)
+        os.chmod(path, 0o600)
+    os.chown(directory, uid, gid)
+    os.chmod(directory, 0o700)
+    return uid
 
 
 def _prepare_managed_terminal_home(env: dict[str, str]) -> str:

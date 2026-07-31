@@ -408,6 +408,62 @@ printf '{"argv":["%s","%s","%s"],"token_ok":true}\\n' "$1" "$2" "$3"
     }
 
 
+def test_agentcomputer_mutation_requires_one_shot_approval_before_token(
+    monkeypatch,
+    tmp_path,
+):
+    _configure(monkeypatch, tmp_path, "raise SystemExit('must not run')\n")
+    captured = {}
+
+    def request_approval(tool_name, reason, **kwargs):
+        captured.update(tool_name=tool_name, reason=reason, kwargs=kwargs)
+        return {
+            "approved": False,
+            "status": "pending_approval",
+            "description": reason,
+            "pattern_key": "agentcomputer:file.delete",
+        }
+
+    monkeypatch.setattr("tools.approval.request_tool_approval", request_approval)
+    monkeypatch.setattr(
+        "tools.environments.local.build_agent_creator_runtime_env",
+        lambda: (_ for _ in ()).throw(AssertionError("token acquired too early")),
+    )
+
+    result = json.loads(terminal_tool_module.terminal_tool(
+        _canonical_command("cli file delete --path notes/a.txt"),
+        task_id="agentcomputer-delete-approval",
+    ))
+
+    assert result["status"] == "pending_approval"
+    assert result["approval_pending"] is True
+    assert captured["tool_name"] == "agentcomputer_cli"
+    assert captured["kwargs"]["one_shot"] is True
+    assert captured["kwargs"]["allow_yolo_bypass"] is False
+
+
+def test_agentcomputer_read_only_cli_does_not_request_mutation_approval(
+    monkeypatch,
+    tmp_path,
+):
+    _configure(monkeypatch, tmp_path, "print('read-only-ok')\n")
+    monkeypatch.setattr(
+        "tools.approval.request_tool_approval",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("read-only CLI must not request mutation approval")
+        ),
+    )
+
+    with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
+        result = json.loads(terminal_tool_module.terminal_tool(
+            _canonical_command("cli file list --path . --limit 20"),
+            task_id="agentcomputer-list-no-approval",
+        ))
+
+    assert result["exit_code"] == 0
+    assert result["output"].strip() == "read-only-ok"
+
+
 def test_concurrent_creator_calls_keep_profile_scope_and_turn_isolated(
     monkeypatch,
     tmp_path,

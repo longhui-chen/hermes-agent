@@ -609,6 +609,26 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             return _err
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
         return _err
+    # The managed gateway adds HERMES_LAZY_INSTALL_TARGET to sys.path during
+    # bootstrap.  A model-controlled .pth file or importable module below that
+    # root would execute in the privileged gateway process on a later import or
+    # restart.  The terminal subprocess runs under a separate unprivileged UID,
+    # but write_file/patch execute in-process, so enforce this as a hard file-tool
+    # boundary rather than relying on filesystem ownership alone.
+    if os.environ.get("HERMES_MANAGED_GATEWAY") == "1":
+        lazy_target = os.environ.get("HERMES_LAZY_INSTALL_TARGET", "").strip()
+        if lazy_target and "\x00" not in lazy_target:
+            try:
+                lazy_root = str(Path(_expand_tilde(lazy_target)).resolve())
+                if os.path.commonpath((resolved, lazy_root)) == lazy_root:
+                    return (
+                        f"Refusing to write to managed runtime import path: {filepath}\n"
+                        "Agent file tools cannot modify executable Python import roots."
+                    )
+            except (OSError, ValueError):
+                # A malformed configured root is a deployment issue.  Do not
+                # broaden the deny to unrelated paths when it cannot be parsed.
+                pass
     # Prevent agents from modifying the Hermes config file directly.
     # approvals.mode and other security settings live here; a malicious or
     # prompt-injected agent could silently disable exec approval by writing to

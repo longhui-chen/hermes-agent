@@ -1801,6 +1801,13 @@ _AGENTCOMPUTER_CLI_REQUIRED_FLAGS = {
     ("system", "smart-info"): frozenset({"--device"}),
 }
 _AGENTCOMPUTER_CLI_PATH_FLAGS = frozenset({"--path", "--source", "--target"})
+_AGENTCOMPUTER_CLI_MUTATIONS = frozenset({
+    ("file", "write"),
+    ("file", "copy"),
+    ("file", "rename"),
+    ("file", "move"),
+    ("file", "delete"),
+})
 _AGENT_CREATOR_HEREDOC_RE = re.compile(
     r"^(?P<command>.+?)\s+<<\s*"
     r"(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_][A-Za-z0-9_]{0,31})(?P=quote)\s*$"
@@ -1813,6 +1820,7 @@ class _AgentCreatorCommand:
     root_identity: tuple[int, int]
     script_identity: tuple[int, int]
     stdin_text: Optional[str]
+    approval_operation: Optional[str]
 
 
 def _agent_creator_blocked_result(
@@ -2159,6 +2167,7 @@ def _parse_agent_creator_command(command: str) -> Optional[_AgentCreatorCommand]
 
     args = tokens[2:]
     stdin_text: Optional[str] = None
+    approval_operation: Optional[str] = None
     if args in (["preflight"], ["list"]):
         if heredoc_payload is not None:
             return None
@@ -2178,10 +2187,14 @@ def _parse_agent_creator_command(command: str) -> Optional[_AgentCreatorCommand]
             except ValueError:
                 return None
     elif args and args[0] == "cli":
+        cli_args = args[1:]
         try:
-            requires_stdin = _validate_agentcomputer_cli_args(args[1:])
+            requires_stdin = _validate_agentcomputer_cli_args(cli_args)
         except (UnicodeEncodeError, ValueError):
             return None
+        cli_operation = tuple(cli_args[:2])
+        if cli_operation in _AGENTCOMPUTER_CLI_MUTATIONS:
+            approval_operation = ".".join(cli_operation)
         if requires_stdin:
             if heredoc_payload is None:
                 return None
@@ -2213,7 +2226,52 @@ def _parse_agent_creator_command(command: str) -> Optional[_AgentCreatorCommand]
         root_identity=anchor.identity,
         script_identity=script_identity,
         stdin_text=stdin_text,
+        approval_operation=approval_operation,
     )
+
+
+def _request_agentcomputer_mutation_approval(
+    parsed: _AgentCreatorCommand,
+) -> Optional[str]:
+    """Require a fresh human decision before a data-changing CLI operation."""
+
+    operation = parsed.approval_operation
+    if operation is None:
+        return None
+
+    from tools.approval import request_tool_approval
+
+    approval = request_tool_approval(
+        "agentcomputer_cli",
+        f"AgentComputer {operation} modifies AgentComputer user data.",
+        rule_key=f"agentcomputer:{operation}",
+        approval_callback=_get_approval_callback(),
+        one_shot=True,
+        allow_yolo_bypass=False,
+    )
+    if approval.get("approved"):
+        return None
+
+    pending = approval.get("status") == "pending_approval"
+    return json.dumps({
+        "output": "",
+        "exit_code": -1,
+        "error": "" if pending else approval.get(
+            "message",
+            f"AgentComputer {operation} was not approved.",
+        ),
+        "status": "pending_approval" if pending else "blocked",
+        "approval_pending": pending,
+        "command": approval.get("command", f"agentcomputer {operation}"),
+        "description": approval.get(
+            "description",
+            f"AgentComputer {operation} modifies AgentComputer user data.",
+        ),
+        "pattern_key": approval.get("pattern_key", f"agentcomputer:{operation}"),
+        "smart_denied": approval.get("smart_denied", False),
+        "allow_permanent": False,
+        "agent_creator_direct": True,
+    }, ensure_ascii=False)
 
 
 def _read_verified_agent_creator_file(
@@ -2365,6 +2423,10 @@ def _run_agent_creator_command_if_allowed(
             "Agent Creator trust identity changed before execution.",
             direct=True,
         )
+
+    approval_result = _request_agentcomputer_mutation_approval(parsed)
+    if approval_result is not None:
+        return approval_result
 
     try:
         script_bytes = _read_verified_agent_creator_script(

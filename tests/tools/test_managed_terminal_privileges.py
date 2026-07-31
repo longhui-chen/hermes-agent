@@ -1,5 +1,6 @@
 import os
 import stat
+import struct
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -114,14 +115,15 @@ def test_managed_execute_code_drops_identity_capabilities(monkeypatch):
     monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
     monkeypatch.setattr(
         local_module,
-        "_managed_terminal_privilege_drop_prefix",
-        lambda _env=None: [
+        "_managed_execute_code_sandbox_argv",
+        lambda argv, *, env, execution_scope: [
             "/usr/bin/setpriv",
             "--reuid=65534",
             "--regid=65534",
             "--clear-groups",
             "--bounding-set=-all",
             "--",
+            *argv,
         ],
     )
 
@@ -129,6 +131,7 @@ def test_managed_execute_code_drops_identity_capabilities(monkeypatch):
         "/app/venv/bin/python",
         "/tmp/hermes-execute/script.py",
         env={},
+        execution_scope="scope-1",
     )
 
     assert argv == [
@@ -141,6 +144,51 @@ def test_managed_execute_code_drops_identity_capabilities(monkeypatch):
         "/app/venv/bin/python",
         "/tmp/hermes-execute/script.py",
     ]
+
+
+def test_managed_execute_code_gets_unique_identity_from_terminal(monkeypatch):
+    monkeypatch.setattr(local_module.os, "geteuid", lambda: 0)
+    monkeypatch.setenv("ZET_AGENT_KEY", "device-key")
+    local_module._MANAGED_TERMINAL_SCOPE_BY_UID.clear()
+    env = {"HERMES_HOME": "/profiles/main"}
+
+    terminal_uid, _ = local_module._managed_terminal_identity(env)
+    first_uid, _ = local_module._managed_execute_code_identity(env, "run-1")
+    second_uid, _ = local_module._managed_execute_code_identity(env, "run-2")
+
+    assert len({terminal_uid, first_uid, second_uid}) == 3
+
+
+def test_rpc_peer_must_match_expected_pid_and_uid():
+    class Connection:
+        def __init__(self, pid, uid):
+            self.pid = pid
+            self.uid = uid
+
+        def getsockopt(self, _level, _option, _size):
+            return struct.pack("3i", self.pid, self.uid, self.uid)
+
+    expected = (1234, 4567)
+    original = getattr(code_execution_module.socket, "SO_PEERCRED", None)
+    code_execution_module.socket.SO_PEERCRED = 17
+    try:
+        code_execution_module._validate_rpc_peer(Connection(*expected), expected)
+        with pytest.raises(PermissionError, match="identity mismatch"):
+            code_execution_module._validate_rpc_peer(
+                Connection(1234, 9999),
+                expected,
+            )
+    finally:
+        if original is None:
+            delattr(code_execution_module.socket, "SO_PEERCRED")
+        else:
+            code_execution_module.socket.SO_PEERCRED = original
+
+
+def test_managed_execute_code_preamble_disables_dumpability():
+    assert "prctl(4, 0, 0, 0, 0)" in (
+        code_execution_module._MANAGED_EXECUTE_CODE_PREAMBLE
+    )
 
 
 def test_managed_service_mounts_system_read_only_with_scoped_writes():
