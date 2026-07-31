@@ -92,3 +92,37 @@ def test_projection_isolated_for_same_session_across_profiles(monkeypatch, tmp_p
     assert not adapter._remove_approval_projection(main_key, "m" * 24)
     assert adapter._approval_projection_head(main_key) is None
     assert adapter._approval_projection_head(coder_key)["command"] == "coder command"
+
+
+def test_timeout_cleanup_advances_projection_fifo():
+    adapter, _goals = _adapter()
+    stream = queue.Queue()
+    notify = adapter._make_approval_cb(stream, "session-a")
+    cleanup_first = notify({"approval_id": "a" * 24, "command": "first"})
+    cleanup_second = notify({"approval_id": "b" * 24, "command": "second"})
+    scoped_key = adapter._active_turn_key("session-a")
+    stream.get_nowait()
+
+    cleanup_first()
+    assert stream.get_nowait()[1]["command"] == "second"
+    assert adapter._approval_projection_head(scoped_key)["command"] == "second"
+    cleanup_second()
+    assert adapter._approval_projection_head(scoped_key) is None
+
+
+def test_projection_payload_and_capacity_are_bounded(monkeypatch):
+    adapter, _goals = _adapter()
+    adapter._APPROVAL_PROJECTION_MAX_PER_SESSION = 2
+    adapter._APPROVAL_PROJECTION_MAX_GLOBAL = 2
+    adapter._APPROVAL_PROJECTION_MAX_BYTES = 32_000
+    stream = queue.Queue()
+    notify = adapter._make_approval_cb(stream, "session-a")
+    notify({"approval_id": "a" * 24, "command": "x" * 100_000})
+    notify({"approval_id": "b" * 24, "command": "second"})
+    scoped_key = adapter._active_turn_key("session-a")
+    head = adapter._approval_projection_head(scoped_key)
+    assert len(head["command"]) < 5000
+    assert len(head["payload_fingerprint"]) == 64
+    with pytest.raises(RuntimeError, match="session limit"):
+        notify({"approval_id": "c" * 24, "command": "third"})
+    assert len(adapter._pending_approval[scoped_key]) == 2

@@ -3599,8 +3599,11 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     )
 
     # Notify the user (bridges sync agent thread → async gateway)
+    projection_cleanup = None
     try:
-        notify_cb(approval_data)
+        callback_result = notify_cb(approval_data)
+        if callable(callback_result):
+            projection_cleanup = callback_result
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
         _drop_entry()
@@ -3655,6 +3658,13 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
             touch_activity_if_due(_activity_state, "waiting for user approval")
 
     _drop_entry()
+    if projection_cleanup is not None:
+        try:
+            projection_cleanup()
+        except Exception:
+            logger.debug(
+                "Gateway approval projection cleanup failed", exc_info=True
+            )
 
     choice = entry.result
     # Normalize outcome for the post hook. Unresolved (timeout) and None both

@@ -75,6 +75,7 @@ After the first successful exchange, reuse Hermes' native
 
 import asyncio
 import inspect
+import hashlib
 import json
 import logging
 import os
@@ -1291,6 +1292,78 @@ class ZetAgentAdapter(APIServerAdapter):
     # Approval — register notify callback, resolve via HTTP respond
     # ------------------------------------------------------------------
 
+    _APPROVAL_PROJECTION_MAX_PER_SESSION = 16
+    _APPROVAL_PROJECTION_MAX_GLOBAL = 256
+    _APPROVAL_PROJECTION_MAX_BYTES = 512 * 1024
+    _APPROVAL_PROJECTION_COMMAND_CHARS = 4096
+    _APPROVAL_PROJECTION_DESCRIPTION_CHARS = 1024
+
+    @staticmethod
+    def _bounded_approval_projection_text(value: Any, limit: int) -> str:
+        text = str(value or "")
+        if len(text) <= limit:
+            return text
+        digest = hashlib.sha256(
+            text.encode("utf-8", errors="replace")
+        ).hexdigest()
+        half = max(limit // 2, 1)
+        return (
+            f"{text[:half]}\n...[truncated sha256={digest}]...\n"
+            f"{text[-half:]}"
+        )
+
+    def _bounded_approval_projection_payload(
+        self, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        bounded = dict(payload)
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8", errors="replace")
+        ).hexdigest()
+        bounded["command"] = self._bounded_approval_projection_text(
+            payload.get("command", ""),
+            self._APPROVAL_PROJECTION_COMMAND_CHARS,
+        )
+        bounded["description"] = self._bounded_approval_projection_text(
+            payload.get("description", ""),
+            self._APPROVAL_PROJECTION_DESCRIPTION_CHARS,
+        )
+        bounded["pattern_key"] = self._bounded_approval_projection_text(
+            payload.get("pattern_key", ""), 512
+        )
+        bounded["pattern_keys"] = [
+            self._bounded_approval_projection_text(value, 512)
+            for value in list(payload.get("pattern_keys", []) or [])[:32]
+            if value
+        ]
+        bounded["payload_fingerprint"] = fingerprint
+        return bounded
+
+    @staticmethod
+    def _approval_projection_size(payload: Dict[str, Any]) -> int:
+        return len(
+            json.dumps(
+                payload,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                default=str,
+            ).encode("utf-8", errors="replace")
+        )
+
+    def _clear_approval_projections(self, scoped_session_key: str) -> int:
+        with self._pending_lock:
+            raw_queue = self._pending_approval.pop(scoped_session_key, [])
+            getattr(self, "_approval_stream_queues", {}).pop(
+                scoped_session_key, None
+            )
+        if isinstance(raw_queue, dict):
+            return 1
+        return len(raw_queue or [])
+
     def _approval_projection_head(
         self, scoped_session_key: str
     ) -> Optional[Dict[str, Any]]:
@@ -1309,12 +1382,29 @@ class ZetAgentAdapter(APIServerAdapter):
         session_id: str,
         payload: Dict[str, Any],
     ) -> None:
+        payload = self._bounded_approval_projection_payload(payload)
+        payload_size = self._approval_projection_size(payload)
         with self._pending_lock:
             raw_queue = self._pending_approval.get(scoped_session_key)
             if isinstance(raw_queue, dict):
                 queue = [raw_queue]
             else:
                 queue = list(raw_queue or [])
+            if len(queue) >= self._APPROVAL_PROJECTION_MAX_PER_SESSION:
+                raise RuntimeError("approval projection session limit reached")
+            all_payloads = []
+            for existing in self._pending_approval.values():
+                if isinstance(existing, dict):
+                    all_payloads.append(existing)
+                else:
+                    all_payloads.extend(existing or [])
+            if len(all_payloads) >= self._APPROVAL_PROJECTION_MAX_GLOBAL:
+                raise RuntimeError("approval projection global limit reached")
+            total_bytes = sum(
+                self._approval_projection_size(item) for item in all_payloads
+            )
+            if total_bytes + payload_size > self._APPROVAL_PROJECTION_MAX_BYTES:
+                raise RuntimeError("approval projection byte limit reached")
             should_emit = not queue
             queue.append(payload)
             self._pending_approval[scoped_session_key] = queue
@@ -1324,7 +1414,13 @@ class ZetAgentAdapter(APIServerAdapter):
                 self._approval_stream_queues = stream_queues
             stream_queues[scoped_session_key] = stream_q
         if should_emit:
-            stream_q.put(("__tool_progress__", payload))
+            try:
+                stream_q.put(("__tool_progress__", payload))
+            except Exception:
+                self._remove_approval_projection(
+                    scoped_session_key, str(payload.get("approval_id") or "")
+                )
+                raise
             try:
                 self._goals().on_interaction_pending(session_id)
             except Exception:
@@ -1404,7 +1500,7 @@ class ZetAgentAdapter(APIServerAdapter):
         # profile with the same public session id.
         scoped_session_key = self._active_turn_key(session_id)
 
-        def _notify(approval_data: Dict[str, Any]) -> None:
+        def _notify(approval_data: Dict[str, Any]):
             # Stamp the deadline using the same config the wait loop in
             # tools/approval.py reads. The notify callback fires
             # immediately before that wait starts, so a stable config
@@ -1426,6 +1522,22 @@ class ZetAgentAdapter(APIServerAdapter):
                 )
             except Exception:
                 logger.debug("[zet_agent] approval notify push failed", exc_info=True)
+                raise
+
+            approval_id = str(payload.get("approval_id") or "")
+
+            def _cleanup_projection() -> None:
+                try:
+                    self._remove_approval_projection(
+                        scoped_session_key, approval_id
+                    )
+                except Exception:
+                    logger.debug(
+                        "[zet_agent] approval projection cleanup failed",
+                        exc_info=True,
+                    )
+
+            return _cleanup_projection
 
         return _notify
 
@@ -2367,6 +2479,9 @@ class ZetAgentAdapter(APIServerAdapter):
         register helper always has a list to stash.
         """
         active_ref = agent_ref if agent_ref is not None else [None]
+        scoped_session_key = (
+            self._active_turn_key(session_id) if session_id else ""
+        )
         self._register_active_session_turn(session_id, active_ref, agent_task)
         try:
             return await super()._write_sse_chat_completion(
@@ -2382,6 +2497,8 @@ class ZetAgentAdapter(APIServerAdapter):
             )
         finally:
             self._clear_active_session_turn(session_id, active_ref, agent_task)
+            if scoped_session_key:
+                self._clear_approval_projections(scoped_session_key)
 
     # ------------------------------------------------------------------
     # HTTP respond handlers — wake blocked agent threads
@@ -4558,6 +4675,13 @@ class ZetAgentAdapter(APIServerAdapter):
                     pass
         except Exception:
             pass
+
+        # Teardown/disconnect is a hard run boundary. Projection callbacks are
+        # idempotent, so clearing here safely races timeout cleanup and keeps a
+        # dead adapter from retaining command cards or stream queue objects.
+        with self._pending_lock:
+            self._pending_approval.clear()
+            getattr(self, "_approval_stream_queues", {}).clear()
 
         # Wake any clarify waiters with empty responses so the agent
         # threads don't sit on threading.Event forever.

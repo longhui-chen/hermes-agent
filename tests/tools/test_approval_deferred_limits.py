@@ -1,4 +1,5 @@
 import tools.approval as approval
+from unittest.mock import Mock
 
 
 def _reset_state():
@@ -70,3 +71,22 @@ def test_expired_sessions_are_actively_swept(monkeypatch):
     with approval._lock:
         assert approval._pending == {}
     _reset_state()
+
+
+def test_live_timeout_invokes_projection_cleanup(monkeypatch):
+    _reset_state()
+    cleanup = Mock()
+    monkeypatch.setattr(approval, "_get_approval_timeout", lambda: 0.0)
+    monkeypatch.setattr(approval, "_fire_approval_hook", lambda *_a, **_k: None)
+    monkeypatch.setattr(approval, "is_interrupted", lambda: False)
+
+    result = approval._await_gateway_decision(
+        "timeout-session",
+        lambda _data: cleanup,
+        {"command": "danger", "pattern_key": "danger"},
+    )
+
+    assert result["resolved"] is False
+    cleanup.assert_called_once_with()
+    with approval._lock:
+        assert approval._gateway_queues == {}
