@@ -419,7 +419,7 @@ def test_agentcomputer_mutation_requires_one_shot_approval_before_token(
         captured.update(tool_name=tool_name, reason=reason, kwargs=kwargs)
         return {
             "approved": False,
-            "status": "pending_approval",
+            "status": "approval_required",
             "description": reason,
             "pattern_key": "agentcomputer:file.delete",
         }
@@ -440,6 +440,99 @@ def test_agentcomputer_mutation_requires_one_shot_approval_before_token(
     assert captured["tool_name"] == "agentcomputer_cli"
     assert captured["kwargs"]["one_shot"] is True
     assert captured["kwargs"]["allow_yolo_bypass"] is False
+    assert captured["kwargs"]["rule_key"].startswith(
+        "agentcomputer:file.delete:"
+    )
+
+
+def test_agentcomputer_mkdir_deferred_approval_replays_exactly_once(
+    monkeypatch,
+    tmp_path,
+):
+    from tools import approval
+    from tools.environments import local as local_environment
+
+    _configure(
+        monkeypatch,
+        tmp_path,
+        """
+        import json
+        import sys
+
+        print(json.dumps({
+            "argv": sys.argv[1:],
+            "token_ok": (
+                _read_injected_secret("ZETTLAB_AGENT_ACTION_TOKEN")
+                == "scope-token"
+            ),
+        }))
+        """,
+    )
+    session_key = "agentcomputer-mkdir-deferred"
+    approval.clear_session(session_key)
+    approval.unregister_gateway_notify(session_key)
+    session_token = approval.set_current_session_key(session_key)
+    monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+    monkeypatch.setattr(
+        approval,
+        "_is_gateway_approval_context",
+        lambda: True,
+    )
+    real_build_runtime_env = local_environment.build_agent_creator_runtime_env
+    token_acquisitions = []
+
+    def tracked_build_runtime_env():
+        token_acquisitions.append(True)
+        return real_build_runtime_env()
+
+    monkeypatch.setattr(
+        local_environment,
+        "build_agent_creator_runtime_env",
+        tracked_build_runtime_env,
+    )
+    command = _canonical_command(
+        "cli file mkdir --path notes/archive --parents"
+    )
+
+    try:
+        pending = json.loads(terminal_tool_module.terminal_tool(
+            command,
+            task_id="agentcomputer-mkdir-pending",
+        ))
+        assert pending["status"] == "pending_approval"
+        assert pending["approval_pending"] is True
+        assert token_acquisitions == []
+
+        assert approval.resolve_gateway_approval(session_key, "once") == 1
+        with _scope({"ZETTLAB_AGENT_ACTION_TOKEN": "scope-token"}):
+            approved = json.loads(terminal_tool_module.terminal_tool(
+                command,
+                task_id="agentcomputer-mkdir-approved",
+            ))
+
+        assert approved["exit_code"] == 0
+        assert json.loads(approved["output"]) == {
+            "argv": [
+                "cli",
+                "file",
+                "mkdir",
+                "--path",
+                "notes/archive",
+                "--parents",
+            ],
+            "token_ok": True,
+        }
+        assert len(token_acquisitions) == 1
+
+        consumed = json.loads(terminal_tool_module.terminal_tool(
+            command,
+            task_id="agentcomputer-mkdir-consumed",
+        ))
+        assert consumed["status"] == "pending_approval"
+        assert len(token_acquisitions) == 1
+    finally:
+        approval.clear_session(session_key)
+        approval.reset_current_session_key(session_token)
 
 
 def test_agentcomputer_read_only_cli_does_not_request_mutation_approval(

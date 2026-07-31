@@ -249,3 +249,46 @@ class TestRequestToolApproval:
 
         assert result["status"] == "approval_required"
         assert submitted["allow_permanent"] is False
+
+    def test_deferred_one_shot_grant_is_exact_and_consumed_once(self, monkeypatch):
+        session_key = "test-session"
+        approval.clear_session(session_key)
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(
+            approval, "_is_gateway_approval_context", lambda: True
+        )
+
+        first = request_tool_approval(
+            "agentcomputer_cli",
+            "delete notes/a.txt",
+            rule_key="agentcomputer:file.delete:request-a",
+            one_shot=True,
+        )
+        assert first["status"] == "approval_required"
+        assert approval.resolve_gateway_approval(session_key, "once") == 1
+
+        different = request_tool_approval(
+            "agentcomputer_cli",
+            "delete notes/b.txt",
+            rule_key="agentcomputer:file.delete:request-b",
+            one_shot=True,
+        )
+        assert different["status"] == "approval_required"
+
+        replay = request_tool_approval(
+            "agentcomputer_cli",
+            "delete notes/a.txt",
+            rule_key="agentcomputer:file.delete:request-a",
+            one_shot=True,
+        )
+        assert replay["approved"] is True
+        assert replay["user_approved"] is True
+
+        consumed = request_tool_approval(
+            "agentcomputer_cli",
+            "delete notes/a.txt",
+            rule_key="agentcomputer:file.delete:request-a",
+            one_shot=True,
+        )
+        assert consumed["status"] == "approval_required"
+        approval.clear_session(session_key)

@@ -32,6 +32,7 @@ Usage:
 """
 
 import importlib.util
+import hashlib
 import json
 import logging
 import os
@@ -1803,6 +1804,7 @@ _AGENTCOMPUTER_CLI_REQUIRED_FLAGS = {
 _AGENTCOMPUTER_CLI_PATH_FLAGS = frozenset({"--path", "--source", "--target"})
 _AGENTCOMPUTER_CLI_MUTATIONS = frozenset({
     ("file", "write"),
+    ("file", "mkdir"),
     ("file", "copy"),
     ("file", "rename"),
     ("file", "move"),
@@ -2241,10 +2243,21 @@ def _request_agentcomputer_mutation_approval(
 
     from tools.approval import request_tool_approval
 
+    fingerprint = hashlib.sha256()
+    for value in parsed.argv[2:]:
+        encoded = value.encode("utf-8")
+        fingerprint.update(len(encoded).to_bytes(8, "big"))
+        fingerprint.update(encoded)
+    stdin_bytes = (parsed.stdin_text or "").encode("utf-8")
+    fingerprint.update(len(stdin_bytes).to_bytes(8, "big"))
+    fingerprint.update(stdin_bytes)
+
     approval = request_tool_approval(
         "agentcomputer_cli",
         f"AgentComputer {operation} modifies AgentComputer user data.",
-        rule_key=f"agentcomputer:{operation}",
+        rule_key=(
+            f"agentcomputer:{operation}:{fingerprint.hexdigest()}"
+        ),
         approval_callback=_get_approval_callback(),
         one_shot=True,
         allow_yolo_bypass=False,
@@ -2252,7 +2265,10 @@ def _request_agentcomputer_mutation_approval(
     if approval.get("approved"):
         return None
 
-    pending = approval.get("status") == "pending_approval"
+    pending = approval.get("status") in {
+        "approval_required",
+        "pending_approval",
+    }
     return json.dumps({
         "output": "",
         "exit_code": -1,

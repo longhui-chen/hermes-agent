@@ -2014,6 +2014,7 @@ def detect_dangerous_command(command: str) -> tuple:
 
 _lock = threading.Lock()
 _pending: dict[str, dict] = {}
+_one_shot_approved: dict[str, dict[str, float]] = {}
 _session_approved: dict[str, set] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
@@ -2086,24 +2087,48 @@ def resolve_gateway_approval(session_key: str, choice: str,
 
     Returns the number of approvals resolved (0 means nothing was pending).
     """
+    pending = None
+    targets = []
     with _lock:
         queue = _gateway_queues.get(session_key)
-        if not queue:
-            return 0
-        if resolve_all:
-            targets = list(queue)
-            queue.clear()
+        if queue:
+            if resolve_all:
+                targets = list(queue)
+                queue.clear()
+            else:
+                targets = [queue.pop(0)]
+            if not queue:
+                _gateway_queues.pop(session_key, None)
         else:
-            targets = [queue.pop(0)]
-        if not queue:
-            _gateway_queues.pop(session_key, None)
+            # API/dashboard sessions without a live notify callback return an
+            # approval_required result instead of blocking the agent thread.
+            # Resolve that deferred request here so an explicit /approve can
+            # authorize one exact replay.
+            pending = _pending.pop(session_key, None)
 
-    for entry in targets:
-        entry.result = choice
-        if reason:
-            entry.reason = reason
-        entry.event.set()
-    return len(targets)
+    if targets:
+        for entry in targets:
+            entry.result = choice
+            if reason:
+                entry.reason = reason
+            entry.event.set()
+        return len(targets)
+
+    if pending is None:
+        return 0
+
+    if choice in {"once", "session", "always"}:
+        pattern_key = pending.get("pattern_key", "")
+        if pattern_key:
+            if pending.get("one_shot") or choice == "once":
+                _grant_one_shot_approval(session_key, pattern_key)
+            elif choice == "session":
+                approve_session(session_key, pattern_key)
+            elif choice == "always":
+                approve_session(session_key, pattern_key)
+                approve_permanent(pattern_key)
+                save_permanent_allowlist(_permanent_approved)
+    return 1
 
 
 def has_blocking_approval(session_key: str) -> bool:
@@ -2116,6 +2141,35 @@ def submit_pending(session_key: str, approval: dict):
     """Store a pending approval request for a session."""
     with _lock:
         _pending[session_key] = approval
+
+
+def _grant_one_shot_approval(session_key: str, pattern_key: str) -> None:
+    """Issue one bounded, exact-pattern replay grant for a deferred request."""
+    expires_at = time.monotonic() + max(float(_get_approval_timeout()), 1.0)
+    with _lock:
+        # A no-notifier session has at most one deferred approval card. Keep
+        # the replay store equally bounded and replace any abandoned grant.
+        _one_shot_approved[session_key] = {pattern_key: expires_at}
+
+
+def _consume_one_shot_approval(session_key: str, pattern_key: str) -> bool:
+    """Atomically consume a non-expired replay grant for this exact pattern."""
+    now = time.monotonic()
+    with _lock:
+        grants = _one_shot_approved.get(session_key)
+        if not grants:
+            return False
+        expires_at = grants.get(pattern_key)
+        if expires_at is None or expires_at < now:
+            if expires_at is not None:
+                grants.pop(pattern_key, None)
+            if not grants:
+                _one_shot_approved.pop(session_key, None)
+            return False
+        grants.pop(pattern_key, None)
+        if not grants:
+            _one_shot_approved.pop(session_key, None)
+        return True
 
 
 def approve_session(session_key: str, pattern_key: str):
@@ -2148,6 +2202,7 @@ def clear_session(session_key: str) -> None:
         _session_approved.pop(session_key, None)
         _session_yolo.discard(session_key)
         _pending.pop(session_key, None)
+        _one_shot_approved.pop(session_key, None)
         entries = _gateway_queues.pop(session_key, [])
     for entry in entries:
         # Session-boundary cleanup should cancel any blocked approval waits
@@ -2701,6 +2756,12 @@ def _run_approval_gate(
         return {"approved": True, "message": None}
 
     session_key = get_current_session_key()
+    if _consume_one_shot_approval(session_key, pattern_key):
+        return {
+            "approved": True,
+            "message": None,
+            "user_approved": True,
+        }
     if not one_shot and is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
@@ -2824,6 +2885,7 @@ def _run_approval_gate(
             "pattern_key": pattern_key,
             "description": description,
             "allow_permanent": not one_shot,
+            "one_shot": one_shot,
         })
         return {
             "approved": False,
