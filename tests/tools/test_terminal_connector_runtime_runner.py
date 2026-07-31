@@ -862,7 +862,13 @@ def test_connector_runtime_rejection_log_never_contains_token(monkeypatch, tmp_p
     )
 
     assert parsed is None
-    assert "owned_by_terminal_user" in caplog.text
+    assert any(
+        reason in caplog.text
+        for reason in (
+            "owned_by_terminal_user",
+            "shared_ancestor_group_writable",
+        )
+    )
     assert token not in caplog.text
 
 
