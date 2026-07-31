@@ -2021,6 +2021,17 @@ _session_approved: dict[str, set] = {}
 _session_yolo: set[str] = set()
 _permanent_approved: set = set()
 
+
+def _approval_profile_scope() -> str:
+    """Return the active immutable profile scope for approval ownership."""
+
+    try:
+        from hermes_constants import get_hermes_home
+
+        return os.path.realpath(str(get_hermes_home()))
+    except Exception:
+        return ""
+
 # =========================================================================
 # Blocking gateway approval (mirrors CLI's synchronous input() flow)
 # =========================================================================
@@ -2170,19 +2181,39 @@ def resolve_gateway_approval(session_key: str, choice: str,
             force_one_shot = (
                 pending.get("one_shot")
                 or pending.get("smart_denied")
-                or pending.get("allow_permanent") is False
             )
             if force_one_shot or choice == "once":
                 _grant_one_shot_approval(
                     session_key,
                     pending.get("one_shot_pattern_key") or pattern_key,
                 )
-            elif choice == "session":
-                approve_session(session_key, pattern_key)
-            elif choice == "always":
-                approve_session(session_key, pattern_key)
-                approve_permanent(pattern_key)
-                save_permanent_allowlist(_permanent_approved)
+            else:
+                pattern_keys = list(dict.fromkeys(
+                    str(key)
+                    for key in (pending.get("pattern_keys") or [pattern_key])
+                    if key
+                ))
+                raw_session_only = pending.get("session_only_pattern_keys")
+                if raw_session_only is None:
+                    session_only = (
+                        set(pattern_keys)
+                        if pending.get("allow_permanent") is False
+                        else set()
+                    )
+                else:
+                    session_only = {
+                        str(key) for key in raw_session_only if key
+                    }
+                for key in pattern_keys:
+                    approve_session(session_key, key)
+                if choice == "always":
+                    permanent_keys = [
+                        key for key in pattern_keys if key not in session_only
+                    ]
+                    for key in permanent_keys:
+                        approve_permanent(key)
+                    if permanent_keys:
+                        save_permanent_allowlist(_permanent_approved)
     return 1
 
 
@@ -2199,6 +2230,7 @@ def submit_pending(session_key: str, approval: dict) -> Optional[str]:
     queued = dict(approval)
     queued.update({
         "approval_id": approval_id,
+        "_approval_profile_scope": _approval_profile_scope(),
         "created_at_monotonic": now,
         "expires_at_monotonic": (
             now + max(float(_get_approval_timeout()), 1.0)
@@ -2214,6 +2246,54 @@ def submit_pending(session_key: str, approval: dict) -> Optional[str]:
             return None
         queue.append(queued)
     return approval_id
+
+
+def approval_session_key_for_id(approval_id: str) -> Optional[str]:
+    """Resolve an opaque approval id to its actual, profile-owned queue key.
+
+    The public URL session id and supported ``X-Hermes-Session-Key`` header
+    may differ.  The opaque id is therefore resolved against both live and
+    deferred queues, but only inside the active profile scope.
+    """
+
+    if not approval_id:
+        return None
+    expected_scope = _approval_profile_scope()
+    now = time.monotonic()
+    with _lock:
+        for session_key, queue in _gateway_queues.items():
+            for entry in queue:
+                if (
+                    secrets.compare_digest(
+                        str(entry.data.get("approval_id", "")), approval_id
+                    )
+                    and secrets.compare_digest(
+                        str(entry.data.get("_approval_profile_scope", "")),
+                        expected_scope,
+                    )
+                ):
+                    return session_key
+
+        for session_key, queue in list(_pending.items()):
+            queue[:] = [
+                item for item in queue
+                if float(item.get("expires_at_monotonic", 0.0)) >= now
+            ]
+            if not queue:
+                _pending.pop(session_key, None)
+                continue
+            for item in queue:
+                if (
+                    secrets.compare_digest(
+                        str(item.get("approval_id", "")), approval_id
+                    )
+                    and secrets.compare_digest(
+                        str(item.get("_approval_profile_scope", "")),
+                        expected_scope,
+                    )
+                ):
+                    return session_key
+    return None
 
 
 def _grant_one_shot_approval(session_key: str, pattern_key: str) -> None:
@@ -3305,6 +3385,7 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     if not approval_id:
         approval_id = secrets.token_urlsafe(24)
         approval_data["approval_id"] = approval_id
+    approval_data["_approval_profile_scope"] = _approval_profile_scope()
 
     command = approval_data.get("command", "")
     description = approval_data.get("description", "")
@@ -3786,6 +3867,10 @@ def check_all_command_guards(command: str, env_type: str,
             "pattern_key": primary_key,
             "one_shot_pattern_key": one_shot_pattern_key,
             "pattern_keys": all_keys,
+            "session_only_pattern_keys": [
+                key for key, _, is_tirith in warnings if is_tirith
+            ],
+            "allow_permanent": not has_tirith and not smart_denied_for_owner,
             "description": _disp_combined_desc,
         }
         if smart_denied_for_owner:
@@ -3813,6 +3898,7 @@ def check_all_command_guards(command: str, env_type: str,
             "approval_pending": True,
             "command": _disp_command,
             "description": _disp_combined_desc,
+            "allow_permanent": not has_tirith and not smart_denied_for_owner,
             "message": (
                 f"⚠️ {_disp_combined_desc}. Asking the user for approval.\n\n**Command:**\n```\n{_disp_command}\n```"
             ),

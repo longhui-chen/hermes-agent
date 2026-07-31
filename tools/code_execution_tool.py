@@ -1639,6 +1639,23 @@ def execute_code(
                 pass
             poll_interval = min(0.2, poll_interval * 1.5)
 
+        # A script can start a detached/background descendant which survives
+        # the top-level process group.  Retire the invocation UID on every
+        # normal exit before readers, RPC state, or the workspace are released.
+        # Failure raises into the error result and keeps the UID reservation.
+        if managed_execute_uid is not None and managed_execute_scope is not None:
+            from tools.environments.local import (
+                retire_managed_execute_code_identity,
+            )
+
+            retire_managed_execute_code_identity(
+                managed_execute_uid,
+                child_env,
+                managed_execute_scope,
+            )
+            managed_execute_uid = None
+            managed_execute_scope = None
+
         # Wait for readers to finish draining
         stdout_reader.join(timeout=3)
         stderr_reader.join(timeout=3)
@@ -1749,17 +1766,17 @@ def execute_code(
         if managed_execute_uid is not None and managed_execute_scope is not None:
             try:
                 from tools.environments.local import (
-                    _release_managed_execute_code_identity,
+                    retire_managed_execute_code_identity,
                 )
 
-                _release_managed_execute_code_identity(
+                retire_managed_execute_code_identity(
                     managed_execute_uid,
                     child_env,
                     managed_execute_scope,
                 )
             except Exception:
                 logger.warning(
-                    "Failed to release managed execute_code identity",
+                    "Failed to retire managed execute_code identity",
                     exc_info=True,
                 )
 

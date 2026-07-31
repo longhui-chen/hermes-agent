@@ -428,6 +428,25 @@ def _terminate_managed_uid(uid: int, timeout: float = 2.0) -> int:
     return len(killed)
 
 
+def retire_managed_execute_code_identity(
+    uid: int,
+    env: Mapping[str, str],
+    execution_scope: str,
+) -> int:
+    """Empty one invocation UID before making it available for reuse.
+
+    A model script can detach descendants from the process group that owns the
+    top-level ``execute_code`` child.  The per-invocation UID is the durable
+    containment boundary, so it must be verified empty before its reservation
+    is released.  If termination fails, the reservation deliberately remains
+    live and the caller fails closed.
+    """
+
+    killed = _terminate_managed_uid(uid)
+    _release_managed_execute_code_identity(uid, env, execution_scope)
+    return killed
+
+
 def retire_managed_terminal_profile(profile_home: str) -> dict[str, object]:
     """Destroy a profile UID domain before that profile can be recreated."""
     if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":

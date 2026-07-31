@@ -1931,10 +1931,29 @@ class ZetAgentAdapter(APIServerAdapter):
         # platform disconnect (or never, for short-lived processes).
         if session_id:
             try:
-                from tools.approval import register_gateway_notify
-                register_gateway_notify(session_id, self._make_approval_cb(stream_q, session_id))
+                from tools.approval import (
+                    get_current_session_key,
+                    register_gateway_notify,
+                )
+                approval_session_key = (
+                    get_current_session_key(default=session_id) or session_id
+                )
+                register_gateway_notify(
+                    approval_session_key,
+                    self._make_approval_cb(stream_q, session_id),
+                )
                 with self._session_lock:
-                    self._approval_session_ids.add(session_id)
+                    self._approval_session_ids.add(approval_session_key)
+                with self._pending_lock:
+                    approval_keys = getattr(
+                        self, "_approval_session_keys", None
+                    )
+                    if approval_keys is None:
+                        approval_keys = {}
+                        self._approval_session_keys = approval_keys
+                    approval_keys[self._active_turn_key(session_id)] = (
+                        approval_session_key
+                    )
             except Exception:
                 logger.warning("[zet_agent] failed to register approval notify", exc_info=True)
 
@@ -2324,7 +2343,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 )
 
         try:
-            from tools.approval import resolve_gateway_approval
+            from tools.approval import (
+                approval_session_key_for_id,
+                resolve_gateway_approval,
+            )
         except Exception as exc:
             logger.exception("[zet_agent] tools.approval import failed")
             return web.json_response(
@@ -2332,11 +2354,16 @@ class ZetAgentAdapter(APIServerAdapter):
                 status=500,
             )
 
-        resolved = resolve_gateway_approval(
-            session_id,
-            choice,
-            approval_id=approval_id,
-        )
+        approval_session_key = session_id
+        if approval_id is not None:
+            approval_session_key = approval_session_key_for_id(approval_id)
+        resolved = 0
+        if approval_session_key is not None:
+            resolved = resolve_gateway_approval(
+                approval_session_key,
+                choice,
+                approval_id=approval_id,
+            )
         if resolved:
             with self._pending_lock:
                 pending = self._pending_approval.get(session_id)
@@ -3140,10 +3167,27 @@ class ZetAgentAdapter(APIServerAdapter):
         # grants. A stale approval card must never authorize work after the
         # interrupted run has ended.
         try:
-            from tools.approval import cancel_session_approvals
-            cancel_session_approvals(session_id)
-            if scoped_session_key != session_id:
-                cancel_session_approvals(scoped_session_key)
+            from tools.approval import (
+                approval_session_key_for_id,
+                cancel_session_approvals,
+            )
+
+            approval_keys = {session_id, scoped_session_key}
+            with self._pending_lock:
+                mapped_key = getattr(
+                    self, "_approval_session_keys", {}
+                ).pop(scoped_session_key, None)
+                pending_card = self._pending_approval.get(session_id)
+            if mapped_key:
+                approval_keys.add(mapped_key)
+            if pending_card and pending_card.get("approval_id"):
+                actual_key = approval_session_key_for_id(
+                    str(pending_card["approval_id"])
+                )
+                if actual_key:
+                    approval_keys.add(actual_key)
+            for approval_key in approval_keys:
+                cancel_session_approvals(approval_key)
         except Exception:
             logger.debug("[zet_agent] session interrupt: approval cleanup failed", exc_info=True)
 

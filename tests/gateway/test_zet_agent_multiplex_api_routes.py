@@ -727,9 +727,13 @@ async def test_prefixed_reset_and_unload_return_ok(profile_homes):
 async def test_deferred_approval_response_requires_matching_id(monkeypatch):
     from tools import approval
 
-    session_id = "sid-deferred-approval-id"
-    approval.clear_session(session_id)
-    token = approval.set_current_session_key(session_id)
+    session_id = "sid-public-url"
+    approval_session_key = "sid-x-hermes-header"
+    approval.clear_session(approval_session_key)
+    token = approval.set_current_session_key(approval_session_key)
+    monkeypatch.setattr(
+        approval, "_approval_profile_scope", lambda: "/profiles/coder"
+    )
     monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
     monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
     monkeypatch.setattr(
@@ -773,6 +777,17 @@ async def test_deferred_approval_response_requires_matching_id(monkeypatch):
             json={"choice": "once", "approval_id": "A" * 32},
             headers=headers,
         )
+        monkeypatch.setattr(
+            approval, "_approval_profile_scope", lambda: "/profiles/other"
+        )
+        wrong_profile = await cli.post(
+            f"/v1/sessions/{session_id}/approval/respond",
+            json={"choice": "once", "approval_id": approval_id},
+            headers=headers,
+        )
+        monkeypatch.setattr(
+            approval, "_approval_profile_scope", lambda: "/profiles/coder"
+        )
         matched = await cli.post(
             f"/v1/sessions/{session_id}/approval/respond",
             json={"choice": "once", "approval_id": approval_id},
@@ -780,10 +795,12 @@ async def test_deferred_approval_response_requires_matching_id(monkeypatch):
         )
         missing_data = await missing.json()
         wrong_data = await wrong.json()
+        wrong_profile_data = await wrong_profile.json()
         matched_data = await matched.json()
 
     assert missing_data == {"resolved": 0}
     assert wrong_data == {"resolved": 0}
+    assert wrong_profile_data == {"resolved": 0}
     assert matched_data == {"resolved": 1}
     exact_retry = approval.check_all_command_guards(command, "local")
     consumed_retry = approval.check_all_command_guards(command, "local")
@@ -794,7 +811,7 @@ async def test_deferred_approval_response_requires_matching_id(monkeypatch):
     assert exact_retry["one_shot_approved"] is True
     assert consumed_retry["status"] == "pending_approval"
     assert different_retry["status"] == "pending_approval"
-    approval.clear_session(session_id)
+    approval.clear_session(approval_session_key)
     approval.reset_current_session_key(token)
 
 
