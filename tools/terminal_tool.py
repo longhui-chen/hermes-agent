@@ -39,7 +39,6 @@ import platform
 import re
 import shlex
 import stat
-import sysconfig
 import time
 import threading
 import atexit
@@ -1014,28 +1013,6 @@ class _ConnectorRuntimeCommand:
 
 
 _CONNECTOR_RUNTIME_ROOT_ANCHOR: Optional[_ConnectorRuntimeRootAnchor] = None
-_CONNECTOR_RUNTIME_STDIN_WRAPPER = r"""
-import json
-import os
-import runpy
-import sys
-
-payload = json.loads(sys.stdin.read() or "{}")
-env = payload.get("env") or {}
-script = payload["script"]
-argv = payload.get("argv") or [script]
-pythonpath = payload.get("pythonpath")
-if isinstance(pythonpath, list):
-    sys.path = [str(item) for item in pythonpath if item]
-for key, value in env.items():
-    if value is not None:
-        os.environ[str(key)] = str(value)
-os.environ.pop("PYTHONPATH", None)
-sys.argv = [script, *[str(arg) for arg in argv[1:]]]
-runpy.run_path(script, run_name="__main__")
-"""
-
-
 def _is_python_executable_token(token: str) -> bool:
     name = Path(token).name.lower()
     return (
@@ -1075,7 +1052,7 @@ def _path_trust_rejection_reason(
         return "owned_by_terminal_user"
     try:
         groups = set(os.getgroups())
-        egid = os.getegid()
+        egid = os.getegid()  # windows-footgun: ok — guarded by try/except
         groups.add(egid)
     except Exception:
         groups = set()
@@ -1487,6 +1464,8 @@ def _connector_runtime_shell_command_argument(arguments: list[str]) -> Optional[
 def _connector_runtime_python_script_index(
     segment: list[str],
     python_index: int,
+    *,
+    script_name: str = _CONNECTOR_RUNTIME_SCRIPT,
 ) -> Optional[int]:
     """Find a script after Python flags without interpreting ``-c``/``-m``."""
     position = python_index + 1
@@ -1507,7 +1486,7 @@ def _connector_runtime_python_script_index(
             position += 1
     if (
         position >= len(segment)
-        or Path(segment[position]).name != _CONNECTOR_RUNTIME_SCRIPT
+        or Path(segment[position]).name != script_name
     ):
         return None
     return position
@@ -1623,45 +1602,10 @@ def _connector_runtime_result_json(
 
 def _connector_runtime_isolated_sys_path(*, script: Path, cwd: Path) -> list[str]:
     """Build a Python import path that excludes model-writable command context."""
-    blocked_exact: set[Path] = set()
-    blocked_roots: set[Path] = set()
-    for raw in ("", ".", str(cwd), os.getcwd()):
-        try:
-            blocked_exact.add(Path(raw or ".").resolve())
-        except OSError:
-            pass
-    for raw in os.environ.get("PYTHONPATH", "").split(os.pathsep):
-        if not raw:
-            continue
-        try:
-            blocked_roots.add(Path(raw).resolve())
-        except OSError:
-            pass
+    del script
+    from tools.trusted_direct_runner import isolated_python_path
 
-    allowed: list[str] = []
-    candidate_paths = list(sys.path)
-    for key in ("stdlib", "platstdlib", "purelib", "platlib"):
-        value = sysconfig.get_paths().get(key)
-        if value:
-            candidate_paths.append(value)
-
-    seen: set[str] = set()
-    for raw in candidate_paths:
-        if not raw:
-            continue
-        try:
-            resolved = Path(raw).resolve()
-        except OSError:
-            continue
-        if resolved in blocked_exact:
-            continue
-        if any(resolved == root or root in resolved.parents for root in blocked_roots):
-            continue
-        text = str(resolved)
-        if text not in seen:
-            seen.add(text)
-            allowed.append(text)
-    return allowed
+    return isolated_python_path(cwd=cwd)
 
 
 def _run_connector_runtime_command_if_allowed(
@@ -1715,44 +1659,23 @@ def _run_connector_runtime_command_if_allowed(
             connector_env.get("ZETTLAB_CONNECTORS_URL", ""),
         ]
         run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
-        isolated_path = _connector_runtime_isolated_sys_path(
-            script=Path(argv[1]),
+        from tools.trusted_direct_runner import run_trusted_python_script
+
+        completed = run_trusted_python_script(
+            script=script,
+            argv=argv[1:],
             cwd=Path(run_cwd),
-        )
-        payload = json.dumps({
-            "script": argv[1],
-            "argv": argv[1:],
-            "env": connector_env,
-            "pythonpath": isolated_path,
-        })
-        completed = subprocess.run(
-            [sys.executable, "-c", _CONNECTOR_RUNTIME_STDIN_WRAPPER],
-            cwd=run_cwd,
-            env=run_env,
-            capture_output=True,
-            text=True,
+            base_env=run_env,
+            injected_env=connector_env,
             timeout=timeout,
-            input=payload,
+            secret_values=secret_values,
         )
         return _connector_runtime_result_json(
             command=command,
-            output=(completed.stdout or "") + (completed.stderr or ""),
+            output=completed.output,
             returncode=completed.returncode,
             secret_values=secret_values,
-        )
-    except subprocess.TimeoutExpired as e:
-        stdout = e.stdout or ""
-        stderr = e.stderr or ""
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode(errors="replace")
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode(errors="replace")
-        return _connector_runtime_result_json(
-            command=command,
-            output=stdout + stderr,
-            returncode=124,
-            secret_values=secret_values,
-            timed_out=True,
+            timed_out=completed.timed_out,
         )
     except Exception as e:
         return json.dumps({
@@ -1761,6 +1684,719 @@ def _run_connector_runtime_command_if_allowed(
             "error": f"Connector runtime execution failed: {type(e).__name__}: {e}",
             "connector_runtime_direct": True,
         }, ensure_ascii=False)
+
+
+_AGENT_CREATOR_SCRIPT = "create_agent.py"
+_AGENT_CREATOR_RELATIVE_PATH = Path(
+    "skills/agent-creator/scripts/create_agent.py"
+)
+_AGENT_CREATOR_MANIFEST_RELATIVE_PATH = Path(
+    "skills/agent-creator/manifest.yaml"
+)
+_AGENT_CREATOR_ACTION_TOKEN_FD_CAPABILITY = (
+    "zettlab.agent_action_token_fd.v1"
+)
+_AGENT_CREATOR_MAX_PAYLOAD_BYTES = 1024 * 1024
+_AGENTCOMPUTER_MAX_STDIN_BYTES = 4 * 1024 * 1024
+_AGENT_CREATOR_MAX_SCRIPT_BYTES = 1024 * 1024
+_AGENT_CREATOR_MAX_MANIFEST_BYTES = 64 * 1024
+_AGENT_CREATOR_MAX_RUNTIME_CAPABILITIES = 32
+_AGENT_CREATOR_PAYLOAD_KEYS = frozenset({
+    "name",
+    "soul_identity",
+    "soul_style",
+    "greeting",
+    "user_entries",
+    "memory_entries",
+})
+_AGENTCOMPUTER_CLI_VALUE_FLAGS = {
+    ("file", "list"): frozenset({"--path", "--offset", "--limit"}),
+    ("file", "stat"): frozenset({"--path"}),
+    ("file", "read"): frozenset({"--path", "--offset", "--limit"}),
+    ("file", "write"): frozenset({"--path"}),
+    ("file", "mkdir"): frozenset({"--path"}),
+    ("file", "rename"): frozenset({"--source", "--target"}),
+    ("file", "copy"): frozenset({"--source", "--target"}),
+    ("file", "move"): frozenset({"--source", "--target"}),
+    ("file", "delete"): frozenset({"--path"}),
+    ("file", "search"): frozenset({"--path", "--query", "--limit"}),
+    ("system", "status"): frozenset(),
+    ("system", "overview"): frozenset(),
+    ("system", "device"): frozenset(),
+    ("system", "pools"): frozenset(),
+    ("system", "disks"): frozenset(),
+    ("system", "smart-status"): frozenset({"--device"}),
+    ("system", "smart-info"): frozenset({"--device"}),
+    ("system", "network"): frozenset(),
+    ("system", "time"): frozenset(),
+}
+_AGENTCOMPUTER_CLI_BOOL_FLAGS = {
+    ("file", "write"): frozenset({"--stdin", "--overwrite", "--parents"}),
+    ("file", "mkdir"): frozenset({"--parents"}),
+    ("file", "copy"): frozenset({"--overwrite"}),
+    ("file", "move"): frozenset({"--overwrite"}),
+}
+_AGENTCOMPUTER_CLI_REQUIRED_FLAGS = {
+    ("file", "stat"): frozenset({"--path"}),
+    ("file", "read"): frozenset({"--path"}),
+    ("file", "write"): frozenset({"--path", "--stdin"}),
+    ("file", "mkdir"): frozenset({"--path"}),
+    ("file", "rename"): frozenset({"--source", "--target"}),
+    ("file", "copy"): frozenset({"--source", "--target"}),
+    ("file", "move"): frozenset({"--source", "--target"}),
+    ("file", "delete"): frozenset({"--path"}),
+    ("file", "search"): frozenset({"--query"}),
+    ("system", "smart-status"): frozenset({"--device"}),
+    ("system", "smart-info"): frozenset({"--device"}),
+}
+_AGENTCOMPUTER_CLI_PATH_FLAGS = frozenset({"--path", "--source", "--target"})
+_AGENT_CREATOR_HEREDOC_RE = re.compile(
+    r"^(?P<command>.+?)\s+<<\s*"
+    r"(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_][A-Za-z0-9_]{0,31})(?P=quote)\s*$"
+)
+
+
+@dataclass(frozen=True)
+class _AgentCreatorCommand:
+    argv: list[str]
+    root_identity: tuple[int, int]
+    script_identity: tuple[int, int]
+    stdin_text: Optional[str]
+
+
+def _agent_creator_blocked_result(
+    code: str,
+    message: str,
+    *,
+    direct: bool = False,
+) -> str:
+    return json.dumps({
+        "output": "",
+        "exit_code": 2,
+        "error": message,
+        "errorCode": code,
+        "status": "error",
+        "agent_creator_direct": direct,
+        "agent_creator_blocked": True,
+    }, ensure_ascii=False)
+
+
+def _agent_creator_shell_guard_result(command: str) -> Optional[str]:
+    """Fail closed when a reserved creator invocation is not exactly allowed."""
+
+    lexer = shlex.shlex(
+        command.strip(),
+        posix=True,
+        punctuation_chars=_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT,
+    )
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION:
+            segments.append([])
+            continue
+        segments[-1].append(token)
+
+    contains_creator_invocation = any(
+        _agent_creator_segment_contains_invocation(segment)
+        for segment in segments
+    )
+    if not contains_creator_invocation:
+        contains_creator_invocation = any(
+            _agent_creator_segment_contains_nested_shell_invocation(segment)
+            for segment in segments
+        )
+    if not contains_creator_invocation:
+        return None
+    return _agent_creator_blocked_result(
+        "agent_creator_command_blocked",
+        (
+            "Agent Creator must run as one direct Python invocation of the "
+            "canonical presets script. Only preflight or create --payload "
+            "with a bounded JSON object is allowed; wrappers, non-canonical "
+            "paths, extra arguments, and shell operators are rejected."
+        ),
+    )
+
+
+def _agent_creator_segment_contains_invocation(segment: list[str]) -> bool:
+    """Recognize creator scripts only where the shell would execute them."""
+
+    for index, token in enumerate(segment):
+        if Path(token).name != _AGENT_CREATOR_SCRIPT:
+            continue
+        if index == 0 or _connector_runtime_command_prefix_is_supported(
+            segment[:index]
+        ):
+            return True
+
+    for index, token in enumerate(segment):
+        if not _is_python_executable_token(token):
+            continue
+        script_index = _connector_runtime_python_script_index(
+            segment,
+            index,
+            script_name=_AGENT_CREATOR_SCRIPT,
+        )
+        if script_index is None:
+            continue
+        if index > 0 and not _connector_runtime_command_prefix_is_supported(
+            segment[:index]
+        ):
+            continue
+        return True
+    return False
+
+
+def _agent_creator_segment_contains_nested_shell_invocation(
+    segment: list[str],
+    *,
+    nested_shell_depth: int = 0,
+) -> bool:
+    if nested_shell_depth >= _CONNECTOR_RUNTIME_NESTED_SHELL_DEPTH:
+        return False
+    for index, token in enumerate(segment):
+        if Path(token).name.lower() not in _CONNECTOR_RUNTIME_COMMAND_SHELLS:
+            continue
+        if index > 0 and not _connector_runtime_command_prefix_is_supported(
+            segment[:index]
+        ):
+            continue
+        nested_command = _connector_runtime_shell_command_argument(
+            segment[index + 1:]
+        )
+        if nested_command is None:
+            continue
+        lexer = shlex.shlex(
+            nested_command.strip(),
+            posix=True,
+            punctuation_chars=_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT,
+        )
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        try:
+            nested_tokens = list(lexer)
+        except ValueError:
+            continue
+        nested_segments: list[list[str]] = [[]]
+        for nested_token in nested_tokens:
+            if (
+                nested_token
+                and set(nested_token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION
+            ):
+                nested_segments.append([])
+                continue
+            nested_segments[-1].append(nested_token)
+        if any(
+            _agent_creator_segment_contains_invocation(nested_segment)
+            for nested_segment in nested_segments
+        ):
+            return True
+        if any(
+            _agent_creator_segment_contains_nested_shell_invocation(
+                nested_segment,
+                nested_shell_depth=nested_shell_depth + 1,
+            )
+            for nested_segment in nested_segments
+        ):
+            return True
+    return False
+
+
+def _log_agent_creator_rejection(reason: str) -> None:
+    logger.warning(
+        "Agent Creator direct runner rejected: reason=%s",
+        reason,
+    )
+
+
+def _resolve_agent_creator_script(raw_path: str) -> Optional[Path]:
+    """Resolve only the fixed creator script below the pinned presets root."""
+
+    anchor = _capture_connector_runtime_root()
+    if anchor is None:
+        return None
+
+    expected = _AGENT_CREATOR_RELATIVE_PATH
+    relative: Optional[Path] = None
+    for prefix in ("$ZETTLAB_PRESETS_DIR/", "${ZETTLAB_PRESETS_DIR}/"):
+        if raw_path.startswith(prefix):
+            relative = Path(raw_path[len(prefix):])
+            break
+    else:
+        supplied = Path(raw_path)
+        if raw_path == expected.as_posix():
+            relative = expected
+        elif not supplied.is_absolute():
+            return None
+        else:
+            expanded = Path(
+                os.path.expandvars(os.path.expanduser(raw_path))
+            ).absolute()
+            for allowed_root in (anchor.configured_root, anchor.resolved_root):
+                try:
+                    relative = expanded.relative_to(allowed_root)
+                    break
+                except ValueError:
+                    continue
+
+    if relative is None or relative != expected or ".." in relative.parts:
+        return None
+
+    candidate = anchor.resolved_root / expected
+    try:
+        resolved = candidate.resolve(strict=True)
+        if resolved.relative_to(anchor.resolved_root) != expected:
+            return None
+    except (OSError, ValueError):
+        return None
+    if not resolved.is_file():
+        return None
+    if not _connector_runtime_path_is_trusted(
+        candidate,
+        anchor.resolved_root,
+        expected_root_identity=anchor.identity,
+    ):
+        reason = _connector_runtime_trust_rejection_reason(
+            candidate,
+            anchor.resolved_root,
+            expected_root_identity=anchor.identity,
+        )
+        _log_agent_creator_rejection(reason or "trust_check_failed")
+        return None
+    return resolved
+
+
+def _split_agent_creator_heredoc(
+    command: str,
+) -> tuple[str, Optional[str]]:
+    """Return the direct command line and optional validated heredoc body."""
+
+    if "\n" not in command:
+        return command.strip(), None
+    first_line, remainder = command.split("\n", 1)
+    first_line = first_line.rstrip("\r")
+    match = _AGENT_CREATOR_HEREDOC_RE.fullmatch(first_line)
+    if match is None:
+        raise ValueError("unsupported stdin shape")
+
+    delimiter = match.group("delimiter")
+    suffix = f"\n{delimiter}"
+    if remainder.endswith(suffix + "\n"):
+        payload = remainder[: -len(suffix + "\n")]
+    elif remainder.endswith(suffix):
+        payload = remainder[: -len(suffix)]
+    else:
+        raise ValueError("missing heredoc terminator")
+    if not payload:
+        raise ValueError("empty payload")
+    return match.group("command").strip(), payload
+
+
+def _validate_agent_creator_payload(payload: str) -> str:
+    if len(payload.encode("utf-8")) > _AGENT_CREATOR_MAX_PAYLOAD_BYTES:
+        raise ValueError("payload too large")
+
+    def reject_constant(value: str):
+        raise ValueError(f"invalid JSON constant {value}")
+
+    try:
+        value = json.loads(payload, parse_constant=reject_constant)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError("payload must be one JSON object") from exc
+    if not isinstance(value, dict):
+        raise ValueError("payload must be one JSON object")
+    if any(
+        not isinstance(key, str) or key not in _AGENT_CREATOR_PAYLOAD_KEYS
+        for key in value
+    ):
+        raise ValueError("payload contains unsupported fields")
+    try:
+        normalized = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError("payload must be one JSON object") from exc
+    if len(normalized.encode("utf-8")) > _AGENT_CREATOR_MAX_PAYLOAD_BYTES:
+        raise ValueError("payload too large")
+    return normalized
+
+
+def _validate_agentcomputer_cli_args(args: list[str]) -> bool:
+    """Validate the exact zettctl grammar before any secret is acquired."""
+
+    if len(args) < 2 or len(args) > 24:
+        raise ValueError("unsupported AgentComputer CLI command")
+    command = (args[0], args[1])
+    value_flags = _AGENTCOMPUTER_CLI_VALUE_FLAGS.get(command)
+    if value_flags is None:
+        raise ValueError("unsupported AgentComputer CLI command")
+    bool_flags = _AGENTCOMPUTER_CLI_BOOL_FLAGS.get(command, frozenset())
+    seen: set[str] = set()
+    index = 2
+    while index < len(args):
+        flag = args[index]
+        if flag in seen:
+            raise ValueError("duplicate AgentComputer CLI flag")
+        if flag in bool_flags:
+            seen.add(flag)
+            index += 1
+            continue
+        if flag not in value_flags or index + 1 >= len(args):
+            raise ValueError("unsupported AgentComputer CLI flag")
+        value = args[index + 1]
+        if (
+            not value
+            or value.startswith("--")
+            or "\x00" in value
+            or len(value.encode("utf-8")) > 4096
+        ):
+            raise ValueError("invalid AgentComputer CLI value")
+        if flag in _AGENTCOMPUTER_CLI_PATH_FLAGS:
+            parts = value.split("/")
+            if value.startswith("/") or "\\" in value or ".." in parts:
+                raise ValueError("AgentComputer file paths must be workspace-relative")
+        seen.add(flag)
+        index += 2
+    required = _AGENTCOMPUTER_CLI_REQUIRED_FLAGS.get(command, frozenset())
+    if not required.issubset(seen):
+        raise ValueError("required AgentComputer CLI flag is missing")
+    return command == ("file", "write")
+
+
+def _parse_agent_creator_command(command: str) -> Optional[_AgentCreatorCommand]:
+    try:
+        command_line, heredoc_payload = _split_agent_creator_heredoc(command)
+    except ValueError:
+        return None
+
+    lexer = shlex.shlex(
+        command_line,
+        posix=True,
+        punctuation_chars=_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT,
+    )
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    if len(tokens) < 3 or not _is_python_executable_token(tokens[0]):
+        return None
+    if any(
+        token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION
+        for token in tokens
+    ):
+        return None
+    if Path(tokens[1]).name != _AGENT_CREATOR_SCRIPT:
+        return None
+
+    script = _resolve_agent_creator_script(tokens[1])
+    if script is None:
+        return None
+
+    args = tokens[2:]
+    stdin_text: Optional[str] = None
+    if args in (["preflight"], ["list"]):
+        if heredoc_payload is not None:
+            return None
+    elif len(args) == 3 and args[:2] == ["create", "--payload"]:
+        if args[2] == "-":
+            if heredoc_payload is None:
+                return None
+            try:
+                stdin_text = _validate_agent_creator_payload(heredoc_payload) + "\n"
+            except ValueError:
+                return None
+        else:
+            if heredoc_payload is not None:
+                return None
+            try:
+                args[2] = _validate_agent_creator_payload(args[2])
+            except ValueError:
+                return None
+    elif args and args[0] == "cli":
+        try:
+            requires_stdin = _validate_agentcomputer_cli_args(args[1:])
+        except (UnicodeEncodeError, ValueError):
+            return None
+        if requires_stdin:
+            if heredoc_payload is None:
+                return None
+            try:
+                payload_size = len(heredoc_payload.encode("utf-8"))
+            except UnicodeEncodeError:
+                return None
+            if (
+                payload_size == 0
+                or payload_size > _AGENTCOMPUTER_MAX_STDIN_BYTES
+                or "\x00" in heredoc_payload
+            ):
+                return None
+            stdin_text = heredoc_payload
+        elif heredoc_payload is not None:
+            return None
+    else:
+        return None
+
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    if anchor is None:
+        return None
+    try:
+        script_identity = _path_identity(script)
+    except OSError:
+        return None
+    return _AgentCreatorCommand(
+        argv=[sys.executable, str(script), *args],
+        root_identity=anchor.identity,
+        script_identity=script_identity,
+        stdin_text=stdin_text,
+    )
+
+
+def _read_verified_agent_creator_file(
+    path: Path,
+    *,
+    expected_identity: tuple[int, int],
+    max_bytes: int,
+) -> bytes:
+    """Freeze one trusted regular file through a non-following descriptor."""
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        file_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(file_stat.st_mode)
+            or (file_stat.st_dev, file_stat.st_ino) != expected_identity
+            or file_stat.st_size > max_bytes
+        ):
+            raise OSError("agent creator trusted file identity invalid")
+
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, max_bytes + 1 - total),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise OSError("agent creator trusted file too large")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _read_verified_agent_creator_script(
+    script: Path,
+    *,
+    expected_identity: tuple[int, int],
+) -> bytes:
+    """Freeze the verified script source before any scoped secret is injected."""
+
+    return _read_verified_agent_creator_file(
+        script,
+        expected_identity=expected_identity,
+        max_bytes=_AGENT_CREATOR_MAX_SCRIPT_BYTES,
+    )
+
+
+def _agent_creator_manifest_supports_action_token_fd(
+    anchor: _ConnectorRuntimeRootAnchor,
+) -> bool:
+    """Validate the preset ABI before acquiring or injecting a scoped token."""
+
+    manifest = anchor.resolved_root / _AGENT_CREATOR_MANIFEST_RELATIVE_PATH
+    if not _connector_runtime_path_is_trusted(
+        manifest,
+        anchor.resolved_root,
+        expected_root_identity=anchor.identity,
+    ):
+        _log_agent_creator_rejection("manifest_trust_check_failed")
+        return False
+
+    try:
+        manifest_identity = _path_identity(manifest)
+        raw = _read_verified_agent_creator_file(
+            manifest,
+            expected_identity=manifest_identity,
+            max_bytes=_AGENT_CREATOR_MAX_MANIFEST_BYTES,
+        )
+
+        import yaml
+
+        loaded = yaml.safe_load(raw.decode("utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError("manifest root must be a mapping")
+        capabilities = loaded.get("runtime_capabilities")
+        if (
+            not isinstance(capabilities, list)
+            or len(capabilities) > _AGENT_CREATOR_MAX_RUNTIME_CAPABILITIES
+            or not all(
+                isinstance(capability, str)
+                and 0 < len(capability) <= 128
+                for capability in capabilities
+            )
+        ):
+            raise ValueError("runtime_capabilities must be a bounded string list")
+        if (
+            _AGENT_CREATOR_ACTION_TOKEN_FD_CAPABILITY
+            not in capabilities
+        ):
+            raise ValueError("action token FD capability missing")
+        if (
+            _path_identity(anchor.resolved_root) != anchor.identity
+            or _path_identity(manifest) != manifest_identity
+            or not _connector_runtime_path_is_trusted(
+                manifest,
+                anchor.resolved_root,
+                expected_root_identity=anchor.identity,
+            )
+        ):
+            raise OSError("manifest trust identity changed")
+    except Exception:
+        _log_agent_creator_rejection("manifest_capability_unavailable")
+        return False
+    return True
+
+
+def _run_agent_creator_command_if_allowed(
+    command: str,
+    *,
+    cwd: str,
+    timeout: int,
+) -> Optional[str]:
+    del cwd
+    parsed = _parse_agent_creator_command(command)
+    if parsed is None:
+        return _agent_creator_shell_guard_result(command)
+
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    if anchor is None:
+        return _agent_creator_blocked_result(
+            "agent_creator_identity_changed",
+            "Agent Creator trust identity changed before execution.",
+            direct=True,
+        )
+    script = Path(parsed.argv[1])
+    try:
+        identities_match = (
+            _path_identity(anchor.resolved_root) == parsed.root_identity
+            and _path_identity(script) == parsed.script_identity
+            and _connector_runtime_path_is_trusted(
+                script,
+                anchor.resolved_root,
+                expected_root_identity=parsed.root_identity,
+            )
+        )
+    except OSError:
+        identities_match = False
+    if not identities_match:
+        return _agent_creator_blocked_result(
+            "agent_creator_identity_changed",
+            "Agent Creator trust identity changed before execution.",
+            direct=True,
+        )
+
+    try:
+        script_bytes = _read_verified_agent_creator_script(
+            script,
+            expected_identity=parsed.script_identity,
+        )
+        if (
+            _path_identity(anchor.resolved_root) != parsed.root_identity
+            or not _connector_runtime_path_is_trusted(
+                script,
+                anchor.resolved_root,
+                expected_root_identity=parsed.root_identity,
+            )
+        ):
+            raise OSError("agent creator trust identity changed")
+    except OSError:
+        return _agent_creator_blocked_result(
+            "agent_creator_identity_changed",
+            "Agent Creator trust identity changed before execution.",
+            direct=True,
+        )
+
+    if not _agent_creator_manifest_supports_action_token_fd(anchor):
+        return _agent_creator_blocked_result(
+            "agent_creator_runtime_capability_unavailable",
+            (
+                "Agent Creator is unavailable because the installed preset "
+                "does not support the scoped authorization channel."
+            ),
+            direct=True,
+        )
+
+    try:
+        from tools.environments.local import build_agent_creator_runtime_env
+
+        creator_env = build_agent_creator_runtime_env()
+    except Exception:
+        return _agent_creator_blocked_result(
+            "agent_creator_scope_unavailable",
+            "Agent Creator is unavailable because its scoped authorization is missing.",
+            direct=True,
+        )
+
+    token = creator_env.pop("ZETTLAB_AGENT_ACTION_TOKEN", "")
+    turn_id = creator_env.get("ZETTLAB_TURN_ID", "")
+    try:
+        from tools.environments.local import _sanitize_subprocess_env
+        from tools.trusted_direct_runner import run_trusted_python_script
+
+        run_env = _sanitize_subprocess_env(os.environ)
+        run_env.pop("ZETTLAB_TURN_ID", None)
+        completed = run_trusted_python_script(
+            script=script,
+            argv=parsed.argv[1:],
+            cwd=anchor.resolved_root,
+            base_env=run_env,
+            injected_env=creator_env,
+            injected_secrets={"ZETTLAB_AGENT_ACTION_TOKEN": token},
+            timeout=timeout,
+            stdin_text=parsed.stdin_text,
+            secret_values=(token, turn_id),
+            script_bytes=script_bytes,
+            stdlib_only=True,
+        )
+    except Exception:
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": "Agent Creator execution failed.",
+            "agent_creator_direct": True,
+        }, ensure_ascii=False)
+
+    error = None
+    if completed.timed_out:
+        error = "Command timed out while running Agent Creator."
+    elif completed.interrupted:
+        error = "Agent Creator was interrupted."
+    return json.dumps({
+        "output": completed.output,
+        "exit_code": completed.returncode,
+        "error": error,
+        "agent_creator_direct": True,
+    }, ensure_ascii=False)
 
 
 # Tool description for LLM
@@ -3051,6 +3687,13 @@ def terminal_tool(
                 }, ensure_ascii=False)
 
         if not background and not pty:
+            agent_creator_result = _run_agent_creator_command_if_allowed(
+                command,
+                cwd=workdir or cwd,
+                timeout=effective_timeout,
+            )
+            if agent_creator_result is not None:
+                return agent_creator_result
             connector_runtime_result = _run_connector_runtime_command_if_allowed(
                 command,
                 cwd=workdir or cwd,
@@ -3059,6 +3702,9 @@ def terminal_tool(
             if connector_runtime_result is not None:
                 return connector_runtime_result
         else:
+            agent_creator_result = _agent_creator_shell_guard_result(command)
+            if agent_creator_result is not None:
+                return agent_creator_result
             connector_runtime_result = _connector_runtime_shell_guard_result(command)
             if connector_runtime_result is not None:
                 return connector_runtime_result

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Mapping
 from pathlib import Path
 
 from tools.environments.base import BaseEnvironment, _pipe_stdin
@@ -462,7 +463,7 @@ def _with_zettlab_turn_id(command: str) -> str:
     return f"export ZETTLAB_TURN_ID={shlex.quote(turn_id)}\n{command}"
 
 
-PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset({
+CONNECTOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     # Connector skill runtime routing. These are generated per Zettlab agent
     # profile by local-server and live in <profile>/.env under the multiplex
     # gateway, so subprocesses must receive the current profile's scope instead
@@ -472,16 +473,25 @@ PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset({
     "ZET_AGENT_ID",
 })
 
+AGENT_CREATOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
+    "ZETTLAB_AGENT_ACTION_TOKEN",
+})
+_AGENT_CREATOR_ACTION_TOKEN_MAX_BYTES = 4 * 1024
+_AGENT_CREATOR_TURN_ID_MAX_BYTES = 256
+
+PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset(
+    CONNECTOR_RUNTIME_ENV_KEYS | AGENT_CREATOR_RUNTIME_ENV_KEYS
+)
+
 
 def _apply_profile_secret_scope_env(env: dict, *, inject: bool) -> None:
-    """Scrub profile-scoped connector runtime vars from generic subprocess env.
+    """Scrub dedicated-runner credentials from generic subprocess env.
 
     The multiplex gateway intentionally avoids merging every profile's .env into
     process-global os.environ. Generic terminal/background/helper subprocesses
-    are not the connector-specific runner, so they must never inherit connector
-    bearer material from globals, extra env, or a shell snapshot. Connector
-    skills that need these values must receive them through a dedicated,
-    allowlisted connector execution path instead of the general terminal path.
+    are not a trusted runner, so they must never inherit connector or Agent
+    action bearer material from globals, extra env, or a shell snapshot. Skills
+    that need these values receive them through a dedicated allowlisted path.
     """
     for key in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
         env.pop(key, None)
@@ -506,7 +516,7 @@ def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
     except Exception:
         scope = None
 
-    for key in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
+    for key in CONNECTOR_RUNTIME_ENV_KEYS:
         value = None
         if scope is not None:
             value = scope.get(key)
@@ -530,7 +540,51 @@ def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
     return env
 
 
-def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
+def build_agent_creator_runtime_env() -> dict[str, str]:
+    """Build the minimal env for the trusted agent-creator preset runner.
+
+    Unlike generic terminal and the legacy single-profile connector bridge,
+    Agent creation always requires an explicit per-turn secret scope. Falling
+    back to process-global ``os.environ`` could select a sibling profile's
+    action token under multiplexing, so absence of a scope/token is an error.
+    """
+
+    from agent.secret_scope import current_secret_scope
+
+    scope = current_secret_scope()
+    if scope is None:
+        raise RuntimeError("agent creator secret scope unavailable")
+    token = str(scope.get("ZETTLAB_AGENT_ACTION_TOKEN") or "").strip()
+    if not token:
+        raise RuntimeError("agent creator action token unavailable")
+    if (
+        "\x00" in token
+        or len(token.encode("utf-8")) > _AGENT_CREATOR_ACTION_TOKEN_MAX_BYTES
+    ):
+        raise RuntimeError("agent creator action token invalid")
+
+    env = {"ZETTLAB_AGENT_ACTION_TOKEN": token}
+    try:
+        from gateway.session_context import zettlab_turn_id
+
+        turn_id = zettlab_turn_id()
+    except Exception:
+        turn_id = ""
+    if turn_id:
+        turn_id = str(turn_id)
+        if (
+            "\x00" in turn_id
+            or len(turn_id.encode("utf-8")) > _AGENT_CREATOR_TURN_ID_MAX_BYTES
+        ):
+            raise RuntimeError("agent creator turn id invalid")
+        env["ZETTLAB_TURN_ID"] = turn_id
+    return env
+
+
+def _sanitize_subprocess_env(
+    base_env: Mapping[str, str] | None,
+    extra_env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
         from tools.env_passthrough import is_env_passthrough as _is_passthrough

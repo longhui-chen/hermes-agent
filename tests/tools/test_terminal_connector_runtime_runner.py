@@ -108,6 +108,8 @@ def test_connector_runtime_direct_runner_flow_receives_profile_scoped_env(monkey
 
 def test_connector_runtime_direct_runner_keeps_token_out_of_popen_env(monkeypatch, tmp_path):
     """Connector bearer is delivered over stdin to the allowlisted runner."""
+    from tools import trusted_direct_runner
+
     _write_connector_runtime(tmp_path)
     monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
     monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "runner-token")
@@ -119,13 +121,15 @@ def test_connector_runtime_direct_runner_keeps_token_out_of_popen_env(monkeypatc
     )
     captured = {}
 
-    def fake_run(argv, **kwargs):
-        captured["argv"] = argv
-        captured["env"] = kwargs.get("env", {})
-        captured["input"] = kwargs.get("input", "")
-        return terminal_tool_module.subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+    def fake_run(**kwargs):
+        captured.update(kwargs)
+        return trusted_direct_runner.TrustedPythonResult(output="ok", returncode=0)
 
-    monkeypatch.setattr(terminal_tool_module.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        trusted_direct_runner,
+        "run_trusted_python_script",
+        fake_run,
+    )
 
     result = json.loads(terminal_tool_module._run_connector_runtime_command_if_allowed(
         'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py" list-tools',
@@ -135,11 +139,11 @@ def test_connector_runtime_direct_runner_keeps_token_out_of_popen_env(monkeypatc
 
     assert result["connector_runtime_direct"] is True
     assert result["exit_code"] == 0
-    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in captured["env"]
-    assert "ZETTLAB_CONNECTORS_URL" not in captured["env"]
-    assert "runner-token" in captured["input"]
-    assert "http://127.0.0.1/rpc" in captured["input"]
-    assert captured["argv"][:2] == [sys.executable, "-c"]
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in captured["base_env"]
+    assert "ZETTLAB_CONNECTORS_URL" not in captured["base_env"]
+    assert captured["injected_env"]["ZETTLAB_CONNECTORS_AUTH_TOKEN"] == "runner-token"
+    assert captured["injected_env"]["ZETTLAB_CONNECTORS_URL"] == "http://127.0.0.1/rpc"
+    assert captured["argv"][0].endswith("connector_runtime.py")
 
 
 def test_connector_runtime_direct_runner_preserves_parent_process_globals(monkeypatch, tmp_path):
