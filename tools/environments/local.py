@@ -365,12 +365,15 @@ def _prepare_managed_terminal_home(env: dict[str, str]) -> str:
     return home_text
 
 
-def _managed_uid_processes(uid: int) -> set[int]:
+def _managed_uid_processes(
+    uid: int,
+    proc_root: Path = Path("/proc"),
+) -> set[int]:
     """Return Linux processes whose effective UID is the managed identity."""
-    if _IS_WINDOWS or not Path("/proc").is_dir():
+    if _IS_WINDOWS or not proc_root.is_dir():
         return set()
     processes: set[int] = set()
-    for entry in Path("/proc").iterdir():
+    for entry in proc_root.iterdir():
         if not entry.name.isdigit():
             continue
         try:
@@ -379,13 +382,22 @@ def _managed_uid_processes(uid: int) -> set[int]:
             )
         except (FileNotFoundError, PermissionError, ProcessLookupError):
             continue
+        effective_uid: int | None = None
+        is_zombie = False
         for line in status.splitlines():
-            if not line.startswith("Uid:"):
-                continue
-            fields = line.split()
-            if len(fields) >= 3 and int(fields[2]) == uid:
-                processes.add(int(entry.name))
-            break
+            if line.startswith("State:"):
+                state_fields = line.split()
+                is_zombie = len(state_fields) >= 2 and state_fields[1] == "Z"
+            elif line.startswith("Uid:"):
+                uid_fields = line.split()
+                if len(uid_fields) >= 3:
+                    effective_uid = int(uid_fields[2])
+        # Zombies have no address space, open descriptors, or executable
+        # thread left to cross a profile boundary. Their parent may reap them
+        # after this bounded cleanup, so treating them as killable would make
+        # every SIGKILL path time out forever.
+        if effective_uid == uid and not is_zombie:
+            processes.add(int(entry.name))
     return processes
 
 

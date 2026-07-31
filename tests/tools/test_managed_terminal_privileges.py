@@ -400,6 +400,25 @@ def test_process_registry_kill_all_is_scoped_to_immutable_profile(monkeypatch):
     assert registry._running["second"].exited is False
 
 
+def test_managed_uid_inventory_ignores_zombies(tmp_path):
+    running = tmp_path / "101"
+    zombie = tmp_path / "102"
+    other = tmp_path / "103"
+    for process_dir in (running, zombie, other):
+        process_dir.mkdir()
+    running.joinpath("status").write_text(
+        "State:\tS (sleeping)\nUid:\t100001\t100001\t100001\t100001\n"
+    )
+    zombie.joinpath("status").write_text(
+        "State:\tZ (zombie)\nUid:\t100001\t100001\t100001\t100001\n"
+    )
+    other.joinpath("status").write_text(
+        "State:\tS (sleeping)\nUid:\t100002\t100002\t100002\t100002\n"
+    )
+
+    assert local_module._managed_uid_processes(100001, tmp_path) == {101}
+
+
 @pytest.mark.skipif(
     sys.platform != "linux" or os.geteuid() != 0,
     reason="requires Linux root identity broker",
