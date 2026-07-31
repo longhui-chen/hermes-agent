@@ -2679,7 +2679,9 @@ def purge_profile_approval_state(profile_owner: str) -> dict[str, int]:
         "permanent_allowlist": 0,
     }
     rejected_entries = []
-    with _lock:
+    # Match the lazy loader's lock order so an in-flight config read cannot
+    # repopulate this profile after the unload purge has completed.
+    with _permanent_load_lock, _lock:
         for state_key in list(_pending):
             if owned(state_key):
                 removed["pending"] += len(_pending.pop(state_key, []))
