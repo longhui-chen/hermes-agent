@@ -304,7 +304,7 @@ async def test_prefixed_models_route_is_registered(profile_homes):
 
     assert resp.status == 200
     assert data["object"] == "list"
-    assert data["data"][0]["id"] == "hermes-agent"
+    assert data["data"][0]["id"] == "coder"
 
 
 @pytest.mark.asyncio
@@ -400,6 +400,10 @@ async def test_prefixed_chat_routes_connector_capability_through_zet_agent_overr
 @pytest.mark.asyncio
 async def test_prefixed_chat_scope_reaches_agent_executor(profile_homes, monkeypatch):
     """The agent is created in an executor thread, so profile context must cross it."""
+    (profile_homes["coder"] / ".env").write_text(
+        "ZET_AGENT_ID=coder\n",
+        encoding="utf-8",
+    )
     seen = []
     adapter = _make_adapter()
 
@@ -413,23 +417,34 @@ async def test_prefixed_chat_scope_reaches_agent_executor(profile_homes, monkeyp
             return {"final_response": "ok", "completed": True}
 
     def fake_create_agent(**_kwargs):
+        from agent.secret_scope import current_secret_scope
+        from gateway.platforms.api_server import _api_request_profile
         from hermes_constants import get_hermes_home
 
-        seen.append(get_hermes_home())
+        scope = current_secret_scope()
+        seen.append((
+            get_hermes_home(),
+            None if scope is None else scope.get("ZET_AGENT_ID"),
+            _api_request_profile.get(),
+        ))
         return FakeAgent()
 
     monkeypatch.setattr(adapter, "_create_agent", fake_create_agent)
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
 
-    with adapter._profile_api_scope("coder"):
-        result, usage = await adapter._run_agent(
-            user_message="hello",
-            conversation_history=[],
-            session_id="sid",
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            "/p/coder/v1/chat/completions",
+            json={
+                "model": "hermes-agent",
+                "messages": [{"role": "user", "content": "hello coder"}],
+            },
+            headers={"Authorization": "Bearer test-key"},
         )
 
-    assert result["final_response"] == "ok"
-    assert usage["total_tokens"] == 2
-    assert seen == [profile_homes["coder"]]
+    assert response.status == 200
+    assert seen == [(profile_homes["coder"], "coder", "coder")]
 
 
 @pytest.mark.asyncio
