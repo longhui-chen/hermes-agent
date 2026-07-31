@@ -25,6 +25,11 @@ def test_managed_terminal_drops_identity_changing_capabilities(monkeypatch):
     )
     monkeypatch.setattr(local_module, "_find_bash", lambda: "/bin/bash")
     monkeypatch.setattr(local_module, "_make_run_env", lambda _env: {})
+    monkeypatch.setattr(
+        local_module,
+        "_managed_terminal_cwd",
+        lambda cwd, *, env: cwd,
+    )
     monkeypatch.setattr(local_module, "_resolve_safe_cwd", lambda cwd: cwd)
     monkeypatch.setattr(local_module.os, "getpgid", lambda _pid: 42)
 
@@ -56,6 +61,43 @@ def test_managed_terminal_drops_identity_changing_capabilities(monkeypatch):
         "-c",
         "id",
     ]
+
+
+def test_managed_terminal_default_cwd_falls_back_to_profile_home(monkeypatch):
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    run_env = {"HERMES_HOME": "/profiles/main"}
+
+    def prepare_home(env):
+        env["HOME"] = "/run/zettlab-claw/terminal-homes/100001"
+        env["TMPDIR"] = env["HOME"]
+        return env["HOME"]
+
+    monkeypatch.setattr(
+        local_module,
+        "_prepare_managed_terminal_home",
+        prepare_home,
+    )
+    monkeypatch.setattr(
+        local_module,
+        "_managed_terminal_identity",
+        lambda _env=None: (100001, 100001),
+    )
+    monkeypatch.setattr(
+        local_module,
+        "_managed_identity_can_traverse",
+        lambda directory, **_kwargs: directory != "/root",
+    )
+
+    assert local_module._managed_terminal_cwd(
+        "/root",
+        env=run_env,
+    ) == "/run/zettlab-claw/terminal-homes/100001"
+    assert local_module._managed_terminal_cwd(
+        "/workspace",
+        env=run_env,
+    ) == "/workspace"
+    assert run_env["HOME"] == "/run/zettlab-claw/terminal-homes/100001"
+    assert run_env["TMPDIR"] == run_env["HOME"]
 
 
 def test_managed_terminal_fails_closed_without_trusted_setpriv(monkeypatch):
@@ -106,6 +148,8 @@ def test_managed_service_mounts_system_read_only_with_scoped_writes():
         encoding="utf-8"
     )
     assert "ProtectSystem=strict" in service
+    assert "RuntimeDirectory=zettlab-claw" in service
+    assert "RuntimeDirectoryMode=0755" in service
     assert "ReadWritePaths=__APP_BASE__/data" in service
     assert "ReadWritePaths=-/volume1/subvol/agents/data" in service
     assert "ReadWritePaths=-/volume1/agents/data" in service
@@ -165,6 +209,11 @@ def _background_registry(monkeypatch):
         process_registry_module,
         "_resolve_safe_cwd",
         lambda cwd: cwd,
+    )
+    monkeypatch.setattr(
+        process_registry_module,
+        "_managed_terminal_cwd",
+        lambda cwd, *, env: cwd,
     )
     return registry
 

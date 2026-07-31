@@ -44,6 +44,7 @@ _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import (
     _find_shell,
     _managed_terminal_argv,
+    _managed_terminal_cwd,
     _resolve_safe_cwd,
     _sanitize_subprocess_env,
 )
@@ -729,6 +730,10 @@ class ProcessRegistry:
                 user_shell = _find_shell()
                 pty_env = _sanitize_subprocess_env(os.environ, env_vars)
                 pty_env["PYTHONUNBUFFERED"] = "1"
+                session.cwd = _managed_terminal_cwd(
+                    session.cwd,
+                    env=pty_env,
+                )
                 pty_proc = _PtyProcessCls.spawn(
                     _managed_terminal_argv(
                         [user_shell, "-lic", f"set +m; {command}"],
@@ -774,6 +779,10 @@ class ProcessRegistry:
         # stdout is a pipe, hiding output from process(action="poll")).
         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
         bg_env["PYTHONUNBUFFERED"] = "1"
+        session.cwd = _managed_terminal_cwd(
+            session.cwd,
+            env=bg_env,
+        )
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
         proc = subprocess.Popen(

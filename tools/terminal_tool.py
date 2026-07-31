@@ -958,6 +958,7 @@ import sys
 
 
 _CONNECTOR_RUNTIME_SCRIPT = "connector_runtime.py"
+_CONNECTOR_RUNTIME_MAX_SCRIPT_BYTES = 1024 * 1024
 _CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT = ";&|<>\n()"
 _CONNECTOR_RUNTIME_SHELL_PUNCTUATION = set(_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT)
 _CONNECTOR_RUNTIME_SHELL_GROUP_START = "{"
@@ -1608,6 +1609,47 @@ def _connector_runtime_isolated_sys_path(*, script: Path, cwd: Path) -> list[str
     return isolated_python_path(cwd=cwd)
 
 
+def _read_connector_runtime_script_bytes(
+    script: Path,
+    *,
+    expected_identity: tuple[int, int],
+) -> bytes:
+    """Freeze a verified runner before the worker drops privileges."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(script, flags)
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or (before.st_dev, before.st_ino) != expected_identity
+            or before.st_size < 0
+            or before.st_size > _CONNECTOR_RUNTIME_MAX_SCRIPT_BYTES
+        ):
+            raise OSError("connector runtime snapshot is not trusted")
+        chunks: list[bytes] = []
+        remaining = _CONNECTOR_RUNTIME_MAX_SCRIPT_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            len(payload) > _CONNECTOR_RUNTIME_MAX_SCRIPT_BYTES
+            or (after.st_dev, after.st_ino) != expected_identity
+            or after.st_size != before.st_size
+            or len(payload) != before.st_size
+        ):
+            raise OSError("connector runtime changed while being frozen")
+        return payload
+    finally:
+        os.close(descriptor)
+
+
 def _run_connector_runtime_command_if_allowed(
     command: str,
     *,
@@ -1644,6 +1686,14 @@ def _run_connector_runtime_command_if_allowed(
             )
         _log_connector_runtime_rejection(reason or "identity_changed_before_exec")
         return None
+    try:
+        script_bytes = _read_connector_runtime_script_bytes(
+            script,
+            expected_identity=parsed.script_identity,
+        )
+    except OSError:
+        _log_connector_runtime_rejection("script_snapshot_failed")
+        return None
 
     secret_values: list[str] = []
     try:
@@ -1669,6 +1719,7 @@ def _run_connector_runtime_command_if_allowed(
             injected_env=connector_env,
             timeout=timeout,
             secret_values=secret_values,
+            script_bytes=script_bytes,
         )
         return _connector_runtime_result_json(
             command=command,

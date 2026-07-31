@@ -110,7 +110,8 @@ def test_connector_runtime_direct_runner_keeps_token_out_of_popen_env(monkeypatc
     """Connector bearer is delivered over stdin to the allowlisted runner."""
     from tools import trusted_direct_runner
 
-    _write_connector_runtime(tmp_path)
+    script = _write_connector_runtime(tmp_path)
+    script.chmod(0o600)
     monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
     monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "runner-token")
     monkeypatch.setenv("ZETTLAB_CONNECTORS_URL", "http://127.0.0.1/rpc")
@@ -144,6 +145,7 @@ def test_connector_runtime_direct_runner_keeps_token_out_of_popen_env(monkeypatc
     assert captured["injected_env"]["ZETTLAB_CONNECTORS_AUTH_TOKEN"] == "runner-token"
     assert captured["injected_env"]["ZETTLAB_CONNECTORS_URL"] == "http://127.0.0.1/rpc"
     assert captured["argv"][0].endswith("connector_runtime.py")
+    assert captured["script_bytes"] == script.read_bytes()
 
 
 def test_connector_runtime_direct_runner_preserves_parent_process_globals(monkeypatch, tmp_path):

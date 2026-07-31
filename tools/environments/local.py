@@ -34,6 +34,7 @@ _MANAGED_TERMINAL_IDENTITY_ATTEMPTS = 64
 _MANAGED_TERMINAL_IDENTITY_CACHE_MAX = 4096
 _MANAGED_TERMINAL_IDENTITY_LOCK = threading.Lock()
 _MANAGED_TERMINAL_SCOPE_BY_UID: dict[int, str] = {}
+_MANAGED_TERMINAL_HOME_ROOT = Path("/run/zettlab-claw/terminal-homes")
 
 
 def _managed_terminal_identity(
@@ -154,6 +155,105 @@ def _prepare_managed_terminal_workspace(
         os.chmod(path, 0o600)
     os.chown(directory, uid, gid)
     os.chmod(directory, 0o700)
+
+
+def _prepare_managed_terminal_home(env: dict[str, str]) -> str:
+    """Create one non-shared writable HOME under a root-owned runtime tree."""
+
+    uid, gid = _managed_terminal_identity(env)
+    parent = _MANAGED_TERMINAL_HOME_ROOT.parent
+    parent_info = os.lstat(parent)
+    if (
+        not stat.S_ISDIR(parent_info.st_mode)
+        or parent_info.st_uid != 0
+        or parent_info.st_mode & 0o022
+    ):
+        raise OSError("managed terminal runtime directory is not trusted")
+
+    try:
+        os.mkdir(_MANAGED_TERMINAL_HOME_ROOT, 0o711)
+    except FileExistsError:
+        pass
+    root_info = os.lstat(_MANAGED_TERMINAL_HOME_ROOT)
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or root_info.st_uid != 0
+        or root_info.st_gid != 0
+        or root_info.st_mode & 0o022
+    ):
+        raise OSError("managed terminal home root is not trusted")
+    os.chmod(_MANAGED_TERMINAL_HOME_ROOT, 0o711)
+
+    home = _MANAGED_TERMINAL_HOME_ROOT / str(uid)
+    created = False
+    try:
+        os.mkdir(home, 0o700)
+        created = True
+    except FileExistsError:
+        pass
+    if created:
+        os.chown(home, uid, gid)
+        os.chmod(home, 0o700)
+    home_info = os.lstat(home)
+    if (
+        not stat.S_ISDIR(home_info.st_mode)
+        or home_info.st_uid != uid
+        or home_info.st_gid != gid
+        or home_info.st_mode & 0o077
+    ):
+        raise OSError("managed terminal profile home is not trusted")
+
+    home_text = str(home)
+    env["HOME"] = home_text
+    env["TMPDIR"] = home_text
+    return home_text
+
+
+def _managed_identity_can_traverse(
+    directory: str,
+    *,
+    uid: int,
+    gid: int,
+) -> bool:
+    """Check directory traversal using the runner's cleared-group identity."""
+
+    try:
+        resolved = Path(directory).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    components = [resolved, *resolved.parents]
+    for component in reversed(components):
+        try:
+            info = component.stat()
+        except OSError:
+            return False
+        if not stat.S_ISDIR(info.st_mode):
+            return False
+        if info.st_uid == uid:
+            permission = (info.st_mode >> 6) & 0o7
+        elif info.st_gid == gid:
+            permission = (info.st_mode >> 3) & 0o7
+        else:
+            permission = info.st_mode & 0o7
+        if permission & 0o1 == 0:
+            return False
+    return True
+
+
+def _managed_terminal_cwd(
+    cwd: str,
+    *,
+    env: dict[str, str],
+) -> str:
+    """Return an accessible cwd and set the matching per-profile HOME."""
+
+    if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
+        return cwd
+    home = _prepare_managed_terminal_home(env)
+    uid, gid = _managed_terminal_identity(env)
+    if cwd and _managed_identity_can_traverse(cwd, uid=uid, gid=gid):
+        return cwd
+    return home
 
 
 def _msys_to_windows_path(cwd: str) -> str:
@@ -1558,7 +1658,12 @@ class LocalEnvironment(BaseEnvironment):
         return tuple(sorted((*PROFILE_SCOPED_SUBPROCESS_ENV_KEYS, "ZETTLAB_TURN_ID")))
 
     def _wrap_command(self, command: str, cwd: str) -> str:
-        return super()._wrap_command(_with_zettlab_turn_id(command), cwd)
+        run_env = _make_run_env(self.env)
+        effective_cwd = _managed_terminal_cwd(cwd, env=run_env)
+        return super()._wrap_command(
+            _with_zettlab_turn_id(command),
+            effective_cwd,
+        )
 
     def get_temp_dir(self) -> str:
         """Return a shell-safe writable temp dir for local execution.
@@ -1632,6 +1737,7 @@ class LocalEnvironment(BaseEnvironment):
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
         run_env = _make_run_env(self.env)
+        managed_cwd = _managed_terminal_cwd(self.cwd, env=run_env)
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
         args = _managed_terminal_argv(args, env=run_env)
 
@@ -1645,22 +1751,27 @@ class LocalEnvironment(BaseEnvironment):
         # POSIX paths (``/c/Users/...``) to native form so a perfectly valid
         # ``pwd -P`` result from bash isn't mistakenly treated as "missing"
         # and spammed as a warning on every command.
-        safe_cwd = _resolve_safe_cwd(self.cwd)
-        if safe_cwd != self.cwd:
+        safe_cwd = _resolve_safe_cwd(managed_cwd)
+        if safe_cwd != managed_cwd:
             # MSYS → Windows translation alone shouldn't surface as a warning
             # (it's a benign normalization, not a recovery). Only warn when
             # the directory really doesn't exist on disk.
-            normalized = _msys_to_windows_path(self.cwd) if _IS_WINDOWS else self.cwd
+            normalized = (
+                _msys_to_windows_path(managed_cwd)
+                if _IS_WINDOWS
+                else managed_cwd
+            )
             if safe_cwd != normalized:
                 logger.warning(
                     "LocalEnvironment cwd %r is missing on disk; "
                     "falling back to %r so terminal commands keep working.",
-                    self.cwd,
+                    managed_cwd,
                     safe_cwd,
                 )
-            self.cwd = safe_cwd
+            if managed_cwd == self.cwd:
+                self.cwd = safe_cwd
 
-        _popen_cwd = self.cwd
+        _popen_cwd = safe_cwd
 
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
