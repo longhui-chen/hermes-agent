@@ -676,10 +676,10 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
                 "Agent file tools cannot modify terminal runtime identities."
             )
 
-        # User/project plugins execute inside the privileged gateway and may
-        # register model or memory providers. File tools also run in-process,
-        # so they may not rewrite any plugin code root, including a sibling
-        # multiplex profile that could be activated later.
+        # User/project plugins and profile event hooks execute inside the
+        # privileged gateway. File tools also run in-process, so they may not
+        # rewrite either code root, including a sibling multiplex profile that
+        # could be activated later.
         plugin_roots = list(managed_hermes_roots)
         project_plugins_enabled = os.environ.get(
             "HERMES_ENABLE_PROJECT_PLUGINS", ""
@@ -695,9 +695,14 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
                     relative_parts = Path(candidate).relative_to(root).parts
                 except (OSError, ValueError):
                     continue
-                if "plugins" in relative_parts:
+                blocked_kind = next(
+                    (kind for kind in ("plugins", "hooks") if kind in relative_parts),
+                    "",
+                )
+                if blocked_kind:
+                    code_kind = "plugin" if blocked_kind == "plugins" else "hook"
                     return (
-                        f"Refusing to write to managed plugin code path: {filepath}\n"
+                        f"Refusing to write to managed {code_kind} code path: {filepath}\n"
                         "Agent file tools cannot modify code loaded by the gateway."
                     )
             if project_plugin_root and _within(candidate, project_plugin_root):

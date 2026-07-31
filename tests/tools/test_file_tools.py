@@ -733,6 +733,46 @@ class TestSensitivePathCheck:
         assert "managed plugin code path" in result["error"]
 
     @pytest.mark.parametrize("tool_name", ["write", "patch"])
+    @pytest.mark.parametrize(
+        "target",
+        [
+            (
+                "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home/"
+                "profiles/agent-a/hooks/audit/handler.py"
+            ),
+            (
+                "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home/"
+                "profiles/agent-b/hooks/lifecycle/handler.py"
+            ),
+        ],
+    )
+    def test_managed_gateway_hook_code_is_not_model_writable(
+        self, monkeypatch, tool_name, target
+    ):
+        monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+        monkeypatch.setenv(
+            "HERMES_HOME",
+            "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home/"
+            "profiles/agent-a",
+        )
+        if tool_name == "write":
+            from tools.file_tools import write_file_tool
+
+            result = json.loads(write_file_tool(target, "def run(ctx): pass\n"))
+        else:
+            from tools.file_tools import patch_tool
+
+            result = json.loads(
+                patch_tool(
+                    mode="replace",
+                    path=target,
+                    old_string="safe",
+                    new_string="payload",
+                )
+            )
+        assert "managed hook code path" in result["error"]
+
+    @pytest.mark.parametrize("tool_name", ["write", "patch"])
     @pytest.mark.parametrize("via_symlink", [False, True])
     def test_managed_terminal_homes_are_not_model_writable(
         self, tmp_path, monkeypatch, tool_name, via_symlink
