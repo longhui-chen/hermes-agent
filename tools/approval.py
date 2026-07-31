@@ -12,6 +12,7 @@ import contextvars
 import fnmatch
 import functools
 import hashlib
+import json
 import logging
 import os
 import re
@@ -2015,12 +2016,20 @@ def detect_dangerous_command(command: str) -> tuple:
 
 _lock = threading.Lock()
 _MAX_DEFERRED_APPROVALS_PER_SESSION = 16
+_MAX_DEFERRED_APPROVALS_GLOBAL = 256
+_MAX_DEFERRED_APPROVAL_BYTES_GLOBAL = 512 * 1024
+_MAX_DEFERRED_COMMAND_CHARS = 4096
+_MAX_DEFERRED_DESCRIPTION_CHARS = 1024
+_MAX_DEFERRED_PATTERN_CHARS = 512
+_DEFERRED_SWEEP_INTERVAL_SECONDS = 30.0
 _ApprovalStateKey = str | tuple[str, str]
 _pending: dict[_ApprovalStateKey, list[dict]] = {}
 _one_shot_approved: dict[_ApprovalStateKey, dict[str, list[float]]] = {}
 _session_approved: dict[_ApprovalStateKey, set] = {}
 _session_yolo: set[_ApprovalStateKey] = set()
 _permanent_approved: set = set()
+_deferred_sweeper_started = False
+_deferred_sweeper_start_lock = threading.Lock()
 
 
 def _approval_profile_scope() -> str:
@@ -2049,6 +2058,141 @@ def _approval_state_key(session_key: str) -> _ApprovalStateKey:
 
 def _approval_raw_session_key(state_key: _ApprovalStateKey) -> str:
     return state_key[1] if isinstance(state_key, tuple) else state_key
+
+
+def _bounded_deferred_text(value: object, limit: int) -> str:
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+    return f"{text[:limit]}\n...[truncated sha256={digest}]"
+
+
+def _bounded_deferred_payload(approval: dict) -> dict:
+    """Keep only authorization metadata plus bounded user-visible summaries."""
+
+    fingerprint_source = json.dumps(
+        approval, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8", errors="replace")
+    queued = {
+        "command": _bounded_deferred_text(
+            approval.get("command", ""), _MAX_DEFERRED_COMMAND_CHARS
+        ),
+        "description": _bounded_deferred_text(
+            approval.get("description", ""), _MAX_DEFERRED_DESCRIPTION_CHARS
+        ),
+        "pattern_key": _bounded_deferred_text(
+            approval.get("pattern_key", ""), _MAX_DEFERRED_PATTERN_CHARS
+        ),
+        "payload_fingerprint": hashlib.sha256(fingerprint_source).hexdigest(),
+    }
+    for key in ("one_shot_pattern_key",):
+        if approval.get(key):
+            queued[key] = _bounded_deferred_text(
+                approval[key], _MAX_DEFERRED_PATTERN_CHARS
+            )
+    for key in ("pattern_keys", "session_only_pattern_keys"):
+        if approval.get(key) is not None:
+            queued[key] = [
+                _bounded_deferred_text(value, _MAX_DEFERRED_PATTERN_CHARS)
+                for value in list(approval.get(key) or [])[:32]
+                if value
+            ]
+    for key in ("allow_permanent", "one_shot", "smart_denied"):
+        if key in approval:
+            queued[key] = bool(approval[key])
+    return queued
+
+
+def _deferred_item_size(item: dict) -> int:
+    stored = item.get("_estimated_bytes")
+    if isinstance(stored, int) and stored >= 0:
+        return stored
+    return len(
+        json.dumps(item, separators=(",", ":"), default=str).encode(
+            "utf-8", errors="replace"
+        )
+    )
+
+
+def _sweep_deferred_locked(now: float) -> None:
+    for state_key, queue in list(_pending.items()):
+        queue[:] = [
+            item
+            for item in queue
+            if float(item.get("expires_at_monotonic", 0.0)) >= now
+        ]
+        if not queue:
+            _pending.pop(state_key, None)
+    for state_key, grants in list(_one_shot_approved.items()):
+        for pattern_key in list(grants):
+            grants[pattern_key] = [
+                expiry for expiry in grants[pattern_key] if expiry >= now
+            ]
+            if not grants[pattern_key]:
+                grants.pop(pattern_key, None)
+        if not grants:
+            _one_shot_approved.pop(state_key, None)
+
+
+def _deferred_usage_locked() -> tuple[int, int]:
+    items = [item for queue in _pending.values() for item in queue]
+    return len(items), sum(_deferred_item_size(item) for item in items)
+
+
+def _evict_oldest_deferred_locked() -> bool:
+    oldest: Optional[tuple[float, _ApprovalStateKey, dict]] = None
+    for state_key, queue in _pending.items():
+        for item in queue:
+            candidate = (
+                float(item.get("created_at_monotonic", 0.0)),
+                state_key,
+                item,
+            )
+            if oldest is None or candidate[0] < oldest[0]:
+                oldest = candidate
+    if oldest is None:
+        return False
+    _, state_key, item = oldest
+    queue = _pending.get(state_key, [])
+    if item in queue:
+        queue.remove(item)
+    if not queue:
+        _pending.pop(state_key, None)
+    return True
+
+
+def _sweep_deferred_approvals() -> None:
+    """Actively reclaim expired deferred approvals and replay grants."""
+
+    with _lock:
+        _sweep_deferred_locked(time.monotonic())
+
+
+def _ensure_deferred_sweeper() -> None:
+    global _deferred_sweeper_started
+    if _deferred_sweeper_started:
+        return
+    with _deferred_sweeper_start_lock:
+        if _deferred_sweeper_started:
+            return
+        _deferred_sweeper_started = True
+
+        def _run() -> None:
+            while True:
+                time.sleep(_DEFERRED_SWEEP_INTERVAL_SECONDS)
+                try:
+                    _sweep_deferred_approvals()
+                except Exception:
+                    logger.debug(
+                        "Deferred approval sweep failed", exc_info=True
+                    )
+
+        threading.Thread(
+            target=_run,
+            name="hermes-approval-sweeper",
+            daemon=True,
+        ).start()
 
 # =========================================================================
 # Blocking gateway approval (mirrors CLI's synchronous input() flow)
@@ -2158,12 +2302,9 @@ def resolve_gateway_approval(session_key: str, choice: str,
             # Deferred requests MUST be resolved by opaque identity: a stale
             # response may never authorize whichever operation was queued
             # later under the same session key.
-            deferred = _pending.get(state_key, [])
             now = time.monotonic()
-            deferred[:] = [
-                item for item in deferred
-                if float(item.get("expires_at_monotonic", 0.0)) >= now
-            ]
+            _sweep_deferred_locked(now)
+            deferred = _pending.get(state_key, [])
             if not deferred:
                 _pending.pop(state_key, None)
                 return 0
@@ -2249,7 +2390,7 @@ def submit_pending(session_key: str, approval: dict) -> Optional[str]:
     """Queue one bounded deferred request and return its opaque identity."""
     now = time.monotonic()
     approval_id = secrets.token_urlsafe(24)
-    queued = dict(approval)
+    queued = _bounded_deferred_payload(approval)
     queued.update({
         "approval_id": approval_id,
         "_approval_profile_scope": _approval_profile_scope(),
@@ -2258,16 +2399,27 @@ def submit_pending(session_key: str, approval: dict) -> Optional[str]:
             now + max(float(_get_approval_timeout()), 1.0)
         ),
     })
+    queued["_estimated_bytes"] = _deferred_item_size(queued)
     state_key = _approval_state_key(session_key)
     with _lock:
+        _sweep_deferred_locked(now)
         queue = _pending.setdefault(state_key, [])
-        queue[:] = [
-            item for item in queue
-            if float(item.get("expires_at_monotonic", 0.0)) >= now
-        ]
         if len(queue) >= _MAX_DEFERRED_APPROVALS_PER_SESSION:
             return None
+        item_size = _deferred_item_size(queued)
+        if item_size > _MAX_DEFERRED_APPROVAL_BYTES_GLOBAL:
+            return None
+        count, total_bytes = _deferred_usage_locked()
+        while (
+            count >= _MAX_DEFERRED_APPROVALS_GLOBAL
+            or total_bytes + item_size > _MAX_DEFERRED_APPROVAL_BYTES_GLOBAL
+        ):
+            if not _evict_oldest_deferred_locked():
+                return None
+            count, total_bytes = _deferred_usage_locked()
+        queue = _pending.setdefault(state_key, [])
         queue.append(queued)
+    _ensure_deferred_sweeper()
     return approval_id
 
 
@@ -2284,6 +2436,7 @@ def approval_session_key_for_id(approval_id: str) -> Optional[str]:
     expected_scope = _approval_profile_scope()
     now = time.monotonic()
     with _lock:
+        _sweep_deferred_locked(now)
         for state_key, queue in _gateway_queues.items():
             for entry in queue:
                 if (
@@ -2298,13 +2451,6 @@ def approval_session_key_for_id(approval_id: str) -> Optional[str]:
                     return _approval_raw_session_key(state_key)
 
         for state_key, queue in list(_pending.items()):
-            queue[:] = [
-                item for item in queue
-                if float(item.get("expires_at_monotonic", 0.0)) >= now
-            ]
-            if not queue:
-                _pending.pop(state_key, None)
-                continue
             for item in queue:
                 if (
                     secrets.compare_digest(
@@ -2326,6 +2472,8 @@ def _grant_one_shot_approval(session_key: str, pattern_key: str) -> None:
     with _lock:
         grants = _one_shot_approved.setdefault(state_key, {})
         now = time.monotonic()
+        _sweep_deferred_locked(now)
+        grants = _one_shot_approved.setdefault(state_key, {})
         for key in list(grants):
             grants[key] = [expiry for expiry in grants[key] if expiry >= now]
             if not grants[key]:
@@ -2347,6 +2495,7 @@ def _consume_one_shot_approval(session_key: str, pattern_key: str) -> bool:
     now = time.monotonic()
     state_key = _approval_state_key(session_key)
     with _lock:
+        _sweep_deferred_locked(now)
         grants = _one_shot_approved.get(state_key)
         if not grants:
             return False

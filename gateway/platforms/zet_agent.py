@@ -1291,9 +1291,11 @@ class ZetAgentAdapter(APIServerAdapter):
     # Approval — register notify callback, resolve via HTTP respond
     # ------------------------------------------------------------------
 
-    def _approval_projection_head(self, session_id: str) -> Optional[Dict[str, Any]]:
+    def _approval_projection_head(
+        self, scoped_session_key: str
+    ) -> Optional[Dict[str, Any]]:
         with self._pending_lock:
-            raw_queue = self._pending_approval.get(session_id)
+            raw_queue = self._pending_approval.get(scoped_session_key)
             if isinstance(raw_queue, dict):
                 return raw_queue
             if raw_queue:
@@ -1303,23 +1305,24 @@ class ZetAgentAdapter(APIServerAdapter):
     def _cache_approval_projection(
         self,
         stream_q: Any,
+        scoped_session_key: str,
         session_id: str,
         payload: Dict[str, Any],
     ) -> None:
         with self._pending_lock:
-            raw_queue = self._pending_approval.get(session_id)
+            raw_queue = self._pending_approval.get(scoped_session_key)
             if isinstance(raw_queue, dict):
                 queue = [raw_queue]
             else:
                 queue = list(raw_queue or [])
             should_emit = not queue
             queue.append(payload)
-            self._pending_approval[session_id] = queue
+            self._pending_approval[scoped_session_key] = queue
             stream_queues = getattr(self, "_approval_stream_queues", None)
             if stream_queues is None:
                 stream_queues = {}
                 self._approval_stream_queues = stream_queues
-            stream_queues[session_id] = stream_q
+            stream_queues[scoped_session_key] = stream_q
         if should_emit:
             stream_q.put(("__tool_progress__", payload))
             try:
@@ -1329,13 +1332,13 @@ class ZetAgentAdapter(APIServerAdapter):
 
     def _remove_approval_projection(
         self,
-        session_id: str,
+        scoped_session_key: str,
         approval_id: Optional[str],
     ) -> bool:
         next_payload = None
         stream_q = None
         with self._pending_lock:
-            raw_queue = self._pending_approval.get(session_id)
+            raw_queue = self._pending_approval.get(scoped_session_key)
             if isinstance(raw_queue, dict):
                 queue = [raw_queue]
             else:
@@ -1357,15 +1360,17 @@ class ZetAgentAdapter(APIServerAdapter):
             removed_head = target_index == 0
             queue.pop(target_index)
             if queue:
-                self._pending_approval[session_id] = queue
+                self._pending_approval[scoped_session_key] = queue
                 if removed_head:
                     next_payload = queue[0]
                     stream_q = getattr(
                         self, "_approval_stream_queues", {}
-                    ).get(session_id)
+                    ).get(scoped_session_key)
             else:
-                self._pending_approval.pop(session_id, None)
-                getattr(self, "_approval_stream_queues", {}).pop(session_id, None)
+                self._pending_approval.pop(scoped_session_key, None)
+                getattr(self, "_approval_stream_queues", {}).pop(
+                    scoped_session_key, None
+                )
         if next_payload is not None and stream_q is not None:
             try:
                 stream_q.put(("__tool_progress__", next_payload))
@@ -1394,6 +1399,11 @@ class ZetAgentAdapter(APIServerAdapter):
         reconnecting client can fetch it via the GET /pending endpoint
         and re-render the modal after a ws drop.
         """
+        # Capture profile identity while attaching the callback. The worker
+        # may invoke it after the request context has switched to a sibling
+        # profile with the same public session id.
+        scoped_session_key = self._active_turn_key(session_id)
+
         def _notify(approval_data: Dict[str, Any]) -> None:
             # Stamp the deadline using the same config the wait loop in
             # tools/approval.py reads. The notify callback fires
@@ -1411,7 +1421,9 @@ class ZetAgentAdapter(APIServerAdapter):
                 "expires_at_ms": expires_at_ms,
             }
             try:
-                self._cache_approval_projection(stream_q, session_id, payload)
+                self._cache_approval_projection(
+                    stream_q, scoped_session_key, session_id, payload
+                )
             except Exception:
                 logger.debug("[zet_agent] approval notify push failed", exc_info=True)
 
@@ -2428,6 +2440,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 status=500,
             )
 
+        scoped_session_key = self._active_turn_key(session_id)
         approval_session_key = session_id
         if approval_id is not None:
             approval_session_key = approval_session_key_for_id(approval_id)
@@ -2453,7 +2466,7 @@ class ZetAgentAdapter(APIServerAdapter):
         has_pending_projection = False
         if resolved:
             has_pending_projection = self._remove_approval_projection(
-                session_id,
+                scoped_session_key,
                 approval_id,
             )
         # Goal projection: the loop is no longer blocked on the user — flip
@@ -2552,7 +2565,7 @@ class ZetAgentAdapter(APIServerAdapter):
             return auth_err
         session_id = request.match_info.get("session_id", "")
         scoped_session_key = self._active_turn_key(session_id)
-        ap = self._approval_projection_head(session_id)
+        ap = self._approval_projection_head(scoped_session_key)
         with self._pending_lock:
             cl = self._pending_clarify.get(scoped_session_key)
         return web.json_response({
@@ -3258,7 +3271,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 mapped_key = getattr(
                     self, "_approval_session_keys", {}
                 ).pop(scoped_session_key, None)
-            pending_card = self._approval_projection_head(session_id)
+            pending_card = self._approval_projection_head(scoped_session_key)
             if mapped_key:
                 approval_keys.add(mapped_key)
             if pending_card and pending_card.get("approval_id"):
@@ -3287,8 +3300,10 @@ class ZetAgentAdapter(APIServerAdapter):
 
         with self._pending_lock:
             self._pending_clarify.pop(scoped_session_key, None)
-            self._pending_approval.pop(session_id, None)
-            getattr(self, "_approval_stream_queues", {}).pop(session_id, None)
+            self._pending_approval.pop(scoped_session_key, None)
+            getattr(self, "_approval_stream_queues", {}).pop(
+                scoped_session_key, None
+            )
 
     # ------------------------------------------------------------------
     # Diagnostic wrapper around base /v1/chat/completions

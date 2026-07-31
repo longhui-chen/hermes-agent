@@ -35,6 +35,7 @@ import os
 import platform
 import shlex
 import signal
+import secrets
 import subprocess
 import threading
 import time
@@ -83,6 +84,15 @@ WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
 
 
+def _current_profile_owner() -> str:
+    """Return the immutable canonical owner for the active profile context."""
+
+    try:
+        return str(get_hermes_home().expanduser().resolve())
+    except Exception:
+        return ""
+
+
 def format_uptime_short(seconds: int) -> str:
     s = max(0, int(seconds))
     if s < 60:
@@ -101,7 +111,7 @@ class ProcessSession:
     command: str                                 # Original command string
     task_id: str = ""                           # Task/sandbox isolation key
     session_key: str = ""                       # Gateway session key (for reset protection)
-    profile_owner: str = ""                     # Immutable canonical HERMES_HOME owner
+    profile_owner: str = field(default_factory=_current_profile_owner)
     pid: Optional[int] = None                   # OS process ID
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
     env_ref: Any = None                         # Reference to the environment object
@@ -1278,6 +1288,14 @@ class ProcessRegistry:
         """Get a session by ID (running or finished)."""
         with self._lock:
             session = self._running.get(session_id) or self._finished.get(session_id)
+        current_owner = _current_profile_owner()
+        if (
+            session is None
+            or not current_owner
+            or not session.profile_owner
+            or not secrets.compare_digest(session.profile_owner, current_owner)
+        ):
+            return None
         return self._refresh_detached_session(session)
 
     def _reconcile_local_exit(self, session: "ProcessSession") -> None:
@@ -1527,6 +1545,7 @@ class ProcessRegistry:
         *,
         source: str = "process.kill",
         consume_output: bool = True,
+        _trusted_session: Optional[ProcessSession] = None,
     ) -> dict:
         """Kill a background process and return its output snapshot.
 
@@ -1537,7 +1556,20 @@ class ProcessRegistry:
         """
         from tools.ansi_strip import strip_ansi
 
-        session = self.get(session_id)
+        session = _trusted_session
+        if session is None:
+            session = self.get(session_id)
+        else:
+            # Only kill_all may supply a previously selected registry object.
+            # Recheck identity under the registry lock so an evicted/replaced
+            # id cannot turn this internal bypass into a cross-profile lookup.
+            with self._lock:
+                registered = (
+                    self._running.get(session_id)
+                    or self._finished.get(session_id)
+                )
+            if registered is not session:
+                session = None
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
@@ -1721,7 +1753,15 @@ class ProcessRegistry:
         moved to ``_finished`` when their subprocess exits.
         """
         try:
-            return len(self._running)
+            current_owner = _current_profile_owner()
+            if not current_owner:
+                return 0
+            return sum(
+                1
+                for session in self._running.values()
+                if session.profile_owner
+                and secrets.compare_digest(session.profile_owner, current_owner)
+            )
         except Exception:
             return 0
 
@@ -1738,6 +1778,16 @@ class ProcessRegistry:
         """
         with self._lock:
             all_sessions = list(self._running.values()) + list(self._finished.values())
+
+        current_owner = _current_profile_owner()
+        if not current_owner:
+            return []
+        all_sessions = [
+            session
+            for session in all_sessions
+            if session.profile_owner
+            and secrets.compare_digest(session.profile_owner, current_owner)
+        ]
 
         all_sessions = [self._refresh_detached_session(s) for s in all_sessions]
 
@@ -1792,7 +1842,9 @@ class ProcessRegistry:
 
         with self._lock:
             return any(
-                s.task_id == task_id and not s.exited
+                s.task_id == task_id
+                and s.profile_owner == _current_profile_owner()
+                and not s.exited
                 for s in self._running.values()
             )
 
@@ -1820,9 +1872,11 @@ class ProcessRegistry:
             self._refresh_detached_session(session)
 
         now = time.time()
+        current_owner = _current_profile_owner()
         with self._lock:
             return any(
                 s.session_key == session_key
+                and s.profile_owner == current_owner
                 and not s.exited
                 and (max_active_age is None or (now - s.started_at) < max_active_age)
                 for s in self._running.values()
@@ -1866,13 +1920,18 @@ class ProcessRegistry:
         self,
         task_id: str = None,
         profile_owner: str = None,
+        *,
+        all_profiles: bool = False,
     ) -> int:
         """Kill running processes filtered by task and/or immutable profile."""
-        canonical_owner = (
-            str(Path(profile_owner).expanduser().resolve())
-            if profile_owner is not None
-            else None
-        )
+        if all_profiles:
+            canonical_owner = None
+        elif profile_owner is not None:
+            canonical_owner = str(Path(profile_owner).expanduser().resolve())
+        else:
+            canonical_owner = _current_profile_owner()
+        if not all_profiles and not canonical_owner:
+            return 0
         with self._lock:
             targets = [
                 s for s in self._running.values()
@@ -1890,6 +1949,7 @@ class ProcessRegistry:
                 session.id,
                 source="kill_all",
                 consume_output=False,
+                _trusted_session=session,
             )
             if result.get("status") in {"killed", "already_exited"}:
                 killed += 1
@@ -1988,6 +2048,18 @@ class ProcessRegistry:
 
         recovered = 0
         for entry in entries:
+            raw_profile_owner = entry.get("profile_owner")
+            if (
+                not isinstance(raw_profile_owner, str)
+                or not raw_profile_owner
+                or not os.path.isabs(raw_profile_owner)
+            ):
+                logger.warning(
+                    "Skipping recovered process without immutable profile owner: %s",
+                    entry.get("session_id", "?"),
+                )
+                continue
+            profile_owner = str(Path(raw_profile_owner).expanduser().resolve())
             pid = entry.get("pid")
             if not pid:
                 continue
@@ -2027,7 +2099,7 @@ class ProcessRegistry:
                 command=entry.get("command", "unknown"),
                 task_id=entry.get("task_id", ""),
                 session_key=entry.get("session_key", ""),
-                profile_owner=entry.get("profile_owner", ""),
+                profile_owner=profile_owner,
                 pid=pid,
                 host_start_time=recorded_start,
                 pid_scope=pid_scope,

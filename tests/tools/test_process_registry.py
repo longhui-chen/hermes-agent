@@ -10,6 +10,7 @@ import time
 import pytest
 from unittest.mock import MagicMock, patch
 
+from hermes_cli.config import get_hermes_home
 from tools.environments.local import _HERMES_PROVIDER_ENV_FORCE_PREFIX
 from tools.process_registry import (
     ProcessRegistry,
@@ -975,6 +976,7 @@ class TestCheckpoint:
             "pid": os.getpid(),  # current process — guaranteed alive
             "task_id": "t1",
             "session_key": "sk1",
+            "profile_owner": str(get_hermes_home().expanduser().resolve()),
             "watcher_platform": "telegram",
             "watcher_chat_id": "123",
             "watcher_user_id": "u123",
@@ -1002,6 +1004,7 @@ class TestCheckpoint:
             "command": "sleep 999",
             "pid": os.getpid(),
             "task_id": "t1",
+            "profile_owner": str(get_hermes_home().expanduser().resolve()),
             "watcher_interval": 0,
         }]))
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
@@ -1017,6 +1020,7 @@ class TestCheckpoint:
             "pid": os.getpid(),
             "task_id": "t1",
             "session_key": "sk1",
+            "profile_owner": str(get_hermes_home().expanduser().resolve()),
         }]))
 
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
@@ -1059,6 +1063,7 @@ class TestCheckpoint:
             "pid": proc.pid,
             "task_id": "t1",
             "session_key": "sk1",
+            "profile_owner": str(get_hermes_home().expanduser().resolve()),
         }]))
 
         try:
@@ -1972,6 +1977,7 @@ class TestPidReuseGuard:
             "pid_scope": "host",
             "host_start_time": real_start,
             "task_id": "t1",
+            "profile_owner": str(get_hermes_home().expanduser().resolve()),
         }]))
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             assert registry.recover_from_checkpoint() == 1
@@ -1985,6 +1991,7 @@ class TestPidReuseGuard:
             "pid": os.getpid(),
             "pid_scope": "host",
             "task_id": "t1",
+            "profile_owner": str(get_hermes_home().expanduser().resolve()),
         }]))
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             assert registry.recover_from_checkpoint() == 1
