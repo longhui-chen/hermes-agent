@@ -25,6 +25,10 @@ def _reset_agent_creator_runtime(monkeypatch):
         "_CONNECTOR_RUNTIME_ROOT_ANCHOR",
         None,
     )
+    monkeypatch.setattr(
+        "agent.credential_broker.request_agentcomputer_token",
+        lambda agent_id: str(agent_id).removeprefix("test-broker:"),
+    )
     yield
     set_zettlab_turn_id(previous_turn_id)
     secret_scope.set_multiplex_active(previous_multiplex)
@@ -33,7 +37,13 @@ def _reset_agent_creator_runtime(monkeypatch):
 
 @contextmanager
 def _scope(values):
-    token = secret_scope.set_secret_scope(values)
+    scoped_values = values
+    if values is not None:
+        scoped_values = dict(values)
+        test_token = scoped_values.get("ZETTLAB_AGENT_ACTION_TOKEN")
+        if test_token:
+            scoped_values["ZET_AGENT_ID"] = f"test-broker:{test_token}"
+    token = secret_scope.set_secret_scope(scoped_values)
     try:
         yield
     finally:

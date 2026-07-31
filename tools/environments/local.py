@@ -1079,20 +1079,25 @@ def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
 def build_agent_creator_runtime_env() -> dict[str, str]:
     """Build the minimal env for the trusted agent-creator preset runner.
 
-    Unlike generic terminal and the legacy single-profile connector bridge,
-    Agent creation always requires an explicit per-turn secret scope. Falling
-    back to process-global ``os.environ`` could select a sibling profile's
-    action token under multiplexing, so absence of a scope/token is an error.
+    The action token is never read from process env or a profile ``.env``.
+    After command validation and mutation approval, the trusted gateway process
+    obtains a short-lived AgentComputer-only token from local-server's Unix
+    broker. The direct runner then gives it to the CLI over a one-shot FD.
     """
 
-    from agent.secret_scope import current_secret_scope
+    from agent.credential_broker import request_agentcomputer_token
+    from agent.secret_scope import current_secret_scope, is_multiplex_active
 
     scope = current_secret_scope()
-    if scope is None:
+    if scope is None and is_multiplex_active():
         raise RuntimeError("agent creator secret scope unavailable")
-    token = str(scope.get("ZETTLAB_AGENT_ACTION_TOKEN") or "").strip()
-    if not token:
-        raise RuntimeError("agent creator action token unavailable")
+    agent_id = str(
+        (scope or {}).get("ZET_AGENT_ID")
+        or ("" if is_multiplex_active() else os.environ.get("ZET_AGENT_ID", ""))
+    ).strip()
+    if not agent_id:
+        raise RuntimeError("agent creator profile identity unavailable")
+    token = request_agentcomputer_token(agent_id)
     if (
         "\x00" in token
         or len(token.encode("utf-8")) > _AGENT_CREATOR_ACTION_TOKEN_MAX_BYTES
