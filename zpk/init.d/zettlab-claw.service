@@ -35,7 +35,9 @@ NoNewPrivileges=true
 PrivateTmp=true
 RuntimeDirectory=zettlab-claw
 RuntimeDirectoryMode=0755
-ProtectProc=invisible
+# trusted_direct_runner audits all process UIDs before reserving an ephemeral
+# worker identity. Keep procfs visible while retaining the ptrace capability ban.
+ProtectProc=default
 ProtectSystem=strict
 CapabilityBoundingSet=~CAP_SYS_PTRACE CAP_SYS_ADMIN
 Delegate=pids memory

@@ -1332,7 +1332,8 @@ def test_zpk_agent_service_names_are_device_facing():
     )
     assert "ExecStart=__APP_BASE__/current/start-claw-service.sh" in service
     assert "NoNewPrivileges=true" in service
-    assert "ProtectProc=invisible" in service
+    assert "ProtectProc=default" in service
+    assert "ProtectProc=invisible" not in service
     assert "CapabilityBoundingSet=~CAP_SYS_PTRACE CAP_SYS_ADMIN" in service
     assert "Delegate=pids memory" in service
     assert "KillMode=control-group" in service

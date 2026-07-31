@@ -2357,6 +2357,18 @@ class ZetAgentAdapter(APIServerAdapter):
         approval_session_key = session_id
         if approval_id is not None:
             approval_session_key = approval_session_key_for_id(approval_id)
+        else:
+            # Legacy clients resolve the live FIFO without an approval id.
+            # The supported X-Hermes-Session-Key may differ from the public URL
+            # session id, so use the profile-scoped registration captured when
+            # the agent was created. Deferred requests still fail closed in
+            # resolve_gateway_approval because they require an opaque id.
+            with self._pending_lock:
+                mapped_session_key = getattr(
+                    self, "_approval_session_keys", {}
+                ).get(self._active_turn_key(session_id))
+            if mapped_session_key:
+                approval_session_key = mapped_session_key
         resolved = 0
         if approval_session_key is not None:
             resolved = resolve_gateway_approval(

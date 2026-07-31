@@ -816,6 +816,51 @@ async def test_deferred_approval_response_requires_matching_id(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_legacy_live_approval_uses_x_hermes_session_key(monkeypatch):
+    from tools import approval
+
+    session_id = "sid-public-legacy"
+    approval_session_key = "sid-header-legacy"
+    entry = approval._ApprovalEntry({
+        "approval_id": "B" * 32,
+        "command": "agentcomputer file.delete notes/a.txt",
+        "pattern_key": "agentcomputer:file.delete",
+        "pattern_keys": ["agentcomputer:file.delete"],
+    })
+    with approval._lock:
+        approval._gateway_queues[approval_session_key] = [entry]
+
+    adapter = _make_adapter()
+    adapter._approval_session_keys = {
+        adapter._active_turn_key(session_id): approval_session_key,
+    }
+    monkeypatch.setattr(
+        adapter,
+        "_goals",
+        lambda: type("Goals", (), {"on_interaction_resolved": lambda self, sid: None})(),
+    )
+    app = web.Application()
+    app.router.add_post(
+        "/v1/sessions/{session_id}/approval/respond",
+        adapter._handle_approval_respond,
+    )
+    try:
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                f"/v1/sessions/{session_id}/approval/respond",
+                json={"choice": "deny"},
+                headers={"Authorization": "Bearer test-key"},
+            )
+            data = await response.json()
+
+        assert data == {"resolved": 1}
+        assert entry.event.is_set()
+        assert entry.result == "deny"
+    finally:
+        approval.cancel_session_approvals(approval_session_key)
+
+
+@pytest.mark.asyncio
 async def test_interrupt_revokes_deferred_approval_before_stale_response():
     from tools import approval
 
