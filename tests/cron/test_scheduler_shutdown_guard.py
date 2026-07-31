@@ -135,3 +135,61 @@ class TestSourceGuardrail:
         # The guard appears shortly before the standalone send comment.
         window = source[max(0, idx - 600):idx]
         assert "_interpreter_shutting_down()" in window
+
+
+class TestTickSkipsBeforeMutatingDuringShutdown:
+    """A tick racing teardown must bail before any next_run_at write, so the
+    skipped occurrence stays due for the next healthy tick's catch-up."""
+
+    @pytest.fixture
+    def storage(self, tmp_path, monkeypatch):
+        import cron.executions as executions_module
+        import cron.jobs as jobs_module
+        import hermes_time
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_TIMEZONE", "UTC")
+        monkeypatch.setattr(jobs_module, "CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr(jobs_module, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr(jobs_module, "OUTPUT_DIR", tmp_path / "cron" / "output")
+        monkeypatch.setattr(
+            executions_module, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db"
+        )
+        (tmp_path / "cron").mkdir(parents=True, exist_ok=True)
+        hermes_time.reset_cache()
+        yield tmp_path
+        hermes_time.reset_cache()
+
+    def _make_due_daily_job(self):
+        from datetime import datetime, timedelta, timezone
+
+        from cron.jobs import create_job, load_jobs, save_jobs
+
+        create_job(prompt="draw daily", schedule="0 9 * * *", name="daily")
+        jobs = load_jobs()
+        due_at = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+        jobs[0]["next_run_at"] = due_at
+        save_jobs(jobs)
+        return jobs[0]["id"], due_at
+
+    def test_shutdown_tick_leaves_due_jobs_untouched(self, storage):
+        from datetime import datetime, timezone
+
+        import cron.scheduler as scheduler
+        from cron.executions import list_executions
+        from cron.jobs import get_due_jobs, load_jobs
+
+        job_id, due_at = self._make_due_daily_job()
+        assert [j["id"] for j in get_due_jobs()] == [job_id]
+
+        with patch("sys.is_finalizing", return_value=True):
+            dispatched = scheduler.tick(verbose=False)
+
+        assert dispatched == 0
+        assert list_executions(job_id=job_id) == []
+
+        job = next(j for j in load_jobs() if j["id"] == job_id)
+        assert job.get("last_run_at") in (None, "")
+        assert job["next_run_at"] == due_at
+        assert datetime.fromisoformat(job["next_run_at"]) <= datetime.now(timezone.utc)
+        assert [j["id"] for j in get_due_jobs()] == [job_id]

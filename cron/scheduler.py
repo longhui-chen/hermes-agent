@@ -4284,6 +4284,13 @@ def tick(
             logger.debug("Cron dispatch paused while gateway drains existing work")
             return 0
 
+        # Before get_due_jobs(): it and the pre-dispatch advance both persist next_run_at.
+        if _interpreter_shutting_down():
+            logger.warning(
+                "Cron tick skipped — interpreter is shutting down; due jobs stay untouched for the next healthy tick"
+            )
+            return 0
+
         due_jobs = get_due_jobs()
 
         if verbose and not due_jobs:
