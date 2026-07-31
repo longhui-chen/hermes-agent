@@ -11,6 +11,7 @@ Covers:
 import json
 import os
 import time
+from pathlib import Path
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -101,7 +102,41 @@ class TestCompletionQueue:
         assert completion["exit_code"] == 0
         assert completion["completion_reason"] == "exited"
         assert completion["termination_source"] == ""
+        assert completion["profile_owner"] == s.profile_owner
         assert "build succeeded" in completion["output"]
+
+    def test_drain_requeues_foreign_profile_output(self, registry, tmp_path):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        owner = str((tmp_path / "profiles" / "owner").resolve())
+        foreign = str((tmp_path / "profiles" / "foreign").resolve())
+        registry.completion_queue.put({
+            "type": "completion",
+            "session_id": "foreign",
+            "profile_owner": foreign,
+            "command": "cat private.txt",
+            "output": "private",
+        })
+        registry.completion_queue.put({
+            "type": "completion",
+            "session_id": "owner",
+            "profile_owner": owner,
+            "command": "echo owner",
+            "output": "owner",
+        })
+        token = set_hermes_home_override(Path(owner))
+        try:
+            drained = registry.drain_notifications()
+        finally:
+            reset_hermes_home_override(token)
+
+        assert [event["session_id"] for event, _text in drained] == ["owner"]
+        queued = registry.completion_queue.get_nowait()
+        assert queued["session_id"] == "foreign"
+        assert queued["output"] == "private"
 
     def test_move_to_finished_nonzero_exit(self, registry):
         """Nonzero exit codes are captured correctly."""
@@ -232,12 +267,15 @@ class TestCheckpointNotify:
             assert data[0]["notify_on_complete"] is False
 
     def test_recover_preserves_notify(self, registry, tmp_path):
+        from hermes_constants import get_hermes_home
+
         checkpoint = tmp_path / "procs.json"
         checkpoint.write_text(json.dumps([{
             "session_id": "proc_live",
             "command": "sleep 999",
             "pid": os.getpid(),
             "task_id": "t1",
+            "profile_owner": str(get_hermes_home().resolve()),
             "notify_on_complete": True,
         }]))
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
@@ -247,12 +285,15 @@ class TestCheckpointNotify:
             assert s.notify_on_complete is True
 
     def test_recover_requeues_notify_watchers(self, registry, tmp_path):
+        from hermes_constants import get_hermes_home
+
         checkpoint = tmp_path / "procs.json"
         checkpoint.write_text(json.dumps([{
             "session_id": "proc_live",
             "command": "sleep 999",
             "pid": os.getpid(),
             "task_id": "t1",
+            "profile_owner": str(get_hermes_home().resolve()),
             "session_key": "sk1",
             "watcher_platform": "telegram",
             "watcher_chat_id": "123",
@@ -269,9 +310,12 @@ class TestCheckpointNotify:
             assert registry.pending_watchers[0]["notify_on_complete"] is True
             assert registry.pending_watchers[0]["user_id"] == "u123"
             assert registry.pending_watchers[0]["user_name"] == "alice"
+            assert registry.pending_watchers[0]["profile_owner"] == str(
+                get_hermes_home().resolve()
+            )
 
-    def test_recover_defaults_false(self, registry, tmp_path):
-        """Old checkpoint entries without the field default to False."""
+    def test_recover_without_profile_owner_fails_closed(self, registry, tmp_path):
+        """Ownerless legacy checkpoints cannot cross a multiplex profile."""
         checkpoint = tmp_path / "procs.json"
         checkpoint.write_text(json.dumps([{
             "session_id": "proc_live",
@@ -281,9 +325,8 @@ class TestCheckpointNotify:
         }]))
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             recovered = registry.recover_from_checkpoint()
-            assert recovered == 1
-            s = registry.get("proc_live")
-            assert s.notify_on_complete is False
+            assert recovered == 0
+            assert registry.get("proc_live") is None
 
 
 # =========================================================================

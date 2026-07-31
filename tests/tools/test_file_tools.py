@@ -812,6 +812,58 @@ class TestSensitivePathCheck:
 
         assert "managed terminal home path" in result["error"]
 
+    @pytest.mark.parametrize("tool_name", ["read", "search", "write", "patch"])
+    def test_managed_sibling_profile_tree_is_inaccessible(
+        self, tmp_path, monkeypatch, tool_name
+    ):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from tools import file_tools
+
+        hermes_root = tmp_path / "hermes_home"
+        active = hermes_root / "profiles" / "active"
+        sibling = hermes_root / "profiles" / "sibling"
+        active.mkdir(parents=True)
+        sibling.mkdir()
+        target = sibling / "private.txt"
+        target.write_text("private\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+        monkeypatch.setattr(
+            file_tools,
+            "_MANAGED_CLAW_HERMES_ROOTS",
+            (str(hermes_root.resolve()),),
+        )
+        monkeypatch.setattr(file_tools, "_SENSITIVE_PATH_PREFIXES", ())
+        token = set_hermes_home_override(active)
+        try:
+            if tool_name == "read":
+                result = json.loads(file_tools.read_file_tool(str(target)))
+            elif tool_name == "search":
+                result = json.loads(
+                    file_tools.search_tool("private", path=str(sibling))
+                )
+            elif tool_name == "write":
+                result = json.loads(
+                    file_tools.write_file_tool(str(target), "attacker\n")
+                )
+            else:
+                result = json.loads(file_tools.patch_tool(
+                    mode="replace",
+                    path=str(target),
+                    old_string="private",
+                    new_string="attacker",
+                ))
+            assert file_tools._managed_sibling_profile_error(
+                str(active / "own.txt")
+            ) is None
+        finally:
+            reset_hermes_home_override(token)
+
+        assert "managed sibling profile path" in result["error"]
+        assert target.read_text(encoding="utf-8") == "private\n"
+
     @pytest.mark.parametrize("tool_name", ["write", "patch"])
     @pytest.mark.parametrize(
         "target",

@@ -4169,6 +4169,7 @@ class ZetAgentAdapter(APIServerAdapter):
         terminal_cleanup = {
             "killed_uid_processes": 0,
             "terminal_home_removed": False,
+            "terminal_cgroup_removed": False,
             "identity_retired": False,
         }
         if profile_home:

@@ -526,7 +526,13 @@ def _search_result_read_block_error(path: str, task_id: str = "default") -> str 
     try:
         resolved = _resolve_path_for_task(path, task_id)
     except (OSError, ValueError, RuntimeError):
+        sibling_error = _managed_sibling_profile_error(path, task_id)
+        if sibling_error:
+            return sibling_error
         return get_read_block_error(path)
+    sibling_error = _managed_sibling_profile_error(str(resolved), task_id)
+    if sibling_error:
+        return sibling_error
     return get_read_block_error(str(resolved))
 
 
@@ -591,6 +597,80 @@ _MANAGED_TERMINAL_HOME_ROOTS = (
     "/run/zettlab-claw/terminal-homes",
 )
 
+
+def _path_within(candidate: str, root: str) -> bool:
+    try:
+        return os.path.commonpath((candidate, root)) == root
+    except (OSError, ValueError):
+        return False
+
+
+def _managed_sibling_profile_error(
+    filepath: str,
+    task_id: str = "default",
+) -> str | None:
+    """Deny managed file-tool access to every profile except the active one."""
+
+    if os.environ.get("HERMES_MANAGED_GATEWAY") != "1":
+        return None
+    try:
+        from hermes_constants import get_hermes_home
+
+        active_home = os.path.normpath(
+            os.path.realpath(str(get_hermes_home().expanduser()))
+        )
+    except Exception:
+        active_home = ""
+
+    try:
+        resolved = str(_resolve_path_for_task(filepath, task_id))
+    except (OSError, ValueError, RuntimeError):
+        expanded = _expand_tilde(filepath)
+        resolved = (
+            os.path.normpath(os.path.realpath(expanded))
+            if os.path.isabs(expanded)
+            else ""
+        )
+    candidates = {
+        candidate
+        for candidate in (
+            resolved,
+            os.path.normpath(os.path.realpath(resolved)) if resolved else "",
+        )
+        if candidate and os.path.isabs(candidate)
+    }
+
+    profile_roots: set[str] = set()
+    for configured_root in _MANAGED_CLAW_HERMES_ROOTS:
+        for root in (
+            os.path.normpath(configured_root),
+            os.path.normpath(os.path.realpath(configured_root)),
+        ):
+            if os.path.isabs(root):
+                profile_roots.add(os.path.join(root, "profiles"))
+
+    allowed_home = ""
+    if active_home and os.path.isabs(active_home):
+        for profiles_root in profile_roots:
+            if (
+                os.path.dirname(active_home) == profiles_root
+                and os.path.basename(active_home) not in {"", ".", ".."}
+            ):
+                allowed_home = active_home
+                break
+
+    for candidate in candidates:
+        for profiles_root in profile_roots:
+            if not _path_within(candidate, profiles_root):
+                continue
+            if allowed_home and _path_within(candidate, allowed_home):
+                continue
+            return (
+                f"Refusing access to managed sibling profile path: {filepath}\n"
+                "Agent file tools are confined to the active profile."
+            )
+    return None
+
 _hermes_config_resolved: str | None = None
 _hermes_config_resolved_loaded = False
 
@@ -640,18 +720,12 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
         except (OSError, ValueError):
             pass
 
-    def _within(candidate: str, root: str) -> bool:
-        try:
-            return os.path.commonpath((candidate, root)) == root
-        except (OSError, ValueError):
-            return False
-
     if any(
-        _within(candidate, root)
+        _path_within(candidate, root)
         for candidate in candidates
         for root in managed_secret_roots
     ) or any(
-        os.path.basename(candidate) == ".env" and _within(candidate, root)
+        os.path.basename(candidate) == ".env" and _path_within(candidate, root)
         for candidate in candidates
         for root in managed_hermes_roots
     ):
@@ -667,7 +741,7 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     # boundary rather than relying on filesystem ownership alone.
     if os.environ.get("HERMES_MANAGED_GATEWAY") == "1":
         if any(
-            _within(candidate, root)
+            _path_within(candidate, root)
             for candidate in candidates
             for root in _MANAGED_TERMINAL_HOME_ROOTS
         ):
@@ -705,7 +779,7 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
                         f"Refusing to write to managed {code_kind} code path: {filepath}\n"
                         "Agent file tools cannot modify code loaded by the gateway."
                     )
-            if project_plugin_root and _within(candidate, project_plugin_root):
+            if project_plugin_root and _path_within(candidate, project_plugin_root):
                 return (
                     f"Refusing to write to managed plugin code path: {filepath}\n"
                     "Agent file tools cannot modify code loaded by the gateway."
@@ -724,6 +798,9 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
                 # A malformed configured root is a deployment issue.  Do not
                 # broaden the deny to unrelated paths when it cannot be parsed.
                 pass
+    sibling_error = _managed_sibling_profile_error(filepath, task_id)
+    if sibling_error:
+        return sibling_error
     # Prevent agents from modifying the Hermes config file directly.
     # approvals.mode and other security settings live here; a malicious or
     # prompt-injected agent could silently disable exec approval by writing to
@@ -1239,6 +1316,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
             })
 
         _resolved = _resolve_path_for_task(path, task_id)
+
+        sibling_error = _managed_sibling_profile_error(str(_resolved), task_id)
+        if sibling_error:
+            return json.dumps({"error": sibling_error}, ensure_ascii=False)
 
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.
@@ -2007,6 +2088,12 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             resolved_path = _resolve_path_for_task(path, task_id)
         except (OSError, ValueError, RuntimeError):
             resolved_path = None
+        sibling_error = _managed_sibling_profile_error(
+            str(resolved_path) if resolved_path else path,
+            task_id,
+        )
+        if sibling_error:
+            return json.dumps({"error": sibling_error}, ensure_ascii=False)
         block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
         if block_error:
             return json.dumps({"error": block_error}, ensure_ascii=False)

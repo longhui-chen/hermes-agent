@@ -35,6 +35,14 @@ def test_managed_terminal_drops_identity_changing_capabilities(monkeypatch):
     )
     monkeypatch.setattr(local_module, "_resolve_safe_cwd", lambda cwd: cwd)
     monkeypatch.setattr(local_module.os, "getpgid", lambda _pid: 42)
+    monkeypatch.setattr(
+        local_module,
+        "_ensure_managed_terminal_cgroup",
+        lambda _env=None: Path("/sys/fs/cgroup/unit/terminal-profile-65534"),
+    )
+    monkeypatch.setattr(
+        local_module, "_trusted_managed_python", lambda: "/usr/bin/python3"
+    )
 
     class Process:
         pid = 42
@@ -50,7 +58,14 @@ def test_managed_terminal_drops_identity_changing_capabilities(monkeypatch):
     environment.cwd = "/tmp"
     environment._run_bash("id")
 
-    assert captured["argv"] == [
+    assert captured["argv"][:5] == [
+        "/usr/bin/python3",
+        "-I",
+        "-c",
+        local_module._MANAGED_TERMINAL_CGROUP_ENTER,
+        "/sys/fs/cgroup/unit/terminal-profile-65534",
+    ]
+    assert captured["argv"][5:] == [
         "/usr/bin/setpriv",
         "--reuid=65534",
         "--regid=65534",
@@ -283,6 +298,14 @@ def test_managed_background_pipe_drops_identity_capabilities(monkeypatch):
             "--",
         ],
     )
+    monkeypatch.setattr(
+        local_module,
+        "_ensure_managed_terminal_cgroup",
+        lambda _env=None: Path("/sys/fs/cgroup/unit/terminal-profile-65534"),
+    )
+    monkeypatch.setattr(
+        local_module, "_trusted_managed_python", lambda: "/usr/bin/python3"
+    )
     registry = _background_registry(monkeypatch)
 
     class Process:
@@ -302,7 +325,7 @@ def test_managed_background_pipe_drops_identity_capabilities(monkeypatch):
         fake_popen,
     )
     registry.spawn_local("sleep 1", cwd="/tmp")
-    assert captured["argv"][:6] == [
+    assert captured["argv"][5:11] == [
         "/usr/bin/setpriv",
         "--reuid=65534",
         "--regid=65534",
@@ -327,6 +350,14 @@ def test_managed_background_pty_drops_identity_capabilities(monkeypatch):
             "--",
         ],
     )
+    monkeypatch.setattr(
+        local_module,
+        "_ensure_managed_terminal_cgroup",
+        lambda _env=None: Path("/sys/fs/cgroup/unit/terminal-profile-65534"),
+    )
+    monkeypatch.setattr(
+        local_module, "_trusted_managed_python", lambda: "/usr/bin/python3"
+    )
     registry = _background_registry(monkeypatch)
 
     class PtyProcess:
@@ -343,7 +374,7 @@ def test_managed_background_pty_drops_identity_capabilities(monkeypatch):
         SimpleNamespace(PtyProcess=PtyProcess),
     )
     registry.spawn_local("sleep 1", cwd="/tmp", use_pty=True)
-    assert captured["argv"][:6] == [
+    assert captured["argv"][5:11] == [
         "/usr/bin/setpriv",
         "--reuid=65534",
         "--regid=65534",
@@ -373,6 +404,64 @@ def test_managed_terminal_identity_is_profile_scoped(monkeypatch):
     assert second[0] == second[1]
     assert first != second
     assert first[0] >= local_module._MANAGED_TERMINAL_UID_MIN
+
+
+def test_managed_terminal_cgroup_enforces_profile_limits(
+    monkeypatch, tmp_path
+):
+    from tools import trusted_direct_runner
+
+    delegation_root = tmp_path / "zettlab-claw.service"
+    delegation_root.mkdir()
+    real_mkdir = os.mkdir
+
+    def materialize_cgroup(path, mode=0o777):
+        real_mkdir(path, mode)
+        path = Path(path)
+        for control in (
+            "cgroup.procs",
+            "cgroup.kill",
+            "cgroup.events",
+            "memory.max",
+            "memory.swap.max",
+            "memory.oom.group",
+            "pids.max",
+        ):
+            (path / control).write_text(
+                "populated 0\n" if control == "cgroup.events" else "",
+                encoding="ascii",
+            )
+
+    monkeypatch.setattr(local_module.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(local_module.os, "mkdir", materialize_cgroup)
+    monkeypatch.setattr(
+        local_module, "_managed_terminal_identity", lambda _env=None: (100001, 100001)
+    )
+    monkeypatch.setattr(
+        trusted_direct_runner,
+        "_resolve_managed_delegation_root",
+        lambda: (delegation_root, "/unit", (1, 2)),
+    )
+    monkeypatch.setattr(
+        trusted_direct_runner,
+        "_write_control_file",
+        lambda path, value: Path(path).write_bytes(value),
+    )
+    monkeypatch.setattr(
+        trusted_direct_runner,
+        "_read_bounded_ascii",
+        lambda path, **_kwargs: Path(path).read_text(encoding="ascii"),
+    )
+
+    cgroup = local_module._ensure_managed_terminal_cgroup(
+        {"HERMES_HOME": "/profiles/main"}
+    )
+
+    assert cgroup.name == "terminal-profile-100001"
+    assert (cgroup / "memory.max").read_text() == str(256 * 1024 * 1024)
+    assert (cgroup / "memory.swap.max").read_text() == "0"
+    assert (cgroup / "memory.oom.group").read_text() == "1"
+    assert (cgroup / "pids.max").read_text() == "64"
 
 
 def test_process_registry_kill_all_is_scoped_to_immutable_profile(monkeypatch):
@@ -431,6 +520,16 @@ def test_profile_retirement_kills_background_and_rotates_identity(
     monkeypatch.setattr(
         local_module, "_MANAGED_TERMINAL_HOME_ROOT", tmp_path / "homes"
     )
+    monkeypatch.setattr(
+        local_module,
+        "_managed_terminal_argv",
+        lambda argv, *, env=None: (
+            local_module._managed_terminal_privilege_drop_prefix(env) + list(argv)
+        ),
+    )
+    monkeypatch.setattr(
+        local_module, "_remove_managed_terminal_cgroup", lambda _uid: True
+    )
     local_module._MANAGED_TERMINAL_SCOPE_BY_UID.clear()
     local_module._MANAGED_TERMINAL_RETIRED_UIDS.clear()
     local_module._MANAGED_TERMINAL_RETIRED_SCOPES.clear()
@@ -460,6 +559,7 @@ def test_profile_retirement_kills_background_and_rotates_identity(
     new_uid, _ = local_module._managed_terminal_identity(env)
     assert result["identity_retired"] is True
     assert result["terminal_home_removed"] is True
+    assert result["terminal_cgroup_removed"] is True
     assert result["killed_uid_processes"] >= 1
     assert not home.exists()
     assert new_uid != uid

@@ -218,6 +218,17 @@ secure_profile_secret_files() {
         fi
     done
 
+    # Multiplex terminal commands use a distinct UID per profile.  The profile
+    # root alone is not enough protection if an inherited ACL/mode or a later
+    # layout change exposes a descendant through another path, so remove every
+    # group/other permission throughout the state tree.  find does not follow
+    # symlinks by default; model-created links therefore cannot make this root
+    # chmod an external target.
+    if [ -d "$profiles_root" ]; then
+        find "$profiles_root" -xdev \( -type d -o -type f \) \
+            -exec chmod go-rwx {} +
+    fi
+
     for path in "$HERMES_HOME/.env" "$profiles_root"/*/.env; do
         if [ ! -e "$path" ] && [ ! -L "$path" ]; then
             continue

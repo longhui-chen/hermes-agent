@@ -525,6 +525,33 @@ def test_prepare_claw_service_does_not_replace_unchanged_env_file(tmp_path: Path
     assert key_path.stat().st_mode & 0o777 == 0o600
 
 
+@pytest.mark.skipif(os.geteuid() != 0, reason="requires root-owned profile tree")
+def test_prepare_claw_service_removes_group_other_profile_permissions(
+    tmp_path: Path,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
+    nested = hermes_home / "profiles" / "agent-a" / "state"
+    nested.mkdir(parents=True)
+    state_file = nested / "history.json"
+    state_file.write_text("{}\n", encoding="utf-8")
+    for path in (hermes_home / "profiles", nested.parent, nested):
+        path.chmod(0o777)
+    state_file.chmod(0o666)
+
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(),
+    )
+
+    for path in (hermes_home / "profiles", nested.parent, nested, state_file):
+        assert path.stat().st_mode & 0o077 == 0
+
+
 def test_prepare_claw_service_removes_complete_multiline_package_assignments(
     tmp_path: Path,
 ):
@@ -1477,6 +1504,22 @@ print(json.dumps({
     }
 
 
+def _write_managed_service_limit_fixture(
+    service: Path,
+    *,
+    include_swap: bool = True,
+) -> None:
+    limits = {
+        "memory.high": "805306368\n",
+        "memory.max": "1073741824\n",
+        "pids.max": "512\n",
+    }
+    if include_swap:
+        limits["memory.swap.max"] = "0\n"
+    for name, value in limits.items():
+        (service / name).write_text(value, encoding="ascii")
+
+
 def test_zpk_secure_launcher_builds_supervisor_and_enables_controllers(
     monkeypatch,
     tmp_path: Path,
@@ -1497,7 +1540,7 @@ def test_zpk_secure_launcher_builds_supervisor_and_enables_controllers(
     (service / "cgroup.procs").write_text("4242\n", encoding="ascii")
     (service / "cgroup.kill").write_text("", encoding="ascii")
     (service / "cgroup.subtree_control").write_text("", encoding="ascii")
-    (service / "memory.swap.max").write_text("max\n", encoding="ascii")
+    _write_managed_service_limit_fixture(service)
     proc_self = tmp_path / "proc-self-cgroup"
     proc_self.write_text(f"0::{service_relative}\n", encoding="ascii")
     monkeypatch.setattr(launcher, "_CGROUP2_ROOT", cgroup_root)
@@ -1584,7 +1627,7 @@ def test_zpk_secure_launcher_fails_before_move_without_controllers(
     (service / "cgroup.procs").write_text("4242\n", encoding="ascii")
     (service / "cgroup.kill").write_text("", encoding="ascii")
     (service / "cgroup.subtree_control").write_text("", encoding="ascii")
-    (service / "memory.swap.max").write_text("max\n", encoding="ascii")
+    _write_managed_service_limit_fixture(service)
     proc_self = tmp_path / "proc-self-cgroup"
     proc_self.write_text(f"0::{service_relative}\n", encoding="ascii")
     monkeypatch.setattr(launcher, "_CGROUP2_ROOT", cgroup_root)
@@ -1624,6 +1667,7 @@ def test_zpk_secure_launcher_main_fails_closed_without_swap_accounting(
     (service / "cgroup.procs").write_text("4242\n", encoding="ascii")
     (service / "cgroup.kill").write_text("", encoding="ascii")
     (service / "cgroup.subtree_control").write_text("", encoding="ascii")
+    _write_managed_service_limit_fixture(service, include_swap=False)
     proc_self = tmp_path / "proc-self-cgroup"
     proc_self.write_text(f"0::{service_relative}\n", encoding="ascii")
     entry_point = tmp_path / "hermes-entry.py"

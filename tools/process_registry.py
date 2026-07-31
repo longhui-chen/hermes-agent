@@ -93,6 +93,43 @@ def _current_profile_owner() -> str:
         return ""
 
 
+def _canonical_profile_owner(value: object) -> str:
+    raw = str(value or "").strip()
+    if (
+        not raw
+        or not os.path.isabs(raw)
+        or "\x00" in raw
+        or len(raw.encode("utf-8")) > 4096
+    ):
+        return ""
+    try:
+        return str(Path(raw).expanduser().resolve())
+    except Exception:
+        return ""
+
+
+def notification_event_matches_profile(
+    event: dict,
+    profile_owner: str | None = None,
+) -> bool:
+    """Return whether a process event belongs to the requested profile.
+
+    Legacy ownerless events remain usable outside the managed gateway.  In the
+    multiplexed managed service they fail closed so one profile cannot consume
+    another profile's queued command or output.
+    """
+
+    event_owner = _canonical_profile_owner(event.get("profile_owner"))
+    if not event_owner:
+        return os.environ.get("HERMES_MANAGED_GATEWAY") != "1"
+    expected = (
+        _canonical_profile_owner(profile_owner)
+        if profile_owner is not None
+        else _current_profile_owner()
+    )
+    return bool(expected and secrets.compare_digest(event_owner, expected))
+
+
 def format_uptime_short(seconds: int) -> str:
     s = max(0, int(seconds))
     if s < 60:
@@ -334,6 +371,7 @@ class ProcessRegistry:
                 self.completion_queue.put({
                     "session_id": session.id,
                     "session_key": session.session_key,
+                    "profile_owner": session.profile_owner,
                     "command": session.command,
                     "type": "watch_disabled",
                     "suppressed": session._watch_suppressed,
@@ -359,12 +397,13 @@ class ProcessRegistry:
             output = output[:2000] + "\n...(truncated)"
 
         # Global circuit breaker — across all sessions (secondary safety net).
-        if not self._global_watch_admit(now):
+        if not self._global_watch_admit(now, session.profile_owner):
             return
 
         self.completion_queue.put({
             "session_id": session.id,
             "session_key": session.session_key,
+            "profile_owner": session.profile_owner,
             "command": session.command,
             "type": "watch_match",
             "pattern": matched_pattern,
@@ -378,7 +417,7 @@ class ProcessRegistry:
             "message_id": session.watcher_message_id,
         })
 
-    def _global_watch_admit(self, now: float) -> bool:
+    def _global_watch_admit(self, now: float, profile_owner: str) -> bool:
         """Return True if this watch_match event is allowed through the global breaker.
 
         Semantics:
@@ -402,6 +441,7 @@ class ProcessRegistry:
                     release_msg = {
                         "session_id": "",
                         "session_key": "",
+                        "profile_owner": profile_owner,
                         "command": "",
                         "type": "watch_overflow_released",
                         "suppressed": suppressed,
@@ -449,6 +489,7 @@ class ProcessRegistry:
             self.completion_queue.put({
                 "session_id": "",
                 "session_key": "",
+                "profile_owner": profile_owner,
                 "command": "",
                 "type": "watch_overflow_tripped",
                 "message": (
@@ -1127,6 +1168,7 @@ class ProcessRegistry:
                 "type": "completion",
                 "session_id": session.id,
                 "session_key": session.session_key,
+                "profile_owner": session.profile_owner,
                 "command": session.command,
                 "exit_code": session.exit_code,
                 "completion_reason": session.completion_reason,
@@ -1240,6 +1282,19 @@ class ProcessRegistry:
                 evt = self.completion_queue.get_nowait()
             except Exception:
                 break
+            evt_type = str(evt.get("type") or "completion")
+            if (
+                evt_type in {
+                    "completion",
+                    "watch_match",
+                    "watch_disabled",
+                    "watch_overflow_tripped",
+                    "watch_overflow_released",
+                }
+                and not notification_event_matches_profile(evt)
+            ):
+                requeue.append(evt)
+                continue
             # Positive-proof ownership beats bare key equality. Delegation
             # payloads always require proof; ordinary events require it once
             # they carry routing metadata. Ownerless ordinary events preserve
@@ -1294,6 +1349,26 @@ class ProcessRegistry:
             or not current_owner
             or not session.profile_owner
             or not secrets.compare_digest(session.profile_owner, current_owner)
+        ):
+            return None
+        return self._refresh_detached_session(session)
+
+    def get_for_profile(
+        self,
+        session_id: str,
+        profile_owner: str,
+    ) -> Optional[ProcessSession]:
+        """Get a session only after explicit immutable profile verification."""
+
+        expected = _canonical_profile_owner(profile_owner)
+        if not expected:
+            return None
+        with self._lock:
+            session = self._running.get(session_id) or self._finished.get(session_id)
+        if (
+            session is None
+            or not session.profile_owner
+            or not secrets.compare_digest(session.profile_owner, expected)
         ):
             return None
         return self._refresh_detached_session(session)
@@ -2127,6 +2202,7 @@ class ProcessRegistry:
                     "session_id": session.id,
                     "check_interval": session.watcher_interval,
                     "session_key": session.session_key,
+                    "profile_owner": session.profile_owner,
                     "platform": session.watcher_platform,
                     "chat_id": session.watcher_chat_id,
                     "user_id": session.watcher_user_id,

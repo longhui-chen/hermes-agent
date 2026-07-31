@@ -38,6 +38,22 @@ _MANAGED_TERMINAL_RETIRED_UIDS: set[int] = set()
 _MANAGED_TERMINAL_RETIRED_SCOPES: set[str] = set()
 _MANAGED_TERMINAL_RETIRED_MAX = 4096
 _MANAGED_TERMINAL_HOME_ROOT = Path("/run/zettlab-claw/terminal-homes")
+_MANAGED_TERMINAL_CGROUP_PREFIX = "terminal-profile"
+_MANAGED_TERMINAL_CGROUP_MEMORY_MAX_BYTES = 256 * 1024 * 1024
+_MANAGED_TERMINAL_CGROUP_MEMORY_SWAP_MAX_BYTES = 0
+_MANAGED_TERMINAL_CGROUP_PIDS_MAX = 64
+_MANAGED_TERMINAL_CGROUP_LOCK = threading.Lock()
+_MANAGED_TERMINAL_CGROUP_CLEANUP_TIMEOUT_SECONDS = 2.0
+_MANAGED_TERMINAL_CGROUP_POLL_SECONDS = 0.05
+_MANAGED_TERMINAL_CGROUP_ENTER = (
+    "import os,sys\n"
+    "path=os.path.join(sys.argv[1],'cgroup.procs')\n"
+    "flags=os.O_WRONLY|os.O_CLOEXEC|getattr(os,'O_NOFOLLOW',0)\n"
+    "fd=os.open(path,flags)\n"
+    "try:\n os.write(fd,(str(os.getpid())+'\\n').encode('ascii'))\n"
+    "finally:\n os.close(fd)\n"
+    "os.execv(sys.argv[2],sys.argv[2:])\n"
+)
 
 
 def _managed_terminal_profile_scope(
@@ -246,7 +262,149 @@ def _managed_terminal_argv(
 
     if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
         return list(argv)
-    return _managed_terminal_privilege_drop_prefix(env) + list(argv)
+    cgroup = _ensure_managed_terminal_cgroup(env)
+    return [
+        _trusted_managed_python(),
+        "-I",
+        "-c",
+        _MANAGED_TERMINAL_CGROUP_ENTER,
+        str(cgroup),
+        *_managed_terminal_privilege_drop_prefix(env),
+        *list(argv),
+    ]
+
+
+def _trusted_managed_python() -> str:
+    """Return the immutable interpreter used by the root cgroup trampoline."""
+
+    try:
+        interpreter = Path(sys.executable).resolve(strict=True)
+        info = interpreter.stat()
+    except OSError as exc:
+        raise OSError("managed terminal cgroup launcher is unavailable") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_mode & 0o022
+        or not info.st_mode & 0o111
+    ):
+        raise OSError("managed terminal cgroup launcher is not trusted")
+    return str(interpreter)
+
+
+def _managed_terminal_cgroup_for_uid(
+    uid: int,
+    *,
+    create: bool,
+):
+    """Resolve one root-owned delegated cgroup and validate all controls."""
+
+    if _IS_WINDOWS or os.geteuid() != 0:
+        raise OSError("managed terminal requires Linux root delegation")
+    if not (_MANAGED_TERMINAL_UID_MIN <= uid <= _MANAGED_TERMINAL_UID_MAX):
+        raise OSError("managed terminal cgroup identity is invalid")
+    from tools import trusted_direct_runner as runner
+
+    delegation_root, _relative, _identity = (
+        runner._resolve_managed_delegation_root()
+    )
+    cgroup = delegation_root / f"{_MANAGED_TERMINAL_CGROUP_PREFIX}-{uid}"
+    created = False
+    if create:
+        try:
+            os.mkdir(cgroup, 0o755)
+            created = True
+        except FileExistsError:
+            pass
+    else:
+        try:
+            cgroup.lstat()
+        except FileNotFoundError:
+            return None, runner
+    try:
+        info = cgroup.lstat()
+        resolved = cgroup.resolve(strict=True)
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or resolved.parent != delegation_root
+            or resolved.name != f"{_MANAGED_TERMINAL_CGROUP_PREFIX}-{uid}"
+        ):
+            raise OSError("managed terminal cgroup is not trusted")
+        controls = (
+            "cgroup.procs",
+            "cgroup.kill",
+            "cgroup.events",
+            "memory.max",
+            "memory.swap.max",
+            "memory.oom.group",
+            "pids.max",
+        )
+        for control in controls:
+            if not (resolved / control).is_file():
+                raise OSError(f"managed terminal cgroup lacks {control}")
+        return resolved, runner
+    except Exception:
+        if created:
+            try:
+                os.rmdir(cgroup)
+            except OSError:
+                pass
+        raise
+
+
+def _ensure_managed_terminal_cgroup(
+    env: Mapping[str, str] | None = None,
+) -> Path:
+    """Create/configure the bounded cgroup shared by one profile terminal."""
+
+    uid, _gid = _managed_terminal_identity(env)
+    expected = {
+        "memory.max": str(_MANAGED_TERMINAL_CGROUP_MEMORY_MAX_BYTES),
+        "memory.swap.max": str(_MANAGED_TERMINAL_CGROUP_MEMORY_SWAP_MAX_BYTES),
+        "memory.oom.group": "1",
+        "pids.max": str(_MANAGED_TERMINAL_CGROUP_PIDS_MAX),
+    }
+    with _MANAGED_TERMINAL_CGROUP_LOCK:
+        cgroup, runner = _managed_terminal_cgroup_for_uid(uid, create=True)
+        assert cgroup is not None
+        for control, value in expected.items():
+            runner._write_control_file(
+                cgroup / control,
+                value.encode("ascii"),
+            )
+        for control, value in expected.items():
+            actual = runner._read_bounded_ascii(
+                cgroup / control,
+                limit=4096,
+            ).strip()
+            if actual != value:
+                raise OSError(f"managed terminal cgroup rejected {control}")
+        return cgroup
+
+
+def _remove_managed_terminal_cgroup(uid: int) -> bool:
+    """Kill every descendant and remove one profile's delegated cgroup."""
+
+    with _MANAGED_TERMINAL_CGROUP_LOCK:
+        cgroup, runner = _managed_terminal_cgroup_for_uid(uid, create=False)
+        if cgroup is None:
+            return False
+        runner._write_control_file(cgroup / "cgroup.kill", b"1")
+        deadline = (
+            time.monotonic()
+            + _MANAGED_TERMINAL_CGROUP_CLEANUP_TIMEOUT_SECONDS
+        )
+        while time.monotonic() < deadline:
+            events = runner._read_bounded_ascii(
+                cgroup / "cgroup.events",
+                limit=4096,
+            ).splitlines()
+            if "populated 0" in events:
+                os.rmdir(cgroup)
+                return True
+            time.sleep(_MANAGED_TERMINAL_CGROUP_POLL_SECONDS)
+        raise OSError("managed terminal cgroup remained populated")
 
 
 def _prepare_managed_terminal_workspace(
@@ -453,6 +611,7 @@ def retire_managed_terminal_profile(profile_home: str) -> dict[str, object]:
         return {
             "killed_uid_processes": 0,
             "terminal_home_removed": False,
+            "terminal_cgroup_removed": False,
             "identity_retired": False,
         }
     scope = _managed_terminal_profile_scope({"HERMES_HOME": profile_home})
@@ -466,6 +625,7 @@ def retire_managed_terminal_profile(profile_home: str) -> dict[str, object]:
             return {
                 "killed_uid_processes": 0,
                 "terminal_home_removed": False,
+                "terminal_cgroup_removed": False,
                 "identity_retired": scope in _MANAGED_TERMINAL_RETIRED_SCOPES,
             }
         if len(matches) != 1:
@@ -479,6 +639,7 @@ def retire_managed_terminal_profile(profile_home: str) -> dict[str, object]:
             raise OSError("managed terminal retired identity cache is full")
 
         killed = _terminate_managed_uid(uid)
+        cgroup_removed = _remove_managed_terminal_cgroup(uid)
         home = _MANAGED_TERMINAL_HOME_ROOT / str(uid)
         removed = False
         try:
@@ -503,6 +664,7 @@ def retire_managed_terminal_profile(profile_home: str) -> dict[str, object]:
         return {
             "killed_uid_processes": killed,
             "terminal_home_removed": removed,
+            "terminal_cgroup_removed": cgroup_removed,
             "identity_retired": True,
         }
 

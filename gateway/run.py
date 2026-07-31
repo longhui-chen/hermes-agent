@@ -2862,6 +2862,8 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
     loop non-terminating, so detach the current batch first, then requeue any
     events this drain does not own after the queue is empty.
     """
+    from tools.process_registry import notification_event_matches_profile
+
     watch_events: list[dict] = []
     requeue: list[dict] = []
     while not completion_queue.empty():
@@ -2870,6 +2872,15 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
         except Exception:
             break
         evt_type = evt.get("type", "completion")
+        if evt_type in {
+            "completion",
+            "watch_match",
+            "watch_disabled",
+            "watch_overflow_tripped",
+            "watch_overflow_released",
+        } and not notification_event_matches_profile(evt):
+            requeue.append(evt)
+            continue
         if evt_type in {"watch_match", "watch_disabled"}:
             watch_events.append(evt)
         elif evt_type == "async_delegation":
@@ -17336,6 +17347,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await asyncio.sleep(interval)
 
     async def _run_process_watcher(self, watcher: dict) -> None:
+        """Verify and restore the immutable profile scope for one watcher."""
+        from tools.process_registry import process_registry
+
+        profile_owner = str(watcher.get("profile_owner") or "").strip()
+        if not profile_owner:
+            if os.environ.get("HERMES_MANAGED_GATEWAY") == "1":
+                logger.error(
+                    "Refusing ownerless managed process watcher: %s",
+                    watcher.get("session_id", "unknown"),
+                )
+                return
+            await self._run_process_watcher_scoped(watcher)
+            return
+        session = process_registry.get_for_profile(
+            str(watcher.get("session_id") or ""),
+            profile_owner,
+        )
+        if session is None:
+            logger.error(
+                "Refusing process watcher with mismatched profile owner: %s",
+                watcher.get("session_id", "unknown"),
+            )
+            return
+        with _profile_runtime_scope(Path(session.profile_owner)):
+            await self._run_process_watcher_scoped(watcher)
+
+    async def _run_process_watcher_scoped(self, watcher: dict) -> None:
         """
         Periodically check a background process and push updates to the user.
 
@@ -17413,10 +17451,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _out = f"[… output truncated — showing last {len(_tail)} chars]\n{_tail}"
                     else:
                         _out = _raw
+                    _profile_owner = str(
+                        getattr(session, "profile_owner", "")
+                        or watcher.get("profile_owner")
+                        or get_hermes_home().expanduser().resolve()
+                    )
                     completion_evt = {
                         "type": "completion",
                         "session_id": session_id,
                         "session_key": session_key,
+                        "profile_owner": _profile_owner,
                         "platform": platform_name,
                         "chat_type": watcher.get("chat_type", ""),
                         "chat_id": chat_id,

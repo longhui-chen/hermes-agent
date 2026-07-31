@@ -82,10 +82,19 @@ def _current_unified_cgroup() -> str:
 
 def _verify_managed_service_limits(service: Path) -> None:
     for control, expected in _MANAGED_SERVICE_LIMITS.items():
-        actual = _read_bounded_ascii(
-            service / control,
-            limit=_CGROUP_METADATA_MAX_BYTES,
-        ).strip()
+        try:
+            actual = _read_bounded_ascii(
+                service / control,
+                limit=_CGROUP_METADATA_MAX_BYTES,
+            ).strip()
+        except FileNotFoundError as exc:
+            if control == "memory.swap.max":
+                raise OSError(
+                    "managed gateway requires memory.swap.max accounting"
+                ) from exc
+            raise OSError(
+                f"managed gateway service limit unavailable: {control}"
+            ) from exc
         if actual != expected:
             raise OSError(
                 f"managed gateway service limit mismatch: {control}"
