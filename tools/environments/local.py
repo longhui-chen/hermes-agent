@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 _MANAGED_GATEWAY_ENV = "HERMES_MANAGED_GATEWAY"
 _MANAGED_SETPRIV_PATH = "/usr/bin/setpriv"
+_MANAGED_UNSHARE_PATH = "/usr/bin/unshare"
 _MANAGED_TERMINAL_UID_MIN = 100_000
 _MANAGED_TERMINAL_UID_MAX = 2_000_000_000
 _MANAGED_TERMINAL_IDENTITY_ATTEMPTS = 64
@@ -55,6 +56,29 @@ _MANAGED_TERMINAL_CGROUP_ENTER = (
     "try:\n os.write(fd,(str(os.getpid())+'\\n').encode('ascii'))\n"
     "finally:\n os.close(fd)\n"
     "os.execv(sys.argv[2],sys.argv[2:])\n"
+)
+_MANAGED_TERMINAL_PRIVATE_TMP_ENTER = (
+    "import ctypes,os,stat,sys\n"
+    "if len(sys.argv)<4:\n raise OSError('managed private tmp argv is invalid')\n"
+    "sources=sys.argv[1:3]\n"
+    "for source in sources:\n"
+    " info=os.lstat(source)\n"
+    " if not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or info.st_gid!=0 or info.st_mode&0o077:\n"
+    "  raise OSError('managed private tmp source is not trusted')\n"
+    "for target in ('/tmp','/var/tmp'):\n"
+    " info=os.lstat(target)\n"
+    " if not stat.S_ISDIR(info.st_mode):\n  raise OSError('managed private tmp target is unavailable')\n"
+    "libc=ctypes.CDLL(None,use_errno=True)\n"
+    "libc.mount.argtypes=[ctypes.c_char_p,ctypes.c_char_p,ctypes.c_char_p,ctypes.c_ulong,ctypes.c_void_p]\n"
+    "libc.mount.restype=ctypes.c_int\n"
+    "def mount(source,target,flags):\n"
+    " result=libc.mount(source,target,None,flags,None)\n"
+    " if result!=0:\n  error=ctypes.get_errno();raise OSError(error,os.strerror(error),os.fsdecode(target))\n"
+    "mount(None,b'/',16384|262144)\n"
+    "mount(os.fsencode(sources[0]),b'/tmp',4096|16384)\n"
+    "mount(os.fsencode(sources[1]),b'/var/tmp',4096|16384)\n"
+    "os.umask(0o077)\n"
+    "os.execv(sys.argv[3],sys.argv[3:])\n"
 )
 
 
@@ -285,13 +309,28 @@ def _managed_terminal_argv(
     if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
         return list(argv)
     cgroup = _ensure_managed_terminal_cgroup(env)
+    _home, private_tmp, private_var_tmp = _managed_terminal_home_paths(env)
+    launcher = _trusted_managed_python()
     return [
-        _trusted_managed_python(),
+        launcher,
         "-I",
         "-c",
         _MANAGED_TERMINAL_CGROUP_ENTER,
         str(cgroup),
         *_managed_terminal_privilege_drop_prefix(env),
+        _trusted_managed_unshare(),
+        "--user",
+        "--map-root-user",
+        "--mount",
+        "--fork",
+        "--kill-child=KILL",
+        "--",
+        launcher,
+        "-I",
+        "-c",
+        _MANAGED_TERMINAL_PRIVATE_TMP_ENTER,
+        str(private_tmp),
+        str(private_var_tmp),
         *list(argv),
     ]
 
@@ -312,6 +351,23 @@ def _trusted_managed_python() -> str:
     ):
         raise OSError("managed terminal cgroup launcher is not trusted")
     return str(interpreter)
+
+
+def _trusted_managed_unshare() -> str:
+    """Return the fixed root-owned user/mount namespace launcher."""
+
+    try:
+        info = os.lstat(_MANAGED_UNSHARE_PATH)
+    except OSError as exc:
+        raise OSError("managed terminal namespace launcher is unavailable") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_mode & 0o022
+        or not info.st_mode & 0o111
+    ):
+        raise OSError("managed terminal namespace launcher is not trusted")
+    return _MANAGED_UNSHARE_PATH
 
 
 def _managed_terminal_cgroup_for_uid(
@@ -493,8 +549,10 @@ def _prepare_managed_execute_code_workspace(
     return uid
 
 
-def _prepare_managed_terminal_home(env: dict[str, str]) -> str:
-    """Create one non-shared writable HOME under a root-owned runtime tree."""
+def _managed_terminal_home_paths(
+    env: Mapping[str, str] | None,
+) -> tuple[Path, Path, Path]:
+    """Create the profile HOME and private tmp mount sources."""
 
     uid, gid = _managed_terminal_identity(env)
     parent = _MANAGED_TERMINAL_HOME_ROOT.parent
@@ -539,9 +597,42 @@ def _prepare_managed_terminal_home(env: dict[str, str]) -> str:
     ):
         raise OSError("managed terminal profile home is not trusted")
 
+    private_paths = []
+    for child_name in ("tmp", "var-tmp"):
+        child = home / child_name
+        created = False
+        try:
+            os.mkdir(child, 0o700)
+            created = True
+        except FileExistsError:
+            pass
+        if created:
+            os.chown(child, uid, gid)
+        child_info = os.lstat(child)
+        if (
+            not stat.S_ISDIR(child_info.st_mode)
+            or child_info.st_uid != uid
+            or child_info.st_gid != gid
+        ):
+            raise OSError("managed terminal private tmp is not trusted")
+        os.chmod(child, 0o700, follow_symlinks=False)
+        child_info = os.lstat(child)
+        if child_info.st_mode & 0o077:
+            raise OSError("managed terminal private tmp is not owner-only")
+        private_paths.append(child)
+
+    return home, private_paths[0], private_paths[1]
+
+
+def _prepare_managed_terminal_home(env: dict[str, str]) -> str:
+    """Set a profile-scoped HOME and namespace-local tmp environment."""
+
+    home, _private_tmp, _private_var_tmp = _managed_terminal_home_paths(env)
     home_text = str(home)
     env["HOME"] = home_text
-    env["TMPDIR"] = home_text
+    env["TMPDIR"] = "/tmp"
+    env["TMP"] = "/tmp"
+    env["TEMP"] = "/tmp"
     return home_text
 
 

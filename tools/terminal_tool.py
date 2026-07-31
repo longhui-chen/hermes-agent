@@ -2085,6 +2085,7 @@ def _validate_agent_creator_payload(payload: str) -> str:
             value,
             ensure_ascii=False,
             separators=(",", ":"),
+            sort_keys=True,
         )
     except (TypeError, ValueError, RecursionError) as exc:
         raise ValueError("payload must be one JSON object") from exc
@@ -2188,6 +2189,7 @@ def _parse_agent_creator_command(command: str) -> Optional[_AgentCreatorCommand]
                 args[2] = _validate_agent_creator_payload(args[2])
             except ValueError:
                 return None
+        approval_operation = "agent.create"
     elif args and args[0] == "cli":
         cli_args = args[1:]
         try:

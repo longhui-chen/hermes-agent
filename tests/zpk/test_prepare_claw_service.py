@@ -526,13 +526,13 @@ def test_prepare_claw_service_does_not_replace_unchanged_env_file(tmp_path: Path
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="requires root-owned profile tree")
-def test_prepare_claw_service_removes_group_other_profile_permissions(
+def test_prepare_claw_service_uses_root_barrier_and_one_time_migration(
     tmp_path: Path,
 ):
     if not _readlink_f_available(tmp_path):
         pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
 
-    app_root, hermes_home, _env_path = _prepare_script_fixture(tmp_path)
+    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
     nested = hermes_home / "profiles" / "agent-a" / "state"
     nested.mkdir(parents=True)
     state_file = nested / "history.json"
@@ -548,8 +548,52 @@ def test_prepare_claw_service_removes_group_other_profile_permissions(
         env=_script_env(),
     )
 
-    for path in (hermes_home / "profiles", nested.parent, nested, state_file):
+    for path in (hermes_home / "profiles", nested.parent):
         assert path.stat().st_mode & 0o077 == 0
+    assert nested.stat().st_mode & 0o077 != 0
+    assert state_file.stat().st_mode & 0o077 != 0
+
+    marker = env_path.parent / "profile-permissions-v2.done"
+    first_marker = marker.stat()
+    assert first_marker.st_mode & 0o777 == 0o600
+
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(),
+    )
+    second_marker = marker.stat()
+    assert second_marker.st_ino == first_marker.st_ino
+    assert second_marker.st_mtime_ns == first_marker.st_mtime_ns
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="requires root-owned profile tree")
+def test_prepare_claw_service_caps_legacy_profile_scan_without_blocking_start(
+    tmp_path: Path,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
+    profiles_root = hermes_home / "profiles"
+    for name in ("agent-a", "agent-b"):
+        (profiles_root / name).mkdir(parents=True)
+
+    env = _script_env()
+    env["HERMES_PROFILE_PERMISSION_MIGRATION_MAX_PROFILES"] = "1"
+    completed = subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert "bounded legacy profile migration stopped after 1 profiles" in completed.stderr
+    assert profiles_root.stat().st_mode & 0o777 == 0o700
+    assert (env_path.parent / "profile-permissions-v2.done").is_file()
 
 
 def test_prepare_claw_service_removes_complete_multiline_package_assignments(

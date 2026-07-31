@@ -13,6 +13,7 @@ VOLUME_DATA_TARGET="/volume1/subvol/apps/$(basename "$APP_BASE")/data"
 LOCK_FILE="$SECRET_DIR/prepare-claw-service.lock"
 KEY_FILE="$SECRET_DIR/zet_agent.key"
 ENV_FILE="$SECRET_DIR/zettlab-claw.env"
+PROFILE_PERMISSIONS_MARKER="$SECRET_DIR/profile-permissions-v2.done"
 SUBVOLUME_ZETTLAB_PRESETS_ROOT="/volume1/subvol/agents/zettlab-presets"
 AGENTS_ZETTLAB_PRESETS_ROOT="/volume1/agents/zettlab-presets"
 SUBVOLUME_ZETTLAB_PRESETS_DIR="$SUBVOLUME_ZETTLAB_PRESETS_ROOT/current"
@@ -152,6 +153,7 @@ pin_trusted_data_symlink() {
     LOCK_FILE="$SECRET_DIR/prepare-claw-service.lock"
     KEY_FILE="$SECRET_DIR/zet_agent.key"
     ENV_FILE="$SECRET_DIR/zettlab-claw.env"
+    PROFILE_PERMISSIONS_MARKER="$SECRET_DIR/profile-permissions-v2.done"
 }
 
 secure_state_directories() {
@@ -196,54 +198,129 @@ secure_state_directories() {
 }
 
 secure_profile_secret_files() {
-    local profiles_root="$HERMES_HOME/profiles" path uid mode group other
-    for path in "$profiles_root" "$profiles_root"/*; do
-        if [ ! -e "$path" ] && [ ! -L "$path" ]; then
-            continue
-        fi
-        if [ -L "$path" ] || [ ! -d "$path" ]; then
-            echo "refusing non-directory profile path: $path" >&2
-            exit 1
-        fi
-        uid="$(stat -c '%u' "$path" 2>/dev/null || stat -f '%u' "$path" 2>/dev/null || true)"
-        mode="$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null || true)"
-        [ "$uid" = "0" ] && [ -n "$mode" ] || {
-            echo "refusing untrusted profile directory: $path" >&2
-            exit 1
-        }
-        group="${mode: -2:1}"
-        other="${mode: -1}"
-        if (( (10#$group & 2) != 0 || (10#$other & 2) != 0 )); then
-            chmod go-w "$path"
-        fi
-    done
+    local profiles_root="$HERMES_HOME/profiles" path uid process_uid
+    process_uid="$(id -u)"
 
-    # Multiplex terminal commands use a distinct UID per profile.  The profile
-    # root alone is not enough protection if an inherited ACL/mode or a later
-    # layout change exposes a descendant through another path, so remove every
-    # group/other permission throughout the state tree.  find does not follow
-    # symlinks by default; model-created links therefore cannot make this root
-    # chmod an external target.
-    if [ -d "$profiles_root" ]; then
-        find "$profiles_root" -xdev \( -type d -o -type f \) \
-            -exec chmod go-rwx {} +
+    if [ -L "$profiles_root" ] || { [ -e "$profiles_root" ] && [ ! -d "$profiles_root" ]; }; then
+        echo "refusing non-directory profile root: $profiles_root" >&2
+        exit 1
+    fi
+    mkdir -p "$profiles_root"
+    uid="$(stat -c '%u' "$profiles_root" 2>/dev/null || stat -f '%u' "$profiles_root" 2>/dev/null || true)"
+    if [ "$uid" != "$process_uid" ]; then
+        echo "refusing profile root not owned by service user: $profiles_root" >&2
+        exit 1
     fi
 
-    for path in "$HERMES_HOME/.env" "$profiles_root"/*/.env; do
-        if [ ! -e "$path" ] && [ ! -L "$path" ]; then
-            continue
-        fi
+    # This root-only traversal barrier is the durable isolation boundary. It is
+    # O(1) on every start, so profile data growth cannot delay service startup.
+    chmod 0700 "$profiles_root"
+
+    path="$HERMES_HOME/.env"
+    if [ -e "$path" ] || [ -L "$path" ]; then
         if [ -L "$path" ] || [ ! -f "$path" ]; then
             echo "refusing non-regular profile secret file: $path" >&2
             exit 1
         fi
         uid="$(stat -c '%u' "$path" 2>/dev/null || stat -f '%u' "$path" 2>/dev/null || true)"
-        if [ "$uid" != "0" ]; then
-            echo "refusing non-root-owned profile secret file: $path" >&2
+        if [ "$uid" != "$process_uid" ]; then
+            echo "refusing profile secret file not owned by service user: $path" >&2
             exit 1
         fi
         chmod 0600 "$path"
-    done
+    fi
+
+    if [ -e "$PROFILE_PERMISSIONS_MARKER" ] || [ -L "$PROFILE_PERMISSIONS_MARKER" ]; then
+        if [ -L "$PROFILE_PERMISSIONS_MARKER" ] || [ ! -f "$PROFILE_PERMISSIONS_MARKER" ]; then
+            echo "refusing non-regular profile permissions marker" >&2
+            exit 1
+        fi
+        uid="$(stat -c '%u' "$PROFILE_PERMISSIONS_MARKER" 2>/dev/null || stat -f '%u' "$PROFILE_PERMISSIONS_MARKER" 2>/dev/null || true)"
+        if [ "$uid" != "$process_uid" ]; then
+            echo "refusing profile permissions marker not owned by service user" >&2
+            exit 1
+        fi
+        chmod 0600 "$PROFILE_PERMISSIONS_MARKER"
+        return
+    fi
+
+    # One bounded pass tightens legacy top-level profiles and their .env files.
+    # Descendants remain protected by the root barrier above; new profiles are
+    # created owner-only by hermes_cli.profiles. The marker keeps normal starts
+    # independent of profile count and state-tree size.
+    HERMES_PROFILES_ROOT="$profiles_root" \
+    HERMES_PROFILE_PERMISSIONS_MARKER="$PROFILE_PERMISSIONS_MARKER" \
+        "$HERMES_PYTHON" - <<'PY'
+import os
+import stat
+import tempfile
+
+profiles_root = os.environ["HERMES_PROFILES_ROOT"]
+marker = os.environ["HERMES_PROFILE_PERMISSIONS_MARKER"]
+try:
+    requested_limit = int(
+        os.environ.get("HERMES_PROFILE_PERMISSION_MIGRATION_MAX_PROFILES", "4096")
+    )
+except ValueError:
+    requested_limit = 4096
+limit = max(1, min(requested_limit, 4096))
+overflow = False
+
+with os.scandir(profiles_root) as entries:
+    for index, entry in enumerate(entries):
+        if index >= limit:
+            overflow = True
+            break
+        info = entry.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise SystemExit(f"refusing non-directory profile path: {entry.path}")
+        if info.st_uid != os.geteuid():
+            raise SystemExit(
+                f"refusing profile directory not owned by service user: {entry.path}"
+            )
+        os.chmod(entry.path, 0o700, follow_symlinks=False)
+
+        env_path = os.path.join(entry.path, ".env")
+        try:
+            env_info = os.lstat(env_path)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(env_info.st_mode) or stat.S_ISLNK(env_info.st_mode):
+            raise SystemExit(f"refusing non-regular profile secret file: {env_path}")
+        if env_info.st_uid != os.geteuid():
+            raise SystemExit(
+                f"refusing profile secret file not owned by service user: {env_path}"
+            )
+        os.chmod(env_path, 0o600, follow_symlinks=False)
+
+marker_dir = os.path.dirname(marker)
+fd, temporary = tempfile.mkstemp(
+    prefix=".profile-permissions-v2.", suffix=".tmp", dir=marker_dir
+)
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="ascii") as stream:
+        stream.write("root-barrier-v2\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, marker)
+finally:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+
+if overflow:
+    print(
+        f"bounded legacy profile migration stopped after {limit} profiles; "
+        "remaining entries are protected by the owner-only profile root",
+        file=os.sys.stderr,
+    )
+PY
 }
 
 acquire_prepare_lock() {

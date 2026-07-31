@@ -110,6 +110,14 @@ def _canonical_command(suffix: str) -> str:
     )
 
 
+def _auto_approve_mutations(monkeypatch) -> None:
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_request_agentcomputer_mutation_approval",
+        lambda _parsed: None,
+    )
+
+
 def test_terminal_dispatch_runs_preflight_with_only_scoped_credentials(
     monkeypatch,
     tmp_path,
@@ -575,6 +583,7 @@ def test_concurrent_creator_calls_keep_profile_scope_and_turn_isolated(
     monkeypatch,
     tmp_path,
 ):
+    _auto_approve_mutations(monkeypatch)
     _configure(
         monkeypatch,
         tmp_path,
@@ -631,6 +640,7 @@ def test_terminal_dispatch_passes_bounded_create_payload_over_stdin(
     monkeypatch,
     tmp_path,
 ):
+    _auto_approve_mutations(monkeypatch)
     _configure(
         monkeypatch,
         tmp_path,
@@ -678,6 +688,7 @@ def test_terminal_dispatch_passes_bounded_create_payload_over_stdin(
 
 
 def test_inline_create_payload_is_canonicalized(monkeypatch, tmp_path):
+    _auto_approve_mutations(monkeypatch)
     _configure(
         monkeypatch,
         tmp_path,
@@ -706,6 +717,55 @@ def test_inline_create_payload_is_canonicalized(monkeypatch, tmp_path):
         "--payload",
         '{"name":"Writer","soul_identity":"Writes clearly"}',
     ]
+
+
+def test_create_requires_one_shot_approval_before_token_for_normalized_payload(
+    monkeypatch,
+    tmp_path,
+):
+    import hashlib
+
+    _configure(monkeypatch, tmp_path, "print('must not run')\n")
+    captured = {}
+
+    def require_approval(tool_name, _reason, **kwargs):
+        captured["tool_name"] = tool_name
+        captured.update(kwargs)
+        return {
+            "approved": False,
+            "status": "approval_required",
+            "approval_id": "create-approval-id",
+        }
+
+    monkeypatch.setattr("tools.approval.request_tool_approval", require_approval)
+    monkeypatch.setattr(
+        "tools.environments.local.build_agent_creator_runtime_env",
+        lambda: (_ for _ in ()).throw(AssertionError("token acquired too early")),
+    )
+    payload = '{ "soul_identity": "Writes clearly", "name": "Writer" }'
+    command = _canonical_command(f"create --payload {shlex.quote(payload)}")
+
+    result = json.loads(terminal_tool_module.terminal_tool(
+        command,
+        task_id="agent-create-approval",
+    ))
+
+    normalized = '{"name":"Writer","soul_identity":"Writes clearly"}'
+    fingerprint = hashlib.sha256()
+    for value in ("create", "--payload", normalized):
+        encoded = value.encode("utf-8")
+        fingerprint.update(len(encoded).to_bytes(8, "big"))
+        fingerprint.update(encoded)
+    fingerprint.update((0).to_bytes(8, "big"))
+    fingerprint_hex = fingerprint.hexdigest()
+
+    assert result["status"] == "pending_approval"
+    assert result["approval_pending"] is True
+    assert captured["tool_name"] == "agentcomputer_cli"
+    assert captured["one_shot"] is True
+    assert captured["allow_yolo_bypass"] is False
+    assert captured["rule_key"] == f"agentcomputer:agent.create:{fingerprint_hex}"
+    assert normalized in captured["display_target"]
 
 
 def test_canonical_relative_presets_command_is_allowed(monkeypatch, tmp_path):

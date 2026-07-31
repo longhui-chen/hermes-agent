@@ -43,6 +43,18 @@ def test_managed_terminal_drops_identity_changing_capabilities(monkeypatch):
     monkeypatch.setattr(
         local_module, "_trusted_managed_python", lambda: "/usr/bin/python3"
     )
+    monkeypatch.setattr(
+        local_module, "_trusted_managed_unshare", lambda: "/usr/bin/unshare"
+    )
+    monkeypatch.setattr(
+        local_module,
+        "_managed_terminal_home_paths",
+        lambda _env=None: (
+            Path("/run/zettlab-claw/terminal-homes/65534"),
+            Path("/run/zettlab-claw/terminal-homes/65534/tmp"),
+            Path("/run/zettlab-claw/terminal-homes/65534/var-tmp"),
+        ),
+    )
 
     class Process:
         pid = 42
@@ -65,7 +77,7 @@ def test_managed_terminal_drops_identity_changing_capabilities(monkeypatch):
         local_module._MANAGED_TERMINAL_CGROUP_ENTER,
         "/sys/fs/cgroup/unit/terminal-profile-65534",
     ]
-    assert captured["argv"][5:] == [
+    assert captured["argv"][5:14] == [
         "/usr/bin/setpriv",
         "--reuid=65534",
         "--regid=65534",
@@ -75,10 +87,32 @@ def test_managed_terminal_drops_identity_changing_capabilities(monkeypatch):
         "--ambient-caps=-all",
         "--no-new-privs",
         "--",
+    ]
+    assert captured["argv"][14:27] == [
+        "/usr/bin/unshare",
+        "--user",
+        "--map-root-user",
+        "--mount",
+        "--fork",
+        "--kill-child=KILL",
+        "--",
+        "/usr/bin/python3",
+        "-I",
+        "-c",
+        local_module._MANAGED_TERMINAL_PRIVATE_TMP_ENTER,
+        "/run/zettlab-claw/terminal-homes/65534/tmp",
+        "/run/zettlab-claw/terminal-homes/65534/var-tmp",
+    ]
+    assert captured["argv"][27:] == [
         "/bin/bash",
         "-c",
         "id",
     ]
+    assert "mount(None,b'/',16384|262144)" in (
+        local_module._MANAGED_TERMINAL_PRIVATE_TMP_ENTER
+    )
+    assert "b'/tmp',4096|16384" in local_module._MANAGED_TERMINAL_PRIVATE_TMP_ENTER
+    assert "b'/var/tmp',4096|16384" in local_module._MANAGED_TERMINAL_PRIVATE_TMP_ENTER
 
 
 def test_managed_terminal_default_cwd_falls_back_to_profile_home(monkeypatch):
@@ -87,7 +121,9 @@ def test_managed_terminal_default_cwd_falls_back_to_profile_home(monkeypatch):
 
     def prepare_home(env):
         env["HOME"] = "/run/zettlab-claw/terminal-homes/100001"
-        env["TMPDIR"] = env["HOME"]
+        env["TMPDIR"] = "/tmp"
+        env["TMP"] = "/tmp"
+        env["TEMP"] = "/tmp"
         return env["HOME"]
 
     monkeypatch.setattr(
@@ -115,7 +151,9 @@ def test_managed_terminal_default_cwd_falls_back_to_profile_home(monkeypatch):
         env=run_env,
     ) == "/workspace"
     assert run_env["HOME"] == "/run/zettlab-claw/terminal-homes/100001"
-    assert run_env["TMPDIR"] == run_env["HOME"]
+    assert run_env["TMPDIR"] == "/tmp"
+    assert run_env["TMP"] == "/tmp"
+    assert run_env["TEMP"] == "/tmp"
 
 
 def test_managed_terminal_fails_closed_without_trusted_setpriv(monkeypatch):
@@ -295,6 +333,8 @@ def test_managed_service_mounts_system_read_only_with_scoped_writes():
     assert "MemorySwapMax=0" in service
     assert "TasksMax=512" in service
     assert "OOMPolicy=continue" in service
+    assert "PrivateTmp=true" in service
+    assert "CAP_SYS_ADMIN" in service and "CapabilityBoundingSet=~CAP_SYS_ADMIN" in service
     assert (
         "Environment=PATH="
         "/zettos/main/apps/com.zettlab.local-server/current/sbin:"
@@ -345,6 +385,18 @@ def _background_registry(monkeypatch):
         process_registry_module,
         "_managed_terminal_cwd",
         lambda cwd, *, env: cwd,
+    )
+    monkeypatch.setattr(
+        local_module,
+        "_managed_terminal_home_paths",
+        lambda _env=None: (
+            Path("/run/zettlab-claw/terminal-homes/65534"),
+            Path("/run/zettlab-claw/terminal-homes/65534/tmp"),
+            Path("/run/zettlab-claw/terminal-homes/65534/var-tmp"),
+        ),
+    )
+    monkeypatch.setattr(
+        local_module, "_trusted_managed_unshare", lambda: "/usr/bin/unshare"
     )
     return registry
 

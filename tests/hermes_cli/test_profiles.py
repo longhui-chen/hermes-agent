@@ -166,9 +166,12 @@ class TestCreateProfile:
     def test_creates_directory_with_subdirs(self, profile_env):
         profile_dir = create_profile("coder", no_alias=True)
         assert profile_dir.is_dir()
+        assert profile_dir.parent.stat().st_mode & 0o777 == 0o700
+        assert profile_dir.stat().st_mode & 0o777 == 0o700
         for subdir in ["memories", "sessions", "skills", "skins", "logs",
                         "plans", "workspace", "cron"]:
             assert (profile_dir / subdir).is_dir(), f"Missing subdir: {subdir}"
+            assert (profile_dir / subdir).stat().st_mode & 0o777 == 0o700
 
     @pytest.mark.parametrize("profile", ["coder", "main", "memo"])
     def test_fresh_profile_always_seeds_neutral_soul(self, profile_env, profile):
@@ -282,6 +285,7 @@ class TestCreateProfile:
         assert not (profile_dir / "gateway.pid").exists()
         assert not (profile_dir / "gateway_state.json").exists()
         assert not (profile_dir / "processes.json").exists()
+        assert profile_dir.stat().st_mode & 0o777 == 0o700
 
     def test_clone_all_excludes_sibling_profiles_tree(self, profile_env):
         """--clone-all from default ~/.hermes must not copy profiles/* (nested explosion)."""
@@ -1198,6 +1202,8 @@ class TestExportImport:
         imported = import_profile(str(archive_path), name="coder")
         assert imported.is_dir()
         assert (imported / "marker.txt").read_text() == "hello"
+        assert imported.stat().st_mode & 0o777 == 0o700
+        assert (imported / ".env").stat().st_mode & 0o777 == 0o600
 
     def test_import_to_existing_name_raises(self, profile_env, tmp_path):
         create_profile("coder", no_alias=True)
