@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import tools.code_execution_tool as code_execution_module
 import tools.environments.local as local_module
 import tools.process_registry as process_registry_module
 from tools.environments.local import LocalEnvironment
@@ -57,6 +58,28 @@ def test_managed_terminal_fails_closed_without_trusted_setpriv(monkeypatch):
     )
     with pytest.raises(OSError, match="privilege drop is unavailable"):
         local_module._managed_terminal_privilege_drop_prefix()
+
+
+def test_managed_execute_code_drops_identity_capabilities(monkeypatch):
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setattr(
+        local_module,
+        "_managed_terminal_privilege_drop_prefix",
+        lambda: ["/usr/bin/setpriv", "--bounding-set=-setuid,-setgid", "--"],
+    )
+
+    argv = code_execution_module._managed_execute_code_argv(
+        "/app/venv/bin/python",
+        "/tmp/hermes-execute/script.py",
+    )
+
+    assert argv == [
+        "/usr/bin/setpriv",
+        "--bounding-set=-setuid,-setgid",
+        "--",
+        "/app/venv/bin/python",
+        "/tmp/hermes-execute/script.py",
+    ]
 
 
 def test_managed_service_mounts_system_read_only_with_scoped_writes():

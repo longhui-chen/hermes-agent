@@ -305,6 +305,13 @@ def check_sandbox_requirements() -> bool:
     return True
 
 
+def _managed_execute_code_argv(python: str, script_path: str) -> List[str]:
+    """Apply the managed local-process capability boundary to execute_code."""
+    from tools.environments.local import _managed_terminal_argv
+
+    return _managed_terminal_argv([python, script_path])
+
+
 # ---------------------------------------------------------------------------
 # hermes_tools.py code generator
 # ---------------------------------------------------------------------------
@@ -1433,7 +1440,7 @@ def execute_code(
         _script_path = os.path.join(tmpdir, "script.py")
 
         proc = subprocess.Popen(
-            [_child_python, _script_path],
+            _managed_execute_code_argv(_child_python, _script_path),
             cwd=_child_cwd,
             env=child_env,
             stdout=subprocess.PIPE,
