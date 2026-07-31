@@ -80,6 +80,30 @@ _MANAGED_TERMINAL_PRIVATE_TMP_ENTER = (
     "os.umask(0o077)\n"
     "os.execv(sys.argv[3],sys.argv[3:])\n"
 )
+_MANAGED_EXECUTE_CODE_PRIVATE_TMP_ENTER = (
+    "import ctypes,os,stat,sys\n"
+    "if len(sys.argv)<4:\n raise OSError('managed execute_code private tmp argv is invalid')\n"
+    "workspace,var_tmp=sys.argv[1:3]\n"
+    "for source in (workspace,var_tmp):\n"
+    " info=os.lstat(source)\n"
+    " if not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or info.st_gid!=0 or info.st_mode&0o077:\n"
+    "  raise OSError('managed execute_code private tmp source is not trusted')\n"
+    "for target in ('/tmp','/var/tmp'):\n"
+    " info=os.lstat(target)\n"
+    " if not stat.S_ISDIR(info.st_mode):\n  raise OSError('managed execute_code private tmp target is unavailable')\n"
+    "libc=ctypes.CDLL(None,use_errno=True)\n"
+    "libc.mount.argtypes=[ctypes.c_char_p,ctypes.c_char_p,ctypes.c_char_p,ctypes.c_ulong,ctypes.c_void_p]\n"
+    "libc.mount.restype=ctypes.c_int\n"
+    "def mount(source,target,flags):\n"
+    " result=libc.mount(source,target,None,flags,None)\n"
+    " if result!=0:\n  error=ctypes.get_errno();raise OSError(error,os.strerror(error),os.fsdecode(target))\n"
+    "mount(None,b'/',16384|262144)\n"
+    "mount(os.fsencode(var_tmp),b'/var/tmp',4096|16384)\n"
+    "mount(os.fsencode(workspace),b'/tmp',4096|16384)\n"
+    "os.chdir('/tmp')\n"
+    "os.umask(0o077)\n"
+    "os.execv(sys.argv[3],sys.argv[3:])\n"
+)
 
 
 def _managed_terminal_profile_scope(
@@ -247,6 +271,7 @@ def _managed_execute_code_sandbox_argv(
     *,
     env: Mapping[str, str],
     execution_scope: str | None,
+    workspace: str | None = None,
 ) -> list[str]:
     """Drop one execute_code invocation into its non-shared identity domain."""
 
@@ -254,6 +279,8 @@ def _managed_execute_code_sandbox_argv(
         return list(argv)
     if execution_scope is None:
         raise OSError("managed execute_code scope is unavailable")
+    if workspace is None:
+        raise OSError("managed execute_code workspace is unavailable")
     try:
         info = os.lstat(_MANAGED_SETPRIV_PATH)
     except OSError as exc:
@@ -268,7 +295,7 @@ def _managed_execute_code_sandbox_argv(
     launcher = _trusted_managed_python()
     namespace_launcher = _trusted_managed_unshare()
     private_tmp, private_var_tmp = _managed_execute_code_private_tmp_paths(
-        env, uid
+        workspace, uid
     )
     from tools.trusted_direct_runner import (
         _create_managed_invocation_cgroup,
@@ -303,13 +330,11 @@ def _managed_execute_code_sandbox_argv(
         "--user",
         "--map-root-user",
         "--mount",
-        "--fork",
-        "--kill-child=KILL",
         "--",
         launcher,
         "-I",
         "-c",
-        _MANAGED_TERMINAL_PRIVATE_TMP_ENTER,
+        _MANAGED_EXECUTE_CODE_PRIVATE_TMP_ENTER,
         str(private_tmp),
         str(private_var_tmp),
         *argv,
@@ -561,7 +586,7 @@ def _prepare_managed_execute_code_workspace(
             raise OSError("managed execute_code workspace entry is not trusted")
         os.chown(path, uid, gid)
         os.chmod(path, 0o600)
-    for child_name in ("tmp", "var-tmp"):
+    for child_name in ("var-tmp",):
         child = Path(directory) / child_name
         os.mkdir(child, 0o700)
         child_info = os.lstat(child)
@@ -580,11 +605,11 @@ def _prepare_managed_execute_code_workspace(
 
 
 def _managed_execute_code_private_tmp_paths(
-    env: Mapping[str, str], uid: int
+    workspace: str, uid: int
 ) -> tuple[Path, Path]:
-    """Validate invocation-owned mount sources created in its scratch HOME."""
+    """Validate invocation-owned mount sources created in its scratch workspace."""
 
-    raw_home = str(env.get("HOME") or "")
+    raw_home = str(workspace or "")
     if not raw_home or not os.path.isabs(raw_home) or "\x00" in raw_home:
         raise OSError("managed execute_code private tmp is unavailable")
     home = Path(raw_home)
@@ -597,19 +622,16 @@ def _managed_execute_code_private_tmp_paths(
     ):
         raise OSError("managed execute_code HOME is not trusted")
 
-    private_paths: list[Path] = []
-    for child_name in ("tmp", "var-tmp"):
-        child = home / child_name
-        child_info = os.lstat(child)
-        if (
-            not stat.S_ISDIR(child_info.st_mode)
-            or child_info.st_uid != uid
-            or child_info.st_gid != uid
-            or child_info.st_mode & 0o077
-        ):
-            raise OSError("managed execute_code private tmp is not trusted")
-        private_paths.append(child)
-    return private_paths[0], private_paths[1]
+    private_var_tmp = home / "var-tmp"
+    child_info = os.lstat(private_var_tmp)
+    if (
+        not stat.S_ISDIR(child_info.st_mode)
+        or child_info.st_uid != uid
+        or child_info.st_gid != uid
+        or child_info.st_mode & 0o077
+    ):
+        raise OSError("managed execute_code private tmp is not trusted")
+    return home, private_var_tmp
 
 
 def _managed_terminal_home_paths(

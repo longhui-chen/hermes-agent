@@ -171,7 +171,7 @@ def test_managed_execute_code_drops_identity_capabilities(monkeypatch):
     monkeypatch.setattr(
         local_module,
         "_managed_execute_code_sandbox_argv",
-        lambda argv, *, env, execution_scope: [
+        lambda argv, *, env, execution_scope, workspace: [
             "/usr/bin/setpriv",
             "--reuid=65534",
             "--regid=65534",
@@ -187,6 +187,7 @@ def test_managed_execute_code_drops_identity_capabilities(monkeypatch):
         "/tmp/hermes-execute/script.py",
         env={},
         execution_scope="scope-1",
+        workspace="/tmp/hermes-execute",
     )
 
     assert argv == [
@@ -237,8 +238,8 @@ def test_managed_execute_code_uses_per_invocation_cgroup(monkeypatch):
     monkeypatch.setattr(
         local_module,
         "_managed_execute_code_private_tmp_paths",
-        lambda _env, _uid: (
-            Path("/run/zettlab-claw/execute-code/61001/tmp"),
+        lambda _workspace, _uid: (
+            Path("/run/zettlab-claw/execute-code/61001"),
             Path("/run/zettlab-claw/execute-code/61001/var-tmp"),
         ),
     )
@@ -256,6 +257,7 @@ def test_managed_execute_code_uses_per_invocation_cgroup(monkeypatch):
         ["/usr/bin/python3", "/tmp/script.py"],
         env={"HERMES_HOME": "/profiles/main"},
         execution_scope="scope-1",
+        workspace="/run/zettlab-claw/execute-code/61001",
     )
 
     assert argv[:6] == [
@@ -271,22 +273,21 @@ def test_managed_execute_code_uses_per_invocation_cgroup(monkeypatch):
         "--regid=61001",
         "--clear-groups",
     ]
-    assert argv[14:27] == [
+    assert argv[14:25] == [
         "/usr/bin/unshare",
         "--user",
         "--map-root-user",
         "--mount",
-        "--fork",
-        "--kill-child=KILL",
         "--",
         "/usr/bin/python3",
         "-I",
         "-c",
-        local_module._MANAGED_TERMINAL_PRIVATE_TMP_ENTER,
-        "/run/zettlab-claw/execute-code/61001/tmp",
+        local_module._MANAGED_EXECUTE_CODE_PRIVATE_TMP_ENTER,
+        "/run/zettlab-claw/execute-code/61001",
         "/run/zettlab-claw/execute-code/61001/var-tmp",
     ]
-    assert argv[27:] == ["/usr/bin/python3", "/tmp/script.py"]
+    assert argv[25:] == ["/usr/bin/python3", "/tmp/script.py"]
+    assert "--fork" not in argv
     monkeypatch.setattr(
         local_module,
         "_terminate_managed_uid",

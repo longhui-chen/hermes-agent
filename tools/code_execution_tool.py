@@ -320,6 +320,7 @@ def _managed_execute_code_argv(
     *,
     env: Dict[str, str],
     execution_scope: str | None = None,
+    workspace: str | None = None,
 ) -> List[str]:
     """Apply the managed local-process capability boundary to execute_code."""
     from tools.environments.local import _managed_execute_code_sandbox_argv
@@ -328,6 +329,7 @@ def _managed_execute_code_argv(
         [python, script_path],
         env=env,
         execution_scope=execution_scope,
+        workspace=workspace,
     )
 
 
@@ -1476,6 +1478,7 @@ def execute_code(
         _child_python = _resolve_child_python(_mode)
         _child_cwd = _resolve_child_cwd(_mode, tmpdir, task_id=task_id or "")
         _script_path = os.path.join(tmpdir, "script.py")
+        _child_script_path = _script_path
         if managed_gateway:
             from tools.environments.local import (
                 _prepare_managed_execute_code_workspace,
@@ -1494,15 +1497,23 @@ def execute_code(
                 env=child_env,
                 execution_scope=managed_execute_scope,
             )
-            child_env["HOME"] = tmpdir
+            child_env["HOME"] = "/tmp"
+            child_env["TMPDIR"] = "/tmp"
+            child_env["TMP"] = "/tmp"
+            child_env["TEMP"] = "/tmp"
+            child_env["HERMES_RPC_SOCKET"] = f"/tmp/{os.path.basename(sock_path)}"
+            _pp_parts[0] = "/tmp"
+            child_env["PYTHONPATH"] = os.pathsep.join(_pp_parts)
             _child_cwd = tmpdir
+            _child_script_path = "/tmp/script.py"
 
         proc = subprocess.Popen(
             _managed_execute_code_argv(
                 _child_python,
-                _script_path,
+                _child_script_path,
                 env=child_env,
                 execution_scope=managed_execute_scope,
+                workspace=tmpdir if managed_gateway else None,
             ),
             cwd=_child_cwd,
             env=child_env,

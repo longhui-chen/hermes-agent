@@ -2028,6 +2028,10 @@ _one_shot_approved: dict[_ApprovalStateKey, dict[str, list[float]]] = {}
 _session_approved: dict[_ApprovalStateKey, set] = {}
 _session_yolo: set[_ApprovalStateKey] = set()
 _permanent_approved: set = set()
+_MAX_PERMANENT_APPROVAL_PROFILES = 4096
+_permanent_approved_by_profile: dict[str, set] = {}
+_permanent_loaded_profiles: set[str] = set()
+_permanent_load_lock = threading.Lock()
 _deferred_sweeper_started = False
 _deferred_sweeper_start_lock = threading.Lock()
 
@@ -2041,6 +2045,58 @@ def _approval_profile_scope() -> str:
         return os.path.realpath(str(get_hermes_home()))
     except Exception:
         return ""
+
+
+def _permanent_approval_scope() -> str | None:
+    """Return the multiplex profile owner, or None for legacy single-profile mode."""
+
+    from agent.secret_scope import is_multiplex_active
+
+    if not is_multiplex_active():
+        return None
+    profile_scope = _approval_profile_scope()
+    if not profile_scope:
+        raise RuntimeError("multiplex permanent approvals require a profile scope")
+    return profile_scope
+
+
+def _permanent_approvals_locked(profile_scope: str | None) -> set:
+    """Resolve the current allowlist while ``_lock`` is held."""
+
+    if profile_scope is None:
+        return _permanent_approved
+    approvals = _permanent_approved_by_profile.get(profile_scope)
+    if approvals is None:
+        if len(_permanent_approved_by_profile) >= _MAX_PERMANENT_APPROVAL_PROFILES:
+            raise RuntimeError("permanent approval profile cache is full")
+        approvals = set()
+        _permanent_approved_by_profile[profile_scope] = approvals
+    return approvals
+
+
+def _ensure_permanent_allowlist_loaded() -> None:
+    """Lazily load the active profile without importing another profile's state."""
+
+    profile_scope = _permanent_approval_scope()
+    if profile_scope is None:
+        return
+    with _lock:
+        if profile_scope in _permanent_loaded_profiles:
+            return
+    with _permanent_load_lock:
+        with _lock:
+            if profile_scope in _permanent_loaded_profiles:
+                return
+        load_permanent_allowlist()
+
+
+def _permanent_allowlist_snapshot() -> set:
+    """Return an immutable-by-caller snapshot for legacy persistence hooks."""
+
+    _ensure_permanent_allowlist_loaded()
+    profile_scope = _permanent_approval_scope()
+    with _lock:
+        return set(_permanent_approvals_locked(profile_scope))
 
 
 def _approval_state_key(session_key: str) -> _ApprovalStateKey:
@@ -2375,7 +2431,7 @@ def resolve_gateway_approval(session_key: str, choice: str,
                     for key in permanent_keys:
                         approve_permanent(key)
                     if permanent_keys:
-                        save_permanent_allowlist(_permanent_approved)
+                        save_permanent_allowlist(_permanent_allowlist_snapshot())
     return 1
 
 
@@ -2613,10 +2669,13 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
     Accept both the current canonical key and the legacy regex-derived key so
     existing command_allowlist entries continue to work after key migrations.
     """
+    _ensure_permanent_allowlist_loaded()
     aliases = _approval_key_aliases(pattern_key)
     state_key = _approval_state_key(session_key)
+    profile_scope = _permanent_approval_scope()
     with _lock:
-        if any(alias in _permanent_approved for alias in aliases):
+        permanent_approvals = _permanent_approvals_locked(profile_scope)
+        if any(alias in permanent_approvals for alias in aliases):
             return True
         session_approvals = _session_approved.get(state_key, set())
         return any(alias in session_approvals for alias in aliases)
@@ -2624,14 +2683,18 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
 
 def approve_permanent(pattern_key: str):
     """Add a pattern to the permanent allowlist."""
+    _ensure_permanent_allowlist_loaded()
+    profile_scope = _permanent_approval_scope()
     with _lock:
-        _permanent_approved.add(pattern_key)
+        _permanent_approvals_locked(profile_scope).add(pattern_key)
 
 
 def load_permanent(patterns: set):
     """Bulk-load permanent allowlist entries from config."""
+    _ensure_permanent_allowlist_loaded()
+    profile_scope = _permanent_approval_scope()
     with _lock:
-        _permanent_approved.update(patterns)
+        _permanent_approvals_locked(profile_scope).update(patterns)
 
 
 _ALLOWLIST_SHELL_OPERATOR_RE = re.compile(r"(?:\n|&&|\|\||[;&|<>`]|\$\()")
@@ -2655,8 +2718,10 @@ def _command_matches_permanent_allowlist(command: str) -> bool:
     if _has_allowlist_shell_operator(command):
         return False
 
+    _ensure_permanent_allowlist_loaded()
+    profile_scope = _permanent_approval_scope()
     with _lock:
-        patterns = tuple(_permanent_approved)
+        patterns = tuple(_permanent_approvals_locked(profile_scope))
 
     for pattern in patterns:
         if not isinstance(pattern, str):
@@ -2682,24 +2747,42 @@ def load_permanent_allowlist() -> set:
     Also syncs them into the approval module so is_approved() works for
     patterns added via 'always' in a previous session.
     """
+    profile_scope = _permanent_approval_scope()
     try:
         from hermes_cli.config import load_config
         config = load_config()
         patterns = set(config.get("command_allowlist", []) or [])
-        if patterns:
-            load_permanent(patterns)
+        with _lock:
+            approvals = _permanent_approvals_locked(profile_scope)
+            approvals.clear()
+            approvals.update(patterns)
+            if profile_scope is not None:
+                _permanent_loaded_profiles.add(profile_scope)
         return patterns
     except Exception as e:
         logger.warning("Failed to load permanent allowlist: %s", e)
+        if profile_scope is not None:
+            with _lock:
+                _permanent_approvals_locked(profile_scope).clear()
+                _permanent_loaded_profiles.add(profile_scope)
         return set()
 
 
-def save_permanent_allowlist(patterns: set):
-    """Save permanently allowed command patterns to config."""
+def save_permanent_allowlist(patterns: set | None = None):
+    """Save only the active profile's permanently allowed command patterns."""
     try:
         from hermes_cli.config import load_config, save_config
+        _ensure_permanent_allowlist_loaded()
+        profile_scope = _permanent_approval_scope()
+        with _lock:
+            if profile_scope is None and patterns is not None:
+                current_patterns = set(patterns)
+            else:
+                current_patterns = set(
+                    _permanent_approvals_locked(profile_scope)
+                )
         config = load_config()
-        config["command_allowlist"] = list(patterns)
+        config["command_allowlist"] = sorted(current_patterns)
         save_config(config)
     except Exception as e:
         logger.warning("Could not save allowlist: %s", e)
@@ -3260,7 +3343,7 @@ def _run_approval_gate(
             elif not one_shot and choice == "always":
                 approve_session(session_key, pattern_key)
                 approve_permanent(pattern_key)
-                save_permanent_allowlist(_permanent_approved)
+                save_permanent_allowlist(_permanent_allowlist_snapshot())
             return {"approved": True, "message": None}
 
         # No notify callback (e.g. API server without an attached chat):
@@ -3322,7 +3405,7 @@ def _run_approval_gate(
     elif not one_shot and choice == "always":
         approve_session(session_key, pattern_key)
         approve_permanent(pattern_key)
-        save_permanent_allowlist(_permanent_approved)
+        save_permanent_allowlist(_permanent_allowlist_snapshot())
 
     return {"approved": True, "message": None}
 
@@ -4042,7 +4125,7 @@ def check_all_command_guards(command: str, env_type: str,
                     elif choice == "always":
                         approve_session(session_key, key)
                         approve_permanent(key)
-                        save_permanent_allowlist(_permanent_approved)
+                        save_permanent_allowlist(_permanent_allowlist_snapshot())
 
             return {"approved": True, "message": None,
                     "user_approved": True, "description": combined_desc}
@@ -4156,7 +4239,7 @@ def check_all_command_guards(command: str, env_type: str,
                 # dangerous patterns: permanent allowed
                 approve_session(session_key, key)
                 approve_permanent(key)
-                save_permanent_allowlist(_permanent_approved)
+                save_permanent_allowlist(_permanent_allowlist_snapshot())
 
     return {"approved": True, "message": None,
             "user_approved": True, "description": combined_desc}
@@ -4404,7 +4487,7 @@ def check_execute_code_guard(code: str, env_type: str,
         elif choice == "always":
             approve_session(session_key, pattern_key)
             approve_permanent(pattern_key)
-            save_permanent_allowlist(_permanent_approved)
+            save_permanent_allowlist(_permanent_allowlist_snapshot())
     # choice == "once": no persistence — approval lasts this single call only.
 
     return {"approved": True, "message": None,
