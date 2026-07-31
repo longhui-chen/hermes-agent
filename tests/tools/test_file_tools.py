@@ -962,6 +962,7 @@ class TestSilentFileMisplacementE2E:
     makes the resolved path correct.
     """
 
+    @_skip_macos_tmp_config
     def test_relative_write_after_env_cleanup_lands_in_user_cwd(self, tmp_path, monkeypatch):
         import tools.terminal_tool as tt
         import tools.file_tools as ft
