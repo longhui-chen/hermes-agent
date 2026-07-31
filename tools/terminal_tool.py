@@ -2664,6 +2664,53 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
 # Thread-safe because each task_id is unique per rollout.
 _task_env_overrides: Dict[str, Dict[str, Any]] = {}
 
+_MANAGED_PROFILE_REGISTRY_PREFIX = "managed-profile:"
+
+
+def _canonical_managed_profile_home(profile_home: object | None = None) -> str | None:
+    """Resolve the canonical owner used to isolate multiplex terminal state."""
+    if profile_home is None:
+        if os.environ.get("HERMES_MANAGED_GATEWAY") != "1":
+            return None
+        try:
+            from hermes_constants import get_hermes_home
+
+            profile_home = get_hermes_home()
+        except Exception:
+            return None
+    raw = str(profile_home or "").strip()
+    if not raw or "\x00" in raw:
+        return None
+    try:
+        return os.path.normcase(
+            os.path.realpath(os.path.abspath(os.path.expanduser(raw)))
+        )
+    except (OSError, ValueError):
+        return None
+
+
+def _managed_profile_registry_prefix(profile_home: object | None = None) -> str:
+    """Return an opaque, stable registry prefix for one profile owner."""
+    canonical = _canonical_managed_profile_home(profile_home)
+    if canonical is None:
+        return ""
+    import hashlib
+
+    digest = hashlib.sha256(
+        canonical.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
+    return f"{_MANAGED_PROFILE_REGISTRY_PREFIX}{digest}:"
+
+
+def _managed_profile_registry_key(
+    task_id: Optional[str],
+    profile_home: object | None = None,
+) -> str:
+    """Bind a task/session key to its canonical multiplex profile owner."""
+    raw = str(task_id or "default")
+    prefix = _managed_profile_registry_prefix(profile_home)
+    return f"{prefix}{raw}" if prefix else raw
+
 # ── Per-session cwd records (cwd rearchitecture, step 1) ────────────────────
 #
 # The durable source of truth for "which directory is THIS session working
@@ -2693,7 +2740,7 @@ def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
     """
     if not isinstance(cwd, str) or not cwd.strip():
         return
-    key = str(session_key or "default")
+    key = _managed_profile_registry_key(session_key)
     with _session_cwd_lock:
         if _session_cwd.get(key) != cwd:
             _session_cwd[key] = cwd
@@ -2706,15 +2753,16 @@ def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
     means (config default, TERMINAL_CWD seed, process cwd). ``None``/empty
     keys read the ``"default"`` record.
     """
-    key = str(session_key or "default")
+    key = _managed_profile_registry_key(session_key)
     with _session_cwd_lock:
         return _session_cwd.get(key)
 
 
 def clear_session_cwd(session_key: str) -> None:
     """Drop a session's cwd record (session teardown)."""
+    key = _managed_profile_registry_key(session_key)
     with _session_cwd_lock:
-        _session_cwd.pop(session_key, None)
+        _session_cwd.pop(key, None)
 
 
 def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
@@ -2733,7 +2781,8 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         task_id: The rollout's unique task identifier
         overrides: Dict of config keys to override
     """
-    _task_env_overrides[task_id] = overrides
+    raw_task_key = _managed_profile_registry_key(task_id)
+    _task_env_overrides[raw_task_key] = overrides
 
     # If a live environment already exists for this task, a freshly registered
     # ``cwd`` override (e.g. the ACP client switching the editor's project root
@@ -2752,7 +2801,7 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         # updates the originating session's env.
         container_id = _resolve_container_task_id(task_id)
         with _env_lock:
-            env = _active_environments.get(task_id) or _active_environments.get(container_id)
+            env = _active_environments.get(raw_task_key) or _active_environments.get(container_id)
         if env is not None and getattr(env, "cwd", None) is not None:
             env.cwd = new_cwd
 
@@ -2763,7 +2812,7 @@ def clear_task_env_overrides(task_id: str):
 
     Called during cleanup to avoid stale entries accumulating.
     """
-    _task_env_overrides.pop(task_id, None)
+    _task_env_overrides.pop(_managed_profile_registry_key(task_id), None)
     clear_session_cwd(task_id)
 
 
@@ -2795,11 +2844,12 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
         "docker_image", "modal_image", "singularity_image",
         "daytona_image", "env_type",
     })
-    if task_id and task_id in _task_env_overrides:
-        overrides = _task_env_overrides[task_id]
+    raw_task_key = _managed_profile_registry_key(task_id)
+    if task_id and raw_task_key in _task_env_overrides:
+        overrides = _task_env_overrides[raw_task_key]
         if set(overrides.keys()) & _ISOLATION_KEYS:
-            return task_id
-    return "default"
+            return raw_task_key
+    return _managed_profile_registry_key("default")
 
 
 def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
@@ -2814,10 +2864,10 @@ def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
     the originating session's override is silently dropped. This is the single
     source of that lookup so the terminal and file layers can't drift apart.
     """
-    raw = task_id or "default"
+    raw = _managed_profile_registry_key(task_id)
     return (
         _task_env_overrides.get(raw)
-        or _task_env_overrides.get(_resolve_container_task_id(raw))
+        or _task_env_overrides.get(_resolve_container_task_id(task_id))
         or {}
     )
 
@@ -3330,8 +3380,9 @@ def _stop_cleanup_thread():
 def get_active_env(task_id: str):
     """Return the active BaseEnvironment for *task_id*, or None."""
     lookup = _resolve_container_task_id(task_id)
+    raw_task_key = _managed_profile_registry_key(task_id)
     with _env_lock:
-        return _active_environments.get(lookup) or _active_environments.get(task_id)
+        return _active_environments.get(lookup) or _active_environments.get(raw_task_key)
 
 
 def is_persistent_env(task_id: str) -> bool:
@@ -3360,7 +3411,7 @@ def cleanup_all_environments():
     
     for task_id in task_ids:
         try:
-            cleanup_vm(task_id)
+            cleanup_vm(task_id, _already_scoped=True)
             cleaned += 1
         except Exception as e:
             logger.error("Error cleaning %s: %s", task_id, e, exc_info=True)
@@ -3380,7 +3431,12 @@ def cleanup_all_environments():
     return cleaned
 
 
-def cleanup_vm(task_id: str, *, force_remove: bool = False):
+def cleanup_vm(
+    task_id: str,
+    *,
+    force_remove: bool = False,
+    _already_scoped: bool = False,
+):
     """Manually clean up a specific environment by task_id.
 
     *force_remove* (default False) is forwarded to backends that accept it
@@ -3404,19 +3460,20 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     # Remove from tracking dicts while holding the lock, but defer the
     # actual (potentially slow) env.cleanup() call to outside the lock
     # so other tool calls aren't blocked.
+    registry_key = task_id if _already_scoped else _resolve_container_task_id(task_id)
     env = None
     with _env_lock:
-        env = _active_environments.pop(task_id, None)
-        _last_activity.pop(task_id, None)
+        env = _active_environments.pop(registry_key, None)
+        _last_activity.pop(registry_key, None)
 
     # Clean up per-task creation lock
     with _creation_locks_lock:
-        _creation_locks.pop(task_id, None)
+        _creation_locks.pop(registry_key, None)
 
     # Invalidate stale file_ops cache entry
     try:
         from tools.file_tools import clear_file_ops_cache
-        clear_file_ops_cache(task_id)
+        clear_file_ops_cache(registry_key)
     except ImportError:
         pass
 
@@ -3438,14 +3495,41 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
         elif hasattr(env, 'terminate'):
             env.terminate()
 
-        logger.info("Manually cleaned up environment for task: %s", task_id)
+        logger.info("Manually cleaned up environment for task: %s", registry_key)
 
     except Exception as e:
         error_str = str(e)
         if "404" in error_str or "not found" in error_str.lower():
-            logger.info("Environment for task %s already cleaned up", task_id)
+            logger.info("Environment for task %s already cleaned up", registry_key)
         else:
-            logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
+            logger.warning("Error cleaning up environment for task %s: %s", registry_key, e)
+
+
+def cleanup_managed_profile_environments(profile_home: object) -> int:
+    """Destroy terminal state owned by one unloaded multiplex profile."""
+    prefix = _managed_profile_registry_prefix(profile_home)
+    if not prefix:
+        return 0
+
+    with _env_lock:
+        active_keys = [
+            key for key in _active_environments if key.startswith(prefix)
+        ]
+    for key in active_keys:
+        cleanup_vm(key, force_remove=True, _already_scoped=True)
+
+    with _session_cwd_lock:
+        for key in list(_session_cwd):
+            if key.startswith(prefix):
+                _session_cwd.pop(key, None)
+    for key in list(_task_env_overrides):
+        if key.startswith(prefix):
+            _task_env_overrides.pop(key, None)
+    with _creation_locks_lock:
+        for key in list(_creation_locks):
+            if key.startswith(prefix):
+                _creation_locks.pop(key, None)
+    return len(active_keys)
 
 
 def _atexit_cleanup():
@@ -3757,6 +3841,7 @@ def terminal_tool(
         # every delegate_task child share one container; only task_ids with
         # a registered env override (RL benchmarks) get isolated sandboxes.
         effective_task_id = _resolve_container_task_id(task_id)
+        raw_task_key = _managed_profile_registry_key(task_id)
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config. ``resolve_task_overrides``
@@ -3875,7 +3960,7 @@ def terminal_tool(
             # task_id; honor it instead of spawning a duplicate.
             _existing_key = (
                 effective_task_id if effective_task_id in _active_environments
-                else (task_id if task_id and task_id in _active_environments else None)
+                else (raw_task_key if raw_task_key in _active_environments else None)
             )
             if _existing_key is not None:
                 _last_activity[_existing_key] = time.time()
@@ -3896,7 +3981,7 @@ def terminal_tool(
                 with _env_lock:
                     _existing_key = (
                         effective_task_id if effective_task_id in _active_environments
-                        else (task_id if task_id and task_id in _active_environments else None)
+                        else (raw_task_key if raw_task_key in _active_environments else None)
                     )
                     if _existing_key is not None:
                         _last_activity[_existing_key] = time.time()

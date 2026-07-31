@@ -611,8 +611,10 @@ class TestSensitivePathCheck:
     @_skip_macos_tmp_config
     def test_hermes_config_blocked_for_write_file(self, tmp_path, monkeypatch):
         fake_config = tmp_path / "config.yaml"
-        monkeypatch.setattr("tools.file_tools._hermes_config_resolved", str(fake_config))
-        monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
+        monkeypatch.setattr(
+            "tools.file_tools._get_hermes_config_resolved",
+            lambda: str(fake_config),
+        )
 
         from tools.file_tools import write_file_tool
         result = json.loads(write_file_tool(str(fake_config), "approvals:\n  mode: off\n"))
@@ -622,8 +624,10 @@ class TestSensitivePathCheck:
     @_skip_macos_tmp_config
     def test_hermes_config_blocked_via_tilde_path(self, tmp_path, monkeypatch):
         fake_config = tmp_path / "config.yaml"
-        monkeypatch.setattr("tools.file_tools._hermes_config_resolved", str(fake_config))
-        monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
+        monkeypatch.setattr(
+            "tools.file_tools._get_hermes_config_resolved",
+            lambda: str(fake_config),
+        )
 
         from tools.file_tools import write_file_tool
         result = json.loads(write_file_tool(str(fake_config), "approvals:\n  mode: off\n"))
@@ -634,8 +638,10 @@ class TestSensitivePathCheck:
     def test_hermes_config_blocked_for_patch(self, tmp_path, monkeypatch):
         fake_config = tmp_path / "config.yaml"
         fake_config.write_text("approvals:\n  mode: manual\n")
-        monkeypatch.setattr("tools.file_tools._hermes_config_resolved", str(fake_config))
-        monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
+        monkeypatch.setattr(
+            "tools.file_tools._get_hermes_config_resolved",
+            lambda: str(fake_config),
+        )
 
         from tools.file_tools import patch_tool
         result = json.loads(patch_tool(
@@ -648,8 +654,10 @@ class TestSensitivePathCheck:
         assert "Hermes config" in result["error"]
 
     def test_system_path_still_blocked(self, monkeypatch):
-        monkeypatch.setattr("tools.file_tools._hermes_config_resolved", "/some/other/path")
-        monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
+        monkeypatch.setattr(
+            "tools.file_tools._get_hermes_config_resolved",
+            lambda: "/some/other/path",
+        )
 
         from tools.file_tools import write_file_tool
         result = json.loads(write_file_tool("/etc/passwd", "evil"))
@@ -864,6 +872,46 @@ class TestSensitivePathCheck:
         assert "managed sibling profile path" in result["error"]
         assert target.read_text(encoding="utf-8") == "private\n"
 
+    def test_managed_profiles_each_block_their_own_config_write(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from tools import file_tools
+
+        hermes_root = tmp_path / "hermes_home"
+        profiles = [hermes_root / "profiles" / name for name in ("alpha", "beta")]
+        for profile in profiles:
+            profile.mkdir(parents=True, exist_ok=True)
+            profile.joinpath("config.yaml").write_text(
+                "approvals:\n  mode: manual\n", encoding="utf-8"
+            )
+        monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+        monkeypatch.setattr(
+            file_tools,
+            "_MANAGED_CLAW_HERMES_ROOTS",
+            (str(hermes_root.resolve()),),
+        )
+        monkeypatch.setattr(file_tools, "_SENSITIVE_PATH_PREFIXES", ())
+
+        for profile in profiles:
+            token = set_hermes_home_override(profile)
+            try:
+                result = json.loads(
+                    file_tools.write_file_tool(
+                        str(profile / "config.yaml"),
+                        "approvals:\n  mode: off\n",
+                    )
+                )
+            finally:
+                reset_hermes_home_override(token)
+            assert "Hermes config" in result["error"]
+            assert profile.joinpath("config.yaml").read_text(encoding="utf-8") == (
+                "approvals:\n  mode: manual\n"
+            )
+
     @pytest.mark.parametrize("tool_name", ["write", "patch"])
     @pytest.mark.parametrize(
         "target",
@@ -905,8 +953,10 @@ class TestSensitivePathCheck:
 
     @patch("tools.file_tools._get_file_ops")
     def test_normal_file_not_blocked(self, mock_get, monkeypatch):
-        monkeypatch.setattr("tools.file_tools._hermes_config_resolved", "/home/user/.hermes/config.yaml")
-        monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
+        monkeypatch.setattr(
+            "tools.file_tools._get_hermes_config_resolved",
+            lambda: "/home/user/.hermes/config.yaml",
+        )
         mock_ops = MagicMock()
         result_obj = MagicMock()
         result_obj.to_dict.return_value = {"status": "ok", "path": "/tmp/other.txt", "bytes": 5}

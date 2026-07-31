@@ -671,25 +671,23 @@ def _managed_sibling_profile_error(
             )
     return None
 
-_hermes_config_resolved: str | None = None
-_hermes_config_resolved_loaded = False
-
-
 def _get_hermes_config_resolved() -> str | None:
-    """Return the resolved absolute path of the Hermes config file (cached)."""
-    global _hermes_config_resolved, _hermes_config_resolved_loaded
-    if _hermes_config_resolved_loaded:
-        return _hermes_config_resolved
-    _hermes_config_resolved_loaded = True
+    """Return the active profile's resolved Hermes config path.
+
+    A multiplex gateway changes ``get_hermes_home()`` through a ContextVar on
+    every profile dispatch.  A process-global single-value cache would pin the
+    first profile's config path and let later profiles rewrite their own
+    security settings.  Resolution is cheap and must remain request-scoped.
+    """
     try:
         from hermes_cli.config import get_config_path
-        _hermes_config_resolved = str(get_config_path().resolve())
+
+        return str(get_config_path().resolve())
     except Exception:
         try:
-            _hermes_config_resolved = str(Path(_expand_tilde("~/.hermes/config.yaml")).resolve())
+            return str(Path(_expand_tilde("~/.hermes/config.yaml")).resolve())
         except Exception:
-            _hermes_config_resolved = None
-    return _hermes_config_resolved
+            return None
 
 
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:

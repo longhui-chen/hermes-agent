@@ -4177,6 +4177,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 from tools.environments.local import (
                     retire_managed_terminal_profile,
                 )
+                from tools.terminal_tool import cleanup_managed_profile_environments
                 from tools.process_registry import process_registry
 
                 killed_profile_processes = await _to_thread_with_completion_barrier(
@@ -4184,9 +4185,16 @@ class ZetAgentAdapter(APIServerAdapter):
                         profile_owner=profile_home
                     )
                 )
+                cleaned_terminal_environments = await _to_thread_with_completion_barrier(
+                    cleanup_managed_profile_environments,
+                    profile_home,
+                )
                 terminal_cleanup = await _to_thread_with_completion_barrier(
                     retire_managed_terminal_profile,
                     profile_home,
+                )
+                terminal_cleanup["terminal_environments_removed"] = (
+                    cleaned_terminal_environments
                 )
                 if process_registry.has_active_for_profile(profile_home):
                     raise OSError("profile process registry is still active")
