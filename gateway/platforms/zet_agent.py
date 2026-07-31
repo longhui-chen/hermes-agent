@@ -391,7 +391,8 @@ class ZetAgentAdapter(APIServerAdapter):
         # for any interaction the agent thread is still blocked on.
         self._pending_lock = threading.Lock()
         self._pending_clarify: Dict[str, Dict[str, Any]] = {}
-        self._pending_approval: Dict[str, Dict[str, Any]] = {}
+        self._pending_approval: Dict[str, List[Dict[str, Any]]] = {}
+        self._approval_stream_queues: Dict[str, Any] = {}
 
         # Active chat-completions turns keyed by X-Hermes-Session-Id, so
         # POST /v1/sessions/{sid}/interrupt can find the running agent +
@@ -1290,6 +1291,88 @@ class ZetAgentAdapter(APIServerAdapter):
     # Approval — register notify callback, resolve via HTTP respond
     # ------------------------------------------------------------------
 
+    def _approval_projection_head(self, session_id: str) -> Optional[Dict[str, Any]]:
+        with self._pending_lock:
+            raw_queue = self._pending_approval.get(session_id)
+            if isinstance(raw_queue, dict):
+                return raw_queue
+            if raw_queue:
+                return raw_queue[0]
+        return None
+
+    def _cache_approval_projection(
+        self,
+        stream_q: Any,
+        session_id: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        with self._pending_lock:
+            raw_queue = self._pending_approval.get(session_id)
+            if isinstance(raw_queue, dict):
+                queue = [raw_queue]
+            else:
+                queue = list(raw_queue or [])
+            should_emit = not queue
+            queue.append(payload)
+            self._pending_approval[session_id] = queue
+            stream_queues = getattr(self, "_approval_stream_queues", None)
+            if stream_queues is None:
+                stream_queues = {}
+                self._approval_stream_queues = stream_queues
+            stream_queues[session_id] = stream_q
+        if should_emit:
+            stream_q.put(("__tool_progress__", payload))
+            try:
+                self._goals().on_interaction_pending(session_id)
+            except Exception:
+                logger.debug("[zet_agent] goal waiting projection failed", exc_info=True)
+
+    def _remove_approval_projection(
+        self,
+        session_id: str,
+        approval_id: Optional[str],
+    ) -> bool:
+        next_payload = None
+        stream_q = None
+        with self._pending_lock:
+            raw_queue = self._pending_approval.get(session_id)
+            if isinstance(raw_queue, dict):
+                queue = [raw_queue]
+            else:
+                queue = list(raw_queue or [])
+            if not queue:
+                return False
+            target_index = 0
+            if approval_id is not None:
+                target_index = next(
+                    (
+                        index
+                        for index, item in enumerate(queue)
+                        if item.get("approval_id") == approval_id
+                    ),
+                    -1,
+                )
+                if target_index < 0:
+                    return True
+            removed_head = target_index == 0
+            queue.pop(target_index)
+            if queue:
+                self._pending_approval[session_id] = queue
+                if removed_head:
+                    next_payload = queue[0]
+                    stream_q = getattr(
+                        self, "_approval_stream_queues", {}
+                    ).get(session_id)
+            else:
+                self._pending_approval.pop(session_id, None)
+                getattr(self, "_approval_stream_queues", {}).pop(session_id, None)
+        if next_payload is not None and stream_q is not None:
+            try:
+                stream_q.put(("__tool_progress__", next_payload))
+            except Exception:
+                logger.debug("[zet_agent] approval projection push failed", exc_info=True)
+        return bool(queue)
+
     def _make_approval_cb(self, stream_q: Any, session_id: str):
         """Return a callable suitable for ``register_gateway_notify``.
 
@@ -1327,19 +1410,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 "pattern_keys": list(approval_data.get("pattern_keys", []) or []),
                 "expires_at_ms": expires_at_ms,
             }
-            with self._pending_lock:
-                self._pending_approval[session_id] = payload
             try:
-                stream_q.put(("__tool_progress__", payload))
+                self._cache_approval_projection(stream_q, session_id, payload)
             except Exception:
                 logger.debug("[zet_agent] approval notify push failed", exc_info=True)
-            # Goal projection: a blocked approval means the loop is waiting
-            # on the user — surface it on the App's goal banner (HR#3: goal
-            # rounds never auto-approve). No-op for non-goal sessions.
-            try:
-                self._goals().on_interaction_pending(session_id)
-            except Exception:
-                logger.debug("[zet_agent] goal waiting projection failed", exc_info=True)
 
         return _notify
 
@@ -2376,24 +2450,19 @@ class ZetAgentAdapter(APIServerAdapter):
                 choice,
                 approval_id=approval_id,
             )
+        has_pending_projection = False
         if resolved:
-            with self._pending_lock:
-                pending = self._pending_approval.get(session_id)
-                if (
-                    pending is not None
-                    and (
-                        approval_id is None
-                        or pending.get("approval_id") == approval_id
-                    )
-                ):
-                    self._pending_approval.pop(session_id, None)
+            has_pending_projection = self._remove_approval_projection(
+                session_id,
+                approval_id,
+            )
         # Goal projection: the loop is no longer blocked on the user — flip
         # the App banner back from "waiting". No-op for non-goal sessions.
         # 仅在真的解析了 approval（resolved > 0）时才清等待标记（codex P1）：
         # gateway 重启后内存 queue 已丢、App 对旧卡片的 POST 返回 resolved=0，
         # 此时清掉 sidecar 上的 interaction_pending 会让 reconcile/自动 resume
         # 把本该等确认的 goal 继续自驱（用户点的可能还是 deny）。
-        if resolved:
+        if resolved and not has_pending_projection:
             try:
                 await asyncio.to_thread(self._goals().on_interaction_resolved, session_id)
             except Exception:
@@ -2483,8 +2552,8 @@ class ZetAgentAdapter(APIServerAdapter):
             return auth_err
         session_id = request.match_info.get("session_id", "")
         scoped_session_key = self._active_turn_key(session_id)
+        ap = self._approval_projection_head(session_id)
         with self._pending_lock:
-            ap = self._pending_approval.get(session_id)
             cl = self._pending_clarify.get(scoped_session_key)
         return web.json_response({
             "approval": ap,
@@ -3189,7 +3258,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 mapped_key = getattr(
                     self, "_approval_session_keys", {}
                 ).pop(scoped_session_key, None)
-                pending_card = self._pending_approval.get(session_id)
+            pending_card = self._approval_projection_head(session_id)
             if mapped_key:
                 approval_keys.add(mapped_key)
             if pending_card and pending_card.get("approval_id"):
@@ -3219,6 +3288,7 @@ class ZetAgentAdapter(APIServerAdapter):
         with self._pending_lock:
             self._pending_clarify.pop(scoped_session_key, None)
             self._pending_approval.pop(session_id, None)
+            getattr(self, "_approval_stream_queues", {}).pop(session_id, None)
 
     # ------------------------------------------------------------------
     # Diagnostic wrapper around base /v1/chat/completions

@@ -2015,10 +2015,11 @@ def detect_dangerous_command(command: str) -> tuple:
 
 _lock = threading.Lock()
 _MAX_DEFERRED_APPROVALS_PER_SESSION = 16
-_pending: dict[str, list[dict]] = {}
-_one_shot_approved: dict[str, dict[str, list[float]]] = {}
-_session_approved: dict[str, set] = {}
-_session_yolo: set[str] = set()
+_ApprovalStateKey = str | tuple[str, str]
+_pending: dict[_ApprovalStateKey, list[dict]] = {}
+_one_shot_approved: dict[_ApprovalStateKey, dict[str, list[float]]] = {}
+_session_approved: dict[_ApprovalStateKey, set] = {}
+_session_yolo: set[_ApprovalStateKey] = set()
 _permanent_approved: set = set()
 
 
@@ -2031,6 +2032,23 @@ def _approval_profile_scope() -> str:
         return os.path.realpath(str(get_hermes_home()))
     except Exception:
         return ""
+
+
+def _approval_state_key(session_key: str) -> _ApprovalStateKey:
+    """Bind mutable approval state to the active multiplex profile."""
+
+    from agent.secret_scope import is_multiplex_active
+
+    if not is_multiplex_active():
+        return session_key
+    profile_scope = _approval_profile_scope()
+    if not profile_scope:
+        raise RuntimeError("multiplex approval state requires a profile scope")
+    return (profile_scope, session_key)
+
+
+def _approval_raw_session_key(state_key: _ApprovalStateKey) -> str:
+    return state_key[1] if isinstance(state_key, tuple) else state_key
 
 # =========================================================================
 # Blocking gateway approval (mirrors CLI's synchronous input() flow)
@@ -2055,8 +2073,8 @@ class _ApprovalEntry:
         self.reason: Optional[str] = None
 
 
-_gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
-_gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_gateway_queues: dict[_ApprovalStateKey, list] = {}
+_gateway_notify_cbs: dict[_ApprovalStateKey, object] = {}
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -2067,8 +2085,9 @@ def register_gateway_notify(session_key: str, cb) -> None:
     ``pattern_keys``.  The callback bridges sync→async (runs in the agent
     thread, must schedule the actual send on the event loop).
     """
+    state_key = _approval_state_key(session_key)
     with _lock:
-        _gateway_notify_cbs[session_key] = cb
+        _gateway_notify_cbs[state_key] = cb
 
 
 def unregister_gateway_notify(session_key: str) -> None:
@@ -2077,9 +2096,10 @@ def unregister_gateway_notify(session_key: str) -> None:
     Signals ALL blocked threads for this session so they don't hang forever
     (e.g. when the agent run finishes or is interrupted).
     """
+    state_key = _approval_state_key(session_key)
     with _lock:
-        _gateway_notify_cbs.pop(session_key, None)
-        entries = _gateway_queues.pop(session_key, [])
+        _gateway_notify_cbs.pop(state_key, None)
+        entries = _gateway_queues.pop(state_key, [])
     for entry in entries:
         entry.event.set()
 
@@ -2101,10 +2121,11 @@ def resolve_gateway_approval(session_key: str, choice: str,
 
     Returns the number of approvals resolved (0 means nothing was pending).
     """
+    state_key = _approval_state_key(session_key)
     pending = None
     targets = []
     with _lock:
-        queue = _gateway_queues.get(session_key)
+        queue = _gateway_queues.get(state_key)
         if queue:
             if resolve_all:
                 targets = list(queue)
@@ -2130,21 +2151,21 @@ def resolve_gateway_approval(session_key: str, choice: str,
                 # bind their response to that exact live card.
                 targets = [queue.pop(0)]
             if not queue:
-                _gateway_queues.pop(session_key, None)
+                _gateway_queues.pop(state_key, None)
         else:
             # API/dashboard sessions without a live notify callback return an
             # approval_required result instead of blocking the agent thread.
             # Deferred requests MUST be resolved by opaque identity: a stale
             # response may never authorize whichever operation was queued
             # later under the same session key.
-            deferred = _pending.get(session_key, [])
+            deferred = _pending.get(state_key, [])
             now = time.monotonic()
             deferred[:] = [
                 item for item in deferred
                 if float(item.get("expires_at_monotonic", 0.0)) >= now
             ]
             if not deferred:
-                _pending.pop(session_key, None)
+                _pending.pop(state_key, None)
                 return 0
             if not approval_id:
                 return 0
@@ -2162,7 +2183,7 @@ def resolve_gateway_approval(session_key: str, choice: str,
                 return 0
             pending = deferred.pop(target_index)
             if not deferred:
-                _pending.pop(session_key, None)
+                _pending.pop(state_key, None)
 
     if targets:
         for entry in targets:
@@ -2219,8 +2240,9 @@ def resolve_gateway_approval(session_key: str, choice: str,
 
 def has_blocking_approval(session_key: str) -> bool:
     """Check if a session has one or more blocking gateway approvals waiting."""
+    state_key = _approval_state_key(session_key)
     with _lock:
-        return bool(_gateway_queues.get(session_key))
+        return bool(_gateway_queues.get(state_key))
 
 
 def submit_pending(session_key: str, approval: dict) -> Optional[str]:
@@ -2236,8 +2258,9 @@ def submit_pending(session_key: str, approval: dict) -> Optional[str]:
             now + max(float(_get_approval_timeout()), 1.0)
         ),
     })
+    state_key = _approval_state_key(session_key)
     with _lock:
-        queue = _pending.setdefault(session_key, [])
+        queue = _pending.setdefault(state_key, [])
         queue[:] = [
             item for item in queue
             if float(item.get("expires_at_monotonic", 0.0)) >= now
@@ -2261,7 +2284,7 @@ def approval_session_key_for_id(approval_id: str) -> Optional[str]:
     expected_scope = _approval_profile_scope()
     now = time.monotonic()
     with _lock:
-        for session_key, queue in _gateway_queues.items():
+        for state_key, queue in _gateway_queues.items():
             for entry in queue:
                 if (
                     secrets.compare_digest(
@@ -2272,15 +2295,15 @@ def approval_session_key_for_id(approval_id: str) -> Optional[str]:
                         expected_scope,
                     )
                 ):
-                    return session_key
+                    return _approval_raw_session_key(state_key)
 
-        for session_key, queue in list(_pending.items()):
+        for state_key, queue in list(_pending.items()):
             queue[:] = [
                 item for item in queue
                 if float(item.get("expires_at_monotonic", 0.0)) >= now
             ]
             if not queue:
-                _pending.pop(session_key, None)
+                _pending.pop(state_key, None)
                 continue
             for item in queue:
                 if (
@@ -2292,15 +2315,16 @@ def approval_session_key_for_id(approval_id: str) -> Optional[str]:
                         expected_scope,
                     )
                 ):
-                    return session_key
+                    return _approval_raw_session_key(state_key)
     return None
 
 
 def _grant_one_shot_approval(session_key: str, pattern_key: str) -> None:
     """Issue one bounded, exact-pattern replay grant for a deferred request."""
     expires_at = time.monotonic() + max(float(_get_approval_timeout()), 1.0)
+    state_key = _approval_state_key(session_key)
     with _lock:
-        grants = _one_shot_approved.setdefault(session_key, {})
+        grants = _one_shot_approved.setdefault(state_key, {})
         now = time.monotonic()
         for key in list(grants):
             grants[key] = [expiry for expiry in grants[key] if expiry >= now]
@@ -2321,8 +2345,9 @@ def _grant_one_shot_approval(session_key: str, pattern_key: str) -> None:
 def _consume_one_shot_approval(session_key: str, pattern_key: str) -> bool:
     """Atomically consume a non-expired replay grant for this exact pattern."""
     now = time.monotonic()
+    state_key = _approval_state_key(session_key)
     with _lock:
-        grants = _one_shot_approved.get(session_key)
+        grants = _one_shot_approved.get(state_key)
         if not grants:
             return False
         expiries = grants.get(pattern_key, [])
@@ -2330,13 +2355,13 @@ def _consume_one_shot_approval(session_key: str, pattern_key: str) -> bool:
         if not expiries:
             grants.pop(pattern_key, None)
             if not grants:
-                _one_shot_approved.pop(session_key, None)
+                _one_shot_approved.pop(state_key, None)
             return False
         expiries.pop(0)
         if not expiries:
             grants.pop(pattern_key, None)
         if not grants:
-            _one_shot_approved.pop(session_key, None)
+            _one_shot_approved.pop(state_key, None)
         return True
 
 
@@ -2360,10 +2385,11 @@ def cancel_session_approvals(
     """
     if not session_key:
         return 0
+    state_key = _approval_state_key(session_key)
     with _lock:
-        entries = _gateway_queues.pop(session_key, [])
-        pending = _pending.pop(session_key, [])
-        grants = _one_shot_approved.pop(session_key, {})
+        entries = _gateway_queues.pop(state_key, [])
+        pending = _pending.pop(state_key, [])
+        grants = _one_shot_approved.pop(state_key, {})
     for entry in entries:
         entry.result = "deny"
         entry.reason = reason
@@ -2377,36 +2403,40 @@ def cancel_session_approvals(
 
 def approve_session(session_key: str, pattern_key: str):
     """Approve a pattern for this session only."""
+    state_key = _approval_state_key(session_key)
     with _lock:
-        _session_approved.setdefault(session_key, set()).add(pattern_key)
+        _session_approved.setdefault(state_key, set()).add(pattern_key)
 
 
 def enable_session_yolo(session_key: str) -> None:
     """Enable YOLO bypass for a single session key."""
     if not session_key:
         return
+    state_key = _approval_state_key(session_key)
     with _lock:
-        _session_yolo.add(session_key)
+        _session_yolo.add(state_key)
 
 
 def disable_session_yolo(session_key: str) -> None:
     """Disable YOLO bypass for a single session key."""
     if not session_key:
         return
+    state_key = _approval_state_key(session_key)
     with _lock:
-        _session_yolo.discard(session_key)
+        _session_yolo.discard(state_key)
 
 
 def clear_session(session_key: str) -> None:
     """Remove all approval and yolo state for a given session."""
     if not session_key:
         return
+    state_key = _approval_state_key(session_key)
     with _lock:
-        _session_approved.pop(session_key, None)
-        _session_yolo.discard(session_key)
-        _pending.pop(session_key, None)
-        _one_shot_approved.pop(session_key, None)
-        entries = _gateway_queues.pop(session_key, [])
+        _session_approved.pop(state_key, None)
+        _session_yolo.discard(state_key)
+        _pending.pop(state_key, None)
+        _one_shot_approved.pop(state_key, None)
+        entries = _gateway_queues.pop(state_key, [])
     for entry in entries:
         # Session-boundary cleanup should cancel any blocked approval waits
         # immediately so the old run can unwind instead of idling until timeout.
@@ -2418,8 +2448,9 @@ def is_session_yolo_enabled(session_key: str) -> bool:
     """Return True when YOLO bypass is enabled for a specific session."""
     if not session_key:
         return False
+    state_key = _approval_state_key(session_key)
     with _lock:
-        return session_key in _session_yolo
+        return state_key in _session_yolo
 
 
 def is_current_session_yolo_enabled() -> bool:
@@ -2434,10 +2465,11 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
     existing command_allowlist entries continue to work after key migrations.
     """
     aliases = _approval_key_aliases(pattern_key)
+    state_key = _approval_state_key(session_key)
     with _lock:
         if any(alias in _permanent_approved for alias in aliases):
             return True
-        session_approvals = _session_approved.get(session_key, set())
+        session_approvals = _session_approved.get(state_key, set())
         return any(alias in session_approvals for alias in aliases)
 
 
@@ -3025,7 +3057,7 @@ def _run_approval_gate(
         # approved/BLOCKED outcome.
         notify_cb = None
         with _lock:
-            notify_cb = _gateway_notify_cbs.get(session_key)
+            notify_cb = _gateway_notify_cbs.get(_approval_state_key(session_key))
 
         if notify_cb is not None:
             from agent.redact import redact_sensitive_text
@@ -3393,16 +3425,17 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     all_keys = approval_data.get("pattern_keys", [primary_key])
 
     entry = _ApprovalEntry(approval_data)
+    state_key = _approval_state_key(session_key)
     with _lock:
-        _gateway_queues.setdefault(session_key, []).append(entry)
+        _gateway_queues.setdefault(state_key, []).append(entry)
 
     def _drop_entry() -> None:
         with _lock:
-            queue = _gateway_queues.get(session_key, [])
+            queue = _gateway_queues.get(state_key, [])
             if entry in queue:
                 queue.remove(entry)
             if not queue:
-                _gateway_queues.pop(session_key, None)
+                _gateway_queues.pop(state_key, None)
 
     # Notify plugins that an approval is being requested. Fires before the
     # gateway notify callback so observers get the event in real time.
@@ -3762,7 +3795,7 @@ def check_all_command_guards(command: str, env_type: str,
     if is_gateway or is_ask:
         notify_cb = None
         with _lock:
-            notify_cb = _gateway_notify_cbs.get(session_key)
+            notify_cb = _gateway_notify_cbs.get(_approval_state_key(session_key))
 
         if notify_cb is not None:
             # --- Blocking gateway approval (queue-based) ---
@@ -4109,7 +4142,7 @@ def check_execute_code_guard(code: str, env_type: str,
 
     notify_cb = None
     with _lock:
-        notify_cb = _gateway_notify_cbs.get(session_key)
+        notify_cb = _gateway_notify_cbs.get(_approval_state_key(session_key))
 
     if notify_cb is None:
         # No gateway callback registered (e.g. ask-mode without a notifier):
@@ -4252,7 +4285,7 @@ def request_elicitation_consent(
 
     if _is_gateway_approval_context():
         with _lock:
-            notify_cb = _gateway_notify_cbs.get(session_key)
+            notify_cb = _gateway_notify_cbs.get(_approval_state_key(session_key))
         if notify_cb is None:
             logger.warning(
                 "Elicitation requested in gateway session %s but no "
