@@ -66,6 +66,7 @@ class TestEnsureHermesHome:
     @pytest.mark.parametrize("profile", ["writer", "main", "memo", "default", "root"])
     def test_zettlab_managed_profile_does_not_seed_soul(self, tmp_path, profile):
         profile_home = tmp_path / "profiles" / profile
+        profile_home.mkdir(parents=True)
         with patch.dict(
             os.environ,
             {"HERMES_HOME": str(profile_home), "ZET_AGENT_ID": profile},
@@ -79,6 +80,7 @@ class TestEnsureHermesHome:
 
         root_home = tmp_path / ".hermes"
         profile_home = root_home / "profiles" / "writer"
+        profile_home.mkdir(parents=True)
         with patch.dict(
             os.environ,
             {"HERMES_HOME": str(root_home), "ZET_AGENT_ID": "main"},

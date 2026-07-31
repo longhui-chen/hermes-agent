@@ -1315,7 +1315,9 @@ def _try_persist_to_session(
         _dbg(f"_try_persist: SessionDB ImportError: {_ie}")
         return f"zet_agent session persist unavailable: {_ie}"
 
-    db = SessionDB()
+    # Resolve the profile's state.db at call time; bare SessionDB() is pinned to the import-time top-level DEFAULT_DB_PATH.
+    from hermes_constants import get_hermes_home
+    db = SessionDB(db_path=get_hermes_home() / "state.db")
     try:
         # deliver=origin 但源对话已被 App 删除：直接 append 会撞 messages→sessions
         # 外键、cron 输出静默丢失。改为新建一个同 user/agent 的承接会话，把本次及
@@ -1354,6 +1356,11 @@ def _try_persist_to_session(
             content=content,
         )
         _dbg(f"_try_persist: appended msg_id={msg_id} session={target_id} recreated={origin_recreated}")
+        # gateway.log line so "cron ran but chat empty" is a grep: db = the state.db it landed in.
+        logger.info(
+            "cron persist: job=%s session=%s db=%s msg_id=%s recreated=%s",
+            job_id, target_id, getattr(db, "db_path", "?"), msg_id, origin_recreated,
+        )
     finally:
         try:
             db.close()
@@ -1394,7 +1401,11 @@ def _try_notify_chat_append(session_id: str, msg_id: int, content: str) -> None:
             body = resp.read(256).decode("utf-8", errors="replace")
             _dbg(f"_try_notify_chat_append: POST status={resp.status} body={body!r}")
     except Exception as e:
-        _dbg(f"_try_notify_chat_append: POST FAILED: {e!r}")
+        # best-effort realtime nudge; summary is already persisted so /history recovers — log, don't fail delivery.
+        logger.warning(
+            "cron realtime chat-append failed (best-effort): session=%s msg_id=%s err=%r",
+            session_id, msg_id, e,
+        )
 
 
 def _build_typed_message_content(

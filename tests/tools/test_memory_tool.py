@@ -305,6 +305,18 @@ class TestMemoryStoreAdd:
         result = store.add("memory", "Project uses Python 3.12 with FastAPI.")
         assert result["success"] is True
 
+    def test_add_zettlab_language_gate_profile_scope_flow(self, store, monkeypatch):
+        """Shared gateway mode: the Zettlab runtime markers live only in the
+        profile secret scope (os.environ has none of them — the fixture deletes
+        them) and the Chinese-only gate must still engage."""
+        from tests.tools._profile_scope import mux_profile_scope
+
+        scope = {"ZET_AGENT_ID": "main"}
+        with mux_profile_scope(monkeypatch, scope):
+            result = store.add("user", "Alice prefers concise engineering updates.")
+        assert result["success"] is False
+        assert "Simplified Chinese" in result["error"]
+
     def test_add_empty_rejected(self, store):
         result = store.add("memory", "  ")
         assert result["success"] is False

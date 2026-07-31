@@ -28,7 +28,12 @@ import os
 import pytest
 
 import gateway.session_context as sc
-from gateway.session_context import _VAR_MAP, clear_session_vars, set_session_vars
+from gateway.session_context import (
+    _VAR_MAP,
+    clear_session_vars,
+    set_session_vars,
+    set_zettlab_connector_route_capability,
+)
 from tools.code_execution_tool import _inject_execute_code_session_context_env, _scrub_child_env
 from tools.environments.local import (
     LocalEnvironment,
@@ -474,6 +479,28 @@ def test_build_connector_runtime_env_uses_profile_scope(monkeypatch):
 
     assert env["ZETTLAB_CONNECTORS_AUTH_TOKEN"] == "main-token"
     assert env["ZET_AGENT_ID"] == "main"
+
+
+def test_connector_route_capability_replaces_only_dedicated_runner_session_key(
+    monkeypatch,
+):
+    """The per-turn capability never replaces generic subprocess routing."""
+    monkeypatch.setenv("HERMES_SESSION_KEY", "foreign-session")
+    tokens = set_session_vars(
+        session_key="real-session",
+        platform="api_server",
+        chat_id="chat-1",
+    )
+    set_zettlab_connector_route_capability("c" * 43)
+    try:
+        connector_env = build_connector_runtime_env()
+        generic_env = _sanitize_subprocess_env(os.environ)
+    finally:
+        set_zettlab_connector_route_capability("")
+        clear_session_vars(tokens)
+
+    assert connector_env["HERMES_SESSION_KEY"] == "c" * 43
+    assert generic_env["HERMES_SESSION_KEY"] == "real-session"
 
 
 def test_sanitize_and_nonterminal_spawn_scrub_connector_runtime_env(monkeypatch):

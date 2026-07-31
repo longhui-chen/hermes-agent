@@ -44,8 +44,8 @@ presets_dir_is_trusted() {
     # per process, so an OTA flip is visible after restart without permanently
     # pinning future starts to an old version directory.
     if [ "$(id -u)" -eq 0 ]; then
-        trusted_data_path_chain "$resolved" "/" || return 1
-        trusted_data_path_chain "$(dirname "$candidate")" "/" || return 1
+        trusted_presets_path_chain "$resolved" "/" || return 1
+        trusted_presets_path_chain "$(dirname "$candidate")" "/" || return 1
     else
         mode="$(stat -c '%a' "$resolved" 2>/dev/null || stat -f '%Lp' "$resolved" 2>/dev/null || true)"
         [ -n "$mode" ] || return 1
@@ -74,24 +74,25 @@ detect_zettlab_presets_dir() {
 }
 
 trusted_data_symlink_target() {
-    local resolved candidate expected="" trust_root=""
+    local resolved candidate expected=""
     resolved="$(readlink -f "$DATA_DIR" 2>/dev/null || true)"
     [ -n "$resolved" ] && [ -d "$resolved" ] || return 1
     for candidate in "$OTA_DATA_TARGET" "$VOLUME_DATA_TARGET"; do
         candidate="$(readlink -f "$candidate" 2>/dev/null || true)"
         if [ -n "$candidate" ] && [ "$resolved" = "$candidate" ]; then
             expected="$candidate"
-            trust_root="$(dirname "$(dirname "$candidate")")"
             break
         fi
     done
     [ -n "$expected" ] || return 1
 
-    trusted_data_path_chain "$resolved" "$trust_root" || return 1
     printf '%s\n' "$resolved"
 }
 
-trusted_data_path_chain() {
+# Presets are executable content selected from a configurable path, so keep the
+# ownership and mode checks for that input. Device data symlinks use the fixed
+# OTA/volume target allowlist above and deliberately do not inherit this gate.
+trusted_presets_path_chain() {
     local current="$1" trust_root="$2" process_uid uid mode group other
     process_uid="$(id -u)"
     while :; do
