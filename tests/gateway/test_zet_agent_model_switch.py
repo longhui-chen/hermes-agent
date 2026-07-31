@@ -1,3 +1,4 @@
+import os
 import types
 from collections import OrderedDict
 
@@ -176,7 +177,8 @@ async def test_agent_model_switch_writes_config_only(tmp_path, monkeypatch):
 
 def test_status_callback_forwards_context_compaction_to_tool_progress_lane():
     stream_q = queue.Queue()
-    cb = ZetAgentAdapter._make_status_cb(stream_q)
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    cb = adapter._make_status_cb(stream_q)
 
     cb("context.compaction", {
         "state": "succeeded",
@@ -198,7 +200,8 @@ def test_status_callback_forwards_context_compaction_to_tool_progress_lane():
 
 def test_status_callback_ignores_unstructured_status():
     stream_q = queue.Queue()
-    cb = ZetAgentAdapter._make_status_cb(stream_q)
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    cb = adapter._make_status_cb(stream_q)
 
     cb("lifecycle", "Compacting context")
 
@@ -208,7 +211,11 @@ def test_status_callback_ignores_unstructured_status():
 def test_status_callback_preserves_existing_callback():
     stream_q = queue.Queue()
     seen = []
-    cb = ZetAgentAdapter._make_status_cb(stream_q, lambda kind, payload=None: seen.append((kind, payload)))
+    adapter = ZetAgentAdapter(PlatformConfig(extra={"key": "test-key"}))
+    cb = adapter._make_status_cb(
+        stream_q,
+        lambda kind, payload=None: seen.append((kind, payload)),
+    )
 
     cb("lifecycle", "Compacting context")
     cb("context.compaction", {"state": "started"})
@@ -272,7 +279,11 @@ async def test_run_agent_no_note_when_model_unchanged(monkeypatch):
 @pytest.mark.asyncio
 async def test_run_agent_forwards_structured_plan_ack(monkeypatch):
     adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
-    plan_ack = {"status": "cancelled", "revision_requested": False}
+    plan_ack = {
+        "turn_id": "plan-turn-1",
+        "status": "cancelled",
+        "revision_requested": False,
+    }
 
     captured = await _capture_run_agent(
         monkeypatch,
@@ -283,6 +294,279 @@ async def test_run_agent_forwards_structured_plan_ack(monkeypatch):
     )
 
     assert captured["plan_ack"] == plan_ack
+
+
+@pytest.mark.asyncio
+async def test_run_agent_legacy_unbound_plan_ack_flow_has_no_execution_capability(
+    monkeypatch,
+):
+    from gateway.platforms.api_server import APIServerAdapter
+    from gateway.session_context import business_execution_token, current_turn_identity
+    from tools.environments.local import build_video_edit_runtime_env
+
+    adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
+    captured = {}
+    boundary_checks = []
+    monkeypatch.setattr(
+        "gateway.platforms.zet_agent.gateway_sensitive_process_boundary_ready",
+        lambda: boundary_checks.append(True) or True,
+    )
+
+    async def fake_super(self, **kwargs):
+        runtime_env = build_video_edit_runtime_env({})
+        captured["receipt"] = [
+            runtime_env.get("HERMES_PLAN_ACK_STATUS", ""),
+            runtime_env.get("HERMES_PLAN_ACK_TURN_ID", ""),
+            runtime_env.get("HERMES_PLAN_ACK_REVISION_REQUESTED", ""),
+        ]
+        captured["turn_identity"] = current_turn_identity()
+        captured["scoped_token"] = business_execution_token()
+        captured["runtime_token"] = runtime_env.get(
+            "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+            "",
+        )
+        captured["forwarded_token"] = kwargs["business_execution_token"]
+        return ({}, {})
+
+    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
+    await adapter._run_agent(
+        user_message="确认执行",
+        conversation_history=[],
+        session_id="legacy-plan-session",
+        turn_id="",
+        business_execution_token="a" * 64,
+        plan_ack={
+            "status": "confirmed",
+            "revision_requested": False,
+        },
+    )
+
+    assert captured == {
+        "receipt": ["confirmed", "", "0"],
+        "turn_identity": None,
+        "scoped_token": "",
+        "runtime_token": "",
+        "forwarded_token": "",
+    }
+    assert boundary_checks == [True]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_direct_unbound_flow_preserves_business_capability(
+    monkeypatch,
+):
+    from gateway.platforms.api_server import APIServerAdapter
+    from gateway.session_context import business_execution_token
+    from tools.environments.local import build_video_edit_runtime_env
+
+    adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
+    captured = {}
+    monkeypatch.setattr(
+        "gateway.platforms.zet_agent.gateway_sensitive_process_boundary_ready",
+        lambda: True,
+    )
+
+    async def fake_super(self, **kwargs):
+        runtime_env = build_video_edit_runtime_env({})
+        captured["scoped_token"] = business_execution_token()
+        captured["runtime_token"] = runtime_env.get(
+            "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+            "",
+        )
+        captured["forwarded_token"] = kwargs["business_execution_token"]
+        return ({}, {})
+
+    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
+    await adapter._run_agent(
+        user_message="直接执行",
+        conversation_history=[],
+        session_id="direct-session",
+        turn_id="",
+        business_execution_token="a" * 64,
+        plan_ack={},
+    )
+
+    assert captured == {
+        "scoped_token": "a" * 64,
+        "runtime_token": "a" * 64,
+        "forwarded_token": "a" * 64,
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_agent_cancelled_plan_ack_drops_business_capability_unit(
+    monkeypatch,
+):
+    from gateway.platforms.api_server import APIServerAdapter
+    from gateway.session_context import business_execution_token
+
+    adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
+    captured = {}
+    monkeypatch.setattr(
+        "gateway.platforms.zet_agent.gateway_sensitive_process_boundary_ready",
+        lambda: True,
+    )
+
+    async def fake_super(self, **kwargs):
+        captured["scoped_token"] = business_execution_token()
+        captured["forwarded_token"] = kwargs["business_execution_token"]
+        return ({}, {})
+
+    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
+    await adapter._run_agent(
+        user_message="取消计划",
+        conversation_history=[],
+        session_id="plan-session",
+        turn_id="confirmation-turn-2",
+        business_execution_token="a" * 64,
+        plan_ack={
+            "turn_id": "plan-turn-1",
+            "status": "cancelled",
+            "revision_requested": False,
+        },
+    )
+
+    assert captured == {"scoped_token": "", "forwarded_token": ""}
+
+
+@pytest.mark.asyncio
+async def test_run_agent_binds_structured_plan_receipt_only_for_current_turn(
+    monkeypatch,
+):
+    from gateway.platforms.api_server import APIServerAdapter
+    from tools.environments.local import LocalEnvironment
+
+    adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
+    monkeypatch.setattr(
+        "gateway.platforms.zet_agent.gateway_sensitive_process_boundary_ready",
+        lambda: True,
+    )
+    captured = []
+    scoped_tokens = []
+    env = LocalEnvironment()
+
+    async def fake_super(self, **kw):
+        from gateway.session_context import business_execution_token
+
+        result = env.execute(
+            "printf '%s|%s|%s|%s|%s' \"$HERMES_TURN_ID\" "
+            "\"$HERMES_PLAN_ACK_STATUS\" \"$HERMES_PLAN_ACK_TURN_ID\" "
+            "\"$HERMES_PLAN_ACK_REVISION_REQUESTED\" "
+            "\"$ZETTLAB_BUSINESS_EXECUTION_TOKEN\""
+        )
+        captured.append(result["output"].split("|"))
+        scoped_tokens.append(business_execution_token())
+        return ({}, {})
+
+    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
+    await adapter._run_agent(
+        user_message="plan",
+        conversation_history=[],
+        session_id="plan-session",
+        turn_id="plan-turn-1",
+    )
+    await adapter._run_agent(
+        user_message="确认执行",
+        conversation_history=[],
+        session_id="plan-session",
+        turn_id="confirmation-turn-2",
+        business_execution_token="a" * 64,
+        plan_ack={
+            "turn_id": "plan-turn-1",
+            "status": "cancelled",
+            "revision_requested": True,
+        },
+    )
+
+    assert captured == [
+        ["plan-turn-1", "", "", "", ""],
+        ["confirmation-turn-2", "cancelled", "plan-turn-1", "1", ""],
+    ]
+    assert scoped_tokens == ["", ""]
+    assert os.environ.get("HERMES_TURN_ID") is None
+    assert os.environ.get("HERMES_PLAN_ACK_STATUS") is None
+    assert os.environ.get("HERMES_PLAN_ACK_TURN_ID") is None
+    assert os.environ.get("HERMES_PLAN_ACK_REVISION_REQUESTED") is None
+    assert os.environ.get("ZETTLAB_BUSINESS_EXECUTION_TOKEN") is None
+
+
+@pytest.mark.asyncio
+async def test_run_agent_requires_process_boundary_before_binding_business_token(
+    monkeypatch,
+):
+    from gateway.platforms.api_server import APIServerAdapter
+    from gateway.session_context import business_execution_token
+
+    adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
+    events = []
+
+    def boundary_ready():
+        events.append(("boundary", business_execution_token()))
+        return True
+
+    async def fake_super(self, **_kwargs):
+        events.append(("model", business_execution_token()))
+        return ({}, {})
+
+    monkeypatch.setattr(
+        zet_agent,
+        "gateway_sensitive_process_boundary_ready",
+        boundary_ready,
+        raising=False,
+    )
+    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
+
+    await adapter._run_agent(
+        user_message="确认执行",
+        conversation_history=[],
+        session_id="plan-session",
+        turn_id="confirmation-turn-2",
+        business_execution_token="a" * 64,
+    )
+
+    assert events == [
+        ("boundary", ""),
+        ("model", "a" * 64),
+    ]
+    assert business_execution_token() == ""
+
+
+@pytest.mark.asyncio
+async def test_run_agent_boundary_failure_keeps_business_token_out_of_context(
+    monkeypatch,
+):
+    from gateway.platforms.api_server import APIServerAdapter
+    from gateway.session_context import business_execution_token
+
+    adapter = _seen_adapter(monkeypatch, config_model="glm-5.1", seen={})
+    model_started = []
+
+    async def fake_super(self, **_kwargs):
+        model_started.append(True)
+        return ({}, {})
+
+    monkeypatch.setattr(
+        zet_agent,
+        "gateway_sensitive_process_boundary_ready",
+        lambda: False,
+        raising=False,
+    )
+    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
+
+    with pytest.raises(
+        PermissionError,
+        match="gateway process memory boundary is unavailable",
+    ):
+        await adapter._run_agent(
+            user_message="确认执行",
+            conversation_history=[],
+            session_id="plan-session",
+            turn_id="confirmation-turn-2",
+            business_execution_token="a" * 64,
+        )
+
+    assert business_execution_token() == ""
+    assert model_started == []
 
 
 @pytest.mark.asyncio

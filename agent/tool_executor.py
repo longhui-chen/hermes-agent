@@ -32,6 +32,10 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.tool_guardrails import ToolGuardrailDecision
+from agent.zet_agent_response_mode import (
+    apply_trusted_skill_execution,
+    trusted_skill_operation_block_message,
+)
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
@@ -51,6 +55,38 @@ from tools.tool_result_storage import (
 from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context_window
 
 logger = logging.getLogger(__name__)
+
+
+def _tool_error_log_preview(
+    function_name: str,
+    function_result: Any,
+    *,
+    max_chars: int = 200,
+) -> str:
+    """Keep generic errors bounded while preserving trusted worker root causes."""
+    text = _multimodal_text_summary(function_result)
+    head = text[:max_chars] if len(text) > max_chars else text
+    if function_name != "terminal":
+        return head
+
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return head
+    if (
+        not isinstance(payload, dict)
+        or payload.get("video_edit_runtime_direct") is not True
+        or not isinstance(payload.get("output"), str)
+    ):
+        return head
+
+    tail = next(
+        (line.strip() for line in reversed(payload["output"].splitlines()) if line.strip()),
+        "",
+    )
+    if not tail or tail in head:
+        return head
+    return f"{head} | tail: {tail[:max_chars]}"
 
 
 def _budget_for_agent(agent) -> BudgetConfig:
@@ -206,6 +242,17 @@ def _zet_agent_plan_mode_block_message(agent, function_name: str, function_args:
             "`present_plan` are allowed until the user reviews the plan. "
             f"Do not call `{function_name}` or perform side effects."
         )
+
+    # Trusted video-edit authority constrains executable helpers only. Plan
+    # presentation is independently governed by the App plan capability.
+    if function_name != "present_plan":
+        skill_scope_block = trusted_skill_operation_block_message(
+            agent,
+            function_name=function_name,
+            function_args=function_args,
+        )
+        if skill_scope_block is not None:
+            return skill_scope_block
 
     if function_name == "skill_view":
         name = str(function_args.get("name") or "").strip().lower()
@@ -941,6 +988,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if blocked:
                 effect_disposition = "none"
 
+            if not blocked and not is_error:
+                apply_trusted_skill_execution(
+                    agent,
+                    function_name=function_name,
+                    function_result=function_result,
+                )
+
             if not blocked:
                 function_result = agent._append_guardrail_observation(
                     function_name,
@@ -950,8 +1004,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
 
             if is_error:
-                _err_text = _multimodal_text_summary(function_result)
-                result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
+                result_preview = _tool_error_log_preview(
+                    function_name,
+                    function_result,
+                )
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
 
             # Track file-mutation outcome for the turn-end verifier.
@@ -1431,6 +1487,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 agent._vprint(f"  {_get_cute_tool_message_impl('read_terminal', function_args, tool_duration, result=function_result)}")
         elif function_name == "present_plan":
             from tools.plan_tool import present_plan as _present_plan
+
             function_result = _present_plan(
                 title=function_args.get("title", ""),
                 groups=function_args.get("groups", []),
@@ -1450,6 +1507,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 _plan_presented_ok = True
             if _plan_presented_ok:
                 agent._zet_agent_plan_presented = True
+                if getattr(agent, "plan_emit_callback", None) is None:
+                    agent._zet_agent_plan_fallback_response = function_result
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('present_plan', function_args, tool_duration, result=function_result)}")
@@ -1665,6 +1724,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+        if not _execution_blocked and not _is_error_result:
+            apply_trusted_skill_execution(
+                agent,
+                function_name=function_name,
+                function_result=function_result,
+            )
         # The agent-runtime tools above (todo, session_search, memory,
         # context-engine, memory-manager, clarify, delegate_task) are
         # dispatched inline — they never reach handle_function_call, so the
@@ -1698,7 +1763,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_result[:200] if len(function_result) > 200 else function_result
             )
         if _is_error_result:
-            logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+            logger.warning(
+                "Tool %s returned error (%.2fs): %s",
+                function_name,
+                tool_duration,
+                _tool_error_log_preview(function_name, function_result),
+            )
         else:
             logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, _result_len)
 

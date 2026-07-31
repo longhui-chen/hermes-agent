@@ -1377,6 +1377,10 @@ CONNECTOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_CONNECTORS_URL",
     "ZETTLAB_CONNECTORS_AUTH_TOKEN",
     "ZET_AGENT_ID",
+    # Turn-scoped side-effect capabilities. Generic subprocesses must not
+    # inherit either a live ContextVar or a stale process-global fallback.
+    "ZETTLAB_AGENT_ACTION_TOKEN",
+    "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
 })
 
 AGENT_CREATOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
@@ -1435,8 +1439,6 @@ def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
             value = os.environ.get(key)
         if value is not None:
             env[key] = str(value)
-        else:
-            env.pop(key, None)
     try:
         from gateway.session_context import zettlab_connector_route_capability
 
@@ -1494,6 +1496,55 @@ def build_agent_creator_runtime_env() -> dict[str, str]:
         ):
             raise RuntimeError("agent creator turn id invalid")
         env["ZETTLAB_TURN_ID"] = turn_id
+    return env
+
+
+def build_video_edit_runtime_env(base_env: dict | None = None) -> dict[str, str]:
+    """Build the minimal env for the trusted video-edit script runner."""
+    env = _sanitize_subprocess_env(os.environ, base_env)
+    for key in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
+        env.pop(key, None)
+    _inject_session_context_env(env)
+
+    try:
+        from agent.zet_agent_response_mode import trusted_video_edit_runtime_receipt
+
+        frozen_receipt = trusted_video_edit_runtime_receipt()
+    except Exception:
+        frozen_receipt = {}
+    if frozen_receipt:
+        env.update(frozen_receipt)
+        return env
+
+    scope = None
+    multiplex_active = False
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+        multiplex_active = is_multiplex_active()
+        scope = current_secret_scope()
+    except Exception:
+        scope = None
+
+    for key in ("ZET_AGENT_ID", "ZETTLAB_AGENT_ACTION_TOKEN"):
+        value = scope.get(key) if scope is not None else None
+        if value is None and not multiplex_active:
+            value = os.environ.get(key)
+        if value is not None:
+            env[key] = str(value)
+        else:
+            env.pop(key, None)
+
+    try:
+        from gateway.session_context import business_execution_token
+
+        token = business_execution_token()
+    except Exception:
+        token = ""
+    if token:
+        env["ZETTLAB_BUSINESS_EXECUTION_TOKEN"] = token
+    else:
+        env.pop("ZETTLAB_BUSINESS_EXECUTION_TOKEN", None)
     return env
 
 
@@ -2338,7 +2389,22 @@ class LocalEnvironment(BaseEnvironment):
         self.init_session()
 
     def _snapshot_ephemeral_env_keys(self) -> tuple[str, ...]:
-        return tuple(sorted((*PROFILE_SCOPED_SUBPROCESS_ENV_KEYS, "ZETTLAB_TURN_ID")))
+        return tuple(
+            sorted(
+                PROFILE_SCOPED_SUBPROCESS_ENV_KEYS
+                | {"ZETTLAB_TURN_ID"}
+                | set(super()._snapshot_ephemeral_env_keys())
+            )
+        )
+
+    def _snapshot_ephemeral_env_exports(self) -> list[str]:
+        """Restore live task-local context after sourcing the shell snapshot.
+
+        A LocalEnvironment persists exported variables between terminal calls.
+        Session and turn identity must not persist that way: a later request
+        can reuse the environment while carrying a different ContextVar set.
+        """
+        return super()._snapshot_ephemeral_env_exports()
 
     def _wrap_command(self, command: str, cwd: str) -> str:
         run_env = _make_run_env(self.env)

@@ -5,6 +5,7 @@ import json
 import queue
 import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -12,7 +13,9 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import PlatformConfig
-from gateway.platforms.zet_agent import ZetAgentAdapter
+from gateway.platforms.zet_agent import ZetAgentAdapter, _ClarifyEntry
+from gateway.session_context import clear_turn_vars, set_turn_vars
+from tools import approval
 
 
 def _make_adapter() -> ZetAgentAdapter:
@@ -60,6 +63,14 @@ def _add_prefixed_zet_agent_routes(app: web.Application, adapter: ZetAgentAdapte
     app.router.add_get(
         "/p/{profile}/v1/sessions/{session_id}/pending",
         adapter._profile_handler(adapter._handle_pending),
+    )
+    app.router.add_get(
+        "/p/{profile}/v1/sessions/{session_id}/interaction-deliveries/{delivery_id}",
+        adapter._profile_handler(adapter._handle_interaction_delivery),
+    )
+    app.router.add_post(
+        "/p/{profile}/v1/sessions/{session_id}/interaction-deliveries/{delivery_id}/recovery-fence",
+        adapter._profile_handler(adapter._handle_recovery_fence),
     )
     app.router.add_post(
         "/p/{profile}/v1/sessions/{session_id}/approval/respond",
@@ -305,6 +316,220 @@ async def test_prefixed_models_route_is_registered(profile_homes):
     assert resp.status == 200
     assert data["object"] == "list"
     assert data["data"][0]["id"] == "coder"
+
+
+@pytest.mark.asyncio
+async def test_prefixed_interaction_delivery_route_is_registered(profile_homes):
+    adapter = _make_adapter()
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(
+            "/p/coder/v1/sessions/session-1/interaction-deliveries/missing",
+            headers={"Authorization": "Bearer test-key"},
+        )
+        data = await resp.json()
+
+    assert resp.status == 404
+    assert data["error"]["code"] == "interaction_delivery_not_found"
+
+
+@pytest.mark.asyncio
+async def test_same_session_id_isolated_across_profile_interaction_queues(profile_homes):
+    adapter = _make_adapter()
+    setattr(
+        adapter,
+        "_goals",
+        lambda: SimpleNamespace(
+            on_interaction_pending=lambda _sid, **_kwargs: None,
+            on_interaction_resolved=lambda _sid: None,
+        ),
+    )
+    seeded = []
+    for profile, command in (("main", "main-command"), ("coder", "coder-command")):
+        with adapter._profile_api_scope(profile):
+            queue_key = adapter._interaction_queue_key("same-session")
+            approval_data = {
+                "interaction_id": f"approval-{profile}",
+                "command": command,
+                "description": "test",
+            }
+            approval_entry = approval.enqueue_gateway_approval(
+                queue_key, approval_data
+            )
+            tokens = set_turn_vars(turn_id=f"turn-{profile}")
+            try:
+                adapter._make_approval_cb(
+                    queue.Queue(), "same-session", queue_key
+                )(approval_data)
+            finally:
+                clear_turn_vars(tokens)
+
+            with approval.reserve_gateway_interaction_generation() as generation:
+                clarify_payload = {
+                    "type": "hermes.clarify",
+                    "interaction_id": f"clarify-{profile}",
+                    "interaction_generation": generation,
+                    "turn_id": f"turn-{profile}",
+                    "question": f"question-{profile}",
+                    "choices_offered": [],
+                }
+                clarify_entry = _ClarifyEntry(
+                    f"clarify-{profile}",
+                    f"turn-{profile}",
+                    clarify_payload,
+                    generation,
+                )
+                with adapter._clarify_state_lock:
+                    adapter._clarify_queues[queue_key] = [clarify_entry]
+            adapter._pending_clarify[queue_key] = [clarify_payload]
+            seeded.append((queue_key, approval_entry, clarify_entry))
+
+    assert seeded[0][0] != seeded[1][0]
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    try:
+        async with TestClient(TestServer(app)) as cli:
+            main_pending = await cli.get(
+                "/p/main/v1/sessions/same-session/pending",
+                headers={"Authorization": "Bearer test-key"},
+            )
+            coder_pending = await cli.get(
+                "/p/coder/v1/sessions/same-session/pending",
+                headers={"Authorization": "Bearer test-key"},
+            )
+            assert (await main_pending.json())["approval"]["command"] == "main-command"
+            assert (await coder_pending.json())["approval"]["command"] == "coder-command"
+
+            main_approval = await cli.post(
+                "/p/main/v1/sessions/same-session/approval/respond",
+                headers={"Authorization": "Bearer test-key"},
+                json={"choice": "deny"},
+            )
+            assert main_approval.status == 200
+            assert seeded[0][1].event.is_set()
+            assert not seeded[1][1].event.is_set()
+
+            main_clarify = await cli.post(
+                "/p/main/v1/sessions/same-session/clarify/respond",
+                headers={"Authorization": "Bearer test-key"},
+                json={"response": "main-answer"},
+            )
+            assert main_clarify.status == 200
+            assert seeded[0][2].event.is_set()
+            assert not seeded[1][2].event.is_set()
+    finally:
+        approval._gateway_queues.clear()
+        approval._gateway_prepared.clear()
+
+
+@pytest.mark.asyncio
+async def test_same_delivery_ids_have_profile_scoped_durable_receipts(profile_homes):
+    class LiveTask:
+        def done(self):
+            return False
+
+    adapter = _make_adapter()
+    setattr(
+        adapter,
+        "_goals",
+        lambda: SimpleNamespace(
+            on_interaction_pending=lambda _sid, **_kwargs: None,
+            on_interaction_resolved=lambda _sid: None,
+        ),
+    )
+    entries = {}
+    for profile in ("main", "coder"):
+        with adapter._profile_api_scope(profile):
+            queue_key = adapter._interaction_queue_key("same-session")
+            data = {
+                "interaction_id": "same-interaction",
+                "command": f"command-{profile}",
+                "description": "test",
+            }
+            entry = approval.enqueue_gateway_approval(queue_key, data)
+            tokens = set_turn_vars(turn_id=f"turn-{profile}")
+            try:
+                adapter._make_approval_cb(
+                    queue.Queue(), "same-session", queue_key
+                )(data)
+            finally:
+                clear_turn_vars(tokens)
+            adapter._active_session_tasks[queue_key] = LiveTask()
+            adapter._active_session_turn_ids[queue_key] = f"turn-{profile}"
+            entries[profile] = entry
+
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+    try:
+        async with TestClient(TestServer(app)) as cli:
+            for profile, choice in (("main", "once"), ("coder", "deny")):
+                body = {
+                    "choice": choice,
+                    "delivery_id": "same-delivery",
+                    "interaction_id": "same-interaction",
+                }
+                prepared = await cli.post(
+                    f"/p/{profile}/v1/sessions/same-session/approval/respond",
+                    headers={"Authorization": "Bearer test-key"},
+                    json={**body, "phase": "prepare"},
+                )
+                assert prepared.status == 200
+                assert entries[profile].event.is_set() is False
+                if profile == "main":
+                    assert entries["coder"].event.is_set() is False
+
+                finalized = await cli.post(
+                    f"/p/{profile}/v1/sessions/same-session/approval/respond",
+                    headers={"Authorization": "Bearer test-key"},
+                    json={**body, "phase": "finalize"},
+                )
+                finalized_body = await finalized.json()
+                assert finalized.status == 200
+                assert finalized_body["turn_id"] == f"turn-{profile}"
+                assert finalized_body["fence_id"]
+                assert entries[profile].event.is_set() is False
+                claim = await cli.post(
+                    f"/p/{profile}/v1/sessions/same-session/interaction-deliveries/same-delivery/recovery-fence",
+                    headers={"Authorization": "Bearer test-key"},
+                    json={
+                        "action": "claim",
+                        "expected_state_revision": finalized_body["state_revision"],
+                    },
+                )
+                assert claim.status == 200
+                ack = await cli.post(
+                    f"/p/{profile}/v1/sessions/same-session/interaction-deliveries/same-delivery/recovery-fence",
+                    headers={"Authorization": "Bearer test-key"},
+                    json={
+                        "action": "ack",
+                        "fence_id": finalized_body["fence_id"],
+                        "expected_state_revision": finalized_body["state_revision"],
+                    },
+                )
+                assert ack.status == 200
+                assert entries[profile].event.is_set() is True
+                if profile == "main":
+                    assert entries["coder"].event.is_set() is False
+
+            main_receipt = await cli.get(
+                "/p/main/v1/sessions/same-session/interaction-deliveries/same-delivery",
+                headers={"Authorization": "Bearer test-key"},
+            )
+            coder_receipt = await cli.get(
+                "/p/coder/v1/sessions/same-session/interaction-deliveries/same-delivery",
+                headers={"Authorization": "Bearer test-key"},
+            )
+            main_body = await main_receipt.json()
+            coder_body = await coder_receipt.json()
+            assert main_body["turn_id"] == "turn-main"
+            assert coder_body["turn_id"] == "turn-coder"
+            assert main_body["payload_digest"] != coder_body["payload_digest"]
+    finally:
+        approval._gateway_queues.clear()
+        approval._gateway_prepared.clear()
 
 
 @pytest.mark.asyncio

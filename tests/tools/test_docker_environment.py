@@ -456,6 +456,18 @@ def test_init_env_args_scrubs_profile_scoped_connector_runtime(monkeypatch):
     assert "SAFE_TOKEN=safe-value" in args_str
 
 
+def test_snapshot_ephemeral_env_keys_include_engaged_turn_context(monkeypatch):
+    import gateway.session_context as sc
+
+    monkeypatch.setattr(sc, "_session_context_engaged", True)
+    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+
+    keys = set(env._snapshot_ephemeral_env_keys())
+
+    assert "HERMES_TURN_ID" in keys
+    assert "HERMES_PLAN_ACK_REVISION_REQUESTED" in keys
+
+
 
 def test_normalize_env_dict_filters_invalid_keys():
     """_normalize_env_dict should reject invalid variable names."""

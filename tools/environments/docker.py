@@ -1067,7 +1067,12 @@ class DockerEnvironment(BaseEnvironment):
         return args
 
     def _snapshot_ephemeral_env_keys(self) -> tuple[str, ...]:
-        return tuple(sorted(PROFILE_SCOPED_SUBPROCESS_ENV_KEYS))
+        return tuple(
+            sorted(
+                PROFILE_SCOPED_SUBPROCESS_ENV_KEYS
+                | set(super()._snapshot_ephemeral_env_keys())
+            )
+        )
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,

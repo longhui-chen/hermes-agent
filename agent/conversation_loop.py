@@ -70,6 +70,11 @@ from agent.retry_utils import (
 )
 from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.zet_agent_response_mode import (
+    reset_trusted_skill_execution,
+    trusted_skill_allowed_tool_names,
+    trusted_skill_scope_active,
+)
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
@@ -197,6 +202,71 @@ def _should_force_present_plan_tool_choice(agent: Any, _user_message: str) -> bo
     return response_mode == "plan"
 
 
+def _apply_zet_agent_plan_tool_visibility(agent: Any, api_kwargs: Dict[str, Any]) -> bool:
+    """Apply only the trusted skill's exact execution scope.
+
+    Plan visibility is owned by the App plan capability. A trusted skill may
+    constrain executable helpers, but it must never hide ``present_plan``.
+    """
+    if (getattr(agent, "platform", "") or "") != "zet_agent":
+        return False
+    if not trusted_skill_scope_active(agent):
+        return False
+
+    scoped_tools = trusted_skill_allowed_tool_names(agent) | {"present_plan"}
+
+    def _tool_name(tool: Any) -> str:
+        if not isinstance(tool, dict):
+            return ""
+        return str(
+            (tool.get("function") or {}).get("name")
+            or (tool.get("toolSpec") or {}).get("name")
+            or tool.get("name")
+            or ""
+        )
+
+    def _is_visible(tool: Any) -> bool:
+        name = _tool_name(tool)
+        return name in scoped_tools
+
+    changed = False
+    tools = api_kwargs.get("tools")
+    if isinstance(tools, list):
+        filtered_tools = [tool for tool in tools if _is_visible(tool)]
+        if len(filtered_tools) != len(tools):
+            api_kwargs["tools"] = filtered_tools
+            changed = True
+
+    tool_config = api_kwargs.get("toolConfig")
+    if isinstance(tool_config, dict) and isinstance(tool_config.get("tools"), list):
+        filtered_tools = [
+            tool for tool in tool_config["tools"] if _is_visible(tool)
+        ]
+        if len(filtered_tools) != len(tool_config["tools"]):
+            tool_config["tools"] = filtered_tools
+            changed = True
+
+    tool_choice = api_kwargs.get("tool_choice")
+    if isinstance(tool_choice, dict):
+        selected_name = _tool_name(tool_choice)
+        if selected_name and not _is_visible(tool_choice):
+            api_kwargs.pop("tool_choice", None)
+            changed = True
+
+    if isinstance(tool_config, dict):
+        bedrock_choice = tool_config.get("toolChoice")
+        selected_tool = bedrock_choice.get("tool") if isinstance(bedrock_choice, dict) else None
+        if isinstance(selected_tool, dict) and not _is_visible(selected_tool):
+            tool_config.pop("toolChoice", None)
+            changed = True
+
+    if getattr(agent, "api_mode", "") == "chat_completions":
+        if api_kwargs.get("parallel_tool_calls") is not False:
+            api_kwargs["parallel_tool_calls"] = False
+            changed = True
+    return changed
+
+
 def _error_text(error: Exception) -> str:
     parts = []
     for value in (
@@ -281,15 +351,27 @@ def _disable_thinking_for_forced_tool_choice(api_kwargs: Dict[str, Any]) -> None
 
 
 def _should_end_after_present_plan(agent: Any) -> bool:
-    # App plan mode ends the turn right after present_plan ONLY when auto-execute
-    # is off (the manual confirmation card). With auto-execute on (the default)
-    # the turn keeps running so the plan is carried out in the same turn.
+    # Only an explicit manual Plan-mode turn waits for confirmation. Plans
+    # presented during a regular tool turn are status UI, not an execution gate.
     return (
         (getattr(agent, "platform", "") or "") == "zet_agent"
         and bool(getattr(agent, "_zet_agent_plan_mode_active", False))
         and bool(getattr(agent, "_zet_agent_plan_presented", False))
         and not bool(getattr(agent, "_zet_agent_plan_auto_execute", False))
     )
+
+
+def _consume_trusted_skill_task_message(agent: Any, fallback: Any) -> Any:
+    """Return the transport-preserved user task once, then clear it."""
+    marker = object()
+    trusted_message = getattr(agent, "_zet_agent_trusted_user_message", marker)
+    if trusted_message is marker:
+        return fallback
+    try:
+        delattr(agent, "_zet_agent_trusted_user_message")
+    except AttributeError:
+        pass
+    return trusted_message
 
 
 def _plan_mode_interaction_error(agent: Any) -> Optional[str]:
@@ -318,9 +400,9 @@ def _plan_mode_interaction_error(agent: Any) -> Optional[str]:
 def _enforce_single_plan_interaction_tool_call(
     agent: Any, assistant_message: Any
 ) -> bool:
-    """Keep one Plan interaction call, preferring clarify over a stale plan."""
-    if not getattr(agent, "_zet_agent_plan_mode_active", False):
-        return False
+    """Keep one App plan or bounded trusted operation per provider response."""
+    plan_mode_active = bool(getattr(agent, "_zet_agent_plan_mode_active", False))
+    trusted_scope = trusted_skill_scope_active(agent)
     tool_calls = getattr(assistant_message, "tool_calls", None)
     if not isinstance(tool_calls, list) or len(tool_calls) <= 1:
         return False
@@ -335,14 +417,90 @@ def _enforce_single_plan_interaction_tool_call(
                 return function.get("name", "") or ""
         return ""
 
-    selected = next((call for call in tool_calls if _name(call) == "clarify"), tool_calls[0])
+    present_plan_call = next(
+        (call for call in tool_calls if _name(call) == "present_plan"), None
+    )
+    manual_present_plan = (
+        (getattr(agent, "platform", "") or "") == "zet_agent"
+        and present_plan_call is not None
+        and not bool(getattr(agent, "_zet_agent_plan_auto_execute", False))
+    )
+    if not plan_mode_active and not trusted_scope and not manual_present_plan:
+        return False
+
+    if not plan_mode_active:
+        selected = present_plan_call if manual_present_plan else tool_calls[0]
+        assistant_message.tool_calls = [selected]
+        _filter_provider_replay_tool_calls(assistant_message, selected)
+        logger.warning(
+            "zet_agent %s: provider returned parallel tools; keeping only %s",
+            (
+                "manual plan interaction"
+                if manual_present_plan
+                else "trusted execution scope"
+            ),
+            _name(selected) or "first call",
+        )
+        return True
+
+    clarify_call = next((call for call in tool_calls if _name(call) == "clarify"), None)
+    selected = clarify_call or present_plan_call or tool_calls[0]
     assistant_message.tool_calls = [selected]
+    _filter_provider_replay_tool_calls(assistant_message, selected)
     logger.warning(
-        "zet_agent plan mode: provider returned parallel interaction tools; "
+        "zet_agent plan interaction: provider returned parallel tools; "
         "keeping only %s",
         _name(selected) or "first call",
     )
     return True
+
+
+def _filter_provider_replay_tool_calls(
+    assistant_message: Any, selected_tool_call: Any
+) -> None:
+    """Keep provider replay state consistent with the selected tool call."""
+    selected_id = getattr(selected_tool_call, "id", None)
+    if not isinstance(selected_id, str) or not selected_id:
+        if isinstance(selected_tool_call, dict):
+            selected_id = selected_tool_call.get("id")
+
+    ordered_blocks = getattr(assistant_message, "anthropic_content_blocks", None)
+    if not isinstance(ordered_blocks, list):
+        return
+    filtered_blocks = None
+    if isinstance(selected_id, str) and selected_id:
+        removed_tool_use = any(
+            isinstance(block, dict)
+            and block.get("type") == "tool_use"
+            and block.get("id") != selected_id
+            for block in ordered_blocks
+        )
+        filtered_blocks = [
+            block
+            for block in ordered_blocks
+            if not (
+                isinstance(block, dict)
+                and (
+                    (block.get("type") == "tool_use" and block.get("id") != selected_id)
+                    or (
+                        removed_tool_use
+                        and block.get("type") in {"thinking", "redacted_thinking"}
+                    )
+                )
+            )
+        ]
+
+    provider_data = getattr(assistant_message, "provider_data", None)
+    if isinstance(provider_data, dict):
+        if filtered_blocks is None:
+            provider_data.pop("anthropic_content_blocks", None)
+        else:
+            provider_data["anthropic_content_blocks"] = filtered_blocks
+        return
+    try:
+        setattr(assistant_message, "anthropic_content_blocks", filtered_blocks)
+    except (AttributeError, TypeError):
+        pass
 
 
 _ZET_AGENT_PLAN_MODE_PROTOCOL = (
@@ -509,6 +667,9 @@ def _apply_forced_present_plan_tool_choice(agent: Any, api_kwargs: Dict[str, Any
     api_kwargs["tool_choice"] = "required"
     disabled_thinking = _should_disable_thinking_for_forced_tool_choice(agent)
     if disabled_thinking:
+        # The retry path uses this marker to distinguish a provider rejection
+        # of our injected disable payload from an unrelated thinking error.
+        agent._zet_agent_force_present_plan_disable_thinking = True
         _disable_thinking_for_forced_tool_choice(api_kwargs)
         logger.info(
             "zet_agent plan mode: requiring clarify/present_plan with thinking disabled"
@@ -1041,6 +1202,10 @@ def run_conversation(
     agent._delivered_interim_texts = set()
 
     # Main conversation loop counters (pure locals consumed by the loop below).
+    reset_trusted_skill_execution(
+        agent,
+        _consume_trusted_skill_task_message(agent, original_user_message),
+    )
     # Zettlab App plan 模式：本轮每次模型调用只允许 clarify / present_plan。
     agent._zet_agent_plan_mode_active = _should_force_present_plan_tool_choice(
         agent, original_user_message
@@ -1050,6 +1215,7 @@ def run_conversation(
     agent._zet_agent_plan_omit_thinking_disable = False
     agent._zet_agent_plan_text_fallback = False
     agent._zet_agent_plan_presented = False
+    agent._zet_agent_plan_fallback_response = ""
     agent._zet_agent_plan_protocol_retries = 0
     plan_mode_error = _plan_mode_interaction_error(agent)
     if plan_mode_error:
@@ -1651,6 +1817,7 @@ def run_conversation(
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
                 api_kwargs = agent._build_api_kwargs(api_messages)
+                _apply_zet_agent_plan_tool_visibility(agent, api_kwargs)
                 _apply_forced_present_plan_tool_choice(agent, api_kwargs)
                 if agent._force_ascii_payload:
                     _sanitize_structure_non_ascii(api_kwargs)
@@ -5555,9 +5722,12 @@ def run_conversation(
 
                 if _should_end_after_present_plan(agent):
                     _turn_exit_reason = "text_response(plan_presented)"
-                    final_response = ""
+                    final_response = str(
+                        getattr(agent, "_zet_agent_plan_fallback_response", "")
+                        or ""
+                    )
                     logger.info(
-                        "zet_agent plan mode: present_plan emitted; ending turn "
+                        "zet_agent: present_plan emitted; ending turn "
                         "without a post-tool LLM follow-up"
                     )
                     break

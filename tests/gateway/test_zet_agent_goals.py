@@ -49,12 +49,18 @@ class FakeAdapter:
         self._active_session_agents = {}
         self._clarify_state_lock = threading.Lock()
         self._clarify_queues = {}
+        self._delivery_lock = threading.Lock()
+        self._interaction_deliveries = {}
+        self._interaction_scope = "main"
 
     def _check_auth(self, request):
         return None
 
     def _active_turn_key(self, session_id):
-        return f"test-home|{session_id}"
+        return f"{self._interaction_scope}|{session_id}"
+
+    def _interaction_queue_key(self, session_id):
+        return self._active_turn_key(session_id)
 
 
 @pytest.fixture
@@ -1181,6 +1187,105 @@ class TestUnloadClosesGoalDB:
 
 
 class TestInteractionResolvedGuards:
+    def test_ack_before_late_pending_callback_does_not_recreate_flag(
+        self, driver, reports
+    ):
+        _create(driver)
+        reports.clear()
+
+        with patch.object(
+            driver, "_interaction_still_pending", return_value=False
+        ):
+            driver.on_interaction_pending(SID, verify_live_source=True)
+
+        assert not driver._interaction_flag_set(SID)
+        assert reports == []
+
+    def test_stale_resolved_cannot_clear_new_prompt_flag(self, driver, reports):
+        _create(driver)
+        driver.on_interaction_pending(SID)
+        reports.clear()
+        resolved_checked = threading.Event()
+        release_resolved = threading.Event()
+        source_live = {"value": False}
+        real_generation = driver._lock_generation
+        gate_used = {"value": False}
+
+        def still_pending(*_sids):
+            return source_live["value"]
+
+        def gated_generation(session_id):
+            if (
+                threading.current_thread().name == "stale-resolved"
+                and not gate_used["value"]
+            ):
+                gate_used["value"] = True
+                resolved_checked.set()
+                assert release_resolved.wait(2)
+            return real_generation(session_id)
+
+        with (
+            patch.object(
+                driver,
+                "_interaction_still_pending",
+                side_effect=still_pending,
+            ),
+            patch.object(
+                driver, "_lock_generation", side_effect=gated_generation
+            ),
+        ):
+            resolved_thread = threading.Thread(
+                target=driver.on_interaction_resolved,
+                args=(SID,),
+                name="stale-resolved",
+            )
+            resolved_thread.start()
+            assert resolved_checked.wait(1)
+            source_live["value"] = True
+            driver.on_interaction_pending(SID, verify_live_source=True)
+            release_resolved.set()
+            resolved_thread.join(1)
+
+        assert not resolved_thread.is_alive()
+        assert driver._interaction_flag_set(SID)
+        assert reports and reports[-1]["proj"]["state"] == "waiting"
+
+    def test_deferred_delivery_keeps_flag_until_ack_release(self, driver, reports):
+        _create(driver)
+        driver.on_interaction_pending(SID)
+        reports.clear()
+        queue_key = driver.adapter._interaction_queue_key(SID)
+        driver.adapter._interaction_deliveries[(queue_key, "delivery-a")] = {
+            "scope_key": queue_key,
+            "_goal_resolve_deferred": True,
+        }
+
+        driver.on_interaction_resolved(SID)
+        assert driver._interaction_flag_set(SID)
+        assert reports == []
+
+        driver.adapter._interaction_deliveries.clear()
+        driver.on_interaction_resolved(SID)
+        assert not driver._interaction_flag_set(SID)
+        assert len(reports) == 1 and reports[0]["proj"]["state"] == "running"
+
+    def test_pending_lookup_is_profile_scoped_with_legacy_raw_fallback(
+        self, driver
+    ):
+        main_key = driver.adapter._interaction_queue_key(SID)
+        driver.adapter._interaction_scope = "coder"
+        coder_key = driver.adapter._interaction_queue_key(SID)
+        driver.adapter._clarify_queues[coder_key] = [object()]
+
+        driver.adapter._interaction_scope = "main"
+        assert not driver._interaction_still_pending(SID)
+        driver.adapter._clarify_queues[main_key] = [object()]
+        assert driver._interaction_still_pending(SID)
+
+        driver.adapter._clarify_queues.pop(main_key)
+        driver.adapter._interaction_scope = "coder"
+        assert driver._interaction_still_pending(SID)
+
     def test_resolved_keeps_flag_while_another_card_pending(self, driver, reports):
         """per-session FIFO 没有 request_id：旧卡被回应时新 goal 自己的卡片
         可能还挂着（codex P1）——此时清 sidecar 等待标记会让重启后的
