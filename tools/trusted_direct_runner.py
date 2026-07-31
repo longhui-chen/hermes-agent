@@ -95,8 +95,9 @@ def enter_managed_cgroup():
     if (
         not cgroup_path.startswith("/sys/fs/cgroup/")
         or not expected_relative.startswith("/")
-        or target_uid != 65534
-        or target_gid != 65534
+        or target_uid != target_gid
+        or target_uid < 60000
+        or target_uid > 64999
         or os.geteuid() != 0
     ):
         raise OSError("invalid managed cgroup boundary")
@@ -190,8 +191,12 @@ _CGROUP_KILL_RETRY_SECONDS = 0.05
 _MANAGED_INVOCATION_MEMORY_MAX_BYTES = 128 * 1024 * 1024
 _MANAGED_INVOCATION_MEMORY_SWAP_MAX_BYTES = 0
 _MANAGED_INVOCATION_PIDS_MAX = 64
-_MANAGED_RUNNER_UID = 65534
-_MANAGED_RUNNER_GID = 65534
+_MANAGED_RUNNER_UID_MIN = 60000
+_MANAGED_RUNNER_UID_MAX = 64999
+_MANAGED_RUNNER_IDENTITY_ATTEMPTS = 128
+_PROC_ROOT = Path("/proc")
+_PROC_STATUS_MAX_BYTES = 16 * 1024
+_MANAGED_RUNNER_LOCK = threading.Lock()
 _MANAGED_CGROUP_PREFIX = "agentcomputer"
 _MANAGED_SUPERVISOR_CGROUP = "agentcomputer-supervisor"
 _MANAGED_CGROUP_ROOT_ENV = "HERMES_MANAGED_CGROUP_ROOT"
@@ -579,6 +584,60 @@ def _create_managed_invocation_cgroup() -> _ManagedInvocationCgroup:
     )
 
 
+def _occupied_process_uids() -> set[int]:
+    """Return every UID currently represented in procfs, with bounded reads."""
+
+    occupied: set[int] = set()
+    try:
+        entries = tuple(_PROC_ROOT.iterdir())
+    except OSError as exc:
+        raise OSError("managed runner process identity audit failed") from exc
+    for entry in entries:
+        if not entry.name.isdecimal():
+            continue
+        try:
+            with (entry / "status").open("rb") as stream:
+                raw = stream.read(_PROC_STATUS_MAX_BYTES + 1)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise OSError(
+                "managed runner process identity audit failed"
+            ) from exc
+        if len(raw) > _PROC_STATUS_MAX_BYTES:
+            raise OSError("managed runner process metadata is oversized")
+        uid_line = next(
+            (
+                line
+                for line in raw.decode("ascii", errors="strict").splitlines()
+                if line.startswith("Uid:")
+            ),
+            "",
+        )
+        fields = uid_line.split()
+        if len(fields) != 5:
+            raise OSError("managed runner process identity is malformed")
+        try:
+            occupied.update(int(value) for value in fields[1:])
+        except ValueError as exc:
+            raise OSError(
+                "managed runner process identity is malformed"
+            ) from exc
+    return occupied
+
+
+def _select_managed_runner_identity() -> tuple[int, int]:
+    occupied = _occupied_process_uids()
+    population = _MANAGED_RUNNER_UID_MAX - _MANAGED_RUNNER_UID_MIN + 1
+    for _attempt in range(_MANAGED_RUNNER_IDENTITY_ATTEMPTS):
+        candidate = (
+            _MANAGED_RUNNER_UID_MIN + secrets.randbelow(population)
+        )
+        if candidate not in occupied:
+            return candidate, candidate
+    raise OSError("managed runner has no isolated process identity")
+
+
 def _cgroup_is_populated(cgroup: _ManagedInvocationCgroup) -> bool:
     events = _read_bounded_ascii(
         cgroup.path / "cgroup.events",
@@ -871,7 +930,7 @@ def _drain_output(
         completed.set()
 
 
-def run_trusted_python_script(
+def _run_trusted_python_script_unlocked(
     *,
     script: Path,
     argv: Sequence[str],
@@ -884,6 +943,7 @@ def run_trusted_python_script(
     secret_values: Sequence[str] = (),
     script_bytes: Optional[bytes] = None,
     stdlib_only: bool = False,
+    managed_identity: tuple[int, int] | None = None,
 ) -> TrustedPythonResult:
     """Execute one verified Python script through the isolated wrapper.
 
@@ -974,15 +1034,18 @@ def run_trusted_python_script(
     managed_cgroup: _ManagedInvocationCgroup | None = None
     try:
         if os.environ.get(_MANAGED_GATEWAY_ENV) == "1":
+            if managed_identity is None:
+                raise OSError("managed runner identity is unavailable")
             managed_cgroup = _create_managed_invocation_cgroup()
         worker_argv = [sys.executable, "-I", "-S", "-c", _CONTROL_WRAPPER]
         if managed_cgroup is not None:
+            runner_uid, runner_gid = managed_identity
             worker_argv.extend([
                 "--managed-cgroup",
                 str(managed_cgroup.path),
                 managed_cgroup.relative_path,
-                str(_MANAGED_RUNNER_UID),
-                str(_MANAGED_RUNNER_GID),
+                str(runner_uid),
+                str(runner_gid),
             ])
         if os.name == "nt":
             from hermes_cli._subprocess_compat import windows_hide_flags
@@ -1183,3 +1246,42 @@ def run_trusted_python_script(
         timed_out=timed_out,
         interrupted=interrupted,
     )
+
+
+def run_trusted_python_script(
+    *,
+    script: Path,
+    argv: Sequence[str],
+    cwd: Path,
+    base_env: Mapping[str, str],
+    injected_env: Mapping[str, str],
+    injected_secrets: Mapping[str, str] | None = None,
+    timeout: float,
+    stdin_text: Optional[str] = None,
+    secret_values: Sequence[str] = (),
+    script_bytes: Optional[bytes] = None,
+    stdlib_only: bool = False,
+) -> TrustedPythonResult:
+    """Run one trusted script, serializing managed identity allocation."""
+
+    arguments = {
+        "script": script,
+        "argv": argv,
+        "cwd": cwd,
+        "base_env": base_env,
+        "injected_env": injected_env,
+        "injected_secrets": injected_secrets,
+        "timeout": timeout,
+        "stdin_text": stdin_text,
+        "secret_values": secret_values,
+        "script_bytes": script_bytes,
+        "stdlib_only": stdlib_only,
+    }
+    if os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
+        return _run_trusted_python_script_unlocked(**arguments)
+    with _MANAGED_RUNNER_LOCK:
+        identity = _select_managed_runner_identity()
+        return _run_trusted_python_script_unlocked(
+            **arguments,
+            managed_identity=identity,
+        )

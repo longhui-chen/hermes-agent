@@ -23,10 +23,13 @@ KillMode=control-group
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectProc=invisible
+ProtectSystem=strict
 CapabilityBoundingSet=~CAP_SYS_PTRACE CAP_SYS_ADMIN
 Delegate=pids memory
 ReadOnlyPaths=/zettos/main/apps
 ReadWritePaths=__APP_BASE__/data
+ReadWritePaths=-/volume1/subvol/agents/data
+ReadWritePaths=-/volume1/agents/data
 ReadOnlyPaths=-/volume1/subvol/agents/zettlab-presets
 ReadOnlyPaths=-/volume1/agents/zettlab-presets
 

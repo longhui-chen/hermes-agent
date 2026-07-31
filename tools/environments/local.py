@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,37 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 _IS_WINDOWS = platform.system() == "Windows"
 
 logger = logging.getLogger(__name__)
+
+_MANAGED_GATEWAY_ENV = "HERMES_MANAGED_GATEWAY"
+_MANAGED_SETPRIV_PATH = "/usr/bin/setpriv"
+_MANAGED_TERMINAL_DROPPED_CAPABILITIES = ("setuid", "setgid")
+
+
+def _managed_terminal_privilege_drop_prefix() -> list[str]:
+    """Return the fixed fail-closed capability drop for model shell commands."""
+
+    try:
+        info = os.lstat(_MANAGED_SETPRIV_PATH)
+    except OSError as exc:
+        raise OSError("managed terminal privilege drop is unavailable") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_mode & 0o022
+    ):
+        raise OSError("managed terminal privilege drop is not trusted")
+    dropped = ",".join(
+        f"-{capability}"
+        for capability in _MANAGED_TERMINAL_DROPPED_CAPABILITIES
+    )
+    return [
+        _MANAGED_SETPRIV_PATH,
+        f"--bounding-set={dropped}",
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        "--no-new-privs",
+        "--",
+    ]
 
 
 def _msys_to_windows_path(cwd: str) -> str:
@@ -1493,6 +1525,11 @@ class LocalEnvironment(BaseEnvironment):
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
+        if (
+            not _IS_WINDOWS
+            and os.environ.get(_MANAGED_GATEWAY_ENV) == "1"
+        ):
+            args = _managed_terminal_privilege_drop_prefix() + args
         run_env = _make_run_env(self.env)
 
         # Recover when the cwd has been deleted out from under us — usually by

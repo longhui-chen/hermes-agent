@@ -13,6 +13,23 @@ import pytest
 
 from tools import trusted_direct_runner
 
+_REAL_SELECT_MANAGED_RUNNER_IDENTITY = (
+    trusted_direct_runner._select_managed_runner_identity
+)
+
+
+@pytest.fixture(autouse=True)
+def _managed_identity_on_non_procfs_hosts(monkeypatch):
+    if not Path("/proc").is_dir():
+        monkeypatch.setattr(
+            trusted_direct_runner,
+            "_select_managed_runner_identity",
+            lambda: (
+                trusted_direct_runner._MANAGED_RUNNER_UID_MIN,
+                trusted_direct_runner._MANAGED_RUNNER_UID_MIN,
+            ),
+        )
+
 
 class _RecordingStdin:
     def __init__(self, stream, captured: bytearray) -> None:
@@ -691,6 +708,47 @@ def test_managed_cgroup_unavailable_fails_before_popen(monkeypatch, tmp_path):
         )
 
 
+def test_managed_runner_fails_before_popen_when_identity_pool_is_occupied(
+    monkeypatch,
+    tmp_path,
+):
+    script = _write_script(tmp_path, "print('must not run')\n")
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setattr(
+        trusted_direct_runner,
+        "_select_managed_runner_identity",
+        _REAL_SELECT_MANAGED_RUNNER_IDENTITY,
+    )
+    monkeypatch.setattr(
+        trusted_direct_runner,
+        "_occupied_process_uids",
+        lambda: set(
+            range(
+                trusted_direct_runner._MANAGED_RUNNER_UID_MIN,
+                trusted_direct_runner._MANAGED_RUNNER_UID_MAX + 1,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        trusted_direct_runner.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Popen must not run with an occupied worker UID")
+        ),
+    )
+
+    with pytest.raises(OSError, match="no isolated process identity"):
+        trusted_direct_runner.run_trusted_python_script(
+            script=script,
+            argv=[str(script)],
+            cwd=tmp_path,
+            base_env=os.environ,
+            injected_env={},
+            injected_secrets={"TEST_TOKEN": "scope-token"},
+            timeout=5,
+        )
+
+
 def test_managed_popen_failure_cleans_new_cgroup(monkeypatch, tmp_path):
     script = _write_script(tmp_path, "print('must not run')\n")
     cgroup = trusted_direct_runner._ManagedInvocationCgroup(
@@ -1042,9 +1100,15 @@ def test_real_managed_cgroup_kills_setsid_double_fork(monkeypatch):
 
         assert result.returncode == 124
         assert result.timed_out is True
-        assert json.loads(result.output) == {
-            "uid": 65534,
-            "gid": 65534,
+        identity = json.loads(result.output)
+        assert (
+            trusted_direct_runner._MANAGED_RUNNER_UID_MIN
+            <= identity["uid"]
+            <= trusted_direct_runner._MANAGED_RUNNER_UID_MAX
+        )
+        assert identity == {
+            "uid": identity["uid"],
+            "gid": identity["uid"],
             "groups": [],
             "dumpable": 0,
             "no_new_privs": 1,
