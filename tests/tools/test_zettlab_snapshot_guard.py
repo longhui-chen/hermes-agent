@@ -486,6 +486,54 @@ def test_write_paths_resolved_via_task_registry(monkeypatch, tmp_path):
     assert rec.requests[0]["body"]["paths"] == [str(resolved)]
 
 
+def test_empty_task_id_resolves_via_default_session(monkeypatch, tmp_path):
+    """handler 侧 `write_file_tool(..., task_id="default")`、`get_session_cwd`
+    也把空 key 读作 "default"：guard 不能因为 task_id 为空就跳过会话解析退回
+    进程级 cwd，否则 default 会话 `cd` 过之后快照落错目录（Codex review P1）。"""
+    file_tools = pytest.importorskip("tools.file_tools")
+    session_dir = tmp_path / "default-session-cwd"
+    session_dir.mkdir()
+    resolved = session_dir / "notes.md"
+    resolved.write_text("x")
+
+    seen = []
+
+    def fake_resolver(path, task_id="default"):
+        seen.append(task_id)
+        return session_dir / path
+
+    monkeypatch.setattr(file_tools, "_resolve_path_for_task", fake_resolver)
+    rec = _install(monkeypatch)
+
+    # 直连 registry.dispatch 只带 turn_id 的形态：task_id 缺省为空串。
+    guard.maybe_require_snapshot("write_file", {"path": "notes.md"}, turn_id="turn_1")
+
+    assert seen == ["default"], "空 task_id 必须按 handler 口径归一成 default"
+    assert rec.requests[0]["body"]["paths"] == [str(resolved)]
+
+
+def test_empty_task_id_terminal_uses_default_session_cwd(monkeypatch, tmp_path):
+    """terminal 侧同源：`get_session_cwd` 的 None/空 key 读 "default" 记录，
+    guard 跳过调用就会退回进程级 cwd，而命令实际跑在 default 会话 cd 到的目录。"""
+    terminal_tool = pytest.importorskip("tools.terminal_tool")
+    session_dir = tmp_path / "default-term-cwd"
+    session_dir.mkdir()
+
+    seen = []
+
+    def fake_get_session_cwd(session_key):
+        seen.append(session_key)
+        return str(session_dir)
+
+    monkeypatch.setattr(terminal_tool, "get_session_cwd", fake_get_session_cwd)
+    rec = _install(monkeypatch)
+
+    guard.maybe_require_snapshot("terminal", {"command": "rm -f a.txt"}, turn_id="turn_1")
+
+    assert seen and seen[0] in ("", None), "空 task_id 要原样交给 get_session_cwd 归一"
+    assert rec.requests[0]["body"]["paths"] == [str(session_dir)]
+
+
 def test_dns_spoofed_loopback_host_is_rejected(monkeypatch, tmp_path):
     """127. 开头的 DNS hostname 不是 loopback，token 一个字节都不能发出去。"""
     for url in (

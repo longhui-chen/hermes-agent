@@ -507,19 +507,25 @@ def _resolve_write_path(path: Any, task_id: str) -> str:
 
     实际写入按 task_id 走 ``tools.file_tools._resolve_path_for_task``（会话注册
     的 cwd 优先于进程 env）；guard 若用进程级 cwd 解析相对路径，会给错误目录拍
-    快照而真正被写的文件没有恢复点（Codex review P1）。没有 task_id 或解析器不
-    可用时退回进程级解析。
+    快照而真正被写的文件没有恢复点（Codex review P1）。解析器不可用时退回进程
+    级解析。
+
+    **空 task_id 也要走会话解析**：handler 侧签名是
+    ``write_file_tool(..., task_id: str = "default")``，直连 registry.dispatch
+    只带 turn_id 的调用最终按 default 会话的 cwd / profile HOME 落盘。这里若
+    因为 task_id 为空就跳过、退回进程级 cwd，default 会话 `cd` 过之后 guard 就
+    会给错目录建快照，真正被写的文件没有恢复点（Codex review P1）。
     """
     raw = str(path or "").strip()
     if not raw:
         return ""
-    if task_id:
-        try:
-            from tools.file_tools import _resolve_path_for_task
+    try:
+        from tools.file_tools import _resolve_path_for_task
 
-            return _map_container_path(os.path.normpath(str(_resolve_path_for_task(raw, task_id))))
-        except Exception:
-            pass
+        return _map_container_path(
+            os.path.normpath(str(_resolve_path_for_task(raw, task_id or "default"))))
+    except Exception:
+        pass
     return _map_container_path(_abs_path(raw))
 
 
@@ -543,13 +549,16 @@ def _terminal_workdir(arguments: dict[str, Any], task_id: str) -> str:
     _bridge_terminal_env()
 
     session_cwd = ""
-    if task_id:
-        try:
-            from tools.terminal_tool import get_session_cwd
+    try:
+        from tools.terminal_tool import get_session_cwd
 
-            session_cwd = str(get_session_cwd(task_id) or "")
-        except Exception:
-            session_cwd = ""
+        # 空 task_id 不能跳过：get_session_cwd 明确把 None / 空 key 读作
+        # "default" 记录，terminal_tool 内部也按 `task_id or "default"` 归一。
+        # 跳过就退回进程级 cwd，而命令实际跑在 default 会话 `cd` 到的目录
+        # （Codex review P1，与 _resolve_write_path 同源的口径缺口）。
+        session_cwd = str(get_session_cwd(task_id) or "")
+    except Exception:
+        session_cwd = ""
     if session_cwd:
         session_cwd = _map_container_path(_abs_path(session_cwd))
 
