@@ -78,15 +78,17 @@ class ZettlabImageGenProvider(ImageGenProvider):
 
     def capabilities(self) -> Dict[str, Any]:
         try:
-            _cap, model = media_client.selected_model_capability("image")
+            cap, model = media_client.selected_model_capability("image")
         except Exception:
             return {"modalities": ["text"], "max_reference_images": 0}
-        modalities: List[str] = []
-        if isinstance(model, dict):
-            for value in model.get("modalities") or []:
-                if isinstance(value, str) and value.strip() and value.strip() not in modalities:
-                    modalities.append(value.strip())
-        return {"modalities": modalities or ["text"], "max_reference_images": 0}
+        return {
+            "modalities": media_client.supported_modalities(cap, model),
+            "max_reference_images": 0,
+            "image_input_description": (
+                "Pass one absolute local PNG, JPEG, or WebP file path, or a standard "
+                "base64 image Data URI. Remote URLs are not supported by Zettlab."
+            ),
+        }
 
     def generate(
         self,

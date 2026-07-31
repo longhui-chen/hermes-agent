@@ -101,13 +101,26 @@ def test_zettlab_image_capabilities_preserve_image_only_modality(monkeypatch):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setattr(client, "selected_model_capability", lambda media_type: ({
-        "limits": {"max_remote_media_inputs": 1},
+        "limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
     }, {
         "id": "image-only",
         "modalities": ["image"],
     }))
 
     assert ZettlabImageGenProvider().capabilities()["modalities"] == ["image"]
+
+
+def test_zettlab_image_capabilities_hide_image_without_inline_limit(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setattr(client, "selected_model_capability", lambda media_type: ({
+        "limits": {},
+    }, {
+        "id": "image-only",
+        "modalities": ["image"],
+    }))
+
+    assert ZettlabImageGenProvider().capabilities()["modalities"] == []
 
 
 def test_zettlab_provider_uses_gateway_default_model(monkeypatch):

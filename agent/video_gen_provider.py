@@ -149,10 +149,13 @@ class VideoGenProvider(abc.ABC):
                 "supports_audio": True,
                 "supports_negative_prompt": True,
                 "max_reference_images": 7,
+                "image_input_description": "...",    # optional provider-specific source rules
             }
 
-        Used by the tool layer for soft validation and by ``hermes tools``
-        for the picker. Default: text-only.
+        ``image_input_description`` optionally replaces the generic
+        ``image_url`` source guidance in the dynamic tool schema. The remaining
+        fields are used by the tool layer for soft validation and by
+        ``hermes tools`` for the picker. Default: text-only.
         """
         return {
             "modalities": ["text"],

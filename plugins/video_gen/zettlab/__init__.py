@@ -52,7 +52,7 @@ class ZettlabVideoGenProvider(VideoGenProvider):
 
     def capabilities(self) -> Dict[str, Any]:
         try:
-            _cap, model = media_client.selected_model_capability("video")
+            cap, model = media_client.selected_model_capability("video")
         except Exception:
             return super().capabilities()
         modalities: List[str] = []
@@ -60,9 +60,7 @@ class ZettlabVideoGenProvider(VideoGenProvider):
         resolutions: List[str] = []
         durations: List[int] = []
         if isinstance(model, dict):
-            for value in model.get("modalities") or []:
-                if isinstance(value, str) and value.strip() and value not in modalities:
-                    modalities.append(value)
+            modalities = media_client.supported_modalities(cap, model)
             for value in model.get("aspect_ratios") or []:
                 if isinstance(value, str) and value not in aspect_ratios:
                     aspect_ratios.append(value)
@@ -73,7 +71,7 @@ class ZettlabVideoGenProvider(VideoGenProvider):
                 if isinstance(value, int) and value not in durations:
                     durations.append(value)
         return {
-            "modalities": modalities or ["text"],
+            "modalities": modalities,
             "aspect_ratios": aspect_ratios or [DEFAULT_ASPECT_RATIO],
             "resolutions": resolutions or [DEFAULT_RESOLUTION],
             "max_duration": max(durations) if durations else 10,
@@ -81,6 +79,10 @@ class ZettlabVideoGenProvider(VideoGenProvider):
             "supports_audio": False,
             "supports_negative_prompt": False,
             "max_reference_images": 0,
+            "image_input_description": (
+                "Pass one absolute local PNG, JPEG, or WebP file path, or a standard "
+                "base64 image Data URI. Remote URLs are not supported by Zettlab."
+            ),
         }
 
     def generate(

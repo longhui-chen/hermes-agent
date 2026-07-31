@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import os
 
 import pytest
 
@@ -74,6 +75,46 @@ def test_inline_image_input_fails_closed_without_gateway_limit():
     value = f"data:image/png;base64,{base64.b64encode(PNG).decode('ascii')}"
     with pytest.raises(client.ZettlabMediaError, match="not enabled"):
         client.inline_image_input(value, None, {"modalities": ["text", "image"]})
+
+
+def test_inline_image_input_clamps_gateway_limit_to_local_hard_cap():
+    from plugins import zettlab_media_client as client
+
+    assert client._inline_image_limit(_capability(limit=16 * 1024 * 1024)) == (
+        client.MAX_INLINE_IMAGE_BYTES
+    )
+
+
+def test_inline_image_input_rejects_oversize_file_before_encoding(tmp_path, monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    image_path = tmp_path / "oversize.png"
+    image_path.write_bytes(PNG + b"x" * client.MAX_INLINE_IMAGE_BYTES)
+    monkeypatch.setattr(
+        base64,
+        "b64encode",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("oversize file must be rejected before encoding")
+        ),
+    )
+
+    with pytest.raises(client.ZettlabMediaError, match="exceeds maximum size"):
+        client.inline_image_input(
+            str(image_path),
+            None,
+            _capability(limit=16 * 1024 * 1024),
+        )
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO is unavailable")
+def test_inline_image_input_rejects_fifo_without_blocking(tmp_path):
+    from plugins import zettlab_media_client as client
+
+    fifo_path = tmp_path / "image.fifo"
+    os.mkfifo(fifo_path)
+
+    with pytest.raises(client.ZettlabMediaError, match="regular file"):
+        client.inline_image_input(str(fifo_path), None, _capability())
 
 
 def test_media_http_session_accepts_base64_sized_request(monkeypatch):

@@ -1156,7 +1156,7 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 from tools.registry import registry, tool_error
 
-IMAGE_GENERATE_SCHEMA = {
+IMAGE_GENERATE_SCHEMA: Dict[str, Any] = {
     "name": "image_generate",
     # Placeholder — the real description is rebuilt dynamically at
     # get_tool_definitions() time so it reflects the active backend's actual
@@ -1590,10 +1590,13 @@ def _active_image_capabilities() -> Dict[str, Any]:
                     caps = {}
                 info["provider"] = provider.display_name
                 info["model"] = _read_configured_image_model() or (provider.default_model() or "")
-                if caps.get("modalities"):
+                if isinstance(caps.get("modalities"), list):
                     info["modalities"] = list(caps["modalities"])
                 if caps.get("max_reference_images"):
                     info["max_reference_images"] = int(caps["max_reference_images"])
+                input_description = caps.get("image_input_description")
+                if isinstance(input_description, str) and input_description.strip():
+                    info["image_input_description"] = input_description.strip()
                 return info
         except Exception:  # noqa: BLE001
             pass
@@ -1626,7 +1629,8 @@ def _build_dynamic_image_schema() -> Dict[str, Any]:
 
     provider = info.get("provider")
     model = info.get("model")
-    modalities = set(info.get("modalities") or ["text"])
+    raw_modalities = info.get("modalities")
+    modalities = set(raw_modalities if isinstance(raw_modalities, list) else ["text"])
 
     line = "\nActive backend"
     if provider:
@@ -1651,15 +1655,36 @@ def _build_dynamic_image_schema() -> Dict[str, Any]:
         parts.append(
             "- this model is image-to-image / edit only — image_url is REQUIRED"
         )
-    else:
+    elif "text" in modalities:
         parts.append(
             "- this model is text-to-image only — it is NOT capable of "
             "image-to-image / editing; do not pass image_url or "
             "reference_image_urls (they will be rejected). Provide a "
             "text-only prompt."
         )
+    else:
+        parts.append(
+            "- this model currently has no usable input modality; generation "
+            "calls will be rejected until the backend capability is corrected"
+        )
 
-    return {"description": "\n".join(parts)}
+    overrides: Dict[str, Any] = {"description": "\n".join(parts)}
+    input_description = info.get("image_input_description")
+    if "image" not in modalities:
+        input_description = "Not supported by the active backend/model; omit image_url."
+    if isinstance(input_description, str) and input_description.strip():
+        parameters = {**IMAGE_GENERATE_SCHEMA["parameters"]}
+        parameters["properties"] = {
+            key: dict(value)
+            for key, value in IMAGE_GENERATE_SCHEMA["parameters"]["properties"].items()
+        }
+        parameters["properties"]["image_url"]["description"] = input_description.strip()
+        if not info.get("max_reference_images"):
+            parameters["properties"]["reference_image_urls"]["description"] = (
+                "Not supported by the active backend/model; omit reference_image_urls."
+            )
+        overrides["parameters"] = parameters
+    return overrides
 
 
 registry.register(

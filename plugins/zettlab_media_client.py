@@ -15,6 +15,7 @@ import json
 import multiprocessing
 import os
 import re
+import stat
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -31,6 +32,7 @@ MAX_CAPABILITY_RESPONSE_BYTES = 256 * 1024
 MAX_ERROR_RESPONSE_BYTES = 64 * 1024
 MAX_MEDIA_REQUEST_BYTES = 7 * 1024 * 1024
 MAX_MEDIA_RESPONSE_BYTES = 1024 * 1024
+MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024
 ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
 ARTIFACT_SESSION_HEADER = "X-Zettlab-Artifact-Session-Id"
 _STARTER_CAPACITY = threading.BoundedSemaphore(value=2)
@@ -521,7 +523,14 @@ def list_models(media_type: str) -> List[Dict[str, Any]]:
     models = section.get("models")
     if not isinstance(models, list):
         return []
-    return [m for m in models if isinstance(m, dict) and isinstance(m.get("id"), str)]
+    out: List[Dict[str, Any]] = []
+    for model in models:
+        if not isinstance(model, dict) or not isinstance(model.get("id"), str):
+            continue
+        normalized = dict(model)
+        normalized["modalities"] = supported_modalities(section, model)
+        out.append(normalized)
+    return out
 
 
 def default_model(media_type: str) -> Optional[str]:
@@ -602,7 +611,16 @@ def is_available(media_type: str) -> bool:
         section = type_capability(media_type)
     except Exception:
         return False
-    return bool(section.get("enabled")) and bool(section.get("models"))
+    models = section.get("models")
+    return (
+        bool(section.get("enabled"))
+        and isinstance(models, list)
+        and any(
+            supported_modalities(section, model)
+            for model in models
+            if isinstance(model, dict)
+        )
+    )
 
 
 def validate_remote_url(value: Optional[str], *, label: str) -> Optional[str]:
@@ -652,17 +670,37 @@ def remote_inputs(
     return out
 
 
+def _effective_inline_image_limit(limits: Any) -> Optional[int]:
+    limit = limits.get("max_inline_image_bytes") if isinstance(limits, dict) else None
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        return None
+    return min(limit, MAX_INLINE_IMAGE_BYTES)
+
+
+def supported_modalities(
+    type_section: Optional[Dict[str, Any]],
+    model_capability: Optional[Dict[str, Any]],
+) -> List[str]:
+    raw = model_capability.get("modalities") if isinstance(model_capability, dict) else None
+    modalities: List[str] = []
+    if isinstance(raw, list):
+        for value in raw:
+            normalized = value.strip() if isinstance(value, str) else ""
+            if normalized and normalized not in modalities:
+                modalities.append(normalized)
+    elif raw is None:
+        modalities.append("text")
+    limits = type_section.get("limits") if isinstance(type_section, dict) else None
+    if "image" in modalities and _effective_inline_image_limit(limits) is None:
+        modalities.remove("image")
+    return modalities
+
+
 def _inline_image_limit(model_capability: Optional[Dict[str, Any]]) -> int:
     modalities = model_capability.get("modalities") if isinstance(model_capability, dict) else None
     limits = model_capability.get("_type_limits") if isinstance(model_capability, dict) else None
-    limit = limits.get("max_inline_image_bytes") if isinstance(limits, dict) else None
-    if (
-        not isinstance(modalities, list)
-        or "image" not in modalities
-        or not isinstance(limit, int)
-        or isinstance(limit, bool)
-        or limit <= 0
-    ):
+    limit = _effective_inline_image_limit(limits)
+    if not isinstance(modalities, list) or "image" not in modalities or limit is None:
         raise ZettlabMediaError(
             "Inline image input is not enabled for this Zettlab media generation model"
         )
@@ -719,12 +757,23 @@ def _local_image_data_uri(source: str, limit: int) -> str:
 
     raise_if_read_blocked(source)
     path = os.path.expanduser(source)
+    if not os.path.isabs(path):
+        raise ZettlabMediaError("local image input must use an absolute path")
     encoded = io.StringIO()
     total = 0
     prefix = bytearray()
     remainder = b""
     try:
-        with open(path, "rb") as image_file:
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as image_file:
+            file_stat = os.fstat(image_file.fileno())
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ZettlabMediaError("local image input must be a regular file")
+            if file_stat.st_size <= 0:
+                raise ZettlabMediaError("local image input must contain image bytes")
+            if file_stat.st_size > limit:
+                raise ZettlabMediaError("inline image input exceeds maximum size")
             while True:
                 chunk = image_file.read(_IMAGE_ENCODE_CHUNK_BYTES)
                 if not chunk:

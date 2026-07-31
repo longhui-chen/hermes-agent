@@ -88,7 +88,7 @@ def test_zettlab_video_capabilities_preserve_image_only_modality(monkeypatch):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setattr(client, "selected_model_capability", lambda media_type: ({
-        "limits": {"max_remote_media_inputs": 1},
+        "limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
     }, {
         "id": "image-only",
         "modalities": ["image"],
@@ -96,6 +96,20 @@ def test_zettlab_video_capabilities_preserve_image_only_modality(monkeypatch):
     }))
 
     assert ZettlabVideoGenProvider().capabilities()["modalities"] == ["image"]
+
+
+def test_zettlab_video_capabilities_hide_image_without_inline_limit(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setattr(client, "selected_model_capability", lambda media_type: ({
+        "limits": {},
+    }, {
+        "id": "image-only",
+        "modalities": ["image"],
+        "durations": [5],
+    }))
+
+    assert ZettlabVideoGenProvider().capabilities()["modalities"] == []
 
 
 def test_zettlab_video_generate_creates_media_job(monkeypatch):
