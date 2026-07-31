@@ -152,6 +152,10 @@ class TestAutoMigration:
             );
         """)
         conn.execute(
+            "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+            ("s1", "cli", 1000.0),
+        )
+        conn.execute(
             "INSERT INTO messages (session_id, role, content, timestamp) "
             "VALUES (?, ?, ?, ?)",
             ("s1", "user", "old row", 1000.0),
@@ -903,7 +907,10 @@ class TestSessionRowExistsBeforePreflightCompaction:
     def _make_agent(self, db, sid, *, in_place):
         from run_agent import AIAgent
 
-        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+        with (
+            patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}),
+            patch("agent.model_metadata.fetch_model_metadata", return_value={}),
+        ):
             agent = AIAgent(
                 api_key="test-key",
                 base_url="https://openrouter.ai/api/v1",
@@ -948,6 +955,7 @@ class TestSessionRowExistsBeforePreflightCompaction:
         compressor.context_length = 1000
         compressor.last_prompt_tokens = -1
         compressor.should_compress = _should_compress
+        compressor.should_defer_rough_estimate_to_real_usage = lambda _t: False
         compressor.should_defer_preflight_to_real_usage = lambda _t: False
         compressor.get_active_compression_failure_cooldown = lambda: None
         compressor.compress = _compress

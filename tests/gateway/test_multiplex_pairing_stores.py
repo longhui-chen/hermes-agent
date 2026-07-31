@@ -57,6 +57,11 @@ def test_secondary_profile_pairing_stores_created(tmp_path, monkeypatch):
     assert "coder" in runner.pairing_stores, (
         "secondary profile PairingStore missing — the NameError swallow is back"
     )
+    assert runner.pairing_stores["default"]._dir in {
+        tmp_path / ".hermes" / "pairing",
+        tmp_path / ".hermes" / "platforms" / "pairing",
+    }
+    assert not (tmp_path / ".hermes" / "profiles" / "default").exists()
 
 
 def test_pairing_store_scoped_to_profile_dir(tmp_path, monkeypatch):
@@ -83,3 +88,43 @@ def test_pairing_store_scoped_to_profile_dir(tmp_path, monkeypatch):
     assert "profiles/ops/pairing" in str(store._dir).replace("\\", "/"), (
         f"store not profile-scoped: {store._dir}"
     )
+
+
+def test_default_pairing_store_uses_root_when_active_profile_is_named(
+    tmp_path, monkeypatch
+):
+    """Multiplex startup must isolate default auth from the active named
+    profile even though PAIRING_DIR was bound in the named-profile process."""
+    root = tmp_path / ".hermes"
+    active_home = root / "profiles" / "coder"
+    active_pairing_dir = active_home / "pairing"
+    active_pairing_dir.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(active_home))
+
+    runner = _bare_runner()
+
+    async def _no_secondary(profile_name, profile_home, claimed):
+        return 0
+
+    runner._start_one_profile_adapters = _no_secondary
+    runner._adapter_credential_fingerprint = lambda adapter: None
+
+    with patch(
+        "gateway.pairing.PAIRING_DIR", active_pairing_dir
+    ), patch(
+        "hermes_cli.profiles.profiles_to_serve",
+        return_value=[("default", root)],
+    ), patch(
+        "hermes_cli.profiles.get_active_profile_name",
+        return_value="coder",
+    ):
+        runner._profile_adapters["default"] = {}
+        asyncio.run(runner._start_secondary_profile_adapters())
+
+    default_store = runner.pairing_stores["default"]
+    assert default_store._dir in {
+        root / "pairing",
+        root / "platforms" / "pairing",
+    }
+    assert default_store._dir != active_pairing_dir
+    assert not (root / "profiles" / "default").exists()

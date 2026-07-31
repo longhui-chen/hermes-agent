@@ -565,6 +565,26 @@ class ZetAgentAdapter(APIServerAdapter):
         """
         return bool(_delegation_advance_url())
 
+    async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
+        """Bind local-server's browser scope capability for this API request.
+
+        The base handler creates the agent task while this context is active,
+        so ContextVar propagation carries the token into synchronous tool
+        workers without exposing it through process-global environment state.
+        """
+        from gateway.session_context import (
+            pop_zettlab_browser_session_token,
+            push_zettlab_browser_session_token,
+        )
+
+        token = push_zettlab_browser_session_token(
+            request.headers.get("X-Zettlab-Browser-Session-Token", "")
+        )
+        try:
+            return await super()._handle_chat_completions(request)
+        finally:
+            pop_zettlab_browser_session_token(token)
+
     def _bind_turn_session_context(self, session_id: str) -> None:
         """Rebind session contextvars for this turn's agent build.
 
@@ -1680,7 +1700,11 @@ class ZetAgentAdapter(APIServerAdapter):
         )
 
         # cron origin + async-delivery capability（见 helper docstring）。
-        self._bind_turn_session_context(session_id)
+        # local-server sends the stable App session as X-Hermes-Session-Key.
+        # Prefer it over the lineage tip so task-local browser ownership keeps
+        # its zettlab:<user>:<agent> scope after Hermes compaction rotates the
+        # continuation id to api-*.
+        self._bind_turn_session_context(gateway_session_key or session_id)
 
         from run_agent import AIAgent
         from gateway.run import (
@@ -1934,6 +1958,7 @@ class ZetAgentAdapter(APIServerAdapter):
         plan_ack: Optional[Dict[str, Any]] = None,
         plan_auto_execute: Optional[bool] = None,
         turn_id: Optional[str] = None,
+        connector_route_capability: Optional[str] = None,
         request_overrides: Optional[Dict[str, Any]] = None,
     ):
         """Wrap base ``_run_agent`` to bind the session-scoped env
@@ -2016,6 +2041,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 plan_ack=plan_ack,
                 plan_auto_execute=plan_auto_execute,
                 turn_id=turn_id,
+                connector_route_capability=connector_route_capability,
                 request_overrides=request_overrides,
             )
             # Early-return steer salvage: many conversation_loop retry/error
@@ -2935,11 +2961,17 @@ class ZetAgentAdapter(APIServerAdapter):
             try:
                 if generation is None:
                     continue
-                session_db = await _to_thread_with_completion_barrier(
-                    self._open_profile_session_db,
-                    Path(profile_home),
-                    create=False,
-                )
+                try:
+                    session_db = await _to_thread_with_completion_barrier(
+                        self._open_profile_session_db,
+                        Path(profile_home),
+                        create=False,
+                    )
+                except FileNotFoundError:
+                    # Discovery lists every served profile home; ones that have
+                    # never opened a session simply have no state.db yet. That
+                    # is not a cleanup failure — skip without warning.
+                    continue
                 if self._profile_directory_identity(key) != generation:
                     logger.warning(
                         "[zet_agent] runtime import profile changed while DB opened; skipping cleanup"

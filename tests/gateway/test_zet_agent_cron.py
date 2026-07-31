@@ -287,6 +287,7 @@ def test_handoff_session_when_origin_deleted(tmp_path, monkeypatch):
     import cron.jobs as cron_jobs
     import gateway.platforms.zet_agent_cron as zc
 
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
     monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
@@ -341,6 +342,7 @@ def test_calendar_reminder_session_is_created_without_handoff(tmp_path, monkeypa
     import cron.jobs as cron_jobs
     import gateway.platforms.zet_agent_cron as zc
 
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
     monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
@@ -386,6 +388,124 @@ def test_calendar_reminder_session_is_created_without_handoff(tmp_path, monkeypa
     assert '"origin_recreated": true' not in blob
     assert '"source": "calendar"' in blob
     assert "喝水提醒" in blob
+
+
+def test_persist_targets_call_time_profile_home_not_frozen_default(tmp_path, monkeypatch):
+    """Multiplex e2e (real mark_job_run): the cron summary must land in the firing
+    profile's state.db (what the App reads /history from), not the top-level DB
+    that DEFAULT_DB_PATH is frozen to at import time — the misroute that left the
+    per-profile DB with 0 cron summaries."""
+    import sqlite3
+    import hermes_state
+    import cron.jobs as cron_jobs
+    import cron.scheduler as scheduler
+    import gateway.platforms.zet_agent_cron as zc
+    from hermes_state import SessionDB
+
+    top = tmp_path / "top"                       # gateway HERMES_HOME at import
+    prof = tmp_path / "profiles" / "eae0707d"    # firing profile home (call-time)
+    top.mkdir(parents=True)
+    prof.mkdir(parents=True)
+
+    # DEFAULT_DB_PATH frozen to the top-level home, but the live home
+    # (get_hermes_home, under the profile cron scope) is the per-profile home.
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", top / "state.db")
+    monkeypatch.setenv("HERMES_HOME", str(prof))
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", prof / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", prof / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", prof / "cron" / "output")
+    monkeypatch.delenv("ZET_CHAT_APPEND_URL", raising=False)
+    zc.install()
+
+    AID = "eae0707d"
+    SID = f"zettlab:userA:{AID}:orig001"
+    JID = "jobMux"
+    job = {
+        "id": JID, "name": "论文推荐", "prompt": "推荐论文", "skills": [], "skill": None,
+        "schedule": {"kind": "cron", "expr": "30 21 * * *", "display": "每天21:30"},
+        "schedule_display": "每天21:30", "repeat": {"times": None, "completed": 1},
+        "enabled": True, "state": "scheduled", "deliver": "origin",
+        "origin": {"platform": "zet_agent", "chat_id": SID},
+        "timezone": "Asia/Shanghai", "last_status": None, "last_error": None,
+        "last_delivery_error": None,
+    }
+    cron_jobs.save_jobs([job])
+
+    # The App-visible origin conversation lives in the PER-PROFILE db.
+    prof_db = SessionDB(db_path=prof / "state.db")
+    prof_db.create_session(SID, source="zet_agent", user_id="userA")
+    prof_db.close()
+
+    zc._LATEST_OUTPUT[JID] = "# Cron\n\n## Response\n\n今日推荐：论文\n"
+    try:
+        scheduler.mark_job_run(JID, True, scheduled_at="2026-07-30T13:30:00Z", output_filename="run.md")
+    finally:
+        zc._LATEST_OUTPUT.pop(JID, None)
+
+    def _cron_summary_count(db_file):
+        if not db_file.exists():
+            return 0
+        c = sqlite3.connect(f"file:{db_file}?mode=ro", uri=True)
+        try:
+            return c.execute(
+                "select count(*) from messages where session_id=? and content like '%cron-summary%'",
+                (SID,),
+            ).fetchone()[0]
+        finally:
+            c.close()
+
+    # Summary in the per-profile db (App reads it), NOT the frozen top-level db.
+    assert _cron_summary_count(prof / "state.db") == 1
+    assert _cron_summary_count(top / "state.db") == 0
+
+
+def test_persist_failure_surfaces_delivery_error_never_silent(tmp_path, monkeypatch):
+    """Never-silent: if persisting the summary raises, the failure is folded into
+    the job's last_delivery_error (App card shows it) — not swallowed."""
+    import hermes_state
+    import cron.jobs as cron_jobs
+    import cron.scheduler as scheduler
+    import gateway.platforms.zet_agent_cron as zc
+    from hermes_state import SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    monkeypatch.setattr(cron_jobs, "CRON_DIR", tmp_path / "cron")
+    monkeypatch.setattr(cron_jobs, "JOBS_FILE", tmp_path / "cron" / "jobs.json")
+    monkeypatch.setattr(cron_jobs, "OUTPUT_DIR", tmp_path / "cron" / "output")
+    monkeypatch.delenv("ZET_CHAT_APPEND_URL", raising=False)
+    zc.install()
+
+    SID = "zettlab:userA:main:origFail"
+    JID = "jobFail"
+    job = {
+        "id": JID, "name": "会失败的任务", "prompt": "生成报告",
+        "schedule": {"kind": "cron", "expr": "0 9 * * *", "display": "每天09:00"},
+        "schedule_display": "每天09:00", "repeat": {"times": None, "completed": 0},
+        "enabled": True, "state": "scheduled", "deliver": "origin",
+        "origin": {"platform": "zet_agent", "chat_id": SID}, "timezone": "UTC",
+    }
+    cron_jobs.save_jobs([job])
+    db = SessionDB()
+    try:
+        db.create_session(SID, source="zet_agent", user_id="userA")
+    finally:
+        db.close()
+
+    # Persisting the summary blows up.
+    def _boom(*a, **k):
+        raise RuntimeError("db write blew up")
+    monkeypatch.setattr(hermes_state.SessionDB, "append_message", _boom)
+
+    zc._LATEST_OUTPUT[JID] = "# Cron\n\n## Response\n\n内容\n"
+    try:
+        scheduler.mark_job_run(JID, True, scheduled_at="2026-07-30T01:00:00Z", output_filename="run.md")
+    finally:
+        zc._LATEST_OUTPUT.pop(JID, None)
+
+    stored = cron_jobs.get_job(JID)
+    assert stored is not None
+    assert stored.get("last_delivery_error")   # failure surfaced, not silently dropped
 
 
 def test_silent_run_skips_session_persist(monkeypatch):

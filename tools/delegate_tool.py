@@ -54,6 +54,10 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "call_agent",  # anonymous workers may not consult real agents — that
         # would bypass the server-side call-chain/quota guardrails with a
         # principal that has no identity to authorize
+        "app_host",  # same principle: workers inherit the parent's secret
+        # scope, so an anonymous child could install/delete/restart device
+        # applications with the parent's action token — device-state verbs
+        # stay with the identified agent the user is actually talking to
     ]
 )
 

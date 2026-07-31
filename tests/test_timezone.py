@@ -415,6 +415,32 @@ class TestOSTimezoneLiveRead:
         assert hermes_time.get_timezone_name() == "Asia/Tokyo"
         assert hermes_time.now().utcoffset() == timedelta(hours=9)
 
+    def test_localtime_symlink_wins_over_stale_etc_timezone(self, tmp_path, monkeypatch):
+        """ZET-2185: /etc/timezone can go stale (e.g. an OTA writes 'Etc/UTC')
+        while /etc/localtime still points at the real zone. The authoritative
+        /etc/localtime symlink must win — otherwise the agent reasons in UTC and
+        schedules cron 8h off. Reproduces the board28 (CEO device) state."""
+        os.environ.pop("HERMES_TIMEZONE", None)
+        os.environ.pop("ZET_AGENT_ENABLED", None)
+        # Stale Debian file left at UTC.
+        tzfile = tmp_path / "timezone"
+        tzfile.write_text("Etc/UTC\n")
+        # Authoritative symlink → Asia/Shanghai. Only the readlink() target
+        # string is parsed (for the zoneinfo marker), so it need not resolve.
+        localtime = tmp_path / "localtime"
+        os.symlink("../usr/share/zoneinfo/Asia/Shanghai", localtime)
+        monkeypatch.setattr(hermes_time, "ETC_TIMEZONE", str(tzfile))
+        monkeypatch.setattr(hermes_time, "ETC_LOCALTIME", str(localtime))
+        # Stub config read directly: _read_config_timezone goes through
+        # read_raw_config() (the real config path, NOT get_config_path), so
+        # patching get_config_path alone leaves the test coupled to the host's
+        # actual hermes config. Force it empty so OS-tz resolution is exercised.
+        monkeypatch.setattr(hermes_time, "_read_config_timezone", lambda: "")
+        monkeypatch.setattr(hermes_time, "_read_timedatectl", lambda: "")
+        hermes_time.reset_cache()
+        assert hermes_time.get_timezone_name() == "Asia/Shanghai"
+        assert hermes_time.now().utcoffset() == timedelta(hours=8)
+
     def test_generic_config_timezone_wins_over_os_timezone(self, tmp_path, monkeypatch):
         os.environ.pop("HERMES_TIMEZONE", None)
         os.environ.pop("ZET_AGENT_ENABLED", None)

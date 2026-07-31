@@ -7,7 +7,7 @@ based on the user's configured IANA timezone (e.g. ``Asia/Kolkata``).
 Resolution order:
   1. ``HERMES_TIMEZONE`` environment variable
   2. ``timezone`` key in ``~/.hermes/config.yaml``
-  3. OS system tz: ``/etc/timezone`` → ``/etc/localtime`` symlink → ``timedatectl``
+  3. OS system tz: ``/etc/localtime`` symlink → ``/etc/timezone`` → ``timedatectl``
   4. Falls back to the server's local time (``datetime.now().astimezone()``)
 
 Resolution is fingerprint-gated: a change to any source (env / config.yaml /
@@ -92,7 +92,8 @@ def _read_config_timezone() -> str:
 
 
 def _read_os_timezone() -> str:
-    for reader in (_read_etc_timezone, _read_localtime_symlink, _read_timedatectl):
+    # /etc/localtime (what the OS clock uses) wins; stale-prone /etc/timezone is a fallback.
+    for reader in (_read_localtime_symlink, _read_etc_timezone, _read_timedatectl):
         tz_os = reader()
         if tz_os:
             return tz_os

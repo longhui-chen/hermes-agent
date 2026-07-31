@@ -8,9 +8,10 @@ channel_id, agent_id, or recipient. Returns a JSON string.
 """
 
 import json
-import os
 import urllib.request
 from urllib.parse import urlsplit, urlunsplit
+
+from agent.secret_scope import get_secret
 
 _ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
 _SEND_PATH = "/api/v1/internal/agent/channels/send"
@@ -40,7 +41,10 @@ SEND_CHANNEL_MESSAGE_SCHEMA = {
 
 
 def _resolve_send_url():
-    raw = os.environ.get("ZET_CHAT_APPEND_URL", "").strip()
+    # Resolved via the profile secret scope (get_secret) so the shared
+    # multiplexing gateway — where the value lives in the profile ``.env``,
+    # not the process env — works too.
+    raw = str(get_secret("ZET_CHAT_APPEND_URL", "") or "").strip()
     if not raw:
         return None
     parts = urlsplit(raw)
@@ -51,9 +55,14 @@ def _resolve_send_url():
 
 def _check_send_channel_message():
     return bool(
-        os.environ.get("ZET_CHAT_APPEND_URL", "").strip()
-        and os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN", "").strip()
+        str(get_secret("ZET_CHAT_APPEND_URL", "") or "").strip()
+        and str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip()
     )
+
+
+# Availability depends on the per-turn profile scope; the registry must not
+# serve one profile's cached verdict to another.
+_check_send_channel_message._profile_scope_sensitive = True  # type: ignore[attr-defined]
 
 
 def _post_channel_send(url, token, target_ref, text):
@@ -89,7 +98,7 @@ def send_channel_message_tool(args, **kw):
     url = _resolve_send_url()
     if not url:
         return json.dumps({"error": "local-server callback URL unavailable (ZET_CHAT_APPEND_URL unset)"}, ensure_ascii=False)
-    token = os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN", "").strip()
+    token = str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip()
     if not token:
         return json.dumps({"error": "agent action token unavailable"}, ensure_ascii=False)
 

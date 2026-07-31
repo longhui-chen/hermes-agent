@@ -345,6 +345,59 @@ async def test_prefixed_chat_hits_handler_inside_profile_scope(profile_homes, mo
 
 
 @pytest.mark.asyncio
+async def test_prefixed_chat_routes_connector_capability_through_zet_agent_override(
+    profile_homes, monkeypatch,
+):
+    from gateway.platforms.api_server import APIServerAdapter
+    from hermes_constants import get_hermes_home
+
+    capability = "c" * 43
+    seen = []
+    adapter = _make_adapter()
+
+    async def fake_base_run(_self, **kwargs):
+        seen.append((
+            get_hermes_home(),
+            kwargs["connector_route_capability"],
+        ))
+        return (
+            {
+                "final_response": "scoped",
+                "session_id": kwargs["session_id"],
+                "completed": True,
+            },
+            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+
+    class NoopGoals:
+        def schedule_after_turn(self, *_args, **_kwargs):
+            return None
+
+    async def noop_title(**_kwargs):
+        return None
+
+    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_base_run)
+    monkeypatch.setattr(adapter, "_goals", lambda: NoopGoals())
+    monkeypatch.setattr(adapter, "_emit_native_session_title", noop_title)
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/p/coder/v1/chat/completions",
+            json={
+                "model": "hermes-agent",
+                "messages": [{"role": "user", "content": "hello coder"}],
+                "metadata": {"connector_route_capability": capability},
+            },
+            headers={"Authorization": "Bearer test-key"},
+        )
+        assert resp.status == 200
+
+    assert seen == [(profile_homes["coder"], capability)]
+
+
+@pytest.mark.asyncio
 async def test_prefixed_chat_scope_reaches_agent_executor(profile_homes, monkeypatch):
     """The agent is created in an executor thread, so profile context must cross it."""
     seen = []

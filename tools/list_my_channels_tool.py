@@ -7,9 +7,10 @@ agent identity from the action token and returns a narrow, credential-free list.
 """
 
 import json
-import os
 import urllib.request
 from urllib.parse import urlsplit, urlunsplit
+
+from agent.secret_scope import get_secret
 
 _ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
 _CHANNELS_PATH = "/api/v1/internal/agent/channels"
@@ -34,9 +35,11 @@ def _resolve_channels_url():
 
     ZET_CHAT_APPEND_URL is injected by the registry and points at
     <base>/api/v1/internal/chat/append. We reuse its scheme+netloc and swap the
-    path. Returns None when the env var is absent or malformed.
+    path. Resolved via the profile secret scope (get_secret) so the shared
+    multiplexing gateway — where the value lives in the profile ``.env``, not
+    the process env — works too. Returns None when absent or malformed.
     """
-    raw = os.environ.get("ZET_CHAT_APPEND_URL", "").strip()
+    raw = str(get_secret("ZET_CHAT_APPEND_URL", "") or "").strip()
     if not raw:
         return None
     parts = urlsplit(raw)
@@ -49,9 +52,14 @@ def _check_list_my_channels():
     """Expose the tool only inside a zet_agent subprocess: both the callback URL
     and the action token must be present."""
     return bool(
-        os.environ.get("ZET_CHAT_APPEND_URL", "").strip()
-        and os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN", "").strip()
+        str(get_secret("ZET_CHAT_APPEND_URL", "") or "").strip()
+        and str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip()
     )
+
+
+# Availability depends on the per-turn profile scope; the registry must not
+# serve one profile's cached verdict to another.
+_check_list_my_channels._profile_scope_sensitive = True  # type: ignore[attr-defined]
 
 
 def list_my_channels_tool(args, **kw):
@@ -63,7 +71,7 @@ def list_my_channels_tool(args, **kw):
     url = _resolve_channels_url()
     if not url:
         return json.dumps({"error": "local-server callback URL unavailable (ZET_CHAT_APPEND_URL unset)"}, ensure_ascii=False)
-    token = os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN", "").strip()
+    token = str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "").strip()
     if not token:
         return json.dumps({"error": "agent action token unavailable (ZETTLAB_AGENT_ACTION_TOKEN unset)"}, ensure_ascii=False)
     try:

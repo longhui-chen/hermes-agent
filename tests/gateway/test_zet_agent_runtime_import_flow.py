@@ -1871,3 +1871,37 @@ def test_malformed_profile_state_db_self_heals_on_open(tmp_path):
         if healed is not None:
             healed.close()
     assert list(profile_home.glob("state.db.malformed-backup-*"))  # backed up first
+
+
+@pytest.mark.asyncio
+async def test_cleanup_discovery_silently_skips_profile_without_state_db(
+    tmp_path, monkeypatch, caplog
+):
+    """A served profile that never opened a session has no state.db yet.
+
+    The discovery pass opens with create=False; the resulting
+    FileNotFoundError is an expected no-op, not a cleanup failure, so it
+    must not emit the per-profile failure warning.
+    """
+    import logging
+
+    empty_home = tmp_path / "profiles" / "fresh"
+    empty_home.mkdir(parents=True)
+
+    adapter = ZetAgentAdapter(
+        PlatformConfig(enabled=True, extra={"key": "test-key"})
+    )
+    adapter._session_db = None
+    adapter._session_dbs = {}
+    adapter._ensure_session_db = lambda: None
+    monkeypatch.setattr(
+        adapter, "_multiplex_profile_homes", lambda: {"fresh": empty_home}
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert await adapter._cleanup_stale_runtime_imports_once() == 0
+
+    assert not any(
+        "runtime import staging cleanup failed" in record.getMessage()
+        for record in caplog.records
+    )

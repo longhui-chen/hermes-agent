@@ -2182,8 +2182,9 @@ def cleanup_task_resources(agent, task_id: str) -> None:
     torn down per-turn as before to prevent resource leakage (the original
     intent of this hook for the Morph backend, see commit fbd3a2fd).
 
-    Skips ``cleanup_browser`` in headed mode so the browser window stays
-    visible between turns. The inactivity reaper in
+    Skips ``cleanup_browser`` in headed mode or while local-server owns the
+    managed browser session so the same page survives between turns. The
+    explicit close path and inactivity reaper in
     ``browser_tool._cleanup_inactive_browser_sessions`` still handles
     idle sessions.
     """
@@ -2200,17 +2201,22 @@ def cleanup_task_resources(agent, task_id: str) -> None:
         if agent.verbose_logging:
             logger.warning(f"Failed to cleanup VM for task {task_id}: {e}")
     try:
-        headed = False
+        preserve_browser_session = False
         try:
-            from tools.browser_tool import _is_headed_mode
-            headed = _is_headed_mode()
+            from tools.browser_tool import (
+                _is_headed_mode,
+                _is_managed_browser_configured,
+            )
+            preserve_browser_session = (
+                _is_headed_mode() or _is_managed_browser_configured()
+            )
         except Exception:
-            headed = bool(os.environ.get("AGENT_BROWSER_HEADED"))
-        if headed:
+            preserve_browser_session = bool(os.environ.get("AGENT_BROWSER_HEADED"))
+        if preserve_browser_session:
             if agent.verbose_logging:
                 logging.debug(
-                    f"Skipping per-turn cleanup_browser for headed session {task_id}; "
-                    f"idle reaper will handle it."
+                    f"Skipping per-turn cleanup_browser for persistent session {task_id}; "
+                    f"explicit close or the idle reaper will handle it."
                 )
         else:
             _ra().cleanup_browser(task_id)

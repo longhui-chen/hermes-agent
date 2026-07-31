@@ -516,6 +516,17 @@ def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
             env[key] = str(value)
         else:
             env.pop(key, None)
+    try:
+        from gateway.session_context import zettlab_connector_route_capability
+
+        route_capability = zettlab_connector_route_capability()
+    except Exception:
+        route_capability = ""
+    if route_capability:
+        # Reuse the legacy runner header transport without exposing the real
+        # session key as selection authority. Generic terminal subprocesses
+        # never receive this private ContextVar.
+        env["HERMES_SESSION_KEY"] = route_capability
     return env
 
 
