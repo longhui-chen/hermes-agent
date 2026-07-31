@@ -343,7 +343,7 @@ def test_managed_navigate_blocks_private_redirect_and_closes_page(monkeypatch):
         )
 
     monkeypatch.setattr(browser_tool, "_route_browser_action", route)
-    monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: True)
+    monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
     monkeypatch.setattr(browser_tool, "_is_local_sidecar_key", lambda _key: False)
     monkeypatch.setattr(browser_tool, "_is_always_blocked_url", lambda _url: False)
     monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
@@ -358,6 +358,237 @@ def test_managed_navigate_blocks_private_redirect_and_closes_page(monkeypatch):
     assert result["success"] is False
     assert "private or internal" in result["error"]
     assert actions == ["navigate", "close"]
+
+
+def test_managed_navigate_allows_lan_page_for_local_backend(monkeypatch):
+    actions = []
+
+    def route(action, _params=None):
+        actions.append(action)
+        return SimpleNamespace(
+            backend="desktop",
+            result=json.dumps({
+                "success": True,
+                "url": "http://192.168.1.10/ui",
+                "title": "Device Web UI",
+            }),
+        )
+
+    monkeypatch.setattr(browser_tool, "_route_browser_action", route)
+    monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: True)
+    monkeypatch.setattr(browser_tool, "_is_local_sidecar_key", lambda _key: False)
+    monkeypatch.setattr(browser_tool, "_is_always_blocked_url", lambda _url: False)
+    monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
+    monkeypatch.setattr(browser_tool, "_is_safe_url", lambda _url: False)
+    monkeypatch.setattr(browser_tool, "check_website_access", lambda _url: None)
+
+    result = json.loads(browser_tool.browser_navigate("http://192.168.1.10/ui"))
+    assert result["success"] is True
+    assert result["url"] == "http://192.168.1.10/ui"
+    assert actions == ["navigate"]
+
+
+def test_managed_navigate_still_blocks_metadata_for_local_backend(monkeypatch):
+    actions = []
+
+    def route(action, _params=None):
+        actions.append(action)
+        if action == "navigate":
+            return SimpleNamespace(
+                backend="desktop",
+                result=json.dumps({
+                    "success": True,
+                    "url": "http://169.254.169.254/latest/meta-data/",
+                    "title": "",
+                }),
+            )
+        return SimpleNamespace(
+            backend="desktop",
+            result=json.dumps({"success": True, "closed": True}),
+        )
+
+    monkeypatch.setattr(browser_tool, "_route_browser_action", route)
+    monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: True)
+    monkeypatch.setattr(browser_tool, "_is_local_sidecar_key", lambda _key: False)
+    monkeypatch.setattr(
+        browser_tool,
+        "_is_always_blocked_url",
+        lambda url: "169.254.169.254" in url,
+    )
+    monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
+    monkeypatch.setattr(browser_tool, "_is_safe_url", lambda _url: True)
+    monkeypatch.setattr(browser_tool, "check_website_access", lambda _url: None)
+
+    result = json.loads(browser_tool.browser_navigate("https://example.com/"))
+    assert result["success"] is False
+    assert "metadata" in result["error"]
+    assert actions == ["navigate", "close"]
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["about:blank", "about:srcdoc", "about:blank#reset", "ABOUT:BLANK"],
+)
+def test_managed_page_safety_skips_browser_internal_blank_pages(monkeypatch, url):
+    monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
+    monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
+    assert browser_tool._managed_page_safety_error(url) is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["about:config", "aboutx:blank", "http://about.blank/"],
+)
+def test_managed_page_safety_does_not_exempt_non_blank_urls(monkeypatch, url):
+    monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
+    monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
+    monkeypatch.setattr(browser_tool, "_is_always_blocked_url", lambda _url: False)
+    monkeypatch.setattr(browser_tool, "_is_safe_url", lambda _url: False)
+    error = browser_tool._managed_page_safety_error(url)
+    assert error is not None
+    assert "private or internal" in error
+
+
+def test_managed_snapshot_allows_about_blank_without_closing(monkeypatch):
+    actions = []
+
+    def route(action, _params=None):
+        actions.append(action)
+        return SimpleNamespace(
+            backend="desktop",
+            result=json.dumps({
+                "success": True,
+                "snapshot": "",
+                "element_count": 0,
+                "url": "about:blank",
+            }),
+        )
+
+    monkeypatch.setattr(browser_tool, "_route_browser_action", route)
+    monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
+    monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
+    # Real _is_safe_url / _is_always_blocked_url on purpose: about:blank has no
+    # http(s) scheme, so only the blank-page exemption can let it through.
+    result = json.loads(browser_tool.browser_snapshot())
+    assert result["success"] is True
+    assert actions == ["snapshot"]
+
+
+def test_managed_console_eval_never_sends_expression_and_rejects_desktop(monkeypatch):
+    seen = []
+
+    def route(action, params=None):
+        seen.append((action, params))
+        return SimpleNamespace(
+            backend="desktop",
+            result=json.dumps({"success": True, "result": "should never be used"}),
+        )
+
+    monkeypatch.setattr(browser_tool, "_route_browser_action", route)
+    result = json.loads(browser_tool.browser_console(expression="document.title"))
+    assert result["success"] is False
+    assert result["code"] == "browser_eval_not_supported_on_managed_desktop"
+    assert seen == [("console", {"clear": False})]
+
+
+def test_managed_console_eval_surfaces_router_error_without_local_eval(monkeypatch):
+    monkeypatch.setattr(
+        browser_tool,
+        "_route_browser_action",
+        lambda _action, _params=None: SimpleNamespace(
+            backend="error",
+            result=json.dumps({
+                "success": False,
+                "code": "browser_action_not_supported_by_backend",
+            }),
+        ),
+    )
+
+    def never_eval(*_args, **_kwargs):
+        raise AssertionError("local eval must not run after a terminal router error")
+
+    monkeypatch.setattr(browser_tool, "_browser_eval", never_eval)
+    result = json.loads(browser_tool.browser_console(expression="1+1"))
+    assert result["success"] is False
+    assert result["code"] == "browser_action_not_supported_by_backend"
+
+
+def test_managed_console_eval_camofox_delegation_uses_local_eval_path(monkeypatch):
+    monkeypatch.setattr(
+        browser_tool,
+        "_route_browser_action",
+        lambda _action, _params=None: SimpleNamespace(backend="camofox", result=None),
+    )
+    monkeypatch.setattr(browser_tool, "_is_camofox_mode", lambda: True)
+    monkeypatch.setattr(
+        browser_tool,
+        "_browser_eval",
+        lambda expression, task_id=None: json.dumps({"success": True, "result": "2"}),
+    )
+    result = json.loads(browser_tool.browser_console(expression="1+1"))
+    assert result == {"success": True, "result": "2"}
+
+
+def test_managed_console_output_redacts_desktop_payload(monkeypatch):
+    monkeypatch.setattr(
+        browser_tool,
+        "_route_browser_action",
+        lambda _action, _params=None: SimpleNamespace(
+            backend="desktop",
+            result=json.dumps({
+                "success": True,
+                "console_messages": [{"type": "log", "text": "token sk-secret"}],
+                "url": "https://example.com",
+            }),
+        ),
+    )
+    monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
+    monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
+    monkeypatch.setattr(browser_tool, "_is_always_blocked_url", lambda _url: False)
+    monkeypatch.setattr(browser_tool, "_is_safe_url", lambda _url: True)
+    monkeypatch.setattr(
+        browser_tool,
+        "_redact_browser_output",
+        lambda value: {**value, "console_messages": "redacted"}
+        if isinstance(value, dict)
+        else value,
+    )
+
+    result = json.loads(browser_tool.browser_console())
+    assert result["success"] is True
+    assert result["console_messages"] == "redacted"
+
+
+def test_managed_console_output_blocks_private_page_and_closes(monkeypatch):
+    actions = []
+
+    def route(action, _params=None):
+        actions.append(action)
+        if action == "console":
+            return SimpleNamespace(
+                backend="desktop",
+                result=json.dumps({
+                    "success": True,
+                    "console_messages": [{"type": "log", "text": "internal secret"}],
+                    "url": "http://127.0.0.1:8080/internal",
+                }),
+            )
+        return SimpleNamespace(
+            backend="desktop",
+            result=json.dumps({"success": True, "closed": True}),
+        )
+
+    monkeypatch.setattr(browser_tool, "_route_browser_action", route)
+    monkeypatch.setattr(browser_tool, "_is_local_backend", lambda: False)
+    monkeypatch.setattr(browser_tool, "_allow_private_urls", lambda: False)
+    monkeypatch.setattr(browser_tool, "_is_always_blocked_url", lambda _url: False)
+    monkeypatch.setattr(browser_tool, "_is_safe_url", lambda _url: False)
+
+    result = json.loads(browser_tool.browser_console())
+    assert result["success"] is False
+    assert "private or internal" in result["error"]
+    assert "internal secret" not in json.dumps(result)
+    assert actions == ["console", "close"]
 
 
 def test_managed_snapshot_truncates_and_redacts_before_return(monkeypatch):

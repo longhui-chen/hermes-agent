@@ -198,13 +198,48 @@ def _managed_desktop_payload(route: Any) -> Optional[Dict[str, Any]]:
     }
 
 
+def _is_browser_internal_blank_url(url: str) -> bool:
+    """Return True for browser-internal blank pages (about:blank / about:srcdoc).
+
+    A managed page legitimately reports these URLs in non-network states: a
+    fresh tab, the post-close safety blanking, or an ``srcdoc`` iframe.  They
+    carry no network target, so the SSRF boundary does not apply to them.
+    Only the exact browser-internal blank pages qualify — URLs with a real
+    network scheme are never exempted here.
+    """
+    value = (url or "").strip().lower()
+    if not value.startswith("about:"):
+        return False
+    rest = value[len("about:"):]
+    # ``about:blank?query`` / ``about:blank#fragment`` still render blank.
+    for separator in ("#", "?"):
+        index = rest.find(separator)
+        if index != -1:
+            rest = rest[:index]
+    return rest in ("blank", "srcdoc")
+
+
 def _managed_page_safety_error(url: str) -> Optional[str]:
-    """Apply the browser's post-navigation network boundary to PC pages."""
+    """Apply the browser's post-navigation network boundary to PC pages.
+
+    Mirrors the gating used by the local/cloud navigation paths: the cloud
+    metadata floor is unconditional, while the private/internal check is
+    skipped for local backends and when ``browser.allow_private_urls`` is set —
+    otherwise the user's own LAN pages (e.g. the device web UI) would be
+    blocked and force-closed on the managed desktop browser.
+    """
     if not url:
+        return None
+    if _is_browser_internal_blank_url(url):
+        # Legitimate initial/reset state, not a network target.
         return None
     if _is_always_blocked_url(url):
         return "Blocked: page URL targets a cloud metadata endpoint"
-    if not _allow_private_urls() and not _is_safe_url(url):
+    if (
+        not _is_local_backend()
+        and not _allow_private_urls()
+        and not _is_safe_url(url)
+    ):
         return "Blocked: page URL targets a private or internal address"
     return None
 
@@ -3536,7 +3571,24 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
         policy_error = _enforce_browser_eval_policy(expression)
         if policy_error:
             return json.dumps({"success": False, "error": policy_error}, ensure_ascii=False)
-        managed_route = _route_browser_action("console", {"expression": expression})
+        # Managed routing is asked WITHOUT the expression: arbitrary page JS is
+        # never proxied to the desktop browser host (the host runs the user's
+        # logged-in browser), so the expression must not leave this process on
+        # the routing request either.  The probe only resolves which backend
+        # owns the session; Camofox delegation and unmanaged sessions continue
+        # into the local eval path, which enforces the private-URL pre-scan,
+        # post-eval URL recheck, and output redaction.
+        managed_route = _route_browser_action("console", {"clear": False})
+        if managed_route is not None and managed_route.backend == "desktop":
+            return json.dumps({
+                "success": False,
+                "code": "browser_eval_not_supported_on_managed_desktop",
+                "error": (
+                    "JavaScript evaluation is not supported on the managed "
+                    "desktop browser. Use browser_snapshot or browser_console "
+                    "(without expression) to inspect the page instead."
+                ),
+            }, ensure_ascii=False)
         managed_result = _managed_route_result(managed_route)
         if managed_result is not None:
             return managed_result
@@ -3544,6 +3596,21 @@ def browser_console(clear: bool = False, expression: Optional[str] = None, task_
 
     # --- Console output mode (original behaviour) ---
     managed_route = _route_browser_action("console", {"clear": bool(clear)})
+    managed_payload = _managed_desktop_payload(managed_route)
+    if managed_payload is not None:
+        # Same defenses as the local console path: refuse output from a page
+        # whose URL crossed the network boundary, and redact secrets from
+        # console messages / exception text before they reach the model.
+        current_url = str(managed_payload.get("url") or "").strip()
+        safety_error = (
+            _managed_page_safety_error(current_url)
+            if managed_payload.get("success") is True
+            else None
+        )
+        if safety_error:
+            _close_unsafe_managed_page()
+            return json.dumps({"success": False, "error": safety_error}, ensure_ascii=False)
+        return json.dumps(_redact_browser_output(managed_payload), ensure_ascii=False)
     managed_result = _managed_route_result(managed_route)
     if managed_result is not None:
         return managed_result
