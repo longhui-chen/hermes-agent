@@ -1461,3 +1461,60 @@ def test_failure_metadata_carries_structured_code():
     ok = zc._build_typed_message_content(job, "job-ok", True, None, None)
     ok_fence = ok.split("```cron-summary\n", 1)[1].split("\n```", 1)[0]
     assert "failure" not in _json.loads(ok_fence)
+
+
+class _FakeCronAgent:
+    def __init__(self, turn_id, interrupted):
+        self._current_turn_id = turn_id
+        self._interrupt_requested = interrupted
+
+
+def _install_wrapper_with_agent(monkeypatch, agent, finishes):
+    """Install a fresh run_job wrapper around a fake that defers *agent*."""
+    from cron import scheduler
+
+    import gateway.platforms.zet_agent_cron as zc
+    import tools.zettlab_snapshot_guard as guard
+
+    monkeypatch.setattr(zc, "_MAX_RUN_RETRIES", 0)
+    monkeypatch.setattr(
+        guard, "finish_turn",
+        lambda state, **kw: finishes.append((state, kw.get("turn_id", ""))),
+    )
+
+    def fake_run_job(job, *, defer_agent_teardown=None):
+        defer_agent_teardown.append(agent)
+        return (False, "out", "", "TimeoutError: Cron job 'j' idle for 600s")
+
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *a, **kw: None)
+    monkeypatch.setattr(scheduler, "save_job_output", lambda _jid, output: output)
+    monkeypatch.setattr(scheduler, "run_job", fake_run_job)
+    monkeypatch.setattr(scheduler, "_teardown_cron_agent", lambda *a, **kw: None)
+    zc.install()
+    return scheduler
+
+
+def test_interrupted_cron_run_leaves_snapshot_pin_to_ttl(monkeypatch):
+    """inactivity timeout 路径：scheduler 先 interrupt 再 shutdown(wait=False)
+    返回失败，工具线程未必已退出——wrapper 不收 pin，留给 LS 侧 PinTTL +
+    reconcile 自愈（Codex review P1）。"""
+    finishes = []
+    scheduler = _install_wrapper_with_agent(
+        monkeypatch, _FakeCronAgent("turn_cron_1", interrupted=True), finishes)
+
+    deferred = []
+    scheduler.run_job({"id": "timeout-job"}, defer_agent_teardown=deferred)
+
+    assert finishes == [], "被 interrupt 的轮不能提前 finish 解 pin"
+
+
+def test_normal_failed_cron_run_still_finishes_turn(monkeypatch):
+    """普通失败（没有 interrupt）照常收 pin，上报 failed 终态。"""
+    finishes = []
+    scheduler = _install_wrapper_with_agent(
+        monkeypatch, _FakeCronAgent("turn_cron_2", interrupted=False), finishes)
+
+    deferred = []
+    scheduler.run_job({"id": "failed-job"}, defer_agent_teardown=deferred)
+
+    assert finishes == [("failed", "turn_cron_2")]

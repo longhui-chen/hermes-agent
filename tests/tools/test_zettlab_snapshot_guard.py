@@ -1796,3 +1796,112 @@ def test_sh_dash_c_daemonizers_are_blocked(monkeypatch, tmp_path):
     assert guard.maybe_require_snapshot(
         "terminal", {"command": "sh -c 'rm -f x'"}, turn_id="turn_1") is None
     assert len(rec.requests) == 1
+
+
+def test_bash_dash_c_option_terminator_daemonizers_are_blocked(monkeypatch, tmp_path):
+    """bash 语义里 -c 的命令串是第一个非选项操作数：`bash -c -- 'cmd'` 执行的
+    是 cmd 而不是 `--`，`bash -c -l 'cmd'` 的命令串在后续选项之后——把 `--` /
+    `-l` 当命令串递归会判出 False 放行（Codex review P1）。"""
+    rec = _install(monkeypatch)
+    for cmd in (
+        "bash -c -- 'setsid -f sh -c \"sleep 1; rm -f victim\"'",
+        "bash -c -l 'setsid rm -f victim'",
+    ):
+        guard.reset_for_test()
+        blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
+        assert blocked is not None and "NOT executed" in blocked, cmd
+    assert rec.requests == []
+
+    # `--` 后没有 daemonizer 的照常走保护，不误伤。
+    guard.reset_for_test()
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "bash -c -- 'rm -f x'"}, turn_id="turn_1") is None
+    assert len(rec.requests) == 1
+
+
+def test_container_backend_disables_readonly_shortcut(monkeypatch, tmp_path):
+    """容器 backend 的命令在容器内 shell 执行：docker_env 注入的 BASH_ENV、镜
+    像自带 ENV / rc 文件主进程都验证不了，「可证明只读」不存在——ls 也按 cwd
+    拍幂等快照，不是阻断（Codex review P1）。"""
+    monkeypatch.setenv("TERMINAL_ENV", "docker")
+    monkeypatch.setenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "true")
+    rec = _install(monkeypatch)
+
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "ls -la"}, turn_id="turn_1") is None
+    assert len(rec.requests) == 1
+
+
+def test_path_shadowed_readonly_names_are_protected(monkeypatch, tmp_path):
+    """PATH 前置的同名 helper（~/bin/ls）会遮蔽系统 ls：首词必须真实解析到可
+    信系统前缀才走只读快捷，否则退化按 cwd 拍快照——不是阻断
+    （Codex review P1）。"""
+    rec = _install(monkeypatch)
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake_ls = bindir / "ls"
+    fake_ls.write_text("#!/bin/sh\nrm -f victim\n")
+    fake_ls.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": "ls -la"}, turn_id="turn_1") is None
+    assert len(rec.requests) == 1
+
+
+def test_cd_symlink_escape_targets_are_protected(monkeypatch, tmp_path):
+    """`cd docs && rm a.txt` 里 docs 是指向主目录外的 symlink 时，真实目标目
+    录要整目录加餐 ensure——docs 与 a.txt 都不含 `/`，逐词判定接不住
+    （Codex review P1）。cd 进主目录内的普通子目录不产生加餐。"""
+    rec = _install(monkeypatch)
+    work = tmp_path / "Work"
+    docs = tmp_path / "Documents"
+    work.mkdir()
+    docs.mkdir()
+    (docs / "a.txt").write_text("x")
+    (work / "docs").symlink_to(docs)
+
+    assert guard.maybe_require_snapshot(
+        "terminal",
+        {"command": "cd docs && rm a.txt", "workdir": str(work)},
+        turn_id="turn_1",
+    ) is None
+
+    all_paths = [p for r in rec.requests for p in r["body"]["paths"]]
+    assert str(work) in all_paths, "主保护仍是 workdir"
+    assert os.path.realpath(str(docs)) in all_paths, "cd 进的 symlink 真实目录要加餐 ensure"
+
+    # cd 进主目录内的普通子目录：主 ensure 一次，无加餐。
+    guard.reset_for_test()
+    rec2 = _install(monkeypatch)
+    (work / "sub").mkdir()
+    assert guard.maybe_require_snapshot(
+        "terminal",
+        {"command": "cd sub && rm x.txt", "workdir": str(work)},
+        turn_id="turn_2",
+    ) is None
+    assert len(rec2.requests) == 1
+    assert rec2.requests[0]["body"]["paths"] == [str(work)]
+
+
+def test_registry_dispatch_direct_path_is_gated(monkeypatch, tmp_path):
+    """插件公开 API ctx.dispatch_tool() 直连 registry.dispatch()、不经
+    handle_function_call——gate 在 registry 统一分发入口必须同样生效
+    （Codex review P1）。"""
+    from tools.registry import registry
+
+    _install(monkeypatch, {"ready": False, "operations": []})
+    target = tmp_path / "a.txt"
+    target.write_text("x")
+
+    out = registry.dispatch(
+        "write_file", {"path": str(target), "content": "y"}, turn_id="turn_r1")
+    assert "error" in json.loads(out)
+    assert target.read_text() == "x", "gate 先于 handler 执行"
+
+    # 没有 turn 上下文的直连调用在设备上同样 fail-closed（missing turn id）。
+    guard.reset_for_test()
+    _install(monkeypatch, {"ready": True, "operations": []})
+    out2 = registry.dispatch("write_file", {"path": str(target), "content": "y"})
+    assert "error" in json.loads(out2)
+    assert target.read_text() == "x"

@@ -35,6 +35,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import threading
 import time
 import urllib.error
@@ -355,14 +356,19 @@ def _bridge_terminal_env() -> None:
         logger.debug("zettlab snapshot guard: terminal env bridge unavailable: %s", exc)
 
 
+def _terminal_env_type() -> str:
+    """terminal 的有效 backend 类型（先触发懒桥接）。"""
+    _bridge_terminal_env()
+    return (os.getenv("TERMINAL_ENV") or "local").strip().lower()
+
+
 def _terminal_backend_is_remote() -> bool:
     """报告工具的有效 backend 是否在远端主机执行（ssh）。
 
     远端文件系统不在本机快照的覆盖面内，按本机路径 ensure 只会造出假恢复点
     （Codex review P1）。
     """
-    _bridge_terminal_env()
-    return (os.getenv("TERMINAL_ENV") or "local").strip().lower() == "ssh"
+    return _terminal_env_type() == "ssh"
 
 
 # ssh backend 下会把写入送去远端执行的工具面：terminal（SSHEnvironment 跑命
@@ -641,15 +647,28 @@ def _segment_daemonizes(words: list[str]) -> bool:
             # 跑同一套自后台化判定（Codex review P1）。变量间接
             # （sh -c \"$CMD\"）在 shlex 展开后只剩 $CMD 字面量、`sh script.sh`
             # 裸脚本执行，均属 PRD §2 Phase 1 静态判定边界。
+            # bash 语义：-c 的命令串是**第一个非选项操作数**，`--` 终止选项
+            # 解析——`bash -c -- 'cmd'` 执行的是 cmd 而不是 `--`，把 `--`
+            # 当命令串递归会判出 False 放行（Codex review P1）。同理
+            # `bash -c -l 'cmd'` 的命令串也在后续选项之后。扫过全部选项与
+            # 至多一个 `--` 再取命令串递归。
             j = i + 1
+            saw_dash_c = False
             while j < len(words):
                 flag = words[j]
+                if flag == "--":
+                    j += 1
+                    break
                 if _SHELL_DASH_C_RE.match(flag):
-                    return j + 1 < len(words) and _shell_self_backgrounds(words[j + 1])
+                    saw_dash_c = True
+                    j += 1
+                    continue
                 if flag.startswith("-"):
                     j += 1
                     continue
                 break
+            if saw_dash_c:
+                return j < len(words) and _shell_self_backgrounds(words[j])
             return False
         if name in _WRAPPER_VALUE_FLAGS:
             # `command -v xxx` 只查名字不执行，不是包裹层。
@@ -761,10 +780,44 @@ def _shell_init_hooks_present() -> bool:
     return False
 
 
+# 只读放行要求首词真实解析到这些系统目录里的二进制：terminal 子进程继承
+# PATH，`/home/alice/bin/ls` 这类同名 helper 排在系统目录前时，按名放行等于
+# 放行任意程序（Codex review P1）。usrmerge 的 /bin -> /usr/bin 由 realpath
+# 归一，两种前缀都收。
+_TRUSTED_BIN_PREFIXES = ("/usr/bin/", "/bin/", "/usr/sbin/", "/sbin/")
+
+
+def _resolves_to_system_binary(name: str) -> bool:
+    """报告命令名在当前 PATH 下是否解析到可信系统目录里的真实二进制。
+
+    解析不到（纯 shell builtin 如 ``type``）或 realpath 落在用户可写路径 →
+    False，调用方放弃只读快捷、退化成拍一张幂等 cwd 快照——多拍无害，放错
+    才有害。PATH 取 Hermes 主进程环境：LocalEnvironment 子进程与主进程同源
+    继承，config 注入的差异属于 Phase 1 静态判定边界。
+    """
+    try:
+        resolved = shutil.which(name)
+        if not resolved:
+            return False
+        return os.path.realpath(resolved).startswith(_TRUSTED_BIN_PREFIXES)
+    except Exception:
+        return False
+
+
 def _command_is_probably_readonly(command: str) -> bool:
     """报告一条 shell 命令是否**可证明**只读。证明不了就按需要保护处理。"""
     if not command.strip():
         return True
+    env_type = _terminal_env_type()
+    if env_type in _CONTAINER_BACKENDS:
+        # 容器 backend 的命令在容器内 shell 执行：terminal.docker_env /
+        # TERMINAL_DOCKER_ENV 在容器创建时以 `-e` 注入（BASH_ENV=/workspace/
+        # hook.sh 会先于任何 `docker exec ... bash -c` 命令被 source），镜像
+        # 自带的 ENV / rc 文件更是主进程完全看不见——`_shell_init_hooks_
+        # present()` 只查得到 Hermes 自己的环境（Codex review P1）。子进程
+        # 环境不可验证就没有「可证明只读」。代价只是容器会话的命令按 cwd 拍
+        # 幂等快照，不是阻断。
+        return False
     if os.environ.get("BASH_ENV") or os.environ.get("ENV") or _shell_init_hooks_present():
         # 非交互 bash 启动时会先 source BASH_ENV（POSIX sh 用 ENV）指向的脚
         # 本；LocalEnvironment 的会话初始化还会 source 用户 rc 文件并快照
@@ -798,6 +851,12 @@ def _command_is_probably_readonly(command: str) -> bool:
             # 且随 env 一路传进 terminal 子进程——它在这里是可见的，命中即不
             # 判只读（Codex review P1）。会话内 alias / function 见函数注释。
             return False
+        if env_type == "local" and not _resolves_to_system_binary(head):
+            # 命令名会被 PATH 遮蔽：`/home/alice/bin/ls` 排在系统目录前时，
+            # `ls` 执行的是任意 helper（Codex review P1）。只有解析到可信系
+            # 统前缀的真实二进制才走只读快捷；ssh backend 下本机解析对远端
+            # PATH 无意义，保持既有口径（远端文件系统本就不在快照覆盖面）。
+            return False
     return True
 
 
@@ -825,17 +884,85 @@ def _ancillary_abs_paths(text: str, primary: list[str], base_dir: str = "") -> l
     try:
         base = os.path.normpath(base_dir) if base_dir else ""
         rbase = os.path.realpath(base) if base else ""
-        for word in shlex.split(text, posix=True):
+
+        def _escapes(real: str) -> bool:
+            return real != rbase and not real.startswith(rbase.rstrip("/") + "/")
+
+        def _static_cd_target(target: str, anchor: str) -> str:
+            """静态解析 cd / pushd 的目标目录；解析不了返回空串。"""
+            if target.startswith(("~", "$HOME", "${HOME}")):
+                normalized = _normalize_pathish(target, anchor)
+                return os.path.realpath(normalized) if normalized else ""
+            if any(ch in target for ch in "$`"):
+                return ""
+            if target.startswith("/"):
+                return os.path.realpath(os.path.normpath(target))
+            if not anchor:
+                return ""
+            return os.path.realpath(os.path.normpath(os.path.join(anchor, target)))
+
+        # 静态 `cd` / `pushd` 会改变后续命令的实际目录：`cd docs && rm a.txt`
+        # 在 docs（可能是指向 ~/Documents 的 symlink）里删文件，而 docs 与
+        # a.txt 都不含 `/`，逐词判定接不住（Codex review P1）。顺序扫描词流
+        # 维护「当前目录」：cd 进的目录逃逸出主保护目录就整目录入候选，后续
+        # 相对词也改锚它。目标静态解析不了（变量、`cd -`、flag 形态）就停掉
+        # 跟踪——锚回 base 会给错误目录背书，宁可少提取也不错提取；变量间接
+        # 本身属于 PRD §2 Phase 1 静态判定边界。
+        cur = rbase
+        cur_known = bool(base)
+        dir_stack: list[str] = []
+        at_head = True
+        skip_next = False
+        words = shlex.split(text, posix=True)
+        for k, word in enumerate(words):
+            if skip_next:
+                skip_next = False
+                continue
+            if word and all(ch in _SHELL_PUNCT_CHARS for ch in word):
+                at_head = True
+                continue
+            head_pos = at_head
+            at_head = False
+            if head_pos and _ENV_ASSIGN_RE.match(word):
+                at_head = True  # env 赋值前缀不消耗段首位置
+                continue
+            if cur_known and head_pos and word in ("cd", "pushd", "popd"):
+                if word == "popd":
+                    if dir_stack:
+                        cur = dir_stack.pop()
+                    else:
+                        cur_known = False
+                    continue
+                nxt = words[k + 1] if k + 1 < len(words) else ""
+                if nxt and all(ch in _SHELL_PUNCT_CHARS for ch in nxt):
+                    nxt = ""
+                if word == "pushd":
+                    dir_stack.append(cur)
+                if not nxt:
+                    cur = os.path.realpath(_subprocess_home())
+                elif nxt.startswith("-"):
+                    cur_known = False  # cd - / cd -P dir：会话状态或 flag 形态
+                    continue
+                else:
+                    resolved = _static_cd_target(nxt, cur)
+                    if not resolved:
+                        cur_known = False
+                        continue
+                    cur = resolved
+                    skip_next = True
+                if _escapes(cur):
+                    raw.append(cur)
+                continue
             if word.startswith(("/", "~", "$HOME", "${HOME}", "../")):
                 raw.append(word)
-            elif base and "/" in word and not word.startswith("-"):
+            elif cur_known and base and "/" in word and not word.startswith("-"):
                 # 相对路径可能经内部 `..` 段（sub/../../x）**或目录 symlink**
                 # （docs/a.txt，docs → ~/Documents）跳出主保护目录，前缀正则
-                # 与 `../` 开头判定都接不住（Codex review P1 ×2）。锚到
-                # base_dir 后按 realpath 判逃逸：仍在主目录内的交给 cwd 快
-                # 照，跳出去的按真实目标整词入候选。
-                real = os.path.realpath(os.path.normpath(os.path.join(base, word)))
-                if real != rbase and not real.startswith(rbase.rstrip("/") + "/"):
+                # 与 `../` 开头判定都接不住（Codex review P1 ×2）。锚到当前
+                # 目录（无 cd 时即 base_dir）后按 realpath 判逃逸：仍在主目
+                # 录内的交给 cwd 快照，跳出去的按真实目标整词入候选。
+                real = os.path.realpath(os.path.normpath(os.path.join(cur, word)))
+                if _escapes(real):
                     raw.append(real)
     except ValueError:
         pass
