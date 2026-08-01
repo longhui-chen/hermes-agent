@@ -960,6 +960,8 @@ import sys
 
 _CONNECTOR_RUNTIME_SCRIPT = "connector_runtime.py"
 _CONNECTOR_RUNTIME_MAX_SCRIPT_BYTES = 1024 * 1024
+_CONNECTOR_RUNTIME_TRUST_MAX_PATHS = 8192
+_CONNECTOR_RUNTIME_TRUST_MAX_BYTES = 64 * 1024 * 1024
 _CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT = ";&|<>\n()"
 _CONNECTOR_RUNTIME_SHELL_PUNCTUATION = set(_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT)
 _CONNECTOR_RUNTIME_SHELL_GROUP_START = "{"
@@ -997,14 +999,13 @@ _CONNECTOR_RUNTIME_SHELL_OPTIONS_WITH_ARG = {
 _CONNECTOR_RUNTIME_NESTED_SHELL_DEPTH = 8
 _CONNECTOR_RUNTIME_ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 _CONNECTOR_RUNTIME_TIMEOUT_RE = re.compile(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[smhd])?")
-_CONNECTOR_RUNTIME_TRUST_CUTOFF = time.time()
-
-
 @dataclass(frozen=True)
 class _ConnectorRuntimeRootAnchor:
     configured_root: Path
     resolved_root: Path
     identity: tuple[int, int]
+    tree_digest: str
+    file_digests: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -1036,19 +1037,15 @@ def _path_trust_rejection_reason(
     mode = stat.S_IMODE(st.st_mode)
     if euid == 0:
         # A root-running terminal can rewrite root-owned files even when mode
-        # bits look read-only. Trust only the packaged tree that was already in
-        # place before this module was loaded; anything changed afterward may
-        # have been swapped by a model-controlled root terminal.
+        # bits look read-only. Runtime immutability is enforced separately by
+        # the startup-pinned tree/content digest; wall-clock mtime/ctime is not
+        # trustworthy while a device RTC is still synchronising (codex P1).
         if st.st_uid != 0:
             return "uid_not_root"
         if mode & stat.S_IWGRP:
             return "group_writable"
         if mode & stat.S_IWOTH:
             return "world_writable"
-        if enforce_cutoff and st.st_mtime > _CONNECTOR_RUNTIME_TRUST_CUTOFF:
-            return "mtime_after_cutoff"
-        if enforce_cutoff and st.st_ctime > _CONNECTOR_RUNTIME_TRUST_CUTOFF:
-            return "ctime_after_cutoff"
         return None
     if euid is not None and st.st_uid == euid:
         return "owned_by_terminal_user"
@@ -1075,6 +1072,103 @@ def _path_writable_by_current_user(path: Path, *, enforce_cutoff: bool = True) -
 def _path_identity(path: Path) -> tuple[int, int]:
     st = path.stat()
     return st.st_dev, st.st_ino
+
+
+def _connector_runtime_file_digest(path: Path, expected: os.stat_result) -> str:
+    """Hash one no-follow regular file while pinning its open descriptor."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        expected_identity = (expected.st_dev, expected.st_ino)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or (before.st_dev, before.st_ino) != expected_identity
+            or before.st_size != expected.st_size
+        ):
+            raise OSError("presets file changed before trust snapshot")
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > expected.st_size:
+                raise OSError("presets file grew during trust snapshot")
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            (after.st_dev, after.st_ino) != expected_identity
+            or after.st_size != before.st_size
+            or size != before.st_size
+        ):
+            raise OSError("presets file changed during trust snapshot")
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def _connector_runtime_tree_snapshot(root: Path) -> tuple[str, dict[str, str]]:
+    """Return a bounded, wall-clock-independent snapshot of a presets tree.
+
+    The digest pins names, file types, inode/device, owner/mode, sizes and file
+    contents. It deliberately excludes mtime/ctime: NTP correcting a cold-boot
+    RTC must not invalidate an otherwise unchanged official preset tree.
+    """
+
+    digest = hashlib.sha256()
+    file_digests: dict[str, str] = {}
+    stack = [root]
+    path_count = 0
+    total_bytes = 0
+    while stack:
+        path = stack.pop()
+        st = path.lstat()
+        path_count += 1
+        if path_count > _CONNECTOR_RUNTIME_TRUST_MAX_PATHS:
+            raise OSError("presets trust snapshot path limit exceeded")
+        try:
+            relative = path.relative_to(root).as_posix() or "."
+        except ValueError as exc:
+            raise OSError("presets trust snapshot escaped root") from exc
+        file_type = stat.S_IFMT(st.st_mode)
+        record = (
+            relative,
+            file_type,
+            stat.S_IMODE(st.st_mode),
+            st.st_dev,
+            st.st_ino,
+            st.st_uid,
+            st.st_gid,
+            st.st_size,
+        )
+        digest.update(repr(record).encode("utf-8", errors="surrogateescape"))
+        digest.update(b"\0")
+
+        if stat.S_ISREG(st.st_mode):
+            if st.st_size < 0:
+                raise OSError("invalid presets file size")
+            total_bytes += st.st_size
+            if total_bytes > _CONNECTOR_RUNTIME_TRUST_MAX_BYTES:
+                raise OSError("presets trust snapshot byte limit exceeded")
+            file_digest = _connector_runtime_file_digest(path, st)
+            file_digests[relative] = file_digest
+            digest.update(file_digest.encode("ascii"))
+            digest.update(b"\0")
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError("presets trust snapshot contains a special path")
+        with os.scandir(path) as entries:
+            children = sorted(
+                (Path(entry.path) for entry in entries),
+                key=lambda child: child.name,
+                reverse=True,
+            )
+        stack.extend(children)
+    return digest.hexdigest(), file_digests
 
 
 def _log_connector_runtime_rejection(reason: str, relative_path: str = "") -> None:
@@ -1105,6 +1199,7 @@ def _capture_connector_runtime_root() -> Optional[_ConnectorRuntimeRootAnchor]:
     try:
         resolved_root = configured_root.resolve(strict=True)
         identity = _path_identity(resolved_root)
+        tree_digest, file_digests = _connector_runtime_tree_snapshot(resolved_root)
     except OSError:
         _log_connector_runtime_rejection("presets_root_unavailable")
         return None
@@ -1113,6 +1208,8 @@ def _capture_connector_runtime_root() -> Optional[_ConnectorRuntimeRootAnchor]:
         configured_root=configured_root,
         resolved_root=resolved_root,
         identity=identity,
+        tree_digest=tree_digest,
+        file_digests=file_digests,
     )
     _CONNECTOR_RUNTIME_ROOT_ANCHOR = anchor
     return anchor
@@ -1144,9 +1241,9 @@ def _connector_runtime_path_is_trusted(
 
     # Shared mount ancestors may legitimately change after Hermes starts (for
     # example, creation of /volume1/subvol/.recycle). They still must have safe
-    # ownership/mode, but their unrelated mtime/ctime is outside the trust
-    # boundary. The pinned version root and everything below it keep the strict
-    # temporal check and reject symlinks.
+    # ownership/mode, but are outside the pinned version-tree digest boundary.
+    # The version root and everything below it reject symlinks and must match
+    # the bounded snapshot captured before any model-authored terminal call.
     root_ancestors = list(resolved_root.parents)
     if any(
         _path_writable_by_current_user(component, enforce_cutoff=False)
@@ -1164,10 +1261,25 @@ def _connector_runtime_path_is_trusted(
             return False
     except OSError:
         return False
-    return not any(
+    if any(
         _path_writable_by_current_user(component, enforce_cutoff=True)
         for component in components
-    )
+    ):
+        return False
+    if expected_root_identity is None:
+        return True
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    if (
+        anchor is None
+        or anchor.identity != expected_root_identity
+        or anchor.resolved_root != resolved_root
+    ):
+        return False
+    try:
+        current_digest, _ = _connector_runtime_tree_snapshot(resolved_root)
+    except OSError:
+        return False
+    return current_digest == anchor.tree_digest
 
 
 def _connector_runtime_trust_rejection_reason(
@@ -1209,6 +1321,20 @@ def _connector_runtime_trust_rejection_reason(
         reason = _path_trust_rejection_reason(component, enforce_cutoff=True)
         if reason is not None:
             return reason
+    if expected_root_identity is not None:
+        anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+        if (
+            anchor is None
+            or anchor.identity != expected_root_identity
+            or anchor.resolved_root != resolved_root
+        ):
+            return "trust_anchor_changed"
+        try:
+            current_digest, _ = _connector_runtime_tree_snapshot(resolved_root)
+        except OSError:
+            return "tree_snapshot_unavailable"
+        if current_digest != anchor.tree_digest:
+            return "tree_changed_since_start"
     return None
 
 
@@ -1614,6 +1740,7 @@ def _read_connector_runtime_script_bytes(
     script: Path,
     *,
     expected_identity: tuple[int, int],
+    expected_digest: Optional[str] = None,
 ) -> bytes:
     """Freeze a verified runner before the worker drops privileges."""
 
@@ -1644,6 +1771,10 @@ def _read_connector_runtime_script_bytes(
             or (after.st_dev, after.st_ino) != expected_identity
             or after.st_size != before.st_size
             or len(payload) != before.st_size
+            or (
+                expected_digest is not None
+                and hashlib.sha256(payload).hexdigest() != expected_digest
+            )
         ):
             raise OSError("connector runtime changed while being frozen")
         return payload
@@ -1664,9 +1795,13 @@ def _run_connector_runtime_command_if_allowed(
 
     anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
     script = Path(argv[1])
+    expected_digest: Optional[str] = None
     try:
+        relative_script = script.relative_to(anchor.resolved_root).as_posix()
+        expected_digest = anchor.file_digests.get(relative_script)
         identities_match = (
             anchor is not None
+            and expected_digest is not None
             and _path_identity(anchor.resolved_root) == parsed.root_identity
             and _path_identity(script) == parsed.script_identity
             and _connector_runtime_path_is_trusted(
@@ -1691,6 +1826,7 @@ def _run_connector_runtime_command_if_allowed(
         script_bytes = _read_connector_runtime_script_bytes(
             script,
             expected_identity=parsed.script_identity,
+            expected_digest=expected_digest,
         )
     except OSError:
         _log_connector_runtime_rejection("script_snapshot_failed")
@@ -2333,6 +2469,7 @@ def _read_verified_agent_creator_file(
     *,
     expected_identity: tuple[int, int],
     max_bytes: int,
+    expected_digest: Optional[str] = None,
 ) -> bytes:
     """Freeze one trusted regular file through a non-following descriptor."""
 
@@ -2362,7 +2499,19 @@ def _read_verified_agent_creator_file(
             total += len(chunk)
             if total > max_bytes:
                 raise OSError("agent creator trusted file too large")
-        return b"".join(chunks)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            (after.st_dev, after.st_ino) != expected_identity
+            or after.st_size != file_stat.st_size
+            or len(payload) != file_stat.st_size
+            or (
+                expected_digest is not None
+                and hashlib.sha256(payload).hexdigest() != expected_digest
+            )
+        ):
+            raise OSError("agent creator trusted file changed")
+        return payload
     finally:
         os.close(descriptor)
 
@@ -2371,6 +2520,7 @@ def _read_verified_agent_creator_script(
     script: Path,
     *,
     expected_identity: tuple[int, int],
+    expected_digest: Optional[str] = None,
 ) -> bytes:
     """Freeze the verified script source before any scoped secret is injected."""
 
@@ -2378,6 +2528,7 @@ def _read_verified_agent_creator_script(
         script,
         expected_identity=expected_identity,
         max_bytes=_AGENT_CREATOR_MAX_SCRIPT_BYTES,
+        expected_digest=expected_digest,
     )
 
 
@@ -2397,10 +2548,16 @@ def _agent_creator_manifest_supports_action_token_fd(
 
     try:
         manifest_identity = _path_identity(manifest)
+        manifest_digest = anchor.file_digests.get(
+            manifest.relative_to(anchor.resolved_root).as_posix()
+        )
+        if manifest_digest is None:
+            raise OSError("manifest absent from startup trust snapshot")
         raw = _read_verified_agent_creator_file(
             manifest,
             expected_identity=manifest_identity,
             max_bytes=_AGENT_CREATOR_MAX_MANIFEST_BYTES,
+            expected_digest=manifest_digest,
         )
 
         import yaml
@@ -2459,9 +2616,14 @@ def _run_agent_creator_command_if_allowed(
             direct=True,
         )
     script = Path(parsed.argv[1])
+    expected_script_digest: Optional[str] = None
     try:
+        expected_script_digest = anchor.file_digests.get(
+            script.relative_to(anchor.resolved_root).as_posix()
+        )
         identities_match = (
-            _path_identity(anchor.resolved_root) == parsed.root_identity
+            expected_script_digest is not None
+            and _path_identity(anchor.resolved_root) == parsed.root_identity
             and _path_identity(script) == parsed.script_identity
             and _connector_runtime_path_is_trusted(
                 script,
@@ -2486,6 +2648,7 @@ def _run_agent_creator_command_if_allowed(
         script_bytes = _read_verified_agent_creator_script(
             script,
             expected_identity=parsed.script_identity,
+            expected_digest=expected_script_digest,
         )
         if (
             _path_identity(anchor.resolved_root) != parsed.root_identity

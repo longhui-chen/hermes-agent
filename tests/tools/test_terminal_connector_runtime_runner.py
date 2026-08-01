@@ -694,70 +694,56 @@ def test_connector_runtime_trust_rejects_non_root_owned_tree_for_root_service(mo
     ) is False
 
 
-def test_connector_runtime_trust_rejects_root_tree_modified_after_module_load(monkeypatch, tmp_path):
+def test_connector_runtime_trust_accepts_future_timestamp_when_snapshot_matches(
+    monkeypatch, tmp_path
+):
+    """Cold-boot RTC behind package timestamps must not disable presets."""
     script = _write_connector_runtime(tmp_path)
-    monkeypatch.setattr(terminal_tool_module.os, "geteuid", lambda: 0, raising=False)
-    future_mtime = terminal_tool_module._CONNECTOR_RUNTIME_TRUST_CUTOFF + 10
-
-    class FakeStat:
-        st_uid = 0
-        st_gid = 0
-        st_mode = 0o100644
-        st_mtime = future_mtime
-        st_ctime = future_mtime
-
-    original_stat = terminal_tool_module.Path.stat
-
-    def fake_stat(path):
-        if path == script:
-            return FakeStat()
-        return original_stat(path)
-
-    monkeypatch.setattr(terminal_tool_module.Path, "stat", fake_stat)
-
-    assert terminal_tool_module._path_writable_by_current_user(script) is True
-
-
-def test_connector_runtime_trust_rejects_root_tree_ctime_bump(monkeypatch, tmp_path):
-    script = _write_connector_runtime(tmp_path)
-    monkeypatch.setattr(terminal_tool_module.os, "geteuid", lambda: 0, raising=False)
-    old_mtime = terminal_tool_module._CONNECTOR_RUNTIME_TRUST_CUTOFF - 10
-    future_ctime = terminal_tool_module._CONNECTOR_RUNTIME_TRUST_CUTOFF + 10
-
-    class FakeStat:
-        st_uid = 0
-        st_gid = 0
-        st_mode = 0o100644
-        st_mtime = old_mtime
-        st_ctime = future_ctime
-
-    original_stat = terminal_tool_module.Path.stat
-
-    def fake_stat(path):
-        if path == script:
-            return FakeStat()
-        return original_stat(path)
-
-    monkeypatch.setattr(terminal_tool_module.Path, "stat", fake_stat)
-
-    assert terminal_tool_module._path_writable_by_current_user(script) is True
-
-
-def test_connector_runtime_trust_rejects_version_tree_modified_after_start(monkeypatch, tmp_path):
-    script = _write_connector_runtime(tmp_path)
-    monkeypatch.setattr(terminal_tool_module.os, "geteuid", lambda: 0, raising=False)
+    presets_root = tmp_path / "presets"
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_root))
+    anchor = terminal_tool_module._capture_connector_runtime_root()
+    assert anchor is not None
     monkeypatch.setattr(
         terminal_tool_module,
-        "_CONNECTOR_RUNTIME_TRUST_CUTOFF",
-        terminal_tool_module.time.time(),
+        "_path_writable_by_current_user",
+        lambda path, *, enforce_cutoff=True: False,
     )
-    future = terminal_tool_module._CONNECTOR_RUNTIME_TRUST_CUTOFF + 10
+    future = terminal_tool_module.time.time() + 24 * 3600
     os.utime(script, (future, future))
 
     assert terminal_tool_module._connector_runtime_path_is_trusted(
         script,
-        tmp_path / "presets",
+        presets_root,
+        expected_root_identity=anchor.identity,
+    ) is True
+
+
+def test_connector_runtime_trust_rejects_same_inode_content_change(
+    monkeypatch, tmp_path
+):
+    """Startup digest catches in-place tampering even when inode/size match."""
+    script = _write_connector_runtime(tmp_path)
+    presets_root = tmp_path / "presets"
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_root))
+    anchor = terminal_tool_module._capture_connector_runtime_root()
+    assert anchor is not None
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_path_writable_by_current_user",
+        lambda path, *, enforce_cutoff=True: False,
+    )
+    original = script.read_bytes()
+    script.write_bytes(bytes([original[0] ^ 1]) + original[1:])
+
+    assert terminal_tool_module._connector_runtime_path_is_trusted(
+        script,
+        presets_root,
+        expected_root_identity=anchor.identity,
     ) is False
+    changed_digest, _ = terminal_tool_module._connector_runtime_tree_snapshot(
+        presets_root
+    )
+    assert changed_digest != anchor.tree_digest
 
 
 def test_connector_runtime_trust_ignores_shared_ancestor_timestamp_changes(monkeypatch, tmp_path):
