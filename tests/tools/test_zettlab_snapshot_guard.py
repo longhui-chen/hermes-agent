@@ -239,6 +239,107 @@ def test_terminal_only_guards_destructive_commands(monkeypatch, tmp_path):
     assert rec.requests[0]["body"]["paths"] == [str(tmp_path)]
 
 
+def test_trusted_video_plan_migrate_does_not_snapshot_gateway_cwd(
+    monkeypatch, tmp_path
+):
+    from tools import terminal_tool
+
+    rec = _install(monkeypatch)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_parse_video_edit_runtime_command",
+        lambda _command: types.SimpleNamespace(
+            argv=[
+                sys.executable,
+                "/trusted/preference_resolver.py",
+                "plan-migrate",
+                "--scene",
+                "general",
+            ]
+        ),
+    )
+
+    command = (
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/video-edit-workflow-mini/'
+        'scripts/preference_resolver.py" plan-migrate --scene general'
+    )
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": command}, turn_id="turn_1"
+    ) is None
+    assert rec.requests == []
+
+
+def test_trusted_video_helper_snapshots_explicit_write_paths_not_gateway_cwd(
+    monkeypatch, tmp_path
+):
+    from tools import terminal_tool
+
+    rec = _install(monkeypatch, {"ready": True, "operations": []})
+    state = tmp_path / "agent" / "workflow_state.json"
+    output = tmp_path / "agent" / "vewm_1.mp4"
+    monkeypatch.setattr(
+        terminal_tool,
+        "_parse_video_edit_runtime_command",
+        lambda _command: types.SimpleNamespace(
+            argv=[
+                sys.executable,
+                "/trusted/normalize.py",
+                "--workflow-state",
+                str(state),
+                "--input",
+                "/volume1/subvol/data/source.mov",
+                "--output",
+                str(output),
+            ]
+        ),
+    )
+
+    command = (
+        'python3 "$ZETTLAB_PRESETS_DIR/skills/video-edit-workflow-mini/'
+        'scripts/normalize.py" --workflow-state "state" --input "source" '
+        '--output "output"'
+    )
+    assert guard.maybe_require_snapshot(
+        "terminal", {"command": command}, turn_id="turn_1"
+    ) is None
+    assert rec.requests[0]["body"]["paths"] == [str(state), str(output)]
+    assert str(tmp_path) not in rec.requests[0]["body"]["paths"]
+
+
+def test_trusted_video_helper_keeps_new_out_of_scope_writes_fail_closed(
+    monkeypatch
+):
+    from tools import terminal_tool
+
+    rec = _install(monkeypatch, _scope_denied_error())
+    monkeypatch.setattr(
+        terminal_tool,
+        "_parse_video_edit_runtime_command",
+        lambda _command: types.SimpleNamespace(
+            argv=[
+                sys.executable,
+                "/trusted/normalize.py",
+                "--workflow-state",
+                "/etc/new-state.json",
+                "--output",
+                "/etc/new-output.mp4",
+            ]
+        ),
+    )
+
+    blocked = guard.maybe_require_snapshot(
+        "terminal",
+        {"command": "python3 trusted/normalize.py --output /etc/new-output.mp4"},
+        turn_id="turn_1",
+    )
+    assert blocked is not None
+    assert "NOT modified" in json.loads(blocked)["error"]
+    assert rec.requests[0]["body"]["paths"] == [
+        "/etc/new-state.json",
+        "/etc/new-output.mp4",
+    ]
+
+
 def test_v4a_patch_reports_every_touched_path(monkeypatch, tmp_path):
     rec = _install(monkeypatch)
     a = tmp_path / "a.py"

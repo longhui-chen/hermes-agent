@@ -1045,6 +1045,91 @@ def _execute_code_workdir(arguments: dict[str, Any], task_id: str) -> str:
     return _terminal_workdir(arguments, task_id)
 
 
+_TRUSTED_VIDEO_EDIT_SCRIPT_NAMES = frozenset({
+    "preference_resolver.py",
+    "workflow_state.py",
+    "cloud_render_business.py",
+    "normalize.py",
+})
+_TRUSTED_VIDEO_EDIT_WRITE_OPTIONS = frozenset({
+    "--output",
+    "--path",
+    "--state-file",
+    "--workflow-state",
+})
+
+
+def _trusted_video_edit_write_paths(
+    command: str,
+    arguments: dict[str, Any],
+    task_id: str,
+) -> Optional[list[str]]:
+    """Return explicit write paths for an integrity-pinned video helper.
+
+    ``terminal_tool`` intercepts these commands before a shell is spawned and
+    runs the pinned helper source in the trusted worker.  Treating that direct
+    Python command like arbitrary shell makes the generic guard snapshot the
+    gateway launch cwd (``/root`` on-device), which is outside every agent
+    scope and blocks even read-only ``plan-migrate`` calls.  Reuse the runner's
+    exact parser/trust decision, then protect only the helper's explicit state,
+    output, or cleanup paths.  A new out-of-scope path is still sent to the
+    server and rejected; untrusted/wrapped Python keeps the generic cwd guard.
+
+    ``None`` means this is not a trusted direct helper command.  ``[]`` means
+    the trusted helper has no explicit filesystem mutation for this call.
+    """
+    if not any(name in command for name in _TRUSTED_VIDEO_EDIT_SCRIPT_NAMES):
+        return None
+    try:
+        from tools.terminal_tool import _parse_video_edit_runtime_command
+
+        parsed = _parse_video_edit_runtime_command(command)
+    except Exception as exc:
+        logger.debug(
+            "zettlab snapshot guard: trusted video-edit parse unavailable: %s",
+            exc,
+        )
+        return None
+    if parsed is None or len(parsed.argv) < 2:
+        return None
+
+    script_name = os.path.basename(str(parsed.argv[1]))
+    if script_name not in _TRUSTED_VIDEO_EDIT_SCRIPT_NAMES:
+        return None
+
+    base_dir = _terminal_workdir(arguments, task_id)
+    paths: list[str] = []
+    seen: set[str] = set()
+    argv = [str(value) for value in parsed.argv[2:]]
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        option, separator, inline_value = token.partition("=")
+        if option not in _TRUSTED_VIDEO_EDIT_WRITE_OPTIONS:
+            index += 1
+            continue
+        if separator:
+            raw_path = inline_value
+            index += 1
+        elif index + 1 < len(argv):
+            raw_path = argv[index + 1]
+            index += 2
+        else:
+            # The helper parser will reject the missing value before writing.
+            index += 1
+            continue
+        path = _normalize_pathish(raw_path, base_dir)
+        if not path:
+            # Relative helper write paths are invalid by contract.  Report the
+            # resolved cwd target anyway so a future helper regression cannot
+            # turn them into an unguarded write.
+            path = _abs_path(os.path.join(base_dir, raw_path))
+        if path and path not in seen:
+            seen.add(path)
+            paths.append(path)
+    return paths
+
+
 def _extract_v4a_paths(patch_body: str) -> list[str]:
     """按 patch_parser 的等价规则抽取 V4A patch 触达的所有路径。"""
     paths: list[str] = []
@@ -1076,6 +1161,13 @@ def _paths_for(tool_name: str, arguments: dict[str, Any], task_id: str) -> list[
 
     if tool_name == "terminal":
         command = str(arguments.get("command") or "")
+        trusted_video_paths = _trusted_video_edit_write_paths(
+            command,
+            arguments,
+            task_id,
+        )
+        if trusted_video_paths is not None:
+            return trusted_video_paths
         if _command_is_probably_readonly(command):
             return []
         return [p for p in (_terminal_workdir(arguments, task_id),) if p]
