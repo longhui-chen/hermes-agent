@@ -313,18 +313,14 @@ async def test_run_agent_legacy_unbound_plan_ack_flow_has_no_execution_capabilit
     )
 
     async def fake_super(self, **kwargs):
-        runtime_env = build_video_edit_runtime_env({})
-        captured["receipt"] = [
-            runtime_env.get("HERMES_PLAN_ACK_STATUS", ""),
-            runtime_env.get("HERMES_PLAN_ACK_TURN_ID", ""),
-            runtime_env.get("HERMES_PLAN_ACK_REVISION_REQUESTED", ""),
-        ]
+        with pytest.raises(
+            PermissionError,
+            match="trusted video-edit execution receipt unavailable",
+        ):
+            build_video_edit_runtime_env({})
+        captured["runtime_rejected"] = True
         captured["turn_identity"] = current_turn_identity()
         captured["scoped_token"] = business_execution_token()
-        captured["runtime_token"] = runtime_env.get(
-            "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
-            "",
-        )
         captured["forwarded_token"] = kwargs["business_execution_token"]
         return ({}, {})
 
@@ -342,10 +338,9 @@ async def test_run_agent_legacy_unbound_plan_ack_flow_has_no_execution_capabilit
     )
 
     assert captured == {
-        "receipt": ["confirmed", "", "0"],
+        "runtime_rejected": True,
         "turn_identity": None,
         "scoped_token": "",
-        "runtime_token": "",
         "forwarded_token": "",
     }
     assert boundary_checks == [True]
@@ -367,12 +362,13 @@ async def test_run_agent_direct_unbound_flow_preserves_business_capability(
     )
 
     async def fake_super(self, **kwargs):
-        runtime_env = build_video_edit_runtime_env({})
+        with pytest.raises(
+            PermissionError,
+            match="trusted video-edit execution receipt unavailable",
+        ):
+            build_video_edit_runtime_env({})
+        captured["video_runtime_rejected"] = True
         captured["scoped_token"] = business_execution_token()
-        captured["runtime_token"] = runtime_env.get(
-            "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
-            "",
-        )
         captured["forwarded_token"] = kwargs["business_execution_token"]
         return ({}, {})
 
@@ -387,8 +383,8 @@ async def test_run_agent_direct_unbound_flow_preserves_business_capability(
     )
 
     assert captured == {
+        "video_runtime_rejected": True,
         "scoped_token": "a" * 64,
-        "runtime_token": "a" * 64,
         "forwarded_token": "a" * 64,
     }
 

@@ -61,14 +61,20 @@ def _write_presets_integrity_manifest(
     key_id: str = _TEST_INTEGRITY_KEY_ID,
     private_key: Ed25519PrivateKey = _TEST_INTEGRITY_PRIVATE_KEY,
     register_public_key: bool = True,
+    extra_files: dict[str, bytes] | None = None,
 ) -> None:
+    files = {
+        "skills/video-edit-workflow-mini/SKILL.md": hashlib.sha256(
+            skill_bytes
+        ).hexdigest(),
+    }
+    files.update({
+        path: hashlib.sha256(payload).hexdigest()
+        for path, payload in (extra_files or {}).items()
+    })
     manifest = {
         "schema": "zettlab.presets.integrity.v1",
-        "files": {
-            "skills/video-edit-workflow-mini/SKILL.md": hashlib.sha256(
-                skill_bytes
-            ).hexdigest(),
-        },
+        "files": files,
     }
     manifest_raw = json.dumps(
         manifest,
@@ -617,6 +623,66 @@ def test_video_edit_followup_capability_is_session_and_intent_bounded_unit():
         response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
 
 
+def test_confirmed_plan_ack_inherits_only_bound_video_edit_turn_unit():
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
+    session_tokens = set_session_vars(
+        session_key="zettlab:user:main:plan-session",
+        session_id="zettlab:user:main:plan-session",
+    )
+    plan_turn_tokens = set_turn_vars(turn_id="video-plan-turn")
+    plan_turn_cleared = False
+    try:
+        plan_agent = _FakeAgent()
+        reset_trusted_skill_execution(plan_agent, "剪辑")
+
+        clear_turn_vars(plan_turn_tokens)
+        plan_turn_cleared = True
+        confirmed_turn_tokens = set_turn_vars(
+            turn_id="video-confirm-turn",
+            plan_ack_status="confirmed",
+            plan_ack_turn_id="video-plan-turn",
+            business_execution_token="business-token",
+        )
+        try:
+            confirmed_agent = _FakeAgent()
+            reset_trusted_skill_execution(
+                confirmed_agent,
+                "确认执行计划，请开始执行。",
+            )
+            task = confirmed_agent._zet_agent_skill_direct_task
+            assert task.video_edit_applicable
+            assert not task.video_edit_explicit
+        finally:
+            clear_turn_vars(confirmed_turn_tokens)
+
+        mismatched_turn_tokens = set_turn_vars(
+            turn_id="other-confirm-turn",
+            plan_ack_status="confirmed",
+            plan_ack_turn_id="unrelated-plan-turn",
+            business_execution_token="business-token",
+        )
+        try:
+            mismatched_agent = _FakeAgent()
+            reset_trusted_skill_execution(
+                mismatched_agent,
+                "确认执行计划，请开始执行。",
+            )
+            assert not (
+                mismatched_agent
+                ._zet_agent_skill_direct_task
+                .video_edit_applicable
+            )
+        finally:
+            clear_turn_vars(mismatched_turn_tokens)
+    finally:
+        if not plan_turn_cleared:
+            clear_turn_vars(plan_turn_tokens)
+        clear_session_vars(session_tokens)
+        response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
+
+
 def test_video_edit_followup_capability_is_profile_bounded_unit(tmp_path):
     from gateway.session_context import clear_session_vars, set_session_vars
     from hermes_constants import (
@@ -671,6 +737,22 @@ def test_short_natural_video_edit_commands_without_inline_asset_are_explicit_uni
         agent = _FakeAgent()
         reset_trusted_skill_execution(agent, unrelated)
         assert not agent._zet_agent_skill_direct_task.video_edit_applicable, unrelated
+
+
+def test_explicit_video_edit_transport_selection_mints_task_scope_unit():
+    agent = _FakeAgent()
+
+    reset_trusted_skill_execution(
+        agent,
+        {
+            "explicit_skill_slug": "/video-edit-workflow-mini",
+            "task": "请总结 [file: /data/input.mp4]",
+        },
+    )
+
+    task = agent._zet_agent_skill_direct_task
+    assert task.video_edit_applicable
+    assert task.video_edit_explicit
 
 
 def test_model_switch_note_video_edit_resume_scope_flow(tmp_path, monkeypatch):
@@ -850,6 +932,43 @@ def test_startup_rejects_skill_bytes_not_pinned_by_release_manifest(
 
     assert snapshot is not None
     assert snapshot.skills == ()
+
+
+def test_startup_exposes_only_signed_video_edit_python_digests(
+    tmp_path,
+    monkeypatch,
+):
+    presets_dir = tmp_path / "presets"
+    skill_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    scripts_dir = skill_dir / "scripts"
+    scripts_dir.mkdir(parents=True)
+    skill_bytes = b"# released skill\n"
+    helper_bytes = b"print('trusted helper')\n"
+    (skill_dir / "SKILL.md").write_bytes(skill_bytes)
+    (scripts_dir / "workflow_state.py").write_bytes(helper_bytes)
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=skill_bytes,
+        monkeypatch=monkeypatch,
+        extra_files={
+            "skills/video-edit-workflow-mini/scripts/workflow_state.py": (
+                helper_bytes
+            ),
+            "skills/video-edit-workflow-mini/scripts/README.md": b"not code\n",
+            "skills/another-skill/scripts/helper.py": b"other skill\n",
+        },
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+    assert snapshot is not None
+    monkeypatch.setattr(response_mode, "_TRUSTED_PRESETS_SNAPSHOT", snapshot)
+
+    assert response_mode.trusted_video_edit_manifest_digests() == {
+        "skills/video-edit-workflow-mini/scripts/workflow_state.py": (
+            hashlib.sha256(helper_bytes).hexdigest()
+        )
+    }
 
 
 def test_startup_rejects_forged_skill_and_manifest_without_release_key(

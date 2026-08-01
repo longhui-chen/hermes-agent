@@ -328,6 +328,17 @@ def _strip_skill_display_token(user_message: Any, skill_slug: str) -> Any:
     ).strip()
 
 
+def _trusted_skill_scope_message(user_message: Any, skill_slug: str) -> Any:
+    """Preserve an explicit transport skill selection outside model text."""
+    task = _strip_skill_display_token(user_message, skill_slug)
+    if skill_slug != "video-edit-workflow-mini":
+        return task
+    return {
+        "explicit_skill_slug": f"/{skill_slug}",
+        "task": task,
+    }
+
+
 def _extract_business_execution_token(raw: Any) -> str:
     """Accept only local-server's fixed-width opaque capability format."""
     token = str(raw or "").strip()
@@ -3988,7 +3999,7 @@ class APIServerAdapter(BasePlatformAdapter):
         #     message passes through unexpanded instead.
         skill_slug = _extract_skill_slug(body)
         trusted_user_message = (
-            _strip_skill_display_token(user_message, skill_slug)
+            _trusted_skill_scope_message(user_message, skill_slug)
             if skill_slug and body.get("tool_choice") != "none"
             else user_message
         )

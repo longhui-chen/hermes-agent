@@ -13,10 +13,14 @@ logger = logging.getLogger(__name__)
 
 def _is_gateway_run_request(argv: Sequence[str]) -> bool:
     args = list(argv[1:])
-    return any(
-        args[index : index + 2] == ["gateway", "run"]
-        for index in range(max(len(args) - 1, 0))
-    )
+    for index, argument in enumerate(args):
+        if argument != "gateway":
+            continue
+        if index + 1 >= len(args):
+            return True
+        following = args[index + 1]
+        return following == "run" or following.startswith("-")
+    return False
 
 
 def prepare_trusted_video_edit_runtime_before_cli_logging(

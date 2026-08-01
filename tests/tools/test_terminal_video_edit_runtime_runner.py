@@ -20,7 +20,27 @@ from tools.environments.local import LocalEnvironment
 
 @pytest.fixture(autouse=True)
 def _reset_runtime_anchor(monkeypatch):
+    from agent import zet_agent_response_mode as response_mode
+
     monkeypatch.setattr(terminal_tool_module, "_CONNECTOR_RUNTIME_ROOT_ANCHOR", None)
+    monkeypatch.setattr(
+        response_mode,
+        "trusted_video_edit_runtime_receipt",
+        lambda: {
+            "ZET_AGENT_ID": "agent-1",
+            "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
+            "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "capability-secret",
+            "HERMES_TURN_ID": "turn-1",
+            "HERMES_SESSION_KEY": "session-1",
+        },
+    )
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_trusted_video_edit_release_digests",
+        lambda: dict(
+            terminal_tool_module._capture_connector_runtime_root().file_digests
+        ),
+    )
     # Other test modules may leave benign helper threads alive. Production
     # preloads the supervisor before gateway threads start; these unit tests
     # create a fresh temporary presets tree per case and explicitly exercise
@@ -310,7 +330,8 @@ def test_trusted_video_runner_keeps_capability_out_of_wrapper_process_env(monkey
     tokens = set_turn_vars(turn_id="turn-1", business_execution_token="capability-secret")
     try:
         result = json.loads(terminal_tool_module._run_video_edit_runtime_command_if_allowed(
-            'python3 "$ZETTLAB_PRESETS_DIR/skills/video-edit-workflow-mini/scripts/cloud_render_business.py"',
+            'python3 "$ZETTLAB_PRESETS_DIR/skills/video-edit-workflow-mini/scripts/cloud_render_business.py" '
+            '--agent-id agent-1 resume-state',
             cwd=str(tmp_path),
             timeout=5,
         ))
@@ -377,6 +398,55 @@ def test_trusted_video_upload_timeout_parser_rejects_option_value_named_upload()
     )
 
     assert terminal_tool_module._video_edit_runtime_timeout(parsed, 600) == 600
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ["--agent-id", "other", "upload"],
+        ["--agent-id=agent-1", "--base-url", "http://127.0.0.1:1", "upload"],
+        ["--agent-id=agent-1", "--base", "http://127.0.0.1:1", "upload"],
+        ["--agent-id=agent-1", "--base=http://127.0.0.1:1", "upload"],
+        ["--agent-id", "agent-1", "--agent", "other", "upload"],
+        ["--agent-id", "agent-1", "--agent=other", "upload"],
+        ["upload"],
+        ["--agent-id", "agent-1", "--agent-id", "agent-1", "upload"],
+    ),
+)
+def test_cloud_render_business_claims_must_match_frozen_receipt(arguments):
+    parsed = terminal_tool_module._VideoEditRuntimeCommand(
+        argv=[
+            sys.executable,
+            "/trusted/cloud_render_business.py",
+            *arguments,
+        ],
+        root_identity=(1, 2),
+        script_identity=(3, 4),
+    )
+
+    assert not terminal_tool_module._video_edit_runtime_claims_match_receipt(
+        parsed,
+        {"ZET_AGENT_ID": "agent-1"},
+    )
+
+
+def test_cloud_render_business_claims_accept_exact_frozen_agent():
+    parsed = terminal_tool_module._VideoEditRuntimeCommand(
+        argv=[
+            sys.executable,
+            "/trusted/cloud_render_business.py",
+            "--agent-id",
+            "agent-1",
+            "upload",
+        ],
+        root_identity=(1, 2),
+        script_identity=(3, 4),
+    )
+
+    assert terminal_tool_module._video_edit_runtime_claims_match_receipt(
+        parsed,
+        {"ZET_AGENT_ID": "agent-1"},
+    )
 
 
 def test_trusted_video_non_upload_keeps_requested_timeout():
@@ -2961,6 +3031,17 @@ def test_trusted_runtime_source_cache_never_rereads_disk_after_trust_closes(
         "_connector_runtime_path_is_trusted",
         lambda *_args, **_kwargs: True,
     )
+    signed_digests = {
+        path.relative_to(presets_root).as_posix(): terminal_tool_module.hashlib.sha256(
+            path.read_bytes()
+        ).hexdigest()
+        for path in script.parent.glob("*.py")
+    }
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_trusted_video_edit_release_digests",
+        lambda: signed_digests,
+    )
 
     captured = terminal_tool_module._trusted_video_edit_source_bundle(
         script=script,
@@ -3089,7 +3170,7 @@ def test_terminal_late_retry_preloads_bundles_and_image_before_trust_closes(
     assert terminal_tool_module._VIDEO_EDIT_WORKER_DISK_TRUST_CLOSED is False
 
 
-def test_generic_terminal_then_first_trusted_video_uses_frozen_image(
+def test_generic_terminal_then_first_trusted_video_uses_frozen_image_and_receipt(
     monkeypatch,
     tmp_path,
 ):
@@ -3149,8 +3230,10 @@ def test_generic_terminal_then_first_trusted_video_uses_frozen_image(
     assert video["video_edit_runtime_direct"] is True
     assert video["exit_code"] == 0
     assert "execution=[REDACTED]" in video["output"]
-    assert "agent=agent-after-terminal" in video["output"]
-    assert "turn=turn-after-terminal" in video["output"]
+    assert "agent=agent-1" in video["output"]
+    assert "turn=turn-1" in video["output"]
+    assert "agent-after-terminal" not in video["output"]
+    assert "turn-after-terminal" not in video["output"]
     assert boundary_calls == ["hardened"]
 
 
@@ -3174,6 +3257,52 @@ def test_trusted_video_runner_rejects_untrusted_sibling_dependency(monkeypatch, 
         timeout=5,
     ))
     assert result["video_edit_runtime_direct"] is True
+    assert result["exit_code"] == -1
+    assert "PermissionError" in result["error"]
+
+
+@pytest.mark.parametrize("signed_state", ("missing", "mismatch"))
+def test_trusted_video_runner_requires_signed_digest_for_every_dependency(
+    monkeypatch,
+    tmp_path,
+    signed_state,
+):
+    script = _write_trusted_script(tmp_path, "preference_resolver.py")
+    sibling = script.parent / "workflow_state.py"
+    sibling.write_text("VALUE = 'signed-sibling'\n")
+    presets_root = tmp_path / "presets"
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_root))
+    monkeypatch.setattr(terminal_tool_module, "_TRUSTED_RUNTIME_SOURCE_CACHE", {})
+    monkeypatch.setattr(terminal_tool_module, "_TRUSTED_RUNTIME_SOURCE_CACHE_BYTES", 0)
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda *_args, **_kwargs: True,
+    )
+    anchor = terminal_tool_module._capture_connector_runtime_root()
+    assert anchor is not None
+    signed_digests = dict(anchor.file_digests)
+    sibling_relative = sibling.relative_to(presets_root).as_posix()
+    if signed_state == "missing":
+        signed_digests.pop(sibling_relative)
+    else:
+        signed_digests[sibling_relative] = "0" * 64
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_trusted_video_edit_release_digests",
+        lambda: signed_digests,
+    )
+
+    result = json.loads(
+        terminal_tool_module._run_video_edit_runtime_command_if_allowed(
+            'python3 "$ZETTLAB_PRESETS_DIR/skills/'
+            'video-edit-workflow-mini/scripts/preference_resolver.py"',
+            cwd=str(tmp_path),
+            timeout=5,
+        )
+    )
+
+    assert result["video_edit_runtime_direct"] is True, result
     assert result["exit_code"] == -1
     assert "PermissionError" in result["error"]
 

@@ -161,6 +161,7 @@ class _TrustedPresetsSnapshot:
     integrity_signature_components: tuple[_PathSnapshot, ...]
     integrity_signature_sha256: str
     integrity_signature_key_id: str
+    video_edit_script_digests: tuple[tuple[str, str], ...]
     skills: tuple[_TrustedDirectSkillSnapshot, ...]
 
 
@@ -232,10 +233,19 @@ class _SkillDirectOperation:
     execution_claimed: bool = field(default=False, repr=False, compare=False)
 
 
+@dataclass(frozen=True)
+class _VideoEditResumeGrant:
+    expires_at: float
+    source_turn_id: str
+
+
 _TRUSTED_PRESETS_SNAPSHOT: _TrustedPresetsSnapshot | None = None
 _PENDING_ATTESTATIONS: OrderedDict[str, _PendingSkillAttestation] = OrderedDict()
 _VideoEditResumeKey = tuple[str, str]
-_VIDEO_EDIT_RESUME_SESSIONS: OrderedDict[_VideoEditResumeKey, float] = OrderedDict()
+_VIDEO_EDIT_RESUME_SESSIONS: OrderedDict[
+    _VideoEditResumeKey,
+    _VideoEditResumeGrant | float,
+] = OrderedDict()
 _ATTESTATION_LOCK = threading.Lock()
 _SKILL_DIRECT_LOCK = threading.Lock()
 _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT: ContextVar[
@@ -310,17 +320,48 @@ def _strip_gateway_model_switch_note(task_text: str) -> str:
 def _video_edit_resume_sessions_locked(
     *,
     now: float,
-) -> OrderedDict[_VideoEditResumeKey, float]:
+) -> OrderedDict[_VideoEditResumeKey, _VideoEditResumeGrant | float]:
+    def _expires_at(value: _VideoEditResumeGrant | float) -> float | None:
+        if isinstance(value, _VideoEditResumeGrant):
+            return value.expires_at
+        if isinstance(value, (int, float)):
+            return float(value)
+        return None
+
     expired = [
         resume_key
-        for resume_key, expires_at in _VIDEO_EDIT_RESUME_SESSIONS.items()
-        if not isinstance(expires_at, (int, float)) or expires_at <= now
+        for resume_key, grant in _VIDEO_EDIT_RESUME_SESSIONS.items()
+        if (_expires_at(grant) is None or _expires_at(grant) <= now)
     ]
     for resume_key in expired:
         _VIDEO_EDIT_RESUME_SESSIONS.pop(resume_key, None)
     while len(_VIDEO_EDIT_RESUME_SESSIONS) > _VIDEO_EDIT_RESUME_MAX_SESSIONS:
         _VIDEO_EDIT_RESUME_SESSIONS.popitem(last=False)
     return _VIDEO_EDIT_RESUME_SESSIONS
+
+
+def _confirmed_video_edit_plan_resume(
+    resume_key: _VideoEditResumeKey | None,
+    resume_sessions: Mapping[
+        _VideoEditResumeKey,
+        _VideoEditResumeGrant | float,
+    ],
+) -> bool:
+    if resume_key is None:
+        return False
+    grant = resume_sessions.get(resume_key)
+    if not isinstance(grant, _VideoEditResumeGrant) or not grant.source_turn_id:
+        return False
+    try:
+        from gateway.session_context import get_session_env
+
+        status = str(get_session_env("HERMES_PLAN_ACK_STATUS") or "").strip()
+        source_turn_id = str(
+            get_session_env("HERMES_PLAN_ACK_TURN_ID") or ""
+        ).strip()
+    except Exception:
+        return False
+    return status == "confirmed" and source_turn_id == grant.source_turn_id
 
 
 def _capture_trusted_execution_receipt(
@@ -391,6 +432,14 @@ def trusted_video_edit_runtime_receipt() -> Mapping[str, str]:
         "HERMES_TURN_ID": receipt.turn_id,
         "HERMES_SESSION_KEY": receipt.session_id,
     }
+
+
+def trusted_video_edit_manifest_digests() -> Mapping[str, str]:
+    """Return signed helper digests captured before model-authored terminal use."""
+    snapshot = _TRUSTED_PRESETS_SNAPSHOT
+    if snapshot is None:
+        return {}
+    return dict(snapshot.video_edit_script_digests)
 
 
 def _stat_fingerprint(value: os.stat_result) -> tuple[int, ...]:
@@ -716,6 +765,13 @@ def _capture_trusted_presets_snapshot(
             raise ValueError(
                 "official video-edit skill is absent from the release manifest"
             )
+        video_edit_scripts_root = Path(_VIDEO_EDIT_SKILL_PATH).parent / "scripts"
+        video_edit_script_digests = tuple(sorted(
+            (relative_path, digest)
+            for relative_path, digest in expected_hashes.items()
+            if Path(relative_path).parent == video_edit_scripts_root
+            and Path(relative_path).suffix == ".py"
+        ))
 
         trusted_skills: list[_TrustedDirectSkillSnapshot] = []
         scanned = 0
@@ -805,6 +861,7 @@ def _capture_trusted_presets_snapshot(
                 integrity_signature_raw
             ).hexdigest(),
             integrity_signature_key_id=integrity_signature_key_id,
+            video_edit_script_digests=video_edit_script_digests,
             skills=tuple(trusted_skills),
         )
     except (OSError, ValueError, PermissionError) as exc:
@@ -1125,12 +1182,21 @@ def _skill_direct_task_context(agent: Any, user_message: Any) -> _SkillDirectTas
     resume_key = _current_skill_direct_resume_key()
     resume_sessions = _video_edit_resume_sessions_locked(now=now)
     continuation_intent = _video_edit_continuation_intent(normalized)
+    confirmed_plan_resume = _confirmed_video_edit_plan_resume(
+        resume_key,
+        resume_sessions,
+    )
     resumed = bool(
         not explicit
-        and continuation_intent
         and (
-            has_edit_intent
-            or (resume_key is not None and resume_key in resume_sessions)
+            confirmed_plan_resume
+            or (
+                continuation_intent
+                and (
+                    has_edit_intent
+                    or (resume_key is not None and resume_key in resume_sessions)
+                )
+            )
         )
     )
     if resumed and resume_key is not None and resume_key in resume_sessions:
@@ -1281,11 +1347,11 @@ def _memory_payload_hashes_from_terminal_result(
         if not isinstance(raw_operation, dict):
             return frozenset()
         operation = dict(raw_operation)
-        target = operation.get("target")
+        target = operation.pop("target", None)
         action = operation.get("action")
         if target not in grouped or action not in {"add", "remove", "replace"}:
             return frozenset()
-        if set(operation) - {"action", "content", "old_text", "target"}:
+        if set(operation) - {"action", "content", "old_text"}:
             return frozenset()
         for field in ("content", "old_text"):
             value = operation.get(field)
@@ -1665,8 +1731,15 @@ def reset_trusted_skill_execution(agent: Any, user_message: Any = None) -> None:
                 sessions = _video_edit_resume_sessions_locked(
                     now=time.monotonic(),
                 )
-                sessions[resume_key] = (
-                    time.monotonic() + _VIDEO_EDIT_RESUME_TTL_SECONDS
+                source_turn_id = (
+                    str(task.turn_identity[0] or "").strip()
+                    if task.turn_identity is not None
+                    else ""
+                )
+                sessions[resume_key] = _VideoEditResumeGrant(
+                    expires_at=time.monotonic()
+                    + _VIDEO_EDIT_RESUME_TTL_SECONDS,
+                    source_turn_id=source_turn_id,
                 )
                 sessions.move_to_end(resume_key)
                 while len(sessions) > _VIDEO_EDIT_RESUME_MAX_SESSIONS:

@@ -336,6 +336,41 @@ def test_trusted_video_memory_schema_is_scoped_even_when_platform_omits_it(
     ] == ["terminal"]
 
 
+def test_plan_success_memory_authorization_matches_memory_tool_shape():
+    content = (
+        "<!-- ZETTLAB_VIDEO_EDIT_SOFT_V1\n"
+        '{"s":{"daily":{"p":{"ar":"9:16","du":30}}},"v":1}\n'
+        "-->"
+    )
+    terminal_result = {
+        "output": json.dumps(
+            {
+                "ok": True,
+                "operations": [{
+                    "action": "add",
+                    "content": content,
+                    "target": "memory",
+                }],
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    }
+    memory_args = {
+        "target": "memory",
+        "operations": [{
+            "action": "add",
+            "content": content,
+        }],
+    }
+
+    assert response_mode._memory_payload_hashes_from_terminal_result(
+        terminal_result
+    ) == frozenset({
+        response_mode._canonical_memory_payload_sha256(memory_args)
+    })
+
+
 def test_trusted_video_response_exception_is_limited_to_memory(monkeypatch):
     agent = _agent(valid_tool_names={"skill_view", "todo"})
     monkeypatch.setattr(

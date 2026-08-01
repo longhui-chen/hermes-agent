@@ -540,6 +540,7 @@ def test_build_video_edit_runtime_env_scrubs_profile_keys_before_video_injection
 ):
     """Video execution cannot inherit connector bearer from any sanitizer output."""
     from agent import secret_scope as ss
+    from agent import zet_agent_response_mode as response_mode
 
     unsafe_env = {
         key: f"foreign-{key.lower()}"
@@ -550,6 +551,17 @@ def test_build_video_edit_runtime_env_scrubs_profile_keys_before_video_injection
         local_env_module,
         "_sanitize_subprocess_env",
         lambda *_args, **_kwargs: dict(unsafe_env),
+    )
+    monkeypatch.setattr(
+        response_mode,
+        "trusted_video_edit_runtime_receipt",
+        lambda: {
+            "ZET_AGENT_ID": "video-agent",
+            "ZETTLAB_AGENT_ACTION_TOKEN": "video-action",
+            "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "video-business",
+            "HERMES_TURN_ID": "turn-video",
+            "HERMES_SESSION_KEY": "session-video",
+        },
     )
     ss.set_multiplex_active(True)
     scope_token = ss.set_secret_scope({
@@ -574,6 +586,36 @@ def test_build_video_edit_runtime_env_scrubs_profile_keys_before_video_injection
     assert env["ZETTLAB_AGENT_ACTION_TOKEN"] == "video-action"
     assert env["ZETTLAB_BUSINESS_EXECUTION_TOKEN"] == "video-business"
     assert env["HERMES_TURN_ID"] == "turn-video"
+
+
+def test_build_video_edit_runtime_env_requires_frozen_receipt(monkeypatch):
+    """Live profile and turn scopes cannot authorize the dedicated runner."""
+    from agent import secret_scope as ss
+    from agent import zet_agent_response_mode as response_mode
+
+    monkeypatch.setattr(
+        response_mode,
+        "trusted_video_edit_runtime_receipt",
+        lambda: {},
+    )
+    ss.set_multiplex_active(True)
+    scope_token = ss.set_secret_scope({
+        "ZET_AGENT_ID": "video-agent",
+        "ZETTLAB_AGENT_ACTION_TOKEN": "video-action",
+    })
+    turn_tokens = set_turn_vars(
+        turn_id="turn-video",
+        business_execution_token="video-business",
+    )
+    try:
+        with pytest.raises(
+            PermissionError,
+            match="trusted video-edit execution receipt unavailable",
+        ):
+            build_video_edit_runtime_env({})
+    finally:
+        clear_turn_vars(turn_tokens)
+        ss.reset_secret_scope(scope_token)
 
 
 def test_trusted_video_receipt_prefers_lineage_session_id():

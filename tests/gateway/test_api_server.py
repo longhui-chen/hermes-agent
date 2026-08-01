@@ -1658,6 +1658,51 @@ class TestChatCompletionsEndpoint:
                 )
 
     @pytest.mark.asyncio
+    async def test_video_edit_skill_selection_preserves_trusted_scope_signal(
+        self,
+        adapter,
+    ):
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        usage = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+            ) as mock_run, patch.object(
+                adapter,
+                "_expand_inbound_skill_invocation",
+                new_callable=AsyncMock,
+            ) as mock_expand:
+                mock_run.return_value = (mock_result, usage)
+                mock_expand.return_value = "<<EXPANDED>>"
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{
+                            "role": "user",
+                            "content": (
+                                "/video-edit-workflow-mini "
+                                "请总结 [file: /data/input.mp4]"
+                            ),
+                        }],
+                        "stream": False,
+                        "metadata": {
+                            "skill_slug": "video-edit-workflow-mini",
+                        },
+                    },
+                )
+
+                assert resp.status == 200
+                assert mock_run.await_args.kwargs["trusted_user_message"] == {
+                    "explicit_skill_slug": "/video-edit-workflow-mini",
+                    "task": "请总结 [file: /data/input.mp4]",
+                }
+
+    @pytest.mark.asyncio
     async def test_slash_text_without_skill_slug_is_never_expanded(self, adapter):
         # The explicit metadata.skill_slug field is the ONLY trigger: message
         # text is never sniffed, so a literal "/<skill> ..." (e.g. the user

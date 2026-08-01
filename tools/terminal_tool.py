@@ -56,7 +56,7 @@ import subprocess
 import types
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Mapping
 
 from utils import env_var_enabled
 
@@ -2411,6 +2411,11 @@ def _trusted_video_edit_source_bundle(
     """Return a pre-trust source snapshot; never reread scripts post-terminal."""
     global _TRUSTED_RUNTIME_SOURCE_CACHE_BYTES
 
+    video_edit_scripts_root = (
+        presets_root / "skills" / "video-edit-workflow-mini" / "scripts"
+    )
+    require_signed_video_edit_sources = script.parent == video_edit_scripts_root
+
     cache_key = (str(script.parent), expected_root_identity)
     with _VIDEO_EDIT_WORKER_LOCK:
         snapshot = _TRUSTED_RUNTIME_SOURCE_CACHE.get(cache_key)
@@ -2424,6 +2429,16 @@ def _trusted_video_edit_source_bundle(
             ):
                 raise MemoryError("trusted runtime source cache directory limit reached")
 
+            signed_digests = (
+                _trusted_video_edit_release_digests()
+                if require_signed_video_edit_sources
+                else {}
+            )
+            if require_signed_video_edit_sources and not signed_digests:
+                raise PermissionError(
+                    "signed video-edit helper manifest is unavailable"
+                )
+
             modules: list[_TrustedWorkerModuleSnapshot] = []
             total_bytes = 0
             for dependency in sorted(script.parent.glob("*.py")):
@@ -2436,6 +2451,20 @@ def _trusted_video_edit_source_bundle(
                         f"untrusted video-edit dependency: {dependency.name}"
                     )
                 source_bytes = _read_stable_trusted_worker_source(dependency)
+                if require_signed_video_edit_sources:
+                    relative_dependency = dependency.relative_to(
+                        presets_root
+                    ).as_posix()
+                    expected_digest = signed_digests.get(relative_dependency)
+                    if (
+                        expected_digest is None
+                        or hashlib.sha256(source_bytes).hexdigest()
+                        != expected_digest
+                    ):
+                        raise PermissionError(
+                            "video-edit dependency does not match signed manifest: "
+                            f"{dependency.name}"
+                        )
                 total_bytes += len(source_bytes)
                 if (
                     _TRUSTED_RUNTIME_SOURCE_CACHE_BYTES + total_bytes
@@ -2497,6 +2526,18 @@ def _trusted_video_edit_source_bundle(
         if "__main__" not in bundle:
             raise PermissionError("runtime entrypoint was not captured before terminal access")
         return bundle
+
+
+def _trusted_video_edit_release_digests() -> dict[str, str]:
+    """Load only the digests from the already verified presets manifest."""
+    try:
+        from agent.zet_agent_response_mode import (
+            trusted_video_edit_manifest_digests,
+        )
+
+        return dict(trusted_video_edit_manifest_digests())
+    except Exception:
+        return {}
 
 
 def _preload_trusted_runtime_source_bundles() -> None:
@@ -4491,6 +4532,55 @@ def _cloud_render_business_subcommand(arguments: list[str]) -> Optional[str]:
     return arguments[position]
 
 
+def _video_edit_runtime_claims_match_receipt(
+    parsed: _VideoEditRuntimeCommand,
+    trusted_env: Mapping[str, str],
+) -> bool:
+    """Bind model-supplied business routing claims to the frozen receipt."""
+    if Path(parsed.argv[1]).name != "cloud_render_business.py":
+        return True
+
+    expected_agent_id = str(trusted_env.get("ZET_AGENT_ID", "") or "").strip()
+    if not expected_agent_id:
+        return False
+
+    agent_ids: list[str] = []
+    arguments = parsed.argv[2:]
+    position = 0
+    while position < len(arguments):
+        token = arguments[position]
+        option_name = token.split("=", 1)[0]
+        if option_name.startswith("--") and "--base-url".startswith(option_name):
+            # argparse accepts unambiguous long-option abbreviations by
+            # default, so --base and --base=<url> are equivalent to the
+            # forbidden --base-url override inside the signed helper.
+            return False
+        if (
+            option_name != "--agent-id"
+            and option_name.startswith("--")
+            and "--agent-id".startswith(option_name)
+        ):
+            # An abbreviated second declaration (for example --agent) would
+            # be accepted by argparse and could override the exact bound ID.
+            return False
+        if token == "--agent-id":
+            position += 1
+            if position >= len(arguments):
+                return False
+            agent_ids.append(arguments[position])
+        elif token.startswith("--agent-id="):
+            agent_ids.append(token.split("=", 1)[1])
+        position += 1
+
+    # The signed workflow always names its profile explicitly. The base URL is
+    # deliberately not model-configurable; the signed helper owns the loopback
+    # business endpoint default.
+    return (
+        len(agent_ids) == 1
+        and agent_ids[0] == expected_agent_id
+    )
+
+
 def _resolve_video_edit_runtime_script(raw_path: str) -> Optional[Path]:
     anchor = _capture_connector_runtime_root()
     if anchor is None:
@@ -5341,6 +5431,8 @@ def _run_video_edit_runtime_command_if_allowed(
         from tools.environments.local import build_video_edit_runtime_env
 
         trusted_env = build_video_edit_runtime_env()
+        if not _video_edit_runtime_claims_match_receipt(parsed, trusted_env):
+            return _video_edit_runtime_shell_guard_result(command)
         secret_values = [
             trusted_env.get("ZETTLAB_BUSINESS_EXECUTION_TOKEN", ""),
             trusted_env.get("ZETTLAB_AGENT_ACTION_TOKEN", ""),

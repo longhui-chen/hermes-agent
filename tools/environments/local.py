@@ -1516,39 +1516,9 @@ def build_video_edit_runtime_env(base_env: dict | None = None) -> dict[str, str]
         frozen_receipt = trusted_video_edit_runtime_receipt()
     except Exception:
         frozen_receipt = {}
-    if frozen_receipt:
-        env.update(frozen_receipt)
-        return env
-
-    scope = None
-    multiplex_active = False
-    try:
-        from agent.secret_scope import current_secret_scope, is_multiplex_active
-
-        multiplex_active = is_multiplex_active()
-        scope = current_secret_scope()
-    except Exception:
-        scope = None
-
-    for key in ("ZET_AGENT_ID", "ZETTLAB_AGENT_ACTION_TOKEN"):
-        value = scope.get(key) if scope is not None else None
-        if value is None and not multiplex_active:
-            value = os.environ.get(key)
-        if value is not None:
-            env[key] = str(value)
-        else:
-            env.pop(key, None)
-
-    try:
-        from gateway.session_context import business_execution_token
-
-        token = business_execution_token()
-    except Exception:
-        token = ""
-    if token:
-        env["ZETTLAB_BUSINESS_EXECUTION_TOKEN"] = token
-    else:
-        env.pop("ZETTLAB_BUSINESS_EXECUTION_TOKEN", None)
+    if not frozen_receipt:
+        raise PermissionError("trusted video-edit execution receipt unavailable")
+    env.update(frozen_receipt)
     return env
 
 
