@@ -4118,6 +4118,59 @@ class ZetAgentAdapter(APIServerAdapter):
                 status=409,
             )
 
+        # Invalidate goal work before runtime/DB teardown. A barrier Timer may
+        # already have detached itself from the timer table and be waiting on
+        # its session lock; cancellation alone cannot stop that callback from
+        # reporting a continuation after this endpoint succeeds (codex P1).
+        # The drain runs off-loop and its completion barrier makes request
+        # cancellation wait until the worker has really exited.
+        drv = getattr(self, "_zet_goal_driver", None)
+        if profile_home and drv is not None:
+            try:
+                await _to_thread_with_completion_barrier(
+                    drv.invalidate_barrier_callbacks_for_home,
+                    profile_home,
+                )
+            except asyncio.CancelledError:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                raise
+            except Exception:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                logger.warning(
+                    "[zet_agent] profile-unload: goal callbacks did not drain",
+                    exc_info=True,
+                )
+                return web.json_response(
+                    _openai_error(
+                        "profile unload failed: goal callbacks could not be released",
+                        err_type="server_error",
+                    ),
+                    status=500,
+                )
+
+        # A callback that began just before invalidation can finish one last
+        # report while unload waits for it. Re-check the active-run gate before
+        # evicting runtime state so that continuation cannot race past the
+        # first check above.
+        active_api_runs = self._active_profile_chat_runs(profile_home)
+        if active_api_runs:
+            self._unblock_runtime_import_profile(
+                profile_home, unload_barrier_owner
+            )
+            return web.json_response(
+                {
+                    "unloaded": False,
+                    "error": "profile has active sessions",
+                    "active_sessions": active_api_runs,
+                    "active_api_runs": active_api_runs,
+                },
+                status=409,
+            )
+
         runtime_unload = {}
         gw = getattr(self, "gateway_runner", None)
         if gw is not None:
@@ -4285,17 +4338,10 @@ class ZetAgentAdapter(APIServerAdapter):
                     )
                     raise
                 closed_session_db = True
-            # 该 profile 的 goal barrier timers 一并取消（codex P1）：daemon
-            # Timer 携带旧 profile 的 runtime scope，卸载后触发会用内存旧
-            # scope 读 goal 并重新自驱一个用户刚删掉的 agent。同时按 home
-            # 翻代，让还在跑的 post-turn judge 任务在 report 前的复核中失效
-            # （active-run 计数在 turn 结束时已归零，拦不住这些后置任务）。
-            # getattr：teardown 期间绝不懒创建 driver。
-            drv = getattr(self, "_zet_goal_driver", None)
+            # Goal callbacks/timers were invalidated and drained before
+            # runtime teardown. Only the cached goal DB remains to close.
             if drv is not None:
                 try:
-                    drv.cancel_barrier_timers_for_home(profile_home)
-                    drv.bump_lock_generations_for_home(profile_home)
                     # goal sidecar 走 hermes_cli.goals._DB_CACHE（按 home 缓存
                     # SessionDB），上面只关了 adapter 自己的 _session_dbs ——
                     # 不关它的话 profile 删除/重建后 goal 读写仍打在旧 inode

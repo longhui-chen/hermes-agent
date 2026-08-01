@@ -981,6 +981,67 @@ class TestProfileUnloadTimers:
         driver.cancel_barrier_timers_for_home(str(hermes_home))
         assert not driver._barrier_timers
 
+    def test_unload_waits_for_detached_callback_and_invalidates_it(
+        self, driver, reports, hermes_home
+    ):
+        """Timer callback 已从 table 弹出、正等 session lock 时，
+        unload 必须等它看到 home epoch 过期并退出；不得在卸载后
+        上报 continuation 重新自驱同名 profile（codex P1）。"""
+        _create(driver)
+        reports.clear()
+        key = driver._scope_key(SID)
+        generation = driver._lock_generation(SID)
+        timer = threading.Timer(60, lambda: None)
+        session_lock = driver._session_lock(SID)
+        session_lock.acquire()
+        with driver._lock:
+            driver._barrier_timers[key] = timer
+
+        callback_done = threading.Event()
+        callback = threading.Thread(
+            target=lambda: (
+                driver._barrier_wakeup(SID, generation, key, timer),
+                callback_done.set(),
+            )
+        )
+        callback.start()
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with driver._lock:
+                if driver._barrier_callbacks.get(key):
+                    break
+            time.sleep(0.01)
+        else:
+            session_lock.release()
+            callback.join(2)
+            pytest.fail("barrier callback did not detach from timer table")
+
+        unload_done = threading.Event()
+        unload = threading.Thread(
+            target=lambda: (
+                driver.invalidate_barrier_callbacks_for_home(str(hermes_home)),
+                unload_done.set(),
+            )
+        )
+        unload.start()
+
+        deadline = time.monotonic() + 2
+        while (
+            time.monotonic() < deadline
+            and driver._lock_generation(SID) == generation
+        ):
+            time.sleep(0.01)
+        assert driver._lock_generation(SID) != generation
+        assert not unload_done.is_set(), "unload 不得越过已弹出的 callback"
+
+        session_lock.release()
+        callback.join(2)
+        unload.join(2)
+        assert callback_done.is_set()
+        assert unload_done.is_set()
+        assert reports == [], "过期 callback 不得上报 continuation"
+
 
 class TestJudgeBackgroundProcesses:
     def test_evaluate_passes_background_snapshot(self, driver, reports):
