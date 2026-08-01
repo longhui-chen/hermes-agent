@@ -99,6 +99,12 @@ class ZetGoalDriver:
         # session_id → threading.Timer for barrier wakeups (bounded: one per
         # waiting goal; cancelled/replaced on every reschedule).
         self._barrier_timers: Dict[str, threading.Timer] = {}
+        # scope key → callbacks that have atomically detached their Timer
+        # from _barrier_timers but have not returned yet. Profile unload must
+        # wait for these callbacks before closing the goal DB; Timer.cancel()
+        # cannot stop a callback that has already begun (codex P1).
+        self._barrier_callbacks: Dict[str, int] = {}
+        self._barrier_callbacks_drained = threading.Condition(self._lock)
         # session_id → threading.Lock serialising every GoalManager
         # read-modify-write for that session. SessionDB writes are atomic
         # per call, but "load state → judge → save" spans several calls;
@@ -173,6 +179,15 @@ class ZetGoalDriver:
         self._home_resolve_cache[home] = resolved
         return resolved
 
+    def _lock_generation_for_key_locked(self, key: str):
+        """Return a generation while ``self._lock`` is held."""
+        home = key.split("|", 1)[0] if "|" in key else ""
+        rhome = self._resolved_home(home)
+        return (
+            self._lock_gens.get(key, 0),
+            self._home_epochs.get(rhome, 0) + self._adapter_epoch,
+        )
+
     def _lock_generation(self, session_id: str):
         """失效代际 = (session 代际, home epoch + adapter epoch)。home epoch
         由 profile unload 递增（codex P1）：覆盖「排队中尚未建 session 键」
@@ -180,13 +195,8 @@ class ZetGoalDriver:
         由 disconnect 递增（codex P1）：整个 adapter 被替换/关停时全量失效。
         两者都只增，求和后任何一次翻转都让 != 复核失效。"""
         key = self._scope_key(session_id)
-        home = key.split("|", 1)[0] if "|" in key else ""
-        rhome = self._resolved_home(home)
         with self._lock:
-            return (
-                self._lock_gens.get(key, 0),
-                self._home_epochs.get(rhome, 0) + self._adapter_epoch,
-            )
+            return self._lock_generation_for_key_locked(key)
 
     def invalidate_all_generations(self) -> None:
         """Adapter teardown hook（codex P1）：disconnect 时让本 driver 名下
@@ -997,15 +1007,60 @@ class ZetGoalDriver:
             except Exception:
                 pass
 
-    def _kick_after_barrier(self, session_id: str, mgr: Any) -> None:
+    def invalidate_barrier_callbacks_for_home(
+        self, profile_home: Any, timeout_s: float = 10.0
+    ) -> None:
+        """Invalidate one profile's goal work and drain detached callbacks.
+
+        A Timer removes itself from ``_barrier_timers`` before waiting for the
+        per-session lock. Therefore cancellation alone cannot prove that no
+        callback still owns the unloaded profile. Bump the non-reusable home
+        epoch first, cancel timers still in the table, then wait for callbacks
+        that already detached themselves. The unload handler calls this before
+        runtime/DB teardown (codex P1).
+        """
+        target = self._resolved_home(str(profile_home))
+        self.bump_lock_generations_for_home(profile_home)
+        self.cancel_barrier_timers_for_home(profile_home)
+
+        def belongs_to_target(key: str) -> bool:
+            home = key.split("|", 1)[0] if "|" in key else ""
+            return bool(home) and self._resolved_home(home) == target
+
+        deadline = time.monotonic() + max(0.1, timeout_s)
+        with self._barrier_callbacks_drained:
+            while any(
+                count > 0 and belongs_to_target(key)
+                for key, count in self._barrier_callbacks.items()
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "profile barrier callbacks did not drain before unload"
+                    )
+                self._barrier_callbacks_drained.wait(remaining)
+
+    def _kick_after_barrier(
+        self, session_id: str, mgr: Any, expected_generation: Any = None
+    ) -> None:
         """Barrier satisfied → issue the continuation (wakeup + schedule 共用
         的续跑路径)。Caller holds the session lock. 下发前复核在途 turn
         （codex P1）：barrier 等待期间用户可能发起了普通 turn，与它并发自驱
         会重复执行工具 —— 让位，其 post-turn 评估接管续轮。"""
+        if (
+            expected_generation is not None
+            and self._lock_generation(session_id) != expected_generation
+        ):
+            return
         if self._session_turn_active(session_id):
             return
         cont = mgr.next_continuation_prompt()
         if not cont:
+            return
+        if (
+            expected_generation is not None
+            and self._lock_generation(session_id) != expected_generation
+        ):
             return
         # 发送前最后一刻让 cancel mark 获胜（codex P1，同 post-turn continue
         # 分支）。
@@ -1018,15 +1073,29 @@ class ZetGoalDriver:
         proj["state"] = "running"
         proj["round"] = self._cumulative_round(session_id, st.turns_used) + 1
         proj["summary"] = "wait barrier cleared; continuing"
+        if (
+            expected_generation is not None
+            and self._lock_generation(session_id) != expected_generation
+        ):
+            return
         self.report(session_id, proj, continuation=cont)
 
-    def _schedule_barrier_wakeup(self, session_id: str) -> None:
+    def _schedule_barrier_wakeup(
+        self, session_id: str, expected_generation: Any = None
+    ) -> None:
         """Arm a timer that re-checks a parked goal's barrier. Time barriers
         wake exactly at the deadline; pid/session barriers poll at
         ``_BARRIER_POLL_S`` (the CLI equivalent is its always-running REPL
         tick — a gateway has no such loop, hence the timers)."""
         from hermes_cli.goals import GoalManager
 
+        scheduled_gen = (
+            expected_generation
+            if expected_generation is not None
+            else self._lock_generation(session_id)
+        )
+        if self._lock_generation(session_id) != scheduled_gen:
+            return
         mgr = GoalManager(session_id)
         st = mgr.state
         if st is None or st.status != "active":
@@ -1036,7 +1105,9 @@ class ZetGoalDriver:
             # is_waiting() 已顺手清掉 barrier —— 静默 return 会让 goal 卡在
             # active 无人续跑直到重启 reconcile（codex P1），走 wakeup 同款
             # 续跑路径。
-            self._kick_after_barrier(session_id, mgr)
+            self._kick_after_barrier(
+                session_id, mgr, expected_generation=scheduled_gen
+            )
             return
         delay = _BARRIER_POLL_S
         if st.waiting_until and st.waiting_until > time.time():
@@ -1047,10 +1118,19 @@ class ZetGoalDriver:
         import contextvars
 
         ctx = contextvars.copy_context()
-        timer = threading.Timer(delay, lambda: ctx.run(self._barrier_wakeup, session_id))
-        timer.daemon = True
         key = self._scope_key(session_id)
+        timer = threading.Timer(
+            delay,
+            lambda: ctx.run(
+                self._barrier_wakeup, session_id, scheduled_gen, key, timer
+            ),
+        )
+        timer.daemon = True
         with self._lock:
+            # Unload may have bumped the home epoch while GoalManager read the
+            # barrier. Never publish a timer carrying the post-unload epoch.
+            if self._lock_generation_for_key_locked(key) != scheduled_gen:
+                return
             old = self._barrier_timers.pop(key, None)
             self._barrier_timers[key] = timer
         if old is not None:
@@ -1060,13 +1140,30 @@ class ZetGoalDriver:
                 pass
         timer.start()
 
-    def _barrier_wakeup(self, session_id: str) -> None:
+    def _barrier_wakeup(
+        self,
+        session_id: str,
+        scheduled_gen: Any,
+        key: str,
+        timer: threading.Timer,
+    ) -> None:
         from hermes_cli.goals import GoalManager
 
-        with self._lock:
-            self._barrier_timers.pop(self._scope_key(session_id), None)
+        with self._barrier_callbacks_drained:
+            # A replacement/cancelled timer must not pop or execute the timer
+            # currently registered for the same session.
+            if self._barrier_timers.get(key) is not timer:
+                return
+            self._barrier_timers.pop(key, None)
+            self._barrier_callbacks[key] = self._barrier_callbacks.get(key, 0) + 1
         try:
+            if self._lock_generation(session_id) != scheduled_gen:
+                return
             with self._session_lock(session_id):
+                # The callback may have waited here while profile unload
+                # invalidated its home epoch. Re-check before touching the DB.
+                if self._lock_generation(session_id) != scheduled_gen:
+                    return
                 try:
                     mgr = GoalManager(session_id)
                 except Exception:
@@ -1076,11 +1173,23 @@ class ZetGoalDriver:
                     return
                 if mgr.is_waiting():
                     # Barrier still holding (pid/session) — keep polling.
-                    self._schedule_barrier_wakeup(session_id)
+                    self._schedule_barrier_wakeup(
+                        session_id, expected_generation=scheduled_gen
+                    )
                     return
-                self._kick_after_barrier(session_id, mgr)
+                self._kick_after_barrier(
+                    session_id, mgr, expected_generation=scheduled_gen
+                )
         except Exception:
             logger.warning("[zet_goal] barrier wakeup failed", exc_info=True)
+        finally:
+            with self._barrier_callbacks_drained:
+                remaining = self._barrier_callbacks.get(key, 0) - 1
+                if remaining > 0:
+                    self._barrier_callbacks[key] = remaining
+                else:
+                    self._barrier_callbacks.pop(key, None)
+                self._barrier_callbacks_drained.notify_all()
 
     # ------------------------------------------------------------------
     # Interrupt + interaction projections

@@ -413,6 +413,7 @@ def test_make_run_env_strips_connector_runtime_without_multiplex(monkeypatch):
 def test_local_snapshot_wrapper_unsets_connector_runtime_before_and_after_command():
     """Sourced shell snapshots must not re-expose or re-persist connector bearer."""
     env = LocalEnvironment.__new__(LocalEnvironment)
+    env.env = {}
     env._session_id = "snapshot-test"
     env._snapshot_path = "/tmp/hermes-snapshot-test.sh"
     env._cwd_file = "/tmp/hermes-cwd-test.txt"

@@ -2623,9 +2623,13 @@ class APIServerAdapter(BasePlatformAdapter):
         async def _wrapped(request: "web.Request") -> "web.Response":
             profile = request.match_info.get("profile", "")
             with self._profile_api_scope(profile) as profile_home:
-                request["hermes_profile"] = profile
-                request["hermes_profile_home"] = str(profile_home)
-                return await handler(request)
+                profile_token = _api_request_profile.set(profile)
+                try:
+                    request["hermes_profile"] = profile
+                    request["hermes_profile_home"] = str(profile_home)
+                    return await handler(request)
+                finally:
+                    _api_request_profile.reset(profile_token)
 
         return _wrapped
 

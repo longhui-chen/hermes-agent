@@ -1,4 +1,5 @@
 import fcntl
+import importlib.util
 import json
 import os
 import shlex
@@ -27,6 +28,7 @@ def _prepare_script_fixture(
     tmp_path: Path,
     *,
     default_presets_dir: Path | None = None,
+    protected_presets_root: Path | None = None,
     volume_data_target: Path | None = None,
 ) -> tuple[Path, Path, Path]:
     repo_root = Path(__file__).resolve().parents[2]
@@ -72,15 +74,27 @@ runpy.run_module("hermes_cli.main", run_name="__main__")
     prepare_source = (repo_root / "zpk" / "prepare-claw-service.sh").read_text(
         encoding="utf-8"
     )
+    protected_root = protected_presets_root or tmp_path
+    for assignment in (
+        'SUBVOLUME_ZETTLAB_PRESETS_ROOT="/volume1/subvol/agents/zettlab-presets"',
+        'AGENTS_ZETTLAB_PRESETS_ROOT="/volume1/agents/zettlab-presets"',
+    ):
+        assert assignment in prepare_source
+        variable = assignment.split("=", 1)[0]
+        prepare_source = prepare_source.replace(
+            assignment,
+            f"{variable}={shlex.quote(str(protected_root))}",
+        )
     if default_presets_dir is not None:
         default_assignment = (
-            'DEFAULT_ZETTLAB_PRESETS_DIR="/volume1/subvol/agents/'
-            'zettlab-presets/current"'
+            'SUBVOLUME_ZETTLAB_PRESETS_DIR='
+            '"$SUBVOLUME_ZETTLAB_PRESETS_ROOT/current"'
         )
         assert default_assignment in prepare_source
         prepare_source = prepare_source.replace(
             default_assignment,
-            f"DEFAULT_ZETTLAB_PRESETS_DIR={shlex.quote(str(default_presets_dir))}",
+            f"SUBVOLUME_ZETTLAB_PRESETS_DIR="
+            f"{shlex.quote(str(default_presets_dir))}",
         )
     if volume_data_target is not None:
         volume_assignment = (
@@ -107,6 +121,9 @@ def _script_env(**overrides: str) -> dict[str, str]:
     env.pop("ZETTLAB_PRESETS_DIR", None)
     env.pop("ZETTLAB_CLAW_PRESETS_DIR", None)
     env.pop("HERMES_MANAGED_DIR", None)
+    env.pop("HERMES_MANAGED_GATEWAY", None)
+    env.pop("HERMES_MANAGED_CGROUP_ROOT", None)
+    env.pop("HERMES_MANAGED_CGROUP_UNIT", None)
     # The fixture's packaged Python must import this checkout, not an unrelated
     # editable Hermes installation that happens to exist in the test venv.
     env["PYTHONPATH"] = str(repo_root)
@@ -324,6 +341,31 @@ def test_prepare_claw_service_respects_presets_dir_override(tmp_path: Path):
     assert f"ZETTLAB_PRESETS_DIR={presets_dir}\n" in env_text
 
 
+def test_prepare_claw_service_rejects_presets_override_outside_protected_roots(
+    tmp_path: Path,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    protected_root = tmp_path / "protected-presets"
+    protected_root.mkdir()
+    app_root, _hermes_home, env_path = _prepare_script_fixture(
+        tmp_path,
+        protected_presets_root=protected_root,
+    )
+    unprotected = tmp_path / "operator-presets"
+    unprotected.mkdir()
+
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(ZETTLAB_PRESETS_DIR=str(unprotected)),
+    )
+
+    assert "ZETTLAB_PRESETS_DIR=" not in env_path.read_text(encoding="utf-8")
+
+
 def test_prepare_claw_service_preserves_presets_selection_across_version_flips(
     tmp_path: Path,
 ):
@@ -483,6 +525,77 @@ def test_prepare_claw_service_does_not_replace_unchanged_env_file(tmp_path: Path
     assert key_path.stat().st_mode & 0o777 == 0o600
 
 
+@pytest.mark.skipif(os.geteuid() != 0, reason="requires root-owned profile tree")
+def test_prepare_claw_service_uses_root_barrier_and_one_time_migration(
+    tmp_path: Path,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
+    nested = hermes_home / "profiles" / "agent-a" / "state"
+    nested.mkdir(parents=True)
+    state_file = nested / "history.json"
+    state_file.write_text("{}\n", encoding="utf-8")
+    for path in (hermes_home / "profiles", nested.parent, nested):
+        path.chmod(0o777)
+    state_file.chmod(0o666)
+
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(),
+    )
+
+    for path in (hermes_home / "profiles", nested.parent):
+        assert path.stat().st_mode & 0o077 == 0
+    assert nested.stat().st_mode & 0o077 != 0
+    assert state_file.stat().st_mode & 0o077 != 0
+
+    marker = env_path.parent / "profile-permissions-v2.done"
+    first_marker = marker.stat()
+    assert first_marker.st_mode & 0o777 == 0o600
+
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(),
+    )
+    second_marker = marker.stat()
+    assert second_marker.st_ino == first_marker.st_ino
+    assert second_marker.st_mtime_ns == first_marker.st_mtime_ns
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="requires root-owned profile tree")
+def test_prepare_claw_service_caps_legacy_profile_scan_without_blocking_start(
+    tmp_path: Path,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
+    profiles_root = hermes_home / "profiles"
+    for name in ("agent-a", "agent-b"):
+        (profiles_root / name).mkdir(parents=True)
+
+    env = _script_env()
+    env["HERMES_PROFILE_PERMISSION_MIGRATION_MAX_PROFILES"] = "1"
+    completed = subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+
+    assert "bounded legacy profile migration stopped after 1 profiles" in completed.stderr
+    assert profiles_root.stat().st_mode & 0o777 == 0o700
+    assert (env_path.parent / "profile-permissions-v2.done").is_file()
+
+
 def test_prepare_claw_service_removes_complete_multiline_package_assignments(
     tmp_path: Path,
 ):
@@ -594,6 +707,68 @@ def test_prepare_claw_service_preserves_restrictive_data_directory_mode(
     )
 
     assert data_dir.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.parametrize(
+    "layout",
+    ["real", "ota_symlink", "volume_symlink"],
+)
+def test_service_data_write_carveout_supports_all_device_layouts(
+    tmp_path: Path,
+    layout: str,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    volume_target = (
+        tmp_path
+        / "volume1"
+        / "subvol"
+        / "apps"
+        / "com.zettlab.claw"
+        / "data"
+    )
+    app_root, hermes_home, env_path = _prepare_script_fixture(
+        tmp_path,
+        volume_data_target=volume_target,
+    )
+    data_path = hermes_home.parent
+    if layout == "real":
+        data_path.mkdir(parents=True)
+    else:
+        target = (
+            tmp_path
+            / "zettos"
+            / "main"
+            / "data"
+            / "com.zettlab.claw"
+            if layout == "ota_symlink"
+            else volume_target
+        )
+        target.mkdir(parents=True)
+        target.chmod(0o750)
+        data_path.parent.mkdir(parents=True, exist_ok=True)
+        data_path.symlink_to(target, target_is_directory=True)
+
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(),
+    )
+
+    service = (
+        Path(__file__).resolve().parents[2]
+        / "zpk"
+        / "init.d"
+        / "zettlab-claw.service"
+    ).read_text(encoding="utf-8")
+    assert "ReadOnlyPaths=/zettos/main/apps" in service
+    assert "ReadWritePaths=__APP_BASE__/data" in service
+    probe = data_path / "service-write-boundary-probe"
+    probe.write_text("writable\n", encoding="utf-8")
+    assert probe.read_text(encoding="utf-8") == "writable\n"
+    assert env_path.is_file()
 
 
 def test_prepare_claw_service_allows_trusted_ota_data_symlink(tmp_path: Path):
@@ -1014,8 +1189,12 @@ def test_start_claw_service_loads_reconciled_env_without_overriding_explicit(
         "HERMES_HOME=/stale/hermes-home\n"
         "HERMES_BUNDLED_SKILLS=/stale/skills\n"
         "HERMES_BUNDLED_PLUGINS=/stale/plugins\n"
+        "HERMES_LAZY_INSTALL_TARGET=/stale/lazy-packages\n"
         f"ZETTLAB_PRESETS_DIR={persisted_presets}\n"
         "GATEWAY_MULTIPLEX_PROFILES=false\n"
+        "HERMES_MANAGED_GATEWAY=0\n"
+        "HERMES_MANAGED_CGROUP_ROOT=/stale/cgroup\n"
+        "HERMES_MANAGED_CGROUP_UNIT=stale.service\n"
         'CUSTOM_SAFE="keep "\'me\'\n'
         r"CUSTOM_UNQUOTED=one\ two" "\n"
         r'CUSTOM_DOUBLE="literal\nvalue"' "\n",
@@ -1039,9 +1218,13 @@ Path({str(gateway_log)!r}).write_text(
         "unquoted": os.environ.get("CUSTOM_UNQUOTED"),
         "double": os.environ.get("CUSTOM_DOUBLE"),
         "multiplex": os.environ.get("GATEWAY_MULTIPLEX_PROFILES"),
+        "managed_gateway": os.environ.get("HERMES_MANAGED_GATEWAY"),
+        "managed_cgroup_root": os.environ.get("HERMES_MANAGED_CGROUP_ROOT"),
+        "managed_cgroup_unit": os.environ.get("HERMES_MANAGED_CGROUP_UNIT"),
         "home": os.environ.get("HERMES_HOME"),
         "skills": os.environ.get("HERMES_BUNDLED_SKILLS"),
         "plugins": os.environ.get("HERMES_BUNDLED_PLUGINS"),
+        "lazy_target": os.environ.get("HERMES_LAZY_INSTALL_TARGET"),
         "presets": os.environ.get("ZETTLAB_PRESETS_DIR"),
         "presets_override": os.environ.get("ZETTLAB_CLAW_PRESETS_DIR"),
     }}),
@@ -1056,9 +1239,13 @@ Path({str(gateway_log)!r}).write_text(
     # Environment= value before ExecStart. The wrapper must reassert true.
     overrides = {
         "GATEWAY_MULTIPLEX_PROFILES": "false",
+        "HERMES_MANAGED_GATEWAY": "0",
+        "HERMES_MANAGED_CGROUP_ROOT": "/stale/cgroup",
+        "HERMES_MANAGED_CGROUP_UNIT": "stale.service",
         "HERMES_HOME": "/stale/hermes-home",
         "HERMES_BUNDLED_SKILLS": "/stale/skills",
         "HERMES_BUNDLED_PLUGINS": "/stale/plugins",
+        "HERMES_LAZY_INSTALL_TARGET": "/stale/lazy-packages",
         "ZETTLAB_CLAW_PRESETS_DIR": str(explicit_presets),
     }
     if with_explicit_override:
@@ -1079,19 +1266,29 @@ Path({str(gateway_log)!r}).write_text(
     assert gateway_env["unquoted"] == "one two"
     assert gateway_env["double"] == r"literal\nvalue"
     assert gateway_env["multiplex"] == "true"
+    assert gateway_env["managed_gateway"] == "1"
+    assert gateway_env["managed_cgroup_root"] is None
+    assert gateway_env["managed_cgroup_unit"] == "zettlab-claw.service"
     assert gateway_env["home"] == str(hermes_home)
     assert gateway_env["skills"] == str(app_root / "lib" / "hermes-agent" / "skills")
     assert gateway_env["plugins"] == str(
         app_root / "lib" / "hermes-agent" / "plugins"
+    )
+    assert gateway_env["lazy_target"] == str(
+        app_root.parent / "data" / "lazy-packages"
     )
     assert gateway_env["presets"] == str(explicit_presets)
     assert gateway_env["presets_override"] is None
     env_text = env_path.read_text(encoding="utf-8")
     for removed in (
         "GATEWAY_MULTIPLEX_PROFILES=",
+        "HERMES_MANAGED_GATEWAY=",
+        "HERMES_MANAGED_CGROUP_ROOT=",
+        "HERMES_MANAGED_CGROUP_UNIT=",
         "HERMES_HOME=",
         "HERMES_BUNDLED_SKILLS=",
         "HERMES_BUNDLED_PLUGINS=",
+        "HERMES_LAZY_INSTALL_TARGET=",
         "ZETTLAB_CLAW_PRESETS_DIR=",
     ):
         assert removed not in env_text
@@ -1184,6 +1381,9 @@ def test_zpk_agent_service_names_are_device_facing():
 
     service = (repo_root / "zpk" / "init.d" / "zettlab-claw.service").read_text(encoding="utf-8")
     start_wrapper = (repo_root / "zpk" / "start-claw-service.sh").read_text(encoding="utf-8")
+    hermes_wrapper = (repo_root / "zpk" / "bin" / "hermes").read_text(
+        encoding="utf-8"
+    )
     package_meta = (repo_root / "zpk" / "package.meta").read_text(encoding="utf-8")
     install = (repo_root / "zpk" / "install.sh").read_text(encoding="utf-8")
     start = (repo_root / "zpk" / "init.d" / "start.sh").read_text(encoding="utf-8")
@@ -1196,10 +1396,42 @@ def test_zpk_agent_service_names_are_device_facing():
         "EnvironmentFile=-__APP_BASE__/data/secrets/zettlab-claw.env" in service
     )
     assert "Environment=GATEWAY_MULTIPLEX_PROFILES=true" in service
+    assert "Environment=HERMES_MANAGED_GATEWAY=1" in service
+    assert (
+        "Environment=HERMES_MANAGED_CGROUP_UNIT=zettlab-claw.service"
+        in service
+    )
     assert "ExecStart=__APP_BASE__/current/start-claw-service.sh" in service
+    assert "NoNewPrivileges=true" in service
+    assert "ProtectProc=invisible" in service
+    assert "ProtectProc=default" not in service
+    assert "CapabilityBoundingSet=~CAP_SYS_ADMIN" in service
+    assert "CapabilityBoundingSet=~CAP_SYS_PTRACE" not in service
+    assert "Delegate=pids memory" in service
+    assert "KillMode=control-group" in service
+    assert "ReadOnlyPaths=/zettos/main/apps" in service
+    assert "ReadWritePaths=__APP_BASE__/data" in service
+    assert (
+        "ReadOnlyPaths=-/volume1/subvol/agents/zettlab-presets" in service
+    )
+    assert "ReadOnlyPaths=-/volume1/agents/zettlab-presets" in service
+    assert 'HERMES_LAUNCHER="$APP_ROOT/libexec/hermes-secure-launcher.py"' in (
+        hermes_wrapper
+    )
+    assert (
+        'exec "$HERMES_PYTHON" -I "$HERMES_LAUNCHER" "$HERMES_SCRIPT" "$@"'
+        in hermes_wrapper
+    )
     assert '"$APP_ROOT/prepare-claw-service.sh" --emit-env' in start_wrapper
     assert "load_reconciled_env" in start_wrapper
     assert "export GATEWAY_MULTIPLEX_PROFILES=true" in start_wrapper
+    assert "export HERMES_MANAGED_GATEWAY=1" in start_wrapper
+    assert 'export HERMES_LAZY_INSTALL_TARGET="$APP_BASE/data/lazy-packages"' in start_wrapper
+    assert (
+        "export HERMES_MANAGED_CGROUP_UNIT=zettlab-claw.service"
+        in start_wrapper
+    )
+    assert "unset HERMES_MANAGED_CGROUP_ROOT" in start_wrapper
     assert '"$APP_ROOT/prepare-claw-service.sh"\n' not in start_wrapper
     assert ". \"$ENV_FILE\"" not in start_wrapper
     assert meta["service_name"] == "zettlab-claw"
@@ -1209,6 +1441,350 @@ def test_zpk_agent_service_names_are_device_facing():
     assert "systemctl start zettlab-claw.service" in start
     assert "systemctl stop zettlab-claw.service" in stop
     assert "zettlab-claw.service" in uninstall
+
+
+def _load_secure_launcher():
+    repo_root = Path(__file__).resolve().parents[2]
+    launcher_path = (
+        repo_root / "zpk" / "libexec" / "hermes-secure-launcher.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "hermes_secure_launcher_for_test",
+        launcher_path,
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_zpk_secure_launcher_is_nondumpable_without_managed_gateway(
+    tmp_path: Path,
+):
+    repo_root = Path(__file__).resolve().parents[2]
+    launcher = repo_root / "zpk" / "libexec" / "hermes-secure-launcher.py"
+    entry_point = tmp_path / "hermes-entry"
+    entry_point.write_text(
+        """
+import ctypes
+import json
+import sys
+
+state = {"argv": sys.argv[1:]}
+if sys.platform.startswith("linux"):
+    libc = ctypes.CDLL(None, use_errno=True)
+    state["dumpable"] = libc.prctl(3, 0, 0, 0, 0)
+    state["no_new_privs"] = libc.prctl(39, 0, 0, 0, 0)
+print(json.dumps(state))
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env.pop("HERMES_MANAGED_GATEWAY", None)
+    env.pop("HERMES_MANAGED_CGROUP_ROOT", None)
+    env.pop("HERMES_MANAGED_CGROUP_UNIT", None)
+    inherited_no_new_privs = None
+    if sys.platform.startswith("linux"):
+        import ctypes
+
+        inherited_no_new_privs = ctypes.CDLL(None, use_errno=True).prctl(
+            39, 0, 0, 0, 0
+        )
+    completed = subprocess.run(
+        [sys.executable, "-I", str(launcher), str(entry_point), "gateway", "run"],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    state = json.loads(completed.stdout)
+    assert state["argv"] == ["gateway", "run"]
+    if sys.platform.startswith("linux"):
+        assert state["dumpable"] == 0
+        assert state["no_new_privs"] == inherited_no_new_privs
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="prctl hardening is Linux-specific",
+)
+def test_zpk_secure_launcher_managed_hardening_sets_no_new_privileges(
+    tmp_path: Path,
+):
+    launcher = Path(__file__).resolve().parents[2] / (
+        "zpk/libexec/hermes-secure-launcher.py"
+    )
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        """
+import ctypes
+import json
+import runpy
+
+namespace = runpy.run_path(%r)
+namespace["_harden_linux_process"](managed_gateway=True)
+libc = ctypes.CDLL(None, use_errno=True)
+print(json.dumps({
+    "dumpable": libc.prctl(3, 0, 0, 0, 0),
+    "no_new_privs": libc.prctl(39, 0, 0, 0, 0),
+}))
+"""
+        % str(launcher),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-I", str(probe)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert json.loads(completed.stdout) == {
+        "dumpable": 0,
+        "no_new_privs": 1,
+    }
+
+
+def _write_managed_service_limit_fixture(
+    service: Path,
+    *,
+    include_swap: bool = True,
+) -> None:
+    limits = {
+        "memory.high": "805306368\n",
+        "memory.max": "1073741824\n",
+        "pids.max": "512\n",
+    }
+    if include_swap:
+        limits["memory.swap.max"] = "0\n"
+    for name, value in limits.items():
+        (service / name).write_text(value, encoding="ascii")
+
+
+def test_zpk_secure_launcher_builds_supervisor_and_enables_controllers(
+    monkeypatch,
+    tmp_path: Path,
+):
+    launcher = _load_secure_launcher()
+    cgroup_root = tmp_path / "cgroup"
+    service_relative = "/system.slice/zettlab-claw.service"
+    service = cgroup_root / service_relative.lstrip("/")
+    service.mkdir(parents=True)
+    (cgroup_root / "cgroup.controllers").write_text(
+        "memory pids\n",
+        encoding="ascii",
+    )
+    (service / "cgroup.controllers").write_text(
+        "memory pids\n",
+        encoding="ascii",
+    )
+    (service / "cgroup.procs").write_text("4242\n", encoding="ascii")
+    (service / "cgroup.kill").write_text("", encoding="ascii")
+    (service / "cgroup.subtree_control").write_text("", encoding="ascii")
+    _write_managed_service_limit_fixture(service)
+    proc_self = tmp_path / "proc-self-cgroup"
+    proc_self.write_text(f"0::{service_relative}\n", encoding="ascii")
+    monkeypatch.setattr(launcher, "_CGROUP2_ROOT", cgroup_root)
+    monkeypatch.setattr(launcher, "_PROC_SELF_CGROUP", proc_self)
+    monkeypatch.setattr(launcher.sys, "platform", "linux")
+    monkeypatch.setattr(launcher.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(launcher.os, "getpid", lambda: 4242)
+    monkeypatch.setenv(
+        launcher._MANAGED_CGROUP_UNIT_ENV,
+        "zettlab-claw.service",
+    )
+    real_mkdir = os.mkdir
+
+    def materialize_cgroup(path, mode):
+        real_mkdir(path, mode)
+        path = Path(path)
+        (path / "cgroup.procs").write_text("", encoding="ascii")
+        (path / "cgroup.events").write_text(
+            "populated 0\n",
+            encoding="ascii",
+        )
+
+    monkeypatch.setattr(launcher.os, "mkdir", materialize_cgroup)
+    real_write = launcher._write_control_file
+
+    def emulate_kernel_write(path, payload):
+        path = Path(path)
+        if path == service / "cgroup.subtree_control":
+            path.write_text("memory pids\n", encoding="ascii")
+            supervisor = service / launcher._MANAGED_SUPERVISOR_CGROUP
+            (supervisor / "memory.max").write_text("max\n", encoding="ascii")
+            (supervisor / "memory.swap.max").write_text(
+                "max\n",
+                encoding="ascii",
+            )
+            (supervisor / "pids.max").write_text("max\n", encoding="ascii")
+            return
+        real_write(path, payload)
+        if path.name == "cgroup.procs":
+            (service / "cgroup.procs").write_text("", encoding="ascii")
+            proc_self.write_text(
+                f"0::{service_relative}/"
+                f"{launcher._MANAGED_SUPERVISOR_CGROUP}\n",
+                encoding="ascii",
+            )
+
+    monkeypatch.setattr(launcher, "_write_control_file", emulate_kernel_write)
+
+    launcher._prepare_managed_service_cgroup()
+
+    supervisor = service / launcher._MANAGED_SUPERVISOR_CGROUP
+    assert supervisor.is_dir()
+    assert (service / "cgroup.subtree_control").read_text(
+        encoding="ascii"
+    ) == "memory pids\n"
+    assert os.environ[launcher._MANAGED_CGROUP_ROOT_ENV] == service_relative
+
+    # Child Hermes processes inherit the managed identity and re-enter through
+    # the same packaged launcher. They may verify, but must not rebuild, the
+    # already-active supervisor topology.
+    launcher._prepare_managed_service_cgroup()
+    monkeypatch.setenv(
+        launcher._MANAGED_CGROUP_ROOT_ENV,
+        "/system.slice/other.service",
+    )
+    with pytest.raises(OSError, match="service cgroup identity"):
+        launcher._prepare_managed_service_cgroup()
+
+
+def test_zpk_secure_launcher_fails_before_move_without_controllers(
+    monkeypatch,
+    tmp_path: Path,
+):
+    launcher = _load_secure_launcher()
+    cgroup_root = tmp_path / "cgroup"
+    service_relative = "/system.slice/zettlab-claw.service"
+    service = cgroup_root / service_relative.lstrip("/")
+    service.mkdir(parents=True)
+    (cgroup_root / "cgroup.controllers").write_text(
+        "memory pids\n",
+        encoding="ascii",
+    )
+    (service / "cgroup.controllers").write_text("pids\n", encoding="ascii")
+    (service / "cgroup.procs").write_text("4242\n", encoding="ascii")
+    (service / "cgroup.kill").write_text("", encoding="ascii")
+    (service / "cgroup.subtree_control").write_text("", encoding="ascii")
+    _write_managed_service_limit_fixture(service)
+    proc_self = tmp_path / "proc-self-cgroup"
+    proc_self.write_text(f"0::{service_relative}\n", encoding="ascii")
+    monkeypatch.setattr(launcher, "_CGROUP2_ROOT", cgroup_root)
+    monkeypatch.setattr(launcher, "_PROC_SELF_CGROUP", proc_self)
+    monkeypatch.setattr(launcher.sys, "platform", "linux")
+    monkeypatch.setattr(launcher.os, "geteuid", lambda: 0)
+    monkeypatch.setenv(
+        launcher._MANAGED_CGROUP_UNIT_ENV,
+        "zettlab-claw.service",
+    )
+
+    with pytest.raises(OSError, match="memory and pids delegation"):
+        launcher._prepare_managed_service_cgroup()
+
+    assert not (service / launcher._MANAGED_SUPERVISOR_CGROUP).exists()
+    assert proc_self.read_text(encoding="ascii") == f"0::{service_relative}\n"
+
+
+def test_zpk_secure_launcher_main_fails_closed_without_swap_accounting(
+    monkeypatch,
+    tmp_path: Path,
+    capsys,
+):
+    launcher = _load_secure_launcher()
+    cgroup_root = tmp_path / "cgroup"
+    service_relative = "/system.slice/zettlab-claw.service"
+    service = cgroup_root / service_relative.lstrip("/")
+    service.mkdir(parents=True)
+    (cgroup_root / "cgroup.controllers").write_text(
+        "memory pids\n",
+        encoding="ascii",
+    )
+    (service / "cgroup.controllers").write_text(
+        "memory pids\n",
+        encoding="ascii",
+    )
+    (service / "cgroup.procs").write_text("4242\n", encoding="ascii")
+    (service / "cgroup.kill").write_text("", encoding="ascii")
+    (service / "cgroup.subtree_control").write_text("", encoding="ascii")
+    _write_managed_service_limit_fixture(service, include_swap=False)
+    proc_self = tmp_path / "proc-self-cgroup"
+    proc_self.write_text(f"0::{service_relative}\n", encoding="ascii")
+    entry_point = tmp_path / "hermes-entry.py"
+    marker = tmp_path / "entry-ran"
+    entry_point.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).touch()\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(launcher, "_CGROUP2_ROOT", cgroup_root)
+    monkeypatch.setattr(launcher, "_PROC_SELF_CGROUP", proc_self)
+    monkeypatch.setattr(launcher.sys, "platform", "linux")
+    monkeypatch.setattr(launcher.sys, "argv", ["launcher", str(entry_point)])
+    monkeypatch.setattr(launcher.os, "geteuid", lambda: 0)
+    monkeypatch.setenv(launcher._MANAGED_GATEWAY_ENV, "1")
+    monkeypatch.setenv(
+        launcher._MANAGED_CGROUP_UNIT_ENV,
+        "zettlab-claw.service",
+    )
+
+    assert launcher.main() == 125
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "requires memory.swap.max accounting" in captured.err
+    assert not marker.exists()
+    assert not (service / launcher._MANAGED_SUPERVISOR_CGROUP).exists()
+    assert proc_self.read_text(encoding="ascii") == f"0::{service_relative}\n"
+
+
+def test_zpk_secure_launcher_managed_startup_fails_closed_without_unit_root(
+    tmp_path: Path,
+):
+    repo_root = Path(__file__).resolve().parents[2]
+    launcher = repo_root / "zpk/libexec/hermes-secure-launcher.py"
+    marker = tmp_path / "entry-ran"
+    entry_point = tmp_path / "hermes-entry.py"
+    entry_point.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).touch()\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["HERMES_MANAGED_GATEWAY"] = "1"
+    env["HERMES_MANAGED_CGROUP_UNIT"] = "not-this-process.service"
+    env.pop("HERMES_MANAGED_CGROUP_ROOT", None)
+
+    completed = subprocess.run(
+        [sys.executable, "-I", str(launcher), str(entry_point)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    assert completed.returncode == 125
+    assert completed.stdout == ""
+    assert "managed gateway cgroup setup failed:" in completed.stderr
+    assert not marker.exists()
+
+
+def test_zpk_secure_launcher_fails_closed_without_packaged_entry(tmp_path: Path):
+    repo_root = Path(__file__).resolve().parents[2]
+    launcher = repo_root / "zpk" / "libexec" / "hermes-secure-launcher.py"
+
+    completed = subprocess.run(
+        [sys.executable, "-I", str(launcher), str(tmp_path / "missing-hermes")],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 127
+    assert completed.stdout == ""
+    assert completed.stderr.strip() == "packaged Hermes entry point is unavailable"
 
 
 def test_zpk_install_removes_legacy_shared_gateway_unit():
