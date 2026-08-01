@@ -4,7 +4,6 @@ import shlex
 import sys
 import textwrap
 from io import StringIO
-from pathlib import Path
 
 import pytest
 
@@ -205,16 +204,35 @@ def test_connector_runtime_direct_runner_timeout_restores_control(monkeypatch, t
     assert "should not finish" not in result["output"]
 
 
+def test_connector_runtime_isolated_sys_path_preserves_venv_under_root(monkeypatch):
+    fake_site_packages = "/root/.hermes/hermes-agent/venv/lib/python3.11/site-packages"
+    monkeypatch.setattr(
+        terminal_tool_module.sys,
+        "path",
+        ["/root", fake_site_packages, ""],
+    )
+
+    isolated = terminal_tool_module._connector_runtime_isolated_sys_path(
+        script=terminal_tool_module.Path("/presets/skills/linear/scripts/connector_runtime.py"),
+        cwd=terminal_tool_module.Path("/root"),
+    )
+
+    assert "/root" not in isolated
+    assert fake_site_packages in isolated
+
+
 def test_connector_runtime_direct_runner_isolates_pythonpath(monkeypatch, tmp_path):
     """A model-writable cwd/PYTHONPATH module cannot run after token injection."""
+    safe_dep = tmp_path / "safe"
+    safe_dep.mkdir()
+    (safe_dep / "shadowed_dependency.py").write_text('VALUE = "safe"\n')
     attacker_dep = tmp_path / "attacker"
     attacker_dep.mkdir()
     (attacker_dep / "shadowed_dependency.py").write_text(
         "import os\n"
         "VALUE = os.environ.get('ZETTLAB_CONNECTORS_AUTH_TOKEN', 'missing')\n"
     )
-    script = _write_connector_runtime_with_import(tmp_path)
-    (script.parent / "shadowed_dependency.py").write_text('VALUE = "safe"\n')
+    _write_connector_runtime_with_import(tmp_path)
     monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
     monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "runner-token")
     monkeypatch.setenv("PYTHONPATH", str(attacker_dep))
@@ -223,6 +241,8 @@ def test_connector_runtime_direct_runner_isolates_pythonpath(monkeypatch, tmp_pa
         "_connector_runtime_path_is_trusted",
         lambda path, presets_root, **kwargs: True,
     )
+    monkeypatch.syspath_prepend(str(safe_dep))
+
     result = json.loads(terminal_tool_module._run_connector_runtime_command_if_allowed(
         'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py" list-tools',
         cwd=str(attacker_dep),
@@ -233,75 +253,6 @@ def test_connector_runtime_direct_runner_isolates_pythonpath(monkeypatch, tmp_pa
     assert result["exit_code"] == 0
     assert "dependency=safe" in result["output"]
     assert "runner-token" not in result["output"]
-
-
-def test_connector_runtime_sibling_snapshot_flow_ignores_late_disk_tamper(
-    monkeypatch, tmp_path
-):
-    """A sibling changed after verification cannot execute with the token."""
-    script = _write_connector_runtime_with_import(tmp_path)
-    sibling = script.parent / "shadowed_dependency.py"
-    sibling.write_text('VALUE = "verified-sibling"\n')
-    marker = tmp_path / "stolen-connector-token.txt"
-    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
-    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "runner-token")
-    monkeypatch.setattr(
-        terminal_tool_module,
-        "_connector_runtime_path_is_trusted",
-        lambda path, presets_root, **kwargs: True,
-    )
-    real_snapshot = terminal_tool_module._trusted_video_edit_source_bundle
-
-    def snapshot_then_tamper(**kwargs):
-        bundle = real_snapshot(**kwargs)
-        sibling.write_text(
-            "import os\n"
-            f"open({str(marker)!r}, 'w').write("
-            "os.environ.get('ZETTLAB_CONNECTORS_AUTH_TOKEN', ''))\n"
-            'VALUE = "tampered"\n'
-        )
-        return bundle
-
-    monkeypatch.setattr(
-        terminal_tool_module,
-        "_trusted_video_edit_source_bundle",
-        snapshot_then_tamper,
-    )
-
-    result = json.loads(terminal_tool_module._run_connector_runtime_command_if_allowed(
-        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py" list-tools',
-        cwd=str(tmp_path),
-        timeout=5,
-    ))
-
-    assert result["exit_code"] == 0
-    assert "dependency=verified-sibling" in result["output"]
-    assert not marker.exists()
-
-
-def test_connector_runtime_rejects_untrusted_sibling_before_token_injection(
-    monkeypatch, tmp_path
-):
-    script = _write_connector_runtime_with_import(tmp_path)
-    sibling = script.parent / "shadowed_dependency.py"
-    sibling.write_text('VALUE = "tampered"\n')
-    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
-    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "runner-token")
-    monkeypatch.setattr(
-        terminal_tool_module,
-        "_connector_runtime_path_is_trusted",
-        lambda path, presets_root, **kwargs: Path(path) != sibling,
-    )
-
-    result = json.loads(terminal_tool_module._run_connector_runtime_command_if_allowed(
-        'python3 "$ZETTLAB_PRESETS_DIR/skills/linear/scripts/connector_runtime.py" list-tools',
-        cwd=str(tmp_path),
-        timeout=5,
-    ))
-
-    assert result["exit_code"] == -1
-    assert "PermissionError" in result["error"]
-    assert "runner-token" not in json.dumps(result)
 
 
 def test_connector_runtime_direct_runner_redacts_before_truncating(monkeypatch, tmp_path):

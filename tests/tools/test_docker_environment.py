@@ -1179,7 +1179,11 @@ def test_cleanup_vm_force_remove_tears_down_persist_container(monkeypatch):
     monkeypatch.setattr(docker_env.subprocess, "run", _capturing_run)
 
     try:
-        terminal_tool.cleanup_vm("explicit-teardown-test", force_remove=True)
+        terminal_tool.cleanup_vm(
+            "explicit-teardown-test",
+            force_remove=True,
+            _already_scoped=True,
+        )
     finally:
         terminal_tool._active_environments.pop("explicit-teardown-test", None)
 

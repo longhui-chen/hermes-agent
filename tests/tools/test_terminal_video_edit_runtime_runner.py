@@ -21,6 +21,17 @@ from tools.environments.local import LocalEnvironment
 @pytest.fixture(autouse=True)
 def _reset_runtime_anchor(monkeypatch):
     monkeypatch.setattr(terminal_tool_module, "_CONNECTOR_RUNTIME_ROOT_ANCHOR", None)
+    # Other test modules may leave benign helper threads alive. Production
+    # preloads the supervisor before gateway threads start; these unit tests
+    # create a fresh temporary presets tree per case and explicitly exercise
+    # the rejection branch by overriding this probe where required.
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_video_edit_worker_process_thread_count",
+        lambda: 1,
+    )
+    yield
+    terminal_tool_module.clear_session_cwd("default")
 
 
 def _write_trusted_script(tmp_path, name="workflow_state.py"):
@@ -3181,6 +3192,10 @@ def test_trusted_video_runner_rejects_same_inode_mutation_during_snapshot(
         "_connector_runtime_path_is_trusted",
         lambda path, presets_root, **kwargs: True,
     )
+    # Latest main pins the whole presets tree before any trusted runner reads
+    # individual sources. Establish that startup anchor first so this test
+    # continues to exercise the later same-inode source snapshot race.
+    assert terminal_tool_module._capture_connector_runtime_root() is not None
     real_fstat = terminal_tool_module.os.fstat
     mutated = False
 

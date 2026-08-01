@@ -289,6 +289,7 @@ async def test_start_gateway_schedules_mcp_discovery_after_runner_start(monkeypa
             self.adapters = {}
             self._restart_requested = False
             self._restart_via_service = False
+            self._running = True
 
         async def start(self):
             events.append("runner.start")
@@ -364,6 +365,7 @@ async def test_start_gateway_does_not_wait_for_slow_mcp_discovery(monkeypatch, t
             self._restart_requested = False
             self._restart_via_service = False
             self._mcp_discovery_task = None
+            self._running = True
 
         async def start(self):
             events.append("runner.start")
@@ -438,6 +440,7 @@ async def test_start_gateway_shutdown_cleanup_runs_on_failure_exit(monkeypatch, 
             self._restart_requested = False
             self._restart_via_service = False
             self._mcp_discovery_task = None
+            self._running = True
 
         async def start(self):
             return True

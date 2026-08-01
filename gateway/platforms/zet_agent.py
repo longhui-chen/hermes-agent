@@ -1657,9 +1657,37 @@ class ZetAgentAdapter(APIServerAdapter):
                 approval_data.get("interaction_generation", 0) or 0
             )
             if interaction_generation <= 0:
-                raise RuntimeError(
-                    "approval source generation was not assigned atomically"
+                # Compatibility path for legacy integrations that invoke the
+                # registered callback directly instead of enqueueing through
+                # tools.approval. Such callers have no durable generation, so
+                # keep the latest-main bounded FIFO projection semantics and
+                # never advertise the two-phase delivery capability.
+                legacy_payload = {
+                    "type": "hermes.approval",
+                    "approval_id": approval_data.get("approval_id", ""),
+                    "command": approval_data.get("command", ""),
+                    "description": approval_data.get("description", ""),
+                    "pattern_key": approval_data.get("pattern_key", ""),
+                    "pattern_keys": list(
+                        approval_data.get("pattern_keys", []) or []
+                    ),
+                    "expires_at_ms": expires_at_ms,
+                }
+                self._cache_approval_projection(
+                    stream_q,
+                    internal_key,
+                    session_id,
+                    legacy_payload,
                 )
+                approval_id = str(legacy_payload.get("approval_id") or "")
+
+                def _cleanup_legacy_projection() -> None:
+                    self._remove_approval_projection(
+                        internal_key,
+                        approval_id,
+                    )
+
+                return _cleanup_legacy_projection
             payload = {
                 "type": "hermes.approval",
                 "approval_id": approval_data.get("approval_id", ""),
@@ -2531,6 +2559,18 @@ class ZetAgentAdapter(APIServerAdapter):
                 )
                 with self._session_lock:
                     self._approval_session_ids.add(interaction_queue_key)
+                with self._pending_lock:
+                    approval_keys = getattr(
+                        self,
+                        "_approval_session_keys",
+                        None,
+                    )
+                    if approval_keys is None:
+                        approval_keys = {}
+                        self._approval_session_keys = approval_keys
+                    approval_keys[self._active_turn_key(session_id)] = (
+                        interaction_queue_key
+                    )
             except Exception:
                 logger.warning("[zet_agent] failed to register approval notify", exc_info=True)
 
@@ -4251,6 +4291,15 @@ class ZetAgentAdapter(APIServerAdapter):
             if resolved_queue_key is None:
                 return web.json_response({"resolved": 0})
             approval_queue_key = resolved_queue_key
+        else:
+            with self._pending_lock:
+                mapped_queue_key = getattr(
+                    self,
+                    "_approval_session_keys",
+                    {},
+                ).get(self._active_turn_key(session_id))
+            if mapped_queue_key:
+                approval_queue_key = mapped_queue_key
         try:
             from tools.approval import list_gateway_approvals
 
@@ -5372,6 +5421,11 @@ class ZetAgentAdapter(APIServerAdapter):
         # grants. A stale approval card must never authorize work after the
         # interrupted run has ended.
         try:
+            with self._pending_lock:
+                getattr(self, "_approval_session_keys", {}).pop(
+                    self._active_turn_key(session_id),
+                    None,
+                )
             from tools.approval import (
                 cancel_gateway_approvals,
                 cancel_session_approvals,

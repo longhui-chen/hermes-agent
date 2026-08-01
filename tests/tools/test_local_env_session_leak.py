@@ -451,6 +451,7 @@ def test_local_snapshot_wrapper_preserves_unengaged_cli_fallback(monkeypatch):
     env._cwd_file = "/tmp/hermes-cwd-cli-test.txt"
     env._cwd_marker = "__HERMES_CWD_snapshot_cli_test__"
     env._snapshot_ready = True
+    env.env = {}
 
     script = env._wrap_command(
         "printf '%s' \"$HERMES_SESSION_KEY\"",

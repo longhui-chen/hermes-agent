@@ -358,7 +358,7 @@ def test_model_child_cannot_read_sensitive_parent_memory_flow():
     }
 
 
-def test_systemd_service_drops_ptrace_capability_flow():
+def test_systemd_service_keeps_root_ptrace_for_hidden_proc_audit_flow():
     service = (
         Path(__file__).resolve().parents[2]
         / "zpk"
@@ -367,5 +367,6 @@ def test_systemd_service_drops_ptrace_capability_flow():
     ).read_text()
 
     assert "NoNewPrivileges=true" in service
-    assert "CapabilityBoundingSet=~CAP_SYS_PTRACE CAP_SYS_RESOURCE" in service
-    assert "AmbientCapabilities=" in service
+    assert "ProtectProc=invisible" in service
+    assert "CapabilityBoundingSet=~CAP_SYS_ADMIN" in service
+    assert "CapabilityBoundingSet=~CAP_SYS_PTRACE" not in service

@@ -1377,14 +1377,15 @@ CONNECTOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_CONNECTORS_URL",
     "ZETTLAB_CONNECTORS_AUTH_TOKEN",
     "ZET_AGENT_ID",
-    # Turn-scoped side-effect capabilities. Generic subprocesses must not
-    # inherit either a live ContextVar or a stale process-global fallback.
-    "ZETTLAB_AGENT_ACTION_TOKEN",
-    "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
 })
 
 AGENT_CREATOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
     "ZETTLAB_AGENT_ACTION_TOKEN",
+})
+VIDEO_EDIT_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
+    # Turn-scoped side-effect capability. Generic subprocesses must not
+    # inherit either a live ContextVar or a stale process-global fallback.
+    "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
 })
 MANAGED_SERVICE_SECRET_ENV_KEYS: frozenset[str] = frozenset({
     "ZET_AGENT_KEY",
@@ -1395,6 +1396,7 @@ _AGENT_CREATOR_TURN_ID_MAX_BYTES = 256
 PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset(
     CONNECTOR_RUNTIME_ENV_KEYS
     | AGENT_CREATOR_RUNTIME_ENV_KEYS
+    | VIDEO_EDIT_RUNTIME_ENV_KEYS
     | MANAGED_SERVICE_SECRET_ENV_KEYS
 )
 
@@ -1439,6 +1441,8 @@ def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
             value = os.environ.get(key)
         if value is not None:
             env[key] = str(value)
+        else:
+            env.pop(key, None)
     try:
         from gateway.session_context import zettlab_connector_route_capability
 

@@ -228,7 +228,7 @@ class TestResumeRoundContinuity:
 class TestAfterTurn:
     def test_continue_verdict_reports_continuation(self, driver, reports):
         _create(driver)
-        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "还有散落文件", False, None)):
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "还有散落文件", False, None, False)):
             driver._after_turn_sync(SID, "整理下载目录", "本轮移动了 3 个文件")
         assert len(reports) == 1
         r = reports[0]
@@ -239,7 +239,7 @@ class TestAfterTurn:
 
     def test_done_verdict_reports_done_and_drops_index(self, driver, reports):
         _create(driver)
-        with patch("hermes_cli.goals.judge_goal", return_value=("done", "全部归位", False, None)):
+        with patch("hermes_cli.goals.judge_goal", return_value=("done", "全部归位", False, None, False)):
             driver._after_turn_sync(SID, "user msg", "最终产出")
         assert reports[-1]["proj"]["state"] == "done"
         assert reports[-1]["continuation"] is None
@@ -247,7 +247,7 @@ class TestAfterTurn:
 
     def test_budget_exhausted_reports_paused(self, driver, reports):
         _create(driver, max_rounds=1)
-        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "还没完", False, None)):
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "还没完", False, None, False)):
             driver._after_turn_sync(SID, "user msg", "产出")
         assert reports[-1]["proj"]["state"] == "paused"
         assert reports[-1]["continuation"] is None
@@ -258,7 +258,7 @@ class TestAfterTurn:
 
     def test_continuation_marker_marks_not_user_initiated(self, driver, reports):
         _create(driver)
-        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "again", False, None)) as jg:
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "again", False, None, False)) as jg:
             driver._after_turn_sync(SID, "[Continuing toward your standing goal]\nGoal: x", "产出")
         assert jg.called
         assert len(reports) == 1
@@ -269,7 +269,7 @@ class TestAfterTurn:
         _create(driver)
         new_sid = SID + "--c2"
         migrate_goal_to_session(SID, new_sid, reason="compression")
-        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "go on", False, None)):
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "go on", False, None, False)):
             driver._after_turn_sync(SID, "user msg", "产出", effective_session_id=new_sid)
         assert len(reports) == 1
         # 驱动内部按迁移后的 sid 继续循环（fixture 捕获的是 report 入参）……
@@ -301,7 +301,7 @@ class TestInterruptAndInteractions:
         assert _wait_until(lambda: bool(reports) and reports[-1]["proj"]["state"] == "paused")
         # 暂停后 post-turn hook 不再续轮（evaluate 返回 inactive）。
         n = len(reports)
-        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "x", False, None)):
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "x", False, None, False)):
             driver._after_turn_sync(SID, "user msg", "产出")
         assert len(reports) == n, "paused goal 不得自动爬起续轮"
 
@@ -314,7 +314,7 @@ class TestInterruptAndInteractions:
         # 模拟"评估还没开始/正在进行时用户按了停止"：只打标记，不跑后台 pause
         # 线程（绕过 _spawn 的时序不确定性，聚焦标记裁决本身）。
         driver._mark_user_cancel(SID)
-        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "还没完", False, None)):
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "还没完", False, None, False)):
             driver._after_turn_sync(SID, "user msg", "产出")
         assert GoalManager(SID).state.status == "paused", "cancel 标记必须压过 continue 判定"
         assert reports[-1]["proj"]["state"] == "paused"
@@ -356,7 +356,7 @@ class TestCancelMarkMigration:
         # 停止落在旧 id：goal 行已迁走，_pause_after_interrupt(old) 扑空，
         # 只剩这个标记承载用户意图。
         driver._mark_user_cancel(SID)
-        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "还没完", False, None)):
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "还没完", False, None, False)):
             driver._after_turn_sync(SID, "user msg", "产出", effective_session_id=new_sid)
         assert GoalManager(new_sid).state.status == "paused"
         assert all(r["continuation"] is None for r in reports), "停止之后不得下发续轮"
@@ -385,7 +385,7 @@ class TestInteractionPersistence:
         随之清掉，循环照常推进。"""
         _create(driver)
         driver.on_interaction_pending(SID)
-        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "继续", False, None)):
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "继续", False, None, False)):
             driver._after_turn_sync(SID, "user msg", "产出")
         assert not driver._interaction_flag_set(SID)
         assert reports[-1]["proj"]["state"] == "running"
@@ -449,7 +449,7 @@ class TestStaleCancelMark:
 
         driver._mark_user_cancel(SID)
         _create(driver)
-        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "继续", False, None)):
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "继续", False, None, False)):
             driver._after_turn_sync(SID, "user msg", "产出")
         assert GoalManager(SID).state.status == "active", "旧 stop 不得暂停新 goal"
         assert reports[-1]["continuation"], "第一轮照常续轮"
@@ -464,7 +464,7 @@ class TestStaleCancelMark:
         GoalManager(SID).pause("user stopped the running turn")
         driver._apply_action_sync(SID, "resume", {})
         assert GoalManager(SID).state.status == "active"
-        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "继续", False, None)):
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "继续", False, None, False)):
             driver._after_turn_sync(SID, "[Continuing toward your standing goal]\nGoal: x", "产出")
         assert GoalManager(SID).state.status == "active", "作废的 stop 不得再次暂停"
 
@@ -787,7 +787,7 @@ class TestUnloadInvalidatesInflightJudge:
         def judge_then_unload(*args, **kwargs):
             # 模拟 judge 进行期间 profile 被 unload。
             driver.bump_lock_generations_for_home(str(hermes_home))
-            return ("continue", "go on", False, None)
+            return ("continue", "go on", False, None, False)
 
         with patch("hermes_cli.goals.judge_goal", side_effect=judge_then_unload):
             driver._after_turn_sync(SID, "user msg", "产出")
@@ -826,7 +826,7 @@ class TestCancelMarkWinsBeforeReport:
         def judge_then_stop(*args, **kwargs):
             # judge 返回 continue 的同时用户按下 stop（mark 同步写入）。
             driver._mark_user_cancel(SID)
-            return ("continue", "还没完", False, None)
+            return ("continue", "还没完", False, None, False)
 
         with patch("hermes_cli.goals.judge_goal", side_effect=judge_then_stop):
             driver._after_turn_sync(SID, "user msg", "产出")
@@ -846,7 +846,7 @@ class TestScheduledGeneration:
         _create(driver, goal_id="g_new", text="新目标 直到完成")
         reports.clear()
 
-        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "go", False, None)) as jg:
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "go", False, None, False)) as jg:
             driver._after_turn_sync(SID, "旧轮消息", "旧轮产出", "", stale)
         assert not jg.called, "旧轮 hook 不得评估新 goal"
         assert reports == []
@@ -864,7 +864,7 @@ class TestScheduledGeneration:
         driver.bump_lock_generations_for_home(str(hermes_home))
         reports.clear()
 
-        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "go", False, None)) as jg:
+        with patch("hermes_cli.goals.judge_goal", return_value=("continue", "go", False, None, False)) as jg:
             driver._after_turn_sync(SID, "user msg", "产出", "", scheduled)
         assert not jg.called, "unload 后排队任务必须失效"
         assert reports == []
@@ -928,7 +928,7 @@ class TestLockGeneration:
             return real(sid)
 
         with patch.object(driver, "_lock_generation", side_effect=stale_first_read):
-            with patch("hermes_cli.goals.judge_goal", return_value=("continue", "go", False, None)) as jg:
+            with patch("hermes_cli.goals.judge_goal", return_value=("continue", "go", False, None, False)) as jg:
                 driver._after_turn_sync(SID, "user msg", "旧轮的产出")
         assert not jg.called, "失效 hook 不得评估新 goal"
         assert reports == [], "失效 hook 不得上报/续轮"
@@ -1056,7 +1056,7 @@ class TestJudgeBackgroundProcesses:
         procs = [{"pid": 4242, "command": "npm run build", "running": True}]
         _create(driver)
         with patch("hermes_cli.goals.gather_background_processes", return_value=procs), \
-             patch("hermes_cli.goals.judge_goal", return_value=("continue", "build 还在跑", False, None)) as jg:
+             patch("hermes_cli.goals.judge_goal", return_value=("continue", "build 还在跑", False, None, False)) as jg:
             driver._after_turn_sync(SID, "user msg", "产出")
         assert jg.called
         assert jg.call_args.kwargs.get("background_processes") == procs
@@ -1153,7 +1153,7 @@ class TestDisconnectInvalidation:
         def judge_then_disconnect(*args, **kwargs):
             # 模拟 judge 进行期间 adapter 被 disconnect。
             driver.invalidate_all_generations()
-            return ("continue", "go on", False, None)
+            return ("continue", "go on", False, None, False)
 
         with patch("hermes_cli.goals.judge_goal", side_effect=judge_then_disconnect):
             driver._after_turn_sync(SID, "user msg", "产出")
