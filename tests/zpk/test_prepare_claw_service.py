@@ -1506,6 +1506,119 @@ print(json.dumps(state))
         assert state["no_new_privs"] == inherited_no_new_privs
 
 
+def test_zpk_secure_launcher_loads_packaged_site_packages_while_ignoring_pythonpath(
+    tmp_path: Path,
+):
+    repo_root = Path(__file__).resolve().parents[2]
+    launcher = repo_root / "zpk" / "libexec" / "hermes-secure-launcher.py"
+    venv_dir = tmp_path / "venv"
+    bin_dir = venv_dir / "bin"
+    site_packages = (
+        venv_dir
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    attacker_dir = tmp_path / "attacker"
+    bin_dir.mkdir(parents=True)
+    site_packages.mkdir(parents=True)
+    attacker_dir.mkdir()
+
+    (site_packages / "isolated_probe.py").write_text(
+        'ORIGIN = "packaged"\n',
+        encoding="utf-8",
+    )
+    (attacker_dir / "isolated_probe.py").write_text(
+        'ORIGIN = "external"\n',
+        encoding="utf-8",
+    )
+    entry_point = bin_dir / "hermes"
+    entry_point.write_text(
+        """
+import json
+import sys
+
+from isolated_probe import ORIGIN
+
+print(json.dumps({"origin": ORIGIN, "sys_path": sys.path}))
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(attacker_dir)
+    completed = subprocess.run(
+        [sys.executable, "-I", str(launcher), str(entry_point)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    state = json.loads(completed.stdout)
+    assert state["origin"] == "packaged"
+    assert str(site_packages.resolve()) in state["sys_path"]
+    assert str(attacker_dir.resolve()) not in state["sys_path"]
+
+
+def test_zpk_secure_launcher_fails_closed_without_packaged_site_packages(
+    tmp_path: Path,
+):
+    repo_root = Path(__file__).resolve().parents[2]
+    launcher = repo_root / "zpk" / "libexec" / "hermes-secure-launcher.py"
+    entry_point = tmp_path / "venv" / "bin" / "hermes"
+    entry_point.parent.mkdir(parents=True)
+    entry_point.write_text(
+        'raise AssertionError("entry point must not run")\n',
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-I", str(launcher), str(entry_point)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 127
+    assert completed.stdout == ""
+    assert completed.stderr.strip() == (
+        "packaged Hermes site-packages is unavailable"
+    )
+
+
+def test_zpk_secure_launcher_prioritizes_packaged_dependencies(
+    monkeypatch,
+    tmp_path: Path,
+):
+    launcher = _load_secure_launcher()
+    entry_point = tmp_path / "venv" / "bin" / "hermes"
+    site_packages = (
+        tmp_path
+        / "venv"
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    system_site_packages = tmp_path / "system" / "site-packages"
+    site_packages.mkdir(parents=True)
+    system_site_packages.mkdir(parents=True)
+    original_path = [
+        "/stdlib",
+        str(system_site_packages),
+        str(site_packages),
+    ]
+    monkeypatch.setattr(launcher.sys, "path", original_path)
+
+    launcher._add_packaged_site_packages(entry_point)
+
+    assert launcher.sys.path == [
+        "/stdlib",
+        str(site_packages.resolve()),
+        str(system_site_packages),
+    ]
+
+
 @pytest.mark.skipif(
     not sys.platform.startswith("linux"),
     reason="prctl hardening is Linux-specific",
