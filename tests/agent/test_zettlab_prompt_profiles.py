@@ -213,7 +213,8 @@ def test_profile_soul_voice_overrides_shared_neutral_voice_flow(monkeypatch):
             (
                 '<response_language locked="true">',
                 "English input gets an English reply",
-                "any permanent or otherwise irreversible deletion",
+                "permanent or otherwise irreversible deletion",
+                "is itself the confirmation",
                 "persistent automation",
                 "Do not recursively scan broad home",
                 "including aspirin",
@@ -226,7 +227,8 @@ def test_profile_soul_voice_overrides_shared_neutral_voice_flow(monkeypatch):
             (
                 '<response_language locked="true">',
                 "用户用英文就用英文回复",
-                "任何永久或不可恢复删除",
+                "永久或不可恢复删除",
+                "指令本身就构成确认",
                 "创建持久化自动化",
                 "不要递归扫描整个 home",
                 "包括阿司匹林",
