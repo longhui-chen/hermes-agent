@@ -523,9 +523,11 @@ def test_video_edit_followup_capability_is_session_and_intent_bounded_unit():
             .video_edit_applicable
         )
 
-        response_mode._VIDEO_EDIT_RESUME_SESSIONS[
-            "zettlab:user:main:first-session"
-        ] = response_mode.time.monotonic() + 60
+        resume_key = response_mode._current_skill_direct_resume_key()
+        assert resume_key is not None
+        response_mode._VIDEO_EDIT_RESUME_SESSIONS[resume_key] = (
+            response_mode.time.monotonic() + 60
+        )
 
         unrelated_agent = _FakeAgent()
         reset_trusted_skill_execution(unrelated_agent, "继续总结这个文档")
@@ -574,16 +576,16 @@ def test_video_edit_followup_capability_is_session_and_intent_bounded_unit():
         assert slash_agent._zet_agent_skill_direct_task.video_edit_applicable
         assert slash_agent._zet_agent_skill_direct_task.video_edit_explicit
 
-        response_mode._VIDEO_EDIT_RESUME_SESSIONS[
-            "zettlab:user:main:first-session"
-        ] = (response_mode.time.monotonic() - 1)
+        response_mode._VIDEO_EDIT_RESUME_SESSIONS[resume_key] = (
+            response_mode.time.monotonic() - 1
+        )
         expired_agent = _FakeAgent()
         reset_trusted_skill_execution(expired_agent, "继续")
         assert not expired_agent._zet_agent_skill_direct_task.video_edit_applicable
 
         now = response_mode.time.monotonic()
         response_mode._VIDEO_EDIT_RESUME_SESSIONS.update(
-            (f"session-{index}", now + 60)
+            ((f"profile-{index}", f"session-{index}"), now + 60)
             for index in range(
                 response_mode._VIDEO_EDIT_RESUME_MAX_SESSIONS + 3
             )
@@ -592,7 +594,7 @@ def test_video_edit_followup_capability_is_session_and_intent_bounded_unit():
             now=now,
         )
         assert len(bounded) == response_mode._VIDEO_EDIT_RESUME_MAX_SESSIONS
-        assert "session-0" not in bounded
+        assert ("profile-0", "session-0") not in bounded
 
         clear_turn_vars(first_turn_tokens)
         clear_session_vars(first_session_tokens)
@@ -612,6 +614,42 @@ def test_video_edit_followup_capability_is_session_and_intent_bounded_unit():
             clear_turn_vars(first_turn_tokens)
         if response_mode._current_skill_direct_session_id():
             clear_session_vars(first_session_tokens)
+        response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
+
+
+def test_video_edit_followup_capability_is_profile_bounded_unit(tmp_path):
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
+    session_tokens = set_session_vars(
+        session_key="shared-session-id",
+        session_id="shared-session-id",
+    )
+    profile_a_token = set_hermes_home_override(tmp_path / "profile-a")
+    try:
+        explicit_agent = _FakeAgent()
+        reset_trusted_skill_execution(explicit_agent, "剪辑")
+
+        same_profile_agent = _FakeAgent()
+        reset_trusted_skill_execution(same_profile_agent, "继续")
+        assert same_profile_agent._zet_agent_skill_direct_task.video_edit_applicable
+    finally:
+        reset_hermes_home_override(profile_a_token)
+
+    profile_b_token = set_hermes_home_override(tmp_path / "profile-b")
+    try:
+        other_profile_agent = _FakeAgent()
+        reset_trusted_skill_execution(other_profile_agent, "继续")
+        assert not (
+            other_profile_agent._zet_agent_skill_direct_task.video_edit_applicable
+        )
+    finally:
+        reset_hermes_home_override(profile_b_token)
+        clear_session_vars(session_tokens)
         response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
 
 

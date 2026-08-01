@@ -228,7 +228,8 @@ class _SkillDirectOperation:
 
 _TRUSTED_PRESETS_SNAPSHOT: _TrustedPresetsSnapshot | None = None
 _PENDING_ATTESTATIONS: OrderedDict[str, _PendingSkillAttestation] = OrderedDict()
-_VIDEO_EDIT_RESUME_SESSIONS: OrderedDict[str, float] = OrderedDict()
+_VideoEditResumeKey = tuple[str, str]
+_VIDEO_EDIT_RESUME_SESSIONS: OrderedDict[_VideoEditResumeKey, float] = OrderedDict()
 _ATTESTATION_LOCK = threading.Lock()
 _SKILL_DIRECT_LOCK = threading.Lock()
 _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT: ContextVar[
@@ -254,6 +255,24 @@ def _current_skill_direct_session_id() -> str:
         return str(get_session_env("HERMES_SESSION_KEY") or "").strip()
     except Exception:
         return ""
+
+
+def _current_skill_direct_resume_key() -> _VideoEditResumeKey | None:
+    """Bind resumable video-edit intent to the active profile and session."""
+    session_id = _current_skill_direct_session_id()
+    if not session_id:
+        return None
+    try:
+        from hermes_constants import get_hermes_home
+
+        profile_home = os.path.normcase(
+            os.path.abspath(os.path.expanduser(str(get_hermes_home())))
+        )
+    except Exception:
+        return None
+    if not profile_home:
+        return None
+    return profile_home, session_id
 
 
 def _video_edit_continuation_intent(normalized: str) -> bool:
@@ -285,14 +304,14 @@ def _strip_gateway_model_switch_note(task_text: str) -> str:
 def _video_edit_resume_sessions_locked(
     *,
     now: float,
-) -> OrderedDict[str, float]:
+) -> OrderedDict[_VideoEditResumeKey, float]:
     expired = [
-        session_id
-        for session_id, expires_at in _VIDEO_EDIT_RESUME_SESSIONS.items()
+        resume_key
+        for resume_key, expires_at in _VIDEO_EDIT_RESUME_SESSIONS.items()
         if not isinstance(expires_at, (int, float)) or expires_at <= now
     ]
-    for session_id in expired:
-        _VIDEO_EDIT_RESUME_SESSIONS.pop(session_id, None)
+    for resume_key in expired:
+        _VIDEO_EDIT_RESUME_SESSIONS.pop(resume_key, None)
     while len(_VIDEO_EDIT_RESUME_SESSIONS) > _VIDEO_EDIT_RESUME_MAX_SESSIONS:
         _VIDEO_EDIT_RESUME_SESSIONS.popitem(last=False)
     return _VIDEO_EDIT_RESUME_SESSIONS
@@ -1097,7 +1116,7 @@ def _skill_direct_task_context(agent: Any, user_message: Any) -> _SkillDirectTas
         or _video_edit_direct_command_intent(normalized)
     )
     now = time.monotonic()
-    session_id = _current_skill_direct_session_id()
+    resume_key = _current_skill_direct_resume_key()
     resume_sessions = _video_edit_resume_sessions_locked(now=now)
     continuation_intent = _video_edit_continuation_intent(normalized)
     resumed = bool(
@@ -1105,11 +1124,11 @@ def _skill_direct_task_context(agent: Any, user_message: Any) -> _SkillDirectTas
         and continuation_intent
         and (
             has_edit_intent
-            or (session_id and session_id in resume_sessions)
+            or (resume_key is not None and resume_key in resume_sessions)
         )
     )
-    if resumed and session_id in resume_sessions:
-        resume_sessions.move_to_end(session_id)
+    if resumed and resume_key is not None and resume_key in resume_sessions:
+        resume_sessions.move_to_end(resume_key)
     return _SkillDirectTaskContext(
         task_sha256=hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
         turn_identity=_current_skill_direct_turn_identity(),
@@ -1562,15 +1581,15 @@ def reset_trusted_skill_execution(agent: Any, user_message: Any = None) -> None:
             user_message,
         )
         if task.video_edit_explicit:
-            session_id = _current_skill_direct_session_id()
-            if session_id:
+            resume_key = _current_skill_direct_resume_key()
+            if resume_key is not None:
                 sessions = _video_edit_resume_sessions_locked(
                     now=time.monotonic(),
                 )
-                sessions[session_id] = (
+                sessions[resume_key] = (
                     time.monotonic() + _VIDEO_EDIT_RESUME_TTL_SECONDS
                 )
-                sessions.move_to_end(session_id)
+                sessions.move_to_end(resume_key)
                 while len(sessions) > _VIDEO_EDIT_RESUME_MAX_SESSIONS:
                     sessions.popitem(last=False)
         agent._zet_agent_skill_direct_task = task
