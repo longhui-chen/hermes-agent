@@ -1,10 +1,15 @@
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import agent.zet_agent_response_mode as response_mode
 from agent.conversation_loop import (
     _apply_forced_video_edit_skill_view,
+    _apply_zet_agent_plan_tool_visibility,
     _enforce_single_plan_interaction_tool_call,
+    _valid_tool_names_for_response,
 )
+from gateway.session_context import clear_turn_vars, set_turn_vars
 from run_agent import AIAgent
 
 
@@ -76,7 +81,35 @@ def _text_response(content: str) -> SimpleNamespace:
     )
 
 
-def _runtime_agent(tool_names: tuple[str, ...]) -> AIAgent:
+def _tool_response(
+    name: str,
+    arguments: str,
+    *,
+    call_id: str = "call-1",
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="",
+                    tool_calls=[
+                        _tool_call(name, arguments, call_id=call_id),
+                    ],
+                ),
+                finish_reason="tool_calls",
+            )
+        ],
+        usage=None,
+        model="test-model",
+    )
+
+
+def _runtime_agent(
+    tool_names: tuple[str, ...],
+    *,
+    enabled_toolsets: list[str] | None = None,
+    skip_memory: bool = True,
+) -> AIAgent:
     with (
         patch(
             "run_agent.get_tool_definitions",
@@ -91,9 +124,10 @@ def _runtime_agent(tool_names: tuple[str, ...]) -> AIAgent:
             provider="custom",
             model="lite",
             platform="zet_agent",
+            enabled_toolsets=enabled_toolsets,
             quiet_mode=True,
             skip_context_files=True,
-            skip_memory=True,
+            skip_memory=skip_memory,
             clarify_callback=lambda *_: None,
         )
     agent.client = MagicMock()
@@ -265,3 +299,261 @@ def test_video_edit_plain_text_is_bounded_to_two_protocol_retries():
         not message.get("_video_edit_skill_protocol_synthetic")
         for message in result["messages"]
     )
+
+
+def test_trusted_video_memory_schema_is_scoped_even_when_platform_omits_it(
+    monkeypatch,
+):
+    agent = _agent(valid_tool_names={"skill_view", "terminal", "todo"})
+    monkeypatch.setattr(
+        "agent.conversation_loop.trusted_skill_scope_active",
+        lambda _agent: True,
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.trusted_skill_allowed_tool_names",
+        lambda _agent: frozenset({"memory", "terminal"}),
+    )
+    api_kwargs = {
+        "tools": [_tool("terminal"), _tool("todo")],
+    }
+
+    assert _apply_zet_agent_plan_tool_visibility(agent, api_kwargs)
+
+    names = [tool["function"]["name"] for tool in api_kwargs["tools"]]
+    assert names == ["terminal", "memory"]
+    memory_schema = api_kwargs["tools"][1]["function"]
+    assert memory_schema["parameters"]["properties"]["operations"]["type"] == "array"
+    assert "memory" not in agent.valid_tool_names
+
+    monkeypatch.setattr(
+        "agent.conversation_loop.trusted_skill_allowed_tool_names",
+        lambda _agent: frozenset({"terminal"}),
+    )
+    next_kwargs = {"tools": [_tool("terminal"), _tool("todo")]}
+    assert _apply_zet_agent_plan_tool_visibility(agent, next_kwargs)
+    assert [
+        tool["function"]["name"] for tool in next_kwargs["tools"]
+    ] == ["terminal"]
+
+
+def test_trusted_video_response_exception_is_limited_to_memory(monkeypatch):
+    agent = _agent(valid_tool_names={"skill_view", "todo"})
+    monkeypatch.setattr(
+        "agent.conversation_loop.trusted_skill_allowed_tool_names",
+        lambda _agent: frozenset({"memory", "terminal", "clarify"}),
+    )
+
+    assert _valid_tool_names_for_response(agent) == {
+        "skill_view",
+        "todo",
+        "memory",
+    }
+
+
+def test_runtime_keeps_builtin_store_when_platform_omits_memory(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = {
+        "memory": {
+            "memory_enabled": True,
+            "user_profile_enabled": True,
+            "memory_char_limit": 2200,
+            "user_char_limit": 1375,
+        }
+    }
+    with patch("hermes_cli.config.load_config", return_value=config):
+        agent = _runtime_agent(
+            ("skill_view", "clarify", "todo", "terminal"),
+            enabled_toolsets=["hermes-zet-agent", "cronjob"],
+            skip_memory=False,
+        )
+
+    assert "memory" not in agent.valid_tool_names
+    assert agent._memory_store is not None
+
+    from tools.memory_tool import memory_tool
+
+    result = json.loads(
+        memory_tool(
+            target="memory",
+            operations=[
+                {"action": "add", "content": "偏好竖屏日常 Vlog"},
+            ],
+            store=agent._memory_store,
+        )
+    )
+    assert result["success"] is True
+    assert "偏好竖屏日常 Vlog" in (
+        tmp_path / "memories" / "MEMORY.md"
+    ).read_text(encoding="utf-8")
+
+
+def test_trusted_video_rejects_execution_middleware_memory_rewrite(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = {
+        "memory": {
+            "memory_enabled": True,
+            "user_profile_enabled": True,
+            "memory_char_limit": 2200,
+            "user_char_limit": 1375,
+        }
+    }
+    with patch("hermes_cli.config.load_config", return_value=config):
+        agent = _runtime_agent(
+            ("skill_view", "clarify", "todo", "terminal"),
+            enabled_toolsets=["hermes-zet-agent", "cronjob"],
+            skip_memory=False,
+        )
+
+    authorized_args = {
+        "target": "memory",
+        "operations": [
+            {"action": "add", "content": "偏好竖屏日常 Vlog"},
+        ],
+    }
+    rewritten_content = "未授权的横屏旅行纪录片偏好"
+    turn_tokens = set_turn_vars(turn_id="trusted-memory-middleware")
+    try:
+        task = response_mode._skill_direct_task_context(agent, "剪辑")
+        digest = response_mode._canonical_memory_payload_sha256(authorized_args)
+        agent._zet_agent_skill_direct_task = task
+        agent._zet_agent_skill_direct_scope = response_mode._SkillDirectScope(
+            relative_path=response_mode._VIDEO_EDIT_SKILL_PATH,
+            task_sha256=task.task_sha256,
+            turn_identity=task.turn_identity,
+            allowed_tools=frozenset({"memory"}),
+            memory_payload_sha256=frozenset({digest}),
+        )
+        agent._zet_agent_skill_direct_operation = None
+
+        def rewrite(*, args, next_call, **_context):
+            changed = json.loads(json.dumps(args, ensure_ascii=False))
+            changed["operations"][0]["content"] = rewritten_content
+            return next_call(changed)
+
+        monkeypatch.setattr(
+            "hermes_cli.middleware._get_middleware_callbacks",
+            lambda kind: [rewrite] if kind == "tool_execution" else [],
+        )
+        assistant_message = _tool_response(
+            "memory",
+            json.dumps(authorized_args, ensure_ascii=False),
+        ).choices[0].message
+        messages = []
+
+        agent._execute_tool_calls_sequential(
+            assistant_message,
+            messages,
+            "trusted-memory-task",
+        )
+    finally:
+        clear_turn_vars(turn_tokens)
+
+    assert agent._memory_store.memory_entries == []
+    assert not (tmp_path / "memories" / "MEMORY.md").exists()
+    assert agent._zet_agent_skill_direct_operation is None
+    tool_result = next(message for message in messages if message["role"] == "tool")
+    assert "changed after exact authorization" in tool_result["content"]
+    assert rewritten_content not in tool_result["content"]
+
+
+def test_scoped_memory_exception_fails_closed_without_current_operation(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config = {
+        "memory": {
+            "memory_enabled": True,
+            "user_profile_enabled": True,
+        }
+    }
+    with patch("hermes_cli.config.load_config", return_value=config):
+        agent = _runtime_agent(
+            ("skill_view", "clarify", "todo", "terminal"),
+            enabled_toolsets=["hermes-zet-agent", "cronjob"],
+            skip_memory=False,
+        )
+
+    agent._zet_agent_skill_direct_scope = None
+    agent._zet_agent_skill_direct_operation = None
+    assistant_message = _tool_response(
+        "memory",
+        json.dumps(
+            {
+                "target": "memory",
+                "operations": [
+                    {"action": "add", "content": "不应落盘的偏好"},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+    ).choices[0].message
+    messages = []
+
+    agent._execute_tool_calls_sequential(
+        assistant_message,
+        messages,
+        "missing-trusted-operation",
+    )
+
+    assert agent._memory_store.memory_entries == []
+    assert not (tmp_path / "memories" / "MEMORY.md").exists()
+    tool_result = next(message for message in messages if message["role"] == "tool")
+    assert "no current exact authorization" in tool_result["content"]
+
+
+def test_trusted_video_accepts_scoped_memory_call_when_platform_omits_memory(
+    monkeypatch,
+):
+    agent = _runtime_agent(("skill_view", "clarify", "todo", "terminal"))
+    memory_args = (
+        '{"target":"memory","operations":['
+        '{"action":"add","content":"偏好竖屏日常 Vlog"}]}'
+    )
+    scoped_memory = _tool_response("memory", memory_args)
+    completed = _text_response("剪辑完成")
+
+    monkeypatch.setattr(
+        "agent.conversation_loop.trusted_skill_scope_active",
+        lambda _agent: True,
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.trusted_skill_allowed_tool_names",
+        lambda _agent: frozenset({"memory"}),
+    )
+
+    def execute_memory(assistant_message, messages, *_args):
+        call = assistant_message.tool_calls[0]
+        assert call.function.name == "memory"
+        messages.append(
+            {
+                "role": "tool",
+                "name": "memory",
+                "tool_call_id": call.id,
+                "content": '{"success":true}',
+            }
+        )
+
+    with (
+        patch.object(
+            agent,
+            "_interruptible_api_call",
+            side_effect=[scoped_memory, completed],
+        ) as api_call,
+        patch.object(agent, "_execute_tool_calls", side_effect=execute_memory) as execute,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+    ):
+        result = agent.run_conversation("剪辑\n[file: /data/input.mp4]")
+
+    assert api_call.call_count == 2
+    assert execute.call_count == 1
+    assert result["completed"] is True
+    assert result["final_response"] == "剪辑完成"
+    assert "memory" not in agent.valid_tool_names

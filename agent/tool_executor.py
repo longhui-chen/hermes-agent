@@ -12,6 +12,7 @@ extracted functions reach back through the ``run_agent`` module via
 
 from __future__ import annotations
 
+import copy
 import concurrent.futures
 import json
 from pathlib import Path
@@ -34,6 +35,7 @@ from agent.display import (
 from agent.tool_guardrails import ToolGuardrailDecision
 from agent.zet_agent_response_mode import (
     apply_trusted_skill_execution,
+    trusted_skill_operation_execution_block_message,
     trusted_skill_operation_block_message,
 )
 from agent.tool_dispatch_helpers import (
@@ -1412,14 +1414,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 agent._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
         elif function_name == "memory":
             def _execute(next_args: dict) -> Any:
-                target = next_args.get("target", "memory")
-                operations = next_args.get("operations")
+                final_args = copy.deepcopy(next_args)
+                trusted_block = trusted_skill_operation_execution_block_message(
+                    agent,
+                    function_name=function_name,
+                    function_args=final_args,
+                )
+                if trusted_block is not None:
+                    return json.dumps({"error": trusted_block}, ensure_ascii=False)
+                target = final_args.get("target", "memory")
+                operations = final_args.get("operations")
                 from tools.memory_tool import memory_tool as _memory_tool
                 result = _memory_tool(
-                    action=next_args.get("action"),
+                    action=final_args.get("action"),
                     target=target,
-                    content=next_args.get("content"),
-                    old_text=next_args.get("old_text"),
+                    content=final_args.get("content"),
+                    old_text=final_args.get("old_text"),
                     operations=operations,
                     store=agent._memory_store,
                 )
@@ -1429,7 +1439,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 if agent._memory_manager:
                     agent._memory_manager.notify_memory_tool_write(
                         result,
-                        next_args,
+                        final_args,
                         build_metadata=lambda: agent._build_memory_write_metadata(
                             task_id=effective_task_id,
                             tool_call_id=getattr(tool_call, "id", None),

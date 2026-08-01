@@ -224,6 +224,12 @@ class _SkillDirectOperation:
     scope: _SkillDirectScope
     function_name: str
     may_authorize_memory: bool = False
+    authorized_payload_sha256: str = field(
+        default="",
+        repr=False,
+        compare=False,
+    )
+    execution_claimed: bool = field(default=False, repr=False, compare=False)
 
 
 _TRUSTED_PRESETS_SNAPSHOT: _TrustedPresetsSnapshot | None = None
@@ -1391,6 +1397,7 @@ def trusted_skill_operation_block_message(
         allowed = function_name in scope.allowed_tools
         operation_scope = scope
         may_authorize_memory = False
+        authorized_payload_sha256 = ""
         if allowed and function_name == "terminal":
             allowed, may_authorize_memory = _video_edit_command_policy(function_args)
             allowed = allowed and scope.execution_receipt is not None
@@ -1398,6 +1405,7 @@ def trusted_skill_operation_block_message(
             memory_digest = _canonical_memory_payload_sha256(function_args)
             allowed = bool(memory_digest and memory_digest in scope.memory_payload_sha256)
             if allowed:
+                authorized_payload_sha256 = memory_digest
                 remaining = scope.memory_payload_sha256 - {memory_digest}
                 allowed_tools = scope.allowed_tools
                 if not remaining:
@@ -1468,9 +1476,80 @@ def trusted_skill_operation_block_message(
             scope=operation_scope,
             function_name=function_name,
             may_authorize_memory=may_authorize_memory,
+            authorized_payload_sha256=authorized_payload_sha256,
         )
         if function_name == "terminal":
             _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(scope.execution_receipt)
+        return None
+
+
+def trusted_skill_operation_execution_block_message(
+    agent: Any,
+    *,
+    function_name: str,
+    function_args: Mapping[str, Any],
+) -> str | None:
+    """Revalidate the final trusted-memory payload after execution middleware."""
+    if function_name != "memory":
+        return None
+
+    turn_identity = _current_skill_direct_turn_identity()
+    with _SKILL_DIRECT_LOCK:
+        operation = getattr(agent, "_zet_agent_skill_direct_operation", None)
+        if not isinstance(operation, _SkillDirectOperation):
+            if "memory" not in set(
+                getattr(agent, "valid_tool_names", set()) or set()
+            ):
+                return (
+                    "The scoped video-edit memory exception has no current "
+                    "exact authorization. The write was blocked."
+                )
+            return None
+        if operation.function_name != "memory":
+            if "memory" not in set(
+                getattr(agent, "valid_tool_names", set()) or set()
+            ):
+                return (
+                    "The scoped video-edit memory exception belongs to another "
+                    "operation. The write was blocked."
+                )
+            return None
+
+        scope = operation.scope
+        task = getattr(agent, "_zet_agent_skill_direct_task", None)
+        if (
+            turn_identity is None
+            or scope.turn_identity != turn_identity
+            or not isinstance(task, _SkillDirectTaskContext)
+            or task.turn_identity != turn_identity
+            or task.task_sha256 != scope.task_sha256
+        ):
+            agent._zet_agent_skill_direct_operation = None
+            return (
+                "The trusted video-edit memory operation belongs to another "
+                "task-local turn. The operation was revoked before writing."
+            )
+
+        final_digest = _canonical_memory_payload_sha256(function_args)
+        if (
+            operation.execution_claimed
+            or not final_digest
+            or final_digest != operation.authorized_payload_sha256
+        ):
+            agent._zet_agent_skill_direct_operation = None
+            logger.warning(
+                "zet_agent: blocked trusted memory payload changed after "
+                "exact authorization"
+            )
+            return (
+                "The trusted video-edit memory payload changed after exact "
+                "authorization. The operation was revoked before writing."
+            )
+
+        agent._zet_agent_skill_direct_operation = replace(
+            operation,
+            execution_claimed=True,
+        )
         return None
 
 

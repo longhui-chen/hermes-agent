@@ -276,6 +276,21 @@ def _apply_zet_agent_plan_tool_visibility(agent: Any, api_kwargs: Dict[str, Any]
             api_kwargs["tools"] = filtered_tools
             changed = True
 
+        if (
+            getattr(agent, "api_mode", "") == "chat_completions"
+            and "memory" in scoped_tools
+            and not any(_tool_name(tool) == "memory" for tool in filtered_tools)
+        ):
+            from tools.memory_tool import MEMORY_SCHEMA
+
+            api_kwargs["tools"].append(
+                {
+                    "type": "function",
+                    "function": copy.deepcopy(MEMORY_SCHEMA),
+                }
+            )
+            changed = True
+
     tool_config = api_kwargs.get("toolConfig")
     if isinstance(tool_config, dict) and isinstance(tool_config.get("tools"), list):
         filtered_tools = [
@@ -304,6 +319,14 @@ def _apply_zet_agent_plan_tool_visibility(agent: Any, api_kwargs: Dict[str, Any]
             api_kwargs["parallel_tool_calls"] = False
             changed = True
     return changed
+
+
+def _valid_tool_names_for_response(agent: Any) -> set[str]:
+    """Allow only the task-bound memory write absent from the platform toolset."""
+    valid = set(getattr(agent, "valid_tool_names", set()) or set())
+    if "memory" in trusted_skill_allowed_tool_names(agent):
+        valid.add("memory")
+    return valid
 
 
 def _error_text(error: Exception) -> str:
@@ -5636,15 +5659,16 @@ def run_conversation(
                 
                 # Validate tool call names - detect model hallucinations
                 # Repair mismatched tool names before validating
+                _turn_valid_tool_names = _valid_tool_names_for_response(agent)
                 for tc in assistant_message.tool_calls:
-                    if tc.function.name not in agent.valid_tool_names:
+                    if tc.function.name not in _turn_valid_tool_names:
                         repaired = agent._repair_tool_call(tc.function.name)
                         if repaired:
                             print(f"{agent.log_prefix}🔧 Auto-repaired tool name: '{tc.function.name}' -> '{repaired}'")
                             tc.function.name = repaired
                 invalid_tool_calls = [
                     tc.function.name for tc in assistant_message.tool_calls
-                    if tc.function.name not in agent.valid_tool_names
+                    if tc.function.name not in _turn_valid_tool_names
                 ]
                 # Mixed batch: at least one valid call alongside the invalid
                 # one(s). Degrading models (observed with gpt-5.6 at very
@@ -5658,7 +5682,7 @@ def run_conversation(
                 # model still halts at 3 while a mostly-coherent one keeps
                 # working.
                 _mixed_invalid_batch = bool(invalid_tool_calls) and any(
-                    tc.function.name in agent.valid_tool_names
+                    tc.function.name in _turn_valid_tool_names
                     for tc in assistant_message.tool_calls
                 )
                 if _mixed_invalid_batch:
@@ -5667,7 +5691,7 @@ def run_conversation(
                     invalid_preview = invalid_name[:80] + "..." if len(invalid_name) > 80 else invalid_name
                     _n_valid = sum(
                         1 for tc in assistant_message.tool_calls
-                        if tc.function.name in agent.valid_tool_names
+                        if tc.function.name in _turn_valid_tool_names
                     )
                     agent._buffer_vprint(
                         f"⚠️  Unknown tool '{invalid_preview}' in batch — erroring that call, "
@@ -5701,11 +5725,11 @@ def run_conversation(
                     messages.append(assistant_msg)
                     for tc in assistant_message.tool_calls:
                         _tc_name = tc.function.name
-                        if _tc_name not in agent.valid_tool_names:
+                        if _tc_name not in _turn_valid_tool_names:
                             # See _invalid_tool_name_error_content for the
                             # blank-name anti-priming rationale (#47967).
                             content = _invalid_tool_name_error_content(
-                                _tc_name, agent.valid_tool_names
+                                _tc_name, _turn_valid_tool_names
                             )
                         else:
                             content = "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
@@ -5739,7 +5763,7 @@ def run_conversation(
                     except json.JSONDecodeError as e:
                         if (
                             _mixed_invalid_batch
-                            and tc.function.name not in agent.valid_tool_names
+                            and tc.function.name not in _turn_valid_tool_names
                         ):
                             # This call never executes — it gets an
                             # invalid-name error result below. Don't let its
@@ -5837,7 +5861,7 @@ def run_conversation(
                 if _mixed_invalid_batch:
                     _invalid_batch_calls = [
                         tc for tc in assistant_message.tool_calls
-                        if tc.function.name not in agent.valid_tool_names
+                        if tc.function.name not in _turn_valid_tool_names
                     ]
 
                 assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
@@ -5950,12 +5974,12 @@ def run_conversation(
                             "name": tc.function.name,
                             "tool_call_id": tc.id,
                             "content": _invalid_tool_name_error_content(
-                                tc.function.name, agent.valid_tool_names
+                                tc.function.name, _turn_valid_tool_names
                             ),
                         })
                     assistant_message.tool_calls = [
                         tc for tc in assistant_message.tool_calls
-                        if tc.function.name in agent.valid_tool_names
+                        if tc.function.name in _turn_valid_tool_names
                     ]
 
                 try:
