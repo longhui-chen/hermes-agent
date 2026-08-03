@@ -19,6 +19,7 @@ import json
 import logging
 import shutil
 import time
+from contextvars import copy_context
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -135,7 +136,7 @@ def generate_base_drafts(
     results: dict[int, Path] = {}
     errors: list[str] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_one, i) for i in range(n)]
+        futures = [pool.submit(copy_context().run, _one, i) for i in range(n)]
         # as_completed runs in *this* (the caller's) thread, so on_draft — and any
         # gateway event it emits — inherits the request's bound transport, unlike
         # the worker threads above.
@@ -292,7 +293,7 @@ def hatch_pet(
     workers = max(1, min(len(generated_specs), _MAX_PARALLEL_GENERATIONS))
     done = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_gen_row, spec) for spec in generated_specs]
+        futures = [pool.submit(copy_context().run, _gen_row, spec) for spec in generated_specs]
         # as_completed runs on the caller (request) thread, so progress events
         # emitted here inherit the request transport — unlike the worker threads.
         for fut in as_completed(futures):

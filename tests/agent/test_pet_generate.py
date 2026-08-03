@@ -425,6 +425,45 @@ def test_generate_base_drafts_hardens_opaque_background(monkeypatch, tmp_path):
     assert rgba.getpixel((rgba.width // 2, rgba.height // 2))[3] > 0
 
 
+def test_hatch_pet_propagates_secret_scope_to_generation_workers(monkeypatch, tmp_path):
+    from agent import secret_scope
+    from agent.pet import store
+    from agent.pet.generate import atlas as atlas_mod
+    from agent.pet.generate import imagegen, orchestrate
+
+    base = tmp_path / "base.png"
+    _strip(1).save(base)
+
+    def fake_generate(prompt, *, n=1, reference_images=None, provider=None, prefix="pet", aspect_ratio="square"):
+        del prompt, n, reference_images, provider, aspect_ratio
+        assert secret_scope.get_secret("PET_TEST_PROFILE") == "profile-a"
+        state = prefix.replace("pet_row_", "")
+        count = atlas_mod.FRAME_COUNTS.get(state, 6)
+        path = tmp_path / f"{prefix}.png"
+        _strip(count).save(path)
+        return [path]
+
+    monkeypatch.setattr(imagegen, "resolve_provider", lambda **_: object())
+    monkeypatch.setattr(imagegen, "generate", fake_generate)
+    monkeypatch.setattr(store, "pets_dir", lambda: tmp_path / "pets")
+
+    previous_multiplex = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    scope_token = secret_scope.set_secret_scope({"PET_TEST_PROFILE": "profile-a"})
+    try:
+        result = orchestrate.hatch_pet(
+            base_image=base,
+            slug="scoped-pet",
+            concept="a scoped robot pet",
+        )
+    finally:
+        secret_scope.reset_secret_scope(scope_token)
+        secret_scope.set_multiplex_active(previous_multiplex)
+
+    assert result.slug == "scoped-pet"
+    assert result.validation["ok"] is True
+
+
 def test_hatch_pet_end_to_end(monkeypatch, tmp_path):
     from agent.pet import store
     from agent.pet.generate import atlas as atlas_mod

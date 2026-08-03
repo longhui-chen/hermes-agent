@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 import zipfile
 from pathlib import Path
 
@@ -175,3 +176,57 @@ def test_desktop_pet_candidate_hatch_export_flow(monkeypatch, tmp_path):
         pet_tool._reset_state_for_tests()
         secret_scope.reset_secret_scope(scope_token)
         secret_scope.set_multiplex_active(previous_multiplex)
+
+
+def test_desktop_pet_draft_flow_propagates_profile_secret_scope(monkeypatch, tmp_path):
+    from agent.pet.generate import imagegen
+
+    home = tmp_path / "hermes"
+    output_root = tmp_path / "files" / "agents" / "data" / "agent-a" / "output"
+    home.mkdir()
+    output_root.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(imagegen, "resolve_provider", lambda **_: object())
+
+    def fake_generate(
+        prompt,
+        *,
+        n=1,
+        reference_images=None,
+        provider=None,
+        prefix="pet",
+        aspect_ratio="square",
+    ):
+        del prompt, n, reference_images, provider, aspect_ratio
+        assert secret_scope.get_secret("PET_TEST_PROFILE") == "agent-a-secret"
+        path = tmp_path / f"{prefix}-{threading.get_ident()}.png"
+        Image.new("RGBA", (96, 96), (80, 120, 220, 255)).save(path)
+        return [path]
+
+    monkeypatch.setattr(imagegen, "generate", fake_generate)
+
+    previous_multiplex = secret_scope.is_multiplex_active()
+    secret_scope.set_multiplex_active(True)
+    scope_token = secret_scope.set_secret_scope(
+        {
+            "ZET_AGENT_ID": "agent-a",
+            "ZET_AGENT_OUTPUT_ROOT": str(output_root),
+            "PET_TEST_PROFILE": "agent-a-secret",
+        }
+    )
+    pet_tool._reset_state_for_tests()
+    try:
+        drafted = _call(
+            {
+                "action": "draft",
+                "concept": "an original scoped robot pet",
+                "count": 2,
+            }
+        )
+    finally:
+        pet_tool._reset_state_for_tests()
+        secret_scope.reset_secret_scope(scope_token)
+        secret_scope.set_multiplex_active(previous_multiplex)
+
+    assert drafted["success"] is True
+    assert len(drafted["drafts"]) == 2
