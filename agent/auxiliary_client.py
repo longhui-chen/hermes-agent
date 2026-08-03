@@ -627,27 +627,36 @@ def _apply_zettlab_session_headers(headers: dict | None) -> dict | None:
     cache hit cannot leak another conversation's sticky-routing key.
     """
     merged = dict(headers or {})
-    # Zettlab credit-ledger task grouping: attribute auxiliary calls
-    # (compression / title / vision) to the conversation/cron task by stamping
-    # X-Task-Id, so they aggregate into its task card instead of surfacing as
-    # orphan model rows. Stamp the same value as X-Zettlab-Conversation-ID so
-    # ai-gateway's model-routing can use an explicit sticky/canary session key.
-    # Each aux client is built fresh per call, so reading the concurrency-safe
-    # session contextvar here is always current (no stale cross-session reuse).
-    # billing_task_id() maps interactive vs cron sessions and returns '' for
-    # non-NAS sessions (no leak to third-party providers).
+    # Zettlab credit-ledger grouping: attribute auxiliary calls (compression /
+    # title / vision) to the turn or cron run that triggered them by stamping
+    # X-Task-Id, so they land on its usage card instead of surfacing as orphan
+    # model rows. Each aux client is built fresh per call, so reading the
+    # concurrency-safe session contextvar here is always current (no stale
+    # cross-session reuse). billing_usage_id() returns '' for non-NAS sessions
+    # (no leak to third-party providers).
+    #
+    # 🔴 X-Zettlab-Conversation-ID stays at conversation granularity — it is
+    # ai-gateway's sticky-routing and prompt-cache affinity key, not a ledger
+    # key. Do not collapse the two values back together (see chat_completions).
     try:
-        from gateway.session_context import billing_task_id, billing_task_title_encoded
-        task_id = billing_task_id()
+        from gateway.session_context import (
+            billing_conversation_id,
+            billing_task_title_encoded,
+            billing_usage_id,
+        )
+        task_id = billing_usage_id()
+        conversation_id = billing_conversation_id() if task_id else ""
         task_title = billing_task_title_encoded() if task_id else ""
     except Exception:
         task_id = ""
+        conversation_id = ""
         task_title = ""
     if task_id:
         merged.setdefault("X-Task-Id", task_id)
-        merged.setdefault("X-Zettlab-Conversation-ID", task_id)
+        if conversation_id:
+            merged.setdefault("X-Zettlab-Conversation-ID", conversation_id)
         merged.setdefault("X-Scene-Type", "agent")
-        # Cron job name → X-Task-Title (empty for interactive); see chat_completions.
+        # Cron job name / turn summary → X-Task-Title; see chat_completions.
         if task_title:
             merged.setdefault("X-Task-Title", task_title)
     return merged or headers

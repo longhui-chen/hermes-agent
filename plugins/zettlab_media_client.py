@@ -647,6 +647,25 @@ def remote_inputs(
     return out
 
 
+def _billing_task_id(session_id: str) -> str:
+    """Bill this media job to the chat turn that asked for it, when known.
+
+    Media generation is requested from inside a turn, so its credits belong on
+    that turn's ledger card like any other model call. Falls back to the raw
+    session id when no turn is bound (CLI, gateway platforms) and for non-Zettlab
+    sessions, so attribution is never weaker than before.
+
+    Only X-Task-Id moves: ARTIFACT_SESSION_HEADER keeps the session id, because
+    generated artifacts are stored per session, not per turn.
+    """
+    try:
+        from gateway.session_context import billing_usage_id_for
+
+        return billing_usage_id_for(session_id) or session_id
+    except Exception:
+        return session_id
+
+
 def create_and_wait(
     *,
     media_type: str,
@@ -673,7 +692,7 @@ def create_and_wait(
     }
     normalized_session_id = str(session_id or "").strip()
     if normalized_session_id:
-        headers["X-Task-Id"] = normalized_session_id
+        headers["X-Task-Id"] = _billing_task_id(normalized_session_id)
     artifact_headers = dict(headers)
     if normalized_session_id:
         artifact_headers[ARTIFACT_SESSION_HEADER] = normalized_session_id
