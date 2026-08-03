@@ -121,8 +121,12 @@ class TestDetectDangerousRm:
 
     def test_nonrecursive_verification_artifact_cleanup_is_not_dangerous(self):
         with mock_patch("tempfile.gettempdir", return_value="/tmp"):
+            canonical_temp = approval_module.os.path.realpath("/tmp")
             for prefix in ("hermes-verify-", "hermes-ad-hoc-"):
-                assert detect_dangerous_command(f"rm -f /tmp/{prefix}example.py") == (
+                target = approval_module.os.path.join(
+                    canonical_temp, f"{prefix}example.py"
+                )
+                assert detect_dangerous_command(f"rm -f {target}") == (
                     False,
                     None,
                     None,
@@ -2558,6 +2562,81 @@ class TestApprovalPromptRedaction:
                     result = check_execute_code_guard(code, "local")
 
         assert result.get("status") == "pending_approval"
+        assert isinstance(result.get("approval_id"), str)
+        assert result["approval_id"]
         # The script's credential must not appear in the user-facing message.
         assert "sk-proj-abc123xyz4567890abcdef" not in result["message"]
         assert "sk-proj-abc123xyz4567890abcdef" not in result["command"]
+
+    def test_gateway_live_approval_notification_has_exact_identity(self):
+        from tools import approval as mod
+
+        session_key = "test-live-approval-id"
+        notified = []
+
+        def notify(data):
+            notified.append(data)
+            assert mod.resolve_gateway_approval(
+                session_key,
+                "deny",
+                approval_id=data["approval_id"],
+            ) == 1
+
+        try:
+            decision = mod._await_gateway_decision(
+                session_key,
+                notify,
+                {
+                    "command": "rm -rf .git",
+                    "pattern_key": "recursive_delete",
+                    "pattern_keys": ["recursive_delete"],
+                    "description": "recursive delete",
+                },
+            )
+        finally:
+            mod._gateway_queues.pop(session_key, None)
+
+        assert decision["resolved"] is True
+        assert decision["choice"] == "deny"
+        assert len(notified) == 1
+        assert notified[0]["approval_id"] == decision["approval_id"]
+        assert notified[0]["approval_id"]
+
+    def test_command_pending_fallback_returns_identity(self):
+        from unittest.mock import patch as _patch
+
+        from tools import approval as mod
+
+        mod._pending.clear()
+        cfg = {"approvals": {"mode": "manual"}}
+        try:
+            with _patch("hermes_cli.config.load_config", return_value=cfg), \
+                 _patch("tools.approval._is_gateway_approval_context", return_value=True), \
+                 _patch("tools.approval._get_approval_mode", return_value="manual"):
+                result = mod.check_all_command_guards("rm -rf .git", "local")
+        finally:
+            mod._pending.clear()
+
+        assert result["status"] == "pending_approval"
+        assert result["approval_pending"] is True
+        assert isinstance(result.get("approval_id"), str)
+        assert result["approval_id"]
+
+    def test_generic_pending_paths_fail_closed_when_queue_is_full(self):
+        from unittest.mock import patch as _patch
+
+        from tools import approval as mod
+
+        cfg = {"approvals": {"mode": "manual"}}
+        with _patch("hermes_cli.config.load_config", return_value=cfg), \
+             _patch("tools.approval._is_gateway_approval_context", return_value=True), \
+             _patch("tools.approval._get_approval_mode", return_value="manual"), \
+             _patch("tools.approval.submit_pending", return_value=None):
+            command_result = mod.check_all_command_guards("rm -rf .git", "local")
+            execute_result = mod.check_execute_code_guard("print('x')", "local")
+
+        for result in (command_result, execute_result):
+            assert result["approved"] is False
+            assert result["status"] == "approval_queue_full"
+            assert result["approval_pending"] is False
+            assert "BLOCKED" in result["message"]

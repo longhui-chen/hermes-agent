@@ -93,7 +93,8 @@ class TestRequestToolApproval:
         monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
         submitted = {}
         monkeypatch.setattr(approval, "submit_pending",
-                            lambda sk, data: submitted.update(data))
+                            lambda sk, data: submitted.update(data)
+                            or "test-approval-id-1234567890")
         res = request_tool_approval("browser_navigate", "external URL",
                                     rule_key="ext-nav")
         assert res["approved"] is False
@@ -238,6 +239,7 @@ class TestRequestToolApproval:
         submitted = {}
         monkeypatch.setattr(
             approval, "submit_pending", lambda sk, data: submitted.update(data)
+            or "test-approval-id-1234567890",
         )
 
         result = request_tool_approval(
@@ -248,4 +250,97 @@ class TestRequestToolApproval:
         )
 
         assert result["status"] == "approval_required"
+        assert result["approval_id"] == "test-approval-id-1234567890"
         assert submitted["allow_permanent"] is False
+
+    def test_deferred_one_shot_grant_is_exact_and_consumed_once(self, monkeypatch):
+        session_key = "test-session"
+        approval.clear_session(session_key)
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(
+            approval, "_is_gateway_approval_context", lambda: True
+        )
+
+        first = request_tool_approval(
+            "agentcomputer_cli",
+            "delete notes/a.txt",
+            rule_key="agentcomputer:file.delete:request-a",
+            one_shot=True,
+        )
+        assert first["status"] == "approval_required"
+        assert approval.resolve_gateway_approval(
+            session_key, "once", approval_id=first["approval_id"]
+        ) == 1
+
+        different = request_tool_approval(
+            "agentcomputer_cli",
+            "delete notes/b.txt",
+            rule_key="agentcomputer:file.delete:request-b",
+            one_shot=True,
+        )
+        assert different["status"] == "approval_required"
+
+        replay = request_tool_approval(
+            "agentcomputer_cli",
+            "delete notes/a.txt",
+            rule_key="agentcomputer:file.delete:request-a",
+            one_shot=True,
+        )
+        assert replay["approved"] is True
+        assert replay["user_approved"] is True
+
+        consumed = request_tool_approval(
+            "agentcomputer_cli",
+            "delete notes/a.txt",
+            rule_key="agentcomputer:file.delete:request-a",
+            one_shot=True,
+        )
+        assert consumed["status"] == "approval_required"
+        approval.clear_session(session_key)
+
+    def test_deferred_queue_requires_exact_opaque_id(self, monkeypatch):
+        session_key = "queued-approval-session"
+        approval.clear_session(session_key)
+        monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
+        monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+        monkeypatch.setattr(
+            approval, "get_current_session_key", lambda default="default": session_key
+        )
+
+        first = request_tool_approval(
+            "agentcomputer_cli",
+            "delete notes/a.txt",
+            rule_key="agentcomputer:file.delete:a",
+            one_shot=True,
+        )
+        second = request_tool_approval(
+            "agentcomputer_cli",
+            "delete notes/b.txt",
+            rule_key="agentcomputer:file.delete:b",
+            one_shot=True,
+        )
+
+        assert first["approval_id"] != second["approval_id"]
+        assert approval.resolve_gateway_approval(session_key, "once") == 0
+        assert approval.resolve_gateway_approval(
+            session_key, "once", approval_id="A" * 32
+        ) == 0
+        assert approval.resolve_gateway_approval(
+            session_key, "once", approval_id=first["approval_id"]
+        ) == 1
+
+        replay_first = request_tool_approval(
+            "agentcomputer_cli",
+            "delete notes/a.txt",
+            rule_key="agentcomputer:file.delete:a",
+            one_shot=True,
+        )
+        assert replay_first["approved"] is True
+        still_pending_second = request_tool_approval(
+            "agentcomputer_cli",
+            "delete notes/b.txt",
+            rule_key="agentcomputer:file.delete:b",
+            one_shot=True,
+        )
+        assert still_pending_second["status"] == "approval_required"
+        approval.clear_session(session_key)

@@ -613,14 +613,14 @@ def test_output_transform_uses_last_chained_result(monkeypatch):
     assert result["messages"][-1]["content"] == "safe final"
 
 
-def test_empty_turn_runs_output_transform_and_persists_its_receipt(monkeypatch):
-    receipt = "<!--creation-recommendation-action-result rejected-->"
+def test_empty_turn_runs_output_transform_and_persists_its_text(monkeypatch):
+    transformed_text = "[plugin transformed output]"
 
     def invoke_hook(name, **kwargs):
         if name == "transform_llm_output":
             assert kwargs["response_text"] == ""
             assert kwargs["failed"] is True
-            return [receipt]
+            return [transformed_text]
         return []
 
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
@@ -643,19 +643,19 @@ def test_empty_turn_runs_output_transform_and_persists_its_receipt(monkeypatch):
         _turn_exit_reason="provider_error",
     )
 
-    assert result["final_response"] == receipt
-    assert result["messages"][-1] == {"role": "assistant", "content": receipt}
+    assert result["final_response"] == transformed_text
+    assert result["messages"][-1] == {"role": "assistant", "content": transformed_text}
     assert agent.persisted_messages[-1] == result["messages"][-1]
 
 
 def test_interrupted_turn_runs_output_transform_without_losing_interrupt_history(monkeypatch):
-    receipt = "<!--creation-recommendation-action-result rejected-->"
+    transformed_text = "[plugin transformed output]"
 
     def invoke_hook(name, **kwargs):
         if name == "transform_llm_output":
             assert kwargs["response_text"] == ""
             assert kwargs["interrupted"] is True
-            return [receipt]
+            return [transformed_text]
         return []
 
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
@@ -682,6 +682,6 @@ def test_interrupted_turn_runs_output_transform_without_losing_interrupt_history
         _turn_exit_reason="interrupted",
     )
 
-    assert result["final_response"] == receipt
-    assert result["messages"][-1]["content"] == "Operation interrupted.\n\n" + receipt
+    assert result["final_response"] == transformed_text
+    assert result["messages"][-1]["content"] == "Operation interrupted.\n\n" + transformed_text
     assert agent.persisted_messages[-1] == result["messages"][-1]

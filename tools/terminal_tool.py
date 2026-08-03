@@ -32,6 +32,7 @@ Usage:
 """
 
 import importlib.util
+import hashlib
 import json
 import logging
 import os
@@ -39,7 +40,6 @@ import platform
 import re
 import shlex
 import stat
-import sysconfig
 import time
 import threading
 import atexit
@@ -959,6 +959,9 @@ import sys
 
 
 _CONNECTOR_RUNTIME_SCRIPT = "connector_runtime.py"
+_CONNECTOR_RUNTIME_MAX_SCRIPT_BYTES = 1024 * 1024
+_CONNECTOR_RUNTIME_TRUST_MAX_PATHS = 8192
+_CONNECTOR_RUNTIME_TRUST_MAX_BYTES = 64 * 1024 * 1024
 _CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT = ";&|<>\n()"
 _CONNECTOR_RUNTIME_SHELL_PUNCTUATION = set(_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT)
 _CONNECTOR_RUNTIME_SHELL_GROUP_START = "{"
@@ -996,14 +999,13 @@ _CONNECTOR_RUNTIME_SHELL_OPTIONS_WITH_ARG = {
 _CONNECTOR_RUNTIME_NESTED_SHELL_DEPTH = 8
 _CONNECTOR_RUNTIME_ENV_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
 _CONNECTOR_RUNTIME_TIMEOUT_RE = re.compile(r"(?:\d+(?:\.\d*)?|\.\d+)(?:[smhd])?")
-_CONNECTOR_RUNTIME_TRUST_CUTOFF = time.time()
-
-
 @dataclass(frozen=True)
 class _ConnectorRuntimeRootAnchor:
     configured_root: Path
     resolved_root: Path
     identity: tuple[int, int]
+    tree_digest: str
+    file_digests: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -1014,28 +1016,6 @@ class _ConnectorRuntimeCommand:
 
 
 _CONNECTOR_RUNTIME_ROOT_ANCHOR: Optional[_ConnectorRuntimeRootAnchor] = None
-_CONNECTOR_RUNTIME_STDIN_WRAPPER = r"""
-import json
-import os
-import runpy
-import sys
-
-payload = json.loads(sys.stdin.read() or "{}")
-env = payload.get("env") or {}
-script = payload["script"]
-argv = payload.get("argv") or [script]
-pythonpath = payload.get("pythonpath")
-if isinstance(pythonpath, list):
-    sys.path = [str(item) for item in pythonpath if item]
-for key, value in env.items():
-    if value is not None:
-        os.environ[str(key)] = str(value)
-os.environ.pop("PYTHONPATH", None)
-sys.argv = [script, *[str(arg) for arg in argv[1:]]]
-runpy.run_path(script, run_name="__main__")
-"""
-
-
 def _is_python_executable_token(token: str) -> bool:
     name = Path(token).name.lower()
     return (
@@ -1057,25 +1037,21 @@ def _path_trust_rejection_reason(
     mode = stat.S_IMODE(st.st_mode)
     if euid == 0:
         # A root-running terminal can rewrite root-owned files even when mode
-        # bits look read-only. Trust only the packaged tree that was already in
-        # place before this module was loaded; anything changed afterward may
-        # have been swapped by a model-controlled root terminal.
+        # bits look read-only. Runtime immutability is enforced separately by
+        # the startup-pinned tree/content digest; wall-clock mtime/ctime is not
+        # trustworthy while a device RTC is still synchronising (codex P1).
         if st.st_uid != 0:
             return "uid_not_root"
         if mode & stat.S_IWGRP:
             return "group_writable"
         if mode & stat.S_IWOTH:
             return "world_writable"
-        if enforce_cutoff and st.st_mtime > _CONNECTOR_RUNTIME_TRUST_CUTOFF:
-            return "mtime_after_cutoff"
-        if enforce_cutoff and st.st_ctime > _CONNECTOR_RUNTIME_TRUST_CUTOFF:
-            return "ctime_after_cutoff"
         return None
     if euid is not None and st.st_uid == euid:
         return "owned_by_terminal_user"
     try:
         groups = set(os.getgroups())
-        egid = os.getegid()
+        egid = os.getegid()  # windows-footgun: ok — guarded by try/except
         groups.add(egid)
     except Exception:
         groups = set()
@@ -1096,6 +1072,103 @@ def _path_writable_by_current_user(path: Path, *, enforce_cutoff: bool = True) -
 def _path_identity(path: Path) -> tuple[int, int]:
     st = path.stat()
     return st.st_dev, st.st_ino
+
+
+def _connector_runtime_file_digest(path: Path, expected: os.stat_result) -> str:
+    """Hash one no-follow regular file while pinning its open descriptor."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        before = os.fstat(descriptor)
+        expected_identity = (expected.st_dev, expected.st_ino)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or (before.st_dev, before.st_ino) != expected_identity
+            or before.st_size != expected.st_size
+        ):
+            raise OSError("presets file changed before trust snapshot")
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > expected.st_size:
+                raise OSError("presets file grew during trust snapshot")
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            (after.st_dev, after.st_ino) != expected_identity
+            or after.st_size != before.st_size
+            or size != before.st_size
+        ):
+            raise OSError("presets file changed during trust snapshot")
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
+
+
+def _connector_runtime_tree_snapshot(root: Path) -> tuple[str, dict[str, str]]:
+    """Return a bounded, wall-clock-independent snapshot of a presets tree.
+
+    The digest pins names, file types, inode/device, owner/mode, sizes and file
+    contents. It deliberately excludes mtime/ctime: NTP correcting a cold-boot
+    RTC must not invalidate an otherwise unchanged official preset tree.
+    """
+
+    digest = hashlib.sha256()
+    file_digests: dict[str, str] = {}
+    stack = [root]
+    path_count = 0
+    total_bytes = 0
+    while stack:
+        path = stack.pop()
+        st = path.lstat()
+        path_count += 1
+        if path_count > _CONNECTOR_RUNTIME_TRUST_MAX_PATHS:
+            raise OSError("presets trust snapshot path limit exceeded")
+        try:
+            relative = path.relative_to(root).as_posix() or "."
+        except ValueError as exc:
+            raise OSError("presets trust snapshot escaped root") from exc
+        file_type = stat.S_IFMT(st.st_mode)
+        record = (
+            relative,
+            file_type,
+            stat.S_IMODE(st.st_mode),
+            st.st_dev,
+            st.st_ino,
+            st.st_uid,
+            st.st_gid,
+            st.st_size,
+        )
+        digest.update(repr(record).encode("utf-8", errors="surrogateescape"))
+        digest.update(b"\0")
+
+        if stat.S_ISREG(st.st_mode):
+            if st.st_size < 0:
+                raise OSError("invalid presets file size")
+            total_bytes += st.st_size
+            if total_bytes > _CONNECTOR_RUNTIME_TRUST_MAX_BYTES:
+                raise OSError("presets trust snapshot byte limit exceeded")
+            file_digest = _connector_runtime_file_digest(path, st)
+            file_digests[relative] = file_digest
+            digest.update(file_digest.encode("ascii"))
+            digest.update(b"\0")
+            continue
+        if not stat.S_ISDIR(st.st_mode):
+            raise OSError("presets trust snapshot contains a special path")
+        with os.scandir(path) as entries:
+            children = sorted(
+                (Path(entry.path) for entry in entries),
+                key=lambda child: child.name,
+                reverse=True,
+            )
+        stack.extend(children)
+    return digest.hexdigest(), file_digests
 
 
 def _log_connector_runtime_rejection(reason: str, relative_path: str = "") -> None:
@@ -1126,6 +1199,7 @@ def _capture_connector_runtime_root() -> Optional[_ConnectorRuntimeRootAnchor]:
     try:
         resolved_root = configured_root.resolve(strict=True)
         identity = _path_identity(resolved_root)
+        tree_digest, file_digests = _connector_runtime_tree_snapshot(resolved_root)
     except OSError:
         _log_connector_runtime_rejection("presets_root_unavailable")
         return None
@@ -1134,6 +1208,8 @@ def _capture_connector_runtime_root() -> Optional[_ConnectorRuntimeRootAnchor]:
         configured_root=configured_root,
         resolved_root=resolved_root,
         identity=identity,
+        tree_digest=tree_digest,
+        file_digests=file_digests,
     )
     _CONNECTOR_RUNTIME_ROOT_ANCHOR = anchor
     return anchor
@@ -1165,9 +1241,9 @@ def _connector_runtime_path_is_trusted(
 
     # Shared mount ancestors may legitimately change after Hermes starts (for
     # example, creation of /volume1/subvol/.recycle). They still must have safe
-    # ownership/mode, but their unrelated mtime/ctime is outside the trust
-    # boundary. The pinned version root and everything below it keep the strict
-    # temporal check and reject symlinks.
+    # ownership/mode, but are outside the pinned version-tree digest boundary.
+    # The version root and everything below it reject symlinks and must match
+    # the bounded snapshot captured before any model-authored terminal call.
     root_ancestors = list(resolved_root.parents)
     if any(
         _path_writable_by_current_user(component, enforce_cutoff=False)
@@ -1185,10 +1261,25 @@ def _connector_runtime_path_is_trusted(
             return False
     except OSError:
         return False
-    return not any(
+    if any(
         _path_writable_by_current_user(component, enforce_cutoff=True)
         for component in components
-    )
+    ):
+        return False
+    if expected_root_identity is None:
+        return True
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    if (
+        anchor is None
+        or anchor.identity != expected_root_identity
+        or anchor.resolved_root != resolved_root
+    ):
+        return False
+    try:
+        current_digest, _ = _connector_runtime_tree_snapshot(resolved_root)
+    except OSError:
+        return False
+    return current_digest == anchor.tree_digest
 
 
 def _connector_runtime_trust_rejection_reason(
@@ -1230,6 +1321,20 @@ def _connector_runtime_trust_rejection_reason(
         reason = _path_trust_rejection_reason(component, enforce_cutoff=True)
         if reason is not None:
             return reason
+    if expected_root_identity is not None:
+        anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+        if (
+            anchor is None
+            or anchor.identity != expected_root_identity
+            or anchor.resolved_root != resolved_root
+        ):
+            return "trust_anchor_changed"
+        try:
+            current_digest, _ = _connector_runtime_tree_snapshot(resolved_root)
+        except OSError:
+            return "tree_snapshot_unavailable"
+        if current_digest != anchor.tree_digest:
+            return "tree_changed_since_start"
     return None
 
 
@@ -1487,6 +1592,8 @@ def _connector_runtime_shell_command_argument(arguments: list[str]) -> Optional[
 def _connector_runtime_python_script_index(
     segment: list[str],
     python_index: int,
+    *,
+    script_name: str = _CONNECTOR_RUNTIME_SCRIPT,
 ) -> Optional[int]:
     """Find a script after Python flags without interpreting ``-c``/``-m``."""
     position = python_index + 1
@@ -1507,7 +1614,7 @@ def _connector_runtime_python_script_index(
             position += 1
     if (
         position >= len(segment)
-        or Path(segment[position]).name != _CONNECTOR_RUNTIME_SCRIPT
+        or Path(segment[position]).name != script_name
     ):
         return None
     return position
@@ -1623,45 +1730,56 @@ def _connector_runtime_result_json(
 
 def _connector_runtime_isolated_sys_path(*, script: Path, cwd: Path) -> list[str]:
     """Build a Python import path that excludes model-writable command context."""
-    blocked_exact: set[Path] = set()
-    blocked_roots: set[Path] = set()
-    for raw in ("", ".", str(cwd), os.getcwd()):
-        try:
-            blocked_exact.add(Path(raw or ".").resolve())
-        except OSError:
-            pass
-    for raw in os.environ.get("PYTHONPATH", "").split(os.pathsep):
-        if not raw:
-            continue
-        try:
-            blocked_roots.add(Path(raw).resolve())
-        except OSError:
-            pass
+    del script
+    from tools.trusted_direct_runner import isolated_python_path
 
-    allowed: list[str] = []
-    candidate_paths = list(sys.path)
-    for key in ("stdlib", "platstdlib", "purelib", "platlib"):
-        value = sysconfig.get_paths().get(key)
-        if value:
-            candidate_paths.append(value)
+    return isolated_python_path(cwd=cwd)
 
-    seen: set[str] = set()
-    for raw in candidate_paths:
-        if not raw:
-            continue
-        try:
-            resolved = Path(raw).resolve()
-        except OSError:
-            continue
-        if resolved in blocked_exact:
-            continue
-        if any(resolved == root or root in resolved.parents for root in blocked_roots):
-            continue
-        text = str(resolved)
-        if text not in seen:
-            seen.add(text)
-            allowed.append(text)
-    return allowed
+
+def _read_connector_runtime_script_bytes(
+    script: Path,
+    *,
+    expected_identity: tuple[int, int],
+    expected_digest: Optional[str] = None,
+) -> bytes:
+    """Freeze a verified runner before the worker drops privileges."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(script, flags)
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or (before.st_dev, before.st_ino) != expected_identity
+            or before.st_size < 0
+            or before.st_size > _CONNECTOR_RUNTIME_MAX_SCRIPT_BYTES
+        ):
+            raise OSError("connector runtime snapshot is not trusted")
+        chunks: list[bytes] = []
+        remaining = _CONNECTOR_RUNTIME_MAX_SCRIPT_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            len(payload) > _CONNECTOR_RUNTIME_MAX_SCRIPT_BYTES
+            or (after.st_dev, after.st_ino) != expected_identity
+            or after.st_size != before.st_size
+            or len(payload) != before.st_size
+            or (
+                expected_digest is not None
+                and hashlib.sha256(payload).hexdigest() != expected_digest
+            )
+        ):
+            raise OSError("connector runtime changed while being frozen")
+        return payload
+    finally:
+        os.close(descriptor)
 
 
 def _run_connector_runtime_command_if_allowed(
@@ -1677,9 +1795,13 @@ def _run_connector_runtime_command_if_allowed(
 
     anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
     script = Path(argv[1])
+    expected_digest: Optional[str] = None
     try:
+        relative_script = script.relative_to(anchor.resolved_root).as_posix()
+        expected_digest = anchor.file_digests.get(relative_script)
         identities_match = (
             anchor is not None
+            and expected_digest is not None
             and _path_identity(anchor.resolved_root) == parsed.root_identity
             and _path_identity(script) == parsed.script_identity
             and _connector_runtime_path_is_trusted(
@@ -1700,6 +1822,15 @@ def _run_connector_runtime_command_if_allowed(
             )
         _log_connector_runtime_rejection(reason or "identity_changed_before_exec")
         return None
+    try:
+        script_bytes = _read_connector_runtime_script_bytes(
+            script,
+            expected_identity=parsed.script_identity,
+            expected_digest=expected_digest,
+        )
+    except OSError:
+        _log_connector_runtime_rejection("script_snapshot_failed")
+        return None
 
     secret_values: list[str] = []
     try:
@@ -1715,44 +1846,24 @@ def _run_connector_runtime_command_if_allowed(
             connector_env.get("ZETTLAB_CONNECTORS_URL", ""),
         ]
         run_cwd = cwd if cwd and os.path.isdir(cwd) else os.getcwd()
-        isolated_path = _connector_runtime_isolated_sys_path(
-            script=Path(argv[1]),
+        from tools.trusted_direct_runner import run_trusted_python_script
+
+        completed = run_trusted_python_script(
+            script=script,
+            argv=argv[1:],
             cwd=Path(run_cwd),
-        )
-        payload = json.dumps({
-            "script": argv[1],
-            "argv": argv[1:],
-            "env": connector_env,
-            "pythonpath": isolated_path,
-        })
-        completed = subprocess.run(
-            [sys.executable, "-c", _CONNECTOR_RUNTIME_STDIN_WRAPPER],
-            cwd=run_cwd,
-            env=run_env,
-            capture_output=True,
-            text=True,
+            base_env=run_env,
+            injected_env=connector_env,
             timeout=timeout,
-            input=payload,
+            secret_values=secret_values,
+            script_bytes=script_bytes,
         )
         return _connector_runtime_result_json(
             command=command,
-            output=(completed.stdout or "") + (completed.stderr or ""),
+            output=completed.output,
             returncode=completed.returncode,
             secret_values=secret_values,
-        )
-    except subprocess.TimeoutExpired as e:
-        stdout = e.stdout or ""
-        stderr = e.stderr or ""
-        if isinstance(stdout, bytes):
-            stdout = stdout.decode(errors="replace")
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode(errors="replace")
-        return _connector_runtime_result_json(
-            command=command,
-            output=stdout + stderr,
-            returncode=124,
-            secret_values=secret_values,
-            timed_out=True,
+            timed_out=completed.timed_out,
         )
     except Exception as e:
         return json.dumps({
@@ -1761,6 +1872,861 @@ def _run_connector_runtime_command_if_allowed(
             "error": f"Connector runtime execution failed: {type(e).__name__}: {e}",
             "connector_runtime_direct": True,
         }, ensure_ascii=False)
+
+
+_AGENT_CREATOR_SCRIPT = "create_agent.py"
+_AGENT_CREATOR_RELATIVE_PATH = Path(
+    "skills/agent-creator/scripts/create_agent.py"
+)
+_AGENT_CREATOR_MANIFEST_RELATIVE_PATH = Path(
+    "skills/agent-creator/manifest.yaml"
+)
+_AGENT_CREATOR_ACTION_TOKEN_FD_CAPABILITY = (
+    "zettlab.agent_action_token_fd.v1"
+)
+_AGENT_CREATOR_MAX_PAYLOAD_BYTES = 1024 * 1024
+_AGENTCOMPUTER_MAX_STDIN_BYTES = 4 * 1024 * 1024
+_AGENT_CREATOR_MAX_SCRIPT_BYTES = 1024 * 1024
+_AGENT_CREATOR_MAX_MANIFEST_BYTES = 64 * 1024
+_AGENT_CREATOR_MAX_RUNTIME_CAPABILITIES = 32
+_AGENT_CREATOR_PAYLOAD_KEYS = frozenset({
+    "name",
+    "soul_identity",
+    "soul_style",
+    "greeting",
+    "user_entries",
+    "memory_entries",
+})
+_AGENTCOMPUTER_CLI_VALUE_FLAGS = {
+    ("file", "list"): frozenset({"--path", "--offset", "--limit"}),
+    ("file", "stat"): frozenset({"--path"}),
+    ("file", "read"): frozenset({"--path", "--offset", "--limit"}),
+    ("file", "write"): frozenset({"--path"}),
+    ("file", "mkdir"): frozenset({"--path"}),
+    ("file", "rename"): frozenset({"--source", "--target"}),
+    ("file", "copy"): frozenset({"--source", "--target"}),
+    ("file", "move"): frozenset({"--source", "--target"}),
+    ("file", "delete"): frozenset({"--path"}),
+    ("file", "search"): frozenset({"--path", "--query", "--limit"}),
+    ("system", "status"): frozenset(),
+    ("system", "overview"): frozenset(),
+    ("system", "device"): frozenset(),
+    ("system", "pools"): frozenset(),
+    ("system", "disks"): frozenset(),
+    ("system", "smart-status"): frozenset({"--device"}),
+    ("system", "smart-info"): frozenset({"--device"}),
+    ("system", "network"): frozenset(),
+    ("system", "time"): frozenset(),
+}
+_AGENTCOMPUTER_CLI_BOOL_FLAGS = {
+    ("file", "write"): frozenset({"--stdin", "--overwrite", "--parents"}),
+    ("file", "mkdir"): frozenset({"--parents"}),
+    ("file", "copy"): frozenset({"--overwrite"}),
+    ("file", "move"): frozenset({"--overwrite"}),
+}
+_AGENTCOMPUTER_CLI_REQUIRED_FLAGS = {
+    ("file", "stat"): frozenset({"--path"}),
+    ("file", "read"): frozenset({"--path"}),
+    ("file", "write"): frozenset({"--path", "--stdin"}),
+    ("file", "mkdir"): frozenset({"--path"}),
+    ("file", "rename"): frozenset({"--source", "--target"}),
+    ("file", "copy"): frozenset({"--source", "--target"}),
+    ("file", "move"): frozenset({"--source", "--target"}),
+    ("file", "delete"): frozenset({"--path"}),
+    ("file", "search"): frozenset({"--query"}),
+    ("system", "smart-status"): frozenset({"--device"}),
+    ("system", "smart-info"): frozenset({"--device"}),
+}
+_AGENTCOMPUTER_CLI_PATH_FLAGS = frozenset({"--path", "--source", "--target"})
+_AGENTCOMPUTER_CLI_MUTATIONS = frozenset({
+    ("file", "write"),
+    ("file", "mkdir"),
+    ("file", "copy"),
+    ("file", "rename"),
+    ("file", "move"),
+    ("file", "delete"),
+})
+_AGENT_CREATOR_HEREDOC_RE = re.compile(
+    r"^(?P<command>.+?)\s+<<\s*"
+    r"(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_][A-Za-z0-9_]{0,31})(?P=quote)\s*$"
+)
+
+
+@dataclass(frozen=True)
+class _AgentCreatorCommand:
+    argv: list[str]
+    root_identity: tuple[int, int]
+    script_identity: tuple[int, int]
+    stdin_text: Optional[str]
+    approval_operation: Optional[str]
+
+
+def _agent_creator_blocked_result(
+    code: str,
+    message: str,
+    *,
+    direct: bool = False,
+) -> str:
+    return json.dumps({
+        "output": "",
+        "exit_code": 2,
+        "error": message,
+        "errorCode": code,
+        "status": "error",
+        "agent_creator_direct": direct,
+        "agent_creator_blocked": True,
+    }, ensure_ascii=False)
+
+
+def _agent_creator_shell_guard_result(command: str) -> Optional[str]:
+    """Fail closed when a reserved creator invocation is not exactly allowed."""
+
+    lexer = shlex.shlex(
+        command.strip(),
+        posix=True,
+        punctuation_chars=_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT,
+    )
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION:
+            segments.append([])
+            continue
+        segments[-1].append(token)
+
+    contains_creator_invocation = any(
+        _agent_creator_segment_contains_invocation(segment)
+        for segment in segments
+    )
+    if not contains_creator_invocation:
+        contains_creator_invocation = any(
+            _agent_creator_segment_contains_nested_shell_invocation(segment)
+            for segment in segments
+        )
+    if not contains_creator_invocation:
+        return None
+    return _agent_creator_blocked_result(
+        "agent_creator_command_blocked",
+        (
+            "Agent Creator must run as one direct Python invocation of the "
+            "canonical presets script. Only preflight or create --payload "
+            "with a bounded JSON object is allowed; wrappers, non-canonical "
+            "paths, extra arguments, and shell operators are rejected."
+        ),
+    )
+
+
+def _agent_creator_segment_contains_invocation(segment: list[str]) -> bool:
+    """Recognize creator scripts only where the shell would execute them."""
+
+    for index, token in enumerate(segment):
+        if Path(token).name != _AGENT_CREATOR_SCRIPT:
+            continue
+        if index == 0 or _connector_runtime_command_prefix_is_supported(
+            segment[:index]
+        ):
+            return True
+
+    for index, token in enumerate(segment):
+        if not _is_python_executable_token(token):
+            continue
+        script_index = _connector_runtime_python_script_index(
+            segment,
+            index,
+            script_name=_AGENT_CREATOR_SCRIPT,
+        )
+        if script_index is None:
+            continue
+        if index > 0 and not _connector_runtime_command_prefix_is_supported(
+            segment[:index]
+        ):
+            continue
+        return True
+    return False
+
+
+def _agent_creator_segment_contains_nested_shell_invocation(
+    segment: list[str],
+    *,
+    nested_shell_depth: int = 0,
+) -> bool:
+    if nested_shell_depth >= _CONNECTOR_RUNTIME_NESTED_SHELL_DEPTH:
+        return False
+    for index, token in enumerate(segment):
+        if Path(token).name.lower() not in _CONNECTOR_RUNTIME_COMMAND_SHELLS:
+            continue
+        if index > 0 and not _connector_runtime_command_prefix_is_supported(
+            segment[:index]
+        ):
+            continue
+        nested_command = _connector_runtime_shell_command_argument(
+            segment[index + 1:]
+        )
+        if nested_command is None:
+            continue
+        lexer = shlex.shlex(
+            nested_command.strip(),
+            posix=True,
+            punctuation_chars=_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT,
+        )
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        try:
+            nested_tokens = list(lexer)
+        except ValueError:
+            continue
+        nested_segments: list[list[str]] = [[]]
+        for nested_token in nested_tokens:
+            if (
+                nested_token
+                and set(nested_token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION
+            ):
+                nested_segments.append([])
+                continue
+            nested_segments[-1].append(nested_token)
+        if any(
+            _agent_creator_segment_contains_invocation(nested_segment)
+            for nested_segment in nested_segments
+        ):
+            return True
+        if any(
+            _agent_creator_segment_contains_nested_shell_invocation(
+                nested_segment,
+                nested_shell_depth=nested_shell_depth + 1,
+            )
+            for nested_segment in nested_segments
+        ):
+            return True
+    return False
+
+
+def _log_agent_creator_rejection(reason: str) -> None:
+    logger.warning(
+        "Agent Creator direct runner rejected: reason=%s",
+        reason,
+    )
+
+
+def _resolve_agent_creator_script(raw_path: str) -> Optional[Path]:
+    """Resolve only the fixed creator script below the pinned presets root."""
+
+    anchor = _capture_connector_runtime_root()
+    if anchor is None:
+        return None
+
+    expected = _AGENT_CREATOR_RELATIVE_PATH
+    relative: Optional[Path] = None
+    for prefix in ("$ZETTLAB_PRESETS_DIR/", "${ZETTLAB_PRESETS_DIR}/"):
+        if raw_path.startswith(prefix):
+            relative = Path(raw_path[len(prefix):])
+            break
+    else:
+        supplied = Path(raw_path)
+        if raw_path == expected.as_posix():
+            relative = expected
+        elif not supplied.is_absolute():
+            return None
+        else:
+            expanded = Path(
+                os.path.expandvars(os.path.expanduser(raw_path))
+            ).absolute()
+            for allowed_root in (anchor.configured_root, anchor.resolved_root):
+                try:
+                    relative = expanded.relative_to(allowed_root)
+                    break
+                except ValueError:
+                    continue
+
+    if relative is None or relative != expected or ".." in relative.parts:
+        return None
+
+    candidate = anchor.resolved_root / expected
+    try:
+        resolved = candidate.resolve(strict=True)
+        if resolved.relative_to(anchor.resolved_root) != expected:
+            return None
+    except (OSError, ValueError):
+        return None
+    if not resolved.is_file():
+        return None
+    if not _connector_runtime_path_is_trusted(
+        candidate,
+        anchor.resolved_root,
+        expected_root_identity=anchor.identity,
+    ):
+        reason = _connector_runtime_trust_rejection_reason(
+            candidate,
+            anchor.resolved_root,
+            expected_root_identity=anchor.identity,
+        )
+        _log_agent_creator_rejection(reason or "trust_check_failed")
+        return None
+    return resolved
+
+
+def _split_agent_creator_heredoc(
+    command: str,
+) -> tuple[str, Optional[str]]:
+    """Return the direct command line and optional validated heredoc body."""
+
+    if "\n" not in command:
+        return command.strip(), None
+    first_line, remainder = command.split("\n", 1)
+    first_line = first_line.rstrip("\r")
+    match = _AGENT_CREATOR_HEREDOC_RE.fullmatch(first_line)
+    if match is None:
+        raise ValueError("unsupported stdin shape")
+
+    delimiter = match.group("delimiter")
+    suffix = f"\n{delimiter}"
+    if remainder.endswith(suffix + "\n"):
+        payload = remainder[: -len(suffix + "\n")]
+    elif remainder.endswith(suffix):
+        payload = remainder[: -len(suffix)]
+    else:
+        raise ValueError("missing heredoc terminator")
+    if not payload:
+        raise ValueError("empty payload")
+    return match.group("command").strip(), payload
+
+
+def _validate_agent_creator_payload(payload: str) -> str:
+    if len(payload.encode("utf-8")) > _AGENT_CREATOR_MAX_PAYLOAD_BYTES:
+        raise ValueError("payload too large")
+
+    def reject_constant(value: str):
+        raise ValueError(f"invalid JSON constant {value}")
+
+    try:
+        value = json.loads(payload, parse_constant=reject_constant)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError("payload must be one JSON object") from exc
+    if not isinstance(value, dict):
+        raise ValueError("payload must be one JSON object")
+    if any(
+        not isinstance(key, str) or key not in _AGENT_CREATOR_PAYLOAD_KEYS
+        for key in value
+    ):
+        raise ValueError("payload contains unsupported fields")
+    try:
+        normalized = json.dumps(
+            value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValueError("payload must be one JSON object") from exc
+    if len(normalized.encode("utf-8")) > _AGENT_CREATOR_MAX_PAYLOAD_BYTES:
+        raise ValueError("payload too large")
+    return normalized
+
+
+def _validate_agentcomputer_cli_args(args: list[str]) -> bool:
+    """Validate the exact zettctl grammar before any secret is acquired."""
+
+    if len(args) < 2 or len(args) > 24:
+        raise ValueError("unsupported AgentComputer CLI command")
+    command = (args[0], args[1])
+    value_flags = _AGENTCOMPUTER_CLI_VALUE_FLAGS.get(command)
+    if value_flags is None:
+        raise ValueError("unsupported AgentComputer CLI command")
+    bool_flags = _AGENTCOMPUTER_CLI_BOOL_FLAGS.get(command, frozenset())
+    seen: set[str] = set()
+    index = 2
+    while index < len(args):
+        flag = args[index]
+        if flag in seen:
+            raise ValueError("duplicate AgentComputer CLI flag")
+        if flag in bool_flags:
+            seen.add(flag)
+            index += 1
+            continue
+        if flag not in value_flags or index + 1 >= len(args):
+            raise ValueError("unsupported AgentComputer CLI flag")
+        value = args[index + 1]
+        if (
+            not value
+            or value.startswith("--")
+            or "\x00" in value
+            or len(value.encode("utf-8")) > 4096
+        ):
+            raise ValueError("invalid AgentComputer CLI value")
+        if flag in _AGENTCOMPUTER_CLI_PATH_FLAGS:
+            parts = value.split("/")
+            if value.startswith("/") or "\\" in value or ".." in parts:
+                raise ValueError("AgentComputer file paths must be workspace-relative")
+        seen.add(flag)
+        index += 2
+    required = _AGENTCOMPUTER_CLI_REQUIRED_FLAGS.get(command, frozenset())
+    if not required.issubset(seen):
+        raise ValueError("required AgentComputer CLI flag is missing")
+    return command == ("file", "write")
+
+
+def _parse_agent_creator_command(command: str) -> Optional[_AgentCreatorCommand]:
+    try:
+        command_line, heredoc_payload = _split_agent_creator_heredoc(command)
+    except ValueError:
+        return None
+
+    lexer = shlex.shlex(
+        command_line,
+        posix=True,
+        punctuation_chars=_CONNECTOR_RUNTIME_SHELL_PUNCTUATION_TEXT,
+    )
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    if len(tokens) < 3 or not _is_python_executable_token(tokens[0]):
+        return None
+    if any(
+        token and set(token) <= _CONNECTOR_RUNTIME_SHELL_PUNCTUATION
+        for token in tokens
+    ):
+        return None
+    if Path(tokens[1]).name != _AGENT_CREATOR_SCRIPT:
+        return None
+
+    script = _resolve_agent_creator_script(tokens[1])
+    if script is None:
+        return None
+
+    args = tokens[2:]
+    stdin_text: Optional[str] = None
+    approval_operation: Optional[str] = None
+    if args in (["preflight"], ["list"]):
+        if heredoc_payload is not None:
+            return None
+    elif len(args) == 3 and args[:2] == ["create", "--payload"]:
+        if args[2] == "-":
+            if heredoc_payload is None:
+                return None
+            try:
+                stdin_text = _validate_agent_creator_payload(heredoc_payload) + "\n"
+            except ValueError:
+                return None
+        else:
+            if heredoc_payload is not None:
+                return None
+            try:
+                args[2] = _validate_agent_creator_payload(args[2])
+            except ValueError:
+                return None
+        approval_operation = "agent.create"
+    elif args and args[0] == "cli":
+        cli_args = args[1:]
+        try:
+            requires_stdin = _validate_agentcomputer_cli_args(cli_args)
+        except (UnicodeEncodeError, ValueError):
+            return None
+        cli_operation = tuple(cli_args[:2])
+        if cli_operation in _AGENTCOMPUTER_CLI_MUTATIONS:
+            approval_operation = ".".join(cli_operation)
+        if requires_stdin:
+            if heredoc_payload is None:
+                return None
+            try:
+                payload_size = len(heredoc_payload.encode("utf-8"))
+            except UnicodeEncodeError:
+                return None
+            if (
+                payload_size == 0
+                or payload_size > _AGENTCOMPUTER_MAX_STDIN_BYTES
+                or "\x00" in heredoc_payload
+            ):
+                return None
+            stdin_text = heredoc_payload
+        elif heredoc_payload is not None:
+            return None
+    else:
+        return None
+
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    if anchor is None:
+        return None
+    try:
+        script_identity = _path_identity(script)
+    except OSError:
+        return None
+    return _AgentCreatorCommand(
+        argv=[sys.executable, str(script), *args],
+        root_identity=anchor.identity,
+        script_identity=script_identity,
+        stdin_text=stdin_text,
+        approval_operation=approval_operation,
+    )
+
+
+def _request_agentcomputer_mutation_approval(
+    parsed: _AgentCreatorCommand,
+) -> Optional[str]:
+    """Require a fresh human decision before a data-changing CLI operation."""
+
+    operation = parsed.approval_operation
+    if operation is None:
+        return None
+
+    from tools.approval import request_tool_approval
+
+    fingerprint = hashlib.sha256()
+    for value in parsed.argv[2:]:
+        encoded = value.encode("utf-8")
+        fingerprint.update(len(encoded).to_bytes(8, "big"))
+        fingerprint.update(encoded)
+    stdin_bytes = (parsed.stdin_text or "").encode("utf-8")
+    fingerprint.update(len(stdin_bytes).to_bytes(8, "big"))
+    fingerprint.update(stdin_bytes)
+
+    fingerprint_hex = fingerprint.hexdigest()
+    shell_argv = shlex.join(["agentcomputer", *parsed.argv[2:]])
+    shell_argv_sha256 = hashlib.sha256(shell_argv.encode("utf-8")).hexdigest()
+    max_argv_display_chars = 2048
+    if len(shell_argv) > max_argv_display_chars:
+        shell_argv_display = (
+            shell_argv[:max_argv_display_chars]
+            + "\n[argv display truncated: "
+            + f"chars={len(shell_argv)} sha256={shell_argv_sha256}]"
+        )
+    else:
+        shell_argv_display = shell_argv
+    stdin_sha256 = hashlib.sha256(stdin_bytes).hexdigest()
+    stdin_text = parsed.stdin_text or ""
+    max_preview_chars = 512
+    if len(stdin_text) <= max_preview_chars:
+        stdin_preview = json.dumps(stdin_text, ensure_ascii=True)
+    else:
+        head_chars = 320
+        tail_chars = 128
+        omitted_chars = len(stdin_text) - head_chars - tail_chars
+        stdin_preview = (
+            json.dumps(stdin_text[:head_chars], ensure_ascii=True)
+            + "\n[stdin preview truncated: "
+            + f"chars={len(stdin_text)} omitted={omitted_chars}]\n"
+            + json.dumps(stdin_text[-tail_chars:], ensure_ascii=True)
+        )
+    display_target = (
+        f"argv: {shell_argv_display}\n"
+        f"stdin: bytes={len(stdin_bytes)} sha256={stdin_sha256}\n"
+        f"stdin preview: {stdin_preview}\n"
+        f"approval fingerprint: sha256={fingerprint_hex}"
+    )
+
+    approval = request_tool_approval(
+        "agentcomputer_cli",
+        f"AgentComputer {operation} modifies AgentComputer user data.",
+        rule_key=(
+            f"agentcomputer:{operation}:{fingerprint_hex}"
+        ),
+        approval_callback=_get_approval_callback(),
+        one_shot=True,
+        allow_yolo_bypass=False,
+        display_target=display_target,
+    )
+    if approval.get("approved"):
+        return None
+
+    pending = approval.get("status") in {
+        "approval_required",
+        "pending_approval",
+    }
+    return json.dumps({
+        "output": "",
+        "exit_code": -1,
+        "error": "" if pending else approval.get(
+            "message",
+            f"AgentComputer {operation} was not approved.",
+        ),
+        "status": "pending_approval" if pending else "blocked",
+        "approval_pending": pending,
+        "approval_id": approval.get("approval_id"),
+        "command": approval.get("command", f"agentcomputer {operation}"),
+        "description": approval.get(
+            "description",
+            f"AgentComputer {operation} modifies AgentComputer user data.",
+        ),
+        "pattern_key": approval.get("pattern_key", f"agentcomputer:{operation}"),
+        "smart_denied": approval.get("smart_denied", False),
+        "allow_permanent": False,
+        "agent_creator_direct": True,
+    }, ensure_ascii=False)
+
+
+def _read_verified_agent_creator_file(
+    path: Path,
+    *,
+    expected_identity: tuple[int, int],
+    max_bytes: int,
+    expected_digest: Optional[str] = None,
+) -> bytes:
+    """Freeze one trusted regular file through a non-following descriptor."""
+
+    flags = os.O_RDONLY
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        file_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(file_stat.st_mode)
+            or (file_stat.st_dev, file_stat.st_ino) != expected_identity
+            or file_stat.st_size > max_bytes
+        ):
+            raise OSError("agent creator trusted file identity invalid")
+
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(
+                descriptor,
+                min(64 * 1024, max_bytes + 1 - total),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > max_bytes:
+                raise OSError("agent creator trusted file too large")
+        payload = b"".join(chunks)
+        after = os.fstat(descriptor)
+        if (
+            (after.st_dev, after.st_ino) != expected_identity
+            or after.st_size != file_stat.st_size
+            or len(payload) != file_stat.st_size
+            or (
+                expected_digest is not None
+                and hashlib.sha256(payload).hexdigest() != expected_digest
+            )
+        ):
+            raise OSError("agent creator trusted file changed")
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+def _read_verified_agent_creator_script(
+    script: Path,
+    *,
+    expected_identity: tuple[int, int],
+    expected_digest: Optional[str] = None,
+) -> bytes:
+    """Freeze the verified script source before any scoped secret is injected."""
+
+    return _read_verified_agent_creator_file(
+        script,
+        expected_identity=expected_identity,
+        max_bytes=_AGENT_CREATOR_MAX_SCRIPT_BYTES,
+        expected_digest=expected_digest,
+    )
+
+
+def _agent_creator_manifest_supports_action_token_fd(
+    anchor: _ConnectorRuntimeRootAnchor,
+) -> bool:
+    """Validate the preset ABI before acquiring or injecting a scoped token."""
+
+    manifest = anchor.resolved_root / _AGENT_CREATOR_MANIFEST_RELATIVE_PATH
+    if not _connector_runtime_path_is_trusted(
+        manifest,
+        anchor.resolved_root,
+        expected_root_identity=anchor.identity,
+    ):
+        _log_agent_creator_rejection("manifest_trust_check_failed")
+        return False
+
+    try:
+        manifest_identity = _path_identity(manifest)
+        manifest_digest = anchor.file_digests.get(
+            manifest.relative_to(anchor.resolved_root).as_posix()
+        )
+        if manifest_digest is None:
+            raise OSError("manifest absent from startup trust snapshot")
+        raw = _read_verified_agent_creator_file(
+            manifest,
+            expected_identity=manifest_identity,
+            max_bytes=_AGENT_CREATOR_MAX_MANIFEST_BYTES,
+            expected_digest=manifest_digest,
+        )
+
+        import yaml
+
+        loaded = yaml.safe_load(raw.decode("utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError("manifest root must be a mapping")
+        capabilities = loaded.get("runtime_capabilities")
+        if (
+            not isinstance(capabilities, list)
+            or len(capabilities) > _AGENT_CREATOR_MAX_RUNTIME_CAPABILITIES
+            or not all(
+                isinstance(capability, str)
+                and 0 < len(capability) <= 128
+                for capability in capabilities
+            )
+        ):
+            raise ValueError("runtime_capabilities must be a bounded string list")
+        if (
+            _AGENT_CREATOR_ACTION_TOKEN_FD_CAPABILITY
+            not in capabilities
+        ):
+            raise ValueError("action token FD capability missing")
+        if (
+            _path_identity(anchor.resolved_root) != anchor.identity
+            or _path_identity(manifest) != manifest_identity
+            or not _connector_runtime_path_is_trusted(
+                manifest,
+                anchor.resolved_root,
+                expected_root_identity=anchor.identity,
+            )
+        ):
+            raise OSError("manifest trust identity changed")
+    except Exception:
+        _log_agent_creator_rejection("manifest_capability_unavailable")
+        return False
+    return True
+
+
+def _run_agent_creator_command_if_allowed(
+    command: str,
+    *,
+    cwd: str,
+    timeout: int,
+) -> Optional[str]:
+    del cwd
+    parsed = _parse_agent_creator_command(command)
+    if parsed is None:
+        return _agent_creator_shell_guard_result(command)
+
+    anchor = _CONNECTOR_RUNTIME_ROOT_ANCHOR
+    if anchor is None:
+        return _agent_creator_blocked_result(
+            "agent_creator_identity_changed",
+            "Agent Creator trust identity changed before execution.",
+            direct=True,
+        )
+    script = Path(parsed.argv[1])
+    expected_script_digest: Optional[str] = None
+    try:
+        expected_script_digest = anchor.file_digests.get(
+            script.relative_to(anchor.resolved_root).as_posix()
+        )
+        identities_match = (
+            expected_script_digest is not None
+            and _path_identity(anchor.resolved_root) == parsed.root_identity
+            and _path_identity(script) == parsed.script_identity
+            and _connector_runtime_path_is_trusted(
+                script,
+                anchor.resolved_root,
+                expected_root_identity=parsed.root_identity,
+            )
+        )
+    except OSError:
+        identities_match = False
+    if not identities_match:
+        return _agent_creator_blocked_result(
+            "agent_creator_identity_changed",
+            "Agent Creator trust identity changed before execution.",
+            direct=True,
+        )
+
+    approval_result = _request_agentcomputer_mutation_approval(parsed)
+    if approval_result is not None:
+        return approval_result
+
+    try:
+        script_bytes = _read_verified_agent_creator_script(
+            script,
+            expected_identity=parsed.script_identity,
+            expected_digest=expected_script_digest,
+        )
+        if (
+            _path_identity(anchor.resolved_root) != parsed.root_identity
+            or not _connector_runtime_path_is_trusted(
+                script,
+                anchor.resolved_root,
+                expected_root_identity=parsed.root_identity,
+            )
+        ):
+            raise OSError("agent creator trust identity changed")
+    except OSError:
+        return _agent_creator_blocked_result(
+            "agent_creator_identity_changed",
+            "Agent Creator trust identity changed before execution.",
+            direct=True,
+        )
+
+    if not _agent_creator_manifest_supports_action_token_fd(anchor):
+        return _agent_creator_blocked_result(
+            "agent_creator_runtime_capability_unavailable",
+            (
+                "Agent Creator is unavailable because the installed preset "
+                "does not support the scoped authorization channel."
+            ),
+            direct=True,
+        )
+
+    try:
+        from tools.environments.local import build_agent_creator_runtime_env
+
+        creator_env = build_agent_creator_runtime_env()
+    except Exception:
+        return _agent_creator_blocked_result(
+            "agent_creator_scope_unavailable",
+            "Agent Creator is unavailable because its scoped authorization is missing.",
+            direct=True,
+        )
+
+    token = creator_env.pop("ZETTLAB_AGENT_ACTION_TOKEN", "")
+    turn_id = creator_env.get("ZETTLAB_TURN_ID", "")
+    try:
+        from tools.environments.local import _sanitize_subprocess_env
+        from tools.trusted_direct_runner import run_trusted_python_script
+
+        run_env = _sanitize_subprocess_env(os.environ)
+        run_env.pop("ZETTLAB_TURN_ID", None)
+        completed = run_trusted_python_script(
+            script=script,
+            argv=parsed.argv[1:],
+            cwd=anchor.resolved_root,
+            base_env=run_env,
+            injected_env=creator_env,
+            injected_secrets={"ZETTLAB_AGENT_ACTION_TOKEN": token},
+            timeout=timeout,
+            stdin_text=parsed.stdin_text,
+            secret_values=(token, turn_id),
+            script_bytes=script_bytes,
+            stdlib_only=True,
+        )
+    except Exception:
+        return json.dumps({
+            "output": "",
+            "exit_code": -1,
+            "error": "Agent Creator execution failed.",
+            "agent_creator_direct": True,
+        }, ensure_ascii=False)
+
+    error = None
+    if completed.timed_out:
+        error = "Command timed out while running Agent Creator."
+    elif completed.interrupted:
+        error = "Agent Creator was interrupted."
+    return json.dumps({
+        "output": completed.output,
+        "exit_code": completed.returncode,
+        "error": error,
+        "agent_creator_direct": True,
+    }, ensure_ascii=False)
 
 
 # Tool description for LLM
@@ -1790,6 +2756,7 @@ Do NOT use vim/nano/interactive tools without pty=true — they hang without a p
 # Global state for environment lifecycle management
 _active_environments: Dict[str, Any] = {}
 _last_activity: Dict[str, float] = {}
+_environment_profile_owners: Dict[str, str] = {}
 _env_lock = threading.Lock()
 _creation_locks: Dict[str, threading.Lock] = {}  # Per-task locks for sandbox creation
 _creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
@@ -1878,6 +2845,53 @@ def _maybe_reap_docker_orphans(container_config: Dict[str, Any]) -> None:
 # Thread-safe because each task_id is unique per rollout.
 _task_env_overrides: Dict[str, Dict[str, Any]] = {}
 
+_MANAGED_PROFILE_REGISTRY_PREFIX = "managed-profile:"
+
+
+def _canonical_managed_profile_home(profile_home: object | None = None) -> str | None:
+    """Resolve the canonical owner used to isolate multiplex terminal state."""
+    if profile_home is None:
+        if os.environ.get("HERMES_MANAGED_GATEWAY") != "1":
+            return None
+        try:
+            from hermes_constants import get_hermes_home
+
+            profile_home = get_hermes_home()
+        except Exception:
+            return None
+    raw = str(profile_home or "").strip()
+    if not raw or "\x00" in raw:
+        return None
+    try:
+        return os.path.normcase(
+            os.path.realpath(os.path.abspath(os.path.expanduser(raw)))
+        )
+    except (OSError, ValueError):
+        return None
+
+
+def _managed_profile_registry_prefix(profile_home: object | None = None) -> str:
+    """Return an opaque, stable registry prefix for one profile owner."""
+    canonical = _canonical_managed_profile_home(profile_home)
+    if canonical is None:
+        return ""
+    import hashlib
+
+    digest = hashlib.sha256(
+        canonical.encode("utf-8", errors="surrogatepass")
+    ).hexdigest()
+    return f"{_MANAGED_PROFILE_REGISTRY_PREFIX}{digest}:"
+
+
+def _managed_profile_registry_key(
+    task_id: Optional[str],
+    profile_home: object | None = None,
+) -> str:
+    """Bind a task/session key to its canonical multiplex profile owner."""
+    raw = str(task_id or "default")
+    prefix = _managed_profile_registry_prefix(profile_home)
+    return f"{prefix}{raw}" if prefix else raw
+
 # ── Per-session cwd records (cwd rearchitecture, step 1) ────────────────────
 #
 # The durable source of truth for "which directory is THIS session working
@@ -1907,7 +2921,7 @@ def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
     """
     if not isinstance(cwd, str) or not cwd.strip():
         return
-    key = str(session_key or "default")
+    key = _managed_profile_registry_key(session_key)
     with _session_cwd_lock:
         if _session_cwd.get(key) != cwd:
             _session_cwd[key] = cwd
@@ -1920,15 +2934,16 @@ def get_session_cwd(session_key: Optional[str]) -> Optional[str]:
     means (config default, TERMINAL_CWD seed, process cwd). ``None``/empty
     keys read the ``"default"`` record.
     """
-    key = str(session_key or "default")
+    key = _managed_profile_registry_key(session_key)
     with _session_cwd_lock:
         return _session_cwd.get(key)
 
 
 def clear_session_cwd(session_key: str) -> None:
     """Drop a session's cwd record (session teardown)."""
+    key = _managed_profile_registry_key(session_key)
     with _session_cwd_lock:
-        _session_cwd.pop(session_key, None)
+        _session_cwd.pop(key, None)
 
 
 def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
@@ -1947,7 +2962,8 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         task_id: The rollout's unique task identifier
         overrides: Dict of config keys to override
     """
-    _task_env_overrides[task_id] = overrides
+    raw_task_key = _managed_profile_registry_key(task_id)
+    _task_env_overrides[raw_task_key] = overrides
 
     # If a live environment already exists for this task, a freshly registered
     # ``cwd`` override (e.g. the ACP client switching the editor's project root
@@ -1966,7 +2982,7 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         # updates the originating session's env.
         container_id = _resolve_container_task_id(task_id)
         with _env_lock:
-            env = _active_environments.get(task_id) or _active_environments.get(container_id)
+            env = _active_environments.get(raw_task_key) or _active_environments.get(container_id)
         if env is not None and getattr(env, "cwd", None) is not None:
             env.cwd = new_cwd
 
@@ -1977,7 +2993,7 @@ def clear_task_env_overrides(task_id: str):
 
     Called during cleanup to avoid stale entries accumulating.
     """
-    _task_env_overrides.pop(task_id, None)
+    _task_env_overrides.pop(_managed_profile_registry_key(task_id), None)
     clear_session_cwd(task_id)
 
 
@@ -2009,11 +3025,12 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
         "docker_image", "modal_image", "singularity_image",
         "daytona_image", "env_type",
     })
-    if task_id and task_id in _task_env_overrides:
-        overrides = _task_env_overrides[task_id]
+    raw_task_key = _managed_profile_registry_key(task_id)
+    if task_id and raw_task_key in _task_env_overrides:
+        overrides = _task_env_overrides[raw_task_key]
         if set(overrides.keys()) & _ISOLATION_KEYS:
-            return task_id
-    return "default"
+            return raw_task_key
+    return _managed_profile_registry_key("default")
 
 
 def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
@@ -2028,10 +3045,10 @@ def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
     the originating session's override is silently dropped. This is the single
     source of that lookup so the terminal and file layers can't drift apart.
     """
-    raw = task_id or "default"
+    raw = _managed_profile_registry_key(task_id)
     return (
         _task_env_overrides.get(raw)
-        or _task_env_overrides.get(_resolve_container_task_id(raw))
+        or _task_env_overrides.get(_resolve_container_task_id(task_id))
         or {}
     )
 
@@ -2451,7 +3468,14 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     try:
         from tools.process_registry import process_registry
         for task_id in list(_last_activity.keys()):
-            if process_registry.has_active_processes(task_id):
+            profile_owner = _environment_profile_owners.get(task_id)
+            if profile_owner:
+                has_active = process_registry.has_active_processes_for_profile(
+                    task_id, profile_owner
+                )
+            else:
+                has_active = process_registry.has_active_processes(task_id)
+            if has_active:
                 _last_activity[task_id] = current_time  # Keep sandbox alive
     except ImportError:
         pass
@@ -2467,6 +3491,7 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
             if current_time - last_time > lifetime_seconds:
                 env = _active_environments.pop(task_id, None)
                 _last_activity.pop(task_id, None)
+                _environment_profile_owners.pop(task_id, None)
                 if env is not None:
                     envs_to_stop.append((task_id, env))
 
@@ -2544,8 +3569,9 @@ def _stop_cleanup_thread():
 def get_active_env(task_id: str):
     """Return the active BaseEnvironment for *task_id*, or None."""
     lookup = _resolve_container_task_id(task_id)
+    raw_task_key = _managed_profile_registry_key(task_id)
     with _env_lock:
-        return _active_environments.get(lookup) or _active_environments.get(task_id)
+        return _active_environments.get(lookup) or _active_environments.get(raw_task_key)
 
 
 def is_persistent_env(task_id: str) -> bool:
@@ -2574,7 +3600,7 @@ def cleanup_all_environments():
     
     for task_id in task_ids:
         try:
-            cleanup_vm(task_id)
+            cleanup_vm(task_id, _already_scoped=True)
             cleaned += 1
         except Exception as e:
             logger.error("Error cleaning %s: %s", task_id, e, exc_info=True)
@@ -2594,7 +3620,12 @@ def cleanup_all_environments():
     return cleaned
 
 
-def cleanup_vm(task_id: str, *, force_remove: bool = False):
+def cleanup_vm(
+    task_id: str,
+    *,
+    force_remove: bool = False,
+    _already_scoped: bool = False,
+):
     """Manually clean up a specific environment by task_id.
 
     *force_remove* (default False) is forwarded to backends that accept it
@@ -2618,19 +3649,21 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     # Remove from tracking dicts while holding the lock, but defer the
     # actual (potentially slow) env.cleanup() call to outside the lock
     # so other tool calls aren't blocked.
+    registry_key = task_id if _already_scoped else _resolve_container_task_id(task_id)
     env = None
     with _env_lock:
-        env = _active_environments.pop(task_id, None)
-        _last_activity.pop(task_id, None)
+        env = _active_environments.pop(registry_key, None)
+        _last_activity.pop(registry_key, None)
+        _environment_profile_owners.pop(registry_key, None)
 
     # Clean up per-task creation lock
     with _creation_locks_lock:
-        _creation_locks.pop(task_id, None)
+        _creation_locks.pop(registry_key, None)
 
     # Invalidate stale file_ops cache entry
     try:
         from tools.file_tools import clear_file_ops_cache
-        clear_file_ops_cache(task_id)
+        clear_file_ops_cache(registry_key)
     except ImportError:
         pass
 
@@ -2652,14 +3685,41 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
         elif hasattr(env, 'terminate'):
             env.terminate()
 
-        logger.info("Manually cleaned up environment for task: %s", task_id)
+        logger.info("Manually cleaned up environment for task: %s", registry_key)
 
     except Exception as e:
         error_str = str(e)
         if "404" in error_str or "not found" in error_str.lower():
-            logger.info("Environment for task %s already cleaned up", task_id)
+            logger.info("Environment for task %s already cleaned up", registry_key)
         else:
-            logger.warning("Error cleaning up environment for task %s: %s", task_id, e)
+            logger.warning("Error cleaning up environment for task %s: %s", registry_key, e)
+
+
+def cleanup_managed_profile_environments(profile_home: object) -> int:
+    """Destroy terminal state owned by one unloaded multiplex profile."""
+    prefix = _managed_profile_registry_prefix(profile_home)
+    if not prefix:
+        return 0
+
+    with _env_lock:
+        active_keys = [
+            key for key in _active_environments if key.startswith(prefix)
+        ]
+    for key in active_keys:
+        cleanup_vm(key, force_remove=True, _already_scoped=True)
+
+    with _session_cwd_lock:
+        for key in list(_session_cwd):
+            if key.startswith(prefix):
+                _session_cwd.pop(key, None)
+    for key in list(_task_env_overrides):
+        if key.startswith(prefix):
+            _task_env_overrides.pop(key, None)
+    with _creation_locks_lock:
+        for key in list(_creation_locks):
+            if key.startswith(prefix):
+                _creation_locks.pop(key, None)
+    return len(active_keys)
 
 
 def _atexit_cleanup():
@@ -2971,6 +4031,10 @@ def terminal_tool(
         # every delegate_task child share one container; only task_ids with
         # a registered env override (RL benchmarks) get isolated sandboxes.
         effective_task_id = _resolve_container_task_id(task_id)
+        raw_task_key = _managed_profile_registry_key(task_id)
+        environment_profile_owner = None
+        if os.environ.get("HERMES_MANAGED_GATEWAY") == "1":
+            environment_profile_owner = _canonical_managed_profile_home()
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
         # before falling back to global env var config. ``resolve_task_overrides``
@@ -3051,6 +4115,13 @@ def terminal_tool(
                 }, ensure_ascii=False)
 
         if not background and not pty:
+            agent_creator_result = _run_agent_creator_command_if_allowed(
+                command,
+                cwd=workdir or cwd,
+                timeout=effective_timeout,
+            )
+            if agent_creator_result is not None:
+                return agent_creator_result
             connector_runtime_result = _run_connector_runtime_command_if_allowed(
                 command,
                 cwd=workdir or cwd,
@@ -3059,6 +4130,9 @@ def terminal_tool(
             if connector_runtime_result is not None:
                 return connector_runtime_result
         else:
+            agent_creator_result = _agent_creator_shell_guard_result(command)
+            if agent_creator_result is not None:
+                return agent_creator_result
             connector_runtime_result = _connector_runtime_shell_guard_result(command)
             if connector_runtime_result is not None:
                 return connector_runtime_result
@@ -3079,10 +4153,14 @@ def terminal_tool(
             # task_id; honor it instead of spawning a duplicate.
             _existing_key = (
                 effective_task_id if effective_task_id in _active_environments
-                else (task_id if task_id and task_id in _active_environments else None)
+                else (raw_task_key if raw_task_key in _active_environments else None)
             )
             if _existing_key is not None:
                 _last_activity[_existing_key] = time.time()
+                if environment_profile_owner:
+                    _environment_profile_owners[_existing_key] = (
+                        environment_profile_owner
+                    )
                 env = _active_environments[_existing_key]
                 needs_creation = False
             else:
@@ -3100,10 +4178,14 @@ def terminal_tool(
                 with _env_lock:
                     _existing_key = (
                         effective_task_id if effective_task_id in _active_environments
-                        else (task_id if task_id and task_id in _active_environments else None)
+                        else (raw_task_key if raw_task_key in _active_environments else None)
                     )
                     if _existing_key is not None:
                         _last_activity[_existing_key] = time.time()
+                        if environment_profile_owner:
+                            _environment_profile_owners[_existing_key] = (
+                                environment_profile_owner
+                            )
                         env = _active_environments[_existing_key]
                         needs_creation = False
 
@@ -3169,6 +4251,10 @@ def terminal_tool(
                     with _env_lock:
                         _active_environments[effective_task_id] = new_env
                         _last_activity[effective_task_id] = time.time()
+                        if environment_profile_owner:
+                            _environment_profile_owners[effective_task_id] = (
+                                environment_profile_owner
+                            )
                         env = new_env
                     logger.info("%s environment ready for task %s", env_type, effective_task_id[:8])
 
@@ -3514,6 +4600,7 @@ def terminal_tool(
                             "session_id": proc_session.id,
                             "check_interval": 5,
                             "session_key": session_key,
+                            "profile_owner": proc_session.profile_owner,
                             "platform": proc_session.watcher_platform,
                             "chat_id": proc_session.watcher_chat_id,
                             "user_id": proc_session.watcher_user_id,

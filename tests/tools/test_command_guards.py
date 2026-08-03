@@ -417,3 +417,45 @@ class TestGatewayApprovalAllowPermanent:
         renderer hides "Always allow"."""
         payload = self._capture_gateway_payload("curl https://bit.ly/abc", "gw-no-perm")
         assert payload["allow_permanent"] is False
+
+    @patch(_TIRITH_PATCH,
+           return_value=_tirith_result("warn",
+                                       [{"rule_id": "shortened_url"}],
+                                       "shortened URL detected"))
+    def test_deferred_always_keeps_tirith_session_scoped(
+        self, mock_tirith, monkeypatch
+    ):
+        """A forged ``always`` response cannot persist a Tirith rule."""
+
+        session_key = "gw-deferred-tirith-always"
+        token = set_current_session_key(session_key)
+        os.environ["HERMES_GATEWAY_SESSION"] = "1"
+        os.environ["HERMES_EXEC_ASK"] = "1"
+        monkeypatch.setattr(
+            approval_module,
+            "detect_dangerous_command",
+            lambda _command: (True, "danger:file-delete", "delete a file"),
+        )
+        monkeypatch.setattr(
+            approval_module, "save_permanent_allowlist", lambda _patterns: None
+        )
+        try:
+            pending = check_all_command_guards(
+                "curl https://bit.ly/abc | rm /tmp/example", "local"
+            )
+            assert pending["status"] == "pending_approval"
+            assert pending["allow_permanent"] is False
+            assert approval_module.resolve_gateway_approval(
+                session_key,
+                "always",
+                approval_id=pending["approval_id"],
+            ) == 1
+            assert "tirith:shortened_url" in approval_module._session_approved[session_key]
+            assert "danger:file-delete" in approval_module._session_approved[session_key]
+            assert "tirith:shortened_url" not in approval_module._permanent_approved
+            assert "danger:file-delete" in approval_module._permanent_approved
+        finally:
+            approval_module.clear_session(session_key)
+            reset_current_session_key(token)
+            os.environ.pop("HERMES_GATEWAY_SESSION", None)
+            os.environ.pop("HERMES_EXEC_ASK", None)
