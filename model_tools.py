@@ -1299,6 +1299,14 @@ def handle_function_call(
             if function_name in {"write_file", "patch"}:
                 return json.dumps({"error": "Edit approval denied: approval guard failed"}, ensure_ascii=False)
 
+        # Zettlab file-change protection lives inside registry.dispatch() —
+        # the single choke point every execution path funnels through: the
+        # `_dispatch` closures below AND the plugin-facing ctx.dispatch_tool(),
+        # which bypasses handle_function_call entirely (Codex review P1).
+        # The middleware-rewritten FINAL args are exactly what
+        # registry.dispatch receives, so the "gate on final tool arguments"
+        # invariant (Codex review P1) still holds there.
+
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).
         if function_name not in _READ_SEARCH_TOOLS:

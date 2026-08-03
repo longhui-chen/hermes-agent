@@ -41,6 +41,10 @@ load_reconciled_env
 export HERMES_HOME="$APP_BASE/data/hermes_home"
 export HERMES_BUNDLED_SKILLS="$APP_ROOT/lib/hermes-agent/skills"
 export HERMES_BUNDLED_PLUGINS="$APP_ROOT/lib/hermes-agent/plugins"
+export HERMES_LAZY_INSTALL_TARGET="$APP_BASE/data/lazy-packages"
+export HERMES_MANAGED_GATEWAY=1
+export HERMES_MANAGED_CGROUP_UNIT=zettlab-claw.service
+unset HERMES_MANAGED_CGROUP_ROOT
 
 # systemd EnvironmentFile values override Environment= values regardless of
 # their textual order in the unit. Reassert the package-required live override

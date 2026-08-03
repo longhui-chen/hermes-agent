@@ -13,8 +13,11 @@ VOLUME_DATA_TARGET="/volume1/subvol/apps/$(basename "$APP_BASE")/data"
 LOCK_FILE="$SECRET_DIR/prepare-claw-service.lock"
 KEY_FILE="$SECRET_DIR/zet_agent.key"
 ENV_FILE="$SECRET_DIR/zettlab-claw.env"
-DEFAULT_ZETTLAB_PRESETS_DIR="/volume1/subvol/agents/zettlab-presets/current"
-LEGACY_ZETTLAB_PRESETS_DIR="/volume1/agents/zettlab-presets/current"
+PROFILE_PERMISSIONS_MARKER="$SECRET_DIR/profile-permissions-v2.done"
+SUBVOLUME_ZETTLAB_PRESETS_ROOT="/volume1/subvol/agents/zettlab-presets"
+AGENTS_ZETTLAB_PRESETS_ROOT="/volume1/agents/zettlab-presets"
+SUBVOLUME_ZETTLAB_PRESETS_DIR="$SUBVOLUME_ZETTLAB_PRESETS_ROOT/current"
+AGENTS_ZETTLAB_PRESETS_DIR="$AGENTS_ZETTLAB_PRESETS_ROOT/current"
 
 env_file_value() {
     local wanted="$1" name value
@@ -37,6 +40,7 @@ presets_dir_is_trusted() {
     esac
     resolved="$(readlink -f "$candidate" 2>/dev/null || true)"
     [ -n "$resolved" ] && [ -d "$resolved" ] || return 1
+    presets_dir_is_protected "$candidate" "$resolved" || return 1
 
     # The device service runs as root. Validate both the concrete version tree
     # and the lexical parent that owns a possible `current` symlink before
@@ -57,6 +61,22 @@ presets_dir_is_trusted() {
     printf '%s\n' "$candidate"
 }
 
+presets_dir_is_protected() {
+    local candidate="$1" resolved="$2" root resolved_root
+    for root in "$SUBVOLUME_ZETTLAB_PRESETS_ROOT" "$AGENTS_ZETTLAB_PRESETS_ROOT"; do
+        case "$candidate" in
+            "$root"|"$root"/*) ;;
+            *) continue ;;
+        esac
+        resolved_root="$(readlink -f "$root" 2>/dev/null || true)"
+        [ -n "$resolved_root" ] || continue
+        case "$resolved" in
+            "$resolved_root"|"$resolved_root"/*) return 0 ;;
+        esac
+    done
+    return 1
+}
+
 detect_zettlab_presets_dir() {
     local explicit existing candidate trusted
     # ZETTLAB_CLAW_PRESETS_DIR is the systemd/drop-in override seam. The shared
@@ -64,7 +84,7 @@ detect_zettlab_presets_dir() {
     # a unit drop-in cannot beat a persisted value under systemd's precedence.
     explicit="${ZETTLAB_CLAW_PRESETS_DIR:-${ZETTLAB_PRESETS_DIR:-}}"
     existing="$(env_file_value ZETTLAB_PRESETS_DIR || true)"
-    for candidate in "$explicit" "$existing" "$DEFAULT_ZETTLAB_PRESETS_DIR" "$LEGACY_ZETTLAB_PRESETS_DIR"; do
+    for candidate in "$explicit" "$existing" "$SUBVOLUME_ZETTLAB_PRESETS_DIR" "$AGENTS_ZETTLAB_PRESETS_DIR"; do
         if trusted="$(presets_dir_is_trusted "$candidate")"; then
             printf '%s\n' "$trusted"
             return 0
@@ -133,6 +153,7 @@ pin_trusted_data_symlink() {
     LOCK_FILE="$SECRET_DIR/prepare-claw-service.lock"
     KEY_FILE="$SECRET_DIR/zet_agent.key"
     ENV_FILE="$SECRET_DIR/zettlab-claw.env"
+    PROFILE_PERMISSIONS_MARKER="$SECRET_DIR/profile-permissions-v2.done"
 }
 
 secure_state_directories() {
@@ -174,6 +195,132 @@ secure_state_directories() {
             exit 1
         }
     done
+}
+
+secure_profile_secret_files() {
+    local profiles_root="$HERMES_HOME/profiles" path uid process_uid
+    process_uid="$(id -u)"
+
+    if [ -L "$profiles_root" ] || { [ -e "$profiles_root" ] && [ ! -d "$profiles_root" ]; }; then
+        echo "refusing non-directory profile root: $profiles_root" >&2
+        exit 1
+    fi
+    mkdir -p "$profiles_root"
+    uid="$(stat -c '%u' "$profiles_root" 2>/dev/null || stat -f '%u' "$profiles_root" 2>/dev/null || true)"
+    if [ "$uid" != "$process_uid" ]; then
+        echo "refusing profile root not owned by service user: $profiles_root" >&2
+        exit 1
+    fi
+
+    # This root-only traversal barrier is the durable isolation boundary. It is
+    # O(1) on every start, so profile data growth cannot delay service startup.
+    chmod 0700 "$profiles_root"
+
+    path="$HERMES_HOME/.env"
+    if [ -e "$path" ] || [ -L "$path" ]; then
+        if [ -L "$path" ] || [ ! -f "$path" ]; then
+            echo "refusing non-regular profile secret file: $path" >&2
+            exit 1
+        fi
+        uid="$(stat -c '%u' "$path" 2>/dev/null || stat -f '%u' "$path" 2>/dev/null || true)"
+        if [ "$uid" != "$process_uid" ]; then
+            echo "refusing profile secret file not owned by service user: $path" >&2
+            exit 1
+        fi
+        chmod 0600 "$path"
+    fi
+
+    if [ -e "$PROFILE_PERMISSIONS_MARKER" ] || [ -L "$PROFILE_PERMISSIONS_MARKER" ]; then
+        if [ -L "$PROFILE_PERMISSIONS_MARKER" ] || [ ! -f "$PROFILE_PERMISSIONS_MARKER" ]; then
+            echo "refusing non-regular profile permissions marker" >&2
+            exit 1
+        fi
+        uid="$(stat -c '%u' "$PROFILE_PERMISSIONS_MARKER" 2>/dev/null || stat -f '%u' "$PROFILE_PERMISSIONS_MARKER" 2>/dev/null || true)"
+        if [ "$uid" != "$process_uid" ]; then
+            echo "refusing profile permissions marker not owned by service user" >&2
+            exit 1
+        fi
+        chmod 0600 "$PROFILE_PERMISSIONS_MARKER"
+        return
+    fi
+
+    # One bounded pass tightens legacy top-level profiles and their .env files.
+    # Descendants remain protected by the root barrier above; new profiles are
+    # created owner-only by hermes_cli.profiles. The marker keeps normal starts
+    # independent of profile count and state-tree size.
+    HERMES_PROFILES_ROOT="$profiles_root" \
+    HERMES_PROFILE_PERMISSIONS_MARKER="$PROFILE_PERMISSIONS_MARKER" \
+        "$HERMES_PYTHON" - <<'PY'
+import os
+import stat
+import tempfile
+
+profiles_root = os.environ["HERMES_PROFILES_ROOT"]
+marker = os.environ["HERMES_PROFILE_PERMISSIONS_MARKER"]
+try:
+    requested_limit = int(
+        os.environ.get("HERMES_PROFILE_PERMISSION_MIGRATION_MAX_PROFILES", "4096")
+    )
+except ValueError:
+    requested_limit = 4096
+limit = max(1, min(requested_limit, 4096))
+overflow = False
+
+with os.scandir(profiles_root) as entries:
+    for index, entry in enumerate(entries):
+        if index >= limit:
+            overflow = True
+            break
+        info = entry.stat(follow_symlinks=False)
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise SystemExit(f"refusing non-directory profile path: {entry.path}")
+        if info.st_uid != os.geteuid():
+            raise SystemExit(
+                f"refusing profile directory not owned by service user: {entry.path}"
+            )
+        os.chmod(entry.path, 0o700, follow_symlinks=False)
+
+        env_path = os.path.join(entry.path, ".env")
+        try:
+            env_info = os.lstat(env_path)
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(env_info.st_mode) or stat.S_ISLNK(env_info.st_mode):
+            raise SystemExit(f"refusing non-regular profile secret file: {env_path}")
+        if env_info.st_uid != os.geteuid():
+            raise SystemExit(
+                f"refusing profile secret file not owned by service user: {env_path}"
+            )
+        os.chmod(env_path, 0o600, follow_symlinks=False)
+
+marker_dir = os.path.dirname(marker)
+fd, temporary = tempfile.mkstemp(
+    prefix=".profile-permissions-v2.", suffix=".tmp", dir=marker_dir
+)
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="ascii") as stream:
+        stream.write("root-barrier-v2\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, marker)
+finally:
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+
+if overflow:
+    print(
+        f"bounded legacy profile migration stopped after {limit} profiles; "
+        "remaining entries are protected by the owner-only profile root",
+        file=os.sys.stderr,
+    )
+PY
 }
 
 acquire_prepare_lock() {
@@ -283,7 +430,10 @@ write_agent_env() {
                 ZET_AGENT_KEY ZET_AGENT_ENABLED ZET_AGENT_HOST \
                 ZET_AGENT_PORT ZETTLAB_PRESETS_DIR \
                 GATEWAY_MULTIPLEX_PROFILES ZETTLAB_CLAW_PRESETS_DIR \
-                HERMES_HOME HERMES_BUNDLED_SKILLS HERMES_BUNDLED_PLUGINS
+                HERMES_HOME HERMES_BUNDLED_SKILLS HERMES_BUNDLED_PLUGINS \
+                HERMES_LAZY_INSTALL_TARGET \
+                HERMES_MANAGED_GATEWAY HERMES_MANAGED_CGROUP_UNIT \
+                HERMES_MANAGED_CGROUP_ROOT
         fi
     } > "$ENV_FILE.tmp.$$"
     if ! "$HERMES_PYTHON" "$APP_ROOT/parse-environment-file.py" \
@@ -318,6 +468,7 @@ esac
 
 secure_state_directories
 acquire_prepare_lock
+secure_profile_secret_files
 ZETTLAB_PRESETS_DIR="$(detect_zettlab_presets_dir || true)"
 write_agent_env
 

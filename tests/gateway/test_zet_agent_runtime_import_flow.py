@@ -908,6 +908,24 @@ async def test_unload_then_sweep_does_not_recreate_deleted_profile(
     adapter._session_db = db
     adapter._session_dbs = {key: db}
     monkeypatch.setattr(adapter, "_multiplex_profile_homes", lambda: {})
+    from tools.process_registry import process_registry
+
+    purged_profiles = []
+    purged_approval_profiles = []
+    monkeypatch.setattr(
+        process_registry,
+        "purge_profile_state",
+        lambda owner: purged_profiles.append(owner) or {
+            "running_records": 0,
+            "finished_records": 0,
+            "pending_watchers": 0,
+            "completion_events": 0,
+        },
+    )
+    monkeypatch.setattr(
+        "tools.approval.purge_profile_approval_state",
+        lambda owner: purged_approval_profiles.append(owner) or {},
+    )
 
     class _Request(dict):
         def __init__(self):
@@ -923,6 +941,8 @@ async def test_unload_then_sweep_does_not_recreate_deleted_profile(
     response = await adapter._handle_profile_unload(_Request())
     assert response.status == 200
     assert adapter._session_db is None
+    assert purged_profiles == [str(profile_home.resolve())]
+    assert purged_approval_profiles == [str(profile_home.resolve())]
     shutil.rmtree(profile_home)
 
     assert await adapter._cleanup_stale_runtime_imports_once() == 0

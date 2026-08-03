@@ -1,8 +1,8 @@
-# PEP 639 SPDX license expression (`license = "MIT"` below) requires
-# setuptools>=77. Keep this floor in lockstep with the `license` form in
-# [project]; an older build backend rejects the string form.
+# PEP 639 SPDX license expressions require setuptools>=77. Keep this exact
+# backend aligned with the locked `zpk-runtime` extra: ZPK builds disable build
+# isolation so no unreviewed backend can execute outside uv.lock.
 [build-system]
-requires = ["setuptools>=77.0,<83"]
+requires = ["setuptools==81.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -152,6 +152,10 @@ dependencies = [
 # tools/lazy_deps.py — 0.87.0 carries the CVE-2026-34450 / CVE-2026-34452
 # fixes; shipping a lower pin in the ZPK would bundle the vulnerable SDK.
 anthropic = ["anthropic==0.87.0"]
+# ZPK-only runtime bootstrap. Devices need pip for lazy dependency installation.
+# The non-isolated project build also consumes this exact setuptools after the
+# wheel-only dependency sync. Both stay behind the uv.lock hash boundary.
+zpk-runtime = ["pip==26.1.2", "setuptools==81.0.0"]
 # Web search backends — each only loaded when the user picks it as their
 # search provider (configured via `hermes tools` or config.yaml).
 exa = ["exa-py==2.10.2"]

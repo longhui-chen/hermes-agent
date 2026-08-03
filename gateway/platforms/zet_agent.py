@@ -75,6 +75,7 @@ After the first successful exchange, reuse Hermes' native
 
 import asyncio
 import inspect
+import hashlib
 import json
 import logging
 import os
@@ -391,7 +392,8 @@ class ZetAgentAdapter(APIServerAdapter):
         # for any interaction the agent thread is still blocked on.
         self._pending_lock = threading.Lock()
         self._pending_clarify: Dict[str, Dict[str, Any]] = {}
-        self._pending_approval: Dict[str, Dict[str, Any]] = {}
+        self._pending_approval: Dict[str, List[Dict[str, Any]]] = {}
+        self._approval_stream_queues: Dict[str, Any] = {}
 
         # Active chat-completions turns keyed by X-Hermes-Session-Id, so
         # POST /v1/sessions/{sid}/interrupt can find the running agent +
@@ -1290,6 +1292,188 @@ class ZetAgentAdapter(APIServerAdapter):
     # Approval — register notify callback, resolve via HTTP respond
     # ------------------------------------------------------------------
 
+    _APPROVAL_PROJECTION_MAX_PER_SESSION = 16
+    _APPROVAL_PROJECTION_MAX_GLOBAL = 256
+    _APPROVAL_PROJECTION_MAX_BYTES = 512 * 1024
+    _APPROVAL_PROJECTION_COMMAND_CHARS = 4096
+    _APPROVAL_PROJECTION_DESCRIPTION_CHARS = 1024
+
+    @staticmethod
+    def _bounded_approval_projection_text(value: Any, limit: int) -> str:
+        text = str(value or "")
+        if len(text) <= limit:
+            return text
+        digest = hashlib.sha256(
+            text.encode("utf-8", errors="replace")
+        ).hexdigest()
+        half = max(limit // 2, 1)
+        return (
+            f"{text[:half]}\n...[truncated sha256={digest}]...\n"
+            f"{text[-half:]}"
+        )
+
+    def _bounded_approval_projection_payload(
+        self, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        bounded = dict(payload)
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8", errors="replace")
+        ).hexdigest()
+        bounded["command"] = self._bounded_approval_projection_text(
+            payload.get("command", ""),
+            self._APPROVAL_PROJECTION_COMMAND_CHARS,
+        )
+        bounded["description"] = self._bounded_approval_projection_text(
+            payload.get("description", ""),
+            self._APPROVAL_PROJECTION_DESCRIPTION_CHARS,
+        )
+        bounded["pattern_key"] = self._bounded_approval_projection_text(
+            payload.get("pattern_key", ""), 512
+        )
+        bounded["pattern_keys"] = [
+            self._bounded_approval_projection_text(value, 512)
+            for value in list(payload.get("pattern_keys", []) or [])[:32]
+            if value
+        ]
+        bounded["payload_fingerprint"] = fingerprint
+        return bounded
+
+    @staticmethod
+    def _approval_projection_size(payload: Dict[str, Any]) -> int:
+        return len(
+            json.dumps(
+                payload,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                default=str,
+            ).encode("utf-8", errors="replace")
+        )
+
+    def _clear_approval_projections(self, scoped_session_key: str) -> int:
+        with self._pending_lock:
+            raw_queue = self._pending_approval.pop(scoped_session_key, [])
+            getattr(self, "_approval_stream_queues", {}).pop(
+                scoped_session_key, None
+            )
+        if isinstance(raw_queue, dict):
+            return 1
+        return len(raw_queue or [])
+
+    def _approval_projection_head(
+        self, scoped_session_key: str
+    ) -> Optional[Dict[str, Any]]:
+        with self._pending_lock:
+            raw_queue = self._pending_approval.get(scoped_session_key)
+            if isinstance(raw_queue, dict):
+                return raw_queue
+            if raw_queue:
+                return raw_queue[0]
+        return None
+
+    def _cache_approval_projection(
+        self,
+        stream_q: Any,
+        scoped_session_key: str,
+        session_id: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        payload = self._bounded_approval_projection_payload(payload)
+        payload_size = self._approval_projection_size(payload)
+        with self._pending_lock:
+            raw_queue = self._pending_approval.get(scoped_session_key)
+            if isinstance(raw_queue, dict):
+                queue = [raw_queue]
+            else:
+                queue = list(raw_queue or [])
+            if len(queue) >= self._APPROVAL_PROJECTION_MAX_PER_SESSION:
+                raise RuntimeError("approval projection session limit reached")
+            all_payloads = []
+            for existing in self._pending_approval.values():
+                if isinstance(existing, dict):
+                    all_payloads.append(existing)
+                else:
+                    all_payloads.extend(existing or [])
+            if len(all_payloads) >= self._APPROVAL_PROJECTION_MAX_GLOBAL:
+                raise RuntimeError("approval projection global limit reached")
+            total_bytes = sum(
+                self._approval_projection_size(item) for item in all_payloads
+            )
+            if total_bytes + payload_size > self._APPROVAL_PROJECTION_MAX_BYTES:
+                raise RuntimeError("approval projection byte limit reached")
+            should_emit = not queue
+            queue.append(payload)
+            self._pending_approval[scoped_session_key] = queue
+            stream_queues = getattr(self, "_approval_stream_queues", None)
+            if stream_queues is None:
+                stream_queues = {}
+                self._approval_stream_queues = stream_queues
+            stream_queues[scoped_session_key] = stream_q
+        if should_emit:
+            try:
+                stream_q.put(("__tool_progress__", payload))
+            except Exception:
+                self._remove_approval_projection(
+                    scoped_session_key, str(payload.get("approval_id") or "")
+                )
+                raise
+            try:
+                self._goals().on_interaction_pending(session_id)
+            except Exception:
+                logger.debug("[zet_agent] goal waiting projection failed", exc_info=True)
+
+    def _remove_approval_projection(
+        self,
+        scoped_session_key: str,
+        approval_id: Optional[str],
+    ) -> bool:
+        next_payload = None
+        stream_q = None
+        with self._pending_lock:
+            raw_queue = self._pending_approval.get(scoped_session_key)
+            if isinstance(raw_queue, dict):
+                queue = [raw_queue]
+            else:
+                queue = list(raw_queue or [])
+            if not queue:
+                return False
+            target_index = 0
+            if approval_id is not None:
+                target_index = next(
+                    (
+                        index
+                        for index, item in enumerate(queue)
+                        if item.get("approval_id") == approval_id
+                    ),
+                    -1,
+                )
+                if target_index < 0:
+                    return True
+            removed_head = target_index == 0
+            queue.pop(target_index)
+            if queue:
+                self._pending_approval[scoped_session_key] = queue
+                if removed_head:
+                    next_payload = queue[0]
+                    stream_q = getattr(
+                        self, "_approval_stream_queues", {}
+                    ).get(scoped_session_key)
+            else:
+                self._pending_approval.pop(scoped_session_key, None)
+                getattr(self, "_approval_stream_queues", {}).pop(
+                    scoped_session_key, None
+                )
+        if next_payload is not None and stream_q is not None:
+            try:
+                stream_q.put(("__tool_progress__", next_payload))
+            except Exception:
+                logger.debug("[zet_agent] approval projection push failed", exc_info=True)
+        return bool(queue)
+
     def _make_approval_cb(self, stream_q: Any, session_id: str):
         """Return a callable suitable for ``register_gateway_notify``.
 
@@ -1300,9 +1484,10 @@ class ZetAgentAdapter(APIServerAdapter):
         loop) emits it, then return immediately — the agent's wait()
         is what actually blocks the run.
 
-        Plan-E rev4 payload: ``{command, description, pattern_key,
-        pattern_keys, expires_at_ms}`` — no request_id (per-session
-        FIFO; oldest pending wins). expires_at_ms is stamped here from
+        Payload: ``{approval_id, command, description, pattern_key,
+        pattern_keys, expires_at_ms}``. ``approval_id`` binds a response to
+        the exact card; legacy clients may still use FIFO for live prompts.
+        expires_at_ms is stamped here from
         the same approval config the wait loop in tools/approval.py
         reads, so the App's countdown matches the agent's actual deadline.
 
@@ -1310,7 +1495,12 @@ class ZetAgentAdapter(APIServerAdapter):
         reconnecting client can fetch it via the GET /pending endpoint
         and re-render the modal after a ws drop.
         """
-        def _notify(approval_data: Dict[str, Any]) -> None:
+        # Capture profile identity while attaching the callback. The worker
+        # may invoke it after the request context has switched to a sibling
+        # profile with the same public session id.
+        scoped_session_key = self._active_turn_key(session_id)
+
+        def _notify(approval_data: Dict[str, Any]):
             # Stamp the deadline using the same config the wait loop in
             # tools/approval.py reads. The notify callback fires
             # immediately before that wait starts, so a stable config
@@ -1319,25 +1509,35 @@ class ZetAgentAdapter(APIServerAdapter):
             expires_at_ms = int((time.time() + _approval_timeout_seconds()) * 1000)
             payload = {
                 "type": "hermes.approval",
+                "approval_id": approval_data.get("approval_id", ""),
                 "command": approval_data.get("command", ""),
                 "description": approval_data.get("description", ""),
                 "pattern_key": approval_data.get("pattern_key", ""),
                 "pattern_keys": list(approval_data.get("pattern_keys", []) or []),
                 "expires_at_ms": expires_at_ms,
             }
-            with self._pending_lock:
-                self._pending_approval[session_id] = payload
             try:
-                stream_q.put(("__tool_progress__", payload))
+                self._cache_approval_projection(
+                    stream_q, scoped_session_key, session_id, payload
+                )
             except Exception:
                 logger.debug("[zet_agent] approval notify push failed", exc_info=True)
-            # Goal projection: a blocked approval means the loop is waiting
-            # on the user — surface it on the App's goal banner (HR#3: goal
-            # rounds never auto-approve). No-op for non-goal sessions.
-            try:
-                self._goals().on_interaction_pending(session_id)
-            except Exception:
-                logger.debug("[zet_agent] goal waiting projection failed", exc_info=True)
+                raise
+
+            approval_id = str(payload.get("approval_id") or "")
+
+            def _cleanup_projection() -> None:
+                try:
+                    self._remove_approval_projection(
+                        scoped_session_key, approval_id
+                    )
+                except Exception:
+                    logger.debug(
+                        "[zet_agent] approval projection cleanup failed",
+                        exc_info=True,
+                    )
+
+            return _cleanup_projection
 
         return _notify
 
@@ -1929,10 +2129,29 @@ class ZetAgentAdapter(APIServerAdapter):
         # platform disconnect (or never, for short-lived processes).
         if session_id:
             try:
-                from tools.approval import register_gateway_notify
-                register_gateway_notify(session_id, self._make_approval_cb(stream_q, session_id))
+                from tools.approval import (
+                    get_current_session_key,
+                    register_gateway_notify,
+                )
+                approval_session_key = (
+                    get_current_session_key(default=session_id) or session_id
+                )
+                register_gateway_notify(
+                    approval_session_key,
+                    self._make_approval_cb(stream_q, session_id),
+                )
                 with self._session_lock:
-                    self._approval_session_ids.add(session_id)
+                    self._approval_session_ids.add(approval_session_key)
+                with self._pending_lock:
+                    approval_keys = getattr(
+                        self, "_approval_session_keys", None
+                    )
+                    if approval_keys is None:
+                        approval_keys = {}
+                        self._approval_session_keys = approval_keys
+                    approval_keys[self._active_turn_key(session_id)] = (
+                        approval_session_key
+                    )
             except Exception:
                 logger.warning("[zet_agent] failed to register approval notify", exc_info=True)
 
@@ -1976,6 +2195,13 @@ class ZetAgentAdapter(APIServerAdapter):
         webui uses the same pattern (api/streaming.py) and the
         contention window is short enough in practice.
         """
+        # 非流式等调用方不传 agent_ref 时本地补一个：base _run_agent 会把构造
+        # 出的 AIAgent 填进 agent_ref[0]，finally 里的 guard finish 才能拿到本
+        # 轮 _current_turn_id 做精确收尾——否则空 turn_id 收不了尾，写入轮的
+        # pin 只能等服务端 TTL（Codex review P1）。
+        if agent_ref is None:
+            agent_ref = [None]
+
         stream_q = self._sniff_stream_q(tool_start_callback, stream_delta_callback)
         title_user_message = self._title_user_message(user_message)
 
@@ -2152,6 +2378,41 @@ class ZetAgentAdapter(APIServerAdapter):
                     logger.debug("[zet_agent] native auto-title hook failed", exc_info=True)
             return result
         finally:
+            # Zettlab file-change protection: release this turn's protection
+            # snapshot pin.  This lives in `finally` because several
+            # run_conversation error/early-return paths never reach
+            # finalize_turn; reporting is idempotent and a no-op when the turn
+            # never took a protection snapshot.  A missed report is not fatal
+            # either — the pin carries a TTL and a periodic reconciler.
+            try:
+                import asyncio as _asyncio
+                import sys as _sys
+
+                from tools.zettlab_snapshot_guard import finish_turn
+
+                _exc_type = _sys.exc_info()[0]
+                # 断流取消：base writer 先 interrupt() 再 cancel()，但
+                # run_conversation 跑在 executor 线程里，取消这个 asyncio
+                # wrapper 不会立刻停住它——此刻解 pin，恢复点的保护窗口会早于
+                # 前台 terminal / execute_code 的真实写入结束（Codex review
+                # P1）。取消路径一律**不收尾**，把 pin 留给服务端 TTL +
+                # reconcile 自愈：晚一点解 pin 是安全方向，早解不是。
+                if _exc_type is not None and issubclass(_exc_type, _asyncio.CancelledError):
+                    logger.debug(
+                        "[zet_agent] turn cancelled; leaving the protection pin to the server TTL"
+                    )
+                else:
+                    # guard 按 agent 运行时的 _current_turn_id 键控轮状态（与工具
+                    # dispatch 传下去的是同一个值）；并发轮时必须指名收自己的轮。
+                    guard_turn = ""
+                    if agent_ref and agent_ref[0] is not None:
+                        guard_turn = str(getattr(agent_ref[0], "_current_turn_id", "") or "")
+                    finish_turn(
+                        "failed" if _exc_type is not None else "completed",
+                        turn_id=guard_turn,
+                    )
+            except Exception:
+                logger.debug("[zet_agent] snapshot guard finish failed", exc_info=True)
             if old_session_key is None:
                 os.environ.pop("HERMES_SESSION_KEY", None)
             else:
@@ -2260,6 +2521,9 @@ class ZetAgentAdapter(APIServerAdapter):
         register helper always has a list to stash.
         """
         active_ref = agent_ref if agent_ref is not None else [None]
+        scoped_session_key = (
+            self._active_turn_key(session_id) if session_id else ""
+        )
         self._register_active_session_turn(session_id, active_ref, agent_task)
         try:
             return await super()._write_sse_chat_completion(
@@ -2275,6 +2539,8 @@ class ZetAgentAdapter(APIServerAdapter):
             )
         finally:
             self._clear_active_session_turn(session_id, active_ref, agent_task)
+            if scoped_session_key:
+                self._clear_approval_projections(scoped_session_key)
 
     # ------------------------------------------------------------------
     # HTTP respond handlers — wake blocked agent threads
@@ -2284,10 +2550,11 @@ class ZetAgentAdapter(APIServerAdapter):
         """POST /v1/sessions/{session_id}/approval/respond — resolve the
         oldest pending gateway approval for the session.
 
-        Body: ``{"choice": "once"|"session"|"always"|"deny"}``.
-        Plan-E rev4: no approval_id — oldest pending wins. Returns
-        ``resolved`` count (0 means nothing was pending; APP can show
-        a "request expired" hint).
+        Body: ``{"choice": "once"|"session"|"always"|"deny",
+        "approval_id": "..."}``. New clients bind responses to the opaque
+        id. Omitting it preserves FIFO compatibility for a live blocking
+        prompt, but cannot resolve deferred no-notifier requests. Returns
+        ``resolved`` count (0 means nothing matched or was pending).
         """
         auth_err = self._check_auth(request)
         if auth_err:
@@ -2305,9 +2572,26 @@ class ZetAgentAdapter(APIServerAdapter):
                 _openai_error('choice must be one of "once","session","always","deny"'),
                 status=400,
             )
+        approval_id = body.get("approval_id")
+        if approval_id is not None:
+            if (
+                not isinstance(approval_id, str)
+                or not 24 <= len(approval_id) <= 128
+                or any(
+                    char not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+                    for char in approval_id
+                )
+            ):
+                return web.json_response(
+                    _openai_error("approval_id must be an opaque URL-safe token"),
+                    status=400,
+                )
 
         try:
-            from tools.approval import resolve_gateway_approval
+            from tools.approval import (
+                approval_session_key_for_id,
+                resolve_gateway_approval,
+            )
         except Exception as exc:
             logger.exception("[zet_agent] tools.approval import failed")
             return web.json_response(
@@ -2315,16 +2599,42 @@ class ZetAgentAdapter(APIServerAdapter):
                 status=500,
             )
 
-        resolved = resolve_gateway_approval(session_id, choice)
-        with self._pending_lock:
-            self._pending_approval.pop(session_id, None)
+        scoped_session_key = self._active_turn_key(session_id)
+        approval_session_key = session_id
+        if approval_id is not None:
+            approval_session_key = approval_session_key_for_id(approval_id)
+        else:
+            # Legacy clients resolve the live FIFO without an approval id.
+            # The supported X-Hermes-Session-Key may differ from the public URL
+            # session id, so use the profile-scoped registration captured when
+            # the agent was created. Deferred requests still fail closed in
+            # resolve_gateway_approval because they require an opaque id.
+            with self._pending_lock:
+                mapped_session_key = getattr(
+                    self, "_approval_session_keys", {}
+                ).get(self._active_turn_key(session_id))
+            if mapped_session_key:
+                approval_session_key = mapped_session_key
+        resolved = 0
+        if approval_session_key is not None:
+            resolved = resolve_gateway_approval(
+                approval_session_key,
+                choice,
+                approval_id=approval_id,
+            )
+        has_pending_projection = False
+        if resolved:
+            has_pending_projection = self._remove_approval_projection(
+                scoped_session_key,
+                approval_id,
+            )
         # Goal projection: the loop is no longer blocked on the user — flip
         # the App banner back from "waiting". No-op for non-goal sessions.
         # 仅在真的解析了 approval（resolved > 0）时才清等待标记（codex P1）：
         # gateway 重启后内存 queue 已丢、App 对旧卡片的 POST 返回 resolved=0，
         # 此时清掉 sidecar 上的 interaction_pending 会让 reconcile/自动 resume
         # 把本该等确认的 goal 继续自驱（用户点的可能还是 deny）。
-        if resolved:
+        if resolved and not has_pending_projection:
             try:
                 await asyncio.to_thread(self._goals().on_interaction_resolved, session_id)
             except Exception:
@@ -2414,8 +2724,8 @@ class ZetAgentAdapter(APIServerAdapter):
             return auth_err
         session_id = request.match_info.get("session_id", "")
         scoped_session_key = self._active_turn_key(session_id)
+        ap = self._approval_projection_head(scoped_session_key)
         with self._pending_lock:
-            ap = self._pending_approval.get(session_id)
             cl = self._pending_clarify.get(scoped_session_key)
         return web.json_response({
             "approval": ap,
@@ -3106,12 +3416,31 @@ class ZetAgentAdapter(APIServerAdapter):
             except Exception:
                 pass
 
-        # Approval gate: tell hermes the pending approval was denied
-        # so its run loop bails. tools.approval.resolve_gateway_approval
-        # is the same path /v1/sessions/{sid}/approval/respond uses.
+        # Approval gate: atomically revoke queued requests and one-shot replay
+        # grants. A stale approval card must never authorize work after the
+        # interrupted run has ended.
         try:
-            from tools.approval import resolve_gateway_approval
-            resolve_gateway_approval(session_id, "deny")
+            from tools.approval import (
+                approval_session_key_for_id,
+                cancel_session_approvals,
+            )
+
+            approval_keys = {session_id, scoped_session_key}
+            with self._pending_lock:
+                mapped_key = getattr(
+                    self, "_approval_session_keys", {}
+                ).pop(scoped_session_key, None)
+            pending_card = self._approval_projection_head(scoped_session_key)
+            if mapped_key:
+                approval_keys.add(mapped_key)
+            if pending_card and pending_card.get("approval_id"):
+                actual_key = approval_session_key_for_id(
+                    str(pending_card["approval_id"])
+                )
+                if actual_key:
+                    approval_keys.add(actual_key)
+            for approval_key in approval_keys:
+                cancel_session_approvals(approval_key)
         except Exception:
             logger.debug("[zet_agent] session interrupt: approval cleanup failed", exc_info=True)
 
@@ -3130,7 +3459,10 @@ class ZetAgentAdapter(APIServerAdapter):
 
         with self._pending_lock:
             self._pending_clarify.pop(scoped_session_key, None)
-            self._pending_approval.pop(session_id, None)
+            self._pending_approval.pop(scoped_session_key, None)
+            getattr(self, "_approval_stream_queues", {}).pop(
+                scoped_session_key, None
+            )
 
     # ------------------------------------------------------------------
     # Diagnostic wrapper around base /v1/chat/completions
@@ -3828,6 +4160,59 @@ class ZetAgentAdapter(APIServerAdapter):
                 status=409,
             )
 
+        # Invalidate goal work before runtime/DB teardown. A barrier Timer may
+        # already have detached itself from the timer table and be waiting on
+        # its session lock; cancellation alone cannot stop that callback from
+        # reporting a continuation after this endpoint succeeds (codex P1).
+        # The drain runs off-loop and its completion barrier makes request
+        # cancellation wait until the worker has really exited.
+        drv = getattr(self, "_zet_goal_driver", None)
+        if profile_home and drv is not None:
+            try:
+                await _to_thread_with_completion_barrier(
+                    drv.invalidate_barrier_callbacks_for_home,
+                    profile_home,
+                )
+            except asyncio.CancelledError:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                raise
+            except Exception:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                logger.warning(
+                    "[zet_agent] profile-unload: goal callbacks did not drain",
+                    exc_info=True,
+                )
+                return web.json_response(
+                    _openai_error(
+                        "profile unload failed: goal callbacks could not be released",
+                        err_type="server_error",
+                    ),
+                    status=500,
+                )
+
+        # A callback that began just before invalidation can finish one last
+        # report while unload waits for it. Re-check the active-run gate before
+        # evicting runtime state so that continuation cannot race past the
+        # first check above.
+        active_api_runs = self._active_profile_chat_runs(profile_home)
+        if active_api_runs:
+            self._unblock_runtime_import_profile(
+                profile_home, unload_barrier_owner
+            )
+            return web.json_response(
+                {
+                    "unloaded": False,
+                    "error": "profile has active sessions",
+                    "active_sessions": active_api_runs,
+                    "active_api_runs": active_api_runs,
+                },
+                status=409,
+            )
+
         runtime_unload = {}
         gw = getattr(self, "gateway_runner", None)
         if gw is not None:
@@ -3874,6 +4259,71 @@ class ZetAgentAdapter(APIServerAdapter):
                 },
                 status=409,
             )
+
+        killed_profile_processes = 0
+        terminal_cleanup = {
+            "killed_uid_processes": 0,
+            "terminal_home_removed": False,
+            "terminal_cgroup_removed": False,
+            "identity_retired": False,
+        }
+        if profile_home:
+            try:
+                from tools.environments.local import (
+                    retire_managed_terminal_profile,
+                )
+                from tools.terminal_tool import cleanup_managed_profile_environments
+                from tools.process_registry import process_registry
+                from tools.approval import purge_profile_approval_state
+
+                killed_profile_processes = await _to_thread_with_completion_barrier(
+                    lambda: process_registry.kill_all(
+                        profile_owner=profile_home
+                    )
+                )
+                cleaned_terminal_environments = await _to_thread_with_completion_barrier(
+                    cleanup_managed_profile_environments,
+                    profile_home,
+                )
+                terminal_cleanup = await _to_thread_with_completion_barrier(
+                    retire_managed_terminal_profile,
+                    profile_home,
+                )
+                terminal_cleanup["terminal_environments_removed"] = (
+                    cleaned_terminal_environments
+                )
+                if process_registry.has_active_for_profile(profile_home):
+                    raise OSError("profile process registry is still active")
+                purged_process_state = await _to_thread_with_completion_barrier(
+                    process_registry.purge_profile_state,
+                    profile_home,
+                )
+                terminal_cleanup["purged_process_state"] = purged_process_state
+                purged_approval_state = await _to_thread_with_completion_barrier(
+                    purge_profile_approval_state,
+                    profile_home,
+                )
+                terminal_cleanup["purged_approval_state"] = purged_approval_state
+            except asyncio.CancelledError:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                raise
+            except Exception:
+                self._unblock_runtime_import_profile(
+                    profile_home, unload_barrier_owner
+                )
+                logger.warning(
+                    "[zet_agent] profile-unload: process identity cleanup failed",
+                    exc_info=True,
+                )
+                return web.json_response(
+                    _openai_error(
+                        "profile unload failed: managed processes could not be released",
+                        err_type="server_error",
+                    ),
+                    status=500,
+                )
 
         closed_session_db = False
         if profile_home:
@@ -3930,17 +4380,10 @@ class ZetAgentAdapter(APIServerAdapter):
                     )
                     raise
                 closed_session_db = True
-            # 该 profile 的 goal barrier timers 一并取消（codex P1）：daemon
-            # Timer 携带旧 profile 的 runtime scope，卸载后触发会用内存旧
-            # scope 读 goal 并重新自驱一个用户刚删掉的 agent。同时按 home
-            # 翻代，让还在跑的 post-turn judge 任务在 report 前的复核中失效
-            # （active-run 计数在 turn 结束时已归零，拦不住这些后置任务）。
-            # getattr：teardown 期间绝不懒创建 driver。
-            drv = getattr(self, "_zet_goal_driver", None)
+            # Goal callbacks/timers were invalidated and drained before
+            # runtime teardown. Only the cached goal DB remains to close.
             if drv is not None:
                 try:
-                    drv.cancel_barrier_timers_for_home(profile_home)
-                    drv.bump_lock_generations_for_home(profile_home)
                     # goal sidecar 走 hermes_cli.goals._DB_CACHE（按 home 缓存
                     # SessionDB），上面只关了 adapter 自己的 _session_dbs ——
                     # 不关它的话 profile 删除/重建后 goal 读写仍打在旧 inode
@@ -3958,6 +4401,8 @@ class ZetAgentAdapter(APIServerAdapter):
         return web.json_response({
             "unloaded": True,
             "closed_session_db": closed_session_db,
+            "killed_profile_processes": killed_profile_processes,
+            **terminal_cleanup,
             "evicted_sessions": int(runtime_unload.get("evicted_sessions", 0) or 0),
             "disconnected_adapters": int(runtime_unload.get("disconnected_adapters", 0) or 0),
         })
@@ -4338,6 +4783,13 @@ class ZetAgentAdapter(APIServerAdapter):
                     pass
         except Exception:
             pass
+
+        # Teardown/disconnect is a hard run boundary. Projection callbacks are
+        # idempotent, so clearing here safely races timeout cleanup and keeps a
+        # dead adapter from retaining command cards or stream queue objects.
+        with self._pending_lock:
+            self._pending_approval.clear()
+            getattr(self, "_approval_stream_queues", {}).clear()
 
         # Wake any clarify waiters with empty responses so the agent
         # threads don't sit on threading.Event forever.

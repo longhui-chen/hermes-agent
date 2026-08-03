@@ -304,7 +304,7 @@ async def test_prefixed_models_route_is_registered(profile_homes):
 
     assert resp.status == 200
     assert data["object"] == "list"
-    assert data["data"][0]["id"] == "hermes-agent"
+    assert data["data"][0]["id"] == "coder"
 
 
 @pytest.mark.asyncio
@@ -400,6 +400,10 @@ async def test_prefixed_chat_routes_connector_capability_through_zet_agent_overr
 @pytest.mark.asyncio
 async def test_prefixed_chat_scope_reaches_agent_executor(profile_homes, monkeypatch):
     """The agent is created in an executor thread, so profile context must cross it."""
+    (profile_homes["coder"] / ".env").write_text(
+        "ZET_AGENT_ID=coder\n",
+        encoding="utf-8",
+    )
     seen = []
     adapter = _make_adapter()
 
@@ -413,23 +417,34 @@ async def test_prefixed_chat_scope_reaches_agent_executor(profile_homes, monkeyp
             return {"final_response": "ok", "completed": True}
 
     def fake_create_agent(**_kwargs):
+        from agent.secret_scope import current_secret_scope
+        from gateway.platforms.api_server import _api_request_profile
         from hermes_constants import get_hermes_home
 
-        seen.append(get_hermes_home())
+        scope = current_secret_scope()
+        seen.append((
+            get_hermes_home(),
+            None if scope is None else scope.get("ZET_AGENT_ID"),
+            _api_request_profile.get(),
+        ))
         return FakeAgent()
 
     monkeypatch.setattr(adapter, "_create_agent", fake_create_agent)
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
 
-    with adapter._profile_api_scope("coder"):
-        result, usage = await adapter._run_agent(
-            user_message="hello",
-            conversation_history=[],
-            session_id="sid",
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            "/p/coder/v1/chat/completions",
+            json={
+                "model": "hermes-agent",
+                "messages": [{"role": "user", "content": "hello coder"}],
+            },
+            headers={"Authorization": "Bearer test-key"},
         )
 
-    assert result["final_response"] == "ok"
-    assert usage["total_tokens"] == 2
-    assert seen == [profile_homes["coder"]]
+    assert response.status == 200
+    assert seen == [(profile_homes["coder"], "coder", "coder")]
 
 
 @pytest.mark.asyncio
@@ -721,3 +736,179 @@ async def test_prefixed_reset_and_unload_return_ok(profile_homes):
     assert reset_resp.status == 200
     assert unload_resp.status == 200
     assert unload_data["unloaded"] is True
+
+
+@pytest.mark.asyncio
+async def test_deferred_approval_response_requires_matching_id(monkeypatch):
+    from tools import approval
+
+    session_id = "sid-public-url"
+    approval_session_key = "sid-x-hermes-header"
+    approval.clear_session(approval_session_key)
+    token = approval.set_current_session_key(approval_session_key)
+    monkeypatch.setattr(
+        approval, "_approval_profile_scope", lambda: "/profiles/coder"
+    )
+    monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(
+        approval, "_command_matches_permanent_allowlist", lambda _command: False
+    )
+    monkeypatch.setattr(
+        approval,
+        "detect_dangerous_command",
+        lambda command: (True, "agentcomputer:file.delete", f"risk:{command}"),
+    )
+    monkeypatch.setattr(
+        "tools.tirith_security.check_command_security",
+        lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        raising=False,
+    )
+    command = "agentcomputer file.delete notes/a.txt"
+    first = approval.check_all_command_guards(command, "local")
+    approval_id = first["approval_id"]
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(
+        adapter,
+        "_goals",
+        lambda: type("Goals", (), {"on_interaction_resolved": lambda self, sid: None})(),
+    )
+    app = web.Application()
+    app.router.add_post(
+        "/v1/sessions/{session_id}/approval/respond",
+        adapter._handle_approval_respond,
+    )
+    headers = {"Authorization": "Bearer test-key"}
+
+    async with TestClient(TestServer(app)) as cli:
+        missing = await cli.post(
+            f"/v1/sessions/{session_id}/approval/respond",
+            json={"choice": "once"},
+            headers=headers,
+        )
+        wrong = await cli.post(
+            f"/v1/sessions/{session_id}/approval/respond",
+            json={"choice": "once", "approval_id": "A" * 32},
+            headers=headers,
+        )
+        monkeypatch.setattr(
+            approval, "_approval_profile_scope", lambda: "/profiles/other"
+        )
+        wrong_profile = await cli.post(
+            f"/v1/sessions/{session_id}/approval/respond",
+            json={"choice": "once", "approval_id": approval_id},
+            headers=headers,
+        )
+        monkeypatch.setattr(
+            approval, "_approval_profile_scope", lambda: "/profiles/coder"
+        )
+        matched = await cli.post(
+            f"/v1/sessions/{session_id}/approval/respond",
+            json={"choice": "once", "approval_id": approval_id},
+            headers=headers,
+        )
+        missing_data = await missing.json()
+        wrong_data = await wrong.json()
+        wrong_profile_data = await wrong_profile.json()
+        matched_data = await matched.json()
+
+    assert missing_data == {"resolved": 0}
+    assert wrong_data == {"resolved": 0}
+    assert wrong_profile_data == {"resolved": 0}
+    assert matched_data == {"resolved": 1}
+    exact_retry = approval.check_all_command_guards(command, "local")
+    consumed_retry = approval.check_all_command_guards(command, "local")
+    different_retry = approval.check_all_command_guards(
+        "agentcomputer file.delete notes/b.txt", "local"
+    )
+    assert exact_retry["approved"] is True
+    assert exact_retry["one_shot_approved"] is True
+    assert consumed_retry["status"] == "pending_approval"
+    assert different_retry["status"] == "pending_approval"
+    approval.clear_session(approval_session_key)
+    approval.reset_current_session_key(token)
+
+
+@pytest.mark.asyncio
+async def test_legacy_live_approval_uses_x_hermes_session_key(monkeypatch):
+    from tools import approval
+
+    session_id = "sid-public-legacy"
+    approval_session_key = "sid-header-legacy"
+    entry = approval._ApprovalEntry({
+        "approval_id": "B" * 32,
+        "command": "agentcomputer file.delete notes/a.txt",
+        "pattern_key": "agentcomputer:file.delete",
+        "pattern_keys": ["agentcomputer:file.delete"],
+    })
+    with approval._lock:
+        approval._gateway_queues[approval_session_key] = [entry]
+
+    adapter = _make_adapter()
+    adapter._approval_session_keys = {
+        adapter._active_turn_key(session_id): approval_session_key,
+    }
+    monkeypatch.setattr(
+        adapter,
+        "_goals",
+        lambda: type("Goals", (), {"on_interaction_resolved": lambda self, sid: None})(),
+    )
+    app = web.Application()
+    app.router.add_post(
+        "/v1/sessions/{session_id}/approval/respond",
+        adapter._handle_approval_respond,
+    )
+    try:
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                f"/v1/sessions/{session_id}/approval/respond",
+                json={"choice": "deny"},
+                headers={"Authorization": "Bearer test-key"},
+            )
+            data = await response.json()
+
+        assert data == {"resolved": 1}
+        assert entry.event.is_set()
+        assert entry.result == "deny"
+    finally:
+        approval.cancel_session_approvals(approval_session_key)
+
+
+@pytest.mark.asyncio
+async def test_interrupt_revokes_deferred_approval_before_stale_response():
+    from tools import approval
+
+    session_id = "sid-interrupt-stale-approval"
+    approval.clear_session(session_id)
+    approval_id = approval.submit_pending(
+        session_id,
+        {
+            "command": "agentcomputer file.delete notes/a.txt",
+            "pattern_key": "agentcomputer:file.delete",
+            "one_shot_pattern_key": "deferred:terminal:exact-a",
+            "description": "delete notes/a.txt",
+        },
+    )
+    assert approval_id
+
+    adapter = _make_adapter()
+    adapter._interrupt_pending_interactions(session_id, session_id)
+    app = web.Application()
+    app.router.add_post(
+        "/v1/sessions/{session_id}/approval/respond",
+        adapter._handle_approval_respond,
+    )
+    async with TestClient(TestServer(app)) as cli:
+        stale = await cli.post(
+            f"/v1/sessions/{session_id}/approval/respond",
+            json={"choice": "once", "approval_id": approval_id},
+            headers={"Authorization": "Bearer test-key"},
+        )
+        stale_data = await stale.json()
+
+    assert stale_data == {"resolved": 0}
+    assert approval._consume_one_shot_approval(
+        session_id, "deferred:terminal:exact-a"
+    ) is False
+    approval.clear_session(session_id)

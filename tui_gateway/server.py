@@ -9547,6 +9547,10 @@ def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) ->
     poller must skip events it doesn't own so a detached result surfaces in the
     launching session, not whichever poller happened to dequeue first.
     """
+    evt_profile_owner = str(evt.get("profile_owner") or "").strip()
+    if evt_profile_owner and not _notification_event_profile_matches(session, evt):
+        return True
+
     evt_ui_sid = str(evt.get("origin_ui_session_id") or "")
     if evt_ui_sid:
         if evt_ui_sid == str(sid or "") and not session.get("_finalized"):
@@ -9637,7 +9641,9 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
     "not provably elsewhere" is NOT good enough to inject a payload into this
     chat (#55578).
     """
-    if session.get("_finalized"):
+    if session.get("_finalized") or not _notification_event_profile_matches(
+        session, evt
+    ):
         return False
     if str(evt.get("origin_ui_session_id") or "") == str(sid or ""):
         return True
@@ -9662,10 +9668,31 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
 
 def _notification_event_requires_owner(evt: dict) -> bool:
     """Whether ``evt`` must be positively claimed before TUI delivery."""
-    return evt.get("type") == "async_delegation" or bool(
+    managed_process_event = (
+        os.environ.get("HERMES_MANAGED_GATEWAY") == "1"
+        and evt.get("type", "completion")
+        in {"completion", "watch_match", "watch_disabled"}
+    )
+    return managed_process_event or evt.get("type") == "async_delegation" or bool(
         str(evt.get("origin_ui_session_id") or "")
         or str(evt.get("session_key") or "")
+        or str(evt.get("profile_owner") or "")
     )
+
+
+def _notification_event_profile_matches(session: dict, evt: dict) -> bool:
+    """Fail closed when a process event targets another multiplex profile."""
+
+    event_owner = str(evt.get("profile_owner") or "").strip()
+    if not event_owner:
+        return os.environ.get("HERMES_MANAGED_GATEWAY") != "1"
+    expected_owner = str(session.get("profile_home") or _hermes_home)
+    try:
+        event_owner = str(Path(event_owner).expanduser().resolve())
+        expected_owner = str(Path(expected_owner).expanduser().resolve())
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return event_owner == expected_owner
 
 
 def _notification_event_dedup_key(evt: dict) -> tuple:

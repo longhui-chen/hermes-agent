@@ -89,6 +89,7 @@ class TestCheckWatchPatterns:
         assert evt["pattern"] == "ERROR"
         assert "disk full" in evt["output"]
         assert evt["session_id"] == "proc_test_watch"
+        assert evt["profile_owner"] == session.profile_owner
 
     def test_match_carries_session_key_and_watcher_routing_metadata(self, registry):
         session = _make_session(watch_patterns=["ERROR"])

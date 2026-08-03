@@ -513,8 +513,9 @@ def install() -> None:
                             job.get("id", ""),
                         )
 
+                run_result = None
                 try:
-                    return _run_job_with_retry(
+                    run_result = _run_job_with_retry(
                         _run_once,
                         job,
                         before_retry=(
@@ -523,7 +524,49 @@ def install() -> None:
                             else None
                         ),
                     )
+                    return run_result
                 finally:
+                    # Zettlab file-change protection: a cron run is one turn, so
+                    # release its protection snapshot pin here. No-op when the
+                    # run never touched protected files.
+                    try:
+                        from tools.zettlab_snapshot_guard import finish_turn
+
+                        succeeded = (
+                            isinstance(run_result, tuple)
+                            and len(run_result) > 0
+                            and bool(run_result[0])
+                        )
+                        # 指名收本次 run 的轮（agent 运行时的 _current_turn_id）；
+                        # 拿不到时 guard 一律不收（空 id 收「唯一余轮」会错收并发
+                        # 轮的 pin），留给服务端 TTL 自愈。
+                        guard_turn = ""
+                        interrupted = False
+                        if attempt_agents:
+                            final_agent = attempt_agents[-1]
+                            guard_turn = str(
+                                getattr(final_agent, "_current_turn_id", "") or ""
+                            )
+                            interrupted = bool(
+                                getattr(final_agent, "_interrupt_requested", False)
+                            )
+                        if interrupted:
+                            # inactivity timeout 路径：scheduler 先 interrupt 再
+                            # shutdown(wait=False) 返回失败，executor / 工具线程
+                            # 未必已退出，立刻 finish 会在后台写入完成前关掉恢复
+                            # 窗口（Codex review P1）。这里不收 pin，留给 LS 侧
+                            # PinTTL + reconcile 自愈（终态 reconcile_timeout）。
+                            _dbg(
+                                "snapshot guard finish skipped: interrupted turn, "
+                                "pin left to server-side TTL"
+                            )
+                        else:
+                            finish_turn(
+                                "completed" if succeeded else "failed",
+                                turn_id=guard_turn,
+                            )
+                    except Exception:
+                        _dbg("snapshot guard finish failed")
                     # Success, terminal failure, or an exception: preserve the
                     # upstream contract for whichever attempt is still live.
                     if attempt_agents:

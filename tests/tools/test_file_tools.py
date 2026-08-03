@@ -611,8 +611,10 @@ class TestSensitivePathCheck:
     @_skip_macos_tmp_config
     def test_hermes_config_blocked_for_write_file(self, tmp_path, monkeypatch):
         fake_config = tmp_path / "config.yaml"
-        monkeypatch.setattr("tools.file_tools._hermes_config_resolved", str(fake_config))
-        monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
+        monkeypatch.setattr(
+            "tools.file_tools._get_hermes_config_resolved",
+            lambda: str(fake_config),
+        )
 
         from tools.file_tools import write_file_tool
         result = json.loads(write_file_tool(str(fake_config), "approvals:\n  mode: off\n"))
@@ -622,8 +624,10 @@ class TestSensitivePathCheck:
     @_skip_macos_tmp_config
     def test_hermes_config_blocked_via_tilde_path(self, tmp_path, monkeypatch):
         fake_config = tmp_path / "config.yaml"
-        monkeypatch.setattr("tools.file_tools._hermes_config_resolved", str(fake_config))
-        monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
+        monkeypatch.setattr(
+            "tools.file_tools._get_hermes_config_resolved",
+            lambda: str(fake_config),
+        )
 
         from tools.file_tools import write_file_tool
         result = json.loads(write_file_tool(str(fake_config), "approvals:\n  mode: off\n"))
@@ -634,8 +638,10 @@ class TestSensitivePathCheck:
     def test_hermes_config_blocked_for_patch(self, tmp_path, monkeypatch):
         fake_config = tmp_path / "config.yaml"
         fake_config.write_text("approvals:\n  mode: manual\n")
-        monkeypatch.setattr("tools.file_tools._hermes_config_resolved", str(fake_config))
-        monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
+        monkeypatch.setattr(
+            "tools.file_tools._get_hermes_config_resolved",
+            lambda: str(fake_config),
+        )
 
         from tools.file_tools import patch_tool
         result = json.loads(patch_tool(
@@ -648,18 +654,358 @@ class TestSensitivePathCheck:
         assert "Hermes config" in result["error"]
 
     def test_system_path_still_blocked(self, monkeypatch):
-        monkeypatch.setattr("tools.file_tools._hermes_config_resolved", "/some/other/path")
-        monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
+        monkeypatch.setattr(
+            "tools.file_tools._get_hermes_config_resolved",
+            lambda: "/some/other/path",
+        )
 
         from tools.file_tools import write_file_tool
         result = json.loads(write_file_tool("/etc/passwd", "evil"))
         assert "error" in result
         assert "sensitive system path" in result["error"]
 
+    @pytest.mark.parametrize("tool_name", ["write", "patch"])
+    def test_managed_runtime_import_root_is_not_model_writable(
+        self,
+        monkeypatch,
+        tool_name,
+    ):
+        monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+        monkeypatch.setenv(
+            "HERMES_LAZY_INSTALL_TARGET",
+            "/volume1/subvol/apps/zettlab-claw/data/lazy-packages",
+        )
+        target = (
+            "/volume1/subvol/apps/zettlab-claw/data/lazy-packages/"
+            "persist.pth"
+        )
+
+        if tool_name == "write":
+            from tools.file_tools import write_file_tool
+
+            result = json.loads(write_file_tool(target, "import payload\n"))
+        else:
+            from tools.file_tools import patch_tool
+
+            result = json.loads(patch_tool(
+                mode="replace",
+                path=target,
+                old_string="safe",
+                new_string="import payload",
+            ))
+
+        assert "managed runtime import path" in result["error"]
+
+    @pytest.mark.parametrize("tool_name", ["write", "patch"])
+    @pytest.mark.parametrize(
+        "target",
+        [
+            (
+                "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home/"
+                "profiles/agent-a/plugins/enabled/__init__.py"
+            ),
+            (
+                "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home/"
+                "profiles/agent-b/plugins/model-provider/__init__.py"
+            ),
+            (
+                "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home/"
+                "plugins/memory-provider/__init__.py"
+            ),
+        ],
+    )
+    def test_managed_gateway_plugin_code_is_not_model_writable(
+        self, monkeypatch, tool_name, target
+    ):
+        monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+        monkeypatch.setenv(
+            "HERMES_HOME",
+            "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home/"
+            "profiles/agent-a",
+        )
+        if tool_name == "write":
+            from tools.file_tools import write_file_tool
+
+            result = json.loads(write_file_tool(target, "def register(ctx): pass\n"))
+        else:
+            from tools.file_tools import patch_tool
+
+            result = json.loads(
+                patch_tool(
+                    mode="replace",
+                    path=target,
+                    old_string="safe",
+                    new_string="payload",
+                )
+            )
+        assert "managed plugin code path" in result["error"]
+
+    @pytest.mark.parametrize("tool_name", ["write", "patch"])
+    @pytest.mark.parametrize(
+        "target",
+        [
+            (
+                "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home/"
+                "profiles/agent-a/hooks/audit/handler.py"
+            ),
+            (
+                "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home/"
+                "profiles/agent-b/hooks/lifecycle/handler.py"
+            ),
+        ],
+    )
+    def test_managed_gateway_hook_code_is_not_model_writable(
+        self, monkeypatch, tool_name, target
+    ):
+        monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+        monkeypatch.setenv(
+            "HERMES_HOME",
+            "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home/"
+            "profiles/agent-a",
+        )
+        if tool_name == "write":
+            from tools.file_tools import write_file_tool
+
+            result = json.loads(write_file_tool(target, "def run(ctx): pass\n"))
+        else:
+            from tools.file_tools import patch_tool
+
+            result = json.loads(
+                patch_tool(
+                    mode="replace",
+                    path=target,
+                    old_string="safe",
+                    new_string="payload",
+                )
+            )
+        assert "managed hook code path" in result["error"]
+
+    @pytest.mark.parametrize("tool_name", ["write", "patch"])
+    @pytest.mark.parametrize(
+        "target, expected_kind",
+        [
+            (
+                "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home/"
+                "profiles/agent-a/agent-hooks/audit.sh",
+                "shell hook",
+            ),
+            (
+                "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home/"
+                "profiles/agent-a/scripts/cron.py",
+                "script",
+            ),
+        ],
+    )
+    def test_managed_gateway_privileged_scripts_are_not_model_writable(
+        self, monkeypatch, tool_name, target, expected_kind
+    ):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from tools import file_tools
+
+        monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+        monkeypatch.setenv(
+            "HERMES_HOME",
+            "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home",
+        )
+        token = set_hermes_home_override(Path(target).parents[1])
+        try:
+            if tool_name == "write":
+                result = json.loads(
+                    file_tools.write_file_tool(target, "#!/bin/sh\nid\n")
+                )
+            else:
+                result = json.loads(
+                    file_tools.patch_tool(
+                        mode="replace",
+                        path=target,
+                        old_string="safe",
+                        new_string="payload",
+                    )
+                )
+        finally:
+            reset_hermes_home_override(token)
+        assert f"managed {expected_kind} code path" in result["error"]
+
+    @pytest.mark.parametrize("tool_name", ["write", "patch"])
+    @pytest.mark.parametrize("via_symlink", [False, True])
+    def test_managed_terminal_homes_are_not_model_writable(
+        self, tmp_path, monkeypatch, tool_name, via_symlink
+    ):
+        from tools import file_tools
+
+        runtime_root = tmp_path / "terminal-homes"
+        runtime_root.mkdir()
+        visible_root = runtime_root
+        if via_symlink:
+            visible_root = tmp_path / "terminal-homes-alias"
+            visible_root.symlink_to(runtime_root, target_is_directory=True)
+
+        monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+        monkeypatch.setattr(
+            file_tools,
+            "_MANAGED_TERMINAL_HOME_ROOTS",
+            (str(runtime_root.resolve()),),
+        )
+        # Keep this test focused on the managed runtime boundary on macOS,
+        # where tmp_path resolves below /private/var.
+        monkeypatch.setattr(file_tools, "_SENSITIVE_PATH_PREFIXES", ())
+        monkeypatch.setattr(file_tools, "_SENSITIVE_EXACT_PATHS", set())
+        target = visible_root / "60001" / ".bashrc"
+
+        if tool_name == "write":
+            result = json.loads(file_tools.write_file_tool(str(target), "payload\n"))
+        else:
+            result = json.loads(
+                file_tools.patch_tool(
+                    mode="replace",
+                    path=str(target),
+                    old_string="safe",
+                    new_string="payload",
+                )
+            )
+
+        assert "managed terminal home path" in result["error"]
+
+    @pytest.mark.parametrize("tool_name", ["read", "search", "write", "patch"])
+    def test_managed_sibling_profile_tree_is_inaccessible(
+        self, tmp_path, monkeypatch, tool_name
+    ):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from tools import file_tools
+
+        hermes_root = tmp_path / "hermes_home"
+        active = hermes_root / "profiles" / "active"
+        sibling = hermes_root / "profiles" / "sibling"
+        active.mkdir(parents=True)
+        sibling.mkdir()
+        target = sibling / "private.txt"
+        target.write_text("private\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+        monkeypatch.setattr(
+            file_tools,
+            "_MANAGED_CLAW_HERMES_ROOTS",
+            (str(hermes_root.resolve()),),
+        )
+        monkeypatch.setattr(file_tools, "_SENSITIVE_PATH_PREFIXES", ())
+        token = set_hermes_home_override(active)
+        try:
+            if tool_name == "read":
+                result = json.loads(file_tools.read_file_tool(str(target)))
+            elif tool_name == "search":
+                result = json.loads(
+                    file_tools.search_tool("private", path=str(sibling))
+                )
+            elif tool_name == "write":
+                result = json.loads(
+                    file_tools.write_file_tool(str(target), "attacker\n")
+                )
+            else:
+                result = json.loads(file_tools.patch_tool(
+                    mode="replace",
+                    path=str(target),
+                    old_string="private",
+                    new_string="attacker",
+                ))
+            assert file_tools._managed_sibling_profile_error(
+                str(active / "own.txt")
+            ) is None
+        finally:
+            reset_hermes_home_override(token)
+
+        assert "managed sibling profile path" in result["error"]
+        assert target.read_text(encoding="utf-8") == "private\n"
+
+    def test_managed_profiles_each_block_their_own_config_write(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+        from tools import file_tools
+
+        hermes_root = tmp_path / "hermes_home"
+        profiles = [hermes_root / "profiles" / name for name in ("alpha", "beta")]
+        for profile in profiles:
+            profile.mkdir(parents=True, exist_ok=True)
+            profile.joinpath("config.yaml").write_text(
+                "approvals:\n  mode: manual\n", encoding="utf-8"
+            )
+        monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+        monkeypatch.setattr(
+            file_tools,
+            "_MANAGED_CLAW_HERMES_ROOTS",
+            (str(hermes_root.resolve()),),
+        )
+        monkeypatch.setattr(file_tools, "_SENSITIVE_PATH_PREFIXES", ())
+
+        for profile in profiles:
+            token = set_hermes_home_override(profile)
+            try:
+                result = json.loads(
+                    file_tools.write_file_tool(
+                        str(profile / "config.yaml"),
+                        "approvals:\n  mode: off\n",
+                    )
+                )
+            finally:
+                reset_hermes_home_override(token)
+            assert "Hermes config" in result["error"]
+            assert profile.joinpath("config.yaml").read_text(encoding="utf-8") == (
+                "approvals:\n  mode: manual\n"
+            )
+
+    @pytest.mark.parametrize("tool_name", ["write", "patch"])
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "/zettos/main/data/com.zettlab.claw/secrets/zettlab-claw.env",
+            "/volume1/subvol/apps/com.zettlab.claw/data/secrets/zet_agent.key",
+            (
+                "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home/"
+                "profiles/agent-a/.env"
+            ),
+        ],
+    )
+    def test_managed_service_and_profile_secrets_are_not_model_writable(
+        self,
+        monkeypatch,
+        tool_name,
+        target,
+    ):
+        monkeypatch.setenv(
+            "HERMES_HOME",
+            "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home",
+        )
+
+        if tool_name == "write":
+            from tools.file_tools import write_file_tool
+
+            result = json.loads(write_file_tool(target, "TOKEN=attacker\n"))
+        else:
+            from tools.file_tools import patch_tool
+
+            result = json.loads(patch_tool(
+                mode="replace",
+                path=target,
+                old_string="TOKEN=safe",
+                new_string="TOKEN=attacker",
+            ))
+
+        assert "managed secret path" in result["error"]
+
     @patch("tools.file_tools._get_file_ops")
     def test_normal_file_not_blocked(self, mock_get, monkeypatch):
-        monkeypatch.setattr("tools.file_tools._hermes_config_resolved", "/home/user/.hermes/config.yaml")
-        monkeypatch.setattr("tools.file_tools._hermes_config_resolved_loaded", True)
+        monkeypatch.setattr(
+            "tools.file_tools._get_hermes_config_resolved",
+            lambda: "/home/user/.hermes/config.yaml",
+        )
         mock_ops = MagicMock()
         result_obj = MagicMock()
         result_obj.to_dict.return_value = {"status": "ok", "path": "/tmp/other.txt", "bytes": 5}
@@ -847,6 +1193,7 @@ class TestSilentFileMisplacementE2E:
     makes the resolved path correct.
     """
 
+    @_skip_macos_tmp_config
     def test_relative_write_after_env_cleanup_lands_in_user_cwd(self, tmp_path, monkeypatch):
         import tools.terminal_tool as tt
         import tools.file_tools as ft
