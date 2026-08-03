@@ -28,6 +28,46 @@ _MANAGED_SERVICE_LIMITS = {
 }
 
 
+def _add_packaged_site_packages(entry_point: Path) -> None:
+    bin_dir = entry_point.parent
+    venv_dir = bin_dir.parent
+    if (
+        entry_point.name != "hermes"
+        or bin_dir.name != "bin"
+        or venv_dir.name != "venv"
+    ):
+        return
+
+    try:
+        venv_root = venv_dir.resolve(strict=True)
+        site_packages = (
+            venv_root
+            / "lib"
+            / f"python{sys.version_info.major}.{sys.version_info.minor}"
+            / "site-packages"
+        ).resolve(strict=True)
+        site_packages.relative_to(venv_root)
+    except (OSError, ValueError) as exc:
+        raise OSError("packaged Hermes site-packages is unavailable") from exc
+    if not site_packages.is_dir():
+        raise OSError("packaged Hermes site-packages is unavailable")
+
+    packaged_path = str(site_packages)
+    sys.path[:] = [path for path in sys.path if path != packaged_path]
+
+    # Keep the standard library ahead of bundled dependencies, while ensuring
+    # the packaged versions win over any system-wide third-party packages.
+    insert_at = next(
+        (
+            index
+            for index, path in enumerate(sys.path)
+            if Path(path).name in {"site-packages", "dist-packages"}
+        ),
+        len(sys.path),
+    )
+    sys.path.insert(insert_at, packaged_path)
+
+
 def _read_bounded_ascii(path: Path, *, limit: int) -> str:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -279,6 +319,12 @@ def main() -> int:
         return 127
     if not entry_point.is_file():
         print("packaged Hermes entry point is not a file", file=sys.stderr)
+        return 127
+
+    try:
+        _add_packaged_site_packages(entry_point)
+    except OSError as exc:
+        print(str(exc), file=sys.stderr)
         return 127
 
     managed_gateway = os.environ.get(_MANAGED_GATEWAY_ENV) == "1"
