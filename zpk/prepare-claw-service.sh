@@ -251,6 +251,7 @@ secure_profile_secret_files() {
     HERMES_PROFILES_ROOT="$profiles_root" \
     HERMES_PROFILE_PERMISSIONS_MARKER="$PROFILE_PERMISSIONS_MARKER" \
         "$HERMES_PYTHON" - <<'PY'
+import json
 import os
 import stat
 import tempfile
@@ -266,12 +267,180 @@ except ValueError:
 limit = max(1, min(requested_limit, 4096))
 overflow = False
 
+deletion_marker_limit = 64 * 1024
+deletion_pending = b"deleted\n"
+deletion_complete = b"deleted\ncleanup-complete\n"
+deletion_origin_header = b"origin-json\n"
+
+
+def reject_non_json_constant(value):
+    raise ValueError(f"invalid JSON constant: {value}")
+
+
+def valid_deletion_origin(body):
+    if not body.startswith(deletion_origin_header) or not body.endswith(b"\n"):
+        return False
+    try:
+        value = json.loads(
+            body[len(deletion_origin_header):-1],
+            parse_constant=reject_non_json_constant,
+        )
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        return False
+    return isinstance(value, dict)
+
+
+def valid_local_server_deletion_blocker(body):
+    if body in {deletion_pending, deletion_complete}:
+        return True
+    if body.startswith(deletion_complete):
+        return valid_deletion_origin(body[len(deletion_complete):])
+    if body.startswith(deletion_pending):
+        return valid_deletion_origin(body[len(deletion_pending):])
+    return False
+
+
+def secure_local_server_deletion_marker(
+    path, initial_info, *, dir_fd=None, display_path=None
+):
+    display_path = display_path or path
+    if initial_info.st_uid != os.geteuid():
+        raise SystemExit(
+            f"refusing deletion marker not owned by service user: {display_path}"
+        )
+    if initial_info.st_size > deletion_marker_limit:
+        return False
+
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        fd = os.open(path, flags, dir_fd=dir_fd)
+    except OSError as exc:
+        raise SystemExit(
+            f"cannot safely open deletion marker: {display_path}: {exc}"
+        )
+    try:
+        current_info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(current_info.st_mode)
+            or current_info.st_dev != initial_info.st_dev
+            or current_info.st_ino != initial_info.st_ino
+            or current_info.st_uid != os.geteuid()
+        ):
+            raise SystemExit(
+                f"deletion marker changed while checking it: {display_path}"
+            )
+
+        chunks = []
+        remaining = deletion_marker_limit + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(8192, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        body = b"".join(chunks)
+        if len(body) > deletion_marker_limit or not valid_local_server_deletion_blocker(body):
+            return False
+        os.fchmod(fd, 0o600)
+        return True
+    finally:
+        os.close(fd)
+
+
+def secure_local_server_deletion_blocker(name, path, initial_info):
+    # Current local-server never tombstones the permanent main profile and
+    # rejects Hermes' virtual default profile. Older versions could leave a
+    # default blocker, so accept that reserved name only when the durable
+    # .deleted-agents sidecar independently proves the same deletion intent.
+    if name == "main" or name.startswith("."):
+        return False
+    if name == "default":
+        sidecar_root = os.path.join(profiles_root, ".deleted-agents")
+        sidecar = os.path.join(sidecar_root, name)
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            sidecar_root_fd = os.open(sidecar_root, directory_flags)
+        except OSError:
+            return False
+        try:
+            sidecar_root_info = os.fstat(sidecar_root_fd)
+            if (
+                not stat.S_ISDIR(sidecar_root_info.st_mode)
+                or sidecar_root_info.st_uid != os.geteuid()
+            ):
+                return False
+            try:
+                sidecar_info = os.stat(
+                    name,
+                    dir_fd=sidecar_root_fd,
+                    follow_symlinks=False,
+                )
+            except OSError:
+                return False
+            if not stat.S_ISREG(sidecar_info.st_mode):
+                return False
+            if not secure_local_server_deletion_marker(
+                name,
+                sidecar_info,
+                dir_fd=sidecar_root_fd,
+                display_path=sidecar,
+            ):
+                return False
+        finally:
+            os.close(sidecar_root_fd)
+    return secure_local_server_deletion_marker(path, initial_info)
+
+
+def secure_reserved_profile_path(name):
+    path = os.path.join(profiles_root, name)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+        if secure_local_server_deletion_blocker(name, path, info):
+            return
+        raise SystemExit(f"refusing non-directory profile path: {path}")
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise SystemExit(f"refusing non-directory profile path: {path}")
+    if info.st_uid != os.geteuid():
+        raise SystemExit(
+            f"refusing profile directory not owned by service user: {path}"
+        )
+    os.chmod(path, 0o700, follow_symlinks=False)
+
+
+# These names carry deletion semantics that cannot be left to the bounded
+# migration scan. Validate them directly before a successful run can publish
+# the one-time completion marker, even when more than `limit` profiles exist.
+for reserved_name in ("main", "default"):
+    secure_reserved_profile_path(reserved_name)
+
 with os.scandir(profiles_root) as entries:
     for index, entry in enumerate(entries):
         if index >= limit:
             overflow = True
             break
         info = entry.stat(follow_symlinks=False)
+        # local-server deletion is fail-closed by an owner-only regular blocker
+        # at profiles/<id>. Preserve only its exact bounded marker grammar; an
+        # arbitrary file or symlink still aborts the migration.
+        if stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+            if secure_local_server_deletion_blocker(
+                entry.name, entry.path, info
+            ):
+                continue
+            raise SystemExit(f"refusing non-directory profile path: {entry.path}")
         if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
             raise SystemExit(f"refusing non-directory profile path: {entry.path}")
         if info.st_uid != os.geteuid():
