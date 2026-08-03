@@ -26,6 +26,7 @@ from aiohttp.test_utils import TestClient, TestServer
 import agent.skill_commands as skill_commands
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
+from gateway.platforms.api_server import _strip_skill_display_token
 from gateway.platforms.zet_agent import ZetAgentAdapter
 
 
@@ -112,6 +113,21 @@ def test_display_token_stripped_wherever_it_sits(monkeypatch):
 
     _expand(adapter, "看下 repo/deep-research 目录 /deep-research")
     assert calls["user_instruction"] == "看下 repo/deep-research 目录"
+
+
+def test_trusted_task_strips_only_the_selected_skill_display_token():
+    message = (
+        "/video-edit-workflow-mini 请总结 [file: /data/input.mp4]\n"
+        "保留 repo/video-edit-workflow-mini 路径"
+    )
+
+    assert _strip_skill_display_token(
+        message,
+        "video-edit-workflow-mini",
+    ) == (
+        "请总结 [file: /data/input.mp4]\n"
+        "保留 repo/video-edit-workflow-mini 路径"
+    )
 
 
 def test_slug_without_token_in_text_still_expands(monkeypatch):
@@ -282,6 +298,44 @@ def test_contextvar_binding_outranks_foreign_platform_env(monkeypatch):
     assert os.environ.get("HERMES_PLATFORM") == "telegram"
 
 
+def test_cancel_racing_semaphore_acquire_never_starts_worker(monkeypatch):
+    # ``asyncio.wait_for(sema.acquire())`` can swallow an external cancel when
+    # its inner acquire task completes in the same loop turn. A disconnect at
+    # that boundary must not continue into the blocking skill worker.
+    _patch_skill_layer(monkeypatch)
+    adapter = _make_adapter()
+
+    class YieldOnceSemaphore:
+        async def acquire(self):
+            await asyncio.sleep(0)
+            return True
+
+        def release(self):
+            raise AssertionError("an unacquired permit must not be released")
+
+    adapter._skill_invoke_semaphore = YieldOnceSemaphore()
+
+    async def _run():
+        loop = asyncio.get_running_loop()
+        with monkeypatch.context() as loop_patch:
+            loop_patch.setattr(
+                loop,
+                "run_in_executor",
+                lambda executor, fn: pytest.fail(
+                    "cancelled expansion must not start an executor worker"
+                ),
+            )
+            task = asyncio.create_task(
+                adapter._expand_inbound_skill_invocation("x", "deep-research")
+            )
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(_run())
+
+
 def test_queued_cancel_refunds_semaphore_permit(monkeypatch):
     # executor 满载时 worker 还在队列里就被取消：fn 永不执行、finally 永不
     # 触发——必须由等待方当场退款，否则 4 次断开就把许可漏光（review P1）。
@@ -291,18 +345,28 @@ def test_queued_cancel_refunds_semaphore_permit(monkeypatch):
     async def _run():
         loop = asyncio.get_running_loop()
         never = loop.create_future()  # 模拟排队中的 executor future
-        monkeypatch.setattr(loop, "run_in_executor", lambda executor, fn: never)
-        task = asyncio.create_task(
-            adapter._expand_inbound_skill_invocation("x", "deep-research")
-        )
-        await asyncio.sleep(0)  # 让 acquire 与 run_in_executor 调用完成
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        sema = adapter._skill_invoke_semaphore
-        assert sema._value == adapter._SKILL_INVOKE_MAX_CONCURRENCY, (
-            "queued-cancel must refund the permit immediately"
-        )
+        executor_called = asyncio.Event()
+
+        def queue_forever(executor, fn):
+            executor_called.set()
+            return never
+
+        # Restore the loop method before ``asyncio.run`` starts its own
+        # default-executor shutdown; otherwise that shutdown is also routed
+        # to ``never`` and the test process hangs after all assertions pass.
+        with monkeypatch.context() as loop_patch:
+            loop_patch.setattr(loop, "run_in_executor", queue_forever)
+            task = asyncio.create_task(
+                adapter._expand_inbound_skill_invocation("x", "deep-research")
+            )
+            await asyncio.wait_for(executor_called.wait(), timeout=1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            sema = adapter._skill_invoke_semaphore
+            assert sema._value == adapter._SKILL_INVOKE_MAX_CONCURRENCY, (
+                "queued-cancel must refund the permit immediately"
+            )
 
     asyncio.run(_run())
 

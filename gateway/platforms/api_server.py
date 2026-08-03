@@ -192,10 +192,24 @@ def _extract_plan_ack(body: Dict[str, Any]) -> Dict[str, Any]:
         raw.get("revision_requested", raw.get("revisionRequested")),
         default=False,
     )
-    return {
+    ack = {
         "status": status,
         "revision_requested": revision_requested,
     }
+    nested_turn_id_present = "turn_id" in raw or "turnId" in raw
+    turn_id = str(raw.get("turn_id", raw.get("turnId", "")) or "").strip()
+    if not turn_id:
+        # Released clients carried the plan's correlation id beside plan_ack.
+        # Prefer the nested v2 field, but preserve that hot-path contract.
+        turn_id = _extract_turn_id(body)
+    metadata_turn_id_present = "turn_id" in metadata or "turnId" in metadata
+    if not turn_id:
+        if nested_turn_id_present or metadata_turn_id_present:
+            return {}
+        return ack
+    if any(c.isspace() or ord(c) < 0x20 for c in turn_id):
+        return {}
+    return {"turn_id": turn_id, **ack}
 
 
 def _extract_plan_auto_execute(body: Dict[str, Any]) -> Optional[bool]:
@@ -297,6 +311,41 @@ def _extract_skill_slug(body: Dict[str, Any]) -> str:
     if not slug or any(c.isspace() or ord(c) < 0x20 for c in slug):
         return ""
     return slug
+
+
+def _strip_skill_display_token(user_message: Any, skill_slug: str) -> Any:
+    """Remove only the App quick-pick token from a string user task."""
+    if not isinstance(user_message, str) or not skill_slug:
+        return user_message
+    token = "/" + skill_slug
+    task_text = re.sub(
+        r"(?<!\S)" + re.escape(token) + r"(?!\S)",
+        "",
+        user_message,
+    )
+    return "\n".join(
+        line for line in (value.rstrip() for value in task_text.splitlines()) if line
+    ).strip()
+
+
+def _trusted_skill_task_message(user_message: Any, skill_slug: str) -> Any:
+    """Preserve user-authored task text separately from transport selection."""
+    return _strip_skill_display_token(user_message, skill_slug)
+
+
+def _extract_business_execution_token(raw: Any) -> str:
+    """Accept only local-server's fixed-width opaque capability format."""
+    token = str(raw or "").strip()
+    return token if re.fullmatch(r"[0-9a-f]{64}", token) else ""
+
+
+def _business_execution_scope_digest(token: str) -> str:
+    """Derive a non-secret cache scope from a validated capability token."""
+    if not token:
+        return ""
+    return hashlib.sha256(
+        b"zettlab-business-execution-scope-v1\0" + token.encode("ascii")
+    ).hexdigest()
 
 
 def _normalize_chat_content(
@@ -986,7 +1035,10 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Headers": (
+        "Authorization, Content-Type, Idempotency-Key, "
+        "X-Zettlab-Business-Execution-Token"
+    ),
 }
 
 
@@ -1260,10 +1312,20 @@ class _IdempotencyCache:
 _idem_cache = _IdempotencyCache()
 
 
-def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
-    from hashlib import sha256
+def _make_request_fingerprint(
+    body: Dict[str, Any],
+    keys: List[str],
+    *,
+    execution_scope_digest: str = "",
+) -> str:
     subset = {k: body.get(k) for k in keys}
-    return sha256(repr(subset).encode("utf-8")).hexdigest()
+    material = repr(subset).encode("utf-8")
+    if execution_scope_digest:
+        material += (
+            b"\0zettlab-business-execution-scope-v1:"
+            + execution_scope_digest.encode("ascii")
+        )
+    return hashlib.sha256(material).hexdigest()
 
 
 def _derive_chat_session_id(
@@ -3808,6 +3870,9 @@ class APIServerAdapter(BasePlatformAdapter):
         plan_auto_execute = _extract_plan_auto_execute(body)
         turn_id = _extract_turn_id(body)
         connector_route_capability = _extract_connector_route_capability(body)
+        business_execution_token = _extract_business_execution_token(
+            request.headers.get("X-Zettlab-Business-Execution-Token", "")
+        )
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -3927,6 +3992,19 @@ class APIServerAdapter(BasePlatformAdapter):
         #     tool) and expansion injects tool-driving instructions — the
         #     message passes through unexpanded instead.
         skill_slug = _extract_skill_slug(body)
+        skill_selection_enabled = bool(
+            skill_slug and body.get("tool_choice") != "none"
+        )
+        trusted_user_message = (
+            _trusted_skill_task_message(user_message, skill_slug)
+            if skill_selection_enabled
+            else user_message
+        )
+        trusted_skill_slug = (
+            skill_slug
+            if skill_selection_enabled
+            else ""
+        )
 
         async def _expanded_user_message(on_settled=None):
             if not skill_slug or body.get("tool_choice") == "none":
@@ -4080,7 +4158,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 plan_auto_execute=plan_auto_execute,
                 turn_id=turn_id,
                 connector_route_capability=connector_route_capability,
+                business_execution_token=business_execution_token,
                 request_overrides=request_overrides or None,
+                trusted_user_message=trusted_user_message,
+                trusted_skill_slug=trusted_skill_slug,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -4131,14 +4212,31 @@ class APIServerAdapter(BasePlatformAdapter):
                     plan_auto_execute=plan_auto_execute,
                     turn_id=turn_id,
                     connector_route_capability=connector_route_capability,
+                    business_execution_token=business_execution_token,
                     request_overrides=request_overrides or None,
+                    trusted_user_message=trusted_user_message,
+                    trusted_skill_slug=trusted_skill_slug,
                 )
             finally:
                 self._end_profile_chat_run(profile_run_key)
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
-            fp = _make_request_fingerprint(body, keys=["model", "messages", "tools", "tool_choice", "response_format", "stream", "metadata"])
+            fp = _make_request_fingerprint(
+                body,
+                keys=[
+                    "model",
+                    "messages",
+                    "tools",
+                    "tool_choice",
+                    "response_format",
+                    "stream",
+                    "metadata",
+                ],
+                execution_scope_digest=_business_execution_scope_digest(
+                    business_execution_token
+                ),
+            )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
             except ValueError as e:
@@ -6283,7 +6381,10 @@ class APIServerAdapter(BasePlatformAdapter):
         plan_auto_execute: Optional[bool] = None,
         turn_id: Optional[str] = None,
         connector_route_capability: Optional[str] = None,
+        business_execution_token: Optional[str] = None,
         request_overrides: Optional[Dict[str, Any]] = None,
+        trusted_user_message: Any = None,
+        trusted_skill_slug: str = "",
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6343,11 +6444,17 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         request_overrides=create_overrides,
                     )
+                    agent._tools_disabled_for_request = (
+                        create_overrides.get("tool_choice") == "none"
+                    )
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     agent._zet_agent_response_mode = response_mode or ""
                     agent._zet_agent_plan_ack = dict(plan_ack or {})
                     agent._zet_agent_plan_auto_execute = resolved_plan_auto_execute
+                    if trusted_user_message is not None:
+                        agent._zet_agent_trusted_user_message = trusted_user_message
+                    agent._zet_agent_trusted_skill_slug = trusted_skill_slug
                     effective_task_id = session_id or str(uuid.uuid4())
                     result = agent.run_conversation(
                         user_message=user_message,

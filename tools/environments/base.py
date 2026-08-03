@@ -601,7 +601,36 @@ class BaseEnvironment(ABC):
 
     def _snapshot_ephemeral_env_keys(self) -> tuple[str, ...]:
         """Env keys that must not survive sourcing or re-dumping snapshots."""
-        return ()
+        try:
+            from gateway.session_context import _VAR_MAP, session_context_engaged
+        except Exception:
+            return ()
+
+        # A CLI/one-shot process that never bound ContextVars still relies on
+        # os.environ for compatibility. Concurrent hosts make ContextVars the
+        # authority, so their task-local keys must not persist in snapshots.
+        return tuple(sorted(_VAR_MAP)) if session_context_engaged() else ()
+
+    def _snapshot_ephemeral_env_exports(self) -> list[str]:
+        """Current values to restore after a persistent snapshot is sourced."""
+        try:
+            from gateway.session_context import (
+                _UNSET,
+                _VAR_MAP,
+                session_context_engaged,
+            )
+        except Exception:
+            return []
+
+        if not session_context_engaged():
+            return []
+        exports = []
+        for key, var in _VAR_MAP.items():
+            value = var.get()
+            if value is _UNSET:
+                continue
+            exports.append(f"export {key}={shlex.quote(str(value or ''))}")
+        return exports
 
     def _unset_snapshot_ephemeral_env_script(self) -> list[str]:
         lines = []
@@ -640,6 +669,7 @@ class BaseEnvironment(ABC):
                 f"source {_quoted_snap} >/dev/null 2>&1 || true"
             )
         parts.extend(self._unset_snapshot_ephemeral_env_script())
+        parts.extend(self._snapshot_ephemeral_env_exports())
 
         # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
         # ``$HOME`` so suffixes with spaces remain a single shell word.

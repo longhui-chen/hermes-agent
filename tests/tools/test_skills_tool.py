@@ -95,9 +95,7 @@ class TestParseFrontmatter:
         assert "name" in fm
 
     def test_utf8_bom_frontmatter(self):
-        """A leading UTF-8 BOM (Windows Notepad / PowerShell ``>`` save) must
-        not drop the frontmatter. Confirms the fix reaches the tools/ surface
-        via the _parse_frontmatter re-export."""
+        """A leading UTF-8 BOM must not drop the frontmatter."""
         bom = chr(0xFEFF)
         content = bom + "---\nname: test\ndescription: A test.\n---\n\n# Body\n"
         fm, body = _parse_frontmatter(content)
@@ -383,6 +381,20 @@ class TestSkillView:
         assert result["success"] is True
         assert result["name"] == "my-skill"
         assert "Step 1" in result["content"]
+        assert "default_response_mode" not in result
+
+    def test_view_does_not_expose_legacy_default_response_mode(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "direct-skill",
+                frontmatter_extra="default_response_mode: direct\n",
+            )
+            raw = skill_view("direct-skill")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "default_response_mode" not in result
 
     def test_view_skill_by_frontmatter_name_when_dir_differs(self, tmp_path):
         # The on-disk directory ("alias-dir") differs from the skill's

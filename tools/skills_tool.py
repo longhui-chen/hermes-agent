@@ -1213,17 +1213,38 @@ def skill_view(
                 ensure_ascii=False,
             )
 
-        # Read the file once — reused for platform check and main content below
+        # Official trusted skills use a stable fd read that is bound to the
+        # immutable startup snapshot. The exact bytes returned here later mint
+        # a one-shot, process-internal trusted-execution attestation. Ordinary and
+        # rejected skills keep the existing reader but can never mint one.
+        response_mode_evidence = None
         try:
-            content = skill_md.read_text(encoding="utf-8")
-        except Exception as e:
-            return json.dumps(
-                {
-                    "success": False,
-                    "error": f"Failed to read skill '{name}': {e}",
-                },
-                ensure_ascii=False,
+            from agent.zet_agent_response_mode import (
+                read_skill_source_with_trusted_execution_evidence,
             )
+
+            content, response_mode_evidence = (
+                read_skill_source_with_trusted_execution_evidence(skill_md)
+            )
+        except Exception:
+            logger.debug(
+                "Could not prepare trusted-execution evidence for %s",
+                skill_md,
+                exc_info=True,
+            )
+            content = None
+            response_mode_evidence = None
+        if content is None:
+            try:
+                content = skill_md.read_text(encoding="utf-8")
+            except Exception as e:
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": f"Failed to read skill '{name}': {e}",
+                    },
+                    ensure_ascii=False,
+                )
 
         # Security: warn if skill is loaded from outside trusted directories
         # (local skills dir + configured external_dirs are all trusted)
@@ -1580,7 +1601,6 @@ def skill_view(
             if setup_needed
             else SkillReadinessStatus.AVAILABLE.value,
         }
-
         setup_help = next((e["help"] for e in required_env_vars if e.get("help")), None)
         if setup_help:
             result["setup_help"] = setup_help
@@ -1621,7 +1641,17 @@ def skill_view(
         if isinstance(metadata, dict):
             result["metadata"] = metadata
 
-        return json.dumps(result, ensure_ascii=False)
+        try:
+            from agent.zet_agent_response_mode import serialize_skill_view_result
+
+            return serialize_skill_view_result(result, response_mode_evidence)
+        except Exception:
+            logger.debug(
+                "Could not serialize trusted-execution evidence for %s",
+                skill_md,
+                exc_info=True,
+            )
+            return json.dumps(result, ensure_ascii=False)
 
     except Exception as e:
         return tool_error(str(e), success=False)

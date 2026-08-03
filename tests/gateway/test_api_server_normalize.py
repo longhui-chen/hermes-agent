@@ -2,12 +2,38 @@
 
 from gateway.platforms import api_server
 from gateway.platforms.api_server import (
+    _extract_business_execution_token,
     _extract_plan_ack,
     _extract_plan_auto_execute,
+    _extract_response_mode,
     _extract_turn_id,
     _normalize_chat_content,
     _resolve_plan_auto_execute,
 )
+
+
+class TestExtractBusinessExecutionToken:
+    def test_valid_opaque_token_is_preserved(self):
+        assert _extract_business_execution_token("a" * 64) == "a" * 64
+
+    def test_malformed_or_header_injected_token_is_dropped(self):
+        assert _extract_business_execution_token("short") == ""
+        assert _extract_business_execution_token("a" * 64 + "\r\nX-Evil: 1") == ""
+        assert _extract_business_execution_token("A" * 64) == ""
+
+
+class TestExtractResponseMode:
+    def test_plan_mode_is_preserved(self):
+        assert _extract_response_mode(
+            {"metadata": {"response_mode": "plan"}}
+        ) == "plan"
+
+    def test_missing_direct_or_unknown_mode_preserves_default(self):
+        assert _extract_response_mode({}) == ""
+        assert _extract_response_mode(
+            {"metadata": {"responseMode": " DIRECT "}}
+        ) == ""
+        assert _extract_response_mode({"metadata": {"response_mode": "auto"}}) == ""
 
 
 class TestExtractPlanAck:
@@ -15,25 +41,69 @@ class TestExtractPlanAck:
         assert _extract_plan_ack({
             "metadata": {
                 "plan_ack": {
+                    "turn_id": "turn-plan-1",
                     "status": "cancelled",
                     "revision_requested": False,
                 },
             },
-        }) == {"status": "cancelled", "revision_requested": False}
+        }) == {
+            "turn_id": "turn-plan-1",
+            "status": "cancelled",
+            "revision_requested": False,
+        }
 
     def test_camel_case_revision_ack(self):
         assert _extract_plan_ack({
             "metadata": {
                 "planAck": {
+                    "turnId": "turn-plan-2",
                     "status": "cancelled",
                     "revisionRequested": True,
                 },
             },
-        }) == {"status": "cancelled", "revision_requested": True}
+        }) == {
+            "turn_id": "turn-plan-2",
+            "status": "cancelled",
+            "revision_requested": True,
+        }
+
+    def test_legacy_ack_uses_metadata_turn_id(self):
+        assert _extract_plan_ack({
+            "metadata": {
+                "turn_id": "legacy-plan-turn",
+                "plan_ack": {
+                    "status": "confirmed",
+                    "revision_requested": False,
+                },
+            },
+        }) == {
+            "turn_id": "legacy-plan-turn",
+            "status": "confirmed",
+            "revision_requested": False,
+        }
+
+    def test_released_ack_without_turn_id_preserves_receipt_without_binding(self):
+        ack = _extract_plan_ack({
+            "metadata": {
+                "plan_ack": {
+                    "status": "confirmed",
+                    "revision_requested": False,
+                },
+            },
+        })
+
+        assert ack == {
+            "status": "confirmed",
+            "revision_requested": False,
+        }
+        assert "turn_id" not in ack
 
     def test_unknown_or_malformed_ack_is_ignored(self):
         assert _extract_plan_ack({"metadata": {"plan_ack": "cancelled"}}) == {}
         assert _extract_plan_ack({"metadata": {"plan_ack": {"status": "other"}}}) == {}
+        assert _extract_plan_ack({
+            "metadata": {"plan_ack": {"status": "confirmed", "turn_id": ""}},
+        }) == {}
 
 
 class TestExtractPlanAutoExecute:

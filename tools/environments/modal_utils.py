@@ -178,6 +178,16 @@ class BaseModalExecutionEnvironment(BaseEnvironment):
         if sudo_stdin is not None:
             exec_command = wrap_modal_sudo_pipe(exec_command, sudo_stdin)
 
+        context_lines = []
+        unset_snapshot_env = getattr(self, "_unset_snapshot_ephemeral_env_script", None)
+        if callable(unset_snapshot_env):
+            context_lines.extend(unset_snapshot_env())
+        snapshot_env_exports = getattr(self, "_snapshot_ephemeral_env_exports", None)
+        if callable(snapshot_env_exports):
+            context_lines.extend(snapshot_env_exports())
+        if context_lines:
+            exec_command = "\n".join((*context_lines, exec_command))
+
         return PreparedModalExec(
             command=exec_command,
             cwd=effective_cwd,
