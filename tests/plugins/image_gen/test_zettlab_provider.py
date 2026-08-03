@@ -15,6 +15,12 @@ import requests
 from plugins.image_gen.zettlab import ZettlabImageGenProvider, _gateway_aspect_ratio, register
 
 
+TINY_PNG_DATA_URL = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
+
+
 def _spawn_parent_watchdog_probe(output):
     from plugins import zettlab_media_client as client
 
@@ -235,6 +241,83 @@ def test_zettlab_image_generate_creates_media_job(monkeypatch):
         {"url": "https://example.com/source.png", "role": "source"},
         {"url": "https://example.com/ref.png", "role": "reference"},
     ]
+    assert "input_image" not in captured["json"]
+
+
+def test_zettlab_image_generate_routes_data_uri_to_inline_input(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    captured = {}
+    monkeypatch.setattr(
+        client,
+        "resolve_model_with_capability",
+        lambda media_type, requested=None: (
+            "seedream-v4",
+            {
+                "id": "seedream-v4",
+                "modalities": ["text", "image"],
+                "_type_limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
+            },
+        ),
+    )
+
+    def fake_create_and_wait(**kwargs):
+        captured.update(kwargs["payload"])
+        return {"job_id": "job-inline", "status": "done", "assets": [{"url": "https://cdn.example/inline.png"}]}
+
+    monkeypatch.setattr(client, "create_and_wait", fake_create_and_wait)
+    got = ZettlabImageGenProvider().generate(
+        "turn this into a pet",
+        reference_image_urls=[TINY_PNG_DATA_URL],
+    )
+
+    assert got["success"] is True
+    assert captured["input_image"] == TINY_PNG_DATA_URL
+    assert "remote_media_inputs" not in captured
+
+
+def test_zettlab_image_generate_rejects_mixed_inline_and_remote_without_http(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setattr(
+        client,
+        "resolve_model_with_capability",
+        lambda media_type, requested=None: (
+            "seedream-v4",
+            {
+                "id": "seedream-v4",
+                "modalities": ["text", "image"],
+                "_type_limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        client,
+        "create_and_wait",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("HTTP must not run")),
+    )
+
+    got = ZettlabImageGenProvider().generate(
+        "turn this into a pet",
+        image_url=TINY_PNG_DATA_URL,
+        reference_image_urls=["https://example.com/ref.png"],
+    )
+
+    assert got["success"] is False
+    assert "cannot be mixed" in got["error"]
+
+
+def test_generated_image_data_uri_rejects_symbolic_links(tmp_path):
+    from plugins import zettlab_media_client as client
+
+    target = tmp_path / "candidate.png"
+    target.write_bytes(b"\x89PNG\r\n\x1a\n" + b"owned-runtime-image")
+    link = tmp_path / "candidate-link.png"
+    link.symlink_to(target)
+
+    assert client.image_path_data_uri(target).startswith("data:image/png;base64,")
+    with pytest.raises(client.ZettlabMediaError, match="symbolic link"):
+        client.image_path_data_uri(link)
 
 
 @pytest.mark.parametrize(

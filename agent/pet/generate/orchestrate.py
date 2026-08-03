@@ -15,7 +15,9 @@ preview/loading point.
 
 from __future__ import annotations
 
+import json
 import logging
+import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -84,7 +86,7 @@ def generate_base_drafts(
     *,
     n: int = 4,
     style: str = "auto",
-    reference_images: list[Path] | None = None,
+    reference_images: list[str | Path] | None = None,
     provider: SpriteProvider | None = None,
     on_draft: Callable[[int, Path], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
@@ -204,12 +206,15 @@ def hatch_pet(
     on_progress: ProgressFn | None = None,
     provider: SpriteProvider | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    staging_dir: str | Path | None = None,
 ) -> HatchResult:
-    """Turn an approved base image into a full, installed Hermes pet.
+    """Turn an approved base image into a full Hermes pet.
 
     Generates a grounded row strip per state, extracts frames, composes +
-    validates the atlas, and registers it. The idle row falls back to the base
-    look so the pet always renders. Raises :class:`GenerationError` on failure.
+    validates the atlas. By default the result is registered in the profile's
+    pet store. When *staging_dir* is supplied, the package is written beneath
+    that existing non-symlink directory without installing it. The idle row
+    falls back to the base look so the pet always renders.
 
     *is_cancelled*, when supplied, is polled cooperatively: rows that haven't
     started are skipped, queued rows are cancelled, and once every row is done we
@@ -339,20 +344,87 @@ def hatch_pet(
             f"only {len(filled_states)}/{len(atlas.ROW_SPECS)} animation rows were usable; regenerate"
         )
 
-    from agent.pet import store
-
     progress("save", slug)
     logger.info("pet hatch %r: saving pet", slug)
-    pet = store.register_local_pet(
-        sheet,
-        slug=slug,
-        display_name=display_name or slug,
-        description=description,
-    )
+    if staging_dir is None:
+        from agent.pet import store
+
+        pet = store.register_local_pet(
+            sheet,
+            slug=slug,
+            display_name=display_name or slug,
+            description=description,
+        )
+        saved_slug = pet.slug
+        saved_display_name = pet.display_name
+        spritesheet = pet.spritesheet
+    else:
+        saved_slug, saved_display_name, spritesheet = _stage_hatched_pet(
+            sheet,
+            staging_dir=Path(staging_dir),
+            slug=slug,
+            display_name=display_name,
+            description=description,
+        )
     return HatchResult(
-        slug=pet.slug,
-        display_name=pet.display_name,
-        spritesheet=pet.spritesheet,
+        slug=saved_slug,
+        display_name=saved_display_name,
+        spritesheet=spritesheet,
         states=validation["filled_states"],
         validation=validation,
     )
+
+
+def _stage_hatched_pet(
+    spritesheet,
+    *,
+    staging_dir: Path,
+    slug: str,
+    display_name: str,
+    description: str,
+) -> tuple[str, str, Path]:
+    """Write one generated pet package outside the installed pet store."""
+    from agent.pet import store
+
+    safe_slug = store.slugify(slug)
+    directory: Path | None = None
+    try:
+        root = staging_dir.expanduser()
+        if root.is_symlink() or not root.is_dir():
+            raise GenerationError("pet staging directory is unavailable")
+        root = root.resolve(strict=True)
+        directory = root / safe_slug
+        if directory.exists() or directory.is_symlink():
+            raise GenerationError("pet staging output already exists")
+        directory.mkdir(mode=0o700)
+        sprite_path = directory / "spritesheet.webp"
+        sprite_partial = directory / "spritesheet.webp.part"
+        metadata_path = directory / "pet.json"
+        metadata_partial = directory / "pet.json.part"
+        try:
+            store._write_spritesheet(spritesheet, sprite_partial)
+            sprite_partial.replace(sprite_path)
+            metadata_partial.write_text(
+                json.dumps(
+                    {
+                        "id": safe_slug,
+                        "displayName": display_name or safe_slug,
+                        "description": description or "",
+                        "spritesheetPath": sprite_path.name,
+                        "createdBy": "generator",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            metadata_partial.replace(metadata_path)
+        finally:
+            sprite_partial.unlink(missing_ok=True)
+            metadata_partial.unlink(missing_ok=True)
+        return safe_slug, display_name or safe_slug, sprite_path
+    except Exception as exc:
+        if directory is not None:
+            shutil.rmtree(directory, ignore_errors=True)
+        if isinstance(exc, GenerationError):
+            raise
+        raise GenerationError(f"could not stage generated pet '{safe_slug}': {exc}") from exc

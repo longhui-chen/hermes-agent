@@ -8,11 +8,14 @@ zettlab-ai-gateway.
 from __future__ import annotations
 
 import atexit
+import base64
+import binascii
 import io
 import ipaddress
 import json
 import multiprocessing
 import os
+import stat
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -27,8 +30,9 @@ CAPABILITY_TIMEOUT = 5.0
 REQUEST_TIMEOUT = 30.0
 MAX_CAPABILITY_RESPONSE_BYTES = 256 * 1024
 MAX_ERROR_RESPONSE_BYTES = 64 * 1024
-MAX_MEDIA_REQUEST_BYTES = 1024 * 1024
+MAX_MEDIA_REQUEST_BYTES = 7 * 1024 * 1024
 MAX_MEDIA_RESPONSE_BYTES = 1024 * 1024
+MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024
 ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
 ARTIFACT_SESSION_HEADER = "X-Zettlab-Artifact-Session-Id"
 _STARTER_CAPACITY = threading.BoundedSemaphore(value=2)
@@ -645,6 +649,121 @@ def remote_inputs(
         if normalized:
             out.append({"url": normalized, "role": "reference"})
     return out
+
+
+def normalized_modalities(model_capability: Optional[Dict[str, Any]]) -> List[str]:
+    """Return the gateway modalities Hermes can safely act on."""
+    raw = model_capability.get("modalities") if isinstance(model_capability, dict) else None
+    if raw is None:
+        return ["text"]
+    out: List[str] = []
+    if isinstance(raw, list):
+        for value in raw:
+            normalized = value.strip().casefold() if isinstance(value, str) else ""
+            if normalized in {"text", "image"} and normalized not in out:
+                out.append(normalized)
+    return out
+
+
+def _inline_image_limit(model_capability: Optional[Dict[str, Any]]) -> int:
+    limits = model_capability.get("_type_limits") if isinstance(model_capability, dict) else None
+    declared = limits.get("max_inline_image_bytes") if isinstance(limits, dict) else None
+    if (
+        "image" not in normalized_modalities(model_capability)
+        or not isinstance(declared, int)
+        or isinstance(declared, bool)
+        or declared <= 0
+    ):
+        raise ZettlabMediaError(
+            "Inline image input is not enabled for this Zettlab image generation model"
+        )
+    return min(declared, MAX_INLINE_IMAGE_BYTES)
+
+
+def _sniff_image_mime(raw: bytes) -> Optional[str]:
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if raw.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if len(raw) >= 12 and raw.startswith(b"RIFF") and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def validate_inline_image_data_uri(value: str, *, max_bytes: int) -> str:
+    """Validate one bounded PNG/JPEG/WebP base64 data URI."""
+    header, separator, encoded = str(value or "").strip().partition(",")
+    if not separator or not header.startswith("data:image/") or not header.endswith(";base64"):
+        raise ZettlabMediaError("inline image input must be a PNG, JPEG, or WebP data URI")
+    declared_mime = header[len("data:") : -len(";base64")].lower()
+    if declared_mime not in {"image/png", "image/jpeg", "image/webp"}:
+        raise ZettlabMediaError("inline image input must use PNG, JPEG, or WebP")
+    padding = 2 if encoded.endswith("==") else 1 if encoded.endswith("=") else 0
+    if not encoded or len(encoded) % 4 != 0:
+        raise ZettlabMediaError("inline image input must contain valid base64")
+    decoded_size = len(encoded) // 4 * 3 - padding
+    if decoded_size <= 0 or decoded_size > min(max_bytes, MAX_INLINE_IMAGE_BYTES):
+        raise ZettlabMediaError("inline image input exceeds maximum size")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise ZettlabMediaError("inline image input must contain valid base64") from exc
+    detected_mime = _sniff_image_mime(raw)
+    if detected_mime is None or detected_mime != declared_mime:
+        raise ZettlabMediaError("inline image input MIME type does not match its bytes")
+    return str(value).strip()
+
+
+def image_path_data_uri(path: os.PathLike[str] | str, *, max_bytes: int = MAX_INLINE_IMAGE_BYTES) -> str:
+    """Encode one runtime-owned regular image file for the inline gateway field."""
+    source = os.fspath(path)
+    limit = min(max_bytes, MAX_INLINE_IMAGE_BYTES)
+    try:
+        if stat.S_ISLNK(os.lstat(source).st_mode):
+            raise ZettlabMediaError("generated image input must not be a symbolic link")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(source, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            metadata = os.fstat(handle.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ZettlabMediaError("generated image input must be a regular file")
+            if metadata.st_size <= 0 or metadata.st_size > limit:
+                raise ZettlabMediaError("generated image input exceeds maximum size")
+            raw = handle.read(limit + 1)
+    except OSError as exc:
+        raise ZettlabMediaError(f"unable to read generated image input: {exc}") from exc
+    if not raw or len(raw) > limit or len(raw) != metadata.st_size:
+        raise ZettlabMediaError("generated image input exceeds maximum size")
+    mime = _sniff_image_mime(raw)
+    if mime is None:
+        raise ZettlabMediaError("generated image input must be PNG, JPEG, or WebP")
+    return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+
+
+def split_image_inputs(
+    image_url: Optional[str],
+    reference_image_urls: Optional[List[str]],
+    model_capability: Optional[Dict[str, Any]],
+) -> tuple[Optional[str], List[Dict[str, str]]]:
+    """Route one inline image or HTTPS references without mixing contracts."""
+    candidates = [
+        str(value).strip()
+        for value in [image_url, *(reference_image_urls or [])]
+        if value is not None and str(value).strip()
+    ]
+    if not candidates:
+        return None, []
+    inline = [value for value in candidates if value.startswith("data:")]
+    remote = [value for value in candidates if not value.startswith("data:")]
+    if inline and remote:
+        raise ZettlabMediaError("inline and remote image inputs cannot be mixed")
+    if inline:
+        if len(inline) != 1:
+            raise ZettlabMediaError("exactly one inline image input is supported")
+        return validate_inline_image_data_uri(
+            inline[0], max_bytes=_inline_image_limit(model_capability)
+        ), []
+    return None, remote_inputs(image_url, reference_image_urls)
 
 
 def create_and_wait(

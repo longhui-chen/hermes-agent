@@ -462,6 +462,36 @@ def test_hatch_pet_end_to_end(monkeypatch, tmp_path):
     assert store.load_pet("mocky").exists
 
 
+def test_stage_hatched_pet_writes_package_without_installing(monkeypatch, tmp_path):
+    import json
+
+    from agent.pet import store
+    from agent.pet.generate import orchestrate
+
+    installed = tmp_path / "installed"
+    staging = tmp_path / "staging"
+    installed.mkdir()
+    staging.mkdir()
+    monkeypatch.setattr(store, "pets_dir", lambda: installed)
+    sheet = atlas.compose_atlas(_frames_for_all_states())
+
+    slug, display_name, spritesheet = orchestrate._stage_hatched_pet(
+        sheet,
+        staging_dir=staging,
+        slug="Blue Byte",
+        display_name="Blue Byte",
+        description="An original test pet.",
+    )
+
+    metadata = json.loads((spritesheet.parent / "pet.json").read_text())
+    assert slug == "blue-byte"
+    assert display_name == "Blue Byte"
+    assert spritesheet.is_file()
+    assert metadata["id"] == "blue-byte"
+    assert metadata["spritesheetPath"] == "spritesheet.webp"
+    assert list(installed.iterdir()) == []
+
+
 def test_hatch_pet_idle_fallback_when_row_fails(monkeypatch, tmp_path):
     from agent.pet.generate import atlas as atlas_mod
     from agent.pet.generate import imagegen, orchestrate
