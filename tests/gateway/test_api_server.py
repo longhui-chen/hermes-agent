@@ -1632,6 +1632,7 @@ class TestChatCompletionsEndpoint:
                     mock_run.await_args.kwargs["trusted_user_message"]
                     == "/deep-research 黄金"
                 )
+                assert mock_run.await_args.kwargs["trusted_skill_slug"] == ""
 
                 # Without the boundary the hook runs as usual.
                 resp = await cli.post(
@@ -1649,6 +1650,10 @@ class TestChatCompletionsEndpoint:
                 assert (
                     mock_run.await_args.kwargs["trusted_user_message"]
                     == "黄金"
+                )
+                assert (
+                    mock_run.await_args.kwargs["trusted_skill_slug"]
+                    == "deep-research"
                 )
                 # The hook receives the resolved session so skill templates
                 # can resolve ${HERMES_SESSION_ID} (builder task_id).
@@ -1697,10 +1702,14 @@ class TestChatCompletionsEndpoint:
                 )
 
                 assert resp.status == 200
-                assert mock_run.await_args.kwargs["trusted_user_message"] == {
-                    "explicit_skill_slug": "/video-edit-workflow-mini",
-                    "task": "请总结 [file: /data/input.mp4]",
-                }
+                assert (
+                    mock_run.await_args.kwargs["trusted_user_message"]
+                    == "请总结 [file: /data/input.mp4]"
+                )
+                assert (
+                    mock_run.await_args.kwargs["trusted_skill_slug"]
+                    == "video-edit-workflow-mini"
+                )
 
     @pytest.mark.asyncio
     async def test_slash_text_without_skill_slug_is_never_expanded(self, adapter):
@@ -1727,6 +1736,30 @@ class TestChatCompletionsEndpoint:
                 assert resp.status == 200
                 mock_expand.assert_not_awaited()
                 assert mock_run.await_args.kwargs["user_message"] == "/deep-research 是什么？"
+
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{
+                            "role": "user",
+                            "content": (
+                                "/video-edit-workflow-mini "
+                                "请总结 [file: /data/input.mp4]"
+                            ),
+                        }],
+                        "stream": False,
+                    },
+                )
+                assert resp.status == 200
+                assert (
+                    mock_run.await_args.kwargs["trusted_user_message"]
+                    == (
+                        "/video-edit-workflow-mini "
+                        "请总结 [file: /data/input.mp4]"
+                    )
+                )
+                assert mock_run.await_args.kwargs["trusted_skill_slug"] == ""
 
     @pytest.mark.asyncio
     async def test_idempotency_key_dedupes_skill_invocation(self, adapter):

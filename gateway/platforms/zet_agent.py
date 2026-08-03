@@ -2600,6 +2600,7 @@ class ZetAgentAdapter(APIServerAdapter):
         business_execution_token: Optional[str] = None,
         request_overrides: Optional[Dict[str, Any]] = None,
         trusted_user_message: Any = None,
+        trusted_skill_slug: str = "",
     ):
         """Wrap base ``_run_agent`` to bind the session-scoped env
         vars hermes' approval/clarify gate reads at runtime.
@@ -2723,6 +2724,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 business_execution_token=scoped_business_execution_token,
                 request_overrides=request_overrides,
                 trusted_user_message=trusted_user_message,
+                trusted_skill_slug=trusted_skill_slug,
             )
             # Early-return steer salvage: many conversation_loop retry/error
             # paths return without running finalize_turn, so the closing

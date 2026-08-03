@@ -103,9 +103,9 @@ _VIDEO_EDIT_CONTINUATION_EN_RE = re.compile(
     r"[\s.!?,]*$",
     re.IGNORECASE,
 )
-_VIDEO_EDIT_SLASH_RE = re.compile(
-    r"^/video-edit-workflow-mini(?:\s+.{0,192})?$",
-    re.IGNORECASE | re.DOTALL,
+_VIDEO_EDIT_SLASH_TOKEN_RE = re.compile(
+    r"(?<!\S)/video-edit-workflow-mini(?!\S)",
+    re.IGNORECASE,
 )
 _GATEWAY_MODEL_SWITCH_NOTE_RE = re.compile(
     r"^\s*\[Note: the model has changed and is now "
@@ -298,12 +298,6 @@ def _video_edit_continuation_intent(normalized: str) -> bool:
         _VIDEO_EDIT_CONTINUATION_CN_RE.fullmatch(normalized)
         or _VIDEO_EDIT_CONTINUATION_EN_RE.fullmatch(normalized)
     )
-
-
-def _video_edit_slash_intent(normalized: str) -> bool:
-    if not normalized or len(normalized) > 224:
-        return False
-    return bool(_VIDEO_EDIT_SLASH_RE.fullmatch(normalized))
 
 
 def _video_edit_direct_command_intent(normalized: str) -> bool:
@@ -1166,22 +1160,42 @@ def _task_text_and_video_asset(user_message: Any) -> tuple[str, bool]:
     return "\n".join(parts), has_video_asset
 
 
-def _skill_direct_task_context(agent: Any, user_message: Any) -> _SkillDirectTaskContext:
+def _skill_direct_task_context(
+    agent: Any,
+    user_message: Any,
+    *,
+    explicit_skill_slug: str = "",
+) -> _SkillDirectTaskContext:
     task_text, has_video_asset = _task_text_and_video_asset(user_message)
     task_text = _strip_gateway_model_switch_note(task_text)
     normalized = " ".join(task_text.lower().split())
+    normalized_skill_slug = (
+        explicit_skill_slug.strip().lstrip("/").lower()
+        if isinstance(explicit_skill_slug, str)
+        else ""
+    )
+    explicit_transport_selection = (
+        normalized_skill_slug == "video-edit-workflow-mini"
+    )
+    # A slash token inside user-authored text is display/content, not a trusted
+    # transport selection. Ignore the token itself for semantic intent while
+    # preserving the remaining natural-language request.
+    intent_normalized = " ".join(
+        _VIDEO_EDIT_SLASH_TOKEN_RE.sub(" ", normalized).split()
+    )
     has_edit_intent = bool(
-        _VIDEO_EDIT_CN_RE.search(normalized) or _VIDEO_EDIT_EN_RE.search(normalized)
+        _VIDEO_EDIT_CN_RE.search(intent_normalized)
+        or _VIDEO_EDIT_EN_RE.search(intent_normalized)
     )
     explicit = (
-        (has_video_asset and has_edit_intent)
-        or _video_edit_slash_intent(normalized)
-        or _video_edit_direct_command_intent(normalized)
+        explicit_transport_selection
+        or (has_video_asset and has_edit_intent)
+        or _video_edit_direct_command_intent(intent_normalized)
     )
     now = time.monotonic()
     resume_key = _current_skill_direct_resume_key()
     resume_sessions = _video_edit_resume_sessions_locked(now=now)
-    continuation_intent = _video_edit_continuation_intent(normalized)
+    continuation_intent = _video_edit_continuation_intent(intent_normalized)
     confirmed_plan_resume = _confirmed_video_edit_plan_resume(
         resume_key,
         resume_sessions,
@@ -1201,8 +1215,13 @@ def _skill_direct_task_context(agent: Any, user_message: Any) -> _SkillDirectTas
     )
     if resumed and resume_key is not None and resume_key in resume_sessions:
         resume_sessions.move_to_end(resume_key)
+    task_binding = (
+        f"skill:{normalized_skill_slug}\n{normalized}"
+        if explicit_transport_selection
+        else normalized
+    )
     return _SkillDirectTaskContext(
-        task_sha256=hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+        task_sha256=hashlib.sha256(task_binding.encode("utf-8")).hexdigest(),
         turn_identity=_current_skill_direct_turn_identity(),
         video_edit_applicable=explicit or resumed,
         video_edit_explicit=explicit,
@@ -1715,7 +1734,12 @@ def request_response_mode(agent: Any) -> str:
     return "plan" if mode == "plan" else ""
 
 
-def reset_trusted_skill_execution(agent: Any, user_message: Any = None) -> None:
+def reset_trusted_skill_execution(
+    agent: Any,
+    user_message: Any = None,
+    *,
+    explicit_skill_slug: str = "",
+) -> None:
     """Clear trusted execution and bind eligibility to the new user task."""
     _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
     with _SKILL_DIRECT_LOCK:
@@ -1724,6 +1748,7 @@ def reset_trusted_skill_execution(agent: Any, user_message: Any = None) -> None:
         task = _skill_direct_task_context(
             agent,
             user_message,
+            explicit_skill_slug=explicit_skill_slug,
         )
         if task.video_edit_explicit:
             resume_key = _current_skill_direct_resume_key()

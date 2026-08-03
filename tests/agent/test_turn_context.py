@@ -22,7 +22,10 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 import agent.zet_agent_response_mode as response_mode
 import tools.skills_tool as skills_tool_module
 from agent.context_compressor import ContextCompressor
-from agent.conversation_loop import _consume_trusted_skill_task_message
+from agent.conversation_loop import (
+    _consume_trusted_skill_slug,
+    _consume_trusted_skill_task_message,
+)
 from agent.turn_context import TurnContext, build_turn_context
 from agent.zet_agent_response_mode import (
     apply_trusted_skill_execution,
@@ -579,8 +582,16 @@ def test_video_edit_followup_capability_is_session_and_intent_bounded_unit():
             slash_agent,
             "/video-edit-workflow-mini resume the existing project",
         )
-        assert slash_agent._zet_agent_skill_direct_task.video_edit_applicable
-        assert slash_agent._zet_agent_skill_direct_task.video_edit_explicit
+        assert not slash_agent._zet_agent_skill_direct_task.video_edit_applicable
+
+        transport_agent = _FakeAgent()
+        reset_trusted_skill_execution(
+            transport_agent,
+            "resume the existing project",
+            explicit_skill_slug="video-edit-workflow-mini",
+        )
+        assert transport_agent._zet_agent_skill_direct_task.video_edit_applicable
+        assert transport_agent._zet_agent_skill_direct_task.video_edit_explicit
 
         response_mode._VIDEO_EDIT_RESUME_SESSIONS[resume_key] = (
             response_mode.time.monotonic() - 1
@@ -740,19 +751,100 @@ def test_short_natural_video_edit_commands_without_inline_asset_are_explicit_uni
 
 
 def test_explicit_video_edit_transport_selection_mints_task_scope_unit():
+    raw_slash_agent = _FakeAgent()
+    reset_trusted_skill_execution(
+        raw_slash_agent,
+        "/video-edit-workflow-mini 请总结 [file: /data/input.mp4]",
+    )
+    assert not raw_slash_agent._zet_agent_skill_direct_task.video_edit_applicable
+
+    natural_intent_agent = _FakeAgent()
+    reset_trusted_skill_execution(
+        natural_intent_agent,
+        "/video-edit-workflow-mini 请把 [file: /data/input.mp4] 剪辑成 vlog",
+    )
+    assert natural_intent_agent._zet_agent_skill_direct_task.video_edit_applicable
+
+    unrelated_transport_agent = _FakeAgent()
+    reset_trusted_skill_execution(
+        unrelated_transport_agent,
+        "请总结 [file: /data/input.mp4]",
+        explicit_skill_slug="deep-research",
+    )
+    assert not (
+        unrelated_transport_agent._zet_agent_skill_direct_task.video_edit_applicable
+    )
+
     agent = _FakeAgent()
 
     reset_trusted_skill_execution(
         agent,
-        {
-            "explicit_skill_slug": "/video-edit-workflow-mini",
-            "task": "请总结 [file: /data/input.mp4]",
-        },
+        "请总结 [file: /data/input.mp4]",
+        explicit_skill_slug="video-edit-workflow-mini",
     )
 
     task = agent._zet_agent_skill_direct_task
     assert task.video_edit_applicable
     assert task.video_edit_explicit
+
+
+def test_raw_slash_text_cannot_mint_trusted_video_scope_flow(
+    tmp_path,
+    monkeypatch,
+):
+    from agent import secret_scope as secret_scope_module
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    presets_dir = tmp_path / "presets"
+    skill_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    skill_dir.mkdir(parents=True)
+    skill_bytes = b"# trusted video edit skill\n"
+    (skill_dir / "SKILL.md").write_bytes(skill_bytes)
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=skill_bytes,
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+    assert snapshot is not None
+    monkeypatch.setattr(response_mode, "_TRUSTED_PRESETS_SNAPSHOT", snapshot)
+    monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", presets_dir / "skills")
+
+    secret_token = secret_scope_module.set_secret_scope(
+        {
+            "ZET_AGENT_ID": "main",
+            "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
+        }
+    )
+    session_tokens = set_session_vars(
+        session_key="zettlab:user:main:raw-slash-session",
+        session_id="zettlab:user:main:raw-slash-session",
+    )
+    turn_tokens = set_turn_vars(
+        turn_id="raw-slash-turn",
+        business_execution_token="business-token",
+    )
+    try:
+        agent = _FakeAgent()
+        agent.platform = "zet_agent"
+        reset_trusted_skill_execution(
+            agent,
+            "/video-edit-workflow-mini 请总结 [file: /data/input.mp4]",
+        )
+
+        result = skills_tool_module.skill_view("video-edit-workflow-mini")
+        assert not apply_trusted_skill_execution(
+            agent,
+            function_name="skill_view",
+            function_result=result,
+        )
+        assert trusted_skill_allowed_tool_names(agent) == frozenset()
+    finally:
+        response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
+        secret_scope_module.reset_secret_scope(secret_token)
 
 
 def test_model_switch_note_video_edit_resume_scope_flow(tmp_path, monkeypatch):
@@ -1017,13 +1109,45 @@ def test_expanded_skill_text_cannot_mint_trusted_video_scope_flow():
         agent = _FakeAgent()
         agent.platform = "zet_agent"
         agent._zet_agent_trusted_user_message = raw_user_message
+        agent._zet_agent_trusted_skill_slug = ""
 
         trusted_task = _consume_trusted_skill_task_message(agent, expanded_message)
-        reset_trusted_skill_execution(agent, trusted_task)
+        trusted_skill_slug = _consume_trusted_skill_slug(agent)
+        reset_trusted_skill_execution(
+            agent,
+            trusted_task,
+            explicit_skill_slug=trusted_skill_slug,
+        )
 
         assert trusted_task == raw_user_message
         assert not agent._zet_agent_skill_direct_task.video_edit_applicable
         assert not hasattr(agent, "_zet_agent_trusted_user_message")
+        assert not hasattr(agent, "_zet_agent_trusted_skill_slug")
+    finally:
+        clear_turn_vars(turn_tokens)
+
+
+def test_transport_skill_selection_is_separate_from_user_text_flow():
+    turn_tokens = set_turn_vars(turn_id="transport-skill-turn")
+    try:
+        agent = _FakeAgent()
+        agent.platform = "zet_agent"
+        agent._zet_agent_trusted_user_message = "请总结 [file: /data/input.mp4]"
+        agent._zet_agent_trusted_skill_slug = "video-edit-workflow-mini"
+
+        trusted_task = _consume_trusted_skill_task_message(agent, "<<EXPANDED>>")
+        trusted_skill_slug = _consume_trusted_skill_slug(agent)
+        reset_trusted_skill_execution(
+            agent,
+            trusted_task,
+            explicit_skill_slug=trusted_skill_slug,
+        )
+
+        assert trusted_task == "请总结 [file: /data/input.mp4]"
+        assert agent._zet_agent_skill_direct_task.video_edit_applicable
+        assert agent._zet_agent_skill_direct_task.video_edit_explicit
+        assert not hasattr(agent, "_zet_agent_trusted_user_message")
+        assert not hasattr(agent, "_zet_agent_trusted_skill_slug")
     finally:
         clear_turn_vars(turn_tokens)
 

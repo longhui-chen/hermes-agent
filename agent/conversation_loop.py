@@ -436,6 +436,19 @@ def _consume_trusted_skill_task_message(agent: Any, fallback: Any) -> Any:
     return trusted_message
 
 
+def _consume_trusted_skill_slug(agent: Any) -> str:
+    """Return the transport-selected skill once, never inferred from text."""
+    marker = object()
+    trusted_skill_slug = getattr(agent, "_zet_agent_trusted_skill_slug", marker)
+    if trusted_skill_slug is marker:
+        return ""
+    try:
+        delattr(agent, "_zet_agent_trusted_skill_slug")
+    except AttributeError:
+        pass
+    return trusted_skill_slug if isinstance(trusted_skill_slug, str) else ""
+
+
 def _plan_mode_interaction_error(agent: Any) -> Optional[str]:
     """Return a recoverable error when Plan mode cannot satisfy its protocol."""
     if not getattr(agent, "_zet_agent_plan_mode_active", False):
@@ -1471,9 +1484,15 @@ def run_conversation(
     agent._delivered_interim_texts = set()
 
     # Main conversation loop counters (pure locals consumed by the loop below).
+    trusted_skill_task = _consume_trusted_skill_task_message(
+        agent,
+        original_user_message,
+    )
+    trusted_skill_slug = _consume_trusted_skill_slug(agent)
     reset_trusted_skill_execution(
         agent,
-        _consume_trusted_skill_task_message(agent, original_user_message),
+        trusted_skill_task,
+        explicit_skill_slug=trusted_skill_slug,
     )
     # Zettlab App plan 模式：本轮每次模型调用只允许 clarify / present_plan。
     agent._zet_agent_plan_mode_active = _should_force_present_plan_tool_choice(

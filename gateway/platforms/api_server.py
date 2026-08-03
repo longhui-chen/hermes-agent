@@ -328,15 +328,9 @@ def _strip_skill_display_token(user_message: Any, skill_slug: str) -> Any:
     ).strip()
 
 
-def _trusted_skill_scope_message(user_message: Any, skill_slug: str) -> Any:
-    """Preserve an explicit transport skill selection outside model text."""
-    task = _strip_skill_display_token(user_message, skill_slug)
-    if skill_slug != "video-edit-workflow-mini":
-        return task
-    return {
-        "explicit_skill_slug": f"/{skill_slug}",
-        "task": task,
-    }
+def _trusted_skill_task_message(user_message: Any, skill_slug: str) -> Any:
+    """Preserve user-authored task text separately from transport selection."""
+    return _strip_skill_display_token(user_message, skill_slug)
 
 
 def _extract_business_execution_token(raw: Any) -> str:
@@ -3998,10 +3992,18 @@ class APIServerAdapter(BasePlatformAdapter):
         #     tool) and expansion injects tool-driving instructions — the
         #     message passes through unexpanded instead.
         skill_slug = _extract_skill_slug(body)
+        skill_selection_enabled = bool(
+            skill_slug and body.get("tool_choice") != "none"
+        )
         trusted_user_message = (
-            _trusted_skill_scope_message(user_message, skill_slug)
-            if skill_slug and body.get("tool_choice") != "none"
+            _trusted_skill_task_message(user_message, skill_slug)
+            if skill_selection_enabled
             else user_message
+        )
+        trusted_skill_slug = (
+            skill_slug
+            if skill_selection_enabled
+            else ""
         )
 
         async def _expanded_user_message(on_settled=None):
@@ -4159,6 +4161,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 business_execution_token=business_execution_token,
                 request_overrides=request_overrides or None,
                 trusted_user_message=trusted_user_message,
+                trusted_skill_slug=trusted_skill_slug,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -4212,6 +4215,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     business_execution_token=business_execution_token,
                     request_overrides=request_overrides or None,
                     trusted_user_message=trusted_user_message,
+                    trusted_skill_slug=trusted_skill_slug,
                 )
             finally:
                 self._end_profile_chat_run(profile_run_key)
@@ -6380,6 +6384,7 @@ class APIServerAdapter(BasePlatformAdapter):
         business_execution_token: Optional[str] = None,
         request_overrides: Optional[Dict[str, Any]] = None,
         trusted_user_message: Any = None,
+        trusted_skill_slug: str = "",
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -6446,6 +6451,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     agent._zet_agent_plan_auto_execute = resolved_plan_auto_execute
                     if trusted_user_message is not None:
                         agent._zet_agent_trusted_user_message = trusted_user_message
+                    agent._zet_agent_trusted_skill_slug = trusted_skill_slug
                     effective_task_id = session_id or str(uuid.uuid4())
                     result = agent.run_conversation(
                         user_message=user_message,
