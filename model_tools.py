@@ -27,7 +27,7 @@ import asyncio
 import logging
 import threading
 import time
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Callable, Dict, Any, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
@@ -1106,6 +1106,9 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    dispatch_wrapper: Optional[
+        Callable[[str, Dict[str, Any], Callable[[], Any]], Any]
+    ] = None,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1127,6 +1130,9 @@ def handle_function_call(
                        matching ``get_tool_definitions`` semantics.
         disabled_toolsets: The session's disabled toolsets, applied as a
                        subtraction when scoping the bridge catalog.
+        dispatch_wrapper: Internal boundary around the raw registry handler.
+                       It runs inside tool-execution middleware and before
+                       post/transform hooks, with the final dispatched args.
 
     Returns:
         Function result as a JSON string.
@@ -1213,6 +1219,7 @@ def handle_function_call(
                 tool_request_middleware_trace=list(_tool_middleware_trace),
                 enabled_toolsets=enabled_toolsets,
                 disabled_toolsets=disabled_toolsets,
+                dispatch_wrapper=dispatch_wrapper,
             )
 
     _tool_original_args = dict(function_args)
@@ -1342,27 +1349,45 @@ def handle_function_call(
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
-                        function_name, next_args,
-                        task_id=task_id,
-                        session_id=session_id,
-                        enabled_tools=sandbox_enabled,
-                        turn_id=turn_id,
-                        tool_call_id=tool_call_id,
-                        user_task=user_task,
-                        previous_assistant_message=previous_assistant_message,
-                    )
+                    def _registry_dispatch() -> Any:
+                        return registry.dispatch(
+                            function_name, next_args,
+                            task_id=task_id,
+                            session_id=session_id,
+                            enabled_tools=sandbox_enabled,
+                            turn_id=turn_id,
+                            tool_call_id=tool_call_id,
+                            user_task=user_task,
+                            previous_assistant_message=previous_assistant_message,
+                        )
+
+                    if dispatch_wrapper is not None:
+                        return dispatch_wrapper(
+                            function_name,
+                            next_args,
+                            _registry_dispatch,
+                        )
+                    return _registry_dispatch()
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
-                        function_name, next_args,
-                        task_id=task_id,
-                        session_id=session_id,
-                        user_task=user_task,
-                        previous_assistant_message=previous_assistant_message,
-                        turn_id=turn_id,
-                        tool_call_id=tool_call_id,
-                    )
+                    def _registry_dispatch() -> Any:
+                        return registry.dispatch(
+                            function_name, next_args,
+                            task_id=task_id,
+                            session_id=session_id,
+                            user_task=user_task,
+                            previous_assistant_message=previous_assistant_message,
+                            turn_id=turn_id,
+                            tool_call_id=tool_call_id,
+                        )
+
+                    if dispatch_wrapper is not None:
+                        return dispatch_wrapper(
+                            function_name,
+                            next_args,
+                            _registry_dispatch,
+                        )
+                    return _registry_dispatch()
             from hermes_cli.middleware import run_tool_execution_middleware
 
             result = run_tool_execution_middleware(
