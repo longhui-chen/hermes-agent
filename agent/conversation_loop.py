@@ -885,6 +885,49 @@ def _invalid_tool_name_error_content(name: str, valid_tool_names) -> str:
     return f"Tool '{name}' does not exist. Available tools: {available}"
 
 
+def _transcript_without_refused_turn(
+    messages: List[Dict],
+    user_message: Any,
+    current_turn_user_idx: int,
+) -> List[Dict]:
+    """Return the transcript with this turn's refused exchange removed.
+
+    A content-policy block must not enter the model's context. Two reasons,
+    both practical rather than legal:
+
+    * The refused text stays in the prompt of every later turn, so one blocked
+      message keeps being re-submitted — to the moderation gateway too, which
+      bills per call.
+    * The model reads its own refusal as precedent and starts hedging on
+      neighbouring topics for the rest of the session.
+
+    The exchange is NOT lost to the user: zettlab-local-server records the turn
+    (and its error code) in its own transcript from the WS path, independent of
+    what hermes persists, so the App still shows which messages were blocked.
+    The two histories diverge here by design — the user sees the attempt, the
+    model does not.
+
+    Trimming has to be done on the returned list, not just skipped at the
+    persist call: the gateway writes ``result["messages"]`` to the session DB
+    itself (zet_agent), so a skipped persist alone would leave the refused turn
+    to be written by the other path.
+
+    ``current_turn_user_idx`` can be stale when compaction rebuilt the list
+    mid-turn, so it is validated and re-anchored. If the turn still cannot be
+    located, everything from the last user message on is dropped — over-trimming
+    one turn is recoverable, keeping refused content is not.
+    """
+    idx = current_turn_user_idx
+    if not (0 <= idx < len(messages)) or messages[idx].get("role") != "user":
+        idx = reanchor_current_turn_user_idx(messages, user_message)
+    if not (0 <= idx < len(messages)):
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].get("role") == "user":
+                return messages[:i]
+        return list(messages)
+    return messages[:idx]
+
+
 def _content_policy_blocked_result(
     messages: List[Dict],
     api_call_count: int,
@@ -2256,7 +2299,12 @@ def run_conversation(
                     )
 
                     agent._cleanup_task_resources(effective_task_id)
-                    agent._persist_session(messages, conversation_history)
+                    # The refused exchange must not survive into the model's
+                    # context — see _transcript_without_refused_turn.
+                    _kept_messages = _transcript_without_refused_turn(
+                        messages, user_message, current_turn_user_idx
+                    )
+                    agent._persist_session(_kept_messages, conversation_history)
                     # No ClassifiedError here — this refusal arrived as a
                     # well-formed HTTP 200 whose finish_reason is
                     # ``content_filter``, so there is no exception to classify.
@@ -2276,7 +2324,7 @@ def run_conversation(
                     if _refusal_text:
                         _refusal_provider_error["provider_message"] = _refusal_text[:500]
                     return _content_policy_blocked_result(
-                        messages,
+                        _kept_messages,
                         api_call_count,
                         final_response=_refusal_response,
                         error_detail=_refusal_text or "model declined (content_filter)",
@@ -4582,6 +4630,18 @@ def run_conversation(
                     # Persisting the failed user message would make the
                     # session even larger, causing the same failure on the
                     # next attempt. (#1630)
+                    _content_refused = (
+                        classified.reason == FailoverReason.content_policy_blocked
+                    )
+                    # A refused turn is trimmed out of the transcript rather
+                    # than persisted — see _transcript_without_refused_turn.
+                    _kept_messages = (
+                        _transcript_without_refused_turn(
+                            messages, user_message, current_turn_user_idx
+                        )
+                        if _content_refused
+                        else messages
+                    )
                     if status_code == 400 and (approx_tokens > 50000 or len(api_messages) > 80):
                         agent._vprint(
                             f"{agent.log_prefix}⚠️  Skipping session persistence "
@@ -4589,8 +4649,8 @@ def run_conversation(
                             force=True,
                         )
                     else:
-                        agent._persist_session(messages, conversation_history)
-                    if classified.reason == FailoverReason.content_policy_blocked:
+                        agent._persist_session(_kept_messages, conversation_history)
+                    if _content_refused:
                         _policy_response = (
                             "⚠️  The model provider's safety filter blocked this request "
                             "(not a Hermes/gateway failure).\n\n"
@@ -4598,7 +4658,7 @@ def run_conversation(
                             f"{_CONTENT_POLICY_RECOVERY_HINT}"
                         )
                         return _content_policy_blocked_result(
-                            messages,
+                            _kept_messages,
                             api_call_count,
                             final_response=_policy_response,
                             error_detail=_nonretryable_summary,

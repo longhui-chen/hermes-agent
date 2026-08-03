@@ -101,3 +101,45 @@ def test_result_without_provider_error_still_degrades_safely():
     payload = _chat_stream_error_payload(result, _chat_finish_reason_from_result(result))
     assert payload is not None
     assert payload["code"] == "agent_error"
+
+
+def test_blocked_turn_flow_strips_refused_text_from_the_persisted_transcript():
+    """Full outbound shape of a blocked turn: wire code out, refused text gone.
+
+    Chains the two halves that ship together — the client must learn the turn
+    was refused (``code``), and the model must not read the refused text on the
+    next turn (``messages``). They are asserted together because fixing one
+    without the other is a silent half-measure: a correct error code on a
+    transcript that still carries the refused prompt keeps re-submitting it to
+    the moderation gateway on every subsequent turn.
+    """
+    from agent.conversation_loop import _transcript_without_refused_turn
+
+    live_messages = [
+        {"role": "user", "content": "早上好"},
+        {"role": "assistant", "content": "早上好"},
+        {"role": "user", "content": "介绍一下敏感人物"},
+    ]
+    kept = _transcript_without_refused_turn(live_messages, live_messages[2], 2)
+
+    err = _GatewayModerationError()
+    classified = classify_api_error(err, provider="zettlab", model="glm-5")
+    result = _content_policy_blocked_result(
+        kept,
+        1,
+        final_response="⚠️  blocked",
+        error_detail="内容不合规",
+        provider_error={
+            "code": normalized_provider_error_code(classified),
+            "reason": classified.reason.value,
+            "retryable": False,
+            "recoverable": False,
+        },
+    )
+
+    payload = _chat_stream_error_payload(result, _chat_finish_reason_from_result(result))
+    assert payload["code"] == "content_blocked"
+    # zet_agent writes result["messages"] to the session DB itself, so this is
+    # the list the model actually re-reads next turn.
+    assert result["messages"] == live_messages[:2]
+    assert all("敏感人物" not in str(m.get("content", "")) for m in result["messages"])
