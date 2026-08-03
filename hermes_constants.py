@@ -1137,6 +1137,41 @@ def apply_subprocess_home_env(env: dict[str, str]) -> None:
         del env[_HOME_FALLBACK_MARKER]
 
 
+# Mirrors hermespath.WeComConfigDirName in local-server. wecom-cli's config
+# root is <profileRoot>/<agent>/wecom-cli-config; keep the two spellings in
+# sync or a profile-scoped child reads an empty directory.
+_WECOM_CLI_CONFIG_DIR_NAME = "wecom-cli-config"
+
+
+def apply_profile_scoped_env(env: dict[str, str], profile_home) -> None:
+    """Point every profile-scoped path in *env* at *profile_home*, in place.
+
+    HERMES_HOME is the one most tools hang off, and for a long time it was the
+    only key this had to set -- which is why callers wrote it inline. wecom-cli
+    is the exception that turns it into a contract: it reads
+    ``WECOM_CLI_CONFIG_DIR`` and nothing else, not HOME and not HERMES_HOME
+    (upstream ``src/paths.rs``). local-server injects that key into the
+    gateway's environment computed for the GATEWAY's agent
+    (``hermespath.WeComConfigDir``), and it survives every sanitizer on the way
+    down. So a child re-pointed at a DIFFERENT profile keeps a pointer to
+    another agent's credential store, finds nothing, and reports "not
+    initialised" while the credentials sit one directory over.
+
+    ⛔ ``LARK_SKILLS_DIR`` / ``WECOM_SKILLS_DIR`` do NOT belong here. The board
+    sets both to one shared global directory
+    (``hermespath.AgentSkillsGlobalDir`` = ``/root/.agents/skills``); deriving
+    them per profile would aim them at a directory with no skills in it.
+    """
+    home = Path(profile_home)
+    env["HERMES_HOME"] = str(home)
+    # hermespath.WeComConfigDir joins <profileRoot>/<agent> with the dir name,
+    # and profile_home is already <profileRoot>/<agent>.
+    env[_WECOM_CLI_CONFIG_DIR_NAME_ENV] = str(home / _WECOM_CLI_CONFIG_DIR_NAME)
+
+
+_WECOM_CLI_CONFIG_DIR_NAME_ENV = "WECOM_CLI_CONFIG_DIR"
+
+
 VALID_REASONING_EFFORTS = (
     "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 )

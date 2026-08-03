@@ -349,16 +349,39 @@ class _SlashWorker:
 
         # slash_worker runs the Hermes agent → needs provider credentials.
         # Tier-1 secrets (gateway/GitHub/infra) are still stripped (#29157).
-        # Global-remote / multi-profile sessions: the worker must resolve
-        # config/skills/state against the session's profile home, not the
-        # gateway's launch HERMES_HOME (#40677). The override goes through the
-        # build_subprocess_env factory's `extra` (applied last, always wins)
-        # instead of a hand-rolled env["HERMES_HOME"] assignment.
+        # slash_worker 要在**会话自己的 profile** 下解析 config/skills/state,
+        # ⛔ 不是 gateway 启动时那个 HERMES_HOME(#40677)。
+        #
+        # 这里有**两类**键,分别由两个 owner 负责,⛔ 不许合成一处:
+        #
+        #   ① **路径事实** —— HERMES_HOME / WECOM_CLI_CONFIG_DIR。
+        #      由 apply_profile_scoped_env 统一改指,加新键只加一处、五条 spawn 路径同时受益。
+        #      ⛔ wecom-cli 只认 WECOM_CLI_CONFIG_DIR(既不认 HOME 也不认 HERMES_HOME),
+        #      而继承来的那个值是 local-server 按 **gateway 的 agent** 算的 ⇒ 不改指就等于
+        #      让这个 worker 去读**别人的凭据库**。
+        #
+        #   ② **策略产物** —— HOME。它有自己的 owner(apply_subprocess_home_env,
+        #      按 TERMINAL_HOME_MODE 的 profile/real/auto 三档决定),所以这里**只把
+        #      inherit_profile_home 打开**让那个 owner 跑起来,⛔ 不把 HOME 塞进 ①。
+        #      塞进去就等于造出第二套 HOME 政策,把用户钉死的 TERMINAL_HOME_MODE=real 也一并改写。
+        #      ⭐ HOME 必须落对的原因:lark-cli 只认 $HOME —— 它的绑定在
+        #      $HOME/.lark-cli/hermes/config.json、密钥在 $HOME/.local/share/lark-cli/*.enc
+        #      (二进制里除 HERMES_HOME/OPENCLAW_HOME 外没有任何配置路径键)。HOME 没设时它
+        #      回落 /root,于是**明明已经授权过**却报 "not bound",AI 助手因此每次会话都提议
+        #      重新绑定。更要命的是回落点是**全 agent 共用**的,而各 profile 绑的是不同真人身份。
+        #
+        # ⚠️ extra 保留同值:它在工厂里**最后应用**,是"调用方 always wins"的既有语义,
+        # 与 ① 幂等;⛔ 别因为看着重复就删掉,那会把那条语义悄悄改掉。
+        base = hermes_subprocess_env(inherit_credentials=True)
+        if profile_home:
+            from hermes_constants import apply_profile_scoped_env
+
+            apply_profile_scoped_env(base, profile_home)
         from tools.environments.local import build_subprocess_env
         env = build_subprocess_env(
-            hermes_subprocess_env(inherit_credentials=True),
+            base,
             scrub_secrets=False,
-            inherit_profile_home=False,  # base already carries the HOME contract
+            inherit_profile_home=True,
             extra={"HERMES_HOME": str(profile_home)} if profile_home else None,
         )
 
