@@ -2468,9 +2468,23 @@ class AIAgent:
         if message:
             payload["provider_message"] = message[:500]
         payload["retryable"] = bool(classified.retryable)
-        payload["recoverable"] = bool(
+        recoverable = bool(
             classified.retryable or classified.should_compress or classified.should_fallback
         )
+        if classified.reason == FailoverReason.content_policy_blocked:
+            # A content-policy block is deterministic for the unchanged input,
+            # so it must never reach the client as "recoverable" — clients key
+            # their affordance off this flag, and a plain "resend" button is the
+            # one action guaranteed not to help. The user has to edit the text.
+            #
+            # The should_fallback term above would otherwise flip this true
+            # whenever a fallback model happens to be configured, even though by
+            # the time this payload is built the fallback has already been
+            # declined or exhausted and the turn is ending. Verified on device
+            # 2026-08-03: without this, the App rendered channel C ("reply
+            # failed / resend") instead of the compliance notice.
+            recoverable = False
+        payload["recoverable"] = recoverable
         return payload
 
     def _usage_summary_for_api_request_hook(self, response: Any) -> Optional[Dict[str, Any]]:
