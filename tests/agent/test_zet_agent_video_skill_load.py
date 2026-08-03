@@ -117,6 +117,7 @@ def _runtime_agent(
         ),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
+        patch("agent.agent_init.query_ollama_num_ctx", return_value=None),
     ):
         agent = AIAgent(
             api_key="test-key",
@@ -129,6 +130,7 @@ def _runtime_agent(
             skip_context_files=True,
             skip_memory=skip_memory,
             clarify_callback=lambda *_: None,
+            config_context_length=65_536,
         )
     agent.client = MagicMock()
     agent._cached_system_prompt = "You are helpful."
@@ -273,6 +275,32 @@ def test_video_edit_skill_load_reports_missing_tool_without_calling_provider():
     assert result["api_calls"] == 0
     assert "skill_view" in result["error"]
     assert _VIDEO_EDIT_SKILL in result["error"]
+
+
+def test_tool_choice_none_video_edit_returns_plain_text_without_skill_bootstrap():
+    agent = _runtime_agent(())
+    agent._tools_disabled_for_request = True
+    completed = _text_response("本轮按无工具模式提供文字说明。")
+
+    with (
+        patch.object(
+            agent,
+            "_interruptible_api_call",
+            return_value=completed,
+        ) as api_call,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "请把 [file: /data/input.mp4] 剪辑成 vlog",
+        )
+
+    api_call.assert_called_once()
+    assert result["completed"] is True
+    assert result["final_response"] == "本轮按无工具模式提供文字说明。"
+    assert not agent._zet_agent_skill_direct_task.video_edit_applicable
+    assert not agent._zet_agent_skill_direct_task.video_edit_explicit
 
 
 def test_video_edit_plain_text_is_bounded_to_two_protocol_retries():

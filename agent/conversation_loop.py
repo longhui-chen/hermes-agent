@@ -210,6 +210,8 @@ def _video_edit_skill_load_required(agent: Any) -> bool:
     """Return whether this App call must first attest the video-edit skill."""
     if (getattr(agent, "platform", "") or "") != "zet_agent":
         return False
+    if bool(getattr(agent, "_tools_disabled_for_request", False)):
+        return False
     # The production Zettlab route uses Chat Completions. Leave other
     # transports on their existing skill-selection behavior until their
     # provider-specific forced-tool contracts are covered independently.
@@ -1489,10 +1491,14 @@ def run_conversation(
         original_user_message,
     )
     trusted_skill_slug = _consume_trusted_skill_slug(agent)
+    tools_disabled_for_request = bool(
+        getattr(agent, "_tools_disabled_for_request", False)
+    )
     reset_trusted_skill_execution(
         agent,
         trusted_skill_task,
         explicit_skill_slug=trusted_skill_slug,
+        tool_execution_allowed=not tools_disabled_for_request,
     )
     # Zettlab App plan 模式：本轮每次模型调用只允许 clarify / present_plan。
     agent._zet_agent_plan_mode_active = _should_force_present_plan_tool_choice(

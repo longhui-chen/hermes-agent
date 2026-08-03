@@ -1165,10 +1165,19 @@ def _skill_direct_task_context(
     user_message: Any,
     *,
     explicit_skill_slug: str = "",
+    tool_execution_allowed: bool = True,
 ) -> _SkillDirectTaskContext:
     task_text, has_video_asset = _task_text_and_video_asset(user_message)
     task_text = _strip_gateway_model_switch_note(task_text)
     normalized = " ".join(task_text.lower().split())
+    if not tool_execution_allowed:
+        task_binding = f"tools:none\n{normalized}"
+        return _SkillDirectTaskContext(
+            task_sha256=hashlib.sha256(task_binding.encode("utf-8")).hexdigest(),
+            turn_identity=_current_skill_direct_turn_identity(),
+            video_edit_applicable=False,
+            video_edit_explicit=False,
+        )
     normalized_skill_slug = (
         explicit_skill_slug.strip().lstrip("/").lower()
         if isinstance(explicit_skill_slug, str)
@@ -1739,6 +1748,7 @@ def reset_trusted_skill_execution(
     user_message: Any = None,
     *,
     explicit_skill_slug: str = "",
+    tool_execution_allowed: bool = True,
 ) -> None:
     """Clear trusted execution and bind eligibility to the new user task."""
     _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
@@ -1749,6 +1759,7 @@ def reset_trusted_skill_execution(
             agent,
             user_message,
             explicit_skill_slug=explicit_skill_slug,
+            tool_execution_allowed=tool_execution_allowed,
         )
         if task.video_edit_explicit:
             resume_key = _current_skill_direct_resume_key()

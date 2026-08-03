@@ -6444,6 +6444,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         request_overrides=create_overrides,
                     )
+                    agent._tools_disabled_for_request = (
+                        create_overrides.get("tool_choice") == "none"
+                    )
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     agent._zet_agent_response_mode = response_mode or ""

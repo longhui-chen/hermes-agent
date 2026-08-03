@@ -975,6 +975,33 @@ class TestAgentExecution:
             task_id="session-123",
         )
 
+    @pytest.mark.asyncio
+    async def test_run_agent_preserves_tool_choice_none_as_request_boundary(
+        self,
+        adapter,
+    ):
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        def _run_conversation(**_kwargs):
+            assert mock_agent._tools_disabled_for_request is True
+            return {"final_response": "ok"}
+
+        mock_agent.run_conversation.side_effect = _run_conversation
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            result, _usage = await adapter._run_agent(
+                user_message="请把 [file: /data/input.mp4] 剪辑成 vlog",
+                conversation_history=[],
+                session_id="no-tools-video",
+                request_overrides={"tool_choice": "none"},
+            )
+
+        assert result["final_response"] == "ok"
+
 
 @pytest.mark.parametrize(
     ("raw", "want"),
