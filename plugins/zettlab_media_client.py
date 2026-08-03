@@ -15,6 +15,7 @@ import ipaddress
 import json
 import multiprocessing
 import os
+import queue
 import stat
 import threading
 import time
@@ -35,7 +36,8 @@ MAX_MEDIA_RESPONSE_BYTES = 1024 * 1024
 MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024
 ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
 ARTIFACT_SESSION_HEADER = "X-Zettlab-Artifact-Session-Id"
-_STARTER_CAPACITY = threading.BoundedSemaphore(value=2)
+MAX_MEDIA_HTTP_WORKERS = 2
+_STARTER_CAPACITY = threading.BoundedSemaphore(value=MAX_MEDIA_HTTP_WORKERS)
 
 
 class ZettlabMediaError(RuntimeError):
@@ -319,13 +321,44 @@ class _MediaHTTPWorker:
 class _MediaHTTPSession:
     trust_env = False
 
+    def __init__(self, workers: Optional[List[_MediaHTTPWorker]] = None) -> None:
+        self._workers = (
+            workers
+            if workers is not None
+            else [_MediaHTTPWorker() for _ in range(MAX_MEDIA_HTTP_WORKERS)]
+        )
+        if not self._workers:
+            raise ValueError("media HTTP session requires at least one worker")
+        self._available: queue.LifoQueue[_MediaHTTPWorker] = queue.LifoQueue(
+            maxsize=len(self._workers)
+        )
+        for worker in self._workers:
+            self._available.put_nowait(worker)
+        self._closed = False
+        self._state_lock = threading.Lock()
+
     def request(self, method: str, url: str, *, timeout: float, allow_redirects: bool, **kwargs: Any) -> requests.Response:
         if allow_redirects:
             raise ZettlabMediaError("media HTTP redirects are not allowed")
         payload = kwargs.get("json")
         if payload is not None and len(json.dumps(payload).encode("utf-8")) > MAX_MEDIA_REQUEST_BYTES:
             raise ZettlabMediaError("media generation request exceeds maximum size")
-        return _HTTP_WORKER.request(method, url, deadline=time.monotonic() + timeout, **kwargs)
+        deadline = time.monotonic() + timeout
+        with self._state_lock:
+            if self._closed:
+                raise ZettlabMediaError("media HTTP session is closed")
+        try:
+            worker = self._available.get(timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Empty as exc:
+            raise ZettlabMediaDeadlineError("media HTTP worker capacity exhausted") from exc
+        with self._state_lock:
+            if self._closed:
+                self._available.put_nowait(worker)
+                raise ZettlabMediaError("media HTTP session is closed")
+        try:
+            return worker.request(method, url, deadline=deadline, **kwargs)
+        finally:
+            self._available.put_nowait(worker)
 
     def get(self, url: str, **kwargs: Any) -> requests.Response:
         return self.request("GET", url, **kwargs)
@@ -339,10 +372,17 @@ class _MediaHTTPSession:
     def merge_environment_settings(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return {"proxies": {}}
 
+    def close(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+        for worker in self._workers:
+            worker.close()
 
-_HTTP_WORKER = _MediaHTTPWorker()
+
 _SESSION = _MediaHTTPSession()
-atexit.register(_HTTP_WORKER.close)
+atexit.register(_SESSION.close)
 
 
 def _config_section(media_type: str) -> Dict[str, Any]:

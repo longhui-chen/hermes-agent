@@ -16,7 +16,7 @@ import uuid
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from hermes_constants import get_hermes_home
 from tools.registry import registry
@@ -143,46 +143,60 @@ def _manifest_path(token: str) -> Path:
 
 
 def _write_manifest(manifest: dict[str, Any]) -> None:
-    token = str(manifest.get("token") or "")
-    directory = _task_dir(token)
-    if not directory.is_dir() or directory.is_symlink():
-        raise ValueError("desktop-pet task storage is unavailable")
-    manifest["updated_epoch"] = time.time()
-    manifest["updated_at"] = _now_iso()
-    payload = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
-    if len(payload) > _MAX_MANIFEST_BYTES:
-        raise ValueError("desktop-pet manifest exceeds maximum size")
-    destination = directory / "manifest.json"
-    partial = directory / "manifest.json.part"
-    partial.unlink(missing_ok=True)
-    try:
-        with partial.open("xb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        partial.replace(destination)
-    finally:
-        partial.unlink(missing_ok=True)
+    with _state_lock:
+        token = str(manifest.get("token") or "")
+        directory = _task_dir(token)
+        if not directory.is_dir() or directory.is_symlink():
+            raise ValueError("desktop-pet task storage is unavailable")
+        manifest["updated_epoch"] = time.time()
+        manifest["updated_at"] = _now_iso()
+        payload = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+        if len(payload) > _MAX_MANIFEST_BYTES:
+            raise ValueError("desktop-pet manifest exceeds maximum size")
+        destination = directory / "manifest.json"
+        partial = directory / f".manifest-{uuid.uuid4().hex}.part"
+        try:
+            with partial.open("xb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            partial.replace(destination)
+        finally:
+            partial.unlink(missing_ok=True)
 
 
 def _load_manifest(token: str, *, task_id: str, session_id: str) -> dict[str, Any]:
-    path = _manifest_path(token)
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > _MAX_MANIFEST_BYTES:
-        raise ValueError("task token is invalid or expired")
-    try:
-        manifest = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError("task token is invalid or expired") from exc
-    if not isinstance(manifest, dict):
-        raise ValueError("task token is invalid or expired")
-    if not (
-        hmac.compare_digest(str(manifest.get("task_id") or ""), task_id)
-        and hmac.compare_digest(str(manifest.get("session_id") or ""), session_id)
-    ):
-        raise ValueError("task token is invalid or expired")
-    manifest["updated_epoch"] = time.time()
-    manifest["updated_at"] = _now_iso()
-    return manifest
+    with _state_lock:
+        path = _manifest_path(token)
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > _MAX_MANIFEST_BYTES:
+            raise ValueError("task token is invalid or expired")
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("task token is invalid or expired") from exc
+        if not isinstance(manifest, dict):
+            raise ValueError("task token is invalid or expired")
+        if not (
+            hmac.compare_digest(str(manifest.get("task_id") or ""), task_id)
+            and hmac.compare_digest(str(manifest.get("session_id") or ""), session_id)
+        ):
+            raise ValueError("task token is invalid or expired")
+        return manifest
+
+
+def _update_manifest(
+    token: str,
+    *,
+    task_id: str,
+    session_id: str,
+    update: Callable[[dict[str, Any]], None],
+) -> dict[str, Any]:
+    """Reload, merge, and atomically persist one task manifest under its lock."""
+    with _state_lock:
+        manifest = _load_manifest(token, task_id=task_id, session_id=session_id)
+        update(manifest)
+        _write_manifest(manifest)
+        return manifest
 
 
 def _new_manifest(
@@ -477,14 +491,33 @@ def _manifest_result(manifest: dict[str, Any]) -> dict[str, Any]:
     export = manifest.get("export")
     if isinstance(export, dict):
         result["export"] = export
+    hatch_progress = manifest.get("hatch_progress")
+    if isinstance(hatch_progress, dict):
+        result["hatch_progress"] = hatch_progress
     return result
+
+
+def _hatch_cache_key(
+    manifest: dict[str, Any], *, candidate_id: str, name: str
+) -> str:
+    payload = json.dumps(
+        {
+            "candidate_id": candidate_id,
+            "name": name,
+            "concept": str(manifest.get("concept") or ""),
+            "style": str(manifest.get("style") or ""),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:32]
 
 
 def _status(args: dict[str, Any], *, task_id: str, session_id: str) -> str:
     token = str(args.get("token") or "").strip()
     if token:
         manifest = _load_manifest(token, task_id=task_id, session_id=session_id)
-        _write_manifest(manifest)
         return _ok("status", **_manifest_result(manifest))
 
     from agent.pet.generate.imagegen import list_sprite_providers
@@ -698,15 +731,106 @@ def _hatch(args: dict[str, Any], *, task_id: str, session_id: str) -> str:
         raise ValueError("current Agent Computer session output directory is unavailable")
 
     cancel = _reserve(token)
+    try:
+        return _run_hatch_reserved(
+            token=token,
+            task_id=task_id,
+            session_id=session_id,
+            candidate_id=candidate_id,
+            name=name,
+            description=description,
+            manifest=manifest,
+            base=base,
+            output_dir=output_dir,
+            cancel=cancel,
+        )
+    finally:
+        _release(token)
+
+
+def _run_hatch_reserved(
+    *,
+    token: str,
+    task_id: str,
+    session_id: str,
+    candidate_id: str,
+    name: str,
+    description: str,
+    manifest: dict[str, Any],
+    base: Path,
+    output_dir: Path,
+    cancel: threading.Event,
+) -> str:
+    """Run a hatch after the caller has reserved exclusive task ownership."""
     task_dir = _task_dir(token)
     staging_root = task_dir / "hatched"
     if staging_root.exists():
         shutil.rmtree(staging_root)
     staging_root.mkdir(mode=0o700)
-    manifest["status"] = "hatching"
-    manifest["selected_candidate_id"] = candidate_id
-    _write_manifest(manifest)
+    cache_key = _hatch_cache_key(manifest, candidate_id=candidate_id, name=name)
+    cache_parent = task_dir / "hatch-rows"
+    if cache_parent.is_symlink():
+        raise ValueError("desktop-pet row cache is unavailable")
+    cache_parent.mkdir(mode=0o700, exist_ok=True)
+    for stale in cache_parent.iterdir():
+        if stale.name == cache_key or not _TOKEN_RE.fullmatch(stale.name):
+            continue
+        if stale.is_dir() and not stale.is_symlink():
+            shutil.rmtree(stale, ignore_errors=True)
+    row_cache = cache_parent / cache_key
+    if row_cache.is_symlink():
+        raise ValueError("desktop-pet row cache is unavailable")
+    row_cache.mkdir(mode=0o700, exist_ok=True)
+    # Rebuild visible progress only from rows actually restored/generated during
+    # this run; never trust a stale manifest after cache loss or corruption.
+    completed_states: set[str] = set()
+    def _progress_payload() -> dict[str, Any]:
+        return {
+            "cache_key": cache_key,
+            "candidate_id": candidate_id,
+            "name": name,
+            "completed_states": sorted(completed_states),
+        }
+
+    def _start_hatch(current: dict[str, Any]) -> None:
+        for key in (
+            "slug",
+            "display_name",
+            "description",
+            "pet_dir",
+            "spritesheet_path",
+            "states",
+            "preview",
+            "export",
+        ):
+            current.pop(key, None)
+        current["hatch_progress"] = _progress_payload()
+        current["status"] = "cancelling" if cancel.is_set() else "hatching"
+        current["selected_candidate_id"] = candidate_id
+        current["last_error"] = ""
+
+    def _record_hatch_progress(event: str, detail: str) -> None:
+        if event != "row-ready" or not detail:
+            return
+        completed_states.add(detail)
+
+        def _merge_progress(current: dict[str, Any]) -> None:
+            current["hatch_progress"] = _progress_payload()
+
+        _update_manifest(
+            token,
+            task_id=task_id,
+            session_id=session_id,
+            update=_merge_progress,
+        )
+
     try:
+        manifest = _update_manifest(
+            token,
+            task_id=task_id,
+            session_id=session_id,
+            update=_start_hatch,
+        )
         from agent.pet.generate import hatch_pet
 
         result = hatch_pet(
@@ -716,8 +840,10 @@ def _hatch(args: dict[str, Any], *, task_id: str, session_id: str) -> str:
             description=description,
             concept=str(manifest["concept"]),
             style=str(manifest["style"]),
+            on_progress=_record_hatch_progress,
             is_cancelled=cancel.is_set,
             staging_dir=staging_root,
+            row_cache_dir=row_cache,
         )
         if cancel.is_set():
             raise RuntimeError("desktop-pet hatch was cancelled")
@@ -734,16 +860,27 @@ def _hatch(args: dict[str, Any], *, task_id: str, session_id: str) -> str:
             partial.replace(preview)
         finally:
             partial.unlink(missing_ok=True)
-        manifest["status"] = "hatched"
-        manifest["slug"] = result.slug
-        manifest["display_name"] = result.display_name
-        manifest["description"] = description
-        manifest["pet_dir"] = str(source.parent)
-        manifest["spritesheet_path"] = str(source)
-        manifest["states"] = result.states
-        manifest["preview"] = _preview_metadata(preview, candidate_id=candidate_id)
-        manifest["last_error"] = ""
-        _write_manifest(manifest)
+        preview_metadata = _preview_metadata(preview, candidate_id=candidate_id)
+
+        def _finish_hatch(current: dict[str, Any]) -> None:
+            if cancel.is_set():
+                raise RuntimeError("desktop-pet hatch was cancelled")
+            current["status"] = "hatched"
+            current["slug"] = result.slug
+            current["display_name"] = result.display_name
+            current["description"] = description
+            current["pet_dir"] = str(source.parent)
+            current["spritesheet_path"] = str(source)
+            current["states"] = result.states
+            current["preview"] = preview_metadata
+            current["last_error"] = ""
+
+        manifest = _update_manifest(
+            token,
+            task_id=task_id,
+            session_id=session_id,
+            update=_finish_hatch,
+        )
         return _ok(
             "hatch",
             token=token,
@@ -753,12 +890,17 @@ def _hatch(args: dict[str, Any], *, task_id: str, session_id: str) -> str:
             preview=manifest["preview"],
         )
     except Exception as exc:
-        manifest["status"] = "drafted"
-        manifest["last_error"] = str(exc)[:500]
-        _write_manifest(manifest)
+        def _fail_hatch(current: dict[str, Any]) -> None:
+            current["status"] = "cancelled" if cancel.is_set() else "drafted"
+            current["last_error"] = str(exc)[:500]
+
+        _update_manifest(
+            token,
+            task_id=task_id,
+            session_id=session_id,
+            update=_fail_hatch,
+        )
         raise
-    finally:
-        _release(token)
 
 
 def _unique_export_path(directory: Path, slug: str) -> Path:
@@ -861,15 +1003,19 @@ def _export(args: dict[str, Any], *, task_id: str, session_id: str) -> str:
 
 def _cancel(args: dict[str, Any], *, task_id: str, session_id: str) -> str:
     token = str(args.get("token") or "").strip()
-    manifest = _load_manifest(token, task_id=task_id, session_id=session_id)
+    _load_manifest(token, task_id=task_id, session_id=session_id)
     event = _cancel_event(token)
     if event is not None:
         event.set()
         status = "cancelling"
     else:
         status = "cancelled"
-    manifest["status"] = status
-    _write_manifest(manifest)
+    _update_manifest(
+        token,
+        task_id=task_id,
+        session_id=session_id,
+        update=lambda manifest: manifest.__setitem__("status", status),
+    )
     return _ok("cancel", token=token, status=status)
 
 

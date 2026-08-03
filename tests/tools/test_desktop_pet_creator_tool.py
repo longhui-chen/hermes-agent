@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 
 import pytest
@@ -218,3 +219,155 @@ def test_scope_mismatch_cannot_resume_task(monkeypatch, pet_env, tmp_path):
 
     assert result["success"] is False
     assert result["error"] == "task token is invalid or expired"
+
+
+def test_concurrent_hatch_is_rejected_before_touching_task_storage(
+    monkeypatch, pet_env, tmp_path
+):
+    monkeypatch.setattr(
+        "agent.pet.generate.generate_base_drafts", _fake_drafts(tmp_path)
+    )
+    drafted = _call(
+        {"action": "draft", "concept": "an original desk companion", "count": 1}
+    )
+    task_dir = pet_env["home"] / "cache" / "desktop-pet-creator" / drafted["token"]
+    staging = task_dir / "hatched"
+    stale_cache = task_dir / "hatch-rows" / ("a" * 32)
+    staging.mkdir()
+    stale_cache.mkdir(parents=True)
+    staging_marker = staging / "active-hatch.txt"
+    cache_marker = stale_cache / "complete.json"
+    staging_marker.write_text("active", encoding="utf-8")
+    cache_marker.write_text("active", encoding="utf-8")
+    monkeypatch.setattr(
+        pet_tool,
+        "_reserve",
+        lambda _token: (_ for _ in ()).throw(ValueError("desktop-pet task is already running")),
+    )
+
+    result = _call(
+        {
+            "action": "hatch",
+            "token": drafted["token"],
+            "candidate_id": drafted["drafts"][0]["candidate_id"],
+            "name": "Blue Byte",
+        }
+    )
+
+    assert result["success"] is False
+    assert "already running" in result["error"]
+    assert staging_marker.read_text(encoding="utf-8") == "active"
+    assert cache_marker.read_text(encoding="utf-8") == "active"
+
+
+def test_failed_rehatch_clears_stale_success_metadata(monkeypatch, pet_env, tmp_path):
+    from agent.pet.generate.imagegen import GenerationError
+
+    monkeypatch.setattr(
+        "agent.pet.generate.generate_base_drafts", _fake_drafts(tmp_path)
+    )
+    drafted = _call(
+        {"action": "draft", "concept": "an original desk companion", "count": 1}
+    )
+    token = drafted["token"]
+
+    def seed_previous_hatch(manifest):
+        manifest.update(
+            {
+                "status": "exported",
+                "slug": "old-pet",
+                "display_name": "Old Pet",
+                "description": "stale",
+                "pet_dir": "/tmp/old-pet",
+                "spritesheet_path": "/tmp/old-pet/spritesheet.webp",
+                "states": ["idle"],
+                "preview": {"path": "/tmp/old-preview.webp"},
+                "export": {"path": "/tmp/old-pet.desktop-pet.zip"},
+            }
+        )
+
+    pet_tool._update_manifest(
+        token,
+        task_id=TASK_ID,
+        session_id=SESSION_ID,
+        update=seed_previous_hatch,
+    )
+
+    def fake_hatch(**kwargs):
+        del kwargs
+        raise GenerationError(
+            "missing required animation row(s): failed; generation failures: "
+            "failed after 3 attempt(s): media generation service timed out"
+        )
+
+    monkeypatch.setattr("agent.pet.generate.hatch_pet", fake_hatch)
+    result = _call(
+        {
+            "action": "hatch",
+            "token": token,
+            "candidate_id": drafted["drafts"][0]["candidate_id"],
+            "name": "Blue Byte",
+        }
+    )
+
+    assert result["success"] is False
+    assert "failed after 3 attempt(s)" in result["error"]
+    status = _call({"action": "status", "token": token})
+    assert status["status"] == "drafted"
+    assert "failed after 3 attempt(s)" in status["last_error"]
+    assert "preview" not in status
+    assert "export" not in status
+
+
+def test_manifest_progress_status_and_cancel_are_serialized(
+    monkeypatch, pet_env, tmp_path
+):
+    monkeypatch.setattr(
+        "agent.pet.generate.generate_base_drafts", _fake_drafts(tmp_path)
+    )
+    drafted = _call(
+        {"action": "draft", "concept": "an original desk companion", "count": 1}
+    )
+    token = drafted["token"]
+    errors: list[Exception] = []
+    barrier = threading.Barrier(3)
+
+    def write_progress() -> None:
+        try:
+            barrier.wait()
+            for index in range(25):
+                pet_tool._update_manifest(
+                    token,
+                    task_id=TASK_ID,
+                    session_id=SESSION_ID,
+                    update=lambda manifest, current=index: manifest.__setitem__(
+                        "hatch_progress", {"completed_states": [f"state-{current}"]}
+                    ),
+                )
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    def read_status() -> None:
+        try:
+            barrier.wait()
+            for _ in range(25):
+                assert _call({"action": "status", "token": token})["success"] is True
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    writer = threading.Thread(target=write_progress)
+    reader = threading.Thread(target=read_status)
+    writer.start()
+    reader.start()
+    barrier.wait()
+    cancelled = _call({"action": "cancel", "token": token})
+    writer.join()
+    reader.join()
+
+    assert errors == []
+    assert cancelled["status"] == "cancelled"
+    final = _call({"action": "status", "token": token})
+    assert final["status"] == "cancelled"
+    assert final["hatch_progress"]["completed_states"] == ["state-24"]
+    task_dir = pet_env["home"] / "cache" / "desktop-pet-creator" / token
+    assert list(task_dir.glob(".manifest-*.part")) == []

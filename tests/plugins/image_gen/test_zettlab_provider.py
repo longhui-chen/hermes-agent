@@ -585,6 +585,96 @@ def test_zettlab_http_worker_kills_timed_out_process_and_recovers(monkeypatch):
     worker.close()
 
 
+def test_zettlab_http_session_runs_requests_concurrently():
+    from plugins import zettlab_media_client as client
+
+    barrier = threading.Barrier(2)
+    release = threading.Event()
+    state_lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    class BlockingWorker:
+        closed = False
+
+        def request(self, method, url, *, deadline, **kwargs):
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                barrier.wait(timeout=1)
+                assert release.wait(timeout=1)
+                return _Resp({"status": "done"})
+            finally:
+                with state_lock:
+                    active -= 1
+
+        def close(self):
+            self.closed = True
+
+    workers = [BlockingWorker(), BlockingWorker()]
+    session = client._MediaHTTPSession(workers=workers)
+    errors = []
+
+    def request():
+        try:
+            session.get("http://127.0.0.1/test", timeout=1, allow_redirects=False)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=request) for _ in range(2)]
+    try:
+        for thread in threads:
+            thread.start()
+        deadline = time.monotonic() + 1
+        while max_active < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert max_active == 2
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(timeout=1)
+        session.close()
+
+    assert errors == []
+    assert all(worker.closed for worker in workers)
+
+
+def test_zettlab_http_session_bounds_worker_capacity():
+    from plugins import zettlab_media_client as client
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingWorker:
+        def request(self, method, url, *, deadline, **kwargs):
+            started.set()
+            assert release.wait(timeout=1)
+            return _Resp({"status": "done"})
+
+        def close(self):
+            return None
+
+    session = client._MediaHTTPSession(workers=[BlockingWorker()])
+    thread = threading.Thread(
+        target=lambda: session.get(
+            "http://127.0.0.1/slow", timeout=1, allow_redirects=False
+        )
+    )
+    try:
+        thread.start()
+        assert started.wait(timeout=1)
+        with pytest.raises(client.ZettlabMediaDeadlineError, match="capacity exhausted"):
+            session.get(
+                "http://127.0.0.1/blocked", timeout=0.05, allow_redirects=False
+            )
+    finally:
+        release.set()
+        thread.join(timeout=1)
+        session.close()
+
+
 def test_zettlab_http_worker_times_out_during_spawn_and_recovers():
     from plugins import zettlab_media_client as client
 
@@ -694,7 +784,9 @@ def test_zettlab_http_worker_bounds_permanently_stalled_starters():
         def close(self):
             return None
 
-    processes = [StalledProcess(), StalledProcess()]
+    processes = [
+        StalledProcess() for _ in range(client.MAX_MEDIA_HTTP_WORKERS)
+    ]
     attempts = iter(processes)
 
     class FakeContext:
@@ -710,7 +802,7 @@ def test_zettlab_http_worker_bounds_permanently_stalled_starters():
     worker = client._MediaHTTPWorker()
     worker._context = FakeContext()
     try:
-        for _ in range(2):
+        for _ in range(client.MAX_MEDIA_HTTP_WORKERS):
             with pytest.raises(client.ZettlabMediaDeadlineError, match="start deadline exceeded"):
                 worker.request("GET", "http://127.0.0.1/media/generation-capabilities", deadline=time.monotonic() + 0.03)
         started = time.monotonic()
@@ -724,10 +816,10 @@ def test_zettlab_http_worker_bounds_permanently_stalled_starters():
     while not all(process.terminated for process in processes) and time.monotonic() < deadline:
         time.sleep(0.01)
     assert all(process.terminated for process in processes)
-    assert client._STARTER_CAPACITY.acquire(timeout=1)
-    assert client._STARTER_CAPACITY.acquire(timeout=1)
-    client._STARTER_CAPACITY.release()
-    client._STARTER_CAPACITY.release()
+    for _ in range(client.MAX_MEDIA_HTTP_WORKERS):
+        assert client._STARTER_CAPACITY.acquire(timeout=1)
+    for _ in range(client.MAX_MEDIA_HTTP_WORKERS):
+        client._STARTER_CAPACITY.release()
 
 
 def test_zettlab_http_worker_cleans_up_after_prespawn_failure():
@@ -788,6 +880,7 @@ def test_zettlab_http_worker_cleanup_continues_after_individual_errors():
     assert worker._connection is None
 
 
+@pytest.mark.live_system_guard_bypass
 def test_zettlab_http_worker_recovers_after_real_header_stall():
     from plugins import zettlab_media_client as client
 

@@ -80,9 +80,13 @@ def test_desktop_pet_candidate_hatch_export_flow(monkeypatch, tmp_path):
         provider=None,
         is_cancelled=None,
         staging_dir=None,
+        row_cache_dir=None,
     ):
-        del base_image, concept, style, provider, on_progress
+        del base_image, concept, style, provider
         assert not is_cancelled()
+        assert Path(row_cache_dir).parent.name == "hatch-rows"
+        assert len(Path(row_cache_dir).name) == 32
+        on_progress("row-ready", "idle")
         root = Path(staging_dir)
         pet_dir = root / "blue-byte"
         pet_dir.mkdir()
@@ -149,6 +153,10 @@ def test_desktop_pet_candidate_hatch_export_flow(monkeypatch, tmp_path):
         assert Path(hatched["preview"]["path"]).is_file()
         assert store.load_pet("blue-byte") is None
         assert store.installed_pets() == []
+
+        status = _call({"action": "status", "token": drafted["token"]})
+        assert status["hatch_progress"]["candidate_id"] == candidate_id
+        assert status["hatch_progress"]["completed_states"] == ["idle"]
 
         exported = _call({"action": "export", "token": drafted["token"]})
         assert exported["success"] is True
