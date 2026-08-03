@@ -61,6 +61,15 @@ _STATUS_PENDING = "pending"
 _STATUS_ACCEPTED = "accepted"
 _STATUS_DISMISSED = "dismissed"
 
+_LIVE_CHAT_AUTHORIZATION_REQUIRED = (
+    "This Linear scheduled task needs task-specific Connector authorization. "
+    "Create or update it in the current chat after connecting Linear."
+)
+
+
+class SuggestionConnectorAuthorizationRequired(ValueError):
+    """The suggestion remains pending because it cannot mint a Chat grant."""
+
 
 def _secure_file(path: Path) -> None:
     try:
@@ -237,6 +246,17 @@ def accept_suggestion(ref: str, *, origin: Optional[Dict[str, Any]] = None) -> O
     spec = dict(s.get("job_spec") or {})
     if origin is not None and "origin" not in spec:
         spec["origin"] = origin
+
+    try:
+        from cron.connector_execution import requires_live_chat_grant
+
+        requested_skills = spec.get("skills", spec.get("skill"))
+        if requires_live_chat_grant(requested_skills):
+            raise SuggestionConnectorAuthorizationRequired(_LIVE_CHAT_AUTHORIZATION_REQUIRED)
+    except SuggestionConnectorAuthorizationRequired:
+        raise
+    except Exception:
+        pass
 
     job = create_job(**spec)
     _set_status(s["id"], _STATUS_ACCEPTED)

@@ -104,6 +104,17 @@ class TestStore:
         # And accepting again is a no-op (not pending anymore).
         assert store.accept_suggestion("acc") is None
 
+    def test_accept_linear_suggestion_requires_live_chat_grant(self, store, monkeypatch):
+        rec = _add(store, key="linear")
+        rec["job_spec"]["skills"] = ["Linear"]
+        store._save_raw([rec])
+        monkeypatch.setattr("cron.connector_execution.enabled", lambda: True)
+
+        with pytest.raises(store.SuggestionConnectorAuthorizationRequired):
+            store.accept_suggestion("linear")
+
+        assert store.get_suggestion("linear")["status"] == "pending"
+
     def test_get_by_id_and_index_and_title(self, store):
         rec = _add(store, key="byref", title="Findable")
         assert store.get_suggestion(rec["id"])["id"] == rec["id"]

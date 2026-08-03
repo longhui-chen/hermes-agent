@@ -231,6 +231,28 @@ class TestCreateJob:
                 assert call_kwargs["origin"]["user_agent"] == "cron-client"
 
     @pytest.mark.asyncio
+    async def test_create_linear_job_requires_live_chat_grant(self, adapter):
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_job_requires_live_chat_authorization", return_value=True
+            ), patch(f"{_MOD}._cron_create", mock_create):
+                resp = await cli.post(
+                    "/api/jobs",
+                    json={
+                        "name": "linear-digest",
+                        "schedule": "every 1 hour",
+                        "skills": ["Linear"],
+                    },
+                )
+                data = await resp.json()
+
+        assert resp.status == 400
+        assert "current chat" in data["error"]
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_create_job_output_language_flow(self, adapter):
         """REST/local-server proxy may pass the optional persisted tag."""
         app = _create_app(adapter)
@@ -600,6 +622,23 @@ class TestUpdateJob:
                 sanitized = call_args[0][1]
                 assert "name" in sanitized
                 assert "schedule" in sanitized
+
+    @pytest.mark.asyncio
+    async def test_update_introducing_linear_requires_live_chat_grant(self, adapter):
+        app = _create_app(adapter)
+        mock_update = MagicMock(return_value={**SAMPLE_JOB, "skills": ["Linear"]})
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_job_requires_live_chat_authorization", return_value=True
+            ), patch(f"{_MOD}._cron_update", mock_update):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}", json={"skills": ["Linear"]}
+                )
+                data = await resp.json()
+
+        assert resp.status == 400
+        assert "current chat" in data["error"]
+        mock_update.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_update_job_rejects_unknown_fields(self, adapter):
