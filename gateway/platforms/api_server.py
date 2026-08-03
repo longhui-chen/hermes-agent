@@ -1381,6 +1381,22 @@ def _notify_cron_provider_jobs_changed() -> None:
     except Exception:
         pass
 
+
+def _cron_job_requires_live_chat_authorization(skills: Any) -> bool:
+    """REST has no exact Chat route and therefore cannot mint a task grant."""
+    try:
+        from cron.connector_execution import requires_live_chat_grant
+
+        return requires_live_chat_grant(skills)
+    except Exception:
+        return False
+
+
+_CRON_LIVE_CHAT_AUTHORIZATION_REQUIRED = (
+    "Linear scheduled tasks must be created or updated in the current chat "
+    "so a task-specific Connector authorization can be issued."
+)
+
 # Defense-in-depth: mirror the agent-facing cronjob tool, which scans the
 # user-supplied prompt for exfiltration/injection payloads at create/update
 # time (tools/cronjob_tools.py).  The REST cron endpoints are authenticated
@@ -5775,6 +5791,11 @@ class APIServerAdapter(BasePlatformAdapter):
             if origin is not None:
                 kwargs["origin"] = origin
 
+            if _cron_job_requires_live_chat_authorization(skills):
+                return web.json_response(
+                    {"error": _CRON_LIVE_CHAT_AUTHORIZATION_REQUIRED}, status=400
+                )
+
             job = _cron_create(**kwargs)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
@@ -5836,6 +5857,15 @@ class APIServerAdapter(BasePlatformAdapter):
                 tz_err = self._validate_timezone_field(sanitized["timezone"])
                 if tz_err:
                     return tz_err
+            # A REST request that introduces Linear has no live Chat route to
+            # obtain the durable task grant. Unrelated edits of a historical
+            # Linear job remain compatible and keep their current semantics.
+            if "skills" in sanitized or "skill" in sanitized:
+                requested_skills = sanitized.get("skills", sanitized.get("skill"))
+                if _cron_job_requires_live_chat_authorization(requested_skills):
+                    return web.json_response(
+                        {"error": _CRON_LIVE_CHAT_AUTHORIZATION_REQUIRED}, status=400
+                    )
             job = _cron_update(job_id, sanitized)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
