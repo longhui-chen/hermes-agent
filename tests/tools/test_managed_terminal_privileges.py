@@ -1,8 +1,10 @@
 import os
+import shutil
 import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -154,6 +156,240 @@ def test_managed_terminal_default_cwd_falls_back_to_profile_home(monkeypatch):
     assert run_env["TMPDIR"] == "/tmp"
     assert run_env["TMP"] == "/tmp"
     assert run_env["TEMP"] == "/tmp"
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(os, "geteuid") or os.geteuid() != 0,
+    reason="requires root POSIX ownership semantics",
+)
+def test_managed_profile_runtime_exposes_only_active_skills_and_output(
+    monkeypatch, request
+):
+    tmp_path = Path(tempfile.mkdtemp(prefix="hermes-runtime-test-", dir="/run"))
+    request.addfinalizer(lambda: shutil.rmtree(tmp_path, ignore_errors=True))
+    os.chmod(tmp_path, 0o755)
+    hermes_root = tmp_path / "hermes_home"
+    profiles_root = hermes_root / "profiles"
+    profile_home = profiles_root / "agent-a"
+    skills_root = profile_home / "skills"
+    sibling_home = profiles_root / "agent-b"
+    output = tmp_path / "agents" / "data" / "agent-a" / "output"
+    skills_root.mkdir(parents=True)
+    sibling_home.mkdir()
+    output.mkdir(parents=True)
+    private_skill_dir = skills_root / "support-suite" / "scripts"
+    private_skill_dir.mkdir(parents=True)
+    private_skill = private_skill_dir / "onboard.py"
+    private_skill.write_text("print('ok')")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside_file = outside / "must-not-be-chowned.txt"
+    outside_file.write_text("protected")
+    os.chmod(outside_file, 0o600)
+    output_link = output / "outside-link"
+    output_link.symlink_to(outside, target_is_directory=True)
+    hermes_alias = tmp_path / "hermes-alias"
+    hermes_alias.symlink_to(hermes_root, target_is_directory=True)
+    lexical_profile_home = hermes_alias / "profiles" / "agent-a"
+    lexical_skill = (
+        lexical_profile_home / "skills" / "support-suite" / "scripts" / "onboard.py"
+    )
+    for path in (hermes_root, profiles_root, profile_home, skills_root, sibling_home):
+        os.chmod(path, 0o700)
+    os.chmod(private_skill_dir.parent, 0o700)
+    os.chmod(private_skill_dir, 0o700)
+    os.chmod(private_skill, 0o600)
+    os.chmod(output, 0o755)
+
+    monkeypatch.setattr(local_module, "_IS_WINDOWS", False)
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setenv("ZET_AGENT_KEY", "device-key")
+    local_module._MANAGED_TERMINAL_SCOPE_BY_UID.clear()
+    env = {
+        "HERMES_HOME": str(lexical_profile_home),
+        "ZET_AGENT_OUTPUT_DIR": str(output),
+    }
+
+    local_module._prepare_managed_profile_runtime(env)
+    command = f'python3 "{lexical_skill}"'
+    local_module._prepare_managed_command_skill_sources(command, env)
+    uid, gid = local_module._managed_terminal_identity(env)
+
+    assert stat.S_IMODE(hermes_root.stat().st_mode) == 0o711
+    assert stat.S_IMODE(profiles_root.stat().st_mode) == 0o711
+    assert profile_home.stat().st_gid == gid
+    assert stat.S_IMODE(profile_home.stat().st_mode) == 0o710
+    assert skills_root.stat().st_gid == gid
+    assert stat.S_IMODE(skills_root.stat().st_mode) == 0o750
+    assert private_skill_dir.stat().st_gid == gid
+    assert stat.S_IMODE(private_skill_dir.stat().st_mode) == 0o750
+    assert private_skill.stat().st_gid == gid
+    assert stat.S_IMODE(private_skill.stat().st_mode) == 0o640
+
+    os.chmod(private_skill, 0o600)
+    local_module._prepare_managed_command_skill_sources(command, env)
+    assert private_skill.stat().st_gid == gid
+    assert stat.S_IMODE(private_skill.stat().st_mode) == 0o640
+    assert output.stat().st_uid == uid
+    assert output.stat().st_gid == gid
+    assert stat.S_IMODE(output.stat().st_mode) == 0o700
+    assert os.lstat(output_link).st_uid == 0
+    assert outside_file.stat().st_uid == 0
+    assert stat.S_IMODE(outside_file.stat().st_mode) == 0o600
+    assert outside_file.read_text() == "protected"
+    assert stat.S_IMODE(sibling_home.stat().st_mode) == 0o700
+    assert local_module._managed_identity_can_traverse(
+        str(skills_root), uid=uid, gid=gid
+    )
+    assert not local_module._managed_identity_can_traverse(
+        str(sibling_home), uid=uid, gid=gid
+    )
+
+    os.chmod(private_skill, 0o622)
+    with pytest.raises(OSError, match="skill entry is writable"):
+        local_module._prepare_managed_command_skill_sources(command, env)
+    os.chmod(private_skill, 0o600)
+    local_module._prepare_managed_command_skill_sources(command, env)
+
+    state_dir = output / "support-suite-state"
+    state_file = state_dir / "onboarding.json"
+    state_dir.mkdir()
+    state_file.write_text("{}")
+    os.chown(state_dir, uid, gid)
+    os.chown(state_file, uid, gid)
+    os.chmod(state_dir, 0o700)
+    os.chmod(state_file, 0o600)
+    monkeypatch.setenv("ZET_AGENT_KEY", "rotated-device-key")
+    local_module._MANAGED_TERMINAL_SCOPE_BY_UID.clear()
+
+    local_module._prepare_managed_profile_runtime(env)
+    rotated_uid, rotated_gid = local_module._managed_terminal_identity(env)
+
+    assert rotated_uid == uid
+    assert rotated_gid == gid
+    assert state_dir.stat().st_uid == uid
+    assert state_file.stat().st_uid == uid
+    assert state_file.stat().st_gid == gid
+
+
+@pytest.mark.skipif(
+    os.name == "nt"
+    or not hasattr(os, "geteuid")
+    or os.geteuid() != 0
+    or not Path("/usr/bin/setpriv").is_file()
+    or not Path("/usr/bin/unshare").is_file(),
+    reason="requires the production root/Linux namespace boundary",
+)
+def test_managed_terminal_reads_but_cannot_modify_skill_and_writes_output(
+    monkeypatch,
+):
+    root = Path(tempfile.mkdtemp(prefix="hermes-managed-test-", dir="/run"))
+    try:
+        os.chmod(root, 0o755)
+        hermes_root = root / "hermes_home"
+        profile_home = hermes_root / "profiles" / "agent-a"
+        script = profile_home / "skills" / "support-suite" / "scripts" / "onboard.py"
+        output = root / "agents" / "data" / "agent-a" / "output"
+        script.parent.mkdir(parents=True)
+        output.mkdir(parents=True)
+        original = (
+            "from pathlib import Path\n"
+            "source = Path(__file__)\n"
+            "try:\n"
+            "    source.write_text('tampered')\n"
+            "except OSError:\n"
+            "    pass\n"
+            "else:\n"
+            "    raise SystemExit('skill source was writable')\n"
+            "Path(__import__('os').environ['ZET_AGENT_OUTPUT_DIR'], "
+            "'state.txt').write_text('ok')\n"
+        )
+        script.write_text(original)
+        for path in (
+            hermes_root,
+            profile_home.parent,
+            profile_home,
+            profile_home / "skills",
+            script.parent.parent,
+            script.parent,
+        ):
+            os.chmod(path, 0o700)
+        os.chmod(script, 0o600)
+        os.chmod(output, 0o755)
+        monkeypatch.setattr(local_module, "_IS_WINDOWS", False)
+        monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+        monkeypatch.setenv("ZET_AGENT_KEY", "device-key")
+        local_module._MANAGED_TERMINAL_SCOPE_BY_UID.clear()
+        env = os.environ.copy()
+        env.update(
+            {
+                "HERMES_HOME": str(profile_home),
+                "ZET_AGENT_OUTPUT_DIR": str(output),
+            }
+        )
+        local_module._prepare_managed_profile_runtime(env)
+        local_module._prepare_managed_command_skill_sources(
+            f'python3 "{script}"', env
+        )
+        uid, gid = local_module._managed_terminal_identity(env)
+        private_tmp = root / "private-tmp"
+        private_var_tmp = root / "private-var-tmp"
+        private_tmp.mkdir()
+        private_var_tmp.mkdir()
+        for path in (private_tmp, private_var_tmp):
+            os.chown(path, uid, gid)
+            os.chmod(path, 0o700)
+
+        argv = [
+            "/usr/bin/setpriv",
+            f"--reuid={uid}",
+            f"--regid={gid}",
+            "--clear-groups",
+            "--bounding-set=-all",
+            "--inh-caps=-all",
+            "--ambient-caps=-all",
+            "--no-new-privs",
+            "--",
+            "/usr/bin/unshare",
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--fork",
+            "--kill-child=KILL",
+            "--",
+            "/usr/bin/python3",
+            "-I",
+            "-c",
+            local_module._MANAGED_TERMINAL_PRIVATE_TMP_ENTER,
+            str(private_tmp),
+            str(private_var_tmp),
+            "/usr/bin/python3",
+            str(script),
+        ]
+        result = subprocess.run(
+            argv,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert script.read_text() == original
+        assert (output / "state.txt").read_text() == "ok"
+    finally:
+        shutil.rmtree(root)
+
+
+def test_managed_terminal_mounts_skill_source_read_only():
+    helper = local_module._MANAGED_TERMINAL_PRIVATE_TMP_ENTER
+
+    assert (
+        "skill_root=os.path.join(os.environ.get('HERMES_HOME',''),'skills')" in helper
+    )
+    assert "mount(encoded,encoded,4096|16384)" in helper
+    assert "mount(None,encoded,32|4096|1|2|4)" in helper
 
 
 def test_managed_terminal_fails_closed_without_trusted_setpriv(monkeypatch):

@@ -879,7 +879,45 @@ def _command_is_probably_readonly(command: str) -> bool:
     return True
 
 
-def _ancillary_abs_paths(text: str, primary: list[str], base_dir: str = "") -> list[str]:
+def _managed_readonly_python_sources(text: str) -> set[str]:
+    """Return active-profile Python entrypoints mounted read-only for terminal.
+
+    Only the first script operand is exempted. Every later absolute argument is
+    still a possible write target and remains covered by ancillary snapshots.
+    """
+
+    if (
+        os.environ.get("HERMES_MANAGED_GATEWAY") != "1"
+        or _terminal_env_type() != "local"
+    ):
+        return set()
+    try:
+        from hermes_constants import get_hermes_home
+
+        skills_root = (get_hermes_home() / "skills").resolve(strict=True)
+    except (OSError, RuntimeError):
+        return set()
+
+    try:
+        from tools.environments.local import _managed_python_skill_sources
+
+        return {
+            str(resolved)
+            for _lexical, resolved in _managed_python_skill_sources(
+                text, skills_root.parent
+            )
+        }
+    except Exception:
+        return set()
+
+
+def _ancillary_abs_paths(
+    text: str,
+    primary: list[str],
+    base_dir: str = "",
+    *,
+    readonly_sources: Optional[set[str]] = None,
+) -> list[str]:
     """从命令 / 脚本文本里抽出**已存在**的写入目标，作为 cwd 之外的附加保护。
 
     覆盖绝对路径、home 前缀（~ / $HOME / ${HOME}，按当前 profile 的 home 展
@@ -993,6 +1031,7 @@ def _ancillary_abs_paths(text: str, primary: list[str], base_dir: str = "") -> l
             candidates.append(tok)
     out: list[str] = []
     seen = set(primary)
+    readonly = {os.path.realpath(path) for path in (readonly_sources or set())}
     for cand in candidates:
         p = _normalize_pathish(cand, base_dir)
         if p:
@@ -1026,6 +1065,8 @@ def _ancillary_abs_paths(text: str, primary: list[str], base_dir: str = "") -> l
             expanded = ([parent] if parent else []) + matches
         for item in expanded:
             if not item or item in seen or not os.path.lexists(item):
+                continue
+            if os.path.realpath(item) in readonly:
                 continue
             seen.add(item)
             out.append(item)
@@ -1617,9 +1658,16 @@ def _ensure_ancillary(
     范围外的**写入**本就不在保护范围承诺内。成功后标记本轮 ensured，finish
     才会释放这些 operation 的 pin。
     """
+    text = str(arguments.get("command") or arguments.get("code") or "")
+    readonly_sources = (
+        _managed_readonly_python_sources(text) if tool_name == "terminal" else set()
+    )
     extras = _ancillary_abs_paths(
-        str(arguments.get("command") or arguments.get("code") or ""), exclude,
-        base_dir=_terminal_workdir(arguments, task))
+        text,
+        exclude,
+        base_dir=_terminal_workdir(arguments, task),
+        readonly_sources=readonly_sources,
+    )
     if not extras:
         return None
     data, err = _post(

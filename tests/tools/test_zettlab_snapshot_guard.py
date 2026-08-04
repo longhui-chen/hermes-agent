@@ -832,6 +832,73 @@ def test_absolute_targets_outside_cwd_get_ancillary_protection(monkeypatch, tmp_
     assert rec.requests[1]["body"]["paths"] == [str(outside)]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX managed-terminal paths")
+def test_managed_python_skill_entry_is_not_treated_as_a_write_target(
+    monkeypatch, tmp_path
+):
+    """A managed terminal may read its active profile's skill entrypoint.
+
+    The cwd still gets the normal recovery point, while the read-only Python
+    source is omitted from ancillary write targets so an out-of-scope skill
+    path cannot reject an otherwise valid command.
+    """
+    profile_home = tmp_path / "hermes_home" / "profiles" / "agent-a"
+    script = profile_home / "skills" / "support-suite" / "scripts" / "onboard.py"
+    output = tmp_path / "agents" / "data" / "agent-a" / "output"
+    script.parent.mkdir(parents=True)
+    output.mkdir(parents=True)
+    script.write_text("print('ok')")
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    rec = _install(monkeypatch, {"ready": True, "operations": []})
+
+    allowed = guard.maybe_require_snapshot(
+        "terminal",
+        {"command": f'python3 "{script}"', "workdir": str(output)},
+        turn_id="turn_1",
+    )
+
+    assert allowed is None
+    assert len(rec.requests) == 1
+    assert rec.requests[0]["body"]["paths"] == [str(output)]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX managed-terminal paths")
+def test_managed_python_skill_user_file_argument_remains_protected(
+    monkeypatch, tmp_path
+):
+    """Only the interpreter source is read-only; later path args may be writes."""
+    profile_home = tmp_path / "hermes_home" / "profiles" / "agent-a"
+    script = profile_home / "skills" / "support-suite" / "scripts" / "onboard.py"
+    output = tmp_path / "agents" / "data" / "agent-a" / "output"
+    target = tmp_path / "user-data" / "settings.json"
+    script.parent.mkdir(parents=True)
+    output.mkdir(parents=True)
+    target.parent.mkdir()
+    script.write_text("print('ok')")
+    target.write_text("{}")
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    rec = _install(
+        monkeypatch,
+        {"ready": True, "operations": []},
+        {"ready": True, "operations": []},
+    )
+
+    allowed = guard.maybe_require_snapshot(
+        "terminal",
+        {
+            "command": f'python3 "{script}" --config "{target}"',
+            "workdir": str(output),
+        },
+        turn_id="turn_1",
+    )
+
+    assert allowed is None
+    assert len(rec.requests) == 2
+    assert rec.requests[1]["body"]["paths"] == [str(target)]
+
+
 def test_ancillary_ensure_failure_does_not_block(monkeypatch, tmp_path):
     """附加保护是加餐：范围外 403 / 服务错误只跳过，不影响已就绪的 cwd 保护。"""
     outside = tmp_path / "other" / "f.txt"
