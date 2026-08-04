@@ -58,7 +58,8 @@ def _write_camera_runtime(tmp_path: Path) -> Path:
             "argv": sys.argv[1:],
             "agent": os.environ.get("ZET_AGENT_ID", ""),
             "turn": os.environ.get("HERMES_TURN_ID", ""),
-            "session": os.environ.get("HERMES_SESSION_KEY", ""),
+            "session_id": os.environ.get("HERMES_SESSION_ID", ""),
+            "session_key": os.environ.get("HERMES_SESSION_KEY", ""),
             "action": secret("ZETTLAB_AGENT_ACTION_TOKEN"),
             "business": secret("ZETTLAB_BUSINESS_EXECUTION_TOKEN"),
             "action_plain": os.environ.get("ZETTLAB_AGENT_ACTION_TOKEN", ""),
@@ -95,7 +96,10 @@ def _bind_receipt():
         "ZET_AGENT_ID": "agent-1",
         "ZETTLAB_AGENT_ACTION_TOKEN": ACTION_TOKEN,
     })
-    session_tokens = set_session_vars(session_key="zettlab:owner-1:agent-1:session-1")
+    session_tokens = set_session_vars(
+        session_key="zettlab:owner-1:agent-1:stable-session",
+        session_id="api-lineage-session-1",
+    )
     turn_tokens = set_turn_vars(
         turn_id="turn-1",
         business_execution_token=BUSINESS_TOKEN,
@@ -184,7 +188,8 @@ def test_camera_runtime_env_is_request_and_profile_scoped():
             "ZETTLAB_AGENT_ACTION_TOKEN": ACTION_TOKEN,
             "ZETTLAB_BUSINESS_EXECUTION_TOKEN": BUSINESS_TOKEN,
             "HERMES_TURN_ID": "turn-1",
-            "HERMES_SESSION_KEY": "zettlab:owner-1:agent-1:session-1",
+            "HERMES_SESSION_ID": "api-lineage-session-1",
+            "HERMES_SESSION_KEY": "api-lineage-session-1",
         }
     finally:
         _clear_receipt(tokens)
@@ -213,7 +218,8 @@ def test_camera_runtime_direct_runner_flow_uses_secret_fds(monkeypatch, tmp_path
     assert payload["argv"] == ["snap", "--camera-id", "cam_front"]
     assert payload["agent"] == "agent-1"
     assert payload["turn"] == "turn-1"
-    assert payload["session"] == "zettlab:owner-1:agent-1:session-1"
+    assert payload["session_id"] == "api-lineage-session-1"
+    assert payload["session_key"] == "api-lineage-session-1"
     assert payload["action"] == "[REDACTED]"
     assert payload["business"] == "[REDACTED]"
     assert payload["action_plain"] == ""

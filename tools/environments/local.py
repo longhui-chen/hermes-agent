@@ -1537,6 +1537,16 @@ def build_camera_runtime_env() -> dict[str, str]:
         get_session_env,
     )
 
+    # CameraService binds the business capability to the exact Hermes lineage
+    # (X-Hermes-Session-Id), not the stable App routing key.  The two values are
+    # intentionally different on the API-server path.  Keep the legacy
+    # HERMES_SESSION_KEY alias populated with the lineage id so already deployed
+    # camsnap v0.1.0/v0.1.1 helpers remain compatible during a rolling update.
+    session_id = (
+        get_session_env("HERMES_SESSION_ID", "").strip()
+        or get_session_env("HERMES_SESSION_KEY", "").strip()
+    )
+
     env = {
         "ZET_AGENT_ID": str(get_secret("ZET_AGENT_ID", "") or "").strip(),
         "ZETTLAB_AGENT_ACTION_TOKEN": str(
@@ -1544,13 +1554,15 @@ def build_camera_runtime_env() -> dict[str, str]:
         ).strip(),
         "ZETTLAB_BUSINESS_EXECUTION_TOKEN": business_execution_token(),
         "HERMES_TURN_ID": get_session_env("HERMES_TURN_ID", "").strip(),
-        "HERMES_SESSION_KEY": get_session_env("HERMES_SESSION_KEY", "").strip(),
+        "HERMES_SESSION_ID": session_id,
+        "HERMES_SESSION_KEY": session_id,
     }
     limits = {
         "ZET_AGENT_ID": 128,
         "ZETTLAB_AGENT_ACTION_TOKEN": 128,
         "ZETTLAB_BUSINESS_EXECUTION_TOKEN": 128,
         "HERMES_TURN_ID": 256,
+        "HERMES_SESSION_ID": 1024,
         "HERMES_SESSION_KEY": 1024,
     }
     if any(
