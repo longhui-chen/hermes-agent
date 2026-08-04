@@ -293,14 +293,13 @@ def _managed_gateway_output_dir() -> str | None:
         else:
             value = agent_output_dir()
             return str(value) if value else None
-        try:
-            from agent.secret_scope import get_secret
+        # 受管网关是 multiplex 单进程：进程级 os.environ 里的
+        # ZET_AGENT_OUTPUT_DIR 可能是**另一个 profile** 留下的，拿它当锚点会让
+        # 相对读写落到别人的产出目录（HR3）。所以 scope 取不到就当不可用，
+        # 沿用原兜底，绝不回落进程环境。
+        from agent.secret_scope import get_secret
 
-            value = get_secret("ZET_AGENT_OUTPUT_DIR")
-        except Exception:
-            value = None
-        if not value:
-            value = os.environ.get("ZET_AGENT_OUTPUT_DIR")
+        value = get_secret("ZET_AGENT_OUTPUT_DIR", "")
         value = str(value or "").strip()
         if value and os.path.isabs(value) and os.path.isdir(value):
             return value
@@ -1627,8 +1626,13 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 pass  # stat failed — fall through to full read
 
         # ── Perform the read ──────────────────────────────────────────
+        # Read the path we just validated, not the raw argument: the ops layer
+        # anchors a relative path against the terminal cwd, which is not the
+        # base this function resolved against. Letting the two differ means the
+        # block check, dedup and staleness bookkeeping all describe a different
+        # file than the one actually read.
         file_ops = _get_file_ops(task_id)
-        result = file_ops.read_file(path, offset, limit)
+        result = file_ops.read_file(str(_resolved) or path, offset, limit)
         result_dict = result.to_dict()
 
         # ── Character-count guard ─────────────────────────────────────
@@ -2262,9 +2266,15 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         if block_error:
             return json.dumps({"error": block_error}, ensure_ascii=False)
 
+        # Search the path the block check just cleared. A relative path handed
+        # to the ops layer anchors against the terminal cwd instead, so the
+        # scope decision above would describe a different tree than the one
+        # actually walked.
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
-            pattern=pattern, path=path, target=target, file_glob=file_glob,
+            pattern=pattern,
+            path=str(resolved_path) if resolved_path else path,
+            target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context
         )
         omitted = _filter_read_blocked_search_results(result, task_id)

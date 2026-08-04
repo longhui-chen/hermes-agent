@@ -378,7 +378,21 @@ def test_workflow_addendum_plan_first_section_is_capability_aware():
         # 工作目录契约是设备上唯一能让模型避开 scope 外锚点的说明；丢了它
         # 模型只能靠撞墙学习，所以这里钉住它的存在。
         assert "## 工作目录与路径" in text
-        assert "agent_output" in text
+        assert "绝对路径" in text
+
+
+def test_workflow_addendum_workdir_alias_line_follows_capability(monkeypatch):
+    """`agent_output` 只在终端工具真能解析它时才教——别名没落地的运行时会把它
+    当普通路径原样 cd，教了反而让命令失败。"""
+    from gateway.platforms import zet_agent
+
+    monkeypatch.setattr(zet_agent, "_agent_output_alias_available", lambda: False)
+    assert "agent_output" not in zet_agent._zettlab_workflow_addendum(True)
+
+    monkeypatch.setattr(zet_agent, "_agent_output_alias_available", lambda: True)
+    with_alias = zet_agent._zettlab_workflow_addendum(True)
+    assert "workdir='agent_output'" in with_alias
+    assert "## 工作目录与路径" in with_alias
 
 
 def test_trusted_video_execution_never_hides_present_plan(monkeypatch):

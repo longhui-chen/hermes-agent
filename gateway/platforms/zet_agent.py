@@ -294,16 +294,37 @@ _ZET_PLAN_FIRST_MANUAL = """\
 
 简单的单步请求、查询、闲聊不需要 present_plan，直接执行即可。"""
 
-# workdir 契约：设备上终端的相对路径没人供给锚点时会兜底到 scope 外的
-# 目录，而契约不进 prompt 模型只能靠撞墙学习，所以在平台层显式声明。
-# `agent_output` 别名由终端工具解析，措辞不做绝对断言以兼容尚未提供
-# 该别名的运行时版本。
+# workdir 契约：设备上终端的相对路径没人供给锚点时会兜底到 scope 外的目录，
+# 而契约不进 prompt 模型只能靠撞墙学习，所以在平台层显式声明。
 _ZET_WORKDIR_SECTION = """\
 ## 工作目录与路径
 
-- 跑脚本、落临时产物：终端调用传 `workdir='agent_output'`（平台提供该别名时），那是你自己的可写产出目录。
 - 读写用户文件：一律用绝对路径（如 `/volume1/subvol/data/...`），不要依赖相对路径。
 - 相对路径的语义是你自己的产出目录，不是用户的文件区。"""
+
+# 只有终端工具真的能解析 `agent_output` 时才教这个姿势。别名尚未落地的运行时
+# 会把它当普通路径原样 `cd`，命令直接失败——教一个用不了的姿势比不教更糟。
+_ZET_WORKDIR_ALIAS_LINE = (
+    "- 跑脚本、落临时产物：终端调用传 `workdir='agent_output'`，"
+    "那是你自己的可写产出目录。"
+)
+
+
+def _agent_output_alias_available() -> bool:
+    """Report whether the terminal tool resolves the ``agent_output`` alias."""
+
+    try:
+        from tools.runtime_workdir import AGENT_OUTPUT_WORKDIR  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _zet_workdir_section() -> str:
+    if not _agent_output_alias_available():
+        return _ZET_WORKDIR_SECTION
+    head, _, rest = _ZET_WORKDIR_SECTION.partition("\n\n")
+    return f"{head}\n\n{_ZET_WORKDIR_ALIAS_LINE}\n{rest}"
 
 _ZET_ADDENDUM_TAIL = """\
 ## 用户画像语言
@@ -325,7 +346,7 @@ def _zettlab_workflow_addendum(auto_execute: bool) -> str:
     """
     plan_first = _ZET_PLAN_FIRST_AUTO if auto_execute else _ZET_PLAN_FIRST_MANUAL
     return "\n\n".join(
-        (_ZET_ADDENDUM_HEAD, plan_first, _ZET_WORKDIR_SECTION, _ZET_ADDENDUM_TAIL)
+        (_ZET_ADDENDUM_HEAD, plan_first, _zet_workdir_section(), _ZET_ADDENDUM_TAIL)
     ) + "\n"
 
 
