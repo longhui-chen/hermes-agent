@@ -64,12 +64,12 @@ pip install pymupdf pymupdf4llm
 
 **Via helper script**:
 ```bash
-python3 ${HERMES_SKILL_DIR}/scripts/extract_pymupdf.py document.pdf              # Plain text
-python3 ${HERMES_SKILL_DIR}/scripts/extract_pymupdf.py document.pdf --markdown    # Markdown
-python3 ${HERMES_SKILL_DIR}/scripts/extract_pymupdf.py document.pdf --tables      # Tables
-python3 ${HERMES_SKILL_DIR}/scripts/extract_pymupdf.py document.pdf --images out/ # Extract images
-python3 ${HERMES_SKILL_DIR}/scripts/extract_pymupdf.py document.pdf --metadata    # Title, author, pages
-python3 ${HERMES_SKILL_DIR}/scripts/extract_pymupdf.py document.pdf --pages 0-4   # Specific pages
+python3 "${HERMES_SKILL_DIR}/scripts/extract_pymupdf.py" document.pdf              # Plain text
+python3 "${HERMES_SKILL_DIR}/scripts/extract_pymupdf.py" document.pdf --markdown    # Markdown
+python3 "${HERMES_SKILL_DIR}/scripts/extract_pymupdf.py" document.pdf --tables      # Tables
+python3 "${HERMES_SKILL_DIR}/scripts/extract_pymupdf.py" document.pdf --images out/ # Extract images
+python3 "${HERMES_SKILL_DIR}/scripts/extract_pymupdf.py" document.pdf --metadata    # Title, author, pages
+python3 "${HERMES_SKILL_DIR}/scripts/extract_pymupdf.py" document.pdf --pages 0-4   # Specific pages
 ```
 
 **Inline**:
@@ -88,18 +88,18 @@ for page in doc:
 
 ```bash
 # Check disk space first
-python3 ${HERMES_SKILL_DIR}/scripts/extract_marker.py --check
+python3 "${HERMES_SKILL_DIR}/scripts/extract_marker.py" --check
 
 pip install marker-pdf
 ```
 
 **Via helper script**:
 ```bash
-python3 ${HERMES_SKILL_DIR}/scripts/extract_marker.py document.pdf                # Markdown
-python3 ${HERMES_SKILL_DIR}/scripts/extract_marker.py document.pdf --json         # JSON with metadata
-python3 ${HERMES_SKILL_DIR}/scripts/extract_marker.py document.pdf --output_dir out/  # Save images
-python3 ${HERMES_SKILL_DIR}/scripts/extract_marker.py scanned.pdf                 # Scanned PDF (OCR)
-python3 ${HERMES_SKILL_DIR}/scripts/extract_marker.py document.pdf --use_llm      # LLM-boosted accuracy
+python3 "${HERMES_SKILL_DIR}/scripts/extract_marker.py" document.pdf                # Markdown
+python3 "${HERMES_SKILL_DIR}/scripts/extract_marker.py" document.pdf --json         # JSON with metadata
+python3 "${HERMES_SKILL_DIR}/scripts/extract_marker.py" document.pdf --output_dir out/  # Save images
+python3 "${HERMES_SKILL_DIR}/scripts/extract_marker.py" scanned.pdf                 # Scanned PDF (OCR)
+python3 "${HERMES_SKILL_DIR}/scripts/extract_marker.py" document.pdf --use_llm      # LLM-boosted accuracy
 ```
 
 **CLI** (installed with marker-pdf):

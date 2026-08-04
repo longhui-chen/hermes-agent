@@ -113,6 +113,18 @@ Rules:
   declare it on the terminal call (`workdir='agent_output'`) instead of assuming
   one; commands that do not declare one anchor to the agent's output directory.
 
+Two places the variable does **not** reach — writing it there leaves a literal
+`${HERMES_SKILL_DIR}` on screen:
+
+- **Frontmatter** (`setup.help` and friends). Substitution runs over the body
+  that `skill_commands` loads; setup metadata is read straight off the parsed
+  YAML. Describe the script by name there and keep the runnable command in the
+  body.
+- **Supporting files** under `references/`, `templates/` and package `README`s.
+  `skill_view` reads those verbatim. Either keep their paths relative and say
+  once, in SKILL.md, that they are relative to the package root, or repeat the
+  runnable form in SKILL.md itself.
+
 ## Peer-Matched Structure
 
 Every in-repo skill follows roughly:
