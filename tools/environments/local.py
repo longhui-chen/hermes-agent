@@ -1150,8 +1150,12 @@ def _migrate_managed_output_tree(
         )
         if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
             return False
-        allowed_owner = info.st_uid in (0, uid)
-        return allowed_type and allowed_owner
+        # Historical output can come from trusted helpers/containers running
+        # under a different numeric UID. The output root is anchored beneath a
+        # validated root-owned parent, and transfer opens every non-symlink via
+        # dir_fd + O_NOFOLLOW before changing ownership. Restrict entry shape
+        # and hard links here; normalize the previous owner during transfer.
+        return allowed_type
 
     def _walk(*, transfer: bool) -> None:
         stack: list[tuple[int, object]] = [(os.dup(root_fd), None)]

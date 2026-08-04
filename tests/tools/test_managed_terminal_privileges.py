@@ -292,6 +292,9 @@ def test_managed_terminal_reads_but_cannot_modify_skill_and_writes_output(
         output = root / "agents" / "data" / "agent-a" / "output"
         script.parent.mkdir(parents=True)
         output.mkdir(parents=True)
+        legacy_output = output / "legacy-owner.txt"
+        legacy_output.write_text("historical")
+        os.chown(legacy_output, 1001, 1001)
         original = (
             "from pathlib import Path\n"
             "source = Path(__file__)\n"
@@ -378,6 +381,9 @@ def test_managed_terminal_reads_but_cannot_modify_skill_and_writes_output(
         assert result.returncode == 0, result.stderr
         assert script.read_text() == original
         assert (output / "state.txt").read_text() == "ok"
+        assert legacy_output.read_text() == "historical"
+        assert legacy_output.stat().st_uid == uid
+        assert legacy_output.stat().st_gid == gid
     finally:
         shutil.rmtree(root)
 
