@@ -333,7 +333,11 @@ class _PluginBothProvider(ImageGenProvider):
         return "both-v1"
 
     def capabilities(self) -> Dict[str, Any]:
-        return {"modalities": ["text", "image"], "max_reference_images": 5}
+        return {
+            "modalities": ["text", "image"],
+            "max_reference_images": 5,
+            "image_input_description": "Use an absolute local image path; remote URLs are unsupported.",
+        }
 
     def generate(self, prompt, aspect_ratio="landscape", *, image_url=None,
                  reference_image_urls=None, **kwargs):
@@ -369,9 +373,28 @@ class TestDynamicSchema:
         reg.register_provider(_PluginBothProvider())
         self._no_discovery(monkeypatch)
 
-        desc = _build_dynamic_image_schema()["description"]
+        schema = _build_dynamic_image_schema()
+        desc = schema["description"]
         assert "image-to-image / editing" in desc
         assert "up to 5 reference image(s)" in desc
+        assert (
+            schema["parameters"]["properties"]["image_url"]["description"]
+            == "Use an absolute local image path; remote URLs are unsupported."
+        )
+
+    def test_provider_without_references_overrides_reference_schema(self, monkeypatch):
+        from tools import image_generation_tool as tool
+
+        monkeypatch.setattr(tool, "_active_image_capabilities", lambda: {
+            "modalities": ["text", "image"],
+            "max_reference_images": 0,
+            "image_input_description": "Use a provider-specific local source.",
+        })
+
+        schema = tool._build_dynamic_image_schema()
+        assert "omit reference_image_urls" in (
+            schema["parameters"]["properties"]["reference_image_urls"]["description"]
+        )
 
     def test_builder_wired_into_registry(self):
         from tools.registry import discover_builtin_tools, registry

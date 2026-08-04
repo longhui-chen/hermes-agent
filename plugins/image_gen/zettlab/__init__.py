@@ -80,27 +80,19 @@ class ZettlabImageGenProvider(ImageGenProvider):
         try:
             cap, model = media_client.selected_model_capability("image")
         except Exception:
-            return {"modalities": ["text"], "max_reference_images": 0}
-        modalities: List[str] = []
-        if isinstance(model, dict):
-            for value in model.get("modalities") or []:
-                if isinstance(value, str) and value.strip() and value.strip() not in modalities:
-                    modalities.append(value.strip())
-        limits = cap.get("limits") if isinstance(cap, dict) else {}
-        max_refs = 0
-        if isinstance(limits, dict):
-            max_refs = int(limits.get("max_remote_media_inputs") or 0)
-            inline_limit = limits.get("max_inline_image_bytes")
-            if isinstance(inline_limit, int) and not isinstance(inline_limit, bool) and inline_limit > 0:
-                max_refs = max(max_refs, 1)
+            return {
+                "modalities": ["text"],
+                "max_reference_images": 0,
+                "supports_inline_image": False,
+            }
+        modalities = media_client.supported_modalities(cap, model)
         return {
-            "modalities": modalities or ["text"],
-            "max_reference_images": max(0, max_refs - 1),
-            "supports_inline_image": bool(
-                isinstance(limits, dict)
-                and isinstance(limits.get("max_inline_image_bytes"), int)
-                and not isinstance(limits.get("max_inline_image_bytes"), bool)
-                and limits.get("max_inline_image_bytes") > 0
+            "modalities": modalities,
+            "max_reference_images": 0,
+            "supports_inline_image": "image" in modalities,
+            "image_input_description": (
+                "Pass one PNG, JPEG, or WebP image as a base64 Data URI, absolute "
+                "local file path, or file URL. HTTP(S) URLs are not enabled yet."
             ),
         }
 
@@ -135,44 +127,28 @@ class ZettlabImageGenProvider(ImageGenProvider):
             )
 
         try:
+            session_id = kwargs.get("_task_id")
             refs = normalize_reference_images(reference_image_urls)
-            input_image, inputs = media_client.split_image_inputs(
-                image_url, refs, model_capability
+            input_image = media_client.inline_image_input(
+                image_url,
+                refs,
+                model_capability,
+                task_id=session_id,
             )
-            configured_modalities = (
-                model_capability.get("modalities")
-                if isinstance(model_capability, dict)
-                else None
-            )
-            type_limits = model_capability.get("_type_limits") if isinstance(model_capability, dict) else None
-            max_remote_inputs = None
-            if isinstance(type_limits, dict):
-                declared_limit = type_limits.get("max_remote_media_inputs")
-                if isinstance(declared_limit, int) and not isinstance(declared_limit, bool) and declared_limit >= 0:
-                    max_remote_inputs = declared_limit
-            if (input_image or inputs) and (
-                not isinstance(configured_modalities, list)
-                or "image" not in configured_modalities
-                or (max_remote_inputs is not None and max_remote_inputs < len(inputs))
-            ):
+            configured_modalities = media_client.normalized_modalities(model_capability)
+            if not input_image and "text" not in configured_modalities:
+                if "image" in configured_modalities:
+                    return error_response(
+                        error="An image input is required for this Zettlab image generation model.",
+                        error_type="missing_image",
+                        provider="zettlab",
+                        model=model,
+                        prompt=prompt,
+                        aspect_ratio=aspect,
+                    )
                 return error_response(
-                    error="Image inputs are not enabled for this Zettlab image generation model.",
-                    error_type="unsupported_input",
-                    provider="zettlab",
-                    model=model,
-                    prompt=prompt,
-                    aspect_ratio=aspect,
-                )
-            if (
-                isinstance(configured_modalities, list)
-                and "image" in configured_modalities
-                and "text" not in configured_modalities
-                and not input_image
-                and not inputs
-            ):
-                return error_response(
-                    error="An image input is required for this Zettlab image generation model.",
-                    error_type="missing_image",
+                    error="The Zettlab image model exposes no supported input modality.",
+                    error_type="unsupported_capability",
                     provider="zettlab",
                     model=model,
                     prompt=prompt,
@@ -185,12 +161,9 @@ class ZettlabImageGenProvider(ImageGenProvider):
             }
             if input_image:
                 payload["input_image"] = input_image
-            elif inputs:
-                payload["remote_media_inputs"] = inputs
             resolutions = _capability_strings(model_capability, "resolutions")
             if resolutions:
                 payload["resolution"] = resolutions[0]
-            session_id = kwargs.get("_task_id")
             job = media_client.create_and_wait(
                 media_type="image",
                 model=model,
@@ -199,7 +172,10 @@ class ZettlabImageGenProvider(ImageGenProvider):
                 payload=payload,
                 session_id=session_id,
             )
-            image = media_client.first_asset_location(job, prefer_local=bool(session_id))
+            image = media_client.first_asset_location(
+                job,
+                prefer_local=bool(session_id),
+            )
         except Exception as exc:
             return error_response(
                 error=f"Zettlab image generation failed: {exc}",
@@ -216,7 +192,7 @@ class ZettlabImageGenProvider(ImageGenProvider):
             prompt=prompt,
             aspect_ratio=aspect,
             provider="zettlab",
-            modality="image" if input_image or inputs else "text",
+            modality="image" if input_image else "text",
             extra={
                 "job_id": job.get("job_id"),
                 "assets": job.get("assets") or [],
