@@ -564,6 +564,16 @@ def _terminal_workdir(arguments: dict[str, Any], task_id: str) -> str:
 
     explicit = str(arguments.get("workdir") or "").strip()
     if explicit:
+        try:
+            from tools.runtime_workdir import resolve_runtime_workdir
+
+            explicit = str(resolve_runtime_workdir(explicit) or "").strip()
+        except ValueError:
+            # Registry dispatch rejects an unavailable semantic alias before
+            # this gate. Direct guard calls still fail safe by protecting the
+            # fallback cwd; the terminal handler will reject the same alias.
+            explicit = ""
+    if explicit:
         # `~` 按工具子进程实际生效的 HOME 展开：workdir 的 `cd` 由 shell 按子
         # 进程 $HOME 解释，home_mode=profile / 缺 HOME fallback 时它是
         # {HERMES_HOME}/home，用 Hermes 进程的 expanduser 会给真实 OS HOME 建

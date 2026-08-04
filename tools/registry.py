@@ -266,6 +266,22 @@ def _zettlab_snapshot_gate(name: str, args: dict, kwargs: dict) -> Optional[str]
         return None
 
 
+def _resolve_runtime_tool_args(name: str, args: dict) -> dict:
+    """Resolve platform-owned semantic arguments before any execution gate."""
+    if name != "terminal" or not isinstance(args, dict):
+        return args
+
+    from tools.runtime_workdir import resolve_runtime_workdir
+
+    workdir = args.get("workdir")
+    resolved_workdir = resolve_runtime_workdir(workdir)
+    if resolved_workdir == workdir:
+        return args
+    resolved_args = dict(args)
+    resolved_args["workdir"] = resolved_workdir
+    return resolved_args
+
+
 class ToolRegistry:
     """Singleton registry that collects tool schemas + handlers from tool files."""
 
@@ -672,6 +688,21 @@ class ToolRegistry:
         * All exceptions are caught and returned as ``{"error": "..."}``
           for consistent error format.
         """
+        # Runtime aliases must become one stable physical path before both the
+        # snapshot gate and handler. Resolving twice would allow a concurrent
+        # environment update to snapshot one directory and execute in another.
+        try:
+            args = _resolve_runtime_tool_args(name, args)
+        except ValueError as exc:
+            return json.dumps(
+                {
+                    "error": str(exc),
+                    "error_type": "runtime_workdir",
+                    "status": "error",
+                },
+                ensure_ascii=False,
+            )
+
         # Zettlab file-change protection：registry.dispatch 是所有工具执行的
         # 统一汇聚点，gate 必须在这里——除 model_tools.handle_function_call
         # 外，插件公开 API ctx.dispatch_tool()（slash command / hook）也直连

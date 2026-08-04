@@ -5521,7 +5521,7 @@ Background: Set background=true to get a session_id. Almost always pair with not
 For servers/watchers, do NOT use shell-level background wrappers (nohup/disown/setsid/trailing '&') in foreground mode. Use background=true so Hermes can track lifecycle and output.
 After starting a server, verify readiness with a health check or log signal, then run tests in a separate terminal() call. Avoid blind sleep loops.
 Use process(action="poll") for progress checks, process(action="wait") to block until done.
-Working directory: Use 'workdir' for per-command cwd.
+Working directory: Use 'workdir' for per-command cwd. Platform runtimes may expose the semantic 'agent_output' workdir for the current agent's managed output directory.
 PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
 
 Do NOT use vim/nano/interactive tools without pty=true — they hang without a pseudo-terminal. Pipe git output to cat if it might page.
@@ -6796,6 +6796,22 @@ def terminal_tool(
                 "status": "error",
             }, ensure_ascii=False)
 
+        try:
+            from tools.runtime_workdir import resolve_runtime_workdir
+
+            workdir = resolve_runtime_workdir(workdir)
+        except ValueError as exc:
+            return json.dumps(
+                {
+                    "output": "",
+                    "exit_code": -1,
+                    "error": str(exc),
+                    "error_type": "runtime_workdir",
+                    "status": "error",
+                },
+                ensure_ascii=False,
+            )
+
         # Get configuration
         config = _get_env_config()
         env_type = config["env_type"]
@@ -7807,7 +7823,7 @@ TERMINAL_SCHEMA = {
             },
             "workdir": {
                 "type": "string",
-                "description": "Working directory for this command (absolute path). Defaults to the session working directory."
+                "description": "Working directory for this command (absolute path), or 'agent_output' when the platform exposes a managed output directory for the current agent. Defaults to the session working directory."
             },
             "pty": {
                 "type": "boolean",
