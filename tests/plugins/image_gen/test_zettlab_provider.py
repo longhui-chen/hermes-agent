@@ -795,25 +795,27 @@ def test_zettlab_parent_watchdog_exits_after_parent_is_killed():
     parent.start()
     child_pid = output.get(timeout=5)
     try:
+        child = psutil.Process(child_pid)
+    except psutil.NoSuchProcess:
+        child = None
+    try:
         parent.kill()
         parent.join(timeout=2)
-        deadline = time.monotonic() + 3
-        while time.monotonic() < deadline:
-            if not psutil.pid_exists(child_pid):
-                break
-            time.sleep(0.05)
-        else:
-            pytest.fail("media HTTP child survived its parent")
+        if child is not None:
+            try:
+                child.wait(timeout=3)
+            except psutil.TimeoutExpired:
+                pytest.fail("media worker child survived its parent")
     finally:
         if parent.is_alive():
             parent.kill()
             parent.join(timeout=1)
-        try:
-            child = psutil.Process(child_pid)
-            child.kill()
-            child.wait(timeout=1)
-        except (psutil.NoSuchProcess, psutil.TimeoutExpired):
-            pass
+        if child is not None and child.is_running():
+            try:
+                child.kill()
+                child.wait(timeout=1)
+            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                pass
         output.close()
 
 

@@ -51,6 +51,11 @@ class ZettlabMediaDeadlineError(ZettlabMediaError):
 
 
 def _watch_parent(parent_pid: int) -> None:
+    parent = multiprocessing.parent_process()
+    if parent is not None:
+        while parent.is_alive():
+            time.sleep(0.2)
+        os._exit(1)
     while os.getppid() == parent_pid:
         time.sleep(0.2)
     os._exit(1)

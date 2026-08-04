@@ -294,6 +294,38 @@ def test_media_file_worker_interrupt_terminates_read(monkeypatch):
     assert connection.closed is True
 
 
+def test_media_worker_parent_watch_uses_cross_platform_parent_sentinel(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    class FakeParent:
+        def __init__(self):
+            self.states = iter([True, False])
+
+        def is_alive(self):
+            return next(self.states)
+
+    exits = []
+    monkeypatch.setattr(client.multiprocessing, "parent_process", lambda: FakeParent())
+    monkeypatch.setattr(client.time, "sleep", lambda _delay: None)
+    monkeypatch.setattr(
+        client.os,
+        "getppid",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("multiprocessing parent sentinel must avoid PPID polling")
+        ),
+    )
+    def fake_exit(code):
+        exits.append(code)
+        raise SystemExit(code)
+
+    monkeypatch.setattr(client.os, "_exit", fake_exit)
+
+    with pytest.raises(SystemExit):
+        client._watch_parent(12345)
+
+    assert exits == [1]
+
+
 def test_media_http_session_accepts_base64_sized_request(monkeypatch):
     from plugins import zettlab_media_client as client
 
