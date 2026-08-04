@@ -165,6 +165,17 @@ def test_profile_scope_flow_works_with_empty_environ(monkeypatch):
      {"staging_dir": "/tmp/stage", "slug": "app1"}),
     ("reload", {"slug": "app1", "staging_dir": "/tmp/stage"}, "POST", "/app1/reload",
      {"staging_dir": "/tmp/stage"}),
+    # The note travels with the version and is what the user is shown when
+    # deciding whether to undo it, so it has to reach the host.
+    ("reload", {"slug": "app1", "staging_dir": "/tmp/stage", "note": "Footer 加了一个链接"},
+     "POST", "/app1/reload", {"staging_dir": "/tmp/stage", "note": "Footer 加了一个链接"}),
+    # Undo without a target: the app goes back one step, whatever that is.
+    ("rollback", {"slug": "app1"}, "POST", "/app1/rollback", {}),
+    # Undo naming the version it means. This is what makes a retry safe — an
+    # undo that already succeeded is recognised instead of swapping the app
+    # forward again.
+    ("rollback", {"slug": "app1", "to_version": "v17858"}, "POST", "/app1/rollback",
+     {"to_version": "v17858"}),
     ("delete", {"slug": "app1"}, "DELETE", "/app1", None),
     ("lifecycle", {"slug": "app1", "lifecycle_action": "restart"}, "POST",
      "/app1/lifecycle", {"action": "restart"}),
@@ -848,3 +859,31 @@ def test_schema_actions_match_handler():
         out = json.loads(app_host_tool({"action": action}))
         error = out.get("error") or {}
         assert "未知动作" not in str(error.get("message", "")), action
+
+
+# --- reachability ------------------------------------------------------------
+# The model can only call what the schema declares. Handling an action in
+# _build_request is not enough: an action missing from the enum is invisible,
+# and the model works around it — which is exactly how undo ended up being
+# "recompile the app with the old content" instead of one step back.
+
+def test_schema_declares_every_action_it_handles():
+    declared = set(APP_HOST_SCHEMA["parameters"]["properties"]["action"]["enum"])
+    for action in ("rollback", "reload", "install", "list", "delete", "lifecycle", "logs"):
+        assert action in declared, f"{action} is handled but not offered to the model"
+
+
+def test_schema_declares_the_arguments_undo_depends_on():
+    props = APP_HOST_SCHEMA["parameters"]["properties"]
+    # Without to_version an undo cannot be retried safely: the swap is
+    # symmetric, so repeating an untargeted one swaps the app forward again.
+    assert "to_version" in props
+    # Without note the archived version has no description, and the user is
+    # asked to undo something the host can only identify by a timestamp.
+    assert "note" in props
+
+
+def test_undo_is_described_where_the_model_reads_it():
+    text = APP_HOST_SCHEMA["description"]
+    assert "rollback" in text
+    assert "prev_version_id" in text, "the model has to be told where to get to_version"

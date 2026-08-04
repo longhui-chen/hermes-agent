@@ -69,7 +69,7 @@ _LIFECYCLE_ACTIONS = ("start", "stop", "restart")
 # the recycle bin lives on the JWT member face, i.e. the client app's list.
 _HTTP_ACTIONS = (
     "probe", "list", "acquire_slot", "release_slot", "install", "reload",
-    "delete", "lifecycle", "logs",
+    "rollback", "delete", "lifecycle", "logs",
 )
 _ACTIONS = _HTTP_ACTIONS + ("build_env",)
 
@@ -84,7 +84,10 @@ APP_HOST_SCHEMA = {
         "immediately with a slot token, or queue_ahead while queued — poll by "
         "calling again), install (register an app staged on disk), reload "
         "(rebuild + restart from a staging dir; idempotent — resending the "
-        "same commit returns current state), delete (soft-delete into the "
+        "same commit returns current state), rollback (put the previous "
+        "version back — one step, no rebuild; pass to_version from the "
+        "app's prev_version_id so a retry cannot swap it forward again), "
+        "delete (soft-delete into the "
         "recycle bin; recovery is done from the client app's list, there is "
         "no recover action here), lifecycle (start/stop/restart), logs "
         "(recent log tail), build_env (local check of the shared Go vendor "
@@ -101,8 +104,8 @@ APP_HOST_SCHEMA = {
             "slug": {
                 "type": "string",
                 "description": (
-                    "Application slug. Required for install, reload, delete, "
-                    "lifecycle, and logs."
+                    "Application slug. Required for install, reload, "
+                    "rollback, delete, lifecycle, and logs."
                 ),
             },
             "staging_dir": {
@@ -110,6 +113,27 @@ APP_HOST_SCHEMA = {
                 "description": (
                     "Absolute path of the staged application source on the "
                     "device. Required for install and reload."
+                ),
+            },
+            "note": {
+                "type": "string",
+                "description": (
+                    "For reload: one line saying what this change did, in the "
+                    "user's own words (\u201cFooter \u52a0\u4e86\u4e00\u4e2a\u94fe\u63a5\u201d). It is stored with the "
+                    "version and is what the user is shown when deciding "
+                    "whether to undo it — without it an undo can only offer a "
+                    "nameless version."
+                ),
+            },
+            "to_version": {
+                "type": "string",
+                "description": (
+                    "For rollback: the version to go back to, taken from the "
+                    "app's prev_version_id in list. Optional but strongly "
+                    "preferred — it makes the request safe to retry, because "
+                    "an undo that already succeeded is recognised instead of "
+                    "being applied a second time and swapping the app "
+                    "forward again."
                 ),
             },
             "lifecycle_action": {
@@ -273,7 +297,21 @@ def _build_request(action, args):
         }, _LONG_TIMEOUT
     if action == "reload":
         slug = _require_slug(args)
-        return "POST", f"/{slug}/reload", {"staging_dir": _require_staging_dir(args)}, _LONG_TIMEOUT
+        body = {"staging_dir": _require_staging_dir(args)}
+        note = str(args.get("note", "") or "").strip()
+        if note:
+            body["note"] = note
+        return "POST", f"/{slug}/reload", body, _LONG_TIMEOUT
+    if action == "rollback":
+        # No rebuild happens here — the previous version is already compiled —
+        # but the app is still stopped, swapped and health-checked, so this
+        # sits on the long tier with reload rather than the default one.
+        slug = _require_slug(args)
+        body = {}
+        to_version = str(args.get("to_version", "") or "").strip()
+        if to_version:
+            body["to_version"] = to_version
+        return "POST", f"/{slug}/rollback", body, _LONG_TIMEOUT
     if action == "delete":
         return "DELETE", f"/{_require_slug(args)}", None, timeout
     if action == "lifecycle":
