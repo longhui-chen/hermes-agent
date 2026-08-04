@@ -1522,6 +1522,47 @@ def build_video_edit_runtime_env(base_env: dict | None = None) -> dict[str, str]
     return env
 
 
+def build_camera_runtime_env() -> dict[str, str]:
+    """Build the exact request-scoped env for the trusted camera helper.
+
+    Camera credentials never enter Hermes. The helper receives only the
+    profile action token and the current request's business capability so the
+    device-local CameraService can bind the call to one Agent, user, turn, and
+    session. Generic subprocesses continue to have all of these values
+    stripped by :func:`_apply_profile_secret_scope_env`.
+    """
+    from agent.secret_scope import get_secret
+    from gateway.session_context import (
+        business_execution_token,
+        get_session_env,
+    )
+
+    env = {
+        "ZET_AGENT_ID": str(get_secret("ZET_AGENT_ID", "") or "").strip(),
+        "ZETTLAB_AGENT_ACTION_TOKEN": str(
+            get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or ""
+        ).strip(),
+        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": business_execution_token(),
+        "HERMES_TURN_ID": get_session_env("HERMES_TURN_ID", "").strip(),
+        "HERMES_SESSION_KEY": get_session_env("HERMES_SESSION_KEY", "").strip(),
+    }
+    limits = {
+        "ZET_AGENT_ID": 128,
+        "ZETTLAB_AGENT_ACTION_TOKEN": 128,
+        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": 128,
+        "HERMES_TURN_ID": 256,
+        "HERMES_SESSION_KEY": 1024,
+    }
+    if any(
+        not value
+        or "\x00" in value
+        or len(value.encode("utf-8")) > limits[key]
+        for key, value in env.items()
+    ):
+        raise PermissionError("trusted camera execution receipt unavailable")
+    return env
+
+
 def _sanitize_subprocess_env(
     base_env: Mapping[str, str] | None,
     extra_env: Mapping[str, str] | None = None,
