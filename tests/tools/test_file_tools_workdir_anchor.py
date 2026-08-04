@@ -160,3 +160,42 @@ class TestV4AHeaderRewrite:
         patch = "*** Begin Patch\n***Update File: notes.md\n*** End Patch"
         out = ft._rewrite_v4a_header_paths(patch, {"notes.md": "/out/notes.md"})
         assert "/out/notes.md" in out
+
+
+class TestOpsPathBackendScoping:
+    """把解析结果交给 ops 层，只在 ops 层作用于本机文件系统时成立。
+
+    ssh 后端在对端执行读/搜/patch：本机绝对路径在那边指向另一个文件或根本
+    不存在，所以本轮还没有终端命令记录 cwd 时，相对路径必须原样交给远端 shell
+    去按远端 cwd 解析。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _no_session_cwd(self, monkeypatch):
+        monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+        monkeypatch.setattr(terminal_tool, "_task_env_overrides", {})
+
+    def test_local_backend_uses_resolved_path(self, monkeypatch):
+        monkeypatch.setattr(ft, "_terminal_env_type_for_task", lambda _t="default": "local")
+        assert ft._ops_path("notes.md", "/base/notes.md", "t") == "/base/notes.md"
+
+    def test_ssh_backend_without_anchor_keeps_relative_path(self, monkeypatch):
+        monkeypatch.setattr(ft, "_terminal_env_type_for_task", lambda _t="default": "ssh")
+        monkeypatch.setattr(ft, "_authoritative_workspace_root", lambda _t="default": None)
+        assert ft._ops_path("notes.md", "/host/cwd/notes.md", "t") == "notes.md"
+
+    def test_ssh_backend_with_remote_cwd_uses_resolved_path(self, monkeypatch):
+        # live cwd 已被终端命令记下来时，那个锚点本身就是远端的，解析结果成立。
+        monkeypatch.setattr(ft, "_terminal_env_type_for_task", lambda _t="default": "ssh")
+        monkeypatch.setattr(ft, "_authoritative_workspace_root", lambda _t="default": "/remote/work")
+        assert ft._ops_path("notes.md", "/remote/work/notes.md", "t") == "/remote/work/notes.md"
+
+    def test_absent_resolution_always_falls_back_to_raw(self, monkeypatch):
+        monkeypatch.setattr(ft, "_terminal_env_type_for_task", lambda _t="default": "local")
+        assert ft._ops_path("notes.md", None, "t") == "notes.md"
+
+    def test_v4a_headers_are_not_rewritten_for_remote_backend(self, monkeypatch):
+        # patch 走的是同一判定：远端无锚点时 header 必须保持相对。
+        monkeypatch.setattr(ft, "_terminal_env_type_for_task", lambda _t="default": "ssh")
+        monkeypatch.setattr(ft, "_authoritative_workspace_root", lambda _t="default": None)
+        assert ft._ops_uses_resolved_paths("t") is False

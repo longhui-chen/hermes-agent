@@ -300,13 +300,14 @@ _ZET_WORKDIR_SECTION = """\
 ## 工作目录与路径
 
 - 读写用户文件：一律用绝对路径（如 `/volume1/subvol/data/...`），不要依赖相对路径。
-- 相对路径的语义是你自己的产出目录，不是用户的文件区。"""
+- 文件工具（read_file / write_file / edit_file / search_files）的相对路径落在你自己的产出目录，不是用户的文件区。
+- 终端命令不共用这个锚点：命令里的脚本、输入、输出参数都写绝对路径。刚用 write_file 写出的文件，交给命令时也要给绝对路径。"""
 
 # 只有终端工具真的能解析 `agent_output` 时才教这个姿势。别名尚未落地的运行时
 # 会把它当普通路径原样 `cd`，命令直接失败——教一个用不了的姿势比不教更糟。
 _ZET_WORKDIR_ALIAS_LINE = (
     "- 跑脚本、落临时产物：终端调用传 `workdir='agent_output'`，"
-    "那是你自己的可写产出目录。"
+    "那是你自己的可写产出目录——只有传了它，命令里的相对路径才和文件工具落在同一处。"
 )
 
 
@@ -332,8 +333,8 @@ def _agent_output_alias_available() -> bool:
 def _zet_workdir_section() -> str:
     if not _agent_output_alias_available():
         return _ZET_WORKDIR_SECTION
-    head, _, rest = _ZET_WORKDIR_SECTION.partition("\n\n")
-    return f"{head}\n\n{_ZET_WORKDIR_ALIAS_LINE}\n{rest}"
+    # 别名行放最后：它是上一条「终端参数写绝对路径」的例外，紧跟着读才不歧义。
+    return f"{_ZET_WORKDIR_SECTION}\n{_ZET_WORKDIR_ALIAS_LINE}"
 
 _ZET_ADDENDUM_TAIL = """\
 ## 用户画像语言

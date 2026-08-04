@@ -407,6 +407,37 @@ def _resolve_base_dir(
     return base.resolve()
 
 
+def _ops_uses_resolved_paths(task_id: str = "default") -> bool:
+    """Whether the ops layer should be handed this layer's resolved paths.
+
+    Passing the resolved path is what keeps the scope check, the dedup
+    bookkeeping and the actual I/O describing one file — but only while the
+    filesystem this process resolved against is the one the ops layer acts on.
+    A remote backend runs the read/search/patch on the far side, where a host
+    absolute path names a different file or none at all, so an ssh session's
+    ``notes.md`` must stay relative and let the remote shell anchor it.
+
+    The exception is a base that came from the backend's *own* cwd
+    (:func:`_authoritative_workspace_root` — the live terminal cwd or a
+    registered session cwd): that anchor is already expressed in the remote's
+    terms, so resolving against it stays correct there. Only the process-cwd
+    fallback — reached on a remote backend before any terminal command has run
+    — is a purely local notion, and there the raw path is the honest answer.
+    """
+
+    if _terminal_env_type_for_task(task_id) == "local":
+        return True
+    return bool(_authoritative_workspace_root(task_id))
+
+
+def _ops_path(path: str, resolved: object, task_id: str = "default") -> str:
+    """Pick the path to hand the ops layer for an already-checked *path*."""
+
+    if not resolved or not _ops_uses_resolved_paths(task_id):
+        return path
+    return str(resolved)
+
+
 def _resolve_path_for_task(filepath: str, task_id: str = "default") -> Path | PurePosixPath:
     """Resolve *filepath* against the task's absolute base directory.
 
@@ -1630,9 +1661,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # anchors a relative path against the terminal cwd, which is not the
         # base this function resolved against. Letting the two differ means the
         # block check, dedup and staleness bookkeeping all describe a different
-        # file than the one actually read.
+        # file than the one actually read. ``_ops_path`` keeps a remote
+        # backend's relative paths relative — see its docstring.
         file_ops = _get_file_ops(task_id)
-        result = file_ops.read_file(str(_resolved) or path, offset, limit)
+        result = file_ops.read_file(_ops_path(path, _resolved, task_id), offset, limit)
         result_dict = result.to_dict()
 
         # ── Character-count guard ─────────────────────────────────────
@@ -2181,7 +2213,12 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 # already resolved, locked and scope-checked, so both layers
                 # agree on which files the patch touches.
                 result = file_ops.patch_v4a(
-                    _rewrite_v4a_header_paths(patch, _path_to_resolved)
+                    _rewrite_v4a_header_paths(
+                        patch,
+                        _path_to_resolved
+                        if _ops_uses_resolved_paths(task_id)
+                        else {},
+                    )
                 )
             else:
                 return tool_error(f"Unknown mode: {mode}")
@@ -2312,11 +2349,12 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         # Search the path the block check just cleared. A relative path handed
         # to the ops layer anchors against the terminal cwd instead, so the
         # scope decision above would describe a different tree than the one
-        # actually walked.
+        # actually walked. ``_ops_path`` keeps a remote backend's relative
+        # paths relative — see its docstring.
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
             pattern=pattern,
-            path=str(resolved_path) if resolved_path else path,
+            path=_ops_path(path, resolved_path, task_id),
             target=target, file_glob=file_glob,
             limit=limit, offset=offset, output_mode=output_mode, context=context
         )
