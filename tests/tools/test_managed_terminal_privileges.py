@@ -196,9 +196,11 @@ def test_managed_profile_runtime_exposes_only_active_skills_and_output(
     )
     for path in (hermes_root, profiles_root, profile_home, skills_root, sibling_home):
         os.chmod(path, 0o700)
-    os.chmod(private_skill_dir.parent, 0o700)
-    os.chmod(private_skill_dir, 0o700)
-    os.chmod(private_skill, 0o600)
+    # Installed board packages may arrive as root-owned 707/607. Preparation
+    # must safely tighten those modes instead of rejecting the entrypoint.
+    os.chmod(private_skill_dir.parent, 0o707)
+    os.chmod(private_skill_dir, 0o707)
+    os.chmod(private_skill, 0o607)
     os.chmod(output, 0o755)
 
     monkeypatch.setattr(local_module, "_IS_WINDOWS", False)
@@ -246,10 +248,8 @@ def test_managed_profile_runtime_exposes_only_active_skills_and_output(
     )
 
     os.chmod(private_skill, 0o622)
-    with pytest.raises(OSError, match="skill entry is writable"):
-        local_module._prepare_managed_command_skill_sources(command, env)
-    os.chmod(private_skill, 0o600)
     local_module._prepare_managed_command_skill_sources(command, env)
+    assert stat.S_IMODE(private_skill.stat().st_mode) == 0o640
 
     state_dir = output / "support-suite-state"
     state_file = state_dir / "onboarding.json"

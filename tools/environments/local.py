@@ -950,57 +950,92 @@ def _managed_identity_can_traverse(
     return True
 
 
-def _iter_managed_tree(
-    root: Path,
-    *,
-    limit: int,
-):
-    """Yield descendants without following symlinks or materializing a tree."""
-
-    stack = [os.scandir(root)]
-    count = 0
-    try:
-        while stack:
-            try:
-                entry = next(stack[-1])
-            except StopIteration:
-                stack.pop().close()
-                continue
-            count += 1
-            if count > limit:
-                raise OSError("managed profile tree exceeds the safety limit")
-            info = entry.stat(follow_symlinks=False)
-            path = Path(entry.path)
-            yield path, info
-            if stat.S_ISDIR(info.st_mode):
-                stack.append(os.scandir(path))
-    finally:
-        for iterator in stack:
-            iterator.close()
-
-
 def _managed_skill_entry_mode(info: os.stat_result) -> int | None:
     if info.st_uid != 0:
         raise OSError("managed profile skill entry is not trusted")
     if stat.S_ISLNK(info.st_mode):
         return None
-    if info.st_mode & 0o022:
-        raise OSError("managed profile skill entry is writable")
     if stat.S_ISDIR(info.st_mode):
         return 0o750
     if stat.S_ISREG(info.st_mode):
         if info.st_nlink != 1:
             raise OSError("managed profile skill hard link is not trusted")
-        return 0o640 | (0o110 if info.st_mode & 0o111 else 0)
+        return 0o640 | (0o110 if info.st_mode & stat.S_IXUSR else 0)
     raise OSError("managed profile skill entry type is not trusted")
 
 
-def _normalize_managed_skill_entry(path: Path, info: os.stat_result, gid: int) -> None:
-    mode = _managed_skill_entry_mode(info)
-    if info.st_gid != gid:
-        os.chown(path, 0, gid, follow_symlinks=False)
-    if mode is not None and stat.S_IMODE(info.st_mode) != mode:
-        os.chmod(path, mode, follow_symlinks=False)
+def _normalize_managed_skill_package(package: Path, gid: int) -> None:
+    """FD-walk and harden one root-owned package without following symlinks."""
+
+    root_info = os.lstat(package)
+    root_mode = _managed_skill_entry_mode(root_info)
+    if root_mode is None:
+        return
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = flags | getattr(os, "O_DIRECTORY", 0)
+    root_flags = directory_flags if stat.S_ISDIR(root_info.st_mode) else flags
+    root_fd = os.open(package, root_flags)
+    opened_root = os.fstat(root_fd)
+    if (
+        opened_root.st_dev != root_info.st_dev
+        or opened_root.st_ino != root_info.st_ino
+        or _managed_skill_entry_mode(opened_root) != root_mode
+    ):
+        os.close(root_fd)
+        raise OSError("managed profile skill package changed during preparation")
+    if opened_root.st_gid != gid:
+        os.fchown(root_fd, 0, gid)
+    if stat.S_IMODE(opened_root.st_mode) != root_mode:
+        os.fchmod(root_fd, root_mode)
+    if not stat.S_ISDIR(opened_root.st_mode):
+        os.close(root_fd)
+        return
+
+    stack: list[tuple[int, object]] = [(root_fd, None)]
+    count = 0
+    try:
+        while stack:
+            directory_fd, iterator = stack[-1]
+            if iterator is None:
+                iterator = os.scandir(directory_fd)
+                stack[-1] = (directory_fd, iterator)
+            try:
+                entry = next(iterator)
+            except StopIteration:
+                iterator.close()
+                os.close(directory_fd)
+                stack.pop()
+                continue
+            count += 1
+            if count > _MANAGED_SKILL_TREE_MAX_ENTRIES:
+                raise OSError("managed profile skill tree exceeds the safety limit")
+            info = entry.stat(follow_symlinks=False)
+            mode = _managed_skill_entry_mode(info)
+            if mode is None:
+                continue
+            entry_flags = directory_flags if stat.S_ISDIR(info.st_mode) else flags
+            entry_fd = os.open(entry.name, entry_flags, dir_fd=directory_fd)
+            opened = os.fstat(entry_fd)
+            if (
+                opened.st_dev != info.st_dev
+                or opened.st_ino != info.st_ino
+                or _managed_skill_entry_mode(opened) != mode
+            ):
+                os.close(entry_fd)
+                raise OSError("managed profile skill entry changed during preparation")
+            if opened.st_gid != gid:
+                os.fchown(entry_fd, 0, gid)
+            if stat.S_IMODE(opened.st_mode) != mode:
+                os.fchmod(entry_fd, mode)
+            if stat.S_ISDIR(opened.st_mode):
+                stack.append((entry_fd, None))
+            else:
+                os.close(entry_fd)
+    finally:
+        for directory_fd, iterator in stack:
+            if iterator is not None:
+                iterator.close()
+            os.close(directory_fd)
 
 
 def _managed_python_skill_sources(
@@ -1091,21 +1126,7 @@ def _prepare_managed_command_skill_sources(
         if inode_key in prepared_inodes:
             continue
         prepared_inodes.add(inode_key)
-        _managed_skill_entry_mode(root_info)
-        if stat.S_ISDIR(root_info.st_mode):
-            for _path, info in _iter_managed_tree(
-                package,
-                limit=_MANAGED_SKILL_TREE_MAX_ENTRIES,
-            ):
-                _managed_skill_entry_mode(info)
-
-        _normalize_managed_skill_entry(package, root_info, gid)
-        if stat.S_ISDIR(root_info.st_mode):
-            for path, info in _iter_managed_tree(
-                package,
-                limit=_MANAGED_SKILL_TREE_MAX_ENTRIES,
-            ):
-                _normalize_managed_skill_entry(path, info, gid)
+        _normalize_managed_skill_package(package, gid)
 
 
 def _migrate_managed_output_tree(
