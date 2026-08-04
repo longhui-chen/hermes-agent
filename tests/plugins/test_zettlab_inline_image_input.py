@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import base64
+import io
 import os
 import time
 
 import pytest
+import requests
 
 
 PNG = b"\x89PNG\r\n\x1a\ninline-image"
@@ -19,18 +21,12 @@ def _capability(limit: int = 1024):
     }
 
 
-def _register_local_artifact(client, path, task_id: str = "session-local") -> str:
-    location = client.first_asset_location(
-        {
-            "job_id": "job-source",
-            "assets": [{"local_path": str(path), "persisted": True}],
-        },
-        prefer_local=True,
-        session_id=task_id,
-        authorize_as_image_input=True,
-    )
-    assert location == str(path)
-    return task_id
+def _response(raw: bytes, *, status: int = 200, headers=None) -> requests.Response:
+    response = requests.Response()
+    response.status_code = status
+    response.headers.update(headers or {})
+    response.raw = io.BytesIO(raw)
+    return response
 
 
 @pytest.mark.parametrize(
@@ -42,16 +38,25 @@ def test_inline_image_input_encodes_supported_local_file(tmp_path, monkeypatch, 
 
     image_path = tmp_path / "source.bin"
     image_path.write_bytes(raw)
-    task_id = _register_local_artifact(client, image_path)
 
     got = client.inline_image_input(
         str(image_path),
         None,
         _capability(),
-        task_id=task_id,
     )
 
     assert got == f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
+
+
+def test_inline_image_input_accepts_file_url(tmp_path):
+    from plugins import zettlab_media_client as client
+
+    image_path = tmp_path / "source.png"
+    image_path.write_bytes(PNG)
+
+    got = client.inline_image_input(image_path.as_uri(), None, _capability())
+
+    assert got == f"data:image/png;base64,{base64.b64encode(PNG).decode('ascii')}"
 
 
 def test_inline_image_input_accepts_matching_data_uri():
@@ -81,7 +86,6 @@ def test_normalized_modalities_ignore_unknown_values(modalities):
 @pytest.mark.parametrize(
     ("value", "message"),
     [
-        ("https://example.com/source.png", "local image path or data URI"),
         ("data:image/jpeg;base64," + base64.b64encode(PNG).decode("ascii"), "does not match"),
         ("data:image/png;base64,not-base64!", "valid base64"),
     ],
@@ -91,6 +95,84 @@ def test_inline_image_input_rejects_unsafe_or_invalid_values(value, message):
 
     with pytest.raises(client.ZettlabMediaError, match=message):
         client.inline_image_input(value, None, _capability())
+
+
+def test_inline_image_input_downloads_safe_remote_url(monkeypatch):
+    from plugins import zettlab_media_client as client
+    from tools import url_safety
+
+    requests_seen = []
+    monkeypatch.setattr(url_safety, "is_safe_url", lambda _url: True)
+
+    def fake_request(method, url, **kwargs):
+        requests_seen.append((method, url, kwargs))
+        return _response(PNG)
+
+    monkeypatch.setattr(client._HTTP_WORKER, "request", fake_request)
+
+    got = client.inline_image_input(
+        "https://example.com/source.png#ignored",
+        None,
+        _capability(),
+    )
+
+    assert got == f"data:image/png;base64,{base64.b64encode(PNG).decode('ascii')}"
+    assert requests_seen[0][0:2] == ("GET", "https://example.com/source.png")
+    assert requests_seen[0][2]["response_limit"] == 1024
+
+
+def test_inline_image_input_revalidates_remote_redirect(monkeypatch):
+    from plugins import zettlab_media_client as client
+    from tools import url_safety
+
+    checked = []
+    responses = iter([
+        _response(b"", status=302, headers={"Location": "/final.png"}),
+        _response(PNG),
+    ])
+    monkeypatch.setattr(
+        url_safety,
+        "is_safe_url",
+        lambda url: checked.append(url) or True,
+    )
+    monkeypatch.setattr(
+        client._HTTP_WORKER,
+        "request",
+        lambda *_args, **_kwargs: next(responses),
+    )
+
+    got = client.inline_image_input(
+        "https://example.com/start.png",
+        None,
+        _capability(),
+    )
+
+    assert got.startswith("data:image/png;base64,")
+    assert checked == [
+        "https://example.com/start.png",
+        "https://example.com/final.png",
+    ]
+
+
+def test_inline_image_input_rejects_remote_url_blocked_by_shared_policy(monkeypatch):
+    from plugins import zettlab_media_client as client
+    from tools import url_safety
+
+    monkeypatch.setattr(url_safety, "is_safe_url", lambda _url: False)
+    monkeypatch.setattr(
+        client._HTTP_WORKER,
+        "request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("blocked URL must not be fetched")
+        ),
+    )
+
+    with pytest.raises(client.ZettlabMediaError, match="URL safety policy"):
+        client.inline_image_input(
+            "http://127.0.0.1/private.png",
+            None,
+            _capability(),
+        )
 
 
 @pytest.mark.parametrize(
@@ -120,59 +202,6 @@ def test_inline_image_input_rejects_windows_network_and_device_paths_before_read
 
     with pytest.raises(client.ZettlabMediaError, match="network and device paths"):
         client.inline_image_input(value, None, _capability())
-
-
-@pytest.mark.parametrize("task_id", [None, "session-local"])
-def test_inline_image_input_rejects_unregistered_local_path_before_read(
-    tmp_path,
-    monkeypatch,
-    task_id,
-):
-    from plugins import zettlab_media_client as client
-
-    image_path = tmp_path / "untrusted.png"
-    image_path.write_bytes(PNG)
-    monkeypatch.setattr(
-        client._FILE_WORKER,
-        "read",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("untrusted local path must be rejected before file handling")
-        ),
-    )
-
-    with pytest.raises(client.ZettlabMediaError, match="not authorized"):
-        client.inline_image_input(
-            str(image_path),
-            None,
-            _capability(),
-            task_id=task_id,
-        )
-
-
-def test_inline_image_input_does_not_share_artifact_authority_between_sessions(
-    tmp_path,
-    monkeypatch,
-):
-    from plugins import zettlab_media_client as client
-
-    image_path = tmp_path / "generated.png"
-    image_path.write_bytes(PNG)
-    _register_local_artifact(client, image_path, task_id="session-owner")
-    monkeypatch.setattr(
-        client._FILE_WORKER,
-        "read",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("cross-session path must be rejected before file handling")
-        ),
-    )
-
-    with pytest.raises(client.ZettlabMediaError, match="not authorized"):
-        client.inline_image_input(
-            str(image_path),
-            None,
-            _capability(),
-            task_id="session-other",
-        )
 
 
 def test_inline_image_input_rejects_oversize_and_multiple_inputs():
@@ -206,7 +235,6 @@ def test_inline_image_input_rejects_oversize_file_before_encoding(tmp_path, monk
 
     image_path = tmp_path / "oversize.png"
     image_path.write_bytes(PNG + b"x" * client.MAX_INLINE_IMAGE_BYTES)
-    task_id = _register_local_artifact(client, image_path)
     monkeypatch.setattr(
         base64,
         "b64encode",
@@ -215,12 +243,11 @@ def test_inline_image_input_rejects_oversize_file_before_encoding(tmp_path, monk
         ),
     )
 
-    with pytest.raises(client.ZettlabMediaError, match="not authorized"):
+    with pytest.raises(client.ZettlabMediaError, match="exceeds maximum size"):
         client.inline_image_input(
             str(image_path),
             None,
             _capability(limit=16 * 1024 * 1024),
-            task_id=task_id,
         )
 
 
@@ -253,7 +280,7 @@ def test_inline_image_input_preserves_file_safety_guard_in_worker(tmp_path):
         )
 
 
-def test_inline_image_input_does_not_follow_registered_symlink(tmp_path):
+def test_inline_image_input_does_not_follow_symlink(tmp_path):
     from plugins import zettlab_media_client as client
 
     target_path = tmp_path / "target.png"
@@ -269,103 +296,6 @@ def test_inline_image_input_does_not_follow_registered_symlink(tmp_path):
             1024,
             deadline=time.monotonic() + 1,
         )
-
-
-def test_inline_image_input_rejects_artifact_replaced_after_registration(tmp_path):
-    from plugins import zettlab_media_client as client
-
-    image_path = tmp_path / "generated.png"
-    image_path.write_bytes(PNG)
-    task_id = _register_local_artifact(client, image_path)
-    replacement = tmp_path / "replacement.png"
-    replacement.write_bytes(JPEG)
-    os.replace(replacement, image_path)
-
-    with pytest.raises(client.ZettlabMediaError, match="authorized content"):
-        client.inline_image_input(
-            str(image_path),
-            None,
-            _capability(),
-            task_id=task_id,
-        )
-
-
-def test_inline_image_input_rejects_artifact_modified_in_place(tmp_path):
-    from plugins import zettlab_media_client as client
-
-    image_path = tmp_path / "generated.png"
-    image_path.write_bytes(PNG)
-    task_id = _register_local_artifact(client, image_path)
-    image_path.write_bytes(JPEG)
-
-    with pytest.raises(client.ZettlabMediaError, match="authorized content"):
-        client.inline_image_input(
-            str(image_path),
-            None,
-            _capability(),
-            task_id=task_id,
-        )
-
-
-def test_inline_image_input_rejects_ancestor_symlink_redirect_after_registration(
-    tmp_path,
-):
-    from plugins import zettlab_media_client as client
-
-    original_dir = tmp_path / "original"
-    replacement_dir = tmp_path / "replacement"
-    original_dir.mkdir()
-    replacement_dir.mkdir()
-    (original_dir / "generated.png").write_bytes(PNG)
-    (replacement_dir / "generated.png").write_bytes(JPEG)
-    current_dir = tmp_path / "current"
-    try:
-        current_dir.symlink_to(original_dir, target_is_directory=True)
-    except (NotImplementedError, OSError):
-        pytest.skip("directory symlinks are unavailable")
-    image_path = current_dir / "generated.png"
-    task_id = _register_local_artifact(client, image_path)
-    current_dir.unlink()
-    current_dir.symlink_to(replacement_dir, target_is_directory=True)
-
-    with pytest.raises(client.ZettlabMediaError, match="authorized content"):
-        client.inline_image_input(
-            str(image_path),
-            None,
-            _capability(),
-            task_id=task_id,
-        )
-
-
-def test_inline_image_input_does_not_share_artifacts_between_profiles(tmp_path):
-    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-    from plugins import zettlab_media_client as client
-
-    profile_a = tmp_path / "profile-a"
-    profile_b = tmp_path / "profile-b"
-    profile_a.mkdir()
-    profile_b.mkdir()
-    image_path = tmp_path / "generated.png"
-    image_path.write_bytes(PNG)
-    task_id = "shared-session-id"
-
-    token = set_hermes_home_override(profile_a)
-    try:
-        _register_local_artifact(client, image_path, task_id=task_id)
-    finally:
-        reset_hermes_home_override(token)
-
-    token = set_hermes_home_override(profile_b)
-    try:
-        with pytest.raises(client.ZettlabMediaError, match="not authorized"):
-            client.inline_image_input(
-                str(image_path),
-                None,
-                _capability(),
-                task_id=task_id,
-            )
-    finally:
-        reset_hermes_home_override(token)
 
 
 def test_media_file_worker_terminates_stalled_read_and_recovers(monkeypatch):
