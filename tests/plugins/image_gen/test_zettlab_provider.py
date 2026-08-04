@@ -1,18 +1,28 @@
 from __future__ import annotations
 
+import base64
 import io
 import multiprocessing
 import os
-import signal
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
+import psutil
 import pytest
 import requests
 
 from plugins.image_gen.zettlab import ZettlabImageGenProvider, _gateway_aspect_ratio, register
+
+
+PNG_DATA_URI = "data:image/png;base64," + base64.b64encode(
+    b"\x89PNG\r\n\x1a\nsource"
+).decode("ascii")
+TINY_PNG_DATA_URL = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+)
 
 
 def _spawn_parent_watchdog_probe(output):
@@ -62,7 +72,7 @@ def test_zettlab_image_provider_reads_capabilities(monkeypatch):
                     "display_name": "Seedream V4",
                     "modalities": ["text", "image"],
                 }],
-                "limits": {"max_remote_media_inputs": 4},
+                "limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
             },
             "video": {"enabled": False, "models": []},
         })
@@ -73,7 +83,7 @@ def test_zettlab_image_provider_reads_capabilities(monkeypatch):
     assert provider.is_available() is True
     assert provider.default_model() == "seedream-v4"
     assert provider.list_models()[0]["display"] == "Seedream V4"
-    assert provider.capabilities()["max_reference_images"] == 3
+    assert provider.capabilities()["max_reference_images"] == 0
 
 
 def test_zettlab_capabilities_response_is_bounded_and_closed(monkeypatch):
@@ -95,13 +105,30 @@ def test_zettlab_image_capabilities_preserve_image_only_modality(monkeypatch):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setattr(client, "selected_model_capability", lambda media_type: ({
-        "limits": {"max_remote_media_inputs": 1},
+        "limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
     }, {
         "id": "image-only",
-        "modalities": ["image"],
+        "modalities": [" IMAGE "],
     }))
 
     assert ZettlabImageGenProvider().capabilities()["modalities"] == ["image"]
+
+
+@pytest.mark.parametrize("invalid_limit", [None, 0, -1, True, "5242880"])
+def test_zettlab_image_capabilities_hide_image_with_invalid_inline_limit(
+    monkeypatch,
+    invalid_limit,
+):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setattr(client, "selected_model_capability", lambda media_type: ({
+        "limits": {"max_inline_image_bytes": invalid_limit},
+    }, {
+        "id": "image-only",
+        "modalities": [" IMAGE "],
+    }))
+
+    assert ZettlabImageGenProvider().capabilities()["modalities"] == []
 
 
 def test_zettlab_provider_uses_gateway_default_model(monkeypatch):
@@ -184,6 +211,7 @@ def test_zettlab_image_generate_creates_media_job(monkeypatch):
                 "limits": {
                     "provider_timeout_seconds": 300,
                     "finalization_timeout_seconds": 600,
+                    "max_inline_image_bytes": 5 * 1024 * 1024,
                 },
             },
         })
@@ -211,8 +239,7 @@ def test_zettlab_image_generate_creates_media_job(monkeypatch):
     got = ZettlabImageGenProvider().generate(
         "make a product shot",
         aspect_ratio="square",
-        image_url="https://example.com/source.png",
-        reference_image_urls=["https://example.com/ref.png"],
+        image_url=PNG_DATA_URI,
         model="seedream-v4",
         num_images=2,
     )
@@ -231,10 +258,84 @@ def test_zettlab_image_generate_creates_media_job(monkeypatch):
     assert captured["json"]["output_count"] == 1
     assert captured["json"]["aspect_ratio"] == "1:1"
     assert captured["json"]["resolution"] == "2K"
-    assert captured["json"]["remote_media_inputs"] == [
-        {"url": "https://example.com/source.png", "role": "source"},
-        {"url": "https://example.com/ref.png", "role": "reference"},
-    ]
+    assert captured["json"]["input_image"] == PNG_DATA_URI
+    assert "remote_media_inputs" not in captured["json"]
+
+
+def test_zettlab_image_generate_routes_data_uri_to_inline_input(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    captured = {}
+    monkeypatch.setattr(
+        client,
+        "resolve_model_with_capability",
+        lambda media_type, requested=None: (
+            "seedream-v4",
+            {
+                "id": "seedream-v4",
+                "modalities": ["text", "image"],
+                "_type_limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
+            },
+        ),
+    )
+
+    def fake_create_and_wait(**kwargs):
+        captured.update(kwargs["payload"])
+        return {"job_id": "job-inline", "status": "done", "assets": [{"url": "https://cdn.example/inline.png"}]}
+
+    monkeypatch.setattr(client, "create_and_wait", fake_create_and_wait)
+    got = ZettlabImageGenProvider().generate(
+        "turn this into a pet",
+        reference_image_urls=[TINY_PNG_DATA_URL],
+    )
+
+    assert got["success"] is True
+    assert captured["input_image"] == TINY_PNG_DATA_URL
+    assert "remote_media_inputs" not in captured
+
+
+def test_zettlab_image_generate_rejects_mixed_inline_and_remote_without_http(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setattr(
+        client,
+        "resolve_model_with_capability",
+        lambda media_type, requested=None: (
+            "seedream-v4",
+            {
+                "id": "seedream-v4",
+                "modalities": ["text", "image"],
+                "_type_limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        client,
+        "create_and_wait",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("HTTP must not run")),
+    )
+
+    got = ZettlabImageGenProvider().generate(
+        "turn this into a pet",
+        image_url=TINY_PNG_DATA_URL,
+        reference_image_urls=["https://example.com/ref.png"],
+    )
+
+    assert got["success"] is False
+    assert "exactly one image input" in got["error"]
+
+
+def test_generated_image_data_uri_rejects_symbolic_links(tmp_path):
+    from plugins import zettlab_media_client as client
+
+    target = tmp_path / "candidate.png"
+    target.write_bytes(b"\x89PNG\r\n\x1a\n" + b"owned-runtime-image")
+    link = tmp_path / "candidate-link.png"
+    link.symlink_to(target)
+
+    assert client.image_path_data_uri(target).startswith("data:image/png;base64,")
+    with pytest.raises(client.ZettlabMediaError, match="symbolic link"):
+        client.image_path_data_uri(link)
 
 
 @pytest.mark.parametrize(
@@ -274,27 +375,53 @@ def test_zettlab_image_generate_uses_gateway_default_when_model_is_omitted(monke
     assert captured["model"] == "seedream-default"
 
 
-def test_zettlab_image_rejects_non_https_remote_input(monkeypatch):
+def test_zettlab_image_rejects_remote_input(monkeypatch):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setattr(
         client,
         "resolve_model_with_capability",
-        lambda media_type, requested=None: ("seedream-v4", {"id": "seedream-v4", "modalities": ["text", "image"]}),
+        lambda media_type, requested=None: (
+            "seedream-v4",
+            {
+                "id": "seedream-v4",
+                "modalities": ["text", "image"],
+                "_type_limits": {"max_inline_image_bytes": 5 * 1024 * 1024},
+            },
+        ),
     )
     got = ZettlabImageGenProvider().generate("make image", image_url="http://example.com/a.png")
     assert got["success"] is False
     assert got["error_type"] == "ZettlabMediaError"
-    assert "https URL" in got["error"]
+    assert "not enabled" in got["error"]
 
 
-def test_zettlab_image_only_model_requires_image_input(monkeypatch):
+@pytest.mark.parametrize(
+    ("modalities", "expected_error"),
+    [
+        ([" IMAGE "], "missing_image"),
+        (["future-mode"], "unsupported_capability"),
+        ([], "unsupported_capability"),
+    ],
+)
+def test_zettlab_image_model_without_text_input_never_sends(
+    monkeypatch,
+    modalities,
+    expected_error,
+):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setattr(
         client,
         "resolve_model_with_capability",
-        lambda media_type, requested=None: ("image-only", {"id": "image-only", "modalities": ["image"]}),
+        lambda media_type, requested=None: (
+            "image-only",
+            {
+                "id": "image-only",
+                "modalities": modalities,
+                "_type_limits": {"max_inline_image_bytes": True},
+            },
+        ),
     )
     monkeypatch.setattr(
         client,
@@ -305,7 +432,7 @@ def test_zettlab_image_only_model_requires_image_input(monkeypatch):
     got = ZettlabImageGenProvider().generate("edit this image")
 
     assert got["success"] is False
-    assert got["error_type"] == "missing_image"
+    assert got["error_type"] == expected_error
 
 
 @pytest.mark.parametrize("value", [
@@ -502,6 +629,96 @@ def test_zettlab_http_worker_kills_timed_out_process_and_recovers(monkeypatch):
     worker.close()
 
 
+def test_zettlab_http_session_runs_requests_concurrently():
+    from plugins import zettlab_media_client as client
+
+    barrier = threading.Barrier(2)
+    release = threading.Event()
+    state_lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    class BlockingWorker:
+        closed = False
+
+        def request(self, method, url, *, deadline, **kwargs):
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                barrier.wait(timeout=1)
+                assert release.wait(timeout=1)
+                return _Resp({"status": "done"})
+            finally:
+                with state_lock:
+                    active -= 1
+
+        def close(self):
+            self.closed = True
+
+    workers = [BlockingWorker(), BlockingWorker()]
+    session = client._MediaHTTPSession(workers=workers)
+    errors = []
+
+    def request():
+        try:
+            session.get("http://127.0.0.1/test", timeout=1, allow_redirects=False)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=request) for _ in range(2)]
+    try:
+        for thread in threads:
+            thread.start()
+        deadline = time.monotonic() + 1
+        while max_active < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert max_active == 2
+    finally:
+        release.set()
+        for thread in threads:
+            thread.join(timeout=1)
+        session.close()
+
+    assert errors == []
+    assert all(worker.closed for worker in workers)
+
+
+def test_zettlab_http_session_bounds_worker_capacity():
+    from plugins import zettlab_media_client as client
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingWorker:
+        def request(self, method, url, *, deadline, **kwargs):
+            started.set()
+            assert release.wait(timeout=1)
+            return _Resp({"status": "done"})
+
+        def close(self):
+            return None
+
+    session = client._MediaHTTPSession(workers=[BlockingWorker()])
+    thread = threading.Thread(
+        target=lambda: session.get(
+            "http://127.0.0.1/slow", timeout=1, allow_redirects=False
+        )
+    )
+    try:
+        thread.start()
+        assert started.wait(timeout=1)
+        with pytest.raises(client.ZettlabMediaDeadlineError, match="capacity exhausted"):
+            session.get(
+                "http://127.0.0.1/blocked", timeout=0.05, allow_redirects=False
+            )
+    finally:
+        release.set()
+        thread.join(timeout=1)
+        session.close()
+
+
 def test_zettlab_http_worker_times_out_during_spawn_and_recovers():
     from plugins import zettlab_media_client as client
 
@@ -611,7 +828,9 @@ def test_zettlab_http_worker_bounds_permanently_stalled_starters():
         def close(self):
             return None
 
-    processes = [StalledProcess(), StalledProcess()]
+    processes = [
+        StalledProcess() for _ in range(client.MAX_MEDIA_HTTP_WORKERS)
+    ]
     attempts = iter(processes)
 
     class FakeContext:
@@ -627,7 +846,7 @@ def test_zettlab_http_worker_bounds_permanently_stalled_starters():
     worker = client._MediaHTTPWorker()
     worker._context = FakeContext()
     try:
-        for _ in range(2):
+        for _ in range(client.MAX_MEDIA_HTTP_WORKERS):
             with pytest.raises(client.ZettlabMediaDeadlineError, match="start deadline exceeded"):
                 worker.request("GET", "http://127.0.0.1/media/generation-capabilities", deadline=time.monotonic() + 0.03)
         started = time.monotonic()
@@ -641,10 +860,10 @@ def test_zettlab_http_worker_bounds_permanently_stalled_starters():
     while not all(process.terminated for process in processes) and time.monotonic() < deadline:
         time.sleep(0.01)
     assert all(process.terminated for process in processes)
-    assert client._STARTER_CAPACITY.acquire(timeout=1)
-    assert client._STARTER_CAPACITY.acquire(timeout=1)
-    client._STARTER_CAPACITY.release()
-    client._STARTER_CAPACITY.release()
+    for _ in range(client.MAX_MEDIA_HTTP_WORKERS):
+        assert client._STARTER_CAPACITY.acquire(timeout=1)
+    for _ in range(client.MAX_MEDIA_HTTP_WORKERS):
+        client._STARTER_CAPACITY.release()
 
 
 def test_zettlab_http_worker_cleans_up_after_prespawn_failure():
@@ -705,6 +924,7 @@ def test_zettlab_http_worker_cleanup_continues_after_individual_errors():
     assert worker._connection is None
 
 
+@pytest.mark.live_system_guard_bypass
 def test_zettlab_http_worker_recovers_after_real_header_stall():
     from plugins import zettlab_media_client as client
 
@@ -752,9 +972,7 @@ def test_zettlab_parent_watchdog_exits_after_parent_is_killed():
         parent.join(timeout=2)
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
-            try:
-                os.kill(child_pid, 0)
-            except ProcessLookupError:
+            if not psutil.pid_exists(child_pid):
                 break
             time.sleep(0.05)
         else:
@@ -764,8 +982,8 @@ def test_zettlab_parent_watchdog_exits_after_parent_is_killed():
             parent.kill()
             parent.join(timeout=1)
         try:
-            os.kill(child_pid, signal.SIGKILL)
-        except ProcessLookupError:
+            psutil.Process(child_pid).kill()
+        except psutil.NoSuchProcess:
             pass
         output.close()
 

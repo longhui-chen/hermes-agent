@@ -372,33 +372,51 @@ description: Trusted video-edit execution flow test
             "_video_edit_command_policy",
             lambda _args: (True, False),
         )
+        terminal_args = {"command": "python3 trusted-workflow_state.py"}
         assert trusted_skill_operation_block_message(
             agent,
             function_name="terminal",
-            function_args={"command": "python3 trusted-workflow_state.py"},
+            function_args=terminal_args,
         ) is None
 
         business_token = session_context_module._BUSINESS_EXECUTION_TOKEN.set("")
         session_key_token = session_context_module._SESSION_KEY.set("")
         empty_secret_token = secret_scope_module.set_secret_scope({})
         try:
-            runtime_env = build_video_edit_runtime_env({})
+            assert response_mode.trusted_video_edit_runtime_receipt() == {}
+
+            def _dispatch():
+                runtime_env = build_video_edit_runtime_env({})
+                assert runtime_env["ZET_AGENT_ID"] == "main"
+                assert runtime_env["ZETTLAB_AGENT_ACTION_TOKEN"] == "action-token"
+                assert (
+                    runtime_env["ZETTLAB_BUSINESS_EXECUTION_TOKEN"]
+                    == "business-token"
+                )
+                assert runtime_env["HERMES_TURN_ID"] == "external-api-turn"
+                assert (
+                    runtime_env["HERMES_SESSION_KEY"]
+                    == "zettlab:user:main:session"
+                )
+                return json.dumps(
+                    {
+                        "output": "",
+                        "exit_code": 0,
+                        "video_edit_runtime_direct": True,
+                    }
+                )
+
+            response_mode.dispatch_trusted_skill_operation(
+                agent,
+                function_name="terminal",
+                function_args=terminal_args,
+                dispatch=_dispatch,
+            )
+            assert response_mode.trusted_video_edit_runtime_receipt() == {}
         finally:
             secret_scope_module.reset_secret_scope(empty_secret_token)
             session_context_module._SESSION_KEY.reset(session_key_token)
             session_context_module._BUSINESS_EXECUTION_TOKEN.reset(business_token)
-
-        assert runtime_env["ZET_AGENT_ID"] == "main"
-        assert runtime_env["ZETTLAB_AGENT_ACTION_TOKEN"] == "action-token"
-        assert (
-            runtime_env["ZETTLAB_BUSINESS_EXECUTION_TOKEN"]
-            == "business-token"
-        )
-        assert runtime_env["HERMES_TURN_ID"] == "external-api-turn"
-        assert (
-            runtime_env["HERMES_SESSION_KEY"]
-            == "zettlab:user:main:session"
-        )
     finally:
         response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
         clear_turn_vars(turn_tokens)
@@ -1218,15 +1236,35 @@ def test_camera_runtime_receipt_requires_attested_camsnap_scope_flow(
             function_name="terminal",
             function_args={"command": "python3 camera_connector.py list"},
         ) is None
-        frozen = build_camera_runtime_env()
-        assert frozen == {
-            "ZET_AGENT_ID": "main",
-            "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
-            "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "business-token",
-            "HERMES_TURN_ID": "camera-turn",
-            "HERMES_SESSION_ID": "zettlab:user:main:camera-session",
-            "HERMES_SESSION_KEY": "zettlab:user:main:camera-session",
-        }
+        with pytest.raises(PermissionError):
+            build_camera_runtime_env()
+
+        def _dispatch():
+            frozen = build_camera_runtime_env()
+            assert frozen == {
+                "ZET_AGENT_ID": "main",
+                "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
+                "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "business-token",
+                "HERMES_TURN_ID": "camera-turn",
+                "HERMES_SESSION_ID": "zettlab:user:main:camera-session",
+                "HERMES_SESSION_KEY": "zettlab:user:main:camera-session",
+            }
+            return json.dumps(
+                {
+                    "output": "",
+                    "exit_code": 0,
+                    "camera_runtime_direct": True,
+                }
+            )
+
+        response_mode.dispatch_trusted_skill_operation(
+            agent,
+            function_name="terminal",
+            function_args={"command": "python3 camera_connector.py list"},
+            dispatch=_dispatch,
+        )
+        with pytest.raises(PermissionError):
+            build_camera_runtime_env()
     finally:
         response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
         clear_turn_vars(turn_tokens)

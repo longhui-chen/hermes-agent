@@ -40,6 +40,8 @@ Requires:
 """
 
 import asyncio
+import base64
+import binascii
 import errno
 import hashlib
 import hmac
@@ -419,6 +421,8 @@ def _normalize_chat_content(
 _TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 _IMAGE_PART_TYPES = frozenset({"image_url", "input_image"})
 _FILE_PART_TYPES = frozenset({"file", "input_file"})
+_CURRENT_TURN_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+_CURRENT_TURN_IMAGE_MIMES = frozenset({"image/png", "image/jpeg", "image/webp"})
 
 
 def _normalize_multimodal_content(content: Any) -> Any:
@@ -554,6 +558,52 @@ def _content_has_visible_payload(content: Any) -> bool:
     return False
 
 
+def _extract_current_turn_reference_image(content: Any) -> str:
+    """Return one bounded data image from the current normalized user turn.
+
+    This is intentionally fail-closed without rejecting the surrounding chat:
+    remote URLs, malformed bytes, unsupported formats, and turns containing a
+    second image simply do not grant the desktop-pet tool image access.
+    """
+    if not isinstance(content, list):
+        return ""
+    image_urls: List[str] = []
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") != "image_url":
+            continue
+        image_ref = part.get("image_url")
+        value = image_ref.get("url") if isinstance(image_ref, dict) else None
+        if isinstance(value, str) and value.strip():
+            image_urls.append(value.strip())
+    if len(image_urls) != 1:
+        return ""
+
+    value = image_urls[0]
+    header, separator, encoded = value.partition(",")
+    if not separator or not header.startswith("data:") or not header.endswith(";base64"):
+        return ""
+    declared_mime = header[len("data:") : -len(";base64")].lower()
+    if declared_mime not in _CURRENT_TURN_IMAGE_MIMES or not encoded:
+        return ""
+    padding = 2 if encoded.endswith("==") else 1 if encoded.endswith("=") else 0
+    if len(encoded) % 4 != 0:
+        return ""
+    decoded_size = len(encoded) // 4 * 3 - padding
+    if decoded_size <= 0 or decoded_size > _CURRENT_TURN_IMAGE_MAX_BYTES:
+        return ""
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        return ""
+    if declared_mime == "image/png":
+        valid_magic = raw.startswith(b"\x89PNG\r\n\x1a\n")
+    elif declared_mime == "image/jpeg":
+        valid_magic = raw.startswith(b"\xff\xd8\xff")
+    else:
+        valid_magic = len(raw) >= 12 and raw.startswith(b"RIFF") and raw[8:12] == b"WEBP"
+    return value if valid_magic else ""
+
+
 def _short_error_text(value: Any, *, limit: int = 500) -> str:
     if value is None:
         return ""
@@ -602,6 +652,28 @@ def _chat_result_is_truncated(result: Dict[str, Any]) -> bool:
     # Treat that structured state as length instead of matching localized or
     # provider-specific error strings such as "max tokens exceeded".
     return is_partial and not completed and not is_failed
+
+
+def _hermes_error_code(result: Dict[str, Any], finish_reason: str) -> str:
+    """Pick the wire error code for a turn that did not complete cleanly.
+
+    Same rule as :func:`_chat_stream_error_payload`: a truncation is
+    ``output_truncated``, otherwise the classifier's ``provider_error.code``
+    wins over the generic ``agent_error``. Extracted because the non-streaming
+    response and the standard SSE finish chunk used to hardcode
+    ``agent_error`` — so a client that does not consume Hermes' private
+    ``__hermes_error__`` event (a plain OpenAI SDK, for instance) saw a content
+    moderation refusal degrade into a generic failure and could not show the
+    compliance message.
+    """
+    if finish_reason == "length":
+        return "output_truncated"
+    provider_error = result.get("provider_error")
+    if isinstance(provider_error, dict):
+        code = _short_error_text(provider_error.get("code"), limit=120)
+        if code:
+            return code
+    return "agent_error"
 
 
 def _chat_stream_error_payload(result: Dict[str, Any], finish_reason: str) -> Optional[Dict[str, Any]]:
@@ -3924,6 +3996,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 {"error": {"message": "No user message found in messages", "type": "invalid_request_error"}},
                 status=400,
             )
+        current_turn_reference_image = _extract_current_turn_reference_image(user_message)
 
         # Allow caller to scope long-term memory (e.g. Honcho) with a
         # stable per-channel identifier via X-Hermes-Session-Key.  This
@@ -4175,6 +4248,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 turn_id=turn_id,
                 connector_route_capability=connector_route_capability,
                 business_execution_token=business_execution_token,
+                current_turn_reference_image=current_turn_reference_image,
                 request_overrides=request_overrides or None,
                 trusted_user_message=trusted_user_message,
                 trusted_skill_slug=trusted_skill_slug,
@@ -4229,6 +4303,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     turn_id=turn_id,
                     connector_route_capability=connector_route_capability,
                     business_execution_token=business_execution_token,
+                    current_turn_reference_image=current_turn_reference_image,
                     request_overrides=request_overrides or None,
                     trusted_user_message=trusted_user_message,
                     trusted_skill_slug=trusted_skill_slug,
@@ -4359,7 +4434,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "partial": is_partial,
                 "failed": is_failed,
                 "error": err_msg,
-                "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
+                "error_code": _hermes_error_code(result, finish_reason),
             }
             response_headers["X-Hermes-Completed"] = "false"
             response_headers["X-Hermes-Partial"] = "true" if is_partial else "false"
@@ -4545,17 +4620,18 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             if finish_reason != "stop":
                 finish_chunk["choices"][0]["delta"] = {}
+                _wire_code = _hermes_error_code(result_dict, finish_reason)
                 if err_msg:
                     finish_chunk["error"] = {
                         "message": err_msg,
-                        "type": "agent_error",
+                        "type": _wire_code,
                     }
                 finish_chunk["hermes"] = {
                     "completed": completed,
                     "partial": is_partial,
                     "failed": is_failed,
                     "error": err_msg,
-                    "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
+                    "error_code": _wire_code,
                 }
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
@@ -4605,7 +4681,7 @@ class APIServerAdapter(BasePlatformAdapter):
         agent_task,
         agent_ref,
         conversation_history: List[Dict[str, str]],
-        user_message: str,
+        user_message: Any,
         instructions: Optional[str],
         conversation: Optional[str],
         store: bool,
@@ -6198,6 +6274,19 @@ class APIServerAdapter(BasePlatformAdapter):
         current_user = {"role": "user", "content": user_message}
         agent_messages = result.get("messages") if isinstance(result, dict) else None
 
+        # 内容审核拒绝的那一轮不进存储的 transcript。
+        #
+        # 被拒时 conversation_loop 会把这一轮从 result["messages"] 里裁掉，首轮
+        # 被拒就裁成空列表 —— 而空列表在下面被当成「旧调用形状」，于是这里又把
+        # current_user 合成回去。之后 previous_response_id 从 response store 读
+        # 回这段历史，被拒文本在链式会话里被重新提交给审核网关和模型：用户反复
+        # 被拦、审核按次计费、风控档位继续上涨。
+        #
+        # 判定看结构化的 provider_error.code，回退看 error 前缀（
+        # _content_policy_blocked_result 统一加的 "content_policy_blocked:"）。
+        if APIServerAdapter._response_turn_was_content_refused(result):
+            return prior
+
         if isinstance(agent_messages, list) and agent_messages:
             turn_start = APIServerAdapter._response_messages_turn_start_index(
                 conversation_history,
@@ -6216,6 +6305,19 @@ class APIServerAdapter(BasePlatformAdapter):
         full_history.append(current_user)
         full_history.append({"role": "assistant", "content": final_response})
         return full_history
+
+    @staticmethod
+    def _response_turn_was_content_refused(result: Dict[str, Any]) -> bool:
+        """Whether this turn ended in a content-moderation refusal."""
+        if not isinstance(result, dict):
+            return False
+        provider_error = result.get("provider_error")
+        if isinstance(provider_error, dict):
+            code = provider_error.get("code")
+            if isinstance(code, str) and code.strip() == "content_blocked":
+                return True
+        err = result.get("error")
+        return isinstance(err, str) and err.startswith("content_policy_blocked:")
 
     @staticmethod
     def _response_messages_turn_start_index(
@@ -6412,6 +6514,7 @@ class APIServerAdapter(BasePlatformAdapter):
         turn_id: Optional[str] = None,
         connector_route_capability: Optional[str] = None,
         business_execution_token: Optional[str] = None,
+        current_turn_reference_image: str = "",
         request_overrides: Optional[Dict[str, Any]] = None,
         trusted_user_message: Any = None,
         trusted_skill_slug: str = "",
@@ -6440,6 +6543,8 @@ class APIServerAdapter(BasePlatformAdapter):
         def _run():
             from gateway.session_context import (
                 clear_session_vars,
+                pop_current_turn_reference_image,
+                push_current_turn_reference_image,
                 set_zettlab_connector_route_capability,
                 set_zettlab_turn_id,
             )
@@ -6456,6 +6561,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 set_zettlab_turn_id(turn_id or "")
                 set_zettlab_connector_route_capability(
                     connector_route_capability or ""
+                )
+                reference_token = push_current_turn_reference_image(
+                    current_turn_reference_image
                 )
                 try:
                     # Resolve the auto-execute flag once so the Plan-First
@@ -6504,6 +6612,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         result["session_id"] = _eff_sid
                     return result, usage
                 finally:
+                    pop_current_turn_reference_image(reference_token)
                     clear_session_vars(tokens)
                     set_zettlab_turn_id("")
                     set_zettlab_connector_route_capability("")
