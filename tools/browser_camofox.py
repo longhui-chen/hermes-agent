@@ -117,156 +117,6 @@ def _redact_handback_page_state(value: str) -> str:
     return _reduce_urls_to_origin("\n".join(lines))
 
 
-_EPOCH_HEADER = "X-Zettlab-Browser-Epoch"
-
-
-def _session_epoch_header(session: Optional[Dict[str, Any]]) -> Dict[str, str]:
-    """Declare the page epoch this session last synchronized with."""
-    if not isinstance(session, dict):
-        return {}
-    epoch = session.get("epoch")
-    if not isinstance(epoch, int) or isinstance(epoch, bool):
-        return {}
-    return {_EPOCH_HEADER: str(epoch)}
-
-
-def _adopt_session_epoch(session: Optional[Dict[str, Any]], epoch: Any) -> None:
-    """Record the server-reported page epoch on the session.
-
-    The epoch increments whenever human control of the page ends, so a change
-    means the page content is no longer what the Agent last saw and any values
-    a human typed may still be present. Adopting a changed epoch therefore
-    also enables the handback privacy filter; the filter clears when the Agent
-    navigates away. Keys are written without the session lock because single
-    key access is atomic and callers may already hold the lock.
-    """
-    if not isinstance(session, dict) or not isinstance(epoch, int) or isinstance(epoch, bool):
-        return
-    previous = session.get("epoch")
-    if previous is not None and previous != epoch:
-        session["privacy_filter_after_handback"] = True
-        # Which document it is for is not known here — the response that
-        # carried this epoch has no URL — so it is filled in by the first read
-        # that does establish it, and by _left_handback_document below.
-        # The epoch only moves when a human took the tab and gave it back, so
-        # the document every outstanding ref describes is the one they left
-        # behind. Turns sharing this physical tab keep their own session entry
-        # and their own stamp, so invalidate by document rather than by
-        # clearing this session's — otherwise a concurrent turn would still
-        # act on refs from before the takeover.
-    session["epoch"] = epoch
-
-
-def _adopt_epoch_from_response(
-    session: Optional[Dict[str, Any]],
-    resp: "requests.Response",
-    *,
-    tab_operation: bool = False,
-) -> bool:
-    """Adopt the epoch header a managed local-server proxy adds to responses.
-
-    On a managed deployment the epoch is the only thing that tells this process
-    a human touched the page. If a tab operation comes back without a usable
-    one — a local-server too old to send it, a proxy that drops it, a garbled
-    value — the handback filter would silently never engage and the next read
-    would hand over whatever the human typed. Once this session has seen a
-    valid epoch, a later tab response without one is a protocol failure, and
-    the safe reading of it is "assume the page changed".
-    """
-    before = bool(session.get("privacy_filter_after_handback")) if isinstance(session, dict) else False
-    status = getattr(resp, "status_code", None)
-    succeeded = isinstance(status, int) and 200 <= status < 300
-    # Only a response that describes a completed operation may move the epoch.
-    # This runs before _raise_for_status, so an older or hostile proxy putting a
-    # header on its own 409 browser_epoch_stale would otherwise hand the Agent
-    # the very epoch that refusal was protecting — and if the recovery snapshot
-    # then failed, the next press or back would carry it and be accepted.
-    value = resp.headers.get(_EPOCH_HEADER) if (resp is not None and succeeded) else None
-    if value is not None:
-        try:
-            _adopt_session_epoch(session, int(str(value).strip()))
-            if isinstance(session, dict) and not before and session.get("privacy_filter_after_handback"):
-                _response_facts.started_handback = True
-            return True
-        except (TypeError, ValueError):
-            pass
-    if not tab_operation or not isinstance(session, dict):
-        return False
-    if not succeeded:
-        # Error envelopes are generated before dispatch and carry no page data,
-        # so a missing header there says nothing about the page.
-        return False
-    if not session.get("local_server_managed"):
-        return False
-    logger.warning("Camofox managed tab response carried no usable %s header", _EPOCH_HEADER)
-    session["privacy_filter_after_handback"] = True
-    _response_facts.started_handback = True
-    return False
-
-
-def _set_handback_privacy_filter(session: Dict[str, Any], enabled: bool, document: str = "") -> None:
-    """Persist handback privacy filtering for subsequent reads of this tab.
-
-    Turning it off does not forget which document it was for. Navigating away
-    clears the filter, but history and bfcache keep that page — including what
-    the human typed into it and a URL that may carry an OAuth code or a reset
-    token — so coming back to it has to filter again.
-    """
-    with _session_lock(session):
-        session["privacy_filter_after_handback"] = enabled
-        if enabled and document:
-            session["handback_document"] = document
-
-
-def _refilter_if_back_on_the_handback_document(session: Dict[str, Any], landed_url: Any) -> None:
-    """Re-enable the filter when a navigation lands back on the human's page."""
-    if not isinstance(session, dict):
-        return
-    with _session_lock(session):
-        remembered = str(session.get("handback_document") or "")
-    if not remembered:
-        return
-    if _document_identity(landed_url) != remembered:
-        return
-    with _session_lock(session):
-        session["privacy_filter_after_handback"] = True
-
-
-def _handback_privacy_filter_enabled(session: Dict[str, Any]) -> bool:
-    """Return whether raw page reads are blocked after human control."""
-    with _session_lock(session):
-        return bool(session.get("privacy_filter_after_handback"))
-
-
-def _filter_page_state_after_handback(
-    session: Dict[str, Any], value: str, filtered_at_request: bool = False
-) -> str:
-    """Filter page state while a human-mutated page remains current.
-
-    ``filtered_at_request`` carries the state from when the read was issued.
-    Concurrent turns share one session dict, so a navigate finishing in between
-    could otherwise clear the flag and let a capture taken under the filter
-    through unredacted.
-    """
-    if filtered_at_request or _handback_privacy_filter_enabled(session):
-        return _redact_handback_page_state(value)
-    return value
-
-
-def _filter_url_after_handback(session: Dict[str, Any], url: Any, revealed: bool = False) -> Any:
-    """Reduce an operation-result URL to its origin while the filter is active.
-
-    Click/back results report the page URL the human left behind; without this
-    the origin-only policy applied to snapshots could be bypassed by reading
-    the same URL from an action result.
-    """
-    if not isinstance(url, str) or not url:
-        return url
-    if not revealed and not _handback_privacy_filter_enabled(session):
-        return url
-    return _url_origin_only(url)
-
-
 from tools.browser_camofox_state import get_camofox_identity
 from tools.registry import tool_error
 
@@ -706,53 +556,6 @@ def _session_lock(session: Dict[str, Any]) -> threading.Lock:
         return lock
 
 
-# Last epoch this process observed per tab. It deliberately outlives the
-# per-turn session cache so an ordinary multi-turn continuation can be told
-# apart from a gateway restart; bounded because a stale entry is only ever a
-# missed filter-suppression, never a leak.
-_MAX_REMEMBERED_TAB_EPOCHS = 256
-_remembered_tab_epochs: Dict[str, tuple] = {}
-
-
-def _tab_epoch_memory_key(session: Dict[str, Any], tab_id: str) -> str:
-    # Keyed by the credential-derived owner as well, like the session cache and
-    # the document registry. Two profiles in one multiplex gateway can be given
-    # the same explicit identity and be handed the same tab id by their own
-    # runtimes; sharing this record would let one profile's "filter was off"
-    # become the other's trusted state and clear a live handback filter.
-    return (
-        f"{session.get('release_owner') or ''}\x00{session.get('user_id')}"
-        f"\x00{session.get('session_key')}\x00{tab_id}"
-    )
-
-
-def _remembered_tab_state(session: Dict[str, Any], tab_id: str) -> Optional[tuple]:
-    with _sessions_lock:
-        return _remembered_tab_epochs.get(_tab_epoch_memory_key(session, tab_id))
-
-
-def _remember_tab_epoch(session: Optional[Dict[str, Any]]) -> None:
-    """Record the epoch a still-owned tab was last seen at, with its filter.
-
-    The privacy flag travels with the epoch because it does not follow from it:
-    a handback detected during this turn leaves the filter on at an epoch the
-    server also reports, so remembering the epoch alone would let the next
-    turn's adoption conclude "nothing happened" and clear the filter over a
-    page the human just typed into.
-    """
-    if not isinstance(session, dict):
-        return
-    tab_id = session.get("tab_id")
-    epoch = session.get("epoch")
-    if not tab_id or not isinstance(epoch, int) or isinstance(epoch, bool):
-        return
-    filtered = bool(session.get("privacy_filter_after_handback"))
-    with _sessions_lock:
-        if len(_remembered_tab_epochs) >= _MAX_REMEMBERED_TAB_EPOCHS:
-            _remembered_tab_epochs.clear()
-        _remembered_tab_epochs[_tab_epoch_memory_key(session, tab_id)] = (epoch, filtered)
-
-
 def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
     """Attach process-local state to an already-open managed Camofox tab.
 
@@ -785,29 +588,6 @@ def _adopt_existing_tab(session: Dict[str, Any]) -> Dict[str, Any]:
     tab_id = _validated_tab_id(latest.get("tabId")) if isinstance(latest, dict) else None
     if tab_id:
         session["tab_id"] = tab_id
-        adopted_epoch = latest.get("epoch")
-        _adopt_session_epoch(session, adopted_epoch)
-        # The in-process session cache is dropped at the end of every turn by
-        # cleanup_task_resources, so most adoptions are an ordinary multi-turn
-        # continuation, not a gateway restart. Filtering those would blank out
-        # every form control and block vision/eval from the second turn on.
-        # Compare against the last epoch this process saw for the tab instead:
-        # unchanged means no handback happened, anything else (including no
-        # record at all, i.e. a genuine restart) filters until the Agent
-        # navigates.
-        remembered = _remembered_tab_state(session, tab_id)
-        recognized = (
-            remembered is not None
-            and isinstance(adopted_epoch, int)
-            and not isinstance(adopted_epoch, bool)
-            and remembered[0] == adopted_epoch
-        )
-        # Recognized means this process saw the tab at exactly this epoch last
-        # turn, so restore the filter state it had then — which stays on when
-        # that turn ended mid-handback. Anything else (moved epoch, or no
-        # record at all, i.e. a genuine restart) filters until the Agent
-        # navigates away.
-        session["privacy_filter_after_handback"] = remembered[1] if recognized else True
         logger.debug("Adopted existing Camofox tab %s for %s", tab_id, session.get("user_id"))
 
     return session
@@ -1863,10 +1643,6 @@ def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
         # closed and would strand the entry plus its local-server lease.
         if not session.get("managed"):
             return False
-        # The tab survives this cleanup (that is the point of the soft path),
-        # so carry its epoch forward: the next turn re-adopts it and must be
-        # able to tell "same page, no handback" from a genuine restart.
-        _remember_tab_epoch(session)
         if session.get("local_server_managed"):
             # Deliberately no release here, and the entry stays. How long a
             # turn will keep using the browser is not observable from this
@@ -1942,32 +1718,7 @@ def _raise_for_status(resp: requests.Response) -> None:
 
 
 def _request_headers(session: Optional[Dict[str, Any]]) -> Dict[str, str]:
-    return {**_auth_headers(), **_session_epoch_header(session)}
-
-
-# Facts about the most recent response on this thread. A turn runs its browser
-# calls synchronously, so "the last response on this thread" is precisely "this
-# call's response" — unlike anything stored on the shared session dict.
-_response_facts = threading.local()
-
-
-def _last_response_epoch_verified() -> bool:
-    return bool(getattr(_response_facts, "epoch_verified", False))
-
-
-def _last_response_started_handback() -> bool:
-    """Whether the response just received is the one that revealed a handback.
-
-    The shared flag it sets can be cleared again by a concurrent turn before
-    this response's caller gets to look at it, so the caller has to remember
-    what its own response reported.
-    """
-    return bool(getattr(_response_facts, "started_handback", False))
-
-
-def _is_tab_operation(path: str) -> bool:
-    """Whether this path targets one specific tab, i.e. carries an epoch."""
-    return path.startswith("/tabs/")
+    return dict(_auth_headers())
 
 
 # Bounded retry for reads only. A cold camofox start or a loaded device makes
@@ -2016,24 +1767,12 @@ def _post(path: str, body: dict, timeout: Optional[int] = None, session: Optiona
     if timeout is None:
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
-    _response_facts.started_handback = False
     _begin_session_call(session)
     try:
         resp = requests.post(url, json=body, timeout=timeout, headers=_request_headers(session),
                              allow_redirects=False, proxies=_NO_ENV_PROXIES)
     finally:
         _end_session_call(session)
-    # POST /tabs establishes the baseline epoch for the new tab. Without it a
-    # later response's epoch looks like the first one ever seen and is taken as
-    # a safe baseline, so a takeover between creation and the first read would
-    # go unnoticed.
-    # Response-local, not session state: concurrent turns share the session
-    # dict, so another response landing in between could flip a shared flag
-    # before this caller reads it. A thread-local is exactly the scope of one
-    # synchronous request/response pair.
-    _response_facts.epoch_verified = _adopt_epoch_from_response(
-        session, resp, tab_operation=_is_tab_operation(path) or path == "/tabs"
-    )
     _raise_for_status(resp)
     return resp.json()
 
@@ -2049,11 +1788,6 @@ def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None, sess
         timeout = _get_command_timeout()
     url = f"{get_camofox_url()}{path}"
 
-    # Reset once for the whole call, not per attempt: an earlier attempt can
-    # carry the epoch that reveals a handback and still fail retryably, and
-    # that fact has to reach the caller.
-    _response_facts.started_handback = False
-
     def _once() -> requests.Response:
         _begin_session_call(session)
         try:
@@ -2061,7 +1795,6 @@ def _get_raw(path: str, params: dict = None, timeout: Optional[int] = None, sess
                                 allow_redirects=False, proxies=_NO_ENV_PROXIES)
         finally:
             _end_session_call(session)
-        _adopt_epoch_from_response(session, resp, tab_operation=_is_tab_operation(path))
         _raise_for_status(resp)
         return resp
 
@@ -2075,7 +1808,6 @@ def _delete(path: str, body: dict = None, timeout: Optional[int] = None, session
     url = f"{get_camofox_url()}{path}"
     resp = requests.delete(url, json=body, timeout=timeout, headers=_request_headers(session),
                            allow_redirects=False, proxies=_NO_ENV_PROXIES)
-    _adopt_epoch_from_response(session, resp)
     _raise_for_status(resp)
     return resp.json()
 
