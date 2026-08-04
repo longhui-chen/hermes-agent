@@ -1166,10 +1166,14 @@ def _trusted_artifact_scope_key(
     ):
         return None
     try:
-        from hermes_constants import get_hermes_home
+        from hermes_constants import (
+            get_hermes_home_override,
+            get_process_hermes_home,
+        )
 
+        active_home = get_hermes_home_override() or get_process_hermes_home()
         profile_home = os.path.normcase(
-            os.path.abspath(os.fspath(get_hermes_home()))
+            os.path.abspath(os.fspath(active_home))
         )
     except Exception:
         return None
