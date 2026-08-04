@@ -956,9 +956,22 @@ def _transcript_without_refused_turn(
         # 原样返回。裁成空会把 system prompt 一起丢掉。
         if not any(m.get("role") == "user" for m in messages):
             return list(messages)
+        # 边界必须是**上一轮**的完成点，不能是最后一条 assistant。
+        #
+        # 审核 400 也可能在本轮的工具调用之后才回来，这时最后一条 assistant
+        # 正是本轮刚产生的 assistant(tool_calls) —— 按它裁会把被拒的 user 连同
+        # 它的 tool-call scaffolding 一起留下。
+        #
+        # 上一轮的完成点 = 最后一条**不带 tool_calls 且不是 tool 结果**的
+        # assistant：带 tool_calls 的 assistant 后面必然还有 tool 回合，说明它
+        # 属于一段没走完的交互；只有干净收尾的 assistant 才代表一轮真的结束了。
         for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "assistant":
-                return messages[: i + 1]
+            m = messages[i]
+            if m.get("role") != "assistant":
+                continue
+            if m.get("tool_calls"):
+                continue
+            return messages[: i + 1]
         return []
     return messages[:idx]
 
@@ -2536,10 +2549,46 @@ def run_conversation(
                         # 的模型上，那条调用根本不过我们的审核网关。和普通
                         # finish_reason="content_filter" 分支同一套规则。
                         if _cf_terminated and content_policy_fallback_disabled():
+                            # 必须在这里终止，不能只打日志。上一版就是只 _vprint
+                            # 然后 fall through 到下面的 length continuation ——
+                            # 被拒上下文继续送给供应商和审核网关，最后还只暴露成
+                            # 截断错误而不是 content_blocked。走和普通
+                            # finish_reason="content_filter" 完全相同的收尾：裁掉
+                            # 被拒的一轮、删掉已落盘的行、返回 content_blocked。
                             agent._vprint(
                                 f"{agent.log_prefix}🛡️  Content filter terminated "
-                                f"stream — fallback disabled by content policy.",
+                                f"stream — fallback disabled by content policy; "
+                                f"ending the turn.",
                                 force=True,
+                            )
+                            agent._cleanup_task_resources(effective_task_id)
+                            _cf_kept = _transcript_without_refused_turn(
+                                messages, user_message, current_turn_user_idx
+                            )
+                            _purge_refused_rows_from_session_db(
+                                agent, messages, len(_cf_kept)
+                            )
+                            agent._persist_session(_cf_kept, conversation_history)
+                            _cf_provider_error: Dict[str, Any] = {
+                                "code": "content_blocked",
+                                "reason": FailoverReason.content_policy_blocked.value,
+                                "retryable": False,
+                                "recoverable": False,
+                            }
+                            if getattr(agent, "provider", None):
+                                _cf_provider_error["provider"] = agent.provider
+                            if getattr(agent, "model", None):
+                                _cf_provider_error["model"] = agent.model
+                            return _content_policy_blocked_result(
+                                _cf_kept,
+                                api_call_count,
+                                final_response=(
+                                    "⚠️  The provider's output safety filter blocked "
+                                    "this response (not a Hermes/gateway failure).\n\n"
+                                    f"{_CONTENT_POLICY_RECOVERY_HINT}"
+                                ),
+                                error_detail="output content filter terminated the stream",
+                                provider_error=_cf_provider_error,
                             )
                         elif (
                             _cf_terminated

@@ -176,3 +176,25 @@ def test_exact_match_reanchor_is_still_trusted():
     ]
     kept = _transcript_without_refused_turn(messages, "违规内容", 99)  # 索引越界，强制 reanchor
     assert [m["content"] for m in kept] == ["早先的正常提问", "正常回答"]
+
+
+def test_fallback_boundary_is_the_previous_completed_turn_not_this_turns_tool_call():
+    """兜底边界不能是「最后一条 assistant」。
+
+    审核 400 也可能在本轮的工具调用之后才回来，这时最后一条 assistant 正是本轮
+    刚产生的 assistant(tool_calls)；按它裁会把被拒的 user 连同它的 tool-call
+    scaffolding 一起留在 transcript 里，下一轮继续提交。
+
+    正确的边界是上一轮真正的完成点 —— 最后一条**不带 tool_calls** 的 assistant。
+    """
+    messages = [
+        {"role": "user", "content": "早先的正常提问"},
+        {"role": "assistant", "content": "正常回答"},              # 上一轮完成点
+        {"role": "user", "content": "被压缩改写过的违规内容"},      # 本轮，无法 exact match
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "..."},
+    ]
+    kept = _transcript_without_refused_turn(messages, "原始违规内容", 2)
+    assert [m.get("content") for m in kept] == ["早先的正常提问", "正常回答"], (
+        "裁剪边界落在了本轮自己的 assistant(tool_calls) 上，被拒内容被留下"
+    )
