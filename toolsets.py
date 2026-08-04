@@ -148,6 +148,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "desktop_pet": {
+        "description": "Persistent desktop-pet candidate creation and export",
+        "tools": ["desktop_pet_creator"],
+        "includes": []
+    },
+
     "video_gen": {
         "description": (
             "Video generation tools. Single ``video_generate`` tool covers "
@@ -485,7 +491,9 @@ TOOLSETS = {
         # generated applications on the device is a device-agent capability —
         # not something telegram/slack/cron schemas should ever advertise.
         # Still gated by ZET_APPHOST_BASE_URL + the action token via check_fn.
-        "tools": _HERMES_CORE_TOOLS + ["call_agent", "app_host"],
+        "tools": _HERMES_CORE_TOOLS + [
+            "call_agent", "app_host", "desktop_pet_creator"
+        ],
         "includes": []
     },
 

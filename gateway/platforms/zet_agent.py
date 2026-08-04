@@ -959,9 +959,40 @@ class ZetAgentAdapter(APIServerAdapter):
                     exc_info=True,
                 )
 
-        if not skill_slug or not isinstance(user_message, str):
+        if not skill_slug:
             _settled()
             return user_message
+        multimodal_parts = user_message if isinstance(user_message, list) else None
+        if multimodal_parts is not None:
+            source_text = "\n".join(
+                str(part.get("text") or "")
+                for part in multimodal_parts
+                if isinstance(part, dict) and part.get("type") == "text"
+                and str(part.get("text") or "")
+            )
+        elif isinstance(user_message, str):
+            source_text = user_message
+        else:
+            _settled()
+            return user_message
+
+        def _restore_multimodal(expanded: Any) -> Any:
+            if multimodal_parts is None or not isinstance(expanded, str):
+                return expanded
+            if expanded == source_text:
+                return user_message
+            restored: list[Any] = []
+            inserted = False
+            for part in multimodal_parts:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    if not inserted:
+                        restored.append({"type": "text", "text": expanded})
+                        inserted = True
+                    continue
+                restored.append(part)
+            if not inserted:
+                restored.insert(0, {"type": "text", "text": expanded})
+            return restored
         import asyncio
 
         sema = self._skill_invoke_semaphore
@@ -1030,19 +1061,19 @@ class ZetAgentAdapter(APIServerAdapter):
                 if state["released"]:
                     # Queued-cancel already refunded the permit; stay out of
                     # the skills layer (the caller is gone anyway).
-                    return user_message
+                    return source_text
                 state["started"] = True
             try:
                 return ctx.run(
                     self._expand_inbound_skill_invocation_blocking,
-                    user_message, skill_slug, session_id,
+                    source_text, skill_slug, session_id,
                 )
             finally:
                 _release_from_worker()
 
         fut = loop.run_in_executor(None, _worker)
         try:
-            return await fut
+            return _restore_multimodal(await fut)
         except asyncio.CancelledError:
             with state_lock:
                 refund = not state["started"] and not state["released"]
@@ -2598,6 +2629,7 @@ class ZetAgentAdapter(APIServerAdapter):
         turn_id: Optional[str] = None,
         connector_route_capability: Optional[str] = None,
         business_execution_token: Optional[str] = None,
+        current_turn_reference_image: str = "",
         request_overrides: Optional[Dict[str, Any]] = None,
         trusted_user_message: Any = None,
         trusted_skill_slug: str = "",
@@ -2722,6 +2754,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 turn_id=turn_id,
                 connector_route_capability=connector_route_capability,
                 business_execution_token=scoped_business_execution_token,
+                current_turn_reference_image=current_turn_reference_image,
                 request_overrides=request_overrides,
                 trusted_user_message=trusted_user_message,
                 trusted_skill_slug=trusted_skill_slug,
