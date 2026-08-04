@@ -1424,6 +1424,16 @@ def _prepare_managed_profile_runtime(env: Mapping[str, str]) -> None:
     # denied。缺一个 workdir 别名不该让技能运行面一起失效（HR2/HR5）。
     output_text = str(env.get("ZET_AGENT_OUTPUT_DIR") or "").strip()
     if not output_text:
+        # 同 managed_fallback_cwd：multiplex 下这个键只活在 per-turn secret scope
+        # 里，run env 和 os.environ 都没有。只查 env 会让 output 的属主迁移在受管
+        # 形态下永不执行，agent 写不进自己的产出目录。
+        try:
+            from tools.runtime_workdir import agent_output_dir
+
+            output_text = str(agent_output_dir() or "").strip()
+        except Exception:
+            output_text = ""
+    if not output_text:
         return
     try:
         output_raw = Path(output_text)
@@ -1496,6 +1506,12 @@ def managed_fallback_cwd(
         from tools.runtime_workdir import agent_output_dir
 
         output_dir = agent_output_dir(environ=env)
+        if not output_dir:
+            # multiplex 下平台把这个键投在 profile .env 里，每轮由
+            # _profile_runtime_scope 装成 secret scope——它既不在 os.environ 也
+            # 不在终端的 run env 里。只查 env 会让受管形态恒取不到值，退回 profile
+            # HOME，而那不在任何快照目标内，破坏性命令又回到全线阻断。
+            output_dir = agent_output_dir()
     except Exception:
         output_dir = None
     if not output_dir or not _managed_output_is_trusted(output_dir):

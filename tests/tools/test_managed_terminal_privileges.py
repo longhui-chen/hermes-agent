@@ -1252,3 +1252,29 @@ def test_managed_profile_runtime_grants_skills_without_output(monkeypatch, reque
     assert shell_pkg.stat().st_gid == gid
     assert shell_script.stat().st_gid == gid
     assert stat.S_IMODE(shell_script.stat().st_mode) == 0o640
+
+
+def test_managed_fallback_cwd_reads_profile_scope_when_env_lacks_output(
+    monkeypatch, tmp_path
+):
+    """multiplex 下 ZET_AGENT_OUTPUT_DIR 只活在 per-turn secret scope 里。
+
+    平台把它投在 profile .env，由 _profile_runtime_scope 装成 scope；os.environ
+    和终端 run env 都没有。只查 env 会让受管形态恒取不到值、退回 profile HOME，
+    而那不在任何快照目标内，破坏性命令又回到全线阻断。
+    """
+    from tests.tools._profile_scope import mux_profile_scope
+
+    output = tmp_path / "output"
+    output.mkdir()
+    os.chmod(output, 0o700)
+    monkeypatch.setattr(local_module, "_IS_WINDOWS", False)
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.delenv("ZET_AGENT_OUTPUT_DIR", raising=False)
+
+    # run env 里没有这个键——真实 multiplex 就是这样。
+    with mux_profile_scope(monkeypatch, {"ZET_AGENT_OUTPUT_DIR": str(output)}):
+        assert local_module.managed_fallback_cwd({}, home="/profile-home") == str(output)
+
+    # scope 也没有时才退回 home。
+    assert local_module.managed_fallback_cwd({}, home="/profile-home") == "/profile-home"
