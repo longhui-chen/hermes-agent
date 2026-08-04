@@ -140,3 +140,39 @@ def test_stale_index_pointing_at_another_user_row_is_reanchored():
     assert all(m["content"] != "违规内容" for m in kept), (
         "被拒内容仍留在 transcript 里，下一轮会被重新提交"
     )
+
+
+# ── reanchor 的 no-exact fallback 不能被采信 ──────────────────────────
+
+def test_reanchor_fallback_to_a_synthetic_user_row_is_rejected():
+    """reanchor 找不到 exact match 时会退回**最后一条** user 行。
+
+    压缩的 merge-summary-into-tail 会改写当前 user 的 content，而 todo store 又
+    可能在尾部追加一条 synthetic user —— 于是那个 fallback 指向的是 snapshot，
+    排在被拒消息之后。按它裁剪就把被拒内容留下了，下一轮继续提交给审核网关和
+    模型；_purge_refused_rows_from_session_db 也只会从 snapshot 开始删。
+
+    正确做法是：锚点内容对不上就当没找到，走更保守的兜底（宁可多裁一轮）。
+    """
+    # 被拒的一轮拿不到助手回复，所以尾部是连续两条 user：被改写的本轮 + snapshot。
+    messages = [
+        {"role": "user", "content": "早先的正常提问"},
+        {"role": "assistant", "content": "正常回答"},
+        {"role": "user", "content": "被压缩改写过的违规内容"},   # 本轮，content 已被改写
+        {"role": "user", "content": "[todo snapshot]"},          # 压缩追加的 synthetic
+    ]
+    kept = _transcript_without_refused_turn(messages, "原始违规内容", 0)
+    assert all("违规" not in str(m.get("content", "")) for m in kept), (
+        "被拒内容仍留在 transcript 里 —— reanchor 的 fallback 被错误采信了"
+    )
+
+
+def test_exact_match_reanchor_is_still_trusted():
+    """反向：内容对得上时仍然按它裁，别把这条也改保守了。"""
+    messages = [
+        {"role": "user", "content": "早先的正常提问"},
+        {"role": "assistant", "content": "正常回答"},
+        {"role": "user", "content": "违规内容"},
+    ]
+    kept = _transcript_without_refused_turn(messages, "违规内容", 99)  # 索引越界，强制 reanchor
+    assert [m["content"] for m in kept] == ["早先的正常提问", "正常回答"]

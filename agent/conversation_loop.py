@@ -922,18 +922,44 @@ def _transcript_without_refused_turn(
     # 被保留下来的历史用户轮。索引一旦落在本轮被拒消息之后，下面的裁剪就会
     # 把被拒内容留在返回的 transcript 里，下一轮继续提交给审核网关和模型。
     # 所以内容对不上也要重新锚定，reanchor 本身就是优先按内容匹配的。
+    # user_message 的约定是「本轮 user 消息的 content」（reanchor 就是这么比的），
+    # 但调用方偶尔会把整条 message dict 传进来。两种都接受，否则内容校验会因为
+    # 类型不同而永远判为不匹配，把每一次裁剪都推进保守兜底。
+    wanted = user_message.get("content") if isinstance(user_message, dict) else user_message
+
     idx = current_turn_user_idx
     if (
         not (0 <= idx < len(messages))
         or messages[idx].get("role") != "user"
-        or messages[idx].get("content") != user_message
+        or messages[idx].get("content") != wanted
     ):
-        idx = reanchor_current_turn_user_idx(messages, user_message)
+        # reanchor 优先按内容匹配，但**没有 exact match 时它会退回最后一条 user
+        # 行** —— 那可能是压缩追加的 todo snapshot，排在被拒消息之后。按它裁剪
+        # 就把被拒内容留下了。所以这里只接受内容对得上的锚点；对不上就当没找到，
+        # 走下面更保守的兜底。
+        candidate = reanchor_current_turn_user_idx(messages, wanted)
+        idx = candidate if (
+            0 <= candidate < len(messages)
+            and messages[candidate].get("content") == wanted
+        ) else -1
     if not (0 <= idx < len(messages)):
+        # 定位不到本轮：从**最后一条 assistant 之后**全部裁掉。
+        #
+        # 被拒的那一轮拿不到助手回复，所以最后一条 assistant 之后的所有行都属于
+        # 当前轮（可能是被压缩改写过的 user、也可能是 todo snapshot 之类的
+        # synthetic 行）。按「最后一条 user 行」裁是不够的——尾部有多条 user 时
+        # 它只裁掉最后那条，被改写过的被拒消息原样留下。
+        #
+        # 宁可多裁一轮（用户在 App 里仍看得见那一轮、可以改了重发），也不能把
+        # 被拒内容留在上下文里：它会在之后每一轮被重新提交给审核网关和模型。
+        # 整个会话里根本没有 user 行（例如只有 system prompt）：没有本轮可裁，
+        # 原样返回。裁成空会把 system prompt 一起丢掉。
+        if not any(m.get("role") == "user" for m in messages):
+            return list(messages)
         for i in range(len(messages) - 1, -1, -1):
-            if messages[i].get("role") == "user":
-                return messages[:i]
-        return list(messages)
+            if messages[i].get("role") == "assistant":
+                return messages[: i + 1]
+        return []
     return messages[:idx]
 
 
@@ -2504,7 +2530,18 @@ def run_conversation(
                         _cf_terminated = getattr(
                             response, "_content_filter_terminated", False
                         )
-                        if (
+                        # 合规部署下不许 fallback。输出层安全过滤以 stream stall
+                        # 形式回来时（MiniMax new_sensitive / Azure content_filter），
+                        # 这里原来无条件换模型重试 —— 被拒内容就转到了用户自己配置
+                        # 的模型上，那条调用根本不过我们的审核网关。和普通
+                        # finish_reason="content_filter" 分支同一套规则。
+                        if _cf_terminated and content_policy_fallback_disabled():
+                            agent._vprint(
+                                f"{agent.log_prefix}🛡️  Content filter terminated "
+                                f"stream — fallback disabled by content policy.",
+                                force=True,
+                            )
+                        elif (
                             _cf_terminated
                             and agent._fallback_index < len(agent._fallback_chain)
                         ):
