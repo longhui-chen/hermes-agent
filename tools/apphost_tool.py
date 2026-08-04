@@ -85,7 +85,7 @@ APP_HOST_SCHEMA = {
         "calling again), install (register an app staged on disk), reload "
         "(rebuild + restart from a staging dir; idempotent — resending the "
         "same commit returns current state), rollback (put the previous "
-        "version back — one step, no rebuild; pass to_version from the "
+        "version back — one step, no rebuild; requires to_version from the "
         "app's prev_version_id so a retry cannot swap it forward again), "
         "delete (soft-delete into the "
         "recycle bin; recovery is done from the client app's list, there is "
@@ -128,10 +128,10 @@ APP_HOST_SCHEMA = {
             "to_version": {
                 "type": "string",
                 "description": (
-                    "For rollback: the version to go back to, taken from the "
-                    "app's prev_version_id in list. Optional but strongly "
-                    "preferred — it makes the request safe to retry, because "
-                    "an undo that already succeeded is recognised instead of "
+                    "Required for rollback: the version to go back to, taken "
+                    "from the app's prev_version_id in list. Naming the "
+                    "version is what makes the request safe to retry — an "
+                    "undo that already succeeded is recognised instead of "
                     "being applied a second time and swapping the app "
                     "forward again."
                 ),
@@ -307,11 +307,20 @@ def _build_request(action, args):
         # but the app is still stopped, swapped and health-checked, so this
         # sits on the long tier with reload rather than the default one.
         slug = _require_slug(args)
-        body = {}
+        # to_version is REQUIRED on this face even though the server accepts
+        # an untargeted rollback. The swap is symmetric, and a long action can
+        # end as status=None (request went out, outcome unknown): retrying an
+        # untargeted rollback whose first attempt succeeded would swap the app
+        # forward again and report success. With the version named, the server
+        # recognises an already-done undo (already_done) instead of undoing
+        # the undo — so the only retry-safe request shape is the one with a
+        # target, and the model always has one (list's prev_version_id).
         to_version = str(args.get("to_version", "") or "").strip()
-        if to_version:
-            body["to_version"] = to_version
-        return "POST", f"/{slug}/rollback", body, _LONG_TIMEOUT
+        if not to_version:
+            raise _BadRequest(
+                "rollback 需要提供 to_version 参数（取 list 结果中该应用的 prev_version_id）"
+            )
+        return "POST", f"/{slug}/rollback", {"to_version": to_version}, _LONG_TIMEOUT
     if action == "delete":
         return "DELETE", f"/{_require_slug(args)}", None, timeout
     if action == "lifecycle":
@@ -415,6 +424,22 @@ def app_host_tool(args, **_kw):
             # string (slug_conflict / storage_full / ...), never the HTTP
             # status. Do not flatten into prose.
             return _fail(upstream, status=exc.code)
+        if action == "rollback" and exc.code == 404:
+            # Hermes and local-server ship as separate OTA packages, so this
+            # tool can meet a server that predates POST /{slug}/rollback. Its
+            # router answers an unregistered path with a bodiless 404, while
+            # every business 404 on this face (unknown app / not the owner)
+            # carries a JSON {code} body and took the verbatim branch above —
+            # so a rollback 404 WITHOUT a parsable body means the route does
+            # not exist. Reporting it as transport_error would invite retries
+            # of a request that can never work; "unsupported" is terminal and
+            # the message names the fallback that always exists.
+            return _local_error(
+                "unsupported",
+                "设备端 App Host 尚不支持 rollback（local-server 版本较旧）。"
+                "请改用 reload 以旧内容重新构建来完成撤销",
+                status=exc.code,
+            )
         return _local_error(
             "transport_error",
             f"App Host 请求失败（HTTP {exc.code}），未返回可解析的错误体",
