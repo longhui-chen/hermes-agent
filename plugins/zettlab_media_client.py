@@ -335,18 +335,17 @@ class _MediaHTTPWorker:
         return response
 
 
-def _resolve_local_image_path(
+def _prepare_local_image_path(
     source: str,
     task_id: Optional[str],
-) -> tuple[str, tuple[int, int]]:
+) -> tuple[str, str, str, tuple[str, ...], Optional[str]]:
     raw = str(source or "").strip()
     if not raw or len(raw) > _MAX_LOCAL_IMAGE_PATH_CHARS or "\x00" in raw:
         raise ZettlabMediaError("local image input path is invalid")
     _reject_windows_network_or_device_path(raw)
 
-    expanded = os.path.expanduser(raw)
-    if os.path.isabs(expanded):
-        candidate = expanded
+    if os.path.isabs(raw):
+        candidate = raw
     else:
         parsed = urlparse(raw)
         if parsed.scheme.casefold() != "file":
@@ -360,23 +359,101 @@ def _resolve_local_image_path(
         candidate = url2pathname(unquote(parsed.path))
         if not candidate:
             raise ZettlabMediaError("local image input path is invalid")
-        candidate = os.path.expanduser(candidate)
 
     _reject_windows_network_or_device_path(candidate)
     if not os.path.isabs(candidate):
         raise ZettlabMediaError("local image input must use an absolute path")
+    normalized_task_id = str(task_id or "default").strip() or "default"
     try:
-        from tools.file_tools import resolve_host_read_path_for_task
+        from hermes_constants import get_hermes_home_override
+        from tools.file_tools import local_host_read_context_for_task
 
-        resolved, expected_identity = resolve_host_read_path_for_task(
-            candidate,
-            str(task_id or "default").strip() or "default",
+        terminal_backend, managed_hermes_roots = local_host_read_context_for_task(
+            normalized_task_id
         )
+        hermes_home_override = get_hermes_home_override()
     except ValueError as exc:
         raise ZettlabMediaError(str(exc)) from exc
-    resolved_path = str(resolved)
-    _reject_windows_network_or_device_path(resolved_path)
-    return resolved_path, expected_identity
+    return (
+        os.path.normpath(candidate),
+        normalized_task_id,
+        terminal_backend,
+        managed_hermes_roots,
+        hermes_home_override,
+    )
+
+
+def _read_authorized_media_file(
+    path: str,
+    limit: int,
+    expected_identity: tuple[int, int],
+    result_buffer: Any,
+) -> int:
+    """Open one authorized regular file and copy it into the bounded buffer."""
+    from agent.file_safety import raise_if_read_blocked
+
+    if (
+        not path
+        or len(path) > _MAX_LOCAL_IMAGE_PATH_CHARS
+        or "\x00" in path
+        or not os.path.isabs(path)
+    ):
+        raise ZettlabMediaError("local image worker requires an absolute path")
+    _reject_windows_network_or_device_path(path)
+    raise_if_read_blocked(path)
+    source_stat = os.stat(path, follow_symlinks=False)
+    if not stat.S_ISREG(source_stat.st_mode):
+        raise ZettlabMediaError("local image input must be a regular file")
+    source_identity = (source_stat.st_dev, source_stat.st_ino)
+    if source_identity != expected_identity:
+        raise ZettlabMediaError("local image input changed after authorization")
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_NONBLOCK", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path, flags)
+    with os.fdopen(descriptor, "rb") as image_file:
+        file_stat = os.fstat(image_file.fileno())
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ZettlabMediaError("local image input must be a regular file")
+        if (file_stat.st_dev, file_stat.st_ino) != source_identity:
+            raise ZettlabMediaError("local image input changed while opening")
+        if (file_stat.st_dev, file_stat.st_ino) != expected_identity:
+            raise ZettlabMediaError("local image input changed after authorization")
+        if file_stat.st_size <= 0:
+            raise ZettlabMediaError("local image input must contain image bytes")
+        if file_stat.st_size > limit:
+            raise ZettlabMediaError("inline image input exceeds maximum size")
+        total = 0
+        while True:
+            chunk = image_file.read(min(_IMAGE_READ_CHUNK_BYTES, limit - total + 1))
+            if not chunk:
+                break
+            new_total = total + len(chunk)
+            if new_total > limit:
+                raise ZettlabMediaError("inline image input exceeds maximum size")
+            result_buffer[total:new_total] = chunk
+            total = new_total
+        final_stat = os.fstat(image_file.fileno())
+        initial_signature = (
+            file_stat.st_dev,
+            file_stat.st_ino,
+            file_stat.st_size,
+            file_stat.st_mtime_ns,
+        )
+        final_signature = (
+            final_stat.st_dev,
+            final_stat.st_ino,
+            final_stat.st_size,
+            final_stat.st_mtime_ns,
+        )
+        if final_signature != initial_signature:
+            raise ZettlabMediaError("local image input changed while reading")
+    if total <= 0:
+        raise ZettlabMediaError("local image input must contain image bytes")
+    return total
 
 
 def _media_file_worker(
@@ -384,82 +461,37 @@ def _media_file_worker(
     parent_pid: int,
     source: str,
     limit: int,
-    expected_identity: Optional[tuple[int, int]],
+    task_id: str,
+    terminal_backend: str,
+    managed_hermes_roots: tuple[str, ...],
+    hermes_home_override: Optional[str],
     result_buffer: Any,
 ) -> None:
     threading.Thread(target=_watch_parent, args=(parent_pid,), daemon=True).start()
     result: Dict[str, Any]
+    override_token: Any = None
     try:
-        from agent.file_safety import raise_if_read_blocked
-
-        path = str(source or "").strip()
-        if (
-            not path
-            or len(path) > _MAX_LOCAL_IMAGE_PATH_CHARS
-            or "\x00" in path
-            or not os.path.isabs(path)
-        ):
-            raise ZettlabMediaError("local image worker requires an absolute path")
-        _reject_windows_network_or_device_path(path)
-        raise_if_read_blocked(path)
-        source_stat = os.stat(path, follow_symlinks=False)
-        if not stat.S_ISREG(source_stat.st_mode):
-            raise ZettlabMediaError("local image input must be a regular file")
-        source_identity = (source_stat.st_dev, source_stat.st_ino)
-        if expected_identity is not None and source_identity != expected_identity:
-            raise ZettlabMediaError("local image input changed after authorization")
-        flags = (
-            os.O_RDONLY
-            | getattr(os, "O_NONBLOCK", 0)
-            | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
         )
-        descriptor = os.open(path, flags)
-        with os.fdopen(descriptor, "rb") as image_file:
-            file_stat = os.fstat(image_file.fileno())
-            if not stat.S_ISREG(file_stat.st_mode):
-                raise ZettlabMediaError("local image input must be a regular file")
-            if (file_stat.st_dev, file_stat.st_ino) != (
-                source_stat.st_dev,
-                source_stat.st_ino,
-            ):
-                raise ZettlabMediaError("local image input changed while opening")
-            if expected_identity is not None and (
-                file_stat.st_dev,
-                file_stat.st_ino,
-            ) != expected_identity:
-                raise ZettlabMediaError("local image input changed after authorization")
-            if file_stat.st_size <= 0:
-                raise ZettlabMediaError("local image input must contain image bytes")
-            if file_stat.st_size > limit:
-                raise ZettlabMediaError("inline image input exceeds maximum size")
-            total = 0
-            while True:
-                chunk = image_file.read(min(_IMAGE_READ_CHUNK_BYTES, limit - total + 1))
-                if not chunk:
-                    break
-                new_total = total + len(chunk)
-                if new_total > limit:
-                    raise ZettlabMediaError("inline image input exceeds maximum size")
-                result_buffer[total:new_total] = chunk
-                total = new_total
-            final_stat = os.fstat(image_file.fileno())
-            initial_signature = (
-                file_stat.st_dev,
-                file_stat.st_ino,
-                file_stat.st_size,
-                file_stat.st_mtime_ns,
-            )
-            final_signature = (
-                final_stat.st_dev,
-                final_stat.st_ino,
-                final_stat.st_size,
-                final_stat.st_mtime_ns,
-            )
-            if final_signature != initial_signature:
-                raise ZettlabMediaError("local image input changed while reading")
-        if total <= 0:
-            raise ZettlabMediaError("local image input must contain image bytes")
+        from tools.file_tools import resolve_host_read_path_for_task
+
+        if hermes_home_override:
+            override_token = set_hermes_home_override(hermes_home_override)
+        resolved, expected_identity = resolve_host_read_path_for_task(
+            source,
+            task_id,
+            terminal_backend=terminal_backend,
+            managed_hermes_roots=managed_hermes_roots,
+        )
+        path = str(resolved)
+        total = _read_authorized_media_file(
+            path,
+            limit,
+            expected_identity,
+            result_buffer,
+        )
         result = {"length": total}
     except ValueError as exc:
         result = {"error": "blocked", "message": str(exc)}
@@ -469,6 +501,12 @@ def _media_file_worker(
         result = {"error": "media", "message": f"unable to read local image input: {exc}"}
     except Exception as exc:
         result = {"error": "internal", "message": str(exc)}
+    finally:
+        if override_token is not None:
+            try:
+                reset_hermes_home_override(override_token)
+            except Exception:
+                pass
     try:
         connection.send(result)
     except (BrokenPipeError, EOFError, OSError):
@@ -491,7 +529,10 @@ class _MediaFileWorker:
         limit: int,
         *,
         deadline: float,
-        expected_identity: Optional[tuple[int, int]] = None,
+        task_id: str = "default",
+        terminal_backend: str = "local",
+        managed_hermes_roots: tuple[str, ...] = (),
+        hermes_home_override: Optional[str] = None,
     ) -> bytes:
         remaining = deadline - time.monotonic()
         if remaining <= 0 or not self._lock.acquire(timeout=remaining):
@@ -504,7 +545,15 @@ class _MediaFileWorker:
                 raise ZettlabMediaDeadlineError(
                     "local image read deadline exceeded before start"
                 )
-            self._ensure_started(source, limit, expected_identity, deadline)
+            self._ensure_started(
+                source,
+                limit,
+                task_id,
+                terminal_backend,
+                managed_hermes_roots,
+                hermes_home_override,
+                deadline,
+            )
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -554,7 +603,10 @@ class _MediaFileWorker:
         self,
         source: str,
         limit: int,
-        expected_identity: Optional[tuple[int, int]],
+        task_id: str,
+        terminal_backend: str,
+        managed_hermes_roots: tuple[str, ...],
+        hermes_home_override: Optional[str],
         deadline: float,
     ) -> None:
         if self._process is not None and self._process.is_alive():
@@ -591,7 +643,10 @@ class _MediaFileWorker:
                         os.getpid(),
                         source,
                         limit,
-                        expected_identity,
+                        task_id,
+                        terminal_backend,
+                        managed_hermes_roots,
+                        hermes_home_override,
                         result_buffer,
                     ),
                     daemon=True,
@@ -1133,14 +1188,23 @@ def _reject_windows_network_or_device_path(source: str) -> None:
 def _local_image_data_uri(
     source: str,
     limit: int,
-    expected_identity: tuple[int, int],
+    task_id: str,
+    terminal_backend: str,
+    managed_hermes_roots: tuple[str, ...],
+    hermes_home_override: Optional[str],
 ) -> str:
-    raw = _FILE_WORKER.read(
-        source,
-        limit,
-        deadline=time.monotonic() + LOCAL_IMAGE_READ_TIMEOUT,
-        expected_identity=expected_identity,
-    )
+    try:
+        raw = _FILE_WORKER.read(
+            source,
+            limit,
+            deadline=time.monotonic() + LOCAL_IMAGE_READ_TIMEOUT,
+            task_id=task_id,
+            terminal_backend=terminal_backend,
+            managed_hermes_roots=managed_hermes_roots,
+            hermes_home_override=hermes_home_override,
+        )
+    except ValueError as exc:
+        raise ZettlabMediaError(str(exc)) from exc
     mime = _sniff_image_mime(raw[:16])
     if mime is None:
         raise ZettlabMediaError("local image input must be a PNG, JPEG, or WebP file")
@@ -1181,8 +1245,21 @@ def inline_image_input(
             "HTTP(S) image URLs are not enabled for Zettlab yet; use a base64 "
             "data URI or an absolute local image path"
         )
-    resolved_source, expected_identity = _resolve_local_image_path(source, task_id)
-    return _local_image_data_uri(resolved_source, limit, expected_identity)
+    (
+        prepared_source,
+        normalized_task_id,
+        terminal_backend,
+        managed_hermes_roots,
+        hermes_home_override,
+    ) = _prepare_local_image_path(source, task_id)
+    return _local_image_data_uri(
+        prepared_source,
+        limit,
+        normalized_task_id,
+        terminal_backend,
+        managed_hermes_roots,
+        hermes_home_override,
+    )
 
 
 def create_and_wait(

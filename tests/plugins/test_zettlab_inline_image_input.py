@@ -191,16 +191,12 @@ def test_host_read_resolver_returns_canonical_target_and_identity(tmp_path, monk
     from tools import file_tools
 
     target_path = tmp_path / "target.png"
+    (tmp_path / "unused").mkdir()
     target_path.write_bytes(PNG)
-    alias_path = tmp_path / "alias.png"
-    try:
-        alias_path.symlink_to(target_path)
-    except (NotImplementedError, OSError):
-        pytest.skip("symlinks are unavailable")
     monkeypatch.setattr(file_tools, "_terminal_env_type_for_task", lambda _task_id: "local")
 
     resolved, identity = file_tools.resolve_host_read_path_for_task(
-        str(alias_path),
+        str(tmp_path / "unused" / ".." / "target.png"),
         "local-session",
     )
     target_stat = target_path.stat()
@@ -209,33 +205,102 @@ def test_host_read_resolver_returns_canonical_target_and_identity(tmp_path, monk
     assert identity == (target_stat.st_dev, target_stat.st_ino)
 
 
-def test_inline_image_input_passes_authorized_file_identity_to_worker(
+def test_inline_image_input_passes_read_context_to_worker(
     tmp_path,
     monkeypatch,
 ):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from plugins import zettlab_media_client as client
 
     image_path = tmp_path / "source.png"
+    profile_home = tmp_path / "profile-home"
     image_path.write_bytes(PNG)
     seen = {}
 
-    def read(source, limit, *, deadline, expected_identity=None):
+    def read(
+        source,
+        limit,
+        *,
+        deadline,
+        task_id="default",
+        terminal_backend="local",
+        managed_hermes_roots=(),
+        hermes_home_override=None,
+    ):
         seen.update(
             source=source,
             limit=limit,
             deadline=deadline,
-            expected_identity=expected_identity,
+            task_id=task_id,
+            terminal_backend=terminal_backend,
+            managed_hermes_roots=managed_hermes_roots,
+            hermes_home_override=hermes_home_override,
         )
         return PNG
 
     monkeypatch.setattr(client._FILE_WORKER, "read", read)
 
-    got = client.inline_image_input(str(image_path), None, _capability())
-    file_stat = image_path.stat()
+    token = set_hermes_home_override(profile_home)
+    try:
+        got = client.inline_image_input(
+            str(image_path),
+            None,
+            _capability(),
+            task_id="local-session",
+        )
+    finally:
+        reset_hermes_home_override(token)
 
     assert got.startswith("data:image/png;base64,")
-    assert seen["source"] == str(image_path.resolve())
-    assert seen["expected_identity"] == (file_stat.st_dev, file_stat.st_ino)
+    assert seen["source"] == str(image_path)
+    assert seen["task_id"] == "local-session"
+    assert seen["terminal_backend"] == "local"
+    assert seen["managed_hermes_roots"]
+    assert seen["hermes_home_override"] == str(profile_home)
+
+
+def test_inline_image_parent_preflight_does_not_resolve_or_stat_path(
+    tmp_path,
+    monkeypatch,
+):
+    from plugins import zettlab_media_client as client
+    from tools import file_tools
+
+    image_path = tmp_path / "source.png"
+    image_path.write_bytes(PNG)
+    monkeypatch.setattr(
+        file_tools,
+        "resolve_host_read_path_for_task",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("path I/O must run only inside the spawned worker")
+        ),
+    )
+    monkeypatch.setattr(client._FILE_WORKER, "read", lambda *_args, **_kwargs: PNG)
+
+    got = client.inline_image_input(str(image_path), None, _capability())
+
+    assert got.startswith("data:image/png;base64,")
+
+
+def test_windows_reparse_component_is_rejected_before_canonical_resolution(
+    tmp_path,
+    monkeypatch,
+):
+    from tools import file_tools
+
+    reparse_path = tmp_path / "junction" / "image.png"
+    real_stat = file_tools.os.stat
+
+    def fake_stat(path, *, follow_symlinks=True):
+        if str(path).endswith("junction") and follow_symlinks is False:
+            return type("ReparseStat", (), {"st_file_attributes": 0x400})()
+        return real_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(file_tools.sys, "platform", "win32")
+    monkeypatch.setattr(file_tools.os, "stat", fake_stat)
+
+    with pytest.raises(ValueError, match="reparse paths"):
+        file_tools._reject_windows_reparse_components(reparse_path)
 
 
 @pytest.mark.parametrize(
@@ -392,7 +457,7 @@ def test_inline_image_input_does_not_follow_symlink(tmp_path):
         symlink_path.symlink_to(target_path)
     except (NotImplementedError, OSError):
         pytest.skip("symlinks are unavailable")
-    with pytest.raises(client.ZettlabMediaError, match="regular file"):
+    with pytest.raises(ValueError, match="symbolic link"):
         client._FILE_WORKER.read(
             str(symlink_path),
             1024,
@@ -410,15 +475,15 @@ def test_media_file_worker_rejects_identity_changed_after_authorization(tmp_path
     authorized_stat = authorized_path.stat()
 
     with pytest.raises(client.ZettlabMediaError, match="changed after authorization"):
-        client._FILE_WORKER.read(
+        client._read_authorized_media_file(
             str(replacement_path),
             1024,
-            deadline=time.monotonic() + 1,
-            expected_identity=(authorized_stat.st_dev, authorized_stat.st_ino),
+            (authorized_stat.st_dev, authorized_stat.st_ino),
+            bytearray(1024),
         )
 
 
-def test_media_file_worker_terminates_stalled_read_and_recovers(monkeypatch):
+def test_media_file_worker_terminates_stalled_preflight_and_recovers(monkeypatch):
     from plugins import zettlab_media_client as client
 
     class FakeProcess:
@@ -471,7 +536,15 @@ def test_media_file_worker_terminates_stalled_read_and_recovers(monkeypatch):
     )
     worker = client._MediaFileWorker()
 
-    def start_next_worker(source, limit, expected_identity, deadline):
+    def start_next_worker(
+        source,
+        limit,
+        task_id,
+        terminal_backend,
+        managed_hermes_roots,
+        hermes_home_override,
+        deadline,
+    ):
         process, connection, payload = next(attempts)
         worker._process = process
         worker._connection = connection
@@ -527,7 +600,15 @@ def test_media_file_worker_interrupt_terminates_read(monkeypatch):
     process = FakeProcess()
     connection = FakeConnection()
 
-    def start_worker(source, limit, expected_identity, deadline):
+    def start_worker(
+        source,
+        limit,
+        task_id,
+        terminal_backend,
+        managed_hermes_roots,
+        hermes_home_override,
+        deadline,
+    ):
         worker._process = process
         worker._connection = connection
         worker._buffer = bytearray(limit)

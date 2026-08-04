@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import posixpath
+import stat
 import sys
 import threading
 from pathlib import Path, PurePosixPath
@@ -608,6 +609,7 @@ def _path_within(candidate: str, root: str) -> bool:
 def _managed_sibling_profile_error(
     filepath: str,
     task_id: str = "default",
+    managed_hermes_roots: tuple[str, ...] | None = None,
 ) -> str | None:
     """Deny managed file-tool access to every profile except the active one."""
 
@@ -641,7 +643,8 @@ def _managed_sibling_profile_error(
     }
 
     profile_roots: set[str] = set()
-    for configured_root in _MANAGED_CLAW_HERMES_ROOTS:
+    configured_roots = managed_hermes_roots or _MANAGED_CLAW_HERMES_ROOTS
+    for configured_root in configured_roots:
         for root in (
             os.path.normpath(configured_root),
             os.path.normpath(os.path.realpath(configured_root)),
@@ -672,9 +675,46 @@ def _managed_sibling_profile_error(
     return None
 
 
+def local_host_read_context_for_task(
+    task_id: str = "default",
+) -> tuple[str, tuple[str, ...]]:
+    """Snapshot non-I/O context required by a direct local host read."""
+    backend = _terminal_env_type_for_task(task_id)
+    if backend != "local":
+        raise ValueError(
+            f"Direct local image paths are unavailable with the {backend or 'non-local'} "
+            "terminal backend; provide the image as a base64 data URI instead."
+        )
+    return backend, tuple(_MANAGED_CLAW_HERMES_ROOTS)
+
+
+def _reject_windows_reparse_components(filepath: Path) -> None:
+    """Reject Windows symlink/junction components before canonical resolution."""
+    if sys.platform != "win32":
+        return
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    parts = filepath.parts
+    if not parts:
+        raise ValueError("Local image input path is invalid")
+    current = Path(parts[0])
+    for part in parts[1:]:
+        current /= part
+        try:
+            component_stat = os.stat(current, follow_symlinks=False)
+        except OSError as exc:
+            raise ValueError(f"Unable to inspect local image input: {exc}") from exc
+        if getattr(component_stat, "st_file_attributes", 0) & reparse_flag:
+            raise ValueError(
+                "Windows reparse paths are not supported for local image input"
+            )
+
+
 def resolve_host_read_path_for_task(
     filepath: str,
     task_id: str = "default",
+    *,
+    terminal_backend: str | None = None,
+    managed_hermes_roots: tuple[str, ...] | None = None,
 ) -> tuple[Path, tuple[int, int]]:
     """Resolve and authorize a model-supplied path for direct host reading.
 
@@ -684,19 +724,32 @@ def resolve_host_read_path_for_task(
     file transport. The returned path is the strict canonical target and the
     identity tuple must be checked again by the process that opens the file.
     """
-    backend = _terminal_env_type_for_task(task_id)
+    if terminal_backend is None:
+        backend, default_managed_roots = local_host_read_context_for_task(task_id)
+        if managed_hermes_roots is None:
+            managed_hermes_roots = default_managed_roots
+    else:
+        backend = terminal_backend
     if backend != "local":
-        raise ValueError(
-            f"Direct local image paths are unavailable with the {backend or 'non-local'} "
-            "terminal backend; provide the image as a base64 data URI instead."
-        )
-    lexical = Path(_resolve_path_for_task(filepath, task_id))
+        raise ValueError("Direct host reads require a verified local terminal backend")
+    from tools.environments.local import _msys_to_windows_path
+
+    lexical = Path(_expand_tilde(_msys_to_windows_path(filepath)))
+    if not lexical.is_absolute():
+        raise ValueError("Direct host reads require an absolute path")
+    _reject_windows_reparse_components(lexical)
+    if sys.platform != "win32" and lexical.is_symlink():
+        raise ValueError("Local image input must not be a symbolic link")
     try:
         canonical = lexical.resolve(strict=True)
     except (OSError, RuntimeError, ValueError) as exc:
         raise ValueError(f"Unable to resolve local image input: {exc}") from exc
 
-    sibling_error = _managed_sibling_profile_error(str(canonical), task_id)
+    sibling_error = _managed_sibling_profile_error(
+        str(canonical),
+        task_id,
+        managed_hermes_roots,
+    )
     if sibling_error:
         raise ValueError(sibling_error)
     blocked = get_read_block_error(str(canonical))
