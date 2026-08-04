@@ -1147,6 +1147,65 @@ def _prepare_managed_command_skill_sources(
         _normalize_managed_skill_package(package, gid)
 
 
+def _managed_skill_tree_fingerprint(skills_root: Path) -> tuple | None:
+    """Timestamp every directory in the tree, not just the top-level packages.
+
+    A skill update usually lands *inside* an existing package —
+    ``skills/foo/scripts/run.sh`` — which leaves ``foo``'s own timestamps
+    untouched. Fingerprinting packages alone therefore keeps hitting the
+    cache while the freshly written, root-owned ``0600`` file stays
+    unreadable to the managed uid, and only ``python <abs path>``
+    entrypoints get rescued by per-command preparation; ``bash x.sh``,
+    ``./x.py`` and in-package data reads fail until a restart.
+
+    Every add / remove / rename does bump its parent directory's mtime, so
+    walking directories catches that whole class. Directories only, because
+    this runs before *every* local terminal command: it is roughly a quarter
+    of the entries of the normalization walk it guards, and that walk opens
+    and fstats each entry rather than merely stat-ing it. The residual gap is
+    an in-place chown/chmod of a single file with no directory change — not a
+    shape skill installation produces.
+
+    Returns None when the tree is too large to fingerprint, meaning "do not
+    cache": re-normalizing every command is slow but correct, whereas a
+    truncated fingerprint would silently stop granting access.
+    """
+
+    fingerprint: list[tuple[str, int, int]] = []
+    visited: set[tuple[int, int]] = set()
+    stack: list[Path] = [skills_root]
+    while stack:
+        current = stack.pop()
+        try:
+            info = os.lstat(current)
+        except OSError:
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            continue
+        # symlink 已被 lstat 排除；inode 去重再挡住 bind mount 造成的环。
+        key = (info.st_dev, info.st_ino)
+        if key in visited:
+            continue
+        visited.add(key)
+        if len(visited) > _MANAGED_SKILL_TREE_MAX_ENTRIES:
+            return None
+        fingerprint.append(
+            (os.fspath(current), info.st_mtime_ns, info.st_ctime_ns)
+        )
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    fingerprint.sort()
+    return tuple(fingerprint)
+
+
 def _prepare_managed_skill_tree(skills_root: Path, gid: int) -> None:
     """Restore group access for every installed package, whatever invokes it.
 
@@ -1158,31 +1217,19 @@ def _prepare_managed_skill_tree(skills_root: Path, gid: int) -> None:
     """
 
     try:
-        root_info = os.lstat(skills_root)
+        os.lstat(skills_root)
     except FileNotFoundError:
         return
     root_key = str(skills_root)
     with os.scandir(skills_root) as entries:
         listing = [(entry.path, entry.name) for entry in entries]
-    # 指纹要覆盖每个顶层包，不能只看 skills_root：在已有包里新增或更新文件
-    # 不会动根目录的时间戳，只按根判定会让新装的脚本一直读不到，直到重启或
-    # 根目录恰好被动过。gid 也进指纹——身份轮换后旧的放权结果不可信。
-    fingerprint: list[tuple[str, int, int]] = []
-    for path_str, name in sorted(listing, key=lambda item: item[1]):
-        try:
-            info = os.lstat(path_str)
-        except OSError:
-            continue
-        fingerprint.append((name, info.st_mtime_ns, info.st_ctime_ns))
-    state = (
-        gid,
-        root_info.st_mtime_ns,
-        root_info.st_ctime_ns,
-        tuple(fingerprint),
-    )
-    with _MANAGED_SKILL_TREE_LOCK:
-        if _MANAGED_SKILL_TREE_PREPARED.get(root_key) == state:
-            return
+    fingerprint = _managed_skill_tree_fingerprint(skills_root)
+    # gid 也进指纹——身份轮换后旧的放权结果不可信。
+    state = (gid, fingerprint) if fingerprint is not None else None
+    if state is not None:
+        with _MANAGED_SKILL_TREE_LOCK:
+            if _MANAGED_SKILL_TREE_PREPARED.get(root_key) == state:
+                return
     packages = [Path(path_str) for path_str, _name in listing]
     for package in packages:
         try:
@@ -1192,6 +1239,8 @@ def _prepare_managed_skill_tree(skills_root: Path, gid: int) -> None:
             logger.warning(
                 "managed skill package skipped: %s (%s)", package, exc
             )
+    if state is None:
+        return
     with _MANAGED_SKILL_TREE_LOCK:
         while len(_MANAGED_SKILL_TREE_PREPARED) >= _MANAGED_SKILL_TREE_PREPARED_MAX:
             _MANAGED_SKILL_TREE_PREPARED.pop(

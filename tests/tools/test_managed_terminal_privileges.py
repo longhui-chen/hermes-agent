@@ -365,6 +365,59 @@ def test_managed_skill_tree_cache_skips_repeat_walks(monkeypatch, tmp_path):
     assert calls[-1][1] == 100002
 
 
+def test_managed_skill_tree_cache_notices_in_package_updates(
+    monkeypatch, tmp_path
+):
+    """技能热更新通常只落在包内子目录，顶层包的时间戳不会动。"""
+
+    skills_root = tmp_path / "skills"
+    scripts = skills_root / "pkg-a" / "scripts"
+    scripts.mkdir(parents=True)
+    (scripts / "run.sh").write_text("echo old\n", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(
+        local_module,
+        "_normalize_managed_skill_package",
+        lambda package, gid: calls.append((package.name, gid)),
+    )
+    local_module._MANAGED_SKILL_TREE_PREPARED.clear()
+
+    local_module._prepare_managed_skill_tree(skills_root, 100001)
+    assert len(calls) == 1
+    package_mtime = os.stat(skills_root / "pkg-a").st_mtime_ns
+
+    (scripts / "extra.py").write_text("print(1)\n", encoding="utf-8")
+    # +1s 而不是 +1ns：NTFS 时间戳粒度 100ns，会把 +1ns 截没
+    info = os.stat(scripts)
+    os.utime(scripts, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
+    # 顶层包自己没被动过——只按包判定的旧指纹正是在这里恒命中缓存
+    assert os.stat(skills_root / "pkg-a").st_mtime_ns == package_mtime
+
+    local_module._prepare_managed_skill_tree(skills_root, 100001)
+    assert len(calls) == 2
+
+
+def test_managed_skill_tree_oversized_tree_never_caches(monkeypatch, tmp_path):
+    """指纹装不下就不缓存：每次重新放权很慢，但不会静默停止放权。"""
+
+    skills_root = tmp_path / "skills"
+    (skills_root / "pkg-a" / "scripts").mkdir(parents=True)
+    monkeypatch.setattr(local_module, "_MANAGED_SKILL_TREE_MAX_ENTRIES", 1)
+    calls = []
+    monkeypatch.setattr(
+        local_module,
+        "_normalize_managed_skill_package",
+        lambda package, gid: calls.append((package.name, gid)),
+    )
+    local_module._MANAGED_SKILL_TREE_PREPARED.clear()
+
+    local_module._prepare_managed_skill_tree(skills_root, 100001)
+    local_module._prepare_managed_skill_tree(skills_root, 100001)
+
+    assert len(calls) == 2
+    assert str(skills_root) not in local_module._MANAGED_SKILL_TREE_PREPARED
+
+
 def test_managed_skill_tree_bad_package_does_not_block_others(
     monkeypatch, tmp_path
 ):
