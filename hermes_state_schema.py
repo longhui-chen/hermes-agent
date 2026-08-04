@@ -10,6 +10,7 @@ module-level constants live in hermes_state_common.
 
 import logging
 import json
+import re
 import sqlite3
 from typing import Dict, Optional
 
@@ -569,6 +570,104 @@ class SessionSchemaMixin:
         finally:
             cursor.execute("PRAGMA foreign_keys=ON")
 
+    @staticmethod
+    def _calendar_delivery_index_is_valid(conn: sqlite3.Connection) -> bool:
+        """Return whether the calendar idempotency index has its exact contract."""
+        index_row = None
+        for row in conn.execute('PRAGMA index_list("messages")').fetchall():
+            name = row["name"] if isinstance(row, sqlite3.Row) else row[1]
+            if name == "idx_messages_calendar_delivery":
+                index_row = row
+                break
+        if index_row is None:
+            return False
+        unique = index_row["unique"] if isinstance(index_row, sqlite3.Row) else index_row[2]
+        partial = index_row["partial"] if isinstance(index_row, sqlite3.Row) else index_row[4]
+        if int(unique) != 1 or int(partial) != 1:
+            return False
+        columns = [
+            row["name"] if isinstance(row, sqlite3.Row) else row[2]
+            for row in conn.execute(
+                'PRAGMA index_info("idx_messages_calendar_delivery")'
+            ).fetchall()
+        ]
+        if columns != ["calendar_delivery_key", "calendar_delivery_generation"]:
+            return False
+        sql_row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            ("idx_messages_calendar_delivery",),
+        ).fetchone()
+        sql = (
+            sql_row["sql"] if isinstance(sql_row, sqlite3.Row) else sql_row[0]
+        ) if sql_row else ""
+        predicate = re.search(
+            r"\bWHERE\s+(.+?)\s*$", sql or "", re.IGNORECASE | re.DOTALL
+        )
+        return bool(
+            predicate
+            and " ".join(predicate.group(1).split()).lower()
+            == "calendar_delivery_key is not null"
+        )
+
+    def _migrate_calendar_delivery_index(self, conn: sqlite3.Connection) -> None:
+        """Atomically install the generation-scoped calendar delivery index."""
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error as exc:
+            raise RuntimeError(
+                f"calendar delivery index migration failed: {exc}"
+            ) from exc
+        try:
+            if not self._calendar_delivery_index_is_valid(conn):
+                conn.execute("DROP INDEX IF EXISTS idx_messages_calendar_delivery")
+            conn.execute(
+                "UPDATE messages SET calendar_delivery_generation = '1' "
+                "WHERE calendar_delivery_key IS NOT NULL "
+                "AND calendar_delivery_generation IS NULL"
+            )
+            duplicate = conn.execute(
+                "SELECT calendar_delivery_key, calendar_delivery_generation "
+                "FROM messages WHERE calendar_delivery_key IS NOT NULL "
+                "GROUP BY calendar_delivery_key, calendar_delivery_generation "
+                "HAVING COUNT(*) > 1 LIMIT 1"
+            ).fetchone()
+            if duplicate is not None:
+                raise RuntimeError(
+                    "calendar delivery index migration failed: duplicate legacy "
+                    "rows require manual resolution"
+                )
+            if not self._calendar_delivery_index_is_valid(conn):
+                conn.execute(
+                    "CREATE UNIQUE INDEX idx_messages_calendar_delivery "
+                    "ON messages(calendar_delivery_key, calendar_delivery_generation) "
+                    "WHERE calendar_delivery_key IS NOT NULL"
+                )
+            if not self._calendar_delivery_index_is_valid(conn):
+                raise RuntimeError(
+                    "calendar delivery index migration failed: installed index "
+                    "does not satisfy unique columns and partial predicate invariant"
+                )
+            conn.commit()
+        except BaseException as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            if not isinstance(exc, Exception):
+                raise
+            if isinstance(exc, RuntimeError) and str(exc).startswith(
+                "calendar delivery index migration failed:"
+            ):
+                raise
+            if isinstance(exc, sqlite3.IntegrityError) and "UNIQUE constraint failed" in str(exc):
+                raise RuntimeError(
+                    "calendar delivery index migration failed: duplicate legacy "
+                    "rows require manual resolution"
+                ) from exc
+            raise RuntimeError(
+                f"calendar delivery index migration failed: {exc}"
+            ) from exc
+
     def _init_schema(self):
         """Create tables and FTS if they don't exist, reconcile columns.
 
@@ -603,6 +702,27 @@ class SessionSchemaMixin:
         # landed — the version-gated rebuild is unreachable there, #73823).
         # Same PK-rebuild constraint as gateway_routing above.
         self._heal_session_model_usage_pk(cursor)
+
+        # Legacy reversible calendar sessions predate the model-visibility
+        # boundary. Preserve them for display/audit while quarantining them
+        # from every model and search consumer.
+        cursor.execute(
+            r"""UPDATE sessions
+               SET model_history_cutoff_message_id = COALESCE(
+                       (SELECT MAX(m.id) FROM messages m WHERE m.session_id = sessions.id), 0
+                   ), archived = 1
+               WHERE id LIKE 'u64\_%:main:calendar-reminders' ESCAPE '\'
+                 AND model_history_cutoff_message_id = 0"""
+        )
+        cursor.execute(
+            r"""UPDATE messages SET llm_visible = 0
+               WHERE session_id IN (
+                   SELECT id FROM sessions
+                   WHERE id LIKE 'u64\_%:main:calendar-reminders' ESCAPE '\'
+               )"""
+        )
+
+        self._migrate_calendar_delivery_index(self._conn)
 
         # Indexes that reference reconciler-added columns must be created
         # AFTER _reconcile_columns runs — declaring them in SCHEMA_SQL

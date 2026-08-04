@@ -46,22 +46,66 @@ class TestEnsureHermesHome:
             ensure_hermes_home()
             soul_path = tmp_path / "SOUL.md"
             assert soul_path.exists()
-            assert soul_path.read_text(encoding="utf-8").strip() != ""
+            content = soul_path.read_text(encoding="utf-8").strip()
+            assert content != ""
+            assert "specialized persona" in content
+            assert "Zettlab Memo" not in content
+
+    @pytest.mark.parametrize("profile", ["writer", "main", "memo", "default", "root"])
+    def test_zettlab_managed_profile_does_not_seed_soul(self, tmp_path, profile):
+        profile_home = tmp_path / "profiles" / profile
+        profile_home.mkdir(parents=True)
+        with patch.dict(
+            os.environ,
+            {"HERMES_HOME": str(profile_home), "ZET_AGENT_ID": profile},
+        ):
+            ensure_hermes_home()
+
+        assert not (profile_home / "SOUL.md").exists()
+
+    def test_context_local_zettlab_profile_home_does_not_seed_soul(self, tmp_path):
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        root_home = tmp_path / ".hermes"
+        profile_home = root_home / "profiles" / "writer"
+        profile_home.mkdir(parents=True)
+        with patch.dict(
+            os.environ,
+            {"HERMES_HOME": str(root_home), "ZET_AGENT_ID": "main"},
+        ):
+            token = set_hermes_home_override(profile_home)
+            try:
+                ensure_hermes_home()
+            finally:
+                reset_hermes_home_override(token)
+
+        assert not (profile_home / "SOUL.md").exists()
 
 
-    def test_upgrades_legacy_template_soul_md(self, tmp_path):
-        # Older installers seeded a comment-only scaffold that shadowed the
-        # runtime default. A SOUL.md still matching that scaffold carries no
-        # user persona and should be upgraded in place to DEFAULT_SOUL_MD.
-        from hermes_cli.default_soul import DEFAULT_SOUL_MD, _LEGACY_TEMPLATE_SOULS
-
+    @pytest.mark.parametrize(
+        "existing",
+        [
+            "You are Zettlab Memo, an intelligent AI assistant.",
+            '<agent_persona id="zettlab-memo"><name>Zettlab Memo</name></agent_persona>',
+            "# Hub Agent\n\nPackage-authored specialist persona.",
+            "# Hermes Agent Persona\n\n<!-- historical scaffold -->",
+        ],
+    )
+    def test_never_migrates_existing_profile_owned_soul(self, tmp_path, existing):
         with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
             soul_path = tmp_path / "SOUL.md"
-            soul_path.write_text(_LEGACY_TEMPLATE_SOULS[0] + "\n", encoding="utf-8")
+            soul_path.write_text(existing, encoding="utf-8")
             ensure_hermes_home()
-            assert soul_path.read_text(encoding="utf-8") == DEFAULT_SOUL_MD
+            assert soul_path.read_text(encoding="utf-8") == existing
 
 
+    def test_installer_and_docker_souls_match_neutral_default(self):
+        from hermes_cli.default_soul import DEFAULT_SOUL_MD
+
+        root = Path(__file__).resolve().parents[2]
+        assert DEFAULT_SOUL_MD in (root / "scripts" / "install.sh").read_text(encoding="utf-8")
+        assert DEFAULT_SOUL_MD in (root / "scripts" / "install.ps1").read_text(encoding="utf-8")
+        assert (root / "docker" / "SOUL.md").read_text(encoding="utf-8").rstrip("\n") == DEFAULT_SOUL_MD
 
 
 

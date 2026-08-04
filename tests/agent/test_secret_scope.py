@@ -91,6 +91,19 @@ class TestScopedSingleProfile:
         finally:
             ss.reset_secret_scope(token)
 
+    @pytest.mark.parametrize(
+        "name,value",
+        [
+            ("HERMES_CRON_MAX_PARALLEL", "1"),
+            ("HERMES_CRON_TIMEOUT", "1200"),
+            ("HERMES_CRON_SCRIPT_TIMEOUT", "30"),
+        ],
+    )
+    def test_cron_operational_env_is_global(self, monkeypatch, name, value):
+        monkeypatch.setenv(name, value)
+        ss.set_multiplex_active(True)
+        assert ss.get_secret(name) == value
+
 
 class TestScopeIsolation:
     """Two scopes never see each other's secrets."""

@@ -10,6 +10,7 @@ import time
 import pytest
 from unittest.mock import MagicMock, patch
 
+from hermes_cli.config import get_hermes_home
 from tools.environments.local import _HERMES_PROVIDER_ENV_FORCE_PREFIX
 from tools.process_registry import (
     ProcessRegistry,
@@ -397,6 +398,41 @@ class TestOrphanedPipeReconciliation:
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
+
+    @pytest.mark.live_system_guard_bypass
+    def test_reconcile_noop_when_child_still_running(self, registry):
+        """Reconcile must NOT flip exited when the direct child is alive."""
+        proc = _spawn_python_sleep(5.0)
+        s = _make_session(sid="proc_running_test")
+        s.process = proc
+        s.pid = proc.pid
+        registry._running[s.id] = s
+
+        result = registry.poll(s.id)
+        assert result["status"] == "running"
+        assert s.exited is False
+
+        proc.kill()
+        proc.wait()
+
+    def test_reconcile_noop_on_already_exited(self, registry):
+        """Reconcile is a no-op when session.exited is already True."""
+        s = _make_session(sid="proc_already_exited", exited=True, exit_code=7)
+        s.process = MagicMock()
+        s.process.poll = MagicMock(return_value=0)  # Would say exit 0
+        registry._finished[s.id] = s
+
+        registry._reconcile_local_exit(s)
+        # Must not overwrite the existing exit_code with proc.poll()'s 0.
+        assert s.exit_code == 7
+
+    def test_reconcile_noop_on_no_process(self, registry):
+        """Reconcile is a no-op for sessions without a local Popen (env/PTY)."""
+        s = _make_session(sid="proc_no_popen")
+        assert getattr(s, "process", None) is None
+        # Must not raise.
+        registry._reconcile_local_exit(s)
+        assert s.exited is False
 
     def test_wait_returns_when_reader_blocked(self, registry):
         """wait() must also reconcile — not just poll()."""
@@ -879,10 +915,102 @@ class TestCheckpoint:
             "pid": 999999999,  # almost certainly not running
             "task_id": "t1",
         }]))
-        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+        with (
+            patch("tools.process_registry.CHECKPOINT_PATH", checkpoint),
+            patch.object(ProcessRegistry, "_is_host_pid_alive", return_value=False),
+        ):
             recovered = registry.recover_from_checkpoint()
             assert recovered == 0
 
+    def test_write_checkpoint_includes_watcher_metadata(self, registry, tmp_path):
+        with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"):
+            s = _make_session()
+            s.watcher_platform = "telegram"
+            s.watcher_chat_id = "999"
+            s.watcher_user_id = "u123"
+            s.watcher_user_name = "alice"
+            s.watcher_thread_id = "42"
+            s.watcher_interval = 60
+            registry._running[s.id] = s
+            registry._write_checkpoint()
+
+            data = json.loads((tmp_path / "procs.json").read_text())
+            assert len(data) == 1
+            assert data[0]["watcher_platform"] == "telegram"
+            assert data[0]["watcher_chat_id"] == "999"
+            assert data[0]["watcher_user_id"] == "u123"
+            assert data[0]["watcher_user_name"] == "alice"
+            assert data[0]["watcher_thread_id"] == "42"
+            assert data[0]["watcher_interval"] == 60
+
+    def test_recover_enqueues_watchers(self, registry, tmp_path):
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_live",
+            "command": "sleep 999",
+            "pid": os.getpid(),  # current process — guaranteed alive
+            "host_start_time": registry._safe_host_start_time(os.getpid()),
+            "task_id": "t1",
+            "session_key": "sk1",
+            "profile_owner": str(get_hermes_home().expanduser().resolve()),
+            "watcher_platform": "telegram",
+            "watcher_chat_id": "123",
+            "watcher_user_id": "u123",
+            "watcher_user_name": "alice",
+            "watcher_thread_id": "42",
+            "watcher_interval": 60,
+        }]))
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            recovered = registry.recover_from_checkpoint()
+            assert recovered == 1
+            assert len(registry.pending_watchers) == 1
+            w = registry.pending_watchers[0]
+            assert w["session_id"] == "proc_live"
+            assert w["platform"] == "telegram"
+            assert w["chat_id"] == "123"
+            assert w["user_id"] == "u123"
+            assert w["user_name"] == "alice"
+            assert w["thread_id"] == "42"
+            assert w["check_interval"] == 60
+
+    def test_recover_skips_watcher_when_no_interval(self, registry, tmp_path):
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_live",
+            "command": "sleep 999",
+            "pid": os.getpid(),
+            "host_start_time": registry._safe_host_start_time(os.getpid()),
+            "task_id": "t1",
+            "profile_owner": str(get_hermes_home().expanduser().resolve()),
+            "watcher_interval": 0,
+        }]))
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            recovered = registry.recover_from_checkpoint()
+            assert recovered == 1
+            assert len(registry.pending_watchers) == 0
+
+    def test_recovery_keeps_live_checkpoint_entries(self, registry, tmp_path):
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_live",
+            "command": "sleep 999",
+            "pid": os.getpid(),
+            "host_start_time": registry._safe_host_start_time(os.getpid()),
+            "task_id": "t1",
+            "session_key": "sk1",
+            "profile_owner": str(get_hermes_home().expanduser().resolve()),
+        }]))
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            recovered = registry.recover_from_checkpoint()
+            assert recovered == 1
+            assert registry.get("proc_live") is not None
+
+            data = json.loads(checkpoint.read_text())
+            assert len(data) == 1
+            assert data[0]["session_id"] == "proc_live"
+            assert data[0]["pid"] == os.getpid()
+            assert data != []
 
     def test_recovery_skips_explicit_sandbox_backed_entries(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
@@ -902,6 +1030,52 @@ class TestCheckpoint:
 
             data = json.loads(checkpoint.read_text())
             assert data == []
+
+    @pytest.mark.live_system_guard_bypass
+    def test_detached_recovered_process_eventually_exits(self, registry, tmp_path):
+        proc = _spawn_python_sleep(0.4)
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_live",
+            "command": "python -c 'import time; time.sleep(0.4)'",
+            "pid": proc.pid,
+            "host_start_time": registry._safe_host_start_time(proc.pid),
+            "task_id": "t1",
+            "session_key": "sk1",
+            "profile_owner": str(get_hermes_home().expanduser().resolve()),
+        }]))
+
+        try:
+            with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+                recovered = registry.recover_from_checkpoint()
+                assert recovered == 1
+
+                session = registry.get("proc_live")
+                assert session is not None
+                assert session.detached is True
+
+                proc.wait(timeout=5)
+
+                assert _wait_until(
+                    lambda: registry.get("proc_live") is not None
+                    and registry.get("proc_live").exited,
+                    timeout=5,
+                )
+
+                poll_result = registry.poll("proc_live")
+                assert poll_result["status"] == "exited"
+
+                wait_result = registry.wait("proc_live", timeout=1)
+                assert wait_result["status"] == "exited"
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    proc.kill()
+                    proc.wait(timeout=5)
+
 
 # =========================================================================
 # Kill process
@@ -1220,6 +1394,85 @@ class TestPidReuseGuard:
             proc.kill()
             proc.wait()
 
+    def test_terminate_kills_when_start_time_matches(self, registry):
+        """The genuine process (start time matches) IS terminated."""
+        proc = _spawn_python_sleep(30)
+        try:
+            real_start = ProcessRegistry._safe_host_start_time(proc.pid)
+            registry._terminate_host_pid(proc.pid, expected_start=real_start)
+            assert _wait_until(lambda: proc.poll() is not None, timeout=5.0)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+    def test_terminate_without_baseline_is_best_effort(self, registry):
+        """No baseline (legacy) → degrade to prior unconditional behaviour."""
+        proc = _spawn_python_sleep(30)
+        try:
+            registry._terminate_host_pid(proc.pid)  # expected_start=None
+            assert _wait_until(lambda: proc.poll() is not None, timeout=5.0)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+    def test_recover_skips_recycled_pid(self, registry, tmp_path):
+        """Checkpoint PID is alive but its start time changed → not adopted."""
+        wrong_start = (ProcessRegistry._safe_host_start_time(os.getpid()) or 0) + 999
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_recycled",
+            "command": "sleep 999",
+            "pid": os.getpid(),            # alive...
+            "pid_scope": "host",
+            "host_start_time": wrong_start,  # ...but a different process now
+            "task_id": "t1",
+        }]))
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert registry.recover_from_checkpoint() == 0
+            assert len(registry._running) == 0
+
+    def test_recover_adopts_when_start_time_matches(self, registry, tmp_path):
+        """Checkpoint PID alive AND start time matches → adopted as before."""
+        real_start = ProcessRegistry._safe_host_start_time(os.getpid())
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_match",
+            "command": "sleep 999",
+            "pid": os.getpid(),
+            "pid_scope": "host",
+            "host_start_time": real_start,
+            "task_id": "t1",
+            "profile_owner": str(get_hermes_home().expanduser().resolve()),
+        }]))
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert registry.recover_from_checkpoint() == 1
+
+    def test_checkpoint_without_start_time_fails_closed(self, registry, tmp_path):
+        """A bare live PID is never adopted without an immutable baseline."""
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_legacy",
+            "command": "sleep 999",
+            "pid": os.getpid(),
+            "pid_scope": "host",
+            "task_id": "t1",
+            "profile_owner": str(get_hermes_home().expanduser().resolve()),
+        }]))
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert registry.recover_from_checkpoint() == 0
+
+    def test_write_checkpoint_backfills_host_start_time(self, registry, tmp_path):
+        """A host session is checkpointed with a kernel start time recorded."""
+        with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"):
+            s = _make_session()
+            s.pid = os.getpid()
+            s.pid_scope = "host"
+            registry._running[s.id] = s
+            registry._write_checkpoint()
+            data = json.loads((tmp_path / "procs.json").read_text())
+            assert data[0]["host_start_time"] is not None
 
     def test_refresh_detached_marks_recycled_pid_exited(self, registry):
         """A detached session whose PID got recycled is moved to finished."""

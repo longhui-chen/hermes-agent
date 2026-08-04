@@ -18,6 +18,40 @@ class _FakeAdapter:
         self.config = config
 
 
+class _DirectProfileAdapter:
+    platform = Platform.TELEGRAM
+
+    def set_message_handler(self, handler):
+        self.message_handler = handler
+
+    def set_fatal_error_handler(self, handler):
+        self.fatal_error_handler = handler
+
+    def set_session_store(self, store):
+        self.session_store = store
+
+    def set_busy_session_handler(self, handler):
+        self.busy_session_handler = handler
+
+    def set_topic_recovery_fn(self, handler):
+        self.topic_recovery_fn = handler
+
+    def set_authorization_check(self, handler):
+        self.authorization_check = handler
+
+
+def _multiplex_profile_runner():
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._profile_adapters = {}
+    runner.session_store = object()
+    runner._handle_active_session_busy_message = object()
+    runner._recover_telegram_topic_thread_id = object()
+    runner._busy_text_mode = "queue"
+    runner._make_adapter_auth_check = lambda platform, profile_name=None: object()
+    return runner
+
+
 class TestCredentialFingerprint:
     def test_none_without_token(self):
         assert GatewayRunner._adapter_credential_fingerprint(_FakeAdapter()) is None
@@ -241,6 +275,40 @@ class TestSecondaryProfileFatalRecovery:
 class TestSecondaryProfileConfigHandling:
     """Secondary config errors degrade only when the profile is safe to skip."""
 
+    @pytest.mark.asyncio
+    async def test_secondary_webhook_uses_degradable_error(self, monkeypatch):
+        from gateway.run import SecondaryPortBindingConfigError
+class TestPortBindingSkip:
+    """A secondary profile enabling a port-binding platform is skipped."""
+
+    @pytest.mark.asyncio
+    async def test_secondary_webhook_skips_listener(self, monkeypatch):
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+        from gateway.run import SecondaryPortBindingConfigError
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._profile_adapters = {}
+
+        # reviewer profile config enables webhook (a port-binding platform)
+        reviewer_cfg = GatewayConfig(multiplex_profiles=True)
+        reviewer_cfg.platforms = {
+            Platform.WEBHOOK: PlatformConfig(enabled=True, extra={"port": 8644}),
+        }
+        monkeypatch.setattr(
+            "gateway.config.load_gateway_config", lambda: reviewer_cfg
+        )
+        monkeypatch.setattr(
+            runner,
+            "_create_adapter",
+            lambda *_: pytest.fail("port-binding adapter should be skipped"),
+        )
+
+        with pytest.raises(SecondaryPortBindingConfigError) as exc_info:
+            await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
+        assert "webhook" in str(exc_info.value)
+        assert "reviewer" in str(exc_info.value)
+        assert "reviewer" not in runner._profile_adapters
 
     @pytest.mark.asyncio
     async def test_secondary_reports_all_port_binding_platforms(self, monkeypatch):
@@ -364,13 +432,288 @@ class TestSecondaryProfileConfigHandling:
                 self._sidecar_port = port
                 self.platform = Platform("photon")
                 self.connected = False
-                self.disconnected = False
-                self.config = PlatformConfig(enabled=True)
+        class _DirectAdapter:
+            platform = Platform.TELEGRAM
 
-            def __getattr__(self, name):
-                if name.startswith("set_"):
-                    return lambda *args, **kwargs: None
-                raise AttributeError(name)
+            def set_message_handler(self, handler):
+                self.message_handler = handler
+
+            def set_fatal_error_handler(self, handler):
+                self.fatal_error_handler = handler
+
+            def set_session_store(self, store):
+                self.session_store = store
+
+            def set_busy_session_handler(self, handler):
+                self.busy_session_handler = handler
+
+            def set_topic_recovery_fn(self, handler):
+                self.topic_recovery_fn = handler
+
+            def set_authorization_check(self, handler):
+                self.authorization_check = handler
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._profile_adapters = {}
+        runner.session_store = object()
+        runner._handle_adapter_fatal_error = object()
+        runner._handle_active_session_busy_message = object()
+        runner._recover_telegram_topic_thread_id = object()
+        runner._busy_text_mode = "queue"
+        runner._make_adapter_auth_check = lambda platform, profile_name=None: object()
+
+        reviewer_cfg = GatewayConfig(multiplex_profiles=True)
+        reviewer_cfg.platforms = {
+            Platform.RELAY: PlatformConfig(enabled=True),
+            Platform.TELEGRAM: PlatformConfig(enabled=True, token="reviewer-token"),
+        }
+        monkeypatch.setattr(
+            "gateway.config.load_gateway_config", lambda: reviewer_cfg
+        )
+
+        direct = _DirectAdapter()
+        factory_calls = []
+
+        def _create_adapter(platform, config):
+            factory_calls.append(platform)
+            if platform is Platform.RELAY:
+                raise AssertionError("secondary Relay factory must not be invoked")
+            return direct
+
+        connect_calls = []
+
+        async def _connect(adapter, platform):
+            connect_calls.append((adapter, platform))
+            return True
+
+        monkeypatch.setattr(runner, "_create_adapter", _create_adapter)
+        monkeypatch.setattr(runner, "_connect_adapter_with_timeout", _connect)
+
+        connected = await runner._start_one_profile_adapters(
+            "reviewer", "/tmp/x", {}
+        )
+
+        assert connected == 1
+        assert factory_calls == [Platform.TELEGRAM]
+        assert connect_calls == [(direct, Platform.TELEGRAM)]
+        assert runner._profile_adapters["reviewer"] == {
+            Platform.TELEGRAM: direct,
+        }
+
+    @pytest.mark.asyncio
+    async def test_multiplex_secondary_skips_shared_zet_listener_but_starts_direct_adapter(
+        self, monkeypatch
+    ):
+        """Zet ingress is process-shared; direct adapters remain per-profile."""
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+        runner = _multiplex_profile_runner()
+
+        reviewer_cfg = GatewayConfig(multiplex_profiles=True)
+        reviewer_cfg.platforms = {
+            Platform.ZET_AGENT: PlatformConfig(
+                enabled=True,
+                extra={"host": "127.0.0.1", "port": 7900},
+            ),
+            Platform.TELEGRAM: PlatformConfig(
+                enabled=True,
+                token="reviewer-token",
+            ),
+        }
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: reviewer_cfg)
+
+        direct = _DirectProfileAdapter()
+        factory_calls = []
+
+        def _create_adapter(platform, config):
+            factory_calls.append(platform)
+            return direct
+
+        connect_calls = []
+
+        async def _connect(adapter, platform):
+            connect_calls.append((adapter, platform))
+            return True
+
+        monkeypatch.setattr(runner, "_create_adapter", _create_adapter)
+        monkeypatch.setattr(runner, "_connect_adapter_with_timeout", _connect)
+
+        connected = await runner._start_one_profile_adapters(
+            "reviewer", "/tmp/x", {}
+        )
+
+        assert connected == 1
+        assert factory_calls == [Platform.TELEGRAM]
+        assert connect_calls == [(direct, Platform.TELEGRAM)]
+        assert runner._profile_adapters["reviewer"] == {
+            Platform.TELEGRAM: direct,
+        }
+
+    @pytest.mark.asyncio
+    async def test_global_zet_env_keeps_secondary_served_without_second_listener(
+        self, tmp_path, monkeypatch
+    ):
+        """Process-wide Zet config must not become a per-profile listener."""
+        from gateway.config import GatewayConfig, Platform, load_gateway_config
+
+        default_home = tmp_path / "default"
+        worker_home = tmp_path / "worker"
+        default_home.mkdir()
+        worker_home.mkdir()
+        (worker_home / ".env").write_text(
+            "TELEGRAM_BOT_TOKEN=worker-token\n",
+            encoding="utf-8",
+        )
+        (worker_home / "config.yaml").write_text(
+            "multiplex_profiles: true\n",
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("ZET_AGENT_ENABLED", "true")
+        monkeypatch.setenv("ZET_AGENT_HOST", "127.0.0.1")
+        monkeypatch.setenv("ZET_AGENT_PORT", "7900")
+        monkeypatch.setattr(
+            "hermes_cli.profiles.profiles_to_serve",
+            lambda multiplex: [
+                ("default", default_home),
+                ("worker", worker_home),
+            ],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_active_profile_name",
+            lambda: "default",
+        )
+        resolved_configs = []
+
+        def _load_profile_config():
+            config = load_gateway_config()
+            resolved_configs.append(config)
+            return config
+
+        monkeypatch.setattr("gateway.config.load_gateway_config", _load_profile_config)
+
+        runner = _multiplex_profile_runner()
+        shared_zet_adapter = object()
+        runner.adapters = {Platform.ZET_AGENT: shared_zet_adapter}
+        runner.pairing_stores = {"default": object(), "worker": object()}
+
+        direct = _DirectProfileAdapter()
+        factory_calls = []
+
+        def _create_adapter(platform, config):
+            factory_calls.append(platform)
+            return direct
+
+        connect_calls = []
+
+        async def _connect(adapter, platform):
+            connect_calls.append((adapter, platform))
+            return True
+
+        monkeypatch.setattr(runner, "_create_adapter", _create_adapter)
+        monkeypatch.setattr(runner, "_connect_adapter_with_timeout", _connect)
+        status_updates = []
+        monkeypatch.setattr(
+            "gateway.status.write_runtime_status",
+            lambda **kwargs: status_updates.append(kwargs),
+        )
+
+        connected = await runner._start_secondary_profile_adapters()
+
+        assert connected == 1
+        assert len(resolved_configs) == 1
+        injected_zet = resolved_configs[0].platforms[Platform.ZET_AGENT]
+        assert injected_zet.enabled is True
+        assert injected_zet.extra["port"] == 7900
+        assert runner.adapters == {Platform.ZET_AGENT: shared_zet_adapter}
+        assert factory_calls == [Platform.TELEGRAM]
+        assert connect_calls == [(direct, Platform.TELEGRAM)]
+        assert runner._profile_adapters["worker"] == {
+            Platform.TELEGRAM: direct,
+        }
+        assert status_updates[-1] == {
+            "served_profiles": ["default", "worker"],
+        }
+        assert all("platform" not in update for update in status_updates)
+
+    @pytest.mark.asyncio
+    async def test_non_multiplex_profile_adapter_start_keeps_relay(self, monkeypatch):
+        """The Relay skip is gated to multiplex mode."""
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+        class _RelayAdapter:
+            platform = Platform.RELAY
+
+            def set_message_handler(self, handler):
+                pass
+
+            def set_fatal_error_handler(self, handler):
+                pass
+
+            def set_session_store(self, store):
+                pass
+
+            def set_busy_session_handler(self, handler):
+                pass
+
+            def set_topic_recovery_fn(self, handler):
+                pass
+
+            def set_authorization_check(self, handler):
+                pass
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=False)
+        runner._profile_adapters = {}
+        runner.session_store = object()
+        runner._handle_adapter_fatal_error = object()
+        runner._handle_active_session_busy_message = object()
+        runner._recover_telegram_topic_thread_id = object()
+        runner._busy_text_mode = "queue"
+        runner._make_adapter_auth_check = lambda platform, profile_name=None: object()
+
+        profile_cfg = GatewayConfig(multiplex_profiles=False)
+        profile_cfg.platforms = {
+            Platform.RELAY: PlatformConfig(enabled=True),
+        }
+        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: profile_cfg)
+
+        relay = _RelayAdapter()
+        factory_calls = []
+        connect_calls = []
+
+        def _create_adapter(platform, config):
+            factory_calls.append(platform)
+            return relay
+
+        async def _connect(adapter, platform):
+            connect_calls.append((adapter, platform))
+            return True
+
+        monkeypatch.setattr(runner, "_create_adapter", _create_adapter)
+        monkeypatch.setattr(runner, "_connect_adapter_with_timeout", _connect)
+
+        connected = await runner._start_one_profile_adapters(
+            "reviewer", "/tmp/x", {}
+        )
+
+        assert connected == 1
+        assert factory_calls == [Platform.RELAY]
+        assert connect_calls == [(relay, Platform.RELAY)]
+
+    @pytest.mark.asyncio
+    async def test_secondary_same_config_token_is_refused(self, monkeypatch):
+        """Adapters that keep their token on config still trip the mux guard."""
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+
+        class _ConfigTokenAdapter:
+            def __init__(self, token):
+                self.config = PlatformConfig(enabled=True, token=token)
+                self.disconnected = False
+
+            async def connect(self):
+                raise AssertionError("duplicate adapter must not connect")
 
             async def disconnect(self):
                 self.disconnected = True
@@ -378,37 +721,37 @@ class TestSecondaryProfileConfigHandling:
         runner = GatewayRunner.__new__(GatewayRunner)
         runner.config = GatewayConfig(multiplex_profiles=True)
         runner._profile_adapters = {}
-        runner.session_store = None
-        runner._busy_text_mode = "queue"
 
-        photon = Platform("photon")
         reviewer_cfg = GatewayConfig(multiplex_profiles=True)
-        reviewer_cfg.platforms = {photon: PlatformConfig(enabled=True)}
-        primary = _PhotonAdapter("primary-secret", 8789)
-        secondary = _PhotonAdapter("different-secret", 8790)
+        reviewer_cfg.platforms = {
+            Platform.TELEGRAM: PlatformConfig(enabled=True, token="same-token"),
+        }
+        duplicate = _ConfigTokenAdapter("same-token")
         claimed = {
-            GatewayRunner._adapter_listener_claim(photon, primary): "default"
+            (
+                Platform.TELEGRAM,
+                GatewayRunner._adapter_credential_fingerprint(
+                    _ConfigTokenAdapter("same-token")
+                ),
+            ): "default"
         }
 
-        async def _connect(adapter, platform):
-            adapter.connected = True
-            return True
-
-        monkeypatch.setattr("gateway.config.load_gateway_config", lambda: reviewer_cfg)
-        monkeypatch.setattr(runner, "_create_adapter", lambda p, c: secondary)
-        monkeypatch.setattr(runner, "_connect_adapter_with_timeout", _connect)
         monkeypatch.setattr(
-            runner, "_make_adapter_auth_check", lambda p, **kwargs: None
+            "gateway.config.load_gateway_config", lambda: reviewer_cfg
         )
+        monkeypatch.setattr(runner, "_create_adapter", lambda p, c: duplicate)
+        monkeypatch.setattr(runner, "_adapter_disconnect_timeout_secs", lambda: 0)
 
         connected = await runner._start_one_profile_adapters(
             "reviewer", "/tmp/x", claimed
         )
 
-        assert connected == 1
-        assert secondary.connected is True
-        assert secondary.disconnected is False
-        assert runner._profile_adapters["reviewer"][photon] is secondary
+        assert connected == 0
+        # The merged registry now rejects a duplicate from its config
+        # fingerprint before the adapter is started, so there is nothing to
+        # disconnect.
+        assert duplicate.disconnected is False
+        assert runner._profile_adapters["reviewer"] == {}
 
     @pytest.mark.asyncio
     async def test_failed_photon_connect_releases_listener_for_later_profile(
@@ -467,6 +810,24 @@ class TestSecondaryProfileConfigHandling:
         assert second == 1
         assert runner._profile_adapters["later"][photon] is later
 
+    def test_port_binding_set_covers_known_listeners(self):
+        from gateway.run import _PORT_BINDING_PLATFORM_VALUES
+
+        # Every adapter that binds a TCP port must be in the guard set.
+        for p in (
+            "webhook",
+            "api_server",
+            "zet_agent",
+            "msgraph_webhook",
+            "feishu",
+            "wecom_callback",
+            "bluebubbles",
+            "sms",
+            "whatsapp_cloud",
+            "line",
+        ):
+            assert p in _PORT_BINDING_PLATFORM_VALUES
+
 
 class TestFeishuPortBindingConditional:
     """Feishu websocket mode does NOT bind a port; only webhook mode does (#52563)."""
@@ -493,5 +854,3 @@ class TestFeishuPortBindingConditional:
 
         connected = await runner._start_one_profile_adapters("reviewer", "/tmp/x", {})
         assert connected == 0  # no error, just nothing connected
-
-

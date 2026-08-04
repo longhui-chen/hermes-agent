@@ -678,7 +678,11 @@ class BaseEnvironment(ABC):
         _snap_tmp_template = self._quote_shell_path(self._snapshot_path + ".tmp.XXXXXXXXXX")
         _snap_tmp = '"$__hermes_snap_tmp"'
         snapshot_excluded = self._snapshot_excluded_passthrough_names()
+        unset_ephemeral = "\n".join(self._unset_snapshot_ephemeral_env_script())
+        if unset_ephemeral:
+            unset_ephemeral += "\n"
         bootstrap = (
+            unset_ephemeral +
             f"umask 077\n"
             f"__hermes_snap_tmp=$(mktemp {_snap_tmp_template}) || exit 1\n"
             f"{_export_dump_excluding_session_vars(_snap_tmp, snapshot_excluded)}\n"
@@ -778,6 +782,46 @@ class BaseEnvironment(ABC):
         """
         return shlex.quote(path)
 
+    def _snapshot_ephemeral_env_keys(self) -> tuple[str, ...]:
+        """Env keys that must not survive sourcing or re-dumping snapshots."""
+        try:
+            from gateway.session_context import _VAR_MAP, session_context_engaged
+        except Exception:
+            return ()
+
+        # A CLI/one-shot process that never bound ContextVars still relies on
+        # os.environ for compatibility. Concurrent hosts make ContextVars the
+        # authority, so their task-local keys must not persist in snapshots.
+        return tuple(sorted(_VAR_MAP)) if session_context_engaged() else ()
+
+    def _snapshot_ephemeral_env_exports(self) -> list[str]:
+        """Current values to restore after a persistent snapshot is sourced."""
+        try:
+            from gateway.session_context import (
+                _UNSET,
+                _VAR_MAP,
+                session_context_engaged,
+            )
+        except Exception:
+            return []
+
+        if not session_context_engaged():
+            return []
+        exports = []
+        for key, var in _VAR_MAP.items():
+            value = var.get()
+            if value is _UNSET:
+                continue
+            exports.append(f"export {key}={shlex.quote(str(value or ''))}")
+        return exports
+
+    def _unset_snapshot_ephemeral_env_script(self) -> list[str]:
+        lines = []
+        for key in self._snapshot_ephemeral_env_keys():
+            if key and key.replace("_", "").isalnum() and not key[0].isdigit():
+                lines.append(f"unset {key}")
+        return lines
+
     def _wrap_command(self, command: str, cwd: str) -> str:
         """Build the full bash script that sources snapshot, cd's, runs command,
         re-dumps env vars, and emits CWD markers."""
@@ -824,6 +868,8 @@ class BaseEnvironment(ABC):
             parts.append(
                 f"source {_quoted_snap} >/dev/null 2>&1 || true"
             )
+        parts.extend(self._unset_snapshot_ephemeral_env_script())
+        parts.extend(self._snapshot_ephemeral_env_exports())
 
         for name, present, value in saved_names:
             parts.append(
@@ -844,6 +890,7 @@ class BaseEnvironment(ABC):
         # Restrict Hermes metadata files without changing the user's command
         # umask. Snapshot files may contain env-carried secrets.
         parts.append("umask 077")
+        parts.extend(self._unset_snapshot_ephemeral_env_script())
 
         # Re-dump env vars to snapshot (atomic replacement to avoid races).
         # Chain mv on the export succeeding so a failed/partial dump never

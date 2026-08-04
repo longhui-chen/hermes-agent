@@ -747,10 +747,217 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
 # Per-task force-loaded skills
 # ---------------------------------------------------------------------------
 
+def test_create_task_persists_skills(kanban_home):
+    """Task.skills round-trips through create -> get_task."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="skilled task",
+            assignee="linguist",
+            skills=["translation", "requesting-code-review"],
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.skills == ["translation", "requesting-code-review"]
+    finally:
+        conn.close()
 
 
 
 
+def test_create_task_skills_deduplicates_and_strips(kanban_home):
+    """Dup names collapse; whitespace is stripped; empties dropped."""
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="dedupe",
+            assignee="x",
+            skills=["  translation  ", "translation", "", None, "review"],
+        )
+        task = kb.get_task(conn, tid)
+        assert task.skills == ["translation", "review"]
+    finally:
+        conn.close()
+
+
+def test_create_task_skills_rejects_comma_embedded(kanban_home):
+    """Comma in a skill name is rejected — force caller to pass a list."""
+    conn = kb.connect()
+    try:
+        with pytest.raises(ValueError, match="cannot contain comma"):
+            kb.create_task(
+                conn,
+                title="bad",
+                assignee="x",
+                skills=["a,b"],
+            )
+    finally:
+        conn.close()
+
+
+def test_create_task_skills_rejects_toolset_names(kanban_home):
+    """Toolset names belong in profile config, not per-task skills."""
+    conn = kb.connect()
+    try:
+        with pytest.raises(ValueError, match="toolset name"):
+            kb.create_task(
+                conn,
+                title="bad toolset skill",
+                assignee="x",
+                skills=["web", "translation"],
+            )
+    finally:
+        conn.close()
+
+
+def test_create_task_skills_lists_all_toolset_typos(kanban_home):
+    """When several toolset names are passed, the error names every one.
+
+    Agents that confuse skills with toolsets usually pass several at once
+    (``skills=["web", "browser", "terminal"]``). Listing only the first
+    mistake forces serial fix-then-retry; listing all of them lets the
+    caller correct in one round-trip.
+    """
+    conn = kb.connect()
+    try:
+        with pytest.raises(ValueError) as exc_info:
+            kb.create_task(
+                conn,
+                title="three bad",
+                assignee="x",
+                skills=["web", "browser", "terminal"],
+            )
+        msg = str(exc_info.value)
+        assert "'web'" in msg
+        assert "'browser'" in msg
+        assert "'terminal'" in msg
+        # Plural noun form when multiple toolsets are flagged.
+        assert "are toolset names" in msg
+    finally:
+        conn.close()
+
+
+def test_default_spawn_appends_per_task_skills(kanban_home, monkeypatch):
+    """Dispatcher argv must carry one `--skills X` pair per task skill,
+    in declared order. No skill is auto-loaded anymore."""
+    captured = {}
+
+    class FakeProc:
+        def __init__(self):
+            self.pid = 42
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="multi-skill worker",
+            assignee="linguist",
+            skills=["translation", "requesting-code-review"],
+        )
+        task = kb.get_task(conn, tid)
+        workspace = kb.resolve_workspace(task)
+        kb._default_spawn(task, str(workspace))
+    finally:
+        conn.close()
+
+    cmd = captured["cmd"]
+    # Count every --skills pair and gather the skill names.
+    skill_names = []
+    for i, tok in enumerate(cmd):
+        if tok == "--skills" and i + 1 < len(cmd):
+            skill_names.append(cmd[i + 1])
+    # Per-task extras are passed through in order; no built-in kanban skill is
+    # auto-loaded anymore.
+    assert skill_names == ["translation", "requesting-code-review"], skill_names
+    # --skills must appear BEFORE the `chat` subcommand so argparse
+    # attaches them to the top-level parser, not the subcommand.
+    chat_idx = cmd.index("chat")
+    last_skills_idx = max(
+        i for i, tok in enumerate(cmd) if tok == "--skills"
+    )
+    assert last_skills_idx < chat_idx, (
+        f"--skills must come before 'chat' in argv: {cmd}"
+    )
+
+
+def test_default_spawn_passes_task_skills_verbatim(kanban_home, monkeypatch):
+    """Per-task skills are passed through verbatim — there is no built-in
+    kanban skill to dedupe against anymore."""
+    captured = {}
+
+    class FakeProc:
+        pid = 1
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn, title="dup", assignee="x",
+            skills=["translation", "github-code-review"],
+        )
+        task = kb.get_task(conn, tid)
+        workspace = kb.resolve_workspace(task)
+        kb._default_spawn(task, str(workspace))
+    finally:
+        conn.close()
+
+    cmd = captured["cmd"]
+    skill_names = [
+        cmd[i + 1]
+        for i, tok in enumerate(cmd)
+        if tok == "--skills" and i + 1 < len(cmd)
+    ]
+    # Exactly the task's skills, once each, in order — no auto-loaded extras.
+    assert skill_names == ["translation", "github-code-review"], (
+        f"unexpected --skills in argv: {cmd}"
+    )
+
+
+def test_cli_create_skill_flag_repeatable(kanban_home):
+    """`hermes kanban create --skill a --skill b` persists the list."""
+    out = run_slash(
+        "create 'multi-skill' --assignee linguist "
+        "--skill translation --skill requesting-code-review --json"
+    )
+    tid = json.loads(out)["id"]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.skills == ["translation", "requesting-code-review"]
+
+
+def test_cli_create_without_skill_flag_leaves_none(kanban_home):
+    """No --skill on the CLI means Task.skills stays None (not []) —
+    we don't want to silently write [] when the user didn't opt in."""
+    out = run_slash("create 'no-skill' --assignee x --json")
+    tid = json.loads(out)["id"]
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+    assert task.skills is None
+
+
+def test_cli_show_renders_skills(kanban_home):
+    """`hermes kanban show <id>` prints a skills row when present."""
+    out = run_slash(
+        "create 'show-test' --assignee x "
+        "--skill translation --json"
+    )
+    tid = json.loads(out)["id"]
+    shown = run_slash(f"show {tid}")
+    assert "skills:" in shown
+    assert "translation" in shown
 
 
 def test_legacy_db_without_skills_column_migrates(tmp_path):

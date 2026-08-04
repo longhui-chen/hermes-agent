@@ -25,6 +25,7 @@ move-and-name refactor with no semantic change.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 import uuid
@@ -46,6 +47,7 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
 )
+from agent.response_format import response_format_requires_structured_output
 
 logger = logging.getLogger(__name__)
 
@@ -384,7 +386,10 @@ def build_turn_context(
     # Tell auxiliary_client what the live main provider/model are for this turn
     # after primary restoration has settled the runtime.
     try:
-        from agent.auxiliary_client import set_runtime_main
+        from agent.auxiliary_client import (
+            set_runtime_auxiliary_task_configs,
+            set_runtime_main,
+        )
         set_runtime_main(
             getattr(agent, "provider", "") or "",
             getattr(agent, "model", "") or "",
@@ -393,6 +398,9 @@ def build_turn_context(
             api_key=getattr(agent, "api_key", "") or "",
             api_mode=getattr(agent, "api_mode", "") or "",
             auth_mode=getattr(agent, "auth_mode", "") or "",
+        )
+        set_runtime_auxiliary_task_configs(
+            getattr(agent, "runtime_auxiliary_task_configs", None)
         )
     except Exception:
         pass
@@ -579,6 +587,18 @@ def build_turn_context(
 
     # Preserve the original user message (no nudge injection).
     original_user_message = persist_user_message if persist_user_message is not None else user_message
+    agent._current_user_message = (
+        original_user_message if isinstance(original_user_message, str) else ""
+    )
+    agent._previous_assistant_message = ""
+    for historical_message in reversed(messages[:current_turn_user_idx]):
+        if (
+            isinstance(historical_message, dict)
+            and historical_message.get("role") == "assistant"
+            and isinstance(historical_message.get("content"), str)
+        ):
+            agent._previous_assistant_message = historical_message["content"]
+            break
 
     # Track memory nudge trigger (turn-based, checked here).
     should_review_memory = False
@@ -766,9 +786,15 @@ def build_turn_context(
                 agent._turn_preflight_display_snapshot = _snapshot_val
         _defer_preflight = getattr(
             _compressor,
-            "should_defer_preflight_to_real_usage",
-            lambda _tokens: False,
+            "should_defer_rough_estimate_to_real_usage",
+            None,
         )
+        if _defer_preflight is None:
+            _defer_preflight = getattr(
+                _compressor,
+                "should_defer_preflight_to_real_usage",
+                lambda _tokens: False,
+            )
         _preflight_deferred = _defer_preflight(_preflight_tokens)
         # Codex app-server threads are compacted by the codex agent itself;
         # Hermes only initiates compaction in "hermes" mode (#36801).
@@ -1052,6 +1078,9 @@ def build_turn_context(
     plugin_user_context = ""
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+        _structured_output = response_format_requires_structured_output(
+            (getattr(agent, "request_overrides", None) or {}).get("response_format")
+        )
         _pre_results = _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
@@ -1061,9 +1090,21 @@ def build_turn_context(
             conversation_history=list(messages),
             is_first_turn=(not bool(conversation_history)),
             model=agent.model,
+            api_mode=getattr(agent, "api_mode", None) or "",
             platform=getattr(agent, "platform", None) or "",
             parent_session_id=getattr(agent, "_parent_session_id", None) or "",
-            sender_id=getattr(agent, "_user_id", None) or "",
+            sender_id=(
+                getattr(agent, "_user_id_alt", None)
+                or getattr(agent, "_user_id", None)
+                or ""
+            ),
+            execution_origin=getattr(agent, "_memory_write_origin", "") or "",
+            is_kanban_worker=bool(os.environ.get("HERMES_KANBAN_TASK")),
+            structured_output=_structured_output,
+            supports_followup_turns=bool(
+                getattr(agent, "_supports_followup_turns", True)
+            ),
+            streaming_output=bool(getattr(agent, "stream_delta_callback", None)),
         )
         _ctx_parts: list[str] = []
         # Spill oversized per-hook context to disk so a runaway plugin

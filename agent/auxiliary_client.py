@@ -57,6 +57,7 @@ import re
 import threading
 import time
 import uuid
+from contextvars import ContextVar
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING
@@ -784,6 +785,7 @@ def _resolve_provider_vision_default(provider: str) -> Optional[str]:
 # describe as having no image_in capability. Vision lives on the separate
 # Kimi Platform (api.moonshot.ai, OpenAI-wire, pay-as-you-go).  See #17076.
 _PROVIDERS_WITHOUT_VISION: frozenset = frozenset({
+    "deepseek",
     "kimi-coding",
     "kimi-coding-cn",
 })
@@ -812,9 +814,10 @@ def _apply_user_default_headers(headers: dict | None) -> dict | None:
     main turn would succeed but title/compression/vision calls to the same
     endpoint would still fail. (#40033)
 
-    Returns the merged dict, or the original ``headers`` (possibly ``None``)
-    when nothing is configured. No allocation when there are no overrides.
+    Returns the merged dict (user overrides), or the original
+    ``headers`` (possibly ``None``) when there is nothing to add.
     """
+    merged = dict(headers or {})
     try:
         from hermes_cli.config import cfg_get, load_config
         _cfg = load_config()
@@ -831,14 +834,47 @@ def _apply_user_default_headers(headers: dict | None) -> dict | None:
             merged_user.update(alias_headers)
             user_headers = merged_user
     except Exception:
-        return headers
-    if not isinstance(user_headers, dict) or not user_headers:
-        return headers
+        user_headers = None
+    if isinstance(user_headers, dict):
+        for key, value in user_headers.items():
+            if value is None:
+                continue
+            merged[str(key)] = str(value)
+    return merged or headers
+
+
+def _apply_zettlab_session_headers(headers: dict | None) -> dict | None:
+    """Stamp per-request Zettlab billing/routing headers for the current session.
+
+    These headers must never live in cached OpenAI ``default_headers``: auxiliary
+    clients are cached across turns/sessions, while the Zettlab conversation id
+    is request-scoped. Keep them in ``extra_headers`` on each create() call so a
+    cache hit cannot leak another conversation's sticky-routing key.
+    """
     merged = dict(headers or {})
-    for key, value in user_headers.items():
-        if value is None:
-            continue
-        merged[str(key)] = str(value)
+    # Zettlab credit-ledger task grouping: attribute auxiliary calls
+    # (compression / title / vision) to the conversation/cron task by stamping
+    # X-Task-Id, so they aggregate into its task card instead of surfacing as
+    # orphan model rows. Stamp the same value as X-Zettlab-Conversation-ID so
+    # ai-gateway's model-routing can use an explicit sticky/canary session key.
+    # Each aux client is built fresh per call, so reading the concurrency-safe
+    # session contextvar here is always current (no stale cross-session reuse).
+    # billing_task_id() maps interactive vs cron sessions and returns '' for
+    # non-NAS sessions (no leak to third-party providers).
+    try:
+        from gateway.session_context import billing_task_id, billing_task_title_encoded
+        task_id = billing_task_id()
+        task_title = billing_task_title_encoded() if task_id else ""
+    except Exception:
+        task_id = ""
+        task_title = ""
+    if task_id:
+        merged.setdefault("X-Task-Id", task_id)
+        merged.setdefault("X-Zettlab-Conversation-ID", task_id)
+        merged.setdefault("X-Scene-Type", "agent")
+        # Cron job name → X-Task-Title (empty for interactive); see chat_completions.
+        if task_title:
+            merged.setdefault("X-Task-Title", task_title)
     return merged or headers
 
 
@@ -2486,9 +2522,10 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
         or_key = explicit_api_key or _pool_runtime_api_key(entry)
         if or_key:
             base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
+            headers = _apply_user_default_headers(build_or_headers())
             logger.debug("Auxiliary client: OpenRouter via pool")
             return _create_openai_client(api_key=or_key, base_url=base_url,
-                           default_headers=build_or_headers()), or_model
+                           default_headers=headers), or_model
         # Pool exists but is exhausted (no usable runtime key) — fall through to
         # the OPENROUTER_API_KEY env-var path rather than failing outright.
         logger.debug("Auxiliary client: OpenRouter pool exhausted, trying OPENROUTER_API_KEY")
@@ -2497,9 +2534,10 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
     if not or_key:
         _mark_provider_unhealthy("openrouter", ttl=60)
         return None, None
+    headers = _apply_user_default_headers(build_or_headers())
     logger.debug("Auxiliary client: OpenRouter")
     return _create_openai_client(api_key=or_key, base_url=OPENROUTER_BASE_URL,
-                   default_headers=build_or_headers()), or_model
+                   default_headers=headers), or_model
 
 
 def _describe_openrouter_unavailable() -> str:
@@ -2594,6 +2632,7 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
         _create_openai_client(
             api_key=api_key,
             base_url=base_url,
+            default_headers=_apply_user_default_headers(None),
         ),
         model,
     )
@@ -2648,7 +2687,7 @@ def _read_main_model() -> str:
 
     Runtime override: when an AIAgent is active with a CLI/gateway-provided
     model that differs from config.yaml, ``set_runtime_main()`` records the
-    override in a process-local global. This is consulted FIRST so tools
+    override in a turn-scoped ContextVar. This is consulted FIRST so tools
     that gate on "the active main model" (e.g. ``vision_analyze``'s native
     fast path) see the live runtime, not the persisted config default.
     """
@@ -3000,6 +3039,10 @@ def _relay_sync_stream(
     )
 _RUNTIME_MAIN_COMPAT_SNAPSHOT: Tuple[Any, ...] = ("", "", "", "", "", "")
 _RUNTIME_MAIN_COMPAT_LOCK = threading.Lock()
+_RUNTIME_AUXILIARY_TASK_CONFIGS: ContextVar[Dict[str, Dict[str, Any]]] = ContextVar(
+    "runtime_auxiliary_task_configs",
+    default={},
+)
 
 
 def _compat_runtime_main() -> Optional[Dict[str, Any]]:
@@ -3123,6 +3166,30 @@ def clear_runtime_main() -> None:
         _RUNTIME_MAIN_API_MODE = ""
         _RUNTIME_MAIN_AUTH_MODE = ""
         _RUNTIME_MAIN_COMPAT_SNAPSHOT = ("", "", "", "", "", "")
+    clear_runtime_auxiliary_task_configs()
+
+
+def set_runtime_auxiliary_task_configs(configs: Optional[Dict[str, Any]]) -> None:
+    """Record session-scoped auxiliary task overrides.
+
+    local-server writes these into ``session_model_overrides.json`` when a
+    session model differs from the profile default. They must override
+    config.yaml so a cloud-profile session switched to a custom model does not
+    keep using the profile's cloud ``auxiliary.vision`` route.
+    """
+    normalized: Dict[str, Dict[str, Any]] = {}
+    if isinstance(configs, dict):
+        for task, task_config in configs.items():
+            if not isinstance(task, str) or not task.strip():
+                continue
+            if isinstance(task_config, dict):
+                normalized[task.strip()] = dict(task_config)
+    _RUNTIME_AUXILIARY_TASK_CONFIGS.set(normalized)
+
+
+def clear_runtime_auxiliary_task_configs() -> None:
+    """Clear session-scoped auxiliary task overrides."""
+    _RUNTIME_AUXILIARY_TASK_CONFIGS.set({})
 
 
 def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[str]]:
@@ -5397,7 +5464,6 @@ def _resolve_auto(
     runtime_api_key = runtime.get("api_key", "")
     runtime_api_mode = str(runtime.get("api_mode") or "")
 
-
     # ── Warn once if OPENAI_BASE_URL is set but config.yaml uses a named
     #    provider (not 'custom').  This catches the common "env poisoning"
     #    scenario where a user switches providers via `hermes model` but the
@@ -7000,7 +7066,11 @@ def _refresh_nous_auxiliary_client(
         return None, model
 
     fresh_key, fresh_base_url = runtime
-    sync_client = _create_openai_client(api_key=fresh_key, base_url=fresh_base_url)
+    sync_client = _create_openai_client(
+        api_key=fresh_key,
+        base_url=fresh_base_url,
+        default_headers=_apply_user_default_headers(None),
+    )
     final_model = model
 
     current_loop = None
@@ -7494,6 +7564,9 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     """
     if not task:
         return {}
+    runtime_task_config = _RUNTIME_AUXILIARY_TASK_CONFIGS.get().get(task)
+    if isinstance(runtime_task_config, dict):
+        return dict(runtime_task_config)
     try:
         from hermes_cli.config import load_config_readonly
         config = load_config_readonly()
@@ -7958,6 +8031,10 @@ def _build_call_kwargs(
             or _is_anthropic_compat_endpoint(provider_norm, effective_base)
         ):
             kwargs["_reasoning_config"] = dict(reasoning_config)
+
+    extra_headers = _apply_zettlab_session_headers(kwargs.get("extra_headers"))
+    if extra_headers:
+        kwargs["extra_headers"] = extra_headers
 
     return kwargs
 
@@ -8449,6 +8526,7 @@ def call_llm(
     max_tokens: int = None,
     tools: list = None,
     timeout: float = None,
+    fail_fast: bool = False,
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
     extra_headers: Optional[Dict[str, str]] = None,
@@ -8474,6 +8552,8 @@ def call_llm(
         max_tokens: Max output tokens (handles max_tokens vs max_completion_tokens).
         tools: Tool definitions (for function calling).
         timeout: Request timeout in seconds (None = read from auxiliary.{task}.timeout config).
+        fail_fast: Make one request to the resolved provider and return its result
+            or error without retries or provider fallback.
         extra_body: Additional request body fields.
         reasoning_config: Optional Hermes reasoning config for direct model calls
               such as MoA reference/aggregator slots.
@@ -8499,6 +8579,27 @@ def call_llm(
     # concurrent /model switch produce a key for one runtime and a client for
     # another.
     main_runtime = _normalize_main_runtime(main_runtime)
+    task_config = _get_auxiliary_task_config(task) if task else {}
+    has_configured_task_route = any(
+        str(task_config.get(key) or "").strip()
+        for key in (
+            "provider",
+            "model",
+            "base_url",
+            "api_key",
+            "key_env",
+            "api_key_env",
+            "api_mode",
+        )
+    )
+    if fail_fast and provider is None and not has_configured_task_route:
+        provider = str(main_runtime.get("provider") or _read_main_provider())
+        model = model or str(main_runtime.get("model") or _read_main_model())
+        base_url = base_url or str(main_runtime.get("base_url") or "")
+        api_key = api_key or main_runtime.get("api_key") or ""
+        api_mode = api_mode or str(main_runtime.get("api_mode") or "")
+        if not provider:
+            raise RuntimeError("No active main provider configured for fail-fast auxiliary call")
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     if api_mode:
@@ -8515,7 +8616,12 @@ def call_llm(
             async_mode=False,
             main_runtime=main_runtime,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if (
+            client is None
+            and not fail_fast
+            and resolved_provider != "auto"
+            and not resolved_base_url
+        ):
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -8542,6 +8648,11 @@ def call_llm(
             main_runtime=main_runtime,
         )
         if client is None:
+            if fail_fast:
+                raise RuntimeError(
+                    f"No LLM provider configured for task={task} provider={resolved_provider}. "
+                    "Run: hermes setup"
+                )
             # When the user explicitly chose a non-OpenRouter provider but no
             # credentials were found, honor the task fallback_chain before
             # raising.  Missing raw env keys are recoverable for auxiliary
@@ -8605,6 +8716,9 @@ def call_llm(
     _client_base = str(getattr(client, "base_url", "") or "")
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+
+    if fail_fast:
+        return _validate_llm_response(client.chat.completions.create(**kwargs), task)
 
     # Streaming path: return the raw SDK Stream iterator directly. This is used by
     # the MoA aggregator so its tokens stream to the user. It deliberately skips

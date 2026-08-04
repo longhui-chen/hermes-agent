@@ -275,6 +275,8 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     # shell override leaked "myhost" into the full suite and flipped 20
     # otherwise-unrelated config tests away from the default "hermes" host.
     "HERMES_HONCHO_HOST",
+    "HERMES_DUMP_REQUESTS",
+    "HERMES_DUMP_REQUEST_STDOUT",
     # Dashboard OAuth auth gate (PR #30156). When set, the bundled
     # dashboard-auth `nous` plugin auto-registers itself on plugin discovery,
     # which is triggered by any `/api/status` call. That leaks a provider
@@ -867,6 +869,7 @@ def _ensure_current_event_loop(request):
 
 _LIVE_SYSTEM_GUARD_BYPASS_MARK = "live_system_guard_bypass"
 _REQUIRES_WAL_MARK = "requires_wal"
+_REQUIRES_WRITABLE_SCHEMA_MARK = "requires_writable_schema"
 
 
 def _wal_is_usable() -> bool:
@@ -904,6 +907,17 @@ def _wal_is_usable() -> bool:
     if (3, 44, 6) <= info < (3, 45, 0):
         return True  # 3.44.x backport
     return False
+
+
+def _writable_schema_is_usable() -> bool:
+    """True when this SQLite build permits deliberate sqlite_master damage."""
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("PRAGMA writable_schema=ON")
+        row = conn.execute("PRAGMA writable_schema").fetchone()
+        return bool(row and row[0] == 1)
+    finally:
+        conn.close()
 
 
 # ── Audio-playback guard ───────────────────────────────────────────────────
@@ -968,6 +982,12 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
     )
     config.addinivalue_line(
         "markers",
+        f"{_REQUIRES_WRITABLE_SCHEMA_MARK}: test deliberately mutates "
+        "sqlite_master to construct corruption; skipped when the linked "
+        "SQLite build disables PRAGMA writable_schema.",
+    )
+    config.addinivalue_line(
+        "markers",
         f"{_AUDIO_GUARD_BYPASS_MARK}: bypass the audio-playback guard (only "
         "for tests that genuinely need real TTS synthesis and speaker "
         "playback — there are none in the default suite).",
@@ -988,23 +1008,31 @@ def pytest_configure(config):  # noqa: D401 — pytest hook
 
 
 def pytest_collection_modifyitems(config, items):  # noqa: D401 — pytest hook
-    """Skip ``requires_wal`` tests when the linked SQLite can't use WAL.
+    """Skip SQLite capability tests unsupported by the linked library.
 
     Cheaper and more honest than each test hand-rolling a version check: the
     reason string names the actual linked version so the skip is diagnosable
     rather than mysterious.
     """
-    if _wal_is_usable():
-        return
+    if not _wal_is_usable():
+        reason = (
+            f"SQLite {sqlite3.sqlite_version} has the WAL-reset bug — Hermes uses "
+            "journal_mode=DELETE here, so no -wal sidecar exists to assert on"
+        )
+        skip_marker = pytest.mark.skip(reason=reason)
+        for item in items:
+            if item.get_closest_marker(_REQUIRES_WAL_MARK) is not None:
+                item.add_marker(skip_marker)
 
-    reason = (
-        f"SQLite {sqlite3.sqlite_version} has the WAL-reset bug — Hermes uses "
-        "journal_mode=DELETE here, so no -wal sidecar exists to assert on"
-    )
-    skip_marker = pytest.mark.skip(reason=reason)
-    for item in items:
-        if item.get_closest_marker(_REQUIRES_WAL_MARK) is not None:
-            item.add_marker(skip_marker)
+    if not _writable_schema_is_usable():
+        reason = (
+            f"SQLite {sqlite3.sqlite_version} disables PRAGMA writable_schema, "
+            "so the test cannot construct its intended malformed schema"
+        )
+        skip_marker = pytest.mark.skip(reason=reason)
+        for item in items:
+            if item.get_closest_marker(_REQUIRES_WRITABLE_SCHEMA_MARK) is not None:
+                item.add_marker(skip_marker)
 
 
 @pytest.fixture(autouse=True)

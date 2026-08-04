@@ -57,6 +57,93 @@ def test_session_slot_is_claimed_on_first_turn_not_on_create(monkeypatch, tmp_pa
         monkeypatch.setattr(server, "_start_agent_build", lambda *args, **kwargs: None)
         monkeypatch.setattr(server, "_completion_cwd", lambda params=None: str(tmp_path))
 
+        first = server._methods["session.create"]("r1", {"cols": 80})
+        second = server._methods["session.create"]("r2", {"cols": 80})
+        assert "result" in first and "result" in second
+        sid = first["result"]["session_id"]
+        other = second["result"]["session_id"]
+        assert active_session_registry_snapshot() == []
+
+        assert server._ensure_active_session_slot(sid, server._sessions[sid]) is None
+        assert server._ensure_active_session_slot(sid, server._sessions[sid]) is None
+        assert len(active_session_registry_snapshot()) == 1
+
+        blocked = server._ensure_active_session_slot(other, server._sessions[other])
+        assert "active session limit (1/1)" in blocked
+
+        closed = server._methods["session.close"]("r3", {"session_id": sid})
+        assert closed["result"]["closed"] is True
+        assert active_session_registry_snapshot() == []
+
+        assert server._ensure_active_session_slot(other, server._sessions[other]) is None
+    finally:
+        _clear_server_sessions()
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        reset_hermes_home_override(token)
+
+
+@pytest.mark.parametrize("method_name", ["learning.delete", "learning.edit"])
+def test_learning_mutations_use_non_cancellable_rpc_worker(
+    monkeypatch, method_name
+):
+    import agent.learning_mutations as mutations
+
+    started = threading.Event()
+    release = threading.Event()
+    written = threading.Event()
+    responses = []
+
+    def slow_mutation(*_args):
+        started.set()
+        assert release.wait(10)
+        return {"ok": True}
+
+    class _Transport:
+        def write(self, payload):
+            responses.append(payload)
+            written.set()
+            return True
+
+    operation = method_name.split(".", 1)[1]
+    monkeypatch.setattr(mutations, f"{operation}_node", slow_mutation)
+    params = {"id": "memory:memory:0"}
+    if operation == "edit":
+        params["content"] = "updated"
+    assert method_name in server._LONG_HANDLERS
+    assert server.dispatch(
+        {"id": "journey", "method": method_name, "params": params},
+        _Transport(),
+    ) is None
+    assert started.wait(2)
+    assert not written.is_set()
+    release.set()
+    assert written.wait(2)
+    assert responses == [
+        {"jsonrpc": "2.0", "id": "journey", "result": {"ok": True}}
+    ]
+
+
+def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("max_concurrent_sessions: 1\n", encoding="utf-8")
+    token = set_hermes_home_override(home)
+
+    def _clear_server_sessions():
+        for session in list(server._sessions.values()):
+            server._teardown_session(session)
+        server._sessions.clear()
+
+    try:
+        server._cfg_cache = None
+        server._cfg_mtime = None
+        server._cfg_path = None
+        _clear_server_sessions()
+        monkeypatch.setattr(server, "_start_agent_build", lambda *args, **kwargs: None)
+        monkeypatch.setattr(server, "_completion_cwd", lambda params=None: str(tmp_path))
+
         # Opening a chat must NOT take a slot. Every tile paint and every
         # background reconnect-resume calls session.create, and an unprompted
         # draft has no DB row and is filtered out of the sidebar — so a slot
@@ -8714,6 +8801,148 @@ def test_session_redirect_rejects_when_idle_without_agent(monkeypatch):
 
     assert resp["error"]["code"] == 4010
     assert session.get("queued_prompt") is None
+
+def _steer_goal_turn_fixture(monkeypatch, agent):
+    """prompt.submit dispatcher 测试脚手架（照 pending_title 测试的 stub 面）。"""
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None, **kw):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    session = {
+        "agent": agent,
+        "session_key": "test-session",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+        "attached_images": [],
+        "image_counter": 0,
+        "cols": 80,
+        "slash_worker": None,
+        "show_reasoning": False,
+        "tool_progress_mode": "all",
+    }
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(
+        server, "_sync_session_key_after_compress", lambda *a, **kw: None
+    )
+    # 防递归：leftover steer 入队后 run() 尾部会 drain 队列再跑一轮。
+    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *a, **kw: False)
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    return session
+
+
+def test_turn_leftover_steer_skips_goal_hook(monkeypatch):
+    """第十轮 review：leftover /steer 必须先于 goal judge 取出并让 judge
+    让路——用户的改向尚未执行，judge 按当前 final_response 评估会烧掉一轮
+    预算、甚至记下 done/paused verdict，随后 steer 才排队。zet 链路同款跳过。"""
+    calls = {}
+
+    class _Agent:
+        session_id = "test-session"
+        model = "x"
+        provider = "openrouter"
+        base_url = ""
+        api_key = ""
+        _cached_system_prompt = ""
+
+        def run_conversation(self, prompt, **kw):
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+                "pending_steer": "改个方向",
+            }
+
+        def _drain_pending_steer(self, close=False):
+            return None
+
+    class _FakeGoalManager:
+        def __init__(self, *a, **kw):
+            pass
+
+        def is_active(self):
+            return True
+
+        def evaluate_after_turn(self, *a, **kw):
+            calls["evaluated"] = True
+            return {"message": "", "should_continue": False}
+
+    import hermes_cli.goals as _goals_mod
+
+    monkeypatch.setattr(_goals_mod, "GoalManager", _FakeGoalManager)
+    session = _steer_goal_turn_fixture(monkeypatch, _Agent())
+
+    try:
+        server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "hello"},
+            }
+        )
+        assert "evaluated" not in calls  # judge 已让路
+        assert session["queued_prompt"]["text"] == "改个方向"  # steer 排为下一条
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_turn_without_leftover_steer_still_evaluates_goal(monkeypatch):
+    """对照组：无 leftover steer 时 goal judge 照常评估（门控不误伤）。"""
+    calls = {}
+
+    class _Agent:
+        session_id = "test-session"
+        model = "x"
+        provider = "openrouter"
+        base_url = ""
+        api_key = ""
+        _cached_system_prompt = ""
+
+        def run_conversation(self, prompt, **kw):
+            return {
+                "final_response": "ok",
+                "messages": [{"role": "assistant", "content": "ok"}],
+            }
+
+        def _drain_pending_steer(self, close=False):
+            return None
+
+    class _FakeGoalManager:
+        def __init__(self, *a, **kw):
+            pass
+
+        def is_active(self):
+            return True
+
+        def evaluate_after_turn(self, *a, **kw):
+            calls["evaluated"] = True
+            return {"message": "", "should_continue": False}
+
+    import hermes_cli.goals as _goals_mod
+
+    monkeypatch.setattr(_goals_mod, "GoalManager", _FakeGoalManager)
+    session = _steer_goal_turn_fixture(monkeypatch, _Agent())
+
+    try:
+        server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "hello"},
+            }
+        )
+        assert calls.get("evaluated") is True
+        assert "queued_prompt" not in session
+    finally:
+        server._sessions.pop("sid", None)
 
 
 def test_session_info_includes_mcp_servers(monkeypatch):

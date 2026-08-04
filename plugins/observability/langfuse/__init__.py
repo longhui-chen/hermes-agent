@@ -19,6 +19,11 @@ Optional env vars:
   HERMES_LANGFUSE_SAMPLE_RATE - sampling rate 0.0–1.0 (default: 1.0)
   HERMES_LANGFUSE_MAX_CHARS   - max chars per field (default: 12000)
   HERMES_LANGFUSE_DEBUG       - set to "true" for verbose logging
+  HERMES_LANGFUSE_SN          - device serial; threads onto every trace as
+                                user_id + "sn:<serial>" tag + metadata so a
+                                multi-device fleet can be sliced by device.
+                                zettlab-local-server injects this automatically
+                                when it spawns the per-agent gateway.
 """
 from __future__ import annotations
 
@@ -600,12 +605,32 @@ def _usage_and_cost(response: Any, *, provider: str, api_mode: str, model: str, 
     return usage_details, cost_details
 
 
-def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform: str, provider: str, model: str,
-                      api_mode: str, messages: Any, client: Langfuse,
-                      turn_id: str = "", api_request_id: str = "") -> TraceState:
-    trace_id = client.create_trace_id(seed=f"{session_id or 'sessionless'}::{task_id or task_key}")
-    trace_input = _extract_last_user_message(messages)
-    metadata = {
+def _root_trace_attributes(
+    *,
+    task_id: str,
+    platform: str,
+    provider: str,
+    model: str,
+    api_mode: str,
+    turn_id: str = "",
+    api_request_id: str = "",
+) -> tuple[Dict[str, Any], list[str], Optional[str]]:
+    """Build (metadata, tags, user_id) for a root "Hermes turn" trace.
+
+    When ``HERMES_LANGFUSE_SN`` is set — zettlab-local-server injects the
+    device serial when it spawns the per-agent hermes gateway — the serial is
+    threaded onto the trace three ways so a multi-device fleet can be sliced by
+    device in Langfuse:
+
+      - ``user_id``  → first-class Langfuse "Users" dashboards (high-cardinality
+        is fine, unlike ``environment`` which is meant for a handful of values)
+      - ``tags``     → quick filtering via ``sn:<serial>``
+      - ``metadata`` → exact-match filtering / export
+
+    Absent the env var the trace is identical to the pre-SN behaviour:
+    ``user_id`` is ``None`` and ``tags == ["hermes", "langfuse"]``.
+    """
+    metadata: Dict[str, Any] = {
         "source": "hermes",
         "task_id": task_id,
         "turn_id": turn_id,
@@ -615,40 +640,47 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         "model": model,
         "api_mode": api_mode,
     }
+    tags = ["hermes", "langfuse"]
+    device_sn = _env("HERMES_LANGFUSE_SN")
+    if device_sn:
+        metadata["device_sn"] = device_sn
+        tags.append(f"sn:{device_sn}")
+    # zettlab-local-server runs one hermes gateway per agent profile and exports
+    # ZET_AGENT_ID into the child env (the same id embedded in the session id).
+    # Surface it as a tag + metadata so traces can be filtered/grouped by agent
+    # in Langfuse without parsing the session id. Empty off-device → omitted.
+    agent_id = _env("ZET_AGENT_ID")
+    if agent_id:
+        metadata["agent_id"] = agent_id
+        tags.append(f"agent:{agent_id}")
+    return metadata, tags, (device_sn or None)
+
+
+def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform: str, provider: str, model: str,
+                      api_mode: str, messages: Any, client: Langfuse,
+                      turn_id: str = "", api_request_id: str = "") -> TraceState:
+    # A Langfuse session groups many turn-level traces.  Do not derive the
+    # trace ID from session/task identity: those values are stable across
+    # turns, so a deterministic seed collapses every turn into one trace.
+    trace_id = client.create_trace_id()
+    trace_input = _extract_last_user_message(messages)
+    metadata, trace_tags, user_id = _root_trace_attributes(
+        task_id=task_id,
+        platform=platform,
+        provider=provider,
+        model=model,
+        api_mode=api_mode,
+        turn_id=turn_id,
+        api_request_id=api_request_id,
+    )
 
     # session_id must be passed in trace_context for Langfuse session grouping.
     trace_ctx: Dict[str, Any] = {"trace_id": trace_id}
     if session_id:
         trace_ctx["session_id"] = session_id
 
-    if propagate_attributes is not None:
-        try:
-            with propagate_attributes(
-                session_id=session_id or task_key,
-                trace_name="Hermes turn",
-                tags=["hermes", "langfuse"],
-            ):
-                root_ctx = client.start_as_current_observation(
-                    trace_context=trace_ctx,
-                    name="Hermes turn",
-                    as_type="chain",
-                    input=trace_input,
-                    metadata=metadata,
-                    end_on_exit=False,
-                )
-                root_span = root_ctx.__enter__()
-        except Exception:
-            root_ctx = client.start_as_current_observation(
-                trace_context=trace_ctx,
-                name="Hermes turn",
-                as_type="chain",
-                input=trace_input,
-                metadata=metadata,
-                end_on_exit=False,
-            )
-            root_span = root_ctx.__enter__()
-    else:
-        root_ctx = client.start_as_current_observation(
+    def _open_root():
+        ctx = client.start_as_current_observation(
             trace_context=trace_ctx,
             name="Hermes turn",
             as_type="chain",
@@ -656,7 +688,32 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
             metadata=metadata,
             end_on_exit=False,
         )
-        root_span = root_ctx.__enter__()
+        return ctx, ctx.__enter__()
+
+    if propagate_attributes is not None:
+        propagate_kwargs: Dict[str, Any] = {
+            "session_id": session_id or task_key,
+            "trace_name": "Hermes turn",
+            "tags": trace_tags,
+        }
+        if user_id:
+            propagate_kwargs["user_id"] = user_id
+        try:
+            with propagate_attributes(**propagate_kwargs):
+                root_ctx, root_span = _open_root()
+        except Exception:
+            # user_id is best-effort — an older SDK may reject the kwarg. Retry
+            # without it so the sn:/agent: tags still land on the trace; only if
+            # propagate is itself unusable do we fall back to an untagged trace
+            # (device_sn is recorded via metadata either way).
+            propagate_kwargs.pop("user_id", None)
+            try:
+                with propagate_attributes(**propagate_kwargs):
+                    root_ctx, root_span = _open_root()
+            except Exception:
+                root_ctx, root_span = _open_root()
+    else:
+        root_ctx, root_span = _open_root()
 
     try:
         root_span.set_trace_io(input=trace_input)

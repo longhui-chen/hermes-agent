@@ -416,6 +416,265 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):
+    """A worker scoped to a dir: task that spawns a child without a
+    workspace arg inherits the dir, not scratch (so follow-up code-gen
+    lands in the same project)."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    proj = "/home/teknium/myproject"
+    conn = kb.connect()
+    try:
+        self_tid = kb.create_task(
+            conn, title="dir worker", assignee="test-worker",
+            workspace_kind="dir", workspace_path=proj,
+        )
+        kb.claim_task(conn, self_tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", self_tid)
+
+    d = json.loads(kt._handle_create({"title": "follow-up", "assignee": "peer"}))
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child.workspace_kind == "dir"
+        assert child.workspace_path == proj
+    finally:
+        conn.close()
+
+
+def test_create_explicit_workspace_beats_inheritance(monkeypatch, worker_env):
+    """An explicit workspace arg overrides worker-task inheritance."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        self_tid = kb.create_task(
+            conn, title="dir worker", assignee="test-worker",
+            workspace_kind="dir", workspace_path="/home/teknium/proj",
+        )
+        kb.claim_task(conn, self_tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", self_tid)
+
+    d = json.loads(kt._handle_create({
+        "title": "scratch child", "assignee": "peer",
+        "workspace_kind": "scratch",
+    }))
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child.workspace_kind == "scratch"
+    finally:
+        conn.close()
+
+
+def test_create_no_worker_task_stays_scratch(monkeypatch, worker_env):
+    """Orchestrator/CLI callers (no HERMES_KANBAN_TASK) still default to
+    scratch — inheritance only applies to task-scoped workers."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    d = json.loads(kt._handle_create({"title": "orch child", "assignee": "peer"}))
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child.workspace_kind == "scratch"
+        assert child.workspace_path is None
+    finally:
+        conn.close()
+
+
+def test_create_stamps_session_id_from_env(monkeypatch, worker_env):
+    """When the agent loop runs under ACP, the server propagates the
+    originating chat session id via HERMES_SESSION_ID. ``kanban_create``
+    reads it and stamps the new task so clients can render a per-session
+    board (issue: ACP session linkage on kanban tasks)."""
+    monkeypatch.setenv("HERMES_SESSION_ID", "acp-sess-abc")
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_create({
+        "title": "from chat",
+        "assignee": "peer",
+        "parents": [worker_env],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        new_task = kb.get_task(conn, d["task_id"])
+        assert new_task.session_id == "acp-sess-abc"
+    finally:
+        conn.close()
+
+
+def test_create_session_id_arg_overrides_env(monkeypatch, worker_env):
+    """An explicit ``session_id`` arg from the model wins over the env
+    propagation. Edge case but exercised: a tool call could carry a
+    different session id (e.g. cross-session linking) and the explicit
+    arg should not be silently overwritten."""
+    monkeypatch.setenv("HERMES_SESSION_ID", "from-env")
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_create({
+        "title": "explicit override",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "session_id": "explicit-arg",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        new_task = kb.get_task(conn, d["task_id"])
+        assert new_task.session_id == "explicit-arg"
+    finally:
+        conn.close()
+
+
+def test_create_session_id_absent_when_env_unset(monkeypatch, worker_env):
+    """No env var, no arg → session_id stays NULL. Important for backwards
+    compatibility: pre-ACP-propagation hosts and CLI-driven creates must
+    not accidentally inherit a stale id."""
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_create({
+        "title": "no session",
+        "assignee": "peer",
+        "parents": [worker_env],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        new_task = kb.get_task(conn, d["task_id"])
+        assert new_task.session_id is None
+    finally:
+        conn.close()
+
+
+def test_create_rejects_no_title(worker_env):
+    from tools import kanban_tools as kt
+    assert json.loads(kt._handle_create({"assignee": "x"})).get("error")
+    assert json.loads(kt._handle_create({"title": "   ", "assignee": "x"})).get("error")
+
+
+def test_create_rejects_no_assignee(worker_env):
+    from tools import kanban_tools as kt
+    assert json.loads(kt._handle_create({"title": "t"})).get("error")
+
+
+def test_create_rejects_non_list_parents(worker_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_create({"title": "t", "assignee": "a", "parents": 42})
+    assert json.loads(out).get("error")
+
+
+def test_create_parses_triage_string_false(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_create({
+        "title": "not triage",
+        "assignee": "peer",
+        "triage": "false",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, d["task_id"])
+        assert task.status == "ready"
+    finally:
+        conn.close()
+
+
+def test_create_parses_triage_string_true(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_create({
+        "title": "needs triage",
+        "assignee": "peer",
+        "triage": "true",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, d["task_id"])
+        assert task.status == "triage"
+    finally:
+        conn.close()
+
+
+def test_create_rejects_bad_triage(worker_env):
+    from tools import kanban_tools as kt
+    out = kt._handle_create({
+        "title": "bad triage",
+        "assignee": "peer",
+        "triage": "sometimes",
+    })
+    assert "triage must be" in json.loads(out).get("error", "")
+
+
+def test_create_accepts_string_parent(worker_env):
+    """Convenience: a single parent id as string is coerced to [id]."""
+    from tools import kanban_tools as kt
+    out = kt._handle_create({
+        "title": "t", "assignee": "a", "parents": worker_env,
+    })
+    assert json.loads(out)["ok"]
+
+
+def test_create_accepts_skills_list(worker_env):
+    """Tool writes the per-task skills through to the kernel."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_create({
+        "title": "skilled",
+        "assignee": "linguist",
+        "skills": ["translation", "requesting-code-review"],
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, d["task_id"])
+    assert task.skills == ["translation", "requesting-code-review"]
+
+
+def test_create_accepts_skills_string(worker_env):
+    """Convenience: a single skill name as string is coerced to [name]."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    out = kt._handle_create({
+        "title": "one-skill",
+        "assignee": "a",
+        "skills": "translation",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    with kb.connect() as conn:
+        task = kb.get_task(conn, d["task_id"])
+    assert task.skills == ["translation"]
+
+
+def test_create_rejects_non_list_skills(worker_env):
+    """skills: 42 must be rejected, not silently dropped."""
+    from tools import kanban_tools as kt
+    out = kt._handle_create({
+        "title": "t", "assignee": "a", "skills": 42,
+    })
+    assert json.loads(out).get("error")
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()

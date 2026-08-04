@@ -21,7 +21,42 @@ from __future__ import annotations
 
 import threading
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Optional
+
+from hermes_time import now as _hermes_now
+
+
+CALENDAR_RECOVERY_RECONCILE_OBSERVED_STATUSES = frozenset({"armed", "not_required"})
+CALENDAR_RECOVERY_RECONCILE_TERMINAL_STATUSES = frozenset({"cancelled", "superseded"})
+CALENDAR_RECOVERY_RECONCILE_2XX_STATUSES = (
+    CALENDAR_RECOVERY_RECONCILE_OBSERVED_STATUSES
+    | CALENDAR_RECOVERY_RECONCILE_TERMINAL_STATUSES
+)
+
+
+def normalize_calendar_recovery_reconcile_result(result: Any) -> dict:
+    """Return the bounded recovery 2xx wire contract from a provider result.
+
+    ``armed`` and ``not_required`` prove a concrete fire time and therefore
+    require ``observed_fire_at``. ``cancelled`` and ``superseded`` are terminal
+    acknowledgements, not observations; provider-supplied observation fields
+    are deliberately discarded so a caller cannot mistake them for an arm.
+    """
+    if not isinstance(result, dict):
+        raise RuntimeError("invalid calendar recovery provider result")
+    status = result.get("status")
+    provider = result.get("provider")
+    if status not in CALENDAR_RECOVERY_RECONCILE_2XX_STATUSES:
+        raise RuntimeError("invalid calendar recovery provider status")
+    if not isinstance(provider, str) or not provider.strip() or len(provider.strip()) > 32:
+        raise RuntimeError("invalid calendar recovery provider identity")
+    body = {"status": status, "provider": provider.strip()}
+    if status in CALENDAR_RECOVERY_RECONCILE_OBSERVED_STATUSES:
+        observed = result.get("observed_fire_at")
+        if not isinstance(observed, str) or not observed.strip() or len(observed.strip()) > 64:
+            raise RuntimeError("calendar recovery observation missing")
+        body["observed_fire_at"] = observed.strip()
+    return body
 
 
 class CronScheduler(ABC):
@@ -88,7 +123,14 @@ class CronScheduler(ABC):
 
         return recover_interrupted_executions()
 
-    def fire_due(self, job_id: str, *, adapters: Any = None, loop: Any = None) -> bool:
+    def fire_due(
+        self,
+        job_id: str,
+        *,
+        adapters: Any = None,
+        loop: Any = None,
+        fire_at: Optional[str] = None,
+    ) -> bool:
         """Run a single job NOW via the shared orchestrator. Called by the
         inbound fire webhook when an external scheduler signals a job is due.
 
@@ -102,15 +144,54 @@ class CronScheduler(ABC):
         """
         from cron.jobs import claim_job_for_fire, get_job
         from cron.executions import create_execution
+        from cron.calendar_delivery import is_managed_calendar_event_alert, run_calendar_delivery
         from cron.scheduler import run_one_job
 
-        if not claim_job_for_fire(job_id):
+        job = get_job(job_id)
+        if job is not None and is_managed_calendar_event_alert(job):
+            return bool(run_calendar_delivery(job).get("terminal"))
+        if not claim_job_for_fire(job_id, fire_at=fire_at):
             return False  # another machine already claimed this fire
         job = get_job(job_id)
         if job is None:
             return False  # job removed (e.g. repeat-N exhausted) between arm and fire
         job["execution_id"] = create_execution(job_id, source=self.name)["id"]
-        return run_one_job(job, adapters=adapters, loop=loop)
+        occurrence_claim = job.get("in_flight_occurrence")
+        triggered_at = (
+            occurrence_claim.get("scheduled_at")
+            if isinstance(occurrence_claim, dict)
+            and isinstance(occurrence_claim.get("scheduled_at"), str)
+            else _hermes_now().isoformat()
+        )
+        return run_one_job(
+            job,
+            adapters=adapters,
+            loop=loop,
+            triggered_at=triggered_at,
+        )
+
+    def calendar_capabilities(self) -> dict:
+        return {
+            "provider": self.name,
+            "contract_version": 1,
+            "calendar_external_fire_v1": self.name == "builtin",
+            "reliable_job_reconcile_v1": self.name == "builtin",
+        }
+
+    def reconcile_calendar_job(self, job_id: str, expected_action: str, projection_revision: int) -> dict:
+        """Durable provider ack for planner outbox; built-in reads jobs.json directly."""
+        if expected_action not in {"upsert", "delete"} or projection_revision <= 0:
+            raise ValueError("invalid calendar reconcile request")
+        return {"status": "not_required", "provider": self.name}
+
+    def reconcile_calendar_recovery_arm(self, intent: dict) -> dict:
+        """Durably arm an external retry. Built-in never needs external arms."""
+        if self.name != "builtin":
+            raise RuntimeError("calendar recovery arm unsupported by provider")
+        retry_at = str((intent or {}).get("retry_at") or "")
+        if not retry_at:
+            raise ValueError("invalid recovery retry_at")
+        return {"status": "not_required", "provider": self.name, "observed_fire_at": retry_at}
 
     def reconcile(self) -> None:
         """Converge the external registry toward jobs.json (the desired state):

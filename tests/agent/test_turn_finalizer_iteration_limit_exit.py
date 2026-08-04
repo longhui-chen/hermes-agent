@@ -78,7 +78,7 @@ class _LimitAgent:
     def _format_turn_completion_explanation(self, _reason):
         return "iteration-limit explanation"
 
-    def _drain_pending_steer(self):
+    def _drain_pending_steer(self, close=False):
         return None
 
     def clear_interrupt(self):

@@ -1,0 +1,781 @@
+{
+  "_meta": {
+    "note": "飞书 open_id 权威注册表。open_id 为 CURRENT_APP 维度，@人首选；open_id_legacy 为旧 webhook 机器人维度，仅当用旧机器人发送时兜底。Codex review 飞书通知使用 at_by_github_active（应用机器人 cli_a97 维度）；旧 at_by_github 仅供旧 webhook 流程兜底。",
+    "current_app_id": "cli_a98867442059900c",
+    "people_count": 58,
+    "legacy_only_count": 28,
+    "at_by_github_count": 27,
+    "at_by_github_active_count": 37,
+    "regenerate": "python3 scripts/test-harness/feishu/build_registry.py",
+    "active_app_id": "cli_a97acaec84389cc0",
+    "active_app_note": "at_by_github_active = 应用机器人 cli_a97 维度的 GitHub login->open_id，供 Codex review 飞书通知（应用机器人/话题模式）@作者使用。旧 at_by_github 为 webhook 维度，仅旧流程兜底。"
+  },
+  "people": [
+    {
+      "name": "Dengjie",
+      "email": null,
+      "github": "zettlab-dengjie",
+      "aliases": [
+        "邓杰"
+      ],
+      "open_id": "ou_359d5d75b98384083e7b57f054e3eaa8",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "JiangCheng",
+      "email": null,
+      "github": "iwgyyyy",
+      "aliases": [
+        "江成",
+        "Cheng Jiang"
+      ],
+      "open_id": "ou_b520ecc5554a0497130d1e182ec65bb5",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "Li Xiaokang",
+      "email": "adrien.li@zettlab.com",
+      "github": "Adrien9210",
+      "aliases": [
+        "李小康",
+        "adrien"
+      ],
+      "open_id": "ou_985db2d071e0b8523c3b44f0f6c70f20",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "冯德伟",
+      "email": "dewei.feng@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_1cd13427636db6e92585cab4b08a15ff",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "冯潇轶",
+      "email": null,
+      "github": "XiaoyiFeng123",
+      "aliases": [],
+      "open_id": "ou_7a1a0a3411b15a10689bfa0f62fc1474",
+      "open_id_legacy": "ou_9691e16e3fdaddb536998019c91b55fc",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "凌伟恒",
+      "email": null,
+      "github": "weihengling",
+      "aliases": [],
+      "open_id": "ou_b6e5d5241f676cdf27d589f84e98af80",
+      "open_id_legacy": "ou_defc683a00fe4650891020f0e777019b",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "凌志",
+      "email": "zhi.ling@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_7a5be23f70ad4b672ece524cb78902c8",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "剑政",
+      "email": null,
+      "github": "jianzheng-cai",
+      "aliases": [
+        "蔡建政",
+        "jianzheng.cai"
+      ],
+      "open_id": "ou_fd435ec2f1390157d586c7bb1cc7747c",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "向卫东",
+      "email": "weidong.xiang@zettlab.com",
+      "github": "xiangweidong-zettlab",
+      "aliases": [
+        "weidong.xiang"
+      ],
+      "open_id": "ou_22b0f991f493a5ee3669f4a44b290d1f",
+      "open_id_legacy": "ou_802fb5e9362c98f5b80100830ce7e818",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "吴瑞芳",
+      "email": "ruifang.wu@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_b6c4cfd09b8c113d6a22d232eb5b817d",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "吴雨村",
+      "email": "yucun.wu@zettlab.com",
+      "github": "yoran-wu",
+      "aliases": [
+        "yoran",
+        "yoran-zettlab",
+        "yucun.wu"
+      ],
+      "open_id": "ou_9e3ce5d0b72ff723027afc27cbc2817b",
+      "open_id_legacy": "ou_eabbc9e4aa743c7cf8683fa88c1a386c",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "周凌峰",
+      "email": "frank.zhou@zettlab.com",
+      "github": "707367586",
+      "aliases": [
+        "Frank Ling",
+        "frank.zhou"
+      ],
+      "open_id": "ou_ffdb0d4b07053ffd17621fc16a3ae2d1",
+      "open_id_legacy": "ou_b3e736cde48e6be287db7aad92073b3e",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "周旭东",
+      "email": null,
+      "github": "zxd-zettlab",
+      "aliases": [
+        "xudong.zhou"
+      ],
+      "open_id": "ou_a796f81280b4975a258ac98e9b09d717",
+      "open_id_legacy": "ou_f268f83c107b29d6b5b9c6867090d44e",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "周黎炜",
+      "email": null,
+      "github": "zettlab-zlw",
+      "aliases": [
+        "liwei.zhou"
+      ],
+      "open_id": "ou_becda967b8650fcc5ad39536a05d4778",
+      "open_id_legacy": "ou_ff1e2a3baf3542a239ffbbb1160a4328",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "庄晓君",
+      "email": "xiaojun.zhuang@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_09f2fe7896fa991d859ea54923165a5b",
+      "open_id_legacy": "ou_b9cb2c292b6c2df6883abb7f34a4c898",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "廖筱乐",
+      "email": "xiaole.liao@zettlab.com",
+      "github": "liao3841054",
+      "aliases": [
+        "Larry"
+      ],
+      "open_id": "ou_1e8adaf8eea29ba909eee106b23782c1",
+      "open_id_legacy": "ou_5efaa986215b1cf5057c8b029f8c69f5",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "彭刚",
+      "email": null,
+      "github": "zettlab-penggang",
+      "aliases": [
+        "2pgcn",
+        "penggang",
+        "gang.peng"
+      ],
+      "open_id": "ou_5e8c9c25658e6370eddb414c5e0af6d4",
+      "open_id_legacy": "ou_f9a42c51f8685afc19297d7686be08ad",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "徐云龙",
+      "email": "yunlong.xu@zettlab.com",
+      "github": "xuyunlong698",
+      "aliases": [
+        "yunlong.xu"
+      ],
+      "open_id": "ou_c0f63dbf7e8f1bf09d4524d35cae305d",
+      "open_id_legacy": "ou_d27e5c8df0964ff9ab38b9110a4fa3b0",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "徐礼兴",
+      "email": null,
+      "github": "setLylToxlx",
+      "aliases": [
+        "observer",
+        "lixing.xu"
+      ],
+      "open_id": "ou_2e450685c36665251745cca1ca019079",
+      "open_id_legacy": "ou_8962010d0f2c3c6b528e3add6b423afa",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "朱明振",
+      "email": null,
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_6e837f55d707bdc1c6dfa3fe8d1d8f94",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "李爽",
+      "email": null,
+      "github": "Sivan-wycx",
+      "aliases": [
+        "Sivan"
+      ],
+      "open_id": "ou_2841dbf242cacef53a408bb5d727053f",
+      "open_id_legacy": "ou_57efb7836aedcfe08544dc43f5d3826d",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "杨亨",
+      "email": null,
+      "github": "zettlab-yangheng",
+      "aliases": [
+        "heng.yang"
+      ],
+      "open_id": "ou_8c3c49e5a3e1118ca1a651a9b3995db7",
+      "open_id_legacy": "ou_4bf61a33459b577986693d3eed2b2471",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "杨小波",
+      "email": "xiaobo.yang@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_3fbb976da2a80dc1f4d5ff5294b1c46b",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "杨智",
+      "email": "zhi.yang@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_d03bf2808d956cdb71bf190e7b009043",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "杨林",
+      "email": "lin.yang@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_16cd5c0c0309c93bcc3102bcb50e65f0",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "林婉珊",
+      "email": "wanshan.lin@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_7e8e82b4cb4f492c4093e3b5ddaf59c3",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "林家富",
+      "email": "jiafu.lin@zettlab.com",
+      "github": "jiafu0",
+      "aliases": [
+        "jiafu.lin"
+      ],
+      "open_id": "ou_af2d258ccb842e60ae32e426c1fc06da",
+      "open_id_legacy": "ou_68e206186246b8336751a1b4318a423d",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "林家达",
+      "email": null,
+      "github": "jiadalin",
+      "aliases": [
+        "jiada.lin"
+      ],
+      "open_id": "ou_c703212ca70370c01199fe8c8148f95f",
+      "open_id_legacy": "ou_4926ad189bebb111e58174fddcd0c631",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "林葳",
+      "email": "wei.lin@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_781d520e522138439998e9bf80c07db8",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "林辉",
+      "email": "hui.lin@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_36e94c6c79223b5a2e6e31bf2165ee40",
+      "open_id_legacy": "ou_7804154cfcdba5176a74b5ef57eab7ec",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "武强",
+      "email": null,
+      "github": "Xianleewu",
+      "aliases": [
+        "qiang.wu"
+      ],
+      "open_id": "ou_4f02e93c418d4869358d8022eafafdf3",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "江宁",
+      "email": "ning.jiang@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_bc8b9a1be34d32488f9f8c1cd28e9951",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "洪鸿鑫",
+      "email": "hongxin.hong@zettlab.com",
+      "github": "hongxin-zettlab",
+      "aliases": [],
+      "open_id": "ou_52d282a142d1b455815198d4118ef0bc",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "王晓云",
+      "email": "xiaoyun.wang@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_1d633a8364fbdc1c53c6e4d2d02edac3",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "王潇钰",
+      "email": "xiaoyu.wang@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_82d70bab5ae74fcb079bb6c010fb1a11",
+      "open_id_legacy": "ou_33de5d44994eb97c969951f98663d37b",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "肖强",
+      "email": null,
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_e69dbaceb4758cdbc96c2be8c84d4fe7",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "肖晗",
+      "email": "han.xiao@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_bb6dc42574b4bbf3b05d9564430c702c",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "葛正斌",
+      "email": "zhengbin.ge@zettlab.com",
+      "github": "gezhengbin888",
+      "aliases": [
+        "gareth",
+        "Gareth"
+      ],
+      "open_id": "ou_0bab91e615241ec0c9d31b7a439080e1",
+      "open_id_legacy": "ou_6d44b270588ec7b5412c8335925f4c9c",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "蔡晓",
+      "email": "xiao.cai@zettlab.com",
+      "github": "x1cai",
+      "aliases": [
+        "xiao.cai"
+      ],
+      "open_id": "ou_477ef29bd577833f1fbdad1c4c1a681a",
+      "open_id_legacy": "ou_8aa356a5a620779015973d22eb5eb16e",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "许少平",
+      "email": "shaoping.xu@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_6f94095b4dd0629649711e70e5c2a5f1",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "邓莉莉",
+      "email": null,
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_321c349ee0bd3fd5ed0d92c0d28b5376",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "郑伟健",
+      "email": null,
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_5739ba9d591196b55dbd550b6e7ea789",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "郑诚伟",
+      "email": "chengwei.zheng@zettlab.com",
+      "github": "xlaya",
+      "aliases": [
+        "chengwei.zheng",
+        "郑成伟"
+      ],
+      "open_id": "ou_971431d50864941d03107f8e55f7d1dc",
+      "open_id_legacy": "ou_b3f4196f3a8815cd4ef8dab042851844",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "郭亚楠",
+      "email": null,
+      "github": "noahgwok",
+      "aliases": [
+        "Noah Gwok",
+        "Founder"
+      ],
+      "open_id": "ou_ccc9d60bc65cc2caf84213bd17b432d4",
+      "open_id_legacy": "ou_de59b68d8da0a1c0533c89072cabf8f1",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "钟熠",
+      "email": null,
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_90ad8199d86a39911db36aa105b5496f",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "陈夏玲",
+      "email": "xialing.chen@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_ae73978b75102f579213685fe8ca3e90",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "陈威",
+      "email": null,
+      "github": "chirschou",
+      "aliases": [
+        "Chirs Chou"
+      ],
+      "open_id": "ou_53e21fdfd48a30a494f57d4514b6bf48",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "陈小娟",
+      "email": null,
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_91ec90a709882724e8bfabd4a0615422",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "陈灿坚",
+      "email": null,
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_80a51480fbb6efa8b688fedee9a08c1c",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "陈龙辉",
+      "email": "longhui.chen@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_0f661e008acc9b64de317c4c04bd982a",
+      "open_id_legacy": "ou_cf43d610e2d73fc5f03403e90dd16c14",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "雷忠谕",
+      "email": null,
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_0ad7fa6ae1ca9f9592483c0ba9ca1703",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "韦天瀚",
+      "email": "tianhan.wei@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_bcfca1a326aa64044cdc82251b169172",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "韦茂涵",
+      "email": null,
+      "github": "maohan1013",
+      "aliases": [
+        "maohan.wei"
+      ],
+      "open_id": "ou_c927ec3e8cbd17da48e1792af43bce5e",
+      "open_id_legacy": "ou_777c2bb1c519ade96982dfa9bd95ff7b",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "韩振杰",
+      "email": "zhenjie.han@zettlab.com",
+      "github": "zett-jay",
+      "aliases": [
+        "zhenjie.han"
+      ],
+      "open_id": "ou_e90fa4c5fd97cba6ee44530c55d5cd27",
+      "open_id_legacy": "ou_a3d71d7a50ce96d7321dcf5f51a9de38",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "韩桐方",
+      "email": "tongfang.han@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_80da154c0f160f88756a13e040323069",
+      "open_id_legacy": "ou_98d441aac7333d474ae5a8a85bb56d61",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "魏士博",
+      "email": "shibo.wei@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_061d921534d7d09a06bb352b0a46833b",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "魏靖雄",
+      "email": "jingxiong.wei@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_d1badb00fe9832d8b6f701172bfdc1b7",
+      "open_id_legacy": "ou_75b5bdd22a9f832a59576713c7aa8fea",
+      "dimension": "cli_a98867442059900c"
+    },
+    {
+      "name": "黄锦文",
+      "email": "jinwen.huang@zettlab.com",
+      "github": null,
+      "aliases": [],
+      "open_id": "ou_eb6a20e94cd2b38b9d8616dc50928f95",
+      "open_id_legacy": null,
+      "dimension": "cli_a98867442059900c"
+    }
+  ],
+  "legacy_only": [
+    {
+      "email": "canjian.chen@zettlab.com",
+      "open_id_legacy": "ou_bf8ae4cb700993884ff9380cdafd551f"
+    },
+    {
+      "email": "gang.peng@zettlab.com",
+      "open_id_legacy": "ou_f9a42c51f8685afc19297d7686be08ad"
+    },
+    {
+      "email": "guangming.liang@zettlab.com",
+      "open_id_legacy": "ou_b16a65d80d0e56f67a9739fb6b039c2a"
+    },
+    {
+      "email": "heng.yang@zettlab.com",
+      "open_id_legacy": "ou_4bf61a33459b577986693d3eed2b2471"
+    },
+    {
+      "email": "jiada.lin@zettlab.com",
+      "open_id_legacy": "ou_4926ad189bebb111e58174fddcd0c631"
+    },
+    {
+      "email": "jianjiang.liu@zettlab.com",
+      "open_id_legacy": "ou_0807c9a1203d40a611986ce0dac16e8b"
+    },
+    {
+      "email": "jiannan.li@zettlab.com",
+      "open_id_legacy": "ou_58d546b62522f025f41c6041d72df507"
+    },
+    {
+      "email": "jie.jiang2@zettlab.com",
+      "open_id_legacy": "ou_6cfefe8289d94863f4a0fdfb102c9c21"
+    },
+    {
+      "email": "kaixuan.huang@zettlab.com",
+      "open_id_legacy": "ou_26f457df633366009cc892cbae2e3485"
+    },
+    {
+      "email": "kiki@zettlab.com",
+      "open_id_legacy": "ou_dc1f25ae546ce211127f50fd8ce54169"
+    },
+    {
+      "email": "lan.fu@zettlab.com",
+      "open_id_legacy": "ou_c30693b92069cd429a609647eca50b9e"
+    },
+    {
+      "email": "liwei.zhou@zettlab.com",
+      "open_id_legacy": "ou_ff1e2a3baf3542a239ffbbb1160a4328"
+    },
+    {
+      "email": "lixing.xu@zettlab.com",
+      "open_id_legacy": "ou_8962010d0f2c3c6b528e3add6b423afa"
+    },
+    {
+      "email": "maohan.wei@zettlab.com",
+      "open_id_legacy": "ou_777c2bb1c519ade96982dfa9bd95ff7b"
+    },
+    {
+      "email": "mingzhen.zhu@zettlab.com",
+      "open_id_legacy": "ou_d7d0619e6e71275d9b770ad8a501e81e"
+    },
+    {
+      "email": "penggang@zettlab.com",
+      "open_id_legacy": "ou_f9a42c51f8685afc19297d7686be08ad"
+    },
+    {
+      "email": "pu.zhan@zettlab.com",
+      "open_id_legacy": "ou_6b1266920aeef0b266957e51671a64b9"
+    },
+    {
+      "email": "qiuping.huang@zettlab.com",
+      "open_id_legacy": "ou_1f5fde0e4beb2a41d935ee9940237548"
+    },
+    {
+      "email": "tao.yang@zettlab.com",
+      "open_id_legacy": "ou_c440a776937c028fe3551089d86f8d08"
+    },
+    {
+      "email": "tiger.zhou@zettlab.com",
+      "open_id_legacy": "ou_ffde9661231d9f9d6c6659d15974eb34"
+    },
+    {
+      "email": "wancheng.lin@zettlab.com",
+      "open_id_legacy": "ou_94bf950069fe6891f5c9a8228c6c2aea"
+    },
+    {
+      "email": "weijian.zheng@zettlab.com",
+      "open_id_legacy": "ou_d32abc59c089426a26ff0df901eea2a8"
+    },
+    {
+      "email": "xiaoqiang.peng@zettlab.com",
+      "open_id_legacy": "ou_2e64b01dd56750946c5ffc93c37dabf8"
+    },
+    {
+      "email": "yanzhen.yang@zettlab.com",
+      "open_id_legacy": "ou_835ff5fb77db673bb2eeb684943ceb7d"
+    },
+    {
+      "email": "yi.zhong@zettlab.com",
+      "open_id_legacy": "ou_bb1a6f108b15a7db42178d9bfdb05f4d"
+    },
+    {
+      "email": "yunlai.luo@zettlab.com",
+      "open_id_legacy": "ou_ef7abcc0a15d3d5549c4e1ba81fb4295"
+    },
+    {
+      "email": "yupeng.zhu@zettlab.com",
+      "open_id_legacy": "ou_a46505703297380a2fe3ec34de8fe399"
+    },
+    {
+      "email": "zhong.li@zettlab.com",
+      "open_id_legacy": "ou_9241fe9aeec3bee5be945f8ba497afb5"
+    }
+  ],
+  "at_by_github": {
+    "707367586": "ou_b3e736cde48e6be287db7aad92073b3e",
+    "KILLY000": "ou_71f2c216a15a73431236c98e4de2663a",
+    "Sivan-wycx": "ou_57efb7836aedcfe08544dc43f5d3826d",
+    "Thomas0x1f": "ou_4ccd7a28e3a2fda7e1dc4adceb7f49f3",
+    "XiaoyiFeng123": "ou_9691e16e3fdaddb536998019c91b55fc",
+    "fguizc": "ou_d13a3b3b4970eac41bf8c64a05082902",
+    "gezhengbin888": "ou_6d44b270588ec7b5412c8335925f4c9c",
+    "jiadalin": "ou_4926ad189bebb111e58174fddcd0c631",
+    "jiafu0": "ou_68e206186246b8336751a1b4318a423d",
+    "liao3841054": "ou_5efaa986215b1cf5057c8b029f8c69f5",
+    "liricooo": "ou_6dda7c7c8d761ec0db973e02daecc0ce",
+    "liulovegame": "ou_2d9e7cad6ed0cbfabb15df204703e87f",
+    "maohan1013": "ou_777c2bb1c519ade96982dfa9bd95ff7b",
+    "noahgwok": "ou_de59b68d8da0a1c0533c89072cabf8f1",
+    "setLylToxlx": "ou_8962010d0f2c3c6b528e3add6b423afa",
+    "tiger573": "ou_ffde9661231d9f9d6c6659d15974eb34",
+    "weihengling": "ou_defc683a00fe4650891020f0e777019b",
+    "x1cai": "ou_8aa356a5a620779015973d22eb5eb16e",
+    "xiangweidong-zettlab": "ou_802fb5e9362c98f5b80100830ce7e818",
+    "xlaya": "ou_b3f4196f3a8815cd4ef8dab042851844",
+    "xuyunlong698": "ou_d27e5c8df0964ff9ab38b9110a4fa3b0",
+    "yoran-wu": "ou_eabbc9e4aa743c7cf8683fa88c1a386c",
+    "zett-jay": "ou_a3d71d7a50ce96d7321dcf5f51a9de38",
+    "zettlab-penggang": "ou_f9a42c51f8685afc19297d7686be08ad",
+    "zettlab-yangheng": "ou_4bf61a33459b577986693d3eed2b2471",
+    "zettlab-zlw": "ou_ff1e2a3baf3542a239ffbbb1160a4328",
+    "zxd-zettlab": "ou_f268f83c107b29d6b5b9c6867090d44e"
+  },
+  "at_by_github_active": {
+    "2pgcn": "ou_b4255723a4013c7ffd7f22840f2c2f7d",
+    "707367586": "ou_8de19982853903b1d1b044de3c9bd5ff",
+    "Adrien9210": "ou_6d03c09a25a54f584da53a19a22b38d2",
+    "Joey-1122": "ou_6b0a8086331150805e878a02a5ba2eed",
+    "KILLY000": "ou_646678db42413610ef78bc334afae507",
+    "Sivan-wycx": "ou_4b51dd8c8addbd8441375b7c73859b68",
+    "Thomas0x1f": "ou_40424262c2a099259254fb3428d0fa50",
+    "ethanblake301": "ou_b6f8bad57ab053944c8eb9b9580e6ec2",
+    "fguizc": "ou_e398270bf0056ecb52bbb03018d416a4",
+    "gezhengbin888": "ou_d3d88d0643dbc48a0ba7dfa93406e623",
+    "halooojustin": "ou_94c306b9f626714bb28da968710ac488",
+    "hongxin-zettlab": "ou_ca32f58f689c4e697d8e09096c3c06ec",
+    "iwgyyyy": "ou_591631c7bbbea0fa3119cc2bff0852fd",
+    "jiadalin": "ou_ee4f4461b8fe293623da43e835c4d19c",
+    "jiafu0": "ou_486e2f5a5491be65acfa225380260e2a",
+    "jianzheng-cai": "ou_0e5f57810bec5db1ebfcf378554dfeb5",
+    "liao3841054": "ou_2f809fbbfd7d1e51ad6ab412deaf391d",
+    "liricooo": "ou_90eb2f880d50b63ce7b20dad4c754ca1",
+    "liulovegame": "ou_d8a11054dc5dce2d259f8311ac54a3fb",
+    "maohan1013": "ou_a00a28193941b7bd04d3d486fe51b0af",
+    "noahgwok": "ou_27d9bb8c5814f5dff8b7b56151da05e7",
+    "nola-123": "ou_21357399d270104c93f84557d17d3e42",
+    "setLylToxlx": "ou_96d0ff5aabdce0dc8e0f8ca1423fa6e7",
+    "weihengling": "ou_f59307db5f275244585eed9b2965d688",
+    "x1cai": "ou_2581c54fa4e912ad970b7eb3ae420d7e",
+    "xiangweidong-zettlab": "ou_4b3f244e9e06f3124729c3f72cfaf20f",
+    "xlaya": "ou_abfb779416d275e0985894423128f925",
+    "xulixingZettlab": "ou_96d0ff5aabdce0dc8e0f8ca1423fa6e7",
+    "xuyunlong698": "ou_c1e281a4d7ce171472a162badaa4d434",
+    "yaozhangjun": "ou_89969da2c553dfe8b4892a87c454a64a",
+    "yoran-wu": "ou_06e34ba295a3eaf78c0cc845f4ba8f80",
+    "zett-jay": "ou_ce2fda1bce9f063f03d61669e055d42f",
+    "zettlab-dengjie": "ou_ee90672addd2b2f5f6cd9bb15f477581",
+    "zettlab-penggang": "ou_b4255723a4013c7ffd7f22840f2c2f7d",
+    "zettlab-yangheng": "ou_b86cc255c6ea9c647ac45c005622a9e8",
+    "zettlab-zlw": "ou_dd7bff2a849f5f654fdab5987ffe1385",
+    "zxd-zettlab": "ou_e6ebfee296bae85ee687bebf28d58da3"
+  }
+}

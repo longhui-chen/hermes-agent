@@ -8,8 +8,7 @@ depends on:
 
     for _hook_result in _transform_results:
         if isinstance(_hook_result, str) and _hook_result:
-            final_response = _hook_result
-            break  # First non-empty string wins
+            final_response = _hook_result  # Last chained transform wins
 
 Mirrors ``test_transform_tool_result_hook.py`` which tests the equivalent
 contract for the generic tool-result seam.
@@ -75,6 +74,29 @@ def test_hook_receives_expected_kwargs(tmp_path, monkeypatch):
     assert results == ["hello world|s1|anthropic/claude-sonnet-4.6|cli"]
 
 
+def test_output_transforms_chain_in_registration_order():
+    manager = PluginManager()
+    seen = []
+
+    def append_governor(**kwargs):
+        return kwargs["response_text"] + " | governor"
+
+    def redact_after_governor(**kwargs):
+        seen.append(kwargs["response_text"])
+        return kwargs["response_text"].replace("secret", "[redacted]")
+
+    manager._hooks["transform_llm_output"] = [append_governor, redact_after_governor]
+
+    results = manager.invoke_hook(
+        "transform_llm_output",
+        response_text="secret",
+        session_id="s1",
+        model="m",
+        platform="cli",
+    )
+
+    assert seen == ["secret | governor"]
+    assert results[-1] == "[redacted] | governor"
 
 
 

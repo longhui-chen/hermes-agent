@@ -36,13 +36,23 @@ import os
 import platform
 import shlex
 import signal
+import secrets
+import stat
 import subprocess
+import sys
 import threading
 import time
 import uuid
+from pathlib import Path, PurePosixPath
 
 _IS_WINDOWS = platform.system() == "Windows"
-from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
+from tools.environments.local import (
+    _find_shell,
+    _managed_terminal_argv,
+    _managed_terminal_cwd,
+    _resolve_safe_cwd,
+    _sanitize_subprocess_env,
+)
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -54,6 +64,70 @@ logger = logging.getLogger(__name__)
 
 # Checkpoint file for crash recovery (gateway only)
 CHECKPOINT_PATH = get_hermes_home() / "processes.json"
+_MANAGED_CHECKPOINT_PATH = Path("/run/zettlab-claw/processes.json")
+_MANAGED_PROFILE_ROOTS = (
+    Path("/volume1/subvol/agents/data"),
+    Path("/volume1/agents/data"),
+)
+
+
+def _managed_gateway_active() -> bool:
+    return os.environ.get("HERMES_MANAGED_GATEWAY") == "1"
+
+
+def _checkpoint_path() -> Path:
+    """Keep managed checkpoints outside every model-writable profile home."""
+
+    return _MANAGED_CHECKPOINT_PATH if _managed_gateway_active() else CHECKPOINT_PATH
+
+
+def _validate_managed_checkpoint_path(path: Path) -> None:
+    """Require a root-owned runtime parent and a non-symlink checkpoint."""
+
+    if not sys.platform.startswith("linux") or os.geteuid() != 0:
+        raise OSError("managed process checkpoint requires Linux root")
+    parent = path.parent
+    parent_info = os.lstat(parent)
+    if (
+        not stat.S_ISDIR(parent_info.st_mode)
+        or parent_info.st_uid != 0
+        or parent_info.st_gid != 0
+        or parent_info.st_mode & 0o022
+    ):
+        raise OSError("managed process checkpoint parent is not trusted")
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or info.st_mode & 0o022
+    ):
+        raise OSError("managed process checkpoint is not trusted")
+
+
+def _managed_profile_owner_allowed(profile_owner: str) -> bool:
+    """Accept only the service profile or a child of an Agent data root."""
+
+    owner = Path(profile_owner).expanduser().resolve()
+    try:
+        from hermes_constants import get_process_hermes_home
+
+        if owner == get_process_hermes_home().expanduser().resolve():
+            return True
+    except Exception:
+        pass
+    for raw_root in _MANAGED_PROFILE_ROOTS:
+        try:
+            root = raw_root.expanduser().resolve()
+            relative = owner.relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if relative.parts:
+            return True
+    return False
 
 # Limits
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
@@ -77,6 +151,52 @@ WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
 
 
+def _current_profile_owner() -> str:
+    """Return the immutable canonical owner for the active profile context."""
+
+    try:
+        return str(get_hermes_home().expanduser().resolve())
+    except Exception:
+        return ""
+
+
+def _canonical_profile_owner(value: object) -> str:
+    raw = str(value or "").strip()
+    if (
+        not raw
+        or not os.path.isabs(raw)
+        or "\x00" in raw
+        or len(raw.encode("utf-8")) > 4096
+    ):
+        return ""
+    try:
+        return str(Path(raw).expanduser().resolve())
+    except Exception:
+        return ""
+
+
+def notification_event_matches_profile(
+    event: dict,
+    profile_owner: str | None = None,
+) -> bool:
+    """Return whether a process event belongs to the requested profile.
+
+    Legacy ownerless events remain usable outside the managed gateway.  In the
+    multiplexed managed service they fail closed so one profile cannot consume
+    another profile's queued command or output.
+    """
+
+    event_owner = _canonical_profile_owner(event.get("profile_owner"))
+    if not event_owner:
+        return os.environ.get("HERMES_MANAGED_GATEWAY") != "1"
+    expected = (
+        _canonical_profile_owner(profile_owner)
+        if profile_owner is not None
+        else _current_profile_owner()
+    )
+    return bool(expected and secrets.compare_digest(event_owner, expected))
+
+
 def format_uptime_short(seconds: int) -> str:
     s = max(0, int(seconds))
     if s < 60:
@@ -95,6 +215,7 @@ class ProcessSession:
     command: str                                 # Original command string
     task_id: str = ""                           # Task/sandbox isolation key
     session_key: str = ""                       # Gateway session key (for reset protection)
+    profile_owner: str = field(default_factory=_current_profile_owner)
     pid: Optional[int] = None                   # OS process ID
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
     env_ref: Any = None                         # Reference to the environment object
@@ -317,6 +438,7 @@ class ProcessRegistry:
                 self.completion_queue.put({
                     "session_id": session.id,
                     "session_key": session.session_key,
+                    "profile_owner": session.profile_owner,
                     "command": session.command,
                     "type": "watch_disabled",
                     "suppressed": session._watch_suppressed,
@@ -342,12 +464,13 @@ class ProcessRegistry:
             output = output[:2000] + "\n...(truncated)"
 
         # Global circuit breaker — across all sessions (secondary safety net).
-        if not self._global_watch_admit(now):
+        if not self._global_watch_admit(now, session.profile_owner):
             return
 
         self.completion_queue.put({
             "session_id": session.id,
             "session_key": session.session_key,
+            "profile_owner": session.profile_owner,
             "command": session.command,
             "type": "watch_match",
             "pattern": matched_pattern,
@@ -361,7 +484,7 @@ class ProcessRegistry:
             "message_id": session.watcher_message_id,
         })
 
-    def _global_watch_admit(self, now: float) -> bool:
+    def _global_watch_admit(self, now: float, profile_owner: str) -> bool:
         """Return True if this watch_match event is allowed through the global breaker.
 
         Semantics:
@@ -385,6 +508,7 @@ class ProcessRegistry:
                     release_msg = {
                         "session_id": "",
                         "session_key": "",
+                        "profile_owner": profile_owner,
                         "command": "",
                         "type": "watch_overflow_released",
                         "suppressed": suppressed,
@@ -432,6 +556,7 @@ class ProcessRegistry:
             self.completion_queue.put({
                 "session_id": "",
                 "session_key": "",
+                "profile_owner": profile_owner,
                 "command": "",
                 "type": "watch_overflow_tripped",
                 "message": (
@@ -489,6 +614,53 @@ class ProcessRegistry:
         if expected_start is None:
             return True
         return cls._safe_host_start_time(pid) == expected_start
+
+    @staticmethod
+    def _managed_pid_matches_profile(pid: int, profile_owner: str) -> bool:
+        """Bind a recovered PID to the profile's UID and delegated cgroup."""
+
+        try:
+            from tools.environments.local import (
+                _MANAGED_TERMINAL_CGROUP_PREFIX,
+                _managed_terminal_identity,
+            )
+
+            uid, _gid = _managed_terminal_identity(
+                {"HERMES_HOME": profile_owner}
+            )
+            status = (Path("/proc") / str(pid) / "status").read_text(
+                encoding="utf-8", errors="replace"
+            )
+            effective_uid = None
+            for line in status.splitlines():
+                if line.startswith("Uid:"):
+                    fields = line.split()
+                    if len(fields) >= 3:
+                        effective_uid = int(fields[2])
+                    break
+            if effective_uid != uid:
+                return False
+
+            cgroup_root = os.environ.get("HERMES_MANAGED_CGROUP_ROOT", "")
+            parsed_root = PurePosixPath(cgroup_root)
+            if (
+                not cgroup_root.startswith("/")
+                or cgroup_root == "/"
+                or ".." in parsed_root.parts
+                or "\x00" in cgroup_root
+            ):
+                return False
+            expected = (
+                f"{cgroup_root.rstrip('/')}/"
+                f"{_MANAGED_TERMINAL_CGROUP_PREFIX}-{uid}"
+            )
+            memberships = (Path("/proc") / str(pid) / "cgroup").read_text(
+                encoding="ascii", errors="strict"
+            ).splitlines()
+            unified = [line[3:] for line in memberships if line.startswith("0::")]
+            return len(unified) == 1 and unified[0].rstrip("/") == expected
+        except Exception:
+            return False
 
     def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
         """Update recovered host-PID sessions when the underlying process has exited."""
@@ -720,6 +892,7 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            profile_owner=str(get_hermes_home().expanduser().resolve()),
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
@@ -734,8 +907,15 @@ class ProcessRegistry:
                 user_shell = _find_shell()
                 pty_env = _sanitize_subprocess_env(os.environ, env_vars)
                 pty_env["PYTHONUNBUFFERED"] = "1"
+                session.cwd = _managed_terminal_cwd(
+                    session.cwd,
+                    env=pty_env,
+                )
                 pty_proc = _PtyProcessCls.spawn(
-                    [user_shell, "-lic", f"set +m; {safe_command}"],
+                    _managed_terminal_argv(
+                        [user_shell, "-lic", f"set +m; {safe_command}"],
+                        env=pty_env,
+                    ),
                     cwd=session.cwd,
                     env=pty_env,
                     dimensions=(30, 120),
@@ -776,10 +956,17 @@ class ProcessRegistry:
         # stdout is a pipe, hiding output from process(action="poll")).
         bg_env = _sanitize_subprocess_env(os.environ, env_vars)
         bg_env["PYTHONUNBUFFERED"] = "1"
+        session.cwd = _managed_terminal_cwd(
+            session.cwd,
+            env=bg_env,
+        )
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
         proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {safe_command}"],
+            _managed_terminal_argv(
+                [user_shell, "-lic", f"set +m; {safe_command}"],
+                env=bg_env,
+            ),
             text=True,
             cwd=session.cwd,
             env=bg_env,
@@ -860,6 +1047,7 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            profile_owner=str(get_hermes_home().expanduser().resolve()),
             cwd=cwd,
             started_at=time.time(),
             env_ref=env,
@@ -1201,6 +1389,7 @@ class ProcessRegistry:
                 "type": "completion",
                 "session_id": session.id,
                 "session_key": session.session_key,
+                "profile_owner": session.profile_owner,
                 "command": session.command,
                 "exit_code": session.exit_code,
                 "completion_reason": session.completion_reason,
@@ -1314,6 +1503,19 @@ class ProcessRegistry:
                 evt = self.completion_queue.get_nowait()
             except Exception:
                 break
+            evt_type = str(evt.get("type") or "completion")
+            if (
+                evt_type in {
+                    "completion",
+                    "watch_match",
+                    "watch_disabled",
+                    "watch_overflow_tripped",
+                    "watch_overflow_released",
+                }
+                and not notification_event_matches_profile(evt)
+            ):
+                requeue.append(evt)
+                continue
             # Positive-proof ownership beats bare key equality. Delegation
             # payloads always require proof; ordinary events require it once
             # they carry routing metadata. Ownerless ordinary events preserve
@@ -1362,6 +1564,34 @@ class ProcessRegistry:
         """Get a session by ID (running or finished)."""
         with self._lock:
             session = self._running.get(session_id) or self._finished.get(session_id)
+        current_owner = _current_profile_owner()
+        if (
+            session is None
+            or not current_owner
+            or not session.profile_owner
+            or not secrets.compare_digest(session.profile_owner, current_owner)
+        ):
+            return None
+        return self._refresh_detached_session(session)
+
+    def get_for_profile(
+        self,
+        session_id: str,
+        profile_owner: str,
+    ) -> Optional[ProcessSession]:
+        """Get a session only after explicit immutable profile verification."""
+
+        expected = _canonical_profile_owner(profile_owner)
+        if not expected:
+            return None
+        with self._lock:
+            session = self._running.get(session_id) or self._finished.get(session_id)
+        if (
+            session is None
+            or not session.profile_owner
+            or not secrets.compare_digest(session.profile_owner, expected)
+        ):
+            return None
         return self._refresh_detached_session(session)
 
     def _reconcile_local_exit(self, session: "ProcessSession") -> None:
@@ -1632,6 +1862,7 @@ class ProcessRegistry:
         *,
         source: str = "process.kill",
         consume_output: bool = True,
+        _trusted_session: Optional[ProcessSession] = None,
     ) -> dict:
         """Kill a background process and return its output snapshot.
 
@@ -1645,7 +1876,20 @@ class ProcessRegistry:
         """
         from tools.ansi_strip import strip_ansi
 
-        session = self.get(session_id)
+        session = _trusted_session
+        if session is None:
+            session = self.get(session_id)
+        else:
+            # Only kill_all may supply a previously selected registry object.
+            # Recheck identity under the registry lock so an evicted/replaced
+            # id cannot turn this internal bypass into a cross-profile lookup.
+            with self._lock:
+                registered = (
+                    self._running.get(session_id)
+                    or self._finished.get(session_id)
+                )
+            if registered is not session:
+                session = None
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
@@ -1829,7 +2073,15 @@ class ProcessRegistry:
         moved to ``_finished`` when their subprocess exits.
         """
         try:
-            return len(self._running)
+            current_owner = _current_profile_owner()
+            if not current_owner:
+                return 0
+            return sum(
+                1
+                for session in self._running.values()
+                if session.profile_owner
+                and secrets.compare_digest(session.profile_owner, current_owner)
+            )
         except Exception:
             return 0
 
@@ -1846,6 +2098,16 @@ class ProcessRegistry:
         """
         with self._lock:
             all_sessions = list(self._running.values()) + list(self._finished.values())
+
+        current_owner = _current_profile_owner()
+        if not current_owner:
+            return []
+        all_sessions = [
+            session
+            for session in all_sessions
+            if session.profile_owner
+            and secrets.compare_digest(session.profile_owner, current_owner)
+        ]
 
         all_sessions = [self._refresh_detached_session(s) for s in all_sessions]
 
@@ -1892,6 +2154,18 @@ class ProcessRegistry:
 
     def has_active_processes(self, task_id: str) -> bool:
         """Check if there are active (running) processes for a task_id."""
+        return self.has_active_processes_for_profile(
+            task_id, _current_profile_owner()
+        )
+
+    def has_active_processes_for_profile(
+        self, task_id: str, profile_owner: str
+    ) -> bool:
+        """Check activity against an explicit immutable profile owner."""
+
+        expected_owner = _canonical_profile_owner(profile_owner)
+        if not expected_owner:
+            return False
         with self._lock:
             sessions = list(self._running.values())
 
@@ -1900,7 +2174,9 @@ class ProcessRegistry:
 
         with self._lock:
             return any(
-                s.task_id == task_id and not s.exited
+                s.task_id == task_id
+                and s.profile_owner == expected_owner
+                and not s.exited
                 for s in self._running.values()
             )
 
@@ -1928,9 +2204,11 @@ class ProcessRegistry:
             self._refresh_detached_session(session)
 
         now = time.time()
+        current_owner = _current_profile_owner()
         with self._lock:
             return any(
                 s.session_key == session_key
+                and s.profile_owner == current_owner
                 and not s.exited
                 and (max_active_age is None or (now - s.started_at) < max_active_age)
                 for s in self._running.values()
@@ -1954,18 +2232,12 @@ class ProcessRegistry:
             return any(not s.exited for s in self._running.values())
 
     def snapshot_running_ids(self, task_id: str) -> frozenset[str]:
-        """Capture running process IDs owned by ``task_id``.
-
-        Gateway turns use this as a boundary marker: if a turn times out, only
-        processes absent from its starting snapshot belong to the abandoned
-        turn. Older session processes must survive because background tasks
-        intentionally span successful turns.
-        """
+        """Capture running process IDs owned by ``task_id``."""
         with self._lock:
             return frozenset(
-                s.id
-                for s in self._running.values()
-                if s.task_id == task_id and not s.exited
+                session.id
+                for session in self._running.values()
+                if session.task_id == task_id and not session.exited
             )
 
     def kill_started_since(
@@ -1975,12 +2247,7 @@ class ProcessRegistry:
         *,
         source: str,
     ) -> int:
-        """Kill processes created for ``task_id`` after a prior snapshot.
-
-        ``consume_output`` is forced on: abandoned-turn output must not
-        enqueue a synthetic follow-up that revives work the timeout
-        deliberately stopped.
-        """
+        """Kill only processes created for a task after a prior snapshot."""
         return self.kill_all(
             task_id,
             exclude_ids=frozenset(baseline_ids or ()),
@@ -1988,20 +2255,143 @@ class ProcessRegistry:
             consume_output=True,
         )
 
+    def has_active_for_profile(self, profile_owner: str) -> bool:
+        """Whether an immutable profile owner still has a live process."""
+        canonical_owner = str(Path(profile_owner).expanduser().resolve())
+        with self._lock:
+            sessions = [
+                session
+                for session in self._running.values()
+                if session.profile_owner == canonical_owner
+            ]
+        for session in sessions:
+            self._refresh_detached_session(session)
+        with self._lock:
+            return any(
+                session.profile_owner == canonical_owner and not session.exited
+                for session in self._running.values()
+            )
+
+    def purge_profile_state(self, profile_owner: str) -> Dict[str, int]:
+        """Atomically discard completed process state for an unloaded profile."""
+
+        canonical_owner = _canonical_profile_owner(profile_owner)
+        if not canonical_owner:
+            raise ValueError("profile owner is required")
+        removed_running = 0
+        removed_finished = 0
+        removed_watchers = 0
+        removed_completions = 0
+        with self._lock:
+            live = [
+                session.id
+                for session in self._running.values()
+                if session.profile_owner == canonical_owner and not session.exited
+            ]
+            if live:
+                raise RuntimeError("profile still has active processes")
+
+            session_ids = {
+                session.id
+                for session in (
+                    list(self._running.values()) + list(self._finished.values())
+                )
+                if session.profile_owner == canonical_owner
+            }
+            for session_id in list(self._running):
+                session = self._running[session_id]
+                if session.profile_owner == canonical_owner:
+                    self._running.pop(session_id, None)
+                    removed_running += 1
+            for session_id in list(self._finished):
+                session = self._finished[session_id]
+                if session.profile_owner == canonical_owner:
+                    self._finished.pop(session_id, None)
+                    removed_finished += 1
+            self._completion_consumed.difference_update(session_ids)
+            self._poll_observed.difference_update(session_ids)
+
+            retained_watchers = []
+            for watcher in self.pending_watchers:
+                watcher_owner = _canonical_profile_owner(
+                    watcher.get("profile_owner")
+                )
+                if (
+                    watcher_owner == canonical_owner
+                    or watcher.get("session_id") in session_ids
+                ):
+                    removed_watchers += 1
+                else:
+                    retained_watchers.append(watcher)
+            self.pending_watchers[:] = retained_watchers
+
+            queue = self.completion_queue
+            with queue.mutex:
+                retained_events = []
+                for event in queue.queue:
+                    event_owner = (
+                        _canonical_profile_owner(event.get("profile_owner"))
+                        if isinstance(event, dict)
+                        else ""
+                    )
+                    event_session = (
+                        event.get("session_id")
+                        if isinstance(event, dict)
+                        else None
+                    )
+                    if (
+                        event_owner == canonical_owner
+                        or event_session in session_ids
+                    ):
+                        removed_completions += 1
+                    else:
+                        retained_events.append(event)
+                queue.queue.clear()
+                queue.queue.extend(retained_events)
+                if removed_completions:
+                    queue.unfinished_tasks = max(
+                        0, queue.unfinished_tasks - removed_completions
+                    )
+                    if queue.unfinished_tasks == 0:
+                        queue.all_tasks_done.notify_all()
+                    queue.not_full.notify_all()
+
+        self._write_checkpoint()
+        return {
+            "running_records": removed_running,
+            "finished_records": removed_finished,
+            "pending_watchers": removed_watchers,
+            "completion_events": removed_completions,
+        }
+
     def kill_all(
         self,
         task_id: Optional[str] = None,
+        profile_owner: Optional[str] = None,
         *,
+        all_profiles: bool = False,
         exclude_ids: frozenset = frozenset(),
         source: str = "kill_all",
         consume_output: bool = False,
     ) -> int:
-        """Kill all running processes, optionally filtered by task_id. Returns count killed."""
+        """Kill running processes filtered by task and/or immutable profile."""
+        if all_profiles:
+            canonical_owner = None
+        elif profile_owner is not None:
+            canonical_owner = str(Path(profile_owner).expanduser().resolve())
+        else:
+            canonical_owner = _current_profile_owner()
+        if not all_profiles and not canonical_owner:
+            return 0
         with self._lock:
             targets = [
                 s for s in self._running.values()
                 if (task_id is None or s.task_id == task_id)
                 and s.id not in exclude_ids
+                and (
+                    canonical_owner is None
+                    or s.profile_owner == canonical_owner
+                )
                 and not s.exited
             ]
 
@@ -2011,6 +2401,7 @@ class ProcessRegistry:
                 session.id,
                 source=source,
                 consume_output=consume_output,
+                _trusted_session=session,
             )
             if result.get("status") in {"killed", "already_exited"}:
                 killed += 1
@@ -2075,6 +2466,7 @@ class ProcessRegistry:
                             "started_at": s.started_at,
                             "task_id": s.task_id,
                             "session_key": s.session_key,
+                            "profile_owner": s.profile_owner,
                             "watcher_platform": s.watcher_platform,
                             "watcher_chat_id": s.watcher_chat_id,
                             "watcher_user_id": s.watcher_user_id,
@@ -2086,9 +2478,17 @@ class ProcessRegistry:
                             "watch_patterns": s.watch_patterns,
                         })
             
-            # Atomic write to avoid corruption on crash
+            checkpoint_path = _checkpoint_path()
+            if _managed_gateway_active():
+                _validate_managed_checkpoint_path(checkpoint_path)
+            # Atomic write to avoid corruption on crash. Managed metadata can
+            # contain commands and profile ownership, so keep it root-only.
             from utils import atomic_json_write
-            atomic_json_write(CHECKPOINT_PATH, entries)
+            atomic_json_write(
+                checkpoint_path,
+                entries,
+                mode=0o600 if _managed_gateway_active() else None,
+            )
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
@@ -2098,18 +2498,50 @@ class ProcessRegistry:
 
         Returns the number of processes recovered as detached.
         """
-        if not CHECKPOINT_PATH.exists():
+        checkpoint_path = _checkpoint_path()
+        if _managed_gateway_active():
+            try:
+                _validate_managed_checkpoint_path(checkpoint_path)
+            except OSError as exc:
+                logger.warning("Ignoring untrusted managed checkpoint: %s", exc)
+                return 0
+        if not checkpoint_path.exists():
             return 0
 
         try:
-            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+            entries = json.loads(checkpoint_path.read_text(encoding="utf-8"))
         except Exception:
+            return 0
+        if not isinstance(entries, list):
             return 0
 
         recovered = 0
         for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            raw_profile_owner = entry.get("profile_owner")
+            if (
+                not isinstance(raw_profile_owner, str)
+                or not raw_profile_owner
+                or not os.path.isabs(raw_profile_owner)
+            ):
+                logger.warning(
+                    "Skipping recovered process without immutable profile owner: %s",
+                    entry.get("session_id", "?"),
+                )
+                continue
+            profile_owner = str(Path(raw_profile_owner).expanduser().resolve())
+            if (
+                _managed_gateway_active()
+                and not _managed_profile_owner_allowed(profile_owner)
+            ):
+                logger.warning(
+                    "Skipping recovered process outside managed profile roots: %s",
+                    entry.get("session_id", "?"),
+                )
+                continue
             pid = entry.get("pid")
-            if not pid:
+            if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
                 continue
 
             pid_scope = entry.get("pid_scope", "host")
@@ -2132,6 +2564,16 @@ class ProcessRegistry:
             # watcher tree-kill a stranger (e.g. a browser). Re-validate the
             # kernel start time recorded in the checkpoint.
             recorded_start = entry.get("host_start_time")
+            if (
+                not isinstance(recorded_start, int)
+                or isinstance(recorded_start, bool)
+                or recorded_start <= 0
+            ):
+                logger.warning(
+                    "Skipping recovered process without a valid start time: %s",
+                    entry.get("session_id", "?"),
+                )
+                continue
             if not self._host_pid_is_ours(pid, recorded_start):
                 if self._is_host_pid_alive(pid):
                     logger.info(
@@ -2141,12 +2583,22 @@ class ProcessRegistry:
                         entry.get("session_id", "?"), pid,
                     )
                 continue
+            if (
+                _managed_gateway_active()
+                and not self._managed_pid_matches_profile(pid, profile_owner)
+            ):
+                logger.warning(
+                    "Skipping recovered process outside its managed identity: %s",
+                    entry.get("session_id", "?"),
+                )
+                continue
 
             session = ProcessSession(
                 id=entry["session_id"],
                 command=entry.get("command", "unknown"),
                 task_id=entry.get("task_id", ""),
                 session_key=entry.get("session_key", ""),
+                profile_owner=profile_owner,
                 pid=pid,
                 host_start_time=recorded_start,
                 pid_scope=pid_scope,
@@ -2174,6 +2626,7 @@ class ProcessRegistry:
                     "session_id": session.id,
                     "check_interval": session.watcher_interval,
                     "session_key": session.session_key,
+                    "profile_owner": session.profile_owner,
                     "platform": session.watcher_platform,
                     "chat_id": session.watcher_chat_id,
                     "user_id": session.watcher_user_id,

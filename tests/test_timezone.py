@@ -21,10 +21,8 @@ import hermes_time
 
 
 def _reset_hermes_time_cache():
-    """Reset the hermes_time module cache (replacement for removed reset_cache)."""
-    hermes_time._cached_tz = None
-    hermes_time._cached_tz_name = None
-    hermes_time._cache_resolved = False
+    """Reset the hermes_time module cache."""
+    hermes_time.reset_cache()
 
 
 # =========================================================================
@@ -87,6 +85,27 @@ class TestGetTimezone:
         assert str(tz) == "Europe/London"
 
 
+    def _isolate_os_sources(self, tmp_path, monkeypatch):
+        """Decouple from the host OS tz so 'None' means 'nothing resolved',
+        not 'CI host happens to have no tz'. OS-tz live read is covered by
+        TestOSTimezoneLiveRead."""
+        monkeypatch.setattr(hermes_time, "ETC_TIMEZONE", str(tmp_path / "nonexistent"))
+        monkeypatch.setattr(hermes_time, "ETC_LOCALTIME", str(tmp_path / "nonexistent2"))
+        monkeypatch.setattr(hermes_time, "get_config_path", lambda: tmp_path / "no_config.yaml")
+        monkeypatch.setattr(hermes_time, "_read_timedatectl", lambda: "")
+        hermes_time.reset_cache()
+
+    def test_returns_none_for_empty(self, tmp_path, monkeypatch):
+        os.environ.pop("HERMES_TIMEZONE", None)
+        self._isolate_os_sources(tmp_path, monkeypatch)
+        tz = hermes_time.get_timezone()
+        assert tz is None
+
+    def test_returns_none_for_invalid(self, tmp_path, monkeypatch):
+        os.environ["HERMES_TIMEZONE"] = "Not/A/Timezone"
+        self._isolate_os_sources(tmp_path, monkeypatch)
+        tz = hermes_time.get_timezone()
+        assert tz is None
 
 
 
@@ -118,28 +137,24 @@ class TestCodeExecutionTZ:
         return _json.dumps({"error": f"unexpected tool call: {function_name}"})
 
     def test_tz_injected_when_configured(self):
-        """When HERMES_TIMEZONE is set, child process sees TZ env var.
+        """When an IANA tz resolves, child process sees TZ env var.
 
-        Verified alongside leak-prevention + empty-TZ handling in one
-        subprocess call so we don't pay 3x the subprocess startup cost
-        (each execute_code spawns a real Python subprocess ~3s).
+        Patches hermes_time.get_timezone_name so this is decoupled from the
+        CI host /etc/timezone. The local execution path (env_type == "local",
+        the default here) is what sets child TZ. Verified alongside
+        leak-prevention in one subprocess call so we don't pay the subprocess
+        startup cost twice (each execute_code spawns a real subprocess ~3s).
         """
         import json as _json
-        os.environ["HERMES_TIMEZONE"] = "Asia/Kolkata"
-
-        # One subprocess, three things checked:
-        #   1) TZ is injected as "Asia/Kolkata"
-        #   2) HERMES_TIMEZONE itself does NOT leak into the child env
         probe = (
             'import os; '
             'print("TZ=" + os.environ.get("TZ", "NOT_SET")); '
             'print("HERMES_TIMEZONE=" + os.environ.get("HERMES_TIMEZONE", "NOT_SET"))'
         )
-        with patch("model_tools.handle_function_call", side_effect=self._mock_handle):
+        with patch("hermes_time.get_timezone_name", return_value="Asia/Kolkata"), \
+             patch("model_tools.handle_function_call", side_effect=self._mock_handle):
             result = _json.loads(self._execute_code(
-                code=probe,
-                task_id="tz-combined-test",
-                enabled_tools=[],
+                code=probe, task_id="tz-combined-test", enabled_tools=[],
             ))
         assert result["status"] == "success"
         assert "TZ=Asia/Kolkata" in result["output"]
@@ -147,12 +162,11 @@ class TestCodeExecutionTZ:
             "HERMES_TIMEZONE should not leak into child env (only TZ)"
         )
 
-    def test_tz_not_injected_when_empty(self):
-        """When HERMES_TIMEZONE is not set, child process has no TZ."""
+    def test_tz_not_injected_when_no_iana(self):
+        """No resolvable IANA tz → child has no TZ (patch decouples from host /etc/timezone)."""
         import json as _json
-        os.environ.pop("HERMES_TIMEZONE", None)
-
-        with patch("model_tools.handle_function_call", side_effect=self._mock_handle):
+        with patch("hermes_time.get_timezone_name", return_value=None), \
+             patch("model_tools.handle_function_call", side_effect=self._mock_handle):
             result = _json.loads(self._execute_code(
                 code='import os; print(os.environ.get("TZ", "NOT_SET"))',
                 task_id="tz-test-empty",
@@ -272,3 +286,131 @@ class TestCronTimezone:
 
         next_run = datetime.fromisoformat(job["next_run_at"])
         assert next_run.tzinfo is not None
+
+
+# =========================================================================
+# OS system-tz live read + fingerprint-gated cache (实时透传)
+# =========================================================================
+
+class TestOSTimezoneLiveRead:
+    def setup_method(self):
+        hermes_time.reset_cache()
+
+    def teardown_method(self):
+        hermes_time.reset_cache()
+        os.environ.pop("HERMES_TIMEZONE", None)
+        os.environ.pop("ZET_AGENT_ENABLED", None)
+
+    def test_reads_etc_timezone_when_no_env(self, tmp_path, monkeypatch):
+        os.environ.pop("HERMES_TIMEZONE", None)
+        tzfile = tmp_path / "timezone"
+        tzfile.write_text("Asia/Tokyo\n")
+        monkeypatch.setattr(hermes_time, "ETC_TIMEZONE", str(tzfile))
+        monkeypatch.setattr(hermes_time, "ETC_LOCALTIME", str(tmp_path / "nonexistent"))
+        # config.yaml 不应有 timezone：指到空目录
+        monkeypatch.setattr(hermes_time, "get_config_path", lambda: tmp_path / "no_config.yaml")
+        hermes_time.reset_cache()
+        assert hermes_time.get_timezone_name() == "Asia/Tokyo"
+        assert hermes_time.now().utcoffset() == timedelta(hours=9)
+
+    def test_localtime_symlink_wins_over_stale_etc_timezone(self, tmp_path, monkeypatch):
+        """ZET-2185: /etc/timezone can go stale (e.g. an OTA writes 'Etc/UTC')
+        while /etc/localtime still points at the real zone. The authoritative
+        /etc/localtime symlink must win — otherwise the agent reasons in UTC and
+        schedules cron 8h off. Reproduces the board28 (CEO device) state."""
+        os.environ.pop("HERMES_TIMEZONE", None)
+        os.environ.pop("ZET_AGENT_ENABLED", None)
+        # Stale Debian file left at UTC.
+        tzfile = tmp_path / "timezone"
+        tzfile.write_text("Etc/UTC\n")
+        # Authoritative symlink → Asia/Shanghai. Only the readlink() target
+        # string is parsed (for the zoneinfo marker), so it need not resolve.
+        localtime = tmp_path / "localtime"
+        os.symlink("../usr/share/zoneinfo/Asia/Shanghai", localtime)
+        monkeypatch.setattr(hermes_time, "ETC_TIMEZONE", str(tzfile))
+        monkeypatch.setattr(hermes_time, "ETC_LOCALTIME", str(localtime))
+        # Stub config read directly: _read_config_timezone goes through
+        # read_raw_config() (the real config path, NOT get_config_path), so
+        # patching get_config_path alone leaves the test coupled to the host's
+        # actual hermes config. Force it empty so OS-tz resolution is exercised.
+        monkeypatch.setattr(hermes_time, "_read_config_timezone", lambda: "")
+        monkeypatch.setattr(hermes_time, "_read_timedatectl", lambda: "")
+        hermes_time.reset_cache()
+        assert hermes_time.get_timezone_name() == "Asia/Shanghai"
+        assert hermes_time.now().utcoffset() == timedelta(hours=8)
+
+    def test_generic_config_timezone_wins_over_os_timezone(self, tmp_path, monkeypatch):
+        os.environ.pop("HERMES_TIMEZONE", None)
+        os.environ.pop("ZET_AGENT_ENABLED", None)
+        tzfile = tmp_path / "timezone"
+        tzfile.write_text("Asia/Tokyo\n")
+        config = tmp_path / "config.yaml"
+        config.write_text("timezone: Europe/London\n")
+        monkeypatch.setattr(hermes_time, "ETC_TIMEZONE", str(tzfile))
+        monkeypatch.setattr(hermes_time, "ETC_LOCALTIME", str(tmp_path / "nonexistent"))
+        monkeypatch.setattr(hermes_time, "get_config_path", lambda: config)
+        hermes_time.reset_cache()
+        assert hermes_time.get_timezone_name() == "Europe/London"
+
+    def test_zettlab_device_os_timezone_wins_over_stale_config(self, tmp_path, monkeypatch):
+        os.environ.pop("HERMES_TIMEZONE", None)
+        os.environ["ZET_AGENT_ENABLED"] = "true"
+        tzfile = tmp_path / "timezone"
+        tzfile.write_text("Asia/Tokyo\n")
+        config = tmp_path / "config.yaml"
+        config.write_text("timezone: Europe/London\n")
+        monkeypatch.setattr(hermes_time, "ETC_TIMEZONE", str(tzfile))
+        monkeypatch.setattr(hermes_time, "ETC_LOCALTIME", str(tmp_path / "nonexistent"))
+        monkeypatch.setattr(hermes_time, "get_config_path", lambda: config)
+        hermes_time.reset_cache()
+        assert hermes_time.get_timezone_name() == "Asia/Tokyo"
+
+    def test_picks_up_change_after_file_rewrite(self, tmp_path, monkeypatch):
+        os.environ.pop("HERMES_TIMEZONE", None)
+        tzfile = tmp_path / "timezone"
+        tzfile.write_text("Asia/Shanghai\n")
+        monkeypatch.setattr(hermes_time, "ETC_TIMEZONE", str(tzfile))
+        monkeypatch.setattr(hermes_time, "ETC_LOCALTIME", str(tmp_path / "nonexistent"))
+        monkeypatch.setattr(hermes_time, "get_config_path", lambda: tmp_path / "no_config.yaml")
+        hermes_time.reset_cache()
+        assert hermes_time.get_timezone_name() == "Asia/Shanghai"
+        # 重写文件（mtime/size 改变）→ 下一次调用必须重解析，无需 reset_cache
+        tzfile.write_text("Asia/Tokyo\n")
+        os.utime(tzfile, ns=(0, 0))  # 强制 mtime_ns 与上次不同
+        assert hermes_time.get_timezone_name() == "Asia/Tokyo"
+
+    def test_file_appearance_triggers_resolve(self, tmp_path, monkeypatch):
+        os.environ.pop("HERMES_TIMEZONE", None)
+        tzfile = tmp_path / "timezone"  # 起初不存在
+        monkeypatch.setattr(hermes_time, "ETC_TIMEZONE", str(tzfile))
+        monkeypatch.setattr(hermes_time, "ETC_LOCALTIME", str(tmp_path / "nonexistent"))
+        monkeypatch.setattr(hermes_time, "get_config_path", lambda: tmp_path / "no_config.yaml")
+        monkeypatch.setattr(hermes_time, "_read_timedatectl", lambda: "")
+        hermes_time.reset_cache()
+        assert hermes_time.get_timezone_name() is None
+        tzfile.write_text("Europe/Paris\n")  # 从无到有
+        assert hermes_time.get_timezone_name() == "Europe/Paris"
+
+    def test_timedatectl_fallback_change_triggers_resolve(self, tmp_path, monkeypatch):
+        os.environ.pop("HERMES_TIMEZONE", None)
+        current = {"tz": "Asia/Shanghai"}
+        monkeypatch.setattr(hermes_time, "ETC_TIMEZONE", str(tmp_path / "nonexistent"))
+        monkeypatch.setattr(hermes_time, "ETC_LOCALTIME", str(tmp_path / "nonexistent2"))
+        monkeypatch.setattr(hermes_time, "get_config_path", lambda: tmp_path / "no_config.yaml")
+        monkeypatch.setattr(hermes_time, "_read_timedatectl", lambda: current["tz"])
+        hermes_time.reset_cache()
+
+        assert hermes_time.get_timezone_name() == "Asia/Shanghai"
+        current["tz"] = "Asia/Tokyo"
+        assert hermes_time.get_timezone_name() == "Asia/Tokyo"
+
+    def test_get_timezone_name_returns_none_for_abbreviation_fallback(self, tmp_path, monkeypatch):
+        os.environ.pop("HERMES_TIMEZONE", None)
+        monkeypatch.setattr(hermes_time, "ETC_TIMEZONE", str(tmp_path / "nonexistent"))
+        monkeypatch.setattr(hermes_time, "ETC_LOCALTIME", str(tmp_path / "nonexistent2"))
+        monkeypatch.setattr(hermes_time, "get_config_path", lambda: tmp_path / "no_config.yaml")
+        monkeypatch.setattr(hermes_time, "_read_timedatectl", lambda: "")
+        hermes_time.reset_cache()
+        # 没有任何 IANA 源 → name 为 None，但 now() 仍 tz-aware（server-local 兜底）
+        assert hermes_time.get_timezone_name() is None
+        assert hermes_time.now().tzinfo is not None

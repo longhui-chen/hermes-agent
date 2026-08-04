@@ -596,6 +596,33 @@ class TestGetHermesDir:
         assert result == tmp_path / "platforms/pairing"
 
 
+    def test_explicit_home_ignores_current_profile_home(
+        self, tmp_path, monkeypatch
+    ):
+        current_home = tmp_path / "root" / "profiles" / "coder"
+        canonical_home = tmp_path / "root"
+        legacy = canonical_home / "pairing"
+        current_home.mkdir(parents=True)
+        legacy.mkdir()
+        (legacy / "feishu-approved.json").write_text("{}")
+        monkeypatch.setenv("HERMES_HOME", str(current_home))
+
+        result = get_hermes_dir(
+            "platforms/pairing",
+            "pairing",
+            home=canonical_home,
+        )
+
+        assert result == legacy
+
+    def test_legacy_populated_with_subdir_returns_legacy(self, tmp_path, monkeypatch):
+        """Sub-directories count as content (e.g. nested cache layout)."""
+        self._set_home(tmp_path, monkeypatch)
+        legacy = tmp_path / "matrix" / "store"
+        legacy.mkdir(parents=True)
+        (legacy / "session").mkdir()  # subdir, not a file
+        result = get_hermes_dir("platforms/matrix/store", "matrix/store")
+        assert result == legacy
 
 
 

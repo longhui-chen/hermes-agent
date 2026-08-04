@@ -188,7 +188,7 @@ def mock_session_db(tmp_path, populated_sessions_dir):
         def __init__(self):
             self._db_path = db_path
 
-        def get_messages(self, session_id):
+        def get_messages_for_model(self, session_id):
             conn = sqlite3.connect(str(self._db_path))
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
@@ -1093,7 +1093,7 @@ class TestEventBridgePollE2E:
 
         # Create a mock SessionDB that reads our test DB
         class TestDB:
-            def get_messages(self, sid):
+            def get_messages_for_model(self, sid):
                 conn = sqlite3.connect(str(db_path))
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
@@ -1144,7 +1144,7 @@ class TestEventBridgePollE2E:
             def __init__(self):
                 self.call_count = 0
 
-            def get_messages(self, sid):
+            def get_messages_for_model(self, sid):
                 self.call_count += 1
                 conn = sqlite3.connect(str(db_path))
                 conn.row_factory = sqlite3.Row
@@ -1193,7 +1193,7 @@ class TestEventBridgePollE2E:
         ])
 
         class TestDB:
-            def get_messages(self, sid):
+            def get_messages_for_model(self, sid):
                 conn = sqlite3.connect(str(db_path))
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
@@ -1274,7 +1274,7 @@ class TestEventBridgePollE2E:
         )
 
         class DB:
-            def get_messages(self, sid):
+            def get_messages_for_model(self, sid):
                 return [{
                     "id": 1, "role": "user",
                     "content": "Hello from a freshly-registered conversation",

@@ -9,6 +9,7 @@ private/internal page the terminal itself can't reach.
 """
 
 import json
+import threading
 
 import pytest
 
@@ -20,7 +21,12 @@ PRIVATE_URL = "http://169.254.169.254/latest/meta-data/"
 
 @pytest.fixture
 def _session(monkeypatch):
-    session = {"tab_id": "tab-1", "user_id": "user-1"}
+    session = {
+        "tab_id": "tab-1",
+        "user_id": "user-1",
+        "release_owner": "owner-1",
+        "session_key": "session-1",
+    }
     monkeypatch.setattr(browser_camofox, "_get_session", lambda task_id: session)
     return session
 
@@ -31,7 +37,7 @@ def _block_active(monkeypatch):
 
     monkeypatch.setattr(browser_tool, "_eval_ssrf_guard_active", lambda task_id: True)
     monkeypatch.setattr(
-        browser_tool, "_camofox_current_page_private_url", lambda tab_id, user_id: PRIVATE_URL
+        browser_tool, "_camofox_current_page_private_url", lambda session: PRIVATE_URL
     )
 
 
@@ -41,7 +47,7 @@ def _block_inactive_guard(monkeypatch):
 
     monkeypatch.setattr(browser_tool, "_eval_ssrf_guard_active", lambda task_id: False)
 
-    def fail_probe(tab_id, user_id):
+    def fail_probe(session):
         raise AssertionError("must not probe page URL when the SSRF guard is inactive")
 
     monkeypatch.setattr(browser_tool, "_camofox_current_page_private_url", fail_probe)
@@ -52,7 +58,7 @@ def _public_page(monkeypatch):
 
     monkeypatch.setattr(browser_tool, "_eval_ssrf_guard_active", lambda task_id: True)
     monkeypatch.setattr(
-        browser_tool, "_camofox_current_page_private_url", lambda tab_id, user_id: None
+        browser_tool, "_camofox_current_page_private_url", lambda session: None
     )
 
 
@@ -117,7 +123,10 @@ def test_snapshot_still_runs_when_page_is_public(monkeypatch, _session):
     monkeypatch.setattr(
         browser_camofox,
         "_get",
-        lambda path, params=None: {"snapshot": "- heading \"Hi\" [e1]", "refsCount": 1},
+        lambda path, params=None, session=None: {
+            "snapshot": "- heading \"Hi\" [e1]",
+            "refsCount": 1,
+        },
     )
 
     out = json.loads(browser_camofox.camofox_snapshot(task_id="t1"))
@@ -130,8 +139,8 @@ def test_camofox_click_still_runs_when_page_is_public(monkeypatch, _session):
     _public_page(monkeypatch)
     calls = []
 
-    def fake_post(path, body=None, timeout=None):
-        calls.append((path, body, timeout))
+    def fake_post(path, body=None, timeout=None, session=None):
+        calls.append((path, body, timeout, session))
         return {"url": "https://example.test/"}
 
     monkeypatch.setattr(browser_camofox, "_post", fake_post)
@@ -145,6 +154,7 @@ def test_camofox_click_still_runs_when_page_is_public(monkeypatch, _session):
             "/tabs/tab-1/click",
             {"userId": "user-1", "ref": "e1"},
             None,
+            _session,
         )
     ]
 
@@ -161,10 +171,62 @@ def test_guard_inactive_does_not_probe(monkeypatch, _session):
     monkeypatch.setattr(
         browser_camofox,
         "_get",
-        lambda path, params=None: {"snapshot": "- heading \"Hi\" [e1]", "refsCount": 1},
+        lambda path, params=None, session=None: {
+            "snapshot": "- heading \"Hi\" [e1]",
+            "refsCount": 1,
+        },
     )
 
     out = json.loads(browser_camofox.camofox_snapshot(task_id="t1"))
 
     assert out["success"] is True
     assert out["element_count"] == 1
+
+
+def test_snapshot_private_probe_and_capture_share_identity_lock(monkeypatch, _session):
+    """A sibling turn cannot navigate between the URL probe and capture."""
+    from tools import browser_tool
+
+    _session["page_url"] = "https://public.example.test/"
+    probe_started = threading.Event()
+    contender_started = threading.Event()
+    private_set = threading.Event()
+
+    monkeypatch.setattr(browser_tool, "_eval_ssrf_guard_active", lambda task_id: True)
+
+    def probe(session):
+        observed_url = session["page_url"]
+        probe_started.set()
+        assert contender_started.wait(1)
+        # With the fixed lock this times out because the contender is queued;
+        # without it the page flips before the capture starts.
+        private_set.wait(0.05)
+        return PRIVATE_URL if observed_url == PRIVATE_URL else None
+
+    monkeypatch.setattr(browser_tool, "_camofox_current_page_private_url", probe)
+
+    def fake_get(path, params=None, session=None):
+        return {
+            "snapshot": f'- heading "{session["page_url"]}" [e1]',
+            "refsCount": 1,
+        }
+
+    monkeypatch.setattr(browser_camofox, "_get", fake_get)
+
+    def navigate_sibling_turn():
+        assert probe_started.wait(1)
+        contender_started.set()
+        identity = browser_camofox._browser_identity_key(_session)
+        with browser_camofox._held_owner_lock(identity):
+            _session["page_url"] = PRIVATE_URL
+            private_set.set()
+
+    thread = threading.Thread(target=navigate_sibling_turn)
+    thread.start()
+    out = json.loads(browser_camofox.camofox_snapshot(task_id="t1"))
+    thread.join(timeout=1)
+
+    assert not thread.is_alive()
+    assert out["success"] is True
+    assert "public.example.test" in out["snapshot"]
+    assert PRIVATE_URL not in out["snapshot"]

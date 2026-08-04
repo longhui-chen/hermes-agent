@@ -6,6 +6,8 @@ against a temp HERMES_HOME, never mocks — the id→file mapping is the whole p
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from agent import learning_mutations as lm
@@ -91,3 +93,81 @@ def test_memory_writes_match_memory_tool_format(home):
 
     assert entries == ["alpha rewritten", "beta note"]
     assert path.read_text(encoding="utf-8") == ENTRY_DELIMITER.join(entries)
+
+
+@pytest.mark.parametrize("operation", ["edit", "delete"])
+def test_memory_mutation_cannot_resurrect_data_after_privacy_reset(
+    home, monkeypatch, operation
+):
+    """A journey RMW that starts during reset must locate only after reset.
+
+    The reset is paused after atomically staging MEMORY.md while it still owns
+    the transaction and target locks.  Edit/delete must remain outside
+    ``_locate_memory`` until reset releases those locks, then observe that the
+    canonical file is gone instead of publishing a stale pre-reset snapshot.
+    """
+    from tools import memory_tool
+
+    reset_staged = threading.Event()
+    release_reset = threading.Event()
+    mutation_started = threading.Event()
+    locate_started = threading.Event()
+    mutation_done = threading.Event()
+    failures: list[BaseException] = []
+    result: dict[str, object] = {}
+
+    original_move = memory_tool._reset_move_no_replace
+    original_locate = lm._locate_memory
+
+    def paused_move(handles, source_scope, source_name, stage_name, stage_scope=None):
+        original_move(handles, source_scope, source_name, stage_name, stage_scope)
+        if source_scope == "memory" and source_name == "MEMORY.md":
+            reset_staged.set()
+            if not release_reset.wait(5):
+                raise AssertionError("test did not release paused reset")
+
+    def observed_locate(source, global_index):
+        locate_started.set()
+        return original_locate(source, global_index)
+
+    monkeypatch.setattr(memory_tool, "_reset_move_no_replace", paused_move)
+    monkeypatch.setattr(lm, "_locate_memory", observed_locate)
+
+    def run_reset():
+        try:
+            memory_tool.reset_curated_memory("memory")
+        except BaseException as exc:
+            failures.append(exc)
+
+    def run_mutation():
+        mutation_started.set()
+        try:
+            if operation == "edit":
+                result.update(lm.edit_node("memory:memory:0", "stale rewrite"))
+            else:
+                result.update(lm.delete_node("memory:memory:0"))
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            mutation_done.set()
+
+    reset_thread = threading.Thread(target=run_reset)
+    mutation_thread = threading.Thread(target=run_mutation)
+    reset_thread.start()
+    assert reset_staged.wait(5)
+
+    mutation_thread.start()
+    assert mutation_started.wait(5)
+    assert not locate_started.wait(0.2)
+    assert not mutation_done.is_set()
+
+    release_reset.set()
+    reset_thread.join(5)
+    mutation_thread.join(5)
+
+    assert not reset_thread.is_alive()
+    assert not mutation_thread.is_alive()
+    assert failures == []
+    assert result["ok"] is False
+    assert "not found" in str(result["message"])
+    assert not (home / "memories" / "MEMORY.md").exists()

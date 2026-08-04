@@ -27,13 +27,19 @@ Usage:
 
 import os
 import re
+import json
+import urllib.request
+from urllib.parse import urlsplit, urlunsplit
 import difflib
 import hashlib
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, ClassVar
 from pathlib import Path
+from agent.secret_scope import get_secret
+from tools.loopback_transport import is_trusted_loopback_http, urlopen_hardened
 from tools.binary_extensions import BINARY_EXTENSIONS
+from gateway.session_context import set_zettlab_turn_id, zettlab_turn_id
 
 from agent.file_safety import (
     build_write_denied_paths,
@@ -260,7 +266,8 @@ class SearchResult:
     limit_reason: Optional[str] = None
     warning: Optional[str] = None
     error: Optional[str] = None
-    
+    note: Optional[str] = None
+
     # Densify content-mode matches into a path-grouped text block above this
     # many matches. Below it, the verbose array is already compact enough that
     # the path-grouping header costs more than it saves.
@@ -323,6 +330,8 @@ class SearchResult:
             result["warning"] = self.warning
         if self.error:
             result["error"] = self.error
+        if self.note:
+            result["note"] = self.note
         return result
 
 
@@ -2145,6 +2154,129 @@ class ShellFileOperations(FileOperations):
     # =========================================================================
     
     def search(self, pattern: str, path: str = ".", target: str = "content",
+               file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
+               output_mode: str = "content", context: int = 0) -> SearchResult:
+        """Search workspace; on Zettlab devices fall back to NAS agent-search when empty."""
+        result = self._search_workspace(
+            pattern, path=path, target=target, file_glob=file_glob,
+            limit=limit, offset=offset, output_mode=output_mode, context=context,
+        )
+        # Only fall back when the workspace search genuinely found nothing.
+        # An errored result (path not found, bad regex, rg/grep hard failure)
+        # also has total_count == 0, but routing it to NAS would mask the real
+        # error behind an unrelated NAS hit — surface the workspace error.
+        if (result.total_count == 0 and not result.error
+                and get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "")):
+            nas = self._zettlab_nas_fallback(pattern, limit)
+            if nas is not None and nas.total_count > 0:
+                return nas
+        return result
+
+    @staticmethod
+    def _zettlab_agent_search_url() -> Optional[str]:
+        """Derive the NAS agent-search endpoint from ZET_CHAT_APPEND_URL.
+
+        ZET_CHAT_APPEND_URL is injected by the registry and points at the
+        loopback local-server (<base>/api/v1/internal/chat/append). We reuse its
+        scheme+netloc and swap the path — same primitive as list_my_channels /
+        send_channel_message. Deriving from the registry-injected URL (instead of
+        a standalone ZETTLAB_LOCAL_SERVER_URL env) keeps the per-agent action
+        token loopback-only: a stale/hostile env can no longer redirect it to an
+        external host. Resolved via the profile secret scope (get_secret) so
+        the shared multiplexing gateway — where the value lives in the profile
+        ``.env``, not the process env — works too. Returns None when absent or
+        malformed.
+        """
+        raw = str(get_secret("ZET_CHAT_APPEND_URL", "") or "").strip()
+        if not raw:
+            return None
+        parts = urlsplit(raw)
+        if not parts.scheme or not parts.netloc:
+            return None
+        # The request below carries the action token: refuse anything that is
+        # not the plain-http loopback face the credential belongs to.
+        if not is_trusted_loopback_http(parts):
+            return None
+        return urlunsplit((parts.scheme, parts.netloc, "/api/v1/file/index/agent-search", "", ""))
+
+    @staticmethod
+    def _zettlab_turn_id() -> str:
+        """Current turn's correlation token (set via set_zettlab_turn_id from the
+        api_server handler's metadata.turn_id). "" when local-server sent none."""
+        return zettlab_turn_id()
+
+    def _zettlab_nas_fallback(self, pattern: str, limit: int) -> Optional[SearchResult]:
+        """Query local-server NAS agent-search; returns None on any error.
+
+        On a hit, local-server injects the matches as preview cards into this
+        agent's current chat turn (rendered in App/Web). The tool therefore
+        returns only a count + a note — never the raw file list: the paths are
+        filename/semantic-level hits (no line numbers / content), so listing them
+        would (a) be misread as content matches and (b) duplicate the cards the
+        user already sees.
+        """
+        token = str(get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or "")
+        query = (pattern or "").strip()
+        url = self._zettlab_agent_search_url()
+        if not token or not query or not url:
+            return None
+        # Default to name+content only (matches local-server's own default).
+        # Semantic is opt-in: forcing it here would drag every empty-workspace
+        # search behind the c-engine cold start (~30s) instead of returning the
+        # fast FTS hits.
+        body = json.dumps({
+            "q": query,
+            "modes": ["name", "content"],
+            "limit": min(max(int(limit or 50), 1), 200),
+        }).encode("utf-8")
+        headers = {
+            "Content-Type": "application/json",
+            "X-Zettlab-Agent-Action-Token": token,
+        }
+        # Echo back the turn local-server tagged this completion with (request
+        # body metadata.turn_id, plumbed onto the session context). local-server
+        # pins the result card to this exact turn (ByTurnIDForAgent); absent it,
+        # it guesses the agent's newest turn (ActiveByAgent), which races with
+        # concurrent same-agent turns. Empty when local-server didn't send one.
+        turn_id = self._zettlab_turn_id()
+        if turn_id:
+            headers["X-Zettlab-Turn-Id"] = turn_id
+        req = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers=headers,
+        )
+        try:
+            with urlopen_hardened(req, timeout=10) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            # Parse inside the try so any malformed reply (non-dict payload,
+            # non-dict items, non-numeric total_count) degrades to None rather
+            # than turning a valid empty search into a tool error.
+            if not isinstance(payload, dict):
+                return None
+            data = payload.get("data")
+            if not isinstance(data, dict):
+                return None
+            hits = sum(
+                1 for it in (data.get("items") or [])
+                if isinstance(it, dict) and (it.get("path") or it.get("filename"))
+            )
+            if not hits:
+                return None
+            total = int(data.get("total_count") or hits)
+        except Exception:
+            return None
+        return SearchResult(
+            total_count=total,
+            note=(
+                f"{hits} NAS file(s) matched and were rendered as preview cards in "
+                "the chat — the user already sees them. Do not list, repeat, or "
+                "describe these results; just continue with the user's request."
+            ),
+        )
+
+    def _search_workspace(self, pattern: str, path: str = ".", target: str = "content",
                file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
                output_mode: str = "content", context: int = 0) -> SearchResult:
         """

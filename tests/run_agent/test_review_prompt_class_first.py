@@ -151,3 +151,19 @@ def test_combined_review_prompt_rejects_unresolved_failures():
 # ---------------------------------------------------------------------------
 # _MEMORY_REVIEW_PROMPT — unchanged, still memory-focused
 # ---------------------------------------------------------------------------
+
+def test_memory_review_prompt_still_focused_on_user_facts():
+    """Memory-only review prompt stays focused on user facts — not touched by this change."""
+    prompt = AIAgent._MEMORY_REVIEW_PROMPT
+    # The memory-only prompt should NOT drift into skill territory
+    assert "skills_list" not in prompt
+    assert "SURVEY" not in prompt
+    assert "memory tool" in prompt
+    assert "target='user'" in prompt
+    assert "Simplified Chinese" in prompt
+
+
+def test_combined_review_prompt_keeps_user_profile_chinese_in_zettlab():
+    prompt = AIAgent._COMBINED_REVIEW_PROMPT
+    assert "target='user'" in prompt
+    assert "Simplified Chinese" in prompt

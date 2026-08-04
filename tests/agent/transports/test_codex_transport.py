@@ -41,6 +41,24 @@ class TestCodexBuildKwargs:
 
 
 
+    @pytest.mark.parametrize(
+        "profile",
+        [
+            pytest.param("main", id="main"),
+            pytest.param("writer", id="writer"),
+        ],
+    )
+    def test_no_system_uses_profile_default(
+        self,
+        transport,
+        monkeypatch,
+        profile,
+    ):
+        monkeypatch.setenv("ZET_AGENT_ID", profile)
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(model="gpt-5.4", messages=messages, tools=[])
+        assert "specialized persona" in kw["instructions"]
+        assert "Zettlab Memo" not in kw["instructions"]
 
 
 
@@ -235,6 +253,69 @@ class TestCodexBuildKwargs:
         assert eb.get("prompt_cache_key") == "caller-override"
         assert eb.get("other_field") == 42
 
+    def test_response_format_json_object_maps_to_text_format(self, transport):
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=messages,
+            tools=[],
+            request_overrides={"response_format": {"type": "json_object"}},
+        )
+        assert "response_format" not in kw
+        assert kw["text"] == {"format": {"type": "json_object"}}
+        assert transport.preflight_kwargs(kw)["text"] == {"format": {"type": "json_object"}}
+
+    def test_response_format_text_is_noop(self, transport):
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=messages,
+            tools=[],
+            request_overrides={"response_format": {"type": "text"}},
+        )
+        assert "response_format" not in kw
+        assert "text" not in kw
+
+    def test_response_format_json_schema_maps_to_text_format(self, transport):
+        schema = {
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+        }
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=messages,
+            tools=[],
+            request_overrides={
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "meeting_minutes",
+                        "schema": schema,
+                        "strict": True,
+                    },
+                }
+            },
+        )
+        assert "response_format" not in kw
+        assert kw["text"] == {
+            "format": {
+                "type": "json_schema",
+                "name": "meeting_minutes",
+                "schema": schema,
+                "strict": True,
+            }
+        }
+        assert transport.preflight_kwargs(kw)["text"] == kw["text"]
+
+    def test_max_tokens(self, transport):
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.4", messages=messages, tools=[],
+            max_tokens=4096,
+        )
+        assert kw.get("max_output_tokens") == 4096
 
 
 

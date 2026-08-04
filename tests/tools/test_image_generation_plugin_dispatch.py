@@ -52,6 +52,56 @@ class TestPluginDispatch:
         assert payload["image"] == "/tmp/codex-test.png"
         assert payload["aspect_ratio"] == "square"
 
+    def test_dispatch_reports_missing_registered_provider(self, monkeypatch, tmp_path):
+        from tools import image_generation_tool
+        from hermes_cli import plugins as plugins_module
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text("image_gen:\n  provider: missing-codex\n")
+
+        monkeypatch.setattr(image_generation_tool, "_read_configured_image_provider", lambda: "missing-codex")
+        monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", lambda: None)
+
+        dispatched = image_generation_tool._dispatch_to_plugin_provider("draw cat", "landscape")
+        payload = json.loads(dispatched)
+
+        assert payload["success"] is False
+        assert payload["error_type"] == "provider_not_registered"
+        assert "image_gen.provider='missing-codex'" in payload["error"]
+
+    def test_dispatch_does_not_force_refresh_when_provider_is_missing(
+        self, monkeypatch, tmp_path
+    ):
+        from tools import image_generation_tool
+        from hermes_cli import plugins as plugins_module
+        from agent import image_gen_registry as registry_module
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text("image_gen:\n  provider: codex\n")
+
+        monkeypatch.setattr(image_generation_tool, "_read_configured_image_provider", lambda: "codex")
+
+        calls = []
+
+        def fake_ensure_plugins_discovered(force=False):
+            calls.append(force)
+
+        monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", fake_ensure_plugins_discovered)
+        monkeypatch.setattr(registry_module, "get_provider", lambda name: None)
+
+        dispatched = image_generation_tool._dispatch_to_plugin_provider("draw hammy", "portrait")
+        payload = json.loads(dispatched)
+
+        assert calls == [False]
+        assert payload["success"] is False
+        assert payload["error_type"] == "provider_not_registered"
+
+    def test_unset_provider_keeps_legacy_fal_path(self, monkeypatch):
+        """An unrelated API key must not opt the user into paid image generation."""
+        from tools import image_generation_tool
+
+        monkeypatch.setattr(image_generation_tool, "_read_configured_image_provider", lambda: None)
+        assert image_generation_tool._dispatch_to_plugin_provider("draw cat", "landscape") is None
 
     def test_deepinfra_key_alone_does_not_select_image_backend(self, monkeypatch):
         """DeepInfra chat credentials do not imply consent to image billing."""
@@ -70,3 +120,124 @@ class TestPluginDispatch:
             image_generation_tool, "_read_configured_image_provider", lambda: None
         )
         assert image_generation_tool.check_image_generation_requirements() is False
+
+    def test_requirements_do_not_fallback_to_fal_for_unavailable_selected_plugin(
+        self, monkeypatch
+    ):
+        from tools import image_generation_tool
+        from hermes_cli import plugins as plugins_module
+        from agent import image_gen_registry as registry_module
+
+        unavailable = _FakeCodexProvider()
+        monkeypatch.setattr(unavailable, "is_available", lambda: False)
+        monkeypatch.setattr(
+            image_generation_tool, "_read_configured_image_provider", lambda: "codex"
+        )
+        monkeypatch.setattr(image_generation_tool, "check_fal_api_key", lambda: True)
+        monkeypatch.setattr(image_generation_tool, "_load_fal_client", lambda: object())
+        monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", lambda: None)
+        monkeypatch.setattr(registry_module, "get_provider", lambda name: unavailable)
+
+        assert image_generation_tool.check_image_generation_requirements() is False
+
+    def test_requirements_do_not_force_refresh_when_selected_plugin_is_missing(
+        self, monkeypatch
+    ):
+        from tools import image_generation_tool
+        from hermes_cli import plugins as plugins_module
+        from agent import image_gen_registry as registry_module
+
+        discovery_calls = []
+
+        def discover(force=False):
+            discovery_calls.append(force)
+
+        monkeypatch.setattr(
+            image_generation_tool, "_read_configured_image_provider", lambda: "codex"
+        )
+        monkeypatch.setattr(image_generation_tool, "check_fal_api_key", lambda: True)
+        monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", discover)
+        monkeypatch.setattr(
+            registry_module, "get_provider", lambda name: None
+        )
+
+        assert image_generation_tool.check_image_generation_requirements() is False
+        assert discovery_calls == [False]
+
+    def test_requirements_are_rechecked_across_multiplex_profiles(
+        self, monkeypatch
+    ):
+        from tools import image_generation_tool
+        from tools import registry as tool_registry
+        from hermes_cli import plugins as plugins_module
+        from agent import image_gen_registry as registry_module
+
+        selected_profile = {"name": "profile-a"}
+        providers = {
+            "profile-a": type(
+                "UnavailableProvider", (), {"is_available": lambda self: False}
+            )(),
+            "profile-b": type(
+                "AvailableProvider", (), {"is_available": lambda self: True}
+            )(),
+        }
+        monkeypatch.setattr(
+            image_generation_tool,
+            "_read_configured_image_provider",
+            lambda: selected_profile["name"],
+        )
+        monkeypatch.setattr(plugins_module, "_ensure_plugins_discovered", lambda: None)
+        monkeypatch.setattr(
+            registry_module,
+            "get_provider",
+            lambda name: providers[name],
+        )
+        monkeypatch.setattr("agent.secret_scope.is_multiplex_active", lambda: True)
+
+        tool_registry._check_fn_cache.clear()
+        tool_registry._check_fn_last_good.clear()
+        assert tool_registry._check_fn_cached(
+            image_generation_tool.check_image_generation_requirements
+        ) is False
+
+        selected_profile["name"] = "profile-b"
+        assert tool_registry._check_fn_cached(
+            image_generation_tool.check_image_generation_requirements
+        ) is True
+
+    def test_handler_does_not_fallback_to_fal_when_selected_plugin_discovery_fails(
+        self, monkeypatch
+    ):
+        from tools import image_generation_tool
+        from hermes_cli import plugins as plugins_module
+
+        monkeypatch.setattr(
+            image_generation_tool, "_read_configured_image_provider", lambda: "codex"
+        )
+        monkeypatch.setattr(
+            image_generation_tool, "_read_configured_image_model", lambda: None
+        )
+        monkeypatch.setattr(
+            plugins_module,
+            "_ensure_plugins_discovered",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("plugin discovery failed")
+            ),
+        )
+        monkeypatch.setattr(
+            image_generation_tool,
+            "image_generate_tool",
+            lambda **kwargs: json.dumps({
+                "success": True,
+                "provider": "fal",
+                "image": "https://fal.example/fallback.png",
+            }),
+        )
+
+        result = json.loads(
+            image_generation_tool._handle_image_generate({"prompt": "draw a cat"})
+        )
+
+        assert result["success"] is False
+        assert result["error_type"] == "provider_exception"
+        assert "codex" in result["error"]

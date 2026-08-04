@@ -1,76 +1,69 @@
-"""Default SOUL.md template seeded into HERMES_HOME on first run."""
+"""Neutral SOUL.md templates seeded by the Hermes runtime.
 
-DEFAULT_SOUL_MD = (
-    "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
-    "You are helpful, knowledgeable, and direct. You assist users with a wide "
-    "range of tasks including answering questions, writing and editing code, "
-    "analyzing information, creative work, and executing actions via your tools. "
-    "You communicate clearly, admit uncertainty when appropriate, and prioritize "
-    "being genuinely useful over being verbose unless otherwise directed below. "
-    "Be targeted and efficient in your exploration and investigations."
+Hermes is profile-agnostic: product personas such as Zettlab Memo are
+materialized into a profile's ``SOUL.md`` by the profile owner (local-server,
+an Agent Hub package, or the user). A missing SOUL therefore always gets the
+same neutral identity slot, regardless of profile name.
+
+Language selection mirrors ``agent.prompt_builder.get_agent_prompt_lang`` so
+the seeded SOUL.md and runtime base prompt agree on language. Unset -> English.
+"""
+
+import os
+
+DEFAULT_BASE_SOUL_MD_EN = (
+    "# Agent SOUL\n\n"
+    "This profile has not been given a specialized persona yet. Treat this file "
+    "as an open identity slot: follow the user's current request, the shared "
+    "Zettlab agent base prompt, and any future edits to this SOUL.md. Do not "
+    "assume any named specialist identity unless this file, a template package, "
+    "or the current user explicitly defines that identity."
 )
 
-# Legacy SOUL.md boilerplate that older installers (install.sh / install.ps1 /
-# docker/SOUL.md) seeded before they were switched to write DEFAULT_SOUL_MD.
-# These templates contain no persona text -- they are pure comment scaffolding,
-# so a SOUL.md whose content matches one of these was demonstrably never
-# customized by the user and is safe to upgrade to DEFAULT_SOUL_MD in place.
-#
-# Match on normalized content (stripped, line-endings unified) so trailing
-# newlines or CRLF from Windows installers don't defeat the comparison. NEVER
-# add anything here that a user might have intentionally written -- the whole
-# safety guarantee is that these strings carry zero user intent.
-_LEGACY_TEMPLATE_SOULS = (
-    (
-        "# Hermes Agent Persona\n"
-        "\n"
-        "<!--\n"
-        "This file defines the agent's personality and tone.\n"
-        "The agent will embody whatever you write here.\n"
-        "Edit this to customize how Hermes communicates with you.\n"
-        "\n"
-        "Examples:\n"
-        '  - "You are a warm, playful assistant who uses kaomoji occasionally."\n'
-        '  - "You are a concise technical expert. No fluff, just facts."\n'
-        '  - "You speak like a friendly coworker who happens to know everything."\n'
-        "\n"
-        "This file is loaded fresh each message -- no restart needed.\n"
-        "Delete the contents (or this file) to use the default personality.\n"
-        "-->"
-    ),
-    # docker/SOUL.md and the install.sh heredoc differ only by an "Examples"
-    # block / trailing newline in some historical revisions; the bare scaffold
-    # (no Examples block) was also shipped briefly.
-    (
-        "# Hermes Agent Persona\n"
-        "\n"
-        "<!--\n"
-        "This file defines the agent's personality and tone.\n"
-        "The agent will embody whatever you write here.\n"
-        "Edit this to customize how Hermes communicates with you.\n"
-        "\n"
-        "This file is loaded fresh each message -- no restart needed.\n"
-        "Delete the contents (or this file) to use the default personality.\n"
-        "-->"
-    ),
+DEFAULT_BASE_SOUL_MD_ZH = (
+    "# Agent SOUL\n\n"
+    "这个 profile 还没有写入专属人格。把这个文件视为开放的身份槽：遵循用户当前请求、"
+    "共享的 Zettlab agent base prompt，以及之后写入本 SOUL.md 的内容。"
+    "除非本文件、模板包或当前用户明确指定，否则不要默认自己是任何具名专家。"
 )
 
 
-def _normalize_soul(text: str) -> str:
-    """Normalize SOUL.md content for legacy-template comparison."""
-    # Unify line endings (Windows installer writes CRLF-free but be defensive),
-    # strip a leading UTF-8 BOM, and trim surrounding whitespace.
-    return text.replace("\r\n", "\n").replace("\r", "\n").lstrip("\ufeff").strip()
+def _resolve_lang(lang: str | None = None) -> str:
+    """Resolve 'zh' or 'en' from an explicit arg or the env contract.
 
-
-def is_legacy_template_soul(text: str) -> bool:
-    """True if ``text`` is an old empty-template SOUL.md (no user persona).
-
-    Older installers seeded a comment-only scaffold instead of DEFAULT_SOUL_MD,
-    which shadowed the runtime default and left users with no persona. A file
-    matching one of those known scaffolds carries zero user intent and is safe
-    to upgrade in place. Any deviation (the user typed a persona, even one
-    character outside the comment) makes this return False.
+    Kept self-contained (no agent.* import) so the lightweight hermes_cli
+    seeding path stays decoupled from the runtime agent package.
     """
-    normalized = _normalize_soul(text)
-    return any(normalized == _normalize_soul(t) for t in _LEGACY_TEMPLATE_SOULS)
+    if lang:
+        raw = lang.strip().lower()
+    else:
+        raw = (
+            os.environ.get("HERMES_AGENT_LANG")
+            or os.environ.get("ZETTLAB_AGENT_LANG")
+            or ""
+        ).strip().lower()
+    if raw in ("zh", "cn", "zh-cn", "zh-hans", "chinese", "mandarin"):
+        return "zh"
+    return "en"
+
+
+def base_soul_md(lang: str | None = None) -> str:
+    """Return the neutral identity slot used by every unmaterialized profile."""
+    return DEFAULT_BASE_SOUL_MD_ZH if _resolve_lang(lang) == "zh" else DEFAULT_BASE_SOUL_MD_EN
+
+
+def default_soul_md(lang: str | None = None, profile: str | None = None) -> str:
+    """Return the profile-agnostic default SOUL body.
+
+    ``profile`` remains accepted for API compatibility, but names never select
+    a product persona. A product owner must materialize that persona into the
+    profile's SOUL.md before Hermes starts it.
+    """
+    _ = profile
+    return base_soul_md(lang)
+
+
+# Back-compat aliases used by installers and existing imports.
+DEFAULT_SOUL_MD_EN = DEFAULT_BASE_SOUL_MD_EN
+DEFAULT_SOUL_MD_ZH = DEFAULT_BASE_SOUL_MD_ZH
+DEFAULT_SOUL_MD = DEFAULT_SOUL_MD_EN

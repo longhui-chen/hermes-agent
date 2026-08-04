@@ -329,6 +329,27 @@ def _check_overrides(
     return final_provider, final_model, requested_agent_id, final_profile
 
 
+def _check_auxiliary_task(plugin_id: str, requested_task: Optional[str]) -> Optional[str]:
+    """Allow a plugin to route only through an auxiliary task it registered."""
+    task = (requested_task or "").strip()
+    if not task:
+        return None
+    try:
+        from hermes_cli.plugins import get_plugin_auxiliary_tasks
+
+        entries = get_plugin_auxiliary_tasks()
+    except Exception as exc:
+        raise PluginLlmTrustError(
+            f"Plugin {plugin_id!r} auxiliary task registry is unavailable"
+        ) from exc
+    for entry in entries:
+        if entry.get("key") == task and entry.get("plugin") == plugin_id:
+            return task
+    raise PluginLlmTrustError(
+        f"Plugin {plugin_id!r} cannot use unowned auxiliary task {task!r}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Input normalization
 # ---------------------------------------------------------------------------
@@ -628,9 +649,11 @@ class PluginLlm:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         timeout: Optional[float] = None,
+        fail_fast: bool = False,
         agent_id: Optional[str] = None,
         profile: Optional[str] = None,
         purpose: Optional[str] = None,
+        auxiliary_task: Optional[str] = None,
     ) -> PluginLlmCompleteResult:
         """Run a host-owned chat completion against the user's active model.
 
@@ -649,6 +672,9 @@ class PluginLlm:
             requested_agent_id=agent_id,
             requested_profile=profile,
         )
+        eff_auxiliary_task = _check_auxiliary_task(
+            self._plugin_id, auxiliary_task
+        )
         real_provider, real_model, response = self._invoke_sync(
             messages=messages,
             provider_override=eff_provider,
@@ -657,6 +683,8 @@ class PluginLlm:
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            fail_fast=fail_fast,
+            auxiliary_task=eff_auxiliary_task,
         )
         text = _extract_text(response)
         usage = _extract_usage(response)
@@ -926,7 +954,9 @@ class PluginLlm:
         temperature: Optional[float],
         max_tokens: Optional[int],
         timeout: Optional[float],
+        fail_fast: bool = False,
         extra_body: Optional[Dict[str, Any]] = None,
+        auxiliary_task: Optional[str] = None,
     ) -> tuple[str, str, Any]:
         """Invoke the host's ``call_llm``. Lazy-imports
         ``agent.auxiliary_client`` to avoid circular deps at plugin
@@ -940,20 +970,23 @@ class PluginLlm:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout=timeout,
+                fail_fast=fail_fast,
                 extra_body=extra_body,
+                auxiliary_task=auxiliary_task,
             )
         from agent.auxiliary_client import call_llm
         merged_extra = dict(extra_body or {})
         if profile_override:
             merged_extra.setdefault("metadata", {})["auth_profile"] = profile_override
         response = call_llm(
-            task=None,
+            task=auxiliary_task,
             provider=provider_override,
             model=model_override,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            fail_fast=fail_fast,
             extra_body=merged_extra or None,
         )
         provider, model = _resolve_attribution(

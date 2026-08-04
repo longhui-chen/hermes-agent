@@ -86,6 +86,20 @@ def _make_plugin_dir(base: Path, name: str, *, register_body: str = "pass",
     return plugin_dir
 
 
+def _disable_plugin(base: Path, name: str) -> None:
+    """Disable a bundled plugin when a test needs an isolated hook set."""
+    hermes_home = base.parent
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    cfg_path = hermes_home / "config.yaml"
+    cfg = yaml.safe_load(cfg_path.read_text()) if cfg_path.exists() else {}
+    cfg = cfg or {}
+    plugins_cfg = cfg.setdefault("plugins", {})
+    disabled = plugins_cfg.setdefault("disabled", [])
+    if name not in disabled:
+        disabled.append(name)
+    cfg_path.write_text(yaml.safe_dump(cfg))
+
+
 # ── TestPluginDiscovery ────────────────────────────────────────────────────
 
 
@@ -335,6 +349,77 @@ class TestPluginHooks:
 
 
 
+    def test_invoke_hook_adds_observer_schema_version(self, tmp_path, monkeypatch):
+        """invoke_hook() supplies the observer schema version for all hooks."""
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _make_plugin_dir(
+            plugins_dir,
+            "schema_plugin",
+            register_body=(
+                'ctx.register_hook("pre_tool_call", '
+                'lambda **kw: kw.get("telemetry_schema_version"))'
+            ),
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert mgr.invoke_hook("pre_tool_call", tool_name="test", args={}) == [
+            "hermes.observer.v1"
+        ]
+
+    def test_hook_exception_does_not_propagate(self, tmp_path, monkeypatch):
+        """A hook callback that raises does NOT crash the caller."""
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _make_plugin_dir(
+            plugins_dir, "bad_hook",
+            register_body='ctx.register_hook("post_tool_call", lambda **kw: 1/0)',
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        # Should not raise despite 1/0
+        mgr.invoke_hook("post_tool_call", tool_name="x", args={}, result="r", task_id="")
+
+    def test_hook_return_values_collected(self, tmp_path, monkeypatch):
+        """invoke_hook() collects non-None return values from callbacks."""
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _disable_plugin(plugins_dir, "creation-governor")
+        _make_plugin_dir(
+            plugins_dir, "ctx_plugin",
+            register_body=(
+                'ctx.register_hook("pre_llm_call", '
+                'lambda **kw: {"context": "memory from plugin"})'
+            ),
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        results = mgr.invoke_hook("pre_llm_call", session_id="s1", user_message="hi",
+                                  conversation_history=[], is_first_turn=True, model="test")
+        assert len(results) == 1
+        assert results[0] == {"context": "memory from plugin"}
+
+    def test_hook_none_returns_excluded(self, tmp_path, monkeypatch):
+        """invoke_hook() excludes None returns from the result list."""
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _make_plugin_dir(
+            plugins_dir, "none_hook",
+            register_body='ctx.register_hook("post_llm_call", lambda **kw: None)',
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        results = mgr.invoke_hook("post_llm_call", session_id="s1",
+                                  user_message="hi", assistant_response="bye", model="test")
+        assert results == []
 
     def test_request_hooks_are_invokeable(self, tmp_path, monkeypatch):
         plugins_dir = tmp_path / "hermes_test" / "plugins"
@@ -813,6 +898,7 @@ class TestPreLlmCallTargetRouting:
 
     def _make_pre_llm_plugin(self, plugins_dir, name, return_expr):
         """Create a plugin that returns a specific value from pre_llm_call."""
+        _disable_plugin(plugins_dir, "creation-governor")
         _make_plugin_dir(
             plugins_dir, name,
             register_body=(

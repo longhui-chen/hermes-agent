@@ -18,6 +18,45 @@ class TestGenerateTitle:
 
 
 
+    def test_default_prompt_matches_user_language(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Some Title"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response) as llm:
+            generate_title("質問です", "回答です")
+
+        system_prompt = llm.call_args.kwargs["messages"][0]["content"]
+        assert "same language the user is writing in" in system_prompt
+
+    def test_prompt_labels_user_intent_instead_of_answering(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "询问她的缺点"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response) as llm:
+            title = generate_title("她有什么缺点？", "她的主要缺点是稳定性存疑。")
+            assert title == "询问她的缺点"
+
+        system_prompt = llm.call_args.kwargs["messages"][0]["content"]
+        assert "never answer" in system_prompt
+        assert "她有什么缺点" in system_prompt
+        assert "询问她的缺点" in system_prompt
+
+    def test_configured_language_pins_prompt(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Some Title"
+
+        with (
+            patch("agent.title_generator.call_llm", return_value=mock_response) as llm,
+            patch("agent.title_generator._title_language", return_value="Japanese"),
+        ):
+            generate_title("hello", "hi")
+
+        system_prompt = llm.call_args.kwargs["messages"][0]["content"]
+        assert "Write the title in Japanese" in system_prompt
+        assert "same language the user" not in system_prompt
 
     def test_title_language_reads_config(self):
         cfg = {"auxiliary": {"title_generation": {"language": "  French "}}}
@@ -79,6 +118,17 @@ class TestGenerateTitle:
             # leaving nothing → None.
             assert title is None
 
+
+    def test_keeps_only_first_line_and_strips_chinese_prefix(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = (
+            "标题：  询问她的缺点  \n这是额外解释，不应进入标题"
+        )
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            title = generate_title("她有什么缺点？", "她的主要缺点是稳定性存疑。")
+            assert title == "询问她的缺点"
 
     def test_truncates_long_titles(self):
         mock_response = MagicMock()
@@ -185,6 +235,26 @@ class TestAutoTitleSession:
         assert seen == [("title generation", boom)]
 
 
+    def test_manual_rename_wins_while_generation_is_running(self):
+        class AtomicDB:
+            def get_session_title(self, _session_id):
+                return None
+
+            def set_session_title_if_empty(self, _session_id, _title):
+                return False
+
+        seen = []
+        with patch("agent.title_generator.generate_title", return_value="Generated Title"):
+            auto_title_session(
+                AtomicDB(),
+                "sess-1",
+                "hi",
+                "hello",
+                title_callback=seen.append,
+            )
+
+        assert seen == []
+
 
 class TestMaybeAutoTitle:
     """Tests for maybe_auto_title() — the fire-and-forget entry point."""
@@ -239,6 +309,71 @@ class TestMaybeAutoTitle:
 
 
 
+    def test_forwards_failure_callback_to_worker(self):
+        """maybe_auto_title must forward failure_callback into the thread."""
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        history = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+        ]
+
+        def _cb(task, exc):
+            pass
+
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            import threading
+            called = threading.Event()
+            mock_auto.side_effect = lambda *a, **k: called.set()
+            maybe_auto_title(db, "sess-1", "hello", "hi there", history, failure_callback=_cb)
+            assert called.wait(timeout=10), "auto_title thread never ran"
+            mock_auto.assert_called_once_with(
+                db,
+                "sess-1",
+                "hello",
+                "hi there",
+                failure_callback=_cb,
+                main_runtime=None,
+                title_callback=None,
+                runtime_validator=None,
+            )
+
+    def test_can_run_worker_synchronously_for_in_band_delivery(self):
+        db = MagicMock()
+        history = [
+            {"role": "user", "content": "她有什么缺点？"},
+            {"role": "assistant", "content": "她的主要缺点是稳定性存疑。"},
+        ]
+        seen = []
+
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            maybe_auto_title(
+                db,
+                "sess-1",
+                "她有什么缺点？",
+                "她的主要缺点是稳定性存疑。",
+                history,
+                title_callback=seen.append,
+                background=False,
+            )
+
+        mock_auto.assert_called_once_with(
+            db,
+            "sess-1",
+            "她有什么缺点？",
+            "她的主要缺点是稳定性存疑。",
+            failure_callback=None,
+            main_runtime=None,
+            title_callback=seen.append,
+            runtime_validator=None,
+        )
+
+    def test_skips_if_no_response(self):
+        db = MagicMock()
+        maybe_auto_title(db, "sess-1", "hello", "", [])  # empty response
+
+    def test_skips_if_no_session_db(self):
+        maybe_auto_title(None, "sess-1", "hello", "response", [])  # no db
 
 
 class TestAutoTitleDuplicateHandling:

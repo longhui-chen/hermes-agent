@@ -95,6 +95,44 @@ class TestBackgroundChildDoesNotHang:
         assert result["output"].endswith("END-MARK")
         assert len(result["output"]) > 200000
 
+    def test_continuous_output_still_honors_foreground_timeout(
+        self, local_env, monkeypatch
+    ):
+        monkeypatch.setattr("tools.tool_output_limits.get_max_bytes", lambda: 5_000)
+        command = (
+            "python3 -c \"import sys; "
+            "chunk = 'x' * 4096; "
+            "exec('while True: sys.stdout.write(chunk); sys.stdout.flush()')\""
+        )
+
+        started = time.monotonic()
+        result = local_env.execute(command, timeout=1, bounded_capture=True)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 10.0
+        assert result["returncode"] == 124
+        assert len(result["output"]) <= 5_000
+        assert "[OUTPUT TRUNCATED" in result["output"]
+        assert result["output"].endswith("[Command timed out after 1s]")
+
+    @pytest.mark.live_system_guard_bypass
+    def test_timeout_path_still_works(self, local_env):
+        """Foreground command exceeding timeout must still be killed."""
+        t0 = time.monotonic()
+        result = local_env.execute("sleep 30", timeout=2)
+        elapsed = time.monotonic() - t0
+
+        assert elapsed < 10.0
+        assert result["returncode"] == 124
+        assert "timed out" in result["output"].lower()
+
+    def test_utf8_output_decoded_correctly(self, local_env):
+        """Multibyte UTF-8 chunks must decode cleanly under select-based reads."""
+        result = local_env.execute("echo 日本語 café résumé", timeout=30)
+        assert result["returncode"] == 0
+        assert "日本語" in result["output"]
+        assert "café" in result["output"]
+        assert "résumé" in result["output"]
 
     def test_utf8_multibyte_across_read_boundary(self, local_env):
         """Multibyte UTF-8 characters straddling a 4096-byte ``os.read()`` boundary

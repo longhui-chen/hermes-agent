@@ -43,6 +43,8 @@ _trigger_cron_job_sync = late("_trigger_cron_job_sync")
 _delete_cron_job_sync = late("_delete_cron_job_sync")
 _find_cron_job_profile = late("_find_cron_job_profile")
 _fire_cron_job_for_profile = late("_fire_cron_job_for_profile")
+_preflight_calendar_fire_for_profile = late("_preflight_calendar_fire_for_profile")
+_run_external_calendar_fire_for_profile = late("_run_external_calendar_fire_for_profile")
 _call_cron_for_profile = late("_call_cron_for_profile")
 load_config = late("load_config")
 cfg_get = late("cfg_get")
@@ -172,10 +174,72 @@ async def cron_fire_webhook(request: Request):
         # does not retry a fire that is intentionally absent.
         return JSONResponse({"status": "gone", "job_id": job_id}, status_code=200)
 
-    # Run in the background; the store CAS claim inside fire_due de-dupes a
-    # NAS/scheduler retry that arrives while this is in flight.
+    provider_fire_id = str(
+        (body or {}).get("provider_fire_id")
+        or (body or {}).get("fire_id")
+        or (body or {}).get("dedupe_key")
+        or request.headers.get("X-Chronos-Fire-ID", "")
+        or claims.get("fire_id")
+        or claims.get("jti")
+        or ""
+    )
+    try:
+        calendar_attempt = await asyncio.to_thread(
+            _preflight_calendar_fire_for_profile,
+            profile,
+            job_id,
+            provider_fire_id,
+        )
+    except Exception:
+        _log.warning(
+            "calendar external fire preflight failed for %s", job_id, exc_info=True
+        )
+        return JSONResponse(
+            {"error": "calendar delivery preflight required"},
+            status_code=503,
+            headers={"Retry-After": "5"},
+        )
+    if calendar_attempt is not None:
+        job, begin = calendar_attempt
+        if (
+            begin.get("state")
+            not in {"fired", "expired", "cancelled", "superseded"}
+            and begin.get("attempt_replayed") is not True
+        ):
+            asyncio.create_task(
+                asyncio.to_thread(
+                    _run_external_calendar_fire_for_profile,
+                    profile,
+                    job,
+                    begin,
+                )
+            )
+        return JSONResponse(
+            {
+                "status": "accepted",
+                "job_id": job_id,
+                "attempt_sequence": begin.get("attempt_sequence"),
+                "dedupe_key": begin.get("dedupe_key"),
+            },
+            status_code=202,
+        )
+
+    # Ordinary jobs preserve the historical background + generic claim path.
+    from cron.jobs import normalize_external_fire_at
+
+    if (body or {}).get("fire_at") is None:
+        return JSONResponse({"error": "missing fire_at"}, status_code=400)
+    try:
+        ordinary_fire_at = normalize_external_fire_at((body or {}).get("fire_at"))
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
     asyncio.create_task(
-        asyncio.to_thread(_fire_cron_job_for_profile, profile, job_id)
+        asyncio.to_thread(
+            _fire_cron_job_for_profile,
+            profile,
+            job_id,
+            ordinary_fire_at,
+        )
     )
     return JSONResponse({"status": "accepted", "job_id": job_id}, status_code=202)
 

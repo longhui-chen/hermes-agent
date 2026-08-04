@@ -58,7 +58,7 @@ def test_fire_cron_job_scopes_store_and_runtime_home_together(
     captured = {}
 
     class RecordingProvider:
-        def fire_due(self, job_id, *, adapters=None, loop=None):
+        def fire_due(self, job_id, *, adapters=None, loop=None, fire_at=None):
             captured["job_id"] = job_id
             captured["runtime_home"] = scheduler._get_hermes_home()
             captured["jobs_file"] = cron_jobs._current_cron_store().jobs_file
@@ -115,7 +115,7 @@ def test_profile_call_cannot_retarget_ticker_store_mid_write(
     monkeypatch.setattr(
         cron_jobs,
         "compute_next_run",
-        lambda _schedule, _last_run_at=None: "2026-07-10T00:00:00+00:00",
+        lambda _schedule, _last_run_at=None, **_kwargs: "2026-07-10T00:00:00+00:00",
     )
 
     ticker_loaded = threading.Event()
@@ -165,6 +165,29 @@ def test_profile_call_cannot_retarget_ticker_store_mid_write(
     assert [job["id"] for job in worker_saved] == ["worker-job"]
     assert [job["id"] for job in default_saved] == ["default-job"]
     assert default_saved[0]["next_run_at"] == "2026-07-10T00:00:00+00:00"
+def test_call_cron_for_profile_installs_profile_secret_scope(isolated_profiles, monkeypatch):
+    from agent.secret_scope import current_secret_scope
+    from cron import jobs as cron_jobs
+    from hermes_cli import web_server
+    from hermes_constants import get_hermes_home
+
+    (isolated_profiles["worker_alpha"] / ".env").write_text(
+        "ANTHROPIC_API_KEY=sk-worker\n",
+        encoding="utf-8",
+    )
+    seen = {}
+
+    def fake_list_jobs(include_disabled=False):
+        seen["home"] = get_hermes_home()
+        seen["scope"] = dict(current_secret_scope() or {})
+        return []
+
+    monkeypatch.setattr(cron_jobs, "list_jobs", fake_list_jobs)
+
+    assert web_server._call_cron_for_profile("worker_alpha", "list_jobs", True) == []
+
+    assert seen["home"] == isolated_profiles["worker_alpha"]
+    assert seen["scope"]["ANTHROPIC_API_KEY"] == "sk-worker"
 
 
 
@@ -236,7 +259,6 @@ async def test_dashboard_cron_rejects_missing_context_from(isolated_profiles):
 
     assert update_exc.value.status_code == 400
     assert "missing-job-id" in update_exc.value.detail
-
 
 
 

@@ -24,6 +24,7 @@ import wave
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 
 from tools.transcription_tools import (
     BUILTIN_STT_PROVIDERS,
@@ -233,6 +234,97 @@ class TestTranscribeCommandSTT:
         assert result["success"] is True
         assert result["transcript"] == "stdout transcript"
 
+    def test_missing_command_returns_error(self, tmp_path):
+        audio = _make_silent_wav(tmp_path / "input.wav")
+        result = _transcribe_command_stt(str(audio), "fake-cli", {}, {})
+        assert result["success"] is False
+        assert "command is not configured" in result["error"]
+
+    def test_missing_audio_returns_error(self, tmp_path):
+        cfg = {"command": _python_emit_command("x")}
+        result = _transcribe_command_stt(
+            str(tmp_path / "does-not-exist.wav"), "fake-cli", cfg, {},
+        )
+        assert result["success"] is False
+        assert "Audio file not found" in result["error"]
+
+    def test_nonzero_exit_returns_error_with_stderr(self, tmp_path):
+        audio = _make_silent_wav(tmp_path / "input.wav")
+        # Use a command that fails reliably across platforms.
+        interpreter = sys.executable
+        cfg = {
+            "command": (
+                f'"{interpreter}" -c "import sys; sys.stderr.write(\'boom\'); sys.exit(7)"'
+            ),
+        }
+        result = _transcribe_command_stt(str(audio), "fake-cli", cfg, {})
+        assert result["success"] is False
+        assert "exited with code 7" in result["error"]
+        assert "boom" in result["error"]
+
+    @pytest.mark.live_system_guard_bypass
+    def test_timeout_returns_clean_error(self, tmp_path):
+        audio = _make_silent_wav(tmp_path / "input.wav")
+        interpreter = sys.executable
+        cfg = {
+            "command": f'"{interpreter}" -c "import time; time.sleep(5)"',
+            "timeout": 0.5,
+        }
+        result = _transcribe_command_stt(str(audio), "slow-cli", cfg, {})
+        assert result["success"] is False
+        assert "timed out after" in result["error"]
+
+    def test_model_override_passed_to_template(self, tmp_path):
+        audio = _make_silent_wav(tmp_path / "input.wav")
+        # Write the model into the transcript so we can assert it propagated.
+        interpreter = sys.executable
+        payload = "import sys; open(sys.argv[2], 'w').write(sys.argv[1])"
+        cfg = {
+            "command": f'"{interpreter}" -c "{payload}" {{model}} {{output_path}}',
+            "model": "config-model",
+        }
+        result = _transcribe_command_stt(
+            str(audio), "fake-cli", cfg, {}, model_override="override-model",
+        )
+        assert result["success"] is True
+        assert result["transcript"] == "override-model"
+
+    def test_config_model_used_when_no_override(self, tmp_path):
+        audio = _make_silent_wav(tmp_path / "input.wav")
+        interpreter = sys.executable
+        payload = "import sys; open(sys.argv[2], 'w').write(sys.argv[1])"
+        cfg = {
+            "command": f'"{interpreter}" -c "{payload}" {{model}} {{output_path}}',
+            "model": "config-model",
+        }
+        result = _transcribe_command_stt(str(audio), "fake-cli", cfg, {})
+        assert result["transcript"] == "config-model"
+
+    def test_language_from_provider_config_wins(self, tmp_path):
+        audio = _make_silent_wav(tmp_path / "input.wav")
+        interpreter = sys.executable
+        payload = "import sys; open(sys.argv[2], 'w').write(sys.argv[1])"
+        cfg = {
+            "command": f'"{interpreter}" -c "{payload}" {{language}} {{output_path}}',
+            "language": "fr",
+        }
+        # stt.language is "es" but provider config says "fr" — provider wins.
+        result = _transcribe_command_stt(
+            str(audio), "fake-cli", cfg, {"language": "es"},
+        )
+        assert result["transcript"] == "fr"
+
+    def test_language_falls_back_to_stt_section(self, tmp_path):
+        audio = _make_silent_wav(tmp_path / "input.wav")
+        interpreter = sys.executable
+        payload = "import sys; open(sys.argv[2], 'w').write(sys.argv[1])"
+        cfg = {
+            "command": f'"{interpreter}" -c "{payload}" {{language}} {{output_path}}',
+        }
+        result = _transcribe_command_stt(
+            str(audio), "fake-cli", cfg, {"language": "ja"},
+        )
+        assert result["transcript"] == "ja"
 
     def test_language_defaults_to_en(self, tmp_path):
         audio = _make_silent_wav(tmp_path / "input.wav")

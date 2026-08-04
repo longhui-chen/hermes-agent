@@ -52,12 +52,15 @@ import logging
 import os
 import re
 import sqlite3
+import stat
 import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 # Sentinel returned by _resolve_request_profile when a /p/<profile>/ prefix
 # names a profile this gateway does not serve (→ 404). Distinct from None
@@ -424,6 +427,184 @@ def _auto_truncate_response_history(
                 break
 
     return [conversation_history[index] for index in sorted(kept_indices)]
+def _extract_response_mode(body: Dict[str, Any]) -> str:
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("response_mode", metadata.get("responseMode", ""))
+    mode = str(raw or "").strip().lower()
+    return "plan" if mode == "plan" else ""
+
+
+def _extract_plan_ack(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract the App's structured Plan Review action from metadata."""
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return {}
+    raw = metadata.get("plan_ack", metadata.get("planAck"))
+    if not isinstance(raw, dict):
+        return {}
+    status = str(raw.get("status", "") or "").strip().lower()
+    if status not in {"confirmed", "cancelled"}:
+        return {}
+    revision_requested = _coerce_request_bool(
+        raw.get("revision_requested", raw.get("revisionRequested")),
+        default=False,
+    )
+    ack = {
+        "status": status,
+        "revision_requested": revision_requested,
+    }
+    nested_turn_id_present = "turn_id" in raw or "turnId" in raw
+    turn_id = str(raw.get("turn_id", raw.get("turnId", "")) or "").strip()
+    if not turn_id:
+        # Released clients carried the plan's correlation id beside plan_ack.
+        # Prefer the nested v2 field, but preserve that hot-path contract.
+        turn_id = _extract_turn_id(body)
+    metadata_turn_id_present = "turn_id" in metadata or "turnId" in metadata
+    if not turn_id:
+        if nested_turn_id_present or metadata_turn_id_present:
+            return {}
+        return ack
+    if any(c.isspace() or ord(c) < 0x20 for c in turn_id):
+        return {}
+    return {"turn_id": turn_id, **ack}
+
+
+def _extract_plan_auto_execute(body: Dict[str, Any]) -> Optional[bool]:
+    """Extract the App's per-turn Plan auto-execute override from metadata.
+
+    Returns None when the App did not send the field OR sent a value that is not
+    a parseable boolean (null / "" / unknown string), so the caller falls back to
+    the env kill-switch / default ladder (legacy manual). Only an explicit bool-ish
+    value counts as a capability opt-in: True auto-executes the plan in the same
+    turn, False keeps the legacy confirmation card. Never let an unparseable value
+    silently enable auto-execute — that would bypass the client capability gate.
+    """
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    if "plan_auto_execute" not in metadata and "planAutoExecute" not in metadata:
+        return None
+    raw = metadata.get("plan_auto_execute", metadata.get("planAutoExecute"))
+    # Probe with both defaults: a real bool-ish value ignores the default and
+    # yields the same result twice; an unparseable value yields different results,
+    # so we return None (fall back) instead of promoting it to auto-execute.
+    as_true = _coerce_request_bool(raw, default=True)
+    as_false = _coerce_request_bool(raw, default=False)
+    if as_true == as_false:
+        return as_true
+    return None
+
+
+def _resolve_plan_auto_execute(meta_override: Optional[bool]) -> bool:
+    """Resolve the effective App Plan-mode auto-execute flag for one turn.
+
+    Precedence: per-turn metadata override (App capability opt-in) > env
+    (``HERMES_ZET_AGENT_PLAN_AUTO_EXECUTE``) > default ``False`` (legacy manual
+    confirm card). Default is manual so older App / local-server builds that do
+    NOT send ``plan_auto_execute`` never auto-execute a plan's side effects
+    before a client that can render the confirm gate — auto-execute requires an
+    explicit client capability opt-in (HR4 capability negotiation).
+    """
+    if meta_override is not None:
+        return meta_override
+    raw = os.environ.get("HERMES_ZET_AGENT_PLAN_AUTO_EXECUTE")
+    if raw is not None and raw.strip() != "":
+        from utils import is_truthy_value
+        return is_truthy_value(raw, default=False)
+    return False
+
+
+def _extract_turn_id(body: Dict[str, Any]) -> str:
+    """Extract metadata.turn_id (zettlab local-server's per-turn correlation
+    token) so the NAS agent-search fallback can echo it back as the
+    X-Zettlab-Turn-Id header. Reject only what would corrupt that header
+    (whitespace / control chars); don't restrict the charset further —
+    local-server accepts any trimmed token, so a stricter filter would silently
+    drop valid ids and lose the precise-turn pinning."""
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("turn_id", metadata.get("turnId", ""))
+    tid = str(raw or "").strip()
+    if not tid or any(c.isspace() or ord(c) < 0x20 for c in tid):
+        return ""
+    return tid
+
+
+def _extract_connector_route_capability(body: Dict[str, Any]) -> str:
+    """Extract local-server's opaque per-turn Connector routing capability.
+
+    The fixed 32-byte base64url shape keeps malformed or oversized metadata
+    out of the dedicated runner environment. It is transport-only and never
+    becomes a general session variable or model-visible instruction.
+    """
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("connector_route_capability")
+    if not isinstance(raw, str):
+        return ""
+    capability = raw.strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{43}", capability) is None:
+        return ""
+    return capability
+
+
+def _extract_skill_slug(body: Dict[str, Any]) -> str:
+    """Extract metadata.skill_slug — the App quick-pick's EXPLICIT skill
+    invocation signal (ZET fork).
+
+    The client owns the text↔selection UX (it drops the field when the user
+    edits the inserted "/<slug>" token away); the server NEVER sniffs message
+    text for slash commands — in-band signaling is ambiguous ("/<skill> 是什么"
+    would fire the skill) and this explicit field is the only trigger.
+    Absent/malformed → no skill. A leading slash is tolerated and stripped so
+    the client may send either "deep-research" or "/deep-research"."""
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("skill_slug", metadata.get("skillSlug", ""))
+    slug = str(raw or "").strip().lstrip("/")
+    if not slug or any(c.isspace() or ord(c) < 0x20 for c in slug):
+        return ""
+    return slug
+
+
+def _strip_skill_display_token(user_message: Any, skill_slug: str) -> Any:
+    """Remove only the App quick-pick token from a string user task."""
+    if not isinstance(user_message, str) or not skill_slug:
+        return user_message
+    token = "/" + skill_slug
+    task_text = re.sub(
+        r"(?<!\S)" + re.escape(token) + r"(?!\S)",
+        "",
+        user_message,
+    )
+    return "\n".join(
+        line for line in (value.rstrip() for value in task_text.splitlines()) if line
+    ).strip()
+
+
+def _trusted_skill_task_message(user_message: Any, skill_slug: str) -> Any:
+    """Preserve user-authored task text separately from transport selection."""
+    return _strip_skill_display_token(user_message, skill_slug)
+
+
+def _extract_business_execution_token(raw: Any) -> str:
+    """Accept only local-server's fixed-width opaque capability format."""
+    token = str(raw or "").strip()
+    return token if re.fullmatch(r"[0-9a-f]{64}", token) else ""
+
+
+def _business_execution_scope_digest(token: str) -> str:
+    """Derive a non-secret cache scope from a validated capability token."""
+    if not token:
+        return ""
+    return hashlib.sha256(
+        b"zettlab-business-execution-scope-v1\0" + token.encode("ascii")
+    ).hexdigest()
 
 
 def _normalize_chat_content(
@@ -630,6 +811,282 @@ def _content_has_visible_payload(content: Any) -> bool:
                 if ptype in _IMAGE_PART_TYPES:
                     return True
     return False
+
+
+def _short_error_text(value: Any, *, limit: int = 500) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()[:limit]
+    if isinstance(value, (list, tuple, set, dict)) and not _has_tool_error_value(value):
+        return ""
+    try:
+        text = str(value).strip()
+    except Exception:
+        return ""
+    return text[:limit]
+
+
+def _has_tool_error_value(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        return any(_has_tool_error_value(item) for item in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_has_tool_error_value(item) for item in value)
+    return bool(value)
+
+
+def _chat_finish_reason_from_result(result: Dict[str, Any]) -> str:
+    completed = bool(result.get("completed", True))
+    is_partial = bool(result.get("partial"))
+    is_failed = bool(result.get("failed"))
+    err_msg = _short_error_text(result.get("error"))
+    if _chat_result_is_truncated(result):
+        return "length"
+    if is_failed or (not completed and err_msg):
+        return "error"
+    return "stop"
+
+
+def _chat_result_is_truncated(result: Dict[str, Any]) -> bool:
+    if bool(result.get("truncated")):
+        return True
+    completed = bool(result.get("completed", True))
+    is_partial = bool(result.get("partial"))
+    is_failed = bool(result.get("failed"))
+    # run_agent marks response-length exhaustion as partial without failed.
+    # Treat that structured state as length instead of matching localized or
+    # provider-specific error strings such as "max tokens exceeded".
+    return is_partial and not completed and not is_failed
+
+
+def _chat_stream_error_payload(result: Dict[str, Any], finish_reason: str) -> Optional[Dict[str, Any]]:
+    completed = bool(result.get("completed", True))
+    is_partial = bool(result.get("partial"))
+    is_failed = bool(result.get("failed"))
+    err_msg = _redact_api_error_text(_short_error_text(result.get("error")))
+    if not (is_partial or is_failed or not completed or finish_reason == "error"):
+        return None
+    provider_error = result.get("provider_error")
+    payload = {
+        "message": err_msg or "Agent run did not complete.",
+        "code": "output_truncated" if finish_reason == "length" else "agent_error",
+        "completed": completed,
+        "partial": is_partial,
+        "failed": is_failed,
+    }
+    if isinstance(provider_error, dict):
+        code = _short_error_text(provider_error.get("code"), limit=120)
+        if code and finish_reason != "length":
+            payload["code"] = code
+        for key in (
+            "reason",
+            "provider",
+            "model",
+            "status_code",
+            "provider_error_code",
+            "provider_message",
+        ):
+            value = provider_error.get(key)
+            if isinstance(value, str):
+                clean = _redact_api_error_text(value.strip())
+                if clean:
+                    payload[key] = clean[:500]
+            elif isinstance(value, int):
+                payload[key] = value
+        recoverable = provider_error.get("recoverable")
+        if isinstance(recoverable, bool):
+            payload["recoverable"] = recoverable
+    return payload
+
+
+def _tool_completion_payload(
+    tool_call_id: str,
+    function_name: str,
+    function_result: Any,
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "tool": function_name,
+        "toolCallId": tool_call_id,
+        "status": "completed",
+        "outcome": "success",
+    }
+    decoded = function_result if isinstance(function_result, dict) else None
+    if decoded is None and isinstance(function_result, str):
+        try:
+            decoded = json.loads(function_result)
+        except json.JSONDecodeError:
+            decoded = None
+    if not isinstance(decoded, dict):
+        return payload
+    decoded = _promote_connector_error_from_tool_output(decoded)
+
+    if function_name in {"image_generate", "video_generate"}:
+        artifact_output: Dict[str, Any] = {}
+        if isinstance(decoded.get("success"), bool):
+            artifact_output["success"] = decoded["success"]
+        for key in (
+            "host_image",
+            "image",
+            "agent_visible_image",
+            "host_video",
+            "video",
+            "agent_visible_video",
+        ):
+            value = decoded.get(key)
+            if isinstance(value, str) and 0 < len(value) <= 4096:
+                artifact_output[key] = value
+        if artifact_output:
+            payload["output"] = artifact_output
+
+    has_error = _has_tool_error_value(decoded.get("error"))
+    has_error_code = _has_tool_error_value(decoded.get("errorCode"))
+    connector_error = decoded.get("connector_error")
+    has_connector_error = _has_tool_error_value(connector_error)
+    ui_hint = _takeover_ui_hint(decoded, function_name)
+    if ui_hint is not None:
+        payload["ui_hint"] = ui_hint
+    if not (has_error or has_error_code or has_connector_error):
+        return payload
+
+    error_msg = (
+        _short_error_text(decoded.get("error"))
+        or _short_error_text(decoded.get("errorCode"), limit=120)
+        or "tool_error"
+    )
+    payload["outcome"] = "error"
+    payload["error"] = error_msg
+    if has_error_code:
+        payload["errorCode"] = _short_error_text(decoded.get("errorCode"), limit=120)
+    if isinstance(connector_error, dict):
+        payload["connector_error"] = connector_error
+        for source_key, wire_key in (
+            ("provider", "provider"),
+            ("status", "statusCode"),
+            ("code", "errorCode"),
+            ("errorCode", "errorCode"),
+        ):
+            value = connector_error.get(source_key)
+            if value is not None and wire_key not in payload:
+                payload[wire_key] = value
+    return payload
+
+
+# Only the browser tool that actually builds a takeover hint may project one.
+# Tool output is attacker-influenced (any MCP server, connector or plugin can
+# return arbitrary JSON), and an unfiltered projection would let a foreign tool
+# hand the App a handoff entry point pointing at someone else's agent/tab.
+_TAKEOVER_UI_HINT_TOOLS = frozenset({"browser_navigate"})
+
+
+def _takeover_ui_hint(decoded: Dict[str, Any], function_name: str = "") -> Optional[Dict[str, str]]:
+    """Return only the exact, bounded App handoff contract from tool output."""
+    if function_name not in _TAKEOVER_UI_HINT_TOOLS:
+        return None
+    success = decoded.get("success")
+    if success is not True and success is not False:
+        return None
+    hint = decoded.get("ui_hint")
+    if not isinstance(hint, dict) or hint.get("type") != "takeover_browser":
+        return None
+    out = {"type": "takeover_browser"}
+    for key in ("agent_id", "browser_session_id", "tab_id"):
+        value = hint.get(key)
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        if not value or len(value) > 256:
+            return None
+        out[key] = value
+    return out
+
+
+def _promote_connector_error_from_tool_output(decoded: Dict[str, Any]) -> Dict[str, Any]:
+    """Promote connector runtime JSON printed by execute_code/terminal wrappers.
+
+    Preset connector skills call a bundled ``connector_runtime.py`` script.
+    When the script exits non-zero through execute_code, the tool result shape
+    is ``{"status":"error","error":"Script exited...", "output":"{...}"}``.
+    The structured connector error lives in ``output`` unless we lift it here.
+    """
+    if _has_tool_error_value(decoded.get("connector_error")):
+        return decoded
+    output = decoded.get("output")
+    if not isinstance(output, str):
+        return decoded
+    text = output.strip()
+    if not text:
+        return decoded
+    try:
+        printed = json.loads(text)
+    except json.JSONDecodeError:
+        return decoded
+    if not isinstance(printed, dict):
+        return decoded
+    connector_error = printed.get("connector_error")
+    if not _has_tool_error_value(connector_error):
+        connector_error = _connector_error_from_json_rpc_error(printed.get("error"))
+    if not _has_tool_error_value(connector_error):
+        return decoded
+    promoted = dict(decoded)
+    promoted["connector_error"] = connector_error
+    error_obj = printed.get("error")
+    if isinstance(error_obj, dict):
+        code = (
+            _connector_error_code(connector_error)
+            or error_obj.get("code")
+            or error_obj.get("errorCode")
+            or error_obj.get("error_code")
+        )
+        message = error_obj.get("message")
+        if _has_tool_error_value(code):
+            promoted["errorCode"] = code
+        if not _has_tool_error_value(promoted.get("error")) and _has_tool_error_value(message):
+            promoted["error"] = message
+    elif _has_tool_error_value(_connector_error_code(connector_error)):
+        promoted["errorCode"] = _connector_error_code(connector_error)
+    return promoted
+
+
+def _connector_error_code(connector_error: Any) -> Any:
+    if not isinstance(connector_error, dict):
+        return None
+    return connector_error.get("errorCode") or connector_error.get("code") or connector_error.get("error_code")
+
+
+def _connector_error_from_json_rpc_error(error_obj: Any) -> Optional[Dict[str, Any]]:
+    """Normalize connector state carried in JSON-RPC ``error.data`` output."""
+    if not isinstance(error_obj, dict):
+        return None
+    data = error_obj.get("data")
+    if not isinstance(data, dict):
+        return None
+    code = data.get("errorCode") or data.get("code") or data.get("error_code")
+    next_action = data.get("nextAction") or data.get("next_action")
+    provider = data.get("provider")
+    if not isinstance(provider, str) and isinstance(next_action, dict):
+        provider = next_action.get("provider")
+    if not _has_tool_error_value(code) or not isinstance(provider, str) or not provider.strip():
+        return None
+
+    connector_error: Dict[str, Any] = {
+        "code": code,
+        "errorCode": code,
+        "provider": provider.strip(),
+    }
+    message = data.get("message") or error_obj.get("message")
+    if _has_tool_error_value(message):
+        connector_error["message"] = _short_error_text(message)
+    if isinstance(next_action, dict):
+        connector_error["nextAction"] = next_action
+    for key in ("connectionId", "connection_id", "toolName", "tool_name", "accountAlias", "account_alias"):
+        value = data.get(key)
+        if value is not None:
+            connector_error[key] = value
+    return connector_error
 
 
 def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Response":
@@ -939,7 +1396,10 @@ class ResponseStore:
 
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
+    "Access-Control-Allow-Headers": (
+        "Authorization, Content-Type, Idempotency-Key, "
+        "X-Zettlab-Business-Execution-Token"
+    ),
 }
 
 
@@ -1111,6 +1571,12 @@ def _reserve_pending_api_work(adapter):
             _release_pending_api_work(adapter, reservation)
 
 
+def _validate_chat_response_format(value: Any) -> Optional[str]:
+    from agent.response_format import validate_chat_response_format
+
+    return validate_chat_response_format(value)
+
+
 if AIOHTTP_AVAILABLE:
     @web.middleware
     async def body_limit_middleware(request, handler):
@@ -1207,10 +1673,20 @@ class _IdempotencyCache:
 _idem_cache = _IdempotencyCache()
 
 
-def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
-    from hashlib import sha256
+def _make_request_fingerprint(
+    body: Dict[str, Any],
+    keys: List[str],
+    *,
+    execution_scope_digest: str = "",
+) -> str:
     subset = {k: body.get(k) for k in keys}
-    return sha256(repr(subset).encode("utf-8")).hexdigest()
+    material = repr(subset).encode("utf-8")
+    if execution_scope_digest:
+        material += (
+            b"\0zettlab-business-execution-scope-v1:"
+            + execution_scope_digest.encode("ascii")
+        )
+    return hashlib.sha256(material).hexdigest()
 
 
 def _derive_chat_session_id(
@@ -1242,6 +1718,7 @@ try:
         pause_job as _cron_pause,
         resume_job as _cron_resume,
         trigger_job as _cron_trigger,
+        job_occurrence_projection as _cron_occurrence_projection,
     )
     _CRON_AVAILABLE = True
 except ImportError:
@@ -1253,6 +1730,7 @@ except ImportError:
     _cron_pause = None
     _cron_resume = None
     _cron_trigger = None
+    _cron_occurrence_projection = None
 
 
 def _notify_cron_provider_jobs_changed() -> None:
@@ -1263,6 +1741,22 @@ def _notify_cron_provider_jobs_changed() -> None:
         _notify_provider_jobs_changed()
     except Exception:
         pass
+
+
+def _cron_job_requires_live_chat_authorization(skills: Any) -> bool:
+    """REST has no exact Chat route and therefore cannot mint a task grant."""
+    try:
+        from cron.connector_execution import requires_live_chat_grant
+
+        return requires_live_chat_grant(skills)
+    except Exception:
+        return False
+
+
+_CRON_LIVE_CHAT_AUTHORIZATION_REQUIRED = (
+    "Linear scheduled tasks must be created or updated in the current chat "
+    "so a task-specific Connector authorization can be issued."
+)
 
 # Defense-in-depth: mirror the agent-facing cronjob tool, which scans the
 # user-supplied prompt for exfiltration/injection payloads at create/update
@@ -1381,7 +1875,12 @@ class APIServerAdapter(BasePlatformAdapter):
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
-        self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+        # Lazy-init SessionDB for session continuity. In multiplex mode this
+        # is keyed by the scoped HERMES_HOME so profiles never share state.db.
+        self._session_db: Optional[Any] = None
+        self._session_dbs: Dict[str, Any] = {}
+        self._session_db_lock: Optional[asyncio.Lock] = None
+        self._session_db_init_lock = threading.Lock()
         # Last-known-good resolved model per session (keyed by gateway_session_key
         # ONLY — never session_id, which rotates/is ephemeral for one-off API
         # server requests; "*" is the process-wide fallback), mirroring
@@ -1389,7 +1888,6 @@ class APIServerAdapter(BasePlatformAdapter):
         # transient empty model resolution (#35314) instead of building an
         # agent with model="" that 400s every call until manual retry.
         self._last_resolved_model: Dict[str, str] = {}
-        self._session_db_lock: Optional[asyncio.Lock] = None  # Single-flight for lazy init
         # Concurrency cap shared across all agent-serving endpoints
         # (/v1/chat/completions, /v1/responses, /v1/runs). Read from
         # config.yaml gateway.api_server.max_concurrent_runs; 0 disables
@@ -1408,6 +1906,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # Shutdown counts this reservation so the request cannot slip through
         # the drain between its first await and _run_agent()/task registration.
         self._pending_agent_requests: int = 0
+        # Profile-home -> in-flight chat-completions count. GatewayRunner
+        # tracks messaging-platform sessions separately; local-server reaches
+        # Hermes through this API path, so profile unload must also see these.
+        self._active_chat_runs_by_home: Dict[str, int] = {}
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -1963,6 +2465,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # API_SERVER_KEY — external platforms hold no API server key.
             ("POST", "/api/platforms/{platform}/events", self._handle_platform_event_callback),
             ("GET", "/api/jobs", self._handle_list_jobs),
+            ("GET", "/api/jobs/occurrences", self._handle_list_job_occurrences),
             ("POST", "/api/jobs", self._handle_create_job),
             ("GET", "/api/jobs/{job_id}", self._handle_get_job),
             ("PATCH", "/api/jobs/{job_id}", self._handle_update_job),
@@ -1979,7 +2482,22 @@ class APIServerAdapter(BasePlatformAdapter):
         if _CRON_AVAILABLE:
             # Chronos managed-cron fire webhook (NAS → agent). Authenticated
             # by a NAS-minted JWT (NOT API_SERVER_KEY).
-            routes.append(("POST", "/api/cron/fire", self._handle_cron_fire))
+            routes.extend(
+                [
+                    ("POST", "/api/cron/fire", self._handle_cron_fire),
+                    ("GET", "/internal/v1/cron/capabilities", self._handle_cron_capabilities),
+                    (
+                        "POST",
+                        "/internal/v1/cron/jobs/{job_id}/reconcile",
+                        self._handle_calendar_job_reconcile,
+                    ),
+                    (
+                        "POST",
+                        "/internal/v1/cron/calendar-recovery-arms/{dedupe_key}/reconcile",
+                        self._handle_calendar_recovery_reconcile,
+                    ),
+                ]
+            )
         return routes
 
     # ------------------------------------------------------------------
@@ -2047,9 +2565,431 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return raw, None
 
+    def _parse_run_session_id(
+        self, raw: Any
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        if raw is None or raw == "":
+            return None, None
+        if not isinstance(raw, str):
+            return None, web.json_response(
+                _openai_error("'session_id' must be a string", code="invalid_session_id"),
+                status=400,
+            )
+        if any(ord(c) < 0x20 for c in raw):
+            return None, web.json_response(
+                _openai_error("Invalid session ID", code="invalid_session_id"),
+                status=400,
+            )
+        session_id = raw.strip()
+        if not session_id:
+            return None, None
+        if len(session_id) > self._MAX_SESSION_HEADER_LEN:
+            return None, web.json_response(
+                _openai_error("Session ID too long", code="invalid_session_id"),
+                status=400,
+            )
+        return session_id, None
+
     # ------------------------------------------------------------------
     # Session DB helper
     # ------------------------------------------------------------------
+
+    # (st_dev, st_ino) -> {"fd": int, "refs": int, "home": str}. One shared
+    # /proc/self/fd anchor per profile-DB inode (Linux only); class-level so
+    # zet_agent's subclass shares the same process-wide registry.
+    _profile_db_anchors: dict = {}
+    _profile_db_anchor_lock = threading.Lock()
+
+    @staticmethod
+    def _profile_db_anchor_points_at(key, home: str) -> bool:
+        """Whether ``home``'s state.db path still resolves to inode ``key``."""
+        try:
+            st = os.stat(os.path.join(home, "state.db"), follow_symlinks=False)
+        except OSError:
+            return False
+        return (st.st_dev, st.st_ino) == tuple(key)
+
+    @staticmethod
+    def _gc_retired_profile_db_anchors_locked() -> None:
+        """Close parked anchors whose inode was rotated away.
+
+        Caller holds ``_profile_db_anchor_lock``.
+        """
+        anchors = APIServerAdapter._profile_db_anchors
+        for key, entry in list(anchors.items()):
+            if entry["refs"] <= 0 and not (
+                APIServerAdapter._profile_db_anchor_points_at(key, entry["home"])
+            ):
+                anchors.pop(key, None)
+                try:
+                    os.close(entry["fd"])
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _acquire_profile_db_anchor(directory_fd: int, expected, profile_home):
+        """Return ``(fd, key)`` of the shared /proc anchor for an inode.
+
+        POSIX record locks forbid closing any fd of an inode that live SQLite
+        connections hold locks on (see _open_profile_session_db), so anchor
+        fds cannot simply be closed per-open. Instead they are refcounted per
+        inode: every open of the same inode shares one fd, so hot repeat
+        opens (e.g. the runtime-import sweep) add zero net fds. Release parks
+        the fd while the inode is still what the profile path resolves to —
+        sibling connections opened outside this helper may still hold locks
+        on it — and closes it only after the path rotates to a new
+        generation, when no other process can reach the inode by path and
+        dropping this process's remaining locks on it is harmless.
+        """
+        key = (expected.st_dev, expected.st_ino)
+        anchors = APIServerAdapter._profile_db_anchors
+        with APIServerAdapter._profile_db_anchor_lock:
+            APIServerAdapter._gc_retired_profile_db_anchors_locked()
+            entry = anchors.get(key)
+            if entry is None:
+                flags = os.O_RDWR
+                flags |= getattr(os, "O_NOFOLLOW", 0)
+                flags |= getattr(os, "O_CLOEXEC", 0)
+                fd = os.open("state.db", flags, dir_fd=directory_fd)
+                anchored = os.fstat(fd)
+                if (anchored.st_dev, anchored.st_ino) != key:
+                    os.close(fd)
+                    raise RuntimeError(
+                        "profile state.db changed while it was opened"
+                    )
+                entry = {"fd": fd, "refs": 0, "home": os.fspath(profile_home)}
+                anchors[key] = entry
+            entry["refs"] += 1
+            entry["home"] = os.fspath(profile_home)
+            return entry["fd"], key
+
+    @staticmethod
+    def _release_profile_db_anchor(key) -> None:
+        """Drop one anchor reference; close the fd only for retired inodes."""
+        anchors = APIServerAdapter._profile_db_anchors
+        with APIServerAdapter._profile_db_anchor_lock:
+            entry = anchors.get(key)
+            if entry is None:
+                return
+            entry["refs"] = max(0, entry["refs"] - 1)
+            if entry["refs"] > 0:
+                return
+            if not APIServerAdapter._profile_db_anchor_points_at(
+                key, entry["home"]
+            ):
+                anchors.pop(key, None)
+                try:
+                    os.close(entry["fd"])
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _bind_profile_db_anchor_to_close(db, key) -> None:
+        """Release the anchor exactly once when ``db.close()`` runs.
+
+        The release happens after the SQLite connection is closed. Without
+        this binding every cache invalidation / explicit close would leak one
+        anchor reference and the fd could never be reclaimed.
+        """
+        original_close = db.close
+        released = False
+
+        def _close_releasing_anchor(*args, **kwargs):
+            nonlocal released
+            try:
+                return original_close(*args, **kwargs)
+            finally:
+                if not released:
+                    released = True
+                    APIServerAdapter._release_profile_db_anchor(key)
+
+        db.close = _close_releasing_anchor
+
+    @staticmethod
+    def _open_profile_session_db(profile_home: Path, *, create: bool = True):
+        """Open one profile's state DB without following an attacker link.
+
+        Linux production builds connect SQLite through ``/proc/self/fd`` so
+        schema setup and stale-import cleanup stay anchored to the exact inode
+        accepted by the no-follow check.  Other POSIX development platforms do
+        not provide a SQLite-compatible fd path, so they retain the before/after
+        identity checks; an active same-UID pathname race there is outside the
+        cross-profile boundary enforced by the Linux/Nix runtime.
+        """
+        from hermes_state import SessionDB
+
+        directory_flags = os.O_RDONLY
+        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_fd = os.open(profile_home, directory_flags)
+        anchor_key = None
+        anchor_owned = False
+        try:
+            directory_stat = os.fstat(directory_fd)
+            if not stat.S_ISDIR(directory_stat.st_mode):
+                raise RuntimeError("profile home is not a directory")
+
+            # POSIX record locks are per (process, inode): closing ANY fd of a
+            # file releases every lock this process holds on it, including the
+            # locks live SQLite connections depend on. A transient
+            # open()+close() here would let another process's closing RW
+            # connection pass SQLite's last-closer probe and checkpoint-delete
+            # the active WAL/SHM (sqlite.org/howtocorrupt.html §2.3), splitting
+            # connections across WAL generations. All identity/shape checks
+            # below therefore use fstatat (os.stat with dir_fd), never a
+            # throwaway fd.
+            def _stat_leaf():
+                return os.stat(
+                    "state.db", dir_fd=directory_fd, follow_symlinks=False
+                )
+
+            try:
+                expected = _stat_leaf()
+            except FileNotFoundError:
+                if not create:
+                    raise
+                create_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+                create_flags |= getattr(os, "O_NOFOLLOW", 0)
+                create_flags |= getattr(os, "O_CLOEXEC", 0)
+                try:
+                    created_fd = os.open(
+                        "state.db", create_flags, 0o600, dir_fd=directory_fd
+                    )
+                except FileExistsError:
+                    pass
+                else:
+                    # A freshly created inode has no SQLite connections yet,
+                    # so there are no locks for this close to drop.
+                    os.close(created_fd)
+                expected = _stat_leaf()
+            if not stat.S_ISREG(expected.st_mode) or expected.st_nlink != 1:
+                raise RuntimeError(
+                    "profile state.db must be a private regular file"
+                )
+
+            # SQLite derives -wal/-shm/-journal names from the canonical
+            # pathname and opens them with ordinary follow-symlink open(),
+            # outside the /proc/self/fd anchor below. A pre-placed symlink
+            # or hardlink sidecar would redirect journal writes into
+            # another profile, so reject any sidecar that is not a private
+            # regular file on the same filesystem as state.db itself.
+            # Compare st_dev against the main file, not the profile
+            # directory: on btrfs the profile home is a subvolume whose
+            # directory inode reports the parent filesystem's st_dev while
+            # every file inside reports the subvolume's, so a directory
+            # comparison rejects all legitimate sidecars. A sidecar on a
+            # different filesystem than state.db still fails closed.
+            # (A racing swap after this check is not covered; closing that
+            # window needs a VFS-level no-follow open for sidecars.)
+            for sidecar_suffix in ("-wal", "-shm", "-journal"):
+                sidecar_name = "state.db" + sidecar_suffix
+                try:
+                    sidecar_stat = os.stat(
+                        sidecar_name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                except FileNotFoundError:
+                    continue
+                except OSError as sidecar_err:
+                    raise RuntimeError(
+                        f"profile {sidecar_name} must be a private regular file"
+                    ) from sidecar_err
+                if (
+                    not stat.S_ISREG(sidecar_stat.st_mode)
+                    or sidecar_stat.st_nlink != 1
+                    or sidecar_stat.st_dev != expected.st_dev
+                ):
+                    raise RuntimeError(
+                        f"profile {sidecar_name} must be a private regular file"
+                    )
+
+            db_path = profile_home / "state.db"
+            if sys.platform.startswith("linux"):
+                # Do not probe/fallback: an unlinked fd makes exists()
+                # false even though the descriptor is still open. SQLite
+                # must either connect through this anchor or fail closed.
+                anchor_fd, anchor_key = (
+                    APIServerAdapter._acquire_profile_db_anchor(
+                        directory_fd, expected, profile_home
+                    )
+                )
+                anchor_owned = True
+                connection_path = f"/proc/self/fd/{anchor_fd}"
+            else:
+                connection_path = str(db_path)
+            # On Linux, SQLite resolves /proc/self/fd/N to the already-open
+            # inode. The refcounted anchor keeps that fd open for as long as
+            # this inode has SessionDBs on it, so every schema/cleanup write
+            # remains bound to that inode even if the canonical pathname is
+            # swapped concurrently.
+            connection = sqlite3.connect(
+                connection_path,
+                check_same_thread=False,
+                timeout=1.0,
+                isolation_level=None,
+            )
+            try:
+                current = os.stat(
+                    "state.db", dir_fd=directory_fd, follow_symlinks=False
+                )
+                current_directory = os.stat(profile_home, follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or current.st_nlink != 1
+                    or (current.st_dev, current.st_ino)
+                    != (expected.st_dev, expected.st_ino)
+                    or (current_directory.st_dev, current_directory.st_ino)
+                    != (directory_stat.st_dev, directory_stat.st_ino)
+                ):
+                    raise RuntimeError(
+                        "profile state.db changed while it was opened"
+                    )
+                try:
+                    db = SessionDB(
+                        db_path,
+                        _preopened_connection=connection,
+                        _allow_path_reopen=False,
+                    )
+                except BaseException:
+                    connection.close()
+                    raise
+                # Re-check only to decide whether this connection may be
+                # cached. On Linux a late rename cannot redirect the
+                # procfd-anchored SQLite connection.
+                current = os.stat(
+                    "state.db", dir_fd=directory_fd, follow_symlinks=False
+                )
+                current_directory = os.stat(profile_home, follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or current.st_nlink != 1
+                    or (current.st_dev, current.st_ino)
+                    != (expected.st_dev, expected.st_ino)
+                    or (current_directory.st_dev, current_directory.st_ino)
+                    != (directory_stat.st_dev, directory_stat.st_ino)
+                ):
+                    raise RuntimeError(
+                        "profile state.db changed during initialization"
+                    )
+                db._profile_home_identity = (
+                    directory_stat.st_dev,
+                    directory_stat.st_ino,
+                )
+                db._profile_state_identity = (expected.st_dev, expected.st_ino)
+                if anchor_key is not None:
+                    # Anchor lifetime is refcounted per inode; db.close()
+                    # drops this open's reference after the SQLite connection
+                    # is gone (see _acquire_profile_db_anchor).
+                    APIServerAdapter._bind_profile_db_anchor_to_close(
+                        db, anchor_key
+                    )
+                    anchor_owned = False
+                return db
+            except BaseException:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+                raise
+        finally:
+            if anchor_key is not None and anchor_owned:
+                # Failure path only: on success the release is bound to
+                # db.close() above.
+                APIServerAdapter._release_profile_db_anchor(anchor_key)
+            os.close(directory_fd)
+
+    @staticmethod
+    def _profile_session_db_is_current(profile_home: Path, db: Any) -> bool:
+        """Return whether a cached DB still belongs to this profile generation."""
+        expected_home = getattr(db, "_profile_home_identity", None)
+        expected_state = getattr(db, "_profile_state_identity", None)
+        if expected_home is None or expected_state is None:
+            return False
+
+        directory_flags = os.O_RDONLY
+        directory_flags |= getattr(os, "O_DIRECTORY", 0)
+        directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_fd = None
+        try:
+            directory_fd = os.open(profile_home, directory_flags)
+            directory_stat = os.fstat(directory_fd)
+            # fstatat, never open()+close(): this runs on every cache hit, and
+            # closing a transient fd on state.db would drop every POSIX lock
+            # this process's SQLite connections hold on it (see
+            # _open_profile_session_db).
+            state_stat = os.stat(
+                "state.db", dir_fd=directory_fd, follow_symlinks=False
+            )
+            return (
+                stat.S_ISDIR(directory_stat.st_mode)
+                and stat.S_ISREG(state_stat.st_mode)
+                and state_stat.st_nlink == 1
+                and (directory_stat.st_dev, directory_stat.st_ino)
+                == tuple(expected_home)
+                and (state_stat.st_dev, state_stat.st_ino)
+                == tuple(expected_state)
+            )
+        except (OSError, TypeError, ValueError):
+            return False
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
+
+    def _open_profile_session_db_with_repair(self, profile_home: Path):
+        """Open the profile SessionDB, restoring the malformed-schema self-heal
+        that predates the fd-anchored open.
+
+        The fd-anchored _open_profile_session_db opens with
+        _allow_path_reopen=False, which disabled SessionDB's long-standing
+        pathname self-heal (backup + repair + reopen) that main used on every
+        open before this feature added fd-anchoring to the normal path. On a
+        malformed error, fall back to that same baseline recovery: a plain
+        SessionDB(state.db) whose default _allow_path_reopen=True heals
+        in place. The fd anchor is a hardening of the normal open path; this
+        rare recovery path stays at main's pre-existing pathname safety level
+        rather than leaving the profile permanently unavailable.
+        """
+        from hermes_state import (
+            SessionDB,
+            _claim_repair_attempt,
+            is_malformed_db_error,
+            repair_state_db_schema,
+        )
+
+        try:
+            return self._open_profile_session_db(profile_home)
+        except BaseException as exc:
+            if not is_malformed_db_error(exc):
+                raise
+            db_path = profile_home / "state.db"
+            # Guard against a repair loop on a genuinely unrecoverable file.
+            if not _claim_repair_attempt(db_path):
+                raise
+            logger.error(
+                "profile state.db schema is malformed (%s) — falling back to "
+                "the baseline pathname repair (backs up main + WAL sidecars "
+                "first), then reopening.",
+                exc,
+            )
+            # repair_state_db_schema is the same pathname recovery main has run
+            # on every open since before the fd-anchored open path existed; it
+            # backs up state.db and its -wal/-shm sidecars, then de-dups
+            # sqlite_master / rebuilds FTS in place. Call it explicitly (rather
+            # than via SessionDB's _allow_path_reopen self-heal, which reuses a
+            # closed connection after repair) and reopen a clean handle.
+            report = repair_state_db_schema(db_path)
+            if not report.get("repaired"):
+                raise
+            db = SessionDB(db_path)
+            try:
+                home_stat = os.stat(profile_home)
+                state_stat = os.stat(db_path)
+                db._profile_home_identity = (home_stat.st_dev, home_stat.st_ino)
+                db._profile_state_identity = (state_stat.st_dev, state_stat.st_ino)
+            except OSError:
+                pass
+            return db
 
     def _open_and_cache_session_db(self, home) -> Optional[Any]:
         """Sync core: return the cached SessionDB for ``home``, opening it once.
@@ -2060,20 +3000,35 @@ class APIServerAdapter(BasePlatformAdapter):
         — that stays reserved for an explicit test/manual override, so the first
         profile served can't pin every later request to its DB.
         """
-        from hermes_state import SessionDB
-
-        key = str(home)
-        cache = getattr(self, "_session_dbs", None)
-        if cache is None:
-            cache = {}
-            self._session_dbs = cache
-        db = cache.get(key)
-        if db is None:
-            db = SessionDB(db_path=home / "state.db")
+        # Lexical key: resolve() would follow a profile symlink before
+        # _open_profile_session_db can reject it with O_NOFOLLOW, and would
+        # also alias the cache entry to the link target.
+        key = os.path.abspath(os.fspath(home))
+        with self._session_db_init_lock:
+            cache = getattr(self, "_session_dbs", None)
+            if cache is None:
+                cache = {}
+                self._session_dbs = cache
+            existing = cache.get(key)
+            if existing is not None:
+                if self._profile_session_db_is_current(Path(key), existing):
+                    return existing
+                cache.pop(key, None)
+                if self._session_db is existing:
+                    self._session_db = None
+                try:
+                    existing.close()
+                except Exception:
+                    logger.warning("Invalidated SessionDB close failed", exc_info=True)
+            try:
+                db = self._open_profile_session_db_with_repair(Path(key))
+            except Exception as e:
+                logger.warning("SessionDB unavailable for API server: %s", e)
+                return None
             cache[key] = db
-        return db
+            return db
 
-    def _ensure_session_db(self):
+    def _ensure_session_db(self, profile_home: Optional[Any] = None):
         """Lazily initialise and return the SessionDB for the active profile home.
 
         Sessions are persisted to ``state.db`` so that ``hermes sessions list``
@@ -2084,48 +3039,190 @@ class APIServerAdapter(BasePlatformAdapter):
         never the default profile's file. Synchronous: used by ``_create_agent``
         (itself sync, and run in both loop and worker contexts). Request
         handlers use ``_ensure_session_db_async`` to keep the SQLite open off
-        the event loop.
+        the event loop. ``profile_home`` may be passed explicitly (tests, and
+        callers that already resolved the scope); otherwise it is read from
+        ``get_hermes_home()``.
         """
         # Explicit override (tests / manual wiring) wins.
         if self._session_db is not None:
             return self._session_db
         try:
-            from hermes_constants import get_hermes_home
-
-            return self._open_and_cache_session_db(get_hermes_home())
+            if profile_home is None:
+                from hermes_constants import get_hermes_home
+                profile_home = get_hermes_home()
+            return self._open_and_cache_session_db(profile_home)
         except Exception as e:
             logger.debug("SessionDB unavailable for API server: %s", e)
             return None
 
-    async def _ensure_session_db_async(self):
-        """Async variant for request handlers: offload the SQLite open/schema
-        init off the single aiohttp event-loop thread.
+    async def _ensure_session_db_async(self, profile_home: Optional[Any] = None):
+        """Async entry for request handlers: run the synchronous resolver off
+        the shared aiohttp event-loop thread.
 
-        The active profile home is captured on the loop thread (its runtime
-        scope is not visible inside ``asyncio.to_thread``); only the blocking
-        construction runs in the worker. A single-flight lock prevents duplicate
-        concurrent construction for the same home.
+        The synchronous core (``_ensure_session_db`` ->
+        ``_open_and_cache_session_db``) owns the lexical cache key, the
+        generation check, the sidecar-anchored O_NOFOLLOW open and its threading
+        lock, so a single ``to_thread`` hop is enough and every cached-DB return
+        still passes the generation gate — unlike a lock-free ``cache[key]``
+        fast path, which could hand back a DB bound to a swapped-out profile
+        inode. ``asyncio.to_thread`` copies the context, so the profile-home
+        ContextVar scope resolves identically in the worker.
+
+        Cache publication happens on the worker thread; coordinating that
+        publish with the profile-unload barrier is tracked in hermes-agent#210.
         """
-        if self._session_db is not None:
-            return self._session_db
-        try:
-            from hermes_constants import get_hermes_home
+        if profile_home is None:
+            return await asyncio.to_thread(self._ensure_session_db)
+        return await asyncio.to_thread(self._ensure_session_db, profile_home)
 
-            home = get_hermes_home()
-            key = str(home)
-            cache = getattr(self, "_session_dbs", None)
-            if cache is not None and cache.get(key) is not None:
-                return cache[key]
-            if self._session_db_lock is None:
-                self._session_db_lock = asyncio.Lock()
-            async with self._session_db_lock:
-                cache = getattr(self, "_session_dbs", None)
-                if cache is not None and cache.get(key) is not None:
-                    return cache[key]
-                return await asyncio.to_thread(self._open_and_cache_session_db, home)
-        except Exception as e:
-            logger.debug("SessionDB unavailable for API server: %s", e)
-            return None
+    @staticmethod
+    def _profile_home_key(profile_home: Optional[Any] = None) -> str:
+        """Return the canonical cache key for a profile home."""
+        try:
+            if profile_home is not None:
+                return str(Path(profile_home).resolve())
+            from hermes_constants import get_hermes_home
+            return str(get_hermes_home().resolve())
+        except Exception:
+            return str(profile_home or "")
+
+    def _begin_profile_chat_run(self, profile_home: Optional[Any] = None) -> str:
+        key = self._profile_home_key(profile_home)
+        if key:
+            self._active_chat_runs_by_home[key] = (
+                self._active_chat_runs_by_home.get(key, 0) + 1
+            )
+        return key
+
+    def _end_profile_chat_run(self, profile_home_key: str) -> None:
+        if not profile_home_key:
+            return
+        remaining = self._active_chat_runs_by_home.get(profile_home_key, 0) - 1
+        if remaining > 0:
+            self._active_chat_runs_by_home[profile_home_key] = remaining
+        else:
+            self._active_chat_runs_by_home.pop(profile_home_key, None)
+
+    def _active_profile_chat_runs(self, profile_home: Optional[Any] = None) -> int:
+        key = self._profile_home_key(profile_home)
+        if not key:
+            return 0
+        return int(self._active_chat_runs_by_home.get(key, 0) or 0)
+
+    @staticmethod
+    def _multiplex_profile_homes() -> Dict[str, Path]:
+        """Return valid `/p/{profile}` targets keyed by URL profile name."""
+        try:
+            from hermes_cli.profiles import profiles_to_serve
+            homes = {name: Path(home) for name, home in profiles_to_serve(multiplex=True)}
+            if "default" in homes:
+                homes.setdefault("main", homes["default"])
+            return homes
+        except Exception:
+            return {}
+
+    @contextmanager
+    def _profile_api_scope(self, profile: str):
+        """Scope one HTTP handler to a profile HERMES_HOME."""
+        homes = self._multiplex_profile_homes()
+        profile_home = homes.get((profile or "").strip())
+        if profile_home is None:
+            raise web.HTTPNotFound(
+                text=json.dumps({"error": f"Unknown profile: {profile}"}),
+                content_type="application/json",
+            )
+
+        try:
+            from gateway.run import _profile_runtime_scope
+        except Exception:
+            _profile_runtime_scope = None
+
+        if _profile_runtime_scope is not None:
+            with _profile_runtime_scope(profile_home):
+                yield profile_home
+            return
+
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        token = set_hermes_home_override(str(profile_home))
+        try:
+            yield profile_home
+        finally:
+            reset_hermes_home_override(token)
+
+    def _profile_handler(
+        self,
+        handler: Callable[["web.Request"], Awaitable["web.Response"]],
+    ) -> Callable[["web.Request"], Awaitable["web.Response"]]:
+        """Wrap an existing route handler so `/p/{profile}` changes runtime scope."""
+        async def _wrapped(request: "web.Request") -> "web.Response":
+            profile = request.match_info.get("profile", "")
+            with self._profile_api_scope(profile) as profile_home:
+                profile_token = _api_request_profile.set(profile)
+                try:
+                    request["hermes_profile"] = profile
+                    request["hermes_profile_home"] = str(profile_home)
+                    return await handler(request)
+                finally:
+                    _api_request_profile.reset(profile_token)
+
+        return _wrapped
+
+    def _register_profile_api_routes(
+        self,
+        router: "web.UrlDispatcher",
+        *,
+        chat_handler: Optional[Callable[["web.Request"], Awaitable["web.Response"]]] = None,
+    ) -> None:
+        """Register `/p/{profile}` mirrors for local-server multiplex mode."""
+        chat = chat_handler or self._handle_chat_completions
+        router.add_get("/p/{profile}/health", self._profile_handler(self._handle_health))
+        router.add_get("/p/{profile}/v1/health", self._profile_handler(self._handle_health))
+        router.add_get("/p/{profile}/v1/models", self._profile_handler(self._handle_models))
+        router.add_get("/p/{profile}/v1/skills", self._profile_handler(self._handle_skills))
+        router.add_get("/p/{profile}/v1/toolsets", self._profile_handler(self._handle_toolsets))
+        router.add_post("/p/{profile}/v1/chat/completions", self._profile_handler(chat))
+
+        router.add_get("/p/{profile}/api/sessions", self._profile_handler(self._handle_list_sessions))
+        router.add_post("/p/{profile}/api/sessions", self._profile_handler(self._handle_create_session))
+        router.add_get("/p/{profile}/api/sessions/{session_id}", self._profile_handler(self._handle_get_session))
+        router.add_patch("/p/{profile}/api/sessions/{session_id}", self._profile_handler(self._handle_patch_session))
+        router.add_delete("/p/{profile}/api/sessions/{session_id}", self._profile_handler(self._handle_delete_session))
+        router.add_get("/p/{profile}/api/sessions/{session_id}/messages", self._profile_handler(self._handle_session_messages))
+        router.add_post("/p/{profile}/api/sessions/{session_id}/fork", self._profile_handler(self._handle_fork_session))
+        router.add_post("/p/{profile}/api/sessions/{session_id}/chat", self._profile_handler(self._handle_session_chat))
+        router.add_post("/p/{profile}/api/sessions/{session_id}/chat/stream", self._profile_handler(self._handle_session_chat_stream))
+
+        router.add_get("/p/{profile}/api/jobs", self._profile_handler(self._handle_list_jobs))
+        router.add_get("/p/{profile}/api/jobs/occurrences", self._profile_handler(self._handle_list_job_occurrences))
+        router.add_post("/p/{profile}/api/jobs", self._profile_handler(self._handle_create_job))
+        router.add_get("/p/{profile}/api/jobs/{job_id}", self._profile_handler(self._handle_get_job))
+        router.add_patch("/p/{profile}/api/jobs/{job_id}", self._profile_handler(self._handle_update_job))
+        router.add_delete("/p/{profile}/api/jobs/{job_id}", self._profile_handler(self._handle_delete_job))
+        router.add_post("/p/{profile}/api/jobs/{job_id}/pause", self._profile_handler(self._handle_pause_job))
+        router.add_post("/p/{profile}/api/jobs/{job_id}/resume", self._profile_handler(self._handle_resume_job))
+        router.add_post("/p/{profile}/api/jobs/{job_id}/run", self._profile_handler(self._handle_run_job))
+        if _CRON_AVAILABLE:
+            router.add_post("/p/{profile}/api/cron/fire", self._profile_handler(self._handle_cron_fire))
+            router.add_get("/p/{profile}/internal/v1/cron/capabilities", self._profile_handler(self._handle_cron_capabilities))
+            router.add_post("/p/{profile}/internal/v1/cron/jobs/{job_id}/reconcile", self._profile_handler(self._handle_calendar_job_reconcile))
+            router.add_post("/p/{profile}/internal/v1/cron/calendar-recovery-arms/{dedupe_key}/reconcile", self._profile_handler(self._handle_calendar_recovery_reconcile))
+
+    def _register_unprefixed_cron_control_routes(
+        self,
+        router: "web.UrlDispatcher",
+    ) -> None:
+        """Register the cron control plane used by per-profile processes.
+
+        ``zettlab-local-server`` addresses a dedicated profile process without
+        a ``/p/<profile>`` prefix.  Keep these routes in one helper so the base
+        API server and ``zet_agent`` adapter cannot drift apart again.
+        """
+        if not _CRON_AVAILABLE:
+            return
+        router.add_post("/api/cron/fire", self._handle_cron_fire)
+        router.add_get("/internal/v1/cron/capabilities", self._handle_cron_capabilities)
+        router.add_post("/internal/v1/cron/jobs/{job_id}/reconcile", self._handle_calendar_job_reconcile)
+        router.add_post("/internal/v1/cron/calendar-recovery-arms/{dedupe_key}/reconcile", self._handle_calendar_recovery_reconcile)
 
     # ------------------------------------------------------------------
     # Agent creation helper
@@ -2489,6 +3586,7 @@ class APIServerAdapter(BasePlatformAdapter):
         route: Optional[Dict[str, Any]] = None,
         session_model: Optional[str] = None,
         confirmed_runtime_lock: bool = False,
+        request_overrides: Optional[Dict[str, Any]] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -2689,6 +3787,18 @@ class APIServerAdapter(BasePlatformAdapter):
             if provider_runtime:
                 _apply_runtime_agent_overrides(runtime_kwargs, provider_runtime)
             elif effective_provider and effective_provider != current_provider:
+                # A failed cross-provider resolution must never reuse the
+                # global provider's credentials or transport. Explicit route
+                # fields below may safely fill the new provider configuration.
+                for key in (
+                    "api_key",
+                    "base_url",
+                    "api_mode",
+                    "command",
+                    "args",
+                    "credential_pool",
+                ):
+                    runtime_kwargs.pop(key, None)
                 runtime_kwargs["provider"] = effective_provider
             model = effective_model
             # Per-route explicit transport secrets/base URLs win within the
@@ -2768,6 +3878,12 @@ class APIServerAdapter(BasePlatformAdapter):
             else GatewayRunner._load_fallback_model()
         )
 
+        agent_request_overrides = dict(request_overrides or {})
+        disable_tools = agent_request_overrides.pop("tool_choice", None) == "none"
+        # Consumed only by the ZetAgent subclass; never forward this private
+        # plan policy hint into AIAgent or an LLM request body.
+        agent_request_overrides.pop("_zet_plan_auto_execute", None)
+
         agent_kwargs = {
             "model": model,
             **runtime_kwargs,
@@ -2787,11 +3903,18 @@ class APIServerAdapter(BasePlatformAdapter):
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
+            "request_overrides": agent_request_overrides or None,
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
+        if disable_tools:
+            # API-level safety boundary across every transport, including
+            # transports without an OpenAI-compatible tool_choice parameter.
+            agent.tools = []
+            agent.valid_tool_names = set()
+            agent._skip_mcp_refresh = True
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider") or getattr(agent, "provider", "") or "",
             "model": getattr(agent, "model", None) or model,
@@ -2806,6 +3929,60 @@ class APIServerAdapter(BasePlatformAdapter):
             ),
         }
         return agent
+
+    def _response_format_transport_error(
+        self,
+        request_overrides: Optional[Dict[str, Any]],
+        *,
+        session_id: Optional[str] = None,
+        gateway_session_key: Optional[str] = None,
+    ) -> Optional[str]:
+        response_format = (request_overrides or {}).get("response_format")
+        if response_format is None:
+            return None
+        from agent.response_format import response_format_requires_structured_output
+
+        if not response_format_requires_structured_output(response_format):
+            return None
+        try:
+            from gateway.run import _resolve_runtime_agent_kwargs
+
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+        except Exception:
+            return None
+
+        override_key = gateway_session_key or session_id
+        if override_key:
+            try:
+                override = getattr(
+                    getattr(self, "gateway_runner", None),
+                    "_session_model_overrides",
+                    {},
+                ).get(override_key)
+            except Exception:
+                override = None
+            if override:
+                for key in ("provider", "base_url", "api_mode"):
+                    value = override.get(key)
+                    if value is not None:
+                        runtime_kwargs[key] = value
+
+        api_mode = getattr(self, "api_mode", None) or runtime_kwargs.get("api_mode")
+        if api_mode == "anthropic_messages":
+            return "response_format is not supported by the Anthropic Messages transport."
+        if api_mode != "chat_completions":
+            return None
+        provider = str(runtime_kwargs.get("provider") or "").strip().lower()
+        base_url = str(runtime_kwargs.get("base_url") or "")
+        try:
+            from agent.gemini_native_adapter import is_native_gemini_base_url
+
+            native_gemini = is_native_gemini_base_url(base_url)
+        except Exception:
+            native_gemini = False
+        if provider == "google-gemini-cli" or base_url.lower().startswith("cloudcode-pa://") or native_gemini:
+            return "response_format is not supported by the Gemini transport."
+        return None
 
     # ------------------------------------------------------------------
     # HTTP Handlers
@@ -3835,6 +5012,38 @@ class APIServerAdapter(BasePlatformAdapter):
             "session_id": session_id,
             "runtime": runtime,
         })
+
+    async def _expand_inbound_skill_invocation(
+        self,
+        user_message: Any,
+        skill_slug: str,
+        session_id: Optional[str] = None,
+        on_settled: Optional[Any] = None,
+    ) -> Any:
+        """Platform hook: expand an EXPLICITLY requested skill (by slug) into
+        the full skill payload.
+
+        Triggered only when the request carried ``metadata.skill_slug`` (the
+        App quick-pick's invocation signal) — the message text is never
+        sniffed for slash commands. Base implementation is a no-op so plain
+        api_server behavior is unchanged; the zet_agent subclass overrides it
+        for CLI-slash parity. Async so that override can push the blocking
+        skill-directory scan/load off the event loop (it runs inside the
+        request handler, before the agent's executor thread exists).
+        ``session_id`` is the resolved chat session — the override forwards
+        it as the skill builder's task_id so ``${HERMES_SESSION_ID}``
+        templates resolve against the real session. ``on_settled`` (when
+        given) is invoked EXACTLY ONCE on the event loop when the expansion
+        work has truly finished — including after the awaiting caller was
+        cancelled while a worker thread was still running. Callers use it to
+        hold resource accounting (e.g. the profile active-run count) open for
+        exactly as long as expansion side effects can still occur. See
+        ZetAgent._expand_inbound_skill_invocation.
+        """
+        if on_settled is not None:
+            on_settled()
+        return user_message
+
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -3857,6 +5066,14 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+        response_mode = _extract_response_mode(body)
+        plan_ack = _extract_plan_ack(body)
+        plan_auto_execute = _extract_plan_auto_execute(body)
+        turn_id = _extract_turn_id(body)
+        connector_route_capability = _extract_connector_route_capability(body)
+        business_execution_token = _extract_business_execution_token(
+            request.headers.get("X-Zettlab-Business-Execution-Token", "")
+        )
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -3961,9 +5178,63 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
 
+        # Explicit skill invocation (zet_agent hook; base no-op): triggered
+        # ONLY by metadata.skill_slug — never by sniffing the message text.
+        # The expansion runs LATE on purpose; the placement is load-bearing:
+        #   - AFTER session_id is final, so skill templates resolve
+        #     ${HERMES_SESSION_ID} against the real session (session_id is
+        #     forwarded as the builder's task_id), matching the CLI slash;
+        #   - INSIDE the Idempotency-Key compute for non-streaming, so a
+        #     retried/concurrent key reuses the first agent result without
+        #     re-running expansion side effects (skills.inline_shell=true
+        #     executes SKILL.md preprocessing at build time);
+        #   - SKIPPED under tool_choice="none": that is an API-level "no
+        #     tools this turn" boundary (request_overrides strips every agent
+        #     tool) and expansion injects tool-driving instructions — the
+        #     message passes through unexpanded instead.
+        skill_slug = _extract_skill_slug(body)
+        skill_selection_enabled = bool(
+            skill_slug and body.get("tool_choice") != "none"
+        )
+        trusted_user_message = (
+            _trusted_skill_task_message(user_message, skill_slug)
+            if skill_selection_enabled
+            else user_message
+        )
+        trusted_skill_slug = (
+            skill_slug
+            if skill_selection_enabled
+            else ""
+        )
+
+        async def _expanded_user_message(on_settled=None):
+            if not skill_slug or body.get("tool_choice") == "none":
+                if on_settled is not None:
+                    on_settled()
+                return user_message
+            return await self._expand_inbound_skill_invocation(
+                user_message, skill_slug, session_id=session_id,
+                on_settled=on_settled,
+            )
+
         completion_id = f"chatcmpl-{uuid.uuid4().hex[:29]}"
         model_name = body.get("model", self._model_name)
         created = int(time.time())
+        request_overrides: Dict[str, Any] = {}
+        if body.get("tool_choice") == "none":
+            request_overrides["tool_choice"] = "none"
+        response_format = body.get("response_format")
+        if response_format is not None:
+            response_format_error = _validate_chat_response_format(response_format)
+            if response_format_error:
+                return web.json_response(
+                    _openai_error(response_format_error, param="response_format"),
+                    status=400,
+                )
+            from agent.response_format import response_format_requires_structured_output
+
+            if response_format_requires_structured_output(response_format):
+                request_overrides["response_format"] = response_format
 
         # Per-client model routing: if the requested model matches a
         # configured model_routes alias, this request's agent is created
@@ -3985,6 +5256,17 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(_openai_error(selection_error), status=400)
 
         if stream:
+            response_format_transport_error = self._response_format_transport_error(
+                request_overrides or None,
+                session_id=session_id,
+                gateway_session_key=gateway_session_key,
+            )
+            if response_format_transport_error:
+                return web.json_response(
+                    _openai_error(response_format_transport_error, param="response_format"),
+                    status=400,
+                )
+
             import queue as _q
             _stream_q: _q.Queue = _q.Queue()
 
@@ -4041,11 +5323,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 if not tool_call_id or tool_call_id not in _started_tool_call_ids:
                     return
                 _started_tool_call_ids.discard(tool_call_id)
-                _stream_q.put(("__tool_progress__", {
-                    "tool": function_name,
-                    "toolCallId": tool_call_id,
-                    "status": "completed",
-                }))
+                _stream_q.put(("__tool_progress__", _tool_completion_payload(
+                    tool_call_id, function_name, function_result,
+                )))
 
             # Start agent in background.  agent_ref is a mutable container
             # so the SSE writer can interrupt the agent on client disconnect.
@@ -4056,6 +5336,27 @@ class APIServerAdapter(BasePlatformAdapter):
             # The structured callbacks are strictly richer (they carry
             # the tool_call id), so they own the chat-completions SSE channel.
             agent_ref = [None]
+            # Streaming has no idempotency layer — expand once, right before
+            # the run (see _expanded_user_message for the placement contract).
+            # The profile active-run count opens FIRST so /v1/profile/unload
+            # cannot tear the profile down under an in-flight expansion.
+            profile_run_key = self._begin_profile_chat_run(
+                request.get("hermes_profile_home")
+            )
+            # 同非流式:展开自持一份计数,worker 真正结束才经 on_settled 释放。
+            expansion_run_key = self._begin_profile_chat_run(
+                request.get("hermes_profile_home")
+            )
+            try:
+                user_message = await _expanded_user_message(
+                    on_settled=lambda: self._end_profile_chat_run(expansion_run_key)
+                )
+            except BaseException:
+                # The stream path ends the run in the agent task's
+                # done-callback; a failure before that task exists must not
+                # leak the active-run count (unload would then hang/refuse).
+                self._end_profile_chat_run(profile_run_key)
+                raise
             agent_task = asyncio.ensure_future(self._run_agent(
                 user_message=user_message,
                 conversation_history=history,
@@ -4068,10 +5369,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                response_mode=response_mode,
+                plan_ack=plan_ack,
+                plan_auto_execute=plan_auto_execute,
+                turn_id=turn_id,
+                connector_route_capability=connector_route_capability,
+                business_execution_token=business_execution_token,
+                request_overrides=request_overrides or None,
+                trusted_user_message=trusted_user_message,
+                trusted_skill_slug=trusted_skill_slug,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
             agent_task.add_done_callback(lambda _fut: _stream_q.put(None))
+            agent_task.add_done_callback(
+                lambda _fut, key=profile_run_key: self._end_profile_chat_run(key)
+            )
 
             return await self._write_sse_chat_completion(
                 request, completion_id, model_name, created, _stream_q,
@@ -4081,24 +5394,81 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Non-streaming: run the agent (with optional Idempotency-Key)
         async def _compute_completion():
-            return await self._run_agent(
-                user_message=user_message,
-                conversation_history=history,
-                ephemeral_system_prompt=system_prompt,
-                session_id=session_id,
-                gateway_session_key=gateway_session_key,
-                **agent_overrides,
-                route=route,
+            # The profile active-run count opens BEFORE expansion: /v1/profile
+            # /unload treats zero active runs as idle, and an expansion still
+            # in flight (scan/load/inline_shell) must not let the profile be
+            # torn down under it. Expansion stays INSIDE the idempotency-
+            # protected compute: an Idempotency-Key hit (or a concurrent
+            # duplicate awaiting the first flight) must reuse the cached
+            # result without re-running expansion side effects.
+            profile_run_key = self._begin_profile_chat_run(
+                request.get("hermes_profile_home")
             )
+            # Expansion holds its OWN active-run count, released via
+            # on_settled when the worker truly finishes: a cancelled await
+            # ends the turn's count in the finally below, but a still-running
+            # scan/load/inline_shell worker must keep the profile pinned so
+            # /v1/profile/unload cannot tear the runtime down under it.
+            expansion_run_key = self._begin_profile_chat_run(
+                request.get("hermes_profile_home")
+            )
+            try:
+                expanded_message = await _expanded_user_message(
+                    on_settled=lambda: self._end_profile_chat_run(expansion_run_key)
+                )
+                return await self._run_agent(
+                    user_message=expanded_message,
+                    conversation_history=history,
+                    ephemeral_system_prompt=system_prompt,
+                    session_id=session_id,
+                    gateway_session_key=gateway_session_key,
+                    **agent_overrides,
+                    route=route,
+                    response_mode=response_mode,
+                    plan_ack=plan_ack,
+                    plan_auto_execute=plan_auto_execute,
+                    turn_id=turn_id,
+                    connector_route_capability=connector_route_capability,
+                    business_execution_token=business_execution_token,
+                    request_overrides=request_overrides or None,
+                    trusted_user_message=trusted_user_message,
+                    trusted_skill_slug=trusted_skill_slug,
+                )
+            finally:
+                self._end_profile_chat_run(profile_run_key)
 
         idempotency_key = request.headers.get("Idempotency-Key")
         if idempotency_key:
             fp = _make_request_fingerprint(
                 body,
-                keys=["model", "provider", "model_options", "messages", "tools", "tool_choice", "stream"],
+                keys=[
+                    "model",
+                    "provider",
+                    "model_options",
+                    "messages",
+                    "tools",
+                    "tool_choice",
+                    "response_format",
+                    "stream",
+                    "metadata",
+                ],
+                execution_scope_digest=_business_execution_scope_digest(
+                    business_execution_token
+                ),
             )
             try:
                 result, usage = await _idem_cache.get_or_set(idempotency_key, fp, _compute_completion)
+            except ValueError as e:
+                if "response_format" in str(e):
+                    return web.json_response(
+                        _openai_error(str(e), param="response_format"),
+                        status=400,
+                    )
+                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
+                return web.json_response(
+                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    status=500,
+                )
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -4108,6 +5478,17 @@ class APIServerAdapter(BasePlatformAdapter):
         else:
             try:
                 result, usage = await _compute_completion()
+            except ValueError as e:
+                if "response_format" in str(e):
+                    return web.json_response(
+                        _openai_error(str(e), param="response_format"),
+                        status=400,
+                    )
+                logger.error("Error running agent for chat completions: %s", e, exc_info=True)
+                return web.json_response(
+                    _openai_error(f"Internal server error: {e}", err_type="server_error"),
+                    status=500,
+                )
             except Exception as e:
                 logger.error("Error running agent for chat completions: %s", e, exc_info=True)
                 return web.json_response(
@@ -4125,12 +5506,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Decide finish_reason. OpenAI uses "length" for truncation, "stop"
         # for normal completion, and downstream SDKs accept "error" / custom
         # codes. See issue #22496.
-        if is_partial and err_msg and "truncat" in err_msg.lower():
-            finish_reason = "length"
-        elif is_failed or (not completed and err_msg):
-            finish_reason = "error"
-        else:
-            finish_reason = "stop"
+        finish_reason = _chat_finish_reason_from_result(result if isinstance(result, dict) else {})
 
         response_headers = {
             "X-Hermes-Session-Id": result.get("session_id", session_id),
@@ -4228,6 +5604,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             last_activity = time.monotonic()
+            streamed_text_parts: list[str] = []
 
             # Role chunk
             role_chunk = {
@@ -4254,7 +5631,14 @@ class APIServerAdapter(BasePlatformAdapter):
                     await response.write(
                         f"event: hermes.tool.progress\ndata: {event_data}\n\n".encode()
                     )
+                elif isinstance(item, tuple) and len(item) == 2 and item[0] == "__hermes_error__":
+                    event_data = json.dumps(item[1])
+                    await response.write(
+                        f"event: hermes.error\ndata: {event_data}\n\n".encode()
+                    )
                 else:
+                    if isinstance(item, str):
+                        streamed_text_parts.append(item)
                     content_chunk = {
                         "id": completion_id, "object": "chat.completion.chunk",
                         "created": created, "model": model,
@@ -4299,34 +5683,57 @@ class APIServerAdapter(BasePlatformAdapter):
             # the failure is detectable — mirroring the non-streaming path's
             # decision logic (see the finish_reason block above).
             usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-            result = None
-            agent_error = None
+            result = {}
             try:
                 result, agent_usage = await agent_task
                 usage = agent_usage or usage
             except Exception as exc:
-                agent_error = exc
-                logger.error(
-                    "Agent task %s failed during SSE streaming: %s", completion_id, exc
-                )
+                logger.warning("Agent task %s failed, usage data lost: %s", completion_id, exc)
+                result = {
+                    "completed": False,
+                    "failed": True,
+                    "error": str(exc),
+                }
+            result_dict = result if isinstance(result, dict) else {}
+            completed = bool(result_dict.get("completed", True))
+            is_partial = bool(result_dict.get("partial"))
+            is_failed = bool(result_dict.get("failed"))
+            raw_err_msg = result_dict.get("error")
+            err_msg = _redact_api_error_text(raw_err_msg) if raw_err_msg else raw_err_msg
 
-            # Inspect the result dict for a flagged (non-exception) failure.
-            is_partial = bool(result.get("partial")) if isinstance(result, dict) else False
-            is_failed = bool(result.get("failed")) if isinstance(result, dict) else False
-            completed = bool(result.get("completed", True)) if isinstance(result, dict) else True
-            err_msg = result.get("error") if isinstance(result, dict) else None
-            if agent_error is not None:
-                is_failed = True
-                err_msg = err_msg or str(agent_error)
+            finish_reason = _chat_finish_reason_from_result(result_dict)
+            error_payload = _chat_stream_error_payload(result_dict, finish_reason)
+            if error_payload:
+                await _emit(("__hermes_error__", error_payload))
 
-            # Decide finish_reason, matching the non-streaming logic: "length"
-            # for truncation, "error" for failure, "stop" for normal completion.
-            if is_partial and err_msg and "truncat" in err_msg.lower():
-                finish_reason = "length"
-            elif agent_error is not None or is_failed or (not completed and err_msg):
-                finish_reason = "error"
-            else:
-                finish_reason = "stop"
+            # Output-transform hooks run after the model token stream has
+            # finished. Chat platforms can edit the streamed message in place,
+            # but OpenAI-compatible HTTP clients only understand additional
+            # content deltas. When a hook appended a suffix (for example the
+            # creation-recommendation envelope), emit that suffix before the
+            # terminal chunk so API consumers persist and render the actual
+            # final response rather than the pre-transform draft.
+            if result_dict.get("response_transformed"):
+                final_response = result_dict.get("final_response") or ""
+                transform_suffix = result_dict.get("response_transform_suffix")
+                streamed_response = "".join(streamed_text_parts)
+                if isinstance(transform_suffix, str) and transform_suffix:
+                    # The finalizer computes this against the exact pre-hook
+                    # response. It remains valid even when the live stream also
+                    # contained interim assistant text from earlier tool steps.
+                    await _emit(transform_suffix)
+                elif final_response.startswith(streamed_response):
+                    transformed_suffix = final_response[len(streamed_response):]
+                    if transformed_suffix:
+                        await _emit(transformed_suffix)
+                elif not streamed_response and final_response:
+                    await _emit(final_response)
+                else:
+                    logger.warning(
+                        "Cannot safely reconcile transformed SSE response for %s: "
+                        "final output is not an append-only transform",
+                        completion_id,
+                    )
 
             # Finish chunk
             finish_chunk = {
@@ -4344,7 +5751,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 if err_msg:
                     finish_chunk["error"] = {
                         "message": err_msg,
-                        "type": type(agent_error).__name__ if agent_error else "agent_error",
+                        "type": "agent_error",
                     }
                 finish_chunk["hermes"] = {
                     "completed": completed,
@@ -5362,8 +6769,12 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
+    _CALENDAR_JOB_ID_RE = __import__("re").compile(r"cal-alert-[a-f0-9]{32}")
     # Allowed fields for update — prevents clients injecting arbitrary keys
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+    _UPDATE_ALLOWED_FIELDS = {
+        "name", "schedule", "prompt", "deliver", "skills", "skill",
+        "repeat", "enabled", "timezone", "output_language",
+    }
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
 
@@ -5390,6 +6801,114 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         return job_id, None
 
+    def _check_calendar_job_id(self, request: "web.Request") -> tuple:
+        """Accept only planner-generated calendar job identifiers."""
+        job_id = request.match_info["job_id"]
+        if not self._CALENDAR_JOB_ID_RE.fullmatch(job_id):
+            logger.warning(
+                "Calendar reconcile rejected invalid job ID %r: %s",
+                job_id,
+                self._request_audit_log_suffix(request),
+            )
+            return job_id, web.json_response(
+                {"error": "Invalid calendar job ID format"}, status=400,
+            )
+        return job_id, None
+
+    # Bounded so a malicious or malformed origin can't push megabytes into
+    # jobs.json. Chat IDs in zet_agent are typically <80 chars
+    # ("zettlab:local-dev:main:EsGjUc7V-2oA"); 500 leaves headroom for future
+    # formats. User/chat name fields are short labels; 500 is generous.
+    _ORIGIN_PLATFORM_MAX = 200
+    _ORIGIN_TEXT_MAX = 500
+
+    @staticmethod
+    def _validate_origin_field(value) -> Optional["web.Response"]:
+        """Validate a cron job ``origin`` body — the chat session that
+        gets the delivery when ``deliver='origin'`` fires.
+
+        Mirrors the shape ``cronjob_tools._origin_from_env()`` writes in
+        the LLM-tool path: ``{platform, chat_id, chat_name?, thread_id?,
+        user_id?, user_name?}``. APP's preview-confirm-POST path lost
+        this metadata because the handler used to ignore unknown body
+        keys, so jobs landed with ``origin=null`` and the scheduler had
+        nowhere to deliver to (ZET-942 follow-up).
+
+        Returns a 400 web.Response on bad input, None when OK.
+        """
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            return web.json_response(
+                {"error": "origin must be an object"}, status=400,
+            )
+        platform = value.get("platform")
+        chat_id = value.get("chat_id")
+        if not isinstance(platform, str) or not platform.strip():
+            return web.json_response(
+                {"error": "origin.platform is required and must be a non-empty string"},
+                status=400,
+            )
+        if not isinstance(chat_id, str) or not chat_id.strip():
+            return web.json_response(
+                {"error": "origin.chat_id is required and must be a non-empty string"},
+                status=400,
+            )
+        if len(platform) > APIServerAdapter._ORIGIN_PLATFORM_MAX:
+            return web.json_response(
+                {"error": f"origin.platform must be ≤ {APIServerAdapter._ORIGIN_PLATFORM_MAX} characters"},
+                status=400,
+            )
+        if len(chat_id) > APIServerAdapter._ORIGIN_TEXT_MAX:
+            return web.json_response(
+                {"error": f"origin.chat_id must be ≤ {APIServerAdapter._ORIGIN_TEXT_MAX} characters"},
+                status=400,
+            )
+        for k in ("chat_name", "thread_id", "user_id", "user_name"):
+            v = value.get(k)
+            if v is None:
+                continue
+            if not isinstance(v, str):
+                return web.json_response(
+                    {"error": f"origin.{k} must be a string"}, status=400,
+                )
+            if len(v) > APIServerAdapter._ORIGIN_TEXT_MAX:
+                return web.json_response(
+                    {"error": f"origin.{k} must be ≤ {APIServerAdapter._ORIGIN_TEXT_MAX} characters"},
+                    status=400,
+                )
+        return None
+
+    @staticmethod
+    def _validate_timezone_field(value) -> Optional["web.Response"]:
+        """Validate an IANA timezone string from a job request body.
+
+        Returns a 400 response on bad input, or None when value is OK
+        (None, empty string, or a recognised zone). Done at the API layer
+        so clients get a clear 400 instead of the catch-all 500 from the
+        underlying ``_cron_create`` / ``_cron_update`` ValueError.
+        """
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return web.json_response(
+                {"error": "timezone must be a string"}, status=400,
+            )
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+        except ImportError:
+            from backports.zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # type: ignore[no-redef]
+        try:
+            ZoneInfo(text)
+        except (ZoneInfoNotFoundError, ValueError):
+            return web.json_response(
+                {"error": f"Invalid IANA timezone: {text!r}"}, status=400,
+            )
+        return None
+
     async def _handle_list_jobs(self, request: "web.Request") -> "web.Response":
         """GET /api/jobs — list all cron jobs."""
         auth_err = self._check_auth(request)
@@ -5402,6 +6921,62 @@ class APIServerAdapter(BasePlatformAdapter):
             include_disabled = request.query.get("include_disabled", "").lower() in {"true", "1"}
             jobs = _cron_list(include_disabled=include_disabled)
             return web.json_response({"jobs": jobs})
+        except Exception as e:
+            return web.json_response({"error": _redact_api_error_text(e)}, status=500)
+
+    async def _handle_list_job_occurrences(self, request: "web.Request") -> "web.Response":
+        """GET /api/jobs/occurrences — real runs plus bounded future previews."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        cron_err = self._check_jobs_available()
+        if cron_err:
+            return cron_err
+        try:
+            raw_from = request.query.get("from", "")
+            raw_to = request.query.get("to", "")
+            if len(raw_from) > 128 or len(raw_to) > 128:
+                raise ValueError("occurrence bounds are too long")
+            from_at = datetime.fromisoformat(raw_from.replace("Z", "+00:00"))
+            to_at = datetime.fromisoformat(raw_to.replace("Z", "+00:00"))
+            if from_at.tzinfo is None or to_at.tzinfo is None:
+                raise ValueError("occurrence bounds must include a timezone")
+            if to_at <= from_at:
+                raise ValueError("occurrence 'to' must be after 'from'")
+            if to_at.astimezone(timezone.utc) - from_at.astimezone(timezone.utc) > timedelta(days=370):
+                raise ValueError("occurrence window must not exceed 370 days")
+            try:
+                limit = max(1, min(int(request.query.get("limit", "2000")), 2000))
+            except ValueError:
+                raise ValueError("occurrence limit must be an integer")
+            jobs = _cron_list(include_disabled=True)
+            requested_job_ids = request.query.getall("job_id", [])
+            if len(requested_job_ids) > 256:
+                raise ValueError("too many occurrence job filters")
+            if requested_job_ids:
+                selected_ids = set()
+                for job_id in requested_job_ids:
+                    if (
+                        not isinstance(job_id, str)
+                        or not job_id
+                        or len(job_id) > 256
+                        or job_id in {".", ".."}
+                        or "/" in job_id
+                        or "\\" in job_id
+                    ):
+                        raise ValueError("invalid occurrence job filter")
+                    selected_ids.add(job_id)
+                jobs = [job for job in jobs if job.get("id") in selected_ids]
+            projection = await asyncio.to_thread(
+                _cron_occurrence_projection,
+                jobs,
+                from_at,
+                to_at,
+                limit=limit,
+            )
+            return web.json_response({**projection, "limit": limit})
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -5421,6 +6996,9 @@ class APIServerAdapter(BasePlatformAdapter):
             deliver = body.get("deliver", "local")
             skills = body.get("skills")
             repeat = body.get("repeat")
+            timezone = body.get("timezone")
+            output_language = body.get("output_language")
+            origin = body.get("origin")
 
             if not name:
                 return web.json_response({"error": "Name is required"}, status=400)
@@ -5440,6 +7018,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     return web.json_response({"error": scan_error}, status=400)
             if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
                 return web.json_response({"error": "Repeat must be a positive integer"}, status=400)
+            tz_err = self._validate_timezone_field(timezone)
+            if tz_err:
+                return tz_err
+            origin_err = self._validate_origin_field(origin)
+            if origin_err:
+                return origin_err
 
             kwargs = {
                 "prompt": prompt,
@@ -5452,10 +7036,23 @@ class APIServerAdapter(BasePlatformAdapter):
                 kwargs["skills"] = skills
             if repeat is not None:
                 kwargs["repeat"] = repeat
+            if timezone is not None:
+                kwargs["timezone"] = timezone
+            if output_language is not None:
+                kwargs["output_language"] = output_language
+            if origin is not None:
+                kwargs["origin"] = origin
+
+            if _cron_job_requires_live_chat_authorization(skills):
+                return web.json_response(
+                    {"error": _CRON_LIVE_CHAT_AUTHORIZATION_REQUIRED}, status=400
+                )
 
             job = _cron_create(**kwargs)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -5508,11 +7105,26 @@ class APIServerAdapter(BasePlatformAdapter):
                 scan_error = _scan_cron_prompt(sanitized["prompt"])
                 if scan_error:
                     return web.json_response({"error": scan_error}, status=400)
+            if "timezone" in sanitized:
+                tz_err = self._validate_timezone_field(sanitized["timezone"])
+                if tz_err:
+                    return tz_err
+            # A REST request that introduces Linear has no live Chat route to
+            # obtain the durable task grant. Unrelated edits of a historical
+            # Linear job remain compatible and keep their current semantics.
+            if "skills" in sanitized or "skill" in sanitized:
+                requested_skills = sanitized.get("skills", sanitized.get("skill"))
+                if _cron_job_requires_live_chat_authorization(requested_skills):
+                    return web.json_response(
+                        {"error": _CRON_LIVE_CHAT_AUTHORIZATION_REQUIRED}, status=400
+                    )
             job = _cron_update(job_id, sanitized)
             if not job:
                 return web.json_response({"error": "Job not found"}, status=404)
             _notify_cron_provider_jobs_changed()
             return web.json_response({"job": job})
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
@@ -5662,11 +7274,107 @@ class APIServerAdapter(BasePlatformAdapter):
             from cron.scheduler_provider import resolve_cron_scheduler
             provider = resolve_cron_scheduler()
 
+            from cron.calendar_delivery import (
+                begin_external_calendar_fire,
+                is_invalid_calendar_job,
+                is_managed_calendar_event_alert,
+                quarantine_invalid_calendar_job,
+                run_external_calendar_delivery,
+            )
+            from cron.jobs import get_job_raw
+
+            # Managed calendar validation is a wire-contract check. In
+            # particular, prompt:null must not be normalized to an empty string.
+            job = get_job_raw(job_id)
+            provider_fire_id = str(
+                (body or {}).get("provider_fire_id")
+                or (body or {}).get("fire_id")
+                or (body or {}).get("dedupe_key")
+                or request.headers.get("X-Chronos-Fire-ID", "")
+                or claims.get("fire_id")
+                or claims.get("jti")
+                or ""
+            )
+            if len(provider_fire_id) > 256:
+                return web.json_response({"error": "invalid fire id"}, status=400)
+            if is_managed_calendar_event_alert(job):
+                capabilities = provider.calendar_capabilities()
+                try:
+                    begin = await asyncio.to_thread(
+                        begin_external_calendar_fire,
+                        job,
+                        provider_name=str(capabilities.get("provider") or provider.name),
+                        provider_contract_version=int(capabilities.get("contract_version") or 0),
+                        provider_fire_id=provider_fire_id,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "calendar external fire preflight remains retryable for %s: %s",
+                        job_id,
+                        exc,
+                    )
+                    return web.json_response(
+                        {"error": "calendar delivery preflight required"},
+                        status=503,
+                        headers={"Retry-After": "5"},
+                    )
+                if (
+                    begin.get("state")
+                    in {"fired", "expired", "cancelled", "superseded"}
+                    or begin.get("attempt_replayed") is True
+                ):
+                    return web.json_response(
+                        {"status": "accepted", "job_id": job_id, **begin},
+                        status=202,
+                    )
+                task = asyncio.create_task(
+                    asyncio.to_thread(run_external_calendar_delivery, job, begin)
+                )
+                reservation["detached"] = True
+                task.add_done_callback(
+                    lambda _task: _release_pending_api_work(self, reservation)
+                )
+                try:
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+                except (TypeError, AttributeError):
+                    pass
+                return web.json_response(
+                    {
+                        "status": "accepted",
+                        "job_id": job_id,
+                        "attempt_sequence": begin.get("attempt_sequence"),
+                        "dedupe_key": begin.get("dedupe_key"),
+                    },
+                    status=202,
+                )
+
+            if is_invalid_calendar_job(job):
+                quarantine_invalid_calendar_job(job)
+                return web.json_response(
+                    {"error": "invalid calendar job contract"},
+                    status=422,
+                )
+
+            from cron.jobs import normalize_external_fire_at
+
+            if (body or {}).get("fire_at") is None:
+                return web.json_response({"error": "missing fire_at"}, status=400)
+            try:
+                ordinary_fire_at = normalize_external_fire_at((body or {}).get("fire_at"))
+            except ValueError as exc:
+                return web.json_response({"error": str(exc)}, status=400)
             loop = asyncio.get_running_loop()
             # Fire in the background (202 immediately). fire_due claims via the
             # store CAS, so a retry while this is in flight is de-duped.
             task = asyncio.create_task(
-                asyncio.to_thread(provider.fire_due, job_id, adapters=None, loop=loop)
+                asyncio.to_thread(
+                    provider.fire_due,
+                    job_id,
+                    adapters=None,
+                    loop=loop,
+                    fire_at=ordinary_fire_at,
+                )
             )
             reservation["detached"] = True
             task.add_done_callback(
@@ -5679,6 +7387,68 @@ class APIServerAdapter(BasePlatformAdapter):
                 pass
 
             return web.json_response({"status": "accepted", "job_id": job_id}, status=202)
+
+    async def _handle_cron_capabilities(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        from cron.scheduler_provider import resolve_cron_scheduler
+        return web.json_response(resolve_cron_scheduler().calendar_capabilities())
+
+    async def _handle_calendar_job_reconcile(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        job_id, id_err = self._check_calendar_job_id(request)
+        if id_err:
+            return id_err
+        if request.content_length is not None and request.content_length > 16 * 1024:
+            return web.json_response({"error": "request too large"}, status=413)
+        try:
+            body = await request.json()
+            action = str((body or {}).get("expected_action") or "")
+            revision = int((body or {}).get("projection_revision") or 0)
+            if action not in {"upsert", "delete"} or revision <= 0:
+                raise ValueError("invalid reconcile contract")
+            from cron.scheduler_provider import resolve_cron_scheduler
+            result = await asyncio.to_thread(
+                resolve_cron_scheduler().reconcile_calendar_job,
+                job_id, action, revision,
+            )
+            return web.json_response(result)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            logger.warning("calendar provider reconcile failed for %s: %s", job_id, exc)
+            return web.json_response({"error": "provider reconcile failed"}, status=503)
+
+    async def _handle_calendar_recovery_reconcile(self, request: "web.Request") -> "web.Response":
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        dedupe_key = str(request.match_info.get("dedupe_key") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", dedupe_key):
+            return web.json_response({"error": "invalid recovery dedupe key"}, status=400)
+        if request.content_length is not None and request.content_length > 16 * 1024:
+            return web.json_response({"error": "request too large"}, status=413)
+        try:
+            body = await request.json()
+            if not isinstance(body, dict) or body.get("dedupe_key") != dedupe_key:
+                raise ValueError("invalid recovery contract")
+            from cron.scheduler_provider import (
+                normalize_calendar_recovery_reconcile_result,
+                resolve_cron_scheduler,
+            )
+            result = await asyncio.to_thread(
+                resolve_cron_scheduler().reconcile_calendar_recovery_arm,
+                body,
+            )
+            return web.json_response(normalize_calendar_recovery_reconcile_result(result))
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception as exc:
+            logger.warning("calendar recovery reconcile failed for %s: %s", dedupe_key, exc)
+            return web.json_response({"error": "provider recovery reconcile failed"}, status=503)
 
 
     # ------------------------------------------------------------------
@@ -5932,6 +7702,15 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        response_mode: Optional[str] = None,
+        plan_ack: Optional[Dict[str, Any]] = None,
+        plan_auto_execute: Optional[bool] = None,
+        turn_id: Optional[str] = None,
+        connector_route_capability: Optional[str] = None,
+        business_execution_token: Optional[str] = None,
+        request_overrides: Optional[Dict[str, Any]] = None,
+        trusted_user_message: Any = None,
+        trusted_skill_slug: str = "",
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -5965,7 +7744,11 @@ class APIServerAdapter(BasePlatformAdapter):
         request_profile = _api_request_profile.get()
 
         def _run():
-            from gateway.session_context import clear_session_vars
+            from gateway.session_context import (
+                clear_session_vars,
+                set_zettlab_connector_route_capability,
+                set_zettlab_turn_id,
+            )
 
             with self._profile_scope(request_profile):
                 tokens = self._bind_api_server_session(
@@ -5974,7 +7757,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id or "",
                 )
                 agent = None
+                # turn_id is request-scoped correlation for NAS fallback and
+                # terminal skill subprocesses. Keep it in its own contextvar and
+                # clear it with the session vars on reused executor threads.
+                set_zettlab_turn_id(turn_id or "")
+                set_zettlab_connector_route_capability(
+                    connector_route_capability or ""
+                )
                 try:
+                    # Resolve the auto-execute flag once so the Plan-First
+                    # system prompt and the turn-level execution policy agree.
+                    resolved_plan_auto_execute = _resolve_plan_auto_execute(plan_auto_execute)
+                    create_overrides = dict(request_overrides or {})
+                    create_overrides["_zet_plan_auto_execute"] = resolved_plan_auto_execute
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,
@@ -5989,9 +7784,19 @@ class APIServerAdapter(BasePlatformAdapter):
                         route=route,
                         session_model=session_model,
                         confirmed_runtime_lock=confirmed_runtime_lock,
+                        request_overrides=create_overrides,
+                    )
+                    agent._tools_disabled_for_request = (
+                        create_overrides.get("tool_choice") == "none"
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
+                    agent._zet_agent_response_mode = response_mode or ""
+                    agent._zet_agent_plan_ack = dict(plan_ack or {})
+                    agent._zet_agent_plan_auto_execute = resolved_plan_auto_execute
+                    if trusted_user_message is not None:
+                        agent._zet_agent_trusted_user_message = trusted_user_message
+                    agent._zet_agent_trusted_skill_slug = trusted_skill_slug
                     effective_task_id = session_id or str(uuid.uuid4())
                     # Baseline for selective background-process reaping on
                     # SSE client disconnect — mirrors gateway/run.py's
@@ -6129,11 +7934,16 @@ class APIServerAdapter(BasePlatformAdapter):
                     if agent is not None:
                         _clear_turn_process_ownership(agent)
                     clear_session_vars(tokens)
+                    set_zettlab_turn_id("")
+                    set_zettlab_connector_route_capability("")
 
         self._activate_admitted_request()
+        from contextvars import copy_context
+
+        ctx = copy_context()
         self._inflight_agent_runs += 1
         try:
-            return await loop.run_in_executor(None, _run)
+            return await loop.run_in_executor(None, ctx.run, _run)
         finally:
             self._inflight_agent_runs -= 1
 
@@ -6326,7 +8136,12 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                     conversation_history.append({"role": msg["role"], "content": str(content)})
 
-        session_id = body.get("session_id") or stored_session_id
+        explicit_session_id, session_err = self._parse_run_session_id(body.get("session_id"))
+        if session_err is not None:
+            return session_err
+
+        run_id = f"run_{uuid.uuid4().hex}"
+        session_id = explicit_session_id or stored_session_id or run_id
         route = self._resolve_route(body.get("model"))
         agent_overrides = _request_agent_overrides(body, virtual_model=self._model_name)
         selection_error = self._request_route_conflict_error(
@@ -6338,9 +8153,6 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
-
-        run_id = f"run_{uuid.uuid4().hex}"
-        session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
         # conversation/memory scopes, not authorization namespaces: multiple

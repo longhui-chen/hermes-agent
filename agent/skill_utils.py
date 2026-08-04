@@ -440,10 +440,12 @@ def get_disabled_skill_names(platform: str | None = None) -> Set[str]:
         return set()
 
     from gateway.session_context import get_session_env
+    # ZET fork: session ContextVar outranks the process env (see
+    # skill_commands._resolve_skill_commands_platform for the rationale).
     resolved_platform = (
         platform
-        or os.getenv("HERMES_PLATFORM")
         or get_session_env("HERMES_SESSION_PLATFORM")
+        or os.getenv("HERMES_PLATFORM")
     )
     global_disabled = _normalize_string_set(skills_cfg.get("disabled"))
     if resolved_platform:
@@ -465,19 +467,42 @@ def _normalize_string_set(values) -> Set[str]:
 
 # ── External skills directories ──────────────────────────────────────────
 
-# (config_path_str, mtime_ns) -> resolved external dirs list.  Keyed by
-# mtime_ns so a config.yaml edit mid-run is picked up automatically;
-# otherwise every call would re-read + re-YAML-parse the 15KB config,
-# which becomes the dominant cost of ``hermes`` startup when ~120 skills
-# each trigger a category lookup during banner construction (10+ seconds
-# of pure waste).
-_EXTERNAL_DIRS_CACHE: Dict[Tuple[str, int], List[Path]] = {}
+# (config_path_str, mtime_ns) -> (raw entries, filesystem fingerprint, resolved
+# external dirs list).  Keyed by mtime_ns so a config.yaml edit mid-run is picked
+# up automatically.  The fingerprint keeps `${VAR}` expansions and symlink-backed
+# entries such as zettlab-presets/current from staying stale while avoiding the
+# full YAML parse on the hot path.
+_ExternalDirsFingerprint = Tuple[Tuple[str, str, str, bool], ...]
+_ExternalDirsCacheValue = Tuple[Tuple[str, ...], _ExternalDirsFingerprint, List[Path]]
+_EXTERNAL_DIRS_CACHE: Dict[Tuple[str, int], _ExternalDirsCacheValue] = {}
 
 
 def _external_dirs_cache_clear() -> None:
     """Test hook — drop the in-process cache."""
     _EXTERNAL_DIRS_CACHE.clear()
     _raw_config_cache_clear()
+
+
+def _external_dirs_fingerprint(
+    raw_dirs: Tuple[str, ...],
+    hermes_home: Path,
+) -> _ExternalDirsFingerprint:
+    fingerprint = []
+    for entry in raw_dirs:
+        expanded = os.path.expanduser(os.path.expandvars(entry))
+        p = Path(expanded)
+        if not p.is_absolute():
+            p = hermes_home / p
+        try:
+            resolved = p.resolve(strict=False)
+        except OSError:
+            resolved = p.absolute()
+        try:
+            is_dir = p.is_dir()
+        except OSError:
+            is_dir = False
+        fingerprint.append((entry, expanded, str(resolved), is_dir))
+    return tuple(fingerprint)
 
 
 def get_external_skills_dirs() -> List[Path]:
@@ -487,14 +512,18 @@ def get_external_skills_dirs() -> List[Path]:
     path.  Only directories that actually exist are returned.  Duplicates and
     paths that resolve to the local ``~/.hermes/skills/`` are silently skipped.
 
-    Cached in-process, keyed on ``config.yaml`` mtime — the function is
-    called once per skill during banner / tool-registry scans, and YAML
-    parsing a non-trivial config dominates ``hermes`` cold-start time
-    when the cache is absent.
+    Cached in-process, keyed on ``config.yaml`` mtime plus the current external
+    dirs filesystem fingerprint — the function is called once per skill during
+    banner / tool-registry scans, and YAML parsing a non-trivial config
+    dominates ``hermes`` cold-start time when the cache is absent.
     """
     config_path = get_config_path()
     if not config_path.exists():
         return []
+
+    from hermes_constants import get_hermes_home
+
+    hermes_home = get_hermes_home()
 
     # Cache key: (absolute path, mtime_ns).  stat() is ~2us vs ~85ms for
     # the full YAML parse, so the fast path is nearly free.
@@ -507,8 +536,12 @@ def get_external_skills_dirs() -> List[Path]:
     if cache_key is not None:
         cached = _EXTERNAL_DIRS_CACHE.get(cache_key)
         if cached is not None:
-            # Return a copy so callers can't mutate the cached list.
-            return list(cached)
+            raw_dirs, fingerprint, result = cached
+            if _external_dirs_fingerprint(raw_dirs, hermes_home) != fingerprint:
+                cached = None
+            else:
+                # Return a copy so callers can't mutate the cached list.
+                return list(result)
 
     parsed = _load_raw_config()
     if not parsed:
@@ -522,24 +555,19 @@ def get_external_skills_dirs() -> List[Path]:
     if not raw_dirs:
         result: List[Path] = []
         if cache_key is not None:
-            _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
+            _EXTERNAL_DIRS_CACHE[cache_key] = ((), (), list(result))
         return result
     if isinstance(raw_dirs, str):
         raw_dirs = [raw_dirs]
     if not isinstance(raw_dirs, list):
         return []
-
-    from hermes_constants import get_hermes_home
-
-    hermes_home = get_hermes_home()
+    raw_dirs_tuple = tuple(str(entry).strip() for entry in raw_dirs if str(entry).strip())
+    fingerprint = _external_dirs_fingerprint(raw_dirs_tuple, hermes_home)
     local_skills = get_skills_dir().resolve()
     seen: Set[Path] = set()
     result = []
 
-    for entry in raw_dirs:
-        entry = str(entry).strip()
-        if not entry:
-            continue
+    for entry in raw_dirs_tuple:
         # Expand ~ and environment variables
         expanded = os.path.expanduser(os.path.expandvars(entry))
         p = Path(expanded)
@@ -556,10 +584,10 @@ def get_external_skills_dirs() -> List[Path]:
             seen.add(p)
             result.append(p)
         else:
-            logger.debug("External skills dir does not exist, skipping: %s", p)
+            logger.warning("External skills dir does not exist, skipping: %s", p)
 
     if cache_key is not None:
-        _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
+        _EXTERNAL_DIRS_CACHE[cache_key] = (raw_dirs_tuple, fingerprint, list(result))
     return result
 
 

@@ -25,7 +25,7 @@ Skills 是 agent 在需要时可以加载的按需知识文档。它们遵循**�
 # 在 CLI 或任何消息平台中：
 /gif-search funny cats
 /axolotl help me fine-tune Llama 3 on my dataset
-/github-pr-workflow create a PR for the auth refactor
+/requesting-code-review verify my auth refactor before commit
 /plan design a rollout for migrating our auth provider
 
 # 只输入 skill 名称即可加载它，并让 agent 询问你的需求：
@@ -272,10 +272,10 @@ Skill 捆绑包是将多个 skills 归组在单个斜杠命令下的小型 YAML 
 ```bash
 # 为后端功能开发创建一个捆绑包
 hermes bundles create backend-dev \
-  --skill github-code-review \
+  --skill requesting-code-review \
   --skill test-driven-development \
-  --skill github-pr-workflow \
-  -d "Backend feature work — review, test, PR workflow"
+  --skill systematic-debugging \
+  -d "Backend feature work — review, test, debugging"
 ```
 
 然后在 CLI 或任何 gateway 平台中：
@@ -294,12 +294,12 @@ agent 接收到所有三个 skills 加载到一条用户消息中，斜杠命令
 name: backend-dev
 description: Backend feature work — review, test, PR workflow.
 skills:
-  - github-code-review
+  - requesting-code-review
   - test-driven-development
-  - github-pr-workflow
+  - systematic-debugging
 instruction: |
   Always start by writing failing tests, then implement.
-  Open the PR through the standard workflow with co-author tags.
+  Verify the final diff before handing it off.
 ```
 
 字段说明：
@@ -398,8 +398,8 @@ hermes skills check                               # Check installed hub skills f
 hermes skills update                              # Reinstall hub skills with upstream changes when needed
 hermes skills audit                               # Re-scan all hub skills for security
 hermes skills uninstall k8s                       # Remove a hub skill
-hermes skills reset google-workspace              # Un-stick a bundled skill from "user-modified" (see below)
-hermes skills reset google-workspace --restore    # Also restore the bundled version, deleting your local edits
+hermes skills reset plan                          # Un-stick a bundled skill from "user-modified" (see below)
+hermes skills reset plan --restore                # Also restore the bundled version, deleting your local edits
 hermes skills publish skills/my-skill --to github --repo owner/repo
 hermes skills snapshot export setup.json          # Export skill config
 hermes skills tap add myorg/skills-repo           # Add a custom GitHub source
@@ -720,21 +720,21 @@ Hermes 在仓库的 `skills/` 中附带一组捆绑 skills。在安装时以及�
 ```bash
 # 安全：清除此 skill 的清单条目。你当前的副本被保留，
 # 但下次同步会重新以其为基准，使未来的更新正常工作。
-hermes skills reset google-workspace
+hermes skills reset plan
 
 # 完全恢复：同时删除你的本地副本并重新复制当前捆绑版本。
 # 当你想要恢复原始上游 skill 时使用此选项。
-hermes skills reset google-workspace --restore
+hermes skills reset plan --restore
 
 # 非交互式（例如在脚本或 TUI 模式中）——跳过 --restore 确认。
-hermes skills reset google-workspace --restore --yes
+hermes skills reset plan --restore --yes
 ```
 
 同样的命令也可以作为斜杠命令在聊天中使用：
 
 ```text
-/skills reset google-workspace
-/skills reset google-workspace --restore
+/skills reset plan
+/skills reset plan --restore
 ```
 
 :::note Profiles
@@ -753,7 +753,7 @@ hermes skills reset google-workspace --restore --yes
 /skills install openai/skills/skill-creator --force
 /skills check
 /skills update
-/skills reset google-workspace
+/skills reset plan
 /skills list
 ```
 

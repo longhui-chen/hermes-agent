@@ -19,6 +19,37 @@ from agent.image_routing import (
 )
 
 
+def test_runtime_inference_base_url_is_context_scoped():
+    import contextvars
+    from agent import auxiliary_client
+    from agent.image_routing import _resolve_inference_base_url
+
+    cfg = {"model": {"base_url": "http://config.example/v1"}}
+    auxiliary_client.clear_runtime_main()
+    try:
+        assert _resolve_inference_base_url(cfg, "custom") == "http://config.example/v1"
+
+        ctx_a = contextvars.Context()
+        ctx_b = contextvars.Context()
+        ctx_a.run(
+            auxiliary_client.set_runtime_main,
+            "custom",
+            "model-a",
+            base_url="http://runtime-a.example/v1",
+        )
+        ctx_b.run(
+            auxiliary_client.set_runtime_main,
+            "custom",
+            "model-b",
+            base_url="http://runtime-b.example/v1",
+        )
+
+        assert ctx_a.run(_resolve_inference_base_url, cfg, "custom") == "http://runtime-a.example/v1"
+        assert ctx_b.run(_resolve_inference_base_url, cfg, "custom") == "http://runtime-b.example/v1"
+    finally:
+        auxiliary_client.clear_runtime_main()
+
+
 # ─── _coerce_mode ────────────────────────────────────────────────────────────
 
 
@@ -121,6 +152,21 @@ class TestSupportsVisionOverride:
         cfg = {"model": {"supports_vision": False}}
         assert _supports_vision_override(cfg, "custom", "my-llava") is False
 
+    def test_top_level_shortcut_only_applies_to_config_default(self):
+        cfg = {"model": {"default": "lite", "supports_vision": False}}
+        assert _supports_vision_override(cfg, "custom", "my-llava") is None
+
+    def test_top_level_shortcut_applies_when_default_matches(self):
+        cfg = {"model": {"default": "my-llava", "supports_vision": True}}
+        assert _supports_vision_override(cfg, "custom", "my-llava") is True
+
+    def test_per_provider_per_model_via_runtime_name(self):
+        cfg = {
+            "providers": {
+                "custom": {"models": {"my-llava": {"supports_vision": True}}},
+            },
+        }
+        assert _supports_vision_override(cfg, "custom", "my-llava") is True
 
 
 

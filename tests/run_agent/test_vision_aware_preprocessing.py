@@ -172,6 +172,23 @@ class TestModelSupportsVision:
              patch("agent.models_dev.get_model_capabilities", return_value=None):
             assert agent._model_supports_vision() is True
 
+    def test_runtime_supports_vision_wins(self):
+        agent = _make_agent()
+        agent.provider = "custom"
+        agent.model = "my-llava"
+        agent.runtime_supports_vision = False
+        with patch("hermes_cli.config.load_config", return_value={"model": {"supports_vision": True}}), \
+             patch("agent.models_dev.get_model_capabilities", return_value=None):
+            assert agent._model_supports_vision() is False
+
+    def test_per_provider_per_model_override_wins(self):
+        agent = _make_agent()
+        agent.provider = "custom"
+        agent.model = "my-llava"
+        cfg = {"providers": {"custom": {"models": {"my-llava": {"supports_vision": True}}}}}
+        with patch("hermes_cli.config.load_config", return_value=cfg), \
+             patch("agent.models_dev.get_model_capabilities", return_value=None):
+            assert agent._model_supports_vision() is True
 
     def test_named_custom_provider_resolved_via_config_provider(self):
         # Named custom providers get runtime self.provider rewritten to

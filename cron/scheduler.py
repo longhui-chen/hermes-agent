@@ -46,11 +46,74 @@ from hermes_cli.config import (
     cron_model_drift_guard_enabled,
     load_config,
 )
+from hermes_cli.env_loader import load_hermes_dotenv as _load_hermes_dotenv
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
 from agent.interrupt_compat import request_hard_interrupt
 
 logger = logging.getLogger(__name__)
+
+try:
+    from agent.secret_scope import (
+        build_profile_secret_scope as _build_profile_secret_scope,
+        get_secret as _get_scoped_secret,
+        _is_global_env as _is_secret_global_env,
+        is_multiplex_active as _is_secret_multiplex_active,
+    )
+except Exception:  # pragma: no cover - standalone cron invocations before agent package import
+    _build_profile_secret_scope = None
+    _get_scoped_secret = None
+    _is_secret_global_env = None
+    _is_secret_multiplex_active = None
+
+
+_ENV_REF_RE = re.compile(r"\${([^}]+)}")
+
+
+def _cron_env(name: str, default: str = "") -> str:
+    """Read a cron env value from the active profile scope when available."""
+    if _get_scoped_secret is None:
+        return os.getenv(name, default)
+    if (
+        _build_profile_secret_scope is not None
+        and _is_secret_global_env is not None
+        and _is_secret_multiplex_active is not None
+        and _is_secret_multiplex_active()
+        and not _is_secret_global_env(name)
+    ):
+        try:
+            fresh_scope = _build_profile_secret_scope(get_hermes_home())
+            value = fresh_scope.get(name)
+            if value is not None:
+                return str(value)
+        except Exception:
+            logger.debug("Failed to refresh cron env %s from profile .env", name, exc_info=True)
+    value = _get_scoped_secret(name, default)
+    return default if value is None else str(value)
+
+
+def _refresh_cron_dotenv_for_legacy_process() -> None:
+    """Reload .env before cron runs in non-multiplex gateway processes."""
+    try:
+        if _is_secret_multiplex_active is not None and _is_secret_multiplex_active():
+            return
+        _load_hermes_dotenv(hermes_home=get_hermes_home())
+    except Exception:
+        logger.debug("Failed to refresh cron dotenv", exc_info=True)
+
+
+def _expand_env_vars_scoped(obj):
+    """Recursively expand ``${VAR}`` references through the cron profile scope."""
+    if isinstance(obj, str):
+        return _ENV_REF_RE.sub(
+            lambda match: _cron_env(match.group(1), match.group(0)),
+            obj,
+        )
+    if isinstance(obj, dict):
+        return {key: _expand_env_vars_scoped(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [_expand_env_vars_scoped(item) for item in obj]
+    return obj
 
 
 def _set_cron_session_title(session_db, session_id, base_title):
@@ -282,7 +345,15 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
+from cron.jobs import (
+    advance_next_runs,
+    claim_dispatch,
+    get_due_jobs,
+    heartbeat_run_claim,
+    mark_job_run,
+    normalize_output_language_tag,
+    save_job_output,
+)
 from cron.executions import create_execution, finish_execution, mark_execution_running
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -291,32 +362,29 @@ from cron.executions import create_execution, finish_execution, mark_execution_r
 SILENT_MARKER = "[SILENT]"
 
 # Canonical silence tokens recognized in cron output.  Cron's contract is
-# intentionally looser than the gateway's exact-whole-response rule: the cron
-# system prompt *instructs* the agent to emit "[SILENT]", and real agents often
-# bracket it with a short note or trailing newline.  We therefore suppress when
-# a marker is the entire response OR appears as its own first/last line — but
-# NOT when a token merely appears mid-sentence in a genuine report (e.g.
-# "I considered staying [SILENT] but here is the summary…" must deliver).
-# The actual matcher is shared with the webhook lane —
-# gateway.response_filters.is_autonomous_silence_response — so the two
-# autonomous lanes cannot drift apart.
+# deliberately requires the whole final response to be a sentinel. Model text
+# is untrusted: a marker beside any substantive content must never suppress a
+# failure report or successful result.
+_CRON_SILENCE_TOKENS = frozenset({"[SILENT]", "SILENT", "NO_REPLY", "NO REPLY"})
 
 
 def _is_cron_silence_response(text: str) -> bool:
     """Return True when a cron final response should suppress delivery.
 
-    Recognizes the bracketed ``[SILENT]`` sentinel (whole-response, first line,
-    or last line) plus the bracketless ``SILENT`` / ``NO_REPLY`` / ``NO REPLY``
-    variants the model emits when it drops the brackets (#51438, #46917).
-    Whitespace-trimmed and case-insensitive.  A token buried mid-sentence is
-    treated as real content and delivered.
-
-    Delegates to the shared autonomous-lane matcher in
-    :mod:`gateway.response_filters` (also used by the webhook adapter).
+    Recognizes a whitespace-trimmed, case-insensitive response containing only
+    the bracketed or legacy bracketless sentinel. Any additional content is a
+    real result and must be delivered.
     """
-    from gateway.response_filters import is_autonomous_silence_response
+    if not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if not stripped:
+        return False
 
-    return is_autonomous_silence_response(text)
+    def _is_token(line: str) -> bool:
+        return " ".join(line.strip().upper().split()) in _CRON_SILENCE_TOKENS
+
+    return _is_token(stripped)
 
 # ---------------------------------------------------------------------------
 # Persistent thread pool for parallel cron jobs.
@@ -354,7 +422,10 @@ def get_running_job_ids() -> "frozenset[str]":
     blind to them (#60432).
     """
     with _running_lock:
-        return frozenset(_running_job_ids)
+        return frozenset(
+            key[1] if isinstance(key, tuple) and len(key) == 2 else key
+            for key in _running_job_ids
+        )
 
 
 def mark_running_jobs_interrupted(reason: str) -> list:
@@ -382,7 +453,10 @@ def mark_running_jobs_interrupted(reason: str) -> list:
     Returns the list of job IDs marked, for the caller to log.
     """
     with _running_lock:
-        job_ids = list(_running_job_ids)
+        job_ids = [
+            key[1] if isinstance(key, tuple) and len(key) == 2 else key
+            for key in _running_job_ids
+        ]
         _interrupted_job_ids.update(job_ids)
     marked = []
     for job_id in job_ids:
@@ -586,6 +660,15 @@ def _get_lock_paths() -> tuple[Path, Path]:
     hermes_home = _get_hermes_home()
     lock_dir = hermes_home / "cron"
     return lock_dir, lock_dir / ".tick.lock"
+
+
+def _running_job_key(job: dict) -> tuple[str, str]:
+    """Return a profile-qualified key for the in-process cron running guard."""
+    try:
+        home_key = str(_get_hermes_home().resolve())
+    except Exception:
+        home_key = str(_get_hermes_home())
+    return home_key, str(job["id"])
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -1039,11 +1122,11 @@ def _get_home_target_chat_id(platform_name: str) -> str:
     env_var = _resolve_home_env_var(platform_name)
     if not env_var:
         return ""
-    value = os.getenv(env_var, "")
+    value = _cron_env(env_var, "")
     if not value:
         legacy = _LEGACY_HOME_TARGET_ENV_VARS.get(env_var)
         if legacy:
-            value = os.getenv(legacy, "")
+            value = _cron_env(legacy, "")
     return value
 
 
@@ -1062,14 +1145,14 @@ def _get_home_target_thread_id(platform_name: str) -> Optional[str]:
     if not env_var:
         return None
     if platform_name.lower() == "telegram":
-        cron_thread = os.getenv("TELEGRAM_CRON_THREAD_ID", "").strip()
+        cron_thread = _cron_env("TELEGRAM_CRON_THREAD_ID", "").strip()
         if cron_thread:
             return cron_thread
-    value = os.getenv(f"{env_var}_THREAD_ID", "").strip()
+    value = _cron_env(f"{env_var}_THREAD_ID", "").strip()
     if not value:
         legacy = _LEGACY_HOME_TARGET_ENV_VARS.get(env_var)
         if legacy:
-            value = os.getenv(f"{legacy}_THREAD_ID", "").strip()
+            value = _cron_env(f"{legacy}_THREAD_ID", "").strip()
     return value or None
 
 
@@ -2120,7 +2203,7 @@ def _get_script_timeout() -> int:
         except Exception:
             logger.warning("Invalid patched _SCRIPT_TIMEOUT=%r; using env/config/default", _SCRIPT_TIMEOUT)
 
-    env_value = os.getenv("HERMES_CRON_SCRIPT_TIMEOUT", "").strip()
+    env_value = _cron_env("HERMES_CRON_SCRIPT_TIMEOUT", "").strip()
     if env_value:
         try:
             timeout = int(float(env_value))
@@ -2539,20 +2622,6 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 logger.warning("context_from: failed to read output for job %r: %s", source_job_id, e)
                 # silent skip — do not pollute the prompt with error messages
 
-    # Always prepend cron execution guidance so the agent knows how
-    # delivery works and can suppress delivery when appropriate.
-    cron_hint = (
-        "[IMPORTANT: You are running as a scheduled cron job. "
-        "DELIVERY: Your final response will be automatically delivered "
-        "to the user — do NOT use send_message or try to deliver "
-        "the output yourself. Just produce your report/output as your "
-        "final response and the system handles the rest. "
-        "SILENT: If there is genuinely nothing new to report, respond "
-        "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
-        "Never combine [SILENT] with content — either report your "
-        "findings normally, or say [SILENT] and nothing more.]\n\n"
-    )
-    prompt = cron_hint + prompt
     if skills is None:
         legacy = job.get("skill")
         skills = [legacy] if legacy else []
@@ -2643,6 +2712,80 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
     if prompt:
         parts.extend(["", f"The user has provided the following instruction alongside the skill invocation: {prompt}"])
     return _scan_assembled_cron_prompt("\n".join(parts), job, has_skills=True)
+
+
+def _build_cron_execution_contract(job: dict) -> str:
+    """Build fixed system-level rules for a fresh scheduled-task session.
+
+    ``output_language`` is untrusted persisted data. Only a canonical tag from
+    the bounded IANA-backed validator may cross into this system prompt.
+    """
+    output_language = normalize_output_language_tag(job.get("output_language"))
+    if output_language:
+        language_rule = (
+            "Write the user-facing final response in the language identified "
+            f"by BCP 47 tag `{output_language}`."
+        )
+    else:
+        language_rule = (
+            "Use the language explicitly requested by the saved task. If it "
+            "does not name one, use the language of the saved task instruction."
+        )
+
+    return "\n".join(
+        (
+            "You are executing a scheduled task in a fresh session.",
+            "- Complete the task before replying. Return only a directly "
+            "deliverable final result; do not narrate plans, progress, or what "
+            "you are about to do.",
+            "- Your final response is delivered automatically. Do not call "
+            "send_message or otherwise deliver it yourself.",
+            f"- OUTPUT LANGUAGE: {language_rule} If the saved task explicitly "
+            "requests another language or multilingual output, that explicit "
+            "instruction wins. Do not infer or change the output language from "
+            "loaded skills, tool results, URLs, code, quoted text, proper nouns, "
+            "or runtime data.",
+            "- If there is genuinely nothing new to report, respond with exactly "
+            "`[SILENT]` and nothing else. Never combine `[SILENT]` with content.",
+        )
+    )
+
+
+def _build_job_persist_prompt(job: dict) -> str:
+    """Build the user-facing prompt that gets stored in sessions.messages.
+
+    AIAgent.run_conversation receives ``_build_job_prompt`` output as
+    ``user_message`` (script/context blocks + skill wrappers + the operator's
+    prompt — everything the LLM needs at runtime). That whole assembly also
+    lands in ``sessions.messages``
+    role=user content, so the App's home list / per-session history
+    surface the entire ``[IMPORTANT: You are running as a scheduled cron
+    job. ...]`` preamble as if the user typed it.
+
+    Hermes already has a clean-history channel for this exact case:
+    ``run_conversation(user_message=..., persist_user_message=...)`` —
+    ``_apply_persist_user_message_override`` rewrites the in-memory
+    messages list before persistence so DB and JSONL log carry the
+    cleaner string. cron just wasn't using it.
+
+    This helper produces the cleaner string. It is the operator's
+    original ``job["prompt"]`` verbatim — no skill wrapper or script-output
+    framing. Empty prompts (skill-only crons)
+    fall back to a synthesized label so the resumed conversation
+    doesn't render an empty user bubble.
+
+    Note: ``job["prompt"]`` is already injection-scanned at create/update
+    time by ``tools/cronjob_tools.py::_scan_cron_prompt``; we re-scan the
+    fully-assembled prompt for runtime-loaded skill content in
+    ``_scan_assembled_cron_prompt`` but that's the LLM-facing scan path.
+    The persist string is just the user's own text and needs no
+    additional scanning here.
+    """
+    user_prompt = (job.get("prompt") or "").strip()
+    if user_prompt:
+        return user_prompt
+    label = job.get("name") or job.get("id") or "unknown"
+    return f"_(cron job: {label})_"
 
 
 def _scan_assembled_cron_prompt(
@@ -2761,6 +2904,90 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+def _connector_execution_blocked_document(error_code: str) -> str:
+    """Return an honest terminal report before any Connector tool can run."""
+    if str(error_code).strip() == "task_connector_mixed_skills_unsupported":
+        return (
+            "**定时任务连接配置不支持**\n\n"
+            "该任务同时使用 Linear 和其他技能/连接器，无法安全使用单一 Linear 执行授权；"
+            "未读取数据、未生成报告。请在当前会话将其拆分为独立的 Linear 定时任务。"
+        )
+    if str(error_code).strip() == "task_connector_temporarily_unavailable":
+        return (
+            "**定时任务连接暂时不可用**\n\n"
+            "任务专属的 Linear 执行授权暂时无法获取；已完成有限重试，未读取数据、未生成报告。"
+            "系统将按下次计划重试；如持续出现，请检查设备与连接状态。"
+        )
+    return (
+        "**定时任务连接未授权/已过期**\n\n"
+        "该 Linear 定时任务尚未完成或已失去任务专属授权，因此未读取数据、未生成报告。"
+        "请在当前会话重新授权 Linear 后更新或重新创建该定时任务。"
+    )
+
+
+def _prepare_connector_execution(job: dict) -> tuple[str, Optional[str]]:
+    """Exchange only an explicitly migrated Linear job's durable grant.
+
+    The rollout flag is intentionally *not* consulted here.  It gates grant
+    creation while a live Chat route is present; using it to reinterpret old
+    jobs at tick time would break every pre-rollout Linear task.  Conversely,
+    a job that already carries the explicit v1 grant must retain its execution
+    contract through a rollout rollback, so it can finish through its narrow
+    lease path rather than falling back to a guessed Chat route.
+    """
+    connector_execution = job.get("connector_execution")
+    if not connector_execution:
+        return "", None
+    try:
+        from cron.connector_execution import (
+            acquire_route_capability,
+            supports_exclusive_linear_execution,
+            wants_linear_execution,
+        )
+
+        if not wants_linear_execution(job.get("skills") or job.get("skill")):
+            return "", None
+        if not supports_exclusive_linear_execution(job.get("skills") or job.get("skill")):
+            return "", "task_connector_mixed_skills_unsupported"
+        capability = acquire_route_capability(
+            connector_execution,
+            str(job.get("_connector_execution_id") or job.get("execution_id") or job.get("id") or ""),
+        )
+        return capability, None
+    except Exception as exc:
+        return "", str(getattr(exc, "code", "task_connector_not_authorized"))
+
+
+def _attach_private_connector_execution(job: dict) -> dict:
+    """Restore the opaque task grant only inside the shared execution body.
+
+    ``get_job`` and ``resolve_job_ref`` intentionally redact the durable grant
+    from every caller-facing representation.  Run-now and external scheduler
+    providers legitimately start with those public views, so `run_one_job`
+    performs this narrow, ID-bound reload immediately before execution.  The
+    merged record is never returned or persisted by this helper.
+    """
+    job_id = str(job.get("id") or "").strip()
+    if not job_id:
+        return job
+    try:
+        from cron.jobs import get_job_raw
+
+        persisted = get_job_raw(job_id)
+    except Exception:
+        return job
+    if not isinstance(persisted, dict):
+        return job
+    execution = persisted.get("connector_execution")
+    if not isinstance(execution, dict) or not str(execution.get("grant_token") or "").strip():
+        return job
+    execution_job = dict(job)
+    # Copy the nested map as well: no downstream mutation can alter the record
+    # held by load_jobs(), and the token remains local to this function/run.
+    execution_job["connector_execution"] = dict(execution)
+    return execution_job
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -2782,6 +3009,43 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    _refresh_cron_dotenv_for_legacy_process()
+
+    # Connector Cron never reconstructs a chat route.  Only a job explicitly
+    # migrated while a Chat route was live carries connector_execution; it must
+    # exchange that grant for one short local capability before Agent creation.
+    # Legacy jobs deliberately retain their exact pre-rollout behavior.
+    connector_route_capability, connector_execution_error = _prepare_connector_execution(job)
+    if connector_execution_error:
+        blocked_doc = _connector_execution_blocked_document(connector_execution_error)
+        logger.warning("Job '%s': connector execution lease unavailable: %s", job_id, connector_execution_error)
+        return False, blocked_doc, "", connector_execution_error
+
+    # ---------------------------------------------------------------
+    # calendar reminder (notify-only) short-circuit — deliver a pre-
+    # rendered notification, no script, no agent, no LLM.
+    # ---------------------------------------------------------------
+    # These jobs are written straight into jobs.json by zettlab-local-
+    # server's calendar sync (source="calendar"): a one-shot "once"
+    # schedule whose ``content`` is the reminder text, already materialized
+    # at sync time. Unlike no_agent (which needs a script to produce
+    # stdout), there is nothing to run — we just deliver ``content`` and the
+    # device turns the delivered output into a push notification
+    # (kind=cron_summary). Placed before the no_agent block so a calendar
+    # job never trips the "no_agent requires a script" guard. Additive and
+    # self-contained to stay a small diff over upstream cron.
+    if job.get("source") == "calendar":
+        from cron.calendar_delivery import quarantine_invalid_calendar_job
+        quarantine_invalid_calendar_job(job)
+        now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
+        silent_doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {now_iso}\n"
+            f"**Mode:** calendar (quarantined generic path)\n"
+            f"**Status:** silent\n"
+        )
+        return True, silent_doc, SILENT_MARKER, None
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -3012,6 +3276,12 @@ def run_job(
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
+    # persist_prompt is the clean operator-typed text we hand to
+    # run_conversation(persist_user_message=...) so sessions.messages
+    # stores the user-facing prompt rather than the full LLM payload
+    # (which carries cron_hint preamble, skill wrappers, etc).
+    persist_prompt = _build_job_persist_prompt(job)
+    origin = _resolve_origin(job)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
@@ -3021,7 +3291,12 @@ def run_job(
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
-    from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
+    from gateway.session_context import (
+        set_session_vars,
+        clear_session_vars,
+        set_zettlab_connector_route_capability,
+        _VAR_MAP,
+    )
 
     # Cron execution is an internal scheduler context, not a live inbound
     # gateway message. Do not seed HERMES_SESSION_* contextvars from the
@@ -3076,6 +3351,10 @@ def run_job(
         async_delivery=False,
         cwd=_job_workdir or "",
     )
+    # This is a private route capability for the dedicated connector runner,
+    # not HERMES_SESSION_KEY and not a user bearer. Generic subprocesses remain
+    # unable to inherit it.
+    set_zettlab_connector_route_capability(connector_route_capability)
     _cron_delivery_vars = (
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
         "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
@@ -3083,6 +3362,20 @@ def run_job(
     )
     for _var_name in _cron_delivery_vars:
         _VAR_MAP[_var_name].set("")
+    # Stamp the human-readable job name so auxiliary + main LLM calls carry it as
+    # X-Task-Title → ai-cloud ledger scene_params.task_title → the App's cron task
+    # card shows the real name even after the job is deleted (it can no longer be
+    # resolved from the live cron list). This is billing/display semantics (not a
+    # delivery target), so it's set explicitly here rather than via the delivery
+    # tuple above. It's always assigned per job below, so it can't leak across
+    # jobs in the parallel pool.
+    #
+    # Use the job NAME (fall back to the opaque job_id, never the prompt): an
+    # HTTP header has a hard size limit and the prompt can be long / sensitive,
+    # so we must not let an unnamed job spill its whole prompt into a header.
+    # Cap length too (ai-api re-caps at 255 runes after percent-decoding).
+    _cron_task_title = (str(job.get("name") or "").strip() or job_id)[:200]
+    _VAR_MAP["HERMES_CRON_TASK_TITLE"].set(_cron_task_title)
 
     # Per-job working directory — _SESSION_CWD was already set via
     # set_session_vars(cwd=...) above. Here we only handle the
@@ -3168,7 +3461,7 @@ def run_job(
         # re-read from storage every tick so a ``cronjob action=update
         # model=...`` after a failed run takes effect on the next tick — there
         # is no in-memory cache.
-        model = job.get("model") or os.getenv("HERMES_MODEL") or ""
+        model = job.get("model") or _cron_env("HERMES_MODEL", "") or ""
 
         # cron.model / cron.model_provider: a deliberate cron-fleet default
         # so unattended jobs stop shadowing chat `/model` switches. When an
@@ -3194,7 +3487,7 @@ def run_job(
                     _cfg = managed_scope.apply_managed_overlay(_cfg)
                 except Exception:
                     pass
-                _cfg = _expand_env_vars(_cfg)
+                _cfg = _expand_env_vars_scoped(_cfg)
                 # Coerce null/missing to {} so a falsy default never
                 # clobbers an already-resolved env value with ``None``.
                 _model_cfg = _cfg.get("model") or {}
@@ -3254,7 +3547,7 @@ def run_job(
         prefill_messages = None
         agent_cfg = _cfg.get("agent", {}) if isinstance(_cfg.get("agent", {}), dict) else {}
         prefill_file = (
-            os.getenv("HERMES_PREFILL_MESSAGES_FILE", "")
+            _cron_env("HERMES_PREFILL_MESSAGES_FILE", "")
             or _cfg.get("prefill_messages_file", "")
             or agent_cfg.get("prefill_messages_file", "")
         )
@@ -3518,6 +3811,7 @@ def run_job(
             platform="cron",
             session_id=_cron_session_id,
             session_db=_session_db,
+            ephemeral_system_prompt=_build_cron_execution_contract(job),
         )
         
         # Run the agent with an *inactivity*-based timeout: the job can run
@@ -3528,7 +3822,7 @@ def run_job(
         #
         # Uses the agent's built-in activity tracker (updated by
         # _touch_activity() on every tool call, API call, and stream delta).
-        _raw_cron_timeout = os.getenv("HERMES_CRON_TIMEOUT", "").strip()
+        _raw_cron_timeout = _cron_env("HERMES_CRON_TIMEOUT", "").strip()
         if _raw_cron_timeout:
             try:
                 _cron_timeout = float(_raw_cron_timeout)
@@ -3579,7 +3873,17 @@ def run_job(
         # env passthrough registrations) when the cron run hops into the worker
         # thread used for inactivity timeout monitoring.
         _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
+        # persist_user_message: AIAgent.run_conversation receives the full
+        # cron payload as user_message but persists persist_prompt (just
+        # the operator's job["prompt"]) via _apply_persist_user_message_override
+        # before flushing to sessions.messages. LLM behavior unchanged,
+        # history clean.
+        _cron_future = _cron_pool.submit(
+            _cron_context.run,
+            agent.run_conversation,
+            prompt,
+            persist_user_message=persist_prompt,
+        )
         _inactivity_timeout = False
         try:
             if _cron_inactivity_limit is None:
@@ -3724,7 +4028,7 @@ def run_job(
 
 ## Prompt
 
-{prompt}
+{persist_prompt}
 
 ## Response
 
@@ -3746,7 +4050,7 @@ def run_job(
 
 ## Prompt
 
-{prompt}
+{persist_prompt}
 
 ## Error
 
@@ -3777,6 +4081,7 @@ def run_job(
         clear_session_vars(_ctx_tokens)
         if _cron_session_token is not None:
             _cron_session_var.reset(_cron_session_token)
+        set_zettlab_connector_route_capability("")
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:
@@ -3889,7 +4194,14 @@ def _teardown_cron_agent(agent, job_id: str) -> None:
         logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
 
 
-def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -> bool:
+def run_one_job(
+    job: dict,
+    *,
+    adapters=None,
+    loop=None,
+    verbose: bool = False,
+    triggered_at: Optional[str] = None,
+) -> bool:
     """Run ONE due job end-to-end: execute → save output → deliver → mark.
 
     This is the shared firing body extracted from ``tick``'s per-job closure so
@@ -3904,6 +4216,48 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     Returns True if the job was processed (even if the job itself failed —
     failure is recorded via ``mark_job_run``), False only if processing raised.
     """
+    from cron.calendar_delivery import (
+        is_invalid_calendar_job,
+        is_managed_calendar_event_alert,
+        quarantine_invalid_calendar_job,
+        run_calendar_delivery,
+    )
+    if is_managed_calendar_event_alert(job):
+        try:
+            result = run_calendar_delivery(job)
+            terminal = bool(result.get("terminal"))
+            if terminal:
+                # Planner owns the delivery saga, but the built-in ticker owns
+                # this local one-shot row. Persist its terminal state so the
+                # same due job cannot re-enter Planner on every 60s tick. Import
+                # the store primitive directly: zet_agent patches this module's
+                # generic mark_job_run symbol to emit a visible cron-summary,
+                # while the calendar saga has already persisted its one hidden,
+                # llm_visible=0 notification through SessionDB.
+                from cron.jobs import mark_job_run as mark_calendar_job_run
+                mark_calendar_job_run(
+                    job["id"],
+                    True,
+                    scheduled_at=triggered_at or _hermes_now().isoformat(),
+                )
+            return terminal
+        except Exception as exc:
+            logger.warning("Calendar delivery %s remains recoverable: %s", job.get("id"), exc)
+            return False
+    if is_invalid_calendar_job(job):
+        quarantine_invalid_calendar_job(job)
+        logger.warning("Calendar job %s quarantined: invalid event-alert contract", job.get("id"))
+        return True
+
+    # Public job reads are redacted by design.  Restore a task grant only for
+    # this in-process execution, after calendar-only paths have returned.
+    job = _attach_private_connector_execution(job)
+
+    # Direct callers are "run now" by default. Due schedulers must pass their
+    # explicit plan/claim instant; never infer it from next_run_at because that
+    # may describe tomorrow's future occurrence.
+    occurrence_triggered_at = triggered_at or _hermes_now().isoformat()
+    output_filename: Optional[str] = None
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
@@ -3956,8 +4310,10 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
         try:
+            execution_job = dict(job)
+            execution_job["_connector_execution_id"] = execution_id
             success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents
+                execution_job, defer_agent_teardown=_deferred_agents
             )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
@@ -3980,6 +4336,7 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         delivery_error = None
         try:
             output_file = save_job_output(job["id"], output)
+            output_filename = os.path.basename(str(output_file))
             if verbose:
                 logger.info("Output saved to: %s", output_file)
 
@@ -4041,7 +4398,14 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+            mark_job_run(
+                job["id"],
+                success,
+                error,
+                delivery_error=delivery_error,
+                scheduled_at=occurrence_triggered_at,
+                output_filename=output_filename,
+            )
         normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
         if delivery_error:
             delivery_outcome = "failed"
@@ -4073,7 +4437,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         logger.error("Error processing job %s: %s", job['id'], _err_text)
         try:
             if not _consume_interrupted_flag(job["id"]):
-                mark_job_run(job["id"], False, _err_text)
+                mark_job_run(
+                    job["id"],
+                    False,
+                    _err_text,
+                    scheduled_at=occurrence_triggered_at,
+                    output_filename=output_filename,
+                )
         except Exception as record_err:
             # Never let bookkeeping mask the original interruption.
             logger.error(
@@ -4183,13 +4553,17 @@ def tick(
         # bumping next_run_at forward so the grace window never expires.
         # mark_job_run() overwrites next_run_at on completion.
         # Batched: one load + one save for the whole due set, not one per job.
-        advance_next_runs([job["id"] for job in due_jobs])
+        from cron.calendar_delivery import is_managed_calendar_event_alert
+        advance_next_runs([
+            job["id"] for job in due_jobs
+            if not is_managed_calendar_event_alert(job)
+        ])
 
         # Resolve max parallel workers: env var > config.yaml > unbounded.
         # Set HERMES_CRON_MAX_PARALLEL=1 to restore old serial behaviour.
         _max_workers: Optional[int] = None
         try:
-            _env_par = os.getenv("HERMES_CRON_MAX_PARALLEL", "").strip()
+            _env_par = _cron_env("HERMES_CRON_MAX_PARALLEL", "").strip()
             if _env_par:
                 _max_workers = int(_env_par) or None
         except (ValueError, TypeError):
@@ -4217,7 +4591,13 @@ def tick(
             module-level ``run_one_job`` so ``tick`` and external providers
             (Chronos ``fire_due``) use the identical execute→save→deliver→mark
             body."""
-            return run_one_job(job, adapters=adapters, loop=loop, verbose=verbose)
+            return run_one_job(
+                job,
+                adapters=adapters,
+                loop=loop,
+                verbose=verbose,
+                triggered_at=job.get("_occurrence_triggered_at"),
+            )
 
         # Partition due jobs: those with a per-job workdir mutate
         # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
@@ -4250,29 +4630,30 @@ def tick(
                     job.get("name", job_id),
                 )
                 return None
+            running_key = _running_job_key(job)
             with _running_lock:
-                if job_id in _running_job_ids:
+                if running_key in _running_job_ids:
                     logger.info("Job '%s' already running — skipping", job.get("name", job_id))
                     return None
-                _running_job_ids.add(job_id)
+                _running_job_ids.add(running_key)
             # Record the attempt before executor dispatch. Recovery classifies
             # abandoned records as unknown; it never automatically retries them.
             execution = create_execution(job_id, source="builtin")
             dispatched_job = dict(job, execution_id=execution["id"])
             _ctx = contextvars.copy_context()
 
-            def _run_and_release(j=dispatched_job, ctx=_ctx):
+            def _run_and_release(j=dispatched_job, ctx=_ctx, key=running_key):
                 try:
                     return ctx.run(_process_job, j)
                 finally:
                     with _running_lock:
-                        _running_job_ids.discard(j["id"])
+                        _running_job_ids.discard(key)
 
             try:
                 return pool.submit(_run_and_release)
             except Exception as submit_err:
                 with _running_lock:
-                    _running_job_ids.discard(job_id)
+                    _running_job_ids.discard(running_key)
                 finish_execution(
                     execution["id"],
                     success=False,

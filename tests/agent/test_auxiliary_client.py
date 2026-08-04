@@ -1554,6 +1554,96 @@ class TestCallLlmPaymentFallback:
         return exc
 
 
+    def test_fail_fast_uses_one_attempt_without_provider_fallback(self):
+        primary_client = MagicMock()
+        timeout_error = TimeoutError("main provider timed out")
+        primary_client.chat.completions.create.side_effect = timeout_error
+
+        with patch("agent.auxiliary_client._get_cached_client", return_value=(primary_client, "model")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("openrouter", "model", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain") as fallback:
+            with pytest.raises(TimeoutError, match="main provider timed out"):
+                call_llm(
+                    task="creation_opportunity_checkpoint_json",
+                    provider="openrouter",
+                    messages=[{"role": "user", "content": "private conversation"}],
+                    fail_fast=True,
+                )
+
+        assert primary_client.chat.completions.create.call_count == 1
+        fallback.assert_not_called()
+
+    def test_fail_fast_resolves_only_the_active_main_provider(self):
+        import agent.auxiliary_client as mod
+
+        client = MagicMock()
+        client.chat.completions.create.return_value = _DummyResponse("ok")
+        mod.clear_runtime_main()
+        try:
+            mod.set_runtime_main(
+                "custom:private",
+                "private-model",
+                base_url="http://127.0.0.1:11434/v1",
+                api_key="local-key",
+            )
+            with patch("agent.auxiliary_client._resolve_task_provider_model", return_value=("custom:private", "private-model", "http://127.0.0.1:11434/v1", "local-key", None)) as resolve, \
+                 patch("agent.auxiliary_client._get_cached_client", return_value=(client, "private-model")):
+                call_llm(
+                    task="creation_opportunity_checkpoint_json",
+                    messages=[{"role": "user", "content": "private conversation"}],
+                    fail_fast=True,
+                )
+
+            assert resolve.call_args.args == (
+                "creation_opportunity_checkpoint_json",
+                "custom:private",
+                "private-model",
+                "http://127.0.0.1:11434/v1",
+                "local-key",
+            )
+        finally:
+            mod.clear_runtime_main()
+
+    def test_fail_fast_preserves_registered_auxiliary_task_route(self):
+        client = MagicMock()
+        client.chat.completions.create.return_value = _DummyResponse("ok")
+        task_config = {
+            "provider": "custom",
+            "model": "zettlab-creation-fast",
+            "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+            "api_key": "local-ai-proxy",
+        }
+
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value=task_config,
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=(
+                "custom",
+                "zettlab-creation-fast",
+                "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+                "local-ai-proxy",
+                None,
+            ),
+        ) as resolve, patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(client, "zettlab-creation-fast"),
+        ):
+            call_llm(
+                task="creation_governor_checkpoint",
+                messages=[{"role": "user", "content": "private conversation"}],
+                fail_fast=True,
+            )
+
+        assert resolve.call_args.args == (
+            "creation_governor_checkpoint",
+            None,
+            None,
+            None,
+            None,
+        )
+
     def test_429_rate_limit_triggers_fallback(self, monkeypatch):
         """429 rate-limit errors should trigger fallback to next provider."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
@@ -3119,6 +3209,7 @@ class TestVisionAutoSkipsKimiCoding:
         """Guard against accidental widening of the skip list."""
         from agent.auxiliary_client import _PROVIDERS_WITHOUT_VISION
         assert _PROVIDERS_WITHOUT_VISION == frozenset({
+            "deepseek",
             "kimi-coding",
             "kimi-coding-cn",
         })
@@ -4363,3 +4454,133 @@ class TestAsynchronousFallbackCachePlans:
         wire_tools = client.chat.completions.create.call_args.kwargs["tools"]
         assert "cache_control" in wire_tools[-1]
         assert "cache_control" not in tools[-1]
+def test_apply_zettlab_session_headers_stamps_task_id_for_zettlab_session():
+    """Auxiliary calls under a zettlab session get task and routing headers."""
+    from agent.auxiliary_client import _apply_zettlab_session_headers
+    from gateway.session_context import set_current_session_id
+
+    set_current_session_id("zettlab:u1:agent-a:abc")
+    try:
+        headers = _apply_zettlab_session_headers(None)
+        assert headers is not None
+        assert headers.get("X-Task-Id") == "zettlab:u1:agent-a:abc"
+        assert headers.get("X-Zettlab-Conversation-ID") == "zettlab:u1:agent-a:abc"
+        assert headers.get("X-Scene-Type") == "agent"
+    finally:
+        set_current_session_id("")
+
+
+def test_apply_zettlab_session_headers_skips_non_zettlab_session():
+    """Non-zettlab sessions must not get billing headers (no leak to 3rd parties)."""
+    from agent.auxiliary_client import _apply_zettlab_session_headers
+    from gateway.session_context import set_current_session_id
+
+    set_current_session_id("local-session-xyz")
+    try:
+        headers = _apply_zettlab_session_headers(None)
+        assert not headers or "X-Task-Id" not in headers
+        assert not headers or "X-Zettlab-Conversation-ID" not in headers
+    finally:
+        set_current_session_id("")
+
+
+def test_apply_zettlab_session_headers_collapses_cron_session():
+    """A cron run's aux calls aggregate into one per-job task card: the
+    cron_<job>_<date>_<time> session collapses to a stable cron_<job> task_id."""
+    from agent.auxiliary_client import _apply_zettlab_session_headers
+    from gateway.session_context import set_current_session_id
+
+    set_current_session_id("cron_4b2628798006_20260624_104233")
+    try:
+        headers = _apply_zettlab_session_headers(None)
+        assert headers is not None
+        assert headers.get("X-Task-Id") == "cron_4b2628798006"
+        assert headers.get("X-Zettlab-Conversation-ID") == "cron_4b2628798006"
+        assert headers.get("X-Scene-Type") == "agent"
+    finally:
+        set_current_session_id("")
+
+
+def test_apply_user_default_headers_stamps_cron_job_title():
+    """A cron run's aux calls also carry the percent-encoded job name as
+    X-Task-Title so the ledger's cron task card shows the real name."""
+    from urllib.parse import unquote
+
+    from agent.auxiliary_client import _apply_zettlab_session_headers
+    from gateway.session_context import _VAR_MAP, set_current_session_id
+
+    set_current_session_id("cron_4b2628798006_20260624_104233")
+    _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("站立提醒")
+    try:
+        headers = _apply_zettlab_session_headers(None)
+        assert headers is not None
+        assert headers.get("X-Task-Id") == "cron_4b2628798006"
+        assert unquote(headers.get("X-Task-Title", "")) == "站立提醒"
+    finally:
+        set_current_session_id("")
+        _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("")
+
+
+def test_apply_user_default_headers_interactive_omits_title():
+    """Interactive sessions carry no cron title var, so no X-Task-Title."""
+    from agent.auxiliary_client import _apply_zettlab_session_headers
+    from gateway.session_context import _VAR_MAP, set_current_session_id
+
+    set_current_session_id("zettlab:u1:agent-a:abc")
+    _VAR_MAP["HERMES_CRON_TASK_TITLE"].set("")
+    try:
+        headers = _apply_zettlab_session_headers(None)
+        assert headers is not None
+        assert "X-Task-Title" not in headers
+    finally:
+        set_current_session_id("")
+
+
+def test_call_llm_stamps_zettlab_headers_per_request_not_cached():
+    """Cached auxiliary clients must not retain a previous conversation id."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock, patch
+
+    from agent.auxiliary_client import call_llm
+    from gateway.session_context import set_current_session_id
+
+    client = MagicMock()
+    client.base_url = "https://api.example.com/v1"
+    client.chat.completions.create.return_value = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))]
+    )
+
+    with patch(
+        "agent.auxiliary_client._get_cached_client",
+        return_value=(client, "aux-model"),
+    ), patch(
+        "agent.auxiliary_client._resolve_task_provider_model",
+        return_value=("custom", "aux-model", None, None, None),
+    ):
+        set_current_session_id("zettlab:u1:agent-a:abc")
+        try:
+            call_llm(task="title_generation", messages=[{"role": "user", "content": "hi"}])
+        finally:
+            set_current_session_id("")
+        first_headers = client.chat.completions.create.call_args.kwargs.get("extra_headers", {})
+
+        set_current_session_id("zettlab:u2:agent-b:def")
+        try:
+            call_llm(task="title_generation", messages=[{"role": "user", "content": "hi"}])
+        finally:
+            set_current_session_id("")
+        second_headers = client.chat.completions.create.call_args.kwargs.get("extra_headers", {})
+
+        set_current_session_id("local-session")
+        try:
+            call_llm(task="title_generation", messages=[{"role": "user", "content": "hi"}])
+        finally:
+            set_current_session_id("")
+        third_headers = client.chat.completions.create.call_args.kwargs.get("extra_headers", {})
+
+    assert first_headers["X-Zettlab-Conversation-ID"] == "zettlab:u1:agent-a:abc"
+    assert first_headers["X-Task-Id"] == "zettlab:u1:agent-a:abc"
+    assert second_headers["X-Zettlab-Conversation-ID"] == "zettlab:u2:agent-b:def"
+    assert second_headers["X-Task-Id"] == "zettlab:u2:agent-b:def"
+    assert "X-Zettlab-Conversation-ID" not in third_headers
+    assert "X-Task-Id" not in third_headers

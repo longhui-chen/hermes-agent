@@ -1,0 +1,53 @@
+[Unit]
+Description=Zettlab Claw Gateway
+Wants=network.target
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-__APP_BASE__/data/secrets/zettlab-claw.env
+Environment=HERMES_HOME=__APP_BASE__/data/hermes_home
+Environment=HERMES_LAZY_INSTALL_TARGET=__APP_BASE__/data/lazy-packages
+Environment=HERMES_DISABLE_LAZY_INSTALLS=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=HERMES_BUNDLED_SKILLS=__APP_BASE__/current/lib/hermes-agent/skills
+Environment=HERMES_BUNDLED_PLUGINS=__APP_BASE__/current/lib/hermes-agent/plugins
+Environment=HERMES_MANAGED_GATEWAY=1
+Environment=HERMES_MANAGED_CGROUP_UNIT=zettlab-claw.service
+Environment=PATH=/zettos/main/apps/com.zettlab.local-server/current/sbin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=GATEWAY_MULTIPLEX_PROFILES=true
+Environment=ZET_AGENT_ENABLED=true
+Environment=ZET_AGENT_HOST=127.0.0.1
+Environment=ZET_AGENT_PORT=7900
+ExecStart=__APP_BASE__/current/start-claw-service.sh
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=210
+KillMode=control-group
+MemoryAccounting=true
+MemoryHigh=768M
+MemoryMax=1G
+MemorySwapMax=0
+TasksAccounting=true
+TasksMax=512
+OOMPolicy=continue
+NoNewPrivileges=true
+PrivateTmp=true
+RuntimeDirectory=zettlab-claw
+RuntimeDirectoryMode=0755
+# Only the root gateway audits process UIDs before reserving an ephemeral worker
+# identity. CAP_SYS_PTRACE lets that broker see hidden procfs entries; every
+# model-controlled child drops its full capability bounding set before exec.
+ProtectProc=invisible
+ProtectSystem=strict
+CapabilityBoundingSet=~CAP_SYS_ADMIN
+Delegate=pids memory
+ReadOnlyPaths=/zettos/main/apps
+ReadWritePaths=__APP_BASE__/data
+ReadWritePaths=-/volume1/subvol/agents/data
+ReadWritePaths=-/volume1/agents/data
+ReadOnlyPaths=-/volume1/subvol/agents/zettlab-presets
+ReadOnlyPaths=-/volume1/agents/zettlab-presets
+
+[Install]
+WantedBy=multi-user.target

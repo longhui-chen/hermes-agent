@@ -200,6 +200,47 @@ class TestRunJobScript:
         assert "encoding" not in captured["kwargs"]
         assert "errors" not in captured["kwargs"]
 
+    def test_script_empty_output(self, cron_env):
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "empty.py"
+        script.write_text("# no output\n")
+
+        success, output = _run_job_script(str(script))
+        assert success is True
+        assert output == ""
+
+    @pytest.mark.live_system_guard_bypass
+    def test_script_timeout(self, cron_env, monkeypatch):
+        from cron import scheduler as sched_mod
+        from cron.scheduler import _run_job_script
+
+        # Use a very short timeout
+        monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 1)
+
+        script = cron_env / "scripts" / "slow.py"
+        script.write_text("import time; time.sleep(30)\n")
+
+        success, output = _run_job_script(str(script))
+        assert success is False
+        assert "timed out" in output.lower()
+
+    def test_script_json_output(self, cron_env):
+        """Scripts can output structured JSON for the LLM to parse."""
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "json_out.py"
+        script.write_text(textwrap.dedent("""\
+            import json
+            data = {"new_prs": [{"number": 42, "title": "Fix bug"}]}
+            print(json.dumps(data, indent=2))
+        """))
+
+        success, output = _run_job_script(str(script))
+        assert success is True
+        parsed = json.loads(output)
+        assert parsed["new_prs"][0]["number"] == 42
+
 
 class TestBuildJobPromptWithScript:
     """Test that script output is injected into the prompt."""

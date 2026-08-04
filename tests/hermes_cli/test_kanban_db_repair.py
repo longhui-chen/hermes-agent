@@ -91,6 +91,7 @@ def _integrity_messages(db_path: Path) -> list[str]:
 # Narrow auto-repair in the connect-time guard
 # ---------------------------------------------------------------------------
 
+@pytest.mark.requires_writable_schema
 def test_connect_auto_repairs_index_only_corruption(tmp_path, caplog):
     """Index-only integrity errors are REINDEXed and connect proceeds."""
     import logging
@@ -269,6 +270,7 @@ def cli_home(tmp_path, monkeypatch):
 
 
 
+@pytest.mark.requires_writable_schema
 def test_cli_repair_json_shape(cli_home, capsys):
     db_path = kb.kanban_db_path()
     _build_board_db(db_path)
@@ -281,5 +283,4 @@ def test_cli_repair_json_shape(cli_home, capsys):
     assert payload["reindexed"] == ["idx_tasks_status"]
     assert payload["backup_path"]
     assert Path(payload["backup_path"]).exists()
-
 

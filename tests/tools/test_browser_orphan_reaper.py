@@ -60,6 +60,64 @@ class TestReapOrphanedBrowserSessions:
         _reap_orphaned_browser_sessions()
         assert not d.exists()
 
+    def test_stale_dir_with_dead_pid_is_removed(self, fake_tmpdir):
+        """Socket dir whose daemon PID is dead gets cleaned up."""
+        from tools.browser_tool import _reap_orphaned_browser_sessions
+        d = _make_socket_dir(fake_tmpdir, "h_dead123456", pid=999999999)
+        assert d.exists()
+        with patch("gateway.status._pid_exists", return_value=False):
+            _reap_orphaned_browser_sessions()
+        assert not d.exists()
+
+    def test_orphaned_alive_daemon_is_killed(self, fake_tmpdir):
+        """Alive daemon not tracked by _active_sessions is terminated (legacy path).
+
+        No owner_pid file => falls back to tracked_names check.
+        """
+        from tools.browser_tool import _reap_orphaned_browser_sessions
+
+        d = _make_socket_dir(fake_tmpdir, "h_orphan12345", pid=12345)
+
+        kill_calls = []
+
+        def mock_terminate(pid):
+            kill_calls.append(pid)
+
+        # Post-#21561 the liveness probe goes through
+        # ``gateway.status._pid_exists`` (which wraps ``psutil.pid_exists``
+        # so it's safe on Windows — ``os.kill(pid, 0)`` is bpo-14484).
+        # The identity guard (#14073) is mocked True here — its own behavior
+        # is covered by TestReaperIdentityGuard below.
+        with patch("gateway.status._pid_exists", return_value=True), \
+             patch("tools.browser_tool._verify_reapable_browser_daemon", return_value=True), \
+             patch("tools.process_registry.ProcessRegistry._terminate_host_pid", side_effect=mock_terminate):
+            _reap_orphaned_browser_sessions()
+
+        assert 12345 in kill_calls
+
+    def test_tracked_session_is_not_reaped(self, fake_tmpdir):
+        """Sessions tracked in _active_sessions are left alone (legacy path)."""
+        import tools.browser_tool as bt
+        from tools.browser_tool import _reap_orphaned_browser_sessions
+
+        session_name = "h_tracked1234"
+        d = _make_socket_dir(fake_tmpdir, session_name, pid=12345)
+
+        # Register the session as actively tracked
+        bt._active_sessions["some_task"] = {"session_name": session_name}
+
+        kill_calls = []
+
+        def mock_terminate(pid):
+            kill_calls.append(pid)
+
+        with patch("tools.process_registry.ProcessRegistry._terminate_host_pid", side_effect=mock_terminate):
+            _reap_orphaned_browser_sessions()
+
+        # Should NOT have tried to terminate anything
+        assert len(kill_calls) == 0
+        # Dir should still exist
+        assert d.exists()
 
     def test_alive_legacy_daemon_is_reaped(self, fake_tmpdir):
         """Alive, untracked, legacy (no owner_pid) daemon is reaped.

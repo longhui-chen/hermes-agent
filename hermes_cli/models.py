@@ -3184,6 +3184,39 @@ def _credential_fingerprint(provider: str) -> str:
         except Exception:
             pass
 
+    # Bedrock model IDs are region-scoped (us.*/eu.*/ap.* inference profiles).
+    # Include the AWS SDK auth and resolved region signals so switching region
+    # or profile cannot reuse another region's provider_models_cache entry.
+    if provider == "bedrock":
+        for ev in (
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "AWS_PROFILE",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        ):
+            parts.append(f"{ev}={_os.environ.get(ev, '')}")
+        resolved_region = (
+            _os.environ.get("AWS_REGION", "").strip()
+            or _os.environ.get("AWS_DEFAULT_REGION", "").strip()
+        )
+        if not resolved_region:
+            try:
+                import botocore.session
+
+                resolved_region = (
+                    botocore.session.get_session().get_config_variable("region")
+                    or ""
+                )
+            except Exception:
+                resolved_region = ""
+        parts.append(f"bedrock_region={resolved_region or 'us-east-1'}")
+
     # OAuth / external-file mtimes that change on re-auth
     try:
         from hermes_constants import get_hermes_home

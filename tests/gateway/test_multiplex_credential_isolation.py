@@ -5,6 +5,8 @@ interpolation) rather than mocking it, proving the property that matters: two
 profiles with different keys never see each other's, and an unscoped read in
 multiplex mode fails closed instead of leaking.
 """
+import json
+
 import pytest
 
 from pathlib import Path
@@ -166,3 +168,77 @@ def test_cold_profile_hydrates_external_source_without_global_env(
     assert "EXPLICIT_API_KEY" not in os.environ
 
 
+    def test_worker_thread_inherits_multiplex_scope(self, tmp_path):
+        import threading
+
+        from gateway.run import _profile_runtime_scope
+        from hermes_constants import get_hermes_home
+        from tools.thread_context import propagate_context_to_thread
+
+        _prof_a, prof_b = self._profiles(tmp_path)
+        seen = {}
+
+        def worker():
+            seen["home"] = str(get_hermes_home())
+
+        with _profile_runtime_scope(prof_b):
+            thread = threading.Thread(target=propagate_context_to_thread(worker))
+            thread.start()
+            thread.join()
+
+        assert seen["home"] == str(prof_b)
+
+
+class TestMarkdownVaultRuntimeScope:
+    """Vault grants must follow the real multiplex turn scope, not os.environ."""
+
+    def test_vault_grants_follow_routed_profile(self, monkeypatch, tmp_path):
+        from gateway.run import _profile_runtime_scope
+        from plugins.markdown_vault import tools as vault_tools
+
+        profile_a = tmp_path / "profile-a"
+        profile_b = tmp_path / "profile-b"
+        profile_a.mkdir()
+        profile_b.mkdir()
+        (profile_a / ".env").write_text(
+            "MARKDOWN_VAULT_PATH=/profile-a/vault\nMARKDOWN_VAULT_WRITE=1\n",
+            encoding="utf-8",
+        )
+        (profile_b / ".env").write_text(
+            "MARKDOWN_VAULT_PATH=/profile-b/vault\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("MARKDOWN_VAULT_PATH", "/foreign/global-vault")
+        monkeypatch.setenv("MARKDOWN_VAULT_WRITE", "1")
+
+        class _Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, _limit=-1):
+                return json.dumps({
+                    "status": "ok",
+                    "capabilities": [vault_tools._CONDITIONAL_MUTATION_CAPABILITY],
+                }).encode("utf-8")
+
+        monkeypatch.setattr(
+            vault_tools.urllib.request,
+            "urlopen",
+            lambda *_args, **_kwargs: _Response(),
+        )
+        ss.set_multiplex_active(True)
+
+        with _profile_runtime_scope(profile_a):
+            assert vault_tools._vault_root() == "/profile-a/vault"
+            assert vault_tools.check_vault_requirements() is True
+            assert vault_tools.check_vault_write_requirements() is True
+
+        with _profile_runtime_scope(profile_b):
+            assert vault_tools._vault_root() == "/profile-b/vault"
+            assert vault_tools.check_vault_requirements() is True
+            assert vault_tools.check_vault_write_requirements() is False

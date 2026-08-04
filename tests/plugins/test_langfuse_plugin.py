@@ -253,11 +253,17 @@ class TestTurnTraceIsolation:
                 return False
 
         class _Client:
+            def __init__(self):
+                self._next_trace_id = 0
+
             def create_trace_id(self, seed=None):
+                if seed is None:
+                    self._next_trace_id += 1
+                    return f"trace::random::{self._next_trace_id}"
                 return f"trace::{seed}"
 
             def start_as_current_observation(self, **kw):
-                started.append(kw.get("trace_context", {}).get("trace_id"))
+                started.append(dict(kw.get("trace_context", {})))
                 return _RootCM()
 
             def flush(self):
@@ -303,7 +309,8 @@ class TestTurnTraceIsolation:
         """A turn that never finalizes must not absorb the following turn."""
         mod = self._fresh_plugin()
         started: list = []
-        monkeypatch.setattr(mod, "_get_langfuse", lambda: self._fake_client(started))
+        client = self._fake_client(started)
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
         monkeypatch.setattr(mod, "_end_observation", lambda *a, **k: None)
         mod._TRACE_STATE.clear()
 
@@ -315,6 +322,11 @@ class TestTurnTraceIsolation:
         # Each turn opened its OWN root trace.  On the pre-fix code the second
         # turn reused turn 1's lingering state and only one trace was opened.
         assert len(started) == 2
+        # Opening two roots is not enough: Langfuse merges observations when
+        # both roots carry the same deterministic trace ID.  A stable
+        # session_id must group the turns without collapsing their trace IDs.
+        assert len({context["trace_id"] for context in started}) == 2
+        assert {context["session_id"] for context in started} == {"sess-iso"}
 
         # Turn 2 finalized and was popped by _finish_trace; only turn 1's
         # (non-finalizing) state lingers.  Assert the surviving key is turn 1's
@@ -779,3 +791,167 @@ class TestUsageFromSanitizedResponse:
 
         assert seen["resp"] is resp
         assert captured["usage_details"] == {"input": 7, "output": 3}
+
+
+# ---------------------------------------------------------------------------
+# Per-device fleet scoping: HERMES_LANGFUSE_SN threads the device serial onto
+# every root trace (user_id + "sn:<serial>" tag + metadata.device_sn) so a
+# multi-device deployment can be sliced by device in Langfuse. Exercises the
+# pure helper directly — no SDK stub needed.
+# ---------------------------------------------------------------------------
+
+class TestDeviceSerialScoping:
+    def _mod(self):
+        return importlib.import_module("plugins.observability.langfuse")
+
+    _ATTRS = dict(task_id="t", platform="cli", provider="custom",
+                  model="glm-5.1", api_mode="chat")
+
+    def test_no_sn_matches_legacy_behaviour(self, monkeypatch):
+        monkeypatch.delenv("HERMES_LANGFUSE_SN", raising=False)
+        monkeypatch.delenv("ZET_AGENT_ID", raising=False)
+        mod = self._mod()
+        metadata, tags, user_id = mod._root_trace_attributes(**self._ATTRS)
+        assert user_id is None
+        assert tags == ["hermes", "langfuse"]
+        assert "device_sn" not in metadata
+        # Existing metadata keys are untouched.
+        assert metadata["model"] == "glm-5.1"
+        assert metadata["source"] == "hermes"
+
+    def test_sn_threads_through_all_three_dimensions(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGFUSE_SN", "WY210260528GT102")
+        monkeypatch.delenv("ZET_AGENT_ID", raising=False)
+        mod = self._mod()
+        metadata, tags, user_id = mod._root_trace_attributes(**self._ATTRS)
+        assert user_id == "WY210260528GT102"
+        assert tags == ["hermes", "langfuse", "sn:WY210260528GT102"]
+        assert metadata["device_sn"] == "WY210260528GT102"
+
+    def test_agent_id_adds_tag_and_metadata(self, monkeypatch):
+        monkeypatch.delenv("HERMES_LANGFUSE_SN", raising=False)
+        monkeypatch.setenv("ZET_AGENT_ID", "cd8266b8-6d70-4302-a835-b6989e173321")
+        mod = self._mod()
+        metadata, tags, user_id = mod._root_trace_attributes(**self._ATTRS)
+        assert metadata["agent_id"] == "cd8266b8-6d70-4302-a835-b6989e173321"
+        assert "agent:cd8266b8-6d70-4302-a835-b6989e173321" in tags
+        # agent_id is independent of device_sn / user_id
+        assert user_id is None
+        assert "device_sn" not in metadata
+
+    def test_sn_and_agent_both_present(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGFUSE_SN", "WY210260528GT104")
+        monkeypatch.setenv("ZET_AGENT_ID", "main")
+        mod = self._mod()
+        metadata, tags, user_id = mod._root_trace_attributes(**self._ATTRS)
+        assert user_id == "WY210260528GT104"
+        assert tags == ["hermes", "langfuse", "sn:WY210260528GT104", "agent:main"]
+        assert metadata["device_sn"] == "WY210260528GT104"
+        assert metadata["agent_id"] == "main"
+
+    def test_blank_sn_is_ignored(self, monkeypatch):
+        # Whitespace-only env (e.g. unset-but-exported) must not produce an
+        # empty user_id or a stray "sn:" tag.
+        monkeypatch.setenv("HERMES_LANGFUSE_SN", "   ")
+        monkeypatch.delenv("ZET_AGENT_ID", raising=False)
+        mod = self._mod()
+        metadata, tags, user_id = mod._root_trace_attributes(**self._ATTRS)
+        assert user_id is None
+        assert tags == ["hermes", "langfuse"]
+        assert "device_sn" not in metadata
+
+
+# ---------------------------------------------------------------------------
+# Root-trace SDK fallback: propagate_attributes carries tags + user_id, but
+# user_id is best-effort. If the installed SDK rejects the kwarg, _start_root_trace
+# must retry WITHOUT user_id so the sn:/agent: tags still land — rather than
+# dropping straight to an untagged trace. On a real device HERMES_LANGFUSE_SN is
+# always set, so without the retry an SDK that rejects user_id would silently
+# lose every trace's tags.
+# ---------------------------------------------------------------------------
+
+class _NullCtx:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeRootSpan:
+    def set_trace_io(self, *, input=None):
+        self.io = input
+
+
+class _FakeRootCtx:
+    def __init__(self, span):
+        self._span = span
+
+    def __enter__(self):
+        return self._span
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _FakeRootClient:
+    def create_trace_id(self, *, seed=None):
+        return f"tid::{seed}"
+
+    def start_as_current_observation(self, **kwargs):
+        return _FakeRootCtx(_FakeRootSpan())
+
+
+class _RecordingPropagate:
+    """Stub for langfuse.propagate_attributes; optionally rejects user_id."""
+
+    def __init__(self, *, reject_user_id):
+        self.calls: list[dict] = []
+        self._reject_user_id = reject_user_id
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        if self._reject_user_id and "user_id" in kwargs:
+            raise TypeError(
+                "propagate_attributes() got an unexpected keyword argument 'user_id'"
+            )
+        return _NullCtx()
+
+
+class TestRootTraceUserIdFallback:
+    def _mod(self):
+        return importlib.import_module("plugins.observability.langfuse")
+
+    _KW = dict(task_id="t", session_id="s", platform="cli", provider="custom",
+               model="glm-5.1", api_mode="chat", messages=[])
+
+    def test_user_id_rejection_retries_without_it_and_keeps_tags(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGFUSE_SN", "WY-1")
+        monkeypatch.delenv("ZET_AGENT_ID", raising=False)
+        mod = self._mod()
+        rec = _RecordingPropagate(reject_user_id=True)
+        monkeypatch.setattr(mod, "propagate_attributes", rec)
+
+        state = mod._start_root_trace("k", client=_FakeRootClient(), **self._KW)
+
+        # Called twice: first with user_id (rejected), then retried without it —
+        # and the retry STILL carries the sn: tag, so device filtering survives.
+        assert len(rec.calls) == 2
+        assert rec.calls[0].get("user_id") == "WY-1"
+        assert "user_id" not in rec.calls[1]
+        assert "sn:WY-1" in rec.calls[1]["tags"]
+        assert state.root_span is not None
+
+    def test_user_id_accepted_does_not_retry(self, monkeypatch):
+        monkeypatch.setenv("HERMES_LANGFUSE_SN", "WY-2")
+        monkeypatch.delenv("ZET_AGENT_ID", raising=False)
+        mod = self._mod()
+        rec = _RecordingPropagate(reject_user_id=False)
+        monkeypatch.setattr(mod, "propagate_attributes", rec)
+
+        mod._start_root_trace("k", client=_FakeRootClient(), **self._KW)
+
+        # Happy path: a single call carrying both user_id and the sn: tag.
+        assert len(rec.calls) == 1
+        assert rec.calls[0].get("user_id") == "WY-2"
+        assert "sn:WY-2" in rec.calls[0]["tags"]

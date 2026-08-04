@@ -17,8 +17,9 @@ file. Pure stdlib + existing skill/memory helpers.
 
 from __future__ import annotations
 
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 _MEMORY_FILES = {"memory": "MEMORY.md", "profile": "USER.md"}
 
@@ -31,6 +32,39 @@ def _memories_dir() -> Path:
     from hermes_constants import get_hermes_home
 
     return get_hermes_home() / "memories"
+
+
+@contextmanager
+def _memory_mutation_lock() -> Iterator[None]:
+    """Serialize journey RMWs with curated-memory import and reset.
+
+    A journey node index is global across both curated-memory files, so the
+    complete locate/read/write operation must hold the transaction lock and
+    both target locks in the same order as reset.  Locking only the final write
+    would let a stale pre-reset snapshot recreate memory after a privacy reset.
+    """
+    from tools.memory_tool import (
+        MemoryStore,
+        _MEMORY_TARGET_FILES,
+        _MEMORY_TRANSACTION_LOCK,
+    )
+
+    memories = _memories_dir()
+    with ExitStack() as stack:
+        stack.enter_context(
+            MemoryStore._file_lock(
+                memories / _MEMORY_TRANSACTION_LOCK,
+                create_parent=False,
+            )
+        )
+        for target in ("memory", "user"):
+            stack.enter_context(
+                MemoryStore._file_lock(
+                    memories / _MEMORY_TARGET_FILES[target],
+                    create_parent=False,
+                )
+            )
+        yield
 
 
 def _parse_memory_id(node_id: str) -> tuple[str, int]:
@@ -143,10 +177,11 @@ def _delete_skill(name: str) -> dict[str, Any]:
 
 def _delete_memory(node_id: str) -> dict[str, Any]:
     source, gidx = _parse_memory_id(node_id)
-    path, chunks, local = _locate_memory(source, gidx)
+    with _memory_mutation_lock():
+        path, chunks, local = _locate_memory(source, gidx)
 
-    del chunks[local]
-    _write_memory(path, chunks)
+        del chunks[local]
+        _write_memory(path, chunks)
 
     return {"ok": True, "message": f"deleted memory from {path.name}"}
 
@@ -178,10 +213,11 @@ def _edit_memory(node_id: str, content: str) -> dict[str, Any]:
     body = content.strip()
     if not body:
         return {"ok": False, "message": "empty memory — use delete to remove it"}
-    path, chunks, local = _locate_memory(source, gidx)
+    with _memory_mutation_lock():
+        path, chunks, local = _locate_memory(source, gidx)
 
-    chunks[local] = body
-    _write_memory(path, chunks)
+        chunks[local] = body
+        _write_memory(path, chunks)
 
     return {"ok": True, "message": f"updated memory in {path.name}"}
 

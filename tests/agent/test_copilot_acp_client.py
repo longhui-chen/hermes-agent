@@ -232,3 +232,123 @@ def test_run_prompt_passes_home_when_parent_env_is_clean(monkeypatch, tmp_path):
 
     assert "env" in captured["kwargs"]
     assert captured["kwargs"]["env"]["HOME"]
+
+
+def test_run_prompt_uses_profile_home_when_host_home_missing(monkeypatch, tmp_path):
+    """ZET-1938 shape: no HOME anywhere (systemd/cron) but a profile home
+    exists. The subprocess HOME policy must win — the ACP child should get
+    the profile home, not the _resolve_home_dir() /tmp-or-pwd guess.
+
+    Regression: _build_subprocess_env used to set env["HOME"] *before*
+    calling apply_subprocess_home_env, so the missing-HOME fallback saw a
+    non-empty HOME and never fired — leaving ~/.lark-cli unreachable.
+    """
+    import hermes_constants
+    monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+    monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+    monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+    monkeypatch.delenv("HERMES_HOME_FALLBACK", raising=False)
+
+    hermes_home = tmp_path / "hermes"
+    profile_home = hermes_home / "home"
+    profile_home.mkdir(parents=True)
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    captured = {}
+    client = _make_home_client(tmp_path)
+
+    with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+        with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+            client._run_prompt("hello", timeout_seconds=1)
+
+    assert captured["kwargs"]["env"]["HOME"] == str(profile_home)
+    # Fallback marker recorded so nested hermes levels keep this HOME.
+    assert captured["kwargs"]["env"]["HERMES_HOME_FALLBACK"] == str(profile_home)
+
+
+def test_run_prompt_never_leaves_child_without_home(monkeypatch, tmp_path):
+    """Even when neither a real HOME nor a profile home exists, the ACP
+    child must still get *some* writable HOME — the original _resolve_home_dir
+    guard must survive the reordering (never crash the subprocess)."""
+    import hermes_constants
+    monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+    monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+    monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+    monkeypatch.delenv("HERMES_HOME_FALLBACK", raising=False)
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+
+    captured = {}
+    client = _make_home_client(tmp_path)
+
+    with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+        with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+            client._run_prompt("hello", timeout_seconds=1)
+
+    assert captured["kwargs"]["env"]["HOME"]  # non-empty, never blank
+
+
+def test_run_prompt_preserves_real_home_over_profile_home(monkeypatch, tmp_path):
+    """Host mode with a genuine HOME must keep the real HOME — the profile
+    home must not be pinned just because a profile home dir exists."""
+    import hermes_constants
+    monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+    monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+    monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+    monkeypatch.delenv("HERMES_HOME_FALLBACK", raising=False)
+
+    hermes_home = tmp_path / "hermes"
+    (hermes_home / "home").mkdir(parents=True)
+    real_home = tmp_path / "real-home"
+    real_home.mkdir()
+    monkeypatch.setenv("HOME", str(real_home))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    captured = {}
+    client = _make_home_client(tmp_path)
+
+    with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+        with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+            client._run_prompt("hello", timeout_seconds=1)
+
+    assert captured["kwargs"]["env"]["HOME"] == str(real_home)
+    assert "HERMES_HOME_FALLBACK" not in captured["kwargs"]["env"]
+
+
+def test_run_prompt_bridges_context_hermes_home_override(monkeypatch, tmp_path):
+    """A per-request set_hermes_home_override(A) with process HERMES_HOME=B
+    must reach the ACP child consistently: the HOME contract resolves HOME
+    from override A, so the child's HERMES_HOME must be A too (not the stale
+    process-global B), or a nested hermes-as-ACP hop flips HOME off A.
+
+    Mirrors the same bridge on the MCP/LSP/codex spawn paths.
+    """
+    import hermes_constants
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+    monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+    monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+    monkeypatch.delenv("HERMES_HOME_FALLBACK", raising=False)
+
+    a = tmp_path / "profileA" / ".hermes"
+    b = tmp_path / "profileB" / ".hermes"
+    (a / "home").mkdir(parents=True)
+    (b / "home").mkdir(parents=True)
+    monkeypatch.delenv("HOME", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(b))
+
+    captured = {}
+    client = _make_home_client(tmp_path)
+
+    token = set_hermes_home_override(str(a))
+    try:
+        with _patch("agent.copilot_acp_client.subprocess.Popen", side_effect=_fake_popen_capture(captured)):
+            with pytest.raises(RuntimeError, match="Could not start Copilot ACP command"):
+                client._run_prompt("hello", timeout_seconds=1)
+    finally:
+        reset_hermes_home_override(token)
+
+    assert captured["kwargs"]["env"]["HERMES_HOME"] == str(a)
+    assert captured["kwargs"]["env"]["HOME"] == str(a / "home")

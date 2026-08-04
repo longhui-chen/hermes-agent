@@ -740,6 +740,18 @@ try:
 except Exception:
     pass  # best-effort — redaction stays at default (enabled) on config errors
 
+# The centralized logging setup below starts a QueueListener thread. Production
+# gateway processes must fork the trusted video-edit supervisor before that
+# thread exists; ordinary CLI commands must not pay this resident-process cost.
+try:
+    from hermes_cli.trusted_video_edit_startup import (
+        prepare_trusted_video_edit_runtime_before_cli_logging,
+    )
+
+    prepare_trusted_video_edit_runtime_before_cli_logging(sys.argv)
+except Exception:
+    pass  # best-effort — the gateway startup guard remains fail-closed
+
 # Initialize centralized file logging early — all `hermes` subcommands
 # (chat, setup, gateway, config, etc.) write to agent.log + errors.log.
 # Dashboard entrypoints bootstrap with GUI mode so gui.log is always present
@@ -920,6 +932,25 @@ def _mark_termux_bundled_skills_synced() -> None:
         pass
 
 
+def _warn_if_seed_policy_error(result, indent: str = "  ") -> bool:
+    """Surface a fail-closed seed-policy error carried by a sync result.
+
+    sync_skills() returns ``policy_error=True`` (and seeds nothing) when the seed
+    policy is present but unreadable/corrupt, or a policy-managed profile's policy
+    has vanished. Callers MUST surface this instead of reporting "up to date" /
+    "Re-seeded 0" / stamping success — otherwise the fail-closed condition is
+    invisible on the very ``hermes update`` path users are told to run. Returns
+    True (and prints) when an error was present."""
+    if result and result.get("policy_error"):
+        print(
+            f"{indent}✗ Skills NOT seeded: the seed policy is present but "
+            f"unreadable/corrupt (fail-closed). Fix config/skill_seed_policy.json, "
+            f"then re-run."
+        )
+        return True
+    return False
+
+
 def _sync_bundled_skills_for_startup() -> bool:
     """Sync bundled skills, but skip unchanged Termux checkouts cheaply.
 
@@ -932,7 +963,11 @@ def _sync_bundled_skills_for_startup() -> bool:
 
     from tools.skills_sync import sync_skills
 
-    sync_skills(quiet=True)
+    synced = sync_skills(quiet=True)
+    if synced and synced.get("policy_error"):
+        # Leave the checkout marked unsynced so a later start retries once the
+        # policy is fixed, instead of stamping success and suppressing the retry.
+        return False
     _mark_termux_bundled_skills_synced()
     return True
 
@@ -9366,6 +9401,18 @@ def cmd_profile(args):
                         "No bundled skills seeded (--no-skills). "
                         "Delete .no-bundled-skills in the profile to opt back in."
                     )
+                elif result and result.get("policy_error"):
+                    # The profile itself is created; only skill seeding failed
+                    # (fail-closed corrupt policy). This is intentionally NON-fatal
+                    # and exit 0, consistent with the generic "could not be seeded"
+                    # branch below — the user fixes the policy and `hermes update`
+                    # re-seeds. The warning is loud so it is never silent.
+                    print(
+                        "⚠ Skills seed FAILED: the seed policy is present but "
+                        "unreadable/corrupt, so no skills were seeded (fail-closed). "
+                        "Fix config/skill_seed_policy.json and run "
+                        "`hermes update` to retry."
+                    )
                 elif result:
                     copied = len(result.get("copied", []))
                     print(f"{copied} bundled skills synced.")
@@ -10963,9 +11010,22 @@ def cmd_memory(args):
         print("  Saved to config.yaml\n")
     elif sub == "reset":
         from hermes_constants import get_hermes_home, display_hermes_home
+        from tools.memory_tool import (
+            MemoryImportConflict,
+            curated_memory_has_state,
+            portable_memory_reset_supported,
+            reset_curated_memory,
+        )
 
         mem_dir = get_hermes_home() / "memories"
         target = getattr(args, "target", "all")
+        if not portable_memory_reset_supported():
+            print(
+                "\n  ! Durable memory reset is unsupported on this platform or "
+                "profile filesystem."
+            )
+            print("  No memory files were changed.\n")
+            raise SystemExit(1)
         files_to_reset = []
         if target in {"all", "memory"}:
             files_to_reset.append(("MEMORY.md", "agent notes"))
@@ -10973,9 +11033,28 @@ def cmd_memory(args):
             files_to_reset.append(("USER.md", "user profile"))
 
         # Check what exists
-        existing = [
-            (f, desc) for f, desc in files_to_reset if (mem_dir / f).exists()
-        ]
+        existing = []
+        unclassified_recovery = False
+        has_any = curated_memory_has_state("all") if target == "all" else None
+        for f, desc in files_to_reset:
+            item = "memory" if f == "MEMORY.md" else "user"
+            try:
+                if curated_memory_has_state(item):
+                    existing.append((f, desc))
+            except MemoryImportConflict:
+                if target != "all":
+                    raise
+                unclassified_recovery = True
+        if unclassified_recovery:
+            existing.append((
+                "managed import recovery state",
+                "unclassified import receipt",
+            ))
+        if target == "all" and has_any and not existing:
+            existing.append((
+                "managed import recovery state",
+                "profile-local transaction residue",
+            ))
         if not existing:
             print(
                 f"\n  Nothing to reset — no memory files found in {display_hermes_home()}/memories/\n"
@@ -10985,8 +11064,11 @@ def cmd_memory(args):
         print("\n  This will permanently erase the following memory files:")
         for f, desc in existing:
             path = mem_dir / f
-            size = path.stat().st_size
-            print(f"    ◆ {f} ({desc}) — {size:,} bytes")
+            if os.path.lexists(path):
+                size = path.lstat().st_size
+                print(f"    ◆ {f} ({desc}) — {size:,} bytes")
+            else:
+                print(f"    ◆ {f} ({desc}) — import recovery state")
 
         if not getattr(args, "yes", False):
             try:
@@ -10998,8 +11080,14 @@ def cmd_memory(args):
                 print("  Cancelled.\n")
                 return
 
+        result = reset_curated_memory(target)
+        if result.get("status") != "completed":
+            print(
+                "\n  ! Memory files were isolated, but secure cleanup is still pending."
+            )
+            print("  Run the same reset command again to finish cleanup.\n")
+            raise SystemExit(1)
         for f, desc in existing:
-            (mem_dir / f).unlink()
             print(f"  ✓ Deleted {f} ({desc})")
 
         print(

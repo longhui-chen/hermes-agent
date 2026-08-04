@@ -599,7 +599,13 @@ def _search_result_read_block_error(path: str, task_id: str = "default") -> str 
     try:
         resolved = _resolve_path_for_task(path, task_id)
     except (OSError, ValueError, RuntimeError):
+        sibling_error = _managed_sibling_profile_error(path, task_id)
+        if sibling_error:
+            return sibling_error
         return get_read_block_error(path)
+    sibling_error = _managed_sibling_profile_error(str(resolved), task_id)
+    if sibling_error:
+        return sibling_error
     return get_read_block_error(str(resolved))
 
 
@@ -651,25 +657,116 @@ _SENSITIVE_PATH_PREFIXES = (
 )
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
-_hermes_config_resolved: str | None = None
-_hermes_config_resolved_loaded = False
+# Managed Claw secrets are consumed by a privileged, long-running gateway.
+# File tools run in-process and therefore must never be able to rewrite the
+# service EnvironmentFile/key or a multiplex profile's credential file.  Keep
+# both lexical device layouts and their durable resolved targets here because
+# deployments may expose app data through either symlink chain.
+_MANAGED_CLAW_SECRET_ROOTS = (
+    "/zettos/main/apps/com.zettlab.claw/data/secrets",
+    "/zettos/main/data/com.zettlab.claw/secrets",
+    "/volume1/subvol/apps/com.zettlab.claw/data/secrets",
+)
+_MANAGED_CLAW_HERMES_ROOTS = (
+    "/zettos/main/apps/com.zettlab.claw/data/hermes_home",
+    "/zettos/main/data/com.zettlab.claw/hermes_home",
+    "/volume1/subvol/apps/com.zettlab.claw/data/hermes_home",
+)
+_MANAGED_TERMINAL_HOME_ROOTS = (
+    "/run/zettlab-claw/terminal-homes",
+)
 
+
+def _path_within(candidate: str, root: str) -> bool:
+    try:
+        return os.path.commonpath((candidate, root)) == root
+    except (OSError, ValueError):
+        return False
+
+
+def _managed_sibling_profile_error(
+    filepath: str,
+    task_id: str = "default",
+) -> str | None:
+    """Deny managed file-tool access to every profile except the active one."""
+
+    if os.environ.get("HERMES_MANAGED_GATEWAY") != "1":
+        return None
+    try:
+        from hermes_constants import get_hermes_home
+
+        active_home = os.path.normpath(
+            os.path.realpath(str(get_hermes_home().expanduser()))
+        )
+    except Exception:
+        active_home = ""
+
+    try:
+        resolved = str(_resolve_path_for_task(filepath, task_id))
+    except (OSError, ValueError, RuntimeError):
+        expanded = _expand_tilde(filepath)
+        resolved = (
+            os.path.normpath(os.path.realpath(expanded))
+            if os.path.isabs(expanded)
+            else ""
+        )
+    candidates = {
+        candidate
+        for candidate in (
+            resolved,
+            os.path.normpath(os.path.realpath(resolved)) if resolved else "",
+        )
+        if candidate and os.path.isabs(candidate)
+    }
+
+    profile_roots: set[str] = set()
+    for configured_root in _MANAGED_CLAW_HERMES_ROOTS:
+        for root in (
+            os.path.normpath(configured_root),
+            os.path.normpath(os.path.realpath(configured_root)),
+        ):
+            if os.path.isabs(root):
+                profile_roots.add(os.path.join(root, "profiles"))
+
+    allowed_home = ""
+    if active_home and os.path.isabs(active_home):
+        for profiles_root in profile_roots:
+            if (
+                os.path.dirname(active_home) == profiles_root
+                and os.path.basename(active_home) not in {"", ".", ".."}
+            ):
+                allowed_home = active_home
+                break
+
+    for candidate in candidates:
+        for profiles_root in profile_roots:
+            if not _path_within(candidate, profiles_root):
+                continue
+            if allowed_home and _path_within(candidate, allowed_home):
+                continue
+            return (
+                f"Refusing access to managed sibling profile path: {filepath}\n"
+                "Agent file tools are confined to the active profile."
+            )
+    return None
 
 def _get_hermes_config_resolved() -> str | None:
-    """Return the resolved absolute path of the Hermes config file (cached)."""
-    global _hermes_config_resolved, _hermes_config_resolved_loaded
-    if _hermes_config_resolved_loaded:
-        return _hermes_config_resolved
-    _hermes_config_resolved_loaded = True
+    """Return the active profile's resolved Hermes config path.
+
+    A multiplex gateway changes ``get_hermes_home()`` through a ContextVar on
+    every profile dispatch.  A process-global single-value cache would pin the
+    first profile's config path and let later profiles rewrite their own
+    security settings.  Resolution is cheap and must remain request-scoped.
+    """
     try:
         from hermes_cli.config import get_config_path
-        _hermes_config_resolved = str(get_config_path().resolve())
+
+        return str(get_config_path().resolve())
     except Exception:
         try:
-            _hermes_config_resolved = str(Path(_expand_tilde("~/.hermes/config.yaml")).resolve())
+            return str(Path(_expand_tilde("~/.hermes/config.yaml")).resolve())
         except Exception:
-            _hermes_config_resolved = None
-    return _hermes_config_resolved
+            return None
 
 
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
@@ -688,6 +785,118 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             return _err
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
         return _err
+    candidates = (resolved, normalized)
+    managed_secret_roots = list(_MANAGED_CLAW_SECRET_ROOTS)
+    managed_hermes_roots = list(_MANAGED_CLAW_HERMES_ROOTS)
+    configured_home = os.environ.get("HERMES_HOME", "").strip()
+    if configured_home and "\x00" not in configured_home:
+        try:
+            managed_hermes_roots.append(
+                str(Path(_expand_tilde(configured_home)).resolve())
+            )
+        except (OSError, ValueError):
+            pass
+    if os.environ.get("HERMES_MANAGED_GATEWAY") == "1":
+        try:
+            from hermes_constants import get_hermes_home
+
+            managed_hermes_roots.append(
+                str(get_hermes_home().expanduser().resolve())
+            )
+        except (OSError, ValueError):
+            pass
+
+    if any(
+        _path_within(candidate, root)
+        for candidate in candidates
+        for root in managed_secret_roots
+    ) or any(
+        os.path.basename(candidate) == ".env" and _path_within(candidate, root)
+        for candidate in candidates
+        for root in managed_hermes_roots
+    ):
+        return (
+            f"Refusing to write to managed secret path: {filepath}\n"
+            "Agent file tools cannot modify service or profile credentials."
+        )
+    # The managed gateway adds HERMES_LAZY_INSTALL_TARGET to sys.path during
+    # bootstrap.  A model-controlled .pth file or importable module below that
+    # root would execute in the privileged gateway process on a later import or
+    # restart.  The terminal subprocess runs under a separate unprivileged UID,
+    # but write_file/patch execute in-process, so enforce this as a hard file-tool
+    # boundary rather than relying on filesystem ownership alone.
+    if os.environ.get("HERMES_MANAGED_GATEWAY") == "1":
+        if any(
+            _path_within(candidate, root)
+            for candidate in candidates
+            for root in _MANAGED_TERMINAL_HOME_ROOTS
+        ):
+            return (
+                f"Refusing to write to managed terminal home path: {filepath}\n"
+                "Agent file tools cannot modify terminal runtime identities."
+            )
+
+        # User/project plugins and profile event hooks execute inside the
+        # privileged gateway. File tools also run in-process, so they may not
+        # rewrite either code root, including a sibling multiplex profile that
+        # could be activated later.
+        plugin_roots = list(managed_hermes_roots)
+        project_plugins_enabled = os.environ.get(
+            "HERMES_ENABLE_PROJECT_PLUGINS", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        project_plugin_root = (
+            str((Path.cwd() / ".hermes" / "plugins").resolve())
+            if project_plugins_enabled
+            else ""
+        )
+        for candidate in candidates:
+            for root in plugin_roots:
+                try:
+                    relative_parts = Path(candidate).relative_to(root).parts
+                except (OSError, ValueError):
+                    continue
+                blocked_kind = next(
+                    (kind for kind in ("plugins", "hooks") if kind in relative_parts),
+                    "",
+                )
+                if not blocked_kind and relative_parts:
+                    if relative_parts[0] == "agent-hooks":
+                        blocked_kind = "agent-hooks"
+                    elif relative_parts[0] == "scripts":
+                        blocked_kind = "scripts"
+                if blocked_kind:
+                    code_kind = {
+                        "plugins": "plugin",
+                        "hooks": "hook",
+                        "agent-hooks": "shell hook",
+                        "scripts": "script",
+                    }[blocked_kind]
+                    return (
+                        f"Refusing to write to managed {code_kind} code path: {filepath}\n"
+                        "Agent file tools cannot modify code loaded by the gateway."
+                    )
+            if project_plugin_root and _path_within(candidate, project_plugin_root):
+                return (
+                    f"Refusing to write to managed plugin code path: {filepath}\n"
+                    "Agent file tools cannot modify code loaded by the gateway."
+                )
+
+        lazy_target = os.environ.get("HERMES_LAZY_INSTALL_TARGET", "").strip()
+        if lazy_target and "\x00" not in lazy_target:
+            try:
+                lazy_root = str(Path(_expand_tilde(lazy_target)).resolve())
+                if os.path.commonpath((resolved, lazy_root)) == lazy_root:
+                    return (
+                        f"Refusing to write to managed runtime import path: {filepath}\n"
+                        "Agent file tools cannot modify executable Python import roots."
+                    )
+            except (OSError, ValueError):
+                # A malformed configured root is a deployment issue.  Do not
+                # broaden the deny to unrelated paths when it cannot be parsed.
+                pass
+    sibling_error = _managed_sibling_profile_error(filepath, task_id)
+    if sibling_error:
+        return sibling_error
     # Prevent agents from modifying the Hermes config file directly.
     # approvals.mode and other security settings live here; a malicious or
     # prompt-injected agent could silently disable exec approval by writing to
@@ -1277,6 +1486,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 2000, task_id: str =
             )
 
         _resolved = _resolve_path_for_task(path, task_id)
+
+        sibling_error = _managed_sibling_profile_error(str(_resolved), task_id)
+        if sibling_error:
+            return json.dumps({"error": sibling_error}, ensure_ascii=False)
 
         # ── Structured-document extraction ────────────────────────────
         # Try before the binary-extension guard so .docx/.xlsx can render as text.
@@ -2083,6 +2296,12 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             resolved_path = _resolve_path_for_task(path, task_id)
         except (OSError, ValueError, RuntimeError):
             resolved_path = None
+        sibling_error = _managed_sibling_profile_error(
+            str(resolved_path) if resolved_path else path,
+            task_id,
+        )
+        if sibling_error:
+            return json.dumps({"error": sibling_error}, ensure_ascii=False)
         block_error = get_read_block_error(str(resolved_path) if resolved_path else path)
         if block_error:
             return tool_error(block_error)

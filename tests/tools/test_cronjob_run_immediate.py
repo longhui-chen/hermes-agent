@@ -14,6 +14,7 @@ import json
 import threading
 import time
 from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from tools.cronjob_tools import cronjob, _execute_job_now
 from tools.environments.base import set_activity_callback
@@ -36,8 +37,8 @@ class TestCronjobRunExecutesImmediately:
         assert out["success"] is True
         assert out["job"]["executed"] is True
         assert out["job"]["execution_success"] is True
-        m_claim.assert_called_once_with("job-run-1")   # at-most-once claim taken
-        m_run.assert_called_once()                       # fired via the shared body
+        m_claim.assert_called_once_with("job-run-1", triggered_at=ANY)
+        m_run.assert_called_once_with(_JOB, triggered_at=ANY)
 
 
     def test_execute_job_now_bails_without_claim(self):
@@ -172,3 +173,4 @@ class TestCronjobRunExecutesImmediately:
             assert len(calls) >= 2, calls
         finally:
             set_activity_callback(None)
+        assert m_mark.call_args.kwargs["scheduled_at"]

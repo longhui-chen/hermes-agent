@@ -1,15 +1,20 @@
 """Local execution environment — spawn-per-call with session snapshot."""
 
+import hashlib
+import hmac
 import logging
 import ntpath
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -20,6 +25,908 @@ from hermes_cli._subprocess_compat import windows_hide_flags
 _IS_WINDOWS = platform.system() == "Windows"
 
 logger = logging.getLogger(__name__)
+
+_MANAGED_GATEWAY_ENV = "HERMES_MANAGED_GATEWAY"
+_MANAGED_BOOTSTRAP_ENV_KEYS = frozenset({
+    _MANAGED_GATEWAY_ENV,
+    "HERMES_MANAGED_CGROUP_UNIT",
+    "HERMES_MANAGED_CGROUP_ROOT",
+})
+_MANAGED_SETPRIV_PATH = "/usr/bin/setpriv"
+_MANAGED_UNSHARE_PATH = "/usr/bin/unshare"
+_MANAGED_TERMINAL_UID_MIN = 100_000
+_MANAGED_TERMINAL_UID_MAX = 2_000_000_000
+_MANAGED_TERMINAL_IDENTITY_ATTEMPTS = 64
+_MANAGED_TERMINAL_IDENTITY_CACHE_MAX = 4096
+_MANAGED_TERMINAL_IDENTITY_LOCK = threading.Lock()
+_MANAGED_TERMINAL_SCOPE_BY_UID: dict[int, str] = {}
+_MANAGED_TERMINAL_RETIRED_UIDS: set[int] = set()
+_MANAGED_TERMINAL_RETIRED_SCOPES: set[str] = set()
+_MANAGED_TERMINAL_RETIRED_MAX = 4096
+_MANAGED_TERMINAL_HOME_ROOT = Path("/run/zettlab-claw/terminal-homes")
+_MANAGED_TERMINAL_CGROUP_PREFIX = "terminal-profile"
+_MANAGED_TERMINAL_CGROUP_MEMORY_MAX_BYTES = 256 * 1024 * 1024
+_MANAGED_TERMINAL_CGROUP_MEMORY_SWAP_MAX_BYTES = 0
+_MANAGED_TERMINAL_CGROUP_PIDS_MAX = 64
+_MANAGED_TERMINAL_CGROUP_LOCK = threading.Lock()
+_MANAGED_TERMINAL_CGROUP_CLEANUP_TIMEOUT_SECONDS = 2.0
+_MANAGED_TERMINAL_CGROUP_POLL_SECONDS = 0.05
+_MANAGED_EXECUTE_CODE_CGROUP_LOCK = threading.Lock()
+_MANAGED_EXECUTE_CODE_CGROUP_BY_UID: dict[int, object] = {}
+_MANAGED_TERMINAL_CGROUP_ENTER = (
+    "import os,sys\n"
+    "path=os.path.join(sys.argv[1],'cgroup.procs')\n"
+    "flags=os.O_WRONLY|os.O_CLOEXEC|getattr(os,'O_NOFOLLOW',0)\n"
+    "fd=os.open(path,flags)\n"
+    "try:\n os.write(fd,(str(os.getpid())+'\\n').encode('ascii'))\n"
+    "finally:\n os.close(fd)\n"
+    "os.execv(sys.argv[2],sys.argv[2:])\n"
+)
+_MANAGED_TERMINAL_PRIVATE_TMP_ENTER = (
+    "import ctypes,os,stat,sys\n"
+    "if len(sys.argv)<4:\n raise OSError('managed private tmp argv is invalid')\n"
+    "sources=sys.argv[1:3]\n"
+    "for source in sources:\n"
+    " info=os.lstat(source)\n"
+    " if not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or info.st_gid!=0 or info.st_mode&0o077:\n"
+    "  raise OSError('managed private tmp source is not trusted')\n"
+    "for target in ('/tmp','/var/tmp'):\n"
+    " info=os.lstat(target)\n"
+    " if not stat.S_ISDIR(info.st_mode):\n  raise OSError('managed private tmp target is unavailable')\n"
+    "libc=ctypes.CDLL(None,use_errno=True)\n"
+    "libc.mount.argtypes=[ctypes.c_char_p,ctypes.c_char_p,ctypes.c_char_p,ctypes.c_ulong,ctypes.c_void_p]\n"
+    "libc.mount.restype=ctypes.c_int\n"
+    "def mount(source,target,flags):\n"
+    " result=libc.mount(source,target,None,flags,None)\n"
+    " if result!=0:\n  error=ctypes.get_errno();raise OSError(error,os.strerror(error),os.fsdecode(target))\n"
+    "mount(None,b'/',16384|262144)\n"
+    "mount(os.fsencode(sources[0]),b'/tmp',4096|16384)\n"
+    "mount(os.fsencode(sources[1]),b'/var/tmp',4096|16384)\n"
+    "os.umask(0o077)\n"
+    "os.execv(sys.argv[3],sys.argv[3:])\n"
+)
+_MANAGED_EXECUTE_CODE_PRIVATE_TMP_ENTER = (
+    "import ctypes,os,stat,sys\n"
+    "if len(sys.argv)<4:\n raise OSError('managed execute_code private tmp argv is invalid')\n"
+    "workspace,var_tmp=sys.argv[1:3]\n"
+    "for source in (workspace,var_tmp):\n"
+    " info=os.lstat(source)\n"
+    " if not stat.S_ISDIR(info.st_mode) or info.st_uid!=0 or info.st_gid!=0 or info.st_mode&0o077:\n"
+    "  raise OSError('managed execute_code private tmp source is not trusted')\n"
+    "for target in ('/tmp','/var/tmp'):\n"
+    " info=os.lstat(target)\n"
+    " if not stat.S_ISDIR(info.st_mode):\n  raise OSError('managed execute_code private tmp target is unavailable')\n"
+    "libc=ctypes.CDLL(None,use_errno=True)\n"
+    "libc.mount.argtypes=[ctypes.c_char_p,ctypes.c_char_p,ctypes.c_char_p,ctypes.c_ulong,ctypes.c_void_p]\n"
+    "libc.mount.restype=ctypes.c_int\n"
+    "def mount(source,target,flags):\n"
+    " result=libc.mount(source,target,None,flags,None)\n"
+    " if result!=0:\n  error=ctypes.get_errno();raise OSError(error,os.strerror(error),os.fsdecode(target))\n"
+    "mount(None,b'/',16384|262144)\n"
+    "mount(os.fsencode(var_tmp),b'/var/tmp',4096|16384)\n"
+    "mount(os.fsencode(workspace),b'/tmp',4096|16384)\n"
+    "os.chdir('/tmp')\n"
+    "os.umask(0o077)\n"
+    "os.execv(sys.argv[3],sys.argv[3:])\n"
+)
+
+
+def _managed_terminal_profile_scope(
+    env: Mapping[str, str] | None = None,
+) -> str:
+    raw_scope = str((env or {}).get("HERMES_HOME") or "").strip()
+    if (
+        not raw_scope
+        or "\x00" in raw_scope
+        or len(raw_scope.encode("utf-8")) > 4096
+    ):
+        raise OSError("managed terminal profile identity is unavailable")
+    return str(Path(raw_scope).expanduser().resolve())
+
+
+def _managed_terminal_identity(
+    env: Mapping[str, str] | None = None,
+) -> tuple[int, int]:
+    """Derive one device-keyed non-root identity per multiplex profile."""
+
+    if _IS_WINDOWS or os.geteuid() != 0:
+        raise OSError("managed terminal requires a root identity broker")
+    secret = os.environ.get("ZET_AGENT_KEY", "")
+    scope = _managed_terminal_profile_scope(env)
+    if (
+        not secret
+        or "\x00" in secret
+        or len(secret.encode("utf-8")) > 4096
+    ):
+        raise OSError("managed terminal profile identity is unavailable")
+
+    import pwd
+
+    registered = {entry.pw_uid for entry in pwd.getpwall()}
+    population = _MANAGED_TERMINAL_UID_MAX - _MANAGED_TERMINAL_UID_MIN + 1
+    with _MANAGED_TERMINAL_IDENTITY_LOCK:
+        for counter in range(_MANAGED_TERMINAL_IDENTITY_ATTEMPTS):
+            digest = hmac.new(
+                secret.encode("utf-8"),
+                f"{scope}\0{counter}".encode("utf-8"),
+                hashlib.sha256,
+            ).digest()
+            uid = _MANAGED_TERMINAL_UID_MIN + (
+                int.from_bytes(digest[:8], "big") % population
+            )
+            owner = _MANAGED_TERMINAL_SCOPE_BY_UID.get(uid)
+            if (
+                uid in registered
+                or uid in _MANAGED_TERMINAL_RETIRED_UIDS
+                or (owner is not None and owner != scope)
+            ):
+                continue
+            if owner is None:
+                if (
+                    len(_MANAGED_TERMINAL_SCOPE_BY_UID)
+                    >= _MANAGED_TERMINAL_IDENTITY_CACHE_MAX
+                ):
+                    raise OSError("managed terminal identity cache is full")
+                _MANAGED_TERMINAL_SCOPE_BY_UID[uid] = scope
+                _MANAGED_TERMINAL_RETIRED_SCOPES.discard(scope)
+            return uid, uid
+    raise OSError("managed terminal profile identity collision")
+
+
+def _managed_terminal_privilege_drop_prefix(
+    env: Mapping[str, str] | None = None,
+) -> list[str]:
+    """Return the fixed fail-closed capability drop for model shell commands."""
+
+    try:
+        info = os.lstat(_MANAGED_SETPRIV_PATH)
+    except OSError as exc:
+        raise OSError("managed terminal privilege drop is unavailable") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_mode & 0o022
+    ):
+        raise OSError("managed terminal privilege drop is not trusted")
+    uid, gid = _managed_terminal_identity(env)
+    return [
+        _MANAGED_SETPRIV_PATH,
+        f"--reuid={uid}",
+        f"--regid={gid}",
+        "--clear-groups",
+        "--bounding-set=-all",
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        "--no-new-privs",
+        "--",
+    ]
+
+
+def _managed_execute_code_identity(
+    env: Mapping[str, str],
+    execution_scope: str,
+) -> tuple[int, int]:
+    """Reserve a per-execution UID distinct from every persistent terminal."""
+
+    if _IS_WINDOWS or os.geteuid() != 0:
+        raise OSError("managed execute_code requires a root identity broker")
+    secret = os.environ.get("ZET_AGENT_KEY", "")
+    profile_scope = _managed_terminal_profile_scope(env)
+    if (
+        not secret
+        or not execution_scope
+        or "\x00" in secret
+        or "\x00" in execution_scope
+        or len(secret.encode("utf-8")) > 4096
+        or len(execution_scope.encode("utf-8")) > 128
+    ):
+        raise OSError("managed execute_code identity is unavailable")
+
+    import pwd
+
+    owner_scope = f"execute-code\0{profile_scope}\0{execution_scope}"
+    registered = {entry.pw_uid for entry in pwd.getpwall()}
+    population = _MANAGED_TERMINAL_UID_MAX - _MANAGED_TERMINAL_UID_MIN + 1
+    with _MANAGED_TERMINAL_IDENTITY_LOCK:
+        for counter in range(_MANAGED_TERMINAL_IDENTITY_ATTEMPTS):
+            digest = hmac.new(
+                secret.encode("utf-8"),
+                f"{owner_scope}\0{counter}".encode("utf-8"),
+                hashlib.sha256,
+            ).digest()
+            uid = _MANAGED_TERMINAL_UID_MIN + (
+                int.from_bytes(digest[:8], "big") % population
+            )
+            owner = _MANAGED_TERMINAL_SCOPE_BY_UID.get(uid)
+            if (
+                uid in registered
+                or uid in _MANAGED_TERMINAL_RETIRED_UIDS
+                or (owner is not None and owner != owner_scope)
+            ):
+                continue
+            if owner is None:
+                if (
+                    len(_MANAGED_TERMINAL_SCOPE_BY_UID)
+                    >= _MANAGED_TERMINAL_IDENTITY_CACHE_MAX
+                ):
+                    raise OSError("managed identity cache is full")
+                _MANAGED_TERMINAL_SCOPE_BY_UID[uid] = owner_scope
+            return uid, uid
+    raise OSError("managed execute_code identity collision")
+
+
+def _release_managed_execute_code_identity(
+    uid: int,
+    env: Mapping[str, str],
+    execution_scope: str,
+) -> None:
+    """Release an invocation UID after its process tree and RPC socket are gone."""
+
+    owner_scope = (
+        f"execute-code\0{_managed_terminal_profile_scope(env)}\0"
+        f"{execution_scope}"
+    )
+    with _MANAGED_TERMINAL_IDENTITY_LOCK:
+        if _MANAGED_TERMINAL_SCOPE_BY_UID.get(uid) == owner_scope:
+            _MANAGED_TERMINAL_SCOPE_BY_UID.pop(uid, None)
+
+
+def _managed_execute_code_sandbox_argv(
+    argv: list[str],
+    *,
+    env: Mapping[str, str],
+    execution_scope: str | None,
+    workspace: str | None = None,
+) -> list[str]:
+    """Drop one execute_code invocation into its non-shared identity domain."""
+
+    if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
+        return list(argv)
+    if execution_scope is None:
+        raise OSError("managed execute_code scope is unavailable")
+    if workspace is None:
+        raise OSError("managed execute_code workspace is unavailable")
+    try:
+        info = os.lstat(_MANAGED_SETPRIV_PATH)
+    except OSError as exc:
+        raise OSError("managed execute_code privilege drop is unavailable") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_mode & 0o022
+    ):
+        raise OSError("managed execute_code privilege drop is not trusted")
+    uid, gid = _managed_execute_code_identity(env, execution_scope)
+    launcher = _trusted_managed_python()
+    namespace_launcher = _trusted_managed_unshare()
+    private_tmp, private_var_tmp = _managed_execute_code_private_tmp_paths(
+        workspace, uid
+    )
+    from tools.trusted_direct_runner import (
+        _create_managed_invocation_cgroup,
+        _kill_and_remove_managed_cgroup,
+    )
+
+    cgroup = _create_managed_invocation_cgroup()
+    try:
+        with _MANAGED_EXECUTE_CODE_CGROUP_LOCK:
+            if uid in _MANAGED_EXECUTE_CODE_CGROUP_BY_UID:
+                raise OSError("managed execute_code cgroup identity collision")
+            _MANAGED_EXECUTE_CODE_CGROUP_BY_UID[uid] = cgroup
+    except Exception:
+        _kill_and_remove_managed_cgroup(cgroup, None)
+        raise
+    return [
+        launcher,
+        "-I",
+        "-c",
+        _MANAGED_TERMINAL_CGROUP_ENTER,
+        str(cgroup.path),
+        _MANAGED_SETPRIV_PATH,
+        f"--reuid={uid}",
+        f"--regid={gid}",
+        "--clear-groups",
+        "--bounding-set=-all",
+        "--inh-caps=-all",
+        "--ambient-caps=-all",
+        "--no-new-privs",
+        "--",
+        namespace_launcher,
+        "--user",
+        "--map-root-user",
+        "--mount",
+        "--",
+        launcher,
+        "-I",
+        "-c",
+        _MANAGED_EXECUTE_CODE_PRIVATE_TMP_ENTER,
+        str(private_tmp),
+        str(private_var_tmp),
+        *argv,
+    ]
+
+
+def _managed_terminal_argv(
+    argv: list[str],
+    *,
+    env: Mapping[str, str] | None = None,
+) -> list[str]:
+    """Apply the managed capability boundary to every local terminal path."""
+
+    if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
+        return list(argv)
+    cgroup = _ensure_managed_terminal_cgroup(env)
+    _home, private_tmp, private_var_tmp = _managed_terminal_home_paths(env)
+    launcher = _trusted_managed_python()
+    return [
+        launcher,
+        "-I",
+        "-c",
+        _MANAGED_TERMINAL_CGROUP_ENTER,
+        str(cgroup),
+        *_managed_terminal_privilege_drop_prefix(env),
+        _trusted_managed_unshare(),
+        "--user",
+        "--map-root-user",
+        "--mount",
+        "--fork",
+        "--kill-child=KILL",
+        "--",
+        launcher,
+        "-I",
+        "-c",
+        _MANAGED_TERMINAL_PRIVATE_TMP_ENTER,
+        str(private_tmp),
+        str(private_var_tmp),
+        *list(argv),
+    ]
+
+
+def _trusted_managed_python() -> str:
+    """Return the immutable interpreter used by the root cgroup trampoline."""
+
+    try:
+        interpreter = Path(sys.executable).resolve(strict=True)
+        info = interpreter.stat()
+    except OSError as exc:
+        raise OSError("managed terminal cgroup launcher is unavailable") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_mode & 0o022
+        or not info.st_mode & 0o111
+    ):
+        raise OSError("managed terminal cgroup launcher is not trusted")
+    return str(interpreter)
+
+
+def _trusted_managed_unshare() -> str:
+    """Return the fixed root-owned user/mount namespace launcher."""
+
+    try:
+        info = os.lstat(_MANAGED_UNSHARE_PATH)
+    except OSError as exc:
+        raise OSError("managed terminal namespace launcher is unavailable") from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_mode & 0o022
+        or not info.st_mode & 0o111
+    ):
+        raise OSError("managed terminal namespace launcher is not trusted")
+    return _MANAGED_UNSHARE_PATH
+
+
+def _managed_terminal_cgroup_for_uid(
+    uid: int,
+    *,
+    create: bool,
+):
+    """Resolve one root-owned delegated cgroup and validate all controls."""
+
+    if _IS_WINDOWS or os.geteuid() != 0:
+        raise OSError("managed terminal requires Linux root delegation")
+    if not (_MANAGED_TERMINAL_UID_MIN <= uid <= _MANAGED_TERMINAL_UID_MAX):
+        raise OSError("managed terminal cgroup identity is invalid")
+    from tools import trusted_direct_runner as runner
+
+    delegation_root, _relative, _identity = (
+        runner._resolve_managed_delegation_root()
+    )
+    cgroup = delegation_root / f"{_MANAGED_TERMINAL_CGROUP_PREFIX}-{uid}"
+    created = False
+    if create:
+        try:
+            os.mkdir(cgroup, 0o755)
+            created = True
+        except FileExistsError:
+            pass
+    else:
+        try:
+            cgroup.lstat()
+        except FileNotFoundError:
+            return None, runner
+    try:
+        info = cgroup.lstat()
+        resolved = cgroup.resolve(strict=True)
+        if (
+            stat.S_ISLNK(info.st_mode)
+            or not stat.S_ISDIR(info.st_mode)
+            or resolved.parent != delegation_root
+            or resolved.name != f"{_MANAGED_TERMINAL_CGROUP_PREFIX}-{uid}"
+        ):
+            raise OSError("managed terminal cgroup is not trusted")
+        controls = (
+            "cgroup.procs",
+            "cgroup.kill",
+            "cgroup.events",
+            "memory.max",
+            "memory.swap.max",
+            "memory.oom.group",
+            "pids.max",
+        )
+        for control in controls:
+            if not (resolved / control).is_file():
+                raise OSError(f"managed terminal cgroup lacks {control}")
+        return resolved, runner
+    except Exception:
+        if created:
+            try:
+                os.rmdir(cgroup)
+            except OSError:
+                pass
+        raise
+
+
+def _ensure_managed_terminal_cgroup(
+    env: Mapping[str, str] | None = None,
+) -> Path:
+    """Create/configure the bounded cgroup shared by one profile terminal."""
+
+    uid, _gid = _managed_terminal_identity(env)
+    expected = {
+        "memory.max": str(_MANAGED_TERMINAL_CGROUP_MEMORY_MAX_BYTES),
+        "memory.swap.max": str(_MANAGED_TERMINAL_CGROUP_MEMORY_SWAP_MAX_BYTES),
+        "memory.oom.group": "1",
+        "pids.max": str(_MANAGED_TERMINAL_CGROUP_PIDS_MAX),
+    }
+    with _MANAGED_TERMINAL_CGROUP_LOCK:
+        cgroup, runner = _managed_terminal_cgroup_for_uid(uid, create=True)
+        assert cgroup is not None
+        for control, value in expected.items():
+            runner._write_control_file(
+                cgroup / control,
+                value.encode("ascii"),
+            )
+        for control, value in expected.items():
+            actual = runner._read_bounded_ascii(
+                cgroup / control,
+                limit=4096,
+            ).strip()
+            if actual != value:
+                raise OSError(f"managed terminal cgroup rejected {control}")
+        return cgroup
+
+
+def _remove_managed_terminal_cgroup(uid: int) -> bool:
+    """Kill every descendant and remove one profile's delegated cgroup."""
+
+    with _MANAGED_TERMINAL_CGROUP_LOCK:
+        cgroup, runner = _managed_terminal_cgroup_for_uid(uid, create=False)
+        if cgroup is None:
+            return False
+        runner._write_control_file(cgroup / "cgroup.kill", b"1")
+        deadline = (
+            time.monotonic()
+            + _MANAGED_TERMINAL_CGROUP_CLEANUP_TIMEOUT_SECONDS
+        )
+        while time.monotonic() < deadline:
+            events = runner._read_bounded_ascii(
+                cgroup / "cgroup.events",
+                limit=4096,
+            ).splitlines()
+            if "populated 0" in events:
+                os.rmdir(cgroup)
+                return True
+            time.sleep(_MANAGED_TERMINAL_CGROUP_POLL_SECONDS)
+        raise OSError("managed terminal cgroup remained populated")
+
+
+def _prepare_managed_terminal_workspace(
+    directory: str,
+    paths: list[str],
+    *,
+    env: Mapping[str, str],
+) -> None:
+    """Transfer one generated scratch workspace to its profile identity."""
+
+    if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
+        return
+    uid, gid = _managed_terminal_identity(env)
+    root = os.lstat(directory)
+    if (
+        not stat.S_ISDIR(root.st_mode)
+        or root.st_uid != 0
+        or root.st_mode & 0o022
+    ):
+        raise OSError("managed terminal workspace is not trusted")
+    for path in paths:
+        info = os.lstat(path)
+        if (
+            not (stat.S_ISREG(info.st_mode) or stat.S_ISSOCK(info.st_mode))
+            or info.st_uid != 0
+            or info.st_mode & 0o022
+        ):
+            raise OSError("managed terminal workspace entry is not trusted")
+        os.chown(path, uid, gid)
+        os.chmod(path, 0o600)
+    os.chown(directory, uid, gid)
+    os.chmod(directory, 0o700)
+
+
+def _prepare_managed_execute_code_workspace(
+    directory: str,
+    paths: list[str],
+    *,
+    env: Mapping[str, str],
+    execution_scope: str,
+) -> int:
+    """Transfer one scratch workspace to a per-invocation execute_code UID."""
+
+    uid, gid = _managed_execute_code_identity(env, execution_scope)
+    root = os.lstat(directory)
+    if (
+        not stat.S_ISDIR(root.st_mode)
+        or root.st_uid != 0
+        or root.st_mode & 0o022
+    ):
+        raise OSError("managed execute_code workspace is not trusted")
+    for path in paths:
+        info = os.lstat(path)
+        if (
+            not (stat.S_ISREG(info.st_mode) or stat.S_ISSOCK(info.st_mode))
+            or info.st_uid != 0
+            or info.st_mode & 0o022
+        ):
+            raise OSError("managed execute_code workspace entry is not trusted")
+        os.chown(path, uid, gid)
+        os.chmod(path, 0o600)
+    for child_name in ("var-tmp",):
+        child = Path(directory) / child_name
+        os.mkdir(child, 0o700)
+        child_info = os.lstat(child)
+        if (
+            not stat.S_ISDIR(child_info.st_mode)
+            or child_info.st_uid != 0
+            or child_info.st_gid != 0
+            or child_info.st_mode & 0o077
+        ):
+            raise OSError("managed execute_code private tmp is not trusted")
+        os.chown(child, uid, gid)
+        os.chmod(child, 0o700)
+    os.chown(directory, uid, gid)
+    os.chmod(directory, 0o700)
+    return uid
+
+
+def _managed_execute_code_private_tmp_paths(
+    workspace: str, uid: int
+) -> tuple[Path, Path]:
+    """Validate invocation-owned mount sources created in its scratch workspace."""
+
+    raw_home = str(workspace or "")
+    if not raw_home or not os.path.isabs(raw_home) or "\x00" in raw_home:
+        raise OSError("managed execute_code private tmp is unavailable")
+    home = Path(raw_home)
+    home_info = os.lstat(home)
+    if (
+        not stat.S_ISDIR(home_info.st_mode)
+        or home_info.st_uid != uid
+        or home_info.st_gid != uid
+        or home_info.st_mode & 0o077
+    ):
+        raise OSError("managed execute_code HOME is not trusted")
+
+    private_var_tmp = home / "var-tmp"
+    child_info = os.lstat(private_var_tmp)
+    if (
+        not stat.S_ISDIR(child_info.st_mode)
+        or child_info.st_uid != uid
+        or child_info.st_gid != uid
+        or child_info.st_mode & 0o077
+    ):
+        raise OSError("managed execute_code private tmp is not trusted")
+    return home, private_var_tmp
+
+
+def _managed_terminal_home_paths(
+    env: Mapping[str, str] | None,
+) -> tuple[Path, Path, Path]:
+    """Create the profile HOME and private tmp mount sources."""
+
+    uid, gid = _managed_terminal_identity(env)
+    parent = _MANAGED_TERMINAL_HOME_ROOT.parent
+    parent_info = os.lstat(parent)
+    if (
+        not stat.S_ISDIR(parent_info.st_mode)
+        or parent_info.st_uid != 0
+        or parent_info.st_mode & 0o022
+    ):
+        raise OSError("managed terminal runtime directory is not trusted")
+
+    try:
+        os.mkdir(_MANAGED_TERMINAL_HOME_ROOT, 0o711)
+    except FileExistsError:
+        pass
+    root_info = os.lstat(_MANAGED_TERMINAL_HOME_ROOT)
+    if (
+        not stat.S_ISDIR(root_info.st_mode)
+        or root_info.st_uid != 0
+        or root_info.st_gid != 0
+        or root_info.st_mode & 0o022
+    ):
+        raise OSError("managed terminal home root is not trusted")
+    os.chmod(_MANAGED_TERMINAL_HOME_ROOT, 0o711)
+
+    home = _MANAGED_TERMINAL_HOME_ROOT / str(uid)
+    created = False
+    try:
+        os.mkdir(home, 0o700)
+        created = True
+    except FileExistsError:
+        pass
+    if created:
+        os.chown(home, uid, gid)
+        os.chmod(home, 0o700)
+    home_info = os.lstat(home)
+    if (
+        not stat.S_ISDIR(home_info.st_mode)
+        or home_info.st_uid != uid
+        or home_info.st_gid != gid
+        or home_info.st_mode & 0o077
+    ):
+        raise OSError("managed terminal profile home is not trusted")
+
+    private_paths = []
+    for child_name in ("tmp", "var-tmp"):
+        child = home / child_name
+        created = False
+        try:
+            os.mkdir(child, 0o700)
+            created = True
+        except FileExistsError:
+            pass
+        if created:
+            os.chown(child, uid, gid)
+        child_info = os.lstat(child)
+        if (
+            not stat.S_ISDIR(child_info.st_mode)
+            or child_info.st_uid != uid
+            or child_info.st_gid != gid
+        ):
+            raise OSError("managed terminal private tmp is not trusted")
+        os.chmod(child, 0o700, follow_symlinks=False)
+        child_info = os.lstat(child)
+        if child_info.st_mode & 0o077:
+            raise OSError("managed terminal private tmp is not owner-only")
+        private_paths.append(child)
+
+    return home, private_paths[0], private_paths[1]
+
+
+def _prepare_managed_terminal_home(env: dict[str, str]) -> str:
+    """Set a profile-scoped HOME and namespace-local tmp environment."""
+
+    home, _private_tmp, _private_var_tmp = _managed_terminal_home_paths(env)
+    home_text = str(home)
+    env["HOME"] = home_text
+    env["TMPDIR"] = "/tmp"
+    env["TMP"] = "/tmp"
+    env["TEMP"] = "/tmp"
+    return home_text
+
+
+def _managed_uid_processes(
+    uid: int,
+    proc_root: Path = Path("/proc"),
+) -> set[int]:
+    """Return Linux processes whose effective UID is the managed identity."""
+    if _IS_WINDOWS or not proc_root.is_dir():
+        return set()
+    processes: set[int] = set()
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            status = (entry / "status").read_text(
+                encoding="utf-8", errors="replace"
+            )
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        effective_uid: int | None = None
+        is_zombie = False
+        for line in status.splitlines():
+            if line.startswith("State:"):
+                state_fields = line.split()
+                is_zombie = len(state_fields) >= 2 and state_fields[1] == "Z"
+            elif line.startswith("Uid:"):
+                uid_fields = line.split()
+                if len(uid_fields) >= 3:
+                    effective_uid = int(uid_fields[2])
+        # Zombies have no address space, open descriptors, or executable
+        # thread left to cross a profile boundary. Their parent may reap them
+        # after this bounded cleanup, so treating them as killable would make
+        # every SIGKILL path time out forever.
+        if effective_uid == uid and not is_zombie:
+            processes.add(int(entry.name))
+    return processes
+
+
+def _terminate_managed_uid(uid: int, timeout: float = 2.0) -> int:
+    """Terminate every process in a managed identity and verify it is empty."""
+    killed: set[int] = set()
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        live = _managed_uid_processes(uid)
+        if not live:
+            return len(killed)
+        for pid in live:
+            try:
+                os.kill(pid, sig)
+                killed.add(pid)
+            except ProcessLookupError:
+                pass
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not _managed_uid_processes(uid):
+                return len(killed)
+            time.sleep(0.05)
+    live = _managed_uid_processes(uid)
+    if live:
+        raise OSError(
+            "managed terminal processes survived identity retirement: "
+            + ",".join(str(pid) for pid in sorted(live))
+        )
+    return len(killed)
+
+
+def retire_managed_execute_code_identity(
+    uid: int,
+    env: Mapping[str, str],
+    execution_scope: str,
+) -> int:
+    """Empty one invocation UID before making it available for reuse.
+
+    A model script can detach descendants from the process group that owns the
+    top-level ``execute_code`` child.  The per-invocation UID is the durable
+    containment boundary, so it must be verified empty before its reservation
+    is released.  If termination fails, the reservation deliberately remains
+    live and the caller fails closed.
+    """
+
+    with _MANAGED_EXECUTE_CODE_CGROUP_LOCK:
+        cgroup = _MANAGED_EXECUTE_CODE_CGROUP_BY_UID.get(uid)
+    if cgroup is not None:
+        from tools.trusted_direct_runner import _kill_and_remove_managed_cgroup
+
+        _kill_and_remove_managed_cgroup(cgroup, None)
+        with _MANAGED_EXECUTE_CODE_CGROUP_LOCK:
+            if _MANAGED_EXECUTE_CODE_CGROUP_BY_UID.get(uid) is cgroup:
+                _MANAGED_EXECUTE_CODE_CGROUP_BY_UID.pop(uid, None)
+
+    killed = _terminate_managed_uid(uid)
+    _release_managed_execute_code_identity(uid, env, execution_scope)
+    return killed
+
+
+def retire_managed_terminal_profile(profile_home: str) -> dict[str, object]:
+    """Destroy a profile UID domain before that profile can be recreated."""
+    if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
+        return {
+            "killed_uid_processes": 0,
+            "terminal_home_removed": False,
+            "terminal_cgroup_removed": False,
+            "identity_retired": False,
+        }
+    scope = _managed_terminal_profile_scope({"HERMES_HOME": profile_home})
+    with _MANAGED_TERMINAL_IDENTITY_LOCK:
+        matches = [
+            uid
+            for uid, owner in _MANAGED_TERMINAL_SCOPE_BY_UID.items()
+            if owner == scope
+        ]
+        if not matches:
+            return {
+                "killed_uid_processes": 0,
+                "terminal_home_removed": False,
+                "terminal_cgroup_removed": False,
+                "identity_retired": scope in _MANAGED_TERMINAL_RETIRED_SCOPES,
+            }
+        if len(matches) != 1:
+            raise OSError("managed terminal profile has ambiguous identities")
+        uid = matches[0]
+        if (
+            uid not in _MANAGED_TERMINAL_RETIRED_UIDS
+            and len(_MANAGED_TERMINAL_RETIRED_UIDS)
+            >= _MANAGED_TERMINAL_RETIRED_MAX
+        ):
+            raise OSError("managed terminal retired identity cache is full")
+
+        killed = _terminate_managed_uid(uid)
+        cgroup_removed = _remove_managed_terminal_cgroup(uid)
+        home = _MANAGED_TERMINAL_HOME_ROOT / str(uid)
+        removed = False
+        try:
+            info = os.lstat(home)
+        except FileNotFoundError:
+            pass
+        else:
+            if (
+                not stat.S_ISDIR(info.st_mode)
+                or info.st_uid != uid
+                or info.st_gid != uid
+                or info.st_mode & 0o077
+            ):
+                raise OSError("managed terminal profile home is not trusted")
+            shutil.rmtree(home)
+            removed = True
+        if _managed_uid_processes(uid):
+            raise OSError("managed terminal identity is still active")
+        _MANAGED_TERMINAL_SCOPE_BY_UID.pop(uid, None)
+        _MANAGED_TERMINAL_RETIRED_UIDS.add(uid)
+        _MANAGED_TERMINAL_RETIRED_SCOPES.add(scope)
+        return {
+            "killed_uid_processes": killed,
+            "terminal_home_removed": removed,
+            "terminal_cgroup_removed": cgroup_removed,
+            "identity_retired": True,
+        }
+
+
+def _managed_identity_can_traverse(
+    directory: str,
+    *,
+    uid: int,
+    gid: int,
+) -> bool:
+    """Check directory traversal using the runner's cleared-group identity."""
+
+    try:
+        resolved = Path(directory).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    components = [resolved, *resolved.parents]
+    for component in reversed(components):
+        try:
+            info = component.stat()
+        except OSError:
+            return False
+        if not stat.S_ISDIR(info.st_mode):
+            return False
+        if info.st_uid == uid:
+            permission = (info.st_mode >> 6) & 0o7
+        elif info.st_gid == gid:
+            permission = (info.st_mode >> 3) & 0o7
+        else:
+            permission = info.st_mode & 0o7
+        if permission & 0o1 == 0:
+            return False
+    return True
+
+
+def _managed_terminal_cwd(
+    cwd: str,
+    *,
+    env: dict[str, str],
+) -> str:
+    """Return an accessible cwd and set the matching per-profile HOME."""
+
+    if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
+        return cwd
+    home = _prepare_managed_terminal_home(env)
+    uid, gid = _managed_terminal_identity(env)
+    if cwd and _managed_identity_can_traverse(cwd, uid=uid, gid=gid):
+        return cwd
+    return home
 
 
 def _msys_to_windows_path(cwd: str) -> str:
@@ -453,7 +1360,176 @@ def _inject_session_context_env(env: dict) -> None:
             env.pop(var_name, None)
 
 
-def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
+def _with_zettlab_turn_id(command: str) -> str:
+    """Prefix a terminal command with this request's correlation token."""
+    try:
+        from gateway.session_context import zettlab_turn_id
+
+        turn_id = zettlab_turn_id()
+    except Exception:
+        turn_id = ""
+    if not turn_id:
+        return command
+    return f"export ZETTLAB_TURN_ID={shlex.quote(turn_id)}\n{command}"
+
+
+CONNECTOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
+    # Connector skill runtime routing. These are generated per Zettlab agent
+    # profile by local-server and live in <profile>/.env under the multiplex
+    # gateway, so subprocesses must receive the current profile's scope instead
+    # of whatever os.environ/shell snapshot happened to contain.
+    "ZETTLAB_CONNECTORS_URL",
+    "ZETTLAB_CONNECTORS_AUTH_TOKEN",
+    "ZET_AGENT_ID",
+})
+
+AGENT_CREATOR_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
+    "ZETTLAB_AGENT_ACTION_TOKEN",
+})
+VIDEO_EDIT_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
+    # Turn-scoped side-effect capability. Generic subprocesses must not
+    # inherit either a live ContextVar or a stale process-global fallback.
+    "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+})
+MANAGED_SERVICE_SECRET_ENV_KEYS: frozenset[str] = frozenset({
+    "ZET_AGENT_KEY",
+})
+_AGENT_CREATOR_ACTION_TOKEN_MAX_BYTES = 4 * 1024
+_AGENT_CREATOR_TURN_ID_MAX_BYTES = 256
+
+PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset(
+    CONNECTOR_RUNTIME_ENV_KEYS
+    | AGENT_CREATOR_RUNTIME_ENV_KEYS
+    | VIDEO_EDIT_RUNTIME_ENV_KEYS
+    | MANAGED_SERVICE_SECRET_ENV_KEYS
+)
+
+
+def _apply_profile_secret_scope_env(env: dict, *, inject: bool) -> None:
+    """Scrub dedicated-runner credentials from generic subprocess env.
+
+    The multiplex gateway intentionally avoids merging every profile's .env into
+    process-global os.environ. Generic terminal/background/helper subprocesses
+    are not a trusted runner, so they must never inherit connector or Agent
+    action bearer material from globals, extra env, or a shell snapshot. Skills
+    that need these values receive them through a dedicated allowlisted path.
+    """
+    for key in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
+        env.pop(key, None)
+
+
+def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
+    """Build env for the dedicated connector_runtime.py runner.
+
+    This is intentionally separate from the generic terminal env. Connector
+    runtime bearer may be supplied to the allowlisted runner subprocess, but it
+    must not be inherited by arbitrary model-authored shell commands.
+    """
+    env = _sanitize_subprocess_env(os.environ, base_env)
+
+    scope = None
+    multiplex_active = False
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+        multiplex_active = is_multiplex_active()
+        scope = current_secret_scope()
+    except Exception:
+        scope = None
+
+    for key in CONNECTOR_RUNTIME_ENV_KEYS:
+        value = None
+        if scope is not None:
+            value = scope.get(key)
+        elif not multiplex_active:
+            value = os.environ.get(key)
+        if value is not None:
+            env[key] = str(value)
+        else:
+            env.pop(key, None)
+    try:
+        from gateway.session_context import zettlab_connector_route_capability
+
+        route_capability = zettlab_connector_route_capability()
+    except Exception:
+        route_capability = ""
+    if route_capability:
+        # Reuse the legacy runner header transport without exposing the real
+        # session key as selection authority. Generic terminal subprocesses
+        # never receive this private ContextVar.
+        env["HERMES_SESSION_KEY"] = route_capability
+    return env
+
+
+def build_agent_creator_runtime_env() -> dict[str, str]:
+    """Build the minimal env for the trusted agent-creator preset runner.
+
+    The action token is never read from process env or a profile ``.env``.
+    After command validation and mutation approval, the trusted gateway process
+    obtains a short-lived AgentComputer-only token from local-server's Unix
+    broker. The direct runner then gives it to the CLI over a one-shot FD.
+    """
+
+    from agent.credential_broker import request_agentcomputer_token
+    from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+    scope = current_secret_scope()
+    if scope is None and is_multiplex_active():
+        raise RuntimeError("agent creator secret scope unavailable")
+    agent_id = str(
+        (scope or {}).get("ZET_AGENT_ID")
+        or ("" if is_multiplex_active() else os.environ.get("ZET_AGENT_ID", ""))
+    ).strip()
+    if not agent_id:
+        raise RuntimeError("agent creator profile identity unavailable")
+    token = request_agentcomputer_token(agent_id)
+    if (
+        "\x00" in token
+        or len(token.encode("utf-8")) > _AGENT_CREATOR_ACTION_TOKEN_MAX_BYTES
+    ):
+        raise RuntimeError("agent creator action token invalid")
+
+    env = {"ZETTLAB_AGENT_ACTION_TOKEN": token}
+    try:
+        from gateway.session_context import zettlab_turn_id
+
+        turn_id = zettlab_turn_id()
+    except Exception:
+        turn_id = ""
+    if turn_id:
+        turn_id = str(turn_id)
+        if (
+            "\x00" in turn_id
+            or len(turn_id.encode("utf-8")) > _AGENT_CREATOR_TURN_ID_MAX_BYTES
+        ):
+            raise RuntimeError("agent creator turn id invalid")
+        env["ZETTLAB_TURN_ID"] = turn_id
+    return env
+
+
+def build_video_edit_runtime_env(base_env: dict | None = None) -> dict[str, str]:
+    """Build the minimal env for the trusted video-edit script runner."""
+    env = _sanitize_subprocess_env(os.environ, base_env)
+    for key in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
+        env.pop(key, None)
+    _inject_session_context_env(env)
+
+    try:
+        from agent.zet_agent_response_mode import trusted_video_edit_runtime_receipt
+
+        frozen_receipt = trusted_video_edit_runtime_receipt()
+    except Exception:
+        frozen_receipt = {}
+    if not frozen_receipt:
+        raise PermissionError("trusted video-edit execution receipt unavailable")
+    env.update(frozen_receipt)
+    return env
+
+
+def _sanitize_subprocess_env(
+    base_env: Mapping[str, str] | None,
+    extra_env: Mapping[str, str] | None = None,
+) -> dict[str, str]:
     """Filter Hermes-managed secrets from a subprocess environment."""
     try:
         from tools.env_passthrough import (
@@ -502,8 +1578,14 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     # Same cross-session leak guard as _make_run_env, for the background/PTY
     # spawn path (process_registry.spawn_local builds env via this function).
     _inject_session_context_env(sanitized)
+    _apply_profile_secret_scope_env(sanitized, inject=False)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
+        sanitized.pop(_marker, None)
+    # These values authorize only the root gateway's ExecStart bootstrap.
+    # Model-controlled terminal/background/PTY children are already placed in
+    # their profile UID+cgroup boundary and must never re-enter that bootstrap.
+    for _marker in _MANAGED_BOOTSTRAP_ENV_KEYS:
         sanitized.pop(_marker, None)
 
     _apply_windows_msys_bash_env_defaults(sanitized)
@@ -549,6 +1631,7 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
     "SLACK_BOT_TOKEN",
     "SLACK_APP_TOKEN",
     "SLACK_SIGNING_SECRET",
+    "ZET_AGENT_KEY",
     "GATEWAY_ALLOWED_USERS",
     "GATEWAY_ALLOW_ALL_USERS",
     # Gateway relay auth — the ID/secret/delivery-key triplet the gateway
@@ -646,6 +1729,7 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # session's identity. Strip _UNSET session vars when engaged so that can't
     # happen; single uniform policy across every spawn surface.
     _inject_session_context_env(env)
+    _apply_profile_secret_scope_env(env, inject=False)
 
     # Non-terminal subprocess helpers (browser, lazy-deps, TUI/ACP hosts, etc.)
     # also need the delegate_task child lineage marker.  Otherwise a child
@@ -1317,6 +2401,10 @@ def _make_run_env(env: dict) -> dict:
     # cross-session leak guard — strips _UNSET vars when a concurrent host is
     # engaged so a sibling session's os.environ mirror can't leak in).
     _inject_session_context_env(run_env)
+    # The generic terminal path is model-controlled shell. Connector bearer
+    # must only flow through a dedicated allowlisted connector runner, not via
+    # Popen env or the shared shell snapshot.
+    _apply_profile_secret_scope_env(run_env, inject=False)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)
@@ -1426,6 +2514,32 @@ class LocalEnvironment(BaseEnvironment):
         super().__init__(cwd=cwd, timeout=timeout, env=env)
         self.init_session()
 
+    def _snapshot_ephemeral_env_keys(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                PROFILE_SCOPED_SUBPROCESS_ENV_KEYS
+                | {"ZETTLAB_TURN_ID"}
+                | set(super()._snapshot_ephemeral_env_keys())
+            )
+        )
+
+    def _snapshot_ephemeral_env_exports(self) -> list[str]:
+        """Restore live task-local context after sourcing the shell snapshot.
+
+        A LocalEnvironment persists exported variables between terminal calls.
+        Session and turn identity must not persist that way: a later request
+        can reuse the environment while carrying a different ContextVar set.
+        """
+        return super()._snapshot_ephemeral_env_exports()
+
+    def _wrap_command(self, command: str, cwd: str) -> str:
+        run_env = _make_run_env(self.env)
+        effective_cwd = _managed_terminal_cwd(cwd, env=run_env)
+        return super()._wrap_command(
+            _with_zettlab_turn_id(command),
+            effective_cwd,
+        )
+
     def get_temp_dir(self) -> str:
         """Return a shell-safe writable temp dir for local execution.
 
@@ -1497,8 +2611,10 @@ class LocalEnvironment(BaseEnvironment):
             init_files = _resolve_shell_init_files()
             if init_files:
                 cmd_string = _prepend_shell_init(cmd_string, init_files)
-        args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
         run_env = _make_run_env(self.env)
+        managed_cwd = _managed_terminal_cwd(self.cwd, env=run_env)
+        args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
+        args = _managed_terminal_argv(args, env=run_env)
 
         # Recover when the cwd has been deleted out from under us — usually by
         # a previous tool call that ran ``rm -rf`` on its own working dir
@@ -1510,22 +2626,27 @@ class LocalEnvironment(BaseEnvironment):
         # POSIX paths (``/c/Users/...``) to native form so a perfectly valid
         # ``pwd -P`` result from bash isn't mistakenly treated as "missing"
         # and spammed as a warning on every command.
-        safe_cwd = _resolve_safe_cwd(self.cwd)
-        if safe_cwd != self.cwd:
+        safe_cwd = _resolve_safe_cwd(managed_cwd)
+        if safe_cwd != managed_cwd:
             # MSYS → Windows translation alone shouldn't surface as a warning
             # (it's a benign normalization, not a recovery). Only warn when
             # the directory really doesn't exist on disk.
-            normalized = _msys_to_windows_path(self.cwd) if _IS_WINDOWS else self.cwd
+            normalized = (
+                _msys_to_windows_path(managed_cwd)
+                if _IS_WINDOWS
+                else managed_cwd
+            )
             if safe_cwd != normalized:
                 logger.warning(
                     "LocalEnvironment cwd %r is missing on disk; "
                     "falling back to %r so terminal commands keep working.",
-                    self.cwd,
+                    managed_cwd,
                     safe_cwd,
                 )
-            self.cwd = safe_cwd
+            if managed_cwd == self.cwd:
+                self.cwd = safe_cwd
 
-        _popen_cwd = self.cwd
+        _popen_cwd = safe_cwd
 
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 

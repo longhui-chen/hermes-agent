@@ -184,3 +184,50 @@ def _install_retry_stubs(monkeypatch, *, connected: bool, calls: dict):
 
 
 
+    monkeypatch.setitem(
+        sys.modules,
+        "model_tools",
+        types.SimpleNamespace(get_tool_definitions=lambda *_a, **_k: ["ok"]),
+    )
+
+    start = time.monotonic()
+    result = cli_mod.get_tool_definitions(enabled_toolsets=["web"], quiet_mode=True)
+    elapsed = time.monotonic() - start
+
+    assert result == ["ok"]
+    assert elapsed >= 0.04
+    assert not thread.is_alive()
+
+
+@pytest.mark.parametrize(
+    ("single_query_mode", "supports_followup_turns"),
+    [(False, True), (True, False)],
+)
+def test_init_agent_waits_for_mcp_discovery_before_agent_build(
+    monkeypatch, single_query_mode, supports_followup_turns
+):
+    waited = {"done": False}
+
+    cli = cli_mod.HermesCLI(compact=True)
+    cli._session_db = object()
+    cli._resumed = False
+    cli.conversation_history = []
+    cli._install_tool_callbacks = lambda: None
+    cli._ensure_tirith_security = lambda: None
+    cli._ensure_runtime_credentials = lambda: True
+    cli._single_query_mode = single_query_mode
+
+    monkeypatch.setattr(
+        mcp_startup,
+        "ensure_mcp_discovery_before_agent_build",
+        lambda **_kwargs: waited.__setitem__("done", True),
+    )
+
+    def _fake_agent(*_a, **_k):
+        assert waited["done"] is True
+        return types.SimpleNamespace()
+
+    monkeypatch.setattr(cli_mod, "AIAgent", _fake_agent)
+
+    assert cli._init_agent() is True
+    assert cli.agent._supports_followup_turns is supports_followup_turns

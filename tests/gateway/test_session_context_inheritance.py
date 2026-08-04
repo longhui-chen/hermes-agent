@@ -32,12 +32,18 @@ import pytest
 
 import gateway.session_context as sc
 from gateway.session_context import (
+    _BUSINESS_EXECUTION_TOKEN,
     _SESSION_ASYNC_DELIVERY,
+    _TURN_BINDING,
     _UNSET,
     _VAR_MAP,
     async_delivery_supported,
+    business_execution_token,
+    clear_turn_vars,
+    current_turn_identity,
     reset_session_vars,
     set_session_vars,
+    set_turn_vars,
 )
 from tools.environments.local import _make_run_env
 
@@ -71,10 +77,14 @@ def _isolate_session_context():
     saved_env = {k: os.environ.get(k) for k in SESSION_VARS}
     saved_ctx = {name: var.get() for name, var in _VAR_MAP.items()}
     saved_async = _SESSION_ASYNC_DELIVERY.get()
+    saved_turn_binding = _TURN_BINDING.get()
+    saved_business_token = _BUSINESS_EXECUTION_TOKEN.get()
     saved_engaged = sc._session_context_engaged
     for var in _VAR_MAP.values():
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _TURN_BINDING.set(_UNSET)
+    _BUSINESS_EXECUTION_TOKEN.set(_UNSET)
     sc._session_context_engaged = True  # a concurrent multi-session host is engaged
     try:
         yield
@@ -82,6 +92,8 @@ def _isolate_session_context():
         for var, val in zip(_VAR_MAP.values(), saved_ctx.values()):
             var.set(val)
         _SESSION_ASYNC_DELIVERY.set(saved_async)
+        _TURN_BINDING.set(saved_turn_binding)
+        _BUSINESS_EXECUTION_TOKEN.set(saved_business_token)
         sc._session_context_engaged = saved_engaged
         for k, v in saved_env.items():
             if v is None:
@@ -146,6 +158,72 @@ def test_reset_session_vars_closes_inheritance_leak():
     # B's own session still binds correctly after the reset window.
     assert captured["bound"]["HERMES_SESSION_CHAT_ID"] == "FOREIGN_CHAT"
     assert captured["bound"]["HERMES_SESSION_KEY"] == FOREIGN["session_key"]
+
+
+def test_reset_session_vars_restores_unset_not_empty():
+    """reset_session_vars sets _UNSET (not "" like clear_session_vars).
+
+    The distinction matters: "" is 'explicitly cleared' (suppresses os.environ
+    fallback, used when a handler finishes); _UNSET is 'never bound here' (lets
+    the bridge strip and a CLI fallback resolve). Entry-reset must use _UNSET.
+    """
+    set_session_vars(**MINE)
+    reset_session_vars()
+    for name, var in _VAR_MAP.items():
+        assert var.get() is _UNSET, f"{name} is {var.get()!r}, expected _UNSET"
+
+
+def test_turn_binding_set_clear_is_exact_for_nested_requests():
+    assert current_turn_identity() is None
+    outer_tokens = set_turn_vars(turn_id="same-external-turn")
+    outer_identity = current_turn_identity()
+    assert outer_identity is not None
+
+    inner_tokens = set_turn_vars(turn_id="same-external-turn")
+    inner_identity = current_turn_identity()
+    assert inner_identity is not None
+    assert inner_identity != outer_identity
+
+    clear_turn_vars(inner_tokens)
+    assert current_turn_identity() == outer_identity
+    clear_turn_vars(outer_tokens)
+    assert current_turn_identity() is None
+
+
+def test_reset_session_vars_drops_inherited_turn_binding():
+    set_turn_vars(turn_id="foreign-turn")
+    assert current_turn_identity() is not None
+
+    reset_session_vars()
+
+    assert current_turn_identity() is None
+    assert _TURN_BINDING.get() is _UNSET
+
+
+def test_reset_session_vars_resets_business_execution_token_to_unset():
+    _BUSINESS_EXECUTION_TOKEN.set("foreign-business-token")
+
+    reset_session_vars()
+
+    assert business_execution_token() == ""
+    assert _BUSINESS_EXECUTION_TOKEN.get() is _UNSET
+
+
+def test_reset_session_vars_drops_inherited_business_execution_token_flow():
+    _BUSINESS_EXECUTION_TOKEN.set("foreign-business-token")
+    captured = {}
+
+    async def child_turn():
+        reset_session_vars()
+        captured["token"] = business_execution_token()
+        captured["raw"] = _BUSINESS_EXECUTION_TOKEN.get()
+
+    async def run_child():
+        await asyncio.create_task(child_turn())
+
+    asyncio.run(run_child())
+
+    assert captured == {"token": "", "raw": _UNSET}
 
 
 # ---------------------------------------------------------------------------

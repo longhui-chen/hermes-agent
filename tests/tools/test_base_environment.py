@@ -74,6 +74,32 @@ class TestWrapCommand:
 
         assert "source" not in wrapped
 
+    def test_unengaged_context_preserves_process_env_fallback(self, monkeypatch):
+        import gateway.session_context as sc
+
+        monkeypatch.setattr(sc, "_session_context_engaged", False)
+        env = _TestableEnv()
+        env._snapshot_ready = True
+
+        wrapped = env._wrap_command("echo hello", "/tmp")
+
+        assert "unset HERMES_SESSION_KEY" not in wrapped
+
+    def test_engaged_context_is_exported_by_shared_backend_bridge(self, monkeypatch):
+        import gateway.session_context as sc
+
+        monkeypatch.setattr(sc, "_session_context_engaged", True)
+        token = sc._PLAN_ACK_STATUS.set("confirmed")
+        try:
+            env = _TestableEnv()
+            env._snapshot_ready = True
+            wrapped = env._wrap_command("echo hello", "/tmp")
+        finally:
+            sc._PLAN_ACK_STATUS.reset(token)
+
+        assert "unset HERMES_PLAN_ACK_STATUS" in wrapped
+        assert "export HERMES_PLAN_ACK_STATUS=confirmed" in wrapped
+
     def test_single_quote_escaping(self):
         env = _TestableEnv()
         env._snapshot_ready = True

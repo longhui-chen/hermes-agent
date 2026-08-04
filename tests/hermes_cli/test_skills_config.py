@@ -110,8 +110,8 @@ class TestGetDisabledSkillNames:
         result = get_disabled_skill_names()
         assert result == {"discord-skill", "global-skill"}
 
-    def test_hermes_platform_takes_precedence(self, tmp_path, monkeypatch):
-        """HERMES_PLATFORM should win over HERMES_SESSION_PLATFORM."""
+    def test_session_platform_takes_precedence(self, tmp_path, monkeypatch):
+        """HERMES_SESSION_PLATFORM should win over HERMES_PLATFORM."""
         config = tmp_path / "config.yaml"
         config.write_text(
             "skills:\n"
@@ -127,7 +127,7 @@ class TestGetDisabledSkillNames:
 
         from agent.skill_utils import get_disabled_skill_names
         result = get_disabled_skill_names()
-        assert result == {"tg-skill"}
+        assert result == {"discord-skill"}
 
 
 # ---------------------------------------------------------------------------

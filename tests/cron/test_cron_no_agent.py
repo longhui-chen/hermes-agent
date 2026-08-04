@@ -106,6 +106,91 @@ def test_run_job_no_agent_success_returns_script_stdout(hermes_env):
 
 
 # ---------------------------------------------------------------------------
+# scheduler.run_job: calendar reminder (notify-only) short-circuit
+# ---------------------------------------------------------------------------
+# Calendar reminders are written straight into jobs.json by
+# zettlab-local-server (source="calendar", a one-shot "once" schedule whose
+# `content` is the reminder text). They are NOT created via create_job, so
+# these tests build the job dict directly — exactly the shape the device
+# writes.
+
+
+def _calendar_job(content="开会：项目评审 16:00", **extra):
+    job = {
+        "id": "cal_job_1",
+        "name": "团队例会",
+        "source": "calendar",
+        "calendar_provider": "google_calendar",
+        "calendar_connection_id": "conn-1",
+        "calendar_series_id": "standup_series",
+        "calendar_original_start": "2026-06-26T07:00:00Z",
+        "content": content,
+        "no_agent": True,
+        "schedule": {"kind": "once", "run_at": "2026-06-26T07:00:00Z"},
+        "deliver": "local",
+    }
+    job.update(extra)
+    return job
+
+
+def test_run_job_legacy_calendar_content_is_suppressed(hermes_env):
+    """Legacy/broad calendar jobs cannot bypass the exact planner contract."""
+    from cron.scheduler import run_job, SILENT_MARKER
+
+    job = _calendar_job(content="开会：项目评审 16:00")
+    success, doc, final_response, error = run_job(job)
+    assert success is True
+    assert error is None
+    assert final_response == SILENT_MARKER
+    assert "开会：项目评审 16:00" not in doc
+
+
+def test_run_job_calendar_no_script_required(hermes_env):
+    """A calendar job carries no script; it must NOT trip the no_agent
+    'requires a script' guard — the calendar branch precedes it."""
+    from cron.scheduler import run_job
+
+    job = _calendar_job()
+    assert "script" not in job
+    success, doc, final_response, error = run_job(job)
+    assert success is True
+    assert error is None  # NOT "no_agent=True but no script is set"
+
+
+def test_run_job_calendar_empty_content_is_silent(hermes_env):
+    """No content to deliver → SILENT_MARKER suppresses delivery."""
+    from cron.scheduler import run_job, SILENT_MARKER
+
+    job = _calendar_job(content="   ", name="")
+    success, doc, final_response, error = run_job(job)
+    assert success is True
+    assert error is None
+    assert final_response == SILENT_MARKER
+
+
+def test_run_job_calendar_never_invokes_aiagent(hermes_env):
+    """Calendar reminders must NOT import/construct the AIAgent (no LLM spend)."""
+    job = _calendar_job()
+    with patch("run_agent.AIAgent") as ai_mock:
+        from cron.scheduler import run_job
+
+        run_job(job)
+    ai_mock.assert_not_called()
+
+
+def test_run_job_calendar_near_miss_is_always_silent(hermes_env):
+    """A calendar marker near-miss is quarantined/silent, never generic execution."""
+    from cron.scheduler import run_job, SILENT_MARKER
+
+    job = _calendar_job(no_agent=False, schedule={"kind": "cron", "expr": "* * * * *"})
+    success, _doc, final_response, error = run_job(job)
+    assert success is True
+    assert final_response == SILENT_MARKER
+    assert error is None
+    assert "开会：项目评审 16:00" not in final_response
+
+
+# ---------------------------------------------------------------------------
 # _run_job_script: shell-script support
 # ---------------------------------------------------------------------------
 

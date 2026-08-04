@@ -14,6 +14,7 @@ profile's path is used.  They are the productionized form of the manual smoke
 probes used to confirm the bug class.
 """
 
+import json
 import threading
 from pathlib import Path
 
@@ -78,6 +79,63 @@ class TestSkillsHubPathResolution:
         assert b_audit == prof_b / "skills" / ".hub" / "audit.log"
         assert b_index == prof_b / "skills" / ".hub" / "index-cache"
 
+
+
+class TestSkillsToolPathResolution:
+    """tools/skills_tool.py must resolve local skills from the active profile."""
+
+    def test_find_and_view_use_active_profile_skills_dir_after_global_import(
+        self, tmp_path, monkeypatch
+    ):
+        process_home = tmp_path / "process-home"
+        profile_home = tmp_path / "profiles" / "general-assistant"
+        process_skills = process_home / "skills"
+        profile_skills = profile_home / "skills"
+        process_skills.mkdir(parents=True)
+        profile_skill = (
+            profile_skills
+            / "__skillhub__"
+            / "Zettlab Official"
+            / "kingdee-k3cloud"
+        )
+        profile_skill.mkdir(parents=True)
+        (process_skills / "process-only").mkdir()
+        (process_skills / "process-only" / "SKILL.md").write_text(
+            "---\nname: process-only\ndescription: process skill\n---\n",
+            encoding="utf-8",
+        )
+        (profile_skill / "SKILL.md").write_text(
+            "---\n"
+            "name: kingdee-k3cloud\n"
+            "description: profile SkillHub skill\n"
+            "---\n\n"
+            "# Kingdee\n\nProfile-local instructions.\n",
+            encoding="utf-8",
+        )
+
+        import tools.skills_tool as skills_tool
+
+        # Match the gateway bug shape: the module was imported while the
+        # process was pointed at the global Hermes home, then a request scopes
+        # HERMES_HOME to one profile with set_hermes_home_override().
+        monkeypatch.setattr(skills_tool, "_DEFAULT_SKILLS_DIR", process_skills)
+        monkeypatch.setattr(skills_tool, "SKILLS_DIR", process_skills)
+
+        def run():
+            listed = skills_tool._find_all_skills(skip_disabled=False)
+            names = {skill["name"] for skill in listed}
+            viewed = json.loads(
+                skills_tool.skill_view("kingdee-k3cloud", preprocess=False)
+            )
+            return names, viewed
+
+        names, viewed = _under_override(profile_home, run)
+
+        assert "kingdee-k3cloud" in names
+        assert "process-only" not in names
+        assert viewed["success"] is True
+        assert viewed["name"] == "kingdee-k3cloud"
+        assert "Profile-local instructions" in viewed["content"]
 
 
 class TestGatewayCacheDirResolution:

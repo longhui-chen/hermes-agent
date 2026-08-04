@@ -1085,32 +1085,35 @@ def _build_no_backend_setup_message() -> str:
 
 def check_image_generation_requirements() -> bool:
     """True if FAL or the explicitly configured image backend is available."""
+    configured = _read_configured_image_provider()
+    if configured and configured != "fal":
+        # An explicit plugin selection is authoritative. A leftover FAL key
+        # must not expose the tool when the selected backend is unavailable,
+        # because dispatch will not fall back to FAL either.
+        try:
+            from agent.image_gen_registry import get_provider
+            from hermes_cli.plugins import _ensure_plugins_discovered
+
+            _ensure_plugins_discovered()
+            provider = get_provider(configured)
+            return bool(provider and provider.is_available())
+        except Exception:
+            return False
+
     try:
         if check_fal_api_key():
             # Trigger the lazy fal_client import here as the SDK presence
             # check. Raises ImportError if the optional ``fal-client``
             # package isn't installed; the caller's except ImportError
-            # below catches that and continues to plugin probing.
+            # below treats the legacy FAL path as unavailable.
             _load_fal_client()
             return True
     except ImportError:
         pass
+    return False
 
-    configured = _read_configured_image_provider()
-    if not configured or configured == "fal":
-        return False
 
-    # Probe only the explicitly selected plugin. Merely possessing a cloud
-    # provider key must not opt a user into a paid image-generation backend.
-    try:
-        from agent.image_gen_registry import get_provider
-        from hermes_cli.plugins import _ensure_plugins_discovered
-
-        _ensure_plugins_discovered()
-        provider = get_provider(configured)
-        return bool(provider and provider.is_available())
-    except Exception:
-        return False
+check_image_generation_requirements._profile_scope_sensitive = True  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -1264,11 +1267,13 @@ def _dispatch_to_plugin_provider(
     aspect_ratio: str,
     image_url: Optional[str] = None,
     reference_image_urls: Optional[list] = None,
+    task_id: Optional[str] = None,
 ):
     """Route the call to a plugin-registered provider when one is selected.
 
-    Returns a JSON string on dispatch, or ``None`` to fall through to the
-    in-tree FAL fallback in ``image_generate_tool``.
+    Returns a JSON string whenever a non-FAL provider is selected. ``None`` is
+    reserved for an unset provider or explicit FAL selection so plugin failures
+    cannot silently route prompts or billing to a backend the user did not pick.
 
     Dispatch fires when ``image_gen.provider`` is explicitly set — including
     ``"fal"`` itself, which now resolves to the
@@ -1296,18 +1301,17 @@ def _dispatch_to_plugin_provider(
         _ensure_plugins_discovered()
         provider = get_provider(configured)
     except Exception as exc:
-        logger.debug("image_gen plugin dispatch skipped: %s", exc)
-        return None
-
-    if provider is None:
-        try:
-            # Long-lived sessions may have discovered plugins before a bundled
-            # backend was patched in or before config changed. Retry once with
-            # a forced refresh before surfacing a missing-provider error.
-            _ensure_plugins_discovered(force=True)
-            provider = get_provider(configured)
-        except Exception as exc:
-            logger.debug("image_gen plugin force-refresh skipped: %s", exc)
+        logger.warning(
+            "Image gen provider '%s' could not be initialized: %s",
+            configured,
+            exc,
+        )
+        return json.dumps({
+            "success": False,
+            "image": None,
+            "error": f"Provider '{configured}' could not be initialized: {exc}",
+            "error_type": "provider_exception",
+        })
 
     if provider is None:
         return json.dumps({
@@ -1323,6 +1327,8 @@ def _dispatch_to_plugin_provider(
 
     kwargs: Dict[str, Any] = {"prompt": prompt, "aspect_ratio": aspect_ratio}
     try:
+        if configured == "zettlab" and task_id:
+            kwargs["_task_id"] = task_id
         if configured_model:
             kwargs["model"] = configured_model
         if isinstance(image_url, str) and image_url.strip():
@@ -1514,6 +1520,7 @@ def _handle_image_generate(args, **kw):
         prompt, aspect_ratio,
         image_url=image_url,
         reference_image_urls=reference_image_urls,
+        task_id=task_id,
     )
     if dispatched is not None:
         return _postprocess_image_generate_result(dispatched, task_id=task_id)

@@ -478,6 +478,54 @@ def test_event_dict_includes_run_id(client):
 # Per-task force-loaded skills via REST
 # ---------------------------------------------------------------------------
 
+def test_create_task_with_skills_roundtrips(client):
+    """POST /tasks accepts `skills: [...]`, GET /tasks/:id returns it."""
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "translate docs",
+            "assignee": "linguist",
+            "skills": ["translation", "requesting-code-review"],
+        },
+    )
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    assert task["skills"] == ["translation", "requesting-code-review"]
+
+    # Fetch via GET /tasks/:id as the drawer does.
+    got = client.get(f"/api/plugins/kanban/tasks/{task['id']}").json()
+    assert got["task"]["skills"] == ["translation", "requesting-code-review"]
+
+
+def test_create_task_without_skills_defaults_to_empty_list(client):
+    """_task_dict serializes Task.skills=None as [] so the drawer can
+    always .length check without guarding against null."""
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "no skills", "assignee": "x"},
+    )
+    assert r.status_code == 200, r.text
+    task = r.json()["task"]
+    # Task.skills is None in-memory; _task_dict serializes via
+    # dataclasses.asdict which keeps it None. The drawer's
+    # `t.skills && t.skills.length > 0` guard handles both null and [].
+    assert task.get("skills") in (None, [])
+
+
+def test_create_task_with_toolset_name_in_skills_is_rejected(client):
+    """POST /tasks fails fast when callers confuse toolsets with skills."""
+    r = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "bad skills payload",
+            "assignee": "linguist",
+            "skills": ["web"],
+        },
+    )
+    assert r.status_code == 400, r.text
+    assert "toolset name" in r.json()["detail"]
+
+
 
 # ---------------------------------------------------------------------------
 # Dispatcher-presence warning in POST /tasks response

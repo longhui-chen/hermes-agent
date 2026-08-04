@@ -146,6 +146,14 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
             (echo "FAIL: HERMES_OPTIONAL_SKILLS not in wrapper"; exit 1)
           echo "PASS: $OPT_COUNT optional skills found, HERMES_OPTIONAL_SKILLS set in wrapper"
 
+          # The seed policy must ship co-located with skills/ (config/ alongside
+          # skills/), else a fresh Nix profile seeds the full un-curated set
+          # instead of the curated allowlist (_read_seed_policy resolves ../config
+          # relative to the bundled skills dir).
+          test -f ${hermes-agent}/share/hermes-agent/config/skill_seed_policy.json || \
+            (echo "FAIL: seed policy missing from bundle (config/skill_seed_policy.json)"; exit 1)
+          echo "PASS: seed policy present next to skills"
+
           echo "=== All bundled skills checks passed ==="
           mkdir -p $out
           echo "ok" > $out/result

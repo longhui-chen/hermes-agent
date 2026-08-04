@@ -31,7 +31,6 @@ import os
 from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
-    DEFAULT_AGENT_IDENTITY,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
@@ -47,6 +46,9 @@ from agent.prompt_builder import (
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     drain_truncation_warnings,
+    default_agent_identity,
+    zettlab_agent_kernel_guidance,
+    zettlab_turn_rules_guidance,
 )
 from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_hermes_home
@@ -190,17 +192,24 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
     # cwd project instructions disabled.
     _soul_loaded = False
+    _identity_text = ""
     if agent.load_soul_identity or not agent.skip_context_files:
         _soul_content = _r.load_soul_md(_ctx_len)
         if _soul_content:
-            stable_parts.append(_soul_content)
+            _identity_text = _soul_content
             _soul_loaded = True
 
     if not _soul_loaded:
-        # Fallback to hardcoded identity
-        stable_parts.append(DEFAULT_AGENT_IDENTITY)
+        # Fall back to the neutral runtime identity for the active language.
+        _identity_text = default_agent_identity()
 
-    # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
+    # Shared XML-ish Zettlab agent base prompt for every agent. It wraps the
+    # active profile SOUL.md (or neutral fallback), then defines runtime-level
+    # protocol, capability boundaries, behaviour, voice/style, SOUL inheritance
+    # contract, and product-facts placeholders.
+    stable_parts.append(zettlab_agent_kernel_guidance(identity_text=_identity_text))
+
+    # Pointer to the zettlab-memo-setup skill for user questions about the runtime itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 
     # Universal task-completion / no-fabrication guidance.  Applied to ALL
@@ -244,8 +253,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
 
-    # Steering only lands inside tool results, so it's only reachable when the
-    # agent has tools. Static text → byte-stable prompt (no cache hit).
+    # Steering only lands mid-turn at tool-batch boundaries, so it's only
+    # reachable when the agent has tools. Static text → byte-stable prompt
+    # (no cache hit).
     if agent.valid_tool_names:
         stable_parts.append(STEER_CHANNEL_NOTE)
 
@@ -520,7 +530,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         except Exception:
             pass
 
-    from hermes_time import now as _hermes_now
+    from hermes_time import now as _hermes_now, get_timezone_name as _hermes_tz_name
     now = _hermes_now()
     # Date-only (not minute-precision) so the system prompt is byte-stable
     # for the full day.  Minute-precision changes invalidate prefix-cache KV
@@ -528,7 +538,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # session resume without a stored prompt).  The model can still query the
     # exact wall-clock time via tools when it actually needs it.
     # Credit: @iamfoz (PR #20451).
-    timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y')}"
+    #
+    # Surface the active timezone (live device tz, ZET-1258) so the model can
+    # answer "what timezone am I in" and reason about wall-clock scheduling.
+    # IANA name when resolvable, always with the UTC offset. The label is
+    # byte-stable too (changes only when the device timezone changes), so it
+    # does not regress the date-only cache stability above.
+    _tz_off = now.strftime('%z')  # e.g. "+0800"; now is tz-aware so present
+    _tz_off = f"UTC{_tz_off[:3]}:{_tz_off[3:]}" if len(_tz_off) == 5 else "UTC"
+    _tz_name = _hermes_tz_name()
+    _tz_label = f"{_tz_name} ({_tz_off})" if _tz_name else _tz_off
+    timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y')} — timezone {_tz_label}"
     if agent.pass_session_id and agent.session_id:
         timestamp_line += f"\nSession ID: {agent.session_id}"
     if agent.model:
@@ -538,6 +558,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     if agent.platform:
         timestamp_line += f"\nPlatform: {agent.platform}"
     volatile_parts.append(timestamp_line)
+
+    # Keep the highest-value behavioral invariants at the very end of the
+    # system prompt. The full prompt can be long after skills, context files,
+    # memory, and runtime hints; a concise recency anchor prevents weaker
+    # models from treating early policy as distant background.
+    volatile_parts.append(zettlab_turn_rules_guidance())
 
     return {
         "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),

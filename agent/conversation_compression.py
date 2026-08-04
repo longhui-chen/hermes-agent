@@ -2293,6 +2293,7 @@ def compress_context(
         f"{approx_tokens:,}" if approx_tokens else "unknown", agent.model,
         focus_topic,
     )
+    _old_session_id = agent.session_id or ""
     _compaction_status = COMPACTION_STATUS
     if not force:
         _compaction_status = automatic_compaction_status_message(
@@ -2307,6 +2308,16 @@ def compress_context(
     _compaction_status_emitted = bool(_compaction_status)
     if _compaction_status:
         agent._emit_status(_compaction_status)
+    agent._emit_structured_status(
+        "context.compaction",
+        {
+            "state": "started",
+            "message": "上下文正在压缩",
+            "old_session_id": _old_session_id,
+            "before_messages": _pre_msg_count,
+            "before_tokens": approx_tokens,
+        },
+    )
     _compaction_done_emitted = False
 
     def _complete_compaction_lifecycle() -> None:
@@ -2904,6 +2915,15 @@ def compress_context(
             _existing_sp = agent._build_system_prompt(system_message)
         return messages, _existing_sp
     except BaseException as _compress_exc:
+        agent._emit_structured_status(
+            "context.compaction",
+            {
+                "state": "failed",
+                "message": "上下文压缩失败",
+                "old_session_id": _old_session_id,
+                "error": str(_compress_exc),
+            },
+        )
         # ANY exception after lock acquisition — memory hook, capability
         # inspection, engine lookup, or compress() — must release the lock so
         # the session isn't permanently blocked from future compression.
@@ -3509,6 +3529,19 @@ def compress_context(
             "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
             agent.session_id or "none", _pre_msg_count, len(compressed),
             f"{_compressed_est:,}",
+        )
+        agent._emit_structured_status(
+            "context.compaction",
+            {
+                "state": "succeeded",
+                "message": "上下文压缩成功",
+                "old_session_id": _old_session_id,
+                "new_session_id": agent.session_id or "",
+                "before_messages": _pre_msg_count,
+                "after_messages": len(compressed),
+                "before_tokens": approx_tokens,
+                "after_tokens": _compressed_est,
+            },
         )
         _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
         _emit_compression_attempt_telemetry(

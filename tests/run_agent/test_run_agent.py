@@ -26,7 +26,7 @@ import run_agent
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
 from agent.memory_manager import MemoryManager
-from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+from agent.prompt_builder import default_agent_identity
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +146,9 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
             for m in messages:
                 self.rows.append(m["content"])
             return list(range(1, len(messages) + 1))
+
+        def flush_token_counts(self):
+            return None
 
     db = _BarrierDB()
     agent._session_db = db
@@ -884,7 +887,7 @@ class TestHydrateTodoStore:
 class TestBuildSystemPrompt:
     def test_always_has_identity(self, agent):
         prompt = agent._build_system_prompt()
-        assert DEFAULT_AGENT_IDENTITY in prompt
+        assert default_agent_identity() in prompt
 
     def test_can_use_soul_identity_even_when_context_files_are_skipped(self):
         with (
@@ -904,7 +907,7 @@ class TestBuildSystemPrompt:
             prompt = agent._build_system_prompt()
 
         assert "SOUL IDENTITY" in prompt
-        assert DEFAULT_AGENT_IDENTITY not in prompt
+        assert default_agent_identity() not in prompt
 
 
     def test_memory_guidance_when_memory_tool_loaded(self, agent_with_memory_tool):
@@ -924,13 +927,14 @@ class TestBuildSystemPrompt:
         # Find the line and strip it for inspection
         for line in prompt.splitlines():
             if line.startswith("Conversation started:"):
+                date_part = line.split(" — timezone ", 1)[0]
                 # Must NOT contain AM/PM indicator (minute precision had %I:%M %p)
-                assert " AM" not in line and " PM" not in line, (
+                assert " AM" not in date_part and " PM" not in date_part, (
                     f"Timestamp line has time-of-day, breaks daily cache stability: {line!r}"
                 )
                 # Must NOT contain a colon followed by two digits (HH:MM pattern)
                 import re as _re
-                assert not _re.search(r":\d{2}", line), (
+                assert not _re.search(r"\b\d{1,2}:\d{2}\b", date_part), (
                     f"Timestamp line has HH:MM, breaks daily cache stability: {line!r}"
                 )
                 break
@@ -1511,7 +1515,10 @@ class TestExecuteToolCalls:
         tool_results = [m for m in messages if m["role"] == "tool"]
         assert [m["tool_call_id"] for m in tool_results] == ["c1", "c2"]
 
-    def test_sequential_memory_remove_notifies_provider_with_tool_result(self, agent):
+    def test_sequential_memory_remove_notifies_provider_with_tool_result(
+        self, agent_with_memory_tool
+    ):
+        agent = agent_with_memory_tool
         old_text = "stale preference entry"
         tc = _mock_tool_call(
             name="memory",
@@ -1895,6 +1902,8 @@ class TestConcurrentToolExecution:
                 session_id=agent.session_id,
                 turn_id="",
                 api_request_id="",
+                user_task="",
+                previous_assistant_message="",
                 enabled_tools=list(agent.valid_tool_names),
                 skip_pre_tool_call_hook=True,
                 skip_tool_request_middleware=True,
@@ -2192,6 +2201,13 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("memory", {"action": "view", "target": "memory"}),
         ("clarify", {"question": "Continue?"}),
         ("read_terminal", {}),
+        (
+            "present_plan",
+            {
+                "title": "Test plan",
+                "groups": [{"label": "Steps", "items": ["Inspect"]}],
+            },
+        ),
         ("delegate_task", {"goal": "Check the child path"}),
     )
 
@@ -3390,6 +3406,7 @@ class TestRunConversation:
         assert result["messages"][-1] == {
             "role": "assistant",
             "content": "Sure, here's how to do it: first",
+            "interrupted": True,
         }
 
     def test_redirect_during_thinking_retries_same_turn_with_context(self, agent):
@@ -3614,9 +3631,6 @@ class TestRunConversation:
         self._setup_agent(agent)
         agent.compression_enabled = True
 
-        # Build a conversation history long enough to clear the
-        # protect_first_n + protect_last_n + 1 guard so the preflight
-        # block actually executes.
         protect_first = agent.context_compressor.protect_first_n
         protect_last = agent.context_compressor.protect_last_n
         prefill = []
@@ -3624,16 +3638,11 @@ class TestRunConversation:
             prefill.append({"role": "user", "content": f"q{_i}"})
             prefill.append({"role": "assistant", "content": f"a{_i}"})
 
-        # Force the preflight estimator far below the threshold so the
-        # legacy ``>= threshold_tokens`` branch does NOT fire — only the
-        # new engine-driven elif branch should be exercised.
         agent.context_compressor.threshold_tokens = 10**9
 
         ok_resp = _mock_response(content="Done", finish_reason="stop")
         agent.client.chat.completions.create.return_value = ok_resp
 
-        # Engine-style hook: returns True so the elif branch should
-        # invoke _compress_context once for sub-threshold maintenance.
         with (
             patch.object(
                 agent.context_compressor,
@@ -3657,7 +3666,77 @@ class TestRunConversation:
         assert result["final_response"] == "Done"
         assert result["completed"] is True
 
+    def test_big_tool_result_triggers_compression_before_next_call(self, agent):
+        """In-loop compression must use the *current* request size, not
+        last_prompt_tokens from the previous API response.
 
+        Regression for the board28 1.6M-token MaxClaw scenario: a single
+        terminal/read_file/web_search dump can balloon the messages list
+        between API calls. If we only check last_prompt_tokens (which was
+        recorded BEFORE the tool result was appended), the next request
+        sails past the threshold and the model errors out / empties.
+        """
+        self._setup_agent(agent)
+        agent.compression_enabled = True
+
+        # Force `last_prompt_tokens` to look under-threshold so the OLD
+        # reactive path would explicitly skip compression.
+        agent.context_compressor.last_prompt_tokens = 1_000
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="All done", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+        # A sizeable tool result, but kept under the 100K-char inline
+        # truncation threshold (tools/budget_config.DEFAULT_RESULT_SIZE_CHARS)
+        # so it lands in the messages list at full size. ~80K chars ≈ 20K
+        # token estimate — comfortably above the 1_000 last_prompt_tokens
+        # we seeded, which is the value the old reactive path would have
+        # used.
+        huge_result = "x" * 80_000
+
+        captured_tokens: list[int] = []
+
+        def _spy_should_compress(prompt_tokens=None):
+            # Record what value the caller passed in; assert later.
+            captured_tokens.append(prompt_tokens or 0)
+            return True
+
+        with (
+            patch("run_agent.handle_function_call", return_value=huge_result),
+            patch.object(
+                agent.context_compressor,
+                "should_compress",
+                side_effect=_spy_should_compress,
+            ),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            mock_compress.return_value = (
+                [{"role": "user", "content": "run a command"}],
+                "compressed system prompt",
+            )
+            agent.run_conversation("run a command")
+
+        # _compress_context must have fired despite last_prompt_tokens=1_000.
+        mock_compress.assert_called_once()
+        # And the token figure passed to should_compress must reflect the
+        # appended large tool result — NOT just the 1_000 from
+        # last_prompt_tokens. 80K chars ≈ 20K tokens via the rough
+        # estimator (~4 chars/token).
+        assert captured_tokens, "should_compress was not called"
+        # The in-loop call (post-tool-execution) is the one we care about;
+        # take the max of the recorded values to be robust against any
+        # earlier preflight/auxiliary call sites also calling should_compress.
+        max_tokens = max(captured_tokens)
+        assert max_tokens > 10_000, (
+            f"largest should_compress arg was {max_tokens} tokens; "
+            "expected a current-messages estimate that includes the 80K-char "
+            "tool result (~20K tokens), not the stale last_prompt_tokens=1_000."
+        )
 
     def test_glm_prompt_exceeds_max_length_triggers_compression(self, agent):
         """GLM/Z.AI uses 'Prompt exceeds max length' for context overflow."""
@@ -4801,8 +4880,34 @@ class TestSystemPromptStability:
         # Should have built fresh, not queried the DB
         mock_db.get_session.assert_not_called()
         assert agent._cached_system_prompt is not None
-        assert "Hermes Agent" in agent._cached_system_prompt
+        assert default_agent_identity() in agent._cached_system_prompt
 
+    def test_fresh_build_when_db_has_no_prompt(self, agent):
+        """If the session DB has no stored prompt, build fresh even with history."""
+        mock_db = MagicMock()
+        mock_db.get_session.return_value = {"system_prompt": ""}
+        agent._session_db = mock_db
+
+        agent._cached_system_prompt = None
+        conversation_history = [{"role": "user", "content": "hi"}]
+
+        if agent._cached_system_prompt is None:
+            stored_prompt = None
+            if conversation_history and agent._session_db:
+                try:
+                    session_row = agent._session_db.get_session(agent.session_id)
+                    if session_row:
+                        stored_prompt = session_row.get("system_prompt") or None
+                except Exception:
+                    pass
+
+            if stored_prompt:
+                agent._cached_system_prompt = stored_prompt
+            else:
+                agent._cached_system_prompt = agent._build_system_prompt()
+
+        # Empty string is falsy, so should fall through to fresh build
+        assert default_agent_identity() in agent._cached_system_prompt
 
 class TestBudgetPressure:
     """Budget exhaustion grace call system."""
@@ -5923,4 +6028,3 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
-

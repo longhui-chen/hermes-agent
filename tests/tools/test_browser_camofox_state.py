@@ -33,6 +33,31 @@ class TestCamofoxIdentity:
             assert identity["user_id"].startswith("hermes_")
             assert identity["session_key"].startswith("task_")
 
+    def test_session_context_is_stable_and_not_exposed(self, tmp_path, monkeypatch):
+        state = _load_module()
+        sensitive_session = "agent:main:telegram:dm:user-13800138000"
+        monkeypatch.setenv("HERMES_SESSION_ID", sensitive_session)
+
+        with patch.object(state, "get_hermes_home", return_value=tmp_path):
+            first = state.get_camofox_identity("transient-tool-task")
+            second = state.get_camofox_identity("different-tool-task")
+
+        assert first == second
+        assert sensitive_session not in first["session_key"]
+        assert "13800138000" not in first["session_key"]
+
+    def test_stable_session_key_takes_precedence_over_rotating_session_id(self, tmp_path, monkeypatch):
+        state = _load_module()
+        monkeypatch.setenv("HERMES_SESSION_KEY", "stable-channel-session")
+        monkeypatch.setenv("HERMES_SESSION_ID", "conversation-before-compression")
+
+        with patch.object(state, "get_hermes_home", return_value=tmp_path):
+            before = state.get_camofox_identity("tool-task")
+            monkeypatch.setenv("HERMES_SESSION_ID", "conversation-after-compression")
+            after = state.get_camofox_identity("tool-task")
+
+        assert before == after
+
 
 class TestCamofoxConfigDefaults:
     def test_default_config_includes_camofox_controls(self):

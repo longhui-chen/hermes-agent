@@ -75,9 +75,7 @@ class TestParseFrontmatter:
 
 
     def test_utf8_bom_frontmatter(self):
-        """A leading UTF-8 BOM (Windows Notepad / PowerShell ``>`` save) must
-        not drop the frontmatter. Confirms the fix reaches the tools/ surface
-        via the _parse_frontmatter re-export."""
+        """A leading UTF-8 BOM must not drop the frontmatter."""
         bom = chr(0xFEFF)
         content = bom + "---\nname: test\ndescription: A test.\n---\n\n# Body\n"
         fm, body = _parse_frontmatter(content)
@@ -304,6 +302,79 @@ class TestSkillsList:
 class TestSkillView:
     def test_view_resolves_by_dir_name_and_frontmatter_name(self, tmp_path):
         with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "my-skill")
+            raw = skill_view("my-skill")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert result["name"] == "my-skill"
+        assert "Step 1" in result["content"]
+        assert "default_response_mode" not in result
+
+    def test_view_does_not_expose_legacy_default_response_mode(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "direct-skill",
+                frontmatter_extra="default_response_mode: direct\n",
+            )
+            raw = skill_view("direct-skill")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "default_response_mode" not in result
+
+    def test_view_skill_by_frontmatter_name_when_dir_differs(self, tmp_path):
+        # The on-disk directory ("alias-dir") differs from the skill's
+        # frontmatter name ("real-skill-name"). skills_list() exposes the
+        # frontmatter name, so skill_view(name) must resolve it too.
+        skill_dir = tmp_path / "alias-dir"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: real-skill-name\n"
+            "description: A skill whose directory name differs from its name.\n"
+            "---\n\n"
+            "# real-skill-name\n\n"
+            "Step 1: Do the thing.\n"
+        )
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            raw = skill_view("real-skill-name")
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "Step 1" in result["content"]
+
+    def test_skill_view_applies_template_vars(self, tmp_path):
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch(
+                "agent.skill_preprocessing.load_skills_config",
+                return_value={"template_vars": True, "inline_shell": False},
+            ),
+        ):
+            skill_dir = _make_skill(
+                tmp_path,
+                "templated",
+                body="Run ${HERMES_SKILL_DIR}/scripts/do.sh in ${HERMES_SESSION_ID}",
+            )
+            raw = skill_view("templated", task_id="session-123")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert f"Run {skill_dir}/scripts/do.sh in session-123" in result["content"]
+        assert "${HERMES_SKILL_DIR}" not in result["content"]
+
+    def test_skill_view_applies_inline_shell_when_enabled(self, tmp_path):
+        with (
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path),
+            patch(
+                "agent.skill_preprocessing.load_skills_config",
+                return_value={
+                    "template_vars": True,
+                    "inline_shell": True,
+                    "inline_shell_timeout": 5,
+                },
+            ),
+        ):
             _make_skill(
                 tmp_path,
                 "my-skill",

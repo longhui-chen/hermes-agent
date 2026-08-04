@@ -56,6 +56,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     # Register only job routes (plus health for sanity)
     app.router.add_get("/health", adapter._handle_health)
     app.router.add_get("/api/jobs", adapter._handle_list_jobs)
+    app.router.add_get("/api/jobs/occurrences", adapter._handle_list_job_occurrences)
     app.router.add_post("/api/jobs", adapter._handle_create_job)
     app.router.add_get("/api/jobs/{job_id}", adapter._handle_get_job)
     app.router.add_patch("/api/jobs/{job_id}", adapter._handle_update_job)
@@ -102,6 +103,66 @@ class TestListJobs:
     # -------------------------------------------------------------------
 
 
+class TestListJobOccurrences:
+    @pytest.mark.asyncio
+    async def test_occurrence_contract_uses_disabled_jobs_and_bounded_query(self, adapter):
+        app = _create_app(adapter)
+        occurrence = {
+            "id": "aabbccddeeff:scheduled:2026-07-21T01:00:00+00:00",
+            "job_id": VALID_JOB_ID,
+            "scheduled_at": "2026-07-21T01:00:00+00:00",
+            "status": "scheduled",
+        }
+        mock_list = MagicMock(return_value=[SAMPLE_JOB])
+        mock_projection = MagicMock(return_value={"occurrences": [occurrence], "history_truncated": False})
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_list", mock_list
+            ), patch(f"{_MOD}._cron_occurrence_projection", mock_projection):
+                resp = await cli.get(
+                    "/api/jobs/occurrences"
+                    "?from=2026-07-01T00:00:00Z&to=2026-08-01T00:00:00Z&limit=25"
+                )
+                assert resp.status == 200
+                assert (await resp.json())["occurrences"] == [occurrence]
+                mock_list.assert_called_once_with(include_disabled=True)
+                assert mock_projection.call_args.kwargs["limit"] == 25
+
+    @pytest.mark.asyncio
+    async def test_occurrence_contract_filters_jobs_before_projection(self, adapter):
+        app = _create_app(adapter)
+        other = {**SAMPLE_JOB, "id": "other-job"}
+        mock_list = MagicMock(return_value=[SAMPLE_JOB, other])
+        mock_projection = MagicMock(return_value={"occurrences": [], "history_truncated": False})
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_list", mock_list
+            ), patch(f"{_MOD}._cron_occurrence_projection", mock_projection):
+                resp = await cli.get(
+                    "/api/jobs/occurrences"
+                    f"?from=2026-07-01T00:00:00Z&to=2026-08-01T00:00:00Z&job_id={VALID_JOB_ID}"
+                )
+                assert resp.status == 200
+                assert mock_projection.call_args.args[0] == [SAMPLE_JOB]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "from=bad&to=2026-08-01T00:00:00Z",
+            "from=2026-08-01T00:00:00Z&to=2026-07-01T00:00:00Z",
+            "from=2026-01-01T00:00:00Z&to=2027-02-01T00:00:00Z",
+            "from=2026-07-01T00:00:00&to=2026-08-01T00:00:00Z",
+        ],
+    )
+    async def test_occurrence_contract_rejects_invalid_or_unbounded_windows(self, adapter, query):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.get(f"/api/jobs/occurrences?{query}")
+                assert resp.status == 400
+
+
 # ---------------------------------------------------------------------------
 # 3-7. test_create_job and validation
 # ---------------------------------------------------------------------------
@@ -139,6 +200,80 @@ class TestCreateJob:
                 assert call_kwargs["origin"]["forwarded_for"] == "203.0.113.11"
                 assert call_kwargs["origin"]["user_agent"] == "cron-client"
 
+    @pytest.mark.asyncio
+    async def test_create_linear_job_requires_live_chat_grant(self, adapter):
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_job_requires_live_chat_authorization", return_value=True
+            ), patch(f"{_MOD}._cron_create", mock_create):
+                resp = await cli.post(
+                    "/api/jobs",
+                    json={
+                        "name": "linear-digest",
+                        "schedule": "every 1 hour",
+                        "skills": ["Linear"],
+                    },
+                )
+                data = await resp.json()
+
+        assert resp.status == 400
+        assert "current chat" in data["error"]
+        mock_create.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_create_job_output_language_flow(self, adapter):
+        """REST/local-server proxy may pass the optional persisted tag."""
+        app = _create_app(adapter)
+        expected = {**SAMPLE_JOB, "output_language": "zh-CN"}
+        mock_create = MagicMock(return_value=expected)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post(
+                    "/api/jobs",
+                    json={
+                        "name": "localized",
+                        "schedule": "every 1h",
+                        "prompt": "https://example.com/report",
+                        "output_language": "zh-CN",
+                    },
+                )
+                data = await resp.json()
+
+        assert resp.status == 200
+        assert data["job"]["output_language"] == "zh-CN"
+        assert mock_create.call_args.kwargs["output_language"] == "zh-CN"
+
+    @pytest.mark.asyncio
+    async def test_create_job_missing_name(self, adapter):
+        """POST /api/jobs without name returns 400."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.post("/api/jobs", json={
+                    "schedule": "*/5 * * * *",
+                    "prompt": "do something",
+                })
+                assert resp.status == 400
+                data = await resp.json()
+                assert "name" in data["error"].lower() or "Name" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_create_job_name_too_long(self, adapter):
+        """POST /api/jobs with name > 200 chars returns 400."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "x" * 201,
+                    "schedule": "*/5 * * * *",
+                })
+                assert resp.status == 400
+                data = await resp.json()
+                assert "200" in data["error"] or "Name" in data["error"]
 
     @pytest.mark.asyncio
     async def test_create_job_prompt_too_long(self, adapter):
@@ -154,6 +289,206 @@ class TestCreateJob:
                 assert resp.status == 400
                 data = await resp.json()
                 assert "5000" in data["error"] or "Prompt" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_create_job_invalid_repeat(self, adapter):
+        """POST /api/jobs with repeat=0 returns 400."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "*/5 * * * *",
+                    "repeat": 0,
+                })
+                assert resp.status == 400
+                data = await resp.json()
+                assert "repeat" in data["error"].lower() or "Repeat" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_create_job_missing_schedule(self, adapter):
+        """POST /api/jobs without schedule returns 400."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                })
+                assert resp.status == 400
+                data = await resp.json()
+                assert "schedule" in data["error"].lower() or "Schedule" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_create_job_with_timezone_passthrough(self, adapter):
+        """POST /api/jobs forwards timezone kwarg into _cron_create."""
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "6 23 * * *",
+                    "timezone": "Asia/Shanghai",
+                })
+                assert resp.status == 200
+                call_kwargs = mock_create.call_args[1]
+                assert call_kwargs["timezone"] == "Asia/Shanghai"
+
+    @pytest.mark.asyncio
+    async def test_create_job_invalid_timezone_returns_400(self, adapter):
+        """Bogus IANA tz must surface as a 400 — not a generic 500."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "6 23 * * *",
+                    "timezone": "Mars/Olympus_Mons",
+                })
+                assert resp.status == 400
+                data = await resp.json()
+                assert "timezone" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_create_job_validation_error_returns_400(self, adapter):
+        """Storage-layer validation failures are client errors, not 500s."""
+        app = _create_app(adapter)
+        mock_create = MagicMock(side_effect=ValueError("one-shot is in the past"))
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "2026-06-30T09:00:00",
+                    "timezone": "Asia/Shanghai",
+                })
+                assert resp.status == 400
+                data = await resp.json()
+                assert "past" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_create_job_with_origin_passthrough(self, adapter):
+        """POST /api/jobs forwards origin dict into _cron_create.
+
+        APP's preview-confirm-POST path needs this — without it, the
+        scheduler has no chat to deliver back to and last_delivery_error
+        ends up "no delivery target resolved for deliver=origin"
+        (ZET-942 follow-up).
+        """
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                origin_body = {
+                    "platform": "zet_agent",
+                    "chat_id": "zettlab:local-dev:main:Abc123",
+                    "chat_name": "",
+                }
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "6 23 * * *",
+                    "origin": origin_body,
+                })
+                assert resp.status == 200
+                call_kwargs = mock_create.call_args[1]
+                assert call_kwargs["origin"] == origin_body
+
+    @pytest.mark.asyncio
+    async def test_create_job_origin_missing_platform_returns_400(self, adapter):
+        """origin must carry platform — caught at API layer, not 500."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "6 23 * * *",
+                    "origin": {"chat_id": "abc"},
+                })
+                assert resp.status == 400
+                data = await resp.json()
+                assert "platform" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_create_job_origin_missing_chat_id_returns_400(self, adapter):
+        """origin must carry chat_id — without it the scheduler can't
+        resolve where to deliver, defeats the whole point of passing origin."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "6 23 * * *",
+                    "origin": {"platform": "zet_agent"},
+                })
+                assert resp.status == 400
+                data = await resp.json()
+                assert "chat_id" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_create_job_origin_non_object_returns_400(self, adapter):
+        """origin field must be a dict — string / number / array reject."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "6 23 * * *",
+                    "origin": "zet_agent:abc",
+                })
+                assert resp.status == 400
+                data = await resp.json()
+                assert "object" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_create_job_origin_oversized_field_returns_400(self, adapter):
+        """Length cap prevents megabyte payloads landing in jobs.json."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "6 23 * * *",
+                    "origin": {
+                        "platform": "zet_agent",
+                        "chat_id": "x" * 10_000,
+                    },
+                })
+                assert resp.status == 400
+                data = await resp.json()
+                assert "chat_id" in data["error"].lower() or "long" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_create_job_records_request_origin_when_not_supplied(self, adapter):
+        """When the caller doesn't supply origin, the API server still stamps
+        request provenance (platform/source metadata) on the cron job so
+        HTTP-created jobs are auditable. An explicit body ``origin`` overrides it
+        (see test_create_job_with_origin_passthrough)."""
+        app = _create_app(adapter)
+        mock_create = MagicMock(return_value=SAMPLE_JOB)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_create", mock_create
+            ):
+                resp = await cli.post("/api/jobs", json={
+                    "name": "test-job",
+                    "schedule": "6 23 * * *",
+                })
+                assert resp.status == 200
+                call_kwargs = mock_create.call_args[1]
+                assert call_kwargs["origin"]["platform"] == "api_server"
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +521,23 @@ class TestGetJob:
 class TestUpdateJob:
 
     @pytest.mark.asyncio
+    async def test_update_introducing_linear_requires_live_chat_grant(self, adapter):
+        app = _create_app(adapter)
+        mock_update = MagicMock(return_value={**SAMPLE_JOB, "skills": ["Linear"]})
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True), patch(
+                f"{_MOD}._cron_job_requires_live_chat_authorization", return_value=True
+            ), patch(f"{_MOD}._cron_update", mock_update):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}", json={"skills": ["Linear"]}
+                )
+                data = await resp.json()
+
+        assert resp.status == 400
+        assert "current chat" in data["error"]
+        mock_update.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_update_job_rejects_unknown_fields(self, adapter):
         """PATCH /api/jobs/{id} — only allowed fields pass through."""
         app = _create_app(adapter)
@@ -211,6 +563,73 @@ class TestUpdateJob:
                 assert "name" in sanitized
                 assert "evil_field" not in sanitized
                 assert "__proto__" not in sanitized
+
+    @pytest.mark.asyncio
+    async def test_update_job_no_valid_fields(self, adapter):
+        """PATCH /api/jobs/{id} with only unknown fields returns 400."""
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"evil_field": "malicious"},
+                )
+                assert resp.status == 400
+                data = await resp.json()
+                assert "No valid fields" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_update_job_timezone_passes_through(self, adapter):
+        """PATCH lets timezone through the whitelist into _cron_update."""
+        app = _create_app(adapter)
+        mock_update = MagicMock(return_value={**SAMPLE_JOB, "timezone": "Asia/Shanghai"})
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_update", mock_update
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"timezone": "Asia/Shanghai"},
+                )
+                assert resp.status == 200
+                sanitized = mock_update.call_args[0][1]
+                assert sanitized["timezone"] == "Asia/Shanghai"
+
+    @pytest.mark.asyncio
+    async def test_update_job_invalid_timezone_returns_400(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch(f"{_MOD}._CRON_AVAILABLE", True):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={"timezone": "Mars/Olympus_Mons"},
+                )
+                assert resp.status == 400
+                data = await resp.json()
+                assert "timezone" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_update_job_validation_error_returns_400(self, adapter):
+        app = _create_app(adapter)
+        mock_update = MagicMock(side_effect=ValueError("one-shot is in the past"))
+        async with TestClient(TestServer(app)) as cli:
+            with patch(
+                f"{_MOD}._CRON_AVAILABLE", True
+            ), patch(
+                f"{_MOD}._cron_update", mock_update
+            ):
+                resp = await cli.patch(
+                    f"/api/jobs/{VALID_JOB_ID}",
+                    json={
+                        "schedule": "2026-06-30T09:00:00",
+                        "timezone": "Asia/Shanghai",
+                    },
+                )
+                assert resp.status == 400
+                data = await resp.json()
+                assert "past" in data["error"]
 
 
 # ---------------------------------------------------------------------------

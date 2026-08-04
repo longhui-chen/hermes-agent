@@ -2981,6 +2981,16 @@ def _render_final_assistant_content(text: str, mode: str = "render"):
     return Markdown(plain)
 
 
+def _should_render_final_response_panel(
+    *,
+    response_transformed: bool,
+    token_streamed: bool,
+    tts_streamed: bool,
+) -> bool:
+    """Render transformed output even when the provider text already streamed."""
+    return response_transformed or not (token_streamed or tts_streamed)
+
+
 _OUTPUT_HISTORY_ENABLED = True
 _OUTPUT_HISTORY_REPLAYING = False
 _OUTPUT_HISTORY_SUPPRESSED = False
@@ -10289,7 +10299,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if accepted:
                         _cprint(f"  ⏩ Steer queued — arrives after the next tool call: {payload[:80]}{'...' if len(payload) > 80 else ''}")
                     else:
-                        _cprint("  Steer rejected (empty payload).")
+                        # steer() also returns False when the turn finalizer
+                        # already closed the slot (agent finishing) — the
+                        # payload is non-empty here, so fall back to queue
+                        # semantics instead of dropping the text.
+                        self._pending_input.put(payload)
+                        _cprint(f"  Turn is finishing; queued as next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
             else:
                 # No active run — treat as a normal next-turn message.
                 self._pending_input.put(payload)
@@ -14332,11 +14347,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
                 is_error_response = result and (result.get("failed") or result.get("partial"))
                 already_streamed = self._stream_started and self._stream_box_opened and not is_error_response
-                if use_streaming_tts and _streaming_box_opened and not is_error_response:
+                response_transformed = bool(result and result.get("response_transformed"))
+                render_final_panel = _should_render_final_response_panel(
+                    response_transformed=response_transformed,
+                    token_streamed=already_streamed,
+                    tts_streamed=bool(
+                        use_streaming_tts
+                        and _streaming_box_opened
+                        and not is_error_response
+                    ),
+                )
+                if (
+                    use_streaming_tts
+                    and _streaming_box_opened
+                    and not is_error_response
+                    and not render_final_panel
+                ):
                     # Text was already printed sentence-by-sentence; just close the box
                     w = self._scrollback_box_width()
                     _cprint(f"\n{_ACCENT}╰{'─' * (w - 2)}╯{_RST}")
-                elif already_streamed:
+                elif already_streamed and not render_final_panel:
                     # Response was already streamed token-by-token with box framing;
                     # _flush_stream() already closed the box. Skip Rich Panel.
                     pass

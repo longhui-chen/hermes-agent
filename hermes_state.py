@@ -20,6 +20,7 @@ import errno
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -266,6 +267,51 @@ def _default_db_path() -> Path:
     if DEFAULT_DB_PATH != _IMPORT_DEFAULT_DB_PATH:
         return DEFAULT_DB_PATH
     return get_hermes_home() / "state.db"
+
+RUNTIME_IMPORT_MAX_CHUNK_MESSAGES = 200
+RUNTIME_IMPORT_MAX_MESSAGES = 10_000
+RUNTIME_IMPORT_MAX_CONTENT_CHARS = 65_536
+RUNTIME_IMPORT_MAX_STAGED_BYTES = 32 * 1024 * 1024
+RUNTIME_IMPORT_MAX_TOTAL_STAGED_BYTES = 64 * 1024 * 1024
+RUNTIME_IMPORT_STAGING_TTL_SECONDS = 24 * 60 * 60
+RUNTIME_IMPORT_CLEANUP_BATCH_SIZE = 8
+RUNTIME_IMPORT_CLEANUP_MAX_BYTES = 64 * 1024 * 1024
+
+
+class RuntimeImportConflict(ValueError):
+    """The idempotency key or target is already bound to different data."""
+
+
+class RuntimeImportIncomplete(ValueError):
+    """A transcript import cannot commit until every declared message exists."""
+
+
+# Matches HermesAPIServer._MAX_SESSION_HEADER_LEN (gateway/platforms/api_server.py) —
+# the ceiling the API server already enforces on session ids reaching the
+# create/chat path. Session-file cleanup must accept everything that path
+# allows, not the tighter 128-char runtime-import default below.
+SESSION_ID_FILENAME_MAX_LEN = 256
+
+
+def _validate_runtime_import_identifier(field: str, value: Any, max_length: int = 128) -> str:
+    """Validate IDs that can later reach session-derived filesystem paths."""
+    from gateway.session import _is_path_unsafe
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > max_length
+        or any(ord(char) < 0x20 for char in value)
+        or any(char in "*?[]" for char in value)
+        or _is_path_unsafe(value)
+    ):
+        raise ValueError(f"{field} must be a path-safe 1..{max_length} character identifier")
+    return value
+
+
+def _runtime_import_receipt_source_id(source_session_id: str) -> str:
+    """Return a non-reversible binding for completed-import idempotency."""
+    return hashlib.sha256(source_session_id.encode("utf-8")).hexdigest()
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -1903,7 +1949,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 data["system_prompt"] = resolved
         return data
 
-    def __init__(self, db_path: Path = None, read_only: bool = False):
+    def __init__(
+        self,
+        db_path: Path = None,
+        read_only: bool = False,
+        *,
+        _preopened_connection: Optional[sqlite3.Connection] = None,
+        _allow_path_reopen: bool = True,
+    ):
         self.db_path = db_path or _default_db_path()
         self.read_only = read_only
 
@@ -1953,6 +2006,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._token_writer_busy = False
         try:
             if read_only:
+                if _preopened_connection is not None:
+                    raise ValueError("read-only SessionDB cannot use a write connection")
                 # Read-only attach for cross-profile aggregation: SELECT-only,
                 # so we skip schema init entirely (no DDL, no FTS probe, no
                 # column reconcile). Crucially this takes NO write lock, so
@@ -2041,18 +2096,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     raise sqlite3.DatabaseError(msg)
 
             def _connect_and_init():
-                self._conn = _connect_tracked_db(
-                    str(self.db_path),
-                    check_same_thread=False,
-                    # Short timeout — application-level retry with random
-                    # jitter handles contention instead of sitting in
-                    # SQLite's internal busy handler for up to 30s.
-                    timeout=1.0,
-                    # auto-starts transactions on DML, which conflicts with
-                    # our explicit BEGIN IMMEDIATE.  None = we manage
-                    # transactions ourselves.
-                    isolation_level=None,
-                )
+                if self._conn is None:
+                    self._conn = _connect_tracked_db(
+                        str(self.db_path),
+                        check_same_thread=False,
+                        # Short timeout — application-level retry with random
+                        # jitter handles contention instead of sitting in
+                        # SQLite's internal busy handler for up to 30s.
+                        timeout=1.0,
+                        # auto-starts transactions on DML, which conflicts with
+                        # our explicit BEGIN IMMEDIATE.  None = we manage
+                        # transactions ourselves.
+                        isolation_level=None,
+                    )
                 self._conn.row_factory = sqlite3.Row
                 self._wal_active = (
                     apply_wal_with_fallback(self._conn, db_label="state.db") == "wal"
@@ -2061,6 +2117,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 self._conn.execute("PRAGMA foreign_keys=ON")
                 self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
                 self._init_schema()
+                # Schema setup/migration uses the same transactional helper as
+                # runtime writes. Maintenance cadence starts at zero once open
+                # completes so schema work cannot consume a checkpoint/FTS slot.
+                self._write_count = 0
 
             def _connect_and_init_with_lock_patience():
                 # Lock contention during open: _init_schema's DDL/reconcile
@@ -2101,7 +2161,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         )
 
             try:
-                _connect_and_init_with_lock_patience()
+                self._conn = _preopened_connection
+                if self._conn is None:
+                    _connect_and_init_with_lock_patience()
+                else:
+                    _connect_and_init()
             except sqlite3.DatabaseError as exc:
                 # The malformed-schema class (e.g. a duplicate sqlite_master
                 # row for messages_fts) fails on the very first statement —
@@ -2110,7 +2174,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # place (backup first; canonical sessions/messages preserved),
                 # then reopen once. This is what lets Desktop/Dashboard
                 # self-heal instead of silently showing "no sessions".
-                if not is_malformed_db_error(exc) or not _claim_repair_attempt(self.db_path):
+                if (
+                    not _allow_path_reopen
+                    or not is_malformed_db_error(exc)
+                    or not _claim_repair_attempt(self.db_path)
+                ):
                     raise
                 logger.error(
                     "state.db schema is malformed (%s) — attempting automatic "
@@ -2124,6 +2192,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 report = repair_state_db_schema(self.db_path)
                 if not report.get("repaired"):
                     raise
+                self._conn = None
                 _connect_and_init_with_lock_patience()
 
             # NOTE: the v23 FTS optimization is OPT-IN (`hermes db optimize`),
@@ -2133,6 +2202,26 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # racing session lifecycle and the surprise disk/latency cost on
             # an unattended open. (An interrupted optimize resumes when the
             # user re-runs the command.)
+            # Expired staging rows can contain complete source transcripts.
+            # Sweep a bounded batch whenever the profile DB opens so abandoned
+            # imports converge even when no later import request arrives.
+            try:
+                self.cleanup_stale_runtime_imports()
+            except sqlite3.OperationalError as exc:
+                if not any(token in str(exc).lower() for token in ("locked", "busy")):
+                    raise
+                # Expired import cleanup is privacy hygiene, but it must not
+                # make the primary session database unavailable when another
+                # process temporarily owns SQLite's write lock. The gateway
+                # sweeper will retry after the profile is open.
+                logger.warning(
+                    "state.db runtime import staging cleanup failed during open",
+                    exc_info=True,
+                )
+            # Startup schema/cleanup transactions are maintenance, not runtime
+            # traffic. Count checkpoint and FTS cadence from the first caller
+            # write after the database is fully open.
+            self._write_count = 0
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
             # session DB is unavailable instead of a bare "Session database
@@ -4662,6 +4751,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception:
             pass  # Best effort — never fatal at interpreter shutdown.
 
+    def clear_all_system_prompts(self) -> int:
+        """Force every session in this profile DB to rebuild its prompt."""
+
+        def _do(conn):
+            cur = conn.execute(
+                "UPDATE sessions SET system_prompt = NULL, "
+                "system_prompt_hash = NULL "
+                "WHERE system_prompt IS NOT NULL OR system_prompt_hash IS NOT NULL"
+            )
+            self._delete_unreferenced_system_prompts(conn)
+            return cur.rowcount
+
+        return self._execute_write(_do)
+
     def update_token_counts(
         self,
         session_id: str,
@@ -5118,6 +5221,84 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return matches[0]
         return None
 
+    # Compression is a multi-step read-modify-write sequence that rotates
+    # session_id and creates a successor row. Two agents sharing one
+    # session_id must not both run that sequence concurrently.
+    def try_acquire_compression_lock(
+        self,
+        session_id: str,
+        holder: str,
+        ttl_seconds: float = 300.0,
+    ) -> bool:
+        """Try to atomically acquire the compression lock for ``session_id``."""
+        if not session_id or not holder:
+            return False
+        now = time.time()
+        expires_at = now + max(0.0, float(ttl_seconds))
+
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM compression_locks "
+                "WHERE session_id = ? AND expires_at < ?",
+                (session_id, now),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO compression_locks "
+                "(session_id, holder, acquired_at, expires_at) "
+                "VALUES (?, ?, ?, ?)",
+                (session_id, holder, now, expires_at),
+            )
+            row = conn.execute(
+                "SELECT holder FROM compression_locks WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            return row is not None and (
+                row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+            ) == holder
+
+        try:
+            return bool(self._execute_write(_do))
+        except sqlite3.Error as exc:
+            logger.warning(
+                "try_acquire_compression_lock(%s) failed: %s",
+                session_id, exc,
+            )
+            return False
+
+    def release_compression_lock(self, session_id: str, holder: str) -> None:
+        """Release the compression lock for ``session_id`` iff we own it."""
+        if not session_id or not holder:
+            return
+
+        def _do(conn):
+            conn.execute(
+                "DELETE FROM compression_locks "
+                "WHERE session_id = ? AND holder = ?",
+                (session_id, holder),
+            )
+
+        try:
+            self._execute_write(_do)
+        except sqlite3.Error as exc:
+            logger.warning(
+                "release_compression_lock(%s) failed: %s",
+                session_id, exc,
+            )
+
+    def get_compression_lock_holder(self, session_id: str) -> Optional[str]:
+        """Return the current non-expired lock holder for ``session_id``."""
+        if not session_id:
+            return None
+        now = time.time()
+        row = self._conn.execute(
+            "SELECT holder FROM compression_locks "
+            "WHERE session_id = ? AND expires_at >= ?",
+            (session_id, now),
+        ).fetchone()
+        if row is None:
+            return None
+        return row["holder"] if isinstance(row, sqlite3.Row) else row[0]
+
     # Maximum length for session titles
     MAX_TITLE_LENGTH = 100
 
@@ -5283,6 +5464,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         :meth:`set_session_title`.
         """
         return self._set_session_title(session_id, title, only_if_empty=True)
+
+    def set_session_title_if_empty(self, session_id: str, title: str) -> bool:
+        """Atomically set an auto-generated title only while it is still empty.
+
+        A user may rename the session while title generation is waiting on the
+        model. The read and conditional update therefore share one immediate
+        transaction so the generated title can never overwrite that rename.
+        """
+        return self.set_auto_title_if_empty(session_id, title)
 
     def get_session_title(self, session_id: str) -> Optional[str]:
         """Get the title for a session, or None."""
@@ -5777,7 +5967,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         (SELECT {_PREVIEW_RAW_SELECT}
                          FROM messages m
                          WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
-                         ORDER BY m.timestamp, m.id LIMIT 1),
+                         ORDER BY m.id LIMIT 1),
                         ''
                     ) AS _preview_raw,
                     {_sql_session_last_active("s")} AS last_active,
@@ -5839,11 +6029,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         (SELECT {_PREVIEW_RAW_SELECT}
                          FROM messages m
                          WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
-                         ORDER BY m.timestamp, m.id LIMIT 1),
+                         ORDER BY m.id LIMIT 1),
                         ''
                     ) AS _preview_raw,
                     COALESCE(
-                        (SELECT MAX(m2.timestamp) FROM messages m2 WHERE m2.session_id = s.id),
+                        (SELECT MAX(NULLIF(m2.timestamp, 0)) FROM messages m2 WHERE m2.session_id = s.id),
                         s.started_at
                     ) AS last_active
                 FROM sessions s
@@ -6210,7 +6400,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         messages: List[Dict[str, Any]],
         compression_lock_holder: Optional[str] = None,
         chunk_rows: Optional[int] = None,
-    ) -> int:
+        return_row_ids: bool = False,
+    ) -> Any:
         """Append multiple messages atomically in ONE write transaction.
 
         ``messages`` is a list of dicts in the same shape
@@ -6236,18 +6427,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         the batch commits in chunks of at most that many rows — same
         recovery semantics as the old per-row loops (a mid-copy failure
         leaves a partial seed), just with bounded lock holds. A turn flush
-        never needs it. Returns the inserted row count.
+        never needs it. Returns the inserted row count, or the ordered row IDs
+        when ``return_row_ids`` is true.
         """
         if not messages:
-            return 0
+            return [] if return_row_ids else 0
 
         if chunk_rows is not None and len(messages) > chunk_rows:
-            inserted_total = 0
+            inserted_total = [] if return_row_ids else 0
             for start in range(0, len(messages), chunk_rows):
                 inserted_total += self.append_messages_batch(
                     session_id,
                     messages[start:start + chunk_rows],
                     compression_lock_holder=compression_lock_holder,
+                    return_row_ids=return_row_ids,
                 )
             return inserted_total
 
@@ -6255,8 +6448,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._check_transcript_write_guards(
                 conn, session_id, compression_lock_holder
             )
+            row_ids: Optional[List[int]] = [] if return_row_ids else None
             inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, messages
+                conn, session_id, messages, row_ids=row_ids
             )
             # One aggregated counter update for the whole batch.
             if tool_calls_total > 0:
@@ -6270,7 +6464,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
                     (inserted, session_id),
                 )
-            return inserted
+            return row_ids if return_row_ids else inserted
 
         # Same criticality as append_message: this IS the turn's transcript.
         return self._execute_write(
@@ -6518,8 +6712,153 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
 
         return row[0] if row else None
+    def stage_calendar_notification(
+        self,
+        session_id: str,
+        content: str,
+        delivery_key: str,
+        delivery_generation: int,
+    ) -> int:
+        """Idempotently stage a hidden calendar message excluded from all replay."""
+        if not isinstance(delivery_key, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", delivery_key):
+            raise ValueError("invalid calendar delivery key")
+        if (
+            not isinstance(delivery_generation, int)
+            or isinstance(delivery_generation, bool)
+            or delivery_generation <= 0
+            or delivery_generation >= 2**64
+        ):
+            raise ValueError("invalid calendar delivery generation")
+        if not isinstance(session_id, str) or not session_id or len(session_id) > 200:
+            raise ValueError("invalid calendar session id")
+        if not isinstance(content, str) or len(content.encode("utf-8")) > 16 * 1024:
+            raise ValueError("calendar notification content exceeded cap")
+        stored_content = self._encode_content(content)
+        stored_generation = str(delivery_generation)
 
-    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
+        def _do(conn):
+            existing = conn.execute(
+                "SELECT id, session_id, content FROM messages "
+                "WHERE calendar_delivery_key = ? AND calendar_delivery_generation = ? LIMIT 1",
+                (delivery_key, stored_generation),
+            ).fetchone()
+            if existing is not None:
+                if existing["session_id"] != session_id:
+                    raise ValueError("calendar delivery key session collision")
+                if self._decode_content(existing["content"]) != content:
+                    raise ValueError("calendar delivery key content collision")
+                return int(existing[0])
+            other_generation = conn.execute(
+                "SELECT session_id FROM messages WHERE calendar_delivery_key = ? LIMIT 1",
+                (delivery_key,),
+            ).fetchone()
+            if other_generation is not None and other_generation["session_id"] != session_id:
+                raise ValueError("calendar delivery key session collision")
+            cursor = conn.execute(
+                """INSERT INTO messages (
+                       session_id, role, content, timestamp, platform_message_id,
+                       observed, active, llm_visible, calendar_delivery_key,
+                       calendar_delivery_generation, calendar_delivery_state
+                   ) VALUES (?, 'assistant', ?, ?, ?, 1, 0, 0, ?, ?, 'staged')""",
+                (
+                    session_id,
+                    stored_content,
+                    time.time(),
+                    delivery_key,
+                    delivery_key,
+                    stored_generation,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+        return self._execute_write(_do)
+
+    def activate_calendar_notification(
+        self, delivery_key: str, delivery_generation: int, message_id: int
+    ) -> bool:
+        """CAS the exact staged row visible after a verified local finalize receipt."""
+        if not isinstance(delivery_key, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", delivery_key):
+            raise ValueError("invalid calendar delivery key")
+        if (
+            not isinstance(delivery_generation, int)
+            or isinstance(delivery_generation, bool)
+            or delivery_generation <= 0
+            or delivery_generation >= 2**64
+        ):
+            raise ValueError("invalid calendar delivery generation")
+        stored_generation = str(delivery_generation)
+        def _do(conn):
+            row = conn.execute(
+                "SELECT id, session_id, calendar_delivery_state FROM messages "
+                "WHERE calendar_delivery_key = ? AND calendar_delivery_generation = ? LIMIT 1",
+                (delivery_key, stored_generation),
+            ).fetchone()
+            if row is None or int(row["id"]) != int(message_id):
+                return False
+            if row["calendar_delivery_state"] == "fully_visible":
+                return True
+            cursor = conn.execute(
+                "UPDATE messages SET active = 1, calendar_delivery_state = 'fully_visible' "
+                "WHERE id = ? AND calendar_delivery_key = ? "
+                "AND calendar_delivery_generation = ? AND calendar_delivery_state = 'staged'",
+                (message_id, delivery_key, stored_generation),
+            )
+            if cursor.rowcount != 1:
+                return False
+            conn.execute("UPDATE sessions SET message_count = message_count + 1 WHERE id = ?", (row["session_id"],))
+            return True
+        return bool(self._execute_write(_do))
+
+    def delete_message(self, session_id: str, message_id: int) -> bool:
+        """Delete a single message row, scoped to *session_id*.
+
+        Used to undo a crash-resilience row whose in-memory message was
+        retracted before any model call consumed it (steer reclaim on
+        early-return turns) — leaving the row would replay a phantom user
+        message on /resume. The FTS DELETE triggers keep the search
+        indexes consistent. Returns True if a row was deleted.
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                "DELETE FROM messages WHERE id = ? AND session_id = ?",
+                (message_id, session_id),
+            )
+            if cursor.rowcount > 0:
+                conn.execute(
+                    """UPDATE sessions SET message_count =
+                       CASE WHEN message_count > 0 THEN message_count - 1 ELSE 0 END
+                       WHERE id = ?""",
+                    (session_id,),
+                )
+            return cursor.rowcount > 0
+
+        return bool(self._execute_write(_do))
+
+    def update_message_content(
+        self,
+        session_id: str,
+        message_id: int,
+        content: Any,
+    ) -> bool:
+        """Update one already-persisted message without appending a duplicate row."""
+        stored_content = self._encode_content(content)
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE messages SET content = ? WHERE id = ? AND session_id = ?",
+                (stored_content, message_id, session_id),
+            )
+            return cursor.rowcount > 0
+
+        return bool(self._execute_write(_do))
+
+    def _insert_message_rows(
+        self,
+        conn,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        row_ids: Optional[List[int]] = None,
+    ) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
 
         Shared by :meth:`replace_messages` (delete-then-insert) and
@@ -6578,12 +6917,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             api_content = msg.get("api_content")
 
-            conn.execute(
+            cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
-                   codex_message_items, platform_message_id, observed, active, api_content, display_kind, display_metadata)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   codex_message_items, platform_message_id, observed, active,
+                   api_content, llm_visible, display_kind, display_metadata)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -6604,10 +6944,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     1 if msg.get("observed") else 0,
                     1,
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
+                    0 if msg.get("llm_visible", 1) in (0, False) else 1,
                     _scrub_surrogates(msg.get("display_kind")) if isinstance(msg.get("display_kind"), str) else None,
                     self._encode_display_metadata(msg.get("display_metadata")),
                 ),
             )
+            if row_ids is not None:
+                row_ids.append(cursor.lastrowid)
             inserted += 1
             if tool_calls is not None:
                 tool_calls_total += (
@@ -6673,6 +7016,482 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
 
         self._execute_write(_do)
+
+    @staticmethod
+    def _normalize_import_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        from portable_import_security import reject_portable_credentials
+
+        if not isinstance(messages, list) or not messages:
+            raise ValueError("messages must be a non-empty list")
+        if len(messages) > RUNTIME_IMPORT_MAX_CHUNK_MESSAGES:
+            raise ValueError(
+                f"chunk exceeds {RUNTIME_IMPORT_MAX_CHUNK_MESSAGES} messages"
+            )
+        normalized: List[Dict[str, Any]] = []
+        seen_source_ids: set[str] = set()
+        for index, raw in enumerate(messages):
+            if not isinstance(raw, dict):
+                raise ValueError(f"messages[{index}] must be an object")
+            role = raw.get("role")
+            if role not in {"user", "assistant"}:
+                raise ValueError(
+                    f"messages[{index}].role must be user or assistant; "
+                    "system/tool/in-flight state is not importable"
+                )
+            content = raw.get("content")
+            if not isinstance(content, str) or not content.strip():
+                raise ValueError(f"messages[{index}].content must be non-empty text")
+            if len(content) > RUNTIME_IMPORT_MAX_CONTENT_CHARS:
+                raise ValueError(
+                    f"messages[{index}].content exceeds "
+                    f"{RUNTIME_IMPORT_MAX_CONTENT_CHARS} characters"
+                )
+            reject_portable_credentials(content, field=f"messages[{index}].content")
+            created_at = raw.get("created_at")
+            if not isinstance(created_at, (int, float)) or isinstance(created_at, bool):
+                raise ValueError(f"messages[{index}].created_at must be unix seconds")
+            created_at = float(created_at)
+            if not math.isfinite(created_at) or created_at < 0:
+                raise ValueError(f"messages[{index}].created_at is invalid")
+            source_id = raw.get("source_id")
+            if source_id is not None:
+                if not isinstance(source_id, str) or not source_id or len(source_id) > 256:
+                    raise ValueError(f"messages[{index}].source_id is invalid")
+                reject_portable_credentials(
+                    source_id, field=f"messages[{index}].source_id"
+                )
+                if source_id in seen_source_ids:
+                    raise ValueError(f"duplicate source_id in chunk: {source_id}")
+                seen_source_ids.add(source_id)
+            normalized.append({
+                "role": role,
+                "content": content,
+                "timestamp": created_at,
+                # Source IDs are staging-only idempotency metadata. They must
+                # never become canonical platform_message_id values because
+                # conversation replay forwards message_id to some providers.
+                "_source_id": source_id,
+            })
+        return normalized
+
+    def cleanup_stale_runtime_imports(
+        self,
+        *,
+        now: Optional[float] = None,
+        limit: int = RUNTIME_IMPORT_CLEANUP_BATCH_SIZE,
+        max_bytes: int = RUNTIME_IMPORT_CLEANUP_MAX_BYTES,
+    ) -> int:
+        """Delete one bounded batch of expired transcript staging rows."""
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 1000:
+            raise ValueError("limit must be an integer in 1..1000")
+        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 1:
+            raise ValueError("max_bytes must be a positive integer")
+        cutoff = (time.time() if now is None else float(now)) - RUNTIME_IMPORT_STAGING_TTL_SECONDS
+        if not math.isfinite(cutoff):
+            raise ValueError("now must be finite")
+
+        def _do(conn):
+            return self._delete_stale_runtime_imports(
+                conn, cutoff=cutoff, limit=limit, max_bytes=max_bytes
+            )
+
+        return self._execute_write(_do)
+
+    @staticmethod
+    def _delete_stale_runtime_imports(conn, *, cutoff: float, limit: int,
+                                      max_bytes: int) -> int:
+        """Delete a count- and byte-bounded batch inside an existing transaction."""
+        rows = conn.execute(
+            "SELECT import_id, staged_bytes FROM runtime_imports "
+            "WHERE status = 'staging' AND updated_at < ? "
+            "ORDER BY updated_at, import_id LIMIT ?",
+            (cutoff, limit),
+        ).fetchall()
+        selected: List[str] = []
+        selected_bytes = 0
+        for row in rows:
+            staged_bytes = max(0, int(row["staged_bytes"] or 0))
+            if selected and selected_bytes + staged_bytes > max_bytes:
+                break
+            selected.append(row["import_id"])
+            selected_bytes += staged_bytes
+        if not selected:
+            return 0
+        placeholders = ",".join("?" for _ in selected)
+        return conn.execute(
+            f"DELETE FROM runtime_imports WHERE import_id IN ({placeholders})",
+            selected,
+        ).rowcount
+
+    @staticmethod
+    def _completed_runtime_import_target_matches(conn, row) -> bool:
+        target = conn.execute(
+            "SELECT model_config FROM sessions WHERE id = ?",
+            (row["target_session_id"],),
+        ).fetchone()
+        if target is None:
+            return False
+        try:
+            model_config = json.loads(target["model_config"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if not isinstance(model_config, dict):
+            return False
+        metadata = model_config.get("_runtime_import", {})
+        if not isinstance(metadata, dict):
+            return False
+        return (
+            metadata.get("import_id") == row["import_id"]
+            and metadata.get("payload_sha256") == row["payload_sha256"]
+        )
+
+    def discard_runtime_import_staging(self) -> int:
+        """Delete all unpublished transcript staging before profile unload."""
+        return self._execute_write(
+            lambda conn: conn.execute(
+                "DELETE FROM runtime_imports WHERE status = 'staging'"
+            ).rowcount
+        )
+
+    def stage_completed_transcript_import(
+        self,
+        *,
+        import_id: str,
+        source: str,
+        source_session_id: str,
+        target_session_id: str,
+        title: Optional[str],
+        payload_sha256: str,
+        expected_message_count: int,
+        chunk_index: int,
+        messages: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Stage one bounded chunk without mutating the canonical transcript.
+
+        ``payload_sha256`` binds the idempotency key to the caller's complete
+        source artifact. It is intentionally opaque because source exporters
+        have different canonical encodings. ``commit`` returns a separate
+        server-computed ``normalized_sha256`` for the Hermes-normalized rows.
+        """
+        for field, value in (("import_id", import_id), ("source", source),
+                             ("source_session_id", source_session_id),
+                             ("target_session_id", target_session_id)):
+            _validate_runtime_import_identifier(field, value)
+        from portable_import_security import reject_portable_credentials
+        for field, value in (("import_id", import_id), ("source", source),
+                             ("source_session_id", source_session_id),
+                             ("target_session_id", target_session_id)):
+            reject_portable_credentials(value, field=field)
+        if title is not None and not isinstance(title, str):
+            raise ValueError("title must be text when provided")
+        title = self.sanitize_title(title)
+        if title:
+            reject_portable_credentials(title, field="title")
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", payload_sha256 or ""):
+            raise ValueError("payload_sha256 must be 64 hexadecimal characters")
+        if not isinstance(expected_message_count, int) or isinstance(expected_message_count, bool):
+            raise ValueError("expected_message_count must be an integer")
+        if not 1 <= expected_message_count <= RUNTIME_IMPORT_MAX_MESSAGES:
+            raise ValueError(
+                f"expected_message_count must be 1..{RUNTIME_IMPORT_MAX_MESSAGES}"
+            )
+        if not isinstance(chunk_index, int) or isinstance(chunk_index, bool) or chunk_index < 0:
+            raise ValueError("chunk_index must be a non-negative integer")
+        normalized = self._normalize_import_messages(messages)
+        canonical = json.dumps(
+            normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        byte_count = len(canonical.encode("utf-8"))
+        chunk_sha = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        now = time.time()
+
+        def _do(conn):
+            self._delete_stale_runtime_imports(
+                conn,
+                cutoff=now - RUNTIME_IMPORT_STAGING_TTL_SECONDS,
+                limit=RUNTIME_IMPORT_CLEANUP_BATCH_SIZE,
+                max_bytes=RUNTIME_IMPORT_CLEANUP_MAX_BYTES,
+            )
+            row = conn.execute(
+                "SELECT * FROM runtime_imports WHERE import_id = ?", (import_id,)
+            ).fetchone()
+            metadata = (source, source_session_id, target_session_id,
+                        payload_sha256.lower(), expected_message_count)
+            if row is None:
+                if chunk_index != 0:
+                    raise RuntimeImportConflict("first chunk_index must be 0")
+                if conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?", (target_session_id,)
+                ).fetchone():
+                    raise RuntimeImportConflict("target_session_id already exists")
+                reserved = conn.execute(
+                    "SELECT import_id FROM runtime_imports "
+                    "WHERE status = 'staging' AND target_session_id = ? LIMIT 1",
+                    (target_session_id,),
+                ).fetchone()
+                if reserved is not None:
+                    raise RuntimeImportConflict(
+                        "target_session_id is reserved by another staged import"
+                    )
+                conn.execute(
+                    """INSERT INTO runtime_imports
+                       (import_id, source, source_session_id, target_session_id, title,
+                        payload_sha256, expected_message_count, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (import_id, source, source_session_id, target_session_id, title,
+                     payload_sha256.lower(), expected_message_count, now, now),
+                )
+                row = conn.execute(
+                    "SELECT * FROM runtime_imports WHERE import_id = ?", (import_id,)
+                ).fetchone()
+            if row["status"] == "completed":
+                # Completed receipts retain only a one-way source-session
+                # binding. Accept raw legacy rows for compatibility, while
+                # still rejecting a reused import_id with different metadata.
+                stored_source_session_id = row["source_session_id"]
+                source_session_matches = stored_source_session_id in {
+                    source_session_id,
+                    _runtime_import_receipt_source_id(source_session_id),
+                }
+                completed_metadata_matches = (
+                    row["source"] == source
+                    and source_session_matches
+                    and row["target_session_id"] == target_session_id
+                    and row["payload_sha256"] == payload_sha256.lower()
+                    and row["expected_message_count"] == expected_message_count
+                )
+                if not completed_metadata_matches:
+                    raise RuntimeImportConflict(
+                        "import_id is already bound to different metadata"
+                    )
+                if not self._completed_runtime_import_target_matches(conn, row):
+                    raise RuntimeImportConflict(
+                        "completed import target session is missing or replaced"
+                    )
+                return {
+                    "import_id": import_id, "status": "completed",
+                    "next_chunk_index": row["next_chunk_index"],
+                    "staged_message_count": row["staged_message_count"],
+                    "replayed": True,
+                }
+            if conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (target_session_id,)
+            ).fetchone():
+                raise RuntimeImportConflict("target_session_id already exists")
+            if tuple(row[k] for k in (
+                "source", "source_session_id", "target_session_id",
+                "payload_sha256", "expected_message_count"
+            )) != metadata:
+                raise RuntimeImportConflict("import_id is already bound to different metadata")
+            existing = conn.execute(
+                "SELECT chunk_sha256 FROM runtime_import_chunks "
+                "WHERE import_id = ? AND chunk_index = ?", (import_id, chunk_index),
+            ).fetchone()
+            if existing:
+                if existing["chunk_sha256"] != chunk_sha:
+                    raise RuntimeImportConflict("chunk_index was already staged with different data")
+                return {
+                    "import_id": import_id, "status": "staged",
+                    "next_chunk_index": row["next_chunk_index"],
+                    "staged_message_count": row["staged_message_count"],
+                    "replayed": True,
+                }
+            if chunk_index != row["next_chunk_index"]:
+                raise RuntimeImportConflict(
+                    f"expected chunk_index {row['next_chunk_index']}"
+                )
+            new_count = row["staged_message_count"] + len(normalized)
+            new_bytes = row["staged_bytes"] + byte_count
+            if new_count > expected_message_count:
+                raise ValueError("staged messages exceed expected_message_count")
+            if new_bytes > RUNTIME_IMPORT_MAX_STAGED_BYTES:
+                raise ValueError("staged transcript exceeds 32 MiB")
+            total_staged_bytes = conn.execute(
+                "SELECT COALESCE(SUM(staged_bytes), 0) FROM runtime_imports "
+                "WHERE status = 'staging'"
+            ).fetchone()[0]
+            if total_staged_bytes + byte_count > RUNTIME_IMPORT_MAX_TOTAL_STAGED_BYTES:
+                raise ValueError("profile staged transcripts exceed 64 MiB")
+            source_ids = [m.get("_source_id") for m in normalized
+                          if m.get("_source_id")]
+            for source_id in source_ids:
+                if conn.execute(
+                    "SELECT 1 FROM runtime_import_message_ids "
+                    "WHERE import_id = ? AND source_id = ?", (import_id, source_id),
+                ).fetchone():
+                    raise RuntimeImportConflict(
+                        f"duplicate source_id across chunks: {source_id}"
+                    )
+            conn.execute(
+                """INSERT INTO runtime_import_chunks
+                   (import_id, chunk_index, chunk_sha256, messages_json,
+                    message_count, byte_count) VALUES (?, ?, ?, ?, ?, ?)""",
+                (import_id, chunk_index, chunk_sha, canonical, len(normalized), byte_count),
+            )
+            conn.executemany(
+                "INSERT INTO runtime_import_message_ids (import_id, source_id) VALUES (?, ?)",
+                [(import_id, source_id) for source_id in source_ids],
+            )
+            conn.execute(
+                """UPDATE runtime_imports SET next_chunk_index = next_chunk_index + 1,
+                   staged_message_count = ?, staged_bytes = ?, updated_at = ?
+                   WHERE import_id = ?""",
+                (new_count, new_bytes, now, import_id),
+            )
+            return {
+                "import_id": import_id, "status": "staged",
+                "next_chunk_index": chunk_index + 1,
+                "staged_message_count": new_count, "replayed": False,
+            }
+
+        return self._execute_write(_do)
+
+    def commit_completed_transcript_import(self, import_id: str) -> Dict[str, Any]:
+        """Atomically publish every staged chunk as one new completed session."""
+        _validate_runtime_import_identifier("import_id", import_id)
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT * FROM runtime_imports WHERE import_id = ?", (import_id,)
+            ).fetchone()
+            if row is None:
+                raise ValueError("unknown import_id")
+            if row["status"] == "completed":
+                if not self._completed_runtime_import_target_matches(conn, row):
+                    raise RuntimeImportConflict(
+                        "completed import target session is missing or replaced"
+                    )
+                return {
+                    "import_id": import_id, "status": "completed",
+                    "session_id": row["target_session_id"],
+                    "message_count": row["staged_message_count"],
+                    "normalized_sha256": row["normalized_sha256"], "replayed": True,
+                }
+            if row["staged_message_count"] != row["expected_message_count"]:
+                raise RuntimeImportIncomplete(
+                    f"staged {row['staged_message_count']} of "
+                    f"{row['expected_message_count']} messages"
+                )
+            if conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ?", (row["target_session_id"],)
+            ).fetchone():
+                raise RuntimeImportConflict("target_session_id already exists")
+
+            title = self.sanitize_title(row["title"])
+            if title and conn.execute(
+                "SELECT 1 FROM sessions WHERE title = ?", (title,)
+            ).fetchone():
+                suffix = f" #{hashlib.sha256(import_id.encode()).hexdigest()[:8]}"
+                title = title[: self.MAX_TITLE_LENGTH - len(suffix)] + suffix
+            started_at = time.time()
+            completed_at = started_at
+            model_config = json.dumps({
+                "_runtime_import": {
+                    "import_id": import_id,
+                    "source": row["source"],
+                    "source_session_id_sha256": _runtime_import_receipt_source_id(
+                        row["source_session_id"]
+                    ),
+                    "payload_sha256": row["payload_sha256"],
+                }
+            })
+            conn.execute(
+                """INSERT INTO sessions
+                   (id, source, model_config, started_at, ended_at, end_reason, title)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (row["target_session_id"], f"import:{row['source']}",
+                 model_config, started_at, completed_at,
+                 "import_completed", title),
+            )
+            # Hash the exact normalized message sequence that becomes canonical
+            # state. Staging-only source IDs and transport chunk boundaries must
+            # not affect this server-computed receipt digest.
+            digest = hashlib.sha256()
+            digest.update(b"[")
+            first_digest_message = True
+            total = 0
+            chunk_count = 0
+            for chunk in self._iter_runtime_import_chunks(conn, import_id):
+                chunk_count += 1
+                raw = chunk["messages_json"]
+                messages = json.loads(raw)
+                for message in messages:
+                    message.pop("_source_id", None)
+                    if not first_digest_message:
+                        digest.update(b",")
+                    digest.update(json.dumps(
+                        message,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8"))
+                    first_digest_message = False
+                inserted, _ = self._insert_message_rows(
+                    conn, row["target_session_id"], messages
+                )
+                total += inserted
+            if chunk_count != row["next_chunk_index"]:
+                raise RuntimeImportIncomplete("one or more staged chunks are missing")
+            digest.update(b"]")
+            normalized_sha = digest.hexdigest()
+            conn.execute(
+                "UPDATE sessions SET message_count = ? WHERE id = ?",
+                (total, row["target_session_id"]),
+            )
+            conn.execute(
+                """UPDATE runtime_imports SET status = 'completed',
+                   normalized_sha256 = ?, source_session_id = ?, title = NULL,
+                   completed_at = ?, updated_at = ?
+                   WHERE import_id = ?""",
+                (normalized_sha,
+                 _runtime_import_receipt_source_id(row["source_session_id"]),
+                 completed_at, completed_at, import_id),
+            )
+            # The completed receipt above is sufficient for idempotent replay.
+            # Remove full staged transcript bodies and source message IDs in the
+            # SAME transaction so session deletion cannot reveal a second copy.
+            conn.execute(
+                "DELETE FROM runtime_import_chunks WHERE import_id = ?", (import_id,)
+            )
+            conn.execute(
+                "DELETE FROM runtime_import_message_ids WHERE import_id = ?", (import_id,)
+            )
+            return {
+                "import_id": import_id, "status": "completed",
+                "session_id": row["target_session_id"], "message_count": total,
+                "normalized_sha256": normalized_sha, "replayed": False,
+            }
+
+        return self._execute_write(_do)
+
+    @staticmethod
+    def _iter_runtime_import_chunks(conn, import_id: str):
+        """Yield one staged chunk at a time; never materialize the 32 MiB bound."""
+        cursor = conn.execute(
+            "SELECT messages_json FROM runtime_import_chunks "
+            "WHERE import_id = ? ORDER BY chunk_index", (import_id,),
+        )
+        while True:
+            row = cursor.fetchone()
+            if row is None:
+                return
+            yield row
+
+    def abort_completed_transcript_import(self, import_id: str) -> Dict[str, Any]:
+        _validate_runtime_import_identifier("import_id", import_id)
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT status FROM runtime_imports WHERE import_id = ?", (import_id,)
+            ).fetchone()
+            if row and row["status"] == "completed":
+                raise RuntimeImportConflict("completed imports cannot be aborted")
+            deleted = conn.execute(
+                "DELETE FROM runtime_imports WHERE import_id = ?", (import_id,)
+            ).rowcount
+            return {"import_id": import_id, "status": "aborted", "replayed": not bool(deleted)}
+
+        return self._execute_write(_do)
 
     def has_archived_messages(self, session_id: str) -> bool:
         """Return True if the session has any soft-archived (``active = 0``) rows.
@@ -6824,6 +7643,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             result.append(msg)
         return result
 
+    def get_messages_for_model(
+        self, session_id: str, include_inactive: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Load only transcript rows that may be exposed to the model.
+
+        Display and audit callers intentionally use :meth:`get_messages`. Model
+        consumers must use this method so hidden control-plane rows and history
+        quarantined by ``model_history_cutoff_message_id`` cannot be recovered
+        through direct session reads.
+        """
+        active_clause = "" if include_inactive else " AND m.active = 1"
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT m.* FROM messages m JOIN sessions s ON s.id = m.session_id "
+                "WHERE m.session_id = ? AND m.llm_visible = 1 "
+                "AND m.id > s.model_history_cutoff_message_id"
+                f"{active_clause} ORDER BY m.id",
+                (session_id,),
+            )
+            rows = cursor.fetchall()
+        result = []
+        for row in rows:
+            msg = dict(row)
+            if "content" in msg:
+                msg["content"] = self._decode_content(msg["content"])
+            if msg.get("tool_calls"):
+                try:
+                    msg["tool_calls"] = json.loads(msg["tool_calls"])
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning(
+                        "Failed to deserialize tool_calls in get_messages_for_model, "
+                        "falling back to []"
+                    )
+                    msg["tool_calls"] = []
+            result.append(msg)
+        return result
+
     def get_messages_around(
         self,
         session_id: str,
@@ -6854,7 +7710,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._read_ctx() as conn:
             # Confirm the anchor exists in this session.
             anchor_exists = conn.execute(
-                "SELECT 1 FROM messages WHERE id = ? AND session_id = ? LIMIT 1",
+                "SELECT 1 FROM messages m JOIN sessions s ON s.id = m.session_id "
+                "WHERE m.id = ? AND m.session_id = ? AND m.llm_visible = 1 "
+                "AND m.id > s.model_history_cutoff_message_id LIMIT 1",
                 (around_message_id, session_id),
             ).fetchone()
             if not anchor_exists:
@@ -6863,15 +7721,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # Two queries: anchor + before (DESC, take window+1), and after
             # (ASC, take window). Final order is id ASC.
             before_rows = conn.execute(
-                "SELECT * FROM messages "
-                "WHERE session_id = ? AND id <= ? "
-                "ORDER BY id DESC LIMIT ?",
+                "SELECT m.* FROM messages m JOIN sessions s ON s.id = m.session_id "
+                "WHERE m.session_id = ? AND m.id <= ? AND m.llm_visible = 1 "
+                "AND m.id > s.model_history_cutoff_message_id "
+                "ORDER BY m.id DESC LIMIT ?",
                 (session_id, around_message_id, window + 1),
             ).fetchall()
             after_rows = conn.execute(
-                "SELECT * FROM messages "
-                "WHERE session_id = ? AND id > ? "
-                "ORDER BY id ASC LIMIT ?",
+                "SELECT m.* FROM messages m JOIN sessions s ON s.id = m.session_id "
+                "WHERE m.session_id = ? AND m.id > ? AND m.llm_visible = 1 "
+                "AND m.id > s.model_history_cutoff_message_id "
+                "ORDER BY m.id ASC LIMIT ?",
                 (session_id, around_message_id, window),
             ).fetchall()
 
@@ -7023,12 +7883,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if include_ancestors:
             session_ids = self._session_lineage_root_to_tip(session_id)
 
-        active_clause = "" if include_inactive else " AND active = 1"
+        active_clause = "" if include_inactive else " AND m.active = 1"
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
             rows = conn.execute(
-                f"SELECT {self._CONVERSATION_ROW_COLUMNS} "
-                f"FROM messages WHERE session_id IN ({placeholders})"
+                "SELECT m.id, m.role, m.content, m.tool_call_id, m.tool_calls, m.tool_name, "
+                "m.effect_disposition, "
+                "m.finish_reason, m.reasoning, m.reasoning_content, m.reasoning_details, "
+                "m.codex_reasoning_items, m.codex_message_items, m.platform_message_id, "
+                "m.observed, m.timestamp, m.api_content, m.display_kind, m.display_metadata "
+                f"FROM messages m JOIN sessions s ON s.id = m.session_id WHERE m.session_id IN ({placeholders}) "
+                "AND m.llm_visible = 1 AND m.id > s.model_history_cutoff_message_id"
                 # Order by AUTOINCREMENT id (true insertion order), NOT timestamp:
                 # append_message stamps rows with time.time(), which is not
                 # monotonic (WSL2, NTP steps, VM/laptop sleep resume). A later
@@ -7037,7 +7902,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # after its tool response, breaking tool-call/response adjacency
                 # and triggering an HTTP 400 on replay. This matches get_messages
                 # — see c03acca50 for the original fix.
-                f"{active_clause} ORDER BY id",
+                f"{active_clause} ORDER BY m.id",
                 tuple(session_ids),
             ).fetchall()
 
@@ -7208,11 +8073,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
             rows = conn.execute(
-                f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
-                f"FROM messages WHERE session_id IN ({placeholders}) AND active = 1 "
+                f"SELECT m.* FROM messages m "
+                f"JOIN sessions s ON s.id = m.session_id "
+                f"WHERE m.session_id IN ({placeholders}) AND m.active = 1 "
+                "AND m.llm_visible = 1 "
+                "AND m.id > s.model_history_cutoff_message_id "
                 # ORDER BY id (insertion order) — see get_messages_as_conversation
                 # for why timestamp ordering is unsafe.
-                "ORDER BY id",
+                "ORDER BY m.id",
                 tuple(session_ids),
             ).fetchall()
 
@@ -7734,6 +8602,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         filesystem hiccup never blocks a DB operation.
         """
         if sessions_dir is None:
+            return
+        try:
+            _validate_runtime_import_identifier(
+                "session_id", session_id, max_length=SESSION_ID_FILENAME_MAX_LEN
+            )
+        except ValueError:
+            logger.warning(
+                "Refusing filesystem cleanup for unsafe session id: %r", session_id
+            )
             return
         for suffix in (".json", ".jsonl"):
             p = sessions_dir / f"{session_id}{suffix}"
@@ -8918,7 +9795,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             (SELECT {_PREVIEW_RAW_SELECT}
                              FROM messages m
                              WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
-                             ORDER BY m.timestamp, m.id LIMIT 1),
+                             ORDER BY m.id LIMIT 1),
                             ''
                         ) AS _preview_raw,
                         {_sql_session_last_active("s")} AS last_active
@@ -8948,7 +9825,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                             (SELECT {_PREVIEW_RAW_SELECT}
                              FROM messages m
                              WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
-                             ORDER BY m.timestamp, m.id LIMIT 1),
+                             ORDER BY m.id LIMIT 1),
                             ''
                         ) AS _preview_raw,
                         {_sql_session_last_active("s")} AS last_active

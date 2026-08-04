@@ -44,6 +44,38 @@ def test_valid_integer_context_length_no_warning():
         assert "Invalid" not in str(c)
 
 
+def test_constructor_context_length_overrides_config_value():
+    """Gateway session overrides can pass context length without writing config."""
+    with (
+        patch("hermes_cli.config.load_config", return_value={
+            "model": {
+                "default": "gpt5.4",
+                "provider": "custom",
+                "base_url": "http://localhost:4000/v1",
+                "context_length": 128000,
+            }
+        }),
+        patch("agent.model_metadata.get_model_context_length", return_value=128_000),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            model="gpt5.4",
+            api_key="test-key-1234567890",
+            base_url="http://localhost:4000/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            config_context_length=1_000_000,
+        )
+
+    assert agent._config_context_length == 1_000_000
+    assert agent.context_compressor.context_length == 1_000_000
+
+
 def test_string_k_suffix_context_length_warns():
     """context_length: '256K' should warn the user clearly."""
     with patch("run_agent.logger") as mock_logger:

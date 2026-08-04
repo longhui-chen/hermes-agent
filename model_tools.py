@@ -284,6 +284,20 @@ _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
 _TOOL_DEFS_CACHE_MAX = 8
 
 
+def _quiet_tool_defs_cache_enabled() -> bool:
+    """Keep quiet-mode schemas local to one profile in multiplex mode.
+
+    Tool availability can depend on the profile secret scope and its live
+    .env grants. A process-wide cache cannot safely represent those values.
+    """
+    try:
+        from agent.secret_scope import is_multiplex_active
+        return not is_multiplex_active()
+    except Exception:
+        # Standalone/minimal callers retain the existing cache behavior.
+        return True
+
+
 def _clear_tool_defs_cache() -> None:
     """Drop memoized get_tool_definitions() results. Called when dynamic
     schema dependencies change (e.g. discord capability cache reset,
@@ -324,7 +338,8 @@ def get_tool_definitions(
     # mode, discord action allowlist, etc.) without needing an explicit
     # invalidate hook on every config-writer.
     cache_key = None
-    if quiet_mode:
+    cache_enabled = quiet_mode and _quiet_tool_defs_cache_enabled()
+    if cache_enabled:
         try:
             from hermes_cli.config import get_config_path
             cfg_path = get_config_path()
@@ -356,7 +371,7 @@ def get_tool_definitions(
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                        skip_tool_search_assembly=skip_tool_search_assembly)
-    if quiet_mode and cache_key is not None:
+    if cache_enabled and cache_key is not None:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
         # schemas to self.tools) don't poison the cache. Without this, a
@@ -613,6 +628,52 @@ def _resolve_active_context_length() -> int:
         model_id = (model_cfg.get("model") or model_cfg.get("default") or "").strip()
         if not model_id:
             return 0
+        raw_context_length = model_cfg.get("context_length")
+        if raw_context_length is not None and not isinstance(raw_context_length, bool):
+            try:
+                context_length = int(raw_context_length)
+                if context_length > 0:
+                    return context_length
+            except (TypeError, ValueError):
+                logger.debug(
+                    "Ignoring invalid model.context_length for tool search: %r",
+                    raw_context_length,
+                )
+
+        custom_providers = None
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
+            custom_providers = get_compatible_custom_providers(cfg)
+        except Exception:
+            raw_custom_providers = cfg.get("custom_providers")
+            custom_providers = raw_custom_providers if isinstance(raw_custom_providers, list) else None
+
+        provider = (model_cfg.get("provider") or "").strip()
+        base_url = (model_cfg.get("base_url") or "").strip()
+        api_key = (model_cfg.get("api_key") or "").strip()
+        if not base_url and provider and isinstance(custom_providers, list):
+            provider_key = provider.lower()
+            for entry in custom_providers:
+                if not isinstance(entry, dict):
+                    continue
+                aliases = (
+                    entry.get("provider_key"),
+                    entry.get("name"),
+                    entry.get("provider"),
+                )
+                if provider_key not in {
+                    str(alias or "").strip().lower() for alias in aliases
+                    if str(alias or "").strip()
+                }:
+                    continue
+                base_url = (entry.get("base_url") or "").strip()
+                if not api_key:
+                    api_key = (entry.get("api_key") or "").strip()
+                    key_env = (entry.get("key_env") or "").strip()
+                    if not api_key and key_env:
+                        api_key = os.environ.get(key_env, "").strip()
+                break
+
         from agent.model_metadata import get_model_context_length
         # Honor explicit `model.context_length` in config.yaml — short-circuits
         # the OpenRouter /models probe at get_model_context_length step 0, so
@@ -650,6 +711,7 @@ def _resolve_active_context_length() -> int:
             api_key=api_key,
             config_context_length=config_ctx,
             provider=provider,
+            custom_providers=custom_providers,
         ) or 0)
     except Exception as e:
         logger.debug("Could not resolve active context length: %s", e)
@@ -664,7 +726,7 @@ def _resolve_active_context_length() -> int:
 # because they need agent-level state (TodoStore, MemoryStore, etc.).
 # The registry still holds their schemas; dispatch just returns a stub error
 # so if something slips through, the LLM sees a sensible message.
-_AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
+_AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task", "present_plan"}
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 
 
@@ -1102,6 +1164,7 @@ def handle_function_call(
     turn_id: Optional[str] = None,
     api_request_id: Optional[str] = None,
     user_task: Optional[str] = None,
+    previous_assistant_message: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
     skip_pre_tool_call_hook: bool = False,
     skip_tool_request_middleware: bool = False,
@@ -1209,7 +1272,10 @@ def handle_function_call(
                 task_id=task_id,
                 tool_call_id=tool_call_id,
                 session_id=session_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
                 user_task=user_task,
+                previous_assistant_message=previous_assistant_message,
                 enabled_tools=enabled_tools,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
                 skip_tool_request_middleware=skip_tool_request_middleware,
@@ -1303,6 +1369,14 @@ def handle_function_call(
             if function_name in {"write_file", "patch"}:
                 return tool_error("Edit approval denied: approval guard failed")
 
+        # Zettlab file-change protection lives inside registry.dispatch() —
+        # the single choke point every execution path funnels through: the
+        # `_dispatch` closures below AND the plugin-facing ctx.dispatch_tool(),
+        # which bypasses handle_function_call entirely (Codex review P1).
+        # The middleware-rewritten FINAL args are exactly what
+        # registry.dispatch receives, so the "gate on final tool arguments"
+        # invariant (Codex review P1) still holds there.
+
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).
         if function_name not in _READ_SEARCH_TOOLS:
@@ -1343,6 +1417,10 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
+                        turn_id=turn_id,
+                        tool_call_id=tool_call_id,
+                        user_task=user_task,
+                        previous_assistant_message=previous_assistant_message,
                     )
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
@@ -1351,6 +1429,9 @@ def handle_function_call(
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
+                        previous_assistant_message=previous_assistant_message,
+                        turn_id=turn_id,
+                        tool_call_id=tool_call_id,
                     )
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)

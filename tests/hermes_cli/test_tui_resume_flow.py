@@ -164,6 +164,7 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
 
         def run_conversation(self, prompt, **_kwargs):
             captured["prompt"] = prompt
+            captured["supports_followup_turns"] = self._supports_followup_turns
             return {"final_response": "ok", "failed": False, "partial": False}
 
     class FakeSessionDB:
@@ -214,6 +215,7 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     assert captured["session_db"] is sentinel_db
     assert captured["enabled_toolsets"] == ["session_search"]
     assert captured["prompt"] == "recall this"
+    assert captured["supports_followup_turns"] is False
 
 
 def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):

@@ -26,6 +26,8 @@ import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
+from agent.prompt_builder import STEER_USER_PREFIX
+from agent.response_format import response_format_requires_structured_output
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -243,7 +245,6 @@ def finalize_turn(
     # are surfaced on the result dict via ``cleanup_errors`` rather than
     # killing the turn.
     _cleanup_errors = []
-
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
     try:
@@ -539,28 +540,111 @@ def finalize_turn(
             logger.debug("turn-completion explainer failed: %s", _exp_err)
 
     _response_transformed = False
+    _response_transform_suffix = ""
+    _structured_output = False
 
     # Plugin hook: transform_llm_output
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
-    # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
-        try:
-            from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-            _transform_results = _invoke_hook(
-                "transform_llm_output",
-                response_text=final_response,
-                session_id=agent.session_id or "",
-                model=agent.model,
-                platform=getattr(agent, "platform", None) or "",
-            )
-            for _hook_result in _transform_results:
-                if isinstance(_hook_result, str) and _hook_result:
-                    final_response = _hook_result
-                    _response_transformed = True
-                    break  # First non-empty string wins
-        except Exception as exc:
-            logger.warning("transform_llm_output hook failed: %s", exc)
+    # Transform hooks run as a chain; None/empty leaves the current text unchanged.
+    # Run them for every turn, including empty and interrupted exits: plugins can
+    # use the terminal outcome to roll back pending state and emit a machine-only
+    # action receipt without requiring a model response.
+    try:
+        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
+        _pre_transform_response = final_response
+        _structured_output = response_format_requires_structured_output(
+            (getattr(agent, "request_overrides", None) or {}).get("response_format")
+        )
+        _transform_results = _invoke_hook(
+            "transform_llm_output",
+            response_text=final_response or "",
+            session_id=agent.session_id or "",
+            model=agent.model,
+            api_mode=getattr(agent, "api_mode", None) or "",
+            platform=getattr(agent, "platform", None) or "",
+            sender_id=(
+                getattr(agent, "_user_id_alt", None)
+                or getattr(agent, "_user_id", None)
+                or ""
+            ),
+            completed=completed,
+            failed=failed,
+            interrupted=interrupted,
+            turn_exit_reason=_turn_exit_reason,
+            execution_origin=getattr(agent, "_memory_write_origin", "") or "",
+            is_kanban_worker=bool(os.environ.get("HERMES_KANBAN_TASK")),
+            structured_output=_structured_output,
+            supports_followup_turns=bool(
+                getattr(agent, "_supports_followup_turns", True)
+            ),
+            streaming_output=bool(getattr(agent, "stream_delta_callback", None)),
+        )
+        for _hook_result in _transform_results:
+            if isinstance(_hook_result, str) and _hook_result:
+                final_response = _hook_result
+        _response_transformed = final_response != _pre_transform_response
+        if (
+            _response_transformed
+            and isinstance(final_response, str)
+            and isinstance(_pre_transform_response, str)
+            and final_response.startswith(_pre_transform_response)
+        ):
+            _response_transform_suffix = final_response[
+                len(_pre_transform_response) :
+            ]
+
+        if _response_transformed:
+            # Keep transformed output durable. Delivery remains the responsibility
+            # of each runtime's existing final-response path.
+            if messages and messages[-1].get("role") == "assistant":
+                _assistant_message = messages[-1]
+                # An interrupted tool sequence may have been closed above with a
+                # human-readable placeholder. Preserve it and append the receipt.
+                if interrupted and not _pre_transform_response:
+                    _assistant_message["content"] = (
+                        str(_assistant_message.get("content") or "").rstrip()
+                        + "\n\n"
+                        + final_response
+                    )
+                else:
+                    _assistant_message["content"] = final_response
+                _db_message_id = _assistant_message.get("_db_message_id")
+                _session_db = getattr(agent, "_session_db", None)
+                if (
+                    _assistant_message.get("_db_persisted")
+                    and isinstance(_db_message_id, int)
+                    and _session_db is not None
+                ):
+                    try:
+                        if not _session_db.update_message_content(
+                            agent.session_id,
+                            _db_message_id,
+                            _assistant_message["content"],
+                        ):
+                            raise RuntimeError("persisted assistant row not found")
+                    except Exception as _update_err:
+                        _cleanup_errors.append(
+                            f"update_transformed_session_message: {_update_err}"
+                        )
+                        logger.error(
+                            "finalize_turn: transformed SessionDB update failed: %s",
+                            _update_err,
+                            exc_info=True,
+                        )
+            elif final_response:
+                messages.append({"role": "assistant", "content": final_response})
+            try:
+                agent._persist_session(messages, conversation_history)
+            except Exception as _persist_err:
+                _cleanup_errors.append(f"persist_transformed_session: {_persist_err}")
+                logger.error(
+                    "finalize_turn: transformed _persist_session failed: %s",
+                    _persist_err,
+                    exc_info=True,
+                )
+    except Exception as exc:
+        logger.warning("transform_llm_output hook failed: %s", exc)
 
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
@@ -578,7 +662,24 @@ def finalize_turn(
                 assistant_response=final_response,
                 conversation_history=list(messages),
                 model=agent.model,
+                api_mode=getattr(agent, "api_mode", None) or "",
                 platform=getattr(agent, "platform", None) or "",
+                sender_id=(
+                    getattr(agent, "_user_id_alt", None)
+                    or getattr(agent, "_user_id", None)
+                    or ""
+                ),
+                completed=completed,
+                failed=failed,
+                interrupted=interrupted,
+                execution_origin=getattr(agent, "_memory_write_origin", "") or "",
+                structured_output=_structured_output,
+                supports_followup_turns=bool(
+                    getattr(agent, "_supports_followup_turns", True)
+                ),
+                streaming_output=bool(
+                    getattr(agent, "stream_delta_callback", None)
+                ),
             )
         except Exception as exc:
             logger.warning("post_llm_call hook failed: %s", exc)
@@ -623,6 +724,11 @@ def finalize_turn(
     last_reasoning = None
     for msg in reversed(messages):
         if msg.get("role") == "user":
+            # Mid-turn /steer user messages live INSIDE the turn — they are
+            # not the turn-starting boundary; keep walking past them.
+            _c = msg.get("content")
+            if isinstance(_c, str) and _c.startswith(STEER_USER_PREFIX):
+                continue
             break  # turn boundary — don't cross into prior turns
         if msg.get("role") == "assistant" and msg.get("reasoning"):
             last_reasoning = msg["reasoning"]
@@ -640,6 +746,7 @@ def finalize_turn(
         "partial": False,  # True only when stopped due to invalid tool calls
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
+        "response_transform_suffix": _response_transform_suffix,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
         "model": agent.model,
         "provider": agent.provider,
@@ -680,9 +787,25 @@ def finalize_turn(
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.
-    _leftover_steer = agent._drain_pending_steer()
+    # close=True: this is the LAST drain of the turn — a steer arriving
+    # after it has no consumer (the SSE task may linger past this point,
+    # so endpoint-side task.done() checks can't cover the window) and
+    # must be refused by steer() so the caller re-queues the text.
+    #
+    # Interrupted turns DROP the leftover instead: a hard interrupt
+    # supersedes any pending steer (interrupt() empties the slot itself,
+    # but a steer landing in the interrupt→finalize window re-fills it).
+    # Handing it back would make CLI/gateway re-deliver it as the next
+    # user turn — auto-executing a redirect the user just cancelled.
+    _leftover_steer = agent._drain_pending_steer(close=True)
     if _leftover_steer:
-        result["pending_steer"] = _leftover_steer
+        if interrupted:
+            logger.info(
+                "Dropping pending /steer superseded by interrupt (%d chars)",
+                len(_leftover_steer),
+            )
+        else:
+            result["pending_steer"] = _leftover_steer
     agent._response_was_previewed = False
 
     # Include interrupt message if one triggered the interrupt

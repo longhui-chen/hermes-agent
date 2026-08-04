@@ -383,6 +383,31 @@ def _node_options_from_run(calls):
         if a == "-e" and i + 1 < len(args) and args[i + 1].startswith("NODE_OPTIONS="):
             return args[i + 1].split("=", 1)[1]
     return None
+def test_docker_env_scrubs_profile_scoped_connector_runtime_at_container_create(monkeypatch):
+    """docker run -e must not receive connector bearer from docker_env."""
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    calls = _mock_subprocess_run(monkeypatch)
+
+    _make_dummy_env(env={
+        "ZETTLAB_CONNECTORS_URL": "http://from-docker-env",
+        "ZETTLAB_CONNECTORS_AUTH_TOKEN": "docker-env-token",
+        "ZET_AGENT_ID": "agent-from-docker-env",
+        "SAFE_TOKEN": "safe-value",
+    })
+
+    run_calls = [c for c in calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "run"]
+    assert run_calls, "docker run should have been called"
+    run_args_str = " ".join(run_calls[0][0])
+    assert "ZETTLAB_CONNECTORS_URL" not in run_args_str
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in run_args_str
+    assert "ZET_AGENT_ID" not in run_args_str
+    assert "SAFE_TOKEN=safe-value" in run_args_str
+
+
+def test_docker_env_appears_in_init_env_args(monkeypatch):
+    """Explicit docker_env values should appear in _build_init_env_args."""
+    env = _make_execute_only_env()
+    env._env = {"MY_VAR": "my_value"}
 
 
 def test_egress_node_options_overrides_conflicting_ca_flag(monkeypatch):
@@ -418,6 +443,66 @@ def test_forward_env_overrides_docker_env_in_init_args(monkeypatch):
 
     assert "MY_KEY=dynamic_value" in args_str
     assert "MY_KEY=static_value" not in args_str
+
+
+def test_docker_env_and_forward_env_merge_in_init_args(monkeypatch):
+    """docker_env and docker_forward_env with different keys should both appear."""
+    env = _make_execute_only_env(forward_env=["TOKEN"])
+    env._env = {"SSH_AUTH_SOCK": "/run/user/1000/agent.sock"}
+
+    monkeypatch.setenv("TOKEN", "secret123")
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {})
+
+    args = env._build_init_env_args()
+    args_str = " ".join(args)
+
+    assert "SSH_AUTH_SOCK=/run/user/1000/agent.sock" in args_str
+    assert "TOKEN=secret123" in args_str
+
+
+def test_init_env_args_scrubs_profile_scoped_connector_runtime(monkeypatch):
+    """Docker init_session must not snapshot connector bearer from any source."""
+    env = _make_execute_only_env(forward_env=[
+        "ZETTLAB_CONNECTORS_URL",
+        "ZETTLAB_CONNECTORS_AUTH_TOKEN",
+        "ZET_AGENT_ID",
+        "SAFE_TOKEN",
+    ])
+    env._env = {
+        "ZETTLAB_CONNECTORS_URL": "http://from-docker-env",
+        "ZETTLAB_CONNECTORS_AUTH_TOKEN": "docker-env-token",
+        "ZET_AGENT_ID": "docker-env-agent",
+    }
+
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_URL", "http://from-shell")
+    monkeypatch.setenv("ZETTLAB_CONNECTORS_AUTH_TOKEN", "shell-token")
+    monkeypatch.setenv("ZET_AGENT_ID", "shell-agent")
+    monkeypatch.setenv("SAFE_TOKEN", "safe-value")
+    monkeypatch.setattr(docker_env, "_load_hermes_env_vars", lambda: {
+        "ZETTLAB_CONNECTORS_AUTH_TOKEN": "dotenv-token",
+        "SAFE_TOKEN": "dotenv-safe",
+    })
+
+    args = env._build_init_env_args()
+    args_str = " ".join(args)
+
+    assert "ZETTLAB_CONNECTORS_URL" not in args_str
+    assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" not in args_str
+    assert "ZET_AGENT_ID" not in args_str
+    assert "SAFE_TOKEN=safe-value" in args_str
+
+
+def test_snapshot_ephemeral_env_keys_include_engaged_turn_context(monkeypatch):
+    import gateway.session_context as sc
+
+    monkeypatch.setattr(sc, "_session_context_engaged", True)
+    env = docker_env.DockerEnvironment.__new__(docker_env.DockerEnvironment)
+
+    keys = set(env._snapshot_ephemeral_env_keys())
+
+    assert "HERMES_TURN_ID" in keys
+    assert "HERMES_PLAN_ACK_REVISION_REQUESTED" in keys
+
 
 
 def test_normalize_env_dict_filters_invalid_keys():
@@ -1000,6 +1085,47 @@ def test_cleanup_vm_default_honors_persist_mode(monkeypatch):
         f"cleanup_vm() default must not docker rm a persist-mode container; "
         f"got: {rms}"
     )
+
+
+def test_cleanup_vm_force_remove_tears_down_persist_container(monkeypatch):
+    """``cleanup_vm(task_id, force_remove=True)`` tears down a persist-mode
+    container — the explicit-teardown path for ``/reset``-style flows.
+
+    Also pins the runtime-signature-inspection plumbing: the kwarg must
+    actually flow through ``cleanup_vm`` into the backend's ``cleanup()``.
+    """
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
+    _mock_subprocess_run(monkeypatch)
+    _install_fake_thread(monkeypatch)
+
+    from tools import terminal_tool
+
+    env = _make_dummy_env(task_id="explicit-teardown-test")
+    terminal_tool._active_environments["explicit-teardown-test"] = env
+
+    cleanup_calls = []
+    real_run = docker_env.subprocess.run
+
+    def _capturing_run(cmd, **kwargs):
+        cleanup_calls.append((list(cmd) if isinstance(cmd, list) else cmd, kwargs))
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _capturing_run)
+
+    try:
+        terminal_tool.cleanup_vm(
+            "explicit-teardown-test",
+            force_remove=True,
+            _already_scoped=True,
+        )
+    finally:
+        terminal_tool._active_environments.pop("explicit-teardown-test", None)
+
+    stops = [c for c in cleanup_calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "stop"]
+    rms = [c for c in cleanup_calls if isinstance(c[0], list) and len(c[0]) >= 2 and c[0][1] == "rm"]
+    assert stops, f"force_remove must reach docker stop; got: {cleanup_calls}"
+    assert rms, f"force_remove must reach docker rm; got: {cleanup_calls}"
 
 
 def test_cleanup_with_persist_disabled_stops_and_rms(monkeypatch):

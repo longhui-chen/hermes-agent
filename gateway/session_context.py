@@ -37,6 +37,7 @@ needs to replace the import + call site:
 """
 
 from contextlib import contextmanager
+import re
 from contextvars import ContextVar
 from typing import Any, Iterator
 
@@ -101,6 +102,27 @@ _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNS
 # masks any leaked process env value.
 _CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 
+# Current chat turn and its structured plan-review receipt. These values are
+# consumed by skill subprocesses, so they must follow the same task-local
+# ContextVar -> child-process bridge as HERMES_SESSION_* rather than using the
+# process-global os.environ in a concurrent API server.
+_TURN_ID: ContextVar = ContextVar("HERMES_TURN_ID", default=_UNSET)
+# Opaque server-minted identity for the exact task-local binding above. The
+# external turn ID is correlation data and can be reused by a buggy or hostile
+# client; this object prevents two concurrent requests carrying the same text
+# ID from consuming each other's in-process capabilities.
+_TURN_BINDING: ContextVar = ContextVar("HERMES_TURN_BINDING", default=_UNSET)
+_PLAN_ACK_STATUS: ContextVar = ContextVar("HERMES_PLAN_ACK_STATUS", default=_UNSET)
+_PLAN_ACK_TURN_ID: ContextVar = ContextVar("HERMES_PLAN_ACK_TURN_ID", default=_UNSET)
+_PLAN_ACK_REVISION_REQUESTED: ContextVar = ContextVar(
+    "HERMES_PLAN_ACK_REVISION_REQUESTED",
+    default=_UNSET,
+)
+_BUSINESS_EXECUTION_TOKEN: ContextVar = ContextVar(
+    "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+    default=_UNSET,
+)
+
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -121,11 +143,61 @@ _CRON_SESSION: ContextVar = ContextVar("HERMES_CRON_SESSION", default=_UNSET)
 # propagates that into this contextvar at session-bind time.
 _SESSION_ASYNC_DELIVERY: ContextVar = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_UNSET)
 
+# Zettlab local-server sends metadata.turn_id with each API request. This token
+# stays task-local so concurrent requests cannot overwrite one another.
+_ZETTLAB_TURN_ID: ContextVar = ContextVar("zettlab_turn_id", default="")
+_ZETTLAB_CONNECTOR_ROUTE_CAPABILITY: ContextVar = ContextVar(
+    "zettlab_connector_route_capability", default=""
+)
+
+# local-server signs the exact authenticated user/agent/session scope for each
+# Hermes request. Keep that capability task-local and out of os.environ so a
+# concurrent API request cannot borrow another user's desktop-browser session.
+_ZETTLAB_BROWSER_SESSION_TOKEN: ContextVar = ContextVar(
+    "zettlab_browser_session_token", default=""
+)
+
+
+def set_zettlab_turn_id(turn_id: str) -> None:
+    _ZETTLAB_TURN_ID.set(turn_id or "")
+
+
+def zettlab_turn_id() -> str:
+    return _ZETTLAB_TURN_ID.get().strip()
+
+
+def push_zettlab_browser_session_token(value: str):
+    """Bind one request's managed-browser scope token and return its reset token."""
+    return _ZETTLAB_BROWSER_SESSION_TOKEN.set(str(value or "").strip())
+
+
+def pop_zettlab_browser_session_token(token) -> None:
+    """Restore the managed-browser scope token that preceded this request."""
+    _ZETTLAB_BROWSER_SESSION_TOKEN.reset(token)
+
+
+def zettlab_browser_session_token() -> str:
+    """Return the current request's managed-browser scope capability."""
+    return _ZETTLAB_BROWSER_SESSION_TOKEN.get().strip()
+
+
+def set_zettlab_connector_route_capability(capability: str) -> None:
+    _ZETTLAB_CONNECTOR_ROUTE_CAPABILITY.set(capability or "")
+
+
+def zettlab_connector_route_capability() -> str:
+    return _ZETTLAB_CONNECTOR_ROUTE_CAPABILITY.get().strip()
+
 # Cron auto-delivery vars — set per-job in run_job() so concurrent jobs
 # don't clobber each other's delivery targets.
 _CRON_AUTO_DELIVER_PLATFORM: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
 _CRON_AUTO_DELIVER_CHAT_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)
 _CRON_AUTO_DELIVER_THREAD_ID: ContextVar = ContextVar("HERMES_CRON_AUTO_DELIVER_THREAD_ID", default=_UNSET)
+# Human-readable cron job name for the current run — stamped as X-Task-Title so
+# the credit ledger's cron task card shows the real job name (and survives the
+# job being deleted, since the App can no longer resolve it from the live list).
+# Set per-job in run_job(); empty for interactive sessions.
+_CRON_TASK_TITLE: ContextVar = ContextVar("HERMES_CRON_TASK_TITLE", default=_UNSET)
 
 _VAR_MAP = {
     "HERMES_SESSION_PLATFORM": _SESSION_PLATFORM,
@@ -142,10 +214,82 @@ _VAR_MAP = {
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
     "HERMES_CRON_SESSION": _CRON_SESSION,
+    "HERMES_TURN_ID": _TURN_ID,
+    "HERMES_PLAN_ACK_STATUS": _PLAN_ACK_STATUS,
+    "HERMES_PLAN_ACK_TURN_ID": _PLAN_ACK_TURN_ID,
+    "HERMES_PLAN_ACK_REVISION_REQUESTED": _PLAN_ACK_REVISION_REQUESTED,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
+    "HERMES_CRON_TASK_TITLE": _CRON_TASK_TITLE,
 }
+
+
+def set_turn_vars(
+    *,
+    turn_id: str = "",
+    plan_ack_status: str = "",
+    plan_ack_turn_id: str = "",
+    plan_ack_revision_requested: str = "",
+    business_execution_token: str = "",
+) -> list:
+    """Bind one request's turn identity and plan receipt task-locally."""
+    global _session_context_engaged
+    _session_context_engaged = True
+    return [
+        _TURN_ID.set(turn_id),
+        _TURN_BINDING.set(object()),
+        _PLAN_ACK_STATUS.set(plan_ack_status),
+        _PLAN_ACK_TURN_ID.set(plan_ack_turn_id),
+        _PLAN_ACK_REVISION_REQUESTED.set(plan_ack_revision_requested),
+        _BUSINESS_EXECUTION_TOKEN.set(business_execution_token),
+    ]
+
+
+def clear_turn_vars(tokens: list) -> None:
+    """Restore the turn context that existed before :func:`set_turn_vars`."""
+    for var, token in zip(
+        (
+            _TURN_ID,
+            _TURN_BINDING,
+            _PLAN_ACK_STATUS,
+            _PLAN_ACK_TURN_ID,
+            _PLAN_ACK_REVISION_REQUESTED,
+            _BUSINESS_EXECUTION_TOKEN,
+        ),
+        tokens,
+    ):
+        var.reset(token)
+
+
+def current_turn_identity() -> tuple[str, object] | None:
+    """Return the exact trusted task-local turn binding, if one is active.
+
+    The first item is the external request turn ID used for correlation. The
+    opaque second item is minted by :func:`set_turn_vars` and deliberately
+    cannot be reconstructed from client metadata. Callers must compare the
+    complete tuple and must never serialize the binding object.
+    """
+    turn_id = _TURN_ID.get()
+    binding = _TURN_BINDING.get()
+    if turn_id is _UNSET or binding is _UNSET:
+        return None
+    normalized_turn_id = str(turn_id or "").strip()
+    if not normalized_turn_id:
+        return None
+    return normalized_turn_id, binding
+
+
+def business_execution_token() -> str:
+    """Return the task-local capability for the trusted video executor only.
+
+    This value intentionally lives outside ``_VAR_MAP`` so generic terminal,
+    execute-code, plugin, and model-driving subprocesses cannot inherit it.
+    """
+    value = _BUSINESS_EXECUTION_TOKEN.get()
+    if value is _UNSET or value is None:
+        return ""
+    return str(value).strip()
 
 
 def set_current_session_id(session_id: str) -> None:
@@ -348,6 +492,8 @@ def reset_session_vars() -> None:
     """
     for var in _VAR_MAP.values():
         var.set(_UNSET)
+    _TURN_BINDING.set(_UNSET)
+    _BUSINESS_EXECUTION_TOKEN.set(_UNSET)
     # Reset the async-delivery capability to "never bound here" (_UNSET) for the
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
@@ -358,6 +504,25 @@ def reset_session_vars() -> None:
         clear_session_cwd()
     except Exception:
         pass
+
+
+def push_session_platform(platform: str):
+    """Bind ONLY the platform contextvar; returns a token for :func:`pop_session_platform`.
+
+    Unlike ``set_session_vars``/``clear_session_vars`` (not nestable — clearing
+    stamps every var to ``""``), this pair is token-based and restores the
+    prior value exactly, so it can wrap a narrow pre-session window. Used by
+    zet_agent's inbound skill invocation expansion (metadata.skill_slug),
+    which runs in the HTTP handler BEFORE the session is bound and must still
+    resolve platform-scoped skill config (``skills.platform_disabled``,
+    frontmatter ``platforms:`` filters).
+    """
+    return _SESSION_PLATFORM.set(platform or "")
+
+
+def pop_session_platform(token) -> None:
+    """Restore the platform contextvar bound by :func:`push_session_platform`."""
+    _SESSION_PLATFORM.reset(token)
 
 
 def get_session_env(name: str, default: str = "") -> str:
@@ -493,3 +658,53 @@ def async_delivery_supported() -> bool:
     if value is _UNSET:
         return True
     return bool(value)
+
+
+# ---------------------------------------------------------------------------
+# Credit-ledger task attribution
+# ---------------------------------------------------------------------------
+
+# Cron sessions are ``cron_<job_id>_<YYYYMMDD>_<HHMMSS>`` (a fresh id per run).
+# Strip the trailing date+time so every run of a job collapses to a stable
+# ``cron_<job_id>`` — the credit ledger then aggregates all runs into one task
+# card per cron job instead of one card per minute.
+_CRON_RUN_TS_RE = re.compile(r"_\d{8}_\d{6}$")
+
+
+def billing_task_id_for(session_id: str) -> str:
+    """Map a session_id to the credit-ledger task_id to attribute spend to.
+
+    - Interactive sessions (``zettlab:<uid>:<agent>:<rand>``) → used as-is, so a
+      conversation's turns aggregate into one task card.
+    - Cron sessions (``cron_<job>_<YYYYMMDD>_<HHMMSS>``) → collapsed to a stable
+      ``cron_<job>`` so all runs of a cron job aggregate into one card.
+    - Anything else → '' (don't attribute; also avoids leaking X-Task-Id to
+      third-party providers on non-NAS sessions).
+    """
+    if not isinstance(session_id, str) or not session_id:
+        return ""
+    if session_id.startswith("zettlab:"):
+        return session_id
+    if session_id.startswith("cron_"):
+        return _CRON_RUN_TS_RE.sub("", session_id)
+    return ""
+
+
+def billing_task_id() -> str:
+    """``billing_task_id_for`` for the current session context (env/contextvar)."""
+    return billing_task_id_for(get_session_env("HERMES_SESSION_ID", ""))
+
+
+def billing_task_title_encoded() -> str:
+    """Percent-encoded cron job name for the current run, for the X-Task-Title header.
+
+    Only cron runs set ``HERMES_CRON_TASK_TITLE`` (see run_job), so this returns
+    '' for interactive sessions. HTTP headers are ASCII-only, so the (possibly
+    CJK) title is percent-encoded here; ai-api ``url.QueryUnescape``-decodes it
+    once at the boundary before persisting to ``scene_params.task_title``.
+    Returns '' when there is no title to stamp.
+    """
+    from urllib.parse import quote
+
+    title = get_session_env("HERMES_CRON_TASK_TITLE", "").strip()
+    return quote(title, safe="") if title else ""

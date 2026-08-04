@@ -118,3 +118,54 @@ class TestAuxClientHonorsUserDefaultHeaders:
         assert client is not None
         headers = mock_openai.call_args.kwargs.get("default_headers", {}) or {}
         assert headers.get("User-Agent") == "curl/8.7.1"
+
+    def test_openrouter_provider_does_not_cache_zettlab_session_headers(self, tmp_path, monkeypatch):
+        """OpenRouter default_headers are cached, so session headers stay per request."""
+        _write_config(tmp_path, {"model": {"default": "test-model"}})
+        monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+
+        from gateway.session_context import set_current_session_id
+        set_current_session_id("zettlab:u1:agent-a:abc")
+        try:
+            with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+                mock_openai.return_value = MagicMock()
+                from agent.auxiliary_client import _try_openrouter
+                client, model = _try_openrouter(model="openrouter/model")
+        finally:
+            set_current_session_id("")
+
+        assert client is not None
+        assert model == "openrouter/model"
+        headers = mock_openai.call_args.kwargs.get("default_headers", {}) or {}
+        assert "X-Task-Id" not in headers
+        assert "X-Zettlab-Conversation-ID" not in headers
+        assert "X-Scene-Type" not in headers
+        assert headers.get("X-Title") == "Hermes Agent"
+
+    def test_nous_provider_does_not_cache_zettlab_session_headers(self, tmp_path):
+        """Nous default_headers are cached, so session headers stay per request."""
+        _write_config(tmp_path, {"model": {"default": "test-model"}})
+
+        from gateway.session_context import set_current_session_id
+        set_current_session_id("zettlab:u1:agent-a:abc")
+        try:
+            with (
+                patch("agent.auxiliary_client._read_nous_auth", return_value={}),
+                patch(
+                    "agent.auxiliary_client._resolve_nous_runtime_api",
+                    return_value=("nous-jwt", "https://inference.example/v1"),
+                ),
+                patch("agent.auxiliary_client.OpenAI") as mock_openai,
+            ):
+                mock_openai.return_value = MagicMock()
+                from agent.auxiliary_client import _try_nous
+                client, model = _try_nous()
+        finally:
+            set_current_session_id("")
+
+        assert client is not None
+        assert model
+        headers = mock_openai.call_args.kwargs.get("default_headers", {}) or {}
+        assert "X-Task-Id" not in headers
+        assert "X-Zettlab-Conversation-ID" not in headers
+        assert "X-Scene-Type" not in headers

@@ -84,6 +84,7 @@ class TestCheckWatchPatterns:
         assert evt["pattern"] == "ERROR"
         assert "disk full" in evt["output"]
         assert evt["session_id"] == "proc_test_watch"
+        assert evt["profile_owner"] == session.profile_owner
 
 
     def test_output_truncation(self, registry):
@@ -173,6 +174,7 @@ class TestCheckpointPersistence:
             "watch_patterns": ["PANIC", "OOM"],
         }]))
         monkeypatch.setattr(pr_mod, "CHECKPOINT_PATH", checkpoint)
+        monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
         # PID doesn't exist, so nothing will be recovered
         count = registry.recover_from_checkpoint()
         # Won't recover since PID is fake, but verify the code path doesn't crash

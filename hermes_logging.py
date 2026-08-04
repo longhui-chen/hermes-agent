@@ -30,12 +30,16 @@ Session context:
 import atexit
 import copy
 import io
+import json
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 from logging.handlers import QueueHandler, QueueListener
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional, Sequence
 
@@ -70,6 +74,21 @@ else:
 
 
 from hermes_constants import get_config_path, get_hermes_home
+
+# Service identity for the zettos-compatible JSON log shape. Read by
+# ZettosJSONFormatter — keep in sync with the collector's filelog
+# service-name regex (see zettlab-deploy/deploy/collector/zettlab-otel-collector.yaml).
+_SERVICE_NAME = "hermes-agent"
+
+# Version is best-effort: __version__ if available, "dev" otherwise.
+try:
+    from hermes import __version__ as _SERVICE_VERSION  # type: ignore
+except Exception:  # noqa: BLE001 — any import failure is fine, fall back.
+    _SERVICE_VERSION = "dev"
+
+# zerolog-RFC3339-ish → "2006-01-02 15:04:05.000" so the collector's
+# transform/process_logs "Time(...)" call hits.
+_ZETTOS_TS_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 # Sentinel to track whether setup_logging() has already run.  The function
 # is idempotent — calling it twice is safe but the second call is a no-op
@@ -216,6 +235,104 @@ _install_session_record_factory()
 # Filters
 # ---------------------------------------------------------------------------
 
+class ZettosJSONFormatter(logging.Formatter):
+    """Emit one JSON record per log line, matching zettlab-local-server's
+    on-disk shape so the zettlab-otel-collector's filelog receiver +
+    transform/process_logs pipeline can ship to the cloud unchanged.
+
+    Wraps an underlying ``RedactingFormatter`` so the redaction layer still
+    runs on the human-readable message — the redacted ``msg`` is then
+    stuffed into the JSON ``Attributes.msg`` field.
+
+    Shape::
+
+        {
+          "Timestamp":"2026-05-19 12:34:56.789",
+          "Level":"INFO",
+          "ServiceName":"hermes-agent",
+          "ServiceVersion":"...",
+          "Attributes":{"msg":"...","logger":"...","session":"..."}
+        }
+    """
+
+    # Strip the leading ``[session_id]`` tag (with leading space) inserted
+    # by ``_install_session_record_factory`` since we surface it as an
+    # attribute instead of bleeding it into the message body.
+    _SESSION_TAG_RE = re.compile(r"^\s*\[([^\]]+)\]\s*")
+
+    def __init__(self, inner: logging.Formatter) -> None:
+        super().__init__()
+        self._inner = inner
+
+    def format(self, record: logging.LogRecord) -> str:
+        # Defer to the wrapped formatter so RedactingFormatter (or any other
+        # message-rewriter) has a chance to scrub secrets.
+        rendered = self._inner.format(record)
+        # The wrapped formatter applied _LOG_FORMAT — i.e. "<asctime>
+        # <levelname>[<session_tag>] <name>: <message>".  We don't want to
+        # ship that whole thing as msg; ``record.getMessage()`` is already
+        # post-args-substitution and unaffected by the format string.  Re-
+        # run redaction on the bare message by asking the inner formatter
+        # to redact directly when it exposes a hook; otherwise fall back to
+        # the formatted line minus the prefix.
+        msg = record.getMessage()
+        if hasattr(self._inner, "redact"):
+            try:
+                msg = self._inner.redact(msg)  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001 — fall back to the rendered prefix-stripped line.
+                msg = self._tail_after_logger(rendered)
+        else:
+            msg = self._tail_after_logger(rendered)
+
+        attrs: dict = {
+            "msg": msg,
+            "logger": record.name,
+        }
+        session = getattr(record, "session_tag", "")
+        if session:
+            m = self._SESSION_TAG_RE.match(session)
+            if m:
+                attrs["session"] = m.group(1)
+        if record.exc_info:
+            attrs["exc_info"] = self.formatException(record.exc_info)
+
+        ts = datetime.fromtimestamp(record.created, tz=timezone.utc)
+        # Truncate to milliseconds — matches the collector's parser.
+        ts_str = ts.strftime(_ZETTOS_TS_FORMAT) + f".{ts.microsecond // 1000:03d}"
+
+        payload = {
+            "Timestamp": ts_str,
+            "Level": self._level_text(record.levelno),
+            "ServiceName": _SERVICE_NAME,
+            "ServiceVersion": _SERVICE_VERSION,
+            "Attributes": attrs,
+        }
+        return json.dumps(payload, default=str, ensure_ascii=False)
+
+    @staticmethod
+    def _level_text(levelno: int) -> str:
+        if levelno >= logging.CRITICAL:
+            return "FATAL"
+        if levelno >= logging.ERROR:
+            return "ERROR"
+        if levelno >= logging.WARNING:
+            return "WARN"
+        if levelno >= logging.INFO:
+            return "INFO"
+        return "DEBUG"
+
+    @staticmethod
+    def _tail_after_logger(rendered: str) -> str:
+        # _LOG_FORMAT is "<ts> <level>[<sid>] <logger>: <msg>".  Split on
+        # the first ": " after the logger name; fall back to the whole
+        # rendered line if the pattern doesn't match (e.g. caller used a
+        # different format).
+        idx = rendered.find(": ")
+        if idx == -1:
+            return rendered
+        return rendered[idx + 2 :]
+
+
 class _ComponentFilter(logging.Filter):
     """Only pass records whose logger name starts with one of *prefixes*.
 
@@ -301,7 +418,12 @@ def setup_logging(
     """
     global _logging_initialized
     home = hermes_home or get_hermes_home()
-    log_dir = home / "logs"
+    # HERMES_LOG_DIR override lets the device-side systemd unit route logs
+    # to /zettos/subvol/log/hermes-agent/ so the zettlab-otel-collector's
+    # filelog receiver picks them up automatically. Local dev / CLI users
+    # keep ~/.hermes/logs (profile-aware) by default.
+    log_dir_env = os.environ.get("HERMES_LOG_DIR")
+    log_dir = Path(log_dir_env) if log_dir_env else home / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # Read config defaults (best-effort — config may not be loaded yet).
@@ -324,7 +446,7 @@ def setup_logging(
         level=level,
         max_bytes=max_bytes,
         backup_count=backups,
-        formatter=RedactingFormatter(_LOG_FORMAT),
+        formatter=ZettosJSONFormatter(RedactingFormatter(_LOG_FORMAT)),
     )
 
     # --- errors.log (WARNING+) — quick triage log --------------------------
@@ -334,7 +456,7 @@ def setup_logging(
         level=logging.WARNING,
         max_bytes=2 * 1024 * 1024,
         backup_count=2,
-        formatter=RedactingFormatter(_LOG_FORMAT),
+        formatter=ZettosJSONFormatter(RedactingFormatter(_LOG_FORMAT)),
     )
 
     # --- gateway.log (INFO+, gateway component only) ------------------------
@@ -345,7 +467,7 @@ def setup_logging(
             level=logging.INFO,
             max_bytes=5 * 1024 * 1024,
             backup_count=3,
-            formatter=RedactingFormatter(_LOG_FORMAT),
+            formatter=ZettosJSONFormatter(RedactingFormatter(_LOG_FORMAT)),
             log_filter=_ComponentFilter(COMPONENT_PREFIXES["gateway"]),
         )
 

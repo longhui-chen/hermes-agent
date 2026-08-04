@@ -337,13 +337,23 @@ class ContextEngine(ABC):
         """
         return False
 
-    def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
-        """Return True when preflight should trust recent real usage instead.
+    def should_defer_rough_estimate_to_real_usage(self, rough_tokens: int) -> bool:
+        """Return True when a rough estimate should trust recent real usage.
 
         Built-in compression uses this to avoid re-compacting from known-noisy
-        rough estimates after a compressed request has already fit. Third-party
-        engines can ignore it safely.
+        rough estimates after a compressed request has already fit. Callers use
+        it for both turn-entry preflight and post-tool in-loop checks.
         """
+        legacy = getattr(type(self), "should_defer_preflight_to_real_usage", None)
+        if legacy is not None and legacy is not ContextEngine.should_defer_preflight_to_real_usage:
+            return self.should_defer_preflight_to_real_usage(rough_tokens)
+        return False
+
+    def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
+        """Compatibility wrapper for engines overriding the older hook name."""
+        modern = getattr(type(self), "should_defer_rough_estimate_to_real_usage", None)
+        if modern is not None and modern is not ContextEngine.should_defer_rough_estimate_to_real_usage:
+            return self.should_defer_rough_estimate_to_real_usage(rough_tokens)
         return False
 
     def get_automatic_compaction_status_message(

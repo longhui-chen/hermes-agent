@@ -128,7 +128,11 @@ class TestPulseSocketReachable:
         sock_path.parent.mkdir(parents=True)
         # Create + bind, then close so the path is a stale socket file.
         s = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        s.bind(str(sock_path))
+        try:
+            s.bind(str(sock_path))
+        except OSError:
+            s.close()
+            pytest.skip("AF_UNIX socket unavailable here (sandbox denial or path too long)")
         s.close()
         monkeypatch.delenv("PULSE_SERVER", raising=False)
         monkeypatch.delenv("PULSE_RUNTIME_PATH", raising=False)
@@ -142,7 +146,11 @@ class TestPulseSocketReachable:
         sock_path = tmp_path / "pulse" / "native"
         sock_path.parent.mkdir(parents=True)
         server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
-        server.bind(str(sock_path))
+        try:
+            server.bind(str(sock_path))
+        except OSError:
+            server.close()
+            pytest.skip("AF_UNIX socket unavailable here (sandbox denial or path too long)")
         server.listen(1)
         try:
             monkeypatch.delenv("PULSE_SERVER", raising=False)
@@ -152,6 +160,26 @@ class TestPulseSocketReachable:
             assert _pulse_socket_reachable() is True
         finally:
             server.close()
+
+    def test_listening_socket_reachable_via_pulse_server_env(self, monkeypatch, tmp_path):
+        import socket as _socket
+        sock_path = tmp_path / "native"
+        server = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        try:
+            server.bind(str(sock_path))
+        except OSError:
+            server.close()
+            pytest.skip("AF_UNIX socket unavailable here (sandbox denial or path too long)")
+        server.listen(1)
+        try:
+            monkeypatch.delenv("PULSE_RUNTIME_PATH", raising=False)
+            monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+            monkeypatch.setenv("PULSE_SERVER", f"unix:{sock_path}")
+            from tools.voice_mode import _pulse_socket_reachable
+            assert _pulse_socket_reachable() is True
+        finally:
+            server.close()
+
 
 class TestDetectAudioEnvironment:
     def test_clean_environment_is_available(self, monkeypatch):
@@ -1043,6 +1071,26 @@ class TestConfigurableSilenceParams:
 # ============================================================================
 # Bugfix regression tests
 # ============================================================================
+
+
+class TestSubprocessTimeoutKill:
+    """Bug: proc.wait(timeout) raised TimeoutExpired but process was not killed."""
+
+    @pytest.mark.live_system_guard_bypass
+    def test_timeout_kills_process(self):
+        import subprocess
+        proc = subprocess.Popen(["sleep", "600"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        pid = proc.pid
+        assert proc.poll() is None
+
+        try:
+            proc.wait(timeout=0.1)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+        assert proc.poll() is not None
+        assert proc.returncode is not None
 
 
 class TestStreamLeakOnStartFailure:

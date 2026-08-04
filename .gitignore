@@ -34,6 +34,10 @@ data/
 .pytest_cache/
 test_durations.json
 .pytest-cache/
+# Coverage artifacts from `scripts/run_tests.sh --coverage`
+cov.json
+.coverage
+.coverage.*
 tmp/
 temp_vision_images/
 hermes-*/*
@@ -59,6 +63,9 @@ privvy*
 images/
 __pycache__/
 hermes_agent.egg-info/
+# Python build artifacts (setuptools/uv build intermediates + dist output)
+/build/
+/dist/
 wandb/
 testlogs
 playwright-report/

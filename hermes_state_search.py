@@ -969,22 +969,28 @@ class SessionSearchMixin:
                 role_params: list = []
                 if keep_roles is not None:
                     role_placeholders = ",".join("?" for _ in keep_roles)
-                    role_clause = f" AND role IN ({role_placeholders})"
+                    role_clause = f" AND m.role IN ({role_placeholders})"
                     role_params = list(keep_roles)
 
                 bookend_start_rows = conn.execute(
-                    f"SELECT * FROM messages "
-                    f"WHERE session_id = ? AND id < ?{role_clause} "
-                    f"AND length(content) > 0 "
-                    f"ORDER BY id ASC LIMIT ?",
+                    f"SELECT m.* FROM messages m "
+                    f"JOIN sessions s ON s.id = m.session_id "
+                    f"WHERE m.session_id = ? AND m.id < ?{role_clause} "
+                    f"AND m.llm_visible = 1 "
+                    f"AND m.id > s.model_history_cutoff_message_id "
+                    f"AND length(m.content) > 0 "
+                    f"ORDER BY m.id ASC LIMIT ?",
                     (session_id, window_min_id, *role_params, bookend),
                 ).fetchall()
 
                 bookend_end_rows = conn.execute(
-                    f"SELECT * FROM messages "
-                    f"WHERE session_id = ? AND id > ?{role_clause} "
-                    f"AND length(content) > 0 "
-                    f"ORDER BY id DESC LIMIT ?",
+                    f"SELECT m.* FROM messages m "
+                    f"JOIN sessions s ON s.id = m.session_id "
+                    f"WHERE m.session_id = ? AND m.id > ?{role_clause} "
+                    f"AND m.llm_visible = 1 "
+                    f"AND m.id > s.model_history_cutoff_message_id "
+                    f"AND length(m.content) > 0 "
+                    f"ORDER BY m.id DESC LIMIT ?",
                     (session_id, window_max_id, *role_params, bookend),
                 ).fetchall()
                 # End rows came back DESC for the LIMIT cap; flip to ASC.
@@ -1451,7 +1457,11 @@ class SessionSearchMixin:
             order_by_sql = "ORDER BY rank"
 
         # Build WHERE clauses dynamically
-        where_clauses = ["messages_fts MATCH ?"]
+        where_clauses = [
+            "messages_fts MATCH ?",
+            "m.llm_visible = 1",
+            "m.id > s.model_history_cutoff_message_id",
+        ]
         params: list = [query]
         if not include_inactive:
             # Live rows (active=1) AND compaction-archived rows (compacted=1)
@@ -1554,7 +1564,11 @@ class SessionSearchMixin:
                     else:
                         parts.append('"' + tok.replace('"', '""') + '"')
                 cjk_query = " ".join(parts)
-                cjk_where = ["messages_fts_cjk MATCH ?"]
+                cjk_where = [
+                    "messages_fts_cjk MATCH ?",
+                    "m.llm_visible = 1",
+                    "m.id > s.model_history_cutoff_message_id",
+                ]
                 cjk_params: list = [cjk_query]
                 if not include_inactive:
                     cjk_where.append("(m.active = 1 OR m.compacted = 1)")
@@ -1643,7 +1657,11 @@ class SessionSearchMixin:
                     else:
                         parts.append('"' + tok.replace('"', '""') + '"')
                 trigram_query = " ".join(parts)
-                tri_where = ["messages_fts_trigram MATCH ?"]
+                tri_where = [
+                    "messages_fts_trigram MATCH ?",
+                    "m.llm_visible = 1",
+                    "m.id > s.model_history_cutoff_message_id",
+                ]
                 tri_params: list = [trigram_query]
                 if not include_inactive:
                     tri_where.append("(m.active = 1 OR m.compacted = 1)")
@@ -1735,7 +1753,11 @@ class SessionSearchMixin:
                         "(m.content LIKE ? ESCAPE '\\' OR m.tool_name LIKE ? ESCAPE '\\' OR m.tool_calls LIKE ? ESCAPE '\\')"
                     )
                     like_params += [f"%{esc}%", f"%{esc}%", f"%{esc}%"]
-                like_where = [f"({' OR '.join(token_clauses)})"]
+                like_where = [
+                    f"({' OR '.join(token_clauses)})",
+                    "m.llm_visible = 1",
+                    "m.id > s.model_history_cutoff_message_id",
+                ]
                 if not include_inactive:
                     # Same visibility rule as the FTS5 paths: live rows and
                     # compaction-archived rows are discoverable; rewind/undo
@@ -1882,32 +1904,42 @@ class SessionSearchMixin:
                 with self._read_ctx() as conn:
                     ctx_cursor = conn.execute(
                         """WITH target AS (
-                               SELECT session_id, timestamp, id
-                               FROM messages
-                               WHERE id = ?
+                               SELECT m.session_id, m.timestamp, m.id
+                               FROM messages m
+                               JOIN sessions s ON s.id = m.session_id
+                               WHERE m.id = ? AND m.llm_visible = 1
+                                 AND m.id > s.model_history_cutoff_message_id
                            )
                            SELECT role, content
                            FROM (
                                SELECT m.id, m.timestamp, m.role, m.content
                                FROM messages m
+                               JOIN sessions s ON s.id = m.session_id
                                JOIN target t ON t.session_id = m.session_id
-                               WHERE (m.timestamp < t.timestamp)
-                                  OR (m.timestamp = t.timestamp AND m.id < t.id)
+                               WHERE m.llm_visible = 1
+                                 AND m.id > s.model_history_cutoff_message_id
+                                 AND ((m.timestamp < t.timestamp)
+                                  OR (m.timestamp = t.timestamp AND m.id < t.id))
                                ORDER BY m.timestamp DESC, m.id DESC
                                LIMIT 1
                            )
                            UNION ALL
                            SELECT role, content
-                           FROM messages
-                           WHERE id = ?
+                           FROM messages m
+                           JOIN sessions s ON s.id = m.session_id
+                           WHERE m.id = ? AND m.llm_visible = 1
+                             AND m.id > s.model_history_cutoff_message_id
                            UNION ALL
                            SELECT role, content
                            FROM (
                                SELECT m.id, m.timestamp, m.role, m.content
                                FROM messages m
+                               JOIN sessions s ON s.id = m.session_id
                                JOIN target t ON t.session_id = m.session_id
-                               WHERE (m.timestamp > t.timestamp)
-                                  OR (m.timestamp = t.timestamp AND m.id > t.id)
+                               WHERE m.llm_visible = 1
+                                 AND m.id > s.model_history_cutoff_message_id
+                                 AND ((m.timestamp > t.timestamp)
+                                  OR (m.timestamp = t.timestamp AND m.id > t.id))
                                ORDER BY m.timestamp ASC, m.id ASC
                                LIMIT 1
                            )""",
@@ -1983,7 +2015,11 @@ class SessionSearchMixin:
         if not terms:
             return []
 
-        where = ["m.id > ? AND m.id <= ?"]
+        where = [
+            "m.id > ? AND m.id <= ?",
+            "m.llm_visible = 1",
+            "m.id > s.model_history_cutoff_message_id",
+        ]
         params: list = [progress, high_water]
         for term in terms:
             esc = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")

@@ -188,4 +188,99 @@ class TestSSEAgentFailureFinishReason:
         assert "error" in finish
         assert "data: [DONE]" in sse
 
+    def test_failed_result_dict_reports_error_not_stop(self):
+        async def failed():
+            return (
+                {
+                    "final_response": "",
+                    "failed": True,
+                    "completed": False,
+                    "error": "upstream model 500",
+                },
+                {"input_tokens": 5, "output_tokens": 0, "total_tokens": 5},
+            )
 
+        reason, finish, _ = self._run(failed)
+        assert reason == "error"
+        assert finish.get("hermes", {}).get("failed") is True
+
+    def test_truncated_result_reports_length(self):
+        async def trunc():
+            return (
+                {"final_response": "half", "partial": True, "completed": False,
+                 "error": "output was truncated"},
+                {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
+            )
+
+        reason, finish, _ = self._run(trunc)
+        assert reason == "length"
+        assert finish["hermes"]["error_code"] == "output_truncated"
+
+    def test_successful_completion_reports_stop(self):
+        async def ok():
+            return (
+                {"final_response": "hi", "completed": True},
+                {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+            )
+
+        reason, finish, _ = self._run(ok)
+        assert reason == "stop"
+        # No error/hermes pollution on the happy path.
+        assert "error" not in finish
+        assert "hermes" not in finish
+
+
+class TestSSETransformedResponseDelivery:
+    """Post-stream output transforms must reach HTTP streaming clients."""
+
+    def test_append_only_transform_emits_missing_suffix_before_done(self):
+        adapter = _make_adapter()
+        stream_q = queue.Queue()
+        stream_q.put("interim tool-step text")
+        stream_q.put("original answer")
+        stream_q.put(None)
+
+        async def transformed():
+            return (
+                {
+                    "final_response": "original answer\n\n[plugin envelope]",
+                    "response_transformed": True,
+                    "response_transform_suffix": "\n\n[plugin envelope]",
+                    "completed": True,
+                },
+                {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+            )
+
+        async def run():
+            agent_task = asyncio.ensure_future(transformed())
+            resp, chunks = _capturing_response()
+            with patch(
+                "gateway.platforms.api_server.web.StreamResponse",
+                return_value=resp,
+            ):
+                await adapter._write_sse_chat_completion(
+                    _make_request(),
+                    "cmpl-transform",
+                    "gpt-4",
+                    1234567890,
+                    stream_q,
+                    agent_task,
+                )
+            return "".join(chunks)
+
+        import json
+
+        sse = asyncio.run(run())
+        content_deltas = []
+        for line in sse.splitlines():
+            if not line.startswith("data: ") or line == "data: [DONE]":
+                continue
+            event = json.loads(line[6:])
+            delta = event.get("choices", [{}])[0].get("delta", {})
+            if "content" in delta:
+                content_deltas.append(delta["content"])
+
+        assert "".join(content_deltas) == (
+            "interim tool-step textoriginal answer\n\n[plugin envelope]"
+        )
+        assert sse.index("[plugin envelope]") < sse.index("data: [DONE]")

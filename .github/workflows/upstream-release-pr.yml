@@ -1,0 +1,147 @@
+name: Open PR on upstream release
+
+on:
+  schedule:
+    - cron: '30 18 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+jobs:
+  open-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          # RELEASE_PR_TOKEN is a fine-grained PAT with Contents +
+          # Workflows + Pull-requests: write on this repo. The Workflows
+          # permission is required because the upstream release commit
+          # modifies files under .github/workflows/, and GitHub blocks
+          # any push that touches those paths without it. GITHUB_TOKEN
+          # cannot be granted the Workflows permission via the workflow
+          # `permissions:` block, so a PAT is the only viable option.
+          token: ${{ secrets.RELEASE_PR_TOKEN }}
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git || true
+
+      - name: Get latest upstream release tag
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
+        run: |
+          TAG=$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "branch=sync/upstream-${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch tag and resolve release commit
+        id: sha
+        run: |
+          git fetch upstream "refs/tags/${{ steps.rel.outputs.tag }}:refs/tags/${{ steps.rel.outputs.tag }}"
+          SHA=$(git rev-parse "refs/tags/${{ steps.rel.outputs.tag }}^{commit}")
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Update origin/upstream pointer to latest release commit
+        run: |
+          SHA="${{ steps.sha.outputs.sha }}"
+          CURRENT=$(git ls-remote origin refs/heads/upstream | awk '{print $1}')
+          if [ "$CURRENT" = "$SHA" ]; then
+            echo "origin/upstream already at $SHA; no-op"
+          else
+            echo "Updating origin/upstream: ${CURRENT:-<absent>} -> $SHA"
+            git push --force origin "${SHA}:refs/heads/upstream"
+          fi
+
+      - name: Ensure sync branch exists (frozen at release tag)
+        run: |
+          BRANCH="${{ steps.rel.outputs.branch }}"
+          SHA="${{ steps.sha.outputs.sha }}"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            echo "Branch $BRANCH already exists; leaving as-is (may contain manual conflict resolutions)."
+          else
+            echo "Creating branch $BRANCH at release commit $SHA"
+            git push origin "${SHA}:refs/heads/${BRANCH}"
+          fi
+
+      - name: Compute commits ahead of main
+        id: diff
+        run: |
+          git fetch origin "${{ steps.rel.outputs.branch }}:${{ steps.rel.outputs.branch }}"
+          BEHIND=$(git rev-list --count "main..${{ steps.rel.outputs.branch }}")
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update sync PR
+        if: steps.diff.outputs.behind != '0'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PR_TOKEN }}
+          BRANCH: ${{ steps.rel.outputs.branch }}
+          TAG: ${{ steps.rel.outputs.tag }}
+          SHA: ${{ steps.sha.outputs.sha }}
+          BEHIND: ${{ steps.diff.outputs.behind }}
+        run: |
+          set -euo pipefail
+
+          BODY=$(cat <<EOF
+          Automated PR from upstream sync.
+
+          - Upstream release: \`${TAG}\`
+          - Source branch (frozen at release commit): \`${BRANCH}\`
+          - Release commit SHA: \`${SHA}\`
+          - Commits ahead of main: ${BEHIND}
+
+          ## Branch maintenance
+
+          This workflow also force-updates \`origin/upstream\` to the latest release commit on each run (idempotent — skipped if already there). \`origin/upstream\` is therefore a stable pointer to the latest upstream release between runs.
+
+          The PR head \`${BRANCH}\` is created once from the release commit and is **not** moved by automation, so manual conflict-resolution commits pushed to it will persist.
+
+          ## Conflict resolution
+
+          If conflicts arise, commit fixes directly to \`${BRANCH}\`.
+
+          ## Review checklist before merging
+
+          - [ ] \`hermes_cli/main.py\` — \`OFFICIAL_REPO_URLS\` / \`OFFICIAL_REPO_URL\` still point to \`zettlab/hermes-agent\`
+          - [ ] \`scripts/install.sh\` — \`REPO_URL_SSH\` / \`REPO_URL_HTTPS\` still point to \`zettlab/hermes-agent\`
+          - [ ] \`.github/workflows/\` — only the approved Zettlab workflows remain: codex review notification, home guard, Infist deploy, seed policy, and upstream release sync
+          - [ ] \`.github/actions/\` — no unused upstream composite actions reintroduced
+          - [ ] Tests still pass on a deploy target
+          EOF
+          )
+          # YAML | indents body by 10; trim leading 10 spaces from each line.
+          BODY=$(printf '%s\n' "$BODY" | sed 's/^          //')
+
+          # Look up existing open PR via REST list.
+          EXISTING=$(gh api -X GET "repos/zettlab/hermes-agent/pulls" \
+            -f state=open -f head="zettlab:${BRANCH}" -f base=main \
+            --jq '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            echo "PR #$EXISTING already open for $BRANCH; updating body via REST PATCH."
+            gh api -X PATCH "repos/zettlab/hermes-agent/pulls/$EXISTING" \
+              -f body="$BODY" >/dev/null
+            PR_NUM="$EXISTING"
+          else
+            echo "Creating PR for $BRANCH -> main via REST POST."
+            PR_NUM=$(gh api -X POST "repos/zettlab/hermes-agent/pulls" \
+              -f title="chore(sync): merge upstream ${TAG}" \
+              -f head="$BRANCH" \
+              -f base=main \
+              -f body="$BODY" \
+              --jq '.number')
+            echo "Created PR #$PR_NUM"
+          fi
+
+          # Add label idempotently via REST.
+          gh api -X POST "repos/zettlab/hermes-agent/issues/$PR_NUM/labels" \
+            -f "labels[]=upstream-sync" >/dev/null || true

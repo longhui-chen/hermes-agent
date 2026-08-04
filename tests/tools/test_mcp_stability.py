@@ -83,7 +83,39 @@ class TestStdioPidTracking:
             _orphan_stdio_pid_servers[fake_pid] = "orphan"
 
         # Should not raise (ProcessLookupError is caught)
-        with patch("tools.mcp_tool.time.sleep"):
+        with patch("tools.mcp_tool.time.sleep"), patch(
+            "tools.mcp_tool.os.kill", side_effect=ProcessLookupError
+        ):
+            _kill_orphaned_mcp_children()
+
+        with _lock:
+            assert fake_pid not in _orphan_stdio_pids
+
+    def test_kill_orphaned_uses_sigkill_when_available(self, monkeypatch):
+        """SIGTERM-first then SIGKILL after 2s for orphan cleanup."""
+        from tools.mcp_tool import (
+            _kill_orphaned_mcp_children,
+            _orphan_stdio_pid_servers,
+            _orphan_stdio_pids,
+            _lock,
+        )
+
+        fake_pid = 424242
+        with _lock:
+            _orphan_stdio_pids.clear()
+            _orphan_stdio_pid_servers.clear()
+            _orphan_stdio_pids.add(fake_pid)
+            _orphan_stdio_pid_servers[fake_pid] = "orphan"
+
+        fake_sigkill = 9
+        monkeypatch.setattr(signal, "SIGKILL", fake_sigkill, raising=False)
+
+        # Post-#21561 the alive check routes through
+        # ``gateway.status._pid_exists`` (so it's safe on Windows — see
+        # bpo-14484). Return True so the SIGKILL escalation fires.
+        with patch("tools.mcp_tool.os.kill") as mock_kill, \
+             patch("gateway.status._pid_exists", return_value=True), \
+             patch("tools.mcp_tool.time.sleep") as mock_sleep:
             _kill_orphaned_mcp_children()
 
         with _lock:

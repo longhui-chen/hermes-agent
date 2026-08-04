@@ -1,15 +1,19 @@
 """Tests for tools/skills_sync.py — manifest-based skill seeding and updating."""
 
-import shutil
 import json
-import pytest
+import shutil
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from tools.skills_sync import (
+    SEED_POLICY_MARKER,
     _get_bundled_dir,
     _read_manifest,
+    _read_seed_policy,
     _read_skill_name,
+    _resolve_seed_target,
     _write_manifest,
     _discover_bundled_skills,
     _compute_relative_dest,
@@ -69,6 +73,27 @@ class TestDirHash:
         # A nonexistent dir hashes as empty content rather than raising.
         assert isinstance(_dir_hash(tmp_path / "nope"), str)
 
+    def test_dir_hash_ignores_copy_junk(self, tmp_path):
+        """_dir_hash must skip the same patterns copytree ignores, so the seed
+        baseline matches the copied file set (else skills with __pycache__/.pyc/
+        .DS_Store in source are wrongly flagged user-modified and never update)."""
+        clean = tmp_path / "clean"
+        clean.mkdir()
+        (clean / "SKILL.md").write_text("# s")
+        (clean / "scripts").mkdir()
+        (clean / "scripts" / "run.py").write_text("print(1)")
+
+        dirty = tmp_path / "dirty"
+        dirty.mkdir()
+        (dirty / "SKILL.md").write_text("# s")
+        (dirty / "scripts").mkdir()
+        (dirty / "scripts" / "run.py").write_text("print(1)")
+        (dirty / "scripts" / "__pycache__").mkdir()
+        (dirty / "scripts" / "__pycache__" / "run.cpython-311.pyc").write_bytes(b"\x00j")
+        (dirty / ".DS_Store").write_bytes(b"\x00")
+
+        assert _dir_hash(clean) == _dir_hash(dirty)
+
 
 class TestDiscoverBundledSkills:
     def test_finds_skill_dirs_and_ignores_non_skills(self, tmp_path):
@@ -95,6 +120,25 @@ class TestDiscoverBundledSkills:
         (nested / "SKILL.md").write_text("---\nname: archived-skill\n---\n")
 
         assert [name for name, _ in _discover_bundled_skills(tmp_path)] == ["umbrella"]
+
+    def test_venv_named_install_prefix_does_not_exclude_bundled(self, tmp_path):
+        """Regression: a wheel installed into a venv named `venv`/`.venv` lands the
+        bundled skills at <venv>/skills/... is_excluded_skill_path matches ANY path
+        component, so an ABSOLUTE check would treat the install prefix's own
+        `venv`/`site-packages` component as a dependency dir and drop every bundled
+        skill (seed 0) — the two most common venv names trigger it. Discovery must
+        check exclusion RELATIVE to the bundled dir."""
+        for prefix in ("venv", ".venv", "site-packages"):
+            bundled = tmp_path / prefix / "skills"
+            (bundled / "cat" / "keep-me").mkdir(parents=True)
+            (bundled / "cat" / "keep-me" / "SKILL.md").write_text("---\nname: keep-me\n---\n# k")
+            names = {n for n, _ in _discover_bundled_skills(bundled)}
+            assert "keep-me" in names, f"bundled skill dropped under install prefix '{prefix}'"
+        # ...but junk BELOW the bundled root (inside a skill) is still excluded.
+        b2 = tmp_path / "ok" / "skills"
+        (b2 / "cat" / "s" / "__pycache__").mkdir(parents=True)
+        (b2 / "cat" / "s" / "__pycache__" / "SKILL.md").write_text("---\nname: junk\n---\n# j")
+        assert "junk" not in {n for n, _ in _discover_bundled_skills(b2)}
 
 
 class TestReadSkillName:
@@ -541,6 +585,10 @@ class TestResetBundledSkill:
         stack.enter_context(patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"))
         stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", skills_dir))
         stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", manifest_file))
+        # Hermetic opt-out check: point HERMES_HOME at the temp tree so
+        # reset_bundled_skill's .no-bundled-skills guard never reads the real
+        # ~/.hermes. Individual tests override this to exercise opt-out.
+        stack.enter_context(patch("tools.skills_sync.HERMES_HOME", skills_dir.parent))
         return stack
 
     def test_reset_clears_stuck_user_modified_flag(self, tmp_path):
@@ -581,6 +629,143 @@ class TestResetBundledSkill:
 
     def test_reset_errors_when_untracked_or_removed_upstream(self, tmp_path):
         """Untracked skills and skills removed upstream both fail clearly."""
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        dest = skills_dir / "productivity" / "google-workspace"
+        dest.mkdir(parents=True)
+        (dest / "SKILL.md").write_text("# heavily edited by user\n")
+        (dest / "my_custom_file.py").write_text("print('user-added')\n")
+        manifest_file.write_text("google-workspace:STALEHASH000000000000000000000000\n")
+
+        with self._patches(bundled, skills_dir, manifest_file):
+            result = reset_bundled_skill("google-workspace", restore=True)
+
+        assert result["ok"] is True
+        assert result["action"] == "restored"
+        # User's custom file should be gone
+        assert not (dest / "my_custom_file.py").exists()
+        # SKILL.md should be the bundled content
+        assert "GW v2 (upstream)" in (dest / "SKILL.md").read_text()
+
+    def test_reset_on_opt_out_profile_refuses_and_keeps_manifest(self, tmp_path):
+        """An opt-out profile (.no-bundled-skills) takes NO bundled-skill state
+        change from reset: sync_skills() is a no-op there, so clearing the
+        manifest entry would empty tracking that nothing rebuilds. reset must
+        refuse up front and leave the manifest byte-identical."""
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        skills_dir.mkdir(parents=True)
+        manifest_file.write_text("google-workspace:abc\n")
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".no-bundled-skills").write_text("opted out\n")
+        before = manifest_file.read_text()
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch("tools.skills_sync.HERMES_HOME", home):
+                result = reset_bundled_skill("google-workspace", restore=False)
+        assert result["ok"] is False
+        assert result["action"] == "opted_out"
+        assert result["synced"] is None
+        assert manifest_file.read_text() == before   # untouched
+
+    def test_reset_surfaces_policy_error_instead_of_false_success(self, tmp_path):
+        """When reset's internal re-baseline sync fail-closes (corrupt/missing seed
+        policy on a policy-managed profile), reset must NOT report green success:
+        the manifest entry was already cleared and tracking was not rebuilt, so the
+        user must fix the policy. (The reset UI keys off ok=False.)"""
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        dest = skills_dir / "productivity" / "google-workspace"
+        dest.mkdir(parents=True)
+        (dest / "SKILL.md").write_text("---\nname: google-workspace\n---\n# GW\n")
+        manifest_file.write_text("google-workspace:abc\n")
+        (skills_dir / SEED_POLICY_MARKER).write_text("3\n")   # policy-managed
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch("tools.skills_sync._read_seed_policy", return_value=None), \
+                    patch("tools.skills_sync._seed_policy_file_present", return_value=True):
+                result = reset_bundled_skill("google-workspace", restore=False)
+        assert result["ok"] is False
+        assert result["action"] == "policy_error"
+        assert result["synced"]["policy_error"] is True
+
+    def test_reset_restore_failure_preserves_curator_suppression(self, tmp_path):
+        """A failed restore (rmtree of the user copy errors) must NOT have already
+        cleared the skill's curator suppression: prune state stays put when the op
+        reports 'nothing was changed'. (Regression: the clear was moved to AFTER
+        the rmtree succeeds.)"""
+        import tools.skill_usage as su
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        dest = skills_dir / "productivity" / "google-workspace"
+        dest.mkdir(parents=True)
+        (dest / "SKILL.md").write_text("# user\n")
+        manifest_file.write_text("google-workspace:abc\n")
+        (skills_dir / ".curator_suppressed").write_text("google-workspace\n")
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch.object(su, "_skills_dir", return_value=skills_dir), \
+                    patch("tools.skills_sync._rmtree_writable", side_effect=OSError("boom")):
+                result = reset_bundled_skill("google-workspace", restore=True)
+        assert result["ok"] is False
+        assert result["action"] == "not_reset"
+        remaining = (skills_dir / ".curator_suppressed").read_text().split()
+        assert "google-workspace" in remaining   # suppression untouched on failure
+
+    def test_reset_restore_clears_curator_suppression(self, tmp_path):
+        """reset --restore is an explicit un-prune: it must clear the skill's
+        curator suppression. Otherwise sync_skills() re-skips it (suppressed names
+        are skipped) and the skill is restored on disk but never tracked/updated
+        again — exactly what sync_skills' own comment promises restore prevents."""
+        import tools.skill_usage as su
+        bundled = self._setup_bundled(tmp_path)
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        skills_dir.mkdir(parents=True)
+        manifest_file.write_text("google-workspace:abc\n")
+        (skills_dir / ".curator_suppressed").write_text("google-workspace\n")
+        with self._patches(bundled, skills_dir, manifest_file):
+            with patch.object(su, "_skills_dir", return_value=skills_dir):
+                result = reset_bundled_skill("google-workspace", restore=True)
+        assert result["ok"] is True
+        supp = skills_dir / ".curator_suppressed"
+        remaining = supp.read_text().split() if supp.exists() else []
+        assert "google-workspace" not in remaining
+        assert "google-workspace" not in (result["synced"].get("suppressed") or [])
+
+    def test_reset_restore_installs_skill_not_in_seed_policy(self, tmp_path):
+        """`reset --restore` is an explicit per-skill request: it must install the
+        bundled skill even when the seed policy would NOT auto-seed it. Otherwise
+        the internal sync (which filters to the allowlist) leaves it uninstalled
+        while the function reports 'restored'."""
+        bundled = self._setup_bundled(tmp_path)  # bundles google-workspace
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        dest = skills_dir / "productivity" / "google-workspace"
+
+        with self._patches(bundled, skills_dir, manifest_file), patch(
+            # active policy that does NOT include google-workspace
+            "tools.skills_sync._read_seed_policy",
+            return_value={"seed_set": {"something-else"}},
+        ):
+            result = reset_bundled_skill("google-workspace", restore=True)
+
+            assert result["ok"] is True
+            assert result["action"] == "restored"
+            assert (dest / "SKILL.md").exists()  # installed despite not seeded
+            assert "GW v2 (upstream)" in (dest / "SKILL.md").read_text()
+            # honest about not being managed, and no manifest entry (which the
+            # next policy-managed sync would only clean — the churn flagged)
+            assert "auto-updated" in result["message"]
+            assert "google-workspace" not in _read_manifest()
+            # the restored copy survives a subsequent normal sync
+            sync_skills(quiet=True)
+            assert (dest / "SKILL.md").exists()
+
+    def test_reset_nonexistent_skill_errors_gracefully(self, tmp_path):
+        """Resetting a skill that's neither bundled nor in the manifest returns a clear error."""
         bundled = self._setup_bundled(tmp_path)
         skills_dir = tmp_path / "user_skills"
         manifest_file = skills_dir / ".bundled_manifest"
@@ -805,13 +990,7 @@ class TestOptOutToggleAndRemove:
 
 
 class TestUpdateBackupRecovery:
-    """Regression tests for backup handling in the bundled-update path.
-
-    Covers three failure modes around ``dest.with_suffix(".bak")``:
-    a stale backup poisoning the next update's move/restore, an orphaned
-    backup (crash between move and copytree) being misread as a user
-    deletion, and a partially-written dest blocking restore-on-failure.
-    """
+    """Regression tests for backup handling in the bundled-update path."""
 
     def _setup(self, tmp_path, bundled_text="# Old v2 (updated)"):
         """Bundled dir with one flat skill, plus user dirs."""
@@ -842,13 +1021,7 @@ class TestUpdateBackupRecovery:
         return dest
 
     def test_stale_backup_does_not_poison_failed_update(self, tmp_path):
-        """A leftover .bak must not nest the live copy or corrupt restore.
-
-        With a stale ``old-skill.bak`` present, ``shutil.move(dest, backup)``
-        moves the live copy *inside* the stale dir. If copytree then fails,
-        restore drags the stale junk (with the live copy nested in it) back
-        to dest — corrupting the skill and wedging it as "user-modified".
-        """
+        """A leftover .bak must not nest the live copy or corrupt restore."""
         bundled, skills_dir, manifest_file = self._setup(tmp_path)
         dest = self._seed_synced_copy(skills_dir, manifest_file)
 
@@ -863,43 +1036,26 @@ class TestUpdateBackupRecovery:
                 patch("tools.skills_sync.shutil.copytree", side_effect=_boom):
             sync_skills(quiet=True)
 
-        # The live copy must survive the failed update untouched...
         assert (dest / "SKILL.md").read_text() == "# Old v1"
-        # ...not be nested inside recycled stale-backup content.
         assert not (dest / "old-skill").exists()
-        # And no backup directory may linger.
         assert not (skills_dir / "old-skill.bak").exists()
 
     def test_orphaned_backup_is_recovered_not_treated_as_deleted(self, tmp_path):
-        """Crash between move and copytree must not lose the skill.
-
-        After such a crash, dest is gone and the user's only copy sits in
-        ``old-skill.bak``. The sync loop's "in manifest but not on disk"
-        branch reads that as a deliberate user deletion and skips — the
-        skill silently vanishes. It must instead be recovered and updated.
-        """
+        """Crash between move and copytree must not lose the skill."""
         bundled, skills_dir, manifest_file = self._setup(tmp_path)
         dest = self._seed_synced_copy(skills_dir, manifest_file)
-        # Simulate the crash: dest was moved aside, new copy never arrived.
         shutil.move(str(dest), str(skills_dir / "old-skill.bak"))
 
         with self._patches(bundled, skills_dir, manifest_file):
             result = sync_skills(quiet=True)
 
-        # Recovered and then updated to the new bundled version in one run.
         assert (dest / "SKILL.md").exists()
         assert (dest / "SKILL.md").read_text() == "# Old v2 (updated)"
         assert "old-skill" in result["updated"]
         assert not (skills_dir / "old-skill.bak").exists()
 
     def test_partial_copy_failure_restores_original(self, tmp_path):
-        """A half-written dest must not block restore-on-failure.
-
-        If copytree dies after creating dest, the ``not dest.exists()``
-        guard skips the restore: the user keeps a broken partial skill,
-        the .bak lingers, and the partial hash wedges the skill as
-        "user-modified" on every later sync.
-        """
+        """A half-written dest must not block restore-on-failure."""
         bundled, skills_dir, manifest_file = self._setup(tmp_path)
         dest = self._seed_synced_copy(skills_dir, manifest_file)
 
@@ -912,13 +1068,361 @@ class TestUpdateBackupRecovery:
                 patch("tools.skills_sync.shutil.copytree", side_effect=_partial_then_fail):
             sync_skills(quiet=True)
 
-        # Original content restored, partial debris and backup gone.
         assert (dest / "SKILL.md").read_text() == "# Old v1"
         assert not (dest / "PARTIAL").exists()
         assert not (skills_dir / "old-skill.bak").exists()
 
-        # And the skill is not wedged: a later normal sync updates cleanly.
         with self._patches(bundled, skills_dir, manifest_file):
             result2 = sync_skills(quiet=True)
         assert "old-skill" in result2["updated"]
         assert result2["user_modified"] == []
+
+
+class TestSeedTimeCuration:
+    """Policy-driven seed allowlist over upstream-verbatim skills/ (this PR does
+    not rename/de-brand). The policy is a pure allowlist deciding which ids a NEW
+    profile seeds (existing profiles are left untouched)."""
+
+    def _setup(self, tmp_path):
+        bundled = tmp_path / "bundled_skills"
+        # seeded (in allowlist)
+        (bundled / "cat" / "keep-me").mkdir(parents=True)
+        (bundled / "cat" / "keep-me" / "SKILL.md").write_text("---\nname: keep-me\n---\n# Keep")
+        # NOT in allowlist → filtered out
+        (bundled / "cat" / "drop-me").mkdir(parents=True)
+        (bundled / "cat" / "drop-me" / "SKILL.md").write_text("---\nname: drop-me\n---\n# Drop")
+        skills_dir = tmp_path / "user_skills"
+        manifest_file = skills_dir / ".bundled_manifest"
+        return bundled, skills_dir, manifest_file
+
+    def _policy(self):
+        return {"seed_set": {"keep-me"}}
+
+    def _patches(self, bundled, skills_dir, manifest_file, policy):
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(patch("tools.skills_sync._get_bundled_dir", return_value=bundled))
+        stack.enter_context(patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"))
+        stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", skills_dir))
+        stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", manifest_file))
+        stack.enter_context(patch("tools.skills_sync._read_seed_policy", return_value=policy))
+        return stack
+
+    def test_allowlist_filters_non_seeded(self, tmp_path):
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        with self._patches(bundled, skills_dir, manifest_file, self._policy()):
+            result = sync_skills(quiet=True)
+        assert "keep-me" in result["copied"]
+        assert "drop-me" not in result["copied"]
+        assert not (skills_dir / "cat" / "drop-me").exists()
+        assert (skills_dir / "cat" / "keep-me" / "SKILL.md").exists()
+        assert result["not_seeded"] == 1            # drop-me
+        assert result["total_bundled"] == 2
+
+    def test_idempotent_second_sync_copies_nothing(self, tmp_path):
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        with self._patches(bundled, skills_dir, manifest_file, self._policy()):
+            sync_skills(quiet=True)
+            result2 = sync_skills(quiet=True)
+        assert result2["copied"] == []
+        assert result2["updated"] == []
+
+    def test_source_junk_not_flagged_user_modified(self, tmp_path):
+        """A seeded skill whose SOURCE carries __pycache__/.pyc (copytree ignores
+        them, so the dest lacks them) must NOT be flagged user-modified on the
+        second sync — _dir_hash skips the same patterns."""
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        pc = bundled / "cat" / "keep-me" / "scripts" / "__pycache__"
+        pc.mkdir(parents=True)
+        (pc / "run.cpython-311.pyc").write_bytes(b"\x00junk")
+        with self._patches(bundled, skills_dir, manifest_file, self._policy()):
+            sync_skills(quiet=True)
+            result2 = sync_skills(quiet=True)
+        assert result2["user_modified"] == []   # not wrongly frozen
+        # and the junk never reached the profile
+        assert not (skills_dir / "cat" / "keep-me" / "scripts" / "__pycache__").exists()
+
+    def test_no_policy_seeds_everything(self, tmp_path):
+        """policy=None → upstream behaviour: every bundled skill seeded."""
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        with self._patches(bundled, skills_dir, manifest_file, None):
+            result = sync_skills(quiet=True)
+        assert set(result["copied"]) == {"keep-me", "drop-me"}
+        assert result["not_seeded"] == 0
+
+    def test_new_profile_writes_policy_marker(self, tmp_path):
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        with self._patches(bundled, skills_dir, manifest_file, self._policy()):
+            sync_skills(quiet=True)
+        assert (skills_dir / SEED_POLICY_MARKER).exists()
+
+    def test_marked_profile_keeps_filtering_on_resync(self, tmp_path):
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        with self._patches(bundled, skills_dir, manifest_file, self._policy()):
+            sync_skills(quiet=True)            # new profile -> filters + writes marker
+            result2 = sync_skills(quiet=True)  # marker present -> still filters
+        assert result2["not_seeded"] == 1      # drop-me stays filtered
+        assert not (skills_dir / "cat" / "drop-me").exists()
+
+    def test_crash_between_marker_and_manifest_stays_filtered(self, tmp_path):
+        """Crash-safety: marker is written before the manifest, so a crash that
+        leaves 'marker present, manifest absent' is read as a fresh profile on
+        the next sync and the policy is re-applied (never silently flips to the
+        unfiltered path)."""
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        skills_dir.mkdir(parents=True)
+        (skills_dir / SEED_POLICY_MARKER).write_text("1\n")  # marker, but NO manifest
+        with self._patches(bundled, skills_dir, manifest_file, self._policy()):
+            result = sync_skills(quiet=True)
+        assert result["not_seeded"] == 1                 # drop-me still filtered
+        assert not (skills_dir / "cat" / "drop-me").exists()
+
+    def test_marker_write_failure_skips_manifest_so_next_sync_reseeds(self, tmp_path):
+        """If the policy marker can't be persisted, the manifest must NOT be
+        written either. Otherwise the next sync sees 'manifest, no marker',
+        classifies the profile as pre-policy, and permanently seeds the full
+        un-curated set. Instead the profile stays manifest-less and re-seeds
+        under policy on the next run."""
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        skills_dir.mkdir(parents=True)
+        # Block the marker write: a directory at .seed_policy makes write_text()
+        # raise IsADirectoryError (an OSError subclass), simulating a failed write.
+        (skills_dir / SEED_POLICY_MARKER).mkdir()
+        with self._patches(bundled, skills_dir, manifest_file, self._policy()):
+            result = sync_skills(quiet=True)
+        # Filtering still happened (curated set copied), but the manifest was NOT
+        # persisted — so the profile cannot be misread as pre-policy next time.
+        assert "keep-me" in result["copied"]
+        assert result.get("not_seeded") == 1
+        assert not manifest_file.exists()
+
+        # Recovery: clear the blocker; the next sync writes marker + manifest and
+        # the profile stays curated — drop-me is never seeded.
+        import shutil
+        shutil.rmtree(skills_dir / SEED_POLICY_MARKER)
+        with self._patches(bundled, skills_dir, manifest_file, self._policy()):
+            sync_skills(quiet=True)
+        assert manifest_file.exists()
+        assert (skills_dir / SEED_POLICY_MARKER).is_file()
+        assert not (skills_dir / "cat" / "drop-me").exists()
+
+    def _patches_no_policy_but_present(self, bundled, skills_dir, manifest_file):
+        """Patches simulating a policy FILE that exists but cannot be parsed:
+        _read_seed_policy() -> None, _seed_policy_file_present() -> True."""
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(patch("tools.skills_sync._get_bundled_dir", return_value=bundled))
+        stack.enter_context(patch("tools.skills_sync._get_optional_dir", return_value=bundled.parent / "optional-skills"))
+        stack.enter_context(patch("tools.skills_sync.SKILLS_DIR", skills_dir))
+        stack.enter_context(patch("tools.skills_sync.MANIFEST_FILE", manifest_file))
+        stack.enter_context(patch("tools.skills_sync._read_seed_policy", return_value=None))
+        stack.enter_context(patch("tools.skills_sync._seed_policy_file_present", return_value=True))
+        return stack
+
+    def test_corrupt_policy_file_fails_closed_no_seed(self, tmp_path):
+        """A policy file present but unparseable must NOT fall through to seeding
+        the full un-curated set. New profile: seed nothing, write no
+        marker/manifest, return policy_error."""
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        with self._patches_no_policy_but_present(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+        assert result.get("policy_error") is True
+        assert result["copied"] == []
+        assert not (skills_dir / "cat" / "keep-me").exists()
+        assert not (skills_dir / "cat" / "drop-me").exists()        # NOT seeded
+        assert not (skills_dir / SEED_POLICY_MARKER).exists()
+        assert not manifest_file.exists()
+
+    def test_corrupt_policy_does_not_affect_pre_policy_profile(self, tmp_path):
+        """A pre-policy profile (manifest, no marker) was going to seed everything
+        anyway, so a corrupt policy changes nothing for it — no fail-closed, no
+        regression."""
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        skills_dir.mkdir(parents=True)
+        manifest_file.write_text("preexisting:abc\n")   # existing, NO marker
+        with self._patches_no_policy_but_present(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+        assert result.get("policy_error") is not True
+        assert "drop-me" in result["copied"]            # seeds everything (upstream)
+        assert (skills_dir / "cat" / "drop-me").exists()
+
+    def test_corrupt_policy_with_skill_on_disk_no_manifest_fails_closed(self, tmp_path):
+        """Regression: a corrupt policy makes _seed_set EMPTY, so every on-disk
+        skill reads as 'not in seed set'. A just-seeded / partial-fallback
+        profile (a seeded skill on disk, NO manifest, NO marker) must NOT be
+        misread as an existing pre-policy one and seed the full un-curated set —
+        it must fail closed. profile_existed falls back to the manifest signal
+        when the policy can't be read."""
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        # A seeded skill already on disk (just-seeded-marker-failed, or a partial
+        # python-free fallback copy), but NO manifest and NO marker.
+        d = skills_dir / "cat" / "keep-me"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text("---\nname: keep-me\n---\n# Keep")
+        with self._patches_no_policy_but_present(bundled, skills_dir, manifest_file):
+            result = sync_skills(quiet=True)
+        assert result.get("policy_error") is True
+        assert result["copied"] == []
+        assert not (skills_dir / "cat" / "drop-me").exists()   # NOT seeded
+        assert not manifest_file.exists()
+        assert not (skills_dir / SEED_POLICY_MARKER).exists()
+
+    def test_managed_profile_with_vanished_policy_fails_closed(self, tmp_path):
+        """A policy-managed profile (.seed_policy marker) whose policy file has
+        VANISHED (downgrade, or a packaging wrapper that shipped skills/ without
+        the co-located config/) must fail closed — it must NOT silently expand
+        the curated set to every bundled skill. Symmetric with the corrupt case;
+        only a genuinely pre-policy profile (no marker) stays on seed-everything.
+        (_patches sets _read_seed_policy→None; _seed_policy_file_present runs for
+        real and is False because no config/ exists under the temp bundle.)"""
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        skills_dir.mkdir(parents=True)
+        manifest_file.write_text("keep-me:abc\n")
+        (skills_dir / SEED_POLICY_MARKER).write_text("3\n")   # marker => managed
+        with self._patches(bundled, skills_dir, manifest_file, None):
+            result = sync_skills(quiet=True)
+        assert result.get("policy_error") is True
+        assert result["copied"] == []
+        assert not (skills_dir / "cat" / "drop-me").exists()  # did NOT expand to full set
+
+    def test_old_fallback_profile_without_manifest_not_filtered(self, tmp_path):
+        """An old installer fallback can copy skills WITHOUT writing a manifest.
+        Such a profile (it carries a non-seeded skill on disk) must be recognised
+        as existing — not misread as new and pulled onto the policy path."""
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        skills_dir.mkdir(parents=True)
+        # simulate old fallback: both skills on disk, NO manifest, NO marker
+        for n in ("keep-me", "drop-me"):
+            d = skills_dir / "cat" / n
+            d.mkdir(parents=True)
+            (d / "SKILL.md").write_text(f"---\nname: {n}\n---\n# {n}")
+        with self._patches(bundled, skills_dir, manifest_file, self._policy()):
+            result = sync_skills(quiet=True)
+        assert result["not_seeded"] == 0                       # not filtered
+        assert not (skills_dir / SEED_POLICY_MARKER).exists()  # not made policy-managed
+
+    def test_user_local_skill_does_not_trigger_full_seed(self, tmp_path):
+        """Regression for the `hermes skills opt-in --sync` policy bypass: a
+        profile that carries only the user's OWN local/hub skill (NOT a bundled
+        skill), with no manifest and no .seed_policy marker, must seed the CURATED
+        set — it must NOT be misread as a pre-policy profile and seed the full
+        un-curated set. Only a BUNDLED-but-unseeded on-disk skill is pre-policy
+        evidence (contrast test_old_fallback_profile_without_manifest_not_filtered);
+        a user skill is legitimately absent from the seed set."""
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        skills_dir.mkdir(parents=True)
+        # User's own local skill — absent from the bundled tree, no manifest, no
+        # marker (e.g. an opt-out profile the user added a skill to, then ran
+        # `hermes skills opt-in --sync`).
+        mine = skills_dir / "mine"
+        mine.mkdir(parents=True)
+        (mine / "SKILL.md").write_text("---\nname: mine\n---\n# Local")
+        with self._patches(bundled, skills_dir, manifest_file, self._policy()):
+            result = sync_skills(quiet=True)
+        # Curated, NOT the full un-curated set.
+        assert "keep-me" in result["copied"]
+        assert "drop-me" not in result["copied"]
+        assert not (skills_dir / "cat" / "drop-me").exists()
+        assert result["not_seeded"] == 1
+        # The user's own skill is left untouched, and the profile is now managed.
+        assert (mine / "SKILL.md").exists()
+        assert (skills_dir / SEED_POLICY_MARKER).exists()
+
+    def test_name_collision_with_bundled_does_not_trigger_full_seed(self, tmp_path):
+        """A user/hub skill whose frontmatter name COLLIDES with a bundled-but-
+        unseeded skill, but lives at a non-canonical path, must NOT count as
+        pre-policy evidence — the profile stays curated. Pre-policy detection
+        requires the canonical seeded path, not just a name match (review on the
+        seed-policy bypass: name match alone let a colliding user skill flip the
+        profile onto the full un-curated seed)."""
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        skills_dir.mkdir(parents=True)
+        # User skill whose frontmatter name collides with bundled `drop-me`, at a
+        # DIFFERENT (non-canonical) path.
+        d = skills_dir / "my-own" / "drop-me-clone"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text("---\nname: drop-me\n---\n# coincidental name collision")
+        with self._patches(bundled, skills_dir, manifest_file, self._policy()):
+            result = sync_skills(quiet=True)
+        # Curated, NOT the full un-curated set — the real bundled drop-me is not seeded.
+        assert "keep-me" in result["copied"]
+        assert "drop-me" not in result["copied"]
+        assert not (skills_dir / "cat" / "drop-me").exists()
+        assert result["not_seeded"] == 1
+        assert (d / "SKILL.md").exists()                   # user skill left untouched
+        assert (skills_dir / SEED_POLICY_MARKER).exists()  # curated + managed
+
+    def test_existing_profile_not_filtered(self, tmp_path):
+        """A profile that predates the policy (manifest present, no marker) is
+        left on the upstream path: every bundled skill seeds, no filtering, no
+        cleanup — the 'don't migrate existing' boundary."""
+        bundled, skills_dir, manifest_file = self._setup(tmp_path)
+        skills_dir.mkdir(parents=True)
+        manifest_file.write_text("preexisting:abc\n")   # existing profile, NO .seed_policy marker
+        with self._patches(bundled, skills_dir, manifest_file, self._policy()):
+            result = sync_skills(quiet=True)
+        assert "drop-me" in result["copied"]            # not filtered
+        assert result["not_seeded"] == 0
+        assert (skills_dir / "cat" / "drop-me").exists()
+        assert not (skills_dir / SEED_POLICY_MARKER).exists()  # unmanaged profile stays unmarked
+
+
+class TestSeedPolicyHelpers:
+    def test_read_seed_policy_builds_set(self, tmp_path):
+        pol = tmp_path / "skill_seed_policy.json"
+        pol.write_text(json.dumps({"seed": ["a", "b"]}))
+        with patch.dict("os.environ", {"HERMES_SEED_POLICY": str(pol)}):
+            data = _read_seed_policy()
+        assert data is not None
+        assert data["seed_set"] == {"a", "b"}
+
+    def test_read_seed_policy_invalid_returns_none(self, tmp_path):
+        """A malformed candidate is skipped; with no other valid candidate -> None."""
+        pol = tmp_path / "bad.json"
+        pol.write_text("{not valid json")
+        with patch.dict("os.environ", {"HERMES_SEED_POLICY": str(pol)}), \
+                patch("tools.skills_sync._get_bundled_dir", return_value=tmp_path / "skills"):
+            assert _read_seed_policy() is None
+
+    def test_read_seed_policy_skips_malformed_then_uses_colocated(self, tmp_path):
+        """A malformed env candidate falls through to the policy co-located with
+        the bundled skills (not a hard return None on the first failure)."""
+        bad = tmp_path / "bad.json"
+        bad.write_text("{nope")
+        bundle = tmp_path / "bundle"
+        (bundle / "config").mkdir(parents=True)
+        (bundle / "skills").mkdir(parents=True)
+        (bundle / "config" / "skill_seed_policy.json").write_text(
+            json.dumps({"seed": ["x"]})
+        )
+        with patch.dict("os.environ", {"HERMES_SEED_POLICY": str(bad)}), \
+                patch("tools.skills_sync._get_bundled_dir", return_value=bundle / "skills"):
+            data = _read_seed_policy()
+        assert data is not None and data["seed_set"] == {"x"}
+
+    def test_resolve_seed_target_allowlist(self, tmp_path):
+        bundled = tmp_path / "b"
+        (bundled / "cat" / "s").mkdir(parents=True)
+        policy = {"seed_set": {"s"}}
+        r = _resolve_seed_target("s", bundled / "cat" / "s", bundled, policy)
+        assert r is not None and r[0] == "s"
+        assert _resolve_seed_target("other", bundled / "cat" / "s", bundled, policy) is None
+
+    def test_resolve_seed_target_none_policy_passes_through(self, tmp_path):
+        bundled = tmp_path / "b"
+        (bundled / "cat" / "s").mkdir(parents=True)
+        r = _resolve_seed_target("anything", bundled / "cat" / "s", bundled, None)
+        assert r is not None and r[0] == "anything"
+
+    def test_read_seed_policy_rejects_malformed_schema(self, tmp_path):
+        """A parseable-but-malformed policy (no/non-list 'seed', bad mode) is
+        rejected like a corrupt one, so the caller fails closed instead of
+        silently seeding 0 / garbage."""
+        for bad in ('{}', '{"seed": "keep"}', '{"seed": [1, 2]}',
+                    '{"mode": "deny", "seed": ["a"]}',
+                    '{"seed": ["a"], "runtime_required": "a"}'):
+            pol = tmp_path / "p.json"
+            pol.write_text(bad)
+            with patch.dict("os.environ", {"HERMES_SEED_POLICY": str(pol)}), \
+                    patch("tools.skills_sync._get_bundled_dir", return_value=tmp_path / "skills"):
+                assert _read_seed_policy() is None, bad

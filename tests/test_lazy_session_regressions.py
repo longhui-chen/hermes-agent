@@ -46,6 +46,25 @@ def _tui_session(agent=None, session_key="session-key-old", **extra):
     }
 
 
+def _run_server_threads_inline(monkeypatch, server):
+    """Run server-owned workers inline without replacing global threading."""
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None, **_kw):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    class _ThreadingProxy:
+        def __getattr__(self, name):
+            return getattr(threading, name)
+
+    proxy = _ThreadingProxy()
+    proxy.Thread = _ImmediateThread
+    monkeypatch.setattr(server, "threading", proxy)
+
+
 # ===========================================================================
 # Bug #20001: _finalize_session uses stale session_key
 # ===========================================================================
@@ -153,15 +172,8 @@ class TestSyncSessionKeyAfterAutoCompress:
         monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
         monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
 
-        # Use _ImmediateThread pattern to run synchronously
-        class _ImmediateThread:
-            def __init__(self, target=None, daemon=None, **kw):
-                self._target = target
-            def start(self):
-                self._target()
-
         server._sessions["test-sid"] = session
-        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        _run_server_threads_inline(monkeypatch, server)
 
         try:
             server.handle_request({
@@ -222,14 +234,8 @@ class TestPendingTitleValueError:
             server, "_sync_session_key_after_compress", lambda *a, **kw: None
         )
 
-        class _ImmediateThread:
-            def __init__(self, target=None, daemon=None, **kw):
-                self._target = target
-            def start(self):
-                self._target()
-
         server._sessions["sid"] = session
-        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        _run_server_threads_inline(monkeypatch, server)
 
         try:
             server.handle_request({
@@ -246,6 +252,53 @@ class TestPendingTitleValueError:
         finally:
             server._sessions.pop("sid", None)
 
+    def test_other_exception_keeps_pending_title_for_retry(self, monkeypatch):
+        """Non-ValueError exceptions should keep pending_title for retry."""
+        from tui_gateway import server
+
+        mock_db = MagicMock()
+        mock_db.set_session_title.side_effect = RuntimeError("transient DB lock")
+
+        class _Agent:
+            session_id = "test-session"
+            _cached_system_prompt = ""
+            def run_conversation(self, prompt, **kw):
+                return {
+                    "final_response": "ok",
+                    "messages": [{"role": "assistant", "content": "ok"}],
+                }
+
+        session = _tui_session(
+            agent=_Agent(),
+            session_key="test-session",
+            pending_title="My Title",
+        )
+
+        monkeypatch.setattr(server, "_get_db", lambda: mock_db)
+        monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
+        monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+        monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+        monkeypatch.setattr(
+            server, "_sync_session_key_after_compress", lambda *a, **kw: None
+        )
+
+        server._sessions["sid"] = session
+        _run_server_threads_inline(monkeypatch, server)
+
+        try:
+            server.handle_request({
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "hello"},
+            })
+
+            # Non-ValueError should keep pending_title for retry
+            assert session.get("pending_title") == "My Title", (
+                "Non-ValueError exceptions should keep pending_title intact "
+                "for retry on next turn"
+            )
+        finally:
+            server._sessions.pop("sid", None)
 
 
 # ===========================================================================

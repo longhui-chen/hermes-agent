@@ -38,6 +38,7 @@ import re
 import secrets
 import shlex
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,14 @@ from tools.thread_context import propagate_context_to_thread
 # ``_use_tcp_rpc`` in ``_execute_local`` below.  That makes execute_code
 # available on every platform Hermes itself runs on.
 logger = logging.getLogger(__name__)
+
+_MANAGED_EXECUTE_CODE_PREAMBLE = """\
+import ctypes as _hermes_ctypes
+_hermes_libc = _hermes_ctypes.CDLL(None, use_errno=True)
+if _hermes_libc.prctl(4, 0, 0, 0, 0) != 0:
+    raise OSError(_hermes_ctypes.get_errno(), "failed to disable process dumpability")
+del _hermes_ctypes, _hermes_libc
+"""
 
 SANDBOX_AVAILABLE = True
 
@@ -165,12 +174,20 @@ _SECRET_SUBSTRINGS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL",
 # are non-secret runtime-location flags (the same set hermes_cli treats as the
 # runtime location) that repo-root modules a sandbox script imports may read at
 # import time.  None match _SECRET_SUBSTRINGS.
+#
+# HERMES_HOME_FALLBACK is the same class of flag: it records the profile home
+# that the missing-HOME fallback injected (see hermes_constants). It must
+# survive scrubbing so a grandchild spawned by an execute_code sandbox inside
+# a nested hermes chain keeps its profile HOME — dropping it lets the child's
+# apply_subprocess_home_env() "repair" HOME back to the pwd-guessed real home
+# (/root) and re-break ZET-1938 on the second hop.
 _HERMES_CHILD_ALLOWED = frozenset({
     "HERMES_HOME",
     "HERMES_PROFILE",
     "HERMES_CONFIG",
     "HERMES_ENV",
     "HERMES_DELEGATED_CHILD_CONTEXT",
+    "HERMES_HOME_FALLBACK",
 })
 
 # Windows-only: a handful of variables are required by the OS/CRT itself.
@@ -242,6 +259,10 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
         is_windows = _IS_WINDOWS
 
     scrubbed = {}
+    try:
+        from tools.environments.local import PROFILE_SCOPED_SUBPROCESS_ENV_KEYS
+    except Exception:
+        PROFILE_SCOPED_SUBPROCESS_ENV_KEYS = frozenset()
     # Non-secret HERMES_* vars dropped by the tightened allowlist (#27303). The
     # broad "HERMES_" prefix used to pass these through; now only the
     # operational set does. The drop is intentional (those vars can carry
@@ -251,6 +272,8 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     # diagnosable and points at the env_passthrough opt-in escape hatch.
     _dropped_hermes = []
     for k, v in source_env.items():
+        if k in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
+            continue
         if is_passthrough(k):
             resolved = resolve_passthrough_value(k, v)
             if resolved is not None:
@@ -299,6 +322,26 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     return scrubbed
 
 
+def _inject_execute_code_session_context_env(env: dict) -> None:
+    """Bridge non-secret gateway session routing vars into execute_code.
+
+    The execute_code child must not receive connector bearer tokens or model
+    credentials, but it may need the same HERMES_SESSION_* routing metadata as
+    terminal() so helper RPCs can stay bound to the correct chat session.
+    """
+    try:
+        from tools.environments.local import _inject_session_context_env
+    except Exception:
+        return
+    _inject_session_context_env(env)
+    logger.debug(
+        "execute_code: session routing env injected "
+        "(session_key_present=%s, connector_auth_present=%s)",
+        bool(env.get("HERMES_SESSION_KEY")),
+        bool(env.get("ZETTLAB_CONNECTORS_AUTH_TOKEN")),
+    )
+
+
 def check_sandbox_requirements() -> bool:
     """Code execution sandbox requires a POSIX OS for Unix domain sockets."""
     if not SANDBOX_AVAILABLE:
@@ -319,6 +362,25 @@ def check_sandbox_requirements() -> bool:
         return _check_vercel_sandbox_requirements(config)
 
     return True
+
+
+def _managed_execute_code_argv(
+    python: str,
+    script_path: str,
+    *,
+    env: Dict[str, str],
+    execution_scope: str | None = None,
+    workspace: str | None = None,
+) -> List[str]:
+    """Apply the managed local-process capability boundary to execute_code."""
+    from tools.environments.local import _managed_execute_code_sandbox_argv
+
+    return _managed_execute_code_sandbox_argv(
+        [python, script_path],
+        env=env,
+        execution_scope=execution_scope,
+        workspace=workspace,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +708,27 @@ def _call(tool_name, args):
 _TERMINAL_BLOCKED_PARAMS = {"background", "pty", "notify_on_complete", "watch_patterns"}
 
 
+def _validate_rpc_peer(
+    conn: socket.socket,
+    expected_peer: tuple[int, int] | None,
+) -> None:
+    """Fail closed unless the UDS client has the expected child PID and UID."""
+
+    if expected_peer is None:
+        return
+    peer_option = getattr(socket, "SO_PEERCRED", None)
+    if peer_option is None:
+        raise PermissionError("RPC peer credentials are unavailable")
+    raw_peer = conn.getsockopt(
+        socket.SOL_SOCKET,
+        peer_option,
+        struct.calcsize("3i"),
+    )
+    peer_pid, peer_uid, _peer_gid = struct.unpack("3i", raw_peer)
+    if (peer_pid, peer_uid) != expected_peer:
+        raise PermissionError("RPC peer identity mismatch")
+
+
 def _rpc_server_loop(
     server_sock: socket.socket,
     task_id: str,
@@ -655,6 +738,7 @@ def _rpc_server_loop(
     allowed_tools: frozenset,
     stop_event: threading.Event,
     rpc_token: str,
+    expected_peer: tuple[int, int] | None = None,
 ):
     """
     Accept one client connection and dispatch tool-call requests until
@@ -673,6 +757,7 @@ def _rpc_server_loop(
                 continue
         if conn is None:
             return
+        _validate_rpc_peer(conn, expected_peer)
         conn.settimeout(300)
 
         buf = b""
@@ -1159,7 +1244,8 @@ def _execute_remote(
             f"HERMES_RPC_TOKEN={shlex.quote(rpc_token)} "
             f"PYTHONDONTWRITEBYTECODE=1"
         )
-        tz = os.getenv("HERMES_TIMEZONE", "").strip()
+        import hermes_time
+        tz = hermes_time.get_timezone_name()
         if tz:
             env_prefix += f" TZ={shlex.quote(tz)}"
 
@@ -1374,6 +1460,10 @@ def execute_code(
     exec_start = time.monotonic()
     server_sock = None
     stop_event = threading.Event()
+    rpc_thread = None
+    managed_gateway = os.environ.get("HERMES_MANAGED_GATEWAY") == "1"
+    managed_execute_scope: str | None = None
+    managed_execute_uid: int | None = None
 
     try:
         # Write the auto-generated hermes_tools module.
@@ -1392,6 +1482,8 @@ def execute_code(
 
         # Write the user's script
         with open(os.path.join(tmpdir, "script.py"), "w", encoding="utf-8") as f:
+            if managed_gateway:
+                f.write(_MANAGED_EXECUTE_CODE_PREAMBLE)
             f.write(code)
 
         # --- Start RPC server ---
@@ -1415,19 +1507,6 @@ def execute_code(
             os.chmod(sock_path, 0o600)
         server_sock.listen(1)
 
-        # Wrapped so the thread inherits the turn's approval context + callbacks
-        # (see tools.thread_context) — else gateway sandbox tool calls silently
-        # auto-approve dangerous commands (#33057, #30882).
-        rpc_thread = threading.Thread(
-            target=propagate_context_to_thread(_rpc_server_loop),
-            args=(
-                server_sock, task_id, tool_call_log,
-                tool_call_counter, max_tool_calls, sandbox_tools, stop_event, rpc_token,
-            ),
-            daemon=True,
-        )
-        rpc_thread.start()
-
         # --- Spawn child process ---
         # Build a minimal environment for the child. We intentionally exclude
         # API keys and tokens to prevent credential exfiltration from LLM-
@@ -1439,6 +1518,10 @@ def execute_code(
         # passed through — without those, the child can't create a socket
         # or spawn a subprocess.  See ``_scrub_child_env`` for the rules.
         child_env = _scrub_child_env(os.environ)
+        _inject_execute_code_session_context_env(child_env)
+        from tools.environments.local import _inject_context_hermes_home
+
+        _inject_context_hermes_home(child_env)
         child_env["HERMES_RPC_SOCKET"] = rpc_endpoint
         child_env["HERMES_RPC_TOKEN"] = rpc_token
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -1475,7 +1558,8 @@ def execute_code(
         # code reflects the correct wall-clock time.  Only TZ is set —
         # HERMES_TIMEZONE is an internal Hermes setting and must not leak
         # into child processes.
-        _tz_name = os.getenv("HERMES_TIMEZONE", "").strip()
+        import hermes_time
+        _tz_name = hermes_time.get_timezone_name()
         if _tz_name:
             child_env["TZ"] = _tz_name
         child_env.pop("HERMES_TIMEZONE", None)
@@ -1488,13 +1572,47 @@ def execute_code(
         #   - project: user's venv python + session's working directory, so
         #              project deps like pandas and user files resolve.
         # Env scrubbing and tool whitelist apply identically in both modes.
-        _mode = _get_execution_mode()
+        _mode = "strict" if managed_gateway else _get_execution_mode()
         _child_python = _resolve_child_python(_mode)
         _child_cwd = _resolve_child_cwd(_mode, tmpdir, task_id=task_id or "")
         _script_path = os.path.join(tmpdir, "script.py")
+        _child_script_path = _script_path
+        if managed_gateway:
+            from tools.environments.local import (
+                _prepare_managed_execute_code_workspace,
+            )
+
+            if sock_path is None:
+                raise OSError("managed execute_code requires a Unix RPC socket")
+            managed_execute_scope = secrets.token_hex(16)
+            managed_execute_uid = _prepare_managed_execute_code_workspace(
+                tmpdir,
+                [
+                    os.path.join(tmpdir, "hermes_tools.py"),
+                    _script_path,
+                    sock_path,
+                ],
+                env=child_env,
+                execution_scope=managed_execute_scope,
+            )
+            child_env["HOME"] = "/tmp"
+            child_env["TMPDIR"] = "/tmp"
+            child_env["TMP"] = "/tmp"
+            child_env["TEMP"] = "/tmp"
+            child_env["HERMES_RPC_SOCKET"] = f"/tmp/{os.path.basename(sock_path)}"
+            _pp_parts[0] = "/tmp"
+            child_env["PYTHONPATH"] = os.pathsep.join(_pp_parts)
+            _child_cwd = tmpdir
+            _child_script_path = "/tmp/script.py"
 
         proc = subprocess.Popen(
-            [_child_python, _script_path],
+            _managed_execute_code_argv(
+                _child_python,
+                _child_script_path,
+                env=child_env,
+                execution_scope=managed_execute_scope,
+                workspace=tmpdir if managed_gateway else None,
+            ),
             cwd=_child_cwd,
             env=child_env,
             stdout=subprocess.PIPE,
@@ -1503,6 +1621,24 @@ def execute_code(
             start_new_session=True,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
         )
+
+        # Start accepting only after Popen returns, so the managed path can bind
+        # the one allowed UDS client to the exact child PID and per-call UID.
+        expected_peer = None
+        if managed_gateway:
+            if managed_execute_uid is None:
+                raise OSError("managed execute_code identity is unavailable")
+            expected_peer = (proc.pid, managed_execute_uid)
+        rpc_thread = threading.Thread(
+            target=propagate_context_to_thread(_rpc_server_loop),
+            args=(
+                server_sock, task_id, tool_call_log,
+                tool_call_counter, max_tool_calls, sandbox_tools, stop_event,
+                rpc_token, expected_peer,
+            ),
+            daemon=True,
+        )
+        rpc_thread.start()
 
         # --- Poll loop: watch for exit, timeout, and interrupt ---
         deadline = time.monotonic() + timeout
@@ -1612,6 +1748,23 @@ def execute_code(
                 pass
             poll_interval = min(0.2, poll_interval * 1.5)
 
+        # A script can start a detached/background descendant which survives
+        # the top-level process group.  Retire the invocation UID on every
+        # normal exit before readers, RPC state, or the workspace are released.
+        # Failure raises into the error result and keeps the UID reservation.
+        if managed_execute_uid is not None and managed_execute_scope is not None:
+            from tools.environments.local import (
+                retire_managed_execute_code_identity,
+            )
+
+            retire_managed_execute_code_identity(
+                managed_execute_uid,
+                child_env,
+                managed_execute_scope,
+            )
+            managed_execute_uid = None
+            managed_execute_scope = None
+
         # Wait for readers to finish draining
         stdout_reader.join(timeout=3)
         stderr_reader.join(timeout=3)
@@ -1631,7 +1784,8 @@ def execute_code(
         stop_event.set()
         server_sock.close()  # break accept() so thread exits promptly
         server_sock = None  # prevent double close in finally
-        rpc_thread.join(timeout=3)
+        if rpc_thread is not None:
+            rpc_thread.join(timeout=3)
 
         # Strip ANSI escape sequences so the model never sees terminal
         # formatting — prevents it from copying escapes into file writes.
@@ -1724,6 +1878,22 @@ def execute_code(
                 os.unlink(sock_path)
         except OSError:
             pass  # already cleaned up or never created
+        if managed_execute_uid is not None and managed_execute_scope is not None:
+            try:
+                from tools.environments.local import (
+                    retire_managed_execute_code_identity,
+                )
+
+                retire_managed_execute_code_identity(
+                    managed_execute_uid,
+                    child_env,
+                    managed_execute_scope,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to retire managed execute_code identity",
+                    exc_info=True,
+                )
 
 
 def _kill_process_group(proc, escalate: bool = False):

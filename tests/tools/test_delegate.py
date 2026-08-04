@@ -1085,6 +1085,11 @@ class TestDelegateHeartbeat(unittest.TestCase):
             # never sets and the bounded wait expires, failing the assertion
             # below instead of hanging.
             kept_going.wait(5)
+            # Long enough to exceed the OLD idle threshold (5 cycles) at
+            # the patched interval, but shorter than the new in-tool
+            # threshold. Keep a scheduling buffer so a busy full-suite run
+            # does not fail just because one heartbeat lands late.
+            time.sleep(0.45)
             return {"final_response": "done", "completed": True, "api_calls": 1}
 
         child.run_conversation.side_effect = slow_run
@@ -1110,6 +1115,7 @@ class TestDelegateHeartbeat(unittest.TestCase):
             len(touch_calls), 2,
             f"Heartbeat stopped too early while child was inside a tool; "
             f"got {len(touch_calls)} touches",
+            f"got {len(touch_calls)} touches over 0.45s at 0.05s interval",
         )
 
 
@@ -1680,3 +1686,38 @@ class TestFallbackModelInheritance(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_run_single_child_propagates_context_to_inner_executor():
+    """The innermost timeout-executor hop (child.run_conversation's actual
+    thread) must inherit the caller's ContextVars — the batch-level propagate
+    only covers _run_single_child's own thread, one hop short (profile
+    HERMES_HOME / secret scope would fall back to the default profile)."""
+    from gateway.session_context import (
+        clear_session_vars,
+        get_session_env,
+        set_session_vars,
+    )
+    import tools.delegate_tool as dt
+
+    seen = {}
+
+    class _FakeChild:
+        model = "test-model"
+
+        def run_conversation(self, user_message, task_id=None, stream_callback=None):
+            seen["session_key"] = get_session_env("HERMES_SESSION_KEY", "")
+            return {"final_response": "ok", "messages": [], "api_calls": 1}
+
+    tokens = set_session_vars(
+        platform="zet_agent",
+        chat_id="c1",
+        session_key="propagated-key",
+        session_id="c1",
+    )
+    try:
+        result = dt._run_single_child(0, "check context", child=_FakeChild())
+    finally:
+        clear_session_vars(tokens)
+    assert seen["session_key"] == "propagated-key"
+    assert result.get("status") not in (None, "error"), result

@@ -30,6 +30,7 @@ def test_tool_name_persisted_to_session_db():
     the batched flush so the column is populated on first write to the
     session DB."""
     session_db = MagicMock()
+    session_db.append_message.return_value = 1
     agent = _make_agent(session_db)
 
     messages = [
@@ -43,3 +44,10 @@ def test_tool_name_persisted_to_session_db():
     tool_rows = [m for m in batch if m.get("role") == "tool"]
     assert len(tool_rows) == 1
     assert tool_rows[0]["tool_name"] == "terminal"
+    tool_appends = [
+        c for c in session_db.append_message.call_args_list
+        if c.kwargs.get("role") == "tool"
+    ]
+    assert len(tool_appends) == 1
+    assert tool_appends[0].kwargs["tool_name"] == "terminal"
+    assert messages[-1]["_db_message_id"] == 1

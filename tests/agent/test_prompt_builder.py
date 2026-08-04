@@ -23,7 +23,11 @@ from agent.prompt_builder import (
     _get_context_file_max_chars,
     _CONTEXT_FILE_DYNAMIC_CEILING,
     DEFAULT_AGENT_IDENTITY,
+    default_agent_identity,
+    get_agent_prompt_lang,
     drain_truncation_warnings,
+    zettlab_agent_kernel_guidance,
+    zettlab_turn_rules_guidance,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
@@ -43,6 +47,153 @@ from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatu
 
 
 class TestGuidanceConstants:
+    def test_zettlab_agent_kernel_guidance_english_matches_poke_style_xml_layers(self):
+        guidance = zettlab_agent_kernel_guidance("en")
+
+        expected_order = [
+            '<zettlab_agent_base_prompt version="0.3" lang="en">',
+            '<profile_soul source="SOUL.md">',
+            "<conversation_protocol",
+            "<message_tags>",
+            "<output_tags>",
+            "<priority>",
+            "<capabilities>",
+            "<behavior>",
+            "<product_policy>",
+            "<platform_ux_rules>",
+            "<voice>",
+            "<style_and_formatting>",
+            "<soul_inheritance>",
+            "<product_facts>",
+            "</zettlab_agent_base_prompt>",
+        ]
+        positions = [guidance.index(marker) for marker in expected_order]
+        assert positions == sorted(positions)
+        assert 'placeholder="true"' in guidance
+        assert "Do not invent unconfigured product facts" in guidance
+        assert "Zettlab Agent Computer (AC)" in guidance
+        assert "personal computer" not in guidance.lower()
+        assert "NAS" not in guidance
+        assert "# Conversation protocol" not in guidance
+
+    def test_zettlab_agent_kernel_guidance_chinese_matches_poke_style_xml_layers(self):
+        guidance = zettlab_agent_kernel_guidance("zh")
+
+        expected_order = [
+            '<zettlab_agent_base_prompt version="0.3" lang="zh">',
+            '<profile_soul source="SOUL.md">',
+            "<conversation_protocol",
+            "<message_tags>",
+            "<output_tags>",
+            "<priority>",
+            "<capabilities>",
+            "<behavior>",
+            "<product_policy>",
+            "<platform_ux_rules>",
+            "<voice>",
+            "<style_and_formatting>",
+            "<soul_inheritance>",
+            "<product_facts>",
+            "</zettlab_agent_base_prompt>",
+        ]
+        positions = [guidance.index(marker) for marker in expected_order]
+        assert positions == sorted(positions)
+        assert 'placeholder="true"' in guidance
+        assert "不要编造未配置的产品事实" in guidance
+        assert "Zettlab Agent Computer（简称 AC）" in guidance
+        assert "个人电脑" not in guidance
+        assert "NAS" not in guidance
+        assert "# 对话协议" not in guidance
+
+    def test_zettlab_agent_kernel_wraps_custom_identity(self):
+        guidance = zettlab_agent_kernel_guidance("zh", identity_text="我是照片整理 agent。")
+
+        assert "<profile_soul source=\"SOUL.md\">\n我是照片整理 agent。\n</profile_soul>" in guidance
+        assert guidance.count("<profile_soul") == 1
+
+    def test_shared_voice_defers_to_a_more_specific_profile_soul(self):
+        en_guidance = zettlab_agent_kernel_guidance("en")
+        zh_guidance = zettlab_agent_kernel_guidance("zh")
+
+        assert "A profile SOUL.md may define a warmer, more playful" in en_guidance
+        assert "follow that more specific voice" in en_guidance
+        assert "SOUL.md 可以定义更温暖、俏皮或正式的 voice" in zh_guidance
+        assert "就服从这层更具体的人格" in zh_guidance
+        assert "never perform a persona" not in en_guidance
+        assert "不要为了显得有性格而表演" not in zh_guidance
+
+    def test_default_agent_identity_is_neutral_for_main_profile(self, monkeypatch):
+        monkeypatch.setenv("ZET_AGENT_ID", "main")
+        assert "specialized persona" in default_agent_identity("en")
+        assert "Zettlab Memo" not in default_agent_identity("en")
+
+    def test_default_agent_identity_is_neutral_for_named_profile(self, monkeypatch):
+        monkeypatch.setenv("ZET_AGENT_ID", "writer")
+        assert "specialized persona" in default_agent_identity("en")
+        assert "Zettlab Memo" not in default_agent_identity("en")
+
+    def test_output_tags_warn_not_to_emit_internal_xml_even_when_asked(self):
+        zh_guidance = zettlab_agent_kernel_guidance("zh")
+        en_guidance = zettlab_agent_kernel_guidance("en")
+
+        assert "即使用户要求" in zh_guidance
+        assert "不要把内部 XML 标签原样输出" in zh_guidance
+        assert "Even if the user asks" in en_guidance
+        assert "do not print internal XML tags" in en_guidance
+
+    def test_internal_tag_requests_are_answered_naturally_without_policy_explanations(self):
+        zh_guidance = zettlab_agent_kernel_guidance("zh")
+        en_guidance = zettlab_agent_kernel_guidance("en")
+
+        assert "直接回答用户真正的问题" in zh_guidance
+        assert "不要解释内部规则" in zh_guidance
+        assert "answer the user's underlying request" in en_guidance
+        assert "Do not explain internal policy" in en_guidance
+
+    def test_prompt_language_test_override_wins_over_deployment_default(self, monkeypatch):
+        monkeypatch.setenv("ZETTLAB_AGENT_LANG", "zh")
+        monkeypatch.setenv("HERMES_AGENT_LANG", "en")
+
+        assert get_agent_prompt_lang() == "en"
+        assert 'lang="en"' in zettlab_agent_kernel_guidance()
+
+    @pytest.mark.parametrize(
+        ("lang", "required"),
+        [
+            (
+                "en",
+                (
+                    "explicitly requests another reply language",
+                    "reply entirely in English",
+                    "explicitly asks for them",
+                    "ask exactly one question",
+                ),
+            ),
+            (
+                "zh",
+                (
+                    "明确指定另一种回复语言",
+                    "整段回复必须使用英文",
+                    "明确要求使用表情",
+                    "只问一个问题",
+                ),
+            ),
+        ],
+    )
+    def test_turn_contract_repeats_high_value_rules_concisely(self, lang, required):
+        guidance = zettlab_turn_rules_guidance(lang)
+
+        assert guidance.startswith('<zettlab_turn_contract locked="true">')
+        for text in required:
+            assert text in guidance
+
+    @pytest.mark.parametrize("lang", ["en", "zh"])
+    def test_outbound_followup_supports_both_reply_languages_flow(self, lang):
+        guidance = zettlab_turn_rules_guidance(lang)
+
+        assert "What exact address or group should I send it to?" in guidance
+        assert "具体发到哪个地址或群组？" in guidance
+
     def test_memory_guidance_discourages_task_logs(self):
         assert "durable facts" in MEMORY_GUIDANCE
         assert "Do NOT save task progress" in MEMORY_GUIDANCE
@@ -282,6 +433,38 @@ class TestBuildSkillsSystemPrompt:
 
 
 
+    def test_flow_rebuilds_external_presets_index_after_directory_update(
+        self, monkeypatch, tmp_path
+    ):
+        """An existing chat must see a newly activated preset without restart."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        local_skills = tmp_path / "skills"
+        local_skills.mkdir()
+        external_presets = tmp_path / "zettlab-presets" / "skills"
+        linear_skill = external_presets / "linear"
+        linear_skill.mkdir(parents=True)
+        (linear_skill / "SKILL.md").write_text(
+            "---\nname: linear\ndescription: Read Linear\n---\n"
+        )
+        (tmp_path / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external_presets}\n"
+        )
+        from agent.skill_utils import _external_dirs_cache_clear
+        _external_dirs_cache_clear()
+
+        first = build_skills_system_prompt()
+        assert "linear" in first
+        assert "discord" not in first
+
+        discord_skill = external_presets / "discord"
+        discord_skill.mkdir()
+        (discord_skill / "SKILL.md").write_text(
+            "---\nname: discord\ndescription: Read Discord\n---\n"
+        )
+
+        second = build_skills_system_prompt()
+        assert "discord" in second
+
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cat_dir = tmp_path / "skills" / "tools"
@@ -441,7 +624,8 @@ class TestBuildContextFilesPrompt:
         with patch("pathlib.Path.home", return_value=fake_home):
             result = build_context_files_prompt(cwd=str(tmp_path))
         assert "Project Context" in result
-        assert "Hermes Agent" in result
+        assert "specialized persona" in result
+        assert "Zettlab Memo" not in result
 
     def test_loads_agents_md(self, tmp_path):
         (tmp_path / "AGENTS.md").write_text("Use Ruff for linting.")
@@ -604,6 +788,26 @@ class TestStripYamlFrontmatter:
 
 
 class TestPromptBuilderConstants:
+    def test_default_identity_non_empty(self):
+        assert len(DEFAULT_AGENT_IDENTITY) > 50
+        assert "Zettlab Memo" not in DEFAULT_AGENT_IDENTITY
+        assert "specialized persona" in DEFAULT_AGENT_IDENTITY
+        assert "Hermes Agent" not in DEFAULT_AGENT_IDENTITY
+
+    def test_default_identity_leaves_product_contract_to_profile_soul(self):
+        for phrase in [
+            "open identity slot",
+            "shared Zettlab agent base prompt",
+            "future edits to this SOUL.md",
+        ]:
+            assert phrase in DEFAULT_AGENT_IDENTITY
+        for product_specific_phrase in [
+            "Zettlab Memo",
+            "built-in main agent for this device",
+            "generalist all-in-one assistant",
+            "created by Nous Research",
+        ]:
+            assert product_specific_phrase not in DEFAULT_AGENT_IDENTITY
 
 
     def test_cli_and_tui_hints_flag_local_only_cron(self):
@@ -919,5 +1123,3 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
-

@@ -794,6 +794,145 @@ class TestDiscordSkillCommands:
     """Tests for discord_skill_commands() — centralized skill registration."""
 
 
+    def test_profile_local_skillhub_skill_is_included(self, tmp_path, monkeypatch):
+        """Profile-local SkillHub installs must not be filtered by process home."""
+        from unittest.mock import patch
+
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        import tools.skills_tool as skills_tool
+
+        process_skills = tmp_path / "process-home" / "skills"
+        profile_home = tmp_path / "profiles" / "general-assistant"
+        skill_dir = (
+            profile_home
+            / "skills"
+            / "__skillhub__"
+            / "Zettlab Official"
+            / "kingdee-k3cloud"
+        )
+        process_skills.mkdir(parents=True)
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("---\nname: kingdee-k3cloud\n---\n")
+        fake_cmds = {
+            "/kingdee-k3cloud": {
+                "name": "kingdee-k3cloud",
+                "description": "Kingdee ERP",
+                "skill_md_path": str(skill_dir / "SKILL.md"),
+                "skill_dir": str(skill_dir),
+            },
+        }
+
+        monkeypatch.setattr(skills_tool, "_DEFAULT_SKILLS_DIR", process_skills)
+        monkeypatch.setattr(skills_tool, "SKILLS_DIR", process_skills)
+        token = set_hermes_home_override(str(profile_home))
+        try:
+            with patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds):
+                entries, hidden = discord_skill_commands(
+                    max_slots=50,
+                    reserved_names=set(),
+                )
+        finally:
+            reset_hermes_home_override(token)
+
+        assert ("kingdee-k3cloud", "Kingdee ERP", "/kingdee-k3cloud") in entries
+        assert hidden == 0
+
+    def test_profile_local_skillhub_skill_is_included_with_symlink_profile_home(
+        self, tmp_path, monkeypatch
+    ):
+        """Flat gateway collectors must normalize symlinked profile paths."""
+        from unittest.mock import patch
+
+        import pytest
+
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        import tools.skills_tool as skills_tool
+
+        process_skills = tmp_path / "process-home" / "skills"
+        real_profile_home = tmp_path / "real-profile"
+        linked_profile_home = tmp_path / "linked-profile"
+        real_skill_dir = (
+            real_profile_home
+            / "skills"
+            / "__skillhub__"
+            / "Zettlab Official"
+            / "kingdee-k3cloud"
+        )
+        process_skills.mkdir(parents=True)
+        real_skill_dir.mkdir(parents=True)
+        try:
+            linked_profile_home.symlink_to(real_profile_home, target_is_directory=True)
+        except (NotImplementedError, OSError) as exc:
+            pytest.skip(f"symlink unavailable: {exc}")
+
+        linked_skill_dir = (
+            linked_profile_home
+            / "skills"
+            / "__skillhub__"
+            / "Zettlab Official"
+            / "kingdee-k3cloud"
+        )
+        fake_cmds = {
+            "/kingdee-k3cloud": {
+                "name": "kingdee-k3cloud",
+                "description": "Kingdee ERP",
+                "skill_md_path": str(linked_skill_dir / "SKILL.md"),
+                "skill_dir": str(linked_skill_dir),
+            },
+        }
+
+        monkeypatch.setattr(skills_tool, "_DEFAULT_SKILLS_DIR", process_skills)
+        monkeypatch.setattr(skills_tool, "SKILLS_DIR", process_skills)
+        token = set_hermes_home_override(str(linked_profile_home))
+        try:
+            with patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds):
+                entries, hidden = discord_skill_commands(
+                    max_slots=50,
+                    reserved_names=set(),
+                )
+        finally:
+            reset_hermes_home_override(token)
+
+        assert ("kingdee-k3cloud", "Kingdee ERP", "/kingdee-k3cloud") in entries
+        assert hidden == 0
+
+    def test_symlinked_skill_dir_under_local_root_is_included(
+        self, tmp_path, monkeypatch
+    ):
+        from unittest.mock import patch
+
+        import pytest
+
+        local_skills = tmp_path / "skills"
+        checkout_skill = tmp_path / "checkout" / "linked-skill"
+        linked_skill = local_skills / "linked-skill"
+        local_skills.mkdir()
+        checkout_skill.mkdir(parents=True)
+        (checkout_skill / "SKILL.md").write_text("---\nname: linked-skill\n---\n")
+        try:
+            linked_skill.symlink_to(checkout_skill, target_is_directory=True)
+        except (NotImplementedError, OSError) as exc:
+            pytest.skip(f"symlink unavailable: {exc}")
+
+        fake_cmds = {
+            "/linked-skill": {
+                "name": "linked-skill",
+                "description": "Linked skill",
+                "skill_md_path": str(linked_skill / "SKILL.md"),
+                "skill_dir": str(linked_skill),
+            },
+        }
+
+        monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", local_skills)
+        with patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds):
+            entries, hidden = discord_skill_commands(
+                max_slots=50,
+                reserved_names=set(),
+            )
+
+        assert ("linked-skill", "Linked skill", "/linked-skill") in entries
+        assert hidden == 0
+
     def test_names_allow_hyphens(self, tmp_path, monkeypatch):
         """Discord names should keep hyphens (unlike Telegram's _ sanitization)."""
         from unittest.mock import patch
@@ -861,8 +1000,230 @@ from hermes_cli.commands import discord_skill_commands_by_category  # noqa: E402
 class TestDiscordSkillCommandsByCategory:
     """Tests for discord_skill_commands_by_category() — /skill group registration."""
 
+    def test_groups_skills_by_category(self, tmp_path, monkeypatch):
+        """Skills nested 2+ levels deep should be grouped by top-level category."""
+        from unittest.mock import patch
 
+        fake_skills_dir = str(tmp_path / "skills")
+        # Create the directory structure so resolve() works
+        for p in [
+            "skills/creative/ascii-art",
+            "skills/creative/excalidraw",
+            "skills/media/gif-search",
+        ]:
+            (tmp_path / p).mkdir(parents=True, exist_ok=True)
+            (tmp_path / p / "SKILL.md").write_text("---\nname: test\n---\n")
 
+        fake_cmds = {
+            "/ascii-art": {
+                "name": "ascii-art",
+                "description": "Generate ASCII art",
+                "skill_md_path": f"{fake_skills_dir}/creative/ascii-art/SKILL.md",
+            },
+            "/excalidraw": {
+                "name": "excalidraw",
+                "description": "Hand-drawn diagrams",
+                "skill_md_path": f"{fake_skills_dir}/creative/excalidraw/SKILL.md",
+            },
+            "/gif-search": {
+                "name": "gif-search",
+                "description": "Search for GIFs",
+                "skill_md_path": f"{fake_skills_dir}/media/gif-search/SKILL.md",
+            },
+        }
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with (
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path / "skills"),
+        ):
+            categories, uncategorized, hidden = discord_skill_commands_by_category(
+                reserved_names=set(),
+            )
+
+        assert "creative" in categories
+        assert "media" in categories
+        assert len(categories["creative"]) == 2
+        assert len(categories["media"]) == 1
+        assert uncategorized == []
+        assert hidden == 0
+
+    def test_profile_local_skillhub_skill_is_grouped_from_active_profile_root(
+        self, tmp_path, monkeypatch
+    ):
+        from unittest.mock import patch
+
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        import tools.skills_tool as skills_tool
+
+        process_skills = tmp_path / "process-home" / "skills"
+        profile_home = tmp_path / "profiles" / "general-assistant"
+        skill_dir = (
+            profile_home
+            / "skills"
+            / "__skillhub__"
+            / "Zettlab Official"
+            / "kingdee-k3cloud"
+        )
+        process_skills.mkdir(parents=True)
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("---\nname: kingdee-k3cloud\n---\n")
+        fake_cmds = {
+            "/kingdee-k3cloud": {
+                "name": "kingdee-k3cloud",
+                "description": "Kingdee ERP",
+                "skill_md_path": str(skill_dir / "SKILL.md"),
+            },
+        }
+
+        monkeypatch.setattr(skills_tool, "_DEFAULT_SKILLS_DIR", process_skills)
+        monkeypatch.setattr(skills_tool, "SKILLS_DIR", process_skills)
+        token = set_hermes_home_override(str(profile_home))
+        try:
+            with patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds):
+                categories, uncategorized, hidden = discord_skill_commands_by_category(
+                    reserved_names=set(),
+                )
+        finally:
+            reset_hermes_home_override(token)
+
+        assert "__skillhub__" in categories
+        assert ("kingdee-k3cloud", "Kingdee ERP", "/kingdee-k3cloud") in categories[
+            "__skillhub__"
+        ]
+        assert uncategorized == []
+        assert hidden == 0
+
+    def test_symlinked_skill_dir_under_category_is_grouped(
+        self, tmp_path, monkeypatch
+    ):
+        from unittest.mock import patch
+
+        import pytest
+
+        local_skills = tmp_path / "skills"
+        local_category = local_skills / "business"
+        checkout_skill = tmp_path / "checkout" / "linked-skill"
+        linked_skill = local_category / "linked-skill"
+        local_category.mkdir(parents=True)
+        checkout_skill.mkdir(parents=True)
+        (checkout_skill / "SKILL.md").write_text("---\nname: linked-skill\n---\n")
+        try:
+            linked_skill.symlink_to(checkout_skill, target_is_directory=True)
+        except (NotImplementedError, OSError) as exc:
+            pytest.skip(f"symlink unavailable: {exc}")
+
+        fake_cmds = {
+            "/linked-skill": {
+                "name": "linked-skill",
+                "description": "Linked skill",
+                "skill_md_path": str(linked_skill / "SKILL.md"),
+            },
+        }
+
+        monkeypatch.setattr("tools.skills_tool.SKILLS_DIR", local_skills)
+        with patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds):
+            categories, uncategorized, hidden = discord_skill_commands_by_category(
+                reserved_names=set(),
+            )
+
+        assert ("linked-skill", "Linked skill", "/linked-skill") in categories[
+            "business"
+        ]
+        assert uncategorized == []
+        assert hidden == 0
+
+    def test_root_level_skills_are_uncategorized(self, tmp_path, monkeypatch):
+        """Skills directly under SKILLS_DIR (only 1 path component) → uncategorized."""
+        from unittest.mock import patch
+
+        fake_skills_dir = str(tmp_path / "skills")
+        (tmp_path / "skills" / "dogfood").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "skills" / "dogfood" / "SKILL.md").write_text("")
+
+        fake_cmds = {
+            "/dogfood": {
+                "name": "dogfood",
+                "description": "QA testing",
+                "skill_md_path": f"{fake_skills_dir}/dogfood/SKILL.md",
+            },
+        }
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with (
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path / "skills"),
+        ):
+            categories, uncategorized, hidden = discord_skill_commands_by_category(
+                reserved_names=set(),
+            )
+
+        assert categories == {}
+        assert len(uncategorized) == 1
+        assert uncategorized[0][0] == "dogfood"
+
+    def test_hub_skills_excluded(self, tmp_path, monkeypatch):
+        """Skills under .hub should be excluded."""
+        from unittest.mock import patch
+
+        fake_skills_dir = str(tmp_path / "skills")
+        (tmp_path / "skills" / ".hub" / "some-skill").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "skills" / ".hub" / "some-skill" / "SKILL.md").write_text("")
+
+        fake_cmds = {
+            "/some-skill": {
+                "name": "some-skill",
+                "description": "Hub skill",
+                "skill_md_path": f"{fake_skills_dir}/.hub/some-skill/SKILL.md",
+            },
+        }
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with (
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path / "skills"),
+        ):
+            categories, uncategorized, hidden = discord_skill_commands_by_category(
+                reserved_names=set(),
+            )
+
+        assert categories == {}
+        assert uncategorized == []
+
+    def test_deep_nested_skills_use_top_category(self, tmp_path, monkeypatch):
+        """Skills like mlops/training/axolotl should group under 'mlops'."""
+        from unittest.mock import patch
+
+        fake_skills_dir = str(tmp_path / "skills")
+        (tmp_path / "skills" / "mlops" / "training" / "axolotl").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "skills" / "mlops" / "training" / "axolotl" / "SKILL.md").write_text("")
+        (tmp_path / "skills" / "mlops" / "inference" / "vllm").mkdir(parents=True, exist_ok=True)
+        (tmp_path / "skills" / "mlops" / "inference" / "vllm" / "SKILL.md").write_text("")
+
+        fake_cmds = {
+            "/axolotl": {
+                "name": "axolotl",
+                "description": "Fine-tuning with Axolotl",
+                "skill_md_path": f"{fake_skills_dir}/mlops/training/axolotl/SKILL.md",
+            },
+            "/vllm": {
+                "name": "vllm",
+                "description": "vLLM inference",
+                "skill_md_path": f"{fake_skills_dir}/mlops/inference/vllm/SKILL.md",
+            },
+        }
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with (
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", tmp_path / "skills"),
+        ):
+            categories, uncategorized, hidden = discord_skill_commands_by_category(
+                reserved_names=set(),
+            )
+
+        # Both should be under 'mlops' regardless of sub-category
+        assert "mlops" in categories
+        names = {n for n, _d, _k in categories["mlops"]}
+        assert "axolotl" in names
+        assert "vllm" in names
+        assert len(uncategorized) == 0
 
     def test_no_legacy_25x25_cap(self, tmp_path, monkeypatch):
         """The old nested-layout caps (25 groups × 25 skills/group) are gone.

@@ -6,7 +6,7 @@
 # Uses uv for desktop/server installs and Python's stdlib venv + pip on Termux.
 #
 # Usage:
-#   curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/zettlab/hermes-agent/main/scripts/install.sh | bash
 #
 # Or with options:
 #   curl -fsSL ... | bash -s -- --no-venv --skip-setup
@@ -43,8 +43,8 @@ NC='\033[0m' # No Color
 BOLD='\033[1m'
 
 # Configuration
-REPO_URL_SSH="git@github.com:NousResearch/hermes-agent.git"
-REPO_URL_HTTPS="https://github.com/NousResearch/hermes-agent.git"
+REPO_URL_SSH="git@github.com:zettlab/hermes-agent.git"
+REPO_URL_HTTPS="https://github.com/zettlab/hermes-agent.git"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 # INSTALL_DIR is resolved AFTER arg parsing and OS detection so we can pick an
 # FHS-style layout for root installs.  Track whether the user gave us an
@@ -1951,14 +1951,14 @@ copy_config_templates() {
         log_info "~/.hermes/config.yaml already exists, keeping it"
     fi
 
-    # Create SOUL.md if it doesn't exist (global persona file).
-    # This MUST match DEFAULT_SOUL_MD in hermes_cli/default_soul.py — the
-    # runtime (_ensure_default_soul_md) treats the old comment-only scaffold as
-    # "never customized" and upgrades it to this text on next run, so any drift
-    # here is self-healing, but keep them in sync to avoid a churn on first run.
+    # Create SOUL.md if it doesn't exist (neutral identity slot).
+    # This MUST match DEFAULT_SOUL_MD in hermes_cli/default_soul.py. Existing
+    # SOUL files are profile-owner data and are never migrated by Hermes.
     if [ ! -f "$HERMES_HOME/SOUL.md" ]; then
         cat > "$HERMES_HOME/SOUL.md" << 'SOUL_EOF'
-You are Hermes Agent, an intelligent AI assistant created by Nous Research. You are helpful, knowledgeable, and direct. You assist users with a wide range of tasks including answering questions, writing and editing code, analyzing information, creative work, and executing actions via your tools. You communicate clearly, admit uncertainty when appropriate, and prioritize being genuinely useful over being verbose unless otherwise directed below. Be targeted and efficient in your exploration and investigations.
+# Agent SOUL
+
+This profile has not been given a specialized persona yet. Treat this file as an open identity slot: follow the user's current request, the shared Zettlab agent base prompt, and any future edits to this SOUL.md. Do not assume any named specialist identity unless this file, a template package, or the current user explicitly defines that identity.
 SOUL_EOF
         log_success "Created ~/.hermes/SOUL.md (edit to customize personality)"
     fi
@@ -1981,10 +1981,31 @@ SOUL_EOF
         if "$INSTALL_DIR/venv/bin/python" "$INSTALL_DIR/tools/skills_sync.py" 2>/dev/null; then
             log_success "Skills synced to ~/.hermes/skills/"
         else
-            # Fallback: simple directory copy if Python sync fails
-            if [ -d "$INSTALL_DIR/skills" ] && [ ! "$(ls -A "$HERMES_HOME/skills/" 2>/dev/null | grep -v '.bundled_manifest')" ]; then
-                cp -r "$INSTALL_DIR/skills/"* "$HERMES_HOME/skills/" 2>/dev/null || true
-                log_success "Skills copied to ~/.hermes/skills/"
+            # Fallback (python seeder unavailable): copy ONLY the policy's seed
+            # set from the pre-baked manifest — policy-correct without python.
+            # Never bulk-copy the whole bundle (would seed the un-curated set).
+            manifest="$INSTALL_DIR/config/seed_fallback_manifest.txt"
+            if [ -f "$manifest" ] && [ ! "$(ls -A "$HERMES_HOME/skills/" 2>/dev/null | grep -v '.bundled_manifest')" ]; then
+                seed_failures=0
+                # `|| [ -n "$src" ]` so a manifest whose last line lacks a
+                # trailing newline still processes that final seed.
+                while IFS= read -r src || [ -n "$src" ]; do
+                    [ -z "$src" ] && continue
+                    dest="${src#*/}"
+                    mkdir -p "$HERMES_HOME/skills/$(dirname "$dest")"
+                    cp -r "$INSTALL_DIR/$src" "$HERMES_HOME/skills/$dest" 2>/dev/null \
+                        || seed_failures=$((seed_failures + 1))
+                done < "$manifest"
+                # Only mark the profile policy-managed when EVERY seed copied. On
+                # partial failure, skip the marker and report honestly: the first
+                # 'hermes' run (no manifest -> treated as new) re-seeds under
+                # policy and completes the missing skills.
+                if [ "$seed_failures" -eq 0 ]; then
+                    : > "$HERMES_HOME/skills/.seed_policy"
+                    log_success "Skills seeded from policy fallback"
+                else
+                    log_warn "Skill fallback seeding incomplete ($seed_failures copy failure(s)); marker not written — the first 'hermes' run will complete seeding under policy."
+                fi
             fi
         fi
     fi

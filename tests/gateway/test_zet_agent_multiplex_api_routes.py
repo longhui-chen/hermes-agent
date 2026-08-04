@@ -1,0 +1,1146 @@
+"""Phase 1: zet_agent `/p/<profile>` API routes for local-server mux mode."""
+
+import asyncio
+import json
+import queue
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import yaml
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+
+from gateway.config import PlatformConfig
+from gateway.platforms.zet_agent import ZetAgentAdapter, _ClarifyEntry
+from gateway.session_context import clear_turn_vars, set_turn_vars
+from tools import approval
+
+TEST_API_KEY = "test-key-0123456789abcdef"
+
+
+def _make_adapter() -> ZetAgentAdapter:
+    return ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": TEST_API_KEY}))
+
+
+def _add_prefixed_zet_agent_routes(app: web.Application, adapter: ZetAgentAdapter) -> None:
+    app["api_server_adapter"] = adapter
+    adapter._register_profile_api_routes(
+        app.router,
+        chat_handler=adapter._diagnostic_chat_completions,
+    )
+    app.router.add_post(
+        "/p/{profile}/v1/model/switch",
+        adapter._profile_handler(adapter._handle_model_switch),
+    )
+    app.router.add_post(
+        "/p/{profile}/v1/skills/reload",
+        adapter._profile_handler(adapter._handle_skills_reload),
+    )
+    app.router.add_post(
+        "/p/{profile}/v1/connectors/reload",
+        adapter._profile_handler(adapter._handle_connectors_reload),
+    )
+    app.router.add_post(
+        "/p/{profile}/v1/profile/reload",
+        adapter._profile_handler(adapter._handle_profile_reload),
+    )
+    app.router.add_post(
+        "/p/{profile}/v1/runtime/reset",
+        adapter._profile_handler(adapter._handle_runtime_reset),
+    )
+    app.router.add_post(
+        "/p/{profile}/v1/profile/unload",
+        adapter._profile_handler(adapter._handle_profile_unload),
+    )
+    app.router.add_post(
+        "/p/{profile}/v1/sessions/{session_id}/model/switch",
+        adapter._profile_handler(adapter._handle_session_model_switch),
+    )
+    app.router.add_delete(
+        "/p/{profile}/v1/sessions/{session_id}/model",
+        adapter._profile_handler(adapter._handle_session_model_clear),
+    )
+    app.router.add_get(
+        "/p/{profile}/v1/sessions/{session_id}/pending",
+        adapter._profile_handler(adapter._handle_pending),
+    )
+    app.router.add_get(
+        "/p/{profile}/v1/sessions/{session_id}/interaction-deliveries/{delivery_id}",
+        adapter._profile_handler(adapter._handle_interaction_delivery),
+    )
+    app.router.add_post(
+        "/p/{profile}/v1/sessions/{session_id}/interaction-deliveries/{delivery_id}/recovery-fence",
+        adapter._profile_handler(adapter._handle_recovery_fence),
+    )
+    app.router.add_post(
+        "/p/{profile}/v1/sessions/{session_id}/approval/respond",
+        adapter._profile_handler(adapter._handle_approval_respond),
+    )
+    app.router.add_post(
+        "/p/{profile}/v1/sessions/{session_id}/clarify/respond",
+        adapter._profile_handler(adapter._handle_clarify_respond),
+    )
+    app.router.add_post(
+        "/p/{profile}/v1/sessions/{session_id}/interrupt",
+        adapter._profile_handler(adapter._handle_session_interrupt),
+    )
+
+
+@pytest.mark.asyncio
+async def test_clarify_id_is_stable_across_stream_pending_and_exact_response():
+    """The same Hermes-generated id must drive live, reconnect and response.
+
+    This exercises the real callback -> HTTP route path. A wrong id must not
+    consume the pending callback; the right id unblocks exactly that callback.
+    """
+    adapter = _make_adapter()
+    app = web.Application()
+    app.router.add_get(
+        "/v1/sessions/{session_id}/pending", adapter._handle_pending,
+    )
+    app.router.add_post(
+        "/v1/sessions/{session_id}/clarify/respond", adapter._handle_clarify_respond,
+    )
+    stream_q: queue.Queue = queue.Queue()
+    answered = []
+    ask = adapter._make_clarify_cb(stream_q, "sid-clarify-id")
+    thread = threading.Thread(
+        target=lambda: answered.append(ask("Choose a runtime", ["A", "B"])),
+        daemon=True,
+    )
+    thread.start()
+    event_name, streamed = stream_q.get(timeout=1)
+    assert event_name == "__tool_progress__"
+    clarify_id = streamed.get("clarify_id")
+    assert isinstance(clarify_id, str) and len(clarify_id) == 32
+
+    async with TestClient(TestServer(app)) as cli:
+        pending = await cli.get(
+            "/v1/sessions/sid-clarify-id/pending",
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+        )
+        pending_data = await pending.json()
+        assert pending.status == 200
+        assert pending_data["clarify"]["clarify_id"] == clarify_id
+
+        wrong = await cli.post(
+            "/v1/sessions/sid-clarify-id/clarify/respond",
+            json={"clarify_id": "not-the-live-card", "response": "wrong"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+        )
+        assert wrong.status == 404
+        assert thread.is_alive(), "a mismatched id must not consume FIFO state"
+
+        resolved = await cli.post(
+            "/v1/sessions/sid-clarify-id/clarify/respond",
+            json={"clarify_id": clarify_id, "response": "B"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+        )
+        assert resolved.status == 200
+        assert await resolved.json() == {"resolved": 1}
+
+    thread.join(timeout=1)
+    assert not thread.is_alive()
+    assert answered == ["B"]
+
+
+@pytest.mark.asyncio
+async def test_exact_clarify_response_keeps_pending_projection_on_fifo_head():
+    """Resolving a later exact id cannot replace /pending's oldest card."""
+    adapter = _make_adapter()
+    app = web.Application()
+    app.router.add_get(
+        "/v1/sessions/{session_id}/pending", adapter._handle_pending,
+    )
+    app.router.add_post(
+        "/v1/sessions/{session_id}/clarify/respond", adapter._handle_clarify_respond,
+    )
+    stream_q: queue.Queue = queue.Queue()
+    ask = adapter._make_clarify_cb(stream_q, "sid-two-clarifies")
+    answers = []
+    def ask_and_record(question):
+        answers.append((question, ask(question, None)))
+
+    first = threading.Thread(target=lambda: ask_and_record("first"), daemon=True)
+    second = threading.Thread(target=lambda: ask_and_record("second"), daemon=True)
+    first.start()
+    second.start()
+    _, first_payload = stream_q.get(timeout=1)
+    _, second_payload = stream_q.get(timeout=1)
+
+    headers = {"Authorization": "Bearer test-key-0123456789abcdef"}
+    async with TestClient(TestServer(app)) as cli:
+        pending = await cli.get("/v1/sessions/sid-two-clarifies/pending", headers=headers)
+        assert (await pending.json())["clarify"]["clarify_id"] == first_payload["clarify_id"]
+
+        later = await cli.post(
+            "/v1/sessions/sid-two-clarifies/clarify/respond",
+            json={"clarify_id": second_payload["clarify_id"], "response": "later answer"},
+            headers=headers,
+        )
+        assert later.status == 200
+        pending_after_later = await cli.get("/v1/sessions/sid-two-clarifies/pending", headers=headers)
+        assert (await pending_after_later.json())["clarify"]["clarify_id"] == first_payload["clarify_id"]
+
+        first_reply = await cli.post(
+            "/v1/sessions/sid-two-clarifies/clarify/respond",
+            json={"clarify_id": first_payload["clarify_id"], "response": "first answer"},
+            headers=headers,
+        )
+        assert first_reply.status == 200
+
+    first.join(timeout=1)
+    second.join(timeout=1)
+    assert not first.is_alive() and not second.is_alive()
+    assert dict(answers) == {
+        first_payload["question"]: "first answer",
+        second_payload["question"]: "later answer",
+    }
+
+
+@pytest.mark.asyncio
+async def test_prefixed_profiles_isolate_same_named_clarify_session(profile_homes):
+    """A profile-local card cannot be read, answered, or interrupted by another profile."""
+    adapter = _make_adapter()
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+    same_session = "same-session-id"
+    main_stream: queue.Queue = queue.Queue()
+    coder_stream: queue.Queue = queue.Queue()
+    main_answers = []
+    coder_answers = []
+
+    # This is the same attachment-time scope used by the real chat-completion
+    # path. The callback later runs on a worker thread, so it proves we
+    # captured profile identity instead of consulting a thread-local value.
+    with adapter._profile_api_scope("main"):
+        ask_main = adapter._make_clarify_cb(main_stream, same_session)
+    with adapter._profile_api_scope("coder"):
+        ask_coder = adapter._make_clarify_cb(coder_stream, same_session)
+
+    main_thread = threading.Thread(target=lambda: main_answers.append(ask_main("main card", None)), daemon=True)
+    coder_thread = threading.Thread(target=lambda: coder_answers.append(ask_coder("coder card", None)), daemon=True)
+    main_thread.start()
+    coder_thread.start()
+    _, main_payload = main_stream.get(timeout=1)
+    _, coder_payload = coder_stream.get(timeout=1)
+    assert main_payload["clarify_id"] != coder_payload["clarify_id"]
+
+    headers = {"Authorization": "Bearer test-key-0123456789abcdef"}
+    async with TestClient(TestServer(app)) as cli:
+        main_pending = await cli.get(f"/p/main/v1/sessions/{same_session}/pending", headers=headers)
+        coder_pending = await cli.get(f"/p/coder/v1/sessions/{same_session}/pending", headers=headers)
+        assert (await main_pending.json())["clarify"]["question"] == "main card"
+        assert (await coder_pending.json())["clarify"]["question"] == "coder card"
+
+        # A coder response carrying main's id must not cross the profile
+        # boundary or wake either callback.
+        crossed = await cli.post(
+            f"/p/coder/v1/sessions/{same_session}/clarify/respond",
+            json={"clarify_id": main_payload["clarify_id"], "response": "wrong profile"},
+            headers=headers,
+        )
+        assert crossed.status == 404
+        assert main_thread.is_alive() and coder_thread.is_alive()
+
+        # Interrupt uses the same scoped key as pending/respond. It may
+        # unblock coder's clarify but must leave main's same-named session
+        # untouched; timeout/push-failure cleanup reuses this exact discard
+        # helper and key shape.
+        coder_interrupt = await cli.post(
+            f"/p/coder/v1/sessions/{same_session}/interrupt",
+            headers=headers,
+        )
+        assert coder_interrupt.status == 200
+        coder_thread.join(timeout=1)
+        assert not coder_thread.is_alive()
+        assert coder_answers == [""]
+        main_still_pending = await cli.get(f"/p/main/v1/sessions/{same_session}/pending", headers=headers)
+        assert (await main_still_pending.json())["clarify"]["clarify_id"] == main_payload["clarify_id"]
+
+        main_reply = await cli.post(
+            f"/p/main/v1/sessions/{same_session}/clarify/respond",
+            json={"clarify_id": main_payload["clarify_id"], "response": "main answer"},
+            headers=headers,
+        )
+        assert main_reply.status == 200
+
+    main_thread.join(timeout=1)
+    assert not main_thread.is_alive() and not coder_thread.is_alive()
+    assert main_answers == ["main answer"]
+    assert coder_answers == [""]
+
+
+@pytest.fixture
+def profile_homes(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    default_home = root
+    coder_home = root / "profiles" / "coder"
+    default_home.mkdir(parents=True)
+    coder_home.mkdir(parents=True)
+    for home in (default_home, coder_home):
+        (home / ".env").write_text(
+            f"API_SERVER_KEY={TEST_API_KEY}\n",
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(default_home))
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profiles_to_serve",
+        lambda multiplex: [("default", default_home), ("coder", coder_home)],
+    )
+    return {"main": default_home, "coder": coder_home}
+
+
+@pytest.mark.asyncio
+async def test_prefixed_main_health_is_registered(profile_homes):
+    adapter = _make_adapter()
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get("/p/main/health")
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_prefixed_models_route_is_registered(profile_homes):
+    adapter = _make_adapter()
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(
+            "/p/coder/v1/models",
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+        )
+        data = await resp.json()
+
+    assert resp.status == 200
+    assert data["object"] == "list"
+    assert data["data"][0]["id"] == "coder"
+
+
+@pytest.mark.asyncio
+async def test_prefixed_interaction_delivery_route_is_registered(profile_homes):
+    adapter = _make_adapter()
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.get(
+            "/p/coder/v1/sessions/session-1/interaction-deliveries/missing",
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+        )
+        data = await resp.json()
+
+    assert resp.status == 404
+    assert data["error"]["code"] == "interaction_delivery_not_found"
+
+
+@pytest.mark.asyncio
+async def test_same_session_id_isolated_across_profile_interaction_queues(profile_homes):
+    adapter = _make_adapter()
+    setattr(
+        adapter,
+        "_goals",
+        lambda: SimpleNamespace(
+            on_interaction_pending=lambda _sid, **_kwargs: None,
+            on_interaction_resolved=lambda _sid: None,
+        ),
+    )
+    seeded = []
+    for profile, command in (("main", "main-command"), ("coder", "coder-command")):
+        with adapter._profile_api_scope(profile):
+            queue_key = adapter._interaction_queue_key("same-session")
+            approval_data = {
+                "interaction_id": f"approval-{profile}",
+                "command": command,
+                "description": "test",
+            }
+            approval_entry = approval.enqueue_gateway_approval(
+                queue_key, approval_data
+            )
+            tokens = set_turn_vars(turn_id=f"turn-{profile}")
+            try:
+                adapter._make_approval_cb(
+                    queue.Queue(), "same-session", queue_key
+                )(approval_data)
+            finally:
+                clear_turn_vars(tokens)
+
+            with approval.reserve_gateway_interaction_generation() as generation:
+                clarify_payload = {
+                    "type": "hermes.clarify",
+                    "interaction_id": f"clarify-{profile}",
+                    "interaction_generation": generation,
+                    "turn_id": f"turn-{profile}",
+                    "question": f"question-{profile}",
+                    "choices_offered": [],
+                }
+                clarify_entry = _ClarifyEntry(
+                    f"clarify-{profile}",
+                    f"turn-{profile}",
+                    clarify_payload,
+                    generation,
+                )
+                with adapter._clarify_state_lock:
+                    adapter._clarify_queues[queue_key] = [clarify_entry]
+            adapter._pending_clarify[queue_key] = [clarify_payload]
+            seeded.append((queue_key, approval_entry, clarify_entry))
+
+    assert seeded[0][0] != seeded[1][0]
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    try:
+        async with TestClient(TestServer(app)) as cli:
+            main_pending = await cli.get(
+                "/p/main/v1/sessions/same-session/pending",
+                headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+            )
+            coder_pending = await cli.get(
+                "/p/coder/v1/sessions/same-session/pending",
+                headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+            )
+            assert (await main_pending.json())["approval"]["command"] == "main-command"
+            assert (await coder_pending.json())["approval"]["command"] == "coder-command"
+
+            main_approval = await cli.post(
+                "/p/main/v1/sessions/same-session/approval/respond",
+                headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+                json={"choice": "deny"},
+            )
+            assert main_approval.status == 200
+            assert seeded[0][1].event.is_set()
+            assert not seeded[1][1].event.is_set()
+
+            main_clarify = await cli.post(
+                "/p/main/v1/sessions/same-session/clarify/respond",
+                headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+                json={"response": "main-answer"},
+            )
+            assert main_clarify.status == 200
+            assert seeded[0][2].event.is_set()
+            assert not seeded[1][2].event.is_set()
+    finally:
+        approval._gateway_queues.clear()
+        approval._gateway_prepared.clear()
+
+
+@pytest.mark.asyncio
+async def test_same_delivery_ids_have_profile_scoped_durable_receipts(profile_homes):
+    class LiveTask:
+        def done(self):
+            return False
+
+    adapter = _make_adapter()
+    setattr(
+        adapter,
+        "_goals",
+        lambda: SimpleNamespace(
+            on_interaction_pending=lambda _sid, **_kwargs: None,
+            on_interaction_resolved=lambda _sid: None,
+        ),
+    )
+    entries = {}
+    for profile in ("main", "coder"):
+        with adapter._profile_api_scope(profile):
+            queue_key = adapter._interaction_queue_key("same-session")
+            data = {
+                "interaction_id": "same-interaction",
+                "command": f"command-{profile}",
+                "description": "test",
+            }
+            entry = approval.enqueue_gateway_approval(queue_key, data)
+            tokens = set_turn_vars(turn_id=f"turn-{profile}")
+            try:
+                adapter._make_approval_cb(
+                    queue.Queue(), "same-session", queue_key
+                )(data)
+            finally:
+                clear_turn_vars(tokens)
+            adapter._active_session_tasks[queue_key] = LiveTask()
+            adapter._active_session_turn_ids[queue_key] = f"turn-{profile}"
+            entries[profile] = entry
+
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+    try:
+        async with TestClient(TestServer(app)) as cli:
+            for profile, choice in (("main", "once"), ("coder", "deny")):
+                body = {
+                    "choice": choice,
+                    "delivery_id": "same-delivery",
+                    "interaction_id": "same-interaction",
+                }
+                prepared = await cli.post(
+                    f"/p/{profile}/v1/sessions/same-session/approval/respond",
+                    headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+                    json={**body, "phase": "prepare"},
+                )
+                assert prepared.status == 200
+                assert entries[profile].event.is_set() is False
+                if profile == "main":
+                    assert entries["coder"].event.is_set() is False
+
+                finalized = await cli.post(
+                    f"/p/{profile}/v1/sessions/same-session/approval/respond",
+                    headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+                    json={**body, "phase": "finalize"},
+                )
+                finalized_body = await finalized.json()
+                assert finalized.status == 200
+                assert finalized_body["turn_id"] == f"turn-{profile}"
+                assert finalized_body["fence_id"]
+                assert entries[profile].event.is_set() is False
+                claim = await cli.post(
+                    f"/p/{profile}/v1/sessions/same-session/interaction-deliveries/same-delivery/recovery-fence",
+                    headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+                    json={
+                        "action": "claim",
+                        "expected_state_revision": finalized_body["state_revision"],
+                    },
+                )
+                assert claim.status == 200
+                ack = await cli.post(
+                    f"/p/{profile}/v1/sessions/same-session/interaction-deliveries/same-delivery/recovery-fence",
+                    headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+                    json={
+                        "action": "ack",
+                        "fence_id": finalized_body["fence_id"],
+                        "expected_state_revision": finalized_body["state_revision"],
+                    },
+                )
+                assert ack.status == 200
+                assert entries[profile].event.is_set() is True
+                if profile == "main":
+                    assert entries["coder"].event.is_set() is False
+
+            main_receipt = await cli.get(
+                "/p/main/v1/sessions/same-session/interaction-deliveries/same-delivery",
+                headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+            )
+            coder_receipt = await cli.get(
+                "/p/coder/v1/sessions/same-session/interaction-deliveries/same-delivery",
+                headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+            )
+            main_body = await main_receipt.json()
+            coder_body = await coder_receipt.json()
+            assert main_body["turn_id"] == "turn-main"
+            assert coder_body["turn_id"] == "turn-coder"
+            assert main_body["payload_digest"] != coder_body["payload_digest"]
+    finally:
+        approval._gateway_queues.clear()
+        approval._gateway_prepared.clear()
+
+
+@pytest.mark.asyncio
+async def test_prefixed_chat_hits_handler_inside_profile_scope(profile_homes, monkeypatch):
+    seen = []
+    adapter = _make_adapter()
+
+    async def fake_run_agent(**kwargs):
+        from hermes_constants import get_hermes_home
+        seen.append((get_hermes_home(), kwargs["user_message"]))
+        return (
+            {
+                "final_response": "scoped",
+                "session_id": kwargs["session_id"],
+                "completed": True,
+            },
+            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+
+    monkeypatch.setattr(adapter, "_run_agent", fake_run_agent)
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/p/coder/v1/chat/completions",
+            json={
+                "model": "hermes-agent",
+                "messages": [{"role": "user", "content": "hello coder"}],
+            },
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+        )
+        assert resp.status == 200
+        data = await resp.json()
+        assert data["choices"][0]["message"]["content"] == "scoped"
+
+    assert seen == [(profile_homes["coder"], "hello coder")]
+
+
+@pytest.mark.asyncio
+async def test_prefixed_chat_routes_connector_capability_through_zet_agent_override(
+    profile_homes, monkeypatch,
+):
+    from gateway.platforms.api_server import APIServerAdapter
+    from hermes_constants import get_hermes_home
+
+    capability = "c" * 43
+    seen = []
+    adapter = _make_adapter()
+
+    async def fake_base_run(_self, **kwargs):
+        seen.append((
+            get_hermes_home(),
+            kwargs["connector_route_capability"],
+        ))
+        return (
+            {
+                "final_response": "scoped",
+                "session_id": kwargs["session_id"],
+                "completed": True,
+            },
+            {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        )
+
+    class NoopGoals:
+        def schedule_after_turn(self, *_args, **_kwargs):
+            return None
+
+    async def noop_title(**_kwargs):
+        return None
+
+    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_base_run)
+    monkeypatch.setattr(adapter, "_goals", lambda: NoopGoals())
+    monkeypatch.setattr(adapter, "_emit_native_session_title", noop_title)
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/p/coder/v1/chat/completions",
+            json={
+                "model": "hermes-agent",
+                "messages": [{"role": "user", "content": "hello coder"}],
+                "metadata": {"connector_route_capability": capability},
+            },
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+        )
+        assert resp.status == 200
+
+    assert seen == [(profile_homes["coder"], capability)]
+
+
+@pytest.mark.asyncio
+async def test_prefixed_chat_scope_reaches_agent_executor(profile_homes, monkeypatch):
+    """The agent is created in an executor thread, so profile context must cross it."""
+    (profile_homes["coder"] / ".env").write_text(
+        f"API_SERVER_KEY={TEST_API_KEY}\nZET_AGENT_ID=coder\n",
+        encoding="utf-8",
+    )
+    seen = []
+    adapter = _make_adapter()
+
+    class FakeAgent:
+        session_prompt_tokens = 1
+        session_completion_tokens = 1
+        session_total_tokens = 2
+        session_id = "sid"
+
+        def run_conversation(self, **_kwargs):
+            return {"final_response": "ok", "completed": True}
+
+    def fake_create_agent(**_kwargs):
+        from agent.secret_scope import current_secret_scope
+        from gateway.platforms.api_server import _api_request_profile
+        from hermes_constants import get_hermes_home
+
+        scope = current_secret_scope()
+        seen.append((
+            get_hermes_home(),
+            None if scope is None else scope.get("ZET_AGENT_ID"),
+            _api_request_profile.get(),
+        ))
+        return FakeAgent()
+
+    monkeypatch.setattr(adapter, "_create_agent", fake_create_agent)
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        response = await cli.post(
+            "/p/coder/v1/chat/completions",
+            json={
+                "model": "hermes-agent",
+                "messages": [{"role": "user", "content": "hello coder"}],
+            },
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+        )
+
+    assert response.status == 200
+    assert seen == [(profile_homes["coder"], "coder", "coder")]
+
+
+@pytest.mark.asyncio
+async def test_prefixed_model_switch_writes_scoped_profile_config(profile_homes):
+    for home in profile_homes.values():
+        (home / "config.yaml").write_text(
+            yaml.safe_dump({"model": {"default": "old"}}),
+            encoding="utf-8",
+        )
+
+    adapter = _make_adapter()
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        main_resp = await cli.post(
+            "/p/main/v1/model/switch",
+            json={"model": "main-model", "provider": "custom"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+        )
+        coder_resp = await cli.post(
+            "/p/coder/v1/model/switch",
+            json={"model": "coder-model", "provider": "custom"},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+        )
+
+    assert main_resp.status == 200
+    assert coder_resp.status == 200
+    main_cfg = yaml.safe_load((profile_homes["main"] / "config.yaml").read_text())
+    coder_cfg = yaml.safe_load((profile_homes["coder"] / "config.yaml").read_text())
+    assert main_cfg["model"]["default"] == "main-model"
+    assert coder_cfg["model"]["default"] == "coder-model"
+
+
+@pytest.mark.asyncio
+async def test_prefixed_jobs_use_scoped_profile_home(profile_homes, monkeypatch):
+    import gateway.platforms.api_server as api_server
+
+    seen = []
+
+    def fake_list(include_disabled=False):
+        from hermes_constants import get_hermes_home
+        seen.append((get_hermes_home(), include_disabled))
+        return []
+
+    monkeypatch.setattr(api_server, "_CRON_AVAILABLE", True)
+    monkeypatch.setattr(api_server, "_cron_list", fake_list)
+
+    adapter = _make_adapter()
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp_main = await cli.get(
+            "/p/main/api/jobs?include_disabled=true",
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+        )
+        resp_coder = await cli.get(
+            "/p/coder/api/jobs",
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+        )
+
+    assert resp_main.status == 200
+    assert resp_coder.status == 200
+    assert seen == [
+        (profile_homes["main"], True),
+        (profile_homes["coder"], False),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_prefixed_cron_fire_uses_scoped_profile_home(profile_homes, monkeypatch):
+    import gateway.platforms.api_server as api_server
+
+    seen = []
+
+    class SpyProvider:
+        def fire_due(self, job_id, *, adapters=None, loop=None, fire_at=None):
+            from hermes_constants import get_hermes_home
+            seen.append((get_hermes_home(), job_id))
+            return True
+
+    monkeypatch.setattr(api_server, "_CRON_AVAILABLE", True)
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: SpyProvider())
+    monkeypatch.setattr(
+        "plugins.cron_providers.chronos.verify.get_fire_verifier",
+        lambda: (lambda **_kwargs: {"purpose": "cron_fire"}),
+    )
+
+    adapter = _make_adapter()
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/p/coder/api/cron/fire",
+            json={"job_id": "nightly", "fire_at": "2026-07-21T09:00:00Z"},
+            headers={"Authorization": "Bearer fire-token"},
+        )
+
+    assert resp.status == 202
+    for _ in range(50):
+        if seen:
+            break
+        await asyncio.sleep(0.01)
+    assert seen == [(profile_homes["coder"], "nightly")]
+
+
+@pytest.mark.asyncio
+async def test_prefixed_profile_unload_calls_targeted_runner(profile_homes):
+    calls = []
+
+    class FakeRunner:
+        async def unload_profile_runtime(self, profile):
+            calls.append(profile)
+            return {"evicted_sessions": 2, "disconnected_adapters": 1}
+
+    adapter = _make_adapter()
+    adapter.gateway_runner = FakeRunner()
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/p/coder/v1/profile/unload",
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+        )
+        data = await resp.json()
+
+    assert resp.status == 200
+    assert calls == ["coder"]
+    assert data["evicted_sessions"] == 2
+    assert data["disconnected_adapters"] == 1
+
+
+@pytest.mark.asyncio
+async def test_prefixed_profile_unload_blocks_active_sessions(profile_homes):
+    class FakeRunner:
+        async def unload_profile_runtime(self, profile):
+            return {
+                "blocked": True,
+                "active_sessions": 1,
+                "evicted_sessions": 0,
+                "disconnected_adapters": 0,
+            }
+
+    adapter = _make_adapter()
+    adapter.gateway_runner = FakeRunner()
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            "/p/coder/v1/profile/unload",
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+        )
+        data = await resp.json()
+
+    assert resp.status == 409
+    assert data["unloaded"] is False
+    assert data["active_sessions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_gateway_profile_unload_blocks_pending_sentinel():
+    from gateway.run import _AGENT_PENDING_SENTINEL, GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner._running_agents = {"agent:coder:api_server:dm:sid": _AGENT_PENDING_SENTINEL}
+
+    result = await runner.unload_profile_runtime("coder")
+
+    assert result["blocked"] is True
+    assert result["active_sessions"] == 1
+
+
+@pytest.mark.asyncio
+async def test_prefixed_jobs_read_scoped_cron_store(profile_homes, monkeypatch):
+    import cron.jobs as cron_jobs
+    import gateway.platforms.api_server as api_server
+
+    def write_jobs(home: Path, job_id: str, name: str) -> None:
+        cron_dir = home / "cron"
+        cron_dir.mkdir(parents=True, exist_ok=True)
+        (cron_dir / "jobs.json").write_text(
+            json.dumps(
+                {
+                    "jobs": [
+                        {
+                            "id": job_id,
+                            "name": name,
+                            "prompt": "ping",
+                            "enabled": True,
+                            "schedule": {
+                                "kind": "interval",
+                                "minutes": 10,
+                                "display": "every 10m",
+                            },
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    write_jobs(profile_homes["main"], "main-job", "main job")
+    write_jobs(profile_homes["coder"], "coder-job", "coder job")
+
+    monkeypatch.setattr(api_server, "_CRON_AVAILABLE", True)
+    monkeypatch.setattr(api_server, "_cron_list", cron_jobs.list_jobs)
+
+    adapter = _make_adapter()
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        main_resp = await cli.get(
+            "/p/main/api/jobs?include_disabled=true",
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+        )
+        coder_resp = await cli.get(
+            "/p/coder/api/jobs?include_disabled=true",
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+        )
+        main_data = await main_resp.json()
+        coder_data = await coder_resp.json()
+
+    assert main_resp.status == 200
+    assert coder_resp.status == 200
+    assert [job["id"] for job in main_data["jobs"]] == ["main-job"]
+    assert [job["id"] for job in coder_data["jobs"]] == ["coder-job"]
+
+
+@pytest.mark.asyncio
+async def test_prefixed_control_routes_registered(profile_homes):
+    adapter = _make_adapter()
+    adapter.gateway_runner = type(
+        "Runner",
+        (),
+        {
+            "_session_model_overrides": {},
+            "_evict_cached_agent": lambda self, sid: None,
+            "invalidate_all_cached_agents": lambda self: 0,
+        },
+    )()
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    registered = {resource.canonical for resource in app.router.resources()}
+    expected = {
+        "/p/{profile}/v1/skills/reload",
+        "/p/{profile}/v1/connectors/reload",
+        "/p/{profile}/v1/profile/reload",
+        "/p/{profile}/v1/runtime/reset",
+        "/p/{profile}/v1/profile/unload",
+        "/p/{profile}/v1/model/switch",
+        "/p/{profile}/v1/sessions/{session_id}/model/switch",
+        "/p/{profile}/v1/sessions/{session_id}/model",
+        "/p/{profile}/v1/sessions/{session_id}/pending",
+        "/p/{profile}/v1/sessions/{session_id}/approval/respond",
+        "/p/{profile}/v1/sessions/{session_id}/clarify/respond",
+        "/p/{profile}/v1/sessions/{session_id}/interrupt",
+    }
+    assert expected <= registered
+
+
+@pytest.mark.asyncio
+async def test_prefixed_reset_and_unload_return_ok(profile_homes):
+    adapter = _make_adapter()
+    adapter.gateway_runner = type(
+        "Runner",
+        (),
+        {"invalidate_all_cached_agents": lambda self: 0},
+    )()
+    app = web.Application()
+    _add_prefixed_zet_agent_routes(app, adapter)
+
+    async with TestClient(TestServer(app)) as cli:
+        reset_resp = await cli.post(
+            "/p/coder/v1/runtime/reset",
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+        )
+        unload_resp = await cli.post(
+            "/p/coder/v1/profile/unload",
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+        )
+        unload_data = await unload_resp.json()
+
+    assert reset_resp.status == 200
+    assert unload_resp.status == 200
+    assert unload_data["unloaded"] is True
+
+
+@pytest.mark.asyncio
+async def test_deferred_approval_response_requires_matching_id(monkeypatch):
+    from tools import approval
+
+    session_id = "sid-public-url"
+    approval_session_key = "sid-x-hermes-header"
+    approval.clear_session(approval_session_key)
+    token = approval.set_current_session_key(approval_session_key)
+    monkeypatch.setattr(
+        approval, "_approval_profile_scope", lambda: "/profiles/coder"
+    )
+    monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+    monkeypatch.setattr(approval, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(
+        approval, "_command_matches_permanent_allowlist", lambda _command: False
+    )
+    monkeypatch.setattr(
+        approval,
+        "detect_dangerous_command",
+        lambda command: (True, "agentcomputer:file.delete", f"risk:{command}"),
+    )
+    monkeypatch.setattr(
+        "tools.tirith_security.check_command_security",
+        lambda _command: {"action": "allow", "findings": [], "summary": ""},
+        raising=False,
+    )
+    command = "agentcomputer file.delete notes/a.txt"
+    first = approval.check_all_command_guards(command, "local")
+    approval_id = first["approval_id"]
+
+    adapter = _make_adapter()
+    monkeypatch.setattr(
+        adapter,
+        "_goals",
+        lambda: type("Goals", (), {"on_interaction_resolved": lambda self, sid: None})(),
+    )
+    app = web.Application()
+    app.router.add_post(
+        "/v1/sessions/{session_id}/approval/respond",
+        adapter._handle_approval_respond,
+    )
+    headers = {"Authorization": "Bearer test-key-0123456789abcdef"}
+
+    async with TestClient(TestServer(app)) as cli:
+        missing = await cli.post(
+            f"/v1/sessions/{session_id}/approval/respond",
+            json={"choice": "once"},
+            headers=headers,
+        )
+        wrong = await cli.post(
+            f"/v1/sessions/{session_id}/approval/respond",
+            json={"choice": "once", "approval_id": "A" * 32},
+            headers=headers,
+        )
+        monkeypatch.setattr(
+            approval, "_approval_profile_scope", lambda: "/profiles/other"
+        )
+        wrong_profile = await cli.post(
+            f"/v1/sessions/{session_id}/approval/respond",
+            json={"choice": "once", "approval_id": approval_id},
+            headers=headers,
+        )
+        monkeypatch.setattr(
+            approval, "_approval_profile_scope", lambda: "/profiles/coder"
+        )
+        matched = await cli.post(
+            f"/v1/sessions/{session_id}/approval/respond",
+            json={"choice": "once", "approval_id": approval_id},
+            headers=headers,
+        )
+        missing_data = await missing.json()
+        wrong_data = await wrong.json()
+        wrong_profile_data = await wrong_profile.json()
+        matched_data = await matched.json()
+
+    assert missing_data == {"resolved": 0}
+    assert wrong_data == {"resolved": 0}
+    assert wrong_profile_data == {"resolved": 0}
+    assert matched_data == {"resolved": 1}
+    exact_retry = approval.check_all_command_guards(command, "local")
+    consumed_retry = approval.check_all_command_guards(command, "local")
+    different_retry = approval.check_all_command_guards(
+        "agentcomputer file.delete notes/b.txt", "local"
+    )
+    assert exact_retry["approved"] is True
+    assert exact_retry["one_shot_approved"] is True
+    assert consumed_retry["status"] == "pending_approval"
+    assert different_retry["status"] == "pending_approval"
+    approval.clear_session(approval_session_key)
+    approval.reset_current_session_key(token)
+
+
+@pytest.mark.asyncio
+async def test_legacy_live_approval_uses_x_hermes_session_key(monkeypatch):
+    from tools import approval
+
+    session_id = "sid-public-legacy"
+    approval_session_key = "sid-header-legacy"
+    entry = approval._ApprovalEntry({
+        "approval_id": "B" * 32,
+        "command": "agentcomputer file.delete notes/a.txt",
+        "pattern_key": "agentcomputer:file.delete",
+        "pattern_keys": ["agentcomputer:file.delete"],
+    })
+    with approval._lock:
+        approval._gateway_queues[approval_session_key] = [entry]
+
+    adapter = _make_adapter()
+    adapter._approval_session_keys = {
+        adapter._active_turn_key(session_id): approval_session_key,
+    }
+    monkeypatch.setattr(
+        adapter,
+        "_goals",
+        lambda: type("Goals", (), {"on_interaction_resolved": lambda self, sid: None})(),
+    )
+    app = web.Application()
+    app.router.add_post(
+        "/v1/sessions/{session_id}/approval/respond",
+        adapter._handle_approval_respond,
+    )
+    try:
+        async with TestClient(TestServer(app)) as cli:
+            response = await cli.post(
+                f"/v1/sessions/{session_id}/approval/respond",
+                json={"choice": "deny"},
+                headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+            )
+            data = await response.json()
+
+        assert data == {"resolved": 1}
+        assert entry.event.is_set()
+        assert entry.result == "deny"
+    finally:
+        approval.cancel_session_approvals(approval_session_key)
+
+
+@pytest.mark.asyncio
+async def test_interrupt_revokes_deferred_approval_before_stale_response():
+    from tools import approval
+
+    session_id = "sid-interrupt-stale-approval"
+    approval.clear_session(session_id)
+    approval_id = approval.submit_pending(
+        session_id,
+        {
+            "command": "agentcomputer file.delete notes/a.txt",
+            "pattern_key": "agentcomputer:file.delete",
+            "one_shot_pattern_key": "deferred:terminal:exact-a",
+            "description": "delete notes/a.txt",
+        },
+    )
+    assert approval_id
+
+    adapter = _make_adapter()
+    adapter._interrupt_pending_interactions(session_id, session_id)
+    app = web.Application()
+    app.router.add_post(
+        "/v1/sessions/{session_id}/approval/respond",
+        adapter._handle_approval_respond,
+    )
+    async with TestClient(TestServer(app)) as cli:
+        stale = await cli.post(
+            f"/v1/sessions/{session_id}/approval/respond",
+            json={"choice": "once", "approval_id": approval_id},
+            headers={"Authorization": "Bearer test-key-0123456789abcdef"},
+        )
+        stale_data = await stale.json()
+
+    assert stale_data == {"resolved": 0}
+    assert approval._consume_one_shot_approval(
+        session_id, "deferred:terminal:exact-a"
+    ) is False
+    approval.clear_session(session_id)

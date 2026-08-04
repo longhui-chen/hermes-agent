@@ -8,15 +8,36 @@ confirm the prologue produces the right ``TurnContext`` and applies the
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import json
 import threading
 import types
 from unittest.mock import MagicMock, patch
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+import agent.zet_agent_response_mode as response_mode
+import tools.skills_tool as skills_tool_module
 from agent.context_compressor import ContextCompressor
+from agent.conversation_loop import (
+    _consume_trusted_skill_slug,
+    _consume_trusted_skill_task_message,
+)
 from agent.turn_context import TurnContext, build_turn_context
+from agent.zet_agent_response_mode import (
+    apply_trusted_skill_execution,
+    reset_trusted_skill_execution,
+    trusted_skill_allowed_tool_names,
+    trusted_skill_operation_block_message,
+)
+from gateway.session_context import clear_turn_vars, set_turn_vars
 from hermes_state import SessionDB
+
+_TEST_INTEGRITY_KEY_ID = "presets-test-202607"
+_TEST_INTEGRITY_PRIVATE_KEY = Ed25519PrivateKey.from_private_bytes(b"\x09" * 32)
 
 
 class _FakeTodoStore:
@@ -33,6 +54,61 @@ class _FakeGuardrails:
 
     def reset_for_turn(self):
         self.reset_called = True
+
+
+def _write_presets_integrity_manifest(
+    presets_dir,
+    *,
+    skill_bytes: bytes,
+    monkeypatch,
+    key_id: str = _TEST_INTEGRITY_KEY_ID,
+    private_key: Ed25519PrivateKey = _TEST_INTEGRITY_PRIVATE_KEY,
+    register_public_key: bool = True,
+    extra_files: dict[str, bytes] | None = None,
+) -> None:
+    files = {
+        "skills/video-edit-workflow-mini/SKILL.md": hashlib.sha256(
+            skill_bytes
+        ).hexdigest(),
+    }
+    files.update({
+        path: hashlib.sha256(payload).hexdigest()
+        for path, payload in (extra_files or {}).items()
+    })
+    manifest = {
+        "schema": "zettlab.presets.integrity.v1",
+        "files": files,
+    }
+    manifest_raw = json.dumps(
+        manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    public_key_b64 = base64.b64encode(
+        private_key.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+    ).decode("ascii")
+    if register_public_key:
+        monkeypatch.setitem(
+            response_mode._TRUSTED_PRESETS_PUBLIC_KEYS_B64,
+            key_id,
+            public_key_b64,
+        )
+    signature = {
+        "schema": "zettlab.presets.integrity-signature.v1",
+        "key_id": key_id,
+        "signature": base64.b64encode(
+            private_key.sign(manifest_raw)
+        ).decode("ascii"),
+    }
+    skills_dir = presets_dir / "skills"
+    (skills_dir / ".zettlab-integrity.json").write_bytes(manifest_raw)
+    (skills_dir / ".zettlab-integrity.sig.json").write_text(
+        json.dumps(signature, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
 
 
 class _FakeAgent:
@@ -172,7 +248,8 @@ def _stub_runtime_main():
     resolution) when the per-test process isolation plugin is disabled. Stub
     it out so the prologue tests stay hermetic.
     """
-    with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None):
+    with patch("agent.auxiliary_client.set_runtime_main", lambda *a, **k: None), \
+         patch("agent.auxiliary_client.set_runtime_auxiliary_task_configs", lambda *a, **k: None):
         yield
 
 
@@ -269,6 +346,25 @@ def test_turn_start_replaces_stale_parent_history_with_compression_child():
     assert ctx.conversation_history == compacted_history
     assert ctx.messages == compacted_history + [{"role": "user", "content": "hello"}]
     assert all(message.get("content") != "stale parent" for message in ctx.messages)
+def test_records_trusted_current_user_and_previous_assistant_messages():
+    agent = _FakeAgent()
+    _build(
+        agent,
+        user_message="确认安装",
+        conversation_history=[
+            {"role": "user", "content": "帮我找技能"},
+            {
+                "role": "assistant",
+                "content": "候选是 owner/repo/example，是否安装？",
+            },
+        ],
+    )
+
+    assert agent._current_user_message == "确认安装"
+    assert (
+        agent._previous_assistant_message
+        == "候选是 owner/repo/example，是否安装？"
+    )
 
 
 def test_applies_agent_side_effects():
@@ -288,6 +384,948 @@ def test_applies_agent_side_effects():
 
 
 
+def test_api_bound_build_turn_context_flow_uses_external_task_identity(
+    tmp_path, monkeypatch
+):
+    from agent import secret_scope as secret_scope_module
+    from gateway import session_context as session_context_module
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.environments.local import build_video_edit_runtime_env
+
+    presets_dir = tmp_path / "presets"
+    skill_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    skill_dir.mkdir(parents=True)
+    skill_bytes = """---
+name: video-edit-workflow-mini
+description: Trusted video-edit execution flow test
+---
+
+# Trusted skill
+""".encode("utf-8")
+    (skill_dir / "SKILL.md").write_bytes(skill_bytes)
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=skill_bytes,
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+    assert snapshot is not None
+    monkeypatch.setattr(response_mode, "_TRUSTED_PRESETS_SNAPSHOT", snapshot)
+    monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", presets_dir / "skills")
+
+    secret_token = secret_scope_module.set_secret_scope(
+        {
+            "ZET_AGENT_ID": "main",
+            "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
+        }
+    )
+    session_tokens = set_session_vars(
+        session_key="zettlab:user:main:session",
+        session_id="zettlab:user:main:session",
+    )
+    turn_tokens = set_turn_vars(
+        turn_id="external-api-turn",
+        business_execution_token="business-token",
+    )
+    try:
+        agent = _FakeAgent()
+        agent.platform = "zet_agent"
+        agent._zet_agent_response_mode = "plan"
+        ctx = _build(
+            agent,
+            user_message="请把 [file: /data/input.mp4] 剪辑成 vlog 成片",
+            task_id="api-task",
+        )
+        assert agent._current_turn_id != "external-api-turn"
+        reset_trusted_skill_execution(agent, ctx.original_user_message)
+
+        result = skills_tool_module.skill_view("video-edit-workflow-mini")
+        assert apply_trusted_skill_execution(
+            agent,
+            function_name="skill_view",
+            function_result=result,
+        )
+        assert trusted_skill_allowed_tool_names(agent) == {
+            "clarify",
+            "terminal",
+            "todo",
+        }
+
+        monkeypatch.setattr(
+            response_mode,
+            "_video_edit_command_policy",
+            lambda _args: (True, False),
+        )
+        assert trusted_skill_operation_block_message(
+            agent,
+            function_name="terminal",
+            function_args={"command": "python3 trusted-workflow_state.py"},
+        ) is None
+
+        business_token = session_context_module._BUSINESS_EXECUTION_TOKEN.set("")
+        session_key_token = session_context_module._SESSION_KEY.set("")
+        empty_secret_token = secret_scope_module.set_secret_scope({})
+        try:
+            runtime_env = build_video_edit_runtime_env({})
+        finally:
+            secret_scope_module.reset_secret_scope(empty_secret_token)
+            session_context_module._SESSION_KEY.reset(session_key_token)
+            session_context_module._BUSINESS_EXECUTION_TOKEN.reset(business_token)
+
+        assert runtime_env["ZET_AGENT_ID"] == "main"
+        assert runtime_env["ZETTLAB_AGENT_ACTION_TOKEN"] == "action-token"
+        assert (
+            runtime_env["ZETTLAB_BUSINESS_EXECUTION_TOKEN"]
+            == "business-token"
+        )
+        assert runtime_env["HERMES_TURN_ID"] == "external-api-turn"
+        assert (
+            runtime_env["HERMES_SESSION_KEY"]
+            == "zettlab:user:main:session"
+        )
+    finally:
+        response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
+        secret_scope_module.reset_secret_scope(secret_token)
+
+
+def test_video_edit_followup_turn_reuses_same_session_capability_flow(
+    tmp_path, monkeypatch
+):
+    from agent import secret_scope as secret_scope_module
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    presets_dir = tmp_path / "presets"
+    skill_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    skill_dir.mkdir(parents=True)
+    skill_bytes = b"# trusted resumable video-edit skill\n"
+    (skill_dir / "SKILL.md").write_bytes(skill_bytes)
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=skill_bytes,
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+    assert snapshot is not None
+    monkeypatch.setattr(response_mode, "_TRUSTED_PRESETS_SNAPSHOT", snapshot)
+    monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", presets_dir / "skills")
+
+    secret_token = secret_scope_module.set_secret_scope(
+        {
+            "ZET_AGENT_ID": "main",
+            "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
+        }
+    )
+    session_tokens = set_session_vars(
+        session_key="zettlab:user:main:resume-session",
+        session_id="zettlab:user:main:resume-session",
+    )
+    turn_tokens = set_turn_vars(
+        turn_id="video-turn-1",
+        business_execution_token="business-token-1",
+    )
+    response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
+    try:
+        agent = _FakeAgent()
+        agent.platform = "zet_agent"
+        reset_trusted_skill_execution(
+            agent,
+            "请把 [file: /data/input.mp4] 剪辑成 vlog 成片",
+        )
+        first_result = skills_tool_module.skill_view("video-edit-workflow-mini")
+        assert apply_trusted_skill_execution(
+            agent,
+            function_name="skill_view",
+            function_result=first_result,
+        )
+
+        clear_turn_vars(turn_tokens)
+        turn_tokens = set_turn_vars(
+            turn_id="video-turn-2",
+            business_execution_token="business-token-2",
+        )
+        response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
+        resumed_agent = _FakeAgent()
+        resumed_agent.platform = "zet_agent"
+        reset_trusted_skill_execution(resumed_agent, "继续剪辑")
+
+        assert resumed_agent._zet_agent_skill_direct_task.video_edit_applicable
+        assert not resumed_agent._zet_agent_skill_direct_task.video_edit_explicit
+        resumed_result = skills_tool_module.skill_view(
+            "video-edit-workflow-mini"
+        )
+        assert apply_trusted_skill_execution(
+            resumed_agent,
+            function_name="skill_view",
+            function_result=resumed_result,
+        )
+        assert trusted_skill_allowed_tool_names(resumed_agent) == {
+            "clarify",
+            "terminal",
+            "todo",
+        }
+    finally:
+        response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
+        response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
+        secret_scope_module.reset_secret_scope(secret_token)
+
+
+def test_video_edit_followup_capability_is_session_and_intent_bounded_unit():
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
+    first_session_tokens = set_session_vars(
+        session_key="zettlab:user:main:first-session",
+        session_id="zettlab:user:main:first-session",
+    )
+    first_turn_tokens = set_turn_vars(turn_id="video-turn-1")
+    try:
+        agent = _FakeAgent()
+        agent.platform = "zet_agent"
+        reset_trusted_skill_execution(
+            agent,
+            "请把 [file: /data/input.mp4] 剪辑成 vlog 成片",
+        )
+
+        response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
+        post_restart_agent = _FakeAgent()
+        reset_trusted_skill_execution(post_restart_agent, "继续剪辑")
+        assert post_restart_agent._zet_agent_skill_direct_task.video_edit_applicable
+        assert not post_restart_agent._zet_agent_skill_direct_task.video_edit_explicit
+
+        model_switch_agent = _FakeAgent()
+        reset_trusted_skill_execution(
+            model_switch_agent,
+            (
+                "[Note: the model has changed and is now lite. "
+                "Adjust your self-identification accordingly.]\n\n继续剪辑"
+            ),
+        )
+        assert model_switch_agent._zet_agent_skill_direct_task.video_edit_applicable
+        assert not model_switch_agent._zet_agent_skill_direct_task.video_edit_explicit
+
+        generic_post_restart_agent = _FakeAgent()
+        reset_trusted_skill_execution(generic_post_restart_agent, "继续")
+        assert not (
+            generic_post_restart_agent
+            ._zet_agent_skill_direct_task
+            .video_edit_applicable
+        )
+
+        resume_key = response_mode._current_skill_direct_resume_key()
+        assert resume_key is not None
+        response_mode._VIDEO_EDIT_RESUME_SESSIONS[resume_key] = (
+            response_mode.time.monotonic() + 60
+        )
+
+        unrelated_agent = _FakeAgent()
+        reset_trusted_skill_execution(unrelated_agent, "继续总结这个文档")
+        assert not unrelated_agent._zet_agent_skill_direct_task.video_edit_applicable
+
+        unrelated_model_switch_agent = _FakeAgent()
+        reset_trusted_skill_execution(
+            unrelated_model_switch_agent,
+            (
+                "[Note: the model has changed and is now pro. "
+                "Adjust your self-identification accordingly.]\n\n"
+                "继续总结这个文档"
+            ),
+        )
+        assert not (
+            unrelated_model_switch_agent
+            ._zet_agent_skill_direct_task
+            .video_edit_applicable
+        )
+
+        matching_agent = _FakeAgent()
+        reset_trusted_skill_execution(matching_agent, "继续剪辑这 9 段素材")
+        assert matching_agent._zet_agent_skill_direct_task.video_edit_applicable
+
+        polling_agent = _FakeAgent()
+        reset_trusted_skill_execution(
+            polling_agent,
+            "继续轮询当前项目，不要重新上传或创建项目",
+        )
+        assert polling_agent._zet_agent_skill_direct_task.video_edit_applicable
+        assert not polling_agent._zet_agent_skill_direct_task.video_edit_explicit
+
+        natural_recovery_agent = _FakeAgent()
+        reset_trusted_skill_execution(
+            natural_recovery_agent,
+            "继续查询刚才的剪辑任务，不要重新上传，也不要创建新项目",
+        )
+        assert natural_recovery_agent._zet_agent_skill_direct_task.video_edit_applicable
+        assert not natural_recovery_agent._zet_agent_skill_direct_task.video_edit_explicit
+
+        slash_agent = _FakeAgent()
+        reset_trusted_skill_execution(
+            slash_agent,
+            "/video-edit-workflow-mini resume the existing project",
+        )
+        assert not slash_agent._zet_agent_skill_direct_task.video_edit_applicable
+
+        transport_agent = _FakeAgent()
+        reset_trusted_skill_execution(
+            transport_agent,
+            "resume the existing project",
+            explicit_skill_slug="video-edit-workflow-mini",
+        )
+        assert transport_agent._zet_agent_skill_direct_task.video_edit_applicable
+        assert transport_agent._zet_agent_skill_direct_task.video_edit_explicit
+
+        response_mode._VIDEO_EDIT_RESUME_SESSIONS[resume_key] = (
+            response_mode.time.monotonic() - 1
+        )
+        expired_agent = _FakeAgent()
+        reset_trusted_skill_execution(expired_agent, "继续")
+        assert not expired_agent._zet_agent_skill_direct_task.video_edit_applicable
+
+        now = response_mode.time.monotonic()
+        response_mode._VIDEO_EDIT_RESUME_SESSIONS.update(
+            ((f"profile-{index}", f"session-{index}"), now + 60)
+            for index in range(
+                response_mode._VIDEO_EDIT_RESUME_MAX_SESSIONS + 3
+            )
+        )
+        bounded = response_mode._video_edit_resume_sessions_locked(
+            now=now,
+        )
+        assert len(bounded) == response_mode._VIDEO_EDIT_RESUME_MAX_SESSIONS
+        assert ("profile-0", "session-0") not in bounded
+
+        clear_turn_vars(first_turn_tokens)
+        clear_session_vars(first_session_tokens)
+        second_session_tokens = set_session_vars(
+            session_key="zettlab:user:main:second-session",
+            session_id="zettlab:user:main:second-session",
+        )
+        second_turn_tokens = set_turn_vars(turn_id="video-turn-2")
+        try:
+            reset_trusted_skill_execution(agent, "继续")
+            assert not agent._zet_agent_skill_direct_task.video_edit_applicable
+        finally:
+            clear_turn_vars(second_turn_tokens)
+            clear_session_vars(second_session_tokens)
+    finally:
+        if response_mode._current_skill_direct_turn_identity() is not None:
+            clear_turn_vars(first_turn_tokens)
+        if response_mode._current_skill_direct_session_id():
+            clear_session_vars(first_session_tokens)
+        response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
+
+
+def test_confirmed_plan_ack_inherits_only_bound_video_edit_turn_unit():
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
+    session_tokens = set_session_vars(
+        session_key="zettlab:user:main:plan-session",
+        session_id="zettlab:user:main:plan-session",
+    )
+    plan_turn_tokens = set_turn_vars(turn_id="video-plan-turn")
+    plan_turn_cleared = False
+    try:
+        plan_agent = _FakeAgent()
+        reset_trusted_skill_execution(plan_agent, "剪辑")
+
+        clear_turn_vars(plan_turn_tokens)
+        plan_turn_cleared = True
+        confirmed_turn_tokens = set_turn_vars(
+            turn_id="video-confirm-turn",
+            plan_ack_status="confirmed",
+            plan_ack_turn_id="video-plan-turn",
+            business_execution_token="business-token",
+        )
+        try:
+            confirmed_agent = _FakeAgent()
+            reset_trusted_skill_execution(
+                confirmed_agent,
+                "确认执行计划，请开始执行。",
+            )
+            task = confirmed_agent._zet_agent_skill_direct_task
+            assert task.video_edit_applicable
+            assert not task.video_edit_explicit
+        finally:
+            clear_turn_vars(confirmed_turn_tokens)
+
+        mismatched_turn_tokens = set_turn_vars(
+            turn_id="other-confirm-turn",
+            plan_ack_status="confirmed",
+            plan_ack_turn_id="unrelated-plan-turn",
+            business_execution_token="business-token",
+        )
+        try:
+            mismatched_agent = _FakeAgent()
+            reset_trusted_skill_execution(
+                mismatched_agent,
+                "确认执行计划，请开始执行。",
+            )
+            assert not (
+                mismatched_agent
+                ._zet_agent_skill_direct_task
+                .video_edit_applicable
+            )
+        finally:
+            clear_turn_vars(mismatched_turn_tokens)
+    finally:
+        if not plan_turn_cleared:
+            clear_turn_vars(plan_turn_tokens)
+        clear_session_vars(session_tokens)
+        response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
+
+
+def test_video_edit_followup_capability_is_profile_bounded_unit(tmp_path):
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
+    session_tokens = set_session_vars(
+        session_key="shared-session-id",
+        session_id="shared-session-id",
+    )
+    profile_a_token = set_hermes_home_override(tmp_path / "profile-a")
+    try:
+        explicit_agent = _FakeAgent()
+        reset_trusted_skill_execution(explicit_agent, "剪辑")
+
+        same_profile_agent = _FakeAgent()
+        reset_trusted_skill_execution(same_profile_agent, "继续")
+        assert same_profile_agent._zet_agent_skill_direct_task.video_edit_applicable
+    finally:
+        reset_hermes_home_override(profile_a_token)
+
+    profile_b_token = set_hermes_home_override(tmp_path / "profile-b")
+    try:
+        other_profile_agent = _FakeAgent()
+        reset_trusted_skill_execution(other_profile_agent, "继续")
+        assert not (
+            other_profile_agent._zet_agent_skill_direct_task.video_edit_applicable
+        )
+    finally:
+        reset_hermes_home_override(profile_b_token)
+        clear_session_vars(session_tokens)
+        response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
+
+
+def test_short_natural_video_edit_commands_without_inline_asset_are_explicit_unit():
+    direct_commands = (
+        "剪辑",
+        "帮我剪成 vlog",
+        "把这些素材剪成 45 秒 竖屏 日常 vlog",
+        "混剪这 9 段视频",
+    )
+    for command in direct_commands:
+        agent = _FakeAgent()
+        reset_trusted_skill_execution(agent, command)
+        task = agent._zet_agent_skill_direct_task
+        assert task.video_edit_applicable, command
+        assert task.video_edit_explicit, command
+
+    for unrelated in ("解释为什么剪辑失败", "总结剪辑需求文档", "继续总结这个文档"):
+        agent = _FakeAgent()
+        reset_trusted_skill_execution(agent, unrelated)
+        assert not agent._zet_agent_skill_direct_task.video_edit_applicable, unrelated
+
+
+def test_explicit_video_edit_transport_selection_mints_task_scope_unit():
+    raw_slash_agent = _FakeAgent()
+    reset_trusted_skill_execution(
+        raw_slash_agent,
+        "/video-edit-workflow-mini 请总结 [file: /data/input.mp4]",
+    )
+    assert not raw_slash_agent._zet_agent_skill_direct_task.video_edit_applicable
+
+    natural_intent_agent = _FakeAgent()
+    reset_trusted_skill_execution(
+        natural_intent_agent,
+        "/video-edit-workflow-mini 请把 [file: /data/input.mp4] 剪辑成 vlog",
+    )
+    assert natural_intent_agent._zet_agent_skill_direct_task.video_edit_applicable
+
+    unrelated_transport_agent = _FakeAgent()
+    reset_trusted_skill_execution(
+        unrelated_transport_agent,
+        "请总结 [file: /data/input.mp4]",
+        explicit_skill_slug="deep-research",
+    )
+    assert not (
+        unrelated_transport_agent._zet_agent_skill_direct_task.video_edit_applicable
+    )
+
+    agent = _FakeAgent()
+
+    reset_trusted_skill_execution(
+        agent,
+        "请总结 [file: /data/input.mp4]",
+        explicit_skill_slug="video-edit-workflow-mini",
+    )
+
+    task = agent._zet_agent_skill_direct_task
+    assert task.video_edit_applicable
+    assert task.video_edit_explicit
+
+
+def test_raw_slash_text_cannot_mint_trusted_video_scope_flow(
+    tmp_path,
+    monkeypatch,
+):
+    from agent import secret_scope as secret_scope_module
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    presets_dir = tmp_path / "presets"
+    skill_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    skill_dir.mkdir(parents=True)
+    skill_bytes = b"# trusted video edit skill\n"
+    (skill_dir / "SKILL.md").write_bytes(skill_bytes)
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=skill_bytes,
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+    assert snapshot is not None
+    monkeypatch.setattr(response_mode, "_TRUSTED_PRESETS_SNAPSHOT", snapshot)
+    monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", presets_dir / "skills")
+
+    secret_token = secret_scope_module.set_secret_scope(
+        {
+            "ZET_AGENT_ID": "main",
+            "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
+        }
+    )
+    session_tokens = set_session_vars(
+        session_key="zettlab:user:main:raw-slash-session",
+        session_id="zettlab:user:main:raw-slash-session",
+    )
+    turn_tokens = set_turn_vars(
+        turn_id="raw-slash-turn",
+        business_execution_token="business-token",
+    )
+    try:
+        agent = _FakeAgent()
+        agent.platform = "zet_agent"
+        reset_trusted_skill_execution(
+            agent,
+            "/video-edit-workflow-mini 请总结 [file: /data/input.mp4]",
+        )
+
+        result = skills_tool_module.skill_view("video-edit-workflow-mini")
+        assert not apply_trusted_skill_execution(
+            agent,
+            function_name="skill_view",
+            function_result=result,
+        )
+        assert trusted_skill_allowed_tool_names(agent) == frozenset()
+    finally:
+        response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
+        secret_scope_module.reset_secret_scope(secret_token)
+
+
+def test_model_switch_note_video_edit_resume_scope_flow(tmp_path, monkeypatch):
+    from agent import secret_scope as secret_scope_module
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    presets_dir = tmp_path / "presets"
+    skill_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    skill_dir.mkdir(parents=True)
+    skill_bytes = b"# trusted video edit skill\n"
+    (skill_dir / "SKILL.md").write_bytes(skill_bytes)
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=skill_bytes,
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+    assert snapshot is not None
+    monkeypatch.setattr(response_mode, "_TRUSTED_PRESETS_SNAPSHOT", snapshot)
+    monkeypatch.setattr(skills_tool_module, "SKILLS_DIR", presets_dir / "skills")
+
+    secret_token = secret_scope_module.set_secret_scope(
+        {
+            "ZET_AGENT_ID": "main",
+            "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
+        }
+    )
+    session_tokens = set_session_vars(
+        session_key="zettlab:user:main:model-switch-session",
+        session_id="zettlab:user:main:model-switch-session",
+    )
+    turn_tokens = set_turn_vars(
+        turn_id="model-switch-video-turn",
+        business_execution_token="business-token",
+    )
+    response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
+    try:
+        agent = _FakeAgent()
+        agent.platform = "zet_agent"
+        reset_trusted_skill_execution(
+            agent,
+            (
+                "[Note: the model has changed and is now lite. "
+                "Adjust your self-identification accordingly.]\n\n继续剪辑"
+            ),
+        )
+
+        result = skills_tool_module.skill_view("video-edit-workflow-mini")
+        assert apply_trusted_skill_execution(
+            agent,
+            function_name="skill_view",
+            function_result=result,
+        )
+        assert trusted_skill_allowed_tool_names(agent) == {
+            "clarify",
+            "terminal",
+            "todo",
+        }
+    finally:
+        response_mode._VIDEO_EDIT_RESUME_SESSIONS.clear()
+        response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
+        clear_turn_vars(turn_tokens)
+        clear_session_vars(session_tokens)
+        secret_scope_module.reset_secret_scope(secret_token)
+
+
+def test_api_bound_build_turn_context_flow_accepts_signed_dev_bundle(
+    tmp_path, monkeypatch
+):
+    presets_dir = tmp_path / "dev-feature-intl-20260724"
+    skill_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    skill_dir.mkdir(parents=True)
+    skill_bytes = b"# signed development video-edit skill\n"
+    (skill_dir / "SKILL.md").write_bytes(skill_bytes)
+    dev_key_id = "presets-dev-test-202607"
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=skill_bytes,
+        monkeypatch=monkeypatch,
+        key_id=dev_key_id,
+        register_public_key=False,
+    )
+    public_key_b64 = base64.b64encode(
+        _TEST_INTEGRITY_PRIVATE_KEY.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+    ).decode("ascii")
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+    monkeypatch.setenv("ZETTLAB_PRESETS_DEV_KEY_ID", dev_key_id)
+    monkeypatch.setenv(
+        "ZETTLAB_PRESETS_DEV_PUBLIC_KEY_B64",
+        public_key_b64,
+    )
+
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+
+    assert snapshot is not None
+    assert snapshot.integrity_signature_key_id == dev_key_id
+    assert tuple(skill.relative_path for skill in snapshot.skills) == (
+        "skills/video-edit-workflow-mini/SKILL.md",
+    )
+
+
+def test_startup_rejects_dev_signing_key_for_release_directory(
+    tmp_path, monkeypatch
+):
+    presets_dir = tmp_path / "v0.7.99"
+    skill_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    skill_dir.mkdir(parents=True)
+    skill_bytes = b"# release directory with development signature\n"
+    (skill_dir / "SKILL.md").write_bytes(skill_bytes)
+    dev_key_id = "presets-dev-test-202607"
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=skill_bytes,
+        monkeypatch=monkeypatch,
+        key_id=dev_key_id,
+        register_public_key=False,
+    )
+    public_key_b64 = base64.b64encode(
+        _TEST_INTEGRITY_PRIVATE_KEY.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+    ).decode("ascii")
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+    monkeypatch.setenv("ZETTLAB_PRESETS_DEV_KEY_ID", dev_key_id)
+    monkeypatch.setenv(
+        "ZETTLAB_PRESETS_DEV_PUBLIC_KEY_B64",
+        public_key_b64,
+    )
+
+    assert response_mode._capture_trusted_presets_snapshot() is None
+
+
+def test_startup_rejects_incomplete_dev_signing_key_configuration(
+    tmp_path, monkeypatch
+):
+    presets_dir = tmp_path / "dev-feature-intl-20260724"
+    skill_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    skill_dir.mkdir(parents=True)
+    skill_bytes = b"# development signature missing public key config\n"
+    (skill_dir / "SKILL.md").write_bytes(skill_bytes)
+    dev_key_id = "presets-dev-test-202607"
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=skill_bytes,
+        monkeypatch=monkeypatch,
+        key_id=dev_key_id,
+        register_public_key=False,
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+    monkeypatch.setenv("ZETTLAB_PRESETS_DEV_KEY_ID", dev_key_id)
+    monkeypatch.delenv("ZETTLAB_PRESETS_DEV_PUBLIC_KEY_B64", raising=False)
+
+    assert response_mode._capture_trusted_presets_snapshot() is None
+
+
+def test_startup_rejects_skill_bytes_not_pinned_by_release_manifest(
+    tmp_path, monkeypatch
+):
+    presets_dir = tmp_path / "presets"
+    skill_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    skill_dir.mkdir(parents=True)
+    released_bytes = b"# released skill\n"
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=released_bytes,
+        monkeypatch=monkeypatch,
+    )
+    (skill_dir / "SKILL.md").write_bytes(b"# forged before startup\n")
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+
+    assert snapshot is not None
+    assert snapshot.skills == ()
+
+
+def test_startup_exposes_only_signed_video_edit_python_digests(
+    tmp_path,
+    monkeypatch,
+):
+    presets_dir = tmp_path / "presets"
+    skill_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    scripts_dir = skill_dir / "scripts"
+    scripts_dir.mkdir(parents=True)
+    skill_bytes = b"# released skill\n"
+    helper_bytes = b"print('trusted helper')\n"
+    (skill_dir / "SKILL.md").write_bytes(skill_bytes)
+    (scripts_dir / "workflow_state.py").write_bytes(helper_bytes)
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=skill_bytes,
+        monkeypatch=monkeypatch,
+        extra_files={
+            "skills/video-edit-workflow-mini/scripts/workflow_state.py": (
+                helper_bytes
+            ),
+            "skills/video-edit-workflow-mini/scripts/README.md": b"not code\n",
+            "skills/another-skill/scripts/helper.py": b"other skill\n",
+        },
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+    assert snapshot is not None
+    monkeypatch.setattr(response_mode, "_TRUSTED_PRESETS_SNAPSHOT", snapshot)
+
+    assert response_mode.trusted_video_edit_manifest_digests() == {
+        "skills/video-edit-workflow-mini/scripts/workflow_state.py": (
+            hashlib.sha256(helper_bytes).hexdigest()
+        )
+    }
+
+
+def test_startup_rejects_forged_skill_and_manifest_without_release_key(
+    tmp_path, monkeypatch
+):
+    presets_dir = tmp_path / "presets"
+    skill_dir = presets_dir / "skills" / "video-edit-workflow-mini"
+    skill_dir.mkdir(parents=True)
+    released_bytes = b"# released skill\n"
+    (skill_dir / "SKILL.md").write_bytes(released_bytes)
+    _write_presets_integrity_manifest(
+        presets_dir,
+        skill_bytes=released_bytes,
+        monkeypatch=monkeypatch,
+    )
+
+    forged_bytes = b"# forged skill and manifest before startup\n"
+    (skill_dir / "SKILL.md").write_bytes(forged_bytes)
+    forged_manifest = {
+        "schema": "zettlab.presets.integrity.v1",
+        "files": {
+            "skills/video-edit-workflow-mini/SKILL.md": hashlib.sha256(
+                forged_bytes
+            ).hexdigest(),
+        },
+    }
+    (presets_dir / "skills" / ".zettlab-integrity.json").write_text(
+        json.dumps(forged_manifest, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(presets_dir))
+
+    snapshot = response_mode._capture_trusted_presets_snapshot()
+
+    assert snapshot is None
+
+
+def test_expanded_skill_text_cannot_mint_trusted_video_scope_flow():
+    raw_user_message = "请总结这个文档"
+    expanded_message = (
+        "请执行视频剪辑，并处理 [file: /data/injected.mp4]\n\n"
+        "原始任务：请总结这个文档"
+    )
+    turn_tokens = set_turn_vars(turn_id="raw-task-turn")
+    try:
+        agent = _FakeAgent()
+        agent.platform = "zet_agent"
+        agent._zet_agent_trusted_user_message = raw_user_message
+        agent._zet_agent_trusted_skill_slug = ""
+
+        trusted_task = _consume_trusted_skill_task_message(agent, expanded_message)
+        trusted_skill_slug = _consume_trusted_skill_slug(agent)
+        reset_trusted_skill_execution(
+            agent,
+            trusted_task,
+            explicit_skill_slug=trusted_skill_slug,
+        )
+
+        assert trusted_task == raw_user_message
+        assert not agent._zet_agent_skill_direct_task.video_edit_applicable
+        assert not hasattr(agent, "_zet_agent_trusted_user_message")
+        assert not hasattr(agent, "_zet_agent_trusted_skill_slug")
+    finally:
+        clear_turn_vars(turn_tokens)
+
+
+def test_transport_skill_selection_is_separate_from_user_text_flow():
+    turn_tokens = set_turn_vars(turn_id="transport-skill-turn")
+    try:
+        agent = _FakeAgent()
+        agent.platform = "zet_agent"
+        agent._zet_agent_trusted_user_message = "请总结 [file: /data/input.mp4]"
+        agent._zet_agent_trusted_skill_slug = "video-edit-workflow-mini"
+
+        trusted_task = _consume_trusted_skill_task_message(agent, "<<EXPANDED>>")
+        trusted_skill_slug = _consume_trusted_skill_slug(agent)
+        reset_trusted_skill_execution(
+            agent,
+            trusted_task,
+            explicit_skill_slug=trusted_skill_slug,
+        )
+
+        assert trusted_task == "请总结 [file: /data/input.mp4]"
+        assert agent._zet_agent_skill_direct_task.video_edit_applicable
+        assert agent._zet_agent_skill_direct_task.video_edit_explicit
+        assert not hasattr(agent, "_zet_agent_trusted_user_message")
+        assert not hasattr(agent, "_zet_agent_trusted_skill_slug")
+    finally:
+        clear_turn_vars(turn_tokens)
+
+
+def test_clarify_requires_nonempty_user_response_to_rearm_trusted_scope_flow():
+    turn_tokens = set_turn_vars(turn_id="clarify-turn")
+    try:
+        agent = _FakeAgent()
+        agent.platform = "zet_agent"
+        task = response_mode._skill_direct_task_context(
+            agent,
+            "请把 [file: /data/input.mp4] 剪辑成 vlog 成片",
+        )
+        scope = response_mode._SkillDirectScope(
+            relative_path=response_mode._VIDEO_EDIT_SKILL_PATH,
+            task_sha256=task.task_sha256,
+            turn_identity=task.turn_identity,
+            allowed_tools=frozenset({"clarify", "terminal", "todo"}),
+        )
+        agent._zet_agent_skill_direct_task = task
+        agent._zet_agent_skill_direct_scope = scope
+        agent._zet_agent_skill_direct_operation = None
+
+        assert (
+            trusted_skill_operation_block_message(
+                agent,
+                function_name="clarify",
+                function_args={"question": "是否压缩？"},
+            )
+            is None
+        )
+        assert not apply_trusted_skill_execution(
+            agent,
+            function_name="clarify",
+            function_result='{"user_response":""}',
+        )
+        assert trusted_skill_allowed_tool_names(agent) == frozenset()
+
+        agent._zet_agent_skill_direct_scope = scope
+        assert (
+            trusted_skill_operation_block_message(
+                agent,
+                function_name="clarify",
+                function_args={"question": "是否压缩？"},
+            )
+            is None
+        )
+        assert apply_trusted_skill_execution(
+            agent,
+            function_name="clarify",
+            function_result='{"user_response":"压缩后上传"}',
+        )
+        assert trusted_skill_allowed_tool_names(agent) == scope.allowed_tools
+    finally:
+        clear_turn_vars(turn_tokens)
+
+
+def test_pre_llm_hook_receives_execution_origin_and_kanban_marker(monkeypatch):
+    agent = _FakeAgent()
+    agent._user_id = "transport-user"
+    agent._user_id_alt = "canonical-user"
+    agent._memory_write_origin = "background_review"
+    agent.request_overrides = {"response_format": {"type": "json_schema"}}
+    agent._supports_followup_turns = False
+    agent.stream_delta_callback = lambda _delta: None
+    captured = {}
+
+    def invoke_hook(name, **kwargs):
+        if name == "pre_llm_call":
+            captured.update(kwargs)
+        return []
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "KAN-123")
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    _build(agent)
+
+    assert captured["platform"] == "cli"
+    assert captured["api_mode"] == "chat_completions"
+    assert captured["sender_id"] == "canonical-user"
+    assert captured["execution_origin"] == "background_review"
+    assert captured["is_kanban_worker"] is True
+    assert captured["structured_output"] is True
+    assert captured["supports_followup_turns"] is False
+    assert captured["streaming_output"] is True
+
+
+def test_persist_user_message_becomes_original():
+    agent = _FakeAgent()
+    ctx = _build(agent, user_message="api-prefixed", persist_user_message="clean")
+    # original_user_message tracks the clean persist override.
+    assert ctx.original_user_message == "clean"
+    # but the appended user turn carries the full (sanitized) message.
+    assert ctx.messages[-1]["content"] == "api-prefixed"
 
 
 
@@ -312,6 +1350,40 @@ def test_pending_cli_message_uses_clean_override_for_api_local_note():
     assert agent._pending_cli_user_message is None
 
 
+def test_runtime_main_sync_happens_after_restore():
+    agent = _FakeAgent()
+    agent.model = "stale-fallback-model"
+    agent.provider = "openai-codex"
+    agent.base_url = "https://chatgpt.com/backend-api/codex"
+    agent.api_key = "fallback-key"
+    agent.api_mode = "codex_responses"
+
+    def restore_primary():
+        agent.model = "primary-model"
+        agent.provider = "anthropic"
+        agent.base_url = "https://api.anthropic.com"
+        agent.api_key = "primary-key"
+        agent.api_mode = "anthropic_messages"
+
+    agent._restore_primary_runtime = restore_primary
+    calls = []
+    with patch(
+        "agent.auxiliary_client.set_runtime_main",
+        side_effect=lambda *args, **kwargs: calls.append((args, kwargs)),
+    ):
+        _build(agent)
+
+    assert calls == [
+        (
+            ("anthropic", "primary-model"),
+            {
+                "base_url": "https://api.anthropic.com",
+                "api_key": "primary-key",
+                "api_mode": "anthropic_messages",
+                "auth_mode": "",
+            },
+        )
+    ]
 
 
 
@@ -369,9 +1441,92 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
 
 
 
+def test_api_server_tool_choice_none_skips_registered_mcp_refresh(monkeypatch):
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+
+    class FakeAgent(_FakeAgent):
+        def __init__(self, **_kwargs):
+            super().__init__()
+            self.platform = "api_server"
+            self.tools = [
+                {"type": "function", "function": {"name": "present_plan"}},
+                {"type": "function", "function": {"name": "todo"}},
+            ]
+            self.valid_tool_names = {"present_plan", "todo"}
+
+    monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openai",
+            "base_url": "https://example.test/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5")
+    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._load_reasoning_config",
+        staticmethod(lambda: {}),
+    )
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._load_fallback_model",
+        staticmethod(lambda: None),
+    )
+    monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 90)
+    monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: set())
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
+    agent = adapter._create_agent(
+        session_id="meeting-summary",
+        request_overrides={"tool_choice": "none"},
+    )
+
+    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=True), \
+         patch("tools.mcp_tool.refresh_agent_mcp_tools") as refresh:
+        _build(agent)
+
+    refresh.assert_not_called()
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()
+
+
+def test_between_turns_refresh_no_churn_when_unchanged():
+    """R2: an unchanged tool set leaves the snapshot object identity intact
+    (no needless swap → nothing for the next request prefix to diff against)."""
+    agent = _FakeAgent()
+    same = [{"type": "function", "function": {"name": "a", "description": "", "parameters": {}}}]
+    agent.tools = same
+    agent.valid_tool_names = {"a"}
+
+    import model_tools
+    with patch("tools.mcp_tool.has_registered_mcp_tools", return_value=True), \
+         patch.object(
+             model_tools, "get_tool_definitions",
+             return_value=[{"type": "function", "function": {"name": "a", "description": "", "parameters": {}}}],
+         ):
+        _build(agent)
+
+    assert agent.tools is same  # not replaced → no churn
 
 
 
 
 
 
+def test_expired_cooldown_allows_preflight(tmp_path):
+    agent = _make_agent_with_cooldown(
+        tmp_path / "state.db",
+        "sess-1",
+        cooldown_until=1.0,
+    )
+
+    with patch("agent.turn_context._should_run_preflight_estimate", return_value=True), \
+         patch("agent.turn_context.estimate_request_tokens_rough", return_value=999_999):
+        ctx = _build(agent)
+
+    assert isinstance(ctx, TurnContext)
+    agent._emit_status.assert_called_once()
+    agent._compress_context.assert_called()

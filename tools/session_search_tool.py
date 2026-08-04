@@ -401,7 +401,7 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10, link_prof
         return tool_error(f"session_id not found: {session_id}", success=False)
 
     try:
-        rows = db.get_messages(session_id)
+        rows = db.get_messages_for_model(session_id)
     except Exception as e:
         logging.error("get_messages failed for %s: %s", session_id, e, exc_info=True)
         return tool_error(f"failed to load session: {e}", success=False)
@@ -651,7 +651,7 @@ def _title_match_result(
         return None
 
     try:
-        messages = db.get_messages(session_id)
+        messages = db.get_messages_for_model(session_id)
     except Exception:
         logging.debug("get_messages failed for title match %s", session_id, exc_info=True)
         messages = []

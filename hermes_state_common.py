@@ -245,6 +245,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     rewind_count INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
     pinned INTEGER NOT NULL DEFAULT 0,
+    model_history_cutoff_message_id INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
     FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
 );
@@ -271,6 +272,10 @@ CREATE TABLE IF NOT EXISTS messages (
     active INTEGER NOT NULL DEFAULT 1,
     compacted INTEGER NOT NULL DEFAULT 0,
     api_content TEXT,
+    llm_visible INTEGER NOT NULL DEFAULT 1,
+    calendar_delivery_key TEXT,
+    calendar_delivery_generation TEXT,
+    calendar_delivery_state TEXT,
     display_kind TEXT,
     display_metadata TEXT
 );
@@ -300,6 +305,40 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS runtime_imports (
+    import_id TEXT PRIMARY KEY,
+    source TEXT NOT NULL,
+    source_session_id TEXT NOT NULL,
+    target_session_id TEXT NOT NULL,
+    title TEXT,
+    payload_sha256 TEXT NOT NULL,
+    expected_message_count INTEGER NOT NULL,
+    next_chunk_index INTEGER NOT NULL DEFAULT 0,
+    staged_message_count INTEGER NOT NULL DEFAULT 0,
+    staged_bytes INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'staging',
+    normalized_sha256 TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS runtime_import_chunks (
+    import_id TEXT NOT NULL REFERENCES runtime_imports(import_id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL,
+    chunk_sha256 TEXT NOT NULL,
+    messages_json TEXT NOT NULL,
+    message_count INTEGER NOT NULL,
+    byte_count INTEGER NOT NULL,
+    PRIMARY KEY (import_id, chunk_index)
+);
+
+CREATE TABLE IF NOT EXISTS runtime_import_message_ids (
+    import_id TEXT NOT NULL REFERENCES runtime_imports(import_id) ON DELETE CASCADE,
+    source_id TEXT NOT NULL,
+    PRIMARY KEY (import_id, source_id)
 );
 
 CREATE TABLE IF NOT EXISTS gateway_routing (
@@ -344,6 +383,8 @@ CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id, id);
+CREATE INDEX IF NOT EXISTS idx_runtime_imports_updated
+    ON runtime_imports(status, updated_at);
 -- Partial index for the Insights assistant tool-call scan
 -- (agent/insights.py _get_tool_usage / _get_skill_usage): those queries filter
 -- messages by role='assistant' AND tool_calls IS NOT NULL, a small fraction of

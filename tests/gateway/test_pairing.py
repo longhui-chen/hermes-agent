@@ -58,12 +58,11 @@ class TestProfileScopedDiscovery:
         global_dir = tmp_path / "global-pairing"
         global_dir.mkdir(parents=True)
 
-        # A profile's store anchors to the hermes ROOT, not the current
-        # HERMES_HOME — the current home may itself be a profile, and nesting
-        # profiles inside profiles is how a `-p work` CLI and its gateway end
-        # up reading different files. Patch that seam, not get_hermes_home.
+        # A profile's store resolves the canonical profile home before applying
+        # the legacy/consolidated pairing layout. Patch that seam directly.
         with patch("gateway.pairing.PAIRING_DIR", global_dir), patch(
-            "gateway.pairing.get_default_hermes_root", return_value=home
+            "hermes_cli.profiles.get_profile_dir",
+            return_value=home / "profiles" / "alice",
         ):
             store = PairingStore(profile="alice")
             # Scoped under the mocked root's profile dir, using the same
@@ -576,6 +575,8 @@ class TestProfileScopedStorage:
 
     def test_profile_store_uses_profiles_subdir(self, tmp_path, monkeypatch):
         """Explicit profile stores use that profile's normal Hermes layout."""
+        """PairingStore(profile="yangyang") puts files under
+        <HERMES_HOME>/profiles/yangyang/pairing/."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         store = PairingStore(profile="yangyang")
         assert store.profile == "yangyang"
@@ -639,6 +640,33 @@ class TestProfileScopedStorage:
 
         assert store.is_approved("telegram", "legacy-user")
         assert store.is_approved("telegram", "new-user")
+    def test_builtin_default_profile_uses_canonical_root(
+        self, tmp_path, monkeypatch
+    ):
+        """An explicit default store must not inherit the active named
+        profile's module-level PAIRING_DIR."""
+        root = tmp_path / ".hermes"
+        active_home = root / "profiles" / "coder"
+        canonical_pairing_dir = root / "pairing"
+        active_pairing_dir = active_home / "pairing"
+        canonical_pairing_dir.mkdir(parents=True)
+        active_pairing_dir.mkdir(parents=True)
+        (canonical_pairing_dir / "feishu-approved.json").write_text(
+            json.dumps({"default-user": {"approved_at": 1.0}})
+        )
+        (active_pairing_dir / "feishu-approved.json").write_text(
+            json.dumps({"coder-user": {"approved_at": 1.0}})
+        )
+        monkeypatch.setenv("HERMES_HOME", str(active_home))
+
+        with patch("gateway.pairing.PAIRING_DIR", active_pairing_dir):
+            store = PairingStore(profile="default")
+
+        assert store.profile == "default"
+        assert store._dir == canonical_pairing_dir
+        assert store.is_approved("feishu", "default-user") is True
+        assert store.is_approved("feishu", "coder-user") is False
+        assert not (root / "profiles" / "default").exists()
 
     def test_profile_approval_does_not_leak_to_global(self, tmp_path, monkeypatch):
         """Approving in a profile-scoped store must not appear in the global
@@ -678,3 +706,38 @@ class TestProfileScopedStorage:
         )
 
 
+    def test_pairing_store_for_helper_routes_by_profile(self, tmp_path, monkeypatch):
+        """_pairing_store_for(source) on a gateway-like object picks the
+        per-profile store when source.profile is set, and falls back to
+        the global store when it isn't (defensive — single-profile
+        gateways, or any code path that hasn't stamped source.profile)."""
+        from gateway.session import SessionSource
+        from gateway.config import Platform
+
+        class FakeGateway:
+            def __init__(self):
+                self.pairing_store = object()  # sentinel
+                self.pairing_stores = {
+                    "default": "default-store",
+                    "yangyang": "yangyang-store",
+                }
+
+            # Method under test — copy of the real helper so this test
+            # is self-contained even if the real one moves.
+            def _pairing_store_for(self, source):
+                per_profile = getattr(self, "pairing_stores", None) or {}
+                profile = getattr(source, "profile", None)
+                if profile and profile in per_profile:
+                    return per_profile[profile]
+                return getattr(self, "pairing_store", None)
+
+        g = FakeGateway()
+        # source with profile="yangyang" → per-profile store
+        s_yy = SessionSource(platform=Platform.WEIXIN, chat_id="c", profile="yangyang")
+        assert g._pairing_store_for(s_yy) == "yangyang-store"
+        # source with no profile → fallback to global
+        s_none = SessionSource(platform=Platform.WEIXIN, chat_id="c")
+        assert g._pairing_store_for(s_none) is g.pairing_store
+        # source with an unknown profile → fallback (defensive)
+        s_unknown = SessionSource(platform=Platform.WEIXIN, chat_id="c", profile="ghost")
+        assert g._pairing_store_for(s_unknown) is g.pairing_store

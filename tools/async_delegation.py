@@ -120,8 +120,53 @@ def _db_path():
     return get_hermes_home() / "state.db"
 
 
-def _connect() -> sqlite3.Connection:
-    path = _db_path()
+def _iter_state_db_homes():
+    """Yield (home, state.db path) for every home that may hold durable rows.
+
+    Dispatches run inside the caller's ``_profile_runtime_scope``, so under a
+    multiplexer each profile's durable rows live in ITS OWN
+    ``profiles/<id>/state.db`` — a default-home-only sweep would leave them
+    permanently pending after a restart. Single-profile processes have no
+    ``profiles/`` children with a state.db, so this degenerates to the
+    default home only.
+    """
+    import os as _os
+
+    def _is_symlink(p) -> bool:
+        try:
+            return _os.path.islink(str(p))
+        except OSError:  # pragma: no cover — treat unstatable as unsafe
+            return True
+
+    default_home = get_hermes_home()
+    homes = [default_home]
+    try:
+        profiles_dir = default_home / "profiles"
+        if profiles_dir.is_dir() and not _is_symlink(profiles_dir):
+            # No-follow discipline (mirrors _open_profile_session_db): a
+            # symlinked profiles/ ROOT, profile dir, or state.db would make
+            # the sweep run WAL/schema writes against an out-of-tree target —
+            # skip all three (child checks can't see a linked ancestor).
+            homes.extend(sorted(
+                p for p in profiles_dir.iterdir()
+                if p.is_dir() and not _is_symlink(p)
+            ))
+    except Exception:  # pragma: no cover — unreadable profiles dir
+        pass
+    seen = set()
+    for home in homes:
+        path = home / "state.db"
+        if path in seen:
+            continue
+        seen.add(path)
+        if _is_symlink(path):
+            continue
+        if home == default_home or path.exists():
+            yield home, path
+
+
+def _connect(db_path=None) -> sqlite3.Connection:
+    path = db_path if db_path is not None else _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path, timeout=10)
     try:
@@ -179,7 +224,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
 
 
 @contextmanager
-def _transaction() -> Iterator[sqlite3.Connection]:
+def _transaction(db_path=None) -> Iterator[sqlite3.Connection]:
     """Open a connection, commit/rollback on exit, and ALWAYS close it.
 
     ``sqlite3.Connection.__enter__``/``__exit__`` only commit or roll back the
@@ -189,7 +234,7 @@ def _transaction() -> Iterator[sqlite3.Connection]:
     to the garbage collector. On a long-running gateway that exhausts
     ``RLIMIT_NOFILE`` (the cron-ledger sibling of this bug was #69567 / PR #69594).
     """
-    conn = _connect()
+    conn = _connect(db_path)
     try:
         with conn:
             yield conn
@@ -290,7 +335,7 @@ def _note_delivery_attempt(delegation_id: str) -> None:
         )
 
 
-def recover_abandoned_delegations() -> int:
+def recover_abandoned_delegations(db_path=None, profile_home: str = "") -> int:
     """Classify records whose owning process disappeared as outcome unknown."""
     try:
         from gateway.status import _pid_exists, get_process_start_time
@@ -298,7 +343,7 @@ def recover_abandoned_delegations() -> int:
         return 0
     now = time.time()
     recovered = 0
-    with _DB_LOCK, _transaction() as conn:
+    with _DB_LOCK, _transaction(db_path) as conn:
         rows = conn.execute(
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
@@ -322,7 +367,8 @@ def recover_abandoned_delegations() -> int:
                 # Restore the durable wake target so completions recovered
                 # after a restart remain routable to api_server sessions.
                 "origin_session_id": origin_session_id or "",
-                "parent_session_id": parent_id, "goal": task.get("goal", ""),
+                "parent_session_id": parent_id, "profile_home": profile_home,
+                "goal": task.get("goal", ""),
                 "goals": task.get("goals"), "context": task.get("context"),
                 "toolsets": task.get("toolsets"), "role": task.get("role"),
                 "model": task.get("model"), "is_batch": bool(task.get("is_batch")),
@@ -353,19 +399,47 @@ def restore_undelivered_completions(target_queue) -> int:
     otherwise a brand-new session adopts a dead session's delegation
     results seconds after boot (#64484).
     """
-    recover_abandoned_delegations()
-    with _DB_LOCK, _transaction() as conn:
-        rows = conn.execute(
-            """SELECT delegation_id, event_json FROM async_delegations
-               WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
-               ORDER BY completed_at, delegation_id"""
-        ).fetchall()
-        for _delegation_id, payload in rows:
-            evt = json.loads(payload)
-            if isinstance(evt, dict):
-                evt["restored"] = True
-            target_queue.put(evt)
-    return len(rows)
+    restored = 0
+    for home, db_path in _iter_state_db_homes():
+        # Per-home fault isolation: one corrupted/locked state.db (or a single
+        # bad event_json row) must not abort the scan — the outer caller
+        # catches once, so raising here would silently skip every remaining
+        # profile's pending completions on every boot.
+        try:
+            recover_abandoned_delegations(db_path, profile_home=str(home))
+            with _DB_LOCK, _transaction(db_path) as conn:
+                rows = conn.execute(
+                    """SELECT delegation_id, event_json FROM async_delegations
+                       WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
+                       ORDER BY completed_at, delegation_id"""
+                ).fetchall()
+            for _delegation_id, payload in rows:
+                try:
+                    evt = json.loads(payload)
+                except Exception:
+                    logger.warning(
+                        "async_delegation restore: undecodable event_json for %s in %s; skipping row",
+                        _delegation_id, db_path,
+                    )
+                    continue
+                if isinstance(evt, dict):
+                    evt["restored"] = True
+                    # The row's on-disk location is the AUTHORITATIVE owner:
+                    # a stamped profile_home goes stale after `hermes profile
+                    # rename` moves the directory (delivery would scope into
+                    # the old path's fresh/absent state.db and the completion
+                    # would vanish while the real row stays pending forever).
+                    # Overwrite unconditionally — for un-renamed profiles the
+                    # stamped value is identical anyway.
+                    evt["profile_home"] = str(home)
+                target_queue.put(evt)
+                restored += 1
+        except Exception:
+            logger.warning(
+                "async_delegation restore failed for %s; continuing with remaining profiles",
+                db_path, exc_info=True,
+            )
+    return restored
 
 
 def mark_completion_delivered(delegation_id: str) -> bool:
@@ -745,6 +819,10 @@ def dispatch_async_delegation(
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
+        # Dispatch runs inside the caller's _profile_runtime_scope, so this
+        # captures the OWNING profile — the control plane filters by it and
+        # the delivery path re-enters this scope (multiplexer correctness).
+        "profile_home": str(get_hermes_home()),
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -827,6 +905,10 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         return
     event_record, _interrupt_fn = claimed
 
+    if event_record.get("suppress_completion"):
+        _discard_suppressed_completion(delegation_id, status)
+        return
+
     _push_completion_event(event_record, result, status)
     _finish_finalization(delegation_id, status)
 
@@ -892,6 +974,9 @@ def _push_completion_event(
         "origin_ui_session_id": record.get("origin_ui_session_id", ""),
         "origin_session_id": record.get("origin_session_id", ""),
         "parent_session_id": record.get("parent_session_id"),
+        # Owning profile home: delivery re-enters this scope so session
+        # lookups and the durable ack hit the RIGHT profile's state.db.
+        "profile_home": record.get("profile_home", ""),
         "goal": record.get("goal", ""),
         "context": record.get("context"),
         "toolsets": record.get("toolsets"),
@@ -985,6 +1070,8 @@ def dispatch_async_delegation_batch(
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
+        # See dispatch_async_delegation: the owning profile, captured in-scope.
+        "profile_home": str(get_hermes_home()),
         "status": "running",
         "dispatched_at": dispatched_at,
         "completed_at": None,
@@ -1061,6 +1148,29 @@ def dispatch_async_delegation_batch(
     return {"status": "dispatched", "delegation_id": delegation_id}
 
 
+def _discard_suppressed_completion(delegation_id: str, status: str) -> None:
+    """Terminal cleanup for a completion whose delivery was suppressed.
+
+    Session-interrupt kills (user stopped the parent turn) set
+    ``suppress_completion`` before invoking the interrupt: the stopped turn
+    already carries the outcome for the user, so re-entering the chat with a
+    completion turn would contradict the explicit stop. Drop the durable row
+    so restarts don't resurrect the delivery, and settle the in-memory record
+    like a normal terminal.
+    """
+    _delete_durable_delegation(delegation_id)
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is not None:
+            record["status"] = status
+        _prune_completed_locked()
+    logger.info(
+        "Async delegation %s finished (%s) with delivery suppressed "
+        "(session interrupt); completion dropped",
+        delegation_id, status,
+    )
+
+
 def _finalize_batch(
     delegation_id: str, combined: Dict[str, Any], status: str
 ) -> None:
@@ -1069,6 +1179,10 @@ def _finalize_batch(
     if claimed is None:
         return
     event_record, _interrupt_fn = claimed
+
+    if event_record.get("suppress_completion"):
+        _discard_suppressed_completion(delegation_id, status)
+        return
 
     _push_batch_completion_event(event_record, combined, status)
     _finish_finalization(delegation_id, status)
@@ -1097,6 +1211,8 @@ def _push_batch_completion_event(
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
         "origin_session_id": event_record.get("origin_session_id", ""),
         "parent_session_id": event_record.get("parent_session_id"),
+        # See _push_completion_event: the owning profile for delivery scope.
+        "profile_home": event_record.get("profile_home", ""),
         "goal": event_record.get("goal", ""),
         "goals": event_record.get("goals"),
         "context": event_record.get("context"),
@@ -1256,6 +1372,9 @@ def _finalize_stalled(delegation_id: str) -> None:
     if claimed is None:
         return
     event_record, _interrupt_fn = claimed
+    if event_record.get("suppress_completion"):
+        _discard_suppressed_completion(delegation_id, "stalled")
+        return
 
     completed_at = event_record.get("completed_at") or time.time()
     duration = round(
@@ -1349,7 +1468,21 @@ def _children_activity_from_token(token: Any, now: float) -> Optional[List]:
     return out
 
 
-def list_async_delegations() -> List[Dict[str, Any]]:
+def _owned_by_profile(record: Dict[str, Any], profile_home: str) -> bool:
+    """True when ``record`` belongs to ``profile_home`` (empty filter = all).
+
+    An empty filter keeps legacy single-profile behavior. Under a multiplexer
+    the control-plane handlers ALWAYS pass their route's profile home, so
+    records from other profiles are invisible and un-cancellable there.
+    """
+    if not profile_home:
+        return True
+    import os.path
+
+    return os.path.normpath(str(record.get("profile_home") or "")) == os.path.normpath(profile_home)
+
+
+def list_async_delegations(profile_home: str = "") -> List[Dict[str, Any]]:
     """Snapshot of async delegations (running + recently completed).
 
     Safe to call from any thread. Excludes the non-serialisable callables
@@ -1363,12 +1496,17 @@ def list_async_delegations() -> List[Dict[str, Any]]:
       ``progress_fn``.
     - ``stalled_after_quiet_seconds`` / ``stall_threshold_seconds`` /
       ``stall_in_tool``: stall context once the monitor has tripped.
+    ``profile_home`` (when non-empty) restricts the snapshot to that
+    profile's own records — the zettlab control plane must never expose one
+    agent's goals/session keys to another profile's route.
     """
     now = time.time()
     samplers: Dict[str, Callable] = {}
     with _records_lock:
         items = []
         for r in _records.values():
+            if not _owned_by_profile(r, profile_home):
+                continue
             item = {
                 k: v
                 for k, v in r.items()
@@ -1411,6 +1549,40 @@ def list_async_delegations() -> List[Dict[str, Any]]:
     return items
 
 
+def interrupt_delegation(
+    delegation_id: str, reason: str = "user_cancel", profile_home: str = ""
+) -> bool:
+    """Signal ONE running async delegation to stop (zettlab control plane).
+
+    Per-id counterpart to ``interrupt_for_session`` — backs the App's
+    "cancel this delegation" button via the zet_agent HTTP surface. Returns
+    True when a running record matched and its interrupt was invoked; the
+    children still emit a normal completion event (status='interrupted')
+    through the finalize path, so the caller session gets closure.
+    """
+    delegation_id = str(delegation_id or "").strip()
+    if not delegation_id:
+        return False
+    with _records_lock:
+        record = _records.get(delegation_id)
+        fn = (
+            record.get("interrupt_fn")
+            if record
+            and record.get("status") in ("running", "stalling")
+            and _owned_by_profile(record, profile_home)
+            else None
+        )
+    if not callable(fn):
+        return False
+    try:
+        fn()
+    except Exception as exc:
+        logger.debug("interrupt_delegation %s failed: %s", delegation_id, exc)
+        return False
+    logger.info("Interrupted async delegation %s (%s)", delegation_id, reason)
+    return True
+
+
 def interrupt_all(reason: str = "shutdown") -> int:
     """Signal every running async delegation to stop. Returns how many.
 
@@ -1445,6 +1617,8 @@ def interrupt_for_session(
     origin_ui_session_id: str = "",
     parent_session_id: str = "",
     reason: str = "session_end",
+    suppress_completion: bool = False,
+    profile_home: str = "",
 ) -> int:
     """Signal running async delegations owned by ONE session to stop.
 
@@ -1471,6 +1645,7 @@ def interrupt_for_session(
         targets = [
             r for r in _records.values()
             if r.get("status") in ("running", "stalling")
+            and _owned_by_profile(r, profile_home)
             and _matches_session_selectors(
                 r,
                 session_key=session_key,
@@ -1478,6 +1653,14 @@ def interrupt_for_session(
                 parent_session_id=parent_session_id,
             )
         ]
+        if suppress_completion:
+            # Mark BEFORE invoking interrupts (and inside the lock): the kill
+            # makes _finalize run on the worker thread at any moment, and its
+            # event_record copy must already see the flag. Records that
+            # reached "finalizing" are not in targets — a batch that finished
+            # right at the stop still delivers its completion normally.
+            for r in targets:
+                r["suppress_completion"] = True
     for r in targets:
         fn = r.get("interrupt_fn")
         if callable(fn):

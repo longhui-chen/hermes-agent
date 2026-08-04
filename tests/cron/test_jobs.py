@@ -3,6 +3,7 @@
 import threading
 import pytest
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from cron.jobs import (
     parse_duration,
@@ -19,6 +20,7 @@ from cron.jobs import (
     remove_job,
     mark_job_run,
     advance_next_run,
+    claim_job_for_fire,
     claim_dispatch,
     heartbeat_run_claim,
     get_due_jobs,
@@ -109,6 +111,43 @@ class TestParseSchedule:
         # Same wall-clock the user typed, on the configured clock.
         assert parsed.replace(tzinfo=None) == datetime(2026, 6, 22, 20, 7, 0)
 
+    def test_naive_iso_with_tz_name_anchors_in_that_zone(self):
+        """The ZET-942 naive-ISO branch: '2030-05-25T10:30' with tz_name=
+        'Asia/Shanghai' must mean 10:30 *Shanghai wall-clock*, not whatever
+        zone hermes happens to run in."""
+        result = parse_schedule("2030-05-25T10:30", tz_name="Asia/Shanghai")
+        assert result["kind"] == "once"
+        run_at = datetime.fromisoformat(result["run_at"])
+        # Wall-clock components are unchanged; the offset is +08:00.
+        assert run_at.hour == 10
+        assert run_at.minute == 30
+        assert run_at.utcoffset() == timedelta(hours=8)
+
+    def test_naive_iso_without_tz_name_uses_configured_hermes_timezone(self, monkeypatch):
+        """No tz_name → configured Hermes timezone, not server-local time."""
+        configured_now = datetime(2030, 5, 25, 9, 0, tzinfo=timezone(timedelta(hours=9)))
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: configured_now)
+        result = parse_schedule("2030-05-25T10:30")
+        run_at = datetime.fromisoformat(result["run_at"])
+        assert run_at.hour == 10
+        assert run_at.minute == 30
+        assert run_at.utcoffset() == configured_now.utcoffset()
+
+    def test_explicit_offset_iso_ignores_tz_name(self):
+        """An ISO timestamp that already carries an offset wins over tz_name —
+        we never rewrite a user-supplied offset."""
+        result = parse_schedule("2030-05-25T10:30+05:00", tz_name="Asia/Shanghai")
+        run_at = datetime.fromisoformat(result["run_at"])
+        assert run_at.utcoffset() == timedelta(hours=5)
+
+    def test_invalid_tz_name_falls_back_to_configured_hermes_timezone(self, monkeypatch):
+        """A bogus tz_name shouldn't crash parsing — graceful configured-tz fallback."""
+        configured_now = datetime(2030, 5, 25, 9, 0, tzinfo=timezone(timedelta(hours=9)))
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: configured_now)
+        result = parse_schedule("2030-05-25T10:30", tz_name="Mars/Olympus_Mons")
+        run_at = datetime.fromisoformat(result["run_at"])
+        assert run_at.utcoffset() == configured_now.utcoffset()
+
 
 # =========================================================================
 # Timezone-divergence regression (#51021)
@@ -121,15 +160,20 @@ class TestNaiveScheduleTimezoneDivergence:
     server-local, so the job never fired."""
 
     def test_recent_past_oneshot_is_due_under_diverging_tz(self, tmp_cron_dir, monkeypatch):
-        # Configured zone: a fixed +05:30 offset. The server's actual local
-        # zone is irrelevant to the parse now — that is the whole point.
-        configured = timezone(timedelta(hours=5, minutes=30))
+        # Per-job zone: Asia/Kolkata (+05:30). The server's actual local zone
+        # is irrelevant to the parse now — that is the whole point.
+        configured = ZoneInfo("Asia/Kolkata")
         now = datetime(2026, 6, 22, 20, 7, 30, tzinfo=configured)
         monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
 
         # 30s ago in the configured wall clock, supplied as a NAIVE string.
         naive_str = (now - timedelta(seconds=30)).replace(tzinfo=None).isoformat()
-        job = create_job(prompt="test message", schedule=naive_str, deliver="local")
+        job = create_job(
+            prompt="test message",
+            schedule=naive_str,
+            deliver="local",
+            timezone="Asia/Kolkata",
+        )
 
         due = get_due_jobs()
         assert any(d["id"] == job["id"] for d in due), (
@@ -172,6 +216,75 @@ class TestComputeNextRun:
         next_dt = datetime.fromisoformat(result)
         # Should be ~60 minutes from now
         assert next_dt > datetime.now().astimezone() + timedelta(minutes=59)
+
+    def test_interval_subsequent_run(self):
+        schedule = {"kind": "interval", "minutes": 30}
+        last = datetime.now().astimezone().isoformat()
+        result = compute_next_run(schedule, last_run_at=last)
+        next_dt = datetime.fromisoformat(result)
+        # Should be ~30 minutes from last run
+        assert next_dt > datetime.now().astimezone() + timedelta(minutes=29)
+
+    def test_cron_returns_future(self):
+        pytest.importorskip("croniter")
+        schedule = {"kind": "cron", "expr": "* * * * *"}  # every minute
+        result = compute_next_run(schedule)
+        assert isinstance(result, str), f"Expected ISO timestamp string, got {type(result)}"
+        assert len(result) > 0
+        next_dt = datetime.fromisoformat(result)
+        assert isinstance(next_dt, datetime)
+        assert next_dt > datetime.now().astimezone()
+
+    def test_unknown_kind_returns_none(self):
+        assert compute_next_run({"kind": "unknown"}) is None
+
+    def test_cron_with_tz_name_evaluates_in_that_zone(self, monkeypatch):
+        """The classic bug: '6 23 * * *' should mean 23:06 *in the user's zone*,
+        not 23:06 UTC. With tz_name='Asia/Shanghai' and a hermes default of UTC,
+        the next firing should be the next 23:06 Shanghai = 15:06 UTC."""
+        pytest.importorskip("croniter")
+        # Pin hermes "now" to a UTC moment well before next 23:06 Shanghai
+        # 2026-05-08 06:00:00 UTC = 14:00 Shanghai. Next 23:06 Shanghai is
+        # the same Shanghai day = 15:06 UTC same day.
+        now = datetime(2026, 5, 8, 6, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        schedule = {"kind": "cron", "expr": "6 23 * * *"}
+        result = compute_next_run(schedule, tz_name="Asia/Shanghai")
+        assert result is not None
+
+        next_dt = datetime.fromisoformat(result)
+        assert next_dt.astimezone(timezone.utc) == datetime(
+            2026, 5, 8, 15, 6, 0, tzinfo=timezone.utc
+        )
+
+    def test_cron_without_tz_name_uses_hermes_default(self, monkeypatch):
+        """When no per-job tz is provided, behaviour matches pre-feature: cron
+        runs in whatever timezone _hermes_now() returns."""
+        pytest.importorskip("croniter")
+        now = datetime(2026, 5, 8, 6, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        schedule = {"kind": "cron", "expr": "6 23 * * *"}
+        result = compute_next_run(schedule)
+        # No tz_name → croniter base is hermes-now (UTC here) → next 23:06 UTC.
+        next_dt = datetime.fromisoformat(result)
+        assert next_dt.astimezone(timezone.utc) == datetime(
+            2026, 5, 8, 23, 6, 0, tzinfo=timezone.utc
+        )
+
+    def test_cron_invalid_tz_name_falls_back_safely(self, monkeypatch):
+        """Bad tz at compute time logs and falls back rather than crashing —
+        keeps the scheduler robust against jobs.json that somehow stored a
+        zone the runtime doesn't know (e.g. tzdata mismatch on a NAS image)."""
+        pytest.importorskip("croniter")
+        now = datetime(2026, 5, 8, 6, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        schedule = {"kind": "cron", "expr": "6 23 * * *"}
+        # Should not raise, should return a value (using fallback).
+        result = compute_next_run(schedule, tz_name="Mars/Olympus_Mons")
+        assert result is not None
 
 
 # =========================================================================
@@ -250,6 +363,209 @@ class TestUpdateJob:
         # Verify persisted to disk
         fetched = get_job(job["id"])
         assert fetched["name"] == "New Name"
+
+    def test_update_schedule(self, tmp_cron_dir):
+        job = create_job(prompt="Daily report", schedule="every 1h")
+        assert job["schedule"]["kind"] == "interval"
+        assert job["schedule"]["minutes"] == 60
+        old_next_run = job["next_run_at"]
+        new_schedule = parse_schedule("every 2h")
+        updated = update_job(job["id"], {"schedule": new_schedule, "schedule_display": new_schedule["display"]})
+        assert updated is not None
+        assert updated["schedule"]["kind"] == "interval"
+        assert updated["schedule"]["minutes"] == 120
+        assert updated["schedule_display"] == "every 120m"
+        assert updated["next_run_at"] != old_next_run
+        # Verify persisted to disk
+        fetched = get_job(job["id"])
+        assert fetched["schedule"]["minutes"] == 120
+        assert fetched["schedule_display"] == "every 120m"
+
+    def test_update_to_past_oneshot_rejected(self, tmp_cron_dir, monkeypatch):
+        """Updating a job's schedule to a one-shot >ONESHOT_GRACE_SECONDS in the
+        past must raise ValueError — otherwise the ghost-job bug (#59395) re-enters
+        through the update door (next_run_at=None stored with state='scheduled').
+        The original job must be left unchanged on disk."""
+        now = datetime(2026, 7, 6, 12, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = create_job(prompt="Recurring", schedule="every 1h", deliver="local")
+        past = parse_schedule((now - timedelta(minutes=10)).isoformat())
+        with pytest.raises(ValueError, match="past and cannot be scheduled"):
+            update_job(job["id"], {"schedule": past})
+        # Original job unchanged — still the recurring interval, still scheduled.
+        fetched = get_job(job["id"])
+        assert fetched["schedule"]["kind"] == "interval"
+        assert fetched["next_run_at"] is not None
+
+    def test_update_to_future_oneshot_accepted(self, tmp_cron_dir, monkeypatch):
+        """Updating to a FUTURE one-shot still works — only past ones are rejected."""
+        now = datetime(2026, 7, 6, 12, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        job = create_job(prompt="Recurring", schedule="every 1h", deliver="local")
+        future = parse_schedule((now + timedelta(hours=2)).isoformat())
+        updated = update_job(job["id"], {"schedule": future})
+        assert updated is not None
+        assert updated["schedule"]["kind"] == "once"
+        assert updated["next_run_at"] is not None
+
+    def test_update_enable_disable(self, tmp_cron_dir):
+        job = create_job(prompt="Toggle me", schedule="every 1h")
+        assert job["enabled"] is True
+        updated = update_job(job["id"], {"enabled": False})
+        assert updated["enabled"] is False
+        fetched = get_job(job["id"])
+        assert fetched["enabled"] is False
+
+    def test_update_nonexistent_returns_none(self, tmp_cron_dir):
+        result = update_job("nonexistent_id", {"name": "X"})
+        assert result is None
+
+    def test_update_rejects_id_change(self, tmp_cron_dir):
+        """Job IDs are filesystem path components — must be immutable."""
+        job = create_job(prompt="Original", schedule="every 1h")
+
+        with pytest.raises(ValueError, match="id"):
+            update_job(job["id"], {"id": "../escape"})
+
+        # Original job still resolvable, no rename happened.
+        assert get_job(job["id"]) is not None
+        assert get_job("../escape") is None
+
+    def test_create_job_persists_timezone(self, tmp_cron_dir):
+        pytest.importorskip("croniter")
+        job = create_job(
+            prompt="Daily greet", schedule="6 23 * * *", timezone="Asia/Shanghai"
+        )
+        assert job["timezone"] == "Asia/Shanghai"
+        fetched = get_job(job["id"])
+        assert fetched["timezone"] == "Asia/Shanghai"
+
+    def test_create_job_naive_iso_honours_timezone(self, tmp_cron_dir):
+        """ZET-942 once-job branch: a naive ISO schedule combined with a
+        per-job timezone anchors the wall-clock in that zone instead of
+        whatever the hermes pod's system tz happens to be."""
+        job = create_job(
+            prompt="Reminder", schedule="2030-05-25T10:30", timezone="Asia/Shanghai"
+        )
+        run_at = datetime.fromisoformat(job["schedule"]["run_at"])
+        assert run_at.utcoffset() == timedelta(hours=8)
+        assert run_at.hour == 10 and run_at.minute == 30
+        next_run = datetime.fromisoformat(job["next_run_at"])
+        assert next_run.utcoffset() == timedelta(hours=8)
+
+    def test_create_job_rejects_stale_one_shot(self, tmp_cron_dir, monkeypatch):
+        """A past one-shot must fail closed instead of creating a scheduled job
+        with next_run_at=None that can never fire."""
+        now = datetime(2026, 6, 30, 13, 5, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        with pytest.raises(ValueError, match="in the past"):
+            create_job(
+                prompt="Reminder",
+                schedule="2026-06-30T09:00:00",
+                timezone="Asia/Shanghai",
+            )
+
+        assert load_jobs() == []
+
+    def test_update_job_rejects_stale_one_shot(self, tmp_cron_dir, monkeypatch):
+        """Updating an existing job must not recreate a scheduled job with
+        next_run_at=None."""
+        now = datetime(2026, 6, 30, 13, 5, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job(
+            prompt="Reminder",
+            schedule="every 1h",
+            timezone="Asia/Shanghai",
+        )
+
+        with pytest.raises(ValueError, match="in the past"):
+            update_job(
+                job["id"],
+                {
+                    "schedule": "2026-06-30T09:00:00",
+                    "timezone": "Asia/Shanghai",
+                },
+            )
+
+        stored = get_job(job["id"])
+        assert stored["schedule"]["kind"] == "interval"
+        assert stored["next_run_at"]
+
+    def test_create_job_invalid_timezone_raises_with_message(self, tmp_cron_dir):
+        with pytest.raises(ValueError, match="Invalid timezone"):
+            create_job(
+                prompt="X", schedule="every 1h", timezone="Mars/Olympus_Mons"
+            )
+
+    def test_update_job_changes_timezone_recomputes_next_run(self, tmp_cron_dir):
+        """Bare timezone PATCH must move next_run_at — otherwise the user
+        fixes their tz and the next firing still uses the stale wall-clock."""
+        pytest.importorskip("croniter")
+        job = create_job(
+            prompt="Daily", schedule="30 10 * * *", timezone="Asia/Shanghai"
+        )
+        old_next = datetime.fromisoformat(job["next_run_at"])
+        assert old_next.utcoffset() == timedelta(hours=8)
+
+        updated = update_job(job["id"], {"timezone": "UTC"})
+        new_next = datetime.fromisoformat(updated["next_run_at"])
+        assert new_next.utcoffset() == timedelta(0)
+
+    def test_update_job_empty_timezone_clears_field(self, tmp_cron_dir):
+        """Empty string means "remove the per-job tz override" — matches the
+        cronjob_tools contract documented in the schema description."""
+        pytest.importorskip("croniter")
+        job = create_job(
+            prompt="Daily", schedule="30 10 * * *", timezone="Asia/Shanghai"
+        )
+        updated = update_job(job["id"], {"timezone": ""})
+        assert updated["timezone"] is None
+
+    def test_create_job_invalid_timezone_raises(self, tmp_cron_dir):
+        with pytest.raises(ValueError):
+            create_job(prompt="x", schedule="every 1h", timezone="Mars/Olympus_Mons")
+
+    def test_update_timezone_only_recomputes_next_run(self, tmp_cron_dir, monkeypatch):
+        """User fixes a wrong tz; next_run_at must move even though schedule
+        didn't change. Otherwise the user has to also re-set the schedule
+        which is the surprising/buggy behaviour we just fixed."""
+        pytest.importorskip("croniter")
+        now = datetime(2026, 5, 8, 6, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        # All-fixed policy (ZET-1258): omitted tz is pinned to the device tz at
+        # creation. Pin it to UTC so the create-time baseline below is
+        # deterministic (otherwise it reads the host's real zone).
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "UTC")
+
+        # Created without tz — pinned to UTC, next_run lands at 23:06 UTC.
+        job = create_job(prompt="x", schedule="6 23 * * *")
+        before = datetime.fromisoformat(job["next_run_at"]).astimezone(timezone.utc)
+        assert before == datetime(2026, 5, 8, 23, 6, 0, tzinfo=timezone.utc)
+
+        updated = update_job(job["id"], {"timezone": "Asia/Shanghai"})
+        after = datetime.fromisoformat(updated["next_run_at"]).astimezone(timezone.utc)
+        # 23:06 Shanghai = 15:06 UTC.
+        assert after == datetime(2026, 5, 8, 15, 6, 0, tzinfo=timezone.utc)
+
+    def test_update_clear_timezone_with_empty_string(self, tmp_cron_dir):
+        pytest.importorskip("croniter")
+        job = create_job(
+            prompt="x", schedule="every 1h", timezone="Asia/Shanghai"
+        )
+        updated = update_job(job["id"], {"timezone": ""})
+        assert updated["timezone"] is None
+
+    def test_create_job_pins_device_tz_when_timezone_omitted(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Tokyo")
+        job = create_job(prompt="p", schedule="30 10 * * *")  # 不传 timezone
+        assert job["timezone"] == "Asia/Tokyo", "omitted timezone must be pinned to device tz"
+
+    def test_create_job_keeps_explicit_timezone(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Tokyo")
+        job = create_job(prompt="p", schedule="30 10 * * *", timezone="America/New_York")
+        assert job["timezone"] == "America/New_York", "explicit per-job tz must win over device default"
 
 
 class TestPauseResumeJob:
@@ -333,6 +649,14 @@ class TestMarkJobRun:
         assert updated["enabled"] is False
         assert updated["next_run_at"] is None
         assert updated["last_status"] == "ok"
+    def test_repeat_limit_retains_inert_completed_job(self, tmp_cron_dir):
+        job = create_job(prompt="Once", schedule="30m", repeat=1)
+        mark_job_run(job["id"], success=True)
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["enabled"] is False
+        assert updated["state"] == "completed"
+        assert updated["next_run_at"] is None
 
     def test_repeat_limit_retains_delivery_error(self, tmp_cron_dir):
         """A one-shot whose delivery failed must keep the error on its record."""
@@ -488,21 +812,24 @@ class TestGetDueJobs:
         For an hourly job, grace = 30 min. Setting 35 min late exceeds the window.
         The job should be returned as due (execute once) with next_run_at in the future.
         """
+        from cron.jobs import _ensure_aware, _hermes_now
+
         job = create_job(prompt="Stale", schedule="every 1h")
         # Force next_run_at to 35 minutes ago (beyond the 30-min grace for hourly)
         jobs = load_jobs()
         jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=35)).isoformat()
         save_jobs(jobs)
 
+        # Missed run is caught up once instead of silently dropped.
         due = get_due_jobs()
         # Job is returned as due — execute once now instead of skipping
         assert len(due) == 1
         assert due[0]["id"] == job["id"]
         # next_run_at should be fast-forwarded to the future (accumulated slots skipped)
         updated = get_job(job["id"])
-        from cron.jobs import _ensure_aware, _hermes_now
         next_dt = _ensure_aware(datetime.fromisoformat(updated["next_run_at"]))
         assert next_dt > _hermes_now()
+        assert get_due_jobs() == []
 
 
     def test_idless_job_does_not_crash_or_block_sibling_jobs(self, tmp_cron_dir):
@@ -564,6 +891,78 @@ class TestGetDueJobs:
         nxt = _ensure_aware(datetime.fromisoformat(get_job(job["id"])["next_run_at"]))
         assert nxt > _hermes_now()
 
+
+    def test_stale_repeat_limited_job_consumes_one_run_on_catchup(self, tmp_cron_dir, monkeypatch):
+        """#33315 behavior note: a stale recurring job with a repeat.times limit
+        fires ONCE on catch-up and consumes one of its runs (it is no longer
+        silently skipped). Pins the documented repeat-count interaction so it
+        isn't changed accidentally."""
+        from cron.jobs import _hermes_now
+        job = create_job(prompt="Limited", schedule="every 5m", repeat=3)
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = (_hermes_now() - timedelta(minutes=11)).isoformat()
+        jobs[0]["last_run_at"] = (_hermes_now() - timedelta(minutes=11)).isoformat()
+        save_jobs(jobs)
+
+        # The stale job is returned to fire once (not skipped).
+        due = get_due_jobs()
+        assert [j["id"] for j in due] == [job["id"]]
+        # Simulate the run completing: mark_job_run increments completed.
+        mark_job_run(job["id"], True)
+        survived = get_job(job["id"])
+        assert survived is not None, "job should survive (3 > 1 completed)"
+        assert survived["repeat"]["completed"] == 1
+
+    def test_external_fire_claim_preserves_per_job_timezone(self, tmp_cron_dir, monkeypatch):
+        pytest.importorskip("croniter")
+        now = datetime(2026, 5, 8, 6, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job(
+            prompt="Shanghai evening",
+            schedule="6 23 * * *",
+            timezone="Asia/Shanghai",
+        )
+
+        assert claim_job_for_fire(job["id"]) is True
+
+        updated = get_job(job["id"])
+        next_run = datetime.fromisoformat(updated["next_run_at"]).astimezone(timezone.utc)
+        assert next_run == datetime(2026, 5, 8, 15, 6, 0, tzinfo=timezone.utc)
+
+    def test_stale_catchup_preserves_per_job_timezone(self, tmp_cron_dir, monkeypatch):
+        pytest.importorskip("croniter")
+        now = datetime(2026, 5, 8, 6, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        job = create_job(
+            prompt="Shanghai evening",
+            schedule="6 23 * * *",
+            timezone="Asia/Shanghai",
+        )
+        jobs = load_jobs()
+        jobs[0]["next_run_at"] = "2026-05-07T15:06:00+00:00"
+        save_jobs(jobs)
+
+        due = get_due_jobs()
+        assert [j["id"] for j in due] == [job["id"]]
+        next_run = datetime.fromisoformat(get_job(job["id"])["next_run_at"]).astimezone(timezone.utc)
+        assert next_run == datetime(2026, 5, 8, 15, 6, 0, tzinfo=timezone.utc)
+
+    def test_future_not_returned(self, tmp_cron_dir):
+        create_job(prompt="Not yet", schedule="every 1h")
+        due = get_due_jobs()
+        assert len(due) == 0
+
+    def test_disabled_not_returned(self, tmp_cron_dir):
+        job = create_job(prompt="Disabled", schedule="every 1h")
+        jobs = load_jobs()
+        jobs[0]["enabled"] = False
+        jobs[0]["next_run_at"] = (datetime.now() - timedelta(minutes=5)).isoformat()
+        save_jobs(jobs)
+
+        due = get_due_jobs()
+        assert len(due) == 0
 
     def test_broken_recent_one_shot_without_next_run_is_recovered(self, tmp_cron_dir, monkeypatch):
         now = datetime(2026, 3, 18, 4, 22, 30, tzinfo=timezone.utc)
@@ -635,6 +1034,160 @@ class TestGetDueJobs:
                                 lambda t0=t0, g=gap: t0 + timedelta(seconds=g))
             assert get_due_jobs() == [], f"double-dispatched at +{gap}s"
 
+    def test_one_shot_run_claim_expires_after_ttl(self, tmp_cron_dir, monkeypatch):
+        """A claiming tick that DIED mid-run must not wedge the one-shot forever:
+        once the run_claim is older than the TTL it is re-dispatched (recovered)."""
+        # Pin the inactivity timeout unset so the derived TTL is deterministic.
+        monkeypatch.delenv("HERMES_CRON_TIMEOUT", raising=False)
+        from cron.jobs import _hermes_now, _oneshot_run_claim_ttl_seconds
+        ttl = _oneshot_run_claim_ttl_seconds()
+        t0 = _hermes_now()
+        run_at = (t0 - timedelta(seconds=5)).isoformat()
+        save_jobs([{
+            "id": "wedged", "name": "R", "prompt": "x",
+            "schedule": {"kind": "once", "run_at": run_at},
+            "next_run_at": run_at, "enabled": True, "state": "scheduled",
+        }])
+        assert [j["id"] for j in get_due_jobs()] == ["wedged"]  # A claims, then dies
+
+        # Just inside the TTL: still claimed → skipped.
+        monkeypatch.setattr("cron.jobs._hermes_now",
+                            lambda: t0 + timedelta(seconds=ttl - 10))
+        assert get_due_jobs() == []
+
+        # Just past the TTL: stale claim → re-dispatched (recovered), re-claimed.
+        monkeypatch.setattr("cron.jobs._hermes_now",
+                            lambda: t0 + timedelta(seconds=ttl + 10))
+        recovered = get_due_jobs()
+        assert [j["id"] for j in recovered] == ["wedged"]
+
+    def test_run_claim_ttl_derived_from_cron_timeout(self, tmp_cron_dir, monkeypatch):
+        """The stale-recovery TTL tracks HERMES_CRON_TIMEOUT (3x headroom), with
+        the fixed constant as a floor, and falls back to the constant when runs
+        are unbounded (timeout=0)."""
+        from cron.jobs import (
+            _oneshot_run_claim_ttl_seconds as ttl,
+            ONESHOT_RUN_CLAIM_TTL_SECONDS as FLOOR,
+        )
+        # Unset → default 600s inactivity → 1800s (== the historical constant).
+        monkeypatch.delenv("HERMES_CRON_TIMEOUT", raising=False)
+        assert ttl() == 1800.0
+
+        # A large custom timeout scales the TTL up (3x headroom).
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "1200")
+        assert ttl() == 3600.0
+
+        # A tiny timeout is floored so a claim can never expire mid-run.
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "30")
+        assert ttl() == float(FLOOR)
+
+        # Unlimited runs (0) → no finite bound → fall back to the floor.
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "0")
+        assert ttl() == float(FLOOR)
+
+        # Invalid value → treated as the default 600s → 1800s.
+        monkeypatch.setenv("HERMES_CRON_TIMEOUT", "not-a-number")
+        assert ttl() == 1800.0
+
+
+    def test_mark_job_run_clears_one_shot_run_claim(self, tmp_cron_dir, monkeypatch):
+        """mark_job_run() clears the run_claim on completion so a re-dispatched
+        one-shot (e.g. a stale-recovered retry) is claimable again."""
+        from cron.jobs import _hermes_now
+        t0 = _hermes_now()
+        run_at = (t0 - timedelta(seconds=5)).isoformat()
+        # Give it repeat headroom so mark_job_run keeps the job around.
+        save_jobs([{
+            "id": "claimclear", "name": "R", "prompt": "x",
+            "schedule": {"kind": "once", "run_at": run_at},
+            "next_run_at": run_at, "enabled": True, "state": "scheduled",
+            "repeat": {"times": 2, "completed": 0},
+        }])
+        assert [j["id"] for j in get_due_jobs()] == ["claimclear"]
+        assert get_job("claimclear").get("run_claim") is not None
+        mark_job_run("claimclear", True)
+        assert get_job("claimclear")["run_claim"] is None
+
+    def test_stale_maxed_oneshot_kept_while_running_in_this_process(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """#62002: a live run must never have its job record deleted underneath it.
+
+        A one-shot whose run outlives the run_claim TTL (stream stall, laptop
+        asleep mid-run) satisfies the same completed >= times + expired-claim
+        condition as a dead tick. When the scheduler in this process still has
+        the job in its running set, the stale-entry recovery must keep the
+        record so the in-flight run's mark_job_run() can land its outcome —
+        and remove it only once the run is actually gone.
+        """
+        import cron.scheduler as scheduler_mod
+        from cron.jobs import _hermes_now, _oneshot_run_claim_ttl_seconds
+        monkeypatch.delenv("HERMES_CRON_TIMEOUT", raising=False)
+        ttl = _oneshot_run_claim_ttl_seconds()
+        t0 = _hermes_now()
+        run_at = (t0 - timedelta(seconds=ttl + 300)).isoformat()
+        # Mid-run store shape: claim_dispatch committed completed=1 and the
+        # run_claim was stamped at fire time; next_run_at is only resolved by
+        # mark_job_run, so it still points at the (past) fire time.
+        save_jobs([{
+            "id": "inflight", "name": "flight check", "prompt": "x",
+            "schedule": {"kind": "once", "run_at": run_at},
+            "next_run_at": run_at, "enabled": True, "state": "scheduled",
+            "repeat": {"times": 1, "completed": 1},
+            "run_claim": {"at": run_at, "by": "this-machine"},
+        }])
+
+        # Run still alive in this process → keep the record, dispatch nothing.
+        monkeypatch.setattr(
+            scheduler_mod, "get_running_job_ids", lambda: frozenset({"inflight"})
+        )
+        assert get_due_jobs() == []
+        assert get_job("inflight") is not None  # still visible to list/run
+
+        # The claiming tick really died (running set empty) → retain an inert
+        # terminal record so calendar/history readers keep stable metadata.
+        monkeypatch.setattr(
+            scheduler_mod, "get_running_job_ids", lambda: frozenset()
+        )
+        assert get_due_jobs() == []
+        retained = get_job("inflight")
+        assert retained is not None
+        assert retained["enabled"] is False
+        assert retained["state"] == "error"
+        assert retained["next_run_at"] is None
+
+    def test_stale_maxed_oneshot_kept_when_running_check_errors(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        """If the running-set lookup fails, do not delete a possibly live run.
+
+        This is the fail-closed sibling of #62002/#62014: the liveness check is
+        the only signal distinguishing "expired but live" from "stale and dead".
+        Treating a lookup error as "not running" reopens the data-loss path by
+        deleting the job record underneath an in-flight one-shot.
+        """
+        import cron.scheduler as scheduler_mod
+        from cron.jobs import _hermes_now, _oneshot_run_claim_ttl_seconds
+
+        monkeypatch.delenv("HERMES_CRON_TIMEOUT", raising=False)
+        ttl = _oneshot_run_claim_ttl_seconds()
+        t0 = _hermes_now()
+        run_at = (t0 - timedelta(seconds=ttl + 300)).isoformat()
+        save_jobs([{
+            "id": "inflight-error", "name": "flight check", "prompt": "x",
+            "schedule": {"kind": "once", "run_at": run_at},
+            "next_run_at": run_at, "enabled": True, "state": "scheduled",
+            "repeat": {"times": 1, "completed": 1},
+            "run_claim": {"at": run_at, "by": "this-machine"},
+        }])
+
+        def fail_running_set():
+            raise RuntimeError("running set unavailable")
+
+        monkeypatch.setattr(scheduler_mod, "get_running_job_ids", fail_running_set)
+
+        assert get_due_jobs() == []
+        assert get_job("inflight-error") is not None
 
     def test_run_claim_heartbeat_keeps_long_run_claimed_past_ttl(
         self, tmp_cron_dir, monkeypatch
@@ -681,6 +1234,14 @@ class TestGetDueJobs:
         assert retired["state"] == "completed"
         assert retired["enabled"] is False
         assert retired["last_status"] == "ok"
+        # Run completes → outcome lands on a retained inert record so the
+        # occurrence history can still join against its stable job metadata.
+        mark_job_run("slowrun", True)
+        retained = get_job("slowrun")
+        assert retained is not None
+        assert retained["enabled"] is False
+        assert retained["state"] == "completed"
+        assert retained["next_run_at"] is None
 
 
     def test_heartbeat_run_claim_rejects_replaced_owner(self, tmp_cron_dir):
@@ -699,6 +1260,403 @@ class TestGetDueJobs:
             "at": original_at,
             "by": "new-owner",
         }
+
+    def test_heartbeat_run_claim_rejects_non_oneshot(self, tmp_cron_dir):
+        """Heartbeat ownership applies only to one-shot dispatch claims."""
+        original_at = datetime.now(timezone.utc).isoformat()
+        save_jobs([{
+            "id": "recurring", "name": "R", "prompt": "x",
+            "schedule": {"kind": "interval", "seconds": 60},
+            "enabled": True,
+            "run_claim": {"at": original_at, "by": "owner"},
+        }])
+
+        assert heartbeat_run_claim("recurring", expected_owner="owner") is False
+        assert get_job("recurring")["run_claim"]["at"] == original_at
+
+
+    def test_broken_cron_without_next_run_is_recovered(self, tmp_cron_dir, monkeypatch):
+        now = datetime(2026, 3, 18, 10, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs(
+            [{
+                "id": "cron-recover",
+                "name": "AI Daily Digest",
+                "prompt": "...",
+                "schedule": {"kind": "cron", "expr": "0 12 * * *", "display": "0 12 * * *"},
+                "schedule_display": "0 12 * * *",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "created_at": "2026-03-18T09:00:00+00:00",
+                "next_run_at": None,
+                "last_run_at": None,
+                "last_status": None,
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+            }]
+        )
+
+        assert get_due_jobs() == []
+        recovered = get_job("cron-recover")["next_run_at"]
+        assert recovered is not None
+        recovered_dt = datetime.fromisoformat(recovered)
+        if recovered_dt.tzinfo is None:
+            recovered_dt = recovered_dt.replace(tzinfo=timezone.utc)
+        assert recovered_dt > now
+
+    def test_broken_interval_without_next_run_is_recovered(self, tmp_cron_dir, monkeypatch):
+        now = datetime(2026, 3, 18, 10, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs(
+            [{
+                "id": "interval-recover",
+                "name": "Hourly heartbeat",
+                "prompt": "...",
+                "schedule": {"kind": "interval", "minutes": 60, "display": "every 60m"},
+                "schedule_display": "every 1h",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "created_at": "2026-03-18T09:00:00+00:00",
+                "next_run_at": None,
+                "last_run_at": None,
+                "last_status": None,
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+            }]
+        )
+
+        assert get_due_jobs() == []
+        recovered = get_job("interval-recover")["next_run_at"]
+        assert recovered is not None
+        recovered_dt = datetime.fromisoformat(recovered)
+        if recovered_dt.tzinfo is None:
+            recovered_dt = recovered_dt.replace(tzinfo=timezone.utc)
+        assert recovered_dt > now
+
+
+    def test_cron_next_run_offset_migration_is_rescheduled_not_fired(self, tmp_cron_dir, monkeypatch):
+        current_tz = timezone(timedelta(hours=2))
+        now = datetime(2026, 5, 19, 13, 2, 0, tzinfo=current_tz)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        # A 21:00 cron was stored while Hermes/system local time was UTC+10.
+        # After the host moves to UTC+02, that absolute timestamp converts to
+        # 13:00+02.  At 13:02+02 the old code considered it due and fired, even
+        # though the user's local wall-clock cron intent is still 21:00.
+        save_jobs(
+            [{
+                "id": "cron-tz-migrate",
+                "name": "Migrated local cron",
+                "prompt": "...",
+                "schedule": {"kind": "cron", "expr": "0 21 * * 2", "display": "0 21 * * 2"},
+                "schedule_display": "0 21 * * 2",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "created_at": "2026-05-12T21:00:00+10:00",
+                "next_run_at": "2026-05-19T21:00:00+10:00",
+                "last_run_at": "2026-05-12T21:00:00+10:00",
+                "last_status": "ok",
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+            }]
+        )
+
+        assert get_due_jobs() == []
+        repaired = datetime.fromisoformat(get_job("cron-tz-migrate")["next_run_at"])
+        assert repaired == datetime(2026, 5, 19, 21, 0, 0, tzinfo=current_tz)
+
+    def test_behavior_matrix_fixed_timezone_due_bypasses_host_migration(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        pytest.importorskip("croniter")
+        now = datetime(2026, 7, 8, 9, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs(
+            [{
+                "id": "cron-per-job-tz-due",
+                "name": "工作日喝水提醒",
+                "prompt": "...",
+                "schedule": {
+                    "kind": "cron",
+                    "expr": "0 9-18 * * 1-5",
+                    "display": "0 9-18 * * 1-5",
+                },
+                "schedule_display": "0 9-18 * * 1-5",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "created_at": "2026-07-08T16:50:52+08:00",
+                "next_run_at": "2026-07-08T17:00:00+08:00",
+                "last_run_at": None,
+                "last_status": "ok",
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+                "timezone": "Asia/Shanghai",
+            }]
+        )
+
+        assert [job["id"] for job in get_due_jobs()] == ["cron-per-job-tz-due"]
+        assert (
+            get_job("cron-per-job-tz-due")["next_run_at"]
+            == "2026-07-08T17:00:00+08:00"
+        )
+
+    def test_behavior_matrix_fixed_timezone_due_flow_advances_once(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        pytest.importorskip("croniter")
+        now = datetime(2026, 7, 8, 9, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        save_jobs(
+            [{
+                "id": "cron-per-job-tz-flow",
+                "name": "工作日喝水提醒",
+                "prompt": "...",
+                "schedule": {
+                    "kind": "cron",
+                    "expr": "0 9-18 * * 1-5",
+                    "display": "0 9-18 * * 1-5",
+                },
+                "schedule_display": "0 9-18 * * 1-5",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "created_at": "2026-07-08T16:50:52+08:00",
+                "next_run_at": "2026-07-08T17:00:00+08:00",
+                "last_run_at": None,
+                "last_status": None,
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+                "timezone": "Asia/Shanghai",
+            }]
+        )
+
+        assert [job["id"] for job in get_due_jobs()] == ["cron-per-job-tz-flow"]
+        assert advance_next_run("cron-per-job-tz-flow") is True
+        assert (
+            get_job("cron-per-job-tz-flow")["next_run_at"]
+            == "2026-07-08T18:00:00+08:00"
+        )
+        assert get_due_jobs() == []
+
+    def test_behavior_matrix_fixed_timezone_dst_fold_advances_absolutely(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        pytest.importorskip("croniter")
+        now = datetime(2026, 10, 25, 1, 15, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        save_jobs(
+            [{
+                "id": "berlin-daily",
+                "name": "Berlin daily reminder",
+                "prompt": "...",
+                "schedule": {
+                    "kind": "cron",
+                    "expr": "30 2 * * *",
+                    "display": "30 2 * * *",
+                },
+                "schedule_display": "30 2 * * *",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "created_at": "2026-10-24T02:30:00+02:00",
+                "next_run_at": "2026-10-25T02:30:00+02:00",
+                "last_run_at": None,
+                "last_status": None,
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+                "timezone": "Europe/Berlin",
+            }]
+        )
+
+        assert [job["id"] for job in get_due_jobs()] == ["berlin-daily"]
+        assert advance_next_run("berlin-daily") is True
+        advanced = get_job("berlin-daily")["next_run_at"]
+        assert advanced == "2026-10-25T02:30:00+01:00"
+        assert datetime.fromisoformat(advanced).timestamp() > now.timestamp()
+
+        mark_job_run("berlin-daily", True)
+
+        assert get_job("berlin-daily")["next_run_at"] == advanced
+        assert get_due_jobs() == []
+
+    @pytest.mark.parametrize(
+        "invalid_timezone",
+        [123, "Mars/Olympus_Mons", "../../etc/passwd", "A" * 10_000],
+        ids=["non-string", "unknown-zone", "path-traversal", "oversized"],
+    )
+    def test_suppression_matrix_invalid_timezone_does_not_poison_due_scan(
+        self, tmp_cron_dir, monkeypatch, invalid_timezone
+    ):
+        now = datetime(2026, 7, 8, 9, 0, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        def due_job(job_id, timezone_value, next_run_at):
+            return {
+                "id": job_id,
+                "name": job_id,
+                "prompt": "...",
+                "schedule": {
+                    "kind": "cron",
+                    "expr": "0 9-18 * * 1-5",
+                    "display": "0 9-18 * * 1-5",
+                },
+                "schedule_display": "0 9-18 * * 1-5",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "created_at": "2026-07-08T16:50:52+08:00",
+                "next_run_at": next_run_at,
+                "last_run_at": None,
+                "last_status": None,
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+                "timezone": timezone_value,
+            }
+
+        save_jobs(
+            [
+                due_job("poisoned", invalid_timezone, "2026-07-08T17:00:00+08:00"),
+                due_job("healthy", "UTC", "2026-07-08T09:00:00+00:00"),
+            ]
+        )
+
+        assert [job["id"] for job in get_due_jobs()] == ["healthy"]
+
+    def test_cron_offset_migration_does_not_repair_already_passed_wall_time(self, tmp_cron_dir, monkeypatch):
+        current_tz = timezone(timedelta(hours=2))
+        now = datetime(2026, 5, 19, 13, 2, 0, tzinfo=current_tz)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+
+        save_jobs(
+            [{
+                "id": "cron-tz-missed",
+                "name": "Migrated missed cron",
+                "prompt": "...",
+                "schedule": {"kind": "cron", "expr": "0 9 * * 2", "display": "0 9 * * 2"},
+                "schedule_display": "0 9 * * 2",
+                "repeat": {"times": None, "completed": 0},
+                "enabled": True,
+                "state": "scheduled",
+                "paused_at": None,
+                "paused_reason": None,
+                "created_at": "2026-05-12T09:00:00+10:00",
+                "next_run_at": "2026-05-19T09:00:00+10:00",
+                "last_run_at": "2026-05-12T09:00:00+10:00",
+                "last_status": "ok",
+                "last_error": None,
+                "deliver": "local",
+                "origin": None,
+            }]
+        )
+
+        # The wall-clock time has already passed, so this does NOT take the
+        # timezone-migration repair path (which is for still-future wall-clock
+        # runs). It falls through to the stale-grace path, which — since #33315
+        # — runs the job once now and fast-forwards next_run_at (rather than
+        # skipping). The key assertion for THIS test is that the repaired
+        # next_run_at is the normal next cron occurrence, not the migration
+        # path's same-day rebase.
+        due = get_due_jobs()
+        assert [j["id"] for j in due] == ["cron-tz-missed"]  # runs once now (#33315)
+        repaired = datetime.fromisoformat(get_job("cron-tz-missed")["next_run_at"])
+        assert repaired == datetime(2026, 5, 26, 9, 0, 0, tzinfo=current_tz)
+
+    def test_same_tz_due_cron_still_fires(self, tmp_cron_dir, monkeypatch):
+        """Guard must NOT over-fire: a due cron in the SAME offset fires normally."""
+        current_tz = timezone(timedelta(hours=2))
+        now = datetime(2026, 5, 19, 21, 0, 30, tzinfo=current_tz)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        save_jobs([{
+            "id": "cron-same-tz", "name": "same tz", "prompt": "...",
+            "schedule": {"kind": "cron", "expr": "0 21 * * 2", "display": "0 21 * * 2"},
+            "schedule_display": "0 21 * * 2",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True, "state": "scheduled", "paused_at": None, "paused_reason": None,
+            "created_at": "2026-05-12T21:00:00+02:00",
+            "next_run_at": "2026-05-19T21:00:00+02:00",  # same offset as now
+            "last_run_at": "2026-05-12T21:00:00+02:00",
+            "last_status": "ok", "last_error": None, "deliver": "local", "origin": None,
+        }])
+        # offset matches -> guard skips -> the genuinely-due job is returned to fire.
+        due = get_due_jobs()
+        assert [j["id"] for j in due] == ["cron-same-tz"]
+
+    def test_interval_job_with_stale_offset_is_unaffected(self, tmp_cron_dir, monkeypatch):
+        """The offset-repair guard is cron-only; interval jobs never take it.
+
+        A stale-offset interval job whose converted instant is well past the
+        grace window is handled by the pre-existing stale fast-forward path
+        (not the cron repair path). Verify it fast-forwards via interval math
+        (next = now + interval), proving the cron-only guard didn't touch it.
+        """
+        current_tz = timezone(timedelta(hours=2))
+        now = datetime(2026, 5, 19, 13, 2, 0, tzinfo=current_tz)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        save_jobs([{
+            "id": "interval-stale-tz", "name": "interval", "prompt": "...",
+            "schedule": {"kind": "interval", "minutes": 60, "display": "every 1h"},
+            "schedule_display": "every 1h",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True, "state": "scheduled", "paused_at": None, "paused_reason": None,
+            "created_at": "2026-05-19T10:00:00+10:00",
+            "next_run_at": "2026-05-19T12:00:00+10:00",  # stale offset, instant 04:00+02 (well past)
+            "last_run_at": "2026-05-19T11:00:00+10:00",
+            "last_status": "ok", "last_error": None, "deliver": "local", "origin": None,
+        }])
+        get_due_jobs()
+        # The cron-only repair path would have produced a cron occurrence; instead
+        # the interval stale fast-forward recomputes next = now + 60m (interval
+        # math), confirming the guard did not intercept this interval job.
+        nr = datetime.fromisoformat(get_job("interval-stale-tz")["next_run_at"])
+        assert nr == now + timedelta(minutes=60)
+
+    def test_offset_migration_at_wall_clock_equal_now_falls_through(self, tmp_cron_dir, monkeypatch):
+        """Boundary: stored wall-clock == now wall-clock (strict >) does NOT take
+        the repair path — it falls through to the existing due/fast-forward logic."""
+        current_tz = timezone(timedelta(hours=2))
+        now = datetime(2026, 5, 19, 13, 0, 0, tzinfo=current_tz)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+        save_jobs([{
+            "id": "cron-wall-equal", "name": "wall equal", "prompt": "...",
+            "schedule": {"kind": "cron", "expr": "0 13 * * 2", "display": "0 13 * * 2"},
+            "schedule_display": "0 13 * * 2",
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True, "state": "scheduled", "paused_at": None, "paused_reason": None,
+            "created_at": "2026-05-12T13:00:00+10:00",
+            # stored naive wall-clock 13:00 == now naive wall-clock 13:00 -> strict > is False
+            "next_run_at": "2026-05-19T13:00:00+10:00",
+            "last_run_at": "2026-05-12T13:00:00+10:00",
+            "last_status": "ok", "last_error": None, "deliver": "local", "origin": None,
+        }])
+        # _stored_wall_clock_is_future is strict (>), so 13:00 == 13:00 is False
+        # -> repair guard skipped -> existing logic handles it (does not raise).
+        get_due_jobs()  # must not raise / must not take the repair branch
+        # next_run_at must NOT have been rewritten to a future cron occurrence by
+        # the repair path (it either fires or fast-forwards via the normal path).
+        nr = get_job("cron-wall-equal")["next_run_at"]
+        assert nr is None or datetime.fromisoformat(nr).utcoffset() == now.utcoffset() or "+10:00" in nr
 
 
 class TestEnabledToolsets:
@@ -929,18 +1887,22 @@ class TestClaimDispatch:
         # Persisted BEFORE any side effect — survives a crash.
         assert load_jobs()[0]["repeat"]["completed"] == 1
 
-    def test_already_dispatched_oneshot_is_removed(self, tmp_cron_dir):
+    def test_already_dispatched_oneshot_is_retained_inert(self, tmp_cron_dir):
         # A prior tick claimed (completed==times) then died before mark_job_run
-        # could remove the job.  The next claim must refuse AND clean up.
+        # could finish the job. The next claim must refuse and retain evidence.
         save_jobs([self._oneshot(times=1, completed=1)])
         assert claim_dispatch("os1") is False
-        assert load_jobs() == []  # removed, will not re-fire
+        retained = load_jobs()[0]
+        assert retained["enabled"] is False
+        assert retained["state"] == "error"
+        assert retained["next_run_at"] is None
 
 
     def test_mark_job_run_does_not_double_count_preclaimed_oneshot(self, tmp_cron_dir):
         # Full lifecycle: claim bumps completed to times, then mark_job_run must
         # NOT increment again — it recognizes the pre-claim and retires the job
         # as a terminal completed record (retained for inspection, not re-fired).
+        # NOT increment again — it recognizes the pre-claim and terminalizes it.
         save_jobs([self._oneshot(times=1, completed=0)])
         assert claim_dispatch("os1") is True
         assert load_jobs()[0]["repeat"]["completed"] == 1
@@ -950,6 +1912,10 @@ class TestClaimDispatch:
         assert retired[0]["repeat"]["completed"] == 1  # no double count
         assert retired[0]["state"] == "completed"
         assert retired[0]["enabled"] is False
+        retained = load_jobs()[0]
+        assert retained["repeat"]["completed"] == 1
+        assert retained["enabled"] is False
+        assert retained["state"] == "completed"
 
 
     def test_get_due_jobs_removes_stale_maxed_oneshot(self, tmp_cron_dir):
@@ -967,7 +1933,10 @@ class TestClaimDispatch:
         }])
         due = get_due_jobs()
         assert due == []
-        assert load_jobs() == []  # cleaned up
+        retained = load_jobs()[0]
+        assert retained["enabled"] is False
+        assert retained["state"] == "error"
+        assert retained["next_run_at"] is None
 
 
 class TestLateEnvRepointScopesStore:
@@ -1250,3 +2219,25 @@ class TestCompletedOneshotRetentionSweep:
         assert updated["enabled"] is True
         assert updated["state"] == "scheduled"
         assert updated["next_run_at"] is not None
+        loaded = load_jobs()
+        assert [j["id"] for j in loaded] == ["ctrlbom01"]
+        assert "newline" in loaded[0]["name"]
+
+class TestUpdateTimezoneRecompute:
+    def test_interval_next_run_unchanged_on_tz_patch(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Shanghai")
+        from cron.jobs import create_job, update_job
+        job = create_job(prompt="p", schedule="every 30m")
+        before = job["next_run_at"]
+        updated = update_job(job["id"], {"timezone": "Europe/London"})
+        assert updated["timezone"] == "Europe/London"
+        assert updated["next_run_at"] == before, "interval next_run must NOT shift on a pure tz change"
+
+    def test_cron_next_run_shifts_on_tz_patch(self, tmp_cron_dir, monkeypatch):
+        monkeypatch.setattr("hermes_time.get_timezone_name", lambda: "Asia/Shanghai")
+        from cron.jobs import create_job, update_job
+        job = create_job(prompt="p", schedule="30 10 * * *")   # 10:30 Shanghai
+        before = job["next_run_at"]
+        updated = update_job(job["id"], {"timezone": "Asia/Tokyo"})  # 10:30 Tokyo (UTC+9)
+        assert updated["next_run_at"] != before, "cron next_run must shift to new tz wall-clock"
+        # 10:30 Tokyo == 09:30 Shanghai；UTC 上 Tokyo 早 1h

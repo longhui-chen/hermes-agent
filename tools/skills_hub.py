@@ -20,8 +20,11 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
+import threading
 import time
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -35,12 +38,24 @@ import httpx
 import yaml
 
 from tools.skills_guard import (
-    ScanResult, content_hash, TRUSTED_REPOS,
+    ScanResult, content_hash, full_content_hash, TRUSTED_REPOS,
 )
 from tools.url_safety import is_safe_url
 from tools.website_policy import check_website_access
 
 logger = logging.getLogger(__name__)
+
+msvcrt = None
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - platform-specific fallback
+    fcntl = None
+    try:
+        import msvcrt
+    except ImportError:
+        pass
+
+_HUB_LOCK_THREAD_GUARD = threading.RLock()
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +165,30 @@ class SkillBundle:
     identifier: str
     trust_level: str
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _InstallMutationAuthorization:
+    skill_name: str
+    identifier: str
+    source_url: str
+    quarantine_hash: str
+
+
+def _issue_install_mutation_authorization(
+    skill_name: str,
+    bundle: SkillBundle,
+    *,
+    approved_source_url: str,
+    approved_quarantine_hash: str,
+) -> _InstallMutationAuthorization:
+    """Bind one internal install capability to the user-approved scan result."""
+    return _InstallMutationAuthorization(
+        skill_name=skill_name,
+        identifier=bundle.identifier,
+        source_url=approved_source_url,
+        quarantine_hash=approved_quarantine_hash,
+    )
 
 
 _ALLOWED_SUPPORT_DIRS = frozenset({"references", "templates", "scripts", "assets", "examples"})
@@ -3514,9 +3553,60 @@ class HubLockFile:
         except (json.JSONDecodeError, OSError):
             return {"version": 1, "installed": {}}
 
+    @contextmanager
+    def _mutation_lock(self):
+        """Serialize complete lock-file read-modify-write cycles."""
+        lock_path = self.path.with_suffix(f"{self.path.suffix}.mutation.lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with _HUB_LOCK_THREAD_GUARD:
+            if fcntl is None and msvcrt is None:
+                yield
+                return
+            if msvcrt and (
+                not lock_path.exists() or lock_path.stat().st_size == 0
+            ):
+                lock_path.write_text(" ", encoding="utf-8")
+            handle = open(
+                lock_path,
+                "r+" if msvcrt else "a+",
+                encoding="utf-8",
+            )
+            try:
+                if fcntl:
+                    fcntl.flock(handle, fcntl.LOCK_EX)
+                else:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                yield
+            finally:
+                if fcntl:
+                    fcntl.flock(handle, fcntl.LOCK_UN)
+                else:
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                handle.close()
+
     def save(self, data: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        payload = json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+        temp_path: Optional[Path] = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+                temp_path = Path(handle.name)
+            os.replace(temp_path, self.path)
+        finally:
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
 
     def record_install(
         self,
@@ -3537,26 +3627,28 @@ class HubLockFile:
         # write time so the file never carries the bad state.
         safe_name = _validate_skill_name(name)
         safe_install_path = _normalize_lock_install_path(install_path, safe_name)
-        data = self.load()
-        data["installed"][safe_name] = {
-            "source": source,
-            "identifier": identifier,
-            "trust_level": trust_level,
-            "scan_verdict": scan_verdict,
-            "content_hash": skill_hash,
-            "install_path": safe_install_path,
-            "files": files,
-            "metadata": metadata or {},
-            "scan_provenance": scan_provenance or {},
-            "installed_at": datetime.now(timezone.utc).isoformat(),
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-        self.save(data)
+        with self._mutation_lock():
+            data = self.load()
+            data["installed"][safe_name] = {
+                "source": source,
+                "identifier": identifier,
+                "trust_level": trust_level,
+                "scan_verdict": scan_verdict,
+                "content_hash": skill_hash,
+                "install_path": safe_install_path,
+                "files": files,
+                "metadata": metadata or {},
+                "scan_provenance": scan_provenance or {},
+                "installed_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self.save(data)
 
     def record_uninstall(self, name: str) -> None:
-        data = self.load()
-        data["installed"].pop(name, None)
-        self.save(data)
+        with self._mutation_lock():
+            data = self.load()
+            data["installed"].pop(name, None)
+            self.save(data)
 
     def get_installed(self, name: str) -> Optional[dict]:
         data = self.load()
@@ -3715,6 +3807,7 @@ def install_from_quarantine(
     bundle: SkillBundle,
     scan_result: ScanResult,
     scan_provenance: Optional[Dict[str, Any]] = None,
+    _authorization: Optional[_InstallMutationAuthorization] = None,
 ) -> Path:
     """Move a scanned skill from quarantine into the skills directory."""
     safe_skill_name = _validate_skill_name(skill_name)
@@ -3811,29 +3904,61 @@ def install_from_quarantine(
             f"Installed skill contains symlinks, which is not allowed: {rel}"
         )
 
-    install_dir.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(quarantine_path), str(install_dir))
-
-    # Record in lock file
-    lock = HubLockFile()
-    lock.record_install(
-        name=safe_skill_name,
-        source=bundle.source,
+    expected_authorization = _InstallMutationAuthorization(
+        skill_name=safe_skill_name,
         identifier=bundle.identifier,
-        trust_level=bundle.trust_level,
-        scan_verdict=scan_result.verdict,
-        skill_hash=content_hash(install_dir),
-        install_path=str(install_dir.relative_to(_skills_dir())),
-        files=list(bundle.files.keys()),
-        metadata=bundle.metadata,
-        scan_provenance=scan_provenance or getattr(scan_result, "scan_provenance", None),
+        source_url=source_url_for_bundle(bundle),
+        quarantine_hash=full_content_hash(quarantine_path),
     )
+    if _authorization != expected_authorization:
+        raise PermissionError(
+            "Install mutation requires authorization bound to this exact "
+            "skill identifier and scanned quarantine content."
+        )
 
-    append_audit_log(
-        "INSTALL", safe_skill_name, bundle.source,
-        bundle.trust_level, scan_result.verdict,
-        content_hash(install_dir),
+    install_dir.parent.mkdir(parents=True, exist_ok=True)
+    backup_root = Path(
+        tempfile.mkdtemp(prefix=".skill-install-backup.", dir=_hub_dir())
     )
+    backup_dir = backup_root / safe_skill_name
+    try:
+        if install_dir.exists():
+            shutil.move(str(install_dir), str(backup_dir))
+        shutil.move(str(quarantine_path), str(install_dir))
+
+        # The lock update is part of the install transaction. If it fails,
+        # restore both the quarantined candidate and any previous installation
+        # before surfacing the error to the caller.
+        lock = HubLockFile()
+        lock.record_install(
+            name=safe_skill_name,
+            source=bundle.source,
+            identifier=bundle.identifier,
+            trust_level=bundle.trust_level,
+            scan_verdict=scan_result.verdict,
+            skill_hash=content_hash(install_dir),
+            install_path=str(install_dir.relative_to(_skills_dir())),
+            files=list(bundle.files.keys()),
+            metadata=bundle.metadata,
+            scan_provenance=scan_provenance or getattr(scan_result, "scan_provenance", None),
+        )
+    except Exception:
+        if install_dir.exists() and not quarantine_path.exists():
+            shutil.move(str(install_dir), str(quarantine_path))
+        if backup_dir.exists() and not install_dir.exists():
+            shutil.move(str(backup_dir), str(install_dir))
+        raise
+    finally:
+        shutil.rmtree(backup_root, ignore_errors=True)
+
+    try:
+        append_audit_log(
+            "INSTALL", safe_skill_name, bundle.source,
+            bundle.trust_level, scan_result.verdict,
+            content_hash(install_dir),
+        )
+    except OSError as exc:
+        logger.warning("Installed skill but could not append audit log: %s", exc)
 
     return install_dir
 

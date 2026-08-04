@@ -149,7 +149,13 @@ class FileToolsIntegrationTests(unittest.TestCase):
 
     def setUp(self) -> None:
         file_state.get_registry().clear()
-        self._tmpdir = tempfile.mkdtemp(prefix="hermes_file_state_int_")
+        # macOS: the default $TMPDIR is /var/folders, which file_tools.py treats
+        # as a sensitive system path (/private/var) and refuses to write to via
+        # write_file_tool — failing these integration tests on a Mac host while
+        # they pass on Linux CI (which uses /tmp). Anchor the temp tree under
+        # /tmp (-> /private/tmp, not sensitive) when available.
+        _tmp_base = "/tmp" if os.path.isdir("/tmp") else None
+        self._tmpdir = tempfile.mkdtemp(prefix="hermes_file_state_int_", dir=_tmp_base)
 
     def tearDown(self) -> None:
         import shutil

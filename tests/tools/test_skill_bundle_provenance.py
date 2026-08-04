@@ -139,21 +139,33 @@ def test_lock_file_persists_scan_provenance(tmp_path):
 
 
 def test_real_temp_repo_and_home_install_e2e(served_repo, monkeypatch, tmp_path):
-    from hermes_cli.skills_hub import do_install
+    from hermes_cli.skills_hub import _DIRECT_USER_INSTALL_REQUEST, do_install
     import tools.skills_hub as hub
 
     _repo, url = served_repo
     home = tmp_path / "home"
     monkeypatch.setenv("HERMES_HOME", str(home))
+    hub_dir = home / "skills" / ".hub"
+    monkeypatch.setattr(hub, "SKILLS_DIR", home / "skills")
+    monkeypatch.setattr(hub, "HUB_DIR", hub_dir)
+    monkeypatch.setattr(hub, "LOCK_FILE", hub_dir / "lock.json")
+    monkeypatch.setattr(hub, "QUARANTINE_DIR", hub_dir / "quarantine")
+    monkeypatch.setattr(hub, "AUDIT_LOG", hub_dir / "audit.log")
+    monkeypatch.setattr(hub, "INDEX_CACHE_DIR", hub_dir / "index-cache")
     monkeypatch.setattr("tools.skills_hub.is_safe_url", lambda _url: True)
     monkeypatch.setattr("tools.skills_hub.check_website_access", lambda _url: None)
     monkeypatch.setattr(hub, "create_source_router", lambda auth=None: [UrlSource()])
 
     sink = StringIO()
-    do_install(url, console=Console(file=sink, force_terminal=False), skip_confirm=True)
+    do_install(
+        url,
+        console=Console(file=sink, force_terminal=False),
+        skip_confirm=True,
+        _agent_request=_DIRECT_USER_INSTALL_REQUEST,
+    )
 
     installed = home / "skills" / "demo-bundle"
-    assert (installed / "references" / "guide.md").read_text() == "safe guide\n"
+    assert (installed / "references" / "guide.md").read_text() == "safe guide\n", sink.getvalue()
     assert (installed / "templates" / "report.md").is_file()
     assert (installed / "scripts" / "run.py").is_file()
     assert (installed / "examples" / "endpoint-inventory.md").is_file()

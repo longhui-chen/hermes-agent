@@ -2699,3 +2699,211 @@ class TestMCPDiscoveryCrossProcessLock:
                 os.unlink(lock_path)
             except Exception:
                 pass
+            register_mcp_servers(config_off)
+        with _lock:
+            assert sanitize_mcp_name_component("toggle_srv") not in _parallel_safe_servers
+
+
+class TestBuildSafeEnvHomeContract:
+    """``_build_safe_env`` must route the stdio-subprocess env through the
+    shared subprocess HOME contract (hermes_constants.apply_subprocess_home_env).
+
+    ``_build_safe_env`` is a *whitelist* filter, so two things have to hold for
+    the contract to work through it:
+      * ``HERMES_HOME`` must survive the filter (the contract needs it to locate
+        ``{HERMES_HOME}/home`` and the child should carry it onward);
+      * ``HERMES_HOME_FALLBACK`` (the nested-chain anti-flip marker) must pass
+        through so a grandchild spawned by an MCP server inside a nested hermes
+        chain keeps its fallback-injected profile HOME instead of "repairing" it
+        back to a pwd-guessed real home (mirrors execute_code's allowlist).
+    """
+
+    def _host_mode(self, monkeypatch):
+        import hermes_constants
+
+        monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+        monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+        monkeypatch.delenv("HERMES_REAL_HOME", raising=False)
+        monkeypatch.delenv("HERMES_HOME_FALLBACK", raising=False)
+
+    def test_missing_home_falls_back_to_profile_home(self, tmp_path, monkeypatch):
+        """systemd/cron host: no HOME anywhere → inject ``{HERMES_HOME}/home``
+        so an MCP stdio server's ``~``-addressed credentials resolve."""
+        from tools.mcp_tool import _build_safe_env
+
+        self._host_mode(monkeypatch)
+        hermes_home = tmp_path / ".hermes"
+        profile_home = hermes_home / "home"
+        profile_home.mkdir(parents=True)
+        monkeypatch.delenv("HOME", raising=False)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        env = _build_safe_env(None)
+        assert env.get("HOME") == str(profile_home)
+
+    def test_real_home_is_preserved(self, tmp_path, monkeypatch):
+        """Host with a real HOME → auto mode keeps it untouched."""
+        from tools.mcp_tool import _build_safe_env
+
+        self._host_mode(monkeypatch)
+        hermes_home = tmp_path / ".hermes"
+        (hermes_home / "home").mkdir(parents=True)
+        real_home = tmp_path / "real-home"
+        real_home.mkdir()
+        monkeypatch.setenv("HOME", str(real_home))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        env = _build_safe_env(None)
+        assert env.get("HOME") == str(real_home)
+
+    def test_hermes_home_is_whitelisted(self, tmp_path, monkeypatch):
+        """HERMES_HOME must survive the whitelist filter so the contract can
+        resolve the profile home and the child carries it forward."""
+        from tools.mcp_tool import _build_safe_env
+
+        self._host_mode(monkeypatch)
+        hermes_home = tmp_path / ".hermes"
+        (hermes_home / "home").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(tmp_path / "real-home"))
+        (tmp_path / "real-home").mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        env = _build_safe_env(None)
+        assert env.get("HERMES_HOME") == str(hermes_home)
+
+    def test_fallback_marker_passes_through_whitelist(self, tmp_path, monkeypatch):
+        """A HERMES_HOME_FALLBACK marker riding in os.environ (nested hermes
+        chain) must not be filtered out — dropping it would let the child's
+        apply_subprocess_home_env() re-hijack a fallback-injected HOME."""
+        from tools.mcp_tool import _build_safe_env
+
+        self._host_mode(monkeypatch)
+        # Two profiles: parent injected A/home and marked it; this hop is B.
+        base = tmp_path / ".hermes" / "profiles"
+        a = base / "alpha"
+        b = base / "beta"
+        (a / "home").mkdir(parents=True)
+        (b / "home").mkdir(parents=True)
+        monkeypatch.delenv("HOME", raising=False)
+        monkeypatch.setenv("HOME", str(a / "home"))
+        monkeypatch.setenv("HERMES_HOME", str(b))
+        monkeypatch.setenv("HERMES_HOME_FALLBACK", str(a / "home"))
+
+        env = _build_safe_env(None)
+        # The marker survived the whitelist (present in the built env)...
+        assert "HERMES_HOME_FALLBACK" in env
+        # ...and the contract re-pointed HOME at B's own profile home, updating
+        # the marker to match (cross-profile leak closed).
+        assert env.get("HOME") == str(b / "home")
+        assert env.get("HERMES_HOME_FALLBACK") == str(b / "home")
+
+    def test_terminal_home_mode_passes_through_whitelist(self, tmp_path, monkeypatch):
+        """TERMINAL_HOME_MODE (the profile/real/auto mode string) must survive
+        the whitelist. If it is dropped, a nested hermes launched by the MCP
+        server re-enters ``auto`` and repairs HOME back to the real dir on the
+        second hop, breaking profile isolation the parent explicitly pinned."""
+        from tools.mcp_tool import _build_safe_env
+
+        self._host_mode(monkeypatch)
+        hermes_home = tmp_path / ".hermes"
+        profile_home = hermes_home / "home"
+        profile_home.mkdir(parents=True)
+        real_home = tmp_path / "real-home"
+        real_home.mkdir()
+        monkeypatch.setenv("HOME", str(real_home))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("TERMINAL_HOME_MODE", "profile")
+
+        env = _build_safe_env(None)
+        # The mode string is transmitted so the second hop honors it too...
+        assert env.get("TERMINAL_HOME_MODE") == "profile"
+        # ...and profile mode pinned HOME at the profile home this hop.
+        assert env.get("HOME") == str(profile_home)
+
+    def test_real_home_var_not_leaked_to_child(self, tmp_path, monkeypatch):
+        """apply_subprocess_home_env unconditionally writes HERMES_REAL_HOME
+        (the OS-account home, e.g. /Users/alice) into the env. That username-
+        bearing path must NOT reach a third-party MCP server: the whitelist's
+        whole purpose is to keep host env off untrusted subprocesses, and
+        HERMES_REAL_HOME is not needed by the child (HOME is already resolved).
+        """
+        from tools.mcp_tool import _build_safe_env
+
+        self._host_mode(monkeypatch)
+        hermes_home = tmp_path / ".hermes"
+        (hermes_home / "home").mkdir(parents=True)
+        real_home = tmp_path / "real-home"
+        real_home.mkdir()
+        monkeypatch.setenv("HOME", str(real_home))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        env = _build_safe_env(None)
+        assert "HERMES_REAL_HOME" not in env
+
+    def test_real_home_pop_does_not_break_missing_home_fallback(self, tmp_path, monkeypatch):
+        """Popping HERMES_REAL_HOME must not disturb the HOME fallback: HOME is
+        already set by apply, REAL_HOME is only a repair-branch reference the
+        MCP child never uses."""
+        from tools.mcp_tool import _build_safe_env
+
+        self._host_mode(monkeypatch)
+        hermes_home = tmp_path / ".hermes"
+        profile_home = hermes_home / "home"
+        profile_home.mkdir(parents=True)
+        monkeypatch.delenv("HOME", raising=False)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        env = _build_safe_env(None)
+        assert env.get("HOME") == str(profile_home)
+        assert "HERMES_REAL_HOME" not in env
+        # Fallback marker still recorded so nested hops don't re-hijack.
+        assert env.get("HERMES_HOME_FALLBACK") == str(profile_home)
+
+    def test_same_profile_nested_marker_passes_through(self, tmp_path, monkeypatch):
+        """same-profile nested MCP chain: a marker that already equals this
+        hop's HOME/profile home must survive _build_safe_env so a grandchild
+        MCP server does not lose it and re-break ZET-1938 on the second hop."""
+        from tools.mcp_tool import _build_safe_env
+
+        self._host_mode(monkeypatch)
+        hermes_home = tmp_path / ".hermes"
+        profile_home = hermes_home / "home"
+        profile_home.mkdir(parents=True)
+        # Parent already injected the profile home and marked it (same profile).
+        monkeypatch.setenv("HOME", str(profile_home))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_HOME_FALLBACK", str(profile_home))
+
+        env = _build_safe_env(None)
+        # same-profile keep: HOME and the marker both stay at the profile home.
+        assert env.get("HOME") == str(profile_home)
+        assert env.get("HERMES_HOME_FALLBACK") == str(profile_home)
+        assert "HERMES_REAL_HOME" not in env
+
+    def test_contextvar_override_bridges_hermes_home(self, tmp_path, monkeypatch):
+        """A per-request set_hermes_home_override(A) while the process env still
+        carries HERMES_HOME=B must reach the child consistently: the contract
+        resolves HOME from override A, so the child's HERMES_HOME must be A too,
+        not the stale process-global B (else a nested hermes-as-MCP flips it)."""
+        from tools.mcp_tool import _build_safe_env
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        self._host_mode(monkeypatch)
+        a = tmp_path / "profileA" / ".hermes"
+        b = tmp_path / "profileB" / ".hermes"
+        (a / "home").mkdir(parents=True)
+        (b / "home").mkdir(parents=True)
+        monkeypatch.delenv("HOME", raising=False)
+        monkeypatch.setenv("HERMES_HOME", str(b))  # stale process-global
+
+        token = set_hermes_home_override(str(a))
+        try:
+            env = _build_safe_env(None)
+        finally:
+            reset_hermes_home_override(token)
+
+        assert env.get("HERMES_HOME") == str(a)
+        assert env.get("HOME") == str(a / "home")

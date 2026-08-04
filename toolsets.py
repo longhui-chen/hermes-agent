@@ -56,7 +56,7 @@ _HERMES_CORE_TOOLS = [
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
-    "todo", "memory",
+    "todo", "present_plan", "memory",
     # NOTE: the desktop Project tools (project_list/create/switch) are
     # deliberately NOT here. They only make sense where a GUI can follow the
     # move, so they live in the `project` toolset and are enabled solely by the
@@ -68,8 +68,20 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
+    # NOTE: call_agent is deliberately NOT in the core set. Its caller
+    # identity comes from _own_session_id(), which only zet_agent sessions
+    # can produce — on CLI/Telegram/cron the tool would pass the env schema
+    # gate yet every call would be rejected by local-server's owner check.
+    # It lives only in hermes-zet-agent below.
     # Cronjob management
     "cronjob",
+    # Cross-platform messaging (gated on gateway running via check_fn)
+    "send_message",
+    # List THIS agent's connected IM channels (gated on zet_agent env via check_fn)
+    "list_my_channels",
+    "send_channel_message",
+    # Main-only, session-bound read-only unified calendar.
+    "get_personal_calendar",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     # Kanban multi-agent coordination — only in schema when the agent is
@@ -228,8 +240,8 @@ TOOLSETS = {
     },
     
     "todo": {
-        "description": "Task planning and tracking for multi-step work",
-        "tools": ["todo"],
+        "description": "Task planning, plan previews, and tracking for multi-step work",
+        "tools": ["todo", "present_plan"],
         "includes": []
     },
     
@@ -269,6 +281,25 @@ TOOLSETS = {
         "includes": []
     },
     
+    "agent_call": {
+        "description": "Hand tasks to other real agents on this device (zettlab)",
+        "tools": ["call_agent"],
+        "includes": []
+    },
+
+    # Catalog entry is load-bearing for reachability, not just organization:
+    # _get_platform_tools reverse-maps a platform's composite into CATALOG
+    # toolset names (its non-configurable recovery walks TOOLSETS), and
+    # get_tool_definitions then resolves those names back to tools. A tool
+    # registered under a toolset with no catalog entry is an orphan the
+    # reverse-mapping silently drops — registered, gate open, yet absent from
+    # the model's schema (found on a real device).
+    "zettlab_apphost": {
+        "description": "Manage device-hosted generated applications via the local App Host (zettlab)",
+        "tools": ["app_host"],
+        "includes": []
+    },
+
     "delegation": {
         "description": "Spawn subagents with isolated context for complex subtasks",
         "tools": ["delegate_task"],
@@ -462,6 +493,29 @@ TOOLSETS = {
     "hermes-cli": {
         "description": "Full interactive CLI toolset - all default tools plus cronjob management",
         "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
+    "hermes-zet-agent": {
+        # Zet Agent (APIServerAdapter subclass) extends api_server's
+        # OpenAI-compatible /v1/chat/completions surface with structured
+        # SSE events (reasoning/approval/clarify/title) on the
+        # `event: hermes.tool.progress` channel. Because the platform
+        # layer handles those interactive prompts (via threading.Event
+        # blocking + HTTP respond endpoints), it can safely expose the
+        # full _HERMES_CORE_TOOLS set — including clarify, send_message,
+        # and text_to_speech that hermes-api-server explicitly excludes.
+        "description": "Zet Agent — APIServerAdapter + interactive SSE extension (reasoning/approval/clarify/title)",
+        # call_agent on top of core: caller identity requires a zet_agent
+        # session (_own_session_id), so only THIS platform can use it — other
+        # platforms would show the model a tool local-server always rejects.
+        # Still schema-gated by ZET_AGENT_CALL_URL via check_fn.
+        # app_host likewise: local-server's App Host internal face (base URL +
+        # action token) only exists in a zet_agent profile, and installing
+        # generated applications on the device is a device-agent capability —
+        # not something telegram/slack/cron schemas should ever advertise.
+        # Still gated by ZET_APPHOST_BASE_URL + the action token via check_fn.
+        "tools": _HERMES_CORE_TOOLS + ["call_agent", "app_host"],
         "includes": []
     },
 

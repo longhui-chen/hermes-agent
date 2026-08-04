@@ -7,7 +7,48 @@ contract and the CLI-config parity (servers/keys written via the API are
 visible to the CLI data layer), not specific catalog values.
 """
 
+import asyncio
+import threading
+
 import pytest
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["delete", "edit"])
+async def test_learning_mutation_offloads_and_finishes_after_cancellation(
+    monkeypatch, operation
+):
+    import agent.learning_mutations as mutations
+    import hermes_cli.web_server as ws
+
+    event_loop_thread = threading.get_ident()
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def slow_mutation(*_args):
+        assert threading.get_ident() != event_loop_thread
+        started.set()
+        assert release.wait(10)
+        finished.set()
+        return {"ok": True}
+
+    monkeypatch.setattr(mutations, f"{operation}_node", slow_mutation)
+    if operation == "delete":
+        awaitable = ws.delete_learning_node(ws.LearningNodeRef(id="memory:memory:0"))
+    else:
+        awaitable = ws.update_learning_node(
+            ws.LearningNodeEdit(id="memory:memory:0", content="updated")
+        )
+    task = asyncio.create_task(awaitable)
+    assert await asyncio.to_thread(started.wait, 2)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert finished.is_set()
 
 
 def _client():
@@ -246,6 +287,66 @@ class TestMemoryEndpoints:
         assert self.client.post(
             "/api/memory/reset", json={"target": "bogus"}
         ).status_code == 400
+
+    def test_reset_removes_memory_import_recovery_state(self):
+        import hashlib
+        from pathlib import Path
+
+        from hermes_constants import get_hermes_home
+        from tools.memory_tool import MemoryStore
+
+        mem = get_hermes_home() / "memories"
+        (mem / "MEMORY.md").write_text("private old memory", encoding="utf-8")
+        result = MemoryStore(memory_char_limit=100, user_char_limit=100).import_replace(
+            target="memory",
+            entries=["imported memory"],
+            import_id="dashboard-reset-import",
+            payload_sha256=hashlib.sha256(b"dashboard-reset-import").hexdigest(),
+        )
+        recovery_path = Path(result["recovery_path"])
+        backup_path = Path(result["backup_path"])
+        receipt_path = next((mem / ".imports").glob("*.json"))
+
+        response = self.client.post("/api/memory/reset", json={"target": "memory"})
+
+        assert response.status_code == 200
+        assert "MEMORY.md" in response.json()["deleted"]
+        assert not (mem / "MEMORY.md").exists()
+        assert not recovery_path.exists()
+        assert not backup_path.exists()
+        assert not receipt_path.exists()
+
+    def test_reset_cleanup_pending_is_not_reported_as_success(self, monkeypatch):
+        import tools.memory_tool as memory_tool
+
+        monkeypatch.setattr(
+            memory_tool,
+            "reset_curated_memory",
+            lambda _target: {
+                "deleted": ["MEMORY.md"],
+                "targets": ["memory"],
+                "status": "cleanup_pending",
+            },
+        )
+
+        response = self.client.post("/api/memory/reset", json={"target": "memory"})
+
+        assert response.status_code == 503
+        assert response.json()["detail"]["code"] == "memory_reset_cleanup_pending"
+
+    def test_reset_unsupported_is_explicit_and_keeps_memory(self, monkeypatch):
+        import tools.memory_tool as memory_tool
+        from hermes_constants import get_hermes_home
+
+        canonical = get_hermes_home() / "memories" / "MEMORY.md"
+        canonical.write_text("private", encoding="utf-8")
+        monkeypatch.setattr(memory_tool, "_OPEN_SUPPORTS_DIR_FD", False)
+
+        response = self.client.post("/api/memory/reset", json={"target": "memory"})
+
+        assert response.status_code == 501
+        assert response.json()["detail"]["code"] == "memory_reset_unsupported"
+        assert canonical.read_text(encoding="utf-8") == "private"
 
 
 class TestPairingEndpoints:

@@ -64,6 +64,19 @@ def _context_thread_target(callback):
     return lambda: context.run(callback)
 
 
+def _apply_zettlab_summary_headers(summary_kwargs: Dict[str, Any], agent: Any) -> None:
+    """Stamp Zettlab routing/billing headers on manual summary Chat calls."""
+    try:
+        from agent.transports.chat_completions import _apply_zettlab_billing_headers
+
+        _apply_zettlab_billing_headers(
+            summary_kwargs,
+            {"session_id": getattr(agent, "session_id", "")},
+        )
+    except Exception:
+        return
+
+
 def _ra():
     """Lazy ``run_agent`` reference.
 
@@ -1126,6 +1139,10 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         tools_for_api = agent.tools
 
     if agent.api_mode == "anthropic_messages":
+        from agent.response_format import response_format_requires_structured_output
+
+        if response_format_requires_structured_output((agent.request_overrides or {}).get("response_format")):
+            raise ValueError("response_format is not supported by the Anthropic Messages transport.")
         _transport = agent._get_transport()
         anthropic_messages = agent._prepare_anthropic_messages_for_api(api_messages)
         ctx_len = getattr(agent, "context_compressor", None)
@@ -2276,6 +2293,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
 
             if summary_extra_body:
                 summary_kwargs["extra_body"] = summary_extra_body
+            _apply_zettlab_summary_headers(summary_kwargs, agent)
 
             if agent.api_mode == "anthropic_messages":
                 _tsum = agent._get_transport()
@@ -2359,6 +2377,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
+                _apply_zettlab_summary_headers(summary_kwargs, agent)
 
                 summary_client = agent._ensure_primary_openai_client(
                     reason="iteration_limit_summary_retry"
@@ -2408,8 +2427,9 @@ def cleanup_task_resources(agent, task_id: str) -> None:
     torn down per-turn as before to prevent resource leakage (the original
     intent of this hook for the Morph backend, see commit fbd3a2fd).
 
-    Skips ``cleanup_browser`` in headed mode so the browser window stays
-    visible between turns. The inactivity reaper in
+    Skips ``cleanup_browser`` in headed mode or while local-server owns the
+    managed browser session so the same page survives between turns. The
+    explicit close path and inactivity reaper in
     ``browser_tool._cleanup_inactive_browser_sessions`` still handles
     idle sessions.
     """
@@ -2426,17 +2446,22 @@ def cleanup_task_resources(agent, task_id: str) -> None:
         if agent.verbose_logging:
             logger.warning("Failed to cleanup VM for task %s: %s", task_id, e)
     try:
-        headed = False
+        preserve_browser_session = False
         try:
-            from tools.browser_tool import _is_headed_mode
-            headed = _is_headed_mode()
+            from tools.browser_tool import (
+                _is_headed_mode,
+                _is_managed_browser_configured,
+            )
+            preserve_browser_session = (
+                _is_headed_mode() or _is_managed_browser_configured()
+            )
         except Exception:
-            headed = bool(os.environ.get("AGENT_BROWSER_HEADED"))
-        if headed:
+            preserve_browser_session = bool(os.environ.get("AGENT_BROWSER_HEADED"))
+        if preserve_browser_session:
             if agent.verbose_logging:
                 logging.debug(
-                    f"Skipping per-turn cleanup_browser for headed session {task_id}; "
-                    f"idle reaper will handle it."
+                    f"Skipping per-turn cleanup_browser for persistent session {task_id}; "
+                    f"explicit close or the idle reaper will handle it."
                 )
         else:
             _ra().cleanup_browser(task_id)
@@ -3230,7 +3255,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # reasoning display.  Non-reasoning text is harmlessly
                 # suppressed by the CLI's _stream_delta when the stream
                 # box is already closed (tool boundary flush).
-                elif agent.stream_delta_callback:
+                elif (
+                    agent.stream_delta_callback
+                    and not getattr(
+                        agent, "_should_suppress_plan_stream_text", lambda: False
+                    )()
+                ):
                     try:
                         agent.stream_delta_callback(delta.content)
                         agent._record_streamed_assistant_text(delta.content)

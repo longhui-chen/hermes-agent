@@ -122,6 +122,55 @@ class TestApplySessionModelOverride:
 
 
 # ---------------------------------------------------------------------------
+# Tests: _resolve_turn_agent_config session vision routing
+# ---------------------------------------------------------------------------
+
+
+class TestResolveTurnAgentConfigVisionRouting:
+    def test_session_auxiliary_and_supports_vision_enter_turn_route(self):
+        runner = _make_runner()
+        sk = build_session_key(_make_source())
+        runner._session_model_overrides[sk] = {
+            "model": "lite",
+            "provider": "custom",
+            "api_key": "local-ai-proxy",
+            "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+            "api_mode": "chat_completions",
+            "supports_vision": False,
+            "auxiliary": {
+                "vision": {
+                    "provider": "custom",
+                    "model": "lite",
+                    "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+                    "api_key": "local-ai-proxy",
+                    "api_mode": "chat_completions",
+                    "extra_body": {
+                        "metadata": {"zettlab_aux_task": "vision"},
+                    },
+                }
+            },
+        }
+
+        route = runner._resolve_turn_agent_config(
+            "describe image",
+            "lite",
+            {
+                "provider": "custom",
+                "api_key": "local-ai-proxy",
+                "base_url": "http://127.0.0.1:9090/api/v1/ai-proxy/v1",
+                "api_mode": "chat_completions",
+            },
+            session_key=sk,
+        )
+
+        assert route["runtime_supports_vision"] is False
+        assert route["runtime_auxiliary_task_configs"]["vision"]["extra_body"]["metadata"] == {
+            "zettlab_aux_task": "vision"
+        }
+        assert "zettlab_aux_task" in route["signature"][-2]
+
+
+# ---------------------------------------------------------------------------
 # Tests: _is_intentional_model_switch
 # ---------------------------------------------------------------------------
 

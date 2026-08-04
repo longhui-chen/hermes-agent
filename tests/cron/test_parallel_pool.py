@@ -67,7 +67,8 @@ class TestRunningJobGuard:
         }
 
         # Simulate the job already running.
-        sched._running_job_ids.add("guard-job")
+        running_key = sched._running_job_key(job)
+        sched._running_job_ids.add(running_key)
 
         dispatched = []
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
@@ -81,7 +82,7 @@ class TestRunningJobGuard:
         assert n == 0  # skipped, not dispatched
         assert dispatched == []
 
-        sched._running_job_ids.discard("guard-job")
+        sched._running_job_ids.discard(running_key)
         sched._shutdown_parallel_pool()
 
 
@@ -168,6 +169,44 @@ class TestSequentialPool:
         time.sleep(0.1)
         sched._shutdown_parallel_pool()
 
+    def test_sequential_running_guard_prevents_double_dispatch(self, tmp_path, monkeypatch):
+        """A workdir job already in _running_job_ids is skipped on next tick."""
+        import cron.scheduler as sched
+
+        sched._parallel_pool = None
+        sched._parallel_pool_max_workers = None
+        sched._sequential_pool = None
+        sched._running_job_ids.clear()
+
+        job = {
+            "id": "guard-seq",
+            "name": "guard-seq",
+            "prompt": "test",
+            "schedule": "every 5m",
+            "enabled": True,
+            "next_run_at": "2020-01-01T00:00:00",
+            "deliver": "local",
+            "workdir": str(tmp_path),
+        }
+
+        # Simulate the job already running.
+        running_key = sched._running_job_key(job)
+        sched._running_job_ids.add(running_key)
+
+        dispatched = []
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: [job])
+        monkeypatch.setattr(sched, "advance_next_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "run_job", lambda j, **_kw: dispatched.append(j["id"]) or (True, "out", "resp", None))
+        monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
+
+        n = sched.tick(verbose=False)
+        assert n == 0  # skipped, not dispatched
+        assert dispatched == []
+
+        sched._running_job_ids.discard(running_key)
+        sched._shutdown_parallel_pool()
 
     def test_get_sequential_pool_is_persistent(self):
         """_get_sequential_pool returns the same single-thread pool."""

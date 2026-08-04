@@ -257,8 +257,8 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "terminal.daytona": ("daytona==0.155.0",),
     "terminal.vercel": ("vercel==0.7.2",),
 
-    # ─── Skills ────────────────────────────────────────────────────────────
-    "skill.google_workspace": (
+    # ─── Platforms ─────────────────────────────────────────────────────────
+    "platform.google_chat": (
         "google-api-python-client==2.194.0",
         "google-auth==2.55.1",
         "google-auth-oauthlib==1.3.1",
@@ -269,6 +269,8 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "httplib2==0.32.0",
         "pyasn1==0.6.4",
     ),
+
+    # ─── Skills ────────────────────────────────────────────────────────────
     "skill.youtube": ("youtube-transcript-api==1.2.4",),
 
     # ─── Tools ─────────────────────────────────────────────────────────────

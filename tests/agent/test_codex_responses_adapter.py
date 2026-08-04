@@ -410,6 +410,30 @@ def test_preflight_passes_native_web_search_tool_through():
 
 
 
+@pytest.mark.parametrize(
+    "profile",
+    [
+        pytest.param("main", id="main"),
+        pytest.param("writer", id="writer"),
+    ],
+)
+def test_preflight_empty_instructions_uses_profile_identity(
+    monkeypatch,
+    profile,
+):
+    monkeypatch.setenv("ZET_AGENT_ID", profile)
+    kwargs = {
+        "model": "gpt-5.4",
+        "instructions": "",
+        "input": [{"role": "user", "content": "hi"}],
+    }
+
+    result = _preflight_codex_api_kwargs(kwargs)
+
+    assert "specialized persona" in result["instructions"]
+    assert "Zettlab Memo" not in result["instructions"]
+
+
 # ---------------------------------------------------------------------------
 # _format_responses_error — adapted from anomalyco/opencode#28757.
 # Provider failures should surface BOTH the code (rate_limit_exceeded /

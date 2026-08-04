@@ -401,6 +401,7 @@ class TestGenerateCommandTts:
 
 
     @pytest.mark.skipif(os.name == "nt", reason="POSIX-only timeout semantics")
+    @pytest.mark.live_system_guard_bypass
     def test_timeout_raises_runtime(self, tmp_path):
         config = {
             "command": f'"{sys.executable}" -c "import time; time.sleep(10)"',

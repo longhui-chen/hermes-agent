@@ -11,7 +11,16 @@ from pathlib import Path
 from typing import Any, Union
 from urllib.parse import urlparse
 
-import yaml
+try:
+    # Optional: only the YAML helpers below (atomic_yaml_write /
+    # atomic_roundtrip_yaml_update) need pyyaml. Keeping the import soft lets
+    # atomic_replace / atomic_json_write — and therefore the low-level skill
+    # seeder that only uses those — run in a degraded env without pyyaml.
+    # `yaml` stays a module attribute (None if absent) so existing
+    # `patch("utils.yaml.dump", ...)` tests still work when pyyaml is installed.
+    import yaml
+except ImportError:  # pragma: no cover - exercised only in degraded envs
+    yaml = None
 
 logger = logging.getLogger(__name__)
 
@@ -284,20 +293,23 @@ def warn_if_credential_file_broadly_readable(
     return True
 
 
-class IndentDumper(yaml.SafeDumper):
-    """PyYAML dumper that indents list items under mapping keys (2-space).
+if yaml is not None:
+    class IndentDumper(yaml.SafeDumper):
+        """PyYAML dumper that indents list items under mapping keys (2-space).
 
-    Default PyYAML emits "indentless" sequences — list items start at the
-    same column as their parent mapping key.  ``ruamel.yaml`` (used by
-    :func:`atomic_roundtrip_yaml_update`) emits 2-space-indented sequences.
-    Mixing both styles in the same ``config.yaml`` produces a file that
-    stricter parsers like ``js-yaml`` reject with ``bad indentation of a
-    mapping entry``.  Forcing ``indentless=False`` aligns the two
-    serializers so all write paths emit byte-identical layouts (#31999).
-    """
+        Default PyYAML emits "indentless" sequences — list items start at the
+        same column as their parent mapping key.  ``ruamel.yaml`` (used by
+        :func:`atomic_roundtrip_yaml_update`) emits 2-space-indented sequences.
+        Mixing both styles in the same ``config.yaml`` produces a file that
+        stricter parsers like ``js-yaml`` reject with ``bad indentation of a
+        mapping entry``.  Forcing ``indentless=False`` aligns the two
+        serializers so all write paths emit byte-identical layouts (#31999).
+        """
 
-    def increase_indent(self, flow=False, indentless=False):  # noqa: ARG002
-        return super().increase_indent(flow, False)
+        def increase_indent(self, flow=False, indentless=False):  # noqa: ARG002
+            return super().increase_indent(flow, False)
+else:
+    IndentDumper = None
 
 
 def atomic_yaml_write(
@@ -322,6 +334,8 @@ def atomic_yaml_write(
         extra_content: Optional string to append after the YAML dump
             (e.g. commented-out sections for user reference).
     """
+    if yaml is None:
+        raise ImportError("pyyaml is required for atomic_yaml_write()")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 

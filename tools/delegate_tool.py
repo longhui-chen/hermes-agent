@@ -52,6 +52,13 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "memory",  # no writes to shared MEMORY.md
         "send_message",  # no cross-platform side effects
         "cronjob",  # no scheduling more work in the parent's name
+        "call_agent",  # anonymous workers may not consult real agents — that
+        # would bypass the server-side call-chain/quota guardrails with a
+        # principal that has no identity to authorize
+        "app_host",  # same principle: workers inherit the parent's secret
+        # scope, so an anonymous child could install/delete/restart device
+        # applications with the parent's action token — device-state verbs
+        # stay with the identified agent the user is actually talking to
     ]
 )
 
@@ -172,8 +179,26 @@ def _register_subagent(record: Dict[str, Any]) -> None:
     sid = record.get("subagent_id")
     if not sid:
         return
+    # Registration happens on the spawning thread, inside the caller's
+    # _profile_runtime_scope — capture the owning profile so the zettlab
+    # control plane can filter its list/interrupt surface per profile.
+    if "profile_home" not in record:
+        try:
+            from hermes_constants import get_hermes_home
+
+            record["profile_home"] = str(get_hermes_home())
+        except Exception:  # pragma: no cover
+            record["profile_home"] = ""
     with _active_subagents_lock:
         _active_subagents[sid] = record
+
+
+def _subagent_owned_by(record: Dict[str, Any], profile_home: str) -> bool:
+    if not profile_home:
+        return True
+    import os.path
+
+    return os.path.normpath(str(record.get("profile_home") or "")) == os.path.normpath(profile_home)
 
 
 def _unregister_subagent(subagent_id: str) -> None:
@@ -181,17 +206,18 @@ def _unregister_subagent(subagent_id: str) -> None:
         _active_subagents.pop(subagent_id, None)
 
 
-def interrupt_subagent(subagent_id: str) -> bool:
+def interrupt_subagent(subagent_id: str, profile_home: str = "") -> bool:
     """Request that a single running subagent stop at its next iteration boundary.
 
     Does not hard-kill the worker thread (Python can't); sets the child's
     interrupt flag which propagates to in-flight tools and recurses into
     grandchildren via AIAgent.interrupt().  Returns True if a matching
-    subagent was found.
+    subagent was found. A non-empty ``profile_home`` only matches subagents
+    owned by that profile (multiplexer control-plane isolation).
     """
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
-    if not record:
+    if not record or not _subagent_owned_by(record, profile_home):
         return False
     agent = record.get("agent")
     if agent is None:
@@ -205,16 +231,19 @@ def interrupt_subagent(subagent_id: str) -> bool:
     return True
 
 
-def list_active_subagents() -> List[Dict[str, Any]]:
+def list_active_subagents(profile_home: str = "") -> List[Dict[str, Any]]:
     """Snapshot of the currently running subagent tree.
 
     Each record: {subagent_id, parent_id, depth, goal, model, started_at,
     tool_count, status}.  Safe to call from any thread — returns a copy.
+    A non-empty ``profile_home`` restricts the snapshot to that profile's
+    own subagents (multiplexer control-plane isolation).
     """
     with _active_subagents_lock:
         return [
             {k: v for k, v in r.items() if k != "agent"}
             for r in _active_subagents.values()
+            if _subagent_owned_by(r, profile_home)
         ]
 
 
@@ -1575,6 +1604,14 @@ def _build_child_agent(
     if child_pool is not None:
         child._credential_pool = child_pool
 
+    # A child has no user to confirm a plan: clarify is blocked and no plan
+    # card reaches any UI (plan_emit_callback is never wired for children).
+    # Without this, present_plan returns "stop and wait for the user's
+    # confirmation" and the child burns iterations waiting for a reply that
+    # cannot come. Forcing the auto-execute branch keeps the plan text in the
+    # child's context and tells it to proceed immediately.
+    child._zet_agent_plan_auto_execute = True
+
     # Register child for interrupt propagation
     if hasattr(parent_agent, "_active_children"):
         lock = getattr(parent_agent, "_active_children_lock", None)
@@ -2185,10 +2222,15 @@ def _run_single_child(
                     stream_callback=_relay_child_text,
                 )
 
-        _child_context = contextvars.copy_context()
+        # The batch-level propagate wraps _run_single_child's thread, but the
+        # actual child.run_conversation runs one MORE hop away on the timeout
+        # executor — without re-propagating here the innermost thread loses
+        # the caller's ContextVars (profile HERMES_HOME / secret scope) and a
+        # non-default profile's child hits default-profile state paths.
+        from tools.thread_context import propagate_context_to_thread as _propagate_ctx
+
         _child_future = _timeout_executor.submit(
-            _child_context.run,
-            _run_with_thread_capture,
+            _propagate_ctx(_run_with_thread_capture)
         )
         try:
             result = _child_future.result(timeout=child_timeout)
@@ -2999,13 +3041,18 @@ def delegate_task(
             # normally, but if the parent is interrupted while a child is
             # wedged, the abandoned worker must not block interpreter exit.
             from tools.daemon_pool import DaemonThreadPoolExecutor
+            from tools.thread_context import propagate_context_to_thread
             with DaemonThreadPoolExecutor(max_workers=max_children) as executor:
                 futures = {}
                 for i, t, child in children:
-                    child_context = contextvars.copy_context()
+                    # Propagate the dispatching profile's contextvars into the
+                    # inner worker: _run_single_child registers the subagent
+                    # (_register_subagent stamps profile_home via
+                    # get_hermes_home()) and resolves per-profile paths — an
+                    # unscoped worker would mislabel a multiplex profile's
+                    # child as the process default profile's.
                     future = executor.submit(
-                        child_context.run,
-                        _run_single_child,
+                        propagate_context_to_thread(_run_single_child),
                         task_index=i,
                         goal=t["goal"],
                         child=child,

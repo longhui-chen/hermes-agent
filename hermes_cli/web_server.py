@@ -135,6 +135,26 @@ except ImportError:
 WEB_DIST = Path(os.environ["HERMES_WEB_DIST"]) if "HERMES_WEB_DIST" in os.environ else Path(__file__).parent / "web_dist"
 _log = logging.getLogger(__name__)
 
+
+async def _to_thread_with_completion_barrier(func, /, *args, **kwargs):
+    """Offload a mutation without releasing its request on cancellation."""
+    worker = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError as cancelled:
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        try:
+            worker.result()
+        except BaseException:
+            pass
+        raise cancelled
+
 # ---------------------------------------------------------------------------
 # Per-channel subscriber registry used by /api/pub (PTY-side gateway → dashboard)
 # and /api/events (dashboard → browser sidebar).  Keyed by an opaque channel id
@@ -2817,6 +2837,7 @@ from hermes_cli.web_routers.git import (  # noqa: E402,F401 — legacy re-export
 _PORT_BINDING_PLATFORM_PORTS: Dict[str, Tuple[str, int]] = {
     "webhook": ("port", 8644),
     "api_server": ("port", 8642),
+    "zet_agent": ("port", 7900),
     "msgraph_webhook": ("port", 8646),
     "feishu": ("webhook_port", 8765),
     "wecom_callback": ("port", 8645),
@@ -3559,7 +3580,7 @@ async def delete_learning_node(body: LearningNodeRef):
     from agent.learning_mutations import delete_node
 
     with _profile_scope(body.profile):
-        res = delete_node(body.id)
+        res = await _to_thread_with_completion_barrier(delete_node, body.id)
     if not res.get("ok"):
         raise HTTPException(status_code=400, detail=res.get("message", "delete failed"))
     return res
@@ -3571,7 +3592,9 @@ async def update_learning_node(body: LearningNodeEdit):
     from agent.learning_mutations import edit_node
 
     with _profile_scope(body.profile):
-        res = edit_node(body.id, body.content)
+        res = await _to_thread_with_completion_barrier(
+            edit_node, body.id, body.content
+        )
     if not res.get("ok"):
         raise HTTPException(status_code=400, detail=res.get("message", "edit failed"))
     return res
@@ -11582,6 +11605,9 @@ def _validate_dashboard_cron_context_from(
             )
 
 
+_CRON_PROFILE_LOCK = threading.RLock()
+
+
 def _cron_profile_dicts() -> List[Dict[str, Any]]:
     """Return dashboard profile records, falling back to a directory scan."""
     from hermes_cli import profiles as profiles_mod
@@ -11636,6 +11662,25 @@ def _annotate_cron_job(job: Dict[str, Any], profile: str, home: Path) -> Dict[st
     return annotated
 
 
+@contextmanager
+def _cron_profile_scope(home: Path):
+    """Scope cron helpers to one profile home without mutating module globals."""
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+
+    home_token = set_hermes_home_override(str(home))
+    secret_token = set_secret_scope(build_profile_secret_scope(Path(home)))
+    try:
+        yield
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+
+
 def _call_cron_for_profile(target_profile: Optional[str], func_name: str, *args, **kwargs):
     """Run cron.jobs helpers against the selected profile's cron directory.
 
@@ -11644,18 +11689,12 @@ def _call_cron_for_profile(target_profile: Optional[str], func_name: str, *args,
     cannot retarget a concurrent desktop ticker's load/save transaction.
     """
     profile_name, home = _cron_profile_home(target_profile)
-    from cron import jobs as cron_jobs
-    from hermes_constants import (
-        reset_hermes_home_override,
-        set_hermes_home_override,
-    )
+    with _CRON_PROFILE_LOCK:
+        from cron import jobs as cron_jobs
 
-    token = set_hermes_home_override(str(home))
-    try:
-        with cron_jobs.use_cron_store(home):
-            result = getattr(cron_jobs, func_name)(*args, **kwargs)
-    finally:
-        reset_hermes_home_override(token)
+        with _cron_profile_scope(home):
+            with cron_jobs.use_cron_store(home):
+                result = getattr(cron_jobs, func_name)(*args, **kwargs)
 
     if isinstance(result, list):
         return [_annotate_cron_job(j, profile_name, home) for j in result]
@@ -11811,6 +11850,7 @@ def _create_cron_job_sync(body: CronJobCreate, profile: Optional[str] = None):
             enabled_toolsets=_cron_string_list(body.enabled_toolsets),
             workdir=_cron_optional_text(body.workdir),
             no_agent=no_agent,
+            output_language=body.output_language,
         )
     except HTTPException:
         raise
@@ -11910,7 +11950,11 @@ def _delete_cron_job_sync(job_id: str, profile: Optional[str] = None):
 
 
 
-def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
+def _fire_cron_job_for_profile(
+    profile: str,
+    job_id: str,
+    fire_at: Optional[str] = None,
+) -> bool:
     """Run ONE due cron job end-to-end for ``profile`` via the resolved
     scheduler provider's ``fire_due`` (store CAS claim + ``run_one_job``).
 
@@ -11920,20 +11964,46 @@ def _fire_cron_job_for_profile(profile: str, job_id: str) -> bool:
     send path.
     """
     _profile_name, home = _cron_profile_home(profile)
-    from cron import jobs as cron_jobs
-    from cron.scheduler_provider import resolve_cron_scheduler
-    from hermes_constants import (
-        reset_hermes_home_override,
-        set_hermes_home_override,
-    )
+    with _CRON_PROFILE_LOCK:
+        from cron import jobs as cron_jobs
+        from cron.scheduler_provider import resolve_cron_scheduler
 
-    token = set_hermes_home_override(str(home))
-    try:
-        with cron_jobs.use_cron_store(home):
+        with _cron_profile_scope(home):
+            with cron_jobs.use_cron_store(home):
+                provider = resolve_cron_scheduler()
+                return bool(provider.fire_due(job_id, adapters=None, loop=None, fire_at=fire_at))
+
+
+def _preflight_calendar_fire_for_profile(profile: str, job_id: str, provider_fire_id: str):
+    """Return a durable calendar attempt, or None for an ordinary job."""
+    _profile_name, home = _cron_profile_home(profile)
+    with _CRON_PROFILE_LOCK:
+        from cron.calendar_delivery import begin_external_calendar_fire, is_managed_calendar_event_alert
+        from cron.jobs import get_job_raw
+        from cron.scheduler_provider import resolve_cron_scheduler
+        with _cron_profile_scope(home):
+            # Managed calendar detection is a wire-contract check.  Preserve
+            # prompt:null instead of applying the ordinary reader's "" coercion.
+            job = get_job_raw(job_id)
+            if not is_managed_calendar_event_alert(job):
+                return None
             provider = resolve_cron_scheduler()
-            return bool(provider.fire_due(job_id, adapters=None, loop=None))
-    finally:
-        reset_hermes_home_override(token)
+            capabilities = provider.calendar_capabilities()
+            begin = begin_external_calendar_fire(
+                job,
+                provider_name=str(capabilities.get("provider") or provider.name),
+                provider_contract_version=int(capabilities.get("contract_version") or 0),
+                provider_fire_id=provider_fire_id,
+            )
+            return job, begin
+
+
+def _run_external_calendar_fire_for_profile(profile: str, job: dict, begin: dict) -> None:
+    _profile_name, home = _cron_profile_home(profile)
+    with _CRON_PROFILE_LOCK:
+        from cron.calendar_delivery import run_external_calendar_delivery
+        with _cron_profile_scope(home):
+            run_external_calendar_delivery(job, begin)
 
 
 
@@ -12746,22 +12816,34 @@ async def reset_memory(body: MemoryReset):
     if target not in {"all", "memory", "user"}:
         raise HTTPException(status_code=400, detail="target must be all, memory, or user")
 
-    mem_dir = get_hermes_home() / "memories"
-    deleted = []
-    targets = []
-    if target in {"all", "memory"}:
-        targets.append("MEMORY.md")
-    if target in {"all", "user"}:
-        targets.append("USER.md")
-    for fname in targets:
-        path = mem_dir / fname
-        if path.exists():
-            try:
-                path.unlink()
-                deleted.append(fname)
-            except OSError as exc:
-                raise HTTPException(status_code=500, detail=f"Could not delete {fname}: {exc}")
-    return {"ok": True, "deleted": deleted}
+    from tools.memory_tool import (
+        MemoryImportConflict,
+        MemoryImportUnsupported,
+        reset_curated_memory,
+    )
+
+    try:
+        result = await asyncio.to_thread(reset_curated_memory, target)
+    except MemoryImportUnsupported as exc:
+        raise HTTPException(
+            status_code=501,
+            detail={
+                "code": "memory_reset_unsupported",
+                "message": str(exc),
+            },
+        )
+    except (OSError, MemoryImportConflict) as exc:
+        raise HTTPException(status_code=500, detail=f"Could not reset memory: {exc}")
+    if result.get("status") != "completed":
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "memory_reset_cleanup_pending",
+                "message": "Memory cleanup is pending; retry reset to finish securely.",
+                "deleted": result["deleted"],
+            },
+        )
+    return {"ok": True, "deleted": result["deleted"], "status": "completed"}
 
 
 # ---------------------------------------------------------------------------

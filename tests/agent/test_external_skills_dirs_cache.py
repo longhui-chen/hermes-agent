@@ -77,6 +77,62 @@ def test_cache_invalidates_on_mtime_change(hermes_home_with_config):
     assert second == [other.resolve()]
 
 
+def test_cache_invalidates_when_external_symlink_target_changes(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    presets = tmp_path / "presets"
+    v1 = presets / "v1" / "skills"
+    v2 = presets / "v2" / "skills"
+    v1.mkdir(parents=True)
+    v2.mkdir(parents=True)
+    current = presets / "current"
+    current.symlink_to(presets / "v1", target_is_directory=True)
+    (home / "config.yaml").write_text(
+        f"skills:\n  external_dirs:\n    - {current}/skills\n", encoding="utf-8"
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _external_dirs_cache_clear()
+
+    assert get_external_skills_dirs() == [v1.resolve()]
+    current.unlink()
+    current.symlink_to(presets / "v2", target_is_directory=True)
+
+    assert get_external_skills_dirs() == [v2.resolve()]
+
+
+def test_cache_invalidates_when_missing_external_dir_appears(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    presets = tmp_path / "presets"
+    current = presets / "current"
+    (home / "config.yaml").write_text(
+        f"skills:\n  external_dirs:\n    - {current}/skills\n", encoding="utf-8"
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _external_dirs_cache_clear()
+
+    assert get_external_skills_dirs() == []
+
+    v1 = presets / "v1" / "skills"
+    v1.mkdir(parents=True)
+    current.symlink_to(presets / "v1", target_is_directory=True)
+
+    assert get_external_skills_dirs() == [v1.resolve()]
+
+
+def test_returns_empty_when_config_missing(tmp_path, monkeypatch):
+    """No config file → empty list, cached as empty."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    _external_dirs_cache_clear()
+
+    assert get_external_skills_dirs() == []
 
 
 

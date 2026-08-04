@@ -2,6 +2,7 @@
 
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 from unittest.mock import patch, MagicMock
 
@@ -484,6 +485,89 @@ class TestHubLockFile:
         data = lock.load()
         assert data == {"version": 1, "installed": {}}
 
+    def test_save_creates_parent_dir(self, tmp_path):
+        lock_file = tmp_path / "subdir" / "lock.json"
+        lock = HubLockFile(path=lock_file)
+        lock.save({"version": 1, "installed": {}})
+        assert lock_file.exists()
+
+    def test_record_install(self, tmp_path):
+        lock = HubLockFile(path=tmp_path / "lock.json")
+        lock.record_install(
+            name="test-skill",
+            source="github",
+            identifier="owner/repo/test-skill",
+            trust_level="trusted",
+            scan_verdict="pass",
+            skill_hash="abc123",
+            install_path="test-skill",
+            files=["SKILL.md", "references/api.md"],
+        )
+        data = lock.load()
+        assert "test-skill" in data["installed"]
+        entry = data["installed"]["test-skill"]
+        assert entry["source"] == "github"
+        assert entry["trust_level"] == "trusted"
+        assert entry["content_hash"] == "abc123"
+        assert "installed_at" in entry
+
+    def test_concurrent_record_install_preserves_every_entry(
+        self, monkeypatch, tmp_path
+    ):
+        lock_path = tmp_path / "lock.json"
+        original_load = HubLockFile.load
+
+        def slow_load(lock):
+            data = original_load(lock)
+            time.sleep(0.01)
+            return data
+
+        monkeypatch.setattr(HubLockFile, "load", slow_load)
+
+        def record(index):
+            HubLockFile(path=lock_path).record_install(
+                name=f"skill-{index}",
+                source="github",
+                identifier=f"owner/repo/skill-{index}",
+                trust_level="community",
+                scan_verdict="safe",
+                skill_hash=f"hash-{index}",
+                install_path=f"skill-{index}",
+                files=["SKILL.md"],
+            )
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            list(executor.map(record, range(12)))
+
+        installed = original_load(HubLockFile(path=lock_path))["installed"]
+        assert set(installed) == {f"skill-{index}" for index in range(12)}
+
+    def test_record_uninstall(self, tmp_path):
+        lock = HubLockFile(path=tmp_path / "lock.json")
+        lock.record_install(
+            name="test-skill", source="github", identifier="x",
+            trust_level="community", scan_verdict="pass",
+            skill_hash="h", install_path="test-skill", files=["SKILL.md"],
+        )
+        lock.record_uninstall("test-skill")
+        data = lock.load()
+        assert "test-skill" not in data["installed"]
+
+    def test_record_uninstall_nonexistent(self, tmp_path):
+        lock = HubLockFile(path=tmp_path / "lock.json")
+        lock.save({"version": 1, "installed": {}})
+        # Should not raise
+        lock.record_uninstall("nonexistent")
+
+    def test_get_installed(self, tmp_path):
+        lock = HubLockFile(path=tmp_path / "lock.json")
+        lock.record_install(
+            name="skill-a", source="github", identifier="x",
+            trust_level="trusted", scan_verdict="pass",
+            skill_hash="h", install_path="skill-a", files=["SKILL.md"],
+        )
+        assert lock.get_installed("skill-a") is not None
+        assert lock.get_installed("nonexistent") is None
 
     def test_list_installed(self, tmp_path):
         lock = HubLockFile(path=tmp_path / "lock.json")

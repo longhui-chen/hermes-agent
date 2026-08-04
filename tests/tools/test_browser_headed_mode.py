@@ -76,6 +76,53 @@ class TestCleanupTaskResourcesHeadedSkip:
             cleanup_task_resources(_make_agent(), "task-x")
             mock_cb.assert_called_once_with("task-x")
 
+    def test_headed_skips_browser_cleanup(self):
+        from agent.chat_completion_helpers import cleanup_task_resources
+        with (
+            patch("tools.browser_tool._is_headed_mode", return_value=True),
+            patch("run_agent.cleanup_vm"),
+            patch("run_agent.cleanup_browser") as mock_cb,
+            patch(
+                "agent.chat_completion_helpers.is_persistent_env",
+                return_value=False,
+            ),
+        ):
+            cleanup_task_resources(_make_agent(), "task-x")
+            mock_cb.assert_not_called()
+
+    def test_managed_browser_skips_per_turn_cleanup(self):
+        from agent.chat_completion_helpers import cleanup_task_resources
+        with (
+            patch("tools.browser_tool._is_headed_mode", return_value=False),
+            patch("tools.browser_tool._is_managed_browser_configured", return_value=True),
+            patch("run_agent.cleanup_vm"),
+            patch("run_agent.cleanup_browser") as mock_cb,
+            patch(
+                "agent.chat_completion_helpers.is_persistent_env",
+                return_value=False,
+            ),
+        ):
+            cleanup_task_resources(_make_agent(), "task-x")
+            mock_cb.assert_not_called()
+
+    def test_headed_env_var_fallback_when_import_fails(self):
+        """If browser_tool import blows up, the env var still gates the skip."""
+        from agent.chat_completion_helpers import cleanup_task_resources
+        with (
+            patch(
+                "tools.browser_tool._is_headed_mode",
+                side_effect=RuntimeError("boom"),
+            ),
+            patch.dict(os.environ, {"AGENT_BROWSER_HEADED": "1"}),
+            patch("run_agent.cleanup_vm"),
+            patch("run_agent.cleanup_browser") as mock_cb,
+            patch(
+                "agent.chat_completion_helpers.is_persistent_env",
+                return_value=False,
+            ),
+        ):
+            cleanup_task_resources(_make_agent(), "task-x")
+            mock_cb.assert_not_called()
 
     def test_headed_does_not_skip_vm_cleanup(self):
         """Headed mode only affects the browser; VM teardown is untouched."""

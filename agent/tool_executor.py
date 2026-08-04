@@ -12,6 +12,7 @@ extracted functions reach back through the ``run_agent`` module via
 
 from __future__ import annotations
 
+import copy
 import concurrent.futures
 import json
 from pathlib import Path
@@ -31,6 +32,11 @@ from agent.display import (
     get_tool_emoji as _get_tool_emoji,
     redact_tool_args_for_display as _redact_tool_args_for_display,
     _detect_tool_failure,
+)
+from agent.zet_agent_response_mode import (
+    apply_trusted_skill_execution,
+    trusted_skill_operation_execution_block_message,
+    trusted_skill_operation_block_message,
 )
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
@@ -73,6 +79,38 @@ def _ensure_file_checkpoint(
     resolved_path = _resolve_path_for_task(file_path, effective_task_id or "default")
     work_dir = agent._checkpoint_mgr.get_working_dir_for_path(str(resolved_path))
     agent._checkpoint_mgr.ensure_checkpoint(work_dir, f"before {function_name}")
+
+
+def _tool_error_log_preview(
+    function_name: str,
+    function_result: Any,
+    *,
+    max_chars: int = 200,
+) -> str:
+    """Keep generic errors bounded while preserving trusted worker root causes."""
+    text = _multimodal_text_summary(function_result)
+    head = text[:max_chars] if len(text) > max_chars else text
+    if function_name != "terminal":
+        return head
+
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return head
+    if (
+        not isinstance(payload, dict)
+        or payload.get("video_edit_runtime_direct") is not True
+        or not isinstance(payload.get("output"), str)
+    ):
+        return head
+
+    tail = next(
+        (line.strip() for line in reversed(payload["output"].splitlines()) if line.strip()),
+        "",
+    )
+    if not tail or tail in head:
+        return head
+    return f"{head} | tail: {tail[:max_chars]}"
 
 
 def _budget_for_agent(agent) -> BudgetConfig:
@@ -212,6 +250,65 @@ def _cancelled_tool_result(reason: str = "user interrupt") -> str:
         },
         ensure_ascii=False,
     )
+
+
+def _zet_agent_plan_mode_block_message(agent, function_name: str, function_args: dict) -> Optional[str]:
+    """Block legacy markdown plan-mode paths in Zettlab App sessions."""
+    if (getattr(agent, "platform", "") or "") != "zet_agent":
+        return None
+
+    if (
+        bool(getattr(agent, "_zet_agent_plan_mode_active", False))
+        and not bool(getattr(agent, "_zet_agent_plan_presented", False))
+        and function_name not in {"clarify", "present_plan"}
+    ):
+        # Only gate BEFORE the plan is presented. Once present_plan fires,
+        # auto-execute mode keeps the turn running and must be allowed to call
+        # real tools; manual mode has already ended the turn by then, so this
+        # relaxation never exposes side-effect tools before the plan is shown.
+        return (
+            "This Zettlab App turn is in Plan mode. Only `clarify` and "
+            "`present_plan` are allowed until the user reviews the plan. "
+            f"Do not call `{function_name}` or perform side effects."
+        )
+
+    # Trusted video-edit authority constrains executable helpers only. Plan
+    # presentation is independently governed by the App plan capability.
+    if function_name != "present_plan":
+        skill_scope_block = trusted_skill_operation_block_message(
+            agent,
+            function_name=function_name,
+            function_args=function_args,
+        )
+        if skill_scope_block is not None:
+            return skill_scope_block
+
+    if function_name == "skill_view":
+        name = str(function_args.get("name") or "").strip().lower()
+        file_path = str(function_args.get("file_path") or "").strip()
+        if name == "plan" and not file_path:
+            return (
+                "Zettlab App plan mode uses the `present_plan` tool to render "
+                "a structured confirmation card. Do not load the markdown "
+                "`plan` skill here. Call `present_plan` with `title` and "
+                "`groups`, then stop and wait for user confirmation."
+            )
+
+    if function_name == "write_file":
+        path = str(function_args.get("path") or "").replace("\\", "/")
+        if (
+            path == ".hermes/plans"
+            or path.startswith(".hermes/plans/")
+            or "/.hermes/plans/" in path
+            or path.endswith("/.hermes/plans")
+        ):
+            return (
+                "Writing `.hermes/plans` is disabled for Zettlab App plan mode. "
+                "Use `present_plan` to show the plan in the App and wait for "
+                "confirmation instead of saving a markdown plan file."
+            )
+
+    return None
 
 
 def _emit_cancelled_terminal_post_tool_call(
@@ -410,6 +507,13 @@ def _run_agent_tool_execution_middleware(
 
         block_message = scope_block
         block_error_type = "tool_scope_block"
+        if block_message is None:
+            block_message = _zet_agent_plan_mode_block_message(
+                agent, function_name, final_args
+            )
+            if block_message is not None:
+                block_error_type = "zet_agent_plan_mode_block"
+
         if block_message is None:
             block_error_type = "plugin_block"
 
@@ -1166,6 +1270,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if blocked:
                 effect_disposition = "none"
 
+            if not blocked and not is_error:
+                apply_trusted_skill_execution(
+                    agent,
+                    function_name=function_name,
+                    function_result=function_result,
+                )
+
             if not blocked:
                 function_result = agent._append_guardrail_observation(
                     function_name,
@@ -1175,8 +1286,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
 
             if is_error:
-                _err_text = _multimodal_text_summary(function_result)
-                result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
+                result_preview = _tool_error_log_preview(
+                    function_name,
+                    function_result,
+                )
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
 
             # Track file-mutation outcome for the turn-end verifier.
@@ -1303,12 +1416,12 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         turn_tool_msgs = messages[-num_tools:]
         enforce_turn_budget(turn_tool_msgs, env=get_active_env(effective_task_id), config=_tool_budget)
 
-    # ── /steer injection ──────────────────────────────────────────────
-    # Append any pending user steer text to the last tool result so the
-    # agent sees it on its next iteration. Runs AFTER budget enforcement
-    # so the steer marker is never truncated. See steer() for details.
-    if finalize and num_tools > 0:
-        agent._apply_pending_steer_to_tool_results(messages, num_tools)
+    # NOTE: no /steer injection here. Draining at the batch boundary could
+    # inject into a turn that immediately breaks out of the loop (present-
+    # plan / guardrail / budget paths) — the steer would persist as an
+    # unanswered user message with no dropped receipt. The conversation
+    # loop's pre-API drain (drain_steer_for_next_api_call) is the single
+    # injection point: it only fires when a next model call is certain.
 
 
 
@@ -1451,6 +1564,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('todo', function_args, tool_duration, result=function_result)}")
+            # Emit hermes.todo event onto the SSE stream (zet_agent platform).
+            # todo_emit_callback is injected by ZetAgentAdapter._create_agent
+            # when a stream_q is available; absent it, this is a no-op.
+            _todo_emit_cb = getattr(agent, "todo_emit_callback", None)
+            if callable(_todo_emit_cb):
+                try:
+                    import json as _json
+                    _todo_payload = _json.loads(function_result)
+                    _todo_emit_cb(_todo_payload.get("todos", []), _todo_payload.get("summary", {}))
+                except Exception:
+                    pass
         elif function_name == "session_search":
             def _execute(next_args: dict) -> Any:
                 session_db = agent._get_session_db_for_recall()
@@ -1484,14 +1608,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 agent._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
         elif function_name == "memory":
             def _execute(next_args: dict) -> Any:
-                target = next_args.get("target", "memory")
-                operations = next_args.get("operations")
+                final_args = copy.deepcopy(next_args)
+                trusted_block = trusted_skill_operation_execution_block_message(
+                    agent,
+                    function_name=function_name,
+                    function_args=final_args,
+                )
+                if trusted_block is not None:
+                    return json.dumps({"error": trusted_block}, ensure_ascii=False)
+                target = final_args.get("target", "memory")
+                operations = final_args.get("operations")
                 from tools.memory_tool import memory_tool as _memory_tool
                 result = _memory_tool(
-                    action=next_args.get("action"),
+                    action=final_args.get("action"),
                     target=target,
-                    content=next_args.get("content"),
-                    old_text=next_args.get("old_text"),
+                    content=final_args.get("content"),
+                    old_text=final_args.get("old_text"),
                     operations=operations,
                     store=agent._memory_store,
                 )
@@ -1501,7 +1633,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 if agent._memory_manager:
                     agent._memory_manager.notify_memory_tool_write(
                         result,
-                        next_args,
+                        final_args,
                         build_metadata=lambda: agent._build_memory_write_metadata(
                             task_id=effective_task_id,
                             tool_call_id=getattr(tool_call, "id", None),
@@ -1564,6 +1696,33 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('read_terminal', function_args, tool_duration, result=function_result)}")
+        elif function_name == "present_plan":
+            from tools.plan_tool import present_plan as _present_plan
+
+            function_result = _present_plan(
+                title=function_args.get("title", ""),
+                groups=function_args.get("groups", []),
+                callback=getattr(agent, "plan_emit_callback", None),
+                auto_execute=bool(getattr(agent, "_zet_agent_plan_auto_execute", False)),
+            )
+            # 只有计划成功呈现（有效 title、已 emit 卡片）才标记 presented；坏参数（如空
+            # title）会返回 error 且没 emit 卡片，此时保持 Plan gate 不放开真实工具，逼
+            # 模型重试 present_plan（否则弱模型一次坏参数就可能在用户没看到任何计划卡时
+            # 执行 write_file / terminal 副作用）。
+            _plan_presented_ok = True
+            try:
+                _pr = json.loads(function_result)
+                if isinstance(_pr, dict) and _pr.get("error"):
+                    _plan_presented_ok = False
+            except (ValueError, TypeError):
+                _plan_presented_ok = True
+            if _plan_presented_ok:
+                agent._zet_agent_plan_presented = True
+                if getattr(agent, "plan_emit_callback", None) is None:
+                    agent._zet_agent_plan_fallback_response = function_result
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl('present_plan', function_args, tool_duration, result=function_result)}")
         elif function_name == "delegate_task":
             tasks_arg = function_args.get("tasks")
             if tasks_arg and isinstance(tasks_arg, list):
@@ -1696,6 +1855,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         turn_id=getattr(agent, "_current_turn_id", "") or "",
                         api_request_id=getattr(agent, "_current_api_request_id", "")
                         or "",
+                        user_task=getattr(agent, "_current_user_message", "") or "",
+                        previous_assistant_message=getattr(
+                            agent, "_previous_assistant_message", ""
+                        ) or "",
                         enabled_tools=(
                             list(agent.valid_tool_names)
                             if agent.valid_tool_names
@@ -1774,6 +1937,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         turn_id=getattr(agent, "_current_turn_id", "") or "",
                         api_request_id=getattr(agent, "_current_api_request_id", "")
                         or "",
+                        user_task=getattr(agent, "_current_user_message", "") or "",
+                        previous_assistant_message=getattr(
+                            agent, "_previous_assistant_message", ""
+                        ) or "",
                         enabled_tools=(
                             list(agent.valid_tool_names)
                             if agent.valid_tool_names
@@ -1845,6 +2012,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+        if not _execution_blocked and not _is_error_result:
+            apply_trusted_skill_execution(
+                agent,
+                function_name=function_name,
+                function_result=function_result,
+            )
         # The agent-runtime tools above (todo, session_search, memory,
         # context-engine, memory-manager, clarify, delegate_task) are
         # dispatched inline — they never reach handle_function_call, so the
@@ -1878,7 +2051,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_result[:200] if len(function_result) > 200 else function_result
             )
         if _is_error_result:
-            logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
+            logger.warning(
+                "Tool %s returned error (%.2fs): %s",
+                function_name,
+                tool_duration,
+                _tool_error_log_preview(function_name, function_result),
+            )
         else:
             logger.info("tool %s completed (%.2fs, %d chars)", function_name, tool_duration, _result_len)
 
@@ -2013,11 +2191,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     if finalize and num_tools_seq > 0:
         enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id), config=_tool_budget)
 
-    # ── /steer injection ──────────────────────────────────────────────
-    # See _execute_tool_calls_parallel for the rationale. Same hook,
-    # applied to sequential execution as well.
-    if finalize and num_tools_seq > 0:
-        agent._apply_pending_steer_to_tool_results(messages, num_tools_seq)
+    # NOTE: no /steer injection here — see the parallel path's note; the
+    # conversation loop's pre-API drain is the single injection point.
 
 
 
@@ -2034,7 +2209,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
     identical ordering and side-effect boundaries to fully-sequential
     execution, with I/O parallelism recovered inside the safe runs.
 
-    Turn-end work (aggregate budget enforcement + /steer injection) is done
+    Turn-end aggregate budget enforcement is done
     once here for the WHOLE batch; the per-segment executor calls run with
     ``finalize=False`` so a multi-segment turn cannot multiply the budget or
     truncate a steer marker.
@@ -2079,7 +2254,6 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             env=get_active_env(effective_task_id),
             config=_tool_budget,
         )
-        agent._apply_pending_steer_to_tool_results(messages, total_tools)
 
 
 __all__ = [

@@ -24,6 +24,7 @@ from agent.plugin_llm import (
     PluginLlmTextInput,
     PluginLlmTrustError,
     _build_structured_messages,
+    _check_auxiliary_task,
     _check_overrides,
     _coerce_allowlist,
     _parse_structured_text,
@@ -147,6 +148,24 @@ class TestTrustGate:
             requested_profile="work",
         )
         assert result == ("openrouter", "anthropic/claude-3-5-sonnet", "ada", "work")
+
+    def test_auxiliary_task_must_belong_to_plugin(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_auxiliary_tasks",
+            lambda: [
+                {
+                    "key": "owner_checkpoint",
+                    "plugin": "owner-plugin",
+                }
+            ],
+        )
+
+        assert (
+            _check_auxiliary_task("owner-plugin", "owner_checkpoint")
+            == "owner_checkpoint"
+        )
+        with pytest.raises(PluginLlmTrustError, match="unowned auxiliary task"):
+            _check_auxiliary_task("other-plugin", "owner_checkpoint")
 
 
 class TestAllowlistCoercion:
@@ -292,6 +311,46 @@ class TestPluginLlmFacade:
         assert result.usage.input_tokens == 4
         assert result.usage.total_tokens == 10
 
+    def test_complete_routes_through_owned_auxiliary_task(self, monkeypatch):
+        captured: dict = {}
+
+        def fake_caller(**kwargs):
+            captured.update(kwargs)
+            return "custom", "zettlab-creation-fast", _fake_response("{}")
+
+        monkeypatch.setattr(
+            "hermes_cli.plugins.get_plugin_auxiliary_tasks",
+            lambda: [
+                {
+                    "key": "creation_governor_checkpoint",
+                    "plugin": "creation-governor",
+                }
+            ],
+        )
+        llm = make_plugin_llm_for_test(
+            plugin_id="creation-governor",
+            policy=_TrustPolicy(plugin_id="creation-governor"),
+            sync_caller=fake_caller,
+        )
+
+        llm.complete(
+            [{"role": "user", "content": "classify"}],
+            auxiliary_task="creation_governor_checkpoint",
+        )
+
+        assert captured["auxiliary_task"] == "creation_governor_checkpoint"
+
+    def test_complete_rejects_provider_override_without_trust(self):
+        llm = make_plugin_llm_for_test(
+            plugin_id="my-plugin",
+            policy=_TrustPolicy(plugin_id="my-plugin"),
+            sync_caller=lambda **_: ("x", "y", _fake_response("")),
+        )
+        with pytest.raises(PluginLlmTrustError, match="cannot override the provider"):
+            llm.complete(
+                [{"role": "user", "content": "hi"}],
+                provider="openrouter",
+            )
 
 
     def test_complete_passes_through_trusted_overrides(self):

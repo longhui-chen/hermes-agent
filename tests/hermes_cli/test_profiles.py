@@ -114,6 +114,22 @@ class TestGetProfileDir:
 class TestCreateProfile:
     """Tests for create_profile()."""
 
+    def test_creates_directory_with_subdirs(self, profile_env):
+        profile_dir = create_profile("coder", no_alias=True)
+        assert profile_dir.is_dir()
+        assert profile_dir.parent.stat().st_mode & 0o777 == 0o700
+        assert profile_dir.stat().st_mode & 0o777 == 0o700
+        for subdir in ["memories", "sessions", "skills", "skins", "logs",
+                        "plans", "workspace", "cron"]:
+            assert (profile_dir / subdir).is_dir(), f"Missing subdir: {subdir}"
+            assert (profile_dir / subdir).stat().st_mode & 0o777 == 0o700
+
+    @pytest.mark.parametrize("profile", ["coder", "main", "memo"])
+    def test_fresh_profile_always_seeds_neutral_soul(self, profile_env, profile):
+        profile_dir = create_profile(profile, no_alias=True)
+        content = (profile_dir / "SOUL.md").read_text(encoding="utf-8")
+        assert "specialized persona" in content
+        assert "Zettlab Memo" not in content
 
     def test_seeds_placeholder_env_file(self, profile_env):
         """Fresh profiles get their own .env (owner-only) so channel/env
@@ -151,8 +167,159 @@ class TestCreateProfile:
         assert (profile_dir / ".env").read_text().strip() == "KEY=val"
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
 
+    def test_clone_config_copies_source_skills(self, profile_env):
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        skill_dir = default_home / "skills" / "custom" / "installed-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text("---\nname: installed-skill\n---\n")
 
+        profile_dir = create_profile("coder", clone_config=True, no_alias=True)
 
+        assert (
+            profile_dir
+            / "skills"
+            / "custom"
+            / "installed-skill"
+            / "SKILL.md"
+        ).read_text() == "---\nname: installed-skill\n---\n"
+
+    def test_clone_all_copies_entire_tree(self, profile_env):
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        # Populate default with some content
+        (default_home / "memories").mkdir(exist_ok=True)
+        (default_home / "memories" / "note.md").write_text("remember this")
+        (default_home / "config.yaml").write_text("model: gpt-4")
+        # Runtime files that should be stripped
+        (default_home / "gateway.pid").write_text("12345")
+        (default_home / "gateway_state.json").write_text("{}")
+        (default_home / "processes.json").write_text("[]")
+
+        profile_dir = create_profile("coder", clone_all=True, no_alias=True)
+
+        # Content should be copied
+        assert (profile_dir / "memories" / "note.md").read_text() == "remember this"
+        assert (profile_dir / "config.yaml").read_text() == "model: gpt-4"
+        # Runtime files should be stripped
+        assert not (profile_dir / "gateway.pid").exists()
+        assert not (profile_dir / "gateway_state.json").exists()
+        assert not (profile_dir / "processes.json").exists()
+        assert profile_dir.stat().st_mode & 0o777 == 0o700
+
+    def test_clone_all_excludes_sibling_profiles_tree(self, profile_env):
+        """--clone-all from default ~/.hermes must not copy profiles/* (nested explosion)."""
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        profiles_root = default_home / "profiles"
+        profiles_root.mkdir(exist_ok=True)
+        (profiles_root / "other").mkdir(parents=True, exist_ok=True)
+        (profiles_root / "other" / "marker.txt").write_text("sibling data")
+
+        (default_home / "memories").mkdir(exist_ok=True)
+        (default_home / "memories" / "note.md").write_text("remember this")
+
+        profile_dir = create_profile("coder", clone_all=True, no_alias=True)
+
+        assert (profile_dir / "memories" / "note.md").read_text() == "remember this"
+        assert not (profile_dir / "profiles").exists()
+
+    def test_clone_all_excludes_default_infrastructure(self, profile_env):
+        """--clone-all from default profile excludes hermes-agent, .worktrees,
+        bin, node_modules at root, plus __pycache__/*.pyc/*.pyo/*.sock/*.tmp
+        at any depth.  Profile data (config, env, skills, logs) must be
+        preserved — clone-all means "complete snapshot minus infrastructure
+        and per-profile history."
+        """
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        # Simulate infrastructure dirs that only the default profile has
+        (default_home / "hermes-agent" / ".git").mkdir(parents=True)
+        (default_home / "hermes-agent" / "venv" / "bin").mkdir(parents=True)
+        (default_home / "hermes-agent" / "README.md").write_text("repo")
+        (default_home / ".worktrees" / "some-tree").mkdir(parents=True)
+        (default_home / "profiles" / "other").mkdir(parents=True)
+        (default_home / "profiles" / "other" / "config.yaml").write_text("x")
+        (default_home / "bin").mkdir(exist_ok=True)
+        (default_home / "bin" / "tool").write_text("binary")
+        (default_home / "node_modules" / ".package-lock.json").mkdir(parents=True)
+        # Bytecode + temp files at nested depth (universal exclusion)
+        (default_home / "skills" / "my-skill" / "__pycache__").mkdir(parents=True)
+        (default_home / "skills" / "my-skill" / "__pycache__" / "module.cpython-311.pyc").write_text("stale")
+        (default_home / "skills" / "my-skill" / "module.pyc").write_text("stale")
+        (default_home / "skills" / "my-skill" / "module.pyo").write_text("stale")
+        (default_home / "data.sock").write_text("socket")
+        (default_home / "data.tmp").write_text("tmp")
+        # Profile data that SHOULD be copied
+        (default_home / "skills" / "my-skill").mkdir(parents=True, exist_ok=True)
+        (default_home / "skills" / "my-skill" / "SKILL.md").write_text("skill")
+        (default_home / "config.yaml").write_text("model: gpt-4")
+        (default_home / ".env").write_text("KEY=val")
+        (default_home / "logs").mkdir(exist_ok=True)
+        (default_home / "logs" / "gateway.log").write_text("log")
+
+        profile_dir = create_profile("cloned", clone_all=True, no_alias=True)
+
+        # Infrastructure must be excluded
+        assert not (profile_dir / "hermes-agent").exists()
+        assert not (profile_dir / ".worktrees").exists()
+        assert not (profile_dir / "profiles").exists()
+        assert not (profile_dir / "bin").exists()
+        assert not (profile_dir / "node_modules").exists()
+        # Universal exclusions at any depth
+        assert not (profile_dir / "data.sock").exists()
+        assert not (profile_dir / "data.tmp").exists()
+        assert not (profile_dir / "skills" / "my-skill" / "__pycache__").exists()
+        assert not (profile_dir / "skills" / "my-skill" / "module.pyc").exists()
+        assert not (profile_dir / "skills" / "my-skill" / "module.pyo").exists()
+        # All profile data must be present
+        assert (profile_dir / "skills" / "my-skill" / "SKILL.md").read_text() == "skill"
+        assert (profile_dir / "config.yaml").read_text() == "model: gpt-4"
+        assert (profile_dir / ".env").read_text() == "KEY=val"
+        assert (profile_dir / "logs" / "gateway.log").read_text() == "log"
+
+    def test_clone_all_excludes_history_artifacts(self, profile_env):
+        """--clone-all excludes the source's session history, backups, and
+        snapshots — a clone is a fresh workspace, and these can reach tens
+        of GB.  Applies to ANY source profile, not just default.
+        """
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        (default_home / "state.db").write_text("sessions-data")
+        (default_home / "state.db-wal").write_text("wal")
+        (default_home / "state.db-shm").write_text("shm")
+        (default_home / "sessions" / "20260101_old").mkdir(parents=True)
+        (default_home / "backups").mkdir(exist_ok=True)
+        (default_home / "backups" / "backup.tar.gz").write_text("archive")
+        (default_home / "state-snapshots" / "snap1").mkdir(parents=True)
+        (default_home / "checkpoints" / "cp1").mkdir(parents=True)
+        # Data that should still copy
+        (default_home / "config.yaml").write_text("model: gpt-4")
+        # Nested dirs with the same names must NOT be excluded (root-only)
+        (default_home / "workspace" / "backups").mkdir(parents=True)
+        (default_home / "workspace" / "backups" / "user-data.txt").write_text("mine")
+
+        profile_dir = create_profile("fresh", clone_all=True, no_alias=True)
+
+        for history in (
+            "state.db", "state.db-wal", "state.db-shm",
+            "sessions", "backups", "state-snapshots", "checkpoints",
+        ):
+            assert not (profile_dir / history).exists(), history
+        assert (profile_dir / "config.yaml").read_text() == "model: gpt-4"
+        # Root-only: nested same-name dirs survive
+        assert (profile_dir / "workspace" / "backups" / "user-data.txt").read_text() == "mine"
+
+    def test_clone_config_missing_files_skipped(self, profile_env):
+        """Clone config gracefully skips files that don't exist in source."""
+        profile_dir = create_profile("coder", clone_config=True, no_alias=True)
+        # No error; optional files just not copied
+        assert not (profile_dir / "config.yaml").exists()
+        # .env is always seeded (placeholder) so the profile has its own
+        # credentials file even when the clone source lacked one.
+        assert (profile_dir / ".env").exists()
+        # SOUL.md is always seeded with the default even when clone source lacks it
+        assert (profile_dir / "SOUL.md").exists()
 
 
 # ===================================================================
@@ -580,11 +747,128 @@ class TestRenameProfile:
 class TestExportImport:
     """Tests for export_profile() / import_profile()."""
 
+    def test_export_creates_tar_gz(self, profile_env, tmp_path):
+        create_profile("coder", no_alias=True)
+        profile_dir = get_profile_dir("coder")
+        (profile_dir / "marker.txt").write_text("hello")
 
+        output = tmp_path / "export" / "coder.tar.gz"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        result = export_profile("coder", str(output))
 
+        assert Path(result).exists()
+        assert tarfile.is_tarfile(str(result))
 
+    def test_import_restores_from_archive(self, profile_env, tmp_path):
+        create_profile("coder", no_alias=True)
+        profile_dir = get_profile_dir("coder")
+        (profile_dir / "marker.txt").write_text("hello")
 
+        archive_path = tmp_path / "export" / "coder.tar.gz"
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        export_profile("coder", str(archive_path))
 
+        import shutil
+
+        shutil.rmtree(profile_dir)
+        assert not profile_dir.is_dir()
+
+        imported = import_profile(str(archive_path), name="coder")
+        assert imported.is_dir()
+        assert (imported / "marker.txt").read_text() == "hello"
+        assert imported.stat().st_mode & 0o777 == 0o700
+        assert (imported / ".env").stat().st_mode & 0o777 == 0o600
+
+    def test_import_to_existing_name_raises(self, profile_env, tmp_path):
+        create_profile("coder", no_alias=True)
+        profile_dir = get_profile_dir("coder")
+
+        archive_path = tmp_path / "export" / "coder.tar.gz"
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        export_profile("coder", str(archive_path))
+
+        # Importing to same existing name should fail
+        with pytest.raises(FileExistsError):
+            import_profile(str(archive_path), name="coder")
+
+    def test_import_with_explicit_name_does_not_mutate_existing_archive_root_profile(
+        self, profile_env, tmp_path
+    ):
+        create_profile("victim", no_alias=True)
+        victim_dir = get_profile_dir("victim")
+        (victim_dir / "marker.txt").write_text("original")
+
+        archive_path = tmp_path / "export" / "victim.tar.gz"
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(archive_path, "w:gz") as tf:
+            data = b"imported"
+            info = tarfile.TarInfo("victim/marker.txt")
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+
+        imported = import_profile(str(archive_path), name="renamed")
+
+        assert imported == get_profile_dir("renamed")
+        assert (imported / "marker.txt").read_text() == "imported"
+        assert (victim_dir / "marker.txt").read_text() == "original"
+
+    def test_import_rejects_archive_with_multiple_top_level_directories(
+        self, profile_env, tmp_path
+    ):
+        archive_path = tmp_path / "export" / "multi-root.tar.gz"
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with tarfile.open(archive_path, "w:gz") as tf:
+            for member_name, data in (
+                ("alpha/marker.txt", b"a"),
+                ("beta/marker.txt", b"b"),
+            ):
+                info = tarfile.TarInfo(member_name)
+                info.size = len(data)
+                tf.addfile(info, io.BytesIO(data))
+
+        with pytest.raises(ValueError, match="exactly one top-level directory"):
+            import_profile(str(archive_path), name="coder")
+
+        assert not get_profile_dir("coder").exists()
+
+    def test_import_rejects_traversal_archive_member(self, profile_env, tmp_path):
+        archive_path = tmp_path / "export" / "evil.tar.gz"
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        escape_path = tmp_path / "escape.txt"
+
+        with tarfile.open(archive_path, "w:gz") as tf:
+            info = tarfile.TarInfo("../../escape.txt")
+            data = b"pwned"
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+
+        with pytest.raises(ValueError, match="Unsafe archive member path"):
+            import_profile(str(archive_path), name="coder")
+
+        assert not escape_path.exists()
+        assert not get_profile_dir("coder").exists()
+
+    def test_import_rejects_absolute_archive_member(self, profile_env, tmp_path):
+        archive_path = tmp_path / "export" / "evil-abs.tar.gz"
+        archive_path.parent.mkdir(parents=True, exist_ok=True)
+        absolute_target = tmp_path / "abs-escape.txt"
+
+        with tarfile.open(archive_path, "w:gz") as tf:
+            info = tarfile.TarInfo(str(absolute_target))
+            data = b"pwned"
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+
+        with pytest.raises(ValueError, match="Unsafe archive member path"):
+            import_profile(str(archive_path), name="coder")
+
+        assert not absolute_target.exists()
+        assert not get_profile_dir("coder").exists()
+
+    def test_export_nonexistent_raises(self, profile_env, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            export_profile("nonexistent", str(tmp_path / "out.tar.gz"))
 
     # ---------------------------------------------------------------
     # Default profile export / import
@@ -814,6 +1098,4 @@ class TestProfilesToServe:
         assert set(serve) == {"default", "coder", "writer"}
         assert serve["default"] == _get_default_hermes_home()
         assert serve["coder"] == get_profile_dir("coder")
-
-
 

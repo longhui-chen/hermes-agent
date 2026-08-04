@@ -110,7 +110,7 @@ platforms:
             URL: {pull_request.html_url}
             Diff URL: {pull_request.diff_url}
             Action: {action}
-          skills: ["github-code-review"]
+          skills: ["requesting-code-review"]
           deliver: "github_comment"
           deliver_extra:
             repo: "{repository.full_name}"
@@ -403,7 +403,7 @@ In addition to static routes in `config.yaml`, you can create webhook subscripti
 ### Create a subscription
 
 ```bash
-hermes webhook subscribe github-issues \
+hermes webhook subscribe repo-issues \
   --events "issues" \
   --prompt "New issue #{issue.number}: {issue.title}\nBy: {issue.user.login}\n\n{issue.body}" \
   --deliver telegram \
@@ -422,14 +422,14 @@ hermes webhook list
 ### Remove a subscription
 
 ```bash
-hermes webhook remove github-issues
+hermes webhook remove repo-issues
 ```
 
 ### Test a subscription
 
 ```bash
-hermes webhook test github-issues
-hermes webhook test github-issues --payload '{"issue": {"number": 42, "title": "Test"}}'
+hermes webhook test repo-issues
+hermes webhook test repo-issues --payload '{"issue": {"number": 42, "title": "Test"}}'
 ```
 
 ### How dynamic subscriptions work

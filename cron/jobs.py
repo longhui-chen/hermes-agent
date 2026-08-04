@@ -7,10 +7,12 @@ Output is saved to ~/.hermes/cron/output/{job_id}/{timestamp}.md
 
 import contextlib
 import copy
+from bisect import bisect_left
 from contextvars import ContextVar
 from dataclasses import dataclass
 import json
 import logging
+import math
 import shutil
 import tempfile
 import threading
@@ -31,7 +33,7 @@ try:
     import msvcrt
 except ImportError:  # pragma: no cover - non-Windows
     msvcrt = None
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Optional, Dict, List, Any, Set, Tuple, Union
@@ -40,6 +42,12 @@ logger = logging.getLogger(__name__)
 
 from hermes_time import now as _hermes_now
 from utils import atomic_replace, atomic_write_text
+
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError:
+    from backports.zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # type: ignore[no-redef]
+
 
 # ``croniter`` compiles ~15 ms of regexes at import and only matters for
 # 5-field cron expressions. Resolve lazily; ``HAS_CRONITER`` stays a module
@@ -60,6 +68,116 @@ def _ensure_croniter() -> bool:
         except ImportError:
             HAS_CRONITER = False
     return bool(HAS_CRONITER)
+
+
+_MAX_TIMEZONE_NAME_LENGTH = 255
+_MAX_OUTPUT_LANGUAGE_TAG_LENGTH = 63
+_MAX_CRON_NEXT_RUN_ATTEMPTS = 8
+_MAX_OCCURRENCE_HISTORY_FILES = 5_000
+_MAX_OCCURRENCE_STATUS_BYTES = 4_096
+_MAX_OCCURRENCE_ITERATIONS = 10_000
+_MAX_OCCURRENCE_JOURNAL_RECORDS = 5_000
+_MAX_OCCURRENCE_JOURNAL_BYTES = 2 * 1024 * 1024
+_MAX_OCCURRENCE_QUERY_JOBS = 256
+_IN_FLIGHT_OCCURRENCE_DEFAULT_TTL_SECONDS = 15 * 60
+_IN_FLIGHT_OCCURRENCE_MIN_TTL_SECONDS = 2 * 60
+_IN_FLIGHT_OCCURRENCE_MAX_TTL_SECONDS = 60 * 60
+_MAX_EXTERNAL_FIRE_AGE_SECONDS = 366 * 24 * 60 * 60
+_MAX_EXTERNAL_FIRE_FUTURE_SECONDS = 5 * 60
+
+
+def normalize_output_language_tag(value: Any) -> Optional[str]:
+    """Return a canonical, bounded BCP 47 tag, or ``None`` if invalid.
+
+    This is the fail-closed reader for an untrusted persisted field.  It never
+    raises, so a hand-edited legacy job cannot break the scheduler, and it
+    imports the IANA-backed validator only when a non-empty value is present.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if (
+        not text
+        or len(text) > _MAX_OUTPUT_LANGUAGE_TAG_LENGTH
+        or not text.isascii()
+        or not re.fullmatch(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*", text)
+    ):
+        return None
+
+    try:
+        from langcodes import standardize_tag, tag_is_valid
+
+        if not tag_is_valid(text):
+            return None
+        normalized = standardize_tag(text)
+    except (ImportError, LookupError, TypeError, ValueError):
+        return None
+
+    # These ISO 639 codes deliberately describe an unknown, multiple, or
+    # non-linguistic language and therefore cannot establish an output
+    # language. Pure private-use tags have the same ambiguity.
+    primary = normalized.split("-", 1)[0].lower()
+    if primary in {"und", "mul", "zxx", "x"}:
+        return None
+    # A one-character subtag after the primary language is an extension
+    # singleton (including private-use ``x``). Output-language preferences do
+    # not need extensions, and allowing their arbitrary payload would turn
+    # this persisted field into a durable system-prompt injection surface.
+    if any(len(subtag) == 1 for subtag in normalized.split("-")[1:]):
+        return None
+    return normalized
+
+
+def validate_output_language_tag(value: Any) -> Optional[str]:
+    """Validate a create/update value, raising a bounded generic error."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    normalized = normalize_output_language_tag(value)
+    if normalized is None:
+        raise ValueError(
+            "output_language must be a valid BCP 47 tag of at most 63 ASCII "
+            "characters (for example 'zh-CN', 'ja', 'ar', or 'sr-Latn-RS')"
+        )
+    return normalized
+
+
+def _normalized_iana_timezone_name(name: Any) -> Optional[str]:
+    """Return a bounded valid IANA timezone name, or ``None``.
+
+    Persisted jobs may predate timezone validation or may have been edited by
+    hand.  Treat that field as untrusted: reject non-strings and oversized
+    values before asking ``ZoneInfo`` to resolve them.
+    """
+    if not isinstance(name, str):
+        return None
+    text = name.strip()
+    if not text or len(text) > _MAX_TIMEZONE_NAME_LENGTH:
+        return None
+    try:
+        ZoneInfo(text)
+    except (OSError, ZoneInfoNotFoundError, TypeError, ValueError):
+        return None
+    return text
+
+
+def _validate_tz_name(name: Optional[str]) -> Optional[str]:
+    """Validate IANA timezone name; return canonical string or None.
+
+    Empty / None means "no per-job timezone" — falls back to the hermes
+    instance's configured timezone (HERMES_TIMEZONE / config.yaml / system).
+    """
+    if name is None:
+        return None
+    if not isinstance(name, str):
+        raise ValueError("Invalid timezone: expected an IANA timezone name")
+    text = name.strip()
+    if not text:
+        return None
+    normalized = _normalized_iana_timezone_name(text)
+    if normalized is None:
+        display = text[:128] + ("..." if len(text) > 128 else "")
+        raise ValueError(f"Invalid timezone {display!r}")
+    return normalized
 
 # =============================================================================
 # Configuration
@@ -187,6 +305,11 @@ def use_cron_store(home: Union[str, Path]):
 def get_cron_output_dir() -> Path:
     """Return the output directory for the active cron store context."""
     return _current_cron_store().output_dir
+
+
+def _output_dir() -> Path:
+    """Compatibility helper for occurrence storage in the active cron store."""
+    return get_cron_output_dir()
 
 
 # Fallback stale-recovery window for a one-shot's running-claim (#59229) when
@@ -384,7 +507,596 @@ def _job_output_dir(job_id: str) -> Path:
         raise ValueError(f"Invalid cron job id for output path: {job_id!r}")
     if Path(text).is_absolute() or Path(text).drive:
         raise ValueError(f"Invalid cron job id for output path: {job_id!r}")
-    return _current_cron_store().output_dir / text
+    return _output_dir() / text
+
+
+def _parse_occurrence_instant(value: Any) -> Optional[datetime]:
+    """Parse a persisted ISO instant into an aware UTC datetime.
+
+    Job files are user-editable and therefore untrusted.  A malformed or naive
+    timestamp must not make the read-only calendar preview endpoint fail or
+    silently inherit the gateway host's local timezone.
+    """
+    if not isinstance(value, str) or len(value) > 128:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def normalize_external_fire_at(value: Any, *, now: Optional[datetime] = None) -> Optional[str]:
+    """Validate and canonicalize Chronos' protocol-owned ``fire_at`` value."""
+    if value is None:
+        return None
+    instant = _parse_occurrence_instant(value)
+    if instant is None:
+        raise ValueError("fire_at must be a bounded aware ISO timestamp")
+    reference = (now or _hermes_now()).astimezone(timezone.utc)
+    delta = (instant - reference).total_seconds()
+    if delta < -_MAX_EXTERNAL_FIRE_AGE_SECONDS or delta > _MAX_EXTERNAL_FIRE_FUTURE_SECONDS:
+        raise ValueError("fire_at is outside the accepted execution window")
+    return instant.isoformat()
+
+
+def _cron_output_occurrence_status(head: str) -> str:
+    """Best-effort legacy status parser scoped to producer-owned metadata.
+
+    Response and prompt bodies are untrusted LLM/user text.  Never interpret
+    headings inside them as execution status. New executions use the
+    structured sidecar below; this parser exists only for pre-sidecar output.
+    """
+    metadata = re.split(r"^##\s+(?:Prompt|Response)\s*$", head, maxsplit=1, flags=re.MULTILINE)[0]
+    if re.search(r"^#\s*Cron Job:[^\n]*\(FAILED\)", metadata, re.MULTILINE):
+        return "failed"
+    match = re.search(r"\*\*Status:\*\*\s*([^\n]+)", metadata)
+    if match:
+        status = match.group(1).strip().lower()
+        if status.startswith("script failed") or status.startswith("blocked"):
+            return "failed"
+        if status.startswith("silent"):
+            return "completed"
+    if re.search(r"^##\s*Error\b", metadata, re.MULTILINE):
+        return "failed"
+    return "completed"
+
+
+def _occurrence_journal_path(job_id: str) -> Path:
+    return _job_output_dir(job_id) / ".occurrences.json"
+
+
+def _occurrence_output_filename(value: Any) -> Optional[str]:
+    """Return a bounded producer-owned markdown basename, never a path."""
+    if not isinstance(value, str) or not value or len(value) > 255:
+        return None
+    if value in {".", ".."} or Path(value).name != value or not value.endswith(".md"):
+        return None
+    return value
+
+
+def _read_occurrence_journal(job: Dict[str, Any]) -> Tuple[Optional[List[Dict[str, Any]]], bool]:
+    """Read the bounded structured execution journal without following links."""
+    try:
+        job_dir = _job_output_dir(job.get("id"))
+        path = job_dir / ".occurrences.json"
+    except ValueError:
+        return None, False
+    if job_dir.is_symlink():
+        return [], True
+    try:
+        if job_dir.resolve(strict=True).parent != _output_dir().resolve(strict=True):
+            return [], True
+    except OSError:
+        return None, False
+    if path.is_symlink() or not path.is_file():
+        return None, False
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, os.O_RDONLY | no_follow)
+        try:
+            stat = os.fstat(fd)
+            if stat.st_size > _MAX_OCCURRENCE_JOURNAL_BYTES:
+                return [], True
+            raw = os.read(fd, _MAX_OCCURRENCE_JOURNAL_BYTES + 1)
+        finally:
+            os.close(fd)
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return [], True
+    if not isinstance(payload, dict) or not isinstance(payload.get("records"), list):
+        return [], True
+    records = [item for item in payload["records"] if isinstance(item, dict)]
+    return records[:_MAX_OCCURRENCE_JOURNAL_RECORDS], bool(payload.get("truncated"))
+
+
+def _append_job_occurrence(
+    job: Dict[str, Any],
+    actual_run_at: datetime,
+    *,
+    scheduled_at: Optional[datetime] = None,
+    output_filename: Optional[str] = None,
+    success: bool,
+    delivery_error: Optional[str],
+) -> None:
+    """Persist compact execution truth independently of verbose output retention."""
+    try:
+        output_root = _output_dir()
+        output_root.mkdir(parents=True, exist_ok=True)
+        _secure_dir(output_root)
+        job_dir = _job_output_dir(job.get("id"))
+        if job_dir.is_symlink():
+            raise ValueError("cron occurrence output directory is a symlink")
+        job_dir.mkdir(parents=True, exist_ok=True)
+        _secure_dir(job_dir)
+        if job_dir.resolve(strict=True).parent != output_root.resolve(strict=True):
+            raise ValueError("cron occurrence output directory escaped sandbox")
+        path = _occurrence_journal_path(job.get("id"))
+        existing, was_truncated = _read_occurrence_journal(job)
+        records = existing or []
+        actual_instant = actual_run_at.astimezone(timezone.utc).isoformat()
+        scheduled_instant = (scheduled_at or actual_run_at).astimezone(timezone.utc).isoformat()
+        status = "delivery_failed" if success and delivery_error else "completed" if success else "failed"
+        record = {
+            # Use the same identity as the scheduled preview so a completion
+            # updates the existing calendar node in place instead of moving it
+            # to the finish time and remounting it.
+            "id": f"{job.get('id')}:scheduled:{scheduled_instant}",
+            "job_id": str(job.get("id") or ""),
+            "scheduled_at": scheduled_instant,
+            "actual_run_at": actual_instant,
+            "status": status,
+        }
+        safe_output_filename = _occurrence_output_filename(output_filename)
+        if safe_output_filename is not None:
+            record["output_filename"] = safe_output_filename
+        records.append(record)
+        truncated = was_truncated or len(records) > _MAX_OCCURRENCE_JOURNAL_RECORDS
+        records = records[-_MAX_OCCURRENCE_JOURNAL_RECORDS:]
+        fd, tmp_path = tempfile.mkstemp(dir=str(job_dir), suffix=".tmp", prefix=".occurrences_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump({"records": records, "truncated": truncated}, handle, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            # This sidecar is producer-owned state, not a user-managed config
+            # symlink. The shared atomic_replace intentionally follows final
+            # symlinks; using it here would let an output-dir symlink overwrite
+            # an arbitrary target. The temp file is created in the same 0700
+            # directory with mode 0600, so a direct replace is atomic and
+            # cannot cross devices or follow the destination symlink.
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except Exception as exc:
+        # Calendar history must never turn a successful scheduled side effect
+        # into a failed execution.
+        logger.warning("Failed to persist occurrence journal for job %r: %s", job.get("id"), exc)
+
+
+def _historical_job_occurrences(
+    job: Dict[str, Any],
+    from_at: datetime,
+    to_at: datetime,
+    limit: int,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Read real execution outputs for one job, without following symlinks."""
+    journal, journal_truncated = _read_occurrence_journal(job)
+    result: List[Dict[str, Any]] = []
+    journal_timestamps: List[float] = []
+    journal_output_filenames: Set[str] = set()
+    if journal:
+        for item in journal:
+            output_filename = _occurrence_output_filename(item.get("output_filename"))
+            if output_filename is not None:
+                journal_output_filenames.add(output_filename)
+            instant = _parse_occurrence_instant(item.get("scheduled_at"))
+            actual_instant = _parse_occurrence_instant(item.get("actual_run_at"))
+            if actual_instant is not None:
+                journal_timestamps.append(actual_instant.timestamp())
+            elif instant is not None:
+                journal_timestamps.append(instant.timestamp())
+            # Build de-dup indexes from the full journal before applying the
+            # requested scheduled-time window. This prevents a run scheduled
+            # before midnight but completed after midnight from resurfacing as
+            # a phantom markdown-only occurrence on the next day.
+            if instant is None or not from_at <= instant < to_at:
+                continue
+            if item.get("status") not in {"completed", "failed", "delivery_failed"}:
+                continue
+            result.append(dict(item))
+    journal_timestamps.sort()
+    try:
+        job_dir = _job_output_dir(job.get("id"))
+    except ValueError:
+        return result[:limit], journal_truncated
+    if job_dir.is_symlink() or not job_dir.is_dir():
+        return result[:limit], journal_truncated
+    try:
+        output_root = _output_dir().resolve(strict=True)
+        resolved_job_dir = job_dir.resolve(strict=True)
+    except OSError:
+        return result[:limit], journal_truncated
+    if resolved_job_dir.parent != output_root:
+        return result[:limit], journal_truncated
+
+    candidates: List[Tuple[int, str, str]] = []
+    scan_truncated = False
+    try:
+        with os.scandir(resolved_job_dir) as entries:
+            for index, entry in enumerate(entries):
+                if index >= _MAX_OCCURRENCE_HISTORY_FILES:
+                    scan_truncated = True
+                    break
+                if not entry.name.endswith(".md") or entry.name.startswith("."):
+                    continue
+                try:
+                    if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                        continue
+                    stat = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                instant = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+                if from_at <= instant < to_at:
+                    candidates.append((stat.st_mtime_ns, entry.name, entry.path))
+    except OSError:
+        return result[:limit], journal_truncated
+
+    candidates.sort(reverse=True)
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    for mtime_ns, filename, path in candidates[:limit]:
+        if filename in journal_output_filenames:
+            continue
+        try:
+            fd = os.open(path, os.O_RDONLY | no_follow)
+            try:
+                head = os.read(fd, _MAX_OCCURRENCE_STATUS_BYTES).decode("utf-8", errors="replace")
+                actual = datetime.fromtimestamp(os.fstat(fd).st_mtime, tz=timezone.utc)
+            finally:
+                os.close(fd)
+        except OSError:
+            continue
+        # New executions have both a verbose markdown output and a compact
+        # journal row. Keep the structured row, but still merge older legacy
+        # markdown so the first post-upgrade execution cannot erase history.
+        actual_timestamp = actual.timestamp()
+        journal_index = bisect_left(journal_timestamps, actual_timestamp - 2.0)
+        if (
+            journal_index < len(journal_timestamps)
+            and journal_timestamps[journal_index] <= actual_timestamp + 2.0
+        ):
+            continue
+        result.append({
+            "id": f"{job.get('id')}:run:{mtime_ns}:{filename}",
+            "job_id": str(job.get("id") or ""),
+            "scheduled_at": actual.isoformat(),
+            "actual_run_at": actual.isoformat(),
+            "status": _cron_output_occurrence_status(head),
+        })
+    result.sort(key=lambda item: item.get("scheduled_at", ""), reverse=True)
+    keep = _cron_output_keep()
+    legacy_truncated = keep > 0 and len(candidates) >= keep
+    query_truncated = len(candidates) > limit or len(result) > limit
+    return result[:limit], journal_truncated or legacy_truncated or scan_truncated or query_truncated
+
+
+def _next_preview_instant(job: Dict[str, Any], base: datetime) -> Optional[datetime]:
+    schedule = job.get("schedule")
+    if not isinstance(schedule, dict):
+        return None
+    kind = schedule.get("kind")
+    if kind == "interval":
+        minutes = schedule.get("minutes")
+        if (
+            not isinstance(minutes, (int, float))
+            or isinstance(minutes, bool)
+            or not math.isfinite(minutes)
+            or minutes <= 0
+            or minutes > 525_600_000
+        ):
+            return None
+        try:
+            return base + timedelta(minutes=float(minutes))
+        except (OverflowError, ValueError):
+            return None
+    if kind != "cron" or not _ensure_croniter():
+        return None
+    expr = schedule.get("expr")
+    if not isinstance(expr, str) or len(expr) > 256:
+        return None
+    tz_name = _normalized_iana_timezone_name(job.get("timezone"))
+    zoned_base = base.astimezone(ZoneInfo(tz_name)) if tz_name else base
+    try:
+        iterator = croniter(expr, zoned_base)
+        base_timestamp = zoned_base.timestamp()
+        for _ in range(_MAX_CRON_NEXT_RUN_ATTEMPTS):
+            candidate = iterator.get_next(datetime)
+            if candidate.tzinfo is None:
+                candidate = candidate.replace(tzinfo=zoned_base.tzinfo)
+            if candidate.timestamp() > base_timestamp:
+                return candidate.astimezone(timezone.utc)
+            folded_candidate = candidate.replace(fold=1)
+            if (
+                folded_candidate.utcoffset() != candidate.utcoffset()
+                and folded_candidate.timestamp() > base_timestamp
+            ):
+                return folded_candidate.astimezone(timezone.utc)
+    except (KeyError, TypeError, ValueError):
+        return None
+    return None
+
+
+def _in_flight_occurrence(job: Dict[str, Any], now: datetime) -> Optional[Dict[str, datetime]]:
+    """Return a fresh, bounded execution claim from the persisted job row.
+
+    ``jobs.json`` can be edited externally, so the claim is treated as
+    untrusted input: only short ISO timestamps are accepted and stale/future
+    claims are ignored.  The claim contains no paths or user-controlled text.
+    """
+    raw = job.get("in_flight_occurrence")
+    if not isinstance(raw, dict):
+        return None
+    values: Dict[str, datetime] = {}
+    for key in ("scheduled_at", "claimed_at", "original_scheduled_at"):
+        value = raw.get(key)
+        if value is None and key == "original_scheduled_at":
+            continue
+        if not isinstance(value, str) or len(value) > 128:
+            return None
+        parsed = _parse_occurrence_instant(value)
+        if parsed is None:
+            return None
+        values[key] = parsed
+    claimed_at = values["claimed_at"]
+    age = (now.astimezone(timezone.utc) - claimed_at).total_seconds()
+    try:
+        configured_ttl = int(os.getenv(
+            "HERMES_CRON_OCCURRENCE_LEASE_SECONDS",
+            str(_IN_FLIGHT_OCCURRENCE_DEFAULT_TTL_SECONDS),
+        ))
+    except (TypeError, ValueError):
+        configured_ttl = _IN_FLIGHT_OCCURRENCE_DEFAULT_TTL_SECONDS
+    ttl_seconds = max(
+        _IN_FLIGHT_OCCURRENCE_MIN_TTL_SECONDS,
+        min(configured_ttl, _IN_FLIGHT_OCCURRENCE_MAX_TTL_SECONDS),
+    )
+    if age < -300 or age > ttl_seconds:
+        return None
+    return values
+
+
+def _set_in_flight_occurrence(
+    job: Dict[str, Any],
+    *,
+    scheduled_at: datetime,
+    claimed_at: datetime,
+    original_scheduled_at: Optional[datetime] = None,
+) -> None:
+    claim = {
+        "scheduled_at": scheduled_at.astimezone(timezone.utc).isoformat(),
+        "claimed_at": claimed_at.astimezone(timezone.utc).isoformat(),
+    }
+    if original_scheduled_at is not None:
+        claim["original_scheduled_at"] = original_scheduled_at.astimezone(timezone.utc).isoformat()
+    job["in_flight_occurrence"] = claim
+
+
+def _future_job_occurrences(
+    job: Dict[str, Any],
+    from_at: datetime,
+    to_at: datetime,
+    now: datetime,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    if not job.get("enabled") or job.get("state") in {"paused", "staged", "completed", "error"}:
+        return []
+    schedule = job.get("schedule")
+    if not isinstance(schedule, dict):
+        return []
+    if schedule.get("kind") == "interval":
+        minutes = schedule.get("minutes")
+        if (
+            not isinstance(minutes, (int, float))
+            or isinstance(minutes, bool)
+            or not math.isfinite(minutes)
+            or minutes <= 0
+            or minutes > 525_600_000
+        ):
+            return []
+    candidate = _parse_occurrence_instant(job.get("next_run_at"))
+    in_flight = _in_flight_occurrence(job, now)
+    frozen_trigger = in_flight["scheduled_at"] if in_flight else _parse_occurrence_instant(
+        job.get("_occurrence_triggered_at")
+    )
+    if candidate is None and frozen_trigger is None:
+        return []
+    original_stale_at: Optional[datetime] = None
+    if frozen_trigger is not None:
+        if in_flight and in_flight.get("original_scheduled_at") is not None:
+            original_stale_at = in_flight["original_scheduled_at"]
+        elif candidate is not None and candidate < frozen_trigger:
+            original_stale_at = candidate
+    elif candidate is not None and candidate < now:
+        missed_by_seconds = (now - candidate).total_seconds()
+        kind = schedule.get("kind")
+        should_catch_up_now = (
+            kind == "once"
+            or (kind in {"cron", "interval"} and missed_by_seconds > _compute_grace_seconds(schedule))
+        )
+        if should_catch_up_now:
+            original_stale_at = candidate
+            candidate = now
+
+    repeat = job.get("repeat") if isinstance(job.get("repeat"), dict) else {}
+    times = repeat.get("times")
+    completed = repeat.get("completed", 0)
+    remaining: Optional[int] = None
+    if isinstance(times, int) and not isinstance(times, bool):
+        done = completed if isinstance(completed, int) and not isinstance(completed, bool) else 0
+        remaining = max(0, times - done)
+        # Finite one-shots are claimed before their side effect. During that
+        # execution window completed==times, but the task is still active and
+        # must not blink out of calendar clients before mark_job_run records
+        # the real terminal occurrence.
+        if (
+            remaining == 0
+            and schedule.get("kind") == "once"
+            and job.get("state") == "scheduled"
+            and job.get("enabled")
+            and not job.get("last_run_at")
+        ):
+            remaining = 1
+
+    result: List[Dict[str, Any]] = []
+    if frozen_trigger is not None and (remaining is None or remaining > 0):
+        if from_at <= frozen_trigger < to_at:
+            iso = frozen_trigger.isoformat()
+            occurrence = {
+                "id": f"{job.get('id')}:scheduled:{iso}",
+                "job_id": str(job.get("id") or ""),
+                "scheduled_at": iso,
+                "status": "scheduled",
+            }
+            if original_stale_at is not None:
+                occurrence["original_scheduled_at"] = original_stale_at.isoformat()
+            result.append(occurrence)
+        if remaining is not None:
+            remaining -= 1
+        # The store may already point at the following run (after a ticker or
+        # external CAS claim), or an ephemeral due object may still point at
+        # this run.  Never project the in-flight identity twice.
+        if candidate is not None and candidate <= frozen_trigger:
+            candidate = _next_preview_instant(job, frozen_trigger)
+
+    if candidate is None:
+        return result
+    first = frozen_trigger is None
+    iterations = 0
+    while (
+        candidate < to_at
+        and len(result) < limit
+        and (remaining is None or remaining > 0)
+        and iterations < _MAX_OCCURRENCE_ITERATIONS
+    ):
+        iterations += 1
+        if candidate >= from_at:
+            iso = candidate.isoformat()
+            occurrence = {
+                "id": f"{job.get('id')}:scheduled:{iso}",
+                "job_id": str(job.get("id") or ""),
+                "scheduled_at": iso,
+                "status": "scheduled",
+            }
+            if original_stale_at is not None and first:
+                occurrence["original_scheduled_at"] = original_stale_at.isoformat()
+            result.append(occurrence)
+        if remaining is not None:
+            remaining -= 1
+        if schedule.get("kind") == "once":
+            break
+        # A stale next_run_at represents one catch-up execution, not every tick
+        # missed while the gateway was offline.  Hermes re-anchors the following
+        # run to the actual catch-up time, so previews must do the same.
+        base = candidate
+        candidate = _next_preview_instant(job, base)
+        if candidate is None:
+            break
+        first = False
+    return result
+
+
+def _collect_job_occurrences(
+    jobs: List[Dict[str, Any]],
+    from_at: datetime,
+    to_at: datetime,
+    *,
+    now: Optional[datetime] = None,
+    limit: int = 2_000,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Collect occurrences and completeness metadata in one bounded scan."""
+    if from_at.tzinfo is None or to_at.tzinfo is None:
+        raise ValueError("occurrence bounds must include a timezone")
+    start = from_at.astimezone(timezone.utc)
+    end = to_at.astimezone(timezone.utc)
+    if end <= start:
+        raise ValueError("occurrence 'to' must be after 'from'")
+    bounded_limit = max(1, min(int(limit), 2_000))
+    current = (now or _hermes_now()).astimezone(timezone.utc)
+    bounded_jobs = jobs[:_MAX_OCCURRENCE_QUERY_JOBS]
+    history_truncated = len(jobs) > len(bounded_jobs)
+    per_job_occurrences: List[List[Dict[str, Any]]] = []
+    for job in bounded_jobs:
+        history, truncated = _historical_job_occurrences(job, start, end, bounded_limit)
+        history_truncated = history_truncated or truncated
+        projected = history + _future_job_occurrences(job, start, end, current, bounded_limit)
+        projected.sort(key=lambda item: (item.get("scheduled_at", ""), item.get("id", "")))
+        per_job_occurrences.append(projected)
+
+    # Select in rounds before the final chronological sort. This prevents one
+    # every-minute task from consuming the entire global cap while other jobs
+    # still have occurrences in the requested range.
+    occurrences: List[Dict[str, Any]] = []
+    round_index = 0
+    while len(occurrences) < bounded_limit:
+        added = False
+        for projected in per_job_occurrences:
+            if round_index < len(projected):
+                occurrences.append(projected[round_index])
+                added = True
+                if len(occurrences) >= bounded_limit:
+                    break
+        if not added:
+            break
+        round_index += 1
+    occurrences.sort(key=lambda item: (item.get("scheduled_at", ""), item.get("id", "")))
+    if sum(len(projected) for projected in per_job_occurrences) > len(occurrences):
+        history_truncated = True
+    return occurrences, history_truncated
+
+
+def list_job_occurrences(
+    jobs: List[Dict[str, Any]],
+    from_at: datetime,
+    to_at: datetime,
+    *,
+    now: Optional[datetime] = None,
+    limit: int = 2_000,
+) -> List[Dict[str, Any]]:
+    """Return real past runs plus read-only future previews for calendar UIs.
+
+    This function never mutates jobs.json and never calls ``compute_next_run``;
+    the scheduler's state transition path remains completely untouched.
+    """
+    occurrences, _ = _collect_job_occurrences(jobs, from_at, to_at, now=now, limit=limit)
+    return occurrences
+
+
+def job_occurrence_projection(
+    jobs: List[Dict[str, Any]],
+    from_at: datetime,
+    to_at: datetime,
+    *,
+    now: Optional[datetime] = None,
+    limit: int = 2_000,
+) -> Dict[str, Any]:
+    """Occurrence payload with an explicit history completeness contract."""
+    occurrences, history_truncated = _collect_job_occurrences(
+        jobs,
+        from_at,
+        to_at,
+        now=now,
+        limit=limit,
+    )
+    return {
+        "occurrences": occurrences,
+        "history_truncated": history_truncated,
+    }
 
 
 def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
@@ -468,6 +1180,39 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
     if not state:
         state = "scheduled" if normalized.get("enabled", True) else "paused"
     normalized["state"] = state
+
+    # A task grant is durable scheduler-private material.  Its opaque token
+    # must never leave jobs.json via any list/get/update API; only the raw
+    # scheduler record may exchange it for a short local route capability.
+    execution = normalized.get("connector_execution")
+    if isinstance(execution, dict):
+        provider_id = str(execution.get("provider_id") or "").strip().lower()
+        grant_id = str(execution.get("grant_id") or "").strip()
+        expires_at = str(execution.get("expires_at") or "").strip()
+        if provider_id == "linear" and grant_id:
+            normalized["connector_execution"] = {
+                "provider_id": provider_id,
+                "grant_id": grant_id,
+                "authorization_state": "authorized",
+            }
+            if expires_at:
+                normalized["connector_execution"]["expires_at"] = expires_at
+        else:
+            normalized.pop("connector_execution", None)
+
+    raw_output_language = normalized.get("output_language")
+    output_language = normalize_output_language_tag(raw_output_language)
+    if output_language is not None:
+        normalized["output_language"] = output_language
+    else:
+        # Missing and invalid values both mean "legacy fallback". In
+        # particular, never pass hand-edited arbitrary text to a system prompt.
+        normalized.pop("output_language", None)
+        if raw_output_language is not None and raw_output_language != "":
+            logger.warning(
+                "Ignoring invalid output_language on cron job %r",
+                normalized.get("id"),
+            )
 
     return normalized
 
@@ -561,16 +1306,21 @@ def parse_duration(s: str) -> int:
     return value * multipliers[unit]
 
 
-def parse_schedule(schedule: str) -> Dict[str, Any]:
+def parse_schedule(schedule: str, *, tz_name: Optional[str] = None) -> Dict[str, Any]:
     """
     Parse schedule string into structured format.
-    
+
     Returns dict with:
         - kind: "once" | "interval" | "cron"
         - For "once": "run_at" (ISO timestamp)
         - For "interval": "minutes" (int)
         - For "cron": "expr" (cron expression)
-    
+
+    ``tz_name`` is an optional IANA timezone (e.g. ``"Asia/Shanghai"``) used to
+    anchor *naive* ISO timestamps. With ``tz_name`` set, ``"2026-05-25T10:30"``
+    is interpreted as 10:30 wall-clock in that zone instead of the system local
+    zone — without it, the result depends on where hermes happens to run.
+
     Examples:
         "30m"              → once in 30 minutes
         "2h"               → once in 2 hours
@@ -619,19 +1369,28 @@ def parse_schedule(schedule: str) -> Dict[str, Any]:
             dt = datetime.fromisoformat(schedule.replace('Z', '+00:00'))
             # Make naive timestamps timezone-aware at parse time so the stored
             # value doesn't depend on the system timezone matching at check time.
-            #
-            # Anchor to the CONFIGURED Hermes timezone, not the server's local
-            # timezone. The due-check (`get_due_jobs`) compares `next_run_at`
-            # against `hermes_time.now()`, which uses the configured zone. If a
-            # naive "20:07" were interpreted as server-local (e.g. UTC) while
-            # now() runs in Asia/Kolkata, the stored instant would land hours
-            # off from the user's wall-clock intent — far enough that one-shots
-            # never become due and recurring jobs fire at the wrong time. Using
-            # the configured zone makes "20:07" mean 20:07 on the same clock the
-            # scheduler checks against (#51021).
+            # When the caller supplied a tz_name (per-job timezone), interpret
+            # the naive wall-clock in that zone. Otherwise anchor to the
+            # CONFIGURED Hermes timezone, not the server's local timezone. The
+            # due-check (`get_due_jobs`) compares `next_run_at` against
+            # `hermes_time.now()`, which uses the configured zone (#51021).
             if dt.tzinfo is None:
-                hermes_tz = _hermes_now().tzinfo
-                dt = dt.replace(tzinfo=hermes_tz)
+                anchor_tz = None
+                if tz_name:
+                    try:
+                        anchor_tz = ZoneInfo(tz_name)
+                    except (ZoneInfoNotFoundError, ValueError):
+                        logger.warning(
+                            "parse_schedule: invalid tz_name %r, falling back "
+                            "to configured Hermes timezone; "
+                            "create_job._validate_tz_name "
+                            "should normally catch this earlier",
+                            tz_name,
+                        )
+                        anchor_tz = None
+                if anchor_tz is None:
+                    anchor_tz = _hermes_now().tzinfo
+                dt = dt.replace(tzinfo=anchor_tz)
             return {
                 "kind": "once",
                 "run_at": dt.isoformat(),
@@ -735,12 +1494,20 @@ def _recoverable_oneshot_run_at(
     return None
 
 
+def _stale_oneshot_error(schedule: Dict[str, Any], fallback: Any) -> ValueError:
+    run_at = schedule.get("run_at") or schedule.get("display") or fallback
+    return ValueError(
+        f"One-shot schedule is in the past and cannot be scheduled: {run_at}"
+    )
+
+
 def _compute_grace_seconds(schedule: dict) -> int:
-    """Compute how late a job can be and still catch up instead of fast-forwarding.
+    """Compute the lateness threshold used to classify a missed recurring run.
 
     Uses half the schedule period, clamped between 120 seconds and 2 hours.
-    This ensures daily jobs can catch up if missed by up to 2 hours,
-    while frequent jobs (every 5-10 min) still fast-forward quickly.
+    Stale runs beyond this threshold are still caught up once; the threshold is
+    kept for diagnostics/logging so operators can distinguish a normal late tick
+    from a gateway-down or device-sleep catch-up.
     """
     MIN_GRACE = 120
     MAX_GRACE = 7200  # 2 hours
@@ -769,11 +1536,23 @@ def _compute_grace_seconds(schedule: dict) -> int:
     return MIN_GRACE
 
 
-def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None) -> Optional[str]:
+def compute_next_run(
+    schedule: Dict[str, Any],
+    last_run_at: Optional[str] = None,
+    *,
+    tz_name: Optional[str] = None,
+) -> Optional[str]:
     """
     Compute the next run time for a schedule.
 
     Returns ISO timestamp string, or None if no more runs.
+
+    ``tz_name`` is a per-job IANA timezone (e.g. ``"Asia/Shanghai"``).
+    Only the cron branch is timezone-sensitive — ``"6 23 * * *"`` means
+    different wall-clock instants in different zones. Interval/once jobs
+    operate on absolute datetimes, so the job-level tz doesn't change
+    their behaviour. When ``tz_name`` is None, fall back to the hermes
+    instance's configured timezone via _hermes_now().
     """
     now = _hermes_now()
 
@@ -814,19 +1593,71 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
                 expr,
             )
             return None
+
+        # Resolve the timezone to evaluate the cron expression in.
+        # Per-job tz wins; otherwise inherit the hermes instance's tz.
+        job_tz = None
+        normalized_tz_name = _normalized_iana_timezone_name(tz_name)
+        if normalized_tz_name is not None:
+            job_tz = ZoneInfo(normalized_tz_name)
+        elif tz_name not in (None, ""):
+            invalid_tz = (
+                tz_name[:128] + ("..." if len(tz_name) > 128 else "")
+                if isinstance(tz_name, str)
+                else f"<{type(tz_name).__name__}>"
+            )
+            logger.warning(
+                "Invalid per-job timezone %r; falling back to hermes default.",
+                invalid_tz,
+            )
+
         # Use last_run_at as the croniter base when available, consistent
         # with interval jobs.  This ensures that after a crash/restart,
         # the next run is anchored to the actual last execution time
         # rather than to an arbitrary restart time.
-        base_time = now
         if last_run_at:
             try:
                 base_time = _ensure_aware(datetime.fromisoformat(last_run_at))
             except Exception:
                 base_time = now
+        else:
+            base_time = now
+        if job_tz is not None:
+            base_time = base_time.astimezone(job_tz)
+
         cron = croniter(expr, base_time)
-        next_run = cron.get_next(datetime)
-        return next_run.isoformat()
+        base_timestamp = base_time.timestamp()
+        for _ in range(_MAX_CRON_NEXT_RUN_ATTEMPTS):
+            next_run = cron.get_next(datetime)
+            if next_run.timestamp() > base_timestamp:
+                return next_run.isoformat()
+
+            # During a DST fall-back, croniter can return the first occurrence
+            # of an ambiguous wall time (fold=0) even when the base is already
+            # in the repeated hour (fold=1).  The wall time looks later, but its
+            # absolute timestamp is in the past.  Prefer the second occurrence
+            # when it is both genuinely ambiguous and strictly after the base.
+            folded_next_run = next_run.replace(fold=1)
+            if (
+                folded_next_run.utcoffset() != next_run.utcoffset()
+                and folded_next_run.timestamp() > base_timestamp
+            ):
+                return folded_next_run.isoformat()
+
+        cron_expr = expr
+        cron_expr_display = (
+            cron_expr[:128] + ("..." if len(cron_expr) > 128 else "")
+            if isinstance(cron_expr, str)
+            else f"<{type(cron_expr).__name__}>"
+        )
+        logger.error(
+            "Cron schedule %r did not produce a next run strictly after %s "
+            "within %d attempts.",
+            cron_expr_display,
+            base_time.isoformat(),
+            _MAX_CRON_NEXT_RUN_ATTEMPTS,
+        )
+        return None
 
     return None
 
@@ -1102,6 +1933,87 @@ def save_jobs(jobs: List[Dict[str, Any]]):
         _save_jobs_unlocked(jobs)
 
 
+def update_job_provider_state(
+    job_id: str,
+    provider: str,
+    state: Optional[Dict[str, Any]],
+    *,
+    revision_field: str,
+    expected_revision: int,
+) -> str:
+    """CAS-update one provider's bounded durable metadata on a job.
+
+    Returns ``updated``, ``missing``, ``superseded`` (the stored projection is
+    newer), or ``future`` (the requested projection has not reached jobs.json).
+    Provider state is execution metadata, so it must never bypass the same
+    projection revision fence that guards the provider's external mutation.
+    """
+    if (
+        not isinstance(job_id, str)
+        or not job_id
+        or len(job_id) > 128
+        or not isinstance(provider, str)
+        or re.fullmatch(r"[a-z0-9_-]{1,32}", provider) is None
+        or not isinstance(revision_field, str)
+        or re.fullmatch(r"[a-z0-9_]{1,64}", revision_field) is None
+        or not isinstance(expected_revision, int)
+        or isinstance(expected_revision, bool)
+        or expected_revision <= 0
+    ):
+        raise ValueError("invalid provider state identity")
+    if state is not None:
+        if not isinstance(state, dict):
+            raise ValueError("provider state must be an object")
+        encoded = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+        if len(encoded.encode("utf-8")) > 4096:
+            raise ValueError("provider state exceeded cap")
+
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            if job.get("id") != job_id:
+                continue
+            current_revision = job.get(revision_field)
+            if (
+                not isinstance(current_revision, int)
+                or isinstance(current_revision, bool)
+                or current_revision <= 0
+            ):
+                return "future"
+            if current_revision > expected_revision:
+                return "superseded"
+            if current_revision < expected_revision:
+                return "future"
+            existing = job.get("provider_state")
+            if existing is None:
+                provider_state: Dict[str, Any] = {}
+            elif isinstance(existing, dict) and len(existing) <= 16:
+                raw_existing = json.dumps(existing, ensure_ascii=False, separators=(",", ":"))
+                if len(raw_existing.encode("utf-8")) > 16 * 1024:
+                    raise ValueError("persisted provider state exceeded cap")
+                provider_state = dict(existing)
+            else:
+                raise ValueError("invalid persisted provider state")
+            if state is None:
+                provider_state.pop(provider, None)
+            else:
+                provider_state[provider] = state
+            if len(provider_state) > 16:
+                raise ValueError("provider state exceeded provider cap")
+            rebuilt = json.dumps(provider_state, ensure_ascii=False, separators=(",", ":"))
+            if len(rebuilt.encode("utf-8")) > 16 * 1024:
+                raise ValueError("provider state exceeded total cap")
+            if provider_state:
+                job["provider_state"] = provider_state
+            else:
+                job.pop("provider_state", None)
+            _save_jobs_unlocked(jobs)
+            return "updated"
+    return "missing"
+
+
 def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     """Normalize and validate a cron job workdir.
 
@@ -1261,6 +2173,8 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    timezone: Optional[str] = None,
+    output_language: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1305,11 +2219,24 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        output_language: Optional canonical BCP 47 language tag captured when
+                         an LLM creates an agent job. Direct/legacy callers may
+                         omit it; script-only jobs ignore it.
 
     Returns:
         The created job dict
     """
-    parsed_schedule = parse_schedule(schedule)
+    # Validate the per-job timezone up-front so parse_schedule can honour it
+    # for naive ISO timestamps (e.g. "2026-05-25T10:30" → 10:30 wall in tz).
+    normalized_tz = _validate_tz_name(timezone)
+    if normalized_tz is None:
+        # All-fixed policy (ZET-1258): pin the device's current timezone at
+        # creation so wall-clock is deterministic no matter which path created
+        # the job (LLM cronjob tool / HTTP) — both converge here. To restore
+        # follow-live later, thread an opt-out param to skip this.
+        from hermes_time import get_timezone_name
+        normalized_tz = get_timezone_name()
+    parsed_schedule = parse_schedule(schedule, tz_name=normalized_tz)
 
     # Normalize repeat: treat 0 or negative values as None (infinite)
     if repeat is not None and repeat <= 0:
@@ -1322,6 +2249,10 @@ def create_job(
     # Default delivery to origin if available, otherwise local
     if deliver is None:
         deliver = "origin" if origin else "local"
+
+    initial_next_run_at = compute_next_run(parsed_schedule, tz_name=normalized_tz)
+    if parsed_schedule["kind"] == "once" and initial_next_run_at is None:
+        raise _stale_oneshot_error(parsed_schedule, schedule)
 
     job_id = uuid.uuid4().hex[:12]
     now = _hermes_now().isoformat()
@@ -1337,6 +2268,11 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_output_language = (
+        None
+        if normalized_no_agent
+        else validate_output_language_tag(output_language)
+    )
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1416,8 +2352,9 @@ def create_job(
         "paused_at": None,
         "paused_reason": None,
         "created_at": now,
-        "next_run_at": next_run_at,
+        "next_run_at": initial_next_run_at,
         "last_run_at": None,
+        "timezone": normalized_tz,
         "last_status": None,
         "last_error": None,
         "last_delivery_error": None,
@@ -1432,7 +2369,8 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
-
+    if normalized_output_language is not None:
+        job["output_language"] = normalized_output_language
     with _jobs_lock():
         jobs = load_jobs()
         jobs.append(job)
@@ -1447,6 +2385,20 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     for job in jobs:
         if job["id"] == job_id:
             return _normalize_job_record(job)
+    return None
+
+
+def get_job_raw(job_id: str) -> Optional[Dict[str, Any]]:
+    """Get the persisted job shape without reader normalization.
+
+    This is intentionally narrow: wire-contract validators sometimes need to
+    distinguish JSON ``null`` from an empty string.  Callers must treat the
+    returned record as untrusted persisted input and validate its full shape
+    before acting on it.
+    """
+    for job in load_jobs():
+        if isinstance(job, dict) and job.get("id") == job_id:
+            return job
     return None
 
 
@@ -1531,11 +2483,45 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                     updates["workdir"] = _normalize_workdir(_wd)
 
             previous_inference_axes = _normalized_inference_axes(job)
+            # Validate timezone if present.  Empty / None clears the per-job tz
+            # and falls back to the hermes instance's configured tz.
+            if "timezone" in updates:
+                updates["timezone"] = _validate_tz_name(updates["timezone"])
+            if "output_language" in updates:
+                updates["output_language"] = validate_output_language_tag(
+                    updates["output_language"]
+                )
+
             updated = _apply_skill_fields({**job, **updates})
+            if "connector_execution" in updates:
+                execution = updates.get("connector_execution")
+                if execution is None:
+                    updated.pop("connector_execution", None)
+                elif isinstance(execution, dict):
+                    provider_id = str(execution.get("provider_id") or "").strip().lower()
+                    grant_id = str(execution.get("grant_id") or "").strip()
+                    grant_token = str(execution.get("grant_token") or "").strip()
+                    expires_at = str(execution.get("expires_at") or "").strip()
+                    if provider_id != "linear" or not grant_id or not grant_token:
+                        raise ValueError("invalid connector execution grant")
+                    updated["connector_execution"] = {
+                        "provider_id": provider_id,
+                        "grant_id": grant_id,
+                        "grant_token": grant_token,
+                        "expires_at": expires_at,
+                    }
+                else:
+                    raise ValueError("invalid connector execution grant")
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
             ) and _normalized_inference_axes(updated) != previous_inference_axes
+            # A bare timezone change must also recompute next_run_at — otherwise
+            # the user fixes their tz and the next firing still uses the old
+            # wall-clock until the next mark_job_run.
+            timezone_changed = (
+                "timezone" in updates and updates["timezone"] != job.get("timezone")
+            )
 
             if "skills" in updates or "skill" in updates:
                 normalized_skills = _normalize_skill_list(updated.get("skill"), updated.get("skills"))
@@ -1548,36 +2534,24 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 # instead of a pre-parsed dict.  Normalize it the same way
                 # create_job() does so downstream code can call .get() safely.
                 if isinstance(updated_schedule, str):
-                    updated_schedule = parse_schedule(updated_schedule)
+                    updated_schedule = parse_schedule(
+                        updated_schedule, tz_name=updated.get("timezone")
+                    )
                     updated["schedule"] = updated_schedule
                 updated["schedule_display"] = updates.get(
                     "schedule_display",
                     updated_schedule.get("display", updated.get("schedule_display")),
                 )
-                if updated.get("state") != "paused":
-                    updated_next_run = compute_next_run(updated_schedule)
-                    # Same guard as create_job: an UPDATE that sets a one-shot
-                    # to a time >ONESHOT_GRACE_SECONDS in the past would store
-                    # next_run_at=None with state="scheduled", re-creating the
-                    # ghost job that never fires (#59395). Reject it here too so
-                    # the bug can't re-enter through the update door.
-                    if (
-                        updated_next_run is None
-                        and updated_schedule.get("kind") == "once"
-                    ):
-                        run_at = updated_schedule.get("run_at") or updated_schedule
-                        logger.warning(
-                            "Rejecting one-shot cron job update '%s': run_at %s "
-                            "is outside the %ss grace window",
-                            updated.get("name", job_id),
-                            run_at,
-                            ONESHOT_GRACE_SECONDS,
-                        )
-                        raise ValueError(
-                            f"Requested one-shot time {run_at} is more than "
-                            f"{ONESHOT_GRACE_SECONDS}s in the past and cannot be scheduled."
-                        )
-                    updated["next_run_at"] = updated_next_run
+            # interval/once next_run 与 tz 无关：纯 tz 变更只该让 cron 重算，否则
+            # compute_next_run(无 last_run_at) 会把 interval 重置成 now+间隔。
+            tz_only_recompute = timezone_changed and updated["schedule"].get("kind") == "cron"
+            if (schedule_changed or tz_only_recompute) and updated.get("state") != "paused":
+                updated["next_run_at"] = compute_next_run(
+                    updated["schedule"], tz_name=updated.get("timezone")
+                )
+                if updated["schedule"].get("kind") == "once" and not updated["next_run_at"]:
+                    fallback_schedule = updates.get("schedule_display") or updates.get("schedule")
+                    raise _stale_oneshot_error(updated["schedule"], fallback_schedule)
 
             if inference_fields_changed:
                 provider_snapshot, model_snapshot = _compute_provider_model_snapshots(
@@ -1590,14 +2564,24 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updated["model_snapshot"] = model_snapshot
 
             if updated.get("enabled", True) and updated.get("state") != "paused" and not updated.get("next_run_at"):
-                next_run = compute_next_run(updated["schedule"])
-                if next_run is None and updated["schedule"].get("kind") == "once":
-                    run_at = updated["schedule"].get("run_at", "unknown")
-                    raise ValueError(
-                        f"Requested one-shot time {run_at} is in the past "
-                        f"(grace window: {ONESHOT_GRACE_SECONDS}s) and cannot be scheduled."
-                    )
-                updated["next_run_at"] = next_run
+                updated["next_run_at"] = compute_next_run(
+                    updated["schedule"], tz_name=updated.get("timezone")
+                )
+                if updated["schedule"].get("kind") == "once" and not updated["next_run_at"]:
+                    fallback_schedule = updates.get("schedule_display") or updates.get("schedule")
+                    raise _stale_oneshot_error(updated["schedule"], fallback_schedule)
+
+            trigger_identity_changed = any(
+                key in updates and updates.get(key) != job.get(key)
+                for key in ("schedule", "timezone", "next_run_at", "enabled", "state")
+            )
+            if trigger_identity_changed:
+                # A claim identifies the exact schedule occurrence that was
+                # active when it was created. User pause/resume/reschedule must
+                # invalidate that identity before a delayed provider retry can
+                # recover it.
+                updated["fire_claim"] = None
+                updated["in_flight_occurrence"] = None
 
             jobs[i] = updated
             save_jobs(jobs)
@@ -1627,13 +2611,9 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
     if not job:
         return None
 
-    next_run_at = compute_next_run(job["schedule"])
+    next_run_at = compute_next_run(job["schedule"], tz_name=job.get("timezone"))
     if next_run_at is None and job["schedule"].get("kind") == "once":
-        run_at = job["schedule"].get("run_at", "unknown")
-        raise ValueError(
-            f"Cannot resume: one-shot time {run_at} is in the past "
-            f"(grace window: {ONESHOT_GRACE_SECONDS}s) and will never fire."
-        )
+        raise _stale_oneshot_error(job["schedule"], job.get("schedule_display"))
     return update_job(
         job["id"],
         {
@@ -1687,12 +2667,15 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 scheduled_at: Optional[str] = None,
+                 output_filename: Optional[str] = None):
     """
     Mark a job as having been run.
     
     Updates last_run_at, last_status, increments completed count,
-    computes next_run_at, and auto-deletes if repeat limit reached.
+    computes next_run_at, and preserves a terminal record when the repeat
+    limit is reached so calendar/history clients can still render the run.
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
@@ -1701,12 +2684,24 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
-                now = _hermes_now().isoformat()
+                now_dt = _hermes_now()
+                now = now_dt.isoformat()
                 job["last_run_at"] = now
                 job["last_status"] = "ok" if success else "error"
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                fire_claim = job.get("fire_claim")
+                completed_fire_at = None
+                if isinstance(fire_claim, dict):
+                    completed_fire_at = _parse_occurrence_instant(fire_claim.get("fire_at"))
+                    if completed_fire_at is not None:
+                        previous = _parse_occurrence_instant(job.get("last_completed_external_fire_at"))
+                        if previous is None or completed_fire_at > previous:
+                            # Chronos arms one one-shot at a time per job, so
+                            # fire_at is a monotonic watermark. This rejects an
+                            # arbitrarily delayed A even after B..N complete.
+                            job["last_completed_external_fire_at"] = completed_fire_at.isoformat()
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
@@ -1715,6 +2710,19 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # is claimable again. No-op if the job never carried a claim.
                 if job.get("run_claim") is not None:
                     job["run_claim"] = None
+                scheduled_instant = _parse_occurrence_instant(scheduled_at)
+                _append_job_occurrence(
+                    job,
+                    now_dt,
+                    scheduled_at=scheduled_instant,
+                    output_filename=output_filename,
+                    success=success,
+                    delivery_error=delivery_error,
+                )
+                # Terminal history now owns this stable occurrence identity.
+                # Clear the bounded execution claim in the same locked write
+                # so API readers never observe both forms after completion.
+                job["in_flight_occurrence"] = None
                 
                 # Increment completed count.  Finite one-shot jobs are
                 # pre-claimed by claim_dispatch() BEFORE the side effect runs
@@ -1754,8 +2762,18 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         save_jobs(jobs)
                         return
                 
+                # External schedulers own the occurrence instant. Use their
+                # canonical fire_at as the recurrence base so tolerated future
+                # clock skew cannot recompute the just-completed cron slot.
+                next_run_base = (
+                    completed_fire_at.isoformat()
+                    if completed_fire_at is not None
+                    else now
+                )
                 # Compute next run
-                job["next_run_at"] = compute_next_run(job["schedule"], now)
+                job["next_run_at"] = compute_next_run(
+                    job["schedule"], next_run_base, tz_name=job.get("timezone")
+                )
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't
@@ -1843,11 +2861,12 @@ def claim_dispatch(job_id: str) -> bool:
     persists the claim immediately, so that if the tick dies mid-execution
     (gateway kill, OOM, segfault, hard-timeout) the dispatch is not lost.
     This converts finite one-shot jobs from *at-least-once* to *at-most-times*
-    semantics — a job that self-destructs fires at most ``repeat.times`` times
-    instead of infinitely (issue #38758).
+    semantics — a job fires at most ``repeat.times`` times instead of
+    infinitely (issue #38758).
 
     Returns ``True`` if the caller may proceed to run the job, ``False`` if the
-    dispatch limit is already reached (in which case the stale job is removed).
+    dispatch limit is already reached (in which case the stale job is made
+    inert and retained for diagnosis/history).
 
     Only claims jobs with ``schedule.kind == "once"`` and ``repeat.times > 0``.
     Recurring jobs (they use ``advance_next_run``) and infinite-repeat / no-repeat
@@ -1885,15 +2904,20 @@ def claim_dispatch(job_id: str) -> bool:
                         times,
                     )
                     return False
-                # A prior tick claimed the dispatch then died before the run
-                # completed (#73973) — a genuinely wedged claim. Remove it so
-                # it stops appearing as due, and leave an operator-visible
-                # diagnostic instead of vanishing silently.
-                jobs.pop(i)
+                # Already dispatched the max number of times (e.g. a prior
+                # tick claimed then died before mark_job_run could terminalize
+                # it). Keep the record but make it impossible to re-fire.
+                job["enabled"] = False
+                job["state"] = "error"
+                job["next_run_at"] = None
+                job["last_status"] = "error"
+                job["last_error"] = job.get("last_error") or (
+                    "Dispatch was claimed but no completed run was recorded"
+                )
                 save_jobs(jobs)
                 _write_wedged_oneshot_diagnostic(job)
                 logger.info(
-                    "Job '%s': dispatch limit reached (%d/%d) — removing",
+                    "Job '%s': dispatch limit reached (%d/%d) — retaining inert terminal record",
                     job.get("name", job.get("id", "?")),
                     completed,
                     times,
@@ -2021,7 +3045,13 @@ def _machine_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
-def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
+def claim_job_for_fire(
+    job_id: str,
+    *,
+    claim_ttl_seconds: int = 300,
+    triggered_at: Optional[str] = None,
+    fire_at: Optional[str] = None,
+) -> bool:
     """Atomically claim a job for a single external 'fire' (multi-machine
     at-most-once). Returns True iff THIS caller won the claim.
 
@@ -2050,6 +3080,41 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
             if not job.get("enabled", True) or job.get("state") == "paused":
                 return False
             now = _hermes_now()
+            recovering_external_claim = False
+            canonical_fire_at = normalize_external_fire_at(fire_at, now=now)
+            if canonical_fire_at is not None:
+                requested_fire = _parse_occurrence_instant(canonical_fire_at)
+                completed_watermark = _parse_occurrence_instant(job.get("last_completed_external_fire_at"))
+                if completed_watermark is not None and requested_fire <= completed_watermark:
+                    return False
+                planned_fire = _parse_occurrence_instant(job.get("next_run_at"))
+                in_flight = _in_flight_occurrence(job, now)
+                in_flight_instants = set()
+                if in_flight is not None:
+                    in_flight_instants.add(in_flight["scheduled_at"])
+                    if in_flight.get("original_scheduled_at") is not None:
+                        in_flight_instants.add(in_flight["original_scheduled_at"])
+                existing = job.get("fire_claim")
+                recoverable_claim_fire = None
+                if isinstance(existing, dict):
+                    existing_fire = _parse_occurrence_instant(existing.get("fire_at"))
+                    existing_at = _parse_occurrence_instant(existing.get("at"))
+                    if (
+                        existing_fire == requested_fire
+                        and existing_at is not None
+                        and (now - existing_at).total_seconds() >= claim_ttl_seconds
+                    ):
+                        recoverable_claim_fire = existing_fire
+                        recovering_external_claim = True
+                if (
+                    requested_fire != planned_fire
+                    and requested_fire not in in_flight_instants
+                    and requested_fire != recoverable_claim_fire
+                ):
+                    # A provider callback is scoped to the exact occurrence it
+                    # was armed for.  An old arm that races a user reschedule
+                    # must not execute the job at the abandoned time.
+                    return False
             existing = job.get("fire_claim")
             if existing:
                 try:
@@ -2065,10 +3130,67 @@ def claim_job_for_fire(job_id: str, *, claim_ttl_seconds: int = 300) -> bool:
                         return False  # someone holds a fresh claim
                 except Exception:
                     pass  # malformed claim → overwrite
-            job["fire_claim"] = {"at": now.isoformat(), "by": _machine_id()}
+            explicit_trigger: Optional[datetime] = None
+            if triggered_at is not None and canonical_fire_at is not None:
+                raise ValueError("triggered_at and fire_at are mutually exclusive")
+            if canonical_fire_at is not None:
+                explicit_trigger = _parse_occurrence_instant(canonical_fire_at)
+            elif triggered_at is not None:
+                if not isinstance(triggered_at, str) or len(triggered_at) > 128:
+                    raise ValueError("triggered_at must be a bounded ISO timestamp")
+                explicit_trigger = _parse_occurrence_instant(triggered_at)
+                if explicit_trigger is None:
+                    raise ValueError("triggered_at must be an aware ISO timestamp")
+
+            # A stale external-fire retry is still the SAME occurrence. The
+            # first claim already advanced next_run_at, so recomputing from it
+            # would consume tomorrow's slot. Manual Run Now is explicit and
+            # intentionally starts a new identity at its requested instant.
+            prior_in_flight = _in_flight_occurrence(job, now) if explicit_trigger is None else None
             kind = job.get("schedule", {}).get("kind")
-            if kind in {"cron", "interval"}:
-                nxt = compute_next_run(job["schedule"], now.isoformat())
+            should_advance = prior_in_flight is None and not recovering_external_claim
+            if explicit_trigger is not None:
+                effective_trigger = explicit_trigger
+                original_trigger = None
+            elif prior_in_flight is not None:
+                effective_trigger = prior_in_flight["scheduled_at"]
+                original_trigger = prior_in_flight.get("original_scheduled_at")
+            else:
+                planned = _parse_occurrence_instant(job.get("next_run_at"))
+                effective_trigger = now
+                original_trigger: Optional[datetime] = None
+                if planned is not None:
+                    lateness = (now - planned).total_seconds()
+                    if lateness <= 0:
+                        effective_trigger = planned
+                    elif kind in {"cron", "interval"}:
+                        if lateness <= _compute_grace_seconds(job.get("schedule", {})):
+                            effective_trigger = planned
+                        else:
+                            original_trigger = planned
+                    elif kind == "once":
+                        if lateness <= ONESHOT_GRACE_SECONDS:
+                            effective_trigger = planned
+                        else:
+                            original_trigger = planned
+            job["fire_claim"] = {
+                "at": now.isoformat(),
+                "by": _machine_id(),
+                "scheduled_at": effective_trigger.isoformat(),
+            }
+            if canonical_fire_at is not None:
+                job["fire_claim"]["fire_at"] = canonical_fire_at
+            _set_in_flight_occurrence(
+                job,
+                scheduled_at=effective_trigger,
+                claimed_at=now,
+                original_scheduled_at=original_trigger,
+            )
+            if should_advance and kind in {"cron", "interval"}:
+                advance_base = effective_trigger if canonical_fire_at is not None else now
+                nxt = compute_next_run(
+                    job["schedule"], advance_base.isoformat(), tz_name=job.get("timezone")
+                )
                 if nxt:
                     job["next_run_at"] = nxt
             save_jobs(jobs)
@@ -2332,7 +3454,9 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                 # silently skipped forever; recompute next_run_at from the
                 # schedule so they pick up at their next scheduled tick.
                 if not recovered_next and kind in {"cron", "interval"}:
-                    recovered_next = compute_next_run(schedule, now.isoformat())
+                    recovered_next = compute_next_run(
+                        schedule, now.isoformat(), tz_name=job.get("timezone")
+                    )
                     if recovered_next:
                         recovery_kind = kind
 
@@ -2366,20 +3490,23 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             # clock* is still in the future, recompute from the schedule so we fire
             # at the intended local time instead of early-then-again.
             #
-            # TRADE-OFF: this cannot distinguish a config/host TZ migration from a
-            # legitimate DST offset change. A DST boundary that satisfies all four
-            # conditions will recompute (and thus SKIP the pending occurrence, no
-            # catch-up) rather than fire it. Accepted: in the pure-migration case
-            # the recompute lands on the same wall-clock time later the same period,
-            # and DST-boundary collisions with a still-future stored wall clock are
-            # rare relative to the double-fire bug this prevents (#28934).
+            # This heuristic applies only to legacy/malformed jobs without a valid
+            # pinned IANA timezone. A pinned timezone owns its offset (including
+            # normal differences from the Hermes runtime), so its persisted aware
+            # timestamp must be judged by absolute time instead.
+            has_fixed_job_timezone = (
+                _normalized_iana_timezone_name(job.get("timezone")) is not None
+            )
             if (
                 kind == "cron"
+                and not has_fixed_job_timezone
                 and next_run_dt <= now
                 and _timezone_offset_mismatch(raw_next_run_dt, now)
                 and _stored_wall_clock_is_future(raw_next_run_dt, now)
             ):
-                new_next = compute_next_run(schedule, now.isoformat())
+                new_next = compute_next_run(
+                    schedule, now.isoformat(), tz_name=job.get("timezone")
+                )
                 if new_next:
                     logger.info(
                         "Job '%s' next_run_at offset changed (%s -> %s). "
@@ -2397,16 +3524,85 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     continue
 
             if next_run_dt <= now:
+                # One-shot dispatch-limit guard (issue #38758): a finite
+                # one-shot claimed by a tick that died before mark_job_run
+                # must not re-fire. Preserve a live in-process run; otherwise
+                # retain an inert terminal row for calendar/history clients.
+                if kind == "once":
+                    repeat = job.get("repeat")
+                    if repeat:
+                        times = repeat.get("times")
+                        completed = repeat.get("completed", 0)
+                        if times is not None and times > 0 and completed >= times:
+                            if _job_running_in_this_process(job.get("id", "")):
+                                logger.info(
+                                    "Job '%s': dispatch limit reached (%d/%d) "
+                                    "but its run is still in flight in this "
+                                    "process — keeping entry",
+                                    job.get("name", job.get("id", "?")),
+                                    completed,
+                                    times,
+                                )
+                                continue
+                            logger.info(
+                                "Job '%s': one-shot dispatch limit reached (%d/%d) "
+                                "— retaining inert stale entry",
+                                job.get("name", job.get("id", "?")),
+                                completed,
+                                times,
+                            )
+                            for rj in raw_jobs:
+                                if rj["id"] == job["id"]:
+                                    rj["enabled"] = False
+                                    rj["state"] = "error"
+                                    rj["next_run_at"] = None
+                                    rj["last_status"] = "error"
+                                    rj["last_error"] = rj.get("last_error") or (
+                                        "Dispatch was claimed but no completed run was recorded"
+                                    )
+                                    rj["in_flight_occurrence"] = None
+                                    needs_save = True
+                                    break
+                            continue
 
-                # For recurring jobs, check if the scheduled time is stale
-                # (gateway was down and missed the window). Fast-forward to
-                # the next future occurrence instead of firing a stale run.
+                # For recurring jobs, a next_run_at far in the past means the
+                # gateway was down across the scheduled time. Execute ONCE now
+                # while fast-forwarding the persisted next slot, preventing a
+                # backlog burst without silently dropping the missed day.
                 grace = _compute_grace_seconds(schedule)
-                if kind in {"cron", "interval"} and (now - next_run_dt).total_seconds() > grace:
+                missed_by_seconds = (now - next_run_dt).total_seconds()
+                stale_recurring_catchup = (
+                    kind in {"cron", "interval"} and missed_by_seconds > grace
+                )
+                late_oneshot = kind == "once" and missed_by_seconds > 0
+                effective_trigger = (
+                    now if stale_recurring_catchup or late_oneshot else next_run_dt
+                )
+                original_trigger = (
+                    next_run_dt if effective_trigger != next_run_dt else None
+                )
+                # Keep the dispatch context on the returned object for the
+                # runner, and persist the same bounded claim for occurrence API
+                # readers while advance_next_run moves the future schedule.
+                job["_occurrence_triggered_at"] = effective_trigger.isoformat()
+                for rj in raw_jobs:
+                    if rj["id"] == job["id"]:
+                        _set_in_flight_occurrence(
+                            rj,
+                            scheduled_at=effective_trigger,
+                            claimed_at=now,
+                            original_scheduled_at=original_trigger,
+                        )
+                        needs_save = True
+                        break
+
+                if stale_recurring_catchup:
                     # Job is past its catch-up grace window — skip accumulated
                     # missed runs but still execute once now to avoid deferring
                     # indefinitely (e.g. a long-running job just finished).
-                    new_next = compute_next_run(schedule, now.isoformat())
+                    new_next = compute_next_run(
+                        schedule, now.isoformat(), tz_name=job.get("timezone")
+                    )
                     if new_next:
                         logger.info(
                             "Job '%s' missed its scheduled time (%s, grace=%ds). "
@@ -2465,14 +3661,20 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                                 continue
                             logger.info(
                                 "Job '%s': one-shot dispatch limit reached (%d/%d) "
-                                "— removing stale due entry",
+                                "— retaining inert error record",
                                 job.get("name", job.get("id", "?")),
                                 completed,
                                 times,
                             )
                             for rj in raw_jobs:
                                 if rj["id"] == job["id"]:
-                                    raw_jobs.remove(rj)
+                                    rj["enabled"] = False
+                                    rj["state"] = "error"
+                                    rj["next_run_at"] = None
+                                    rj["last_status"] = "error"
+                                    rj["last_error"] = rj.get("last_error") or (
+                                        "Dispatch was claimed but no completed run was recorded"
+                                    )
                                     needs_save = True
                                     break
                             # The claimed run never completed here by

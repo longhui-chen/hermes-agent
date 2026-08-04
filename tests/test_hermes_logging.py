@@ -1,5 +1,6 @@
 """Tests for hermes_logging — centralized logging setup."""
 import io
+import json
 import logging
 import os
 import stat
@@ -18,6 +19,10 @@ import hermes_logging
 # (the #44873 fix) but keeps stdlib RotatingFileHandler on POSIX, so importing
 # the name from the module under test keeps the two in lockstep.
 from hermes_logging import RotatingFileHandler
+
+
+def _json_log_records(content: str) -> list[dict]:
+    return [json.loads(line) for line in content.splitlines() if line.strip()]
 
 
 @pytest.fixture(autouse=True)
@@ -244,9 +249,80 @@ class TestSessionContext:
 
         agent_log = hermes_home / "logs" / "agent.log"
         content = agent_log.read_text()
-        assert "[abc123]" in content
-        assert "tagged message" in content
+        records = _json_log_records(content)
+        assert any(
+            record["Attributes"].get("msg") == "tagged message"
+            and record["Attributes"].get("session") == "abc123"
+            for record in records
+        )
 
+    def test_no_session_tag_without_context(self, hermes_home):
+        """Without session context, log lines have no session tag."""
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        hermes_logging.clear_session_context()
+
+        test_logger = logging.getLogger("test.no_session")
+        test_logger.info("untagged message")
+
+        hermes_logging.flush_log_queue()
+
+        agent_log = hermes_home / "logs" / "agent.log"
+        content = agent_log.read_text()
+        assert "untagged message" in content
+        for record in _json_log_records(content):
+            if record["Attributes"].get("msg") == "untagged message":
+                assert "session" not in record["Attributes"]
+
+    def test_clear_session_context(self, hermes_home):
+        """After clearing, session tag disappears."""
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+        hermes_logging.set_session_context("xyz789")
+        hermes_logging.clear_session_context()
+
+        test_logger = logging.getLogger("test.cleared")
+        test_logger.info("after clear")
+
+        hermes_logging.flush_log_queue()
+
+        agent_log = hermes_home / "logs" / "agent.log"
+        content = agent_log.read_text()
+        for record in _json_log_records(content):
+            if record["Attributes"].get("msg") == "after clear":
+                assert "session" not in record["Attributes"]
+
+    def test_session_context_thread_isolated(self, hermes_home):
+        """Session context is per-thread — one thread's context doesn't leak."""
+        hermes_logging.setup_logging(hermes_home=hermes_home)
+
+        results = {}
+
+        def thread_a():
+            hermes_logging.set_session_context("thread_a_session")
+            logging.getLogger("test.thread_a").info("from thread A")
+            hermes_logging.flush_log_queue()
+
+        def thread_b():
+            hermes_logging.set_session_context("thread_b_session")
+            logging.getLogger("test.thread_b").info("from thread B")
+            hermes_logging.flush_log_queue()
+
+        ta = threading.Thread(target=thread_a)
+        tb = threading.Thread(target=thread_b)
+        ta.start()
+        ta.join()
+        tb.start()
+        tb.join()
+
+        agent_log = hermes_home / "logs" / "agent.log"
+        content = agent_log.read_text()
+        records = _json_log_records(content)
+
+        # Each thread's message should have its own session tag.
+        for record in records:
+            if record["Attributes"].get("msg") == "from thread A":
+                assert record["Attributes"].get("session") == "thread_a_session"
+            if record["Attributes"].get("msg") == "from thread B":
+                assert record["Attributes"].get("session") == "thread_b_session"
 
 
 

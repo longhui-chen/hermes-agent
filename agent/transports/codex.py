@@ -10,6 +10,7 @@ import json
 import re
 from typing import Any, Dict, List, Optional
 
+from agent.response_format import responses_text_format_from_chat_response_format
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
 
@@ -185,7 +186,7 @@ class ResponsesApiTransport(ProviderTransport):
             _responses_tools,
         )
 
-        from run_agent import DEFAULT_AGENT_IDENTITY
+        from agent.prompt_builder import default_agent_identity
 
         instructions = params.get("instructions", "")
         payload_messages = messages
@@ -194,7 +195,7 @@ class ResponsesApiTransport(ProviderTransport):
                 instructions = str(messages[0].get("content") or "").strip()
                 payload_messages = messages[1:]
         if not instructions:
-            instructions = DEFAULT_AGENT_IDENTITY
+            instructions = default_agent_identity()
 
         is_github_responses = params.get("is_github_responses") is True
         is_codex_backend = params.get("is_codex_backend") is True
@@ -367,6 +368,12 @@ class ResponsesApiTransport(ProviderTransport):
 
         request_overrides = params.get("request_overrides")
         if request_overrides:
+            request_overrides = dict(request_overrides)
+            response_format = request_overrides.pop("response_format", None)
+            if response_format is not None:
+                text_format = responses_text_format_from_chat_response_format(response_format)
+                if text_format is not None:
+                    kwargs["text"] = {"format": text_format}
             kwargs.update(request_overrides)
 
         if "prompt_cache_key" in kwargs:

@@ -2494,8 +2494,8 @@ class ContextCompressor(ContextEngine):
             return
         self.last_prompt_tokens = snapshot
 
-    def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
-        """Return True when a high rough preflight estimate is known-noisy.
+    def should_defer_rough_estimate_to_real_usage(self, rough_tokens: int) -> bool:
+        """Return True when a high rough request estimate is known-noisy.
 
         ``estimate_request_tokens_rough(..., tools=...)`` intentionally
         overestimates schema-heavy requests so Hermes compresses before a
@@ -2535,6 +2535,10 @@ class ContextCompressor(ContextEngine):
 
         self.last_rough_tokens_when_real_prompt_fit = max(baseline, rough_tokens)
         return True
+
+    def should_defer_preflight_to_real_usage(self, rough_tokens: int) -> bool:
+        """Compatibility wrapper for older context-engine call sites."""
+        return self.should_defer_rough_estimate_to_real_usage(rough_tokens)
 
     def should_compress(self, prompt_tokens: int = None) -> bool:
         """Check if context exceeds the compression threshold.

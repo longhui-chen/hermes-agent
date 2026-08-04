@@ -240,6 +240,11 @@ _LONG_HANDLERS = frozenset(
         "pet.select",
         "pet.thumb",
         "learning.frames",
+        # Journey writes can wait on the cross-process memory transaction lock.
+        # The RPC pool is their completion barrier: the reader thread stays
+        # responsive and the worker is never abandoned mid-mutation.
+        "learning.delete",
+        "learning.edit",
         "plugins.manage",
         # reload.mcp shuts down and rediscovers every MCP server — with a
         # flapping server (retry loops, connect timeouts up to 120s) that can
@@ -7311,6 +7316,8 @@ def _enqueue_prompt(
     text: Any,
     transport: Any,
     image_paths: list[str] | None = None,
+    *,
+    prepend: bool = False,
 ) -> None:
     """Stash a message to run as the very next turn once the live one ends.
 
@@ -7320,6 +7327,10 @@ def _enqueue_prompt(
     separate envelopes, so their attachment ownership and chronology survive.
     ``transport`` is pinned so the drained turn streams back to the client that
     sent it even if the session transport is rebound meanwhile.
+
+    ``prepend`` puts a leftover steer before prompts queued later in the turn.
+    When text can be merged into the existing slot, its transport remains the
+    return address because it belongs to the later user submission.
     """
     image_paths = list(image_paths or [])
     queued = {"text": text, "transport": transport}
@@ -7335,9 +7346,16 @@ def _enqueue_prompt(
         and not session.get("queued_prompts")
     ):
         prev = existing["text"]
-        existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
+        if prepend:
+            existing["text"] = f"{text}\n\n{prev}" if prev and text else (prev or text)
+        else:
+            existing["text"] = f"{prev}\n\n{text}" if prev and text else (prev or text)
         return
     if existing:
+        if prepend:
+            session.setdefault("queued_prompts", []).insert(0, existing)
+            session["queued_prompt"] = queued
+            return
         session.setdefault("queued_prompts", []).append(queued)
         return
     session["queued_prompt"] = queued
@@ -8659,6 +8677,10 @@ def _notification_event_belongs_elsewhere(sid: str, session: dict, evt: dict) ->
     poller must skip events it doesn't own so a detached result surfaces in the
     launching session, not whichever poller happened to dequeue first.
     """
+    evt_profile_owner = str(evt.get("profile_owner") or "").strip()
+    if evt_profile_owner and not _notification_event_profile_matches(session, evt):
+        return True
+
     evt_ui_sid = str(evt.get("origin_ui_session_id") or "")
     if evt_ui_sid:
         if evt_ui_sid == str(sid or "") and not session.get("_finalized"):
@@ -8749,7 +8771,9 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
     "not provably elsewhere" is NOT good enough to inject a payload into this
     chat (#55578).
     """
-    if session.get("_finalized"):
+    if session.get("_finalized") or not _notification_event_profile_matches(
+        session, evt
+    ):
         return False
     if str(evt.get("origin_ui_session_id") or "") == str(sid or ""):
         return True
@@ -8774,10 +8798,31 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
 
 def _notification_event_requires_owner(evt: dict) -> bool:
     """Whether ``evt`` must be positively claimed before TUI delivery."""
-    return evt.get("type") == "async_delegation" or bool(
+    managed_process_event = (
+        os.environ.get("HERMES_MANAGED_GATEWAY") == "1"
+        and evt.get("type", "completion")
+        in {"completion", "watch_match", "watch_disabled"}
+    )
+    return managed_process_event or evt.get("type") == "async_delegation" or bool(
         str(evt.get("origin_ui_session_id") or "")
         or str(evt.get("session_key") or "")
+        or str(evt.get("profile_owner") or "")
     )
+
+
+def _notification_event_profile_matches(session: dict, evt: dict) -> bool:
+    """Fail closed when a process event targets another multiplex profile."""
+
+    event_owner = str(evt.get("profile_owner") or "").strip()
+    if not event_owner:
+        return os.environ.get("HERMES_MANAGED_GATEWAY") != "1"
+    expected_owner = str(session.get("profile_home") or _hermes_home)
+    try:
+        event_owner = str(Path(event_owner).expanduser().resolve())
+        expected_owner = str(Path(expected_owner).expanduser().resolve())
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return event_owner == expected_owner
 
 
 def _notification_event_dedup_key(evt: dict) -> tuple:
@@ -9396,6 +9441,7 @@ def _run_prompt_submit(
         marker_text = session.pop("_auto_continue_prompt", None) or text
         if isinstance(marker_text, str) and marker_text.strip():
             record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
+        _leftover_steer = None  # un-consumed /steer handed back by the turn
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -9855,6 +9901,20 @@ def _run_prompt_submit(
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
 
+            # Pull the leftover /steer BEFORE the goal hook: a steer that
+            # arrived after the last API call means the user redirected
+            # this turn — evaluating the goal on a final_response that
+            # ignores the redirect would burn a turn of budget (and could
+            # record a done/paused verdict) before the steer even runs.
+            # Mirrors zet_agent's pending-steer goal-hook skip. The slot
+            # close+drain is the same salvage the tail block used to do.
+            _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
+            if not _leftover_steer:
+                try:
+                    _leftover_steer = agent._drain_pending_steer(close=True)
+                except Exception:
+                    _leftover_steer = None
+
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
             # whether the goal is done and — if not and we're still under
@@ -9863,7 +9923,10 @@ def _run_prompt_submit(
             # ("✓ Goal achieved" / "⏸ budget exhausted") is surfaced as
             # a system line so the user sees progress regardless of
             # outcome. Mirrors gateway/run._post_turn_goal_continuation.
-            if status == "complete" and isinstance(raw, str) and raw.strip():
+            # Skipped when a leftover steer is about to requeue — that
+            # steer becomes the next prompt and the judge re-evaluates at
+            # the end of THAT turn.
+            if status == "complete" and not _leftover_steer and isinstance(raw, str) and raw.strip():
                 try:
                     from hermes_cli.goals import GoalManager
 
@@ -10089,19 +10152,41 @@ def _run_prompt_submit(
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, agent)
 
+        # Leftover /steer handed back by the turn finalizer (the turn ended
+        # before another model call could absorb it): requeue as the next
+        # prompt — same as CLI/gateway — instead of silently dropping text
+        # the user was told was accepted. _enqueue_prompt merges losslessly
+        # with any prompt already queued mid-turn. The extraction itself
+        # runs inside the try (before the goal hook, which it gates); this
+        # tail only covers turns that died before reaching it.
+        if not _leftover_steer:
+            # Exception paths (image preprocessing / run_conversation
+            # raising) skip the in-try extraction, and early-return paths
+            # (invalid-response / provider error) bypass finalize_turn: a
+            # steer accepted in that window is still sitting in the slot
+            # with nothing to drain it — it would leak into the NEXT
+            # prompt's pre-API drain and execute a stale redirect out of
+            # order. Close+drain here (no-op when the in-try extraction
+            # already ran: the slot is drained and closed).
+            try:
+                _leftover_steer = agent._drain_pending_steer(close=True)
+            except Exception:
+                _leftover_steer = None
+        if _leftover_steer:
+            # prepend=True：steer 在已结束的 turn 内被接受，先于 turn 中
+            # 排队的后续 prompt 到达——合并进单槽时必须排在它前面，否则
+            # 后到的普通 prompt 抢在改向前执行/被读取。
+            with session["history_lock"]:
+                _enqueue_prompt(
+                    session,
+                    _leftover_steer,
+                    session.get("transport"),
+                    prepend=True,
+                )
+
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;
         # the goal judge / notifications re-evaluate at the end of that turn.
-        # Leftover /steer: the steer arrived after the last tool batch (e.g.
-        # during the final API call), so the agent couldn't inject it and
-        # returned it in result["pending_steer"]. Requeue it as the next turn
-        # so it isn't silently dropped — same rule as cli.py and gateway/run.py.
-        # A real queued prompt still wins: the merge in _enqueue_prompt keeps
-        # both texts.
-        _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
-        if isinstance(_leftover_steer, str) and _leftover_steer.strip():
-            with session["history_lock"]:
-                _enqueue_prompt(session, _leftover_steer, session.get("transport"))
         if _drain_queued_prompt(rid, sid, session):
             return
 

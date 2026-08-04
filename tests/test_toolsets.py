@@ -269,3 +269,165 @@ class TestResolveToolsetIncludeRegistry:
 
     def test_registry_only_toolset_static_view_is_empty(self):
         assert resolve_toolset("__definitely_not_a_real_toolset__", include_registry=False) == []
+
+
+class TestZetAgentDeviceToolReachability:
+    """Registration alone does not make a tool reachable. The REAL path on a
+    device is: platform config -> _get_platform_tools (reverse-maps the
+    hermes-zet-agent composite into catalog toolset names; non-configurable
+    catalog entries are recovered by walking TOOLSETS) -> get_tool_definitions
+    (resolves those names back to tool names, then applies check_fn gates).
+    A tool registered under a toolset with no catalog entry is an orphan the
+    reverse-mapping silently drops — registered, discovered, gate open, and
+    still absent from the model's schema (found via live tooldump on a real
+    device; two intermediate layers looked correct while the model got
+    nothing). Assertions below therefore run the real path, not the layers.
+    """
+
+    # The shipped device config for the zet_agent platform (verified live).
+    _DEVICE_CONFIG = {"platform_toolsets": {"zet_agent": ["hermes-zet-agent", "cronjob"]}}
+
+    # Verbatim enabled-toolsets list dumped from a real device's gateway
+    # ([E2E_TOOLDUMP] instrumentation, 2026-07-30) — the exact input the
+    # gateway passed to get_tool_definitions before the catalog fix. The
+    # gateway recomputes this list per session via _get_platform_tools
+    # (gateway/platforms/zet_agent.py:1783); it is not persisted state, so
+    # after the catalog fix a restarted gateway computes it WITH
+    # zettlab_apphost added.
+    _DEVICE_DUMP_ENABLED = [
+        "agent_call", "browser", "clarify", "code_execution", "computer_use",
+        "creation_governor", "cronjob", "delegation", "file", "image_gen",
+        "kanban", "memory", "session_search", "skills", "terminal", "todo",
+        "tts", "video_gen", "vision", "web",
+    ]
+
+    @staticmethod
+    def _real_path_tool_names(config, platform):
+        from hermes_cli.tools_config import _get_platform_tools
+
+        enabled = sorted(
+            _get_platform_tools(config, platform, include_default_mcp_servers=False)
+        )
+        universe = set()
+        for ts in enabled:
+            universe.update(resolve_toolset(ts))
+        return universe
+
+    def test_real_path_full_chain_exposes_app_host(self, monkeypatch):
+        """End-to-end: device config -> _get_platform_tools ->
+        get_tool_definitions (with the profile scope satisfying the gate) ->
+        app_host present in the final model schema."""
+        from hermes_cli.tools_config import _get_platform_tools
+        from model_tools import get_tool_definitions
+        from tests.tools._profile_scope import mux_profile_scope
+
+        enabled = sorted(_get_platform_tools(
+            self._DEVICE_CONFIG, "zet_agent", include_default_mcp_servers=False
+        ))
+        scope = {
+            "ZET_APPHOST_BASE_URL": "http://127.0.0.1:18080/api/v1/internal/apphost",
+            "ZETTLAB_AGENT_ACTION_TOKEN": "t",
+        }
+        with mux_profile_scope(monkeypatch, scope):
+            defs = get_tool_definitions(enabled_toolsets=enabled, quiet_mode=True)
+        names = {d["function"]["name"] for d in defs}
+        assert "app_host" in names
+
+    def test_device_dump_fixture_plus_catalog_entry_exposes_app_host(self, monkeypatch):
+        """Live-dump boundary test: feed the exact enabled list a real device's
+        gateway passes to get_tool_definitions — plus the catalog entry the
+        fixed generator now appends — and assert app_host reaches the final
+        model schema. Complements the generator test below: this one proves
+        'once the list carries zettlab_apphost the schema has app_host', the
+        generator test proves 'the recomputed list does carry it'."""
+        from model_tools import get_tool_definitions
+        from tests.tools._profile_scope import mux_profile_scope
+
+        scope = {
+            "ZET_APPHOST_BASE_URL": "http://127.0.0.1:18080/api/v1/internal/apphost",
+            "ZETTLAB_AGENT_ACTION_TOKEN": "t",
+        }
+        with mux_profile_scope(monkeypatch, scope):
+            defs = get_tool_definitions(
+                enabled_toolsets=[*self._DEVICE_DUMP_ENABLED, "zettlab_apphost"],
+                quiet_mode=True,
+            )
+        assert "app_host" in {d["function"]["name"] for d in defs}
+
+    def test_generator_output_covers_device_dump_plus_apphost(self):
+        """The enabled list is recomputed per session, so the dump fixture
+        stays honest only if the generator's output covers it (minus entries
+        that are device-conditional) and now includes zettlab_apphost."""
+        from hermes_cli.tools_config import _get_platform_tools
+
+        enabled = set(_get_platform_tools(
+            self._DEVICE_CONFIG, "zet_agent", include_default_mcp_servers=False
+        ))
+        # video_gen on the device comes from the ai-gateway capability probe,
+        # which this environment doesn't have — exempt it from the coverage
+        # comparison, nothing else.
+        device_conditional = {"video_gen"}
+        assert set(self._DEVICE_DUMP_ENABLED) - device_conditional <= enabled
+        assert "zettlab_apphost" in enabled
+
+    def test_catalog_entry_and_composite_are_both_load_bearing(self):
+        # Both halves are required by the recovery walk: the catalog entry is
+        # what gets recovered, and its static tools must be a subset of the
+        # platform composite's tool-name universe. Dropping either one makes
+        # app_host unreachable (deletion experiments EV8a/EV8b).
+        assert "app_host" in TOOLSETS["zettlab_apphost"]["tools"]
+        assert "app_host" in resolve_toolset("hermes-zet-agent")
+
+    def test_app_host_stays_off_shared_and_cron_real_paths(self):
+        # Deliberate scoping, same rationale as call_agent: the App Host
+        # credentials only exist in a zet_agent profile, and installing
+        # applications on the device is a device-agent capability —
+        # messaging/cron schemas must not advertise it. Changing this is a
+        # decision, not a drive-by.
+        from toolsets import _HERMES_CORE_TOOLS
+        assert "app_host" not in _HERMES_CORE_TOOLS
+        # Real path for cron (no explicit config -> its default composite).
+        assert "app_host" not in self._real_path_tool_names({}, "cron")
+
+    def test_profile_scope_sensitive_tools_reachable_on_zet_agent_real_path(self):
+        """Generalized guard for this class of omission: a tool whose check_fn
+        is profile-scope-sensitive depends on device-profile credentials that
+        only a zet_agent turn can resolve — if the real resolution path drops
+        it, it is silently unreachable exactly where it is meant to work.
+
+        Exemptions, each deliberate and documented:
+        - opt-in toolsets (_DEFAULT_OFF_TOOLSETS): injected via platform
+          config when the user enables them (e.g. video_generate) — absent by
+          decision, not lost.
+        - KNOWN PRE-EXISTING GAPS, reported upstream and pending a decision:
+          list_my_channels / send_channel_message (toolset zettlab_channels)
+          and get_personal_calendar (toolset personal_calendar) are registered
+          under toolsets with no catalog entry, so the real path drops them
+          today. Do NOT add to this set — fix the catalog instead; remove an
+          entry here when its gap is fixed.
+        """
+        from hermes_cli.tools_config import _DEFAULT_OFF_TOOLSETS
+        from tools.registry import discover_builtin_tools, registry
+
+        known_preexisting_gaps = {
+            "list_my_channels", "send_channel_message", "get_personal_calendar",
+        }
+        discover_builtin_tools()
+        scope_sensitive = {
+            entry.name
+            for entry in registry._tools.values()
+            if getattr(entry.check_fn, "_profile_scope_sensitive", False)
+            and entry.toolset not in _DEFAULT_OFF_TOOLSETS
+        }
+        # Sanity: the guard must be looking at a non-empty set, otherwise a
+        # marker rename would silently turn this test into a no-op.
+        assert "app_host" in scope_sensitive
+        reachable = self._real_path_tool_names(self._DEVICE_CONFIG, "zet_agent")
+        missing = scope_sensitive - reachable - known_preexisting_gaps
+        assert not missing, (
+            f"profile-scope-sensitive tools not reachable on zet_agent real path: {missing}"
+        )
+        # If a known gap becomes reachable, the exemption is stale — prune it
+        # so the guard tightens instead of rotting.
+        healed = known_preexisting_gaps & reachable
+        assert not healed, f"known gaps now reachable — remove from exemptions: {healed}"

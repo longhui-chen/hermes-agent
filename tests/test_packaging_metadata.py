@@ -149,8 +149,6 @@ def test_locked_starlette_is_not_vulnerable_to_cve_2026_48710():
         )
 
 
-
-
 # ---------------------------------------------------------------------------
 # Dependency-pin consistency: pyproject extras <-> tools/lazy_deps.py
 #

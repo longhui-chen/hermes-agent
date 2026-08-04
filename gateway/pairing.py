@@ -34,7 +34,6 @@ from gateway.whatsapp_identity import (
     normalize_whatsapp_identifier,
 )
 from hermes_constants import (
-    get_default_hermes_root,
     get_hermes_dir,
     get_hermes_home,
 )
@@ -421,30 +420,25 @@ class PairingStore:
     def __init__(self, profile: Optional[str] = None):
         # Resolve storage directory lazily — tests use a temp HERMES_HOME
         # and PairingStore may be constructed before the env is set.
+        migration_home: Optional[Path] = None
         if profile:
-            root = get_default_hermes_root()
-            profile_home = (
-                root
-                if profile == "default"
-                else root / "profiles" / profile
-            )
+            from hermes_cli.profiles import get_profile_dir, normalize_profile_name
+
+            canonical_profile = normalize_profile_name(profile)
+            profile_home = get_profile_dir(canonical_profile)
             self._dir = get_hermes_dir(
                 "platforms/pairing",
                 "pairing",
                 home=profile_home,
             )
+            migration_home = profile_home
         else:
             self._dir = PAIRING_DIR
+            migration_home = get_hermes_home()
         self._dir.mkdir(parents=True, exist_ok=True)
-        if profile:
-            # Explicit stores must resolve exactly as a standalone
-            # ``hermes -p <profile> pairing ...`` process does. Merge the
-            # alternate old/new layout so upgrades cannot split approvals.
-            _migrate_split_pairing_dirs(home=profile_home, active=self._dir)
-        else:
-            # Heal installs whose global pairing data ended up split across
-            # the legacy and new directories.
-            _migrate_split_pairing_dirs()
+        if migration_home is not None:
+            # Heal approvals split across the legacy and consolidated layouts.
+            _migrate_split_pairing_dirs(home=migration_home, active=self._dir)
         # Protects all read-modify-write cycles. The gateway runs multiple
         # platform adapters concurrently in threads sharing one PairingStore.
         self._lock = threading.RLock()

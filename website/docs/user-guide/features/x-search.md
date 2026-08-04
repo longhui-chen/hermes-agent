@@ -157,7 +157,7 @@ Causes worth checking:
 
 - **Typo in the handle.** Strip the `@`, double-check spelling, and confirm the account exists.
 - **Date range too narrow** or sliding past today's posts; widen and retry.
-- **xAI index gap.** Some active accounts intermittently fail to surface in `x_search` even when they post regularly. Retry after a few minutes, or use the `xurl` skill for direct X API reads when you need an exact handle's timeline.
+- **xAI index gap.** Some active accounts intermittently fail to surface in `x_search` even when they post regularly. Retry after a few minutes, or use the connector-backed X / Twitter preset when you need an exact handle's timeline.
 
 ## See Also
 

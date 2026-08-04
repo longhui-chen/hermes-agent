@@ -15,6 +15,8 @@ containers?" section, and the Container lifecycle paragraph under
 Docker Backend in ``website/docs/user-guide/configuration.md``.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from tools import terminal_tool
@@ -67,3 +69,57 @@ def test_env_type_override_keeps_own_id():
         )
     finally:
         terminal_tool.clear_task_env_overrides("bench-env")
+
+
+def test_managed_profiles_isolate_same_session_terminal_state(tmp_path, monkeypatch):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    alpha = tmp_path / "profiles" / "alpha"
+    beta = tmp_path / "profiles" / "beta"
+    alpha.mkdir(parents=True)
+    beta.mkdir()
+    cleaned = []
+
+    def install(profile, path_value, cwd):
+        token = set_hermes_home_override(profile)
+        try:
+            key = terminal_tool._resolve_container_task_id("default")
+            terminal_tool.record_session_cwd("default", cwd)
+            terminal_tool.register_task_env_overrides("default", {"cwd": cwd})
+            terminal_tool._active_environments[key] = SimpleNamespace(
+                env={"PATH": path_value},
+                cwd=cwd,
+                cleanup=lambda: cleaned.append(str(profile.resolve())),
+            )
+            terminal_tool._last_activity[key] = 1.0
+            return key
+        finally:
+            reset_hermes_home_override(token)
+
+    alpha_key = install(alpha, "/tmp/alpha:/usr/bin", "/tmp/alpha")
+    beta_token = set_hermes_home_override(beta)
+    try:
+        beta_key = terminal_tool._resolve_container_task_id("default")
+        assert beta_key != alpha_key
+        assert terminal_tool.get_active_env("default") is None
+        assert terminal_tool.get_session_cwd("default") is None
+        assert terminal_tool.resolve_task_overrides("default") == {}
+    finally:
+        reset_hermes_home_override(beta_token)
+
+    beta_key = install(beta, "/tmp/beta:/usr/bin", "/tmp/beta")
+    alpha_token = set_hermes_home_override(alpha)
+    try:
+        assert terminal_tool.get_active_env("default").env["PATH"].startswith(
+            "/tmp/alpha:"
+        )
+        assert terminal_tool.get_session_cwd("default") == "/tmp/alpha"
+    finally:
+        reset_hermes_home_override(alpha_token)
+
+    assert terminal_tool.cleanup_managed_profile_environments(alpha) == 1
+    assert alpha_key not in terminal_tool._active_environments
+    assert beta_key in terminal_tool._active_environments
+    assert cleaned == [str(alpha.resolve())]
+    terminal_tool.cleanup_managed_profile_environments(beta)

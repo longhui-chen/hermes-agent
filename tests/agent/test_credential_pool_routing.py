@@ -60,7 +60,9 @@ class TestGatewayTurnRoutePool:
         from gateway.run import GatewayRunner
 
         fake_pool = MagicMock(name="FakePool")
-        runner = SimpleNamespace(_service_tier=None)
+        runner = object.__new__(GatewayRunner)
+        runner._service_tier = None
+        runner._session_model_overrides = {}
         runtime_kwargs = {
             "api_key": "***",
             "base_url": None,
@@ -72,8 +74,7 @@ class TestGatewayTurnRoutePool:
             "credential_pool": fake_pool,
         }
 
-        bound = GatewayRunner._resolve_turn_agent_config.__get__(runner)
-        route = bound("test message", "gpt-5.4", runtime_kwargs)
+        route = runner._resolve_turn_agent_config("test message", "gpt-5.4", runtime_kwargs)
 
         assert route["runtime"]["credential_pool"] is fake_pool
         assert route["runtime"]["requested_provider"] == "openai-codex"

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -22,6 +23,13 @@ logger = logging.getLogger(__name__)
 
 _skill_commands: Dict[str, Dict[str, Any]] = {}
 _skill_commands_platform: Optional[str] = None
+_skill_commands_skills_dir_key: Optional[str] = None
+_skill_commands_cache: Dict[
+    tuple[Optional[str], Optional[str]], Dict[str, Dict[str, Any]]
+] = {}
+_skill_commands_generations: Dict[Optional[str], int] = {}
+_skill_commands_lock = threading.RLock()
+_skill_commands_reload_lock = threading.RLock()
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
 _SKILL_MULTI_HYPHEN = re.compile(r"-{2,}")
@@ -181,13 +189,41 @@ def _resolve_skill_commands_platform() -> Optional[str]:
     try:
         from gateway.session_context import get_session_env
 
+        # ZET fork: the per-turn session ContextVar outranks the process-wide
+        # HERMES_PLATFORM env. A bound context is strictly more specific than
+        # a global pin, and env-first would let one platform's env leak into
+        # another platform's turn in a co-hosted gateway process (and defeat
+        # zet_agent's expansion-window binding). Unbound contexts (CLI, cron
+        # scheduler) still fall back to the env exactly as before.
         resolved_platform = (
-            os.getenv("HERMES_PLATFORM")
-            or get_session_env("HERMES_SESSION_PLATFORM")
+            get_session_env("HERMES_SESSION_PLATFORM")
+            or os.getenv("HERMES_PLATFORM")
         )
     except Exception:
         resolved_platform = os.getenv("HERMES_PLATFORM")
     return resolved_platform or None
+
+
+def _resolve_skill_commands_skills_dir_key() -> Optional[str]:
+    """Return the active local skills dir used to scope the command cache."""
+    try:
+        from tools.skills_tool import _active_skills_dir
+
+        skills_dir = _active_skills_dir()
+        try:
+            return str(skills_dir.resolve())
+        except Exception:
+            return str(skills_dir)
+    except Exception:
+        return None
+
+
+def _current_skill_commands_scope_key() -> tuple[Optional[str], Optional[str]]:
+    return (
+        _resolve_skill_commands_platform(),
+        _resolve_skill_commands_skills_dir_key(),
+    )
+
 
 def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:
     """Load a skill by name/path and return (loaded_payload, skill_dir, display_name)."""
@@ -196,10 +232,41 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
         return None
 
     try:
-        from tools.skills_tool import SKILLS_DIR, skill_view
-        from agent.skill_utils import normalize_skill_lookup_name
+        from tools.skills_tool import _active_skills_dir, skill_view
+        from agent.skill_utils import get_external_skills_dirs
 
-        normalized = normalize_skill_lookup_name(raw_identifier)
+        skills_dir = _active_skills_dir()
+        identifier_path = Path(raw_identifier).expanduser()
+        if identifier_path.is_absolute():
+            normalized = None
+            trusted_roots = [skills_dir]
+            try:
+                trusted_roots.extend(get_external_skills_dirs())
+            except Exception:
+                pass
+
+            # Prefer the lexical path under a trusted skill root before
+            # resolving symlinks.  Slash-command discovery can legitimately
+            # find a skill via ~/.hermes/skills/<name> where <name> is a
+            # symlink to a checked-out skill elsewhere.  Resolving first turns
+            # that trusted visible path into an arbitrary absolute path that
+            # skill_view() refuses to load.
+            for root in trusted_roots:
+                try:
+                    normalized = str(identifier_path.relative_to(root))
+                    break
+                except ValueError:
+                    continue
+
+            if normalized is None:
+                try:
+                    normalized = str(
+                        identifier_path.resolve().relative_to(skills_dir.resolve())
+                    )
+                except Exception:
+                    normalized = raw_identifier
+        else:
+            normalized = raw_identifier.lstrip("/")
 
         loaded_skill = json.loads(
             skill_view(normalized, task_id=task_id, preprocess=False)
@@ -222,7 +289,7 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
         skill_dir = Path(abs_skill_dir)
     elif skill_path:
         try:
-            skill_dir = SKILLS_DIR / Path(skill_path).parent
+            skill_dir = skills_dir / Path(skill_path).parent
         except Exception:
             skill_dir = None
 
@@ -277,8 +344,9 @@ def _build_skill_message(
     session_id: str | None = None,
 ) -> str:
     """Format a loaded skill into a user/system message payload."""
-    from tools.skills_tool import SKILLS_DIR
+    from tools.skills_tool import _active_skills_dir
 
+    skills_dir = _active_skills_dir()
     content = str(loaded_skill.get("content") or "")
 
     # ── Template substitution and inline-shell expansion ──
@@ -346,7 +414,7 @@ def _build_skill_message(
 
     if supporting and skill_dir:
         try:
-            skill_view_target = str(skill_dir.relative_to(SKILLS_DIR))
+            skill_view_target = str(skill_dir.relative_to(skills_dir))
         except ValueError:
             # Skill is from an external dir — use the skill name instead
             skill_view_target = skill_dir.name
@@ -377,11 +445,20 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
     Returns:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
-    global _skill_commands, _skill_commands_platform
-    _skill_commands_platform = _resolve_skill_commands_platform()
-    _skill_commands = {}
+    global _skill_commands, _skill_commands_platform, _skill_commands_skills_dir_key
+    scope_key = _current_skill_commands_scope_key()
+    platform_key, skills_dir_key = scope_key
+    with _skill_commands_lock:
+        scan_generation = _skill_commands_generations.get(skills_dir_key, 0)
+    commands: Dict[str, Dict[str, Any]] = {}
     try:
-        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, skill_matches_environment, _get_disabled_skill_names
+        from tools.skills_tool import (
+            _active_skills_dir,
+            _get_disabled_skill_names,
+            _parse_frontmatter,
+            skill_matches_environment,
+            skill_matches_platform,
+        )
         from agent.skill_utils import get_external_skills_dirs, iter_skill_index_files
         from hermes_cli.commands import resolve_command
         disabled = _get_disabled_skill_names()
@@ -389,8 +466,9 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
 
         # Scan local dir first, then external dirs
         dirs_to_scan = []
-        if SKILLS_DIR.exists():
-            dirs_to_scan.append(SKILLS_DIR)
+        skills_dir = _active_skills_dir()
+        if skills_dir.exists():
+            dirs_to_scan.append(skills_dir)
         dirs_to_scan.extend(get_external_skills_dirs())
 
         for scan_dir in dirs_to_scan:
@@ -447,14 +525,14 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     # slug (e.g. "git_helper" vs "git-helper"). First-wins
                     # preserves local-before-external precedence.
                     cmd_key = f"/{cmd_name}"
-                    if cmd_key in _skill_commands:
+                    if cmd_key in commands:
                         logger.warning(
                             "Skill %r maps to slash command %s already claimed "
                             "by %r; keeping the first and skipping this one.",
-                            name, cmd_key, _skill_commands[cmd_key]["name"],
+                            name, cmd_key, commands[cmd_key]["name"],
                         )
                         continue
-                    _skill_commands[cmd_key] = {
+                    commands[cmd_key] = {
                         "name": name,
                         "description": description or f"Invoke the {name} skill",
                         "skill_md_path": str(skill_md),
@@ -464,22 +542,71 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                     continue
     except Exception:
         pass
-    return _skill_commands
+    with _skill_commands_lock:
+        if _skill_commands_generations.get(skills_dir_key, 0) != scan_generation:
+            return commands
+        _skill_commands_platform = platform_key
+        _skill_commands_skills_dir_key = skills_dir_key
+        _skill_commands = commands
+        _skill_commands_cache[scope_key] = commands
+    return commands
 
 
 def get_skill_commands() -> Dict[str, Dict[str, Any]]:
     """Return the current skill commands mapping (scan first if empty).
 
-    Rescans when the active platform scope changes (e.g. a gateway
-    process serving Telegram and Discord concurrently) so each platform
-    sees its own ``skills.platform_disabled`` view (#14536).
+    Rescans when the active platform scope or local skills directory changes
+    so single-process multi-profile gateways never reuse another profile's
+    slash-command cache.
     """
-    if (
-        not _skill_commands
-        or _skill_commands_platform != _resolve_skill_commands_platform()
-    ):
-        scan_skill_commands()
-    return _skill_commands
+    global _skill_commands, _skill_commands_platform, _skill_commands_skills_dir_key
+    scope_key = _current_skill_commands_scope_key()
+    platform_key, skills_dir_key = scope_key
+    with _skill_commands_lock:
+        if (
+            _skill_commands
+            and _skill_commands_platform == platform_key
+            and _skill_commands_skills_dir_key == skills_dir_key
+        ):
+            return _skill_commands
+
+        cached = _skill_commands_cache.get(scope_key)
+        if cached:
+            _skill_commands_platform = platform_key
+            _skill_commands_skills_dir_key = skills_dir_key
+            _skill_commands = cached
+            return cached
+
+    return scan_skill_commands()
+
+
+def _cached_skill_commands_for_current_scope() -> Dict[str, Dict[str, Any]]:
+    scope_key = _current_skill_commands_scope_key()
+    platform_key, skills_dir_key = scope_key
+    with _skill_commands_lock:
+        if (
+            _skill_commands_platform == platform_key
+            and _skill_commands_skills_dir_key == skills_dir_key
+        ):
+            return _skill_commands
+        return _skill_commands_cache.get(scope_key, {})
+
+
+def _invalidate_other_skill_command_scopes(
+    scope_key: tuple[Optional[str], Optional[str]]
+) -> None:
+    _, skills_dir_key = scope_key
+    with _skill_commands_lock:
+        for cached_scope in list(_skill_commands_cache):
+            if cached_scope != scope_key and cached_scope[1] == skills_dir_key:
+                _skill_commands_cache.pop(cached_scope, None)
+
+
+def _bump_skill_command_generation(skills_dir_key: Optional[str]) -> None:
+    with _skill_commands_lock:
+        _skill_commands_generations[skills_dir_key] = (
+            _skill_commands_generations.get(skills_dir_key, 0) + 1
+        )
 
 
 def reload_skills() -> Dict[str, Any]:
@@ -521,30 +648,36 @@ def reload_skills() -> Dict[str, Any]:
             out[bare] = (info or {}).get("description") or ""
         return out
 
-    before = _snapshot(_skill_commands)
+    with _skill_commands_reload_lock:
+        scope_key = _current_skill_commands_scope_key()
+        _, skills_dir_key = scope_key
+        before = _snapshot(_cached_skill_commands_for_current_scope())
 
-    # Rescan the skills dir. ``scan_skill_commands`` resets
-    # ``_skill_commands = {}`` internally and repopulates it.
-    new_commands = scan_skill_commands()
+        _bump_skill_command_generation(skills_dir_key)
 
-    after = _snapshot(new_commands)
+        # Rescan the skills dir for the current scope and atomically replace that
+        # scoped cache entry.
+        new_commands = scan_skill_commands()
+        _invalidate_other_skill_command_scopes(scope_key)
 
-    added_names = sorted(set(after) - set(before))
-    removed_names = sorted(set(before) - set(after))
-    unchanged = sorted(set(after) & set(before))
+        after = _snapshot(new_commands)
 
-    added = [{"name": n, "description": after[n]} for n in added_names]
-    # For removed skills, use the description we had cached pre-rescan
-    # (the skill file is gone so we can't re-read it).
-    removed = [{"name": n, "description": before[n]} for n in removed_names]
+        added_names = sorted(set(after) - set(before))
+        removed_names = sorted(set(before) - set(after))
+        unchanged = sorted(set(after) & set(before))
 
-    return {
-        "added": added,
-        "removed": removed,
-        "unchanged": unchanged,
-        "total": len(after),
-        "commands": len(new_commands),
-    }
+        added = [{"name": n, "description": after[n]} for n in added_names]
+        # For removed skills, use the description we had cached pre-rescan
+        # (the skill file is gone so we can't re-read it).
+        removed = [{"name": n, "description": before[n]} for n in removed_names]
+
+        return {
+            "added": added,
+            "removed": removed,
+            "unchanged": unchanged,
+            "total": len(after),
+            "commands": len(new_commands),
+        }
 
 
 def resolve_skill_command_key(command: str) -> Optional[str]:

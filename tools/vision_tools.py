@@ -45,17 +45,25 @@ import httpx
 # → rich (~50 ms cold); only vision handlers need it. Loaded lazily; both
 # names stay module attributes so tests can keep patching
 # ``tools.vision_tools.async_call_llm``. Truthy-skip: injected mocks win.
+_get_auxiliary_task_config: Any = None
 async_call_llm: Any = None
 extract_content_or_reasoning: Any = None
 
 
 def _load_auxiliary_client() -> None:
-    global async_call_llm, extract_content_or_reasoning
-    if async_call_llm is None or extract_content_or_reasoning is None:
+    global _get_auxiliary_task_config, async_call_llm, extract_content_or_reasoning
+    if (
+        _get_auxiliary_task_config is None
+        or async_call_llm is None
+        or extract_content_or_reasoning is None
+    ):
         from agent.auxiliary_client import (
+            _get_auxiliary_task_config as _gatc,
             async_call_llm as _acl,
             extract_content_or_reasoning as _ecr,
         )
+        if _get_auxiliary_task_config is None:
+            _get_auxiliary_task_config = _gatc
         if async_call_llm is None:
             async_call_llm = _acl
         if extract_content_or_reasoning is None:
@@ -1251,10 +1259,9 @@ async def vision_analyze_tool(
         # Local vision models (llama.cpp, ollama) can take well over 30s.
         vision_timeout = 120.0
         vision_temperature = 0.1
+        _load_auxiliary_client()
         try:
-            from hermes_cli.config import cfg_get, load_config
-            _cfg = load_config()
-            _vision_cfg = cfg_get(_cfg, "auxiliary", "vision", default={})
+            _vision_cfg = _get_auxiliary_task_config("vision")
             _vt = _vision_cfg.get("timeout")
             if _vt is not None:
                 vision_timeout = float(_vt)
