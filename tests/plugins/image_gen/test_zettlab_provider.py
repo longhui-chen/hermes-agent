@@ -3,12 +3,12 @@ from __future__ import annotations
 import io
 import multiprocessing
 import os
-import signal
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 
+import psutil
 import pytest
 import requests
 
@@ -928,9 +928,7 @@ def test_zettlab_parent_watchdog_exits_after_parent_is_killed():
         parent.join(timeout=2)
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
-            try:
-                os.kill(child_pid, 0)
-            except ProcessLookupError:
+            if not psutil.pid_exists(child_pid):
                 break
             time.sleep(0.05)
         else:
@@ -940,8 +938,8 @@ def test_zettlab_parent_watchdog_exits_after_parent_is_killed():
             parent.kill()
             parent.join(timeout=1)
         try:
-            os.kill(child_pid, signal.SIGKILL)
-        except ProcessLookupError:
+            psutil.Process(child_pid).kill()
+        except psutil.NoSuchProcess:
             pass
         output.close()
 
