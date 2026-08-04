@@ -270,6 +270,45 @@ def _registered_task_cwd_override(task_id: str = "default") -> str | None:
     return _sentinel_free_abs_cwd(overrides.get("cwd"))
 
 
+def _managed_gateway_output_dir() -> str | None:
+    """受管网关下平台供给的 agent output 目录，作为相对路径的兜底锚点。
+
+    multiplex 网关形态没有终端 live cwd、注册的 session cwd 和 ``$TERMINAL_CWD``
+    可供锚定，原兜底会落到 root 守护进程的 HOME（scope 外）：相对路径写入必被
+    守卫 403 拦截，读取则报出误导性的 ``/root/...`` 路径。锚到 agent 自己的可写
+    地盘在安全上成立——文件工具的目标始终是显式路径，藏不住任何写入，用户文件
+    必然走绝对路径、保护照常；它也不像终端 cwd 那样兼任 project-context 加载根。
+
+    tools/runtime_workdir.py 合入后本 helper 自然收敛到那份共享实现；在此之前
+    保留一份语义一致的内联实现（profile scope 优先，须为已存在的绝对目录）。
+    任何异常都视为不可用、沿用原兜底，绝不让文件工具因此抛错（HR2）。
+    """
+    if os.environ.get("HERMES_MANAGED_GATEWAY") != "1":
+        return None
+    try:
+        try:
+            from tools.runtime_workdir import agent_output_dir
+        except ImportError:
+            pass
+        else:
+            value = agent_output_dir()
+            return str(value) if value else None
+        try:
+            from agent.secret_scope import get_secret
+
+            value = get_secret("ZET_AGENT_OUTPUT_DIR")
+        except Exception:
+            value = None
+        if not value:
+            value = os.environ.get("ZET_AGENT_OUTPUT_DIR")
+        value = str(value or "").strip()
+        if value and os.path.isabs(value) and os.path.isdir(value):
+            return value
+        return None
+    except Exception:
+        return None
+
+
 def _authoritative_workspace_root(task_id: str = "default") -> str | None:
     """Best-effort absolute workspace root for divergence checks.
 
@@ -319,7 +358,9 @@ def _resolve_base_dir(
       3. A sentinel-free, absolute ``$TERMINAL_CWD`` (the worktree path set by
          ``cli.py``/``main.py`` for ``-w`` sessions). Used even before any
          terminal command has populated the live cwd registry.
-      4. The process cwd.
+      4. Managed multiplex gateway only (host paths): the platform-provisioned
+         agent output directory — see :func:`_managed_gateway_output_dir`.
+      5. The process cwd.
 
     The returned base is ALWAYS absolute. This is the core invariant that
     prevents the worktree-cwd divergence bug: a relative or sentinel
@@ -334,6 +375,11 @@ def _resolve_base_dir(
     root = _authoritative_workspace_root(task_id)
     if container_paths is None:
         container_paths = _uses_container_paths(task_id)
+    if not root and not container_paths:
+        # 受管网关下前三层锚点均无人供给，落到进程 cwd 会指向 root 守护进程的
+        # HOME（scope 外），故先锚到平台 output 目录；容器路径语义在沙箱内，
+        # host 目录对其无意义，保持原兜底不动。
+        root = _managed_gateway_output_dir()
     if root:
         base_text = _expand_tilde(root)
     else:

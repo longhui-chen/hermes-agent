@@ -375,6 +375,10 @@ def test_workflow_addendum_plan_first_section_is_capability_aware():
         assert "## 工作风格" in text
         assert "## 计划先行（Plan-First）" in text
         assert "## 用户画像语言" in text
+        # 工作目录契约是设备上唯一能让模型避开 scope 外锚点的说明；丢了它
+        # 模型只能靠撞墙学习，所以这里钉住它的存在。
+        assert "## 工作目录与路径" in text
+        assert "agent_output" in text
 
 
 def test_trusted_video_execution_never_hides_present_plan(monkeypatch):

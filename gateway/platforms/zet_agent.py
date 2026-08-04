@@ -294,6 +294,17 @@ _ZET_PLAN_FIRST_MANUAL = """\
 
 简单的单步请求、查询、闲聊不需要 present_plan，直接执行即可。"""
 
+# workdir 契约：设备上终端的相对路径没人供给锚点时会兜底到 scope 外的
+# 目录，而契约不进 prompt 模型只能靠撞墙学习，所以在平台层显式声明。
+# `agent_output` 别名由终端工具解析，措辞不做绝对断言以兼容尚未提供
+# 该别名的运行时版本。
+_ZET_WORKDIR_SECTION = """\
+## 工作目录与路径
+
+- 跑脚本、落临时产物：终端调用传 `workdir='agent_output'`（平台提供该别名时），那是你自己的可写产出目录。
+- 读写用户文件：一律用绝对路径（如 `/volume1/subvol/data/...`），不要依赖相对路径。
+- 相对路径的语义是你自己的产出目录，不是用户的文件区。"""
+
 _ZET_ADDENDUM_TAIL = """\
 ## 用户画像语言
 
@@ -313,7 +324,9 @@ def _zettlab_workflow_addendum(auto_execute: bool) -> str:
     PLAN_SCHEMA so no side effect runs before the user confirms.
     """
     plan_first = _ZET_PLAN_FIRST_AUTO if auto_execute else _ZET_PLAN_FIRST_MANUAL
-    return "\n\n".join((_ZET_ADDENDUM_HEAD, plan_first, _ZET_ADDENDUM_TAIL)) + "\n"
+    return "\n\n".join(
+        (_ZET_ADDENDUM_HEAD, plan_first, _ZET_WORKDIR_SECTION, _ZET_ADDENDUM_TAIL)
+    ) + "\n"
 
 
 _DELEGATION_ADVANCE_ENV = "ZET_DELEGATION_ADVANCE_URL"
