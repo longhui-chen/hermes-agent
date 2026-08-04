@@ -786,7 +786,15 @@ def classify_api_error(
     # carry the machine token only in ``error.code`` and put a localized,
     # pattern-free sentence in ``error.message`` (the Zettlab CN moderation
     # gateway returns code=moderation_input_blocked with message="内容不合规").
-    _policy_haystack = f"{error_msg} {(error_code or '').lower()}"
+    # ``error.type`` is added separately because ``_extract_error_code`` cannot
+    # be relied on to surface it: it reads ``code or type``, and a generic but
+    # truthy ``code`` (the CN gateway sends ``"400"`` on some paths) short-
+    # circuits the ``or`` and is then dropped by the ``!= "400"`` guard, so the
+    # type is never consulted again. Without it the frame falls through to
+    # ``format_error``/``provider_bad_request``: the client never sees
+    # ``content_blocked``, and the request may be retried on a fallback model
+    # even though the compliance gateway already refused it.
+    _policy_haystack = f"{error_msg} {(error_code or '').lower()} {_error_type_of(body)}"
     if any(p in _policy_haystack for p in _CONTENT_POLICY_BLOCKED_PATTERNS):
         return _result(
             FailoverReason.content_policy_blocked,
@@ -1733,6 +1741,23 @@ _ERROR_CODE_TEXT_PATTERNS = (
     "invalid_api_key",
     "invalid_request_error",
 )
+
+
+def _error_type_of(body) -> str:
+    """Return ``error.type`` lowercased, or "" when absent.
+
+    Kept separate from :func:`_extract_error_code` on purpose — that function
+    answers "what is this error's code", and its ``code or type`` fallback is
+    right for that question. Content-policy matching needs the type even when a
+    code exists, which is a different question.
+    """
+    if not isinstance(body, dict):
+        return ""
+    err = body.get("error")
+    if not isinstance(err, dict):
+        return ""
+    t = err.get("type")
+    return t.strip().lower() if isinstance(t, str) else ""
 
 
 def _extract_error_code(body: dict) -> str:

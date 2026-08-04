@@ -917,8 +917,17 @@ def _transcript_without_refused_turn(
     located, everything from the last user message on is dropped — over-trimming
     one turn is recoverable, keeping refused content is not.
     """
+    # 只校验 role 是不够的：压缩重建 messages 之后，旧索引可能仍在范围内、
+    # 也确实是一条 user 行，但那是**另一条**——压缩追加的 todo snapshot，或
+    # 被保留下来的历史用户轮。索引一旦落在本轮被拒消息之后，下面的裁剪就会
+    # 把被拒内容留在返回的 transcript 里，下一轮继续提交给审核网关和模型。
+    # 所以内容对不上也要重新锚定，reanchor 本身就是优先按内容匹配的。
     idx = current_turn_user_idx
-    if not (0 <= idx < len(messages)) or messages[idx].get("role") != "user":
+    if (
+        not (0 <= idx < len(messages))
+        or messages[idx].get("role") != "user"
+        or messages[idx].get("content") != user_message
+    ):
         idx = reanchor_current_turn_user_idx(messages, user_message)
     if not (0 <= idx < len(messages)):
         for i in range(len(messages) - 1, -1, -1):
@@ -926,6 +935,42 @@ def _transcript_without_refused_turn(
                 return messages[:i]
         return list(messages)
     return messages[:idx]
+
+
+def _purge_refused_rows_from_session_db(agent, messages: List[Dict], kept: int) -> None:
+    """Delete the refused turn's already-persisted rows from the session DB.
+
+    ``build_turn_context`` writes the current user message to SQLite before the
+    first model call, so by the time a refusal comes back the row is already
+    durable and carries a ``_db_message_id``. Trimming the in-memory list and
+    re-persisting only rewrites the JSON log and the live list — the DB row
+    survives, and the next turn restores it through
+    ``get_messages_as_conversation()``. The refused content then goes back to
+    the moderation gateway (billed) and the user is blocked again on text they
+    can no longer see a way to change.
+
+    Best-effort by design: a store without ``delete_message`` (or a delete that
+    fails) must not turn a content refusal into a crashed turn. The in-memory
+    trim still keeps the refused text out of THIS process's context.
+    """
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    delete = getattr(session_db, "delete_message", None)
+    if session_db is None or not session_id or not callable(delete):
+        return
+    for msg in messages[kept:]:
+        if not isinstance(msg, dict):
+            continue
+        row_id = msg.get("_db_message_id")
+        if not isinstance(row_id, int) or row_id <= 0:
+            continue
+        try:
+            delete(session_id, row_id)
+        except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+            logger.warning(
+                "content refusal: failed to delete persisted message row %s: %s",
+                row_id, exc,
+            )
 
 
 def _content_policy_blocked_result(
@@ -2303,6 +2348,12 @@ def run_conversation(
                     # context — see _transcript_without_refused_turn.
                     _kept_messages = _transcript_without_refused_turn(
                         messages, user_message, current_turn_user_idx
+                    )
+                    # 内存里裁掉还不够：user 消息在首次模型调用之前就已经写进
+                    # SQLite 了，不删行的话下一轮 get_messages_as_conversation()
+                    # 会把它恢复回来重新提交。
+                    _purge_refused_rows_from_session_db(
+                        agent, messages, len(_kept_messages)
                     )
                     agent._persist_session(_kept_messages, conversation_history)
                     # No ClassifiedError here — this refusal arrived as a
@@ -4469,6 +4520,18 @@ def run_conversation(
                     )
                 ) and not is_context_length_error
 
+                # 合规拦截不得走 fallback。classified.should_fallback 已经被
+                # content_policy_fallback_disabled() 置为 False，但下面这段从来
+                # 不读它 —— 只要还有 pending fallback 就照样调
+                # _try_activate_fallback()，于是合规网关已经拒绝的请求被路由到
+                # 用户自配的备用模型，并且可能真的拿到回答。
+                #
+                # 只跳过「尝试 fallback」这一步，后面的终止/上报路径要照常走：
+                # 这一轮必须以内容拦截结束，而不是悄悄中止。
+                _policy_no_fallback = (
+                    classified.reason == FailoverReason.content_policy_blocked
+                    and not classified.should_fallback
+                )
                 if is_client_error:
                     # Try fallback before aborting — a different provider may
                     # not have the same issue (rate limit, auth, etc.). Only
@@ -4476,14 +4539,14 @@ def run_conversation(
                     # exists; otherwise "trying fallback..." is a lie and the
                     # session looks like it's recovering when it's about to
                     # abort silently (#35314, #17446).
-                    if agent._has_pending_fallback():
+                    if agent._has_pending_fallback() and not _policy_no_fallback:
                         if classified.reason == FailoverReason.content_policy_blocked:
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
                         elif classified.reason == FailoverReason.ssl_cert_verification:
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if not _policy_no_fallback and agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -4642,6 +4705,13 @@ def run_conversation(
                         if _content_refused
                         else messages
                     )
+                    if _content_refused:
+                        # 同上：DB 里那条已落盘的 user 行也要删掉。放在
+                        # persist 之前，因为大 session 会跳过 persist —— 但
+                        # 被拒的行无论如何都得清。
+                        _purge_refused_rows_from_session_db(
+                            agent, messages, len(_kept_messages)
+                        )
                     if status_code == 400 and (approx_tokens > 50000 or len(api_messages) > 80):
                         agent._vprint(
                             f"{agent.log_prefix}⚠️  Skipping session persistence "
