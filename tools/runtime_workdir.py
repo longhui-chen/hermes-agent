@@ -9,10 +9,29 @@ from typing import Optional
 
 AGENT_OUTPUT_WORKDIR = "agent_output"
 AGENT_OUTPUT_ENV = "ZET_AGENT_OUTPUT_DIR"
+AGENT_OUTPUT_ARG = "_zettlab_agent_output_workdir"
 
 
 class RuntimeWorkdirError(ValueError):
     """A semantic workdir alias cannot be resolved safely."""
+
+
+def agent_output_dir(
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Optional[str]:
+    """Return the validated platform output directory, or ``None``.
+
+    Non-raising companion to :func:`resolve_runtime_workdir`. The snapshot guard
+    and the local terminal backend both anchor an out-of-scope fallback cwd here,
+    and they MUST agree on the value: protecting one directory while the command
+    runs in another is exactly the split the guard exists to prevent.
+    """
+
+    try:
+        return resolve_runtime_workdir(AGENT_OUTPUT_WORKDIR, environ=environ)
+    except RuntimeWorkdirError:
+        return None
 
 
 def resolve_runtime_workdir(
