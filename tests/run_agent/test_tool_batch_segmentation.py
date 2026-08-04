@@ -106,6 +106,17 @@ class TestPlanToolBatchSegments:
         assert _kinds(segments) == ["sequential", "parallel"]
         assert [tc.id for tc in segments[0][1]] == ["b1", "b2"]
 
+    def test_terminal_and_todo_are_both_sequential_barriers(self):
+        calls = [
+            _tc("terminal", '{"command":"render"}', call_id="terminal-1"),
+            _tc("todo", '{"action":"read"}', call_id="todo-1"),
+        ]
+
+        segments = _plan_tool_batch_segments(calls)
+
+        assert _kinds(segments) == ["sequential"]
+        assert [tc.id for tc in segments[0][1]] == ["terminal-1", "todo-1"]
+
     def test_never_parallel_tool_is_a_barrier(self):
         calls = [
             _tc("web_search", call_id="r1"),
@@ -320,6 +331,22 @@ class TestSegmentedDispatchIntegration:
         calls = [
             _tc("terminal", '{"command":"a"}'),
             _tc("terminal", '{"command":"b"}'),
+        ]
+        msg = SimpleNamespace(content="", tool_calls=calls)
+
+        with (
+            patch.object(agent, "_execute_tool_calls_concurrent") as conc,
+            patch.object(agent, "_execute_tool_calls_sequential") as seq,
+        ):
+            agent._execute_tool_calls(msg, [], "task-1")
+
+        seq.assert_called_once()
+        conc.assert_not_called()
+
+    def test_terminal_and_todo_batch_uses_sequential_executor(self, agent):
+        calls = [
+            _tc("terminal", '{"command":"render"}'),
+            _tc("todo", '{"action":"read"}'),
         ]
         msg = SimpleNamespace(content="", tool_calls=calls)
 

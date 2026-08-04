@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import logging
@@ -16,7 +17,7 @@ from collections import OrderedDict
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -225,7 +226,7 @@ class _SkillDirectOperation:
     scope: _SkillDirectScope
     function_name: str
     may_authorize_memory: bool = False
-    authorized_payload_sha256: str = field(
+    authorized_args_sha256: str = field(
         default="",
         repr=False,
         compare=False,
@@ -1356,6 +1357,42 @@ def _canonical_memory_payload_sha256(function_args: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _canonical_tool_args_sha256(function_args: Mapping[str, Any]) -> str:
+    """Freeze exact preflight args for the final registry dispatch check."""
+    try:
+        canonical = json.dumps(
+            dict(function_args),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+    except (TypeError, ValueError):
+        return ""
+    if len(canonical.encode("utf-8")) > 256 * 1024:
+        return ""
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _normalized_registry_tool_args(
+    function_name: str,
+    function_args: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Return the same schema-coerced args the registry will dispatch."""
+    try:
+        normalized = copy.deepcopy(dict(function_args))
+        from model_tools import coerce_tool_args
+
+        normalized = coerce_tool_args(function_name, normalized)
+    except Exception as exc:
+        logger.warning(
+            "zet_agent: failed to normalize trusted %s args: %s",
+            function_name,
+            exc,
+        )
+        return None
+    return normalized if isinstance(normalized, dict) else None
+
+
 def _memory_payload_hashes_from_terminal_result(
     result: Mapping[str, Any],
 ) -> frozenset[str]:
@@ -1491,15 +1528,31 @@ def trusted_skill_operation_block_message(
         allowed = function_name in scope.allowed_tools
         operation_scope = scope
         may_authorize_memory = False
-        authorized_payload_sha256 = ""
+        authorized_args_sha256 = ""
         if allowed and function_name == "terminal":
-            allowed, may_authorize_memory = _video_edit_command_policy(function_args)
-            allowed = allowed and scope.execution_receipt is not None
+            normalized_args = _normalized_registry_tool_args(
+                function_name,
+                function_args,
+            )
+            if normalized_args is None:
+                allowed = False
+            else:
+                allowed, may_authorize_memory = _video_edit_command_policy(
+                    normalized_args
+                )
+                authorized_args_sha256 = _canonical_tool_args_sha256(
+                    normalized_args
+                )
+            allowed = bool(
+                allowed
+                and scope.execution_receipt is not None
+                and authorized_args_sha256
+            )
         elif allowed and function_name == "memory":
             memory_digest = _canonical_memory_payload_sha256(function_args)
             allowed = bool(memory_digest and memory_digest in scope.memory_payload_sha256)
             if allowed:
-                authorized_payload_sha256 = memory_digest
+                authorized_args_sha256 = memory_digest
                 remaining = scope.memory_payload_sha256 - {memory_digest}
                 allowed_tools = scope.allowed_tools
                 if not remaining:
@@ -1570,10 +1623,8 @@ def trusted_skill_operation_block_message(
             scope=operation_scope,
             function_name=function_name,
             may_authorize_memory=may_authorize_memory,
-            authorized_payload_sha256=authorized_payload_sha256,
+            authorized_args_sha256=authorized_args_sha256,
         )
-        if function_name == "terminal":
-            _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(scope.execution_receipt)
         return None
 
 
@@ -1584,7 +1635,10 @@ def trusted_skill_operation_execution_block_message(
     function_args: Mapping[str, Any],
 ) -> str | None:
     """Revalidate the final trusted-memory payload after execution middleware."""
-    if function_name != "memory":
+    if (
+        (getattr(agent, "platform", "") or "") != "zet_agent"
+        or function_name != "memory"
+    ):
         return None
 
     turn_identity = _current_skill_direct_turn_identity()
@@ -1628,7 +1682,7 @@ def trusted_skill_operation_execution_block_message(
         if (
             operation.execution_claimed
             or not final_digest
-            or final_digest != operation.authorized_payload_sha256
+            or final_digest != operation.authorized_args_sha256
         ):
             agent._zet_agent_skill_direct_operation = None
             logger.warning(
@@ -1645,6 +1699,150 @@ def trusted_skill_operation_execution_block_message(
             execution_claimed=True,
         )
         return None
+
+
+def _claim_trusted_video_terminal_dispatch(
+    agent: Any,
+    function_args: Mapping[str, Any],
+) -> tuple[_TrustedExecutionReceipt | None, str | None]:
+    """Claim one exact terminal dispatch after all plugin gates have run."""
+    turn_identity = _current_skill_direct_turn_identity()
+    with _SKILL_DIRECT_LOCK:
+        operation = getattr(agent, "_zet_agent_skill_direct_operation", None)
+        if not isinstance(operation, _SkillDirectOperation):
+            if _video_edit_runtime_argv(function_args) is not None:
+                return None, (
+                    "Trusted video-edit runtime commands require a current "
+                    "request-bound operation at final dispatch. Reload the "
+                    "trusted skill and retry the exact operation."
+                )
+            return None, None
+
+        if operation.function_name != "terminal" or operation.execution_claimed:
+            agent._zet_agent_skill_direct_operation = None
+            return None, (
+                "The trusted video-edit terminal operation was already claimed "
+                "or belongs to another tool. It was revoked before dispatch."
+            )
+
+        scope = operation.scope
+        task = getattr(agent, "_zet_agent_skill_direct_task", None)
+        if (
+            turn_identity is None
+            or scope.turn_identity != turn_identity
+            or not isinstance(task, _SkillDirectTaskContext)
+            or task.turn_identity != turn_identity
+            or task.task_sha256 != scope.task_sha256
+        ):
+            agent._zet_agent_skill_direct_operation = None
+            return None, (
+                "The trusted video-edit terminal operation belongs to another "
+                "task-local turn. It was revoked before dispatch."
+            )
+
+        normalized_args = _normalized_registry_tool_args("terminal", function_args)
+        final_digest = (
+            _canonical_tool_args_sha256(normalized_args)
+            if normalized_args is not None
+            else ""
+        )
+        if normalized_args is None:
+            allowed, may_authorize_memory = False, False
+        else:
+            allowed, may_authorize_memory = _video_edit_command_policy(
+                normalized_args
+            )
+        receipt = scope.execution_receipt
+        if (
+            not allowed
+            or not final_digest
+            or final_digest != operation.authorized_args_sha256
+            or may_authorize_memory != operation.may_authorize_memory
+            or not isinstance(receipt, _TrustedExecutionReceipt)
+        ):
+            agent._zet_agent_skill_direct_operation = None
+            logger.warning(
+                "zet_agent: blocked trusted terminal args changed after exact "
+                "authorization"
+            )
+            return None, (
+                "The trusted video-edit terminal arguments changed after exact "
+                "authorization. The operation was revoked before dispatch."
+            )
+
+        agent._zet_agent_skill_direct_operation = replace(
+            operation,
+            execution_claimed=True,
+        )
+        return receipt, None
+
+
+def dispatch_trusted_skill_operation(
+    agent: Any,
+    *,
+    function_name: str,
+    function_args: Mapping[str, Any],
+    dispatch: Callable[[], Any],
+) -> Any:
+    """Run registry dispatch inside the narrow trusted-skill boundary.
+
+    Plugin pre-hooks and execution middleware run before this function, while
+    post/transform hooks run after it returns. The private receipt therefore
+    exists only during the actual terminal registry handler. Terminal success
+    is bound to the raw handler result before plugins can replace it, while a
+    ``skill_view`` scope is activated later from the final displayed result.
+    """
+    _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
+    receipt: _TrustedExecutionReceipt | None = None
+    block_message: str | None = None
+    if function_name == "terminal":
+        receipt, block_message = _claim_trusted_video_terminal_dispatch(
+            agent,
+            function_args,
+        )
+
+    if block_message is not None:
+        result = json.dumps(
+            {
+                "output": "",
+                "exit_code": -1,
+                "error": block_message,
+                "video_edit_runtime_direct": False,
+                "video_edit_runtime_blocked": True,
+            },
+            ensure_ascii=False,
+        )
+        if function_name != "skill_view":
+            apply_trusted_skill_execution(
+                agent,
+                function_name=function_name,
+                function_result=result,
+            )
+        return result
+
+    if receipt is not None:
+        _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(receipt)
+    try:
+        result = dispatch()
+    except BaseException:
+        _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
+        if function_name != "skill_view":
+            apply_trusted_skill_execution(
+                agent,
+                function_name=function_name,
+                function_result=None,
+            )
+        raise
+    finally:
+        _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
+
+    if function_name != "skill_view":
+        apply_trusted_skill_execution(
+            agent,
+            function_name=function_name,
+            function_result=result,
+        )
+    return result
 
 
 def _rearm_skill_direct_scope_after_success(

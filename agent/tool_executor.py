@@ -35,6 +35,7 @@ from agent.display import (
 from agent.tool_guardrails import ToolGuardrailDecision
 from agent.zet_agent_response_mode import (
     apply_trusted_skill_execution,
+    dispatch_trusted_skill_operation,
     trusted_skill_operation_execution_block_message,
     trusted_skill_operation_block_message,
 )
@@ -419,6 +420,70 @@ def _run_agent_tool_execution_middleware(
         api_request_id=getattr(agent, "_current_api_request_id", "") or "",
     )
     return result, observed_args
+
+
+def _handle_registry_function_call(
+    agent,
+    *,
+    function_name: str,
+    function_args: dict,
+    effective_task_id: str,
+    tool_call_id: str,
+    middleware_trace: list[dict[str, Any]],
+) -> Any:
+    """Dispatch once and bind trusted state to the raw registry result."""
+    trusted_boundary_enabled = (
+        (getattr(agent, "platform", "") or "") == "zet_agent"
+    )
+    dispatch_observed = not trusted_boundary_enabled
+
+    def _dispatch_wrapper(name: str, args: dict, dispatch) -> Any:
+        nonlocal dispatch_observed
+        dispatch_observed = True
+        return dispatch_trusted_skill_operation(
+            agent,
+            function_name=name,
+            function_args=args,
+            dispatch=dispatch,
+        )
+
+    call_kwargs = {
+        "tool_call_id": tool_call_id,
+        "session_id": agent.session_id or "",
+        "turn_id": getattr(agent, "_current_turn_id", "") or "",
+        "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
+        "user_task": getattr(agent, "_current_user_message", "") or "",
+        "previous_assistant_message": getattr(
+            agent,
+            "_previous_assistant_message",
+            "",
+        ) or "",
+        "enabled_tools": (
+            list(agent.valid_tool_names) if agent.valid_tool_names else None
+        ),
+        "skip_pre_tool_call_hook": True,
+        "skip_tool_request_middleware": True,
+        "enabled_toolsets": getattr(agent, "enabled_toolsets", None),
+        "disabled_toolsets": getattr(agent, "disabled_toolsets", None),
+        "tool_request_middleware_trace": list(middleware_trace),
+    }
+    if trusted_boundary_enabled:
+        call_kwargs["dispatch_wrapper"] = _dispatch_wrapper
+
+    try:
+        return _ra().handle_function_call(
+            function_name,
+            function_args,
+            effective_task_id,
+            **call_kwargs,
+        )
+    finally:
+        if not dispatch_observed:
+            apply_trusted_skill_execution(
+                agent,
+                function_name=function_name,
+                function_result=None,
+            )
 
 
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
@@ -1638,22 +1703,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 spinner.start()
             _spinner_result = None
             try:
-                function_result = _ra().handle_function_call(
-                    function_name, function_args, effective_task_id,
+                function_result = _handle_registry_function_call(
+                    agent,
+                    function_name=function_name,
+                    function_args=function_args,
+                    effective_task_id=effective_task_id,
                     tool_call_id=tool_call.id,
-                    session_id=agent.session_id or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    user_task=getattr(agent, "_current_user_message", "") or "",
-                    previous_assistant_message=getattr(
-                        agent, "_previous_assistant_message", ""
-                    ) or "",
-                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-                    skip_pre_tool_call_hook=True,
-                    skip_tool_request_middleware=True,
-                    enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                    disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                    tool_request_middleware_trace=list(middleware_trace),
+                    middleware_trace=list(middleware_trace),
                 )
                 _spinner_result = function_result
             except KeyboardInterrupt:
@@ -1684,22 +1740,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     agent._vprint(f"  {cute_msg}")
         else:
             try:
-                function_result = _ra().handle_function_call(
-                    function_name, function_args, effective_task_id,
+                function_result = _handle_registry_function_call(
+                    agent,
+                    function_name=function_name,
+                    function_args=function_args,
+                    effective_task_id=effective_task_id,
                     tool_call_id=tool_call.id,
-                    session_id=agent.session_id or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    user_task=getattr(agent, "_current_user_message", "") or "",
-                    previous_assistant_message=getattr(
-                        agent, "_previous_assistant_message", ""
-                    ) or "",
-                    enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-                    skip_pre_tool_call_hook=True,
-                    skip_tool_request_middleware=True,
-                    enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                    disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                    tool_request_middleware_trace=list(middleware_trace),
+                    middleware_trace=list(middleware_trace),
                 )
             except KeyboardInterrupt:
                 _emit_cancelled_terminal_post_tool_call(
