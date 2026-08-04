@@ -555,6 +555,28 @@ def _chat_result_is_truncated(result: Dict[str, Any]) -> bool:
     return is_partial and not completed and not is_failed
 
 
+def _hermes_error_code(result: Dict[str, Any], finish_reason: str) -> str:
+    """Pick the wire error code for a turn that did not complete cleanly.
+
+    Same rule as :func:`_chat_stream_error_payload`: a truncation is
+    ``output_truncated``, otherwise the classifier's ``provider_error.code``
+    wins over the generic ``agent_error``. Extracted because the non-streaming
+    response and the standard SSE finish chunk used to hardcode
+    ``agent_error`` — so a client that does not consume Hermes' private
+    ``__hermes_error__`` event (a plain OpenAI SDK, for instance) saw a content
+    moderation refusal degrade into a generic failure and could not show the
+    compliance message.
+    """
+    if finish_reason == "length":
+        return "output_truncated"
+    provider_error = result.get("provider_error")
+    if isinstance(provider_error, dict):
+        code = _short_error_text(provider_error.get("code"), limit=120)
+        if code:
+            return code
+    return "agent_error"
+
+
 def _chat_stream_error_payload(result: Dict[str, Any], finish_reason: str) -> Optional[Dict[str, Any]]:
     completed = bool(result.get("completed", True))
     is_partial = bool(result.get("partial"))
@@ -4245,7 +4267,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "partial": is_partial,
                 "failed": is_failed,
                 "error": err_msg,
-                "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
+                "error_code": _hermes_error_code(result, finish_reason),
             }
             response_headers["X-Hermes-Completed"] = "false"
             response_headers["X-Hermes-Partial"] = "true" if is_partial else "false"
@@ -4431,17 +4453,18 @@ class APIServerAdapter(BasePlatformAdapter):
             }
             if finish_reason != "stop":
                 finish_chunk["choices"][0]["delta"] = {}
+                _wire_code = _hermes_error_code(result_dict, finish_reason)
                 if err_msg:
                     finish_chunk["error"] = {
                         "message": err_msg,
-                        "type": "agent_error",
+                        "type": _wire_code,
                     }
                 finish_chunk["hermes"] = {
                     "completed": completed,
                     "partial": is_partial,
                     "failed": is_failed,
                     "error": err_msg,
-                    "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
+                    "error_code": _wire_code,
                 }
             await response.write(f"data: {json.dumps(finish_chunk)}\n\n".encode())
             await response.write(b"data: [DONE]\n\n")
@@ -6070,6 +6093,19 @@ class APIServerAdapter(BasePlatformAdapter):
         current_user = {"role": "user", "content": user_message}
         agent_messages = result.get("messages") if isinstance(result, dict) else None
 
+        # 内容审核拒绝的那一轮不进存储的 transcript。
+        #
+        # 被拒时 conversation_loop 会把这一轮从 result["messages"] 里裁掉，首轮
+        # 被拒就裁成空列表 —— 而空列表在下面被当成「旧调用形状」，于是这里又把
+        # current_user 合成回去。之后 previous_response_id 从 response store 读
+        # 回这段历史，被拒文本在链式会话里被重新提交给审核网关和模型：用户反复
+        # 被拦、审核按次计费、风控档位继续上涨。
+        #
+        # 判定看结构化的 provider_error.code，回退看 error 前缀（
+        # _content_policy_blocked_result 统一加的 "content_policy_blocked:"）。
+        if APIServerAdapter._response_turn_was_content_refused(result):
+            return prior
+
         if isinstance(agent_messages, list) and agent_messages:
             turn_start = APIServerAdapter._response_messages_turn_start_index(
                 conversation_history,
@@ -6088,6 +6124,19 @@ class APIServerAdapter(BasePlatformAdapter):
         full_history.append(current_user)
         full_history.append({"role": "assistant", "content": final_response})
         return full_history
+
+    @staticmethod
+    def _response_turn_was_content_refused(result: Dict[str, Any]) -> bool:
+        """Whether this turn ended in a content-moderation refusal."""
+        if not isinstance(result, dict):
+            return False
+        provider_error = result.get("provider_error")
+        if isinstance(provider_error, dict):
+            code = provider_error.get("code")
+            if isinstance(code, str) and code.strip() == "content_blocked":
+                return True
+        err = result.get("error")
+        return isinstance(err, str) and err.startswith("content_policy_blocked:")
 
     @staticmethod
     def _response_messages_turn_start_index(
