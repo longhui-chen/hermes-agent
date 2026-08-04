@@ -311,13 +311,22 @@ _ZET_WORKDIR_ALIAS_LINE = (
 
 
 def _agent_output_alias_available() -> bool:
-    """Report whether the terminal tool resolves the ``agent_output`` alias."""
+    """Report whether ``workdir='agent_output'`` will actually work right now.
+
+    Both halves have to hold: the terminal tool must know the alias *and* the
+    platform must have provisioned the directory it resolves to. A device whose
+    agent runtime is newer than its local-server has the first without the
+    second, and teaching the alias there produces a command that fails on every
+    use. Staying quiet costs nothing — the model falls back to absolute paths,
+    which work either way.
+    """
 
     try:
-        from tools.runtime_workdir import AGENT_OUTPUT_WORKDIR  # noqa: F401
+        from tools.runtime_workdir import agent_output_dir
+
+        return bool(agent_output_dir())
     except Exception:
         return False
-    return True
 
 
 def _zet_workdir_section() -> str:
