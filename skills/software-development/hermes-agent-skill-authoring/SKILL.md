@@ -84,6 +84,35 @@ Common quality failures:
 - **Sprawl** — too much always-visible material; push branch-specific reference behind pointers.
 - **No-op prose** — generic advice the agent would already follow without the skill.
 
+## Invoking Bundled Scripts (hard requirement)
+
+Never write a relative path to a script the skill ships. The working directory a
+command runs in is **not** the skill package — on Zettlab devices it is the
+agent's own output directory, so `python scripts/x.py` cannot find the script at
+all. Relative paths only ever worked when the model happened to convert them
+using the injected skill directory, which is a soft, per-model behaviour.
+
+Use the `${HERMES_SKILL_DIR}` template variable. It is substituted with the
+package's absolute path when SKILL.md loads:
+
+```
+python3 "${HERMES_SKILL_DIR}/scripts/search.py" --query "..."
+bash "${HERMES_SKILL_DIR}/scripts/setup.sh"
+```
+
+Rules:
+
+- Spell it exactly `${HERMES_SKILL_DIR}` — a bare `SKILL_DIR` or a missing brace
+  is not substituted and fails silently as a literal path.
+- Quote the expansion. The substituted path may contain spaces.
+- Prefer `python3` over `python`; the latter is absent on some device images.
+- Only for scripts **this package ships**. Paths into a cloned repository, the
+  user's project, or `/tmp` are not skill paths — leave those relative to
+  whatever the surrounding steps establish.
+- If the command needs a scratch working directory rather than a script path,
+  declare it on the terminal call (`workdir='agent_output'`) instead of assuming
+  one; commands that do not declare one anchor to the agent's output directory.
+
 ## Peer-Matched Structure
 
 Every in-repo skill follows roughly:
