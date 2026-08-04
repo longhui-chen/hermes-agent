@@ -606,12 +606,129 @@ def _extract_business_execution_token(raw: Any) -> str:
     return token if re.fullmatch(r"[0-9a-f]{64}", token) else ""
 
 
+_BUSINESS_EXECUTION_PROOF_HEADER = "X-Zettlab-Business-Execution-Proof"
+_BUSINESS_EXECUTION_PROOF_DOMAIN = "zettlab-business-execution-proof-v1"
+_BUSINESS_EXECUTION_SKILL_SLUG_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}"
+)
+
+
+def _business_execution_task_digest(user_message: Any) -> str:
+    """Hash the exact text-only task accepted for trusted automation."""
+    if not isinstance(user_message, str):
+        return ""
+    return hashlib.sha256(user_message.encode("utf-8")).hexdigest()
+
+
+def _business_execution_proof(
+    action_token: str,
+    business_execution_token: str,
+    execution_policy: str,
+    gateway_session_key: str,
+    session_id: str,
+    turn_id: str,
+    skill_slug: str,
+    task_digest: str,
+) -> str:
+    """Build the local-server/Hermes proof for one exact silent turn."""
+    fields = (
+        _BUSINESS_EXECUTION_PROOF_DOMAIN,
+        business_execution_token,
+        execution_policy,
+        gateway_session_key,
+        session_id,
+        turn_id,
+        skill_slug,
+        task_digest,
+    )
+    if (
+        not action_token
+        or not re.fullmatch(r"[0-9a-f]{64}", business_execution_token or "")
+        or execution_policy != "silent_automation"
+        or any(not value or "\x00" in value for value in fields[3:])
+        or _BUSINESS_EXECUTION_SKILL_SLUG_RE.fullmatch(skill_slug) is None
+        or re.fullmatch(r"[0-9a-f]{64}", task_digest) is None
+    ):
+        return ""
+    canonical = "\x00".join(fields).encode("utf-8")
+    digest = hmac.new(
+        action_token.encode("utf-8"),
+        canonical,
+        hashlib.sha256,
+    ).hexdigest()
+    return f"v1={digest}"
+
+
+def _extract_execution_policy(
+    body: Dict[str, Any],
+    business_execution_token: str,
+    business_execution_proof: str = "",
+    *,
+    gateway_session_key: str = "",
+    session_id: str = "",
+    turn_id: str = "",
+    skill_slug: str = "",
+    task_digest: str = "",
+    action_token: Optional[str] = None,
+) -> str:
+    """Return a trusted, allowlisted per-turn execution policy.
+
+    The metadata field and business token are transport hints. They become
+    authoritative only when local-server attests the exact token, policy,
+    stable session key, lineage session id, turn, selected skill and exact task
+    digest with the current profile's action token. An API client that knows
+    only API_SERVER_KEY therefore cannot suppress interaction tools or replay a
+    proof against a different skill/task. Unknown policies fail closed.
+    """
+    if not re.fullmatch(r"[0-9a-f]{64}", business_execution_token or ""):
+        return ""
+    metadata = body.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    raw = metadata.get("execution_policy", metadata.get("executionPolicy", ""))
+    policy = str(raw or "").strip().lower()
+    if policy != "silent_automation":
+        return ""
+    proof = str(business_execution_proof or "").strip()
+    if not re.fullmatch(r"v1=[0-9a-f]{64}", proof):
+        return ""
+    if action_token is None:
+        try:
+            from agent.secret_scope import get_secret
+
+            action_token = str(
+                get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or ""
+            ).strip()
+        except Exception:
+            action_token = ""
+    expected = _business_execution_proof(
+        str(action_token or "").strip(),
+        business_execution_token,
+        policy,
+        gateway_session_key,
+        session_id,
+        turn_id,
+        skill_slug,
+        task_digest,
+    )
+    return policy if expected and hmac.compare_digest(proof, expected) else ""
+
+
 def _business_execution_scope_digest(token: str) -> str:
     """Derive a non-secret cache scope from a validated capability token."""
     if not token:
         return ""
     return hashlib.sha256(
         b"zettlab-business-execution-scope-v1\0" + token.encode("ascii")
+    ).hexdigest()
+
+
+def _business_execution_proof_scope_digest(proof: str) -> str:
+    """Derive a non-secret cache scope from a verified request proof."""
+    if not re.fullmatch(r"v1=[0-9a-f]{64}", proof or ""):
+        return ""
+    return hashlib.sha256(
+        b"zettlab-business-execution-proof-scope-v1\0" + proof.encode("ascii")
     ).hexdigest()
 
 
@@ -1492,6 +1609,10 @@ class ResponseStore:
 # CORS middleware
 # ---------------------------------------------------------------------------
 
+# X-Zettlab-Business-Execution-Proof is intentionally absent. It is a
+# loopback local-server -> Hermes capability, not a browser/App contract;
+# omission makes browser preflight fail closed even for an allowed origin.
+
 _CORS_HEADERS = {
     "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": (
@@ -1843,6 +1964,8 @@ def _make_request_fingerprint(
     keys: List[str],
     *,
     execution_scope_digest: str = "",
+    execution_policy: str = "",
+    execution_proof_digest: str = "",
 ) -> str:
     subset = {k: body.get(k) for k in keys}
     material = repr(subset).encode("utf-8")
@@ -1850,6 +1973,18 @@ def _make_request_fingerprint(
         material += (
             b"\0zettlab-business-execution-scope-v1:"
             + execution_scope_digest.encode("ascii")
+        )
+    if execution_policy:
+        # This is the already-verified trust result, not caller metadata. Keep
+        # silent and ordinary requests in distinct idempotency buckets.
+        material += (
+            b"\0zettlab-execution-policy-v1:"
+            + execution_policy.encode("ascii")
+        )
+    if execution_proof_digest:
+        material += (
+            b"\0zettlab-execution-proof-scope-v1:"
+            + execution_proof_digest.encode("ascii")
         )
     return hashlib.sha256(material).hexdigest()
 
@@ -4125,6 +4260,7 @@ class APIServerAdapter(BasePlatformAdapter):
         # Consumed only by the ZetAgent subclass; never forward this private
         # plan policy hint into AIAgent or an LLM request body.
         agent_request_overrides.pop("_zet_plan_auto_execute", None)
+        agent_request_overrides.pop("_zet_execution_policy", None)
 
         agent_kwargs = {
             "model": model,
@@ -5312,6 +5448,11 @@ class APIServerAdapter(BasePlatformAdapter):
         business_execution_token = _extract_business_execution_token(
             request.headers.get("X-Zettlab-Business-Execution-Token", "")
         )
+        business_execution_proof = request.headers.get(
+            _BUSINESS_EXECUTION_PROOF_HEADER,
+            "",
+        )
+        execution_policy = ""
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -5359,7 +5500,9 @@ class APIServerAdapter(BasePlatformAdapter):
             return key_err
 
         # Allow caller to continue an existing session by passing X-Hermes-Session-Id.
-        # When provided, history is loaded from state.db instead of from the request body.
+        # Validate the lineage before proof verification; history is loaded only
+        # after the execution policy is known so trusted silent turns never read
+        # request or SessionDB conversation history.
         #
         # Security: session continuation exposes conversation history, so it is
         # only allowed when the API key is configured and the request is
@@ -5397,13 +5540,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     status=400,
                 )
             session_id = provided_session_id
-            try:
-                db = await self._ensure_session_db_async()
-                if db is not None:
-                    history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
-            except Exception as e:
-                logger.warning("Failed to load session history for %s: %s", session_id, e)
-                history = []
         else:
             # Derive a stable session ID from the conversation fingerprint so
             # that consecutive messages from the same Open WebUI (or similar)
@@ -5416,6 +5552,51 @@ class APIServerAdapter(BasePlatformAdapter):
                     break
             session_id = _derive_chat_session_id(system_prompt, first_user)
             # history already set from request body above
+
+        # Trusted silent automation binds the selected slug and exact text task
+        # into local-server's HMAC proof. Text-only is intentional: a digest
+        # that ignored image bytes would be replayable.
+        skill_slug = _extract_skill_slug(body)
+        task_digest = _business_execution_task_digest(user_message)
+        execution_policy = _extract_execution_policy(
+            body,
+            business_execution_token,
+            business_execution_proof,
+            gateway_session_key=gateway_session_key or "",
+            session_id=session_id,
+            turn_id=turn_id,
+            skill_slug=skill_slug,
+            task_digest=task_digest,
+        )
+
+        metadata = body.get("metadata")
+        requested_execution_policy = ""
+        if isinstance(metadata, dict):
+            requested_execution_policy = str(
+                metadata.get("execution_policy", metadata.get("executionPolicy", "")) or ""
+            ).strip().lower()
+        requested_silent_automation = requested_execution_policy == "silent_automation"
+        trusted_business_execution_token = business_execution_token
+        if requested_silent_automation and execution_policy != "silent_automation":
+            # The capability and proof are one credential. A replay with a
+            # changed task/skill must not retain the side-effect token after
+            # the policy fails verification.
+            trusted_business_execution_token = ""
+
+        if execution_policy == "silent_automation":
+            # A silent proof is a self-contained task receipt, not permission
+            # to expose either caller-supplied or persisted chat context.
+            history = []
+            system_prompt = None
+            current_turn_reference_image = ""
+        elif provided_session_id:
+            try:
+                db = await self._ensure_session_db_async()
+                if db is not None:
+                    history = await asyncio.to_thread(db.get_messages_as_conversation, session_id)
+            except Exception as e:
+                logger.warning("Failed to load session history for %s: %s", session_id, e)
+                history = []
 
         # Explicit skill invocation (zet_agent hook; base no-op): triggered
         # ONLY by metadata.skill_slug — never by sniffing the message text.
@@ -5431,9 +5612,10 @@ class APIServerAdapter(BasePlatformAdapter):
         #     tools this turn" boundary (request_overrides strips every agent
         #     tool) and expansion injects tool-driving instructions — the
         #     message passes through unexpanded instead.
-        skill_slug = _extract_skill_slug(body)
         skill_selection_enabled = bool(
-            skill_slug and body.get("tool_choice") != "none"
+            skill_slug
+            and body.get("tool_choice") != "none"
+            and (not requested_silent_automation or execution_policy == "silent_automation")
         )
         trusted_user_message = (
             _trusted_skill_task_message(user_message, skill_slug)
@@ -5447,12 +5629,12 @@ class APIServerAdapter(BasePlatformAdapter):
         )
 
         async def _expanded_user_message(on_settled=None):
-            if not skill_slug or body.get("tool_choice") == "none":
+            if not skill_selection_enabled:
                 if on_settled is not None:
                     on_settled()
                 return user_message
             return await self._expand_inbound_skill_invocation(
-                user_message, skill_slug, session_id=session_id,
+                user_message, trusted_skill_slug, session_id=session_id,
                 on_settled=on_settled,
             )
 
@@ -5613,7 +5795,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 plan_auto_execute=plan_auto_execute,
                 turn_id=turn_id,
                 connector_route_capability=connector_route_capability,
-                business_execution_token=business_execution_token,
+                business_execution_token=trusted_business_execution_token,
+                execution_policy=execution_policy,
                 current_turn_reference_image=current_turn_reference_image,
                 request_overrides=request_overrides or None,
                 trusted_user_message=trusted_user_message,
@@ -5669,7 +5852,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     plan_auto_execute=plan_auto_execute,
                     turn_id=turn_id,
                     connector_route_capability=connector_route_capability,
-                    business_execution_token=business_execution_token,
+                    business_execution_token=trusted_business_execution_token,
+                    execution_policy=execution_policy,
                     current_turn_reference_image=current_turn_reference_image,
                     request_overrides=request_overrides or None,
                     trusted_user_message=trusted_user_message,
@@ -5694,7 +5878,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     "metadata",
                 ],
                 execution_scope_digest=_business_execution_scope_digest(
-                    business_execution_token
+                    trusted_business_execution_token
+                ),
+                execution_policy=execution_policy,
+                execution_proof_digest=(
+                    _business_execution_proof_scope_digest(
+                        business_execution_proof
+                    )
+                    if execution_policy
+                    else ""
                 ),
             )
             try:
@@ -7986,6 +8178,7 @@ class APIServerAdapter(BasePlatformAdapter):
         turn_id: Optional[str] = None,
         connector_route_capability: Optional[str] = None,
         business_execution_token: Optional[str] = None,
+        execution_policy: Optional[str] = None,
         current_turn_reference_image: str = "",
         request_overrides: Optional[Dict[str, Any]] = None,
         trusted_user_message: Any = None,
@@ -8054,6 +8247,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     resolved_plan_auto_execute = _resolve_plan_auto_execute(plan_auto_execute)
                     create_overrides = dict(request_overrides or {})
                     create_overrides["_zet_plan_auto_execute"] = resolved_plan_auto_execute
+                    create_overrides["_zet_execution_policy"] = execution_policy or ""
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt,
                         session_id=session_id,

@@ -734,6 +734,28 @@ def test_trusted_video_terminal_authorization_normalizes_registry_args(
     assert json.loads(result)["exit_code"] == 0
 
 
+def test_trusted_video_receipt_preserves_stable_and_lineage_sessions():
+    receipt = response_mode._TrustedExecutionReceipt(
+        agent_id="agent-1",
+        action_token="action-secret",
+        business_execution_token="business-secret",
+        turn_id="pvm-aaaaaaaaaaaaaaaaaaaaaaaa",
+        session_id="api-lineage-tip",
+        gateway_session_key="proactive-pvm-aaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    token = response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(receipt)
+    try:
+        captured = response_mode.trusted_video_edit_runtime_receipt()
+    finally:
+        response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.reset(token)
+
+    assert captured["HERMES_SESSION_KEY"] == "api-lineage-tip"
+    assert (
+        captured["HERMES_GATEWAY_SESSION_KEY"]
+        == "proactive-pvm-aaaaaaaaaaaaaaaaaaaaaaaa"
+    )
+
+
 @pytest.mark.parametrize(
     ("rewrite_result", "expected_scope"),
     [(False, True), (True, False)],

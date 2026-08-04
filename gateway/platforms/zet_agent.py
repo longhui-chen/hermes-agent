@@ -129,6 +129,53 @@ _zet_agent_cron.install()
 logger = logging.getLogger(__name__)
 
 
+_SILENT_AUTOMATION_ALLOWED_TOOLS = frozenset({
+    # Explicit skill selection forces the attested first skill_view call.
+    "skill_view",
+    # terminal has a second, receipt-bound video runtime allowlist.
+    "terminal",
+})
+
+
+def _agent_tool_name(tool: Any) -> str:
+    if not isinstance(tool, dict):
+        return ""
+    function = tool.get("function")
+    if isinstance(function, dict):
+        return str(function.get("name") or "")
+    return str(tool.get("name") or "")
+
+
+def _apply_execution_policy(agent: Any, execution_policy: str) -> None:
+    """Bootstrap a trusted silent turn with no side-effect tool exposed."""
+    if execution_policy != "silent_automation":
+        return
+    allowed_tools = [
+        tool
+        for tool in list(getattr(agent, "tools", ()) or ())
+        if _agent_tool_name(tool) in _SILENT_AUTOMATION_ALLOWED_TOOLS
+    ]
+    allowed_names = {
+        name
+        for name in set(getattr(agent, "valid_tool_names", ()) or ())
+        if name in _SILENT_AUTOMATION_ALLOWED_TOOLS
+    }
+    # The model may not see terminal until an exact startup-snapshotted skill
+    # has been attested for this turn. Keeping the bounded snapshot private on
+    # the agent lets attestation restore only the policy/skill intersection.
+    agent._zet_agent_execution_policy = execution_policy
+    agent._zet_agent_execution_policy_tools = allowed_tools
+    agent._zet_agent_execution_policy_valid_tool_names = allowed_names
+    agent.tools = [
+        tool for tool in allowed_tools if _agent_tool_name(tool) == "skill_view"
+    ]
+    agent.valid_tool_names = {"skill_view"} & allowed_names
+    # A between-turn MCP refresh rebuilds the complete configured toolset and
+    # would silently reintroduce non-allowlisted tools before model dispatch.
+    # This agent exists for one internal turn, so preserve the exact snapshot.
+    agent._skip_mcp_refresh = True
+
+
 async def _to_thread_with_completion_barrier(func, /, *args, **kwargs):
     """Keep a cancelled request alive until its non-cancellable worker exits.
 
@@ -350,8 +397,22 @@ _ZET_ADDENDUM_TAIL = """\
 写入长期用户画像（memory 工具 target="user"，即 USER.md）时，必须使用简体中文。
 姓名、产品名、命令、代码标识符可以保留原文，但描述用户特征、偏好、沟通风格的正文必须写成中文。"""
 
+_ZET_SILENT_AUTOMATION_ADDENDUM = """\
+## 可信静默自动化
 
-def _zettlab_workflow_addendum(auto_execute: bool) -> str:
+这是由可信 transport 发起、无需用户交互的内部任务。直接执行请求中显式选择的工作流：
+- 不调用澄清、计划、todo 或消息发送工具；
+- 不读取或修改用户画像；工作流只能使用其受信输入中已经冻结的偏好；
+- 不等待用户确认，也不创建面向用户的中间进度或失败消息；
+- 只通过工作流规定的确定性结果边界报告最终产物。
+
+普通对话不得套用本段规则。"""
+
+
+def _zettlab_workflow_addendum(
+    auto_execute: bool,
+    execution_policy: str = "",
+) -> str:
     """Assemble the zet_agent workflow addendum with a capability-aware Plan-First
     section.
 
@@ -362,6 +423,8 @@ def _zettlab_workflow_addendum(auto_execute: bool) -> str:
     confirmation, matching the legacy confirm card and the global stop-and-wait
     PLAN_SCHEMA so no side effect runs before the user confirms.
     """
+    if execution_policy == "silent_automation":
+        return _ZET_SILENT_AUTOMATION_ADDENDUM + "\n"
     plan_first = _ZET_PLAN_FIRST_AUTO if auto_execute else _ZET_PLAN_FIRST_MANUAL
     return "\n\n".join(
         (_ZET_ADDENDUM_HEAD, plan_first, _zet_workdir_section(), _ZET_ADDENDUM_TAIL)
@@ -795,12 +858,13 @@ class ZetAgentAdapter(APIServerAdapter):
 
             set_session_vars(
                 platform="zet_agent",
-                chat_id=session_id,
+                chat_id=session_key,
                 chat_name="",  # 暂留空，APP 这边的 chat title 不通过这条路径来
                 thread_id="",
                 user_id="",
                 user_name="",
                 session_key=session_key or session_id,
+                session_id=session_id,
                 async_delivery=self.supports_async_delivery,
                 exec_ask="1",
             )
@@ -2586,6 +2650,9 @@ class ZetAgentAdapter(APIServerAdapter):
         plan_auto_execute = agent_request_overrides.pop(
             "_zet_plan_auto_execute", None
         )
+        execution_policy = agent_request_overrides.pop(
+            "_zet_execution_policy", ""
+        )
         disable_tools = agent_request_overrides.pop("tool_choice", None) == "none"
 
         # 在 ephemeral_system_prompt 头部接 zettlab 工作风格 addendum。
@@ -2594,7 +2661,10 @@ class ZetAgentAdapter(APIServerAdapter):
         # 的 instruction 优先级更高，per-agent SOUL 真要 override 这条 workflow
         # 时仍能压过去。
         ephemeral_system_prompt = (
-            _zettlab_workflow_addendum(bool(plan_auto_execute))
+            _zettlab_workflow_addendum(
+                bool(plan_auto_execute),
+                execution_policy,
+            )
             + ("\n\n" + ephemeral_system_prompt if ephemeral_system_prompt else "")
         )
 
@@ -2844,16 +2914,27 @@ class ZetAgentAdapter(APIServerAdapter):
             "fallback_model": fallback_model,
             "reasoning_config": reasoning_config,
             "gateway_session_key": gateway_session_key,
+            "skip_memory": execution_policy == "silent_automation",
             "request_overrides": agent_request_overrides or None,
         }
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
 
         agent = AIAgent(**agent_kwargs)
+        if execution_policy == "silent_automation":
+            # A trusted silent turn may share a lineage identifier for request
+            # authorization, but it is not part of the user's canonical chat.
+            # Disable every SessionDB/JSON persistence path before the turn can
+            # append its internal prompt, tool results, or final response.
+            agent._persist_disabled = True
+            agent._session_db = None
+            agent._session_json_enabled = False
         if disable_tools:
             agent.tools = []
             agent.valid_tool_names = set()
             agent._skip_mcp_refresh = True
+        else:
+            _apply_execution_policy(agent, execution_policy)
         agent._hermes_api_runtime = {
             "provider": runtime_kwargs.get("provider")
             or getattr(agent, "provider", "")
@@ -3048,6 +3129,7 @@ class ZetAgentAdapter(APIServerAdapter):
         turn_id: Optional[str] = None,
         connector_route_capability: Optional[str] = None,
         business_execution_token: Optional[str] = None,
+        execution_policy: Optional[str] = None,
         current_turn_reference_image: str = "",
         request_overrides: Optional[Dict[str, Any]] = None,
         trusted_user_message: Any = None,
@@ -3099,6 +3181,9 @@ class ZetAgentAdapter(APIServerAdapter):
             # carry the newer turn-bound side-effect capability. Cancellation
             # similarly preserves the receipt while revoking execution.
             scoped_business_execution_token = ""
+        scoped_execution_policy = (
+            execution_policy if scoped_business_execution_token else ""
+        )
 
         stream_q = self._sniff_stream_q(tool_start_callback, stream_delta_callback)
         title_user_message = self._title_user_message(user_message)
@@ -3211,6 +3296,7 @@ class ZetAgentAdapter(APIServerAdapter):
                 turn_id=turn_id,
                 connector_route_capability=connector_route_capability,
                 business_execution_token=scoped_business_execution_token,
+                execution_policy=scoped_execution_policy,
                 current_turn_reference_image=current_turn_reference_image,
                 request_overrides=request_overrides,
                 trusted_user_message=trusted_user_message,
@@ -3276,7 +3362,11 @@ class ZetAgentAdapter(APIServerAdapter):
                 has_pending_steer = False
                 if isinstance(result, tuple) and result and isinstance(result[0], dict):
                     has_pending_steer = bool(result[0].get("pending_steer"))
-                if run_ok and not has_pending_steer:
+                if (
+                    scoped_execution_policy != "silent_automation"
+                    and run_ok
+                    and not has_pending_steer
+                ):
                     # Consumed mid-turn steer = the user intervened in this
                     # round. The goal judge keys user_initiated off the
                     # message NOT starting with CONTINUATION_MARKER — pass
@@ -3294,6 +3384,11 @@ class ZetAgentAdapter(APIServerAdapter):
                         _consumed_steer or user_message,
                         final_response,
                         effective_session_id=effective_sid,
+                    )
+                elif scoped_execution_policy == "silent_automation":
+                    logger.debug(
+                        "[zet_agent] goal post-turn hook skipped for silent automation session=%s",
+                        session_id,
                     )
                 elif run_ok:
                     logger.info(
@@ -3316,7 +3411,10 @@ class ZetAgentAdapter(APIServerAdapter):
             # close sentinel is enqueued by agent_task's done callback, and
             # anything put on stream_q after that may never be drained.
             self._push_steer_dropped_if_any(stream_q, result)
-            if not title_user_message.startswith("[ZETTLAB:"):
+            if (
+                scoped_execution_policy != "silent_automation"
+                and not title_user_message.startswith("[ZETTLAB:")
+            ):
                 try:
                     await self._emit_native_session_title(
                         result=result,

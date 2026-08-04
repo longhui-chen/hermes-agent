@@ -211,6 +211,7 @@ class _TrustedExecutionReceipt:
     business_execution_token: str = field(repr=False)
     turn_id: str
     session_id: str
+    gateway_session_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -394,12 +395,12 @@ def _capture_trusted_execution_receipt(
         )
 
         business_token = business_execution_token()
-        session_id = get_session_env("HERMES_SESSION_ID") or get_session_env(
-            "HERMES_SESSION_KEY"
-        )
+        gateway_session_key = get_session_env("HERMES_SESSION_KEY")
+        session_id = get_session_env("HERMES_SESSION_ID") or gateway_session_key
     except Exception:
         business_token = ""
         session_id = ""
+        gateway_session_key = ""
 
     receipt = _TrustedExecutionReceipt(
         agent_id=_profile_value("ZET_AGENT_ID"),
@@ -407,6 +408,7 @@ def _capture_trusted_execution_receipt(
         business_execution_token=str(business_token or "").strip(),
         turn_id=str(turn_identity[0] or "").strip(),
         session_id=str(session_id or "").strip(),
+        gateway_session_key=str(gateway_session_key or "").strip(),
     )
     present = {
         "agent_id": bool(receipt.agent_id),
@@ -429,13 +431,19 @@ def trusted_video_edit_runtime_receipt() -> Mapping[str, str]:
     receipt = _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.get()
     if receipt is None:
         return {}
-    return {
+    result = {
         "ZET_AGENT_ID": receipt.agent_id,
         "ZETTLAB_AGENT_ACTION_TOKEN": receipt.action_token,
         "ZETTLAB_BUSINESS_EXECUTION_TOKEN": receipt.business_execution_token,
         "HERMES_TURN_ID": receipt.turn_id,
         "HERMES_SESSION_KEY": receipt.session_id,
     }
+    if receipt.gateway_session_key:
+        # Preserve the caller's stable session key separately from the lineage
+        # session id used by deployed helper authorization. Terminal policy
+        # consumes this private field before launching the helper.
+        result["HERMES_GATEWAY_SESSION_KEY"] = receipt.gateway_session_key
+    return result
 
 
 def trusted_camera_runtime_receipt() -> Mapping[str, str]:
@@ -1300,6 +1308,42 @@ def trusted_skill_scope_active(agent: Any) -> bool:
         )
 
 
+def _activate_execution_policy_tools(
+    agent: Any,
+    allowed_tools: frozenset[str],
+) -> None:
+    """Restore only the intersection of policy and attested-skill tools."""
+    if getattr(agent, "_zet_agent_execution_policy", "") != "silent_automation":
+        return
+    policy_tools = list(
+        getattr(agent, "_zet_agent_execution_policy_tools", ()) or ()
+    )
+    policy_names = set(
+        getattr(
+            agent,
+            "_zet_agent_execution_policy_valid_tool_names",
+            (),
+        )
+        or ()
+    )
+
+    def _tool_name(tool: Any) -> str:
+        if not isinstance(tool, dict):
+            return ""
+        function = tool.get("function")
+        if isinstance(function, dict):
+            return str(function.get("name") or "")
+        return str(tool.get("name") or "")
+
+    scoped_names = policy_names & set(allowed_tools)
+    agent.tools = [
+        copy.deepcopy(tool)
+        for tool in policy_tools
+        if _tool_name(tool) in scoped_names
+    ]
+    agent.valid_tool_names = scoped_names
+
+
 def _video_edit_runtime_argv(
     function_args: Mapping[str, Any],
 ) -> list[str] | None:
@@ -1565,6 +1609,18 @@ def trusted_skill_operation_block_message(
                     "operation in flight or did not complete successfully. "
                     "The scope was revoked before this call; reload the trusted "
                     "skill for this turn."
+                )
+            if (
+                function_name == "terminal"
+                and getattr(agent, "_zet_agent_execution_policy", "")
+                == "silent_automation"
+            ):
+                logger.warning(
+                    "zet_agent: blocked silent terminal without an attested skill scope"
+                )
+                return (
+                    "Silent automation terminal access requires a current "
+                    "request-bound scope minted by an attested `skill_view` result."
                 )
             if (
                 function_name == "terminal"
@@ -2169,6 +2225,7 @@ def apply_trusted_skill_execution(
             allowed_tools=allowed_tools,
             execution_receipt=execution_receipt,
         )
+        _activate_execution_policy_tools(agent, allowed_tools)
     logger.info(
         "zet_agent: trusted skill %s activated bounded execution scope",
         pending.relative_path,

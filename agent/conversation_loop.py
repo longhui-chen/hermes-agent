@@ -1278,9 +1278,10 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     (which constructs a fresh ``AIAgent`` per turn and depends on this
     DB roundtrip).
     """
+    skip_memory_context = getattr(agent, "_skip_memory_context", False) is True
     stored_prompt = None
     stored_state = "missing"
-    if conversation_history and agent._session_db:
+    if conversation_history and agent._session_db and not skip_memory_context:
         try:
             session_row = agent._session_db.get_session(agent.session_id)
             if session_row is not None:
@@ -1357,7 +1358,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     agent._cached_system_prompt = agent._build_system_prompt(system_message)
 
     is_brand_new_session = not conversation_history
-    if is_brand_new_session:
+    if is_brand_new_session and not skip_memory_context:
         # Plugin hook: on_session_start — fired once when a brand-new
         # session is created (not on continuation, not after a
         # hot-reload-driven rebuild).  Plugins can use this to
@@ -1390,7 +1391,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # to log at DEBUG, which silently broke prefix-cache reuse on the
     # gateway path (fresh AIAgent per turn → reads from this row every
     # subsequent turn).
-    if agent._session_db:
+    if agent._session_db and not skip_memory_context:
         try:
             agent._session_db.update_system_prompt(agent.session_id, agent._cached_system_prompt)
         except Exception as exc:

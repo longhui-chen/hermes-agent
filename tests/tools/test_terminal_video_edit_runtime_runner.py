@@ -72,6 +72,7 @@ def _write_trusted_script(tmp_path, name="workflow_state.py"):
         print("execution=" + runtime_value("ZETTLAB_BUSINESS_EXECUTION_TOKEN"))
         print("agent=" + os.environ.get("ZET_AGENT_ID", ""))
         print("turn=" + os.environ.get("HERMES_TURN_ID", ""))
+        print("gateway=" + os.environ.get("HERMES_GATEWAY_SESSION_KEY", ""))
         print("connector-token=" + os.environ.get("ZETTLAB_CONNECTORS_AUTH_TOKEN", ""))
         print("connector-url=" + os.environ.get("ZETTLAB_CONNECTORS_URL", ""))
         """
@@ -193,6 +194,52 @@ def test_trusted_video_runner_receives_only_current_scoped_capability(monkeypatc
     assert "connector-url=" in result["output"]
     assert "connector-secret" not in result["output"]
     assert "connector.invalid" not in result["output"]
+
+
+def test_proactive_video_runner_receives_turn_scoped_capability(monkeypatch, tmp_path):
+    from agent import zet_agent_response_mode as response_mode
+
+    _write_trusted_script(tmp_path, "proactive_video.py")
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setattr(
+        terminal_tool_module,
+        "_connector_runtime_path_is_trusted",
+        lambda path, presets_root, **kwargs: True,
+    )
+    turn_id = "pvm-" + "a" * 24
+    stable_key = f"proactive-{turn_id}"
+    monkeypatch.setattr(
+        response_mode,
+        "trusted_video_edit_runtime_receipt",
+        lambda: {
+            "ZET_AGENT_ID": "agent-1",
+            "ZETTLAB_AGENT_ACTION_TOKEN": "action-token",
+            "ZETTLAB_BUSINESS_EXECUTION_TOKEN": "capability-secret",
+            "HERMES_TURN_ID": turn_id,
+            "HERMES_SESSION_KEY": "api-lineage-tip",
+            "HERMES_GATEWAY_SESSION_KEY": stable_key,
+        },
+    )
+    tokens = set_turn_vars(
+        turn_id=turn_id,
+        business_execution_token="capability-secret",
+    )
+    try:
+        result = json.loads(terminal_tool_module._run_video_edit_runtime_command_if_allowed(
+            'python3 "$ZETTLAB_PRESETS_DIR/skills/video-edit-workflow-mini/scripts/proactive_video.py" '
+            '--agent-id agent-1 resolve --manifest-id pvm_' + "A" * 32,
+            cwd=str(tmp_path),
+            timeout=5,
+        ))
+    finally:
+        clear_turn_vars(tokens)
+
+    assert result["video_edit_runtime_direct"] is True
+    assert result["exit_code"] == 0
+    assert "execution=[REDACTED]" in result["output"]
+    assert "agent=agent-1" in result["output"]
+    assert f"turn={turn_id}" in result["output"]
+    assert f"gateway={stable_key}" in result["output"]
 
 
 def test_trusted_video_runner_can_import_sibling_from_same_pinned_tree(monkeypatch, tmp_path):
@@ -400,6 +447,28 @@ def test_trusted_video_upload_timeout_parser_rejects_option_value_named_upload()
     assert terminal_tool_module._video_edit_runtime_timeout(parsed, 600) == 600
 
 
+def test_proactive_upload_uses_turn_bounded_long_timeout():
+    parsed = terminal_tool_module._VideoEditRuntimeCommand(
+        argv=[
+            sys.executable,
+            "/trusted/proactive_video.py",
+            "--agent-id",
+            "agent-1",
+            "upload",
+            "--manifest-id",
+            "pvm_" + "A" * 32,
+        ],
+        root_identity=(1, 2),
+        script_identity=(3, 4),
+    )
+
+    assert (
+        terminal_tool_module._video_edit_runtime_timeout(parsed, 600)
+        == terminal_tool_module._PROACTIVE_VIDEO_UPLOAD_TIMEOUT_SECONDS
+    )
+
+
+@pytest.mark.parametrize("script_name", ("cloud_render_business.py", "proactive_video.py"))
 @pytest.mark.parametrize(
     "arguments",
     (
@@ -413,11 +482,14 @@ def test_trusted_video_upload_timeout_parser_rejects_option_value_named_upload()
         ["--agent-id", "agent-1", "--agent-id", "agent-1", "upload"],
     ),
 )
-def test_cloud_render_business_claims_must_match_frozen_receipt(arguments):
+def test_agent_bound_video_helper_claims_must_match_frozen_receipt(
+    script_name,
+    arguments,
+):
     parsed = terminal_tool_module._VideoEditRuntimeCommand(
         argv=[
             sys.executable,
-            "/trusted/cloud_render_business.py",
+            f"/trusted/{script_name}",
             *arguments,
         ],
         root_identity=(1, 2),
@@ -430,7 +502,7 @@ def test_cloud_render_business_claims_must_match_frozen_receipt(arguments):
     )
 
 
-def test_cloud_render_business_claims_accept_exact_frozen_agent():
+def test_agent_bound_video_helper_claims_accept_exact_frozen_agent():
     parsed = terminal_tool_module._VideoEditRuntimeCommand(
         argv=[
             sys.executable,
@@ -446,6 +518,261 @@ def test_cloud_render_business_claims_accept_exact_frozen_agent():
     assert terminal_tool_module._video_edit_runtime_claims_match_receipt(
         parsed,
         {"ZET_AGENT_ID": "agent-1"},
+    )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ["--agent-id", "agent-1", "resolve"],
+        ["--agent-id", "agent-1", "delete", "--manifest-id", "pvm_" + "A" * 32],
+        ["--agent-id", "agent-1", "resolve", "--manifest", "pvm_" + "A" * 32],
+        ["--agent-id", "agent-1", "resolve", "--manifest-id", "not-a-manifest"],
+        [
+            "--agent-id",
+            "agent-1",
+            "resolve",
+            "--manifest-id",
+            "pvm_" + "A" * 32,
+            "--extra",
+        ],
+        ["--agent-id", "agent-1", "report", "--manifest-id", "pvm_" + "A" * 32],
+        [
+            "--agent-id",
+            "agent-1",
+            "report",
+            "--manifest-id",
+            "pvm_" + "A" * 32,
+            "--workflow-state",
+            "/private/other.json",
+        ],
+    ),
+)
+def test_proactive_helper_rejects_non_allowlisted_arguments(arguments):
+    turn_id = "pvm-" + "a" * 24
+    parsed = terminal_tool_module._VideoEditRuntimeCommand(
+        argv=[sys.executable, "/trusted/proactive_video.py", *arguments],
+        root_identity=(1, 2),
+        script_identity=(3, 4),
+    )
+
+    assert not terminal_tool_module._video_edit_runtime_claims_match_receipt(
+        parsed,
+        {
+            "ZET_AGENT_ID": "agent-1",
+            "HERMES_TURN_ID": turn_id,
+            "HERMES_SESSION_KEY": "api-lineage-tip",
+            "HERMES_GATEWAY_SESSION_KEY": f"proactive-{turn_id}",
+        },
+    )
+
+
+def test_proactive_helper_allows_exact_report_state_path():
+    turn_id = "pvm-" + "a" * 24
+    state_path = (
+        f"/volume1/subvol/agents/data/agent-1/output/proactive-{turn_id}/"
+        ".video-edit-workflow-mini/workflow_state.json"
+    )
+    parsed = terminal_tool_module._VideoEditRuntimeCommand(
+        argv=[
+            sys.executable,
+            "/trusted/proactive_video.py",
+            "--agent-id",
+            "agent-1",
+            "report",
+            "--manifest-id",
+            "pvm_" + "A" * 32,
+            "--workflow-state",
+            state_path,
+        ],
+        root_identity=(1, 2),
+        script_identity=(3, 4),
+    )
+
+    assert terminal_tool_module._video_edit_runtime_claims_match_receipt(
+        parsed,
+        {
+            "ZET_AGENT_ID": "agent-1",
+            "HERMES_TURN_ID": turn_id,
+            "HERMES_SESSION_KEY": "api-lineage-tip",
+            "HERMES_GATEWAY_SESSION_KEY": f"proactive-{turn_id}",
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("script_name", "arguments"),
+    (
+        ("normalize.py", ["--inspect-input", "/private/source.mov"]),
+        (
+            "preference_resolver.py",
+            ["select-upload", "--state-file", "/trusted/state.json"],
+        ),
+        (
+            "preference_resolver.py",
+            ["resolve-freeze", "--state-file", "/trusted/state.json"],
+        ),
+        (
+            "cloud_render_business.py",
+            ["--agent-id", "agent-1", "upload", "--file", "/private/source.mov"],
+        ),
+        (
+            "cloud_render_business.py",
+            [
+                "--agent-id",
+                "agent-1",
+                "create-project",
+                "--workflow-state",
+                "/trusted/state.json",
+            ],
+        ),
+    ),
+)
+def test_proactive_receipt_blocks_model_direct_source_path_helpers(
+    script_name,
+    arguments,
+):
+    turn_id = "pvm-" + "a" * 24
+    parsed = terminal_tool_module._VideoEditRuntimeCommand(
+        argv=[sys.executable, f"/trusted/{script_name}", *arguments],
+        root_identity=(1, 2),
+        script_identity=(3, 4),
+    )
+
+    assert not terminal_tool_module._video_edit_runtime_claims_match_receipt(
+        parsed,
+        {
+            "ZET_AGENT_ID": "agent-1",
+            "HERMES_TURN_ID": turn_id,
+            "HERMES_SESSION_KEY": "api-lineage-tip",
+            "HERMES_GATEWAY_SESSION_KEY": f"proactive-{turn_id}",
+        },
+    )
+
+
+def test_proactive_receipt_allows_manifest_bound_upload_wrapper():
+    turn_id = "pvm-" + "a" * 24
+    parsed = terminal_tool_module._VideoEditRuntimeCommand(
+        argv=[
+            sys.executable,
+            "/trusted/proactive_video.py",
+            "--agent-id",
+            "agent-1",
+            "upload",
+            "--manifest-id",
+            "pvm_" + "A" * 32,
+        ],
+        root_identity=(1, 2),
+        script_identity=(3, 4),
+    )
+
+    assert terminal_tool_module._video_edit_runtime_claims_match_receipt(
+        parsed,
+        {
+            "ZET_AGENT_ID": "agent-1",
+            "HERMES_TURN_ID": turn_id,
+            "HERMES_SESSION_KEY": "api-lineage-tip",
+            "HERMES_GATEWAY_SESSION_KEY": f"proactive-{turn_id}",
+        },
+    )
+
+
+def test_proactive_receipt_allows_only_preference_success_finalizer():
+    turn_id = "pvm-" + "a" * 24
+    expected_state = (
+        "/volume1/subvol/agents/data/agent-1/output/"
+        f"proactive-{turn_id}/.video-edit-workflow-mini/workflow_state.json"
+    )
+    parsed = terminal_tool_module._VideoEditRuntimeCommand(
+        argv=[
+            sys.executable,
+            "/trusted/preference_resolver.py",
+            "finalize-success",
+            "--workflow-state",
+            expected_state,
+            "--memory-commit-state",
+            "skipped",
+            "--sidecar-state",
+            "skipped",
+        ],
+        root_identity=(1, 2),
+        script_identity=(3, 4),
+    )
+
+    assert terminal_tool_module._video_edit_runtime_claims_match_receipt(
+        parsed,
+        {
+            "ZET_AGENT_ID": "agent-1",
+            "HERMES_TURN_ID": turn_id,
+            "HERMES_SESSION_KEY": "api-lineage-tip",
+            "HERMES_GATEWAY_SESSION_KEY": f"proactive-{turn_id}",
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    (
+        ["finalize-success"],
+        [
+            "finalize-success",
+            "--workflow-state",
+            "/trusted/state.json",
+            "--memory-commit-state",
+            "skipped",
+            "--sidecar-state",
+            "skipped",
+        ],
+        [
+            "finalize-success",
+            "--workflow-state",
+            "EXPECTED_STATE",
+            "--memory-commit-state",
+            "committed",
+            "--sidecar-state",
+            "updated",
+        ],
+        [
+            "finalize-success",
+            "--workflow-state",
+            "EXPECTED_STATE",
+            "--memory-commit-state",
+            "skipped",
+            "--sidecar-state",
+            "skipped",
+            "--extra",
+            "value",
+        ],
+    ),
+)
+def test_proactive_receipt_rejects_unbound_preference_finalizer(arguments):
+    turn_id = "pvm-" + "a" * 24
+    expected_state = (
+        "/volume1/subvol/agents/data/agent-1/output/"
+        f"proactive-{turn_id}/.video-edit-workflow-mini/workflow_state.json"
+    )
+    resolved_arguments = [
+        expected_state if value == "EXPECTED_STATE" else value
+        for value in arguments
+    ]
+    parsed = terminal_tool_module._VideoEditRuntimeCommand(
+        argv=[
+            sys.executable,
+            "/trusted/preference_resolver.py",
+            *resolved_arguments,
+        ],
+        root_identity=(1, 2),
+        script_identity=(3, 4),
+    )
+
+    assert not terminal_tool_module._video_edit_runtime_claims_match_receipt(
+        parsed,
+        {
+            "ZET_AGENT_ID": "agent-1",
+            "HERMES_TURN_ID": turn_id,
+            "HERMES_SESSION_KEY": "api-lineage-tip",
+            "HERMES_GATEWAY_SESSION_KEY": f"proactive-{turn_id}",
+        },
     )
 
 

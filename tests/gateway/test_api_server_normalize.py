@@ -2,7 +2,9 @@
 
 from gateway.platforms import api_server
 from gateway.platforms.api_server import (
+    _business_execution_proof,
     _extract_business_execution_token,
+    _extract_execution_policy,
     _extract_plan_ack,
     _extract_plan_auto_execute,
     _extract_response_mode,
@@ -20,6 +22,121 @@ class TestExtractBusinessExecutionToken:
         assert _extract_business_execution_token("short") == ""
         assert _extract_business_execution_token("a" * 64 + "\r\nX-Evil: 1") == ""
         assert _extract_business_execution_token("A" * 64) == ""
+
+
+class TestExtractExecutionPolicy:
+    def test_silent_automation_requires_exact_local_server_proof(self):
+        body = {
+            "metadata": {
+                "execution_policy": "silent_automation",
+                "turn_id": "pvm-" + "a" * 24,
+            }
+        }
+        token = "a" * 64
+        action_token = "profile-action-secret"
+        session_id = "proactive-pvm-" + "a" * 24
+        skill_slug = "video-edit-workflow-mini"
+        task_digest = "d" * 64
+        proof = _business_execution_proof(
+            action_token,
+            token,
+            "silent_automation",
+            session_id,
+            session_id,
+            "pvm-" + "a" * 24,
+            skill_slug,
+            task_digest,
+        )
+        # This vector is shared with local-server's Go signer test.
+        assert proof == "v1=420358a690e5c7ea0e7342ab9b0c26fd2753e100eef582516bd08f91da813d98"
+
+        assert _extract_execution_policy(
+            body,
+            token,
+            proof,
+            gateway_session_key=session_id,
+            session_id=session_id,
+            turn_id="pvm-" + "a" * 24,
+            skill_slug=skill_slug,
+            task_digest=task_digest,
+            action_token=action_token,
+        ) == "silent_automation"
+        assert _extract_execution_policy(
+            body,
+            token,
+            proof,
+            gateway_session_key=session_id,
+            session_id=session_id,
+            turn_id="pvm-" + "a" * 24,
+            skill_slug=skill_slug,
+            task_digest=task_digest,
+            action_token="wrong-profile-secret",
+        ) == ""
+        assert _extract_execution_policy(
+            body,
+            token,
+            proof,
+            gateway_session_key=session_id,
+            session_id=session_id,
+            turn_id="pvm-" + "a" * 24,
+            skill_slug="another-skill",
+            task_digest=task_digest,
+            action_token=action_token,
+        ) == ""
+        assert _extract_execution_policy(
+            body,
+            token,
+            proof,
+            gateway_session_key=session_id,
+            session_id=session_id,
+            turn_id="pvm-" + "a" * 24,
+            skill_slug=skill_slug,
+            task_digest="e" * 64,
+            action_token=action_token,
+        ) == ""
+        assert _extract_execution_policy(body, token) == ""
+        assert _extract_execution_policy(body, "") == ""
+        assert _extract_execution_policy(body, "not-a-capability") == ""
+
+    def test_unknown_or_malformed_policy_is_ignored(self):
+        token = "a" * 64
+        action_token = "profile-action-secret"
+        session_id = "proactive-pvm-" + "d" * 24
+        turn_id = "pvm-" + "d" * 24
+        skill_slug = "video-edit-workflow-mini"
+        task_digest = "e" * 64
+        proof = _business_execution_proof(
+            action_token,
+            token,
+            "silent_automation",
+            session_id,
+            session_id,
+            turn_id,
+            skill_slug,
+            task_digest,
+        )
+        trusted = {
+            "business_execution_proof": proof,
+            "gateway_session_key": session_id,
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "skill_slug": skill_slug,
+            "task_digest": task_digest,
+            "action_token": action_token,
+        }
+
+        assert _extract_execution_policy({}, token, **trusted) == ""
+        assert _extract_execution_policy(
+            {"metadata": "silent_automation"}, token, **trusted
+        ) == ""
+        assert _extract_execution_policy(
+            {"metadata": {"execution_policy": "interactive"}}, token, **trusted
+        ) == ""
+        assert _extract_execution_policy(
+            {"metadata": {"executionPolicy": " silent_automation "}},
+            token,
+            **trusted,
+        ) == "silent_automation"
 
 
 class TestExtractResponseMode:

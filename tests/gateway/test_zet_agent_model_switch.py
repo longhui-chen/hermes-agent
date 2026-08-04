@@ -411,6 +411,7 @@ async def test_run_agent_cancelled_plan_ack_drops_business_capability_unit(
     async def fake_super(self, **kwargs):
         captured["scoped_token"] = business_execution_token()
         captured["forwarded_token"] = kwargs["business_execution_token"]
+        captured["execution_policy"] = kwargs["execution_policy"]
         return ({}, {})
 
     monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_super)
@@ -420,6 +421,7 @@ async def test_run_agent_cancelled_plan_ack_drops_business_capability_unit(
         session_id="plan-session",
         turn_id="confirmation-turn-2",
         business_execution_token="a" * 64,
+        execution_policy="silent_automation",
         plan_ack={
             "turn_id": "plan-turn-1",
             "status": "cancelled",
@@ -427,7 +429,11 @@ async def test_run_agent_cancelled_plan_ack_drops_business_capability_unit(
         },
     )
 
-    assert captured == {"scoped_token": "", "forwarded_token": ""}
+    assert captured == {
+        "scoped_token": "",
+        "forwarded_token": "",
+        "execution_policy": "",
+    }
 
 
 @pytest.mark.asyncio
