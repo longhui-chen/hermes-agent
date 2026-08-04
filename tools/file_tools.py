@@ -413,21 +413,20 @@ def _ops_uses_resolved_paths(task_id: str = "default") -> bool:
     Passing the resolved path is what keeps the scope check, the dedup
     bookkeeping and the actual I/O describing one file — but only while the
     filesystem this process resolved against is the one the ops layer acts on.
-    A remote backend runs the read/search/patch on the far side, where a host
-    absolute path names a different file or none at all, so an ssh session's
-    ``notes.md`` must stay relative and let the remote shell anchor it.
+    Local is that case, and it is also the only backend the snapshot guard
+    protects, so it is the whole reason the alignment matters.
 
-    The exception is a base that came from the backend's *own* cwd
-    (:func:`_authoritative_workspace_root` — the live terminal cwd or a
-    registered session cwd): that anchor is already expressed in the remote's
-    terms, so resolving against it stays correct there. Only the process-cwd
-    fallback — reached on a remote backend before any terminal command has run
-    — is a purely local notion, and there the raw path is the honest answer.
+    Every other backend executes elsewhere. An ssh session's ``notes.md`` must
+    stay relative so the remote shell anchors it against the remote cwd; a
+    container backend's must stay relative because the base this layer picks is
+    a host notion — :func:`_authoritative_workspace_root` falls through to a
+    raw ``$TERMINAL_CWD`` that is never mapped into the namespace, while
+    ``terminal_tool`` normalizes the container's own cwd to ``/workspace`` or
+    ``/root``. Handing either one a host absolute path names a different file
+    or none at all, so they keep the pre-existing raw-path behaviour.
     """
 
-    if _terminal_env_type_for_task(task_id) == "local":
-        return True
-    return bool(_authoritative_workspace_root(task_id))
+    return _terminal_env_type_for_task(task_id) == "local"
 
 
 def _ops_path(path: str, resolved: object, task_id: str = "default") -> str:

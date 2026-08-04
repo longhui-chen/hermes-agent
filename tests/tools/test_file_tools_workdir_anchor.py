@@ -184,11 +184,22 @@ class TestOpsPathBackendScoping:
         monkeypatch.setattr(ft, "_authoritative_workspace_root", lambda _t="default": None)
         assert ft._ops_path("notes.md", "/host/cwd/notes.md", "t") == "notes.md"
 
-    def test_ssh_backend_with_remote_cwd_uses_resolved_path(self, monkeypatch):
-        # live cwd 已被终端命令记下来时，那个锚点本身就是远端的，解析结果成立。
+    def test_ssh_backend_with_recorded_cwd_still_keeps_relative_path(self, monkeypatch):
+        # 有 live 记录也不例外：_authoritative_workspace_root 会一路兜底到裸的
+        # $TERMINAL_CWD，那是宿主机路径，对远端 / 容器都不成立。
         monkeypatch.setattr(ft, "_terminal_env_type_for_task", lambda _t="default": "ssh")
         monkeypatch.setattr(ft, "_authoritative_workspace_root", lambda _t="default": "/remote/work")
-        assert ft._ops_path("notes.md", "/remote/work/notes.md", "t") == "/remote/work/notes.md"
+        assert ft._ops_path("notes.md", "/remote/work/notes.md", "t") == "notes.md"
+
+    def test_container_backend_never_gets_host_terminal_cwd(self, monkeypatch):
+        # TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE 下宿主项目映射成容器内
+        # /workspace，把宿主绝对路径交给容器 shell 会找错文件。
+        monkeypatch.setattr(ft, "_terminal_env_type_for_task", lambda _t="default": "docker")
+        monkeypatch.setattr(
+            ft, "_authoritative_workspace_root", lambda _t="default": "/home/u/project"
+        )
+        assert ft._ops_path("foo", "/home/u/project/foo", "t") == "foo"
+        assert ft._ops_uses_resolved_paths("t") is False
 
     def test_absent_resolution_always_falls_back_to_raw(self, monkeypatch):
         monkeypatch.setattr(ft, "_terminal_env_type_for_task", lambda _t="default": "local")
