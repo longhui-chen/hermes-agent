@@ -23,6 +23,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+from contextlib import contextmanager
 from typing import Optional
 from hermes_cli.config import cfg_get
 
@@ -2275,6 +2276,51 @@ class _ApprovalEntry:
 
 _gateway_queues: dict[_ApprovalStateKey, list] = {}
 _gateway_notify_cbs: dict[_ApprovalStateKey, object] = {}
+_gateway_interaction_sequence_lock = threading.Lock()
+_gateway_interaction_generation = 0
+# Prepared interaction leases are deliberately separate from _ApprovalEntry so
+# the long-established entry shape stays compatible with gateway integrations.
+# Guarded by _lock. Key: (profile-scoped session key, interaction_id), value:
+# (delivery_id, monotonic_expiry).
+_gateway_prepared: dict[
+    tuple[_ApprovalStateKey, str], tuple[str, float]
+] = {}
+_GATEWAY_PREPARE_TTL_SECONDS = 300.0
+
+
+@contextmanager
+def reserve_gateway_interaction_generation():
+    """Reserve one global generation while the source FIFO append commits.
+
+    Approval and clarify share this sequencer so their generations are
+    comparable. Callers must append to their source queue before leaving the
+    context; notifier delivery happens only after the context is released.
+    """
+    global _gateway_interaction_generation
+    with _gateway_interaction_sequence_lock:
+        _gateway_interaction_generation += 1
+        yield _gateway_interaction_generation
+
+
+def enqueue_gateway_approval(
+    session_key: str, approval_data: dict
+) -> _ApprovalEntry:
+    """Assign generation and append one approval in the same critical section."""
+    state_key = _approval_state_key(session_key)
+    with reserve_gateway_interaction_generation() as generation:
+        approval_data["interaction_generation"] = generation
+        entry = _ApprovalEntry(approval_data)
+        with _lock:
+            _gateway_queues.setdefault(state_key, []).append(entry)
+    return entry
+
+
+def _prune_gateway_prepared_locked(now: Optional[float] = None) -> None:
+    """Drop expired two-phase leases. Caller must hold ``_lock``."""
+    current = time.monotonic() if now is None else now
+    for key, (_, expires_at) in list(_gateway_prepared.items()):
+        if expires_at <= current:
+            _gateway_prepared.pop(key, None)
 
 
 def register_gateway_notify(session_key: str, cb) -> None:
@@ -2300,8 +2346,23 @@ def unregister_gateway_notify(session_key: str) -> None:
     with _lock:
         _gateway_notify_cbs.pop(state_key, None)
         entries = _gateway_queues.pop(state_key, [])
+        for key in [key for key in _gateway_prepared if key[0] == state_key]:
+            _gateway_prepared.pop(key, None)
     for entry in entries:
         entry.event.set()
+
+
+def cancel_gateway_approvals(session_key: str, choice: str = "deny") -> int:
+    """Cancel every source entry and prepare lease for a session boundary."""
+    state_key = _approval_state_key(session_key)
+    with _lock:
+        entries = _gateway_queues.pop(state_key, [])
+        for key in [key for key in _gateway_prepared if key[0] == state_key]:
+            _gateway_prepared.pop(key, None)
+    for entry in entries:
+        entry.result = choice
+        entry.event.set()
+    return len(entries)
 
 
 def resolve_gateway_approval(session_key: str, choice: str,
@@ -2325,11 +2386,11 @@ def resolve_gateway_approval(session_key: str, choice: str,
     pending = None
     targets = []
     with _lock:
+        _prune_gateway_prepared_locked()
         queue = _gateway_queues.get(state_key)
         if queue:
             if resolve_all:
                 targets = list(queue)
-                queue.clear()
             elif approval_id:
                 target_index = next(
                     (
@@ -2344,12 +2405,23 @@ def resolve_gateway_approval(session_key: str, choice: str,
                 )
                 if target_index is None:
                     return 0
-                targets = [queue.pop(target_index)]
+                targets = [queue[target_index]]
             else:
                 # Backward-compatible path for chat commands and older App
                 # clients. New HTTP clients receive approval_id and should
                 # bind their response to that exact live card.
-                targets = [queue.pop(0)]
+                targets = [queue[0]]
+
+            # A prepare lease is a recovery fence: no legacy responder may
+            # wake the agent between durable intent persistence and finalize.
+            if any(
+                (state_key, str(entry.data.get("interaction_id", "")))
+                in _gateway_prepared
+                for entry in targets
+            ):
+                return 0
+            for entry in targets:
+                queue.remove(entry)
             if not queue:
                 _gateway_queues.pop(state_key, None)
         else:
@@ -2435,11 +2507,145 @@ def resolve_gateway_approval(session_key: str, choice: str,
     return 1
 
 
+def prepare_gateway_approval(
+    session_key: str,
+    interaction_id: str,
+    delivery_id: str,
+    *,
+    ttl_seconds: float = _GATEWAY_PREPARE_TTL_SECONDS,
+) -> tuple[str, Optional[dict]]:
+    """Atomically lease the oldest approval without waking its waiter.
+
+    Returns ``(status, data)`` where status is ``prepared``, ``missing``,
+    ``interaction_conflict`` or ``delivery_conflict``. Repeating the same
+    delivery is idempotent and refreshes the short prepare lease.
+    """
+    state_key = _approval_state_key(session_key)
+    with _lock:
+        now = time.monotonic()
+        _prune_gateway_prepared_locked(now)
+        queue = _gateway_queues.get(state_key)
+        if not queue:
+            return "missing", None
+        entry = queue[0]
+        current_interaction_id = str(entry.data.get("interaction_id", ""))
+        if not current_interaction_id or current_interaction_id != interaction_id:
+            return "interaction_conflict", None
+        key = (state_key, interaction_id)
+        prepared = _gateway_prepared.get(key)
+        if prepared is not None and prepared[0] != delivery_id:
+            return "delivery_conflict", entry.data
+        _gateway_prepared[key] = (
+            delivery_id,
+            now + max(float(ttl_seconds), 0.0),
+        )
+        return "prepared", entry.data
+
+
+def _finalize_gateway_approval_entry(
+    session_key: str,
+    interaction_id: str,
+    delivery_id: str,
+    choice: str,
+) -> tuple[str, Optional[_ApprovalEntry]]:
+    """Commit the exact leased FIFO entry without deciding wake timing."""
+    state_key = _approval_state_key(session_key)
+    with _lock:
+        _prune_gateway_prepared_locked()
+        queue = _gateway_queues.get(state_key)
+        if not queue:
+            return "missing", None
+        entry = queue[0]
+        current_interaction_id = str(entry.data.get("interaction_id", ""))
+        if not current_interaction_id or current_interaction_id != interaction_id:
+            return "interaction_conflict", entry.data
+        key = (state_key, interaction_id)
+        prepared = _gateway_prepared.get(key)
+        if prepared is None:
+            return "prepare_missing", None
+        if prepared[0] != delivery_id:
+            return "delivery_conflict", None
+        queue.pop(0)
+        _gateway_prepared.pop(key, None)
+        if not queue:
+            _gateway_queues.pop(state_key, None)
+
+    entry.result = choice
+    return "resolved", entry
+
+
+def finalize_gateway_approval(
+    session_key: str,
+    interaction_id: str,
+    delivery_id: str,
+    choice: str,
+) -> tuple[str, Optional[dict]]:
+    """Resolve and immediately wake the exact leased approval."""
+    status, entry = _finalize_gateway_approval_entry(
+        session_key, interaction_id, delivery_id, choice
+    )
+    if entry is None:
+        return status, None
+    entry.event.set()
+    return "resolved", entry.data
+
+
+def finalize_gateway_approval_deferred(
+    session_key: str,
+    interaction_id: str,
+    delivery_id: str,
+    choice: str,
+    *,
+    wake_after_seconds: float,
+) -> tuple[str, Optional[dict], Optional[threading.Event]]:
+    """Commit the exact leased approval and return its unsignalled waiter."""
+    status, entry = _finalize_gateway_approval_entry(
+        session_key, interaction_id, delivery_id, choice
+    )
+    if entry is None:
+        return status, None, None
+    entry.data["_gateway_deferred_wake_at"] = (
+        time.monotonic() + max(float(wake_after_seconds), 0.0)
+    )
+    return "resolved", entry.data, entry.event
+
+
+def release_gateway_approval_prepare(
+    session_key: str,
+    interaction_id: str,
+    delivery_id: str,
+) -> bool:
+    """Release an uncommitted lease after adapter-side prepare rollback."""
+    state_key = _approval_state_key(session_key)
+    with _lock:
+        key = (state_key, interaction_id)
+        prepared = _gateway_prepared.get(key)
+        if prepared is None or prepared[0] != delivery_id:
+            return False
+        _gateway_prepared.pop(key, None)
+        return True
+
+
 def has_blocking_approval(session_key: str) -> bool:
     """Check if a session has one or more blocking gateway approvals waiting."""
     state_key = _approval_state_key(session_key)
     with _lock:
         return bool(_gateway_queues.get(state_key))
+
+
+def peek_gateway_approval(session_key: str) -> Optional[dict]:
+    """Return the exact oldest queued approval data without consuming it."""
+    state_key = _approval_state_key(session_key)
+    with _lock:
+        queue = _gateway_queues.get(state_key)
+        return queue[0].data if queue else None
+
+
+def list_gateway_approvals(session_key: str) -> list[dict]:
+    """Snapshot queued approval data in source FIFO order."""
+    state_key = _approval_state_key(session_key)
+    with _lock:
+        return [entry.data for entry in _gateway_queues.get(state_key, [])]
 
 
 def submit_pending(session_key: str, approval: dict) -> Optional[str]:
@@ -3721,24 +3927,41 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         approval_id = secrets.token_urlsafe(24)
         approval_data["approval_id"] = approval_id
     approval_data["_approval_profile_scope"] = _approval_profile_scope()
-
+    approval_data.setdefault("interaction_id", secrets.token_hex(16))
     command = approval_data.get("command", "")
     description = approval_data.get("description", "")
     primary_key = approval_data.get("pattern_key", "")
     all_keys = approval_data.get("pattern_keys", [primary_key])
 
-    entry = _ApprovalEntry(approval_data)
     state_key = _approval_state_key(session_key)
-    with _lock:
-        _gateway_queues.setdefault(state_key, []).append(entry)
+    entry = enqueue_gateway_approval(session_key, approval_data)
+    drop_notified = False
 
     def _drop_entry() -> None:
+        nonlocal drop_notified
         with _lock:
             queue = _gateway_queues.get(state_key, [])
             if entry in queue:
                 queue.remove(entry)
+            interaction_id = str(entry.data.get("interaction_id", ""))
+            if interaction_id:
+                _gateway_prepared.pop((state_key, interaction_id), None)
             if not queue:
                 _gateway_queues.pop(state_key, None)
+        if drop_notified:
+            return
+        drop_notified = True
+        drop_cb = getattr(notify_cb, "_gateway_interaction_dropped", None)
+        if callable(drop_cb):
+            try:
+                drop_cb(
+                    session_key,
+                    str(entry.data.get("interaction_id", "") or ""),
+                )
+            except Exception:
+                logger.debug(
+                    "Gateway approval drop callback failed", exc_info=True
+                )
 
     # Notify plugins that an approval is being requested. Fires before the
     # gateway notify callback so observers get the event in real time.
@@ -3806,6 +4029,20 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         if _remaining <= 0:
             break
         if entry.event.wait(timeout=min(1.0, _remaining)):
+            resolved = True
+            break
+        deferred_wake_at = float(
+            entry.data.get("_gateway_deferred_wake_at", 0.0) or 0.0
+        )
+        if (
+            entry.result is not None
+            and deferred_wake_at
+            and time.monotonic() >= deferred_wake_at
+        ):
+            # Local-server disappeared after durable finalize. Release the
+            # in-process waiter after the bounded fence TTL, but deliberately
+            # leave the persisted goal interaction flag fail-closed.
+            entry.event.set()
             resolved = True
             break
         if touch_activity_if_due is not None:

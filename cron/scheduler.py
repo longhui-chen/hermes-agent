@@ -2783,6 +2783,90 @@ def _guard_job_credential_exfil(job: dict) -> None:
         raise RuntimeError(f"Cron job '{job_id}' blocked for safety: {err}")
 
 
+def _connector_execution_blocked_document(error_code: str) -> str:
+    """Return an honest terminal report before any Connector tool can run."""
+    if str(error_code).strip() == "task_connector_mixed_skills_unsupported":
+        return (
+            "**定时任务连接配置不支持**\n\n"
+            "该任务同时使用 Linear 和其他技能/连接器，无法安全使用单一 Linear 执行授权；"
+            "未读取数据、未生成报告。请在当前会话将其拆分为独立的 Linear 定时任务。"
+        )
+    if str(error_code).strip() == "task_connector_temporarily_unavailable":
+        return (
+            "**定时任务连接暂时不可用**\n\n"
+            "任务专属的 Linear 执行授权暂时无法获取；已完成有限重试，未读取数据、未生成报告。"
+            "系统将按下次计划重试；如持续出现，请检查设备与连接状态。"
+        )
+    return (
+        "**定时任务连接未授权/已过期**\n\n"
+        "该 Linear 定时任务尚未完成或已失去任务专属授权，因此未读取数据、未生成报告。"
+        "请在当前会话重新授权 Linear 后更新或重新创建该定时任务。"
+    )
+
+
+def _prepare_connector_execution(job: dict) -> tuple[str, Optional[str]]:
+    """Exchange only an explicitly migrated Linear job's durable grant.
+
+    The rollout flag is intentionally *not* consulted here.  It gates grant
+    creation while a live Chat route is present; using it to reinterpret old
+    jobs at tick time would break every pre-rollout Linear task.  Conversely,
+    a job that already carries the explicit v1 grant must retain its execution
+    contract through a rollout rollback, so it can finish through its narrow
+    lease path rather than falling back to a guessed Chat route.
+    """
+    connector_execution = job.get("connector_execution")
+    if not connector_execution:
+        return "", None
+    try:
+        from cron.connector_execution import (
+            acquire_route_capability,
+            supports_exclusive_linear_execution,
+            wants_linear_execution,
+        )
+
+        if not wants_linear_execution(job.get("skills") or job.get("skill")):
+            return "", None
+        if not supports_exclusive_linear_execution(job.get("skills") or job.get("skill")):
+            return "", "task_connector_mixed_skills_unsupported"
+        capability = acquire_route_capability(
+            connector_execution,
+            str(job.get("_connector_execution_id") or job.get("execution_id") or job.get("id") or ""),
+        )
+        return capability, None
+    except Exception as exc:
+        return "", str(getattr(exc, "code", "task_connector_not_authorized"))
+
+
+def _attach_private_connector_execution(job: dict) -> dict:
+    """Restore the opaque task grant only inside the shared execution body.
+
+    ``get_job`` and ``resolve_job_ref`` intentionally redact the durable grant
+    from every caller-facing representation.  Run-now and external scheduler
+    providers legitimately start with those public views, so `run_one_job`
+    performs this narrow, ID-bound reload immediately before execution.  The
+    merged record is never returned or persisted by this helper.
+    """
+    job_id = str(job.get("id") or "").strip()
+    if not job_id:
+        return job
+    try:
+        from cron.jobs import get_job_raw
+
+        persisted = get_job_raw(job_id)
+    except Exception:
+        return job
+    if not isinstance(persisted, dict):
+        return job
+    execution = persisted.get("connector_execution")
+    if not isinstance(execution, dict) or not str(execution.get("grant_token") or "").strip():
+        return job
+    execution_job = dict(job)
+    # Copy the nested map as well: no downstream mutation can alter the record
+    # held by load_jobs(), and the token remains local to this function/run.
+    execution_job["connector_execution"] = dict(execution)
+    return execution_job
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -2805,6 +2889,16 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
     _refresh_cron_dotenv_for_legacy_process()
+
+    # Connector Cron never reconstructs a chat route.  Only a job explicitly
+    # migrated while a Chat route was live carries connector_execution; it must
+    # exchange that grant for one short local capability before Agent creation.
+    # Legacy jobs deliberately retain their exact pre-rollout behavior.
+    connector_route_capability, connector_execution_error = _prepare_connector_execution(job)
+    if connector_execution_error:
+        blocked_doc = _connector_execution_blocked_document(connector_execution_error)
+        logger.warning("Job '%s': connector execution lease unavailable: %s", job_id, connector_execution_error)
+        return False, blocked_doc, "", connector_execution_error
 
     # ---------------------------------------------------------------
     # calendar reminder (notify-only) short-circuit — deliver a pre-
@@ -3080,7 +3174,12 @@ def run_job(
 
     # Use ContextVars for per-job session/delivery state so parallel jobs
     # don't clobber each other's targets (os.environ is process-global).
-    from gateway.session_context import set_session_vars, clear_session_vars, _VAR_MAP
+    from gateway.session_context import (
+        set_session_vars,
+        clear_session_vars,
+        set_zettlab_connector_route_capability,
+        _VAR_MAP,
+    )
 
     # Cron execution is an internal scheduler context, not a live inbound
     # gateway message. Do not seed HERMES_SESSION_* contextvars from the
@@ -3122,6 +3221,10 @@ def run_job(
         # See declare_stateless_channel(). Upstream: #53027, #63142.
         async_delivery=False,
     )
+    # This is a private route capability for the dedicated connector runner,
+    # not HERMES_SESSION_KEY and not a user bearer. Generic subprocesses remain
+    # unable to inherit it.
+    set_zettlab_connector_route_capability(connector_route_capability)
     _cron_delivery_vars = (
         "HERMES_CRON_AUTO_DELIVER_PLATFORM",
         "HERMES_CRON_AUTO_DELIVER_CHAT_ID",
@@ -3808,6 +3911,7 @@ def run_job(
             _terminal_cwd_lock.release_read()
         # Clean up ContextVar session/delivery state for this job.
         clear_session_vars(_ctx_tokens)
+        set_zettlab_connector_route_capability("")
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:
@@ -3947,6 +4051,10 @@ def run_one_job(
         logger.warning("Calendar job %s quarantined: invalid event-alert contract", job.get("id"))
         return True
 
+    # Public job reads are redacted by design.  Restore a task grant only for
+    # this in-process execution, after calendar-only paths have returned.
+    job = _attach_private_connector_execution(job)
+
     # Direct callers are "run now" by default. Due schedulers must pass their
     # explicit plan/claim instant; never infer it from next_run_at because that
     # may describe tomorrow's future occurrence.
@@ -4004,8 +4112,10 @@ def run_one_job(
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
         try:
+            execution_job = dict(job)
+            execution_job["_connector_execution_id"] = execution_id
             success, output, final_response, error = run_job(
-                job, defer_agent_teardown=_deferred_agents
+                execution_job, defer_agent_teardown=_deferred_agents
             )
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear

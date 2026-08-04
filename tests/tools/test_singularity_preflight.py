@@ -145,3 +145,14 @@ class TestSingularityConnectorEnvScrub:
         assert "ZETTLAB_CONNECTORS_AUTH_TOKEN" in keys
         assert "ZETTLAB_CONNECTORS_URL" in keys
         assert "ZET_AGENT_ID" in keys
+
+    def test_snapshot_ephemeral_env_keys_include_engaged_turn_context(self, monkeypatch):
+        import gateway.session_context as sc
+
+        monkeypatch.setattr(sc, "_session_context_engaged", True)
+        env = SingularityEnvironment.__new__(SingularityEnvironment)
+
+        keys = set(env._snapshot_ephemeral_env_keys())
+
+        assert "HERMES_TURN_ID" in keys
+        assert "HERMES_PLAN_ACK_REVISION_REQUESTED" in keys

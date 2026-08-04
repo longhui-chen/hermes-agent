@@ -46,6 +46,10 @@ from pathlib import Path
 from datetime import datetime
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Union
 
+from gateway.sensitive_process_boundary import (
+    initialize_gateway_sensitive_process_boundary,
+)
+
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
 # /usage; we still import it at module top in the gateway because test
 # patches (tests/gateway/test_usage_command.py) target
@@ -7422,6 +7426,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         
         Returns True if at least one adapter connected successfully.
         """
+        zet_agent_config = self.config.platforms.get(Platform.ZET_AGENT)
+        self._zet_agent_process_boundary_failed = False
+        if zet_agent_config is not None and zet_agent_config.enabled:
+            # This is the first action after construction and runs before any
+            # adapter connects or any startup recovery can create an
+            # agent/model/terminal child. Failure disables business-token
+            # execution but keeps the compatibility chat listener available.
+            self._zet_agent_process_boundary_failed = not (
+                initialize_gateway_sensitive_process_boundary()
+            )
+            if self._zet_agent_process_boundary_failed:
+                logger.warning(
+                    "ZetAgent process memory boundary is unavailable: "
+                    "business-token requests are disabled; ordinary chat "
+                    "remains available"
+                )
+
         logger.info("Starting Hermes Gateway...")
         try:
             self._gateway_loop = asyncio.get_running_loop()
@@ -7769,7 +7790,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _multiplex_skipped_platforms.append(platform)
                 continue
             enabled_platform_count += 1
-            
             adapter = self._create_adapter(platform, platform_config)
             if not adapter:
                 # Distinguish between missing builtin deps and missing plugin
@@ -23294,6 +23314,23 @@ def _start_gateway_cron_schedulers(
     ]
 
 
+def _prepare_trusted_video_edit_runtime_before_gateway_threads() -> bool:
+    """Prepare the trusted video worker while the gateway is single-threaded."""
+    if not os.environ.get("ZETTLAB_PRESETS_DIR"):
+        return False
+    try:
+        from tools import terminal_tool
+
+        terminal_tool._late_prepare_video_edit_worker_before_terminal()
+        return True
+    except Exception as exc:
+        logger.warning(
+            "Trusted video-edit runtime unavailable during gateway startup: %s",
+            type(exc).__name__,
+        )
+        return False
+
+
 async def start_gateway(
     config: Optional[GatewayConfig] = None,
     replace: bool = False,
@@ -23463,6 +23500,11 @@ async def start_gateway(
         sync_skills(quiet=True)
     except Exception:
         pass
+
+    # The trusted worker must fork from a single-threaded CPython process.
+    # Centralized logging starts a queue-listener thread, so this preparation
+    # must also happen before setup_logging().
+    _prepare_trusted_video_edit_runtime_before_gateway_threads()
 
     # Centralized logging — agent.log (INFO+), errors.log (WARNING+),
     # and gateway.log (INFO+, gateway-component records only).

@@ -13,6 +13,7 @@ Tests cover:
 """
 
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms import api_server as api_server_module
 from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
@@ -364,6 +366,40 @@ class TestResponseStore:
 
 
 class TestIdempotencyCache:
+    def test_business_execution_scope_digest_isolated_and_non_secret(self):
+        body = {
+            "model": "hermes-agent",
+            "messages": [{"role": "user", "content": "render"}],
+            "stream": False,
+        }
+        keys = ["model", "messages", "stream"]
+        token_a = "a" * 64
+        token_b = "b" * 64
+        legacy_subset = {key: body.get(key) for key in keys}
+        legacy_fingerprint = hashlib.sha256(
+            repr(legacy_subset).encode("utf-8")
+        ).hexdigest()
+
+        assert (
+            api_server_module._make_request_fingerprint(body, keys)
+            == legacy_fingerprint
+        )
+        digest_a = api_server_module._business_execution_scope_digest(token_a)
+        digest_b = api_server_module._business_execution_scope_digest(token_b)
+        assert digest_a == api_server_module._business_execution_scope_digest(
+            token_a
+        )
+        assert digest_a != digest_b
+        fingerprint_a = api_server_module._make_request_fingerprint(
+            body, keys, execution_scope_digest=digest_a
+        )
+        fingerprint_b = api_server_module._make_request_fingerprint(
+            body, keys, execution_scope_digest=digest_b
+        )
+        assert fingerprint_a != fingerprint_b
+        assert token_a not in repr((digest_a, fingerprint_a))
+        assert token_b not in repr((digest_b, fingerprint_b))
+
     @pytest.mark.asyncio
     async def test_concurrent_same_key_and_fingerprint_runs_once(self):
         cache = _IdempotencyCache()
@@ -939,6 +975,33 @@ class TestAgentExecution:
             task_id="session-123",
         )
 
+    @pytest.mark.asyncio
+    async def test_run_agent_preserves_tool_choice_none_as_request_boundary(
+        self,
+        adapter,
+    ):
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "ok"}
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        def _run_conversation(**_kwargs):
+            assert mock_agent._tools_disabled_for_request is True
+            return {"final_response": "ok"}
+
+        mock_agent.run_conversation.side_effect = _run_conversation
+
+        with patch.object(adapter, "_create_agent", return_value=mock_agent):
+            result, _usage = await adapter._run_agent(
+                user_message="请把 [file: /data/input.mp4] 剪辑成 vlog",
+                conversation_history=[],
+                session_id="no-tools-video",
+                request_overrides={"tool_choice": "none"},
+            )
+
+        assert result["final_response"] == "ok"
+
 
 @pytest.mark.parametrize(
     ("raw", "want"),
@@ -1403,6 +1466,86 @@ class TestToolsetsEndpoint:
 
 class TestChatCompletionsEndpoint:
     @pytest.mark.asyncio
+    async def test_idempotency_is_scoped_by_business_execution_token(
+        self, adapter, monkeypatch, caplog
+    ):
+        cache = _IdempotencyCache()
+        monkeypatch.setattr(api_server_module, "_idem_cache", cache)
+        token_a = "a" * 64
+        token_b = "b" * 64
+        body = {
+            "model": "hermes-agent",
+            "messages": [{"role": "user", "content": "render"}],
+            "stream": False,
+        }
+        calls = []
+
+        async def run_agent(**kwargs):
+            token = kwargs["business_execution_token"]
+            calls.append(token)
+            return (
+                {
+                    "final_response": f"run-{len(calls)}",
+                    "messages": [],
+                    "api_calls": 1,
+                },
+                {
+                    "input_tokens": 1,
+                    "output_tokens": 1,
+                    "total_tokens": 2,
+                },
+            )
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", side_effect=run_agent):
+                first = await cli.post(
+                    "/v1/chat/completions",
+                    json=body,
+                    headers={
+                        "Idempotency-Key": "same-key",
+                        "X-Zettlab-Business-Execution-Token": token_a,
+                    },
+                )
+                first_body = await first.json()
+                same_scope = await cli.post(
+                    "/v1/chat/completions",
+                    json=body,
+                    headers={
+                        "Idempotency-Key": "same-key",
+                        "X-Zettlab-Business-Execution-Token": token_a,
+                    },
+                )
+                same_scope_body = await same_scope.json()
+                other_scope = await cli.post(
+                    "/v1/chat/completions",
+                    json=body,
+                    headers={
+                        "Idempotency-Key": "same-key",
+                        "X-Zettlab-Business-Execution-Token": token_b,
+                    },
+                )
+                other_scope_body = await other_scope.json()
+
+        assert [first.status, same_scope.status, other_scope.status] == [
+            200,
+            200,
+            200,
+        ]
+        assert first_body["choices"][0]["message"]["content"] == "run-1"
+        assert same_scope_body["choices"][0]["message"]["content"] == "run-1"
+        assert other_scope_body["choices"][0]["message"]["content"] == "run-2"
+        assert calls == [token_a, token_b]
+        cache_state = repr((cache._store, cache._inflight))
+        response_state = repr((first_body, same_scope_body, other_scope_body))
+        assert token_a not in cache_state
+        assert token_b not in cache_state
+        assert token_a not in response_state
+        assert token_b not in response_state
+        assert token_a not in caplog.text
+        assert token_b not in caplog.text
+
+    @pytest.mark.asyncio
     async def test_invalid_json_returns_400(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
@@ -1512,6 +1655,11 @@ class TestChatCompletionsEndpoint:
                 assert resp.status == 200
                 mock_expand.assert_not_awaited()
                 assert mock_run.await_args.kwargs["user_message"] == "/deep-research 黄金"
+                assert (
+                    mock_run.await_args.kwargs["trusted_user_message"]
+                    == "/deep-research 黄金"
+                )
+                assert mock_run.await_args.kwargs["trusted_skill_slug"] == ""
 
                 # Without the boundary the hook runs as usual.
                 resp = await cli.post(
@@ -1526,11 +1674,68 @@ class TestChatCompletionsEndpoint:
                 assert resp.status == 200
                 mock_expand.assert_awaited_once()
                 assert mock_run.await_args.kwargs["user_message"] == "<<EXPANDED:deep-research:/deep-research 黄金>>"
+                assert (
+                    mock_run.await_args.kwargs["trusted_user_message"]
+                    == "黄金"
+                )
+                assert (
+                    mock_run.await_args.kwargs["trusted_skill_slug"]
+                    == "deep-research"
+                )
                 # The hook receives the resolved session so skill templates
                 # can resolve ${HERMES_SESSION_ID} (builder task_id).
                 assert (
                     mock_expand.await_args.kwargs["session_id"]
                     == mock_run.await_args.kwargs["session_id"]
+                )
+
+    @pytest.mark.asyncio
+    async def test_video_edit_skill_selection_preserves_trusted_scope_signal(
+        self,
+        adapter,
+    ):
+        mock_result = {"final_response": "ok", "messages": [], "api_calls": 1}
+        usage = {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}
+
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter,
+                "_run_agent",
+                new_callable=AsyncMock,
+            ) as mock_run, patch.object(
+                adapter,
+                "_expand_inbound_skill_invocation",
+                new_callable=AsyncMock,
+            ) as mock_expand:
+                mock_run.return_value = (mock_result, usage)
+                mock_expand.return_value = "<<EXPANDED>>"
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{
+                            "role": "user",
+                            "content": (
+                                "/video-edit-workflow-mini "
+                                "请总结 [file: /data/input.mp4]"
+                            ),
+                        }],
+                        "stream": False,
+                        "metadata": {
+                            "skill_slug": "video-edit-workflow-mini",
+                        },
+                    },
+                )
+
+                assert resp.status == 200
+                assert (
+                    mock_run.await_args.kwargs["trusted_user_message"]
+                    == "请总结 [file: /data/input.mp4]"
+                )
+                assert (
+                    mock_run.await_args.kwargs["trusted_skill_slug"]
+                    == "video-edit-workflow-mini"
                 )
 
     @pytest.mark.asyncio
@@ -1558,6 +1763,30 @@ class TestChatCompletionsEndpoint:
                 assert resp.status == 200
                 mock_expand.assert_not_awaited()
                 assert mock_run.await_args.kwargs["user_message"] == "/deep-research 是什么？"
+
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [{
+                            "role": "user",
+                            "content": (
+                                "/video-edit-workflow-mini "
+                                "请总结 [file: /data/input.mp4]"
+                            ),
+                        }],
+                        "stream": False,
+                    },
+                )
+                assert resp.status == 200
+                assert (
+                    mock_run.await_args.kwargs["trusted_user_message"]
+                    == (
+                        "/video-edit-workflow-mini "
+                        "请总结 [file: /data/input.mp4]"
+                    )
+                )
+                assert mock_run.await_args.kwargs["trusted_skill_slug"] == ""
 
     @pytest.mark.asyncio
     async def test_idempotency_key_dedupes_skill_invocation(self, adapter):
@@ -4283,6 +4512,16 @@ class TestCORS:
         assert headers["Access-Control-Allow-Origin"] == "http://localhost:3000"
         assert "POST" in headers["Access-Control-Allow-Methods"]
 
+    def test_cors_headers_allow_business_execution_token_unit(self):
+        adapter = _make_adapter(cors_origins=["http://localhost:3000"])
+        headers = adapter._cors_headers_for_origin("http://localhost:3000")
+        assert headers is not None
+        allowed = {
+            value.strip().lower()
+            for value in headers["Access-Control-Allow-Headers"].split(",")
+        }
+        assert "x-zettlab-business-execution-token" in allowed
+
     def test_cors_headers_for_origin_rejects_unknown_origin(self):
         adapter = _make_adapter(cors_origins=["http://localhost:3000"])
         assert adapter._cors_headers_for_origin("http://evil.example") is None
@@ -4347,6 +4586,34 @@ class TestCORS:
             )
             assert resp.status == 200
             assert "Idempotency-Key" in resp.headers.get("Access-Control-Allow-Headers", "")
+
+    @pytest.mark.asyncio
+    async def test_cors_business_execution_token_preflight_flow(self):
+        adapter = _make_adapter(cors_origins=["http://localhost:3000"])
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.options(
+                "/v1/chat/completions",
+                headers={
+                    "Origin": "http://localhost:3000",
+                    "Access-Control-Request-Method": "POST",
+                    "Access-Control-Request-Headers": (
+                        "Content-Type, X-Zettlab-Business-Execution-Token"
+                    ),
+                },
+            )
+            assert resp.status == 200
+            assert resp.headers.get("Access-Control-Allow-Origin") == (
+                "http://localhost:3000"
+            )
+            allowed = {
+                value.strip().lower()
+                for value in resp.headers.get(
+                    "Access-Control-Allow-Headers",
+                    "",
+                ).split(",")
+            }
+            assert "x-zettlab-business-execution-token" in allowed
 
     @pytest.mark.asyncio
     async def test_cors_sets_vary_origin_header(self):

@@ -265,7 +265,12 @@ class SingularityEnvironment(BaseEnvironment):
         )
 
     def _snapshot_ephemeral_env_keys(self) -> tuple[str, ...]:
-        return tuple(sorted(PROFILE_SCOPED_SUBPROCESS_ENV_KEYS))
+        return tuple(
+            sorted(
+                PROFILE_SCOPED_SUBPROCESS_ENV_KEYS
+                | set(super()._snapshot_ephemeral_env_keys())
+            )
+        )
 
     def cleanup(self):
         """Stop the instance. If persistent, the overlay dir survives."""

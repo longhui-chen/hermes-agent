@@ -94,6 +94,27 @@ _SESSION_MESSAGE_ID: ContextVar = ContextVar("HERMES_SESSION_MESSAGE_ID", defaul
 
 _SESSION_PROFILE: ContextVar = ContextVar("HERMES_SESSION_PROFILE", default=_UNSET)
 
+# Current chat turn and its structured plan-review receipt. These values are
+# consumed by skill subprocesses, so they must follow the same task-local
+# ContextVar -> child-process bridge as HERMES_SESSION_* rather than using the
+# process-global os.environ in a concurrent API server.
+_TURN_ID: ContextVar = ContextVar("HERMES_TURN_ID", default=_UNSET)
+# Opaque server-minted identity for the exact task-local binding above. The
+# external turn ID is correlation data and can be reused by a buggy or hostile
+# client; this object prevents two concurrent requests carrying the same text
+# ID from consuming each other's in-process capabilities.
+_TURN_BINDING: ContextVar = ContextVar("HERMES_TURN_BINDING", default=_UNSET)
+_PLAN_ACK_STATUS: ContextVar = ContextVar("HERMES_PLAN_ACK_STATUS", default=_UNSET)
+_PLAN_ACK_TURN_ID: ContextVar = ContextVar("HERMES_PLAN_ACK_TURN_ID", default=_UNSET)
+_PLAN_ACK_REVISION_REQUESTED: ContextVar = ContextVar(
+    "HERMES_PLAN_ACK_REVISION_REQUESTED",
+    default=_UNSET,
+)
+_BUSINESS_EXECUTION_TOKEN: ContextVar = ContextVar(
+    "ZETTLAB_BUSINESS_EXECUTION_TOKEN",
+    default=_UNSET,
+)
+
 # Whether the current session's delivery channel can route an ASYNC completion
 # back to the agent AFTER the current turn ends (i.e. wake a fresh turn).
 #
@@ -184,11 +205,82 @@ _VAR_MAP = {
     "HERMES_UI_SESSION_ID": _SESSION_UI_SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
     "HERMES_SESSION_PROFILE": _SESSION_PROFILE,
+    "HERMES_TURN_ID": _TURN_ID,
+    "HERMES_PLAN_ACK_STATUS": _PLAN_ACK_STATUS,
+    "HERMES_PLAN_ACK_TURN_ID": _PLAN_ACK_TURN_ID,
+    "HERMES_PLAN_ACK_REVISION_REQUESTED": _PLAN_ACK_REVISION_REQUESTED,
     "HERMES_CRON_AUTO_DELIVER_PLATFORM": _CRON_AUTO_DELIVER_PLATFORM,
     "HERMES_CRON_AUTO_DELIVER_CHAT_ID": _CRON_AUTO_DELIVER_CHAT_ID,
     "HERMES_CRON_AUTO_DELIVER_THREAD_ID": _CRON_AUTO_DELIVER_THREAD_ID,
     "HERMES_CRON_TASK_TITLE": _CRON_TASK_TITLE,
 }
+
+
+def set_turn_vars(
+    *,
+    turn_id: str = "",
+    plan_ack_status: str = "",
+    plan_ack_turn_id: str = "",
+    plan_ack_revision_requested: str = "",
+    business_execution_token: str = "",
+) -> list:
+    """Bind one request's turn identity and plan receipt task-locally."""
+    global _session_context_engaged
+    _session_context_engaged = True
+    return [
+        _TURN_ID.set(turn_id),
+        _TURN_BINDING.set(object()),
+        _PLAN_ACK_STATUS.set(plan_ack_status),
+        _PLAN_ACK_TURN_ID.set(plan_ack_turn_id),
+        _PLAN_ACK_REVISION_REQUESTED.set(plan_ack_revision_requested),
+        _BUSINESS_EXECUTION_TOKEN.set(business_execution_token),
+    ]
+
+
+def clear_turn_vars(tokens: list) -> None:
+    """Restore the turn context that existed before :func:`set_turn_vars`."""
+    for var, token in zip(
+        (
+            _TURN_ID,
+            _TURN_BINDING,
+            _PLAN_ACK_STATUS,
+            _PLAN_ACK_TURN_ID,
+            _PLAN_ACK_REVISION_REQUESTED,
+            _BUSINESS_EXECUTION_TOKEN,
+        ),
+        tokens,
+    ):
+        var.reset(token)
+
+
+def current_turn_identity() -> tuple[str, object] | None:
+    """Return the exact trusted task-local turn binding, if one is active.
+
+    The first item is the external request turn ID used for correlation. The
+    opaque second item is minted by :func:`set_turn_vars` and deliberately
+    cannot be reconstructed from client metadata. Callers must compare the
+    complete tuple and must never serialize the binding object.
+    """
+    turn_id = _TURN_ID.get()
+    binding = _TURN_BINDING.get()
+    if turn_id is _UNSET or binding is _UNSET:
+        return None
+    normalized_turn_id = str(turn_id or "").strip()
+    if not normalized_turn_id:
+        return None
+    return normalized_turn_id, binding
+
+
+def business_execution_token() -> str:
+    """Return the task-local capability for the trusted video executor only.
+
+    This value intentionally lives outside ``_VAR_MAP`` so generic terminal,
+    execute-code, plugin, and model-driving subprocesses cannot inherit it.
+    """
+    value = _BUSINESS_EXECUTION_TOKEN.get()
+    if value is _UNSET or value is None:
+        return ""
+    return str(value).strip()
 
 
 def set_current_session_id(session_id: str) -> None:
@@ -341,6 +433,8 @@ def reset_session_vars() -> None:
     """
     for var in _VAR_MAP.values():
         var.set(_UNSET)
+    _TURN_BINDING.set(_UNSET)
+    _BUSINESS_EXECUTION_TOKEN.set(_UNSET)
     # Reset the async-delivery capability to "never bound here" (_UNSET) for the
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.

@@ -16,6 +16,14 @@ def test_terminal_env_injects_current_zettlab_turn_id_and_clears_stale_value():
         session_context.set_zettlab_turn_id("")
 
 
+def test_local_snapshot_always_treats_zettlab_turn_id_as_ephemeral(tmp_path):
+    env = local.LocalEnvironment(cwd=str(tmp_path), timeout=10)
+    try:
+        assert "ZETTLAB_TURN_ID" in env._snapshot_ephemeral_env_keys()
+    finally:
+        env.cleanup()
+
+
 def test_local_terminal_process_receives_zettlab_turn_id_flow(tmp_path):
     try:
         session_context.set_zettlab_turn_id("turn-flow-456")

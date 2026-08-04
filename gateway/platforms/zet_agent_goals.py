@@ -1309,7 +1309,12 @@ class ZetGoalDriver:
         except Exception:
             logger.debug("[zet_goal] clear interaction flag failed", exc_info=True)
 
-    def on_interaction_pending(self, session_id: str) -> None:
+    def on_interaction_pending(
+        self,
+        session_id: str,
+        *,
+        verify_live_source: bool = False,
+    ) -> None:
         """An approval/clarify card is blocking the turn: project 'waiting'
         so the App banner explains the stall. GoalManager state itself is
         untouched — the turn is still running from the loop's viewpoint.
@@ -1321,6 +1326,7 @@ class ZetGoalDriver:
         # 回调闭包捕获的是 _create_agent 时的 sid —— 本轮若已压缩轮转，goal
         # 行/sidecar 都在新 sid 下（旧行 cleared、旧 sidecar tombstone），
         # 不解析的话 is_active() 直接 False，等待态既不投影也不落盘。
+        req_sid = session_id
         session_id = self._live_session_id(session_id)
         # 判定 + flag 写入 + 投影构造全部在 session lock 内、状态锁内新载
         # （codex P1）：锁外判定 active 与锁内写 flag 之间 clear/create 可能
@@ -1338,6 +1344,14 @@ class ZetGoalDriver:
                 except Exception:
                     return
                 if not mgr.is_active():
+                    return
+                # A fast durable responder can remove the source + deferred
+                # receipt before this post-publication callback reaches the
+                # session lock. Re-check under the same lock used by resolved
+                # so a late callback cannot recreate a waiting flag after ack.
+                if verify_live_source and not self._interaction_still_pending(
+                    req_sid, session_id
+                ):
                     return
                 side = self._load_sidecar(session_id)
                 if not side.get(self._INTERACTION_FLAG):
@@ -1361,20 +1375,33 @@ class ZetGoalDriver:
                 continue
             seen.add(sid)
             try:
+                scoped_sid = self.adapter._interaction_queue_key(sid)
+            except Exception:
+                scoped_sid = sid
+            queue_keys = (scoped_sid, sid) if scoped_sid != sid else (sid,)
+            try:
                 from tools.approval import has_blocking_approval
 
-                if has_blocking_approval(sid):
+                if any(has_blocking_approval(key) for key in queue_keys):
                     return True
             except Exception:
                 pass
             try:
-                # Clarify queues are keyed by the same profile-scoped
-                # session identity as ZetAgentAdapter's active turns. A
-                # bare sid here would make coder's outstanding card keep
-                # main's goal projection in waiting (or vice versa).
-                clarify_key = self.adapter._active_turn_key(sid)
                 with self.adapter._clarify_state_lock:
-                    if self.adapter._clarify_queues.get(clarify_key):
+                    if any(
+                        self.adapter._clarify_queues.get(key)
+                        for key in queue_keys
+                    ):
+                        return True
+            except Exception:
+                pass
+            try:
+                with self.adapter._delivery_lock:
+                    if any(
+                        receipt.get("scope_key") in queue_keys
+                        and receipt.get("_goal_resolve_deferred")
+                        for receipt in self.adapter._interaction_deliveries.values()
+                    ):
                         return True
             except Exception:
                 pass
@@ -1404,6 +1431,12 @@ class ZetGoalDriver:
                 try:
                     mgr = GoalManager(session_id)
                 except Exception:
+                    return
+                # Serialize the final ownership decision with pending's
+                # in-lock source check. A stale resolve that observed an empty
+                # queue before a newer prompt arrived must not clear that
+                # newer prompt's persisted waiting flag.
+                if self._interaction_still_pending(req_sid, session_id):
                     return
                 self._clear_interaction_flag_locked(session_id)
                 if not mgr.is_active():

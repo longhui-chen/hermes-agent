@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from agent.conversation_loop import (
     _apply_forced_present_plan_tool_choice,
+    _apply_zet_agent_plan_tool_visibility,
     _is_thinking_tool_choice_rejection,
     _is_unsupported_thinking_parameter_error,
     _should_end_after_present_plan,
@@ -265,7 +266,7 @@ def test_present_plan_does_not_end_turn_when_auto_execute_enabled():
     )
 
 
-def test_present_plan_tool_result_does_not_end_regular_tool_turns():
+def test_present_plan_does_not_end_regular_tool_turns():
     assert not _should_end_after_present_plan(
         _agent(
             _zet_agent_plan_mode_active=False,
@@ -374,3 +375,27 @@ def test_workflow_addendum_plan_first_section_is_capability_aware():
         assert "## 工作风格" in text
         assert "## 计划先行（Plan-First）" in text
         assert "## 用户画像语言" in text
+
+
+def test_trusted_video_execution_never_hides_present_plan(monkeypatch):
+    agent = _agent()
+    monkeypatch.setattr(
+        "agent.conversation_loop.trusted_skill_scope_active",
+        lambda _agent: True,
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop.trusted_skill_allowed_tool_names",
+        lambda _agent: frozenset({"terminal", "todo"}),
+    )
+    api_kwargs = {
+        "tools": [
+            {"type": "function", "function": {"name": "present_plan"}},
+            {"type": "function", "function": {"name": "terminal"}},
+            {"type": "function", "function": {"name": "write_file"}},
+        ]
+    }
+
+    assert _apply_zet_agent_plan_tool_visibility(agent, api_kwargs)
+    assert [
+        tool["function"]["name"] for tool in api_kwargs["tools"]
+    ] == ["present_plan", "terminal"]

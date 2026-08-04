@@ -525,6 +525,238 @@ def test_prepare_claw_service_does_not_replace_unchanged_env_file(tmp_path: Path
     assert key_path.stat().st_mode & 0o777 == 0o600
 
 
+@pytest.mark.parametrize(
+    ("name", "body"),
+    [
+        ("default", b"deleted\n"),
+        ("config.yaml", b"deleted\ncleanup-complete\n"),
+        (
+            "removed-agent",
+            b'deleted\norigin-json\n{"import_job_id":"job-1"}\n',
+        ),
+        (
+            "completed-agent",
+            b'deleted\ncleanup-complete\norigin-json\n'
+            b'{"clone_history_id":"clone-1"}\n',
+        ),
+    ],
+)
+def test_prepare_claw_service_preserves_local_server_deletion_blockers(
+    tmp_path: Path,
+    name: str,
+    body: bytes,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
+    profiles_root = hermes_home / "profiles"
+    profiles_root.mkdir(parents=True)
+    blocker = profiles_root / name
+    blocker.write_bytes(body)
+    blocker.chmod(0o644)
+    if name == "default":
+        tombstones = profiles_root / ".deleted-agents"
+        tombstones.mkdir()
+        sidecar = tombstones / name
+        sidecar.write_bytes(b"deleted\ncleanup-complete\n")
+        sidecar.chmod(0o600)
+
+    subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=True,
+        cwd=str(app_root),
+        env=_script_env(),
+    )
+
+    assert blocker.read_bytes() == body
+    assert blocker.stat().st_mode & 0o777 == 0o600
+    assert (env_path.parent / "profile-permissions-v2.done").is_file()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"not-a-deletion-blocker\n",
+        b"deleted\nunexpected-tail\n",
+        b"deleted\norigin-json\nnot-json\n",
+        b'deleted\norigin-json\n{"value":NaN}\n',
+        pytest.param(
+            b'deleted\norigin-json\n{"value":'
+            + (b"[" * 30000)
+            + b"0"
+            + (b"]" * 30000)
+            + b"}\n",
+            id="deeply-nested-origin-json",
+        ),
+    ],
+)
+def test_prepare_claw_service_rejects_arbitrary_profile_root_files(
+    tmp_path: Path,
+    body: bytes,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
+    profiles_root = hermes_home / "profiles"
+    profiles_root.mkdir(parents=True)
+    unexpected = profiles_root / "unexpected"
+    unexpected.write_bytes(body)
+    unexpected.chmod(0o600)
+
+    result = subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=False,
+        cwd=str(app_root),
+        env=_script_env(),
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "refusing non-directory profile path" in result.stderr
+    assert unexpected.read_bytes() == body
+    assert not (env_path.parent / "profile-permissions-v2.done").exists()
+
+
+@pytest.mark.parametrize(
+    ("name", "sidecar_body"),
+    [
+        ("default", None),
+        ("default", b"not-a-deletion-marker\n"),
+        ("main", b"deleted\ncleanup-complete\n"),
+        (".hidden", b"deleted\ncleanup-complete\n"),
+    ],
+)
+def test_prepare_claw_service_rejects_unproven_or_reserved_deletion_blockers(
+    tmp_path: Path,
+    name: str,
+    sidecar_body: bytes | None,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
+    profiles_root = hermes_home / "profiles"
+    profiles_root.mkdir(parents=True)
+    blocker = profiles_root / name
+    blocker.write_bytes(b"deleted\n")
+    blocker.chmod(0o600)
+    if sidecar_body is not None:
+        tombstones = profiles_root / ".deleted-agents"
+        tombstones.mkdir()
+        sidecar = tombstones / name
+        sidecar.write_bytes(sidecar_body)
+        sidecar.chmod(0o600)
+
+    result = subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=False,
+        cwd=str(app_root),
+        env=_script_env(),
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "refusing non-directory profile path" in result.stderr
+    assert blocker.read_bytes() == b"deleted\n"
+    assert not (env_path.parent / "profile-permissions-v2.done").exists()
+
+
+def test_prepare_claw_service_rejects_symlinked_deletion_blocker(tmp_path: Path):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
+    profiles_root = hermes_home / "profiles"
+    profiles_root.mkdir(parents=True)
+    target = tmp_path / "outside-blocker"
+    target.write_bytes(b"deleted\n")
+    target.chmod(0o644)
+    os.symlink(target, profiles_root / "removed-agent")
+
+    result = subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=False,
+        cwd=str(app_root),
+        env=_script_env(),
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "refusing non-directory profile path" in result.stderr
+    assert target.read_bytes() == b"deleted\n"
+    assert target.stat().st_mode & 0o777 == 0o644
+    assert not (env_path.parent / "profile-permissions-v2.done").exists()
+
+
+def test_prepare_claw_service_rejects_symlinked_deletion_sidecar_root(
+    tmp_path: Path,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
+    profiles_root = hermes_home / "profiles"
+    profiles_root.mkdir(parents=True)
+    blocker = profiles_root / "default"
+    blocker.write_bytes(b"deleted\n")
+    blocker.chmod(0o600)
+
+    outside_root = tmp_path / "outside-deleted-agents"
+    outside_root.mkdir()
+    outside_sidecar = outside_root / "default"
+    outside_sidecar.write_bytes(b"deleted\ncleanup-complete\n")
+    outside_sidecar.chmod(0o644)
+    os.symlink(outside_root, profiles_root / ".deleted-agents")
+
+    result = subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=False,
+        cwd=str(app_root),
+        env=_script_env(),
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "refusing non-directory profile path" in result.stderr
+    assert blocker.read_bytes() == b"deleted\n"
+    assert outside_sidecar.read_bytes() == b"deleted\ncleanup-complete\n"
+    assert outside_sidecar.stat().st_mode & 0o777 == 0o644
+    assert not (env_path.parent / "profile-permissions-v2.done").exists()
+
+
+@pytest.mark.parametrize("name", ["main", "default"])
+def test_prepare_claw_service_checks_reserved_blockers_outside_bounded_scan(
+    tmp_path: Path,
+    name: str,
+):
+    if not _readlink_f_available(tmp_path):
+        pytest.skip("prepare-claw-service.sh uses GNU readlink -f")
+
+    app_root, hermes_home, env_path = _prepare_script_fixture(tmp_path)
+    profiles_root = hermes_home / "profiles"
+    (profiles_root / "agent-a").mkdir(parents=True)
+    (profiles_root / name).write_bytes(b"deleted\n")
+
+    result = subprocess.run(
+        [str(app_root / "prepare-claw-service.sh")],
+        check=False,
+        cwd=str(app_root),
+        env=_script_env(HERMES_PROFILE_PERMISSION_MIGRATION_MAX_PROFILES="1"),
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert f"refusing non-directory profile path: {profiles_root / name}" in result.stderr
+    assert not (env_path.parent / "profile-permissions-v2.done").exists()
+
+
 @pytest.mark.skipif(os.geteuid() != 0, reason="requires root-owned profile tree")
 def test_prepare_claw_service_uses_root_barrier_and_one_time_migration(
     tmp_path: Path,
@@ -1504,6 +1736,119 @@ print(json.dumps(state))
     if sys.platform.startswith("linux"):
         assert state["dumpable"] == 0
         assert state["no_new_privs"] == inherited_no_new_privs
+
+
+def test_zpk_secure_launcher_loads_packaged_site_packages_while_ignoring_pythonpath(
+    tmp_path: Path,
+):
+    repo_root = Path(__file__).resolve().parents[2]
+    launcher = repo_root / "zpk" / "libexec" / "hermes-secure-launcher.py"
+    venv_dir = tmp_path / "venv"
+    bin_dir = venv_dir / "bin"
+    site_packages = (
+        venv_dir
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    attacker_dir = tmp_path / "attacker"
+    bin_dir.mkdir(parents=True)
+    site_packages.mkdir(parents=True)
+    attacker_dir.mkdir()
+
+    (site_packages / "isolated_probe.py").write_text(
+        'ORIGIN = "packaged"\n',
+        encoding="utf-8",
+    )
+    (attacker_dir / "isolated_probe.py").write_text(
+        'ORIGIN = "external"\n',
+        encoding="utf-8",
+    )
+    entry_point = bin_dir / "hermes"
+    entry_point.write_text(
+        """
+import json
+import sys
+
+from isolated_probe import ORIGIN
+
+print(json.dumps({"origin": ORIGIN, "sys_path": sys.path}))
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(attacker_dir)
+    completed = subprocess.run(
+        [sys.executable, "-I", str(launcher), str(entry_point)],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    state = json.loads(completed.stdout)
+    assert state["origin"] == "packaged"
+    assert str(site_packages.resolve()) in state["sys_path"]
+    assert str(attacker_dir.resolve()) not in state["sys_path"]
+
+
+def test_zpk_secure_launcher_fails_closed_without_packaged_site_packages(
+    tmp_path: Path,
+):
+    repo_root = Path(__file__).resolve().parents[2]
+    launcher = repo_root / "zpk" / "libexec" / "hermes-secure-launcher.py"
+    entry_point = tmp_path / "venv" / "bin" / "hermes"
+    entry_point.parent.mkdir(parents=True)
+    entry_point.write_text(
+        'raise AssertionError("entry point must not run")\n',
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-I", str(launcher), str(entry_point)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 127
+    assert completed.stdout == ""
+    assert completed.stderr.strip() == (
+        "packaged Hermes site-packages is unavailable"
+    )
+
+
+def test_zpk_secure_launcher_prioritizes_packaged_dependencies(
+    monkeypatch,
+    tmp_path: Path,
+):
+    launcher = _load_secure_launcher()
+    entry_point = tmp_path / "venv" / "bin" / "hermes"
+    site_packages = (
+        tmp_path
+        / "venv"
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    system_site_packages = tmp_path / "system" / "site-packages"
+    site_packages.mkdir(parents=True)
+    system_site_packages.mkdir(parents=True)
+    original_path = [
+        "/stdlib",
+        str(system_site_packages),
+        str(site_packages),
+    ]
+    monkeypatch.setattr(launcher.sys, "path", original_path)
+
+    launcher._add_packaged_site_packages(entry_point)
+
+    assert launcher.sys.path == [
+        "/stdlib",
+        str(site_packages.resolve()),
+        str(system_site_packages),
+    ]
 
 
 @pytest.mark.skipif(
