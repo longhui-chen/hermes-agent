@@ -17,6 +17,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -24,17 +25,31 @@ logger = logging.getLogger(__name__)
 # (Nous Portal → OpenAI → OpenRouter → …). OpenRouter/Nous run a quality-first
 # model chain and may fall back depending on account access and endpoint behavior,
 # so fidelity can vary by configured backend + model availability.
-_REF_CAPABLE = ("nous", "openai", "openai-codex", "openrouter", "krea")
+_REF_CAPABLE = ("zettlab", "nous", "openai", "openai-codex", "openrouter", "krea")
 
 # Friendly display label per reference-capable provider, surfaced in the desktop
 # pet-gen picker.
 _PROVIDER_LABELS: dict[str, str] = {
+    "zettlab": "Zettlab",
     "nous": "Nous Portal",
     "openrouter": "OpenRouter",
     "openai": "OpenAI",
     "openai-codex": "OpenAI (Codex)",
     "krea": "Krea",
 }
+
+
+def _supports_references(name: str, provider: Any) -> bool:
+    if name != "zettlab":
+        return name in _REF_CAPABLE
+    try:
+        capabilities = provider.capabilities()
+    except Exception:  # noqa: BLE001 - provider discovery is best-effort
+        return False
+    return (
+        "image" in (capabilities.get("modalities") or [])
+        and capabilities.get("supports_inline_image") is True
+    )
 
 
 def _forced_provider_from_env() -> str | None:
@@ -57,7 +72,7 @@ class SpriteProvider:
     """Resolved provider plus whether it can take reference images."""
 
     name: str
-    provider: object
+    provider: Any
     supports_references: bool
 
 
@@ -87,14 +102,19 @@ def resolve_provider(*, require_references: bool = True, prefer: str | None = No
     forced = _forced_provider_from_env()
     if forced:
         chosen = get_provider(forced)
-        if chosen is not None and chosen.is_available():
+        if chosen is not None and chosen.is_available() and _supports_references(forced, chosen):
             return SpriteProvider(name=forced, provider=chosen, supports_references=True)
 
     # An explicit user pick wins when it's reference-capable and has credentials;
     # otherwise we ignore it and fall through to the normal resolution.
     if prefer:
         chosen = get_provider(prefer)
-        if prefer in _REF_CAPABLE and chosen is not None and chosen.is_available():
+        if (
+            prefer in _REF_CAPABLE
+            and chosen is not None
+            and chosen.is_available()
+            and _supports_references(prefer, chosen)
+        ):
             return SpriteProvider(name=prefer, provider=chosen, supports_references=True)
 
     # Configured / active provider first.
@@ -105,13 +125,13 @@ def resolve_provider(*, require_references: bool = True, prefer: str | None = No
         active = None
     if active is not None:
         name = getattr(active, "name", "")
-        if name in _REF_CAPABLE and active.is_available():
+        if name in _REF_CAPABLE and active.is_available() and _supports_references(name, active):
             return SpriteProvider(name=name, provider=active, supports_references=True)
 
     # Any available reference-capable provider.
     for name in _REF_CAPABLE:
         provider = get_provider(name)
-        if provider is not None and provider.is_available():
+        if provider is not None and provider.is_available() and _supports_references(name, provider):
             return SpriteProvider(name=name, provider=provider, supports_references=True)
 
     if not require_references and active is not None and active.is_available():
@@ -146,7 +166,11 @@ def list_sprite_providers() -> list[dict]:
     out: list[dict] = []
     for name in _REF_CAPABLE:
         provider = get_provider(name)
-        if provider is None or not provider.is_available():
+        if (
+            provider is None
+            or not provider.is_available()
+            or not _supports_references(name, provider)
+        ):
             continue
         out.append(
             {
@@ -183,7 +207,7 @@ def generate(
     prompt: str,
     *,
     n: int = 1,
-    reference_images: list[Path] | None = None,
+    reference_images: list[str | Path] | None = None,
     provider: SpriteProvider | None = None,
     prefix: str = "pet_gen",
     aspect_ratio: str = "square",
@@ -206,7 +230,23 @@ def generate(
             "configure OpenAI gpt-image-2 or Krea for pet generation"
         )
 
-    refs = [str(p) for p in (reference_images or [])]
+    raw_refs = list(reference_images or [])
+    refs = [str(reference) for reference in raw_refs]
+    if raw_refs and sprite.name == "zettlab":
+        from plugins.zettlab_media_client import image_path_data_uri
+
+        refs = []
+        for reference in raw_refs:
+            if isinstance(reference, Path):
+                refs.append(image_path_data_uri(reference))
+                continue
+            value = str(reference).strip()
+            if not value.startswith(("data:", "https://")):
+                raise GenerationError(
+                    "Zettlab reference images must come from current-turn media "
+                    "or a runtime-owned generated image"
+                )
+            refs.append(value)
 
     def _run(extra: dict) -> tuple[Path | None, str]:
         kwargs: dict = {"aspect_ratio": aspect_ratio, **extra}

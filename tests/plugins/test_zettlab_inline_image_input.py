@@ -91,7 +91,7 @@ def test_inline_image_input_rejects_remote_url_before_network(monkeypatch):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setattr(
-        client._HTTP_WORKER,
+        client._SESSION,
         "request",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
             AssertionError("remote URL must not be fetched")
@@ -655,23 +655,33 @@ def test_media_worker_parent_watch_uses_cross_platform_parent_sentinel(monkeypat
     assert exits == [1]
 
 
-def test_media_http_session_accepts_base64_sized_request(monkeypatch):
+def test_media_http_session_accepts_base64_sized_request():
     from plugins import zettlab_media_client as client
 
     sentinel = object()
-    monkeypatch.setattr(client._HTTP_WORKER, "request", lambda *args, **kwargs: sentinel)
-    got = client._SESSION.post(
-        "http://127.0.0.1:9090/media/generation-jobs",
-        json={"input_image": "A" * (2 * 1024 * 1024)},
-        timeout=1,
-        allow_redirects=False,
-    )
-    assert got is sentinel
+    class FakeWorker:
+        def request(self, *args, **kwargs):
+            return sentinel
 
-    with pytest.raises(client.ZettlabMediaError, match="request exceeds maximum size"):
-        client._SESSION.post(
+        def close(self):
+            return None
+
+    session = client._MediaHTTPSession(workers=[FakeWorker()])
+    try:
+        got = session.post(
             "http://127.0.0.1:9090/media/generation-jobs",
-            json={"input_image": "A" * client.MAX_MEDIA_REQUEST_BYTES},
+            json={"input_image": "A" * (2 * 1024 * 1024)},
             timeout=1,
             allow_redirects=False,
         )
+        assert got is sentinel
+
+        with pytest.raises(client.ZettlabMediaError, match="request exceeds maximum size"):
+            session.post(
+                "http://127.0.0.1:9090/media/generation-jobs",
+                json={"input_image": "A" * client.MAX_MEDIA_REQUEST_BYTES},
+                timeout=1,
+                allow_redirects=False,
+            )
+    finally:
+        session.close()

@@ -80,10 +80,16 @@ class ZettlabImageGenProvider(ImageGenProvider):
         try:
             cap, model = media_client.selected_model_capability("image")
         except Exception:
-            return {"modalities": ["text"], "max_reference_images": 0}
+            return {
+                "modalities": ["text"],
+                "max_reference_images": 0,
+                "supports_inline_image": False,
+            }
+        modalities = media_client.supported_modalities(cap, model)
         return {
-            "modalities": media_client.supported_modalities(cap, model),
+            "modalities": modalities,
             "max_reference_images": 0,
+            "supports_inline_image": "image" in modalities,
             "image_input_description": (
                 "Pass one PNG, JPEG, or WebP image as a base64 Data URI, absolute "
                 "local file path, or file URL. HTTP(S) URLs are not enabled yet."

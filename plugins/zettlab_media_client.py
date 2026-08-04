@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import atexit
 import base64
+import binascii
 import io
 import ipaddress
 import json
 import multiprocessing
 import os
-import re
+import queue
 import stat
 import threading
 import time
@@ -37,8 +38,8 @@ MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024
 LOCAL_IMAGE_READ_TIMEOUT = 30.0
 ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
 ARTIFACT_SESSION_HEADER = "X-Zettlab-Artifact-Session-Id"
-_STARTER_CAPACITY = threading.BoundedSemaphore(value=2)
-_BASE64_BODY_RE = re.compile(r"[A-Za-z0-9+/]*={0,2}\Z", re.ASCII)
+MAX_MEDIA_HTTP_WORKERS = 2
+_STARTER_CAPACITY = threading.BoundedSemaphore(value=MAX_MEDIA_HTTP_WORKERS)
 _SUPPORTED_IMAGE_MIMES = {"image/png", "image/jpeg", "image/webp"}
 _IMAGE_READ_CHUNK_BYTES = 48 * 1024
 _MAX_LOCAL_IMAGE_PATH_CHARS = 4096
@@ -735,13 +736,44 @@ class _MediaFileWorker:
 class _MediaHTTPSession:
     trust_env = False
 
+    def __init__(self, workers: Optional[List[_MediaHTTPWorker]] = None) -> None:
+        self._workers = (
+            workers
+            if workers is not None
+            else [_MediaHTTPWorker() for _ in range(MAX_MEDIA_HTTP_WORKERS)]
+        )
+        if not self._workers:
+            raise ValueError("media HTTP session requires at least one worker")
+        self._available: queue.LifoQueue[_MediaHTTPWorker] = queue.LifoQueue(
+            maxsize=len(self._workers)
+        )
+        for worker in self._workers:
+            self._available.put_nowait(worker)
+        self._closed = False
+        self._state_lock = threading.Lock()
+
     def request(self, method: str, url: str, *, timeout: float, allow_redirects: bool, **kwargs: Any) -> requests.Response:
         if allow_redirects:
             raise ZettlabMediaError("media HTTP redirects are not allowed")
         payload = kwargs.get("json")
         if payload is not None and len(json.dumps(payload).encode("utf-8")) > MAX_MEDIA_REQUEST_BYTES:
             raise ZettlabMediaError("media generation request exceeds maximum size")
-        return _HTTP_WORKER.request(method, url, deadline=time.monotonic() + timeout, **kwargs)
+        deadline = time.monotonic() + timeout
+        with self._state_lock:
+            if self._closed:
+                raise ZettlabMediaError("media HTTP session is closed")
+        try:
+            worker = self._available.get(timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Empty as exc:
+            raise ZettlabMediaDeadlineError("media HTTP worker capacity exhausted") from exc
+        with self._state_lock:
+            if self._closed:
+                self._available.put_nowait(worker)
+                raise ZettlabMediaError("media HTTP session is closed")
+        try:
+            return worker.request(method, url, deadline=deadline, **kwargs)
+        finally:
+            self._available.put_nowait(worker)
 
     def get(self, url: str, **kwargs: Any) -> requests.Response:
         return self.request("GET", url, **kwargs)
@@ -755,11 +787,18 @@ class _MediaHTTPSession:
     def merge_environment_settings(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return {"proxies": {}}
 
+    def close(self) -> None:
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+        for worker in self._workers:
+            worker.close()
 
-_HTTP_WORKER = _MediaHTTPWorker()
+
 _FILE_WORKER = _MediaFileWorker()
 _SESSION = _MediaHTTPSession()
-atexit.register(_HTTP_WORKER.close)
+atexit.register(_SESSION.close)
 atexit.register(_FILE_WORKER.close)
 
 
@@ -1136,13 +1175,15 @@ def _sniff_image_mime(raw: bytes) -> Optional[str]:
     return None
 
 
-def _validate_image_data_uri(value: str, limit: int) -> str:
-    header, separator, encoded = value.partition(",")
+def validate_inline_image_data_uri(value: str, *, max_bytes: int) -> str:
+    """Validate one bounded PNG/JPEG/WebP base64 data URI."""
+    normalized = str(value or "").strip()
+    header, separator, encoded = normalized.partition(",")
     if not separator or not header.startswith("data:image/") or not header.endswith(";base64"):
         raise ZettlabMediaError(
             "image input must be a local image path or data URI using PNG, JPEG, or WebP"
         )
-    declared_mime = header[len("data:"):-len(";base64")]
+    declared_mime = header[len("data:"):-len(";base64")].lower()
     if declared_mime not in _SUPPORTED_IMAGE_MIMES:
         raise ZettlabMediaError("image data URI must use PNG, JPEG, or WebP")
     if not encoded or len(encoded) % 4 != 0:
@@ -1152,23 +1193,22 @@ def _validate_image_data_uri(value: str, limit: int) -> str:
     decoded_length = len(encoded) // 4 * 3 - padding
     if decoded_length <= 0:
         raise ZettlabMediaError("image data URI must contain image bytes")
-    if decoded_length > limit:
+    if decoded_length > min(max_bytes, MAX_INLINE_IMAGE_BYTES):
         raise ZettlabMediaError("inline image input exceeds maximum size")
-    if _BASE64_BODY_RE.fullmatch(encoded) is None:
-        raise ZettlabMediaError("image data URI must contain valid base64")
-
-    prefix_chars = min(len(encoded), 24)
-    prefix_chars -= prefix_chars % 4
     try:
-        prefix = base64.b64decode(encoded[:prefix_chars], validate=True)
-    except ValueError as exc:
+        raw = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as exc:
         raise ZettlabMediaError("image data URI must contain valid base64") from exc
-    detected_mime = _sniff_image_mime(prefix)
+    detected_mime = _sniff_image_mime(raw)
     if detected_mime is None:
         raise ZettlabMediaError("image data URI does not contain a supported image")
     if detected_mime != declared_mime:
         raise ZettlabMediaError("image data URI MIME type does not match its bytes")
-    return value
+    return normalized
+
+
+def _validate_image_data_uri(value: str, limit: int) -> str:
+    return validate_inline_image_data_uri(value, max_bytes=limit)
 
 
 def _reject_windows_network_or_device_path(source: str) -> None:
@@ -1260,6 +1300,32 @@ def inline_image_input(
         managed_hermes_roots,
         hermes_home_override,
     )
+
+
+def image_path_data_uri(path: os.PathLike[str] | str, *, max_bytes: int = MAX_INLINE_IMAGE_BYTES) -> str:
+    """Encode one runtime-owned regular image file for the inline gateway field."""
+    source = os.fspath(path)
+    limit = min(max_bytes, MAX_INLINE_IMAGE_BYTES)
+    try:
+        if stat.S_ISLNK(os.lstat(source).st_mode):
+            raise ZettlabMediaError("generated image input must not be a symbolic link")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(source, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            metadata = os.fstat(handle.fileno())
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ZettlabMediaError("generated image input must be a regular file")
+            if metadata.st_size <= 0 or metadata.st_size > limit:
+                raise ZettlabMediaError("generated image input exceeds maximum size")
+            raw = handle.read(limit + 1)
+    except OSError as exc:
+        raise ZettlabMediaError(f"unable to read generated image input: {exc}") from exc
+    if not raw or len(raw) > limit or len(raw) != metadata.st_size:
+        raise ZettlabMediaError("generated image input exceeds maximum size")
+    mime = _sniff_image_mime(raw)
+    if mime is None:
+        raise ZettlabMediaError("generated image input must be PNG, JPEG, or WebP")
+    return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
 
 
 def create_and_wait(
