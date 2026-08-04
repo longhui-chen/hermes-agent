@@ -116,3 +116,47 @@ def test_unusable_output_dir_falls_back_to_process_cwd(_managed_gateway, monkeyp
 
     assert resolved.is_absolute()
     assert resolved == (daemon_home / "notes.md").resolve()
+
+
+class TestV4AHeaderRewrite:
+    """V4A header 路径必须换成本层已解析、已加锁、已过 scope 检查的绝对路径。
+
+    shell 层按自己的 cwd 解析相对 header，和本层的解析基准不是同一个——检查的
+    文件和真正被 patch 的文件因此可能不是一个（Codex review P1）。
+    """
+
+    def test_update_header_uses_resolved_path(self):
+        patch = "*** Begin Patch\n*** Update File: notes.md\n@@\n-a\n+b\n*** End Patch"
+        out = ft._rewrite_v4a_header_paths(patch, {"notes.md": "/out/notes.md"})
+        assert "*** Update File: /out/notes.md" in out
+        assert "-a\n+b" in out
+
+    def test_move_header_rewrites_both_endpoints(self):
+        patch = "*** Begin Patch\n*** Move File: a.txt -> b.txt\n*** End Patch"
+        out = ft._rewrite_v4a_header_paths(
+            patch, {"a.txt": "/out/a.txt", "b.txt": "/out/b.txt"}
+        )
+        assert "*** Move File: /out/a.txt -> /out/b.txt" in out
+
+    def test_unresolved_path_is_left_alone(self):
+        patch = "*** Begin Patch\n*** Add File: keep.md\n*** End Patch"
+        assert ft._rewrite_v4a_header_paths(patch, {"other.md": "/out/other.md"}) == patch
+        assert ft._rewrite_v4a_header_paths(patch, {}) == patch
+
+    def test_body_lines_are_never_touched(self):
+        # 正文里出现同名字符串不能被当成 header 改掉。
+        patch = (
+            "*** Begin Patch\n*** Update File: x.py\n@@\n-print('x.py')\n"
+            "+print('x.py updated')\n*** End Patch"
+        )
+        out = ft._rewrite_v4a_header_paths(patch, {"x.py": "/out/x.py"})
+        assert "*** Update File: /out/x.py" in out
+        assert "-print('x.py')" in out
+        assert "+print('x.py updated')" in out
+
+    def test_no_space_after_asterisks_still_rewritten(self):
+        # patch_parser 容忍 ``***Update File:``，路径检查也按这个宽松度做，
+        # 重写漏掉它就会让一条能跑通的 patch 绕过重写。
+        patch = "*** Begin Patch\n***Update File: notes.md\n*** End Patch"
+        out = ft._rewrite_v4a_header_paths(patch, {"notes.md": "/out/notes.md"})
+        assert "/out/notes.md" in out

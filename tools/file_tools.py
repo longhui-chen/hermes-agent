@@ -2016,6 +2016,42 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         return tool_error(str(e))
 
 
+_V4A_FILE_HEADER = r'^(\*\*\*\s*(?:Update|Add|Delete)\s+File:\s*)(.+)$'
+_V4A_MOVE_HEADER = r'^(\*\*\*\s*Move\s+File:\s*)(.+?)(\s*->\s*)(.+)$'
+
+
+def _rewrite_v4a_header_paths(patch: str, resolved: dict[str, str]) -> str:
+    """Replace V4A header paths with the absolute paths already resolved here.
+
+    Header paths are what the shell layer acts on, and it anchors a relative one
+    against its own cwd — a different base than this layer used for locking and
+    the scope pre-check. Rewriting keeps one answer for "which file". Headers
+    whose path did not resolve are left untouched so the existing error path
+    still reports them.
+    """
+
+    if not resolved:
+        return patch
+    import re as _re
+
+    def _swap(raw: str) -> str:
+        return resolved.get(raw.strip()) or raw
+
+    def _file_header(match: "re.Match[str]") -> str:
+        return match.group(1) + _swap(match.group(2))
+
+    def _move_header(match: "re.Match[str]") -> str:
+        return (
+            match.group(1)
+            + _swap(match.group(2))
+            + match.group(3)
+            + _swap(match.group(4))
+        )
+
+    patch = _re.sub(_V4A_MOVE_HEADER, _move_header, patch, flags=_re.MULTILINE)
+    return _re.sub(_V4A_FILE_HEADER, _file_header, patch, flags=_re.MULTILINE)
+
+
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                new_string: str = None, replace_all: bool = False, patch: str = None,
                task_id: str = "default", cross_profile: bool = False,
@@ -2139,7 +2175,14 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             elif mode == "patch":
                 if not patch:
                     return tool_error("patch content required")
-                result = file_ops.patch_v4a(patch)
+                # Same reason as ``replace`` above: the headers carry the paths
+                # the shell layer will act on, and it resolves a relative one
+                # against its own cwd. Rewrite them to the paths this layer
+                # already resolved, locked and scope-checked, so both layers
+                # agree on which files the patch touches.
+                result = file_ops.patch_v4a(
+                    _rewrite_v4a_header_paths(patch, _path_to_resolved)
+                )
             else:
                 return tool_error(f"Unknown mode: {mode}")
 
