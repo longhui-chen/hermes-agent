@@ -80,6 +80,49 @@ def test_agent_output_alias_is_resolved_before_snapshot_gate_and_execution_flow(
     sys.platform.startswith("win"),
     reason="terminal process hardening is Linux-only in the current repository",
 )
+def test_agent_output_alias_rejects_non_local_backend_before_execution(
+    monkeypatch, tmp_path
+):
+    import model_tools
+    from tools import terminal_tool
+
+    output_dir = tmp_path / "agent-output"
+    output_dir.mkdir()
+    monkeypatch.setenv("ZET_AGENT_OUTPUT_DIR", str(output_dir))
+    monkeypatch.setattr(registry_module, "_zettlab_snapshot_gate", lambda *_args: None)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_env_config",
+        lambda: {
+            "env_type": "docker",
+            "cwd": "/root",
+            "timeout": 30,
+            "docker_image": "unused",
+        },
+    )
+
+    def fail_if_environment_starts(**_kwargs):
+        raise AssertionError("non-local environment must not start")
+
+    monkeypatch.setattr(terminal_tool, "_create_environment", fail_if_environment_starts)
+
+    result = json.loads(
+        model_tools.handle_function_call(
+            "terminal",
+            {"command": "pwd", "workdir": "agent_output"},
+            task_id="agent-output-non-local-flow",
+            turn_id="agent-output-non-local-flow-turn",
+        )
+    )
+
+    assert result["error_type"] == "runtime_workdir"
+    assert "local terminal backend" in result["error"]
+
+
+@pytest.mark.skipif(
+    sys.platform.startswith("win"),
+    reason="terminal process hardening is Linux-only in the current repository",
+)
 def test_real_terminal_executes_in_agent_output_workdir_flow(monkeypatch, tmp_path):
     import model_tools
     from tools import terminal_tool

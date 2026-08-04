@@ -11,6 +11,12 @@ def test_non_alias_workdir_is_unchanged(monkeypatch):
     assert resolve_runtime_workdir("./project") == "./project"
 
 
+def test_agent_output_alias_requires_an_exact_match(monkeypatch):
+    monkeypatch.setenv("ZET_AGENT_OUTPUT_DIR", "/ignored/platform/path")
+
+    assert resolve_runtime_workdir(" agent_output ") == " agent_output "
+
+
 def test_agent_output_alias_resolves_to_existing_absolute_directory(
     monkeypatch, tmp_path
 ):

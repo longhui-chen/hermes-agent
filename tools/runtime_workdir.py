@@ -27,7 +27,7 @@ def resolve_runtime_workdir(
     environment outside multiplex mode); arbitrary variables embedded in
     either the argument or platform value are never expanded.
     """
-    if not isinstance(workdir, str) or workdir.strip() != AGENT_OUTPUT_WORKDIR:
+    if workdir != AGENT_OUTPUT_WORKDIR:
         return workdir
 
     if environ is None:

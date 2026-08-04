@@ -266,18 +266,25 @@ def _zettlab_snapshot_gate(name: str, args: dict, kwargs: dict) -> Optional[str]
         return None
 
 
+class _ResolvedRuntimeToolArgs(dict):
+    """Dispatch-local arguments carrying semantic resolution metadata."""
+
+    agent_output_workdir = False
+
+
 def _resolve_runtime_tool_args(name: str, args: dict) -> dict:
     """Resolve platform-owned semantic arguments before any execution gate."""
     if name != "terminal" or not isinstance(args, dict):
         return args
 
-    from tools.runtime_workdir import resolve_runtime_workdir
+    from tools.runtime_workdir import AGENT_OUTPUT_WORKDIR, resolve_runtime_workdir
 
     workdir = args.get("workdir")
-    resolved_workdir = resolve_runtime_workdir(workdir)
-    if resolved_workdir == workdir:
+    if workdir != AGENT_OUTPUT_WORKDIR:
         return args
-    resolved_args = dict(args)
+    resolved_workdir = resolve_runtime_workdir(workdir)
+    resolved_args = _ResolvedRuntimeToolArgs(args)
+    resolved_args.agent_output_workdir = True
     resolved_args["workdir"] = resolved_workdir
     return resolved_args
 

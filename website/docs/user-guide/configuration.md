@@ -2082,9 +2082,11 @@ Platform-managed deployments can also expose `workdir: agent_output` on an
 individual `terminal` call. Hermes resolves that fixed semantic alias from the
 active agent profile's `ZET_AGENT_OUTPUT_DIR`, verifies that it is an existing
 absolute directory, and uses the resolved path for both filesystem protection
-and command execution. The alias is unavailable when the platform has not
-provisioned the directory; Hermes does not expand arbitrary environment
-variables supplied as workdir values.
+and command execution. This semantic alias is limited to the `local` terminal
+backend because the platform path is host-local; container and remote backends
+must use an explicit path that is visible inside that backend. The alias is
+unavailable when the platform has not provisioned the directory; Hermes does
+not expand arbitrary environment variables supplied as workdir values.
 
 ## Network
 
