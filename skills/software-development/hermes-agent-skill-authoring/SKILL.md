@@ -86,44 +86,17 @@ Common quality failures:
 
 ## Invoking Bundled Scripts (hard requirement)
 
-Never write a relative path to a script the skill ships. The working directory a
-command runs in is **not** the skill package — on Zettlab devices it is the
-agent's own output directory, so `python scripts/x.py` cannot find the script at
-all. Relative paths only ever worked when the model happened to convert them
-using the injected skill directory, which is a soft, per-model behaviour.
+A skill must never reference its own scripts by a relative path: the working
+directory a command runs in is not the skill package, so `python scripts/x.py`
+simply does not find the file. The same asymmetry applies to a command's data
+arguments — a file one tool wrote is not necessarily where another tool looks.
 
-Use the `${HERMES_SKILL_DIR}` template variable. It is substituted with the
-package's absolute path when SKILL.md loads:
-
-```
-python3 "${HERMES_SKILL_DIR}/scripts/search.py" --query "..."
-bash "${HERMES_SKILL_DIR}/scripts/setup.sh"
-```
-
-Rules:
-
-- Spell it exactly `${HERMES_SKILL_DIR}` — a bare `SKILL_DIR` or a missing brace
-  is not substituted and fails silently as a literal path.
-- Quote the expansion. The substituted path may contain spaces.
-- Prefer `python3` over `python`; the latter is absent on some device images.
-- Only for scripts **this package ships**. Paths into a cloned repository, the
-  user's project, or `/tmp` are not skill paths — leave those relative to
-  whatever the surrounding steps establish.
-- If the command needs a scratch working directory rather than a script path,
-  declare it on the terminal call (`workdir='agent_output'`) instead of assuming
-  one; commands that do not declare one anchor to the agent's output directory.
-
-Two places the variable does **not** reach — writing it there leaves a literal
-`${HERMES_SKILL_DIR}` on screen:
-
-- **Frontmatter** (`setup.help` and friends). Substitution runs over the body
-  that `skill_commands` loads; setup metadata is read straight off the parsed
-  YAML. Describe the script by name there and keep the runnable command in the
-  body.
-- **Supporting files** under `references/`, `templates/` and package `README`s.
-  `skill_view` reads those verbatim. Either keep their paths relative and say
-  once, in SKILL.md, that they are relative to the package root, or repeat the
-  runnable form in SKILL.md itself.
+The exact syntax, the quoting rule, and the two places substitution does not
+reach are in `references/script-paths.md`. Read it before writing any step that
+runs a shipped script. It is a supporting file rather than part of this body
+because template substitution rewrites placeholders in SKILL.md bodies — spelled
+out here, the examples would arrive as one machine's absolute path instead of
+the syntax they are meant to teach.
 
 ## Peer-Matched Structure
 

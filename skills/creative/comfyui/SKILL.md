@@ -148,6 +148,13 @@ python3 "${HERMES_SKILL_DIR}/scripts/extract_schema.py" workflow_api.json
 
 ### Step 3: Run with parameters
 
+> **Pass absolute paths for `--workflow`, `--input-image` and `--output-dir`.**
+> These resolve against the terminal's working directory, which is not
+> necessarily where a `write_file` call just put the workflow JSON — a relative
+> argument can send the script looking in one place while the file sits in
+> another, and drop outputs somewhere nothing collects them. The examples below
+> use short names for readability; substitute real absolute paths when running.
+
 ```bash
 # Local (defaults to http://127.0.0.1:8188)
 python3 "${HERMES_SKILL_DIR}/scripts/run_workflow.py" \
