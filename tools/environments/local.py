@@ -1531,30 +1531,24 @@ def build_camera_runtime_env() -> dict[str, str]:
     session. Generic subprocesses continue to have all of these values
     stripped by :func:`_apply_profile_secret_scope_env`.
     """
-    from agent.secret_scope import get_secret
-    from gateway.session_context import (
-        business_execution_token,
-        get_session_env,
-    )
+    try:
+        from agent.zet_agent_response_mode import trusted_camera_runtime_receipt
 
-    # CameraService binds the business capability to the exact Hermes lineage
-    # (X-Hermes-Session-Id), not the stable App routing key.  The two values are
-    # intentionally different on the API-server path.  Keep the legacy
-    # HERMES_SESSION_KEY alias populated with the lineage id so already deployed
-    # camsnap v0.1.0/v0.1.1 helpers remain compatible during a rolling update.
-    session_id = (
-        get_session_env("HERMES_SESSION_ID", "").strip()
-        or get_session_env("HERMES_SESSION_KEY", "").strip()
-    )
-
+        frozen_receipt = dict(trusted_camera_runtime_receipt())
+    except Exception:
+        frozen_receipt = {}
+    session_id = str(frozen_receipt.get("HERMES_SESSION_KEY", "") or "").strip()
     env = {
-        "ZET_AGENT_ID": str(get_secret("ZET_AGENT_ID", "") or "").strip(),
+        "ZET_AGENT_ID": str(frozen_receipt.get("ZET_AGENT_ID", "") or "").strip(),
         "ZETTLAB_AGENT_ACTION_TOKEN": str(
-            get_secret("ZETTLAB_AGENT_ACTION_TOKEN", "") or ""
+            frozen_receipt.get("ZETTLAB_AGENT_ACTION_TOKEN", "") or ""
         ).strip(),
-        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": business_execution_token(),
-        "HERMES_TURN_ID": get_session_env("HERMES_TURN_ID", "").strip(),
+        "ZETTLAB_BUSINESS_EXECUTION_TOKEN": str(
+            frozen_receipt.get("ZETTLAB_BUSINESS_EXECUTION_TOKEN", "") or ""
+        ).strip(),
+        "HERMES_TURN_ID": str(frozen_receipt.get("HERMES_TURN_ID", "") or "").strip(),
         "HERMES_SESSION_ID": session_id,
+        # Keep the legacy alias for already deployed camsnap v0.1.x helpers.
         "HERMES_SESSION_KEY": session_id,
     }
     limits = {

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from agent import zet_agent_response_mode as response_mode
 from agent.secret_scope import reset_secret_scope, set_secret_scope
 from gateway.session_context import (
     clear_session_vars,
@@ -104,11 +105,17 @@ def _bind_receipt():
         turn_id="turn-1",
         business_execution_token=BUSINESS_TOKEN,
     )
-    return secret_token, session_tokens, turn_tokens
+    turn_identity = response_mode._current_skill_direct_turn_identity()
+    assert turn_identity is not None
+    receipt = response_mode._capture_trusted_execution_receipt(turn_identity)
+    assert receipt is not None
+    receipt_token = response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(receipt)
+    return secret_token, session_tokens, turn_tokens, receipt_token
 
 
 def _clear_receipt(tokens) -> None:
-    secret_token, session_tokens, turn_tokens = tokens
+    secret_token, session_tokens, turn_tokens, receipt_token = tokens
+    response_mode._TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.reset(receipt_token)
     clear_turn_vars(turn_tokens)
     clear_session_vars(session_tokens)
     reset_secret_scope(secret_token)
