@@ -1207,3 +1207,48 @@ def test_managed_profile_runtime_migrates_previous_identity_output(
     assert carried.read_text() == "earlier run"
     assert carried.stat().st_uid == uid
     assert carried.stat().st_gid == gid
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(os, "geteuid") or os.geteuid() != 0,
+    reason="requires root POSIX ownership semantics",
+)
+def test_managed_profile_runtime_grants_skills_without_output(monkeypatch, request):
+    """output 是可选能力，skills 放权不是。
+
+    平台没注入 ZET_AGENT_OUTPUT_DIR 时提前返回会连带跳过 skills 放权，非
+    `python <abs>` 的技能入口拿不到 per-command 兜底，在设备上 permission denied。
+    """
+    tmp_path = Path(tempfile.mkdtemp(prefix="hermes-nooutput-test-", dir="/run"))
+    request.addfinalizer(lambda: shutil.rmtree(tmp_path, ignore_errors=True))
+    os.chmod(tmp_path, 0o755)
+    hermes_root = tmp_path / "hermes_home"
+    profiles_root = hermes_root / "profiles"
+    profile_home = profiles_root / "agent-a"
+    skills_root = profile_home / "skills"
+    shell_pkg = skills_root / "shell-suite"
+    shell_script = shell_pkg / "run.sh"
+    shell_pkg.mkdir(parents=True)
+    shell_script.write_text("echo ok")
+    for path in (hermes_root, profiles_root, profile_home, skills_root, shell_pkg):
+        os.chmod(path, 0o700)
+    os.chmod(shell_script, 0o600)
+
+    monkeypatch.setattr(local_module, "_IS_WINDOWS", False)
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setenv("ZET_AGENT_KEY", "device-key")
+    local_module._MANAGED_TERMINAL_SCOPE_BY_UID.clear()
+    local_module._MANAGED_SKILL_TREE_PREPARED.clear()
+    env = {"HERMES_HOME": str(profile_home)}  # 平台未注入 output
+
+    local_module._prepare_managed_profile_runtime(env)
+    _uid, gid = local_module._managed_terminal_identity(env)
+
+    assert stat.S_IMODE(hermes_root.stat().st_mode) == 0o711
+    assert stat.S_IMODE(profiles_root.stat().st_mode) == 0o711
+    assert profile_home.stat().st_gid == gid
+    assert skills_root.stat().st_gid == gid
+    assert stat.S_IMODE(skills_root.stat().st_mode) == 0o750
+    assert shell_pkg.stat().st_gid == gid
+    assert shell_script.stat().st_gid == gid
+    assert stat.S_IMODE(shell_script.stat().st_mode) == 0o640

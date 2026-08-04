@@ -1358,9 +1358,6 @@ def _prepare_managed_profile_runtime(env: Mapping[str, str]) -> None:
     skill tree is additionally bind-mounted read-only in the child namespace.
     """
 
-    output_text = str(env.get("ZET_AGENT_OUTPUT_DIR") or "").strip()
-    if not output_text:
-        return
     uid, gid = _managed_terminal_identity(env)
     try:
         profile_home = _validate_managed_root_directory_chain(
@@ -1369,25 +1366,11 @@ def _prepare_managed_profile_runtime(env: Mapping[str, str]) -> None:
         profiles_root = profile_home.parent
         hermes_root = profiles_root.parent
         skills_root = profile_home / "skills"
-        output_raw = Path(output_text)
-        output_dir = output_raw.resolve(strict=True)
     except (OSError, RuntimeError) as exc:
         raise OSError("managed profile runtime paths are unavailable") from exc
 
     if profiles_root.name != "profiles":
         raise OSError("managed profile runtime scope is invalid")
-    if output_raw != output_dir or output_dir.name != "output":
-        raise OSError("managed profile output is invalid")
-    if output_dir.parent.name != profile_home.name:
-        raise OSError("managed profile output does not match the active profile")
-    _validate_managed_root_directory_chain(output_dir.parent)
-    output_parent_info = os.lstat(output_dir.parent)
-    if (
-        not stat.S_ISDIR(output_parent_info.st_mode)
-        or output_parent_info.st_uid != 0
-        or output_parent_info.st_mode & 0o022
-    ):
-        raise OSError("managed profile output parent is not trusted")
 
     for common in (hermes_root, profiles_root):
         info = os.lstat(common)
@@ -1434,6 +1417,31 @@ def _prepare_managed_profile_runtime(env: Mapping[str, str]) -> None:
             logger.warning(
                 "managed skill tree preparation skipped: %s", exc
             )
+
+    # output 是可选能力，skills 放权不是。平台没注入 ZET_AGENT_OUTPUT_DIR 时提前
+    # 返回会连带跳过上面整段——非 `python <abs>` 的技能入口（bash / ./run.sh /
+    # python -m / 包内数据读取）拿不到 per-command 兜底，会在设备上 permission
+    # denied。缺一个 workdir 别名不该让技能运行面一起失效（HR2/HR5）。
+    output_text = str(env.get("ZET_AGENT_OUTPUT_DIR") or "").strip()
+    if not output_text:
+        return
+    try:
+        output_raw = Path(output_text)
+        output_dir = output_raw.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise OSError("managed profile output path is unavailable") from exc
+    if output_raw != output_dir or output_dir.name != "output":
+        raise OSError("managed profile output is invalid")
+    if output_dir.parent.name != profile_home.name:
+        raise OSError("managed profile output does not match the active profile")
+    _validate_managed_root_directory_chain(output_dir.parent)
+    output_parent_info = os.lstat(output_dir.parent)
+    if (
+        not stat.S_ISDIR(output_parent_info.st_mode)
+        or output_parent_info.st_uid != 0
+        or output_parent_info.st_mode & 0o022
+    ):
+        raise OSError("managed profile output parent is not trusted")
 
     output_info = os.lstat(output_dir)
     # 属主判定与 _managed_output_is_trusted 同一条规则：root、本身份、或任何
