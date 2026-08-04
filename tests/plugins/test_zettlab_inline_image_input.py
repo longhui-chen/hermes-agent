@@ -19,6 +19,19 @@ def _capability(limit: int = 1024):
     }
 
 
+def _register_local_artifact(client, path, task_id: str = "session-local") -> str:
+    location = client.first_asset_location(
+        {
+            "job_id": "job-source",
+            "assets": [{"local_path": str(path), "persisted": True}],
+        },
+        prefer_local=True,
+        session_id=task_id,
+    )
+    assert location == str(path)
+    return task_id
+
+
 @pytest.mark.parametrize(
     ("raw", "mime"),
     [(PNG, "image/png"), (JPEG, "image/jpeg"), (WEBP, "image/webp")],
@@ -28,8 +41,14 @@ def test_inline_image_input_encodes_supported_local_file(tmp_path, monkeypatch, 
 
     image_path = tmp_path / "source.bin"
     image_path.write_bytes(raw)
+    task_id = _register_local_artifact(client, image_path)
 
-    got = client.inline_image_input(str(image_path), None, _capability())
+    got = client.inline_image_input(
+        str(image_path),
+        None,
+        _capability(),
+        task_id=task_id,
+    )
 
     assert got == f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
 
@@ -102,6 +121,59 @@ def test_inline_image_input_rejects_windows_network_and_device_paths_before_read
         client.inline_image_input(value, None, _capability())
 
 
+@pytest.mark.parametrize("task_id", [None, "session-local"])
+def test_inline_image_input_rejects_unregistered_local_path_before_read(
+    tmp_path,
+    monkeypatch,
+    task_id,
+):
+    from plugins import zettlab_media_client as client
+
+    image_path = tmp_path / "untrusted.png"
+    image_path.write_bytes(PNG)
+    monkeypatch.setattr(
+        client._FILE_WORKER,
+        "read",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("untrusted local path must be rejected before file handling")
+        ),
+    )
+
+    with pytest.raises(client.ZettlabMediaError, match="not authorized"):
+        client.inline_image_input(
+            str(image_path),
+            None,
+            _capability(),
+            task_id=task_id,
+        )
+
+
+def test_inline_image_input_does_not_share_artifact_authority_between_sessions(
+    tmp_path,
+    monkeypatch,
+):
+    from plugins import zettlab_media_client as client
+
+    image_path = tmp_path / "generated.png"
+    image_path.write_bytes(PNG)
+    _register_local_artifact(client, image_path, task_id="session-owner")
+    monkeypatch.setattr(
+        client._FILE_WORKER,
+        "read",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cross-session path must be rejected before file handling")
+        ),
+    )
+
+    with pytest.raises(client.ZettlabMediaError, match="not authorized"):
+        client.inline_image_input(
+            str(image_path),
+            None,
+            _capability(),
+            task_id="session-other",
+        )
+
+
 def test_inline_image_input_rejects_oversize_and_multiple_inputs():
     from plugins import zettlab_media_client as client
 
@@ -133,6 +205,7 @@ def test_inline_image_input_rejects_oversize_file_before_encoding(tmp_path, monk
 
     image_path = tmp_path / "oversize.png"
     image_path.write_bytes(PNG + b"x" * client.MAX_INLINE_IMAGE_BYTES)
+    task_id = _register_local_artifact(client, image_path)
     monkeypatch.setattr(
         base64,
         "b64encode",
@@ -146,6 +219,7 @@ def test_inline_image_input_rejects_oversize_file_before_encoding(tmp_path, monk
             str(image_path),
             None,
             _capability(limit=16 * 1024 * 1024),
+            task_id=task_id,
         )
 
 
@@ -155,9 +229,15 @@ def test_inline_image_input_rejects_fifo_without_blocking(tmp_path):
 
     fifo_path = tmp_path / "image.fifo"
     os.mkfifo(fifo_path)
+    task_id = _register_local_artifact(client, fifo_path)
 
     with pytest.raises(client.ZettlabMediaError, match="regular file"):
-        client.inline_image_input(str(fifo_path), None, _capability())
+        client.inline_image_input(
+            str(fifo_path),
+            None,
+            _capability(),
+            task_id=task_id,
+        )
 
 
 def test_inline_image_input_preserves_file_safety_guard_in_worker(tmp_path):
@@ -165,9 +245,36 @@ def test_inline_image_input_preserves_file_safety_guard_in_worker(tmp_path):
 
     blocked_path = tmp_path / ".env"
     blocked_path.write_bytes(PNG)
+    task_id = _register_local_artifact(client, blocked_path)
 
     with pytest.raises(ValueError, match="Access denied"):
-        client.inline_image_input(str(blocked_path), None, _capability())
+        client.inline_image_input(
+            str(blocked_path),
+            None,
+            _capability(),
+            task_id=task_id,
+        )
+
+
+def test_inline_image_input_does_not_follow_registered_symlink(tmp_path):
+    from plugins import zettlab_media_client as client
+
+    target_path = tmp_path / "target.png"
+    target_path.write_bytes(PNG)
+    symlink_path = tmp_path / "generated.png"
+    try:
+        symlink_path.symlink_to(target_path)
+    except (NotImplementedError, OSError):
+        pytest.skip("symlinks are unavailable")
+    task_id = _register_local_artifact(client, symlink_path)
+
+    with pytest.raises(client.ZettlabMediaError, match="regular file"):
+        client.inline_image_input(
+            str(symlink_path),
+            None,
+            _capability(),
+            task_id=task_id,
+        )
 
 
 def test_media_file_worker_terminates_stalled_read_and_recovers(monkeypatch):

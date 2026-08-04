@@ -85,8 +85,9 @@ class ZettlabImageGenProvider(ImageGenProvider):
             "modalities": media_client.supported_modalities(cap, model),
             "max_reference_images": 0,
             "image_input_description": (
-                "Pass one absolute local PNG, JPEG, or WebP file path, or a standard "
-                "base64 image Data URI. Remote URLs are not supported by Zettlab."
+                "Pass one base64 PNG, JPEG, or WebP Data URI, or an absolute local "
+                "path returned by prior Zettlab media generation in this session. "
+                "Other local paths and remote URLs are not supported by Zettlab."
             ),
         }
 
@@ -121,8 +122,14 @@ class ZettlabImageGenProvider(ImageGenProvider):
             )
 
         try:
+            session_id = kwargs.get("_task_id")
             refs = normalize_reference_images(reference_image_urls)
-            input_image = media_client.inline_image_input(image_url, refs, model_capability)
+            input_image = media_client.inline_image_input(
+                image_url,
+                refs,
+                model_capability,
+                task_id=session_id,
+            )
             configured_modalities = media_client.normalized_modalities(model_capability)
             if not input_image and "text" not in configured_modalities:
                 if "image" in configured_modalities:
@@ -152,7 +159,6 @@ class ZettlabImageGenProvider(ImageGenProvider):
             resolutions = _capability_strings(model_capability, "resolutions")
             if resolutions:
                 payload["resolution"] = resolutions[0]
-            session_id = kwargs.get("_task_id")
             job = media_client.create_and_wait(
                 media_type="image",
                 model=model,
@@ -161,7 +167,11 @@ class ZettlabImageGenProvider(ImageGenProvider):
                 payload=payload,
                 session_id=session_id,
             )
-            image = media_client.first_asset_location(job, prefer_local=bool(session_id))
+            image = media_client.first_asset_location(
+                job,
+                prefer_local=bool(session_id),
+                session_id=session_id,
+            )
         except Exception as exc:
             return error_response(
                 error=f"Zettlab image generation failed: {exc}",

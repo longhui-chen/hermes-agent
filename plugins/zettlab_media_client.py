@@ -18,6 +18,7 @@ import re
 import stat
 import threading
 import time
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, urlunparse
 
@@ -40,6 +41,11 @@ _STARTER_CAPACITY = threading.BoundedSemaphore(value=2)
 _BASE64_BODY_RE = re.compile(r"[A-Za-z0-9+/]*={0,2}\Z", re.ASCII)
 _SUPPORTED_IMAGE_MIMES = {"image/png", "image/jpeg", "image/webp"}
 _IMAGE_READ_CHUNK_BYTES = 48 * 1024
+_MAX_TRUSTED_ARTIFACT_SESSIONS = 512
+_MAX_TRUSTED_ARTIFACTS_PER_SESSION = 32
+_MAX_LOCAL_IMAGE_PATH_CHARS = 4096
+_TRUSTED_LOCAL_ARTIFACTS_LOCK = threading.Lock()
+_TRUSTED_LOCAL_ARTIFACTS: OrderedDict[str, OrderedDict[str, None]] = OrderedDict()
 
 
 class ZettlabMediaError(RuntimeError):
@@ -349,12 +355,25 @@ def _media_file_worker(
         if not os.path.isabs(path):
             raise ZettlabMediaError("local image input must use an absolute path")
         raise_if_read_blocked(path)
-        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+        source_stat = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise ZettlabMediaError("local image input must be a regular file")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
         descriptor = os.open(path, flags)
         with os.fdopen(descriptor, "rb") as image_file:
             file_stat = os.fstat(image_file.fileno())
             if not stat.S_ISREG(file_stat.st_mode):
                 raise ZettlabMediaError("local image input must be a regular file")
+            if (file_stat.st_dev, file_stat.st_ino) != (
+                source_stat.st_dev,
+                source_stat.st_ino,
+            ):
+                raise ZettlabMediaError("local image input changed while opening")
             if file_stat.st_size <= 0:
                 raise ZettlabMediaError("local image input must contain image bytes")
             if file_stat.st_size > limit:
@@ -1017,6 +1036,58 @@ def _reject_windows_network_or_device_path(source: str) -> None:
         )
 
 
+def _trusted_artifact_task_key(task_id: Optional[str]) -> Optional[str]:
+    key = str(task_id or "").strip()
+    if not key or len(key) > 512 or any(ord(char) < 0x20 for char in key):
+        return None
+    return key
+
+
+def _trusted_local_artifact_key(source: str) -> Optional[str]:
+    raw = str(source or "").strip()
+    if not raw or len(raw) > _MAX_LOCAL_IMAGE_PATH_CHARS or "\x00" in raw:
+        return None
+    _reject_windows_network_or_device_path(raw)
+    parsed = urlparse(raw)
+    if parsed.scheme in {"http", "https"} or parsed.netloc:
+        return None
+    expanded = os.path.expanduser(raw)
+    if not os.path.isabs(expanded):
+        return None
+    return os.path.normcase(os.path.normpath(expanded))
+
+
+def _register_trusted_local_artifact(task_id: Optional[str], source: str) -> None:
+    """Remember a persisted media output as readable by its owning session."""
+    task_key = _trusted_artifact_task_key(task_id)
+    artifact_key = _trusted_local_artifact_key(source)
+    if task_key is None or artifact_key is None:
+        return
+    with _TRUSTED_LOCAL_ARTIFACTS_LOCK:
+        artifacts = _TRUSTED_LOCAL_ARTIFACTS.pop(task_key, OrderedDict())
+        artifacts.pop(artifact_key, None)
+        artifacts[artifact_key] = None
+        while len(artifacts) > _MAX_TRUSTED_ARTIFACTS_PER_SESSION:
+            artifacts.popitem(last=False)
+        _TRUSTED_LOCAL_ARTIFACTS[task_key] = artifacts
+        while len(_TRUSTED_LOCAL_ARTIFACTS) > _MAX_TRUSTED_ARTIFACT_SESSIONS:
+            _TRUSTED_LOCAL_ARTIFACTS.popitem(last=False)
+
+
+def _is_trusted_local_artifact(task_id: Optional[str], source: str) -> bool:
+    task_key = _trusted_artifact_task_key(task_id)
+    artifact_key = _trusted_local_artifact_key(source)
+    if task_key is None or artifact_key is None:
+        return False
+    with _TRUSTED_LOCAL_ARTIFACTS_LOCK:
+        artifacts = _TRUSTED_LOCAL_ARTIFACTS.get(task_key)
+        if artifacts is None or artifact_key not in artifacts:
+            return False
+        artifacts.move_to_end(artifact_key)
+        _TRUSTED_LOCAL_ARTIFACTS.move_to_end(task_key)
+        return True
+
+
 def _local_image_data_uri(source: str, limit: int) -> str:
     raw = _FILE_WORKER.read(
         source,
@@ -1033,6 +1104,8 @@ def inline_image_input(
     image_url: Optional[str],
     reference_image_urls: Optional[List[str]],
     model_capability: Optional[Dict[str, Any]],
+    *,
+    task_id: Optional[str] = None,
 ) -> Optional[str]:
     """Return one bounded inline image accepted by the gateway's v1 contract."""
     if isinstance(reference_image_urls, str):
@@ -1059,6 +1132,11 @@ def inline_image_input(
     if parsed.scheme in {"http", "https"} or parsed.netloc:
         raise ZettlabMediaError(
             "image input must be a local image path or data URI; remote URLs are not supported"
+        )
+    if not _is_trusted_local_artifact(task_id, source):
+        raise ZettlabMediaError(
+            "local image path is not authorized for this session; use a base64 data URI "
+            "or a path returned by prior Zettlab media generation"
         )
     return _local_image_data_uri(source, limit)
 
@@ -1286,10 +1364,17 @@ def first_asset_local_path(job: Dict[str, Any]) -> str:
     )
 
 
-def first_asset_location(job: Dict[str, Any], *, prefer_local: bool) -> str:
+def first_asset_location(
+    job: Dict[str, Any],
+    *,
+    prefer_local: bool,
+    session_id: Optional[str] = None,
+) -> str:
     if prefer_local:
         try:
-            return first_asset_local_path(job)
+            path = first_asset_local_path(job)
+            _register_trusted_local_artifact(session_id, path)
+            return path
         except ZettlabMediaError:
             pass
     return first_asset_url(job)

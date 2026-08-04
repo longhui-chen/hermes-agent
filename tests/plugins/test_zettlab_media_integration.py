@@ -183,6 +183,7 @@ def test_local_image_dispatches_through_both_generation_tools(tmp_path, monkeypa
 
     image_path = tmp_path / "source.png"
     image_path.write_bytes(b"\x89PNG\r\n\x1a\nsource-image")
+    task_id = "zettlab:user:main:session-local"
     image_gen_registry._reset_for_tests()
     video_gen_registry._reset_for_tests()
     image_gen_registry.register_provider(ZettlabImageGenProvider())
@@ -213,11 +214,18 @@ def test_local_image_dispatches_through_both_generation_tools(tmp_path, monkeypa
         },
     }
     requests = []
-    monkeypatch.setattr(
-        client._SESSION,
-        "get",
-        lambda url, timeout, allow_redirects, stream: _Resp(capabilities),
-    )
+    def fake_get(url, timeout, allow_redirects, stream, headers=None):
+        if url.endswith("/media/generation-capabilities"):
+            return _Resp(capabilities)
+        media_type = "image" if url.endswith("job-image") else "video"
+        extension = "png" if media_type == "image" else "mp4"
+        return _Resp({
+            "job_id": f"job-{media_type}",
+            "status": "done",
+            "assets": [{"url": f"https://cdn.example/generated.{extension}"}],
+        })
+
+    monkeypatch.setattr(client._SESSION, "get", fake_get)
 
     def fake_post(url, json, headers, timeout, allow_redirects, stream):
         requests.append(json)
@@ -231,15 +239,24 @@ def test_local_image_dispatches_through_both_generation_tools(tmp_path, monkeypa
 
     monkeypatch.setattr(client._SESSION, "post", fake_post)
 
+    assert client.first_asset_location(
+        {
+            "job_id": "job-source",
+            "assets": [{"local_path": str(image_path), "persisted": True}],
+        },
+        prefer_local=True,
+        session_id=task_id,
+    ) == str(image_path)
+
     image_result = json.loads(image_tool._handle_image_generate({
         "prompt": "edit this image",
         "image_url": str(image_path),
-    }))
+    }, task_id=task_id))
     video_result = json.loads(video_tool._handle_video_generate({
         "prompt": "animate this image",
         "image_url": str(image_path),
         "duration": 5,
-    }))
+    }, task_id=task_id))
 
     assert image_result["success"] is True
     assert image_result["modality"] == "image"
