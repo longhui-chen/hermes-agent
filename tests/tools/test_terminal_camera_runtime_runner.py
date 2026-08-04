@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import textwrap
+import types
 from pathlib import Path
 
 import pytest
@@ -15,6 +16,7 @@ from gateway.session_context import (
     set_turn_vars,
 )
 from tools import terminal_tool as terminal_tool_module
+from tools import zettlab_snapshot_guard
 from tools.environments.local import build_camera_runtime_env
 
 
@@ -136,6 +138,42 @@ def test_camera_runtime_parser_accepts_only_fixed_actions(monkeypatch, tmp_path)
         terminal_tool_module._parse_camera_runtime_command(command) is None
         for command in rejected
     )
+
+
+def test_camera_runtime_flow_bypasses_generic_cwd_snapshot(monkeypatch, tmp_path):
+    _write_camera_runtime(tmp_path)
+    monkeypatch.setenv("ZETTLAB_PRESETS_DIR", str(tmp_path / "presets"))
+    monkeypatch.setenv(
+        "ZET_CHAT_APPEND_URL",
+        "http://127.0.0.1:19090/api/v1/internal/chat/append",
+    )
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", ACTION_TOKEN)
+    monkeypatch.setenv("TERMINAL_CWD", "/root")
+    monkeypatch.setattr(
+        zettlab_snapshot_guard,
+        "_OPENER",
+        types.SimpleNamespace(
+            open=lambda *_args, **_kwargs: pytest.fail(
+                "trusted camera action must not request a cwd snapshot"
+            )
+        ),
+    )
+    zettlab_snapshot_guard.reset_for_test()
+    try:
+        result = zettlab_snapshot_guard.maybe_require_snapshot(
+            "terminal",
+            {
+                "command": (
+                    'python3 "$ZETTLAB_PRESETS_DIR/skills/camsnap/scripts/'
+                    'camera_connector.py" list'
+                )
+            },
+            turn_id="turn-1",
+        )
+    finally:
+        zettlab_snapshot_guard.reset_for_test()
+
+    assert result is None
 
 
 def test_camera_runtime_env_is_request_and_profile_scoped():
