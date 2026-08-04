@@ -210,3 +210,33 @@ class TestOpsPathBackendScoping:
         monkeypatch.setattr(ft, "_terminal_env_type_for_task", lambda _t="default": "ssh")
         monkeypatch.setattr(ft, "_authoritative_workspace_root", lambda _t="default": None)
         assert ft._ops_uses_resolved_paths("t") is False
+
+
+def test_relative_path_cannot_escape_into_a_sibling_agent_output(
+    _managed_gateway, monkeypatch
+):
+    """受管终端把每个 agent 的 output 归自己 UID、0700，shell 天然进不去别人的
+    产出；但文件工具跑在 root 网关进程里没有这层保护，而相对路径此刻正锚在自己
+    的 output 上（HR3）。"""
+    output, _daemon_home = _managed_gateway
+    agents_root = output.parent.parent
+    sibling = agents_root / "agent-b" / "output"
+    sibling.mkdir(parents=True)
+    (sibling / "secret.md").write_text("theirs", encoding="utf-8")
+    monkeypatch.setenv("ZET_AGENT_OUTPUT_DIR", str(output))
+
+    denied = ft._managed_sibling_profile_error(
+        "../../agent-b/output/secret.md", task_id="mux-session"
+    )
+    assert denied is not None
+    assert "another agent's data directory" in denied
+
+    # 自己 output 里的相对路径照常放行。
+    assert ft._managed_sibling_profile_error("notes.md", task_id="mux-session") is None
+    # 绝对路径不走这个锚点，交给正常的 scope gate。
+    assert (
+        ft._managed_sibling_profile_error(
+            str(output / "notes.md"), task_id="mux-session"
+        )
+        is None
+    )

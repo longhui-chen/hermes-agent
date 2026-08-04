@@ -747,6 +747,28 @@ def _managed_sibling_profile_error(
                 f"Refusing access to managed sibling profile path: {filepath}\n"
                 "Agent file tools are confined to the active profile."
             )
+
+    # 同一条约束的另一半：agent 产出树。受管终端把每个 agent 的 output 归自己的
+    # UID、0700，所以 shell 天然进不去别人的产出；但文件工具跑在 root 网关进程里
+    # 没有这层保护，而相对路径此刻正锚在自己的 output 上——`../../agent-b/output/x`
+    # 就直接读到隔壁 agent 的产物（HR3）。绝对路径不受影响：它们不用这个锚点，
+    # 照常走 scope gate。
+    own_output = _managed_gateway_output_dir()
+    if own_output:
+        own_output = os.path.normpath(os.path.realpath(own_output))
+        agents_root = os.path.dirname(os.path.dirname(own_output))
+        own_agent_dir = os.path.dirname(own_output)
+        if os.path.isabs(agents_root) and os.path.basename(own_output) == "output":
+            for candidate in candidates:
+                if not _path_within(candidate, agents_root):
+                    continue
+                if _path_within(candidate, own_agent_dir):
+                    continue
+                return (
+                    f"Refusing access to another agent's data directory: {filepath}\n"
+                    "Relative paths are anchored to this agent's own output "
+                    "directory; pass an absolute path for files elsewhere."
+                )
     return None
 
 
