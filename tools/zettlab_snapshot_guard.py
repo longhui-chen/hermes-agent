@@ -549,6 +549,11 @@ def _managed_effective_workdir(cwd: str) -> str:
     两边各自推导则会漂移成「快照拍在 A、命令跑在 B」，那正是本守卫要防的裂缝。
     非受管 / Windows / 模块缺失时原样返回，绝不抛。
     """
+    # 只有 local backend 的命令才会经过 _managed_terminal_cwd。容器 / 远端
+    # backend 下套用本机解析，会把已映射的容器 cwd 判成不可用而改锚到本机
+    # output 目录——命令仍在容器里跑，快照却拍在宿主机，正是要防的分叉。
+    if _terminal_env_type() != "local":
+        return cwd
     try:
         from tools.environments.local import managed_effective_cwd
 
