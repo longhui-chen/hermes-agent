@@ -622,6 +622,16 @@ def _interpreter_shutting_down(exc: Optional[BaseException] = None) -> bool:
     """
     if sys.is_finalizing():
         return True
+    try:
+        # Set by threading._shutdown() before finalization; while it joins
+        # still-running executor threads the daemon ticker keeps ticking, so
+        # this window can be seconds wide, not a hair.
+        from concurrent.futures import thread as _cf_thread
+
+        if _cf_thread._shutdown:
+            return True
+    except Exception:
+        pass
     if exc is not None:
         # Match the SHORT prefix deliberately: CPython emits two shutdown
         # variants — "cannot schedule new futures after interpreter shutdown"
@@ -4282,6 +4292,13 @@ def tick(
     try:
         if can_dispatch is not None and not can_dispatch():
             logger.debug("Cron dispatch paused while gateway drains existing work")
+            return 0
+
+        # Before get_due_jobs(): it and the pre-dispatch advance both persist next_run_at.
+        if _interpreter_shutting_down():
+            logger.warning(
+                "Cron tick skipped — interpreter is shutting down; due jobs stay untouched for the next healthy tick"
+            )
             return 0
 
         due_jobs = get_due_jobs()
