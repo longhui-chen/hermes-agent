@@ -33,12 +33,13 @@ MAX_ERROR_RESPONSE_BYTES = 64 * 1024
 MAX_MEDIA_REQUEST_BYTES = 7 * 1024 * 1024
 MAX_MEDIA_RESPONSE_BYTES = 1024 * 1024
 MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024
+LOCAL_IMAGE_READ_TIMEOUT = 30.0
 ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
 ARTIFACT_SESSION_HEADER = "X-Zettlab-Artifact-Session-Id"
 _STARTER_CAPACITY = threading.BoundedSemaphore(value=2)
 _BASE64_BODY_RE = re.compile(r"[A-Za-z0-9+/]*={0,2}\Z", re.ASCII)
 _SUPPORTED_IMAGE_MIMES = {"image/png", "image/jpeg", "image/webp"}
-_IMAGE_ENCODE_CHUNK_BYTES = 48 * 1024
+_IMAGE_READ_CHUNK_BYTES = 48 * 1024
 
 
 class ZettlabMediaError(RuntimeError):
@@ -53,6 +54,47 @@ def _watch_parent(parent_pid: int) -> None:
     while os.getppid() == parent_pid:
         time.sleep(0.2)
     os._exit(1)
+
+
+def _dispose_worker_process(process: Any, *, force: bool) -> None:
+    alive = False
+    try:
+        alive = process.is_alive()
+    except (AssertionError, OSError, ValueError):
+        pass
+    if force and alive:
+        try:
+            process.terminate()
+        except (AssertionError, OSError, ValueError):
+            pass
+    try:
+        process.join(timeout=0.2)
+    except (AssertionError, OSError, ValueError):
+        pass
+    try:
+        alive = process.is_alive()
+    except (AssertionError, OSError, ValueError):
+        alive = False
+    if alive:
+        try:
+            process.kill()
+        except (AssertionError, OSError, ValueError):
+            pass
+        try:
+            process.join(timeout=0.2)
+        except (AssertionError, OSError, ValueError):
+            pass
+    try:
+        process.close()
+    except (AssertionError, OSError, ValueError):
+        pass
+
+
+def _safe_close_worker_resource(resource: Any) -> None:
+    try:
+        resource.close()
+    except (OSError, ValueError):
+        pass
 
 
 def _media_http_worker(connection: Any, parent_pid: int, request_buffer: Any, request_length: int) -> None:
@@ -264,44 +306,11 @@ class _MediaHTTPWorker:
 
     @staticmethod
     def _dispose_process(process: Any, *, force: bool) -> None:
-        alive = False
-        try:
-            alive = process.is_alive()
-        except (AssertionError, OSError, ValueError):
-            pass
-        if force and alive:
-            try:
-                process.terminate()
-            except (AssertionError, OSError, ValueError):
-                pass
-        try:
-            process.join(timeout=0.2)
-        except (AssertionError, OSError, ValueError):
-            pass
-        try:
-            alive = process.is_alive()
-        except (AssertionError, OSError, ValueError):
-            alive = False
-        if alive:
-            try:
-                process.kill()
-            except (AssertionError, OSError, ValueError):
-                pass
-            try:
-                process.join(timeout=0.2)
-            except (AssertionError, OSError, ValueError):
-                pass
-        try:
-            process.close()
-        except (AssertionError, OSError, ValueError):
-            pass
+        _dispose_worker_process(process, force=force)
 
     @staticmethod
     def _safe_close(resource: Any) -> None:
-        try:
-            resource.close()
-        except (OSError, ValueError):
-            pass
+        _safe_close_worker_resource(resource)
 
     @staticmethod
     def _response_from_result(url: str, result: Dict[str, Any]) -> requests.Response:
@@ -317,6 +326,237 @@ class _MediaHTTPWorker:
         response.url = url
         response.raw = io.BytesIO(result.get("body") or b"")
         return response
+
+
+def _media_file_worker(
+    connection: Any,
+    parent_pid: int,
+    source: str,
+    limit: int,
+    result_buffer: Any,
+) -> None:
+    threading.Thread(target=_watch_parent, args=(parent_pid,), daemon=True).start()
+    result: Dict[str, Any]
+    try:
+        from agent.file_safety import raise_if_read_blocked
+
+        path = os.path.expanduser(source)
+        if not os.path.isabs(path):
+            raise ZettlabMediaError("local image input must use an absolute path")
+        raise_if_read_blocked(path)
+        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as image_file:
+            file_stat = os.fstat(image_file.fileno())
+            if not stat.S_ISREG(file_stat.st_mode):
+                raise ZettlabMediaError("local image input must be a regular file")
+            if file_stat.st_size <= 0:
+                raise ZettlabMediaError("local image input must contain image bytes")
+            if file_stat.st_size > limit:
+                raise ZettlabMediaError("inline image input exceeds maximum size")
+            total = 0
+            while True:
+                chunk = image_file.read(min(_IMAGE_READ_CHUNK_BYTES, limit - total + 1))
+                if not chunk:
+                    break
+                new_total = total + len(chunk)
+                if new_total > limit:
+                    raise ZettlabMediaError("inline image input exceeds maximum size")
+                result_buffer[total:new_total] = chunk
+                total = new_total
+        if total <= 0:
+            raise ZettlabMediaError("local image input must contain image bytes")
+        result = {"length": total}
+    except ValueError as exc:
+        result = {"error": "blocked", "message": str(exc)}
+    except ZettlabMediaError as exc:
+        result = {"error": "media", "message": str(exc)}
+    except OSError as exc:
+        result = {"error": "media", "message": f"unable to read local image input: {exc}"}
+    except Exception as exc:
+        result = {"error": "internal", "message": str(exc)}
+    try:
+        connection.send(result)
+    except (BrokenPipeError, EOFError, OSError):
+        pass
+    finally:
+        connection.close()
+
+
+class _MediaFileWorker:
+    def __init__(self) -> None:
+        self._context = multiprocessing.get_context("spawn")
+        self._lock = threading.Lock()
+        self._process: Any = None
+        self._connection: Any = None
+        self._buffer: Any = None
+
+    def read(self, source: str, limit: int, *, deadline: float) -> bytes:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not self._lock.acquire(timeout=remaining):
+            raise ZettlabMediaDeadlineError(
+                "local image read deadline exceeded while waiting"
+            )
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ZettlabMediaDeadlineError(
+                    "local image read deadline exceeded before start"
+                )
+            self._ensure_started(source, limit, deadline)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._reset(force=True)
+                    raise ZettlabMediaDeadlineError("local image read deadline exceeded")
+                if is_interrupted():
+                    self._reset(force=True)
+                    raise ZettlabMediaError("media generation interrupted")
+                try:
+                    ready = self._connection.poll(min(0.1, remaining))
+                except (EOFError, OSError) as exc:
+                    self._reset(force=True)
+                    raise ZettlabMediaError("local image worker poll failed") from exc
+                if not ready:
+                    if not self._process.is_alive():
+                        try:
+                            if self._connection.poll(0):
+                                result = self._connection.recv()
+                                try:
+                                    return self._bytes_from_result(result, limit)
+                                finally:
+                                    self._reset(force=False)
+                        except (EOFError, OSError) as exc:
+                            self._reset(force=True)
+                            raise ZettlabMediaError(
+                                "local image worker result read failed"
+                            ) from exc
+                        self._reset(force=True)
+                        raise ZettlabMediaError("local image worker exited unexpectedly")
+                    continue
+                try:
+                    result = self._connection.recv()
+                except (EOFError, OSError) as exc:
+                    self._reset(force=True)
+                    raise ZettlabMediaError("local image worker closed unexpectedly") from exc
+                try:
+                    return self._bytes_from_result(result, limit)
+                finally:
+                    self._reset(force=False)
+        finally:
+            self._lock.release()
+
+    def close(self) -> None:
+        self._reset(force=True)
+
+    def _ensure_started(self, source: str, limit: int, deadline: float) -> None:
+        if self._process is not None and self._process.is_alive():
+            return
+        self._reset(force=True)
+        if limit <= 0 or time.monotonic() >= deadline:
+            raise ZettlabMediaDeadlineError("local image process start deadline exceeded")
+        finished = threading.Event()
+        cancelled = threading.Event()
+        state_lock = threading.Lock()
+        state: Dict[str, Any] = {}
+
+        def cleanup(resources: Dict[str, Any]) -> None:
+            parent = resources.get("parent")
+            child = resources.get("child")
+            process = resources.get("process")
+            if parent is not None:
+                _safe_close_worker_resource(parent)
+            if child is not None:
+                _safe_close_worker_resource(child)
+            if process is not None:
+                _dispose_worker_process(process, force=True)
+
+        def start_process() -> None:
+            resources: Dict[str, Any] = {}
+            try:
+                result_buffer = self._context.RawArray("B", limit)
+                parent, child = self._context.Pipe()
+                resources.update(parent=parent, child=child, buffer=result_buffer)
+                process = self._context.Process(
+                    target=_media_file_worker,
+                    args=(child, os.getpid(), source, limit, result_buffer),
+                    daemon=True,
+                )
+                resources["process"] = process
+                process.start()
+            except Exception as exc:
+                resources["failure"] = exc
+            finally:
+                try:
+                    with state_lock:
+                        should_cleanup = cancelled.is_set()
+                        if not should_cleanup:
+                            state.update(resources)
+                        finished.set()
+                    if should_cleanup or resources.get("failure") is not None:
+                        cleanup(resources)
+                finally:
+                    _STARTER_CAPACITY.release()
+
+        if not _STARTER_CAPACITY.acquire(blocking=False):
+            raise ZettlabMediaDeadlineError("local image process starter capacity exhausted")
+        try:
+            threading.Thread(
+                target=start_process,
+                name="zettlab-media-file-spawn",
+                daemon=True,
+            ).start()
+        except Exception:
+            _STARTER_CAPACITY.release()
+            raise
+        while not finished.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic()))):
+            if time.monotonic() >= deadline or is_interrupted():
+                with state_lock:
+                    cancelled.set()
+                    cleanup_now = dict(state) if finished.is_set() else None
+                if cleanup_now:
+                    cleanup(cleanup_now)
+                if is_interrupted():
+                    raise ZettlabMediaError("media generation interrupted")
+                raise ZettlabMediaDeadlineError(
+                    "local image process start deadline exceeded"
+                )
+        if time.monotonic() >= deadline:
+            cleanup(state)
+            raise ZettlabMediaDeadlineError("local image process start deadline exceeded")
+        if state.get("failure") is not None:
+            raise ZettlabMediaError("local image process failed to start") from state["failure"]
+        _safe_close_worker_resource(state["child"])
+        self._connection = state["parent"]
+        self._process = state["process"]
+        self._buffer = state["buffer"]
+
+    def _reset(self, *, force: bool) -> None:
+        connection, process = self._connection, self._process
+        self._connection = None
+        self._process = None
+        self._buffer = None
+        if connection is not None:
+            _safe_close_worker_resource(connection)
+        if process is not None:
+            _dispose_worker_process(process, force=force)
+
+    def _bytes_from_result(self, result: Dict[str, Any], limit: int) -> bytes:
+        error = result.get("error")
+        if error == "blocked":
+            raise ValueError(result.get("message") or "local image read denied")
+        if error:
+            raise ZettlabMediaError(result.get("message") or "local image read failed")
+        length = result.get("length")
+        if (
+            not isinstance(length, int)
+            or isinstance(length, bool)
+            or length <= 0
+            or length > limit
+            or self._buffer is None
+        ):
+            raise ZettlabMediaError("local image worker returned an invalid result")
+        return bytes(self._buffer[:length])
 
 
 class _MediaHTTPSession:
@@ -344,8 +584,10 @@ class _MediaHTTPSession:
 
 
 _HTTP_WORKER = _MediaHTTPWorker()
+_FILE_WORKER = _MediaFileWorker()
 _SESSION = _MediaHTTPSession()
 atexit.register(_HTTP_WORKER.close)
+atexit.register(_FILE_WORKER.close)
 
 
 def _config_section(media_type: str) -> Dict[str, Any]:
@@ -756,52 +998,30 @@ def _validate_image_data_uri(value: str, limit: int) -> str:
     return value
 
 
-def _local_image_data_uri(source: str, limit: int) -> str:
-    from agent.file_safety import raise_if_read_blocked
+def _reject_windows_network_or_device_path(source: str) -> None:
+    normalized = source.replace("/", "\\")
+    folded = normalized.casefold()
+    if (
+        normalized.startswith("\\\\")
+        or folded.startswith("\\??\\")
+        or folded.startswith("\\device\\")
+        or folded.startswith("\\global??\\")
+    ):
+        raise ZettlabMediaError(
+            "Windows network and device paths are not supported for image input"
+        )
 
-    raise_if_read_blocked(source)
-    path = os.path.expanduser(source)
-    if not os.path.isabs(path):
-        raise ZettlabMediaError("local image input must use an absolute path")
-    encoded = io.StringIO()
-    total = 0
-    prefix = bytearray()
-    remainder = b""
-    try:
-        flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_CLOEXEC", 0)
-        descriptor = os.open(path, flags)
-        with os.fdopen(descriptor, "rb") as image_file:
-            file_stat = os.fstat(image_file.fileno())
-            if not stat.S_ISREG(file_stat.st_mode):
-                raise ZettlabMediaError("local image input must be a regular file")
-            if file_stat.st_size <= 0:
-                raise ZettlabMediaError("local image input must contain image bytes")
-            if file_stat.st_size > limit:
-                raise ZettlabMediaError("inline image input exceeds maximum size")
-            while True:
-                chunk = image_file.read(_IMAGE_ENCODE_CHUNK_BYTES)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > limit:
-                    raise ZettlabMediaError("inline image input exceeds maximum size")
-                if len(prefix) < 16:
-                    prefix.extend(chunk[:16 - len(prefix)])
-                pending = remainder + chunk
-                aligned_length = len(pending) - len(pending) % 3
-                if aligned_length:
-                    encoded.write(base64.b64encode(pending[:aligned_length]).decode("ascii"))
-                remainder = pending[aligned_length:]
-    except ZettlabMediaError:
-        raise
-    except OSError as exc:
-        raise ZettlabMediaError(f"unable to read local image input: {exc}") from exc
-    if remainder:
-        encoded.write(base64.b64encode(remainder).decode("ascii"))
-    mime = _sniff_image_mime(bytes(prefix))
-    if total <= 0 or mime is None:
+
+def _local_image_data_uri(source: str, limit: int) -> str:
+    raw = _FILE_WORKER.read(
+        source,
+        limit,
+        deadline=time.monotonic() + LOCAL_IMAGE_READ_TIMEOUT,
+    )
+    mime = _sniff_image_mime(raw[:16])
+    if mime is None:
         raise ZettlabMediaError("local image input must be a PNG, JPEG, or WebP file")
-    return f"data:{mime};base64,{encoded.getvalue()}"
+    return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
 
 
 def inline_image_input(
@@ -829,6 +1049,7 @@ def inline_image_input(
     source = candidates[0]
     if source.startswith("data:"):
         return _validate_image_data_uri(source, limit)
+    _reject_windows_network_or_device_path(source)
     parsed = urlparse(source)
     if parsed.scheme in {"http", "https"} or parsed.netloc:
         raise ZettlabMediaError(

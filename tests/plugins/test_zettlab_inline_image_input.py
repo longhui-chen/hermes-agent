@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import os
+import time
 
 import pytest
 
@@ -23,17 +24,13 @@ def _capability(limit: int = 1024):
     [(PNG, "image/png"), (JPEG, "image/jpeg"), (WEBP, "image/webp")],
 )
 def test_inline_image_input_encodes_supported_local_file(tmp_path, monkeypatch, raw, mime):
-    from agent import file_safety
     from plugins import zettlab_media_client as client
 
     image_path = tmp_path / "source.bin"
     image_path.write_bytes(raw)
-    checked = []
-    monkeypatch.setattr(file_safety, "raise_if_read_blocked", checked.append)
 
     got = client.inline_image_input(str(image_path), None, _capability())
 
-    assert checked == [str(image_path)]
     assert got == f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
 
 
@@ -73,6 +70,35 @@ def test_inline_image_input_rejects_unsafe_or_invalid_values(value, message):
     from plugins import zettlab_media_client as client
 
     with pytest.raises(client.ZettlabMediaError, match=message):
+        client.inline_image_input(value, None, _capability())
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        r"\\server\share\image.png",
+        r"//server/share/image.png",
+        r"\\?\UNC\server\share\image.png",
+        r"\\.\C:\image.png",
+        r"\??\C:\image.png",
+        r"\Device\Mup\server\share\image.png",
+    ],
+)
+def test_inline_image_input_rejects_windows_network_and_device_paths_before_read(
+    monkeypatch,
+    value,
+):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setattr(
+        client._FILE_WORKER,
+        "read",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unsafe Windows path must be rejected before file handling")
+        ),
+    )
+
+    with pytest.raises(client.ZettlabMediaError, match="network and device paths"):
         client.inline_image_input(value, None, _capability())
 
 
@@ -132,6 +158,140 @@ def test_inline_image_input_rejects_fifo_without_blocking(tmp_path):
 
     with pytest.raises(client.ZettlabMediaError, match="regular file"):
         client.inline_image_input(str(fifo_path), None, _capability())
+
+
+def test_inline_image_input_preserves_file_safety_guard_in_worker(tmp_path):
+    from plugins import zettlab_media_client as client
+
+    blocked_path = tmp_path / ".env"
+    blocked_path.write_bytes(PNG)
+
+    with pytest.raises(ValueError, match="Access denied"):
+        client.inline_image_input(str(blocked_path), None, _capability())
+
+
+def test_media_file_worker_terminates_stalled_read_and_recovers(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    class FakeProcess:
+        def __init__(self, *, alive=True):
+            self.alive = alive
+            self.terminated = False
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.terminated = True
+            self.alive = False
+
+        def join(self, timeout=None):
+            return None
+
+        def kill(self):
+            self.alive = False
+
+        def close(self):
+            return None
+
+    class FakeConnection:
+        def __init__(self, result=None):
+            self.result = result
+            self.closed = False
+
+        def poll(self, timeout):
+            if self.result is None:
+                time.sleep(timeout)
+                return False
+            return True
+
+        def recv(self):
+            return self.result
+
+        def close(self):
+            self.closed = True
+
+    stalled_process = FakeProcess()
+    stalled_connection = FakeConnection()
+    recovered_process = FakeProcess(alive=False)
+    recovered_connection = FakeConnection({"length": len(PNG)})
+    attempts = iter(
+        [
+            (stalled_process, stalled_connection, b""),
+            (recovered_process, recovered_connection, PNG),
+        ]
+    )
+    worker = client._MediaFileWorker()
+
+    def start_next_worker(source, limit, deadline):
+        process, connection, payload = next(attempts)
+        worker._process = process
+        worker._connection = connection
+        worker._buffer = bytearray(limit)
+        worker._buffer[: len(payload)] = payload
+
+    monkeypatch.setattr(worker, "_ensure_started", start_next_worker)
+
+    started = time.monotonic()
+    with pytest.raises(client.ZettlabMediaDeadlineError, match="deadline exceeded"):
+        worker.read("/stalled/image.png", 1024, deadline=time.monotonic() + 0.05)
+    assert time.monotonic() - started < 0.15
+    assert stalled_process.terminated is True
+    assert stalled_connection.closed is True
+
+    assert worker.read("/recovered/image.png", 1024, deadline=time.monotonic() + 1) == PNG
+    worker.close()
+
+
+def test_media_file_worker_interrupt_terminates_read(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    class FakeProcess:
+        alive = True
+        terminated = False
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.terminated = True
+            self.alive = False
+
+        def join(self, timeout=None):
+            return None
+
+        def kill(self):
+            self.alive = False
+
+        def close(self):
+            return None
+
+    class FakeConnection:
+        closed = False
+
+        def poll(self, timeout):
+            return False
+
+        def close(self):
+            self.closed = True
+
+    worker = client._MediaFileWorker()
+    process = FakeProcess()
+    connection = FakeConnection()
+
+    def start_worker(source, limit, deadline):
+        worker._process = process
+        worker._connection = connection
+        worker._buffer = bytearray(limit)
+
+    monkeypatch.setattr(worker, "_ensure_started", start_worker)
+    monkeypatch.setattr(client, "is_interrupted", lambda: True)
+
+    with pytest.raises(client.ZettlabMediaError, match="interrupted"):
+        worker.read("/stalled/image.png", 1024, deadline=time.monotonic() + 1)
+
+    assert process.terminated is True
+    assert connection.closed is True
 
 
 def test_media_http_session_accepts_base64_sized_request(monkeypatch):
