@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import atexit
 import base64
+import hashlib
 import io
 import ipaddress
 import json
@@ -19,7 +20,7 @@ import stat
 import threading
 import time
 from collections import OrderedDict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, urlunparse
 
 import requests
@@ -45,7 +46,12 @@ _MAX_TRUSTED_ARTIFACT_SESSIONS = 512
 _MAX_TRUSTED_ARTIFACTS_PER_SESSION = 32
 _MAX_LOCAL_IMAGE_PATH_CHARS = 4096
 _TRUSTED_LOCAL_ARTIFACTS_LOCK = threading.Lock()
-_TRUSTED_LOCAL_ARTIFACTS: OrderedDict[str, OrderedDict[str, None]] = OrderedDict()
+_FileFingerprint = Tuple[int, int, int, int, str]
+_ArtifactScopeKey = Tuple[str, str]
+_TRUSTED_LOCAL_ARTIFACTS: OrderedDict[
+    _ArtifactScopeKey,
+    OrderedDict[str, _FileFingerprint],
+] = OrderedDict()
 
 
 class ZettlabMediaError(RuntimeError):
@@ -345,6 +351,7 @@ def _media_file_worker(
     source: str,
     limit: int,
     result_buffer: Any,
+    expected_fingerprint: Optional[_FileFingerprint],
 ) -> None:
     threading.Thread(target=_watch_parent, args=(parent_pid,), daemon=True).start()
     result: Dict[str, Any]
@@ -379,6 +386,7 @@ def _media_file_worker(
             if file_stat.st_size > limit:
                 raise ZettlabMediaError("inline image input exceeds maximum size")
             total = 0
+            digest = hashlib.sha256()
             while True:
                 chunk = image_file.read(min(_IMAGE_READ_CHUNK_BYTES, limit - total + 1))
                 if not chunk:
@@ -387,10 +395,37 @@ def _media_file_worker(
                 if new_total > limit:
                     raise ZettlabMediaError("inline image input exceeds maximum size")
                 result_buffer[total:new_total] = chunk
+                digest.update(chunk)
                 total = new_total
+            final_stat = os.fstat(image_file.fileno())
+            initial_signature = (
+                file_stat.st_dev,
+                file_stat.st_ino,
+                file_stat.st_size,
+                file_stat.st_mtime_ns,
+            )
+            final_signature = (
+                final_stat.st_dev,
+                final_stat.st_ino,
+                final_stat.st_size,
+                final_stat.st_mtime_ns,
+            )
+            if final_signature != initial_signature:
+                raise ZettlabMediaError("local image input changed while reading")
         if total <= 0:
             raise ZettlabMediaError("local image input must contain image bytes")
-        result = {"length": total}
+        fingerprint: _FileFingerprint = (
+            int(final_stat.st_dev),
+            int(final_stat.st_ino),
+            total,
+            int(final_stat.st_mtime_ns),
+            digest.hexdigest(),
+        )
+        if expected_fingerprint is not None and fingerprint != tuple(expected_fingerprint):
+            raise ZettlabMediaError(
+                "local image artifact no longer matches its authorized content"
+            )
+        result = {"length": total, "fingerprint": list(fingerprint)}
     except ValueError as exc:
         result = {"error": "blocked", "message": str(exc)}
     except ZettlabMediaError as exc:
@@ -415,7 +450,46 @@ class _MediaFileWorker:
         self._connection: Any = None
         self._buffer: Any = None
 
-    def read(self, source: str, limit: int, *, deadline: float) -> bytes:
+    def read(
+        self,
+        source: str,
+        limit: int,
+        *,
+        deadline: float,
+        expected_fingerprint: Optional[_FileFingerprint] = None,
+    ) -> bytes:
+        raw, _ = self._read_with_optional_fingerprint(
+            source,
+            limit,
+            deadline=deadline,
+            expected_fingerprint=expected_fingerprint,
+        )
+        return raw
+
+    def read_with_fingerprint(
+        self,
+        source: str,
+        limit: int,
+        *,
+        deadline: float,
+    ) -> tuple[bytes, _FileFingerprint]:
+        raw, fingerprint = self._read_with_optional_fingerprint(
+            source,
+            limit,
+            deadline=deadline,
+        )
+        if fingerprint is None:
+            raise ZettlabMediaError("local image worker returned no file fingerprint")
+        return raw, fingerprint
+
+    def _read_with_optional_fingerprint(
+        self,
+        source: str,
+        limit: int,
+        *,
+        deadline: float,
+        expected_fingerprint: Optional[_FileFingerprint] = None,
+    ) -> tuple[bytes, Optional[_FileFingerprint]]:
         remaining = deadline - time.monotonic()
         if remaining <= 0 or not self._lock.acquire(timeout=remaining):
             raise ZettlabMediaDeadlineError(
@@ -427,7 +501,15 @@ class _MediaFileWorker:
                 raise ZettlabMediaDeadlineError(
                     "local image read deadline exceeded before start"
                 )
-            self._ensure_started(source, limit, deadline)
+            if expected_fingerprint is None:
+                self._ensure_started(source, limit, deadline)
+            else:
+                self._ensure_started(
+                    source,
+                    limit,
+                    deadline,
+                    expected_fingerprint=expected_fingerprint,
+                )
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -447,7 +529,7 @@ class _MediaFileWorker:
                             if self._connection.poll(0):
                                 result = self._connection.recv()
                                 try:
-                                    return self._bytes_from_result(result, limit)
+                                    return self._value_from_result(result, limit)
                                 finally:
                                     self._reset(force=False)
                         except (EOFError, OSError) as exc:
@@ -464,7 +546,7 @@ class _MediaFileWorker:
                     self._reset(force=True)
                     raise ZettlabMediaError("local image worker closed unexpectedly") from exc
                 try:
-                    return self._bytes_from_result(result, limit)
+                    return self._value_from_result(result, limit)
                 finally:
                     self._reset(force=False)
         finally:
@@ -473,7 +555,14 @@ class _MediaFileWorker:
     def close(self) -> None:
         self._reset(force=True)
 
-    def _ensure_started(self, source: str, limit: int, deadline: float) -> None:
+    def _ensure_started(
+        self,
+        source: str,
+        limit: int,
+        deadline: float,
+        *,
+        expected_fingerprint: Optional[_FileFingerprint] = None,
+    ) -> None:
         if self._process is not None and self._process.is_alive():
             return
         self._reset(force=True)
@@ -503,7 +592,14 @@ class _MediaFileWorker:
                 resources.update(parent=parent, child=child, buffer=result_buffer)
                 process = self._context.Process(
                     target=_media_file_worker,
-                    args=(child, os.getpid(), source, limit, result_buffer),
+                    args=(
+                        child,
+                        os.getpid(),
+                        source,
+                        limit,
+                        result_buffer,
+                        expected_fingerprint,
+                    ),
                     daemon=True,
                 )
                 resources["process"] = process
@@ -565,7 +661,11 @@ class _MediaFileWorker:
         if process is not None:
             _dispose_worker_process(process, force=force)
 
-    def _bytes_from_result(self, result: Dict[str, Any], limit: int) -> bytes:
+    def _value_from_result(
+        self,
+        result: Dict[str, Any],
+        limit: int,
+    ) -> tuple[bytes, Optional[_FileFingerprint]]:
         error = result.get("error")
         if error == "blocked":
             raise ValueError(result.get("message") or "local image read denied")
@@ -580,7 +680,26 @@ class _MediaFileWorker:
             or self._buffer is None
         ):
             raise ZettlabMediaError("local image worker returned an invalid result")
-        return bytes(self._buffer[:length])
+        raw_fingerprint = result.get("fingerprint")
+        fingerprint: Optional[_FileFingerprint] = None
+        if (
+            isinstance(raw_fingerprint, (list, tuple))
+            and len(raw_fingerprint) == 5
+            and all(
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in raw_fingerprint[:4]
+            )
+            and isinstance(raw_fingerprint[4], str)
+            and re.fullmatch(r"[0-9a-f]{64}", raw_fingerprint[4]) is not None
+        ):
+            fingerprint = (
+                int(raw_fingerprint[0]),
+                int(raw_fingerprint[1]),
+                int(raw_fingerprint[2]),
+                int(raw_fingerprint[3]),
+                raw_fingerprint[4],
+            )
+        return bytes(self._buffer[:length]), fingerprint
 
 
 class _MediaHTTPSession:
@@ -1036,11 +1155,27 @@ def _reject_windows_network_or_device_path(source: str) -> None:
         )
 
 
-def _trusted_artifact_task_key(task_id: Optional[str]) -> Optional[str]:
-    key = str(task_id or "").strip()
-    if not key or len(key) > 512 or any(ord(char) < 0x20 for char in key):
+def _trusted_artifact_scope_key(
+    task_id: Optional[str],
+) -> Optional[_ArtifactScopeKey]:
+    task_key = str(task_id or "").strip()
+    if (
+        not task_key
+        or len(task_key) > 512
+        or any(ord(char) < 0x20 for char in task_key)
+    ):
         return None
-    return key
+    try:
+        from hermes_constants import get_hermes_home
+
+        profile_home = os.path.normcase(
+            os.path.abspath(os.fspath(get_hermes_home()))
+        )
+    except Exception:
+        return None
+    if not profile_home or len(profile_home) > _MAX_LOCAL_IMAGE_PATH_CHARS:
+        return None
+    return profile_home, task_key
 
 
 def _trusted_local_artifact_key(source: str) -> Optional[str]:
@@ -1059,40 +1194,60 @@ def _trusted_local_artifact_key(source: str) -> Optional[str]:
 
 def _register_trusted_local_artifact(task_id: Optional[str], source: str) -> None:
     """Remember a persisted media output as readable by its owning session."""
-    task_key = _trusted_artifact_task_key(task_id)
+    scope_key = _trusted_artifact_scope_key(task_id)
     artifact_key = _trusted_local_artifact_key(source)
-    if task_key is None or artifact_key is None:
+    if scope_key is None or artifact_key is None:
+        return
+    try:
+        raw, fingerprint = _FILE_WORKER.read_with_fingerprint(
+            source,
+            MAX_INLINE_IMAGE_BYTES,
+            deadline=time.monotonic() + LOCAL_IMAGE_READ_TIMEOUT,
+        )
+    except (ValueError, ZettlabMediaError):
+        if is_interrupted():
+            raise ZettlabMediaError("media generation interrupted")
+        return
+    if _sniff_image_mime(raw[:16]) is None:
         return
     with _TRUSTED_LOCAL_ARTIFACTS_LOCK:
-        artifacts = _TRUSTED_LOCAL_ARTIFACTS.pop(task_key, OrderedDict())
+        artifacts = _TRUSTED_LOCAL_ARTIFACTS.pop(scope_key, OrderedDict())
         artifacts.pop(artifact_key, None)
-        artifacts[artifact_key] = None
+        artifacts[artifact_key] = fingerprint
         while len(artifacts) > _MAX_TRUSTED_ARTIFACTS_PER_SESSION:
             artifacts.popitem(last=False)
-        _TRUSTED_LOCAL_ARTIFACTS[task_key] = artifacts
+        _TRUSTED_LOCAL_ARTIFACTS[scope_key] = artifacts
         while len(_TRUSTED_LOCAL_ARTIFACTS) > _MAX_TRUSTED_ARTIFACT_SESSIONS:
             _TRUSTED_LOCAL_ARTIFACTS.popitem(last=False)
 
 
-def _is_trusted_local_artifact(task_id: Optional[str], source: str) -> bool:
-    task_key = _trusted_artifact_task_key(task_id)
+def _trusted_local_artifact_fingerprint(
+    task_id: Optional[str],
+    source: str,
+) -> Optional[_FileFingerprint]:
+    scope_key = _trusted_artifact_scope_key(task_id)
     artifact_key = _trusted_local_artifact_key(source)
-    if task_key is None or artifact_key is None:
-        return False
+    if scope_key is None or artifact_key is None:
+        return None
     with _TRUSTED_LOCAL_ARTIFACTS_LOCK:
-        artifacts = _TRUSTED_LOCAL_ARTIFACTS.get(task_key)
+        artifacts = _TRUSTED_LOCAL_ARTIFACTS.get(scope_key)
         if artifacts is None or artifact_key not in artifacts:
-            return False
+            return None
         artifacts.move_to_end(artifact_key)
-        _TRUSTED_LOCAL_ARTIFACTS.move_to_end(task_key)
-        return True
+        _TRUSTED_LOCAL_ARTIFACTS.move_to_end(scope_key)
+        return artifacts[artifact_key]
 
 
-def _local_image_data_uri(source: str, limit: int) -> str:
+def _local_image_data_uri(
+    source: str,
+    limit: int,
+    expected_fingerprint: _FileFingerprint,
+) -> str:
     raw = _FILE_WORKER.read(
         source,
         limit,
         deadline=time.monotonic() + LOCAL_IMAGE_READ_TIMEOUT,
+        expected_fingerprint=expected_fingerprint,
     )
     mime = _sniff_image_mime(raw[:16])
     if mime is None:
@@ -1133,12 +1288,13 @@ def inline_image_input(
         raise ZettlabMediaError(
             "image input must be a local image path or data URI; remote URLs are not supported"
         )
-    if not _is_trusted_local_artifact(task_id, source):
+    fingerprint = _trusted_local_artifact_fingerprint(task_id, source)
+    if fingerprint is None:
         raise ZettlabMediaError(
             "local image path is not authorized for this session; use a base64 data URI "
             "or a path returned by prior Zettlab media generation"
         )
-    return _local_image_data_uri(source, limit)
+    return _local_image_data_uri(source, limit, fingerprint)
 
 
 def create_and_wait(
@@ -1369,11 +1525,13 @@ def first_asset_location(
     *,
     prefer_local: bool,
     session_id: Optional[str] = None,
+    authorize_as_image_input: bool = False,
 ) -> str:
     if prefer_local:
         try:
             path = first_asset_local_path(job)
-            _register_trusted_local_artifact(session_id, path)
+            if authorize_as_image_input:
+                _register_trusted_local_artifact(session_id, path)
             return path
         except ZettlabMediaError:
             pass

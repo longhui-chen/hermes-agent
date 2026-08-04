@@ -171,6 +171,7 @@ class ZettlabImageGenProvider(ImageGenProvider):
                 job,
                 prefer_local=bool(session_id),
                 session_id=session_id,
+                authorize_as_image_input=True,
             )
         except Exception as exc:
             return error_response(

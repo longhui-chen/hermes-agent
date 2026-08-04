@@ -246,6 +246,7 @@ def test_local_image_dispatches_through_both_generation_tools(tmp_path, monkeypa
         },
         prefer_local=True,
         session_id=task_id,
+        authorize_as_image_input=True,
     ) == str(image_path)
 
     image_result = json.loads(image_tool._handle_image_generate({

@@ -27,6 +27,7 @@ def _register_local_artifact(client, path, task_id: str = "session-local") -> st
         },
         prefer_local=True,
         session_id=task_id,
+        authorize_as_image_input=True,
     )
     assert location == str(path)
     return task_id
@@ -214,7 +215,7 @@ def test_inline_image_input_rejects_oversize_file_before_encoding(tmp_path, monk
         ),
     )
 
-    with pytest.raises(client.ZettlabMediaError, match="exceeds maximum size"):
+    with pytest.raises(client.ZettlabMediaError, match="not authorized"):
         client.inline_image_input(
             str(image_path),
             None,
@@ -229,14 +230,12 @@ def test_inline_image_input_rejects_fifo_without_blocking(tmp_path):
 
     fifo_path = tmp_path / "image.fifo"
     os.mkfifo(fifo_path)
-    task_id = _register_local_artifact(client, fifo_path)
 
     with pytest.raises(client.ZettlabMediaError, match="regular file"):
-        client.inline_image_input(
+        client._FILE_WORKER.read(
             str(fifo_path),
-            None,
-            _capability(),
-            task_id=task_id,
+            1024,
+            deadline=time.monotonic() + 1,
         )
 
 
@@ -245,14 +244,12 @@ def test_inline_image_input_preserves_file_safety_guard_in_worker(tmp_path):
 
     blocked_path = tmp_path / ".env"
     blocked_path.write_bytes(PNG)
-    task_id = _register_local_artifact(client, blocked_path)
 
     with pytest.raises(ValueError, match="Access denied"):
-        client.inline_image_input(
+        client._FILE_WORKER.read(
             str(blocked_path),
-            None,
-            _capability(),
-            task_id=task_id,
+            1024,
+            deadline=time.monotonic() + 1,
         )
 
 
@@ -266,15 +263,109 @@ def test_inline_image_input_does_not_follow_registered_symlink(tmp_path):
         symlink_path.symlink_to(target_path)
     except (NotImplementedError, OSError):
         pytest.skip("symlinks are unavailable")
-    task_id = _register_local_artifact(client, symlink_path)
-
     with pytest.raises(client.ZettlabMediaError, match="regular file"):
-        client.inline_image_input(
+        client._FILE_WORKER.read(
             str(symlink_path),
+            1024,
+            deadline=time.monotonic() + 1,
+        )
+
+
+def test_inline_image_input_rejects_artifact_replaced_after_registration(tmp_path):
+    from plugins import zettlab_media_client as client
+
+    image_path = tmp_path / "generated.png"
+    image_path.write_bytes(PNG)
+    task_id = _register_local_artifact(client, image_path)
+    replacement = tmp_path / "replacement.png"
+    replacement.write_bytes(JPEG)
+    os.replace(replacement, image_path)
+
+    with pytest.raises(client.ZettlabMediaError, match="authorized content"):
+        client.inline_image_input(
+            str(image_path),
             None,
             _capability(),
             task_id=task_id,
         )
+
+
+def test_inline_image_input_rejects_artifact_modified_in_place(tmp_path):
+    from plugins import zettlab_media_client as client
+
+    image_path = tmp_path / "generated.png"
+    image_path.write_bytes(PNG)
+    task_id = _register_local_artifact(client, image_path)
+    image_path.write_bytes(JPEG)
+
+    with pytest.raises(client.ZettlabMediaError, match="authorized content"):
+        client.inline_image_input(
+            str(image_path),
+            None,
+            _capability(),
+            task_id=task_id,
+        )
+
+
+def test_inline_image_input_rejects_ancestor_symlink_redirect_after_registration(
+    tmp_path,
+):
+    from plugins import zettlab_media_client as client
+
+    original_dir = tmp_path / "original"
+    replacement_dir = tmp_path / "replacement"
+    original_dir.mkdir()
+    replacement_dir.mkdir()
+    (original_dir / "generated.png").write_bytes(PNG)
+    (replacement_dir / "generated.png").write_bytes(JPEG)
+    current_dir = tmp_path / "current"
+    try:
+        current_dir.symlink_to(original_dir, target_is_directory=True)
+    except (NotImplementedError, OSError):
+        pytest.skip("directory symlinks are unavailable")
+    image_path = current_dir / "generated.png"
+    task_id = _register_local_artifact(client, image_path)
+    current_dir.unlink()
+    current_dir.symlink_to(replacement_dir, target_is_directory=True)
+
+    with pytest.raises(client.ZettlabMediaError, match="authorized content"):
+        client.inline_image_input(
+            str(image_path),
+            None,
+            _capability(),
+            task_id=task_id,
+        )
+
+
+def test_inline_image_input_does_not_share_artifacts_between_profiles(tmp_path):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from plugins import zettlab_media_client as client
+
+    profile_a = tmp_path / "profile-a"
+    profile_b = tmp_path / "profile-b"
+    profile_a.mkdir()
+    profile_b.mkdir()
+    image_path = tmp_path / "generated.png"
+    image_path.write_bytes(PNG)
+    task_id = "shared-session-id"
+
+    token = set_hermes_home_override(profile_a)
+    try:
+        _register_local_artifact(client, image_path, task_id=task_id)
+    finally:
+        reset_hermes_home_override(token)
+
+    token = set_hermes_home_override(profile_b)
+    try:
+        with pytest.raises(client.ZettlabMediaError, match="not authorized"):
+            client.inline_image_input(
+                str(image_path),
+                None,
+                _capability(),
+                task_id=task_id,
+            )
+    finally:
+        reset_hermes_home_override(token)
 
 
 def test_media_file_worker_terminates_stalled_read_and_recovers(monkeypatch):
