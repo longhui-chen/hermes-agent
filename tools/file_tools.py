@@ -675,28 +675,48 @@ def _managed_sibling_profile_error(
 def resolve_host_read_path_for_task(
     filepath: str,
     task_id: str = "default",
-) -> Path:
+) -> tuple[Path, tuple[int, int]]:
     """Resolve and authorize a model-supplied path for direct host reading.
 
     Provider integrations use this when they need bytes rather than the
-    paginated ``read_file`` response. It preserves task-relative cwd, managed
-    sibling-profile confinement, and the common credential read guard.
-    Sandbox-backed tasks must use a container-aware resolver instead of mapping
-    a container path onto the host filesystem.
+    paginated ``read_file`` response. Direct host reads are valid only for the
+    local terminal backend; remote and sandboxed backends must use their own
+    file transport. The returned path is the strict canonical target and the
+    identity tuple must be checked again by the process that opens the file.
     """
-    if _uses_container_paths(task_id):
+    backend = _terminal_env_type_for_task(task_id)
+    if backend != "local":
         raise ValueError(
-            "Direct local image paths are unavailable with a sandbox terminal "
-            "backend; provide the image as a base64 data URI instead."
+            f"Direct local image paths are unavailable with the {backend or 'non-local'} "
+            "terminal backend; provide the image as a base64 data URI instead."
         )
-    resolved = _resolve_path_for_task(filepath, task_id)
-    sibling_error = _managed_sibling_profile_error(str(resolved), task_id)
+    lexical = Path(_resolve_path_for_task(filepath, task_id))
+    try:
+        canonical = lexical.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"Unable to resolve local image input: {exc}") from exc
+
+    sibling_error = _managed_sibling_profile_error(str(canonical), task_id)
     if sibling_error:
         raise ValueError(sibling_error)
-    blocked = get_read_block_error(str(resolved))
+    blocked = get_read_block_error(str(canonical))
     if blocked:
         raise ValueError(blocked)
-    return Path(resolved)
+    try:
+        authorized_stat = os.stat(canonical, follow_symlinks=False)
+        canonical_after = lexical.resolve(strict=True)
+        final_stat = os.stat(canonical_after, follow_symlinks=False)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"Unable to authorize local image input: {exc}") from exc
+    if canonical_after != canonical or (
+        final_stat.st_dev,
+        final_stat.st_ino,
+    ) != (
+        authorized_stat.st_dev,
+        authorized_stat.st_ino,
+    ):
+        raise ValueError("Local image input changed while authorizing")
+    return canonical_after, (final_stat.st_dev, final_stat.st_ino)
 
 
 def _get_hermes_config_resolved() -> str | None:

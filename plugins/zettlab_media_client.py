@@ -335,7 +335,10 @@ class _MediaHTTPWorker:
         return response
 
 
-def _resolve_local_image_path(source: str, task_id: Optional[str]) -> str:
+def _resolve_local_image_path(
+    source: str,
+    task_id: Optional[str],
+) -> tuple[str, tuple[int, int]]:
     raw = str(source or "").strip()
     if not raw or len(raw) > _MAX_LOCAL_IMAGE_PATH_CHARS or "\x00" in raw:
         raise ZettlabMediaError("local image input path is invalid")
@@ -365,7 +368,7 @@ def _resolve_local_image_path(source: str, task_id: Optional[str]) -> str:
     try:
         from tools.file_tools import resolve_host_read_path_for_task
 
-        resolved = resolve_host_read_path_for_task(
+        resolved, expected_identity = resolve_host_read_path_for_task(
             candidate,
             str(task_id or "default").strip() or "default",
         )
@@ -373,7 +376,7 @@ def _resolve_local_image_path(source: str, task_id: Optional[str]) -> str:
         raise ZettlabMediaError(str(exc)) from exc
     resolved_path = str(resolved)
     _reject_windows_network_or_device_path(resolved_path)
-    return resolved_path
+    return resolved_path, expected_identity
 
 
 def _media_file_worker(
@@ -381,6 +384,7 @@ def _media_file_worker(
     parent_pid: int,
     source: str,
     limit: int,
+    expected_identity: Optional[tuple[int, int]],
     result_buffer: Any,
 ) -> None:
     threading.Thread(target=_watch_parent, args=(parent_pid,), daemon=True).start()
@@ -401,6 +405,9 @@ def _media_file_worker(
         source_stat = os.stat(path, follow_symlinks=False)
         if not stat.S_ISREG(source_stat.st_mode):
             raise ZettlabMediaError("local image input must be a regular file")
+        source_identity = (source_stat.st_dev, source_stat.st_ino)
+        if expected_identity is not None and source_identity != expected_identity:
+            raise ZettlabMediaError("local image input changed after authorization")
         flags = (
             os.O_RDONLY
             | getattr(os, "O_NONBLOCK", 0)
@@ -417,6 +424,11 @@ def _media_file_worker(
                 source_stat.st_ino,
             ):
                 raise ZettlabMediaError("local image input changed while opening")
+            if expected_identity is not None and (
+                file_stat.st_dev,
+                file_stat.st_ino,
+            ) != expected_identity:
+                raise ZettlabMediaError("local image input changed after authorization")
             if file_stat.st_size <= 0:
                 raise ZettlabMediaError("local image input must contain image bytes")
             if file_stat.st_size > limit:
@@ -479,6 +491,7 @@ class _MediaFileWorker:
         limit: int,
         *,
         deadline: float,
+        expected_identity: Optional[tuple[int, int]] = None,
     ) -> bytes:
         remaining = deadline - time.monotonic()
         if remaining <= 0 or not self._lock.acquire(timeout=remaining):
@@ -491,7 +504,7 @@ class _MediaFileWorker:
                 raise ZettlabMediaDeadlineError(
                     "local image read deadline exceeded before start"
                 )
-            self._ensure_started(source, limit, deadline)
+            self._ensure_started(source, limit, expected_identity, deadline)
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -541,6 +554,7 @@ class _MediaFileWorker:
         self,
         source: str,
         limit: int,
+        expected_identity: Optional[tuple[int, int]],
         deadline: float,
     ) -> None:
         if self._process is not None and self._process.is_alive():
@@ -577,6 +591,7 @@ class _MediaFileWorker:
                         os.getpid(),
                         source,
                         limit,
+                        expected_identity,
                         result_buffer,
                     ),
                     daemon=True,
@@ -1118,11 +1133,13 @@ def _reject_windows_network_or_device_path(source: str) -> None:
 def _local_image_data_uri(
     source: str,
     limit: int,
+    expected_identity: tuple[int, int],
 ) -> str:
     raw = _FILE_WORKER.read(
         source,
         limit,
         deadline=time.monotonic() + LOCAL_IMAGE_READ_TIMEOUT,
+        expected_identity=expected_identity,
     )
     mime = _sniff_image_mime(raw[:16])
     if mime is None:
@@ -1164,8 +1181,8 @@ def inline_image_input(
             "HTTP(S) image URLs are not enabled for Zettlab yet; use a base64 "
             "data URI or an absolute local image path"
         )
-    resolved_source = _resolve_local_image_path(source, task_id)
-    return _local_image_data_uri(resolved_source, limit)
+    resolved_source, expected_identity = _resolve_local_image_path(source, task_id)
+    return _local_image_data_uri(resolved_source, limit, expected_identity)
 
 
 def create_and_wait(

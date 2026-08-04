@@ -121,6 +121,123 @@ def test_inline_image_input_rejects_relative_path_before_read(monkeypatch):
         client.inline_image_input("source.png", None, _capability())
 
 
+@pytest.mark.parametrize("backend", ["ssh", "docker", "singularity", "modal", "daytona"])
+def test_inline_image_input_rejects_nonlocal_terminal_backends(
+    tmp_path,
+    monkeypatch,
+    backend,
+):
+    from plugins import zettlab_media_client as client
+    from tools import file_tools
+
+    image_path = tmp_path / "source.png"
+    image_path.write_bytes(PNG)
+    monkeypatch.setattr(file_tools, "_terminal_env_type_for_task", lambda _task_id: backend)
+    monkeypatch.setattr(
+        client._FILE_WORKER,
+        "read",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("non-local path must not reach file worker")
+        ),
+    )
+
+    with pytest.raises(client.ZettlabMediaError, match=f"{backend} terminal backend"):
+        client.inline_image_input(
+            str(image_path),
+            None,
+            _capability(),
+            task_id="remote-session",
+        )
+
+
+def test_inline_image_input_rejects_registered_ssh_environment(tmp_path, monkeypatch):
+    from plugins import zettlab_media_client as client
+    from tools import file_tools, terminal_tool
+
+    class SSHEnvironment:
+        pass
+
+    task_id = "ssh-media-session"
+    image_path = tmp_path / "source.png"
+    image_path.write_bytes(PNG)
+    monkeypatch.setattr(
+        client._FILE_WORKER,
+        "read",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("SSH path must not reach host file worker")
+        ),
+    )
+    with terminal_tool._env_lock:
+        previous = terminal_tool._active_environments.get(task_id)
+        terminal_tool._active_environments[task_id] = SSHEnvironment()
+    try:
+        assert file_tools._terminal_env_type_for_task(task_id) == "ssh"
+        with pytest.raises(client.ZettlabMediaError, match="ssh terminal backend"):
+            client.inline_image_input(
+                str(image_path),
+                None,
+                _capability(),
+                task_id=task_id,
+            )
+    finally:
+        with terminal_tool._env_lock:
+            if previous is None:
+                terminal_tool._active_environments.pop(task_id, None)
+            else:
+                terminal_tool._active_environments[task_id] = previous
+
+
+def test_host_read_resolver_returns_canonical_target_and_identity(tmp_path, monkeypatch):
+    from tools import file_tools
+
+    target_path = tmp_path / "target.png"
+    target_path.write_bytes(PNG)
+    alias_path = tmp_path / "alias.png"
+    try:
+        alias_path.symlink_to(target_path)
+    except (NotImplementedError, OSError):
+        pytest.skip("symlinks are unavailable")
+    monkeypatch.setattr(file_tools, "_terminal_env_type_for_task", lambda _task_id: "local")
+
+    resolved, identity = file_tools.resolve_host_read_path_for_task(
+        str(alias_path),
+        "local-session",
+    )
+    target_stat = target_path.stat()
+
+    assert resolved == target_path.resolve(strict=True)
+    assert identity == (target_stat.st_dev, target_stat.st_ino)
+
+
+def test_inline_image_input_passes_authorized_file_identity_to_worker(
+    tmp_path,
+    monkeypatch,
+):
+    from plugins import zettlab_media_client as client
+
+    image_path = tmp_path / "source.png"
+    image_path.write_bytes(PNG)
+    seen = {}
+
+    def read(source, limit, *, deadline, expected_identity=None):
+        seen.update(
+            source=source,
+            limit=limit,
+            deadline=deadline,
+            expected_identity=expected_identity,
+        )
+        return PNG
+
+    monkeypatch.setattr(client._FILE_WORKER, "read", read)
+
+    got = client.inline_image_input(str(image_path), None, _capability())
+    file_stat = image_path.stat()
+
+    assert got.startswith("data:image/png;base64,")
+    assert seen["source"] == str(image_path.resolve())
+    assert seen["expected_identity"] == (file_stat.st_dev, file_stat.st_ino)
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -283,6 +400,24 @@ def test_inline_image_input_does_not_follow_symlink(tmp_path):
         )
 
 
+def test_media_file_worker_rejects_identity_changed_after_authorization(tmp_path):
+    from plugins import zettlab_media_client as client
+
+    authorized_path = tmp_path / "authorized.png"
+    replacement_path = tmp_path / "replacement.png"
+    authorized_path.write_bytes(PNG)
+    replacement_path.write_bytes(PNG)
+    authorized_stat = authorized_path.stat()
+
+    with pytest.raises(client.ZettlabMediaError, match="changed after authorization"):
+        client._FILE_WORKER.read(
+            str(replacement_path),
+            1024,
+            deadline=time.monotonic() + 1,
+            expected_identity=(authorized_stat.st_dev, authorized_stat.st_ino),
+        )
+
+
 def test_media_file_worker_terminates_stalled_read_and_recovers(monkeypatch):
     from plugins import zettlab_media_client as client
 
@@ -336,7 +471,7 @@ def test_media_file_worker_terminates_stalled_read_and_recovers(monkeypatch):
     )
     worker = client._MediaFileWorker()
 
-    def start_next_worker(source, limit, deadline):
+    def start_next_worker(source, limit, expected_identity, deadline):
         process, connection, payload = next(attempts)
         worker._process = process
         worker._connection = connection
@@ -392,7 +527,7 @@ def test_media_file_worker_interrupt_terminates_read(monkeypatch):
     process = FakeProcess()
     connection = FakeConnection()
 
-    def start_worker(source, limit, deadline):
+    def start_worker(source, limit, expected_identity, deadline):
         worker._process = process
         worker._connection = connection
         worker._buffer = bytearray(limit)
