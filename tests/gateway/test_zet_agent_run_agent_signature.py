@@ -14,6 +14,9 @@ fast and would have gone red the moment the override drifted.
 
 import inspect
 
+import pytest
+
+from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.platforms.zet_agent import ZetAgentAdapter
 
@@ -71,3 +74,27 @@ def test_zet_agent_connect_covers_base_signature():
         "Gateway startup and reconnect both call connect(is_reconnect=...), so "
         "signature drift prevents the zet_agent gateway from binding its health port."
     )
+
+
+@pytest.mark.asyncio
+async def test_zet_agent_forwards_current_turn_reference_image(monkeypatch):
+    captured = {}
+
+    async def fake_run_agent(self, **kwargs):
+        del self
+        captured.update(kwargs)
+        return (
+            {"final_response": "ok", "session_id": "session-1"},
+            {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        )
+
+    monkeypatch.setattr(APIServerAdapter, "_run_agent", fake_run_agent)
+    adapter = ZetAgentAdapter(PlatformConfig(enabled=True, extra={"key": "test-key"}))
+
+    await adapter._run_agent(
+        user_message="create a desktop pet",
+        session_id="session-1",
+        current_turn_reference_image="data:image/png;base64,cGV0",
+    )
+
+    assert captured["current_turn_reference_image"] == "data:image/png;base64,cGV0"

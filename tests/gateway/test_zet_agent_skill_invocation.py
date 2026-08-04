@@ -148,12 +148,30 @@ def test_unknown_slug_passes_through(monkeypatch):
     assert _expand(adapter, original) == original
 
 
-def test_empty_slug_and_multimodal_pass_through(monkeypatch):
+def test_empty_slug_passes_through(monkeypatch):
     _patch_skill_layer(monkeypatch)
     adapter = _make_adapter()
     assert _expand(adapter, "你好，帮我查天气", slug="") == "你好，帮我查天气"
-    multimodal = [{"type": "text", "text": "研究黄金"}]
-    assert _expand(adapter, multimodal) is multimodal
+
+
+def test_multimodal_skill_expands_text_without_dropping_image(monkeypatch):
+    calls = _patch_skill_layer(monkeypatch)
+    adapter = _make_adapter()
+    image_part = {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="},
+    }
+    expanded = _expand(
+        adapter,
+        [
+            {"type": "text", "text": "/deep-research 研究黄金"},
+            image_part,
+        ],
+    )
+
+    assert expanded[0]["text"].startswith("<<EXPANDED:SKILL BODY")
+    assert expanded[1] == image_part
+    assert calls["user_instruction"] == "研究黄金"
 
 
 def test_load_failure_falls_back_to_original(monkeypatch):

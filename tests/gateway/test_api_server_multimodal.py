@@ -17,9 +17,16 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     _content_has_visible_payload,
+    _extract_current_turn_reference_image,
     _normalize_multimodal_content,
     cors_middleware,
     security_headers_middleware,
+)
+
+
+TINY_PNG_DATA_URL = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
 
 
@@ -61,6 +68,35 @@ class TestContentHasVisiblePayload:
 
     def test_list_with_image_only(self):
         assert _content_has_visible_payload([{"type": "image_url", "image_url": {"url": "x"}}])
+
+
+class TestCurrentTurnReferenceImage:
+    def test_extracts_one_bounded_data_image(self):
+        content = _normalize_multimodal_content(
+            [{"type": "image_url", "image_url": {"url": TINY_PNG_DATA_URL}}]
+        )
+        assert _extract_current_turn_reference_image(content) == TINY_PNG_DATA_URL
+
+    def test_remote_image_does_not_grant_tool_context(self):
+        content = _normalize_multimodal_content(
+            [{"type": "image_url", "image_url": {"url": "https://example.com/pet.png"}}]
+        )
+        assert _extract_current_turn_reference_image(content) == ""
+
+    def test_second_image_fails_closed(self):
+        content = _normalize_multimodal_content(
+            [
+                {"type": "image_url", "image_url": {"url": TINY_PNG_DATA_URL}},
+                {"type": "image_url", "image_url": {"url": TINY_PNG_DATA_URL}},
+            ]
+        )
+        assert _extract_current_turn_reference_image(content) == ""
+
+    def test_invalid_or_mismatched_data_image_fails_closed(self):
+        content = _normalize_multimodal_content(
+            [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,iVBORw0KGgo="}}]
+        )
+        assert _extract_current_turn_reference_image(content) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +157,44 @@ class TestChatCompletionsMultimodalHTTP:
 
             assert resp.status == 200, await resp.text()
             assert mock_run.captured["user_message"] == image_payload
+            assert mock_run.captured["current_turn_reference_image"] == ""
+
+    @pytest.mark.asyncio
+    async def test_only_final_user_turn_data_image_is_bound(self, adapter):
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(adapter, "_run_agent", new=MagicMock()) as mock_run:
+                async def _stub(**kwargs):
+                    mock_run.captured = kwargs
+                    return (
+                        {"final_response": "ok", "messages": [], "api_calls": 1},
+                        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                    )
+                mock_run.side_effect = _stub
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "hermes-agent",
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}},
+                                ],
+                            },
+                            {
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": "create this pet"},
+                                    {"type": "image_url", "image_url": {"url": TINY_PNG_DATA_URL}},
+                                ],
+                            },
+                        ],
+                    },
+                )
+
+            assert resp.status == 200, await resp.text()
+            assert mock_run.captured["current_turn_reference_image"] == TINY_PNG_DATA_URL
 
 
 class TestResponsesMultimodalHTTP:

@@ -8,15 +8,18 @@ Two steps, mirroring the UX across every surface:
    strip per Hermes state, slices each into frames, composes the atlas, validates
    it, and writes the pet into the store.
 
-Splitting it this way bounds cost (4 cheap base calls per round; the ~6 row
-calls happen once, on the pet you actually keep) and gives each UI a natural
-preview/loading point.
+Splitting it this way bounds cost (a few cheap base calls per round; eight
+generated state rows plus one mirrored row happen only for the pet you keep)
+and gives each UI a natural preview/loading point.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import shutil
 import time
+from contextvars import copy_context
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,17 +33,25 @@ logger = logging.getLogger(__name__)
 # (event, detail) — e.g. ("row", "idle"), ("compose", ""), ("save", "<slug>").
 ProgressFn = Callable[[str, str], None]
 
-# Image generations are independent network calls, so we fan them out instead of
-# blocking on each in turn — a hatch is ~8 row calls that would otherwise run
-# back-to-back and routinely blow past the client's RPC timeout. Capped so we
-# don't hammer the provider's rate limit (one cold call can still be slow).
-_MAX_PARALLEL_GENERATIONS = 4
-# How many times to (re)generate a single row before accepting a best-effort
-# slice. Early attempts demand clean per-pose gutters; the last is lenient so a
-# stubborn row still yields frames instead of dropping out entirely.
+# Image generations are independent network calls. Drafts use a small bounded
+# pool, while hatch rows stay at one active provider call so each completed state
+# can be checkpointed before the next one starts.
+_MAX_PARALLEL_DRAFT_GENERATIONS = 2
+_MAX_PARALLEL_HATCH_ROWS = 1
+# Retry a failed state within the same hatch call. The final attempt uses lenient
+# equal-slot slicing so touching poses still get one recovery path.
 _ROW_GEN_ATTEMPTS = 3
-_MIN_FILLED_STATES = 6
-_REQUIRED_STATES = frozenset({"idle", "running-right", "waving"})
+_REQUIRED_STATES = frozenset(state for state, _, _ in atlas.ROW_SPECS)
+_ROW_CACHE_VERSION = 1
+_MAX_CACHED_FRAME_BYTES = 4 * 1024 * 1024
+_MAX_CACHED_ROW_BYTES = 16 * 1024 * 1024
+_MAX_CACHED_TASK_BYTES = 64 * 1024 * 1024
+_MAX_CACHED_FRAME_DIMENSION = 4096
+_MAX_CACHED_ROW_PIXELS = 8_000_000
+# The hatch may hold all eight generated rows before normalizing the atlas.
+# Keep the aggregate bound consistent with the already-enforced per-row bound;
+# running-left is mirrored only after this accounting pass.
+_MAX_HATCH_FRAME_PIXELS = _MAX_CACHED_ROW_PIXELS * (len(atlas.ROW_SPECS) - 1)
 
 
 @dataclass(frozen=True)
@@ -52,6 +63,126 @@ class HatchResult:
     spritesheet: Path
     states: list[str]
     validation: dict
+
+
+def _resolve_row_cache(row_cache_dir: str | Path | None) -> Path | None:
+    """Resolve an existing, caller-owned cache directory without following links."""
+    if row_cache_dir is None:
+        return None
+    root = Path(row_cache_dir).expanduser()
+    if root.is_symlink() or not root.is_dir():
+        raise GenerationError("pet row cache directory is unavailable")
+    return root.resolve(strict=True)
+
+
+def _load_cached_row(cache_root: Path | None, state: str, count: int) -> list | None:
+    """Load one complete cached animation row; partial or unsafe entries miss."""
+    if cache_root is None:
+        return None
+    from PIL import Image
+
+    directory = cache_root / state
+    marker = directory / "complete.json"
+    try:
+        if directory.is_symlink() or not directory.is_dir():
+            return None
+        if marker.is_symlink() or not marker.is_file() or marker.stat().st_size > 4096:
+            return None
+        metadata = json.loads(marker.read_text(encoding="utf-8"))
+        if metadata != {"version": _ROW_CACHE_VERSION, "state": state, "count": count}:
+            return None
+
+        frames = []
+        total_bytes = 0
+        total_pixels = 0
+        for index in range(count):
+            path = directory / f"frame-{index}.png"
+            if path.is_symlink() or not path.is_file():
+                return None
+            size = path.stat().st_size
+            total_bytes += size
+            if size > _MAX_CACHED_FRAME_BYTES or total_bytes > _MAX_CACHED_ROW_BYTES:
+                return None
+            with Image.open(path) as opened:
+                if (
+                    opened.width <= 0
+                    or opened.height <= 0
+                    or opened.width > _MAX_CACHED_FRAME_DIMENSION
+                    or opened.height > _MAX_CACHED_FRAME_DIMENSION
+                ):
+                    return None
+                total_pixels += opened.width * opened.height
+                if total_pixels > _MAX_CACHED_ROW_PIXELS:
+                    return None
+                frames.append(opened.convert("RGBA").copy())
+        return frames
+    except (OSError, ValueError, json.JSONDecodeError):
+        logger.warning("pet hatch: ignoring invalid cached row %r", state)
+        return None
+
+
+def _save_cached_row(cache_root: Path | None, state: str, frames: list) -> None:
+    """Atomically publish one complete animation row to the task-private cache."""
+    if cache_root is None:
+        return
+    destination = cache_root / state
+    temporary = cache_root / f".{state}.part"
+    if destination.is_symlink() or temporary.is_symlink():
+        raise GenerationError("pet row cache entry is unavailable")
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    temporary.mkdir(mode=0o700)
+    try:
+        total_bytes = 0
+        total_pixels = 0
+        for index, frame in enumerate(frames):
+            if (
+                frame.width <= 0
+                or frame.height <= 0
+                or frame.width > _MAX_CACHED_FRAME_DIMENSION
+                or frame.height > _MAX_CACHED_FRAME_DIMENSION
+            ):
+                raise GenerationError("generated pet frame dimensions are invalid")
+            total_pixels += frame.width * frame.height
+            if total_pixels > _MAX_CACHED_ROW_PIXELS:
+                raise GenerationError("generated pet row exceeds decoded pixel limits")
+            path = temporary / f"frame-{index}.png"
+            frame.convert("RGBA").save(path, format="PNG")
+            size = path.stat().st_size
+            total_bytes += size
+            if size > _MAX_CACHED_FRAME_BYTES or total_bytes > _MAX_CACHED_ROW_BYTES:
+                raise GenerationError("generated pet row exceeds cache limits")
+        (temporary / "complete.json").write_text(
+            json.dumps(
+                {"version": _ROW_CACHE_VERSION, "state": state, "count": len(frames)},
+                separators=(",", ":"),
+            ),
+            encoding="utf-8",
+        )
+        if destination.exists():
+            shutil.rmtree(destination)
+        temporary.replace(destination)
+        if _row_cache_bytes(cache_root) > _MAX_CACHED_TASK_BYTES:
+            shutil.rmtree(destination, ignore_errors=True)
+            raise GenerationError("desktop-pet row cache exceeds task size limits")
+    finally:
+        if temporary.exists():
+            shutil.rmtree(temporary, ignore_errors=True)
+
+
+def _row_cache_bytes(cache_root: Path) -> int:
+    """Return bounded task-cache bytes without following directory symlinks."""
+    total = 0
+    for directory in cache_root.iterdir():
+        if directory.is_symlink() or not directory.is_dir():
+            continue
+        for path in directory.iterdir():
+            if path.is_symlink() or not path.is_file():
+                continue
+            total += path.stat().st_size
+            if total > _MAX_CACHED_TASK_BYTES:
+                return total
+    return total
 
 
 def _harden_transparency(path: Path) -> Path:
@@ -84,7 +215,7 @@ def generate_base_drafts(
     *,
     n: int = 4,
     style: str = "auto",
-    reference_images: list[Path] | None = None,
+    reference_images: list[str | Path] | None = None,
     provider: SpriteProvider | None = None,
     on_draft: Callable[[int, Path], None] | None = None,
     is_cancelled: Callable[[], bool] | None = None,
@@ -129,11 +260,11 @@ def generate_base_drafts(
         logger.info("pet generate: draft %d ready in %.1fs", index, time.monotonic() - t0)
         return index, _harden_transparency(out[0]), None
 
-    workers = max(1, min(n, _MAX_PARALLEL_GENERATIONS))
+    workers = max(1, min(n, _MAX_PARALLEL_DRAFT_GENERATIONS))
     results: dict[int, Path] = {}
     errors: list[str] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_one, i) for i in range(n)]
+        futures = [pool.submit(copy_context().run, _one, i) for i in range(n)]
         # as_completed runs in *this* (the caller's) thread, so on_draft — and any
         # gateway event it emits — inherits the request's bound transport, unlike
         # the worker threads above.
@@ -193,6 +324,14 @@ def _humanize_image_error(error: str) -> str:
     return error.splitlines()[0].strip()[:200]
 
 
+def _row_error_is_retryable(error: Exception) -> bool:
+    """Retry timeouts even when an upstream transport labels them non-retryable."""
+    message = str(error).casefold()
+    if "timed out" in message or "timeout" in message:
+        return True
+    return "retryable=false" not in message
+
+
 def hatch_pet(
     *,
     base_image: str | Path,
@@ -204,12 +343,18 @@ def hatch_pet(
     on_progress: ProgressFn | None = None,
     provider: SpriteProvider | None = None,
     is_cancelled: Callable[[], bool] | None = None,
+    staging_dir: str | Path | None = None,
+    row_cache_dir: str | Path | None = None,
 ) -> HatchResult:
-    """Turn an approved base image into a full, installed Hermes pet.
+    """Turn an approved base image into a full Hermes pet.
 
     Generates a grounded row strip per state, extracts frames, composes +
-    validates the atlas, and registers it. The idle row falls back to the base
-    look so the pet always renders. Raises :class:`GenerationError` on failure.
+    validates the atlas. By default the result is registered in the profile's
+    pet store. When *staging_dir* is supplied, the package is written beneath
+    that existing non-symlink directory without installing it. When
+    *row_cache_dir* is supplied, each completed state is persisted there and
+    reused by later retries. All nine animation states are required; a state that
+    cannot be generated after its in-call retries fails the hatch.
 
     *is_cancelled*, when supplied, is polled cooperatively: rows that haven't
     started are skipped, queued rows are cancelled, and once every row is done we
@@ -224,27 +369,36 @@ def hatch_pet(
     progress = on_progress or (lambda *_: None)
     cancelled = is_cancelled or (lambda: False)
     label = concept or display_name or slug
+    row_cache = _resolve_row_cache(row_cache_dir)
 
     frames_by_state: dict[str, list] = {}
+    decoded_frame_pixels = 0
     total_rows = len(atlas.ROW_SPECS)
     logger.info("pet hatch %r: generating %d animation rows", slug, total_rows)
 
-    # Generate every state's row strip concurrently — they're independent
-    # grounded calls, so the hatch waits for the slowest row, not their sum. A
-    # single row failing is tolerated (idle is guaranteed below).
-    def _gen_row(spec: tuple[str, int, int]) -> tuple[str, list | None]:
+    # Generate each grounded row through a bounded pool. The production limit is
+    # deliberately one: finish and checkpoint a state before starting the next.
+    def _gen_row(
+        spec: tuple[str, int, int],
+    ) -> tuple[str, list | None, bool, int, Exception | None]:
         state, _row, count = spec
         if cancelled():
-            return state, None
+            return state, None, False, 0, None
+        cached = _load_cached_row(row_cache, state, count)
+        if cached is not None:
+            logger.info("pet hatch %r: row %r restored from cache", slug, state)
+            return state, cached, True, 0, None
         t0 = time.monotonic()
         last_exc: Exception | None = None
+        attempts_used = 0
         # Self-healing: a model occasionally returns a row whose poses are touching
         # (no clean gutters), which slices badly. We retry such rolls; only the
         # final attempt falls back to lenient ``auto`` slicing so a stubborn row
         # still yields *something* rather than dropping the whole row.
         for attempt in range(_ROW_GEN_ATTEMPTS):
             if cancelled():
-                return state, None
+                return state, None, False, attempts_used, None
+            attempts_used = attempt + 1
             strict = attempt < _ROW_GEN_ATTEMPTS - 1
             try:
                 strips = imagegen.generate(
@@ -267,27 +421,39 @@ def hatch_pet(
                     "pet hatch %r: row %r ready in %.1fs (attempt %d)",
                     slug, state, time.monotonic() - t0, attempt + 1,
                 )
-                return state, frames
+                durable = True
+                if row_cache is not None:
+                    try:
+                        _save_cached_row(row_cache, state, frames)
+                    except Exception as exc:  # noqa: BLE001 - current run can continue
+                        durable = False
+                        logger.warning(
+                            "pet hatch %r: row %r cache write failed: %s", slug, state, exc
+                        )
+                return state, frames, durable, attempts_used, None
             except Exception as exc:  # noqa: BLE001 - retried; one bad row is tolerated
                 last_exc = exc
                 logger.warning(
                     "pet hatch %r: row %r attempt %d/%d failed: %s",
                     slug, state, attempt + 1, _ROW_GEN_ATTEMPTS, exc,
                 )
+                if not _row_error_is_retryable(exc):
+                    break
         logger.warning(
             "pet hatch %r: row %r gave up after %.1fs: %s",
             slug, state, time.monotonic() - t0, last_exc,
         )
-        return state, None
+        return state, None, False, attempts_used, last_exc
 
     # running-left is derived by mirroring running-right (guaranteed-consistent
     # and one fewer generation), so we don't generate it directly.
     generated_specs = [spec for spec in atlas.ROW_SPECS if spec[0] != "running-left"]
 
-    workers = max(1, min(len(generated_specs), _MAX_PARALLEL_GENERATIONS))
+    workers = max(1, min(len(generated_specs), _MAX_PARALLEL_HATCH_ROWS))
     done = 0
+    row_failures: dict[str, tuple[int, Exception]] = {}
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_gen_row, spec) for spec in generated_specs]
+        futures = [pool.submit(copy_context().run, _gen_row, spec) for spec in generated_specs]
         # as_completed runs on the caller (request) thread, so progress events
         # emitted here inherit the request transport — unlike the worker threads.
         for fut in as_completed(futures):
@@ -296,11 +462,18 @@ def hatch_pet(
                 for pending in futures:
                     pending.cancel()
                 break
-            state, frames = fut.result()
+            state, frames, durable, attempts_used, row_error = fut.result()
             done += 1
             progress("row", f"{state}:{done}:{total_rows}")
             if frames:
+                decoded_frame_pixels += sum(frame.width * frame.height for frame in frames)
+                if decoded_frame_pixels > _MAX_HATCH_FRAME_PIXELS:
+                    raise GenerationError("generated pet animation exceeds decoded pixel limits")
                 frames_by_state[state] = frames
+                if durable:
+                    progress("row-ready", state)
+            elif row_error is not None:
+                row_failures[state] = (attempts_used, row_error)
 
     if cancelled():
         raise GenerationError("hatch cancelled")
@@ -317,11 +490,6 @@ def hatch_pet(
     else:
         logger.warning("pet hatch %r: no running-right to mirror; left walk left empty", slug)
 
-    # Idle is the resting state the renderer falls back to — guarantee it.
-    if not frames_by_state.get("idle"):
-        progress("row", "idle-fallback")
-        frames_by_state["idle"] = [atlas.single_frame(base, fit=False)]
-
     progress("compose", "")
     logger.info("pet hatch %r: composing atlas from %d states", slug, len(frames_by_state))
     # One shared scale + baseline across every state so the pet never slides or
@@ -333,26 +501,101 @@ def hatch_pet(
     filled_states = set(validation["filled_states"])
     missing_required = sorted(_REQUIRED_STATES - filled_states)
     if missing_required:
-        raise GenerationError(f"missing required animation row(s): {', '.join(missing_required)}")
-    if len(filled_states) < _MIN_FILLED_STATES:
+        failure_details = []
+        for state in missing_required:
+            failure = row_failures.get(state)
+            if failure is None:
+                continue
+            attempts, error = failure
+            failure_details.append(
+                f"{state} after {attempts} attempt(s): {_humanize_image_error(str(error))}"
+            )
+        detail = f"; generation failures: {'; '.join(failure_details)}" if failure_details else ""
         raise GenerationError(
-            f"only {len(filled_states)}/{len(atlas.ROW_SPECS)} animation rows were usable; regenerate"
+            f"missing required animation row(s): {', '.join(missing_required)}{detail}"
         )
-
-    from agent.pet import store
 
     progress("save", slug)
     logger.info("pet hatch %r: saving pet", slug)
-    pet = store.register_local_pet(
-        sheet,
-        slug=slug,
-        display_name=display_name or slug,
-        description=description,
-    )
+    if staging_dir is None:
+        from agent.pet import store
+
+        pet = store.register_local_pet(
+            sheet,
+            slug=slug,
+            display_name=display_name or slug,
+            description=description,
+        )
+        saved_slug = pet.slug
+        saved_display_name = pet.display_name
+        spritesheet = pet.spritesheet
+    else:
+        saved_slug, saved_display_name, spritesheet = _stage_hatched_pet(
+            sheet,
+            staging_dir=Path(staging_dir),
+            slug=slug,
+            display_name=display_name,
+            description=description,
+        )
     return HatchResult(
-        slug=pet.slug,
-        display_name=pet.display_name,
-        spritesheet=pet.spritesheet,
+        slug=saved_slug,
+        display_name=saved_display_name,
+        spritesheet=spritesheet,
         states=validation["filled_states"],
         validation=validation,
     )
+
+
+def _stage_hatched_pet(
+    spritesheet,
+    *,
+    staging_dir: Path,
+    slug: str,
+    display_name: str,
+    description: str,
+) -> tuple[str, str, Path]:
+    """Write one generated pet package outside the installed pet store."""
+    from agent.pet import store
+
+    safe_slug = store.slugify(slug)
+    directory: Path | None = None
+    try:
+        root = staging_dir.expanduser()
+        if root.is_symlink() or not root.is_dir():
+            raise GenerationError("pet staging directory is unavailable")
+        root = root.resolve(strict=True)
+        directory = root / safe_slug
+        if directory.exists() or directory.is_symlink():
+            raise GenerationError("pet staging output already exists")
+        directory.mkdir(mode=0o700)
+        sprite_path = directory / "spritesheet.webp"
+        sprite_partial = directory / "spritesheet.webp.part"
+        metadata_path = directory / "pet.json"
+        metadata_partial = directory / "pet.json.part"
+        try:
+            store._write_spritesheet(spritesheet, sprite_partial)
+            sprite_partial.replace(sprite_path)
+            metadata_partial.write_text(
+                json.dumps(
+                    {
+                        "id": safe_slug,
+                        "displayName": display_name or safe_slug,
+                        "description": description or "",
+                        "spritesheetPath": sprite_path.name,
+                        "createdBy": "generator",
+                    },
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            metadata_partial.replace(metadata_path)
+        finally:
+            sprite_partial.unlink(missing_ok=True)
+            metadata_partial.unlink(missing_ok=True)
+        return safe_slug, display_name or safe_slug, sprite_path
+    except Exception as exc:
+        if directory is not None:
+            shutil.rmtree(directory, ignore_errors=True)
+        if isinstance(exc, GenerationError):
+            raise
+        raise GenerationError(f"could not stage generated pet '{safe_slug}': {exc}") from exc

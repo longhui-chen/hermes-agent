@@ -69,6 +69,37 @@ FOREIGN = dict(
 )
 
 
+@pytest.mark.asyncio
+async def test_current_turn_reference_images_are_task_local_and_reset():
+    ready = asyncio.Event()
+    release = asyncio.Event()
+    seen: list[str] = []
+
+    async def run(value: str) -> None:
+        token = sc.push_current_turn_reference_image(value)
+        try:
+            seen.append(sc.current_turn_reference_image())
+            if len(seen) == 2:
+                ready.set()
+            await ready.wait()
+            await release.wait()
+            assert sc.current_turn_reference_image() == value
+        finally:
+            sc.pop_current_turn_reference_image(token)
+        assert sc.current_turn_reference_image() == ""
+
+    first = asyncio.create_task(run("data:image/png;base64,AAAA"))
+    second = asyncio.create_task(run("data:image/png;base64,BBBB"))
+    await ready.wait()
+    release.set()
+    await asyncio.gather(first, second)
+
+    assert set(seen) == {
+        "data:image/png;base64,AAAA",
+        "data:image/png;base64,BBBB",
+    }
+
+
 @pytest.fixture(autouse=True)
 def _isolate_session_context():
     """Clean ContextVar + engaged-latch slate per test, restored afterwards."""
@@ -79,12 +110,14 @@ def _isolate_session_context():
     saved_async = _SESSION_ASYNC_DELIVERY.get()
     saved_turn_binding = _TURN_BINDING.get()
     saved_business_token = _BUSINESS_EXECUTION_TOKEN.get()
+    saved_reference = sc._CURRENT_TURN_REFERENCE_IMAGE.get()
     saved_engaged = sc._session_context_engaged
     for var in _VAR_MAP.values():
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _TURN_BINDING.set(_UNSET)
     _BUSINESS_EXECUTION_TOKEN.set(_UNSET)
+    sc._CURRENT_TURN_REFERENCE_IMAGE.set("")
     sc._session_context_engaged = True  # a concurrent multi-session host is engaged
     try:
         yield
@@ -94,6 +127,7 @@ def _isolate_session_context():
         _SESSION_ASYNC_DELIVERY.set(saved_async)
         _TURN_BINDING.set(saved_turn_binding)
         _BUSINESS_EXECUTION_TOKEN.set(saved_business_token)
+        sc._CURRENT_TURN_REFERENCE_IMAGE.set(saved_reference)
         sc._session_context_engaged = saved_engaged
         for k, v in saved_env.items():
             if v is None:

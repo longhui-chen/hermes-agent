@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 
 
 class _Resp:
@@ -266,6 +267,62 @@ def test_generated_media_local_artifact_flow(monkeypatch):
     )
 
 
+def test_concurrent_generation_flow_uses_bounded_http_workers(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    barrier = threading.Barrier(2)
+    calls = []
+
+    class FlowWorker:
+        def __init__(self, job_id):
+            self.job_id = job_id
+
+        def request(self, method, url, *, deadline, **kwargs):
+            calls.append(kwargs["json"]["prompt"])
+            barrier.wait(timeout=1)
+            return _Resp({"job_id": self.job_id, "status": "done", "assets": []})
+
+        def close(self):
+            return None
+
+    session = client._MediaHTTPSession(
+        workers=[FlowWorker("job-a"), FlowWorker("job-b")]
+    )
+    monkeypatch.setattr(client, "_SESSION", session)
+    monkeypatch.setattr(client, "base_url", lambda media_type: "http://127.0.0.1/test")
+    monkeypatch.setattr(client, "action_headers", lambda: {"X-Test": "token"})
+    results = []
+    errors = []
+
+    def generate(prompt):
+        try:
+            results.append(client.create_and_wait(
+                media_type="image",
+                model="seedream-v4",
+                prompt=prompt,
+                payload={},
+                timeout_seconds=2,
+            ))
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=generate, args=("pet-a",)),
+        threading.Thread(target=generate, args=("pet-b",)),
+    ]
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=2)
+    finally:
+        session.close()
+
+    assert errors == []
+    assert sorted(calls) == ["pet-a", "pet-b"]
+    assert sorted(result["job_id"] for result in results) == ["job-a", "job-b"]
+
+
 def test_generated_media_falls_back_to_remote_url_with_older_local_server(monkeypatch):
     from agent import image_gen_registry
     from plugins import zettlab_media_client as client
@@ -397,6 +454,10 @@ def test_zet_agent_exposes_video_tool_when_gateway_capability_is_enabled(monkeyp
     definitions = model_tools.get_tool_definitions(
         enabled_toolsets=sorted(enabled),
         quiet_mode=True,
+        # Progressive tool search may defer plugin schemas from the eager
+        # model-facing list.  This assertion verifies the capability-filtered
+        # source catalog before that presentation layer is applied.
+        skip_tool_search_assembly=True,
     )
 
     assert "video_generate" in {item["function"]["name"] for item in definitions}

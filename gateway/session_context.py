@@ -157,6 +157,14 @@ _ZETTLAB_BROWSER_SESSION_TOKEN: ContextVar = ContextVar(
     "zettlab_browser_session_token", default=""
 )
 
+# One validated image from the current API request's final user message. This
+# value is deliberately request-local and never mirrored into os.environ or
+# persisted in session history/metadata. Desktop-pet creation reads it without
+# accepting a model-supplied file path.
+_CURRENT_TURN_REFERENCE_IMAGE: ContextVar[str] = ContextVar(
+    "current_turn_reference_image", default=""
+)
+
 
 def set_zettlab_turn_id(turn_id: str) -> None:
     _ZETTLAB_TURN_ID.set(turn_id or "")
@@ -179,6 +187,21 @@ def pop_zettlab_browser_session_token(token) -> None:
 def zettlab_browser_session_token() -> str:
     """Return the current request's managed-browser scope capability."""
     return _ZETTLAB_BROWSER_SESSION_TOKEN.get().strip()
+
+
+def push_current_turn_reference_image(value: str):
+    """Bind the current request's validated reference image data URI."""
+    return _CURRENT_TURN_REFERENCE_IMAGE.set(str(value or "").strip())
+
+
+def pop_current_turn_reference_image(token) -> None:
+    """Restore the reference-image context that preceded this request."""
+    _CURRENT_TURN_REFERENCE_IMAGE.reset(token)
+
+
+def current_turn_reference_image() -> str:
+    """Return the current request's bounded reference image data URI."""
+    return _CURRENT_TURN_REFERENCE_IMAGE.get().strip()
 
 
 def set_zettlab_connector_route_capability(capability: str) -> None:
@@ -498,6 +521,7 @@ def reset_session_vars() -> None:
     # same inheritance-leak reason as the mapped vars above — see clear_session_vars,
     # which resets this var on the handler-exit path for the symmetric concern.
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
+    _CURRENT_TURN_REFERENCE_IMAGE.set("")
     try:
         from agent.runtime_cwd import clear_session_cwd
 

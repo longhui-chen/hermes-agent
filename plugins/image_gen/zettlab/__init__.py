@@ -90,7 +90,19 @@ class ZettlabImageGenProvider(ImageGenProvider):
         max_refs = 0
         if isinstance(limits, dict):
             max_refs = int(limits.get("max_remote_media_inputs") or 0)
-        return {"modalities": modalities or ["text"], "max_reference_images": max(0, max_refs - 1)}
+            inline_limit = limits.get("max_inline_image_bytes")
+            if isinstance(inline_limit, int) and not isinstance(inline_limit, bool) and inline_limit > 0:
+                max_refs = max(max_refs, 1)
+        return {
+            "modalities": modalities or ["text"],
+            "max_reference_images": max(0, max_refs - 1),
+            "supports_inline_image": bool(
+                isinstance(limits, dict)
+                and isinstance(limits.get("max_inline_image_bytes"), int)
+                and not isinstance(limits.get("max_inline_image_bytes"), bool)
+                and limits.get("max_inline_image_bytes") > 0
+            ),
+        }
 
     def generate(
         self,
@@ -124,7 +136,9 @@ class ZettlabImageGenProvider(ImageGenProvider):
 
         try:
             refs = normalize_reference_images(reference_image_urls)
-            inputs = media_client.remote_inputs(image_url, refs)
+            input_image, inputs = media_client.split_image_inputs(
+                image_url, refs, model_capability
+            )
             configured_modalities = (
                 model_capability.get("modalities")
                 if isinstance(model_capability, dict)
@@ -136,7 +150,7 @@ class ZettlabImageGenProvider(ImageGenProvider):
                 declared_limit = type_limits.get("max_remote_media_inputs")
                 if isinstance(declared_limit, int) and not isinstance(declared_limit, bool) and declared_limit >= 0:
                     max_remote_inputs = declared_limit
-            if inputs and (
+            if (input_image or inputs) and (
                 not isinstance(configured_modalities, list)
                 or "image" not in configured_modalities
                 or (max_remote_inputs is not None and max_remote_inputs < len(inputs))
@@ -153,6 +167,7 @@ class ZettlabImageGenProvider(ImageGenProvider):
                 isinstance(configured_modalities, list)
                 and "image" in configured_modalities
                 and "text" not in configured_modalities
+                and not input_image
                 and not inputs
             ):
                 return error_response(
@@ -167,8 +182,11 @@ class ZettlabImageGenProvider(ImageGenProvider):
             payload: Dict[str, Any] = {
                 "output_count": 1,
                 "aspect_ratio": gateway_aspect,
-                "remote_media_inputs": inputs,
             }
+            if input_image:
+                payload["input_image"] = input_image
+            elif inputs:
+                payload["remote_media_inputs"] = inputs
             resolutions = _capability_strings(model_capability, "resolutions")
             if resolutions:
                 payload["resolution"] = resolutions[0]
@@ -198,7 +216,7 @@ class ZettlabImageGenProvider(ImageGenProvider):
             prompt=prompt,
             aspect_ratio=aspect,
             provider="zettlab",
-            modality="image" if image_url or reference_image_urls else "text",
+            modality="image" if input_image or inputs else "text",
             extra={
                 "job_id": job.get("job_id"),
                 "assets": job.get("assets") or [],
