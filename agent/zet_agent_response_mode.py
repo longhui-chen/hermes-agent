@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import json
 import logging
@@ -1372,6 +1373,26 @@ def _canonical_tool_args_sha256(function_args: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _normalized_registry_tool_args(
+    function_name: str,
+    function_args: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    """Return the same schema-coerced args the registry will dispatch."""
+    try:
+        normalized = copy.deepcopy(dict(function_args))
+        from model_tools import coerce_tool_args
+
+        normalized = coerce_tool_args(function_name, normalized)
+    except Exception as exc:
+        logger.warning(
+            "zet_agent: failed to normalize trusted %s args: %s",
+            function_name,
+            exc,
+        )
+        return None
+    return normalized if isinstance(normalized, dict) else None
+
+
 def _memory_payload_hashes_from_terminal_result(
     result: Mapping[str, Any],
 ) -> frozenset[str]:
@@ -1509,8 +1530,19 @@ def trusted_skill_operation_block_message(
         may_authorize_memory = False
         authorized_args_sha256 = ""
         if allowed and function_name == "terminal":
-            allowed, may_authorize_memory = _video_edit_command_policy(function_args)
-            authorized_args_sha256 = _canonical_tool_args_sha256(function_args)
+            normalized_args = _normalized_registry_tool_args(
+                function_name,
+                function_args,
+            )
+            if normalized_args is None:
+                allowed = False
+            else:
+                allowed, may_authorize_memory = _video_edit_command_policy(
+                    normalized_args
+                )
+                authorized_args_sha256 = _canonical_tool_args_sha256(
+                    normalized_args
+                )
             allowed = bool(
                 allowed
                 and scope.execution_receipt is not None
@@ -1708,8 +1740,18 @@ def _claim_trusted_video_terminal_dispatch(
                 "task-local turn. It was revoked before dispatch."
             )
 
-        final_digest = _canonical_tool_args_sha256(function_args)
-        allowed, may_authorize_memory = _video_edit_command_policy(function_args)
+        normalized_args = _normalized_registry_tool_args("terminal", function_args)
+        final_digest = (
+            _canonical_tool_args_sha256(normalized_args)
+            if normalized_args is not None
+            else ""
+        )
+        if normalized_args is None:
+            allowed, may_authorize_memory = False, False
+        else:
+            allowed, may_authorize_memory = _video_edit_command_policy(
+                normalized_args
+            )
         receipt = scope.execution_receipt
         if (
             not allowed
@@ -1746,8 +1788,9 @@ def dispatch_trusted_skill_operation(
 
     Plugin pre-hooks and execution middleware run before this function, while
     post/transform hooks run after it returns. The private receipt therefore
-    exists only during the actual terminal registry handler. Trust state is
-    updated from that raw handler result before plugins can replace it.
+    exists only during the actual terminal registry handler. Terminal success
+    is bound to the raw handler result before plugins can replace it, while a
+    ``skill_view`` scope is activated later from the final displayed result.
     """
     _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
     receipt: _TrustedExecutionReceipt | None = None
@@ -1769,11 +1812,12 @@ def dispatch_trusted_skill_operation(
             },
             ensure_ascii=False,
         )
-        apply_trusted_skill_execution(
-            agent,
-            function_name=function_name,
-            function_result=result,
-        )
+        if function_name != "skill_view":
+            apply_trusted_skill_execution(
+                agent,
+                function_name=function_name,
+                function_result=result,
+            )
         return result
 
     if receipt is not None:
@@ -1782,20 +1826,22 @@ def dispatch_trusted_skill_operation(
         result = dispatch()
     except BaseException:
         _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
-        apply_trusted_skill_execution(
-            agent,
-            function_name=function_name,
-            function_result=None,
-        )
+        if function_name != "skill_view":
+            apply_trusted_skill_execution(
+                agent,
+                function_name=function_name,
+                function_result=None,
+            )
         raise
     finally:
         _TRUSTED_VIDEO_EDIT_RUNTIME_RECEIPT.set(None)
 
-    apply_trusted_skill_execution(
-        agent,
-        function_name=function_name,
-        function_result=result,
-    )
+    if function_name != "skill_view":
+        apply_trusted_skill_execution(
+            agent,
+            function_name=function_name,
+            function_result=result,
+        )
     return result
 
 

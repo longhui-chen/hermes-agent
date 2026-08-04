@@ -2,6 +2,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import agent.zet_agent_response_mode as response_mode
 from agent.conversation_loop import (
     _apply_forced_video_edit_skill_view,
@@ -531,6 +533,7 @@ def test_trusted_video_receipt_and_rearm_ignore_plugin_result_rewrite(
     agent = _runtime_agent(("skill_view", "clarify", "todo", "terminal"))
     terminal_args = {
         "command": "python3 /trusted/video-edit/preference_resolver.py resolve",
+        "timeout": "300",
     }
     raw_failure = json.dumps(
         {
@@ -589,6 +592,7 @@ def test_trusted_video_receipt_and_rearm_ignore_plugin_result_rewrite(
 
     def _dispatch(_tool_name, _args, **_kwargs):
         assert response_mode.trusted_video_edit_runtime_receipt() == expected_receipt
+        assert _args["timeout"] == 300
         events.append("dispatch")
         return raw_failure
 
@@ -657,6 +661,166 @@ def test_trusted_video_receipt_and_rearm_ignore_plugin_result_rewrite(
         "post_tool_call",
         "transform_tool_result",
     ]
+
+
+def test_trusted_video_terminal_authorization_normalizes_registry_args(
+    monkeypatch,
+):
+    agent = _agent(valid_tool_names={"skill_view", "terminal", "todo"})
+    preflight_args = {
+        "command": "python3 trusted-helper.py resolve",
+        "timeout": "300",
+    }
+    dispatched_args = {
+        "command": "python3 trusted-helper.py resolve",
+        "timeout": 300,
+    }
+    receipt = response_mode._TrustedExecutionReceipt(
+        agent_id="agent-1",
+        action_token="action-secret",
+        business_execution_token="business-secret",
+        turn_id="trusted-terminal-coercion",
+        session_id="session-1",
+    )
+    dispatched = False
+
+    turn_tokens = set_turn_vars(turn_id="trusted-terminal-coercion")
+    try:
+        task = response_mode._skill_direct_task_context(agent, "剪辑")
+        agent._zet_agent_skill_direct_task = task
+        agent._zet_agent_skill_direct_scope = response_mode._SkillDirectScope(
+            relative_path=response_mode._VIDEO_EDIT_SKILL_PATH,
+            task_sha256=task.task_sha256,
+            turn_identity=task.turn_identity,
+            allowed_tools=frozenset({"terminal"}),
+            execution_receipt=receipt,
+        )
+        agent._zet_agent_skill_direct_operation = None
+        monkeypatch.setattr(
+            response_mode,
+            "_video_edit_command_policy",
+            lambda _args: (True, False),
+        )
+
+        assert response_mode.trusted_skill_operation_block_message(
+            agent,
+            function_name="terminal",
+            function_args=preflight_args,
+        ) is None
+        assert preflight_args["timeout"] == "300"
+
+        def _dispatch():
+            nonlocal dispatched
+            dispatched = True
+            return '{"exit_code":0,"video_edit_runtime_direct":true}'
+
+        result = response_mode.dispatch_trusted_skill_operation(
+            agent,
+            function_name="terminal",
+            function_args=dispatched_args,
+            dispatch=_dispatch,
+        )
+    finally:
+        clear_turn_vars(turn_tokens)
+
+    assert dispatched
+    assert json.loads(result)["exit_code"] == 0
+
+
+@pytest.mark.parametrize(
+    ("rewrite_result", "expected_scope"),
+    [(False, True), (True, False)],
+)
+def test_trusted_skill_scope_uses_final_displayed_skill_view_result(
+    monkeypatch,
+    rewrite_result,
+    expected_scope,
+):
+    agent = _runtime_agent(("skill_view", "clarify", "todo", "terminal"))
+    monkeypatch.setattr(
+        response_mode,
+        "_capture_trusted_execution_receipt",
+        lambda _turn_identity: response_mode._TrustedExecutionReceipt(
+            agent_id="agent-1",
+            action_token="action-secret",
+            business_execution_token="business-secret",
+            turn_id="final-skill-view-result",
+            session_id="session-1",
+        ),
+    )
+
+    turn_tokens = set_turn_vars(turn_id="final-skill-view-result")
+    try:
+        task = response_mode._skill_direct_task_context(agent, "剪辑")
+        agent._zet_agent_skill_direct_task = task
+        agent._zet_agent_skill_direct_scope = None
+        agent._zet_agent_skill_direct_operation = None
+        attestation = "test-final-skill-view-attestation"
+        raw_result = json.dumps(
+            {
+                "name": _VIDEO_EDIT_SKILL,
+                "content": "trusted skill",
+                response_mode._ATTESTATION_FIELD: attestation,
+            },
+            ensure_ascii=False,
+        )
+        consumed = False
+
+        def _consume_attestation(token, serialized_result):
+            nonlocal consumed
+            if consumed or token != attestation or serialized_result != raw_result:
+                return None
+            consumed = True
+            return SimpleNamespace(
+                relative_path=response_mode._VIDEO_EDIT_SKILL_PATH,
+                turn_identity=task.turn_identity,
+            )
+
+        monkeypatch.setattr(
+            response_mode,
+            "_consume_skill_attestation",
+            _consume_attestation,
+        )
+        displayed_payload = json.loads(raw_result)
+        if rewrite_result:
+            displayed_payload["content"] = "plugin-rewritten skill"
+        displayed_result = json.dumps(displayed_payload, ensure_ascii=False)
+
+        monkeypatch.setattr(
+            "model_tools.registry.dispatch",
+            lambda _name, _args, **_kwargs: raw_result,
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.has_hook",
+            lambda hook_name: hook_name == "transform_tool_result",
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins.invoke_hook",
+            lambda hook_name, **_kwargs: (
+                [displayed_result]
+                if hook_name == "transform_tool_result"
+                else []
+            ),
+        )
+
+        assistant_message = _tool_response(
+            "skill_view",
+            json.dumps({"name": _VIDEO_EDIT_SKILL}),
+        ).choices[0].message
+        messages = []
+        agent._execute_tool_calls_sequential(
+            assistant_message,
+            messages,
+            "trusted-skill-view-task",
+        )
+
+        tool_result = next(
+            message for message in messages if message["role"] == "tool"
+        )
+        assert tool_result["content"] == displayed_result
+        assert response_mode.trusted_skill_scope_active(agent) is expected_scope
+    finally:
+        clear_turn_vars(turn_tokens)
 
 
 def test_trusted_video_blocks_terminal_args_changed_after_preflight(monkeypatch):
