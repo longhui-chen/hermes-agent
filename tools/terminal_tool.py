@@ -7869,6 +7869,10 @@ TERMINAL_SCHEMA = {
 
 
 def _handle_terminal(args, **kw):
+    from tools.runtime_workdir import AGENT_OUTPUT_ARG
+
+    # registry 解析层注入的内部标记到此为止：pop 掉避免作为业务参数外溢。
+    runtime_agent_output = bool(args.pop(AGENT_OUTPUT_ARG, False))
     return terminal_tool(
         command=args.get("command"),
         background=args.get("background", False),
@@ -7879,9 +7883,7 @@ def _handle_terminal(args, **kw):
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),
         watch_patterns=args.get("watch_patterns"),
-        _runtime_agent_output_workdir=getattr(
-            args, "agent_output_workdir", False
-        ),
+        _runtime_agent_output_workdir=runtime_agent_output,
     )
 
 

@@ -41,6 +41,11 @@ _MANAGED_TERMINAL_IDENTITY_CACHE_MAX = 4096
 _MANAGED_TERMINAL_IDENTITY_LOCK = threading.Lock()
 _MANAGED_TERMINAL_SCOPE_BY_UID: dict[int, str] = {}
 _MANAGED_SKILL_TREE_MAX_ENTRIES = 20_000
+_MANAGED_SKILL_TREE_PREPARED_MAX = 4096
+_MANAGED_SKILL_TREE_LOCK = threading.Lock()
+# 按 root 存指纹而不是把 (root, mtime, ctime) 当 key：同一 root 的旧指纹没有价值，
+# 避免安装/卸载 churn 把缓存撑到上限（HR1）。
+_MANAGED_SKILL_TREE_PREPARED: dict[str, tuple] = {}
 _MANAGED_OUTPUT_TREE_MAX_ENTRIES = 100_000
 _MANAGED_TERMINAL_RETIRED_UIDS: set[int] = set()
 _MANAGED_TERMINAL_RETIRED_SCOPES: set[str] = set()
@@ -65,7 +70,7 @@ _MANAGED_TERMINAL_CGROUP_ENTER = (
     "os.execv(sys.argv[2],sys.argv[2:])\n"
 )
 _MANAGED_TERMINAL_PRIVATE_TMP_ENTER = (
-    "import ctypes,os,stat,sys\n"
+    "import ctypes,os,re,stat,sys\n"
     "if len(sys.argv)<4:\n raise OSError('managed private tmp argv is invalid')\n"
     "sources=sys.argv[1:3]\n"
     "for source in sources:\n"
@@ -84,14 +89,27 @@ _MANAGED_TERMINAL_PRIVATE_TMP_ENTER = (
     "mount(None,b'/',16384|262144)\n"
     "mount(os.fsencode(sources[0]),b'/tmp',4096|16384)\n"
     "mount(os.fsencode(sources[1]),b'/var/tmp',4096|16384)\n"
-    "skill_root=os.path.join(os.environ.get('HERMES_HOME',''),'skills')\n"
-    "if skill_root and os.path.isdir(skill_root):\n"
+    # 相对 HERMES_HOME 会把子进程 cwd 下的同名目录挂成只读，必须要求绝对路径
+    "hermes_home=os.environ.get('HERMES_HOME','')\n"
+    "skill_root=os.path.join(hermes_home,'skills')\n"
+    "if os.path.isabs(hermes_home) and os.path.isdir(skill_root):\n"
     " info=os.lstat(skill_root)\n"
     " if not stat.S_ISDIR(info.st_mode) or info.st_mode&0o022:\n"
     "  raise OSError('managed skill source is not trusted')\n"
     " encoded=os.fsencode(skill_root)\n"
     " mount(encoded,encoded,4096|16384)\n"
-    " mount(None,encoded,32|4096|1|2|4)\n"
+    # MS_REMOUNT 不递归：skills 下的子挂载若不逐个补只读，就是快照守卫豁免区里的可写洞
+    " points={skill_root}\n"
+    " with open('/proc/self/mountinfo','rb') as handle:\n"
+    "  for line in handle:\n"
+    "   fields=line.split(b' ')\n"
+    "   if len(fields)<5:\n"
+    "    continue\n"
+    "   point=os.fsdecode(re.sub(rb'\\\\([0-7]{3})',lambda m:bytes([int(m.group(1),8)]),fields[4]))\n"
+    "   if point==skill_root or point.startswith(skill_root+'/'):\n"
+    "    points.add(point)\n"
+    " for point in sorted(points,key=len,reverse=True):\n"
+    "  mount(None,os.fsencode(point),32|4096|1|2|4)\n"
     "os.umask(0o077)\n"
     "os.execv(sys.argv[3],sys.argv[3:])\n"
 )
@@ -1129,6 +1147,59 @@ def _prepare_managed_command_skill_sources(
         _normalize_managed_skill_package(package, gid)
 
 
+def _prepare_managed_skill_tree(skills_root: Path, gid: int) -> None:
+    """Restore group access for every installed package, whatever invokes it.
+
+    Command parsing only recognizes ``python <abs path>`` entrypoints, but
+    skills also run as ``bash x.sh``, ``./x.py``, ``python -m``, relative
+    paths or plain reads. Walking every top-level package here keeps those
+    shapes readable too; per-command preparation stays as the fallback for
+    packages installed after this pass.
+    """
+
+    try:
+        root_info = os.lstat(skills_root)
+    except FileNotFoundError:
+        return
+    root_key = str(skills_root)
+    with os.scandir(skills_root) as entries:
+        listing = [(entry.path, entry.name) for entry in entries]
+    # 指纹要覆盖每个顶层包，不能只看 skills_root：在已有包里新增或更新文件
+    # 不会动根目录的时间戳，只按根判定会让新装的脚本一直读不到，直到重启或
+    # 根目录恰好被动过。gid 也进指纹——身份轮换后旧的放权结果不可信。
+    fingerprint: list[tuple[str, int, int]] = []
+    for path_str, name in sorted(listing, key=lambda item: item[1]):
+        try:
+            info = os.lstat(path_str)
+        except OSError:
+            continue
+        fingerprint.append((name, info.st_mtime_ns, info.st_ctime_ns))
+    state = (
+        gid,
+        root_info.st_mtime_ns,
+        root_info.st_ctime_ns,
+        tuple(fingerprint),
+    )
+    with _MANAGED_SKILL_TREE_LOCK:
+        if _MANAGED_SKILL_TREE_PREPARED.get(root_key) == state:
+            return
+    packages = [Path(path_str) for path_str, _name in listing]
+    for package in packages:
+        try:
+            _normalize_managed_skill_package(package, gid)
+        except OSError as exc:
+            # 单个坏包不许废掉整棵树的放权（HR2）
+            logger.warning(
+                "managed skill package skipped: %s (%s)", package, exc
+            )
+    with _MANAGED_SKILL_TREE_LOCK:
+        while len(_MANAGED_SKILL_TREE_PREPARED) >= _MANAGED_SKILL_TREE_PREPARED_MAX:
+            _MANAGED_SKILL_TREE_PREPARED.pop(
+                next(iter(_MANAGED_SKILL_TREE_PREPARED))
+            )
+        _MANAGED_SKILL_TREE_PREPARED[root_key] = state
+
+
 def _migrate_managed_output_tree(
     output_dir: Path,
     *,
@@ -1300,8 +1371,20 @@ def _prepare_managed_profile_runtime(env: Mapping[str, str]) -> None:
             or skills_info.st_mode & 0o022
         ):
             raise OSError("managed profile skills are not trusted")
-        os.chown(skills_root, 0, gid, follow_symlinks=False)
-        os.chmod(skills_root, 0o750, follow_symlinks=False)
+        # 只在确有差异时写：无条件 chown/chmod 会刷新 skills_root 的 ctime，
+        # 而技能树缓存正是按它的时间戳判定是否需要重扫——那样缓存永远不命中，
+        # 每条受管终端命令都退化成一次全树 walk。
+        if skills_info.st_gid != gid or skills_info.st_uid != 0:
+            os.chown(skills_root, 0, gid, follow_symlinks=False)
+        if stat.S_IMODE(skills_info.st_mode) != 0o750:
+            os.chmod(skills_root, 0o750, follow_symlinks=False)
+        try:
+            _prepare_managed_skill_tree(skills_root, gid)
+        except OSError as exc:
+            # 技能树放权失败不该拖垮下面的 output 迁移（HR2/HR5）
+            logger.warning(
+                "managed skill tree preparation skipped: %s", exc
+            )
 
     output_info = os.lstat(output_dir)
     if (
@@ -1323,6 +1406,117 @@ def _prepare_managed_profile_runtime(env: Mapping[str, str]) -> None:
         )
 
 
+def managed_fallback_cwd(
+    env: Mapping[str, str] | None = None,
+    *,
+    home: str = "",
+) -> str:
+    """Return the directory a managed terminal falls back to, or *home*.
+
+    Prefers the platform output directory: it sits inside the agent's writable
+    scope, so the snapshot guard can protect it, while the profile home lives
+    outside every snapshot target and makes the guard reject the whole command.
+
+    Pure on purpose — it never creates, chowns or chmods anything. The guard
+    calls it to learn where a command will really run; if the two sides derived
+    that answer separately they could drift, and a snapshot taken for one
+    directory while the command writes another is the exact split this guard
+    exists to prevent.
+    """
+
+    if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
+        return home
+    try:
+        from tools.runtime_workdir import agent_output_dir
+
+        output_dir = agent_output_dir(environ=env)
+    except Exception:
+        output_dir = None
+    if not output_dir or not _managed_output_is_trusted(output_dir):
+        return home
+    return output_dir
+
+
+def _managed_output_is_trusted(output_dir: str) -> bool:
+    """Report whether the platform output directory is safe to run commands in.
+
+    The trust check lives here rather than at the (single) preparation call site
+    so that both sides of the contract reach the same verdict: the guard never
+    runs preparation, and an output directory rejected there must not silently
+    remain the guard's protection target. A symlink, a group/other-writable
+    directory, or anything not owned by root or the derived identity means the
+    platform did not provision it — fall back to the profile home instead.
+    """
+
+    try:
+        info = os.lstat(output_dir)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        return False
+    if info.st_mode & 0o022:
+        return False
+    return info.st_uid == 0 or info.st_uid >= _MANAGED_TERMINAL_UID_MIN
+
+
+def _managed_cwd_is_unusable(cwd: str) -> bool:
+    """Report whether *cwd* is unreachable by any derived identity.
+
+    Identity-free stand-in for :func:`_managed_identity_can_traverse`, used when
+    the derived UID is not available (the guard resolves an effective cwd from
+    the gateway process, which may not carry the terminal's env). Walks the whole
+    parent chain, not just the leaf: the execution side rejects a cwd whose
+    *parent* is unreachable (``/volume1`` at 0770 root:group), and a leaf-only
+    check would leave the guard protecting a directory the command never enters.
+
+    A derived identity owns nothing outside its own profile tree, so "other"
+    execute is the honest permission to demand of a candidate cwd. ``/root`` —
+    the hardcoded terminal default that made every non-readonly command fail
+    closed on device — is 0700 root and falls out of the same rule.
+    """
+
+    if not cwd:
+        return True
+    try:
+        resolved = Path(cwd).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return True
+    for component in (resolved, *resolved.parents):
+        try:
+            info = component.stat()
+        except OSError:
+            return True
+        if not stat.S_ISDIR(info.st_mode) or not info.st_mode & 0o001:
+            return True
+    return False
+
+
+def managed_effective_cwd(
+    cwd: str,
+    env: Mapping[str, str] | None = None,
+    *,
+    home: str = "",
+) -> str:
+    """Return where a managed terminal will really run a command started in *cwd*.
+
+    Single source of truth for "which directory does this command touch". The
+    snapshot guard protects whatever this returns and the local backend runs in
+    whatever this returns; deriving that answer twice is how a snapshot ends up
+    covering a directory the command never writes.
+    """
+
+    if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
+        return cwd
+    try:
+        uid, gid = _managed_terminal_identity(env)
+        usable = bool(cwd) and _managed_identity_can_traverse(cwd, uid=uid, gid=gid)
+    except Exception:
+        usable = not _managed_cwd_is_unusable(cwd)
+    if usable:
+        return cwd
+    return managed_fallback_cwd(env, home=home) or home or cwd
+
+
 def _managed_terminal_cwd(
     cwd: str,
     *,
@@ -1333,11 +1527,17 @@ def _managed_terminal_cwd(
     if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
         return cwd
     home = _prepare_managed_terminal_home(env)
-    _prepare_managed_profile_runtime(env)
-    uid, gid = _managed_terminal_identity(env)
-    if cwd and _managed_identity_can_traverse(cwd, uid=uid, gid=gid):
-        return cwd
-    return home
+    try:
+        _prepare_managed_profile_runtime(env)
+    except OSError as exc:
+        # A hostile-looking path chain must not take the whole shell surface
+        # down with it: every managed terminal command routes through here, so
+        # raising turns one untrusted mount point into a total terminal outage
+        # (HR2/HR5 — availability outranks the hardening this call performs).
+        # Degrade to "runtime not prepared": skills stay root-only and output
+        # keeps its old owner, which fails the affected commands individually.
+        logger.warning("managed profile runtime preparation skipped: %s", exc)
+    return managed_effective_cwd(cwd, env, home=home)
 
 
 def _msys_to_windows_path(cwd: str) -> str:

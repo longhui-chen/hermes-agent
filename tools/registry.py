@@ -266,25 +266,33 @@ def _zettlab_snapshot_gate(name: str, args: dict, kwargs: dict) -> Optional[str]
         return None
 
 
-class _ResolvedRuntimeToolArgs(dict):
-    """Dispatch-local arguments carrying semantic resolution metadata."""
-
-    agent_output_workdir = False
-
-
 def _resolve_runtime_tool_args(name: str, args: dict) -> dict:
     """Resolve platform-owned semantic arguments before any execution gate."""
-    if name != "terminal" or not isinstance(args, dict):
+    if not isinstance(args, dict):
         return args
 
-    from tools.runtime_workdir import AGENT_OUTPUT_WORKDIR, resolve_runtime_workdir
+    from tools.runtime_workdir import (
+        AGENT_OUTPUT_ARG,
+        AGENT_OUTPUT_WORKDIR,
+        resolve_runtime_workdir,
+    )
+
+    # HR3：AGENT_OUTPUT_ARG 只允许由本函数注入。模型可控入参可能自带同名
+    # key 冒充「平台已解析」，所以所有分支一律先剥（拷贝、不就地改调用方
+    # dict），只有真正解析了 alias 才重新注入。标记走字典带内传递而非对象
+    # 属性，是为了让中间层的 dict(args) 浅拷贝不弄丢它。
+    if AGENT_OUTPUT_ARG in args:
+        args = {k: v for k, v in args.items() if k != AGENT_OUTPUT_ARG}
+
+    if name != "terminal":
+        return args
 
     workdir = args.get("workdir")
     if workdir != AGENT_OUTPUT_WORKDIR:
         return args
     resolved_workdir = resolve_runtime_workdir(workdir)
-    resolved_args = _ResolvedRuntimeToolArgs(args)
-    resolved_args.agent_output_workdir = True
+    resolved_args = dict(args)
+    resolved_args[AGENT_OUTPUT_ARG] = True
     resolved_args["workdir"] = resolved_workdir
     return resolved_args
 
