@@ -1436,10 +1436,19 @@ def _prepare_managed_profile_runtime(env: Mapping[str, str]) -> None:
             )
 
     output_info = os.lstat(output_dir)
+    # 属主判定与 _managed_output_is_trusted 同一条规则：root、本身份、或任何
+    # 受管 UID 段内的旧身份都算可信可迁移。只认 (0, uid) 会把升级板挡在
+    # _migrate_managed_output_tree 之外——那个函数本就是为「历史 output 属于
+    # 另一个数字 UID」写的（见其 _trusted 注释），存量 output 却在这里先被
+    # 判成 not trusted，agent 从此写不进自己的产出目录。受管 UID 段只由本
+    # 进程的身份代理分配，且 output 的父链已校验为 root 所有、非全局可写。
     if (
         not stat.S_ISDIR(output_info.st_mode)
         or output_info.st_mode & 0o022
-        or output_info.st_uid not in (0, uid)
+        or not (
+            output_info.st_uid == 0
+            or output_info.st_uid >= _MANAGED_TERMINAL_UID_MIN
+        )
     ):
         raise OSError("managed profile output is not trusted")
     if (

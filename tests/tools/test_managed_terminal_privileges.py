@@ -1153,3 +1153,57 @@ def test_generic_subprocess_scrubs_managed_gateway_key(monkeypatch):
     assert "HERMES_MANAGED_GATEWAY" not in sanitized
     assert "HERMES_MANAGED_CGROUP_UNIT" not in sanitized
     assert "HERMES_MANAGED_CGROUP_ROOT" not in sanitized
+
+
+@pytest.mark.skipif(
+    os.name == "nt" or not hasattr(os, "geteuid") or os.geteuid() != 0,
+    reason="requires root POSIX ownership semantics",
+)
+def test_managed_profile_runtime_migrates_previous_identity_output(
+    monkeypatch, request
+):
+    """升级板的 output 属于上一版算法派生的旧 UID，必须走迁移而不是被判不可信。
+
+    _migrate_managed_output_tree 本就是为「历史 output 属于另一个数字 UID」写
+    的；调用方只认 (0, uid) 会把它挡在门外，agent 从此写不进自己的产出目录。
+    """
+    tmp_path = Path(tempfile.mkdtemp(prefix="hermes-migrate-test-", dir="/run"))
+    request.addfinalizer(lambda: shutil.rmtree(tmp_path, ignore_errors=True))
+    os.chmod(tmp_path, 0o755)
+    hermes_root = tmp_path / "hermes_home"
+    profiles_root = hermes_root / "profiles"
+    profile_home = profiles_root / "agent-a"
+    output = tmp_path / "agents" / "data" / "agent-a" / "output"
+    profile_home.mkdir(parents=True)
+    output.mkdir(parents=True)
+    carried = output / "report.md"
+    carried.write_text("earlier run")
+    for path in (hermes_root, profiles_root, profile_home):
+        os.chmod(path, 0o700)
+
+    # 上一版身份算法派生出来的旧 UID：在受管段内，但既不是 root 也不是新身份。
+    stale_uid = local_module._MANAGED_TERMINAL_UID_MIN + 4242
+    os.chown(carried, stale_uid, stale_uid)
+    os.chown(output, stale_uid, stale_uid)
+    os.chmod(output, 0o700)
+
+    monkeypatch.setattr(local_module, "_IS_WINDOWS", False)
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setenv("ZET_AGENT_KEY", "device-key")
+    local_module._MANAGED_TERMINAL_SCOPE_BY_UID.clear()
+    local_module._MANAGED_SKILL_TREE_PREPARED.clear()
+    env = {
+        "HERMES_HOME": str(profile_home),
+        "ZET_AGENT_OUTPUT_DIR": str(output),
+    }
+
+    local_module._prepare_managed_profile_runtime(env)
+    uid, gid = local_module._managed_terminal_identity(env)
+
+    assert uid != stale_uid
+    assert output.stat().st_uid == uid
+    assert stat.S_IMODE(output.stat().st_mode) == 0o700
+    # 存量产出跟着换主，不是被删或跳过。
+    assert carried.read_text() == "earlier run"
+    assert carried.stat().st_uid == uid
+    assert carried.stat().st_gid == gid

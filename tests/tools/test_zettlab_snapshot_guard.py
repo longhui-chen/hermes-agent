@@ -2258,3 +2258,38 @@ def test_registry_dispatch_direct_path_is_gated(monkeypatch, tmp_path):
     out2 = registry.dispatch("write_file", {"path": str(target), "content": "y"})
     assert "error" in json.loads(out2)
     assert target.read_text() == "x"
+
+
+def test_padded_agent_output_alias_is_not_resolved(monkeypatch, tmp_path):
+    """带首尾空白的 workdir 不是别名。
+
+    registry.dispatch 和 terminal_tool 都对 `agent_output` 做精确比较，守卫
+    先 strip 再匹配就会单方面解析成平台 output 目录，而命令仍 `cd` 进那个字面
+    相对路径——快照拍在 A、破坏性命令改的是 B。
+    """
+    output = tmp_path / "output"
+    output.mkdir()
+    session = tmp_path / "session"
+    session.mkdir()
+    monkeypatch.chdir(session)
+    monkeypatch.delenv("HERMES_MANAGED_GATEWAY", raising=False)
+    monkeypatch.setenv("ZET_AGENT_OUTPUT_DIR", str(output))
+    rec = _install(monkeypatch)
+
+    guard.maybe_require_snapshot(
+        "terminal",
+        {"command": "rm -f x", "workdir": " agent_output "},
+        turn_id="turn_1",
+    )
+
+    protected = rec.requests[0]["body"]["paths"]
+    assert str(output) not in protected
+
+    # 未加空白的原值仍照常解析成 output 目录。
+    rec.requests.clear()
+    guard.maybe_require_snapshot(
+        "terminal",
+        {"command": "rm -f x", "workdir": "agent_output"},
+        turn_id="turn_2",
+    )
+    assert rec.requests[0]["body"]["paths"] == [str(output)]

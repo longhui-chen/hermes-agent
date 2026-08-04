@@ -595,12 +595,17 @@ def _terminal_workdir(arguments: dict[str, Any], task_id: str) -> str:
     if session_cwd:
         session_cwd = _map_container_path(_abs_path(session_cwd))
 
-    explicit = str(arguments.get("workdir") or "").strip()
+    raw_workdir = arguments.get("workdir")
+    explicit = str(raw_workdir or "").strip()
     if explicit:
         try:
             from tools.runtime_workdir import resolve_runtime_workdir
 
-            explicit = str(resolve_runtime_workdir(explicit) or "").strip()
+            # 别名匹配必须用未预处理的原值。registry.dispatch 和 terminal_tool
+            # 都对 `agent_output` 做精确比较，这里先 strip 会让 " agent_output "
+            # 只在守卫侧解析成平台 output 目录，而命令仍 `cd` 进那个字面相对
+            # 路径——快照拍在 A、破坏性命令改的是 B，正是本 gate 要防的分叉。
+            explicit = str(resolve_runtime_workdir(raw_workdir) or "").strip()
         except ValueError:
             # Registry dispatch rejects an unavailable semantic alias before
             # this gate. Direct guard calls still fail safe by protecting the
