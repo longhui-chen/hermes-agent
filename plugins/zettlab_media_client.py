@@ -19,7 +19,7 @@ import stat
 import threading
 import time
 from typing import Any, Dict, List, Optional
-from urllib.parse import unquote, urljoin, urlparse, urlunparse
+from urllib.parse import unquote, urlparse, urlunparse
 from urllib.request import url2pathname
 
 import requests
@@ -35,8 +35,6 @@ MAX_MEDIA_REQUEST_BYTES = 7 * 1024 * 1024
 MAX_MEDIA_RESPONSE_BYTES = 1024 * 1024
 MAX_INLINE_IMAGE_BYTES = 5 * 1024 * 1024
 LOCAL_IMAGE_READ_TIMEOUT = 30.0
-REMOTE_IMAGE_READ_TIMEOUT = 30.0
-REMOTE_IMAGE_MAX_REDIRECTS = 3
 ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
 ARTIFACT_SESSION_HEADER = "X-Zettlab-Artifact-Session-Id"
 _STARTER_CAPACITY = threading.BoundedSemaphore(value=2)
@@ -122,15 +120,8 @@ def _media_http_worker(connection: Any, parent_pid: int, request_buffer: Any, re
             allow_redirects=False,
             stream=True,
         )
-        requested_limit = request.get("response_limit")
         if response.status_code >= 400:
             limit = MAX_ERROR_RESPONSE_BYTES
-        elif (
-            isinstance(requested_limit, int)
-            and not isinstance(requested_limit, bool)
-            and requested_limit > 0
-        ):
-            limit = requested_limit
         elif request["url"].endswith("/media/generation-capabilities"):
             limit = MAX_CAPABILITY_RESPONSE_BYTES
         else:
@@ -142,11 +133,7 @@ def _media_http_worker(connection: Any, parent_pid: int, request_buffer: Any, re
         if len(body) > limit:
             connection.send({"error": "response_too_large"})
         else:
-            connection.send({
-                "status_code": response.status_code,
-                "body": body,
-                "headers": dict(response.headers),
-            })
+            connection.send({"status_code": response.status_code, "body": body})
     except requests.Timeout as exc:
         connection.send({"error": "timeout", "message": str(exc)})
     except requests.RequestException as exc:
@@ -185,7 +172,6 @@ class _MediaHTTPWorker:
                 "json": kwargs.get("json"),
                 "headers": kwargs.get("headers"),
                 "timeout": max(0.2, remaining),
-                "response_limit": kwargs.get("response_limit"),
             }, deadline)
             while True:
                 remaining = deadline - time.monotonic()
@@ -345,12 +331,11 @@ class _MediaHTTPWorker:
         response = requests.Response()
         response.status_code = int(result.get("status_code") or 0)
         response.url = url
-        response.headers.update(result.get("headers") or {})
         response.raw = io.BytesIO(result.get("body") or b"")
         return response
 
 
-def _local_image_path(source: str) -> str:
+def _resolve_local_image_path(source: str, task_id: Optional[str]) -> str:
     raw = str(source or "").strip()
     if not raw or len(raw) > _MAX_LOCAL_IMAGE_PATH_CHARS or "\x00" in raw:
         raise ZettlabMediaError("local image input path is invalid")
@@ -358,19 +343,37 @@ def _local_image_path(source: str) -> str:
 
     expanded = os.path.expanduser(raw)
     if os.path.isabs(expanded):
-        return os.path.abspath(expanded)
-
-    parsed = urlparse(raw)
-    if parsed.scheme.casefold() == "file":
+        candidate = expanded
+    else:
+        parsed = urlparse(raw)
+        if parsed.scheme.casefold() != "file":
+            if parsed.scheme or parsed.netloc:
+                raise ZettlabMediaError("image input URL must use HTTP or HTTPS")
+            raise ZettlabMediaError("local image input must use an absolute path")
         if parsed.netloc.casefold() not in {"", "localhost"}:
             raise ZettlabMediaError("network file URLs are not supported for image input")
-        path = url2pathname(unquote(parsed.path))
-        if not path:
+        if parsed.query or parsed.fragment:
+            raise ZettlabMediaError("local image file URL must not include query or fragment")
+        candidate = url2pathname(unquote(parsed.path))
+        if not candidate:
             raise ZettlabMediaError("local image input path is invalid")
-        return os.path.abspath(os.path.expanduser(path))
-    if parsed.scheme or parsed.netloc:
-        raise ZettlabMediaError("image input URL must use HTTP or HTTPS")
-    return os.path.abspath(expanded)
+        candidate = os.path.expanduser(candidate)
+
+    _reject_windows_network_or_device_path(candidate)
+    if not os.path.isabs(candidate):
+        raise ZettlabMediaError("local image input must use an absolute path")
+    try:
+        from tools.file_tools import resolve_host_read_path_for_task
+
+        resolved = resolve_host_read_path_for_task(
+            candidate,
+            str(task_id or "default").strip() or "default",
+        )
+    except ValueError as exc:
+        raise ZettlabMediaError(str(exc)) from exc
+    resolved_path = str(resolved)
+    _reject_windows_network_or_device_path(resolved_path)
+    return resolved_path
 
 
 def _media_file_worker(
@@ -385,7 +388,15 @@ def _media_file_worker(
     try:
         from agent.file_safety import raise_if_read_blocked
 
-        path = _local_image_path(source)
+        path = str(source or "").strip()
+        if (
+            not path
+            or len(path) > _MAX_LOCAL_IMAGE_PATH_CHARS
+            or "\x00" in path
+            or not os.path.isabs(path)
+        ):
+            raise ZettlabMediaError("local image worker requires an absolute path")
+        _reject_windows_network_or_device_path(path)
         raise_if_read_blocked(path)
         source_stat = os.stat(path, follow_symlinks=False)
         if not stat.S_ISREG(source_stat.st_mode):
@@ -1119,77 +1130,12 @@ def _local_image_data_uri(
     return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
 
 
-def _remote_image_data_uri(source: str, limit: int) -> str:
-    from tools.url_safety import is_safe_url, normalize_url_for_request
-
-    current = normalize_url_for_request(source)
-    deadline = time.monotonic() + REMOTE_IMAGE_READ_TIMEOUT
-    for redirect_count in range(REMOTE_IMAGE_MAX_REDIRECTS + 1):
-        parsed = urlparse(current)
-        if (
-            parsed.scheme.casefold() not in {"http", "https"}
-            or not parsed.netloc
-            or parsed.username
-            or parsed.password
-        ):
-            raise ZettlabMediaError("image input URL must use HTTP or HTTPS without credentials")
-        current = urlunparse(parsed._replace(fragment=""))
-        if not is_safe_url(current):
-            raise ZettlabMediaError("image input URL is blocked by Hermes URL safety policy")
-
-        try:
-            response = _HTTP_WORKER.request(
-                "GET",
-                current,
-                deadline=deadline,
-                headers={
-                    "Accept": "image/png,image/jpeg,image/webp",
-                    "User-Agent": "Hermes-Agent/Zettlab-Media",
-                },
-                response_limit=limit,
-            )
-        except ZettlabMediaError as exc:
-            if "response exceeds maximum size" in str(exc):
-                raise ZettlabMediaError("inline image input exceeds maximum size") from exc
-            raise
-        except requests.Timeout as exc:
-            raise ZettlabMediaDeadlineError("remote image read deadline exceeded") from exc
-        except requests.RequestException as exc:
-            raise ZettlabMediaError(f"unable to read remote image input: {exc}") from exc
-
-        try:
-            status_code = int(getattr(response, "status_code", 0) or 0)
-            if 300 <= status_code < 400:
-                location = response.headers.get("Location")
-                if not location:
-                    raise ZettlabMediaError("remote image redirect has no Location header")
-                if redirect_count >= REMOTE_IMAGE_MAX_REDIRECTS:
-                    raise ZettlabMediaError("remote image input exceeded redirect limit")
-                current = normalize_url_for_request(urljoin(current, location))
-                continue
-            if status_code >= 400:
-                raise ZettlabMediaError(
-                    f"remote image request failed with HTTP {status_code}"
-                )
-            raw = response.content
-        finally:
-            _close_response(response)
-
-        if not raw:
-            raise ZettlabMediaError("remote image input must contain image bytes")
-        if len(raw) > limit:
-            raise ZettlabMediaError("inline image input exceeds maximum size")
-        mime = _sniff_image_mime(raw[:16])
-        if mime is None:
-            raise ZettlabMediaError("remote image input must be a PNG, JPEG, or WebP file")
-        return f"data:{mime};base64,{base64.b64encode(raw).decode('ascii')}"
-    raise ZettlabMediaError("remote image input exceeded redirect limit")
-
-
 def inline_image_input(
     image_url: Optional[str],
     reference_image_urls: Optional[List[str]],
     model_capability: Optional[Dict[str, Any]],
+    *,
+    task_id: Optional[str] = None,
 ) -> Optional[str]:
     """Return one bounded inline image accepted by the gateway's v1 contract."""
     if isinstance(reference_image_urls, str):
@@ -1214,8 +1160,12 @@ def inline_image_input(
     _reject_windows_network_or_device_path(source)
     parsed = urlparse(source)
     if parsed.scheme.casefold() in {"http", "https"}:
-        return _remote_image_data_uri(source, limit)
-    return _local_image_data_uri(source, limit)
+        raise ZettlabMediaError(
+            "HTTP(S) image URLs are not enabled for Zettlab yet; use a base64 "
+            "data URI or an absolute local image path"
+        )
+    resolved_source = _resolve_local_image_path(source, task_id)
+    return _local_image_data_uri(resolved_source, limit)
 
 
 def create_and_wait(

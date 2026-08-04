@@ -313,10 +313,9 @@ def test_zettlab_video_model_without_text_input_never_sends(
     assert got["error_type"] == expected_error
 
 
-def test_zettlab_video_accepts_remote_input_from_media_resolver(monkeypatch):
+def test_zettlab_video_rejects_remote_input(monkeypatch):
     from plugins import zettlab_media_client as client
 
-    captured = {}
     monkeypatch.setattr(
         client,
         "resolve_model_with_capability",
@@ -330,23 +329,10 @@ def test_zettlab_video_accepts_remote_input_from_media_resolver(monkeypatch):
             },
         ),
     )
-    monkeypatch.setattr(
-        client,
-        "inline_image_input",
-        lambda image_url, references, capability: PNG_DATA_URI,
-    )
-    monkeypatch.setattr(
-        client,
-        "create_and_wait",
-        lambda **kwargs: captured.update(kwargs["payload"]) or {
-            "job_id": "job-remote",
-            "status": "done",
-            "assets": [{"url": "https://cdn.example/generated.mp4"}],
-        },
-    )
     got = ZettlabVideoGenProvider().generate("make video", image_url="https://example.com/source.png")
-    assert got["success"] is True
-    assert captured["input_image"] == PNG_DATA_URI
+    assert got["success"] is False
+    assert got["error_type"] == "ZettlabMediaError"
+    assert "not enabled" in got["error"]
 
 
 def test_first_asset_url_accepts_legacy_top_level_shortcut_without_assets():

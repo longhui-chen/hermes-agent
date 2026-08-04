@@ -671,6 +671,34 @@ def _managed_sibling_profile_error(
             )
     return None
 
+
+def resolve_host_read_path_for_task(
+    filepath: str,
+    task_id: str = "default",
+) -> Path:
+    """Resolve and authorize a model-supplied path for direct host reading.
+
+    Provider integrations use this when they need bytes rather than the
+    paginated ``read_file`` response. It preserves task-relative cwd, managed
+    sibling-profile confinement, and the common credential read guard.
+    Sandbox-backed tasks must use a container-aware resolver instead of mapping
+    a container path onto the host filesystem.
+    """
+    if _uses_container_paths(task_id):
+        raise ValueError(
+            "Direct local image paths are unavailable with a sandbox terminal "
+            "backend; provide the image as a base64 data URI instead."
+        )
+    resolved = _resolve_path_for_task(filepath, task_id)
+    sibling_error = _managed_sibling_profile_error(str(resolved), task_id)
+    if sibling_error:
+        raise ValueError(sibling_error)
+    blocked = get_read_block_error(str(resolved))
+    if blocked:
+        raise ValueError(blocked)
+    return Path(resolved)
+
+
 def _get_hermes_config_resolved() -> str | None:
     """Return the active profile's resolved Hermes config path.
 

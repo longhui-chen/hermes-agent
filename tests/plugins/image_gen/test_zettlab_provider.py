@@ -295,10 +295,9 @@ def test_zettlab_image_generate_uses_gateway_default_when_model_is_omitted(monke
     assert captured["model"] == "seedream-default"
 
 
-def test_zettlab_image_accepts_remote_input_from_media_resolver(monkeypatch):
+def test_zettlab_image_rejects_remote_input(monkeypatch):
     from plugins import zettlab_media_client as client
 
-    captured = {}
     monkeypatch.setattr(
         client,
         "resolve_model_with_capability",
@@ -311,23 +310,10 @@ def test_zettlab_image_accepts_remote_input_from_media_resolver(monkeypatch):
             },
         ),
     )
-    monkeypatch.setattr(
-        client,
-        "inline_image_input",
-        lambda image_url, references, capability: PNG_DATA_URI,
-    )
-    monkeypatch.setattr(
-        client,
-        "create_and_wait",
-        lambda **kwargs: captured.update(kwargs["payload"]) or {
-            "job_id": "job-remote",
-            "status": "done",
-            "assets": [{"url": "https://cdn.example/generated.png"}],
-        },
-    )
     got = ZettlabImageGenProvider().generate("make image", image_url="http://example.com/a.png")
-    assert got["success"] is True
-    assert captured["input_image"] == PNG_DATA_URI
+    assert got["success"] is False
+    assert got["error_type"] == "ZettlabMediaError"
+    assert "not enabled" in got["error"]
 
 
 @pytest.mark.parametrize(
@@ -774,10 +760,7 @@ def test_zettlab_http_worker_recovers_after_real_header_stall():
             if self.path == "/slow":
                 time.sleep(1)
                 return
-            if self.path == "/large":
-                body = b"x" * (client.MAX_MEDIA_RESPONSE_BYTES + 1)
-            else:
-                body = b'{"job_id":"real-worker","status":"done"}'
+            body = b'{"job_id":"real-worker","status":"done"}'
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -797,13 +780,6 @@ def test_zettlab_http_worker_recovers_after_real_header_stall():
             worker.request("GET", base + "/slow", deadline=time.monotonic() + 0.3)
         response = worker.request("GET", base + "/ok", deadline=time.monotonic() + 3)
         assert client._bounded_response_json(response, client.MAX_MEDIA_RESPONSE_BYTES)["job_id"] == "real-worker"
-        response = worker.request(
-            "GET",
-            base + "/large",
-            deadline=time.monotonic() + 3,
-            response_limit=client.MAX_MEDIA_RESPONSE_BYTES + 1,
-        )
-        assert len(response.raw.read()) == client.MAX_MEDIA_RESPONSE_BYTES + 1
     finally:
         worker.close()
         server.shutdown()

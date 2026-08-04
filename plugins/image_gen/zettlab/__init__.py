@@ -85,8 +85,8 @@ class ZettlabImageGenProvider(ImageGenProvider):
             "modalities": media_client.supported_modalities(cap, model),
             "max_reference_images": 0,
             "image_input_description": (
-                "Pass one PNG, JPEG, or WebP image as a base64 Data URI, local file "
-                "path/file URL, or HTTP(S) URL."
+                "Pass one PNG, JPEG, or WebP image as a base64 Data URI, absolute "
+                "local file path, or file URL. HTTP(S) URLs are not enabled yet."
             ),
         }
 
@@ -127,6 +127,7 @@ class ZettlabImageGenProvider(ImageGenProvider):
                 image_url,
                 refs,
                 model_capability,
+                task_id=session_id,
             )
             configured_modalities = media_client.normalized_modalities(model_capability)
             if not input_image and "text" not in configured_modalities:

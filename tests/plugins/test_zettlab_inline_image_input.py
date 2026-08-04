@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import base64
-import io
 import os
 import time
 
 import pytest
-import requests
 
 
 PNG = b"\x89PNG\r\n\x1a\ninline-image"
@@ -19,14 +17,6 @@ def _capability(limit: int = 1024):
         "modalities": ["text", "image"],
         "_type_limits": {"max_inline_image_bytes": limit},
     }
-
-
-def _response(raw: bytes, *, status: int = 200, headers=None) -> requests.Response:
-    response = requests.Response()
-    response.status_code = status
-    response.headers.update(headers or {})
-    response.raw = io.BytesIO(raw)
-    return response
 
 
 @pytest.mark.parametrize(
@@ -97,82 +87,38 @@ def test_inline_image_input_rejects_unsafe_or_invalid_values(value, message):
         client.inline_image_input(value, None, _capability())
 
 
-def test_inline_image_input_downloads_safe_remote_url(monkeypatch):
+def test_inline_image_input_rejects_remote_url_before_network(monkeypatch):
     from plugins import zettlab_media_client as client
-    from tools import url_safety
 
-    requests_seen = []
-    monkeypatch.setattr(url_safety, "is_safe_url", lambda _url: True)
-
-    def fake_request(method, url, **kwargs):
-        requests_seen.append((method, url, kwargs))
-        return _response(PNG)
-
-    monkeypatch.setattr(client._HTTP_WORKER, "request", fake_request)
-
-    got = client.inline_image_input(
-        "https://example.com/source.png#ignored",
-        None,
-        _capability(),
-    )
-
-    assert got == f"data:image/png;base64,{base64.b64encode(PNG).decode('ascii')}"
-    assert requests_seen[0][0:2] == ("GET", "https://example.com/source.png")
-    assert requests_seen[0][2]["response_limit"] == 1024
-
-
-def test_inline_image_input_revalidates_remote_redirect(monkeypatch):
-    from plugins import zettlab_media_client as client
-    from tools import url_safety
-
-    checked = []
-    responses = iter([
-        _response(b"", status=302, headers={"Location": "/final.png"}),
-        _response(PNG),
-    ])
-    monkeypatch.setattr(
-        url_safety,
-        "is_safe_url",
-        lambda url: checked.append(url) or True,
-    )
-    monkeypatch.setattr(
-        client._HTTP_WORKER,
-        "request",
-        lambda *_args, **_kwargs: next(responses),
-    )
-
-    got = client.inline_image_input(
-        "https://example.com/start.png",
-        None,
-        _capability(),
-    )
-
-    assert got.startswith("data:image/png;base64,")
-    assert checked == [
-        "https://example.com/start.png",
-        "https://example.com/final.png",
-    ]
-
-
-def test_inline_image_input_rejects_remote_url_blocked_by_shared_policy(monkeypatch):
-    from plugins import zettlab_media_client as client
-    from tools import url_safety
-
-    monkeypatch.setattr(url_safety, "is_safe_url", lambda _url: False)
     monkeypatch.setattr(
         client._HTTP_WORKER,
         "request",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("blocked URL must not be fetched")
+            AssertionError("remote URL must not be fetched")
         ),
     )
 
-    with pytest.raises(client.ZettlabMediaError, match="URL safety policy"):
+    with pytest.raises(client.ZettlabMediaError, match="not enabled"):
         client.inline_image_input(
-            "http://127.0.0.1/private.png",
+            "https://example.com/source.png",
             None,
             _capability(),
         )
+
+
+def test_inline_image_input_rejects_relative_path_before_read(monkeypatch):
+    from plugins import zettlab_media_client as client
+
+    monkeypatch.setattr(
+        client._FILE_WORKER,
+        "read",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("relative path must not reach file worker")
+        ),
+    )
+
+    with pytest.raises(client.ZettlabMediaError, match="absolute path"):
+        client.inline_image_input("source.png", None, _capability())
 
 
 @pytest.mark.parametrize(
@@ -184,6 +130,8 @@ def test_inline_image_input_rejects_remote_url_blocked_by_shared_policy(monkeypa
         r"\\.\C:\image.png",
         r"\??\C:\image.png",
         r"\Device\Mup\server\share\image.png",
+        "file:////server/share/image.png",
+        "file:///%2Fserver/share/image.png",
     ],
 )
 def test_inline_image_input_rejects_windows_network_and_device_paths_before_read(
@@ -202,6 +150,43 @@ def test_inline_image_input_rejects_windows_network_and_device_paths_before_read
 
     with pytest.raises(client.ZettlabMediaError, match="network and device paths"):
         client.inline_image_input(value, None, _capability())
+
+
+def test_inline_image_input_confines_managed_sibling_profiles(tmp_path, monkeypatch):
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from plugins import zettlab_media_client as client
+    from tools import file_tools
+
+    managed_root = tmp_path / "hermes-home"
+    profile_a = managed_root / "profiles" / "profile-a"
+    profile_b = managed_root / "profiles" / "profile-b"
+    profile_a.mkdir(parents=True)
+    profile_b.mkdir(parents=True)
+    own_image = profile_a / "own.png"
+    sibling_image = profile_b / "sibling.png"
+    own_image.write_bytes(PNG)
+    sibling_image.write_bytes(PNG)
+    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
+    monkeypatch.setattr(file_tools, "_MANAGED_CLAW_HERMES_ROOTS", (str(managed_root),))
+
+    token = set_hermes_home_override(profile_a)
+    try:
+        own = client.inline_image_input(
+            str(own_image),
+            None,
+            _capability(),
+            task_id="session-a",
+        )
+        assert own.startswith("data:image/png;base64,")
+        with pytest.raises(client.ZettlabMediaError, match="sibling profile"):
+            client.inline_image_input(
+                str(sibling_image),
+                None,
+                _capability(),
+                task_id="session-a",
+            )
+    finally:
+        reset_hermes_home_override(token)
 
 
 def test_inline_image_input_rejects_oversize_and_multiple_inputs():

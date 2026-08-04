@@ -80,8 +80,8 @@ class ZettlabVideoGenProvider(VideoGenProvider):
             "supports_negative_prompt": False,
             "max_reference_images": 0,
             "image_input_description": (
-                "Pass one PNG, JPEG, or WebP image as a base64 Data URI, local file "
-                "path/file URL, or HTTP(S) URL."
+                "Pass one PNG, JPEG, or WebP image as a base64 Data URI, absolute "
+                "local file path, or file URL. HTTP(S) URLs are not enabled yet."
             ),
         }
 
@@ -160,6 +160,7 @@ class ZettlabVideoGenProvider(VideoGenProvider):
                 image_url,
                 reference_image_urls,
                 model_capability,
+                task_id=session_id,
             )
             configured_modalities = media_client.normalized_modalities(model_capability)
             if not input_image and "text" not in configured_modalities:
