@@ -1661,7 +1661,7 @@ def maybe_require_snapshot(
 
     data, err = _post(
         _ENSURE_PATH,
-        {"turnId": turn, "paths": paths, "title": _title_for(paths)},
+        _ensure_body(turn, paths),
         _ENSURE_TIMEOUT,
     )
 
@@ -1728,6 +1728,24 @@ def maybe_require_snapshot(
         return _ensure_ancillary(
             tool_name, arguments, turn, paths, task=task, required=True, started=started)
     return None
+
+
+def _ensure_body(turn: str, paths: list[str]) -> dict[str, Any]:
+    """ensure 请求体。带上 ``deadlineMs``——**客户端自己还会等多久**。
+
+    服务端据此把同步上限收窄到同一刻。不带的话服务端会一路跑到它自己的 30s 上限，
+    而客户端 3s 就放行了：那之后服务端若仍登记成功，就留下一张**调用方并不知情**
+    的保护快照，而 Agent 此刻正在写文件——用户看到的是一个恢复不回写入前状态的
+    「恢复点」，比没有恢复点更糟（Codex review P1）。
+
+    字段可选，老 local-server 忽略未知字段，行为不变（HR4）。
+    """
+    return {
+        "turnId": turn,
+        "paths": paths,
+        "title": _title_for(paths),
+        "deadlineMs": int(_ENSURE_TIMEOUT * 1000),
+    }
 
 
 def _title_for(paths: list[str]) -> str:
@@ -1934,7 +1952,7 @@ def _ensure_ancillary(
         return None
     data, err = _post(
         _ENSURE_PATH,
-        {"turnId": turn, "paths": extras, "title": _title_for(extras)},
+        _ensure_body(turn, extras),
         _ENSURE_TIMEOUT,
     )
     if not err and isinstance(data, dict) and data.get("ready"):
@@ -1963,7 +1981,7 @@ def _ensure_ancillary(
         for p in extras:
             d2, e2 = _post(
                 _ENSURE_PATH,
-                {"turnId": turn, "paths": [p], "title": _title_for([p])},
+                _ensure_body(turn, [p]),
                 _ENSURE_TIMEOUT,
             )
             if not e2 and isinstance(d2, dict) and d2.get("ready"):

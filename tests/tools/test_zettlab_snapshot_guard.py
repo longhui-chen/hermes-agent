@@ -2871,3 +2871,36 @@ def test_ancillary_batch_error_does_not_mask_restore(monkeypatch, tmp_path):
     assert blocked is not None, "加餐整批 400 不能把同批的还原冲突吃掉"
     assert rec.unprotected == []
     assert rec.requests[-1]["url"].endswith("/agent-protection/restore-probe")
+
+
+def test_ensure_requests_carry_client_deadline(monkeypatch, tmp_path):
+    """ensure 请求要告诉服务端「客户端自己还会等多久」（Codex review P1）。
+
+    不带的话服务端会一路跑到它自己的 30s 上限，而客户端 3s 就放行了——那之后服务端
+    若仍登记成功，就留下一张调用方并不知情的保护快照，而 Agent 此刻正在写文件。用户
+    看到的是一个恢复不回写入前状态的「恢复点」，比没有恢复点更糟。
+    """
+    cwd = tmp_path / "Documents"
+    cwd.mkdir()
+    doc = cwd / "a.txt"
+    doc.write_text("x")
+    outside = tmp_path / "Pictures"
+    outside.mkdir()
+    (outside / "b.txt").write_text("x")
+    rec = _install(
+        monkeypatch,
+        {"ready": True, "operations": []},
+        {"ready": True, "operations": []},
+    )
+
+    guard.maybe_require_snapshot(
+        "terminal", {"command": f"rm -f {outside}/b.txt", "workdir": str(cwd)},
+        turn_id="turn_1", task_id="task_9",
+    )
+
+    ensures = ensure_requests(rec)
+    assert ensures, "没有发出 ensure"
+    for r in ensures:
+        assert r["body"].get("deadlineMs") == int(guard._ENSURE_TIMEOUT * 1000), (
+            f"ensure 请求没带 deadlineMs：{r['body']}"
+        )
