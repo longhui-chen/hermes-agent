@@ -10,6 +10,7 @@ log line anywhere — the model then told users the capability did not exist.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 
 import pytest
@@ -178,23 +179,31 @@ def test_cache_is_bounded(client, monkeypatch):
     assert len(client._capability_cache) <= client.MAX_CAPABILITY_CACHE_ENTRIES
 
 
-def test_slow_dribbling_body_hits_the_wall_clock_deadline(client, monkeypatch):
-    """`requests` only bounds socket idle time, not total elapsed time.
+def test_stalled_body_read_is_cancelled_at_the_deadline(client, monkeypatch):
+    """The budget must hold even when the read itself never returns.
 
-    A peer that keeps sending one byte resets that timer forever. Without an
-    explicit budget this stalls agent construction, which is worse for the user
-    than the missing-tool symptom this PR set out to fix.
+    `raw.read(n)` has BufferedReader semantics — it comes back only once n bytes
+    have arrived or the stream ends. A peer dribbling one byte every few seconds
+    keeps each recv under the socket timeout while stalling the read as a whole,
+    so checking a clock *between* reads is useless: control never returns to do
+    it. The bound has to be imposed from outside, which is what this asserts.
     """
+    released = threading.Event()
 
-    class _Dribbling:
+    class _Stalled:
+        def __init__(self):
+            self.closed = False
+
         def read(self, _n, decode_content=False):
-            time.sleep(0.02)
-            return b"x"
+            # Blocks like the real thing; only a close() gets us out.
+            released.wait(30)
+            return b"{}"
 
     def _stream_resp():
         resp = requests.Response()
         resp.status_code = 200
-        resp.raw = _Dribbling()
+        resp.raw = _Stalled()
+        resp.close = lambda: released.set()
         return resp
 
     monkeypatch.setattr(client, "_capability_timeout", lambda: 0.2)
@@ -205,7 +214,34 @@ def test_slow_dribbling_body_hits_the_wall_clock_deadline(client, monkeypatch):
         client.get_capabilities("image")
     elapsed = time.monotonic() - started
 
-    assert elapsed < 5.0, "read must abort on the wall-clock budget, not run on"
+    assert elapsed < 5.0, f"deadline must cancel the stalled read, took {elapsed:.1f}s"
+    assert released.is_set(), "expiry must close the response to unblock the reader"
+
+
+def test_stalled_probe_degrades_to_tool_unavailable(client, monkeypatch, caplog):
+    """A stalled probe must hide the tool, never hang agent construction."""
+    released = threading.Event()
+
+    class _Stalled:
+        def read(self, _n, decode_content=False):
+            released.wait(30)
+            return b"{}"
+
+    def _stream_resp():
+        resp = requests.Response()
+        resp.status_code = 200
+        resp.raw = _Stalled()
+        resp.close = lambda: released.set()
+        return resp
+
+    monkeypatch.setattr(client, "_capability_timeout", lambda: 0.2)
+    monkeypatch.setattr(client._CAPABILITY_SESSION, "get", lambda *a, **k: _stream_resp())
+
+    started = time.monotonic()
+    with caplog.at_level(logging.WARNING, logger="plugins.zettlab_media_client"):
+        assert client.is_available("image") is False
+    assert time.monotonic() - started < 5.0
+    assert any("capability probe failed" in record.getMessage() for record in caplog.records)
 
 
 def test_oversized_body_is_still_rejected(client, monkeypatch):
