@@ -498,6 +498,13 @@ def test_zettlab_remote_input_requires_structural_https_url(value):
     "https://127.0.0.1/a.png",
     "https://[::1]/a.png",
     "https://example.com:8443/a.png?token=signed-value",
+    "https://127.1/a.png",
+    "https://2130706433/a.png",
+    "https://0177.0.0.1/a.png",
+    "https://0x7f000001/a.png",
+    "https://intranet/a.png",
+    "https://localhost。/a.png",
+    "https://127。0。0。1/a.png",
 ])
 def test_zettlab_remote_input_rejects_local_ip_and_non_default_port(value):
     from plugins import zettlab_media_client as client
@@ -510,6 +517,13 @@ def test_zettlab_remote_input_preserves_signed_default_port_url():
     from plugins import zettlab_media_client as client
 
     value = "https://images.example.com:443/a.png?token=signed-value"
+    assert client.validate_remote_url(value, label="image_url") == value
+
+
+def test_zettlab_remote_input_preserves_zero_padded_default_port_url():
+    from plugins import zettlab_media_client as client
+
+    value = "https://images.example.com:0443/a.png?token=signed-value"
     assert client.validate_remote_url(value, label="image_url") == value
 
 

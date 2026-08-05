@@ -1078,6 +1078,37 @@ def is_available(media_type: str) -> bool:
     )
 
 
+def _looks_like_legacy_ipv4_literal(host: str) -> bool:
+    parts = host.split(".")
+    if not 1 <= len(parts) <= 4:
+        return False
+    for part in parts:
+        if part and part.isascii() and part.isdecimal():
+            continue
+        if (
+            len(part) > 2
+            and part[:2].casefold() == "0x"
+            and all(character in "0123456789abcdefABCDEF" for character in part[2:])
+        ):
+            continue
+        return False
+    return True
+
+
+def _is_ascii_dns_hostname(host: str) -> bool:
+    if not host.isascii() or len(host) > 253 or "." not in host:
+        return False
+    for part in host.split("."):
+        if (
+            not 1 <= len(part) <= 63
+            or part.startswith("-")
+            or part.endswith("-")
+            or not all(character.isalnum() or character == "-" for character in part)
+        ):
+            return False
+    return True
+
+
 def validate_remote_url(value: Optional[str], *, label: str) -> Optional[str]:
     if value is None:
         return None
@@ -1108,6 +1139,8 @@ def validate_remote_url(value: Optional[str], *, label: str) -> Optional[str]:
         or host == "localhost"
         or host.endswith(".localhost")
         or is_ip_literal
+        or _looks_like_legacy_ipv4_literal(host)
+        or not _is_ascii_dns_hostname(host)
     ):
         raise ZettlabMediaError(
             f"{label} must be a valid HTTPS URL for Zettlab media generation"

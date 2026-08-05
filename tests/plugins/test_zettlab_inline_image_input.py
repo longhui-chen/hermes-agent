@@ -148,6 +148,13 @@ def test_inline_image_input_fails_closed_when_url_capability_is_missing():
         "https://10.0.0.5/source.png",
         "https://[::1]/source.png",
         "https://images.example.com:8443/source.png",
+        "https://127.1/source.png",
+        "https://2130706433/source.png",
+        "https://0177.0.0.1/source.png",
+        "https://0x7f000001/source.png",
+        "https://intranet/source.png",
+        "https://localhost。/source.png",
+        "https://127。0。0。1/source.png",
     ],
 )
 def test_inline_image_input_rejects_invalid_remote_url(value):
