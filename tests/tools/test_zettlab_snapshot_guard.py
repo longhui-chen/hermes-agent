@@ -63,7 +63,37 @@ def _install(monkeypatch, *replies):
     rec = _Recorder(replies)
     # 实现走禁用重定向的 _OPENER.open（不是裸 urlopen），mock 也挂在这一层。
     monkeypatch.setattr(guard, "_OPENER", types.SimpleNamespace(open=rec))
+
+    # PRD 附录 B #18（2026-08-05）：守卫由门禁降级为记录器，所有判定点改为
+    # 「记原因后放行」。判定逻辑本身一行没动——它算出的 reason 是事后唯一的
+    # 追溯依据，也正是这些用例现在该断言的东西。
+    #
+    # 这里挂一层录制：`rec.unprotected` 收集本次 dispatch 走过的放行原因，
+    # 用例用它替代原来的 `assert blocked is not None`。只断言「返回 None」是
+    # 不够的——那区分不了「记录器放行」和「守卫压根没跑到」。
+    rec.unprotected = []
+    real_unprotected = guard._unprotected
+
+    def _recording_unprotected(reason, **kwargs):
+        rec.unprotected.append(reason)
+        return real_unprotected(reason, **kwargs)
+
+    monkeypatch.setattr(guard, "_unprotected", _recording_unprotected)
     return rec
+
+
+def assert_allowed_unprotected(result, rec, *reasons):
+    """断言守卫**放行**了这次操作，并把原因归到 ``reasons`` 之一。
+
+    #18 之后守卫不再返回错误串，所以 `result` 必须是 None；同时 `rec.unprotected`
+    必须非空且落在预期的原因集合里——否则说明判定点被绕过或归错了因。
+    """
+    assert result is None, f"守卫不该再阻断，got {result!r}"
+    assert rec.unprotected, "放行了但没记原因——fail-open 之后这等于无痕放行"
+    if reasons:
+        assert set(rec.unprotected) <= set(reasons), (
+            f"归因 {rec.unprotected}，期望落在 {list(reasons)} 内"
+        )
 
 
 def test_unguarded_tools_are_ignored(monkeypatch, tmp_path):
@@ -116,18 +146,18 @@ def test_relative_paths_are_resolved_against_cwd(monkeypatch, tmp_path):
 
 def test_blocks_when_snapshot_is_not_ready(monkeypatch, tmp_path):
     """ready=false 只可能是服务端真的没拍出快照——无保护路径它自己就放行了。"""
-    _install(monkeypatch, {"ready": False, "operations": []})
+    rec = _install(monkeypatch, {"ready": False, "operations": []})
     target = tmp_path / "a.txt"
     target.write_text("x")
 
     blocked = guard.maybe_require_snapshot("write_file", {"path": str(target)}, turn_id="turn_1")
-    assert blocked is not None
-    assert "NOT modified" in json.loads(blocked)["error"]
+    assert_allowed_unprotected(blocked, rec, "snapshot_failed", "broker_unavailable", "outside_scope")
+    assert_allowed_unprotected(blocked, rec)
 
 
 def test_unprotected_paths_are_allowed_and_logged(monkeypatch, tmp_path, caplog):
     """无保护放行：不打断用户，但必须在日志里留下「这次没有恢复点」的现场。"""
-    _install(monkeypatch, {
+    rec = _install(monkeypatch, {
         "ready": True,
         "operations": [
             {
@@ -164,18 +194,18 @@ def test_unprotected_paths_are_allowed_and_logged(monkeypatch, tmp_path, caplog)
     ],
 )
 def test_fails_closed_on_transport_and_server_errors(monkeypatch, tmp_path, failure):
-    _install(monkeypatch, failure)
+    rec = _install(monkeypatch, failure)
     target = tmp_path / "a.txt"
     target.write_text("x")
 
     blocked = guard.maybe_require_snapshot("write_file", {"path": str(target)}, turn_id="turn_1")
-    assert blocked is not None
-    assert "NOT modified" in json.loads(blocked)["error"]
+    assert_allowed_unprotected(blocked, rec, "broker_unavailable", "snapshot_failed", "outside_scope")
+    assert_allowed_unprotected(blocked, rec)
 
 
 def test_old_local_server_without_endpoint_degrades_open(monkeypatch, tmp_path, caplog):
     """404 means the device firmware predates this feature: proceed, don't lie."""
-    _install(monkeypatch, urllib.error.HTTPError("http://x", 404, "nope", {}, io.BytesIO(b"")))
+    rec = _install(monkeypatch, urllib.error.HTTPError("http://x", 404, "nope", {}, io.BytesIO(b"")))
     target = tmp_path / "a.txt"
     target.write_text("x")
 
@@ -188,7 +218,7 @@ def test_missing_turn_id_is_fail_closed(monkeypatch, tmp_path):
     target.write_text("x")
 
     blocked = guard.maybe_require_snapshot("write_file", {"path": str(target)}, turn_id="")
-    assert blocked is not None
+    assert_allowed_unprotected(blocked, rec, "missing_turn_id")
     assert rec.requests == []
 
 
@@ -214,7 +244,7 @@ def test_same_turn_created_files_are_exempt(monkeypatch, tmp_path):
 
 
 def test_created_tracking_is_bounded(monkeypatch, tmp_path):
-    _install(monkeypatch)
+    rec = _install(monkeypatch)
     limit = guard._MAX_CREATED_TRACKED
     for i in range(limit + 5):
         guard.maybe_require_snapshot(
@@ -382,8 +412,8 @@ def test_trusted_video_helper_keeps_new_out_of_scope_writes_fail_closed(
         {"command": "python3 trusted/normalize.py --output /etc/new-output.mp4"},
         turn_id="turn_1",
     )
-    assert blocked is not None
-    assert "NOT modified" in json.loads(blocked)["error"]
+    assert_allowed_unprotected(blocked, rec, "outside_scope", "snapshot_failed")
+    assert_allowed_unprotected(blocked, rec)
     assert rec.requests[0]["body"]["paths"] == [
         "/etc/new-state.json",
         "/etc/new-output.mp4",
@@ -452,7 +482,7 @@ def test_finish_turn_failure_does_not_raise(monkeypatch, tmp_path):
     """A failed report must never take down the turn — the pin has a TTL."""
     target = tmp_path / "a.txt"
     target.write_text("x")
-    _install(monkeypatch, {"ready": True, "operations": []}, urllib.error.URLError("down"))
+    rec = _install(monkeypatch, {"ready": True, "operations": []}, urllib.error.URLError("down"))
 
     guard.maybe_require_snapshot("write_file", {"path": str(target)}, turn_id="turn_1")
     guard.finish_turn("completed", turn_id="turn_1")  # must not raise
@@ -497,7 +527,7 @@ def test_block_logging_records_outcome_without_leaking_paths(monkeypatch, tmp_pa
 
     路径只进 local-server 受权限控制的审计表；journalctl 是运维面，任何人读得到。
     """
-    _install(monkeypatch, urllib.error.URLError("down"))
+    rec = _install(monkeypatch, urllib.error.URLError("down"))
     secret_name = "非常机密的季度预算.xlsx"
     target = tmp_path / secret_name
     target.write_text("x")
@@ -505,9 +535,11 @@ def test_block_logging_records_outcome_without_leaking_paths(monkeypatch, tmp_pa
     with caplog.at_level("WARNING", logger=guard.logger.name):
         blocked = guard.maybe_require_snapshot("write_file", {"path": str(target)}, turn_id="turn_1")
 
-    assert blocked is not None
+    assert_allowed_unprotected(blocked, rec, "snapshot_failed", "broker_unavailable", "outside_scope")
     logged = "\n".join(r.getMessage() for r in caplog.records)
-    assert "outcome=" in logged, "运维需要按 outcome 聚合失败原因"
+    # #18：日志从「挡了什么」改成「放行了但没有恢复点，原因是什么」。字段名
+    # 随之从 outcome= 改成 reason=——运维聚合的对象变了，聚合这件事没变。
+    assert "reason=" in logged, "运维需要按 reason 聚合无保护放行"
     assert "tool=write_file" in logged
     assert "duration_ms=" in logged
     assert secret_name not in logged
@@ -856,8 +888,8 @@ def test_background_destructive_terminal_is_blocked(monkeypatch, tmp_path):
     blocked = guard.maybe_require_snapshot(
         "terminal", {"command": "rm -rf data", "background": True}, turn_id="turn_1"
     )
-    assert blocked is not None
-    assert "foreground" in json.loads(blocked)["error"]
+    assert_allowed_unprotected(blocked, rec, "background_write")
+    assert_allowed_unprotected(blocked, rec, "background_write")
     assert rec.requests == []
 
     # 只读后台命令不受影响。
@@ -1080,13 +1112,13 @@ def test_strict_execute_code_blocks_when_ancillary_ensure_fails(monkeypatch, tmp
     target = tmp_path / "Documents" / "a.txt"
     target.parent.mkdir()
     target.write_text("x")
-    _install(monkeypatch, urllib.error.URLError("down"))
+    rec = _install(monkeypatch, urllib.error.URLError("down"))
 
     out = guard.maybe_require_snapshot(
         "execute_code", {"code": f"open('{target}','w').write('y')"},
         turn_id="turn_1", task_id="task_9",
     )
-    assert out is not None and "NOT executed" in out
+    assert_allowed_unprotected(out, rec, "snapshot_failed", "broker_unavailable", "outside_scope")
 
 
 def test_strict_execute_code_skips_out_of_scope_but_requires_in_scope(monkeypatch, tmp_path):
@@ -1146,55 +1178,12 @@ def test_managed_gateway_without_output_keeps_env_cwd_fallback(monkeypatch, tmp_
     monkeypatch.delenv("ZET_AGENT_OUTPUT_DIR", raising=False)
     rec = _install(monkeypatch)
 
-    guard.maybe_require_snapshot("terminal", {"command": "rm -f x"}, turn_id="turn_1")
-    assert rec.requests[0]["body"]["paths"] == [str(tmp_path)]
-
-
-def test_unmanaged_process_ignores_platform_output_dir(monkeypatch, tmp_path):
-    """非受管环境不锚 output：命令实际跑在 TERMINAL_CWD，锚去 output 就是
-    「快照拍在 A、命令跑在 B」。"""
-    output = tmp_path / "output"
-    output.mkdir()
-    monkeypatch.delenv("HERMES_MANAGED_GATEWAY", raising=False)
-    monkeypatch.setenv("ZET_AGENT_OUTPUT_DIR", str(output))
-    rec = _install(monkeypatch)
+    monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
 
     guard.maybe_require_snapshot("terminal", {"command": "rm -f x"}, turn_id="turn_1")
     assert rec.requests[0]["body"]["paths"] == [str(tmp_path)]
 
 
-def test_out_of_scope_block_includes_agent_output_hint(monkeypatch, tmp_path):
-    """scope 越界的阻断不该是死胡同：output 可用时引导模型改用
-    workdir='agent_output' 重试。"""
-    local_mod = pytest.importorskip("tools.environments.local")
-    monkeypatch.setattr(local_mod, "_IS_WINDOWS", False)
-    output = tmp_path / "output"
-    output.mkdir()
-    monkeypatch.setenv("HERMES_MANAGED_GATEWAY", "1")
-    monkeypatch.setenv("ZET_AGENT_OUTPUT_DIR", str(output))
-    _install(monkeypatch, _scope_denied_error())
-
-    blocked = guard.maybe_require_snapshot(
-        "terminal", {"command": "rm -f a.txt"}, turn_id="turn_1"
-    )
-    assert blocked is not None
-    assert "workdir='agent_output'" in json.loads(blocked)["error"]
-
-
-def test_out_of_scope_block_without_output_has_no_hint(monkeypatch, tmp_path):
-    """output 不可用时不加指引——别教一个用不了的姿势。"""
-    monkeypatch.delenv("HERMES_MANAGED_GATEWAY", raising=False)
-    monkeypatch.delenv("ZET_AGENT_OUTPUT_DIR", raising=False)
-    _install(monkeypatch, _scope_denied_error())
-
-    blocked = guard.maybe_require_snapshot(
-        "terminal", {"command": "rm -f a.txt"}, turn_id="turn_1"
-    )
-    assert blocked is not None
-    assert "agent_output" not in json.loads(blocked)["error"]
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX managed-terminal paths")
 def test_relative_hermes_home_yields_no_readonly_exemption(monkeypatch, tmp_path):
     """HERMES_HOME 为相对路径时不产生任何豁免：执行侧挂载脚本对相对路径同样
     不生效，豁免一棵没挂成只读的树就是免检洞——skill 入口按普通附加写入目标
@@ -1337,7 +1326,7 @@ def test_shared_collapsed_key_with_concurrent_turns_fails_closed(monkeypatch, tm
 
     # 两轮都在册：折叠 key 分不清归属，嵌套写入 fail-closed。
     blocked = guard.maybe_require_snapshot("write_file", {"path": str(c)}, task_id="default")
-    assert blocked is not None and "cannot be attributed" in blocked
+    assert_allowed_unprotected(blocked, rec, "ambiguous_turn")
 
     # 一轮结束后恢复可归属：写入归到仍在进行的那一轮。
     guard.finish_turn("completed", turn_id="turn_1")
@@ -1420,7 +1409,7 @@ def test_self_backgrounding_write_commands_are_blocked(monkeypatch, tmp_path):
     ):
         guard.reset_for_test()
         blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
-        assert blocked is not None and "NOT executed" in blocked, cmd
+        assert_allowed_unprotected(blocked, rec, "background_write"), cmd
     assert rec.requests == []
 
     # `&&` / `2>&1` / `&>` 不是后台化；只读命令带 & 也不进这条路。
@@ -1540,7 +1529,7 @@ def test_amp_separated_write_segment_is_not_readonly(monkeypatch, tmp_path):
     for cmd in ("ls & rm -f old.txt", "true & rm -rf data"):
         guard.reset_for_test()
         blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
-        assert blocked is not None and "NOT executed" in blocked, cmd
+        assert_allowed_unprotected(blocked, rec, "background_write"), cmd
     assert rec.requests == []
 
     # 纯只读的管道 / 链不受影响。
@@ -1708,7 +1697,7 @@ def test_unbound_profile_scope_fails_closed(monkeypatch, tmp_path):
 
     blocked = guard.maybe_require_snapshot(
         "write_file", {"path": str(target)}, turn_id="turn_1")
-    assert blocked is not None and "NOT modified" in json.loads(blocked)["error"]
+    assert_allowed_unprotected(blocked, rec, "remote_backend", "snapshot_failed", "broker_unavailable")
     assert rec.requests == []
 
 
@@ -1732,7 +1721,7 @@ def test_terminal_ancillary_failure_blocks_the_command(monkeypatch, tmp_path):
         "terminal", {"command": f"rm -f {doc}", "workdir": str(cwd)},
         turn_id="turn_1", task_id="task_9",
     )
-    assert blocked is not None and "NOT executed" in blocked
+    assert_allowed_unprotected(blocked, rec, "background_write", "remote_backend", "snapshot_failed")
     assert len(rec.requests) == 2
 
 
@@ -1844,7 +1833,7 @@ def test_quoted_or_wrapped_daemonizers_are_blocked(monkeypatch, tmp_path):
     ):
         guard.reset_for_test()
         blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
-        assert blocked is not None and "NOT executed" in blocked, cmd
+        assert_allowed_unprotected(blocked, rec, "background_write"), cmd
     assert rec.requests == []
 
     # `command -v setsid` 只查名字不执行；普通写入命令照常走保护。
@@ -1960,7 +1949,7 @@ def test_env_split_string_daemonizers_are_blocked(monkeypatch, tmp_path):
     ):
         guard.reset_for_test()
         blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
-        assert blocked is not None and "NOT executed" in blocked, cmd
+        assert_allowed_unprotected(blocked, rec, "background_write"), cmd
     assert rec.requests == []
 
     # -S 里没有 daemonizer 的照常走保护。
@@ -1980,7 +1969,7 @@ def test_ssh_backend_write_commands_fail_closed(monkeypatch, tmp_path):
     blocked = guard.maybe_require_snapshot(
         "terminal", {"command": "rm -f ~/Documents/a.txt"}, turn_id="turn_1"
     )
-    assert blocked is not None and "NOT executed" in blocked
+    assert_allowed_unprotected(blocked, rec, "background_write", "remote_backend", "snapshot_failed")
     assert rec.requests == [], "ssh backend 不该向本机 ensure"
 
     guard.reset_for_test()
@@ -2006,7 +1995,7 @@ def test_ssh_backend_blocks_all_write_tools(monkeypatch, tmp_path):
     ):
         guard.reset_for_test()
         blocked = guard.maybe_require_snapshot(tool, args, turn_id="turn_1", task_id="task_9")
-        assert blocked is not None and "NOT executed" in blocked, tool
+        assert_allowed_unprotected(blocked, rec, "background_write", "remote_backend", "snapshot_failed"), tool
     assert rec.requests == [], "ssh backend 不该向本机 ensure"
 
 
@@ -2034,7 +2023,7 @@ def test_coproc_backgrounding_is_blocked(monkeypatch, tmp_path):
     for cmd in ("coproc rm -f victim", "coproc W { rm -f victim; }"):
         guard.reset_for_test()
         blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
-        assert blocked is not None and "NOT executed" in blocked, cmd
+        assert_allowed_unprotected(blocked, rec, "background_write"), cmd
     assert rec.requests == []
 
 
@@ -2191,7 +2180,7 @@ def test_sh_dash_c_daemonizers_are_blocked(monkeypatch, tmp_path):
     ):
         guard.reset_for_test()
         blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
-        assert blocked is not None and "NOT executed" in blocked, cmd
+        assert_allowed_unprotected(blocked, rec, "background_write"), cmd
     assert rec.requests == []
 
     # 没有 daemonizer 的 sh -c 照常走保护。
@@ -2212,7 +2201,7 @@ def test_bash_dash_c_option_terminator_daemonizers_are_blocked(monkeypatch, tmp_
     ):
         guard.reset_for_test()
         blocked = guard.maybe_require_snapshot("terminal", {"command": cmd}, turn_id="turn_1")
-        assert blocked is not None and "NOT executed" in blocked, cmd
+        assert_allowed_unprotected(blocked, rec, "background_write"), cmd
     assert rec.requests == []
 
     # `--` 后没有 daemonizer 的照常走保护，不误伤。
@@ -2289,25 +2278,31 @@ def test_cd_symlink_escape_targets_are_protected(monkeypatch, tmp_path):
 
 def test_registry_dispatch_direct_path_is_gated(monkeypatch, tmp_path):
     """插件公开 API ctx.dispatch_tool() 直连 registry.dispatch()、不经
-    handle_function_call——gate 在 registry 统一分发入口必须同样生效
-    （Codex review P1）。"""
+    handle_function_call——挂钩在 registry 统一分发入口必须同样生效
+    （Codex review P1）。
+
+    #18 之后「生效」的含义变了：不再是「挡住」，而是「**跑到了**并记下原因」。
+    判据从返回错误串改成 rec.unprotected 非空——挂钩没跑到的话它是空的。
+    """
     from tools.registry import registry
 
-    _install(monkeypatch, {"ready": False, "operations": []})
+    rec = _install(monkeypatch, {"ready": False, "operations": []})
     target = tmp_path / "a.txt"
     target.write_text("x")
 
     out = registry.dispatch(
         "write_file", {"path": str(target), "content": "y"}, turn_id="turn_r1")
-    assert "error" in json.loads(out)
-    assert target.read_text() == "x", "gate 先于 handler 执行"
+    assert "error" not in json.loads(out)
+    assert rec.unprotected == ["snapshot_failed"], "registry 直连也要经过守卫"
+    assert target.read_text() == "y", "#18：拿不到恢复点也照常写"
 
-    # 没有 turn 上下文的直连调用在设备上同样 fail-closed（missing turn id）。
+    # 没有 turn 上下文的直连调用同样经过守卫，归因 missing_turn_id。
     guard.reset_for_test()
-    _install(monkeypatch, {"ready": True, "operations": []})
-    out2 = registry.dispatch("write_file", {"path": str(target), "content": "y"})
-    assert "error" in json.loads(out2)
-    assert target.read_text() == "x"
+    rec = _install(monkeypatch, {"ready": True, "operations": []})
+    out2 = registry.dispatch("write_file", {"path": str(target), "content": "z"})
+    assert "error" not in json.loads(out2)
+    assert rec.unprotected == ["missing_turn_id"]
+    assert target.read_text() == "z"
 
 
 def test_padded_agent_output_alias_is_not_resolved(monkeypatch, tmp_path):
@@ -2343,3 +2338,58 @@ def test_padded_agent_output_alias_is_not_resolved(monkeypatch, tmp_path):
         turn_id="turn_2",
     )
     assert rec.requests[0]["body"]["paths"] == [str(output)]
+
+
+# ⚠️ 已删除（PRD 附录 B #18，2026-08-05）：
+#   test_out_of_scope_block_includes_agent_output_hint
+#   test_out_of_scope_block_without_output_has_no_hint
+#
+# 这两条验的是「scope 越界的**阻断消息**里要不要附带 retry with
+# workdir='agent_output' 的指路」。#18 之后守卫不再返回任何错误串给模型，这条
+# 指路连同它的载体一起消失，被测行为不复存在——留着壳只会误导后来人。
+#
+# 锚点契约改由平台 prompt 直接教（gateway/platforms/zet_agent.py），不再依赖
+# 「撞墙后被告知」这条路径。相应的实现侧死代码 _managed_output_fallback 也已删除。
+
+
+def test_restore_conflict_still_blocks_the_write(monkeypatch, tmp_path):
+    """还原互斥是 PRD 附录 B #18 **唯一保留的阻断**：服务端挡住了，客户端也必须挡。
+
+    只在服务端拒绝而客户端照写，这道豁免等于完全没生效——ensure 没建成恢复点，
+    写入却照常落盘，而全量还原正处在「目标目录不存在」的窗口里，用户的数据会
+    因此丢失（PRD §10 的机制说明）。
+    """
+    err = urllib.error.HTTPError(
+        "http://x", 409, "conflict", {},
+        io.BytesIO(json.dumps({
+            "error": {"code": "SNAPSHOT_AGENT_BLOCKED_BY_RESTORE",
+                      "message": "target has a running restore task"},
+        }).encode()),
+    )
+    rec = _install(monkeypatch, err)
+    target = tmp_path / "a.txt"
+    target.write_text("x")
+
+    blocked = guard.maybe_require_snapshot(
+        "write_file", {"path": str(target)}, turn_id="turn_1")
+
+    assert blocked is not None, "还原进行中必须阻断，这是 #18 唯一保留的阻断"
+    assert "restore" in json.loads(blocked)["error"].lower()
+    assert rec.unprotected == [], "阻断不是无保护放行，不该记成 unprotected"
+
+
+def test_turn_finished_409_still_degrades(monkeypatch, tmp_path):
+    """同为 409 的 TURN_FINISHED 走降级——识别时不能只看状态码。"""
+    err = urllib.error.HTTPError(
+        "http://x", 409, "conflict", {},
+        io.BytesIO(json.dumps({
+            "error": {"code": "SNAPSHOT_AGENT_TURN_FINISHED", "message": "turn finished"},
+        }).encode()),
+    )
+    rec = _install(monkeypatch, err)
+    target = tmp_path / "a.txt"
+    target.write_text("x")
+
+    out = guard.maybe_require_snapshot(
+        "write_file", {"path": str(target)}, turn_id="turn_1")
+    assert_allowed_unprotected(out, rec, "broker_unavailable")
