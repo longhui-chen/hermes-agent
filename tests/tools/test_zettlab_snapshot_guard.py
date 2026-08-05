@@ -1742,7 +1742,7 @@ def test_terminal_ancillary_failure_blocks_the_command(monkeypatch, tmp_path):
         turn_id="turn_1", task_id="task_9",
     )
     assert_allowed_unprotected(blocked, rec, "background_write", "remote_backend", "snapshot_failed")
-    assert len(rec.requests) == 2
+    assert len(ensure_requests(rec)) == 2
 
 
 def test_glob_expansion_is_streamed_and_capped(monkeypatch, tmp_path):
@@ -2737,12 +2737,17 @@ def test_ensure_ancillary_still_skips_missing_targets(monkeypatch, tmp_path):
     )
 
 
-def test_probe_retries_main_paths_when_batch_fails(monkeypatch, tmp_path):
-    """加餐目标让整批探测失败时，主 workdir 要单独再探一次（Codex review P1）。
+def test_probe_batches_targets_and_blocks_on_any_batch(monkeypatch, tmp_path):
+    """探测按 _PROBE_BATCH 分批发，任何一批命中还原都阻断。
 
-    否则加餐里一条坏路径（悬空 symlink 让服务端 canonicalPath 解析失败）就能掩盖
-    主目录上真实存在的还原冲突，探测等于没做。
+    一次请求的路径数受服务端 MaxEnsurePaths 约束，主 paths + 加餐目标合起来可能
+    超限而整批 400——那会把某条路径上真实存在的还原冲突整个吃掉。分批还隔离了单批
+    失败：前一批查不了不影响后一批（Codex review P1）。
+
+    坏路径不需要客户端切到逐条：服务端的探测端点逐路径归 target，解析不了的只跳过
+    它自己（见 LS 侧 ProbeRestore）。
     """
+    monkeypatch.setattr(guard, "_PROBE_BATCH", 1)
     cwd = tmp_path / "Work"
     cwd.mkdir()
     (cwd / "a.txt").write_text("x")
@@ -2752,11 +2757,12 @@ def test_probe_retries_main_paths_when_batch_fails(monkeypatch, tmp_path):
     doc.write_text("x")
 
     batch_fails = urllib.error.HTTPError(
-        "http://x", 400, "bad request", {},
+        "http://x", 500, "server error", {},
         io.BytesIO(json.dumps({
-            "error": {"code": "SNAPSHOT_AGENT_BAD_REQUEST", "message": "dangling symlink"},
+            "error": {"code": "SNAPSHOT_AGENT_INTERNAL", "message": "boom"},
         }).encode()),
     )
+    # 第一批（主 cwd）查不了，第二批（加餐目标）正在还原。
     rec = _install(monkeypatch, batch_fails, _restore_conflict_error())
 
     blocked = guard.maybe_require_snapshot(
@@ -2764,9 +2770,8 @@ def test_probe_retries_main_paths_when_batch_fails(monkeypatch, tmp_path):
         turn_id="turn_1", task_id="task_9",
     )
 
-    assert blocked is not None, "整批失败不能掩盖主目录的还原冲突"
-    assert len(rec.requests) == 2, "主 paths 应单独重探一次"
-    assert rec.requests[1]["body"]["paths"] == [str(cwd)]
+    assert blocked is not None, "前一批查不了不该掩盖后一批的还原冲突"
+    assert len(rec.requests) == 2, "两个目标应分两批发"
 
 
 def test_probe_does_not_retry_when_endpoint_missing(monkeypatch, tmp_path):
@@ -2788,3 +2793,81 @@ def test_probe_does_not_retry_when_endpoint_missing(monkeypatch, tmp_path):
     )
     assert_allowed_unprotected(out, rec, "background_write")
     assert len(rec.requests) == 1, "端点不存在时不该重探"
+
+
+def test_main_ensure_batch_error_does_not_mask_restore(monkeypatch, tmp_path):
+    """主 ensure 的整批错误不能遮蔽还原冲突（Codex review P1）。
+
+    多路径 ensure（V4A patch 改多个文件、trusted helper 上报多个输出）里只要一条
+    先触发 403/400，服务端本要为另一条正在还原的路径返的 409 就永远到不了客户端。
+    """
+    a = tmp_path / "a.txt"
+    a.write_text("x")
+    b = tmp_path / "b.txt"
+    b.write_text("x")
+    rec = _install(
+        monkeypatch,
+        _scope_denied_error(),       # 主 ensure：整批 403（一条路径越界拖累全批）
+        _restore_conflict_error(),   # 补探测：另一条路径正在还原
+    )
+
+    patch = f"*** Update File: {a}\n*** Update File: {b}\n"
+    blocked = guard.maybe_require_snapshot(
+        "patch", {"mode": "v4a", "patch": patch}, turn_id="turn_1")
+
+    assert blocked is not None, "整批 403 不能把同批的还原冲突吃掉"
+    assert "restore" in json.loads(blocked)["error"].lower()
+    assert rec.unprotected == []
+    assert rec.requests[-1]["url"].endswith("/agent-protection/restore-probe")
+
+
+def test_main_ensure_not_ready_does_not_mask_restore(monkeypatch, tmp_path):
+    """ready=false 同样是整批结论，可能盖着某条路径的还原冲突。"""
+    target = tmp_path / "a.txt"
+    target.write_text("x")
+    rec = _install(
+        monkeypatch,
+        {"ready": False, "operations": []},
+        _restore_conflict_error(),
+    )
+
+    blocked = guard.maybe_require_snapshot(
+        "write_file", {"path": str(target)}, turn_id="turn_1")
+
+    assert blocked is not None
+    assert rec.unprotected == []
+
+
+def test_ancillary_batch_error_does_not_mask_restore(monkeypatch, tmp_path):
+    """加餐 ensure 的非 403 整批失败（悬空 symlink 一类坏路径）同样不能遮蔽还原。
+
+    那条分支只对 403 逐路径重试，400 直接按 snapshot_failed 放行——若同批另一个
+    加餐目标正在还原，阻断就没了（Codex review P1）。
+    """
+    cwd = tmp_path / "Work"
+    cwd.mkdir()
+    outside = tmp_path / "Documents"
+    outside.mkdir()
+    doc = outside / "a.txt"
+    doc.write_text("x")
+    bad = urllib.error.HTTPError(
+        "http://x", 400, "bad request", {},
+        io.BytesIO(json.dumps({
+            "error": {"code": "SNAPSHOT_AGENT_BAD_REQUEST", "message": "dangling symlink"},
+        }).encode()),
+    )
+    rec = _install(
+        monkeypatch,
+        {"ready": True, "operations": []},   # 主 cwd 成功
+        bad,                                  # 加餐批量 400
+        _restore_conflict_error(),            # 补探测：加餐目标正在还原
+    )
+
+    blocked = guard.maybe_require_snapshot(
+        "terminal", {"command": f"rm -f {doc}", "workdir": str(cwd)},
+        turn_id="turn_1", task_id="task_9",
+    )
+
+    assert blocked is not None, "加餐整批 400 不能把同批的还原冲突吃掉"
+    assert rec.unprotected == []
+    assert rec.requests[-1]["url"].endswith("/agent-protection/restore-probe")

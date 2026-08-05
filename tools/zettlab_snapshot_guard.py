@@ -65,6 +65,9 @@ _FINISH_TIMEOUT = 10.0
 # 探测只读两张表、不碰 btrfs，而调用它的全是「本来就要放行」的分支——让那些写入
 # 为一次探测卡住得不偿失。超时按放行处理（服务端 ProbeTimeout 是 2s）。
 _PROBE_TIMEOUT = 2.5
+# 单次探测的路径数上限，远低于服务端 MaxEnsurePaths(256)：整批超限会 400，把某条
+# 路径上真实存在的还原冲突整个吃掉。分批还隔离了单批失败。
+_PROBE_BATCH = 64
 
 # 响应体上限：正常载荷只有几个 ID 和状态字符串。
 _MAX_RESPONSE_BYTES = 256 * 1024
@@ -1684,6 +1687,14 @@ def maybe_require_snapshot(
         if _is_blocked_by_restore(data, err):
             # #18 唯一保留的阻断，见 _is_blocked_by_restore 的注释。
             return _restore_conflict_error(tool_name, started)
+        # 整批错误会**遮蔽还原冲突**：多路径 ensure（V4A patch 改多个文件、
+        # trusted helper 上报多个输出）里只要一条先触发 403/400，服务端本要为另
+        # 一条正在还原的路径返的 409 就永远到不了这里，Agent 照写
+        # （Codex review P1）。降级放行之前用只读探测把这批路径再问一遍——它逐
+        # 路径归 target、坏路径只跳过自己，不会被同一条坏路径再遮一次。
+        blocked = _restore_probe_blocks(paths, tool_name, arguments, task, started)
+        if blocked is not None:
+            return blocked
         reason = (
             "outside_scope"
             if _is_out_of_scope(data, err)
@@ -1693,6 +1704,10 @@ def maybe_require_snapshot(
 
     if not data.get("ready"):
         # 服务端只在真正失败时才会给 ready=false（无保护路径它自己就放行了）。
+        # 同上：ready=false 是整批结论，可能盖着某条路径的还原冲突。
+        blocked = _restore_probe_blocks(paths, tool_name, arguments, task, started)
+        if blocked is not None:
+            return blocked
         return _unprotected("snapshot_failed", tool=tool_name, started=started)
 
     _log_unprotected(data, tool_name)
@@ -1806,6 +1821,8 @@ def _restore_probe_blocks(
     arguments: dict[str, Any],
     task: str,
     started: float,
+    *,
+    expand_ancillary: bool = True,
 ) -> Optional[str]:
     """给**不走 ensure 的放行分支**补上还原互斥检查。
 
@@ -1832,24 +1849,27 @@ def _restore_probe_blocks(
     这里合并 `_ancillary_targets`——与 `_ensure_ancillary` 同一套提取。
     """
     targets = list(paths)
-    for extra in _ancillary_targets(
-        tool_name, arguments, list(paths), task, include_missing=True
-    ):
-        if extra not in targets:
-            targets.append(extra)
+    if expand_ancillary:
+        for extra in _ancillary_targets(
+            tool_name, arguments, list(paths), task, include_missing=True
+        ):
+            if extra not in targets:
+                targets.append(extra)
     if not targets:
         return None
-    data, err = _post(_PROBE_PATH, {"paths": targets}, _PROBE_TIMEOUT)
-    if _is_blocked_by_restore(data, err):
-        return _restore_conflict_error(tool_name, started)
-    # 整批失败会**掩盖主目录的还原冲突**：加餐目标里只要有一条让服务端整批拒绝
-    # （悬空 symlink 让 canonicalPath 解析失败是最现实的一种），主 workdir 上真实
-    # 存在的还原就查不出来了，探测等于没做（Codex review P1）。用主 paths 单独再
-    # 探一次——它是这条命令**必定**会写的地方，最不能漏。
+    # **分批发**，不要一次性把主路径与加餐目标塞进同一个请求。
     #
-    # 404 / 未配置不重试：那是「服务端没有这条通道」，重试也是同样结果。
-    if err and err not in ("unconfigured", "not_supported") and paths and len(targets) > len(paths):
-        data, err = _post(_PROBE_PATH, {"paths": list(paths)}, _PROBE_TIMEOUT)
+    # 一次请求的路径数受服务端 MaxEnsurePaths 约束，主 paths + 加餐目标合起来可能
+    # 超限而整批 400——那会把某条路径上真实存在的还原冲突整个吃掉，探测等于没做。
+    # 分批还顺带隔离了单批失败：一批查不了不影响其余批（Codex review P1 ×2）。
+    #
+    # 剩下的整批失败（网络、500、404）无论怎么切都查不出来，按探测的既定语义
+    # fail-open——那三种下服务端本来就管不了这批写入。
+    #
+    # 坏路径不需要客户端再切细：服务端的探测端点逐路径归 target，解析不了的只跳过
+    # 它自己，不会连累同批其余路径（见 LS 侧 ProbeRestore）。
+    for i in range(0, len(targets), _PROBE_BATCH):
+        data, err = _post(_PROBE_PATH, {"paths": targets[i:i + _PROBE_BATCH]}, _PROBE_TIMEOUT)
         if _is_blocked_by_restore(data, err):
             return _restore_conflict_error(tool_name, started)
     return None
@@ -1967,6 +1987,14 @@ def _ensure_ancillary(
             with _lock:
                 _state_for_locked(turn).ensured = True
         return None
+    # 非 403 的整批失败（悬空 symlink 一类坏路径让服务端整批 400/500）不走上面
+    # 那条逐路径重试，于是这批加餐目标里若有一个正在还原，服务端的 409 就被这个
+    # 整批错误遮掉了（Codex review P1）。降级放行之前用只读探测把这批目标再问一
+    # 遍——它逐路径归 target，坏路径只跳过自己。
+    blocked = _restore_probe_blocks(
+        extras, tool_name, arguments, task, started, expand_ancillary=False)
+    if blocked is not None:
+        return blocked
     return _unprotected("snapshot_failed", tool=tool_name, started=started)
 
 
