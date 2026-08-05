@@ -10,9 +10,11 @@ from __future__ import annotations
 import atexit
 import base64
 import binascii
+import copy
 import io
 import ipaddress
 import json
+import logging
 import multiprocessing
 import os
 import queue
@@ -27,6 +29,8 @@ import requests
 from agent.secret_scope import get_secret
 from tools.interrupt import is_interrupted
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_BASE_URL = "http://127.0.0.1:9090/api/v1/ai-proxy/v1"
 CAPABILITY_TIMEOUT = 5.0
 REQUEST_TIMEOUT = 30.0
@@ -40,6 +44,10 @@ ACTION_TOKEN_HEADER = "X-Zettlab-Agent-Action-Token"
 ARTIFACT_SESSION_HEADER = "X-Zettlab-Artifact-Session-Id"
 MAX_MEDIA_HTTP_WORKERS = 2
 _STARTER_CAPACITY = threading.BoundedSemaphore(value=MAX_MEDIA_HTTP_WORKERS)
+# How long a successful capability response is reused. The probe runs on every
+# tool-definition pass (twice: image + video), so without a cache each turn pays
+# a fresh round-trip for a value that only changes when the cloud catalog does.
+CAPABILITY_CACHE_TTL = 60.0
 _SUPPORTED_IMAGE_MIMES = {"image/png", "image/jpeg", "image/webp"}
 _IMAGE_READ_CHUNK_BYTES = 48 * 1024
 _MAX_LOCAL_IMAGE_PATH_CHARS = 4096
@@ -798,8 +806,16 @@ class _MediaHTTPSession:
 
 _FILE_WORKER = _MediaFileWorker()
 _SESSION = _MediaHTTPSession()
+# In-process session for the capability probe only (loopback GET, bounded
+# response). ``trust_env`` stays off so a proxy env var cannot redirect a
+# request the caller believes is loopback-only.
+_CAPABILITY_SESSION = requests.Session()
+_CAPABILITY_SESSION.trust_env = False
+_capability_cache: Dict[tuple, tuple[float, Dict[str, Any]]] = {}
+_capability_cache_lock = threading.Lock()
 atexit.register(_SESSION.close)
 atexit.register(_FILE_WORKER.close)
+atexit.register(_CAPABILITY_SESSION.close)
 
 
 def _config_section(media_type: str) -> Dict[str, Any]:
@@ -863,12 +879,49 @@ def base_url(media_type: str) -> str:
     return raw
 
 
+def _capability_timeout() -> float:
+    """Wall-clock budget for one capability probe.
+
+    Env-overridable because everything else on this path is a hard-coded
+    constant, which left operators with no lever at all when the probe started
+    failing in the field.
+    """
+    raw = os.environ.get("ZETTLAB_MEDIA_CAPABILITY_TIMEOUT", "").strip()
+    if raw:
+        try:
+            value = float(raw)
+        except ValueError:
+            value = 0.0
+        if value > 0:
+            return value
+    return CAPABILITY_TIMEOUT
+
+
 def get_capabilities(media_type: Optional[str] = None) -> Dict[str, Any]:
+    """Fetch the ai-proxy media capability document, cached per base URL.
+
+    Deliberately NOT routed through ``_SESSION``: that worker pool exists to
+    give remote media transfers a killable subprocess with a real wall-clock
+    bound, and each request there costs a fresh interpreter plus a re-import of
+    the Hermes entry point. This probe is a loopback GET with no request body
+    and a size-capped response — it does not need that isolation, and paying
+    for it made every probe race ``CAPABILITY_TIMEOUT``. Losing that race
+    silently stripped ``image_generate`` / ``video_generate`` from the tool
+    list, so the model reported the capability as missing.
+    """
     mt = media_type or "image"
-    deadline = time.monotonic() + CAPABILITY_TIMEOUT
-    resp = _SESSION.get(
-        f"{base_url(mt)}/media/generation-capabilities",
-        timeout=max(0.2, deadline - time.monotonic()),
+    url = f"{base_url(mt)}/media/generation-capabilities"
+    cache_key = (url, mt)
+
+    now = time.monotonic()
+    with _capability_cache_lock:
+        cached = _capability_cache.get(cache_key)
+        if cached is not None and now - cached[0] < CAPABILITY_CACHE_TTL:
+            return copy.deepcopy(cached[1])
+
+    resp = _CAPABILITY_SESSION.get(
+        url,
+        timeout=_capability_timeout(),
         allow_redirects=False,
         stream=True,
     )
@@ -879,7 +932,23 @@ def get_capabilities(media_type: Optional[str] = None) -> Dict[str, Any]:
         _close_response(resp)
     if not isinstance(data, dict):
         raise ZettlabMediaError("media capability response is not a JSON object")
-    return data
+
+    with _capability_cache_lock:
+        # Only successful probes are cached. A negative cache would keep the
+        # tool hidden for the full TTL after a single blip — the exact failure
+        # mode this change exists to remove.
+        _capability_cache[cache_key] = (time.monotonic(), data)
+    return copy.deepcopy(data)
+
+
+def invalidate_capability_cache() -> None:
+    """Drop cached capability documents.
+
+    Call after anything that can change the device's media catalog (config
+    reload, credential change) so the next probe re-reads it immediately.
+    """
+    with _capability_cache_lock:
+        _capability_cache.clear()
 
 
 def action_headers() -> Dict[str, str]:
@@ -1063,7 +1132,18 @@ def _resolve_model_from_section(
 def is_available(media_type: str) -> bool:
     try:
         section = type_capability(media_type)
-    except Exception:
+    except Exception as exc:
+        # Never swallow this silently: the caller turns False into "the tool
+        # does not exist", and the model then tells the user the capability is
+        # missing. Without this line that path leaves no trace anywhere.
+        logger.warning(
+            "Zettlab %s capability probe failed (%s: %s); %s generation tools "
+            "are unavailable this turn",
+            media_type,
+            type(exc).__name__,
+            exc,
+            media_type,
+        )
         return False
     models = section.get("models")
     return (

@@ -56,7 +56,7 @@ class _ErrorResp(_Resp):
         raise requests.HTTPError(response=self)
 
 
-def test_zettlab_image_provider_reads_capabilities(monkeypatch):
+def test_zettlab_image_provider_reads_capabilities(monkeypatch, patch_media_get):
     from plugins import zettlab_media_client as client
 
     def fake_get(url, timeout, allow_redirects, stream):
@@ -77,7 +77,7 @@ def test_zettlab_image_provider_reads_capabilities(monkeypatch):
             "video": {"enabled": False, "models": []},
         })
 
-    monkeypatch.setattr(client._SESSION, "get", fake_get)
+    patch_media_get(client, fake_get)
 
     provider = ZettlabImageGenProvider()
     assert provider.is_available() is True
@@ -86,14 +86,14 @@ def test_zettlab_image_provider_reads_capabilities(monkeypatch):
     assert provider.capabilities()["max_reference_images"] == 0
 
 
-def test_zettlab_capabilities_response_is_bounded_and_closed(monkeypatch):
+def test_zettlab_capabilities_response_is_bounded_and_closed(monkeypatch, patch_media_get):
     from plugins import zettlab_media_client as client
 
     response = requests.Response()
     response.status_code = 200
     raw = io.BytesIO(b"x" * (client.MAX_CAPABILITY_RESPONSE_BYTES + 1))
     response.raw = raw
-    monkeypatch.setattr(client._SESSION, "get", lambda *args, **kwargs: response)
+    patch_media_get(client, lambda *args, **kwargs: response)
 
     with pytest.raises(client.ZettlabMediaError, match="exceeds maximum size"):
         client.get_capabilities("image")
@@ -192,7 +192,7 @@ def test_zettlab_provider_validates_local_model_override(monkeypatch):
     assert client.default_model("image") is None
 
 
-def test_zettlab_image_generate_creates_media_job(monkeypatch):
+def test_zettlab_image_generate_creates_media_job(monkeypatch, patch_media_get):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
@@ -233,7 +233,7 @@ def test_zettlab_image_generate_creates_media_job(monkeypatch):
             }],
         })
 
-    monkeypatch.setattr(client._SESSION, "get", fake_get)
+    patch_media_get(client, fake_get)
     monkeypatch.setattr(client._SESSION, "post", fake_post)
 
     got = ZettlabImageGenProvider().generate(
@@ -514,7 +514,7 @@ def test_zettlab_ai_proxy_ignores_environment_proxies(monkeypatch):
     assert settings["proxies"] == {}
 
 
-def test_zettlab_poll_retries_transient_error_without_cleanup(monkeypatch):
+def test_zettlab_poll_retries_transient_error_without_cleanup(monkeypatch, patch_media_get):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
@@ -529,7 +529,7 @@ def test_zettlab_poll_retries_transient_error_without_cleanup(monkeypatch):
             raise result
         return result
 
-    monkeypatch.setattr(client._SESSION, "get", fake_get)
+    patch_media_get(client, fake_get)
     monkeypatch.setattr(client._SESSION, "delete", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("cleanup should not run")))
 
     job = client.create_and_wait(media_type="image", model="seedream-v4", prompt="retry", payload={}, timeout_seconds=10)
@@ -1108,7 +1108,7 @@ def test_zettlab_poll_interrupt_preserves_active_job(monkeypatch):
         client.create_and_wait(media_type="image", model="seedream-v4", prompt="stop", payload={}, timeout_seconds=10)
 
 
-def test_zettlab_poll_attempt_timeout_retries_until_total_deadline(monkeypatch):
+def test_zettlab_poll_attempt_timeout_retries_until_total_deadline(monkeypatch, patch_media_get):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
@@ -1123,14 +1123,14 @@ def test_zettlab_poll_attempt_timeout_retries_until_total_deadline(monkeypatch):
             raise client.ZettlabMediaDeadlineError("single poll timed out")
         return _Resp({"job_id": "job-slow-poll", "status": "done", "assets": [{"url": "https://cdn.example/done.png"}]})
 
-    monkeypatch.setattr(client._SESSION, "get", timeout_first_poll)
+    patch_media_get(client, timeout_first_poll)
     job = client.create_and_wait(media_type="image", model="seedream-v4", prompt="retry", payload={}, timeout_seconds=10)
 
     assert job["status"] == "done"
     assert attempts == 2
 
 
-def test_zettlab_malformed_poll_response_preserves_job_id(monkeypatch):
+def test_zettlab_malformed_poll_response_preserves_job_id(monkeypatch, patch_media_get):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
@@ -1139,7 +1139,7 @@ def test_zettlab_malformed_poll_response_preserves_job_id(monkeypatch):
     response = requests.Response()
     response.status_code = 200
     response.raw = io.BytesIO(b"{not-json")
-    monkeypatch.setattr(client._SESSION, "get", lambda *args, **kwargs: response)
+    patch_media_get(client, lambda *args, **kwargs: response)
 
     with pytest.raises(client.ZettlabMediaError, match=r"not valid JSON.*job_id=job-malformed"):
         client.create_and_wait(media_type="image", model="seedream-v4", prompt="bad", payload={}, timeout_seconds=10)
@@ -1161,7 +1161,7 @@ def test_zettlab_poll_transport_failure_preserves_job_id(monkeypatch):
         client.create_and_wait(media_type="image", model="seedream-v4", prompt="pipe", payload={}, timeout_seconds=0.02)
 
 
-def test_zettlab_poll_continues_past_transient_failures(monkeypatch):
+def test_zettlab_poll_continues_past_transient_failures(monkeypatch, patch_media_get):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
@@ -1182,7 +1182,7 @@ def test_zettlab_poll_continues_past_transient_failures(monkeypatch):
             raise result
         return result
 
-    monkeypatch.setattr(client._SESSION, "get", fake_get)
+    patch_media_get(client, fake_get)
     job = client.create_and_wait(media_type="image", model="seedream-v4", prompt="recover", payload={}, timeout_seconds=10)
     assert job["status"] == "done"
 

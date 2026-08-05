@@ -15,7 +15,7 @@ class _Resp:
         return self._data
 
 
-def test_image_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
+def test_image_generate_tool_dispatches_to_zettlab_provider(monkeypatch, patch_media_get):
     from agent import image_gen_registry
     from plugins import zettlab_media_client as client
     from plugins.image_gen.zettlab import ZettlabImageGenProvider
@@ -40,7 +40,7 @@ def test_image_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
             "assets": [{"url": "https://cdn.example/image.png"}],
         })
 
-    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout, allow_redirects, stream: _Resp({
+    patch_media_get(client, lambda url, timeout, allow_redirects, stream: _Resp({
         "image": {
             "enabled": True,
             "default_model": "seedream-v4",
@@ -91,7 +91,7 @@ def test_image_tool_hidden_when_selected_zettlab_capability_is_disabled(monkeypa
     assert image_tool.check_image_generation_requirements() is False
 
 
-def test_image_only_model_requires_input_through_generation_tool(monkeypatch):
+def test_image_only_model_requires_input_through_generation_tool(monkeypatch, patch_media_get):
     from agent import image_gen_registry
     from plugins import zettlab_media_client as client
     from plugins.image_gen.zettlab import ZettlabImageGenProvider
@@ -102,7 +102,7 @@ def test_image_only_model_requires_input_through_generation_tool(monkeypatch):
     monkeypatch.setattr(image_tool, "_read_configured_image_provider", lambda: "zettlab")
     monkeypatch.setattr(image_tool, "_read_configured_image_model", lambda: None)
     monkeypatch.setattr("hermes_cli.plugins._ensure_plugins_discovered", lambda *args, **kwargs: None)
-    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout, allow_redirects, stream: _Resp({
+    patch_media_get(client, lambda url, timeout, allow_redirects, stream: _Resp({
         "image": {
             "enabled": True,
             "default_model": "image-only",
@@ -121,7 +121,7 @@ def test_image_only_model_requires_input_through_generation_tool(monkeypatch):
     assert got["error_type"] == "missing_image"
 
 
-def test_video_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
+def test_video_generate_tool_dispatches_to_zettlab_provider(monkeypatch, patch_media_get):
     from agent import video_gen_registry
     from plugins import zettlab_media_client as client
     from plugins.video_gen.zettlab import ZettlabVideoGenProvider
@@ -146,7 +146,7 @@ def test_video_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
             "assets": [{"url": "https://cdn.example/video.mp4"}],
         })
 
-    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout, allow_redirects, stream: _Resp({
+    patch_media_get(client, lambda url, timeout, allow_redirects, stream: _Resp({
         "video": {
             "enabled": True,
             "default_model": "seedance-v1",
@@ -174,7 +174,7 @@ def test_video_generate_tool_dispatches_to_zettlab_provider(monkeypatch):
     assert "duration" not in captured["json"]
 
 
-def test_local_image_dispatches_through_both_generation_tools(tmp_path, monkeypatch):
+def test_local_image_dispatches_through_both_generation_tools(tmp_path, monkeypatch, patch_media_get):
     from agent import image_gen_registry, video_gen_registry
     from plugins import zettlab_media_client as client
     from plugins.image_gen.zettlab import ZettlabImageGenProvider
@@ -226,7 +226,7 @@ def test_local_image_dispatches_through_both_generation_tools(tmp_path, monkeypa
             "assets": [{"url": f"https://cdn.example/generated.{extension}"}],
         })
 
-    monkeypatch.setattr(client._SESSION, "get", fake_get)
+    patch_media_get(client, fake_get)
 
     def fake_post(url, json, headers, timeout, allow_redirects, stream):
         requests.append(json)
@@ -267,7 +267,7 @@ def test_local_image_dispatches_through_both_generation_tools(tmp_path, monkeypa
     assert all("remote_media_inputs" not in request for request in requests)
 
 
-def test_generated_media_local_artifact_flow(monkeypatch):
+def test_generated_media_local_artifact_flow(monkeypatch, patch_media_get):
     from agent import image_gen_registry, video_gen_registry
     from plugins import zettlab_media_client as client
     from plugins.image_gen.zettlab import ZettlabImageGenProvider
@@ -318,7 +318,7 @@ def test_generated_media_local_artifact_flow(monkeypatch):
             }],
         })
 
-    monkeypatch.setattr(client._SESSION, "get", fake_get)
+    patch_media_get(client, fake_get)
 
     def fake_post(url, json, headers, timeout, allow_redirects, stream):
         create_headers.append(dict(headers))
@@ -416,7 +416,7 @@ def test_concurrent_generation_flow_uses_bounded_http_workers(monkeypatch):
     assert sorted(result["job_id"] for result in results) == ["job-a", "job-b"]
 
 
-def test_generated_media_falls_back_to_remote_url_with_older_local_server(monkeypatch):
+def test_generated_media_falls_back_to_remote_url_with_older_local_server(monkeypatch, patch_media_get):
     from agent import image_gen_registry
     from plugins import zettlab_media_client as client
     from plugins.image_gen.zettlab import ZettlabImageGenProvider
@@ -443,7 +443,7 @@ def test_generated_media_falls_back_to_remote_url_with_older_local_server(monkey
             "assets": [{"url": "https://cdn.example/generated.png"}],
         })
 
-    monkeypatch.setattr(client._SESSION, "get", fake_get)
+    patch_media_get(client, fake_get)
     monkeypatch.setattr(client._SESSION, "post", lambda *args, **kwargs: _Resp({
         "job_id": "job-old-server",
         "status": "done",
@@ -459,7 +459,7 @@ def test_generated_media_falls_back_to_remote_url_with_older_local_server(monkey
     assert got["image"] == "https://cdn.example/generated.png"
 
 
-def test_async_media_uses_short_polls_then_remaining_budget_for_artifact_finalization(monkeypatch):
+def test_async_media_uses_short_polls_then_remaining_budget_for_artifact_finalization(monkeypatch, patch_media_get):
     from plugins import zettlab_media_client as client
 
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "media-token")
@@ -490,7 +490,7 @@ def test_async_media_uses_short_polls_then_remaining_budget_for_artifact_finaliz
             }],
         })
 
-    monkeypatch.setattr(client._SESSION, "get", fake_get)
+    patch_media_get(client, fake_get)
 
     job = client.create_and_wait(
         media_type="video",
@@ -509,7 +509,7 @@ def test_async_media_uses_short_polls_then_remaining_budget_for_artifact_finaliz
     assert client.first_asset_local_path(job).endswith("video.mp4")
 
 
-def test_zet_agent_exposes_video_tool_when_gateway_capability_is_enabled(monkeypatch):
+def test_zet_agent_exposes_video_tool_when_gateway_capability_is_enabled(monkeypatch, patch_media_get):
     from agent import video_gen_registry
     from hermes_cli.tools_config import _get_platform_tools
     import model_tools
@@ -521,7 +521,7 @@ def test_zet_agent_exposes_video_tool_when_gateway_capability_is_enabled(monkeyp
     video_gen_registry.register_provider(ZettlabVideoGenProvider())
     monkeypatch.setattr("hermes_cli.plugins._ensure_plugins_discovered", lambda *args, **kwargs: None)
     monkeypatch.setattr(video_tool, "_read_configured_video_provider", lambda: "zettlab")
-    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout, allow_redirects, stream: _Resp({
+    patch_media_get(client, lambda url, timeout, allow_redirects, stream: _Resp({
         "video": {
             "enabled": True,
             "default_model": "seedance-v1",
@@ -608,7 +608,7 @@ def test_read_only_vault_hides_zettlab_video_even_when_capability_is_enabled(mon
     }
 
 
-def test_zet_agent_hides_video_tool_when_zettlab_is_disabled_even_if_another_provider_is_available(monkeypatch):
+def test_zet_agent_hides_video_tool_when_zettlab_is_disabled_even_if_another_provider_is_available(monkeypatch, patch_media_get):
     from agent import video_gen_registry
     from agent.video_gen_provider import VideoGenProvider
     from hermes_cli.tools_config import _get_platform_tools
@@ -631,7 +631,7 @@ def test_zet_agent_hides_video_tool_when_zettlab_is_disabled_even_if_another_pro
     monkeypatch.setattr("hermes_cli.plugins._ensure_plugins_discovered", lambda *args, **kwargs: None)
     monkeypatch.setattr("agent.secret_scope.is_multiplex_active", lambda: True)
     monkeypatch.setattr(video_tool, "_read_configured_video_provider", lambda: "zettlab")
-    monkeypatch.setattr(client._SESSION, "get", lambda url, timeout, allow_redirects, stream: _Resp({
+    patch_media_get(client, lambda url, timeout, allow_redirects, stream: _Resp({
         "video": {
             "enabled": False,
             "default_model": "",

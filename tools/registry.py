@@ -162,6 +162,39 @@ def _must_recheck_profile_scope(fn: Callable) -> bool:
         return False
 
 
+def _profile_scoped_check(fn: Callable) -> bool:
+    """Evaluate a profile-scoped check_fn with no caching at all.
+
+    Deliberately uncached: a function-global TTL/last-good verdict would let
+    one profile's grant expose a tool for another, or outlive a revoke — see
+    ``test_mutation_dispatch_flow_rechecks_revoked_profile_after_cached_gate``.
+    Callers still de-duplicate within a single get_definitions() pass.
+
+    That makes the cost of the probe itself the thing to keep small; caching
+    belongs behind the check (e.g. a cached capability document), not in front
+    of the authorization decision.
+    """
+    raised = False
+    try:
+        value = bool(fn())
+    except Exception:
+        value = False
+        raised = True
+
+    if value:
+        return True
+
+    # Log both failure modes. This used to log only the raising case, so a
+    # check that merely returned False removed its tools without leaving a
+    # single line anywhere — undiagnosable from a device.
+    logger.warning(
+        "profile-scoped check_fn %s %s; dependent tools are unavailable this turn",
+        getattr(fn, "__qualname__", fn),
+        "raised" if raised else "returned False",
+    )
+    return False
+
+
 def _check_fn_cached(fn: Callable) -> bool:
     """Return bool(fn()), TTL-cached across calls.
 
@@ -172,18 +205,7 @@ def _check_fn_cached(fn: Callable) -> bool:
     contention, probe timeout) from silently stripping tools mid-session.
     """
     if _must_recheck_profile_scope(fn):
-        # A function-global TTL/last-good cache is unsafe here: profile A's
-        # grant can otherwise expose a tool for profile B, or outlive revoke.
-        # Keep the normal per-definitions-pass de-duplication in callers, but
-        # re-evaluate across multiplexed profile scopes.
-        try:
-            return bool(fn())
-        except Exception:
-            logger.warning(
-                "profile-scoped check_fn %s raised; dependent tools are unavailable this turn",
-                getattr(fn, "__qualname__", fn),
-            )
-            return False
+        return _profile_scoped_check(fn)
 
     now = time.monotonic()
     with _check_fn_cache_lock:
