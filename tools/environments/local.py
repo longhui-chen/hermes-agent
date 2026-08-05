@@ -40,6 +40,13 @@ _MANAGED_TERMINAL_IDENTITY_ATTEMPTS = 64
 _MANAGED_TERMINAL_IDENTITY_CACHE_MAX = 4096
 _MANAGED_TERMINAL_IDENTITY_LOCK = threading.Lock()
 _MANAGED_TERMINAL_SCOPE_BY_UID: dict[int, str] = {}
+_MANAGED_SKILL_TREE_MAX_ENTRIES = 20_000
+_MANAGED_SKILL_TREE_PREPARED_MAX = 4096
+_MANAGED_SKILL_TREE_LOCK = threading.Lock()
+# 按 root 存指纹而不是把 (root, mtime, ctime) 当 key：同一 root 的旧指纹没有价值，
+# 避免安装/卸载 churn 把缓存撑到上限（HR1）。
+_MANAGED_SKILL_TREE_PREPARED: dict[str, tuple] = {}
+_MANAGED_OUTPUT_TREE_MAX_ENTRIES = 100_000
 _MANAGED_TERMINAL_RETIRED_UIDS: set[int] = set()
 _MANAGED_TERMINAL_RETIRED_SCOPES: set[str] = set()
 _MANAGED_TERMINAL_RETIRED_MAX = 4096
@@ -63,7 +70,7 @@ _MANAGED_TERMINAL_CGROUP_ENTER = (
     "os.execv(sys.argv[2],sys.argv[2:])\n"
 )
 _MANAGED_TERMINAL_PRIVATE_TMP_ENTER = (
-    "import ctypes,os,stat,sys\n"
+    "import ctypes,os,re,stat,sys\n"
     "if len(sys.argv)<4:\n raise OSError('managed private tmp argv is invalid')\n"
     "sources=sys.argv[1:3]\n"
     "for source in sources:\n"
@@ -82,6 +89,27 @@ _MANAGED_TERMINAL_PRIVATE_TMP_ENTER = (
     "mount(None,b'/',16384|262144)\n"
     "mount(os.fsencode(sources[0]),b'/tmp',4096|16384)\n"
     "mount(os.fsencode(sources[1]),b'/var/tmp',4096|16384)\n"
+    # 相对 HERMES_HOME 会把子进程 cwd 下的同名目录挂成只读，必须要求绝对路径
+    "hermes_home=os.environ.get('HERMES_HOME','')\n"
+    "skill_root=os.path.join(hermes_home,'skills')\n"
+    "if os.path.isabs(hermes_home) and os.path.isdir(skill_root):\n"
+    " info=os.lstat(skill_root)\n"
+    " if not stat.S_ISDIR(info.st_mode) or info.st_mode&0o022:\n"
+    "  raise OSError('managed skill source is not trusted')\n"
+    " encoded=os.fsencode(skill_root)\n"
+    " mount(encoded,encoded,4096|16384)\n"
+    # MS_REMOUNT 不递归：skills 下的子挂载若不逐个补只读，就是快照守卫豁免区里的可写洞
+    " points={skill_root}\n"
+    " with open('/proc/self/mountinfo','rb') as handle:\n"
+    "  for line in handle:\n"
+    "   fields=line.split(b' ')\n"
+    "   if len(fields)<5:\n"
+    "    continue\n"
+    "   point=os.fsdecode(re.sub(rb'\\\\([0-7]{3})',lambda m:bytes([int(m.group(1),8)]),fields[4]))\n"
+    "   if point==skill_root or point.startswith(skill_root+'/'):\n"
+    "    points.add(point)\n"
+    " for point in sorted(points,key=len,reverse=True):\n"
+    "  mount(None,os.fsencode(point),32|4096|1|2|4)\n"
     "os.umask(0o077)\n"
     "os.execv(sys.argv[3],sys.argv[3:])\n"
 )
@@ -124,19 +152,37 @@ def _managed_terminal_profile_scope(
     return str(Path(raw_scope).expanduser().resolve())
 
 
+def _validate_managed_root_directory_chain(directory: Path) -> Path:
+    """Resolve and validate a root-owned, non-writable directory chain."""
+
+    resolved = directory.resolve(strict=True)
+    for component in (resolved, *resolved.parents):
+        info = os.lstat(component)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != 0
+            or info.st_mode & 0o022
+        ):
+            raise OSError("managed profile directory chain is not trusted")
+    return resolved
+
+
 def _managed_terminal_identity(
     env: Mapping[str, str] | None = None,
 ) -> tuple[int, int]:
-    """Derive one device-keyed non-root identity per multiplex profile."""
+    """Derive one device-independent non-root identity per multiplex profile."""
 
     if _IS_WINDOWS or os.geteuid() != 0:
         raise OSError("managed terminal requires a root identity broker")
     secret = os.environ.get("ZET_AGENT_KEY", "")
     scope = _managed_terminal_profile_scope(env)
+    profile_id = Path(scope).name
     if (
         not secret
         or "\x00" in secret
         or len(secret.encode("utf-8")) > 4096
+        or not profile_id
+        or profile_id in (".", "..")
     ):
         raise OSError("managed terminal profile identity is unavailable")
 
@@ -145,11 +191,20 @@ def _managed_terminal_identity(
     registered = {entry.pw_uid for entry in pwd.getpwall()}
     population = _MANAGED_TERMINAL_UID_MAX - _MANAGED_TERMINAL_UID_MIN + 1
     with _MANAGED_TERMINAL_IDENTITY_LOCK:
+        existing = [
+            uid
+            for uid, owner_scope in _MANAGED_TERMINAL_SCOPE_BY_UID.items()
+            if owner_scope == scope
+        ]
+        if len(existing) == 1:
+            return existing[0], existing[0]
+        if len(existing) > 1:
+            raise OSError("managed terminal profile has ambiguous identities")
         for counter in range(_MANAGED_TERMINAL_IDENTITY_ATTEMPTS):
-            digest = hmac.new(
-                secret.encode("utf-8"),
-                f"{scope}\0{counter}".encode("utf-8"),
-                hashlib.sha256,
+            digest = hashlib.sha256(
+                f"zettlab-managed-profile-v1\0{profile_id}\0{counter}".encode(
+                    "utf-8"
+                )
             ).digest()
             uid = _MANAGED_TERMINAL_UID_MIN + (
                 int.from_bytes(digest[:8], "big") % population
@@ -913,6 +968,637 @@ def _managed_identity_can_traverse(
     return True
 
 
+def _managed_skill_entry_mode(info: os.stat_result) -> int | None:
+    if info.st_uid != 0:
+        raise OSError("managed profile skill entry is not trusted")
+    if stat.S_ISLNK(info.st_mode):
+        return None
+    if stat.S_ISDIR(info.st_mode):
+        return 0o750
+    if stat.S_ISREG(info.st_mode):
+        if info.st_nlink != 1:
+            raise OSError("managed profile skill hard link is not trusted")
+        return 0o640 | (0o110 if info.st_mode & stat.S_IXUSR else 0)
+    raise OSError("managed profile skill entry type is not trusted")
+
+
+def _normalize_managed_skill_package(package: Path, gid: int) -> None:
+    """FD-walk and harden one root-owned package without following symlinks."""
+
+    root_info = os.lstat(package)
+    root_mode = _managed_skill_entry_mode(root_info)
+    if root_mode is None:
+        return
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = flags | getattr(os, "O_DIRECTORY", 0)
+    root_flags = directory_flags if stat.S_ISDIR(root_info.st_mode) else flags
+    root_fd = os.open(package, root_flags)
+    opened_root = os.fstat(root_fd)
+    if (
+        opened_root.st_dev != root_info.st_dev
+        or opened_root.st_ino != root_info.st_ino
+        or _managed_skill_entry_mode(opened_root) != root_mode
+    ):
+        os.close(root_fd)
+        raise OSError("managed profile skill package changed during preparation")
+    if opened_root.st_gid != gid:
+        os.fchown(root_fd, 0, gid)
+    if stat.S_IMODE(opened_root.st_mode) != root_mode:
+        os.fchmod(root_fd, root_mode)
+    if not stat.S_ISDIR(opened_root.st_mode):
+        os.close(root_fd)
+        return
+
+    stack: list[tuple[int, object]] = [(root_fd, None)]
+    count = 0
+    try:
+        while stack:
+            directory_fd, iterator = stack[-1]
+            if iterator is None:
+                iterator = os.scandir(directory_fd)
+                stack[-1] = (directory_fd, iterator)
+            try:
+                entry = next(iterator)
+            except StopIteration:
+                iterator.close()
+                os.close(directory_fd)
+                stack.pop()
+                continue
+            count += 1
+            if count > _MANAGED_SKILL_TREE_MAX_ENTRIES:
+                raise OSError("managed profile skill tree exceeds the safety limit")
+            info = entry.stat(follow_symlinks=False)
+            mode = _managed_skill_entry_mode(info)
+            if mode is None:
+                continue
+            entry_flags = directory_flags if stat.S_ISDIR(info.st_mode) else flags
+            entry_fd = os.open(entry.name, entry_flags, dir_fd=directory_fd)
+            opened = os.fstat(entry_fd)
+            if (
+                opened.st_dev != info.st_dev
+                or opened.st_ino != info.st_ino
+                or _managed_skill_entry_mode(opened) != mode
+            ):
+                os.close(entry_fd)
+                raise OSError("managed profile skill entry changed during preparation")
+            if opened.st_gid != gid:
+                os.fchown(entry_fd, 0, gid)
+            if stat.S_IMODE(opened.st_mode) != mode:
+                os.fchmod(entry_fd, mode)
+            if stat.S_ISDIR(opened.st_mode):
+                stack.append((entry_fd, None))
+            else:
+                os.close(entry_fd)
+    finally:
+        for directory_fd, iterator in stack:
+            if iterator is not None:
+                iterator.close()
+            os.close(directory_fd)
+
+
+def _managed_python_skill_sources(
+    command: str,
+    profile_home: Path,
+) -> set[tuple[Path, Path]]:
+    """Identify Python's first script operand inside the active skill root."""
+
+    lexical_skills_root = profile_home.expanduser() / "skills"
+    try:
+        resolved_skills_root = lexical_skills_root.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return set()
+    sources: set[tuple[Path, Path]] = set()
+    for segment in re.split(r"&&|\|\||;|\||\n|&", command or ""):
+        try:
+            tokens = shlex.split(segment, posix=True)
+        except ValueError:
+            continue
+        while tokens and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
+            tokens.pop(0)
+        if not tokens or not re.fullmatch(
+            r"python(?:\d+(?:\.\d+)*)?",
+            os.path.basename(tokens[0]),
+        ):
+            continue
+        script = ""
+        index = 1
+        while index < len(tokens):
+            token = tokens[index]
+            if token in ("-c", "-m"):
+                break
+            if token in ("-W", "-X"):
+                index += 2
+                continue
+            if token == "--":
+                index += 1
+                if index < len(tokens):
+                    script = tokens[index]
+                break
+            if token.startswith("-"):
+                index += 1
+                continue
+            script = token
+            break
+        if not script or not os.path.isabs(script):
+            continue
+        try:
+            lexical_source = Path(os.path.normpath(script))
+            lexical_source.relative_to(lexical_skills_root)
+            resolved_source = lexical_source.resolve(strict=True)
+            resolved_source.relative_to(resolved_skills_root)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if resolved_source.is_file():
+            sources.add((lexical_source, resolved_source))
+    return sources
+
+
+def _prepare_managed_command_skill_sources(
+    command: str,
+    env: Mapping[str, str],
+) -> None:
+    """Make each invoked skill package profile-readable before namespace mount."""
+
+    if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
+        return
+    raw_profile_home = str(env.get("HERMES_HOME") or "").strip()
+    if not raw_profile_home:
+        return
+    lexical_profile_home = Path(raw_profile_home).expanduser()
+    profile_home = Path(_managed_terminal_profile_scope(env))
+    lexical_skills_root = lexical_profile_home / "skills"
+    skills_root = profile_home / "skills"
+    _uid, gid = _managed_terminal_identity(env)
+    packages: set[Path] = set()
+    for lexical_source, resolved_source in _managed_python_skill_sources(
+        command, lexical_profile_home
+    ):
+        lexical_relative = lexical_source.relative_to(lexical_skills_root)
+        packages.add(lexical_skills_root / lexical_relative.parts[0])
+        resolved_relative = resolved_source.relative_to(skills_root)
+        packages.add(skills_root / resolved_relative.parts[0])
+    prepared_inodes: set[tuple[int, int]] = set()
+    for package in packages:
+        root_info = os.lstat(package)
+        inode_key = (root_info.st_dev, root_info.st_ino)
+        if inode_key in prepared_inodes:
+            continue
+        prepared_inodes.add(inode_key)
+        _normalize_managed_skill_package(package, gid)
+
+
+def _managed_skill_tree_fingerprint(skills_root: Path) -> tuple | None:
+    """Timestamp every directory in the tree, not just the top-level packages.
+
+    A skill update usually lands *inside* an existing package —
+    ``skills/foo/scripts/run.sh`` — which leaves ``foo``'s own timestamps
+    untouched. Fingerprinting packages alone therefore keeps hitting the
+    cache while the freshly written, root-owned ``0600`` file stays
+    unreadable to the managed uid, and only ``python <abs path>``
+    entrypoints get rescued by per-command preparation; ``bash x.sh``,
+    ``./x.py`` and in-package data reads fail until a restart.
+
+    Every add / remove / rename does bump its parent directory's mtime, so
+    walking directories catches that whole class. Directories only, because
+    this runs before *every* local terminal command: it is roughly a quarter
+    of the entries of the normalization walk it guards, and that walk opens
+    and fstats each entry rather than merely stat-ing it. The residual gap is
+    an in-place chown/chmod of a single file with no directory change — not a
+    shape skill installation produces.
+
+    Returns None when the tree is too large to fingerprint, meaning "do not
+    cache": re-normalizing every command is slow but correct, whereas a
+    truncated fingerprint would silently stop granting access.
+    """
+
+    fingerprint: list[tuple[str, int, int]] = []
+    visited: set[tuple[int, int]] = set()
+    stack: list[Path] = [skills_root]
+    while stack:
+        current = stack.pop()
+        try:
+            info = os.lstat(current)
+        except OSError:
+            continue
+        if not stat.S_ISDIR(info.st_mode):
+            continue
+        # symlink 已被 lstat 排除；inode 去重再挡住 bind mount 造成的环。
+        key = (info.st_dev, info.st_ino)
+        if key in visited:
+            continue
+        visited.add(key)
+        if len(visited) > _MANAGED_SKILL_TREE_MAX_ENTRIES:
+            return None
+        fingerprint.append(
+            (os.fspath(current), info.st_mtime_ns, info.st_ctime_ns)
+        )
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    fingerprint.sort()
+    return tuple(fingerprint)
+
+
+def _prepare_managed_skill_tree(skills_root: Path, gid: int) -> None:
+    """Restore group access for every installed package, whatever invokes it.
+
+    Command parsing only recognizes ``python <abs path>`` entrypoints, but
+    skills also run as ``bash x.sh``, ``./x.py``, ``python -m``, relative
+    paths or plain reads. Walking every top-level package here keeps those
+    shapes readable too; per-command preparation stays as the fallback for
+    packages installed after this pass.
+    """
+
+    try:
+        os.lstat(skills_root)
+    except FileNotFoundError:
+        return
+    root_key = str(skills_root)
+    with os.scandir(skills_root) as entries:
+        listing = [(entry.path, entry.name) for entry in entries]
+    fingerprint = _managed_skill_tree_fingerprint(skills_root)
+    # gid 也进指纹——身份轮换后旧的放权结果不可信。
+    state = (gid, fingerprint) if fingerprint is not None else None
+    if state is not None:
+        with _MANAGED_SKILL_TREE_LOCK:
+            if _MANAGED_SKILL_TREE_PREPARED.get(root_key) == state:
+                return
+    packages = [Path(path_str) for path_str, _name in listing]
+    for package in packages:
+        try:
+            _normalize_managed_skill_package(package, gid)
+        except OSError as exc:
+            # 单个坏包不许废掉整棵树的放权（HR2）
+            logger.warning(
+                "managed skill package skipped: %s (%s)", package, exc
+            )
+    if state is None:
+        return
+    with _MANAGED_SKILL_TREE_LOCK:
+        while len(_MANAGED_SKILL_TREE_PREPARED) >= _MANAGED_SKILL_TREE_PREPARED_MAX:
+            _MANAGED_SKILL_TREE_PREPARED.pop(
+                next(iter(_MANAGED_SKILL_TREE_PREPARED))
+            )
+        _MANAGED_SKILL_TREE_PREPARED[root_key] = state
+
+
+def _migrate_managed_output_tree(
+    output_dir: Path,
+    *,
+    uid: int,
+    gid: int,
+    expected: os.stat_result,
+) -> None:
+    """FD-walk, validate, then transfer an older identity's profile output."""
+
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = flags | getattr(os, "O_DIRECTORY", 0)
+    root_fd = os.open(output_dir, directory_flags)
+
+    def _trusted(info: os.stat_result) -> bool:
+        allowed_type = (
+            stat.S_ISDIR(info.st_mode)
+            or stat.S_ISREG(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+        )
+        if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
+            return False
+        # Historical output can come from trusted helpers/containers running
+        # under a different numeric UID. The output root is anchored beneath a
+        # validated root-owned parent, and transfer opens every non-symlink via
+        # dir_fd + O_NOFOLLOW before changing ownership. Restrict entry shape
+        # and hard links here; normalize the previous owner during transfer.
+        return allowed_type
+
+    def _walk(*, transfer: bool) -> None:
+        stack: list[tuple[int, object]] = [(os.dup(root_fd), None)]
+        count = 0
+        try:
+            while stack:
+                directory_fd, iterator = stack[-1]
+                if iterator is None:
+                    iterator = os.scandir(directory_fd)
+                    stack[-1] = (directory_fd, iterator)
+                try:
+                    entry = next(iterator)
+                except StopIteration:
+                    iterator.close()
+                    os.close(directory_fd)
+                    stack.pop()
+                    continue
+                count += 1
+                if count > _MANAGED_OUTPUT_TREE_MAX_ENTRIES:
+                    raise OSError("managed profile tree exceeds the safety limit")
+                info = entry.stat(follow_symlinks=False)
+                if not _trusted(info):
+                    raise OSError("managed profile output entry is not trusted")
+                if stat.S_ISLNK(info.st_mode):
+                    # Symlink ownership has no bearing on traversal and changing
+                    # it by pathname would reintroduce a lstat/chown race.
+                    continue
+                entry_flags = directory_flags if stat.S_ISDIR(info.st_mode) else flags
+                entry_fd = os.open(entry.name, entry_flags, dir_fd=directory_fd)
+                opened_info = os.fstat(entry_fd)
+                if (
+                    opened_info.st_dev != info.st_dev
+                    or opened_info.st_ino != info.st_ino
+                    or not _trusted(opened_info)
+                ):
+                    os.close(entry_fd)
+                    raise OSError("managed profile output changed during transfer")
+                if transfer:
+                    os.fchown(entry_fd, uid, gid)
+                    if stat.S_ISDIR(opened_info.st_mode):
+                        os.fchmod(entry_fd, 0o700)
+                    else:
+                        mode = (stat.S_IMODE(opened_info.st_mode) & 0o700) | 0o600
+                        os.fchmod(entry_fd, mode)
+                if stat.S_ISDIR(opened_info.st_mode):
+                    stack.append((entry_fd, None))
+                else:
+                    os.close(entry_fd)
+        finally:
+            for directory_fd, iterator in stack:
+                if iterator is not None:
+                    iterator.close()
+                os.close(directory_fd)
+
+    try:
+        root_info = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or root_info.st_dev != expected.st_dev
+            or root_info.st_ino != expected.st_ino
+        ):
+            raise OSError("managed profile output changed before transfer")
+        _walk(transfer=False)
+        _walk(transfer=True)
+        current = os.lstat(output_dir)
+        if current.st_dev != root_info.st_dev or current.st_ino != root_info.st_ino:
+            raise OSError("managed profile output changed during transfer")
+        os.fchown(root_fd, uid, gid)
+        os.fchmod(root_fd, 0o700)
+    finally:
+        os.close(root_fd)
+
+
+def _prepare_managed_profile_runtime(env: Mapping[str, str]) -> None:
+    """Expose only this profile's skills and output to its terminal identity.
+
+    Platform profiles are root-owned. The model shell receives a stable,
+    profile-stable UID/GID, so it needs execute permission on the common parents,
+    profile-group access to its own source, and ownership of its output. The
+    skill tree is additionally bind-mounted read-only in the child namespace.
+    """
+
+    uid, gid = _managed_terminal_identity(env)
+    try:
+        profile_home = _validate_managed_root_directory_chain(
+            Path(_managed_terminal_profile_scope(env))
+        )
+        profiles_root = profile_home.parent
+        hermes_root = profiles_root.parent
+        skills_root = profile_home / "skills"
+    except (OSError, RuntimeError) as exc:
+        raise OSError("managed profile runtime paths are unavailable") from exc
+
+    if profiles_root.name != "profiles":
+        raise OSError("managed profile runtime scope is invalid")
+
+    for common in (hermes_root, profiles_root):
+        info = os.lstat(common)
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != 0
+            or info.st_mode & 0o022
+        ):
+            raise OSError("managed profile parent is not trusted")
+        os.chmod(common, 0o711, follow_symlinks=False)
+
+    profile_info = os.lstat(profile_home)
+    if (
+        not stat.S_ISDIR(profile_info.st_mode)
+        or profile_info.st_uid != 0
+        or profile_info.st_mode & 0o022
+    ):
+        raise OSError("managed profile home is not trusted")
+    os.chown(profile_home, 0, gid, follow_symlinks=False)
+    os.chmod(profile_home, 0o710, follow_symlinks=False)
+
+    try:
+        skills_info = os.lstat(skills_root)
+    except FileNotFoundError:
+        skills_info = None
+    if skills_info is not None:
+        if (
+            not stat.S_ISDIR(skills_info.st_mode)
+            or skills_info.st_uid != 0
+            or skills_info.st_mode & 0o022
+        ):
+            raise OSError("managed profile skills are not trusted")
+        # 只在确有差异时写：无条件 chown/chmod 会刷新 skills_root 的 ctime，
+        # 而技能树缓存正是按它的时间戳判定是否需要重扫——那样缓存永远不命中，
+        # 每条受管终端命令都退化成一次全树 walk。
+        if skills_info.st_gid != gid or skills_info.st_uid != 0:
+            os.chown(skills_root, 0, gid, follow_symlinks=False)
+        if stat.S_IMODE(skills_info.st_mode) != 0o750:
+            os.chmod(skills_root, 0o750, follow_symlinks=False)
+        try:
+            _prepare_managed_skill_tree(skills_root, gid)
+        except OSError as exc:
+            # 技能树放权失败不该拖垮下面的 output 迁移（HR2/HR5）
+            logger.warning(
+                "managed skill tree preparation skipped: %s", exc
+            )
+
+    # output 是可选能力，skills 放权不是。平台没注入 ZET_AGENT_OUTPUT_DIR 时提前
+    # 返回会连带跳过上面整段——非 `python <abs>` 的技能入口（bash / ./run.sh /
+    # python -m / 包内数据读取）拿不到 per-command 兜底，会在设备上 permission
+    # denied。缺一个 workdir 别名不该让技能运行面一起失效（HR2/HR5）。
+    output_text = str(env.get("ZET_AGENT_OUTPUT_DIR") or "").strip()
+    if not output_text:
+        # 同 managed_fallback_cwd：multiplex 下这个键只活在 per-turn secret scope
+        # 里，run env 和 os.environ 都没有。只查 env 会让 output 的属主迁移在受管
+        # 形态下永不执行，agent 写不进自己的产出目录。
+        try:
+            from tools.runtime_workdir import agent_output_dir
+
+            output_text = str(agent_output_dir() or "").strip()
+        except Exception:
+            output_text = ""
+    if not output_text:
+        return
+    try:
+        output_raw = Path(output_text)
+        output_dir = output_raw.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise OSError("managed profile output path is unavailable") from exc
+    if output_raw != output_dir or output_dir.name != "output":
+        raise OSError("managed profile output is invalid")
+    if output_dir.parent.name != profile_home.name:
+        raise OSError("managed profile output does not match the active profile")
+    _validate_managed_root_directory_chain(output_dir.parent)
+    output_parent_info = os.lstat(output_dir.parent)
+    if (
+        not stat.S_ISDIR(output_parent_info.st_mode)
+        or output_parent_info.st_uid != 0
+        or output_parent_info.st_mode & 0o022
+    ):
+        raise OSError("managed profile output parent is not trusted")
+
+    output_info = os.lstat(output_dir)
+    # 属主判定与 _managed_output_is_trusted 同一条规则：root、本身份、或任何
+    # 受管 UID 段内的旧身份都算可信可迁移。只认 (0, uid) 会把升级板挡在
+    # _migrate_managed_output_tree 之外——那个函数本就是为「历史 output 属于
+    # 另一个数字 UID」写的（见其 _trusted 注释），存量 output 却在这里先被
+    # 判成 not trusted，agent 从此写不进自己的产出目录。受管 UID 段只由本
+    # 进程的身份代理分配，且 output 的父链已校验为 root 所有、非全局可写。
+    if (
+        not stat.S_ISDIR(output_info.st_mode)
+        or output_info.st_mode & 0o022
+        or not (
+            output_info.st_uid == 0
+            or output_info.st_uid >= _MANAGED_TERMINAL_UID_MIN
+        )
+    ):
+        raise OSError("managed profile output is not trusted")
+    if (
+        output_info.st_uid != uid
+        or output_info.st_gid != gid
+        or stat.S_IMODE(output_info.st_mode) != 0o700
+    ):
+        _migrate_managed_output_tree(
+            output_dir,
+            uid=uid,
+            gid=gid,
+            expected=output_info,
+        )
+
+
+def managed_fallback_cwd(
+    env: Mapping[str, str] | None = None,
+    *,
+    home: str = "",
+) -> str:
+    """Return the directory a managed terminal falls back to, or *home*.
+
+    Prefers the platform output directory: it sits inside the agent's writable
+    scope, so the snapshot guard can protect it, while the profile home lives
+    outside every snapshot target and makes the guard reject the whole command.
+
+    Pure on purpose — it never creates, chowns or chmods anything. The guard
+    calls it to learn where a command will really run; if the two sides derived
+    that answer separately they could drift, and a snapshot taken for one
+    directory while the command writes another is the exact split this guard
+    exists to prevent.
+    """
+
+    if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
+        return home
+    try:
+        from tools.runtime_workdir import agent_output_dir
+
+        output_dir = agent_output_dir(environ=env)
+        if not output_dir:
+            # multiplex 下平台把这个键投在 profile .env 里，每轮由
+            # _profile_runtime_scope 装成 secret scope——它既不在 os.environ 也
+            # 不在终端的 run env 里。只查 env 会让受管形态恒取不到值，退回 profile
+            # HOME，而那不在任何快照目标内，破坏性命令又回到全线阻断。
+            output_dir = agent_output_dir()
+    except Exception:
+        output_dir = None
+    if not output_dir or not _managed_output_is_trusted(output_dir):
+        return home
+    return output_dir
+
+
+def _managed_output_is_trusted(output_dir: str) -> bool:
+    """Report whether the platform output directory is safe to run commands in.
+
+    The trust check lives here rather than at the (single) preparation call site
+    so that both sides of the contract reach the same verdict: the guard never
+    runs preparation, and an output directory rejected there must not silently
+    remain the guard's protection target. A symlink, a group/other-writable
+    directory, or anything not owned by root or the derived identity means the
+    platform did not provision it — fall back to the profile home instead.
+    """
+
+    try:
+        info = os.lstat(output_dir)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        return False
+    if info.st_mode & 0o022:
+        return False
+    return info.st_uid == 0 or info.st_uid >= _MANAGED_TERMINAL_UID_MIN
+
+
+def _managed_cwd_is_unusable(cwd: str) -> bool:
+    """Report whether *cwd* is unreachable by any derived identity.
+
+    Identity-free stand-in for :func:`_managed_identity_can_traverse`, used when
+    the derived UID is not available (the guard resolves an effective cwd from
+    the gateway process, which may not carry the terminal's env). Walks the whole
+    parent chain, not just the leaf: the execution side rejects a cwd whose
+    *parent* is unreachable (``/volume1`` at 0770 root:group), and a leaf-only
+    check would leave the guard protecting a directory the command never enters.
+
+    A derived identity owns nothing outside its own profile tree, so "other"
+    execute is the honest permission to demand of a candidate cwd. ``/root`` —
+    the hardcoded terminal default that made every non-readonly command fail
+    closed on device — is 0700 root and falls out of the same rule.
+    """
+
+    if not cwd:
+        return True
+    try:
+        resolved = Path(cwd).resolve(strict=True)
+    except (OSError, RuntimeError):
+        return True
+    for component in (resolved, *resolved.parents):
+        try:
+            info = component.stat()
+        except OSError:
+            return True
+        if not stat.S_ISDIR(info.st_mode) or not info.st_mode & 0o001:
+            return True
+    return False
+
+
+def managed_effective_cwd(
+    cwd: str,
+    env: Mapping[str, str] | None = None,
+    *,
+    home: str = "",
+) -> str:
+    """Return where a managed terminal will really run a command started in *cwd*.
+
+    Single source of truth for "which directory does this command touch". The
+    snapshot guard protects whatever this returns and the local backend runs in
+    whatever this returns; deriving that answer twice is how a snapshot ends up
+    covering a directory the command never writes.
+    """
+
+    if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
+        return cwd
+    try:
+        uid, gid = _managed_terminal_identity(env)
+        usable = bool(cwd) and _managed_identity_can_traverse(cwd, uid=uid, gid=gid)
+    except Exception:
+        usable = not _managed_cwd_is_unusable(cwd)
+    if usable:
+        return cwd
+    return managed_fallback_cwd(env, home=home) or home or cwd
+
+
 def _managed_terminal_cwd(
     cwd: str,
     *,
@@ -923,10 +1609,17 @@ def _managed_terminal_cwd(
     if _IS_WINDOWS or os.environ.get(_MANAGED_GATEWAY_ENV) != "1":
         return cwd
     home = _prepare_managed_terminal_home(env)
-    uid, gid = _managed_terminal_identity(env)
-    if cwd and _managed_identity_can_traverse(cwd, uid=uid, gid=gid):
-        return cwd
-    return home
+    try:
+        _prepare_managed_profile_runtime(env)
+    except OSError as exc:
+        # A hostile-looking path chain must not take the whole shell surface
+        # down with it: every managed terminal command routes through here, so
+        # raising turns one untrusted mount point into a total terminal outage
+        # (HR2/HR5 — availability outranks the hardening this call performs).
+        # Degrade to "runtime not prepared": skills stay root-only and output
+        # keeps its old owner, which fails the affected commands individually.
+        logger.warning("managed profile runtime preparation skipped: %s", exc)
+    return managed_effective_cwd(cwd, env, home=home)
 
 
 def _msys_to_windows_path(cwd: str) -> str:
@@ -1390,6 +2083,12 @@ VIDEO_EDIT_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
 MANAGED_SERVICE_SECRET_ENV_KEYS: frozenset[str] = frozenset({
     "ZET_AGENT_KEY",
 })
+PROFILE_PUBLIC_RUNTIME_ENV_KEYS: frozenset[str] = frozenset({
+    # Platform-owned, profile-scoped filesystem capability. Unlike connector
+    # and action tokens this value is safe for model-authored shell commands,
+    # and skills use it to keep mutable state outside their read-only source.
+    "ZET_AGENT_OUTPUT_DIR",
+})
 _AGENT_CREATOR_ACTION_TOKEN_MAX_BYTES = 4 * 1024
 _AGENT_CREATOR_TURN_ID_MAX_BYTES = 256
 
@@ -1398,20 +2097,53 @@ PROFILE_SCOPED_SUBPROCESS_ENV_KEYS: frozenset[str] = frozenset(
     | AGENT_CREATOR_RUNTIME_ENV_KEYS
     | VIDEO_EDIT_RUNTIME_ENV_KEYS
     | MANAGED_SERVICE_SECRET_ENV_KEYS
+    | PROFILE_PUBLIC_RUNTIME_ENV_KEYS
 )
 
 
 def _apply_profile_secret_scope_env(env: dict, *, inject: bool) -> None:
-    """Scrub dedicated-runner credentials from generic subprocess env.
+    """Scrub profile values and optionally inject safe terminal runtime data.
 
     The multiplex gateway intentionally avoids merging every profile's .env into
     process-global os.environ. Generic terminal/background/helper subprocesses
     are not a trusted runner, so they must never inherit connector or Agent
     action bearer material from globals, extra env, or a shell snapshot. Skills
-    that need these values receive them through a dedicated allowlisted path.
+    that need secret values receive them through a dedicated allowlisted path.
+    The one public terminal value is re-read from the active profile scope only;
+    a stale process-global or shell-snapshot value is never trusted in multiplex
+    mode.
     """
     for key in PROFILE_SCOPED_SUBPROCESS_ENV_KEYS:
         env.pop(key, None)
+    if not inject:
+        return
+
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+        scope = current_secret_scope()
+        multiplex_active = is_multiplex_active()
+    except Exception:
+        scope = None
+        multiplex_active = True
+
+    for key in PROFILE_PUBLIC_RUNTIME_ENV_KEYS:
+        if scope is not None:
+            raw_value = scope.get(key)
+        elif not multiplex_active:
+            raw_value = os.environ.get(key)
+        else:
+            raw_value = None
+        value = str(raw_value or "").strip()
+        if (
+            not value
+            or "\x00" in value
+            or len(value.encode("utf-8")) > 4096
+            or not os.path.isabs(value)
+            or not os.path.isdir(value)
+        ):
+            continue
+        env[key] = os.path.normpath(value)
 
 
 def build_connector_runtime_env(base_env: dict | None = None) -> dict[str, str]:
@@ -2303,7 +3035,7 @@ def _make_run_env(env: dict) -> dict:
     # The generic terminal path is model-controlled shell. Connector bearer
     # must only flow through a dedicated allowlisted connector runner, not via
     # Popen env or the shared shell snapshot.
-    _apply_profile_secret_scope_env(run_env, inject=False)
+    _apply_profile_secret_scope_env(run_env, inject=True)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)
@@ -2425,11 +3157,19 @@ class LocalEnvironment(BaseEnvironment):
         Session and turn identity must not persist that way: a later request
         can reuse the environment while carrying a different ContextVar set.
         """
-        return super()._snapshot_ephemeral_env_exports()
+        exports = super()._snapshot_ephemeral_env_exports()
+        public_env: dict[str, str] = {}
+        _apply_profile_secret_scope_env(public_env, inject=True)
+        for key in sorted(PROFILE_PUBLIC_RUNTIME_ENV_KEYS):
+            value = public_env.get(key)
+            if value is not None:
+                exports.append(f"export {key}={shlex.quote(value)}")
+        return exports
 
     def _wrap_command(self, command: str, cwd: str) -> str:
         run_env = _make_run_env(self.env)
         effective_cwd = _managed_terminal_cwd(cwd, env=run_env)
+        _prepare_managed_command_skill_sources(command, run_env)
         return super()._wrap_command(
             _with_zettlab_turn_id(command),
             effective_cwd,

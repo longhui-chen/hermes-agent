@@ -5781,7 +5781,7 @@ Background: Set background=true to get a session_id. Almost always pair with not
 For servers/watchers, do NOT use shell-level background wrappers (nohup/disown/setsid/trailing '&') in foreground mode. Use background=true so Hermes can track lifecycle and output.
 After starting a server, verify readiness with a health check or log signal, then run tests in a separate terminal() call. Avoid blind sleep loops.
 Use process(action="poll") for progress checks, process(action="wait") to block until done.
-Working directory: Use 'workdir' for per-command cwd.
+Working directory: Use 'workdir' for per-command cwd. Platform runtimes may expose the semantic 'agent_output' workdir for the current agent's managed output directory when using the local terminal backend.
 PTY mode: Set pty=true for interactive CLI tools (Codex, Claude Code, Python REPL).
 
 Do NOT use vim/nano/interactive tools without pty=true — they hang without a pseudo-terminal. Pipe git output to cat if it might page.
@@ -7011,6 +7011,7 @@ def terminal_tool(
     pty: bool = False,
     notify_on_complete: bool = False,
     watch_patterns: Optional[List[str]] = None,
+    _runtime_agent_output_workdir: bool = False,
 ) -> str:
     """
     Execute a command in the configured terminal environment.
@@ -7056,9 +7057,46 @@ def terminal_tool(
                 "status": "error",
             }, ensure_ascii=False)
 
+        try:
+            from tools.runtime_workdir import (
+                AGENT_OUTPUT_WORKDIR,
+                resolve_runtime_workdir,
+            )
+
+            requested_agent_output = (
+                _runtime_agent_output_workdir or workdir == AGENT_OUTPUT_WORKDIR
+            )
+            workdir = resolve_runtime_workdir(workdir)
+        except ValueError as exc:
+            return json.dumps(
+                {
+                    "output": "",
+                    "exit_code": -1,
+                    "error": str(exc),
+                    "error_type": "runtime_workdir",
+                    "status": "error",
+                },
+                ensure_ascii=False,
+            )
+
         # Get configuration
         config = _get_env_config()
         env_type = config["env_type"]
+        if requested_agent_output and env_type != "local":
+            return json.dumps(
+                {
+                    "output": "",
+                    "exit_code": -1,
+                    "error": (
+                        "workdir 'agent_output' is available only with the local "
+                        "terminal backend; configure an explicit backend-visible "
+                        "workdir for container or remote execution"
+                    ),
+                    "error_type": "runtime_workdir",
+                    "status": "error",
+                },
+                ensure_ascii=False,
+            )
 
         # Use task_id for environment isolation. By default all subagent
         # task_ids collapse back to "default" so the top-level agent and
@@ -8077,7 +8115,7 @@ TERMINAL_SCHEMA = {
             },
             "workdir": {
                 "type": "string",
-                "description": "Working directory for this command (absolute path). Defaults to the session working directory."
+                "description": "Working directory for this command (absolute path), or 'agent_output' when the platform exposes a managed output directory for the current agent and the local terminal backend is active. Defaults to the session working directory."
             },
             "pty": {
                 "type": "boolean",
@@ -8101,6 +8139,10 @@ TERMINAL_SCHEMA = {
 
 
 def _handle_terminal(args, **kw):
+    from tools.runtime_workdir import AGENT_OUTPUT_ARG
+
+    # registry 解析层注入的内部标记到此为止：pop 掉避免作为业务参数外溢。
+    runtime_agent_output = bool(args.pop(AGENT_OUTPUT_ARG, False))
     return terminal_tool(
         command=args.get("command"),
         background=args.get("background", False),
@@ -8111,6 +8153,7 @@ def _handle_terminal(args, **kw):
         pty=args.get("pty", False),
         notify_on_complete=args.get("notify_on_complete", False),
         watch_patterns=args.get("watch_patterns"),
+        _runtime_agent_output_workdir=runtime_agent_output,
     )
 
 
