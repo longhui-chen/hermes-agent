@@ -2381,6 +2381,8 @@ def test_real_backgrounding_operators_still_detected(monkeypatch, tmp_path):
         "rm -rf data &",
         "cp a b & cp c d",
         "echo A&B > f",          # 未加引号：bash 里确实是「A 后台 + B」
+        "(rm -rf data)&",        # 贴括号：shlex 把 `)` 与 `&` 合成一个标点 token
+        "{ rm -f x; }&",
         "nohup sh -c 'rm -f x'",
         "setsid rm -f x",
     ):
@@ -2409,35 +2411,26 @@ def test_non_backgrounding_ampersand_forms_still_ensure(monkeypatch, tmp_path):
         assert rec.requests, cmd
 
 
-def test_loopback_ssh_backend_is_not_remote(monkeypatch, tmp_path):
-    """ssh 到本机时写入仍落在本机受保护目录，不能按 remote_backend 放行。
+# ⚠️ 已撤销（Codex review P1 ×3）：曾把 ssh 到 localhost / 本机 hostname 识别成
+# 本机以便照常 ensure。被击穿三条：TERMINAL_SSH_PORT 可把 localhost 转发进 VM；
+# ~/.ssh/config 的 HostName 可重映射到别的机器；即使真是本机，ssh 默认 cwd 是目标
+# 用户的 ~，与守卫按本进程 cwd 算出的 ensure 路径对不上。host 字面量推不出「写入
+# 落在守卫算出的那些路径上」，对着算错的路径 ensure 会拍出假恢复点。ssh 一律按
+# 远端处置，见 _terminal_backend_is_remote 的注释。
 
-    原先只看 `TERMINAL_ENV=ssh` 就放行且不做还原互斥探测，用户正在还原时 Agent
-    仍会通过 ssh 写进 rename 窗口（Codex review P1）。
-    """
+
+def test_ssh_backend_is_remote_even_for_loopback_host(monkeypatch, tmp_path):
+    """ssh 一律按远端处置——host 写着 localhost 也不例外（理由见上）。"""
     target = tmp_path / "a.txt"
     target.write_text("x")
-
-    for host in ("localhost", "127.0.0.1", "::1"):
+    for host in ("localhost", "127.0.0.1", "192.168.1.50"):
         guard.reset_for_test()
         monkeypatch.setattr(guard, "_terminal_env_type", lambda: "ssh")
         monkeypatch.setenv("TERMINAL_SSH_HOST", host)
-        rec = _install(monkeypatch, {"ready": True, "operations": []})
+        rec = _install(monkeypatch)
         out = guard.maybe_require_snapshot(
             "write_file", {"path": str(target)}, turn_id="turn_1")
-        assert out is None, f"ssh 到 {host} 的写入落在本机，ensure 该成功"
-        assert rec.requests, f"ssh 到 {host} 被当成远端，跳过了 ensure"
+        assert out is not None, f"ssh({host}) 该按远端处置"
+        assert rec.requests == [], f"ssh({host}) 不该向本机 ensure"
 
 
-def test_real_remote_ssh_backend_still_skips_ensure(monkeypatch, tmp_path):
-    """真正的远端主机照常按 remote_backend 放行——本机快照护不住远端文件。"""
-    target = tmp_path / "a.txt"
-    target.write_text("x")
-    monkeypatch.setattr(guard, "_terminal_env_type", lambda: "ssh")
-    monkeypatch.setenv("TERMINAL_SSH_HOST", "192.168.1.50")
-    rec = _install(monkeypatch)
-
-    out = guard.maybe_require_snapshot(
-        "write_file", {"path": str(target)}, turn_id="turn_1")
-    assert out is not None, "真正的远端主机上，本机快照护不住那些文件"
-    assert rec.requests == [], "远端写入不该向本机 ensure"

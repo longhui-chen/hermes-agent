@@ -36,7 +36,6 @@ import os
 import re
 import shlex
 import shutil
-import socket
 import threading
 import time
 import urllib.error
@@ -364,38 +363,21 @@ def _terminal_env_type() -> str:
 
 
 def _terminal_backend_is_remote() -> bool:
-    """报告工具的有效 backend 是否在**远端主机**执行。
+    """报告工具的有效 backend 是否在远端主机执行（ssh）。
 
     远端文件系统不在本机快照的覆盖面内，按本机路径 ensure 只会造出假恢复点
     （Codex review P1）。
 
-    ⚠️ `env_type=ssh` 并不等于远端：ssh 到 `localhost` / `127.0.0.1` / 本机
-    hostname 时，写入仍然落在**本机**受保护目录。原先只看 env_type 就按远端放行、
-    连还原互斥都不查，用户正在还原时 Agent 仍会通过 ssh 写进 rename 窗口
-    （Codex review P1）。host 指向本机时按本地 backend 处置，照常 ensure。
+    ⚠️ **ssh 一律按远端处置，包括 host 写着 localhost 的**。曾尝试把 loopback /
+    本机 hostname 识别成本机以便照常 ensure，review 击穿了三条（Codex review
+    P1 ×3）：`TERMINAL_SSH_PORT` 可能把 localhost 转发进 VM / 容器；
+    `~/.ssh/config` 的 HostName 可以把任意别名重映射到别的机器；即使真是本机，
+    ssh 的默认 cwd 是目标用户的 `~`，与守卫按本进程 cwd 算出的 ensure 路径对不
+    上。三条的共同点：**host 字面量推不出「写入落在守卫算出的那些路径上」**，
+    而对着算错的路径 ensure 会拍出一张护不住实际写入的假恢复点——比诚实记成
+    无保护更糟。
     """
-    if _terminal_env_type() != "ssh":
-        return False
-    return not _ssh_host_is_this_device(os.getenv("TERMINAL_SSH_HOST"))
-
-
-def _ssh_host_is_this_device(host: Optional[str]) -> bool:
-    """报告一个 ssh 目标是否就是本机。
-
-    只认能**静态确认**的三种：loopback 字面量、`localhost`、本机 hostname。判不出
-    来的一律当远端——那是保守方向（按远端处置只是少一张快照，按本机处置却会对着
-    远端路径拍本机快照，造出假恢复点）。
-    """
-    h = (host or "").strip().strip("[]").lower()
-    if not h:
-        return False
-    if _is_loopback_host(h):
-        return True
-    try:
-        local = socket.gethostname().strip().lower()
-    except Exception:
-        return False
-    return bool(local) and h in (local, local.split(".", 1)[0])
+    return _terminal_env_type() == "ssh"
 
 
 # ssh backend 下会把写入送去远端执行的工具面：terminal（SSHEnvironment 跑命
@@ -783,6 +765,11 @@ def _segment_daemonizes(words: list[str]) -> bool:
     return False
 
 
+# 单个 `&`（非 `&&` / `2>&1` / `&>` / `|&`）把命令甩到后台。只用于扫描 shlex 切
+# 出的**标点 token**，不再扫原始字符串——那会把引号里的字面 `&` 也当成操作符。
+_SHELL_AMP_BACKGROUND_RE = re.compile(r"(?<![&>|])&(?![&>])")
+
+
 def _shell_self_backgrounds(command: str) -> bool:
     """报告一条 shell 命令是否会自行后台化（`cmd &`、nohup / setsid 包裹）。
 
@@ -805,11 +792,18 @@ def _shell_self_backgrounds(command: str) -> bool:
     # 于是跳过 ensure，用户静默失去本该有的写入前恢复点（Codex review P1）。
     #
     # shlex 的 punctuation_chars 模式已经把这几种形态分得很干净：`&&` / `&>` /
-    # `>&` 各是独立 token，引号里的 `&` 留在 word 内部，只有真正的后台操作符才
-    # 单独成为 `&`。未加引号的 `echo A&B` 判成后台化是**对的**——bash 里它确实是
+    # `>&` 各是独立 token，引号里的 `&` 留在 word 内部，后台操作符只出现在**标点
+    # token** 里。未加引号的 `echo A&B` 判成后台化是**对的**——bash 里它确实是
     # 「A 后台执行、再跑 B」。
-    if any(word == "&" for word in words):
-        return True
+    #
+    # 不能只认 `word == "&"`：贴括号的子 shell 后台化（`(rm -rf data)&`）会把
+    # 相邻标点合成一个 token `)&`（Codex review P1）。对标点 token 整体跑一遍
+    # 「`&` 且不是 `&&` / `&>` / `>&` / `|&` 的一部分」的判定——正则只扫操作符
+    # token，引号里的字面 `&` 在普通 word 里，到不了这里。
+    for word in words:
+        if word and all(ch in _SHELL_PUNCT_CHARS for ch in word):
+            if _SHELL_AMP_BACKGROUND_RE.search(word):
+                return True
     segment: list[str] = []
     segments = [segment]
     for word in words:
