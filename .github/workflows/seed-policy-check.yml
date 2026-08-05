@@ -48,7 +48,7 @@ jobs:
         run: python tools/check_sibling_debrand.py
       - name: Seed sync and ZPK packaging contracts
         run: |
-          scripts/run_tests.sh \
+          HERMES_PYTHON="$(command -v python)" scripts/run_tests.sh \
             tests/tools/test_skills_sync.py \
             tests/tools/test_check_sibling_debrand.py \
             tests/scripts/test_zpk_stage_payload.py \

@@ -2591,6 +2591,40 @@ class TestMcpParallelToolCalls:
             # Cleanup
             _parallel_safe_servers.discard(sanitize_mcp_name_component("parallel_srv"))
 
+    def test_register_mcp_servers_removes_parallel_flag_on_toggle(self):
+        """Toggling supports_parallel_tool_calls to false removes server from the set."""
+        from tools.mcp_tool import (
+            register_mcp_servers, _parallel_safe_servers, _lock,
+            sanitize_mcp_name_component,
+        )
+        config_on = {
+            "toggle_srv": {
+                "command": "echo",
+                "supports_parallel_tool_calls": True,
+            },
+        }
+        with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+             patch("tools.mcp_tool._ensure_mcp_loop"), \
+             patch("tools.mcp_tool._run_on_mcp_loop"), \
+             patch("tools.mcp_tool._existing_tool_names", return_value=[]):
+            register_mcp_servers(config_on)
+        with _lock:
+            assert sanitize_mcp_name_component("toggle_srv") in _parallel_safe_servers
+
+        config_off = {
+            "toggle_srv": {
+                "command": "echo",
+                "supports_parallel_tool_calls": False,
+            },
+        }
+        with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
+             patch("tools.mcp_tool._ensure_mcp_loop"), \
+             patch("tools.mcp_tool._run_on_mcp_loop"), \
+             patch("tools.mcp_tool._existing_tool_names", return_value=[]):
+            register_mcp_servers(config_off)
+        with _lock:
+            assert sanitize_mcp_name_component("toggle_srv") not in _parallel_safe_servers
+
 # ---------------------------------------------------------------------------
 # Cross-process MCP discovery lock (issue #62771)
 # ---------------------------------------------------------------------------
@@ -2699,9 +2733,6 @@ class TestMCPDiscoveryCrossProcessLock:
                 os.unlink(lock_path)
             except Exception:
                 pass
-            register_mcp_servers(config_off)
-        with _lock:
-            assert sanitize_mcp_name_component("toggle_srv") not in _parallel_safe_servers
 
 
 class TestBuildSafeEnvHomeContract:
