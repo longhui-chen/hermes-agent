@@ -986,8 +986,15 @@ def _ancillary_abs_paths(
     base_dir: str = "",
     *,
     readonly_sources: Optional[set[str]] = None,
+    include_missing: bool = False,
 ) -> list[str]:
     """从命令 / 脚本文本里抽出**已存在**的写入目标，作为 cwd 之外的附加保护。
+
+    ``include_missing=True`` 时连**尚不存在**的目标一起返回。快照保护用不上它们
+    （纯新增没有「改动前的原始状态」可存），但**还原互斥用得上**：还原正在把目录
+    换回快照时点的内容，此刻新建的文件会被直接丢掉，所以 `touch <正在还原的目录>
+    /new.txt &` 同样必须挡住（Codex review P1）。服务端的 canonicalPath 会把不存在
+    的尾部逐级上溯解析出所属 target，路径原样发过去即可。
 
     覆盖绝对路径、home 前缀（~ / $HOME / ${HOME}，按当前 profile 的 home 展
     开）与 `../` 相对目标（锚到 base_dir，即主保护用的工作目录）。引号字面量
@@ -1133,7 +1140,9 @@ def _ancillary_abs_paths(
             # 父目录放前面：截断时它最该保住——整个目录的恢复点覆盖面最大。
             expanded = ([parent] if parent else []) + matches
         for item in expanded:
-            if not item or item in seen or not os.path.lexists(item):
+            if not item or item in seen:
+                continue
+            if not include_missing and not os.path.lexists(item):
                 continue
             if os.path.realpath(item) in readonly:
                 continue
@@ -1761,12 +1770,18 @@ def _ancillary_targets(
     arguments: dict[str, Any],
     exclude: list[str],
     task: str,
+    *,
+    include_missing: bool = False,
 ) -> list[str]:
-    """命令 / 脚本文本里 cwd 之外的**已存在**写入目标。
+    """命令 / 脚本文本里 cwd 之外的写入目标。
 
-    ensure 与还原互斥探测共用这一套提取：两侧各自推导必然漂移，而漏掉的那一侧
+    ensure 与还原互斥探测共用这一套**提取**：两侧各自推导必然漂移，而漏掉的那一侧
     就是 Agent 写进正在还原的目录（Codex review P1）。只对 terminal /
     execute_code 有意义——文件工具的目标已经全在 paths 里。
+
+    ⚠️ 共用提取，**不共用存在性过滤**：ensure 只保护已存在的文件（纯新增没有原始
+    状态可存），而还原互斥不分新旧——还原会把目录换回快照时点的内容，此刻新建的
+    文件同样会被丢掉。所以探测侧传 ``include_missing=True``。
 
     结果受 `_MAX_ANCILLARY_PATHS` 界住（HR1）。
     """
@@ -1781,6 +1796,7 @@ def _ancillary_targets(
         exclude,
         base_dir=_terminal_workdir(arguments, task),
         readonly_sources=readonly_sources,
+        include_missing=include_missing,
     )
 
 
@@ -1816,7 +1832,9 @@ def _restore_probe_blocks(
     这里合并 `_ancillary_targets`——与 `_ensure_ancillary` 同一套提取。
     """
     targets = list(paths)
-    for extra in _ancillary_targets(tool_name, arguments, list(paths), task):
+    for extra in _ancillary_targets(
+        tool_name, arguments, list(paths), task, include_missing=True
+    ):
         if extra not in targets:
             targets.append(extra)
     if not targets:
@@ -1824,6 +1842,16 @@ def _restore_probe_blocks(
     data, err = _post(_PROBE_PATH, {"paths": targets}, _PROBE_TIMEOUT)
     if _is_blocked_by_restore(data, err):
         return _restore_conflict_error(tool_name, started)
+    # 整批失败会**掩盖主目录的还原冲突**：加餐目标里只要有一条让服务端整批拒绝
+    # （悬空 symlink 让 canonicalPath 解析失败是最现实的一种），主 workdir 上真实
+    # 存在的还原就查不出来了，探测等于没做（Codex review P1）。用主 paths 单独再
+    # 探一次——它是这条命令**必定**会写的地方，最不能漏。
+    #
+    # 404 / 未配置不重试：那是「服务端没有这条通道」，重试也是同样结果。
+    if err and err not in ("unconfigured", "not_supported") and paths and len(targets) > len(paths):
+        data, err = _post(_PROBE_PATH, {"paths": list(paths)}, _PROBE_TIMEOUT)
+        if _is_blocked_by_restore(data, err):
+            return _restore_conflict_error(tool_name, started)
     return None
 
 

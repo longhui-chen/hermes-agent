@@ -2684,3 +2684,107 @@ def test_probe_does_not_expand_ancillary_for_file_tools(monkeypatch, tmp_path):
         "write_file", {"path": str(target)}, turn_id="", task_id="")
     assert_allowed_unprotected(out, rec, "missing_turn_id")
     assert rec.requests[0]["body"]["paths"] == [str(target)]
+
+
+def test_probe_covers_not_yet_created_ancillary_targets(monkeypatch, tmp_path):
+    """探测要覆盖**尚不存在**的目标（Codex review P1）。
+
+    ensure 的加餐只保护已存在的文件（纯新增没有原始状态可存），但还原互斥不分新
+    旧——还原正在把目录换回快照时点的内容，此刻新建的文件会被直接丢掉。
+    `touch <正在还原的目录>/new.txt &` 必须挡住。
+    """
+    cwd = tmp_path / "Work"
+    cwd.mkdir()
+    outside = tmp_path / "Documents"
+    outside.mkdir()
+    new_file = outside / "new.txt"  # 尚不存在
+    rec = _install(monkeypatch, _restore_conflict_error())
+
+    blocked = guard.maybe_require_snapshot(
+        "terminal", {"command": f"touch {new_file} &", "workdir": str(cwd)},
+        turn_id="turn_1", task_id="task_9",
+    )
+
+    assert blocked is not None, "在正在还原的目录里新建文件同样必须阻断"
+    probed = rec.requests[0]["body"]["paths"]
+    assert str(new_file) in probed, f"探测漏了尚不存在的新建目标：{probed}"
+
+
+def test_ensure_ancillary_still_skips_missing_targets(monkeypatch, tmp_path):
+    """ensure 侧不受影响：纯新增没有原始状态可存，仍然只保护已存在的目标。"""
+    cwd = tmp_path / "Work"
+    cwd.mkdir()
+    outside = tmp_path / "Documents"
+    outside.mkdir()
+    existing = outside / "old.txt"
+    existing.write_text("x")
+    missing = outside / "new.txt"
+    rec = _install(
+        monkeypatch,
+        {"ready": True, "operations": []},   # 主 cwd
+        {"ready": True, "operations": []},   # 加餐
+    )
+
+    assert guard.maybe_require_snapshot(
+        "terminal",
+        {"command": f"cp {existing} {missing}", "workdir": str(cwd)},
+        turn_id="turn_1", task_id="task_9",
+    ) is None
+    ancillary = rec.requests[-1]["body"]["paths"]
+    assert str(existing) in ancillary
+    assert str(missing) not in ancillary, (
+        f"ensure 不该为纯新增目标拍快照：{ancillary}"
+    )
+
+
+def test_probe_retries_main_paths_when_batch_fails(monkeypatch, tmp_path):
+    """加餐目标让整批探测失败时，主 workdir 要单独再探一次（Codex review P1）。
+
+    否则加餐里一条坏路径（悬空 symlink 让服务端 canonicalPath 解析失败）就能掩盖
+    主目录上真实存在的还原冲突，探测等于没做。
+    """
+    cwd = tmp_path / "Work"
+    cwd.mkdir()
+    (cwd / "a.txt").write_text("x")
+    outside = tmp_path / "Documents"
+    outside.mkdir()
+    doc = outside / "a.txt"
+    doc.write_text("x")
+
+    batch_fails = urllib.error.HTTPError(
+        "http://x", 400, "bad request", {},
+        io.BytesIO(json.dumps({
+            "error": {"code": "SNAPSHOT_AGENT_BAD_REQUEST", "message": "dangling symlink"},
+        }).encode()),
+    )
+    rec = _install(monkeypatch, batch_fails, _restore_conflict_error())
+
+    blocked = guard.maybe_require_snapshot(
+        "terminal", {"command": f"rm -rf . {doc} &", "workdir": str(cwd)},
+        turn_id="turn_1", task_id="task_9",
+    )
+
+    assert blocked is not None, "整批失败不能掩盖主目录的还原冲突"
+    assert len(rec.requests) == 2, "主 paths 应单独重探一次"
+    assert rec.requests[1]["body"]["paths"] == [str(cwd)]
+
+
+def test_probe_does_not_retry_when_endpoint_missing(monkeypatch, tmp_path):
+    """404 不重试：那是「服务端没有这条通道」，重试也是同样结果。"""
+    cwd = tmp_path / "Work"
+    cwd.mkdir()
+    (cwd / "a.txt").write_text("x")
+    outside = tmp_path / "Documents"
+    outside.mkdir()
+    doc = outside / "a.txt"
+    doc.write_text("x")
+    not_found = urllib.error.HTTPError(
+        "http://x", 404, "not found", {}, io.BytesIO(b"{}"))
+    rec = _install(monkeypatch, not_found)
+
+    out = guard.maybe_require_snapshot(
+        "terminal", {"command": f"rm -rf . {doc} &", "workdir": str(cwd)},
+        turn_id="turn_1", task_id="task_9",
+    )
+    assert_allowed_unprotected(out, rec, "background_write")
+    assert len(rec.requests) == 1, "端点不存在时不该重探"
