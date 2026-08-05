@@ -42,7 +42,7 @@ _ACTION_TOKEN_ENV = "ZETTLAB_AGENT_ACTION_TOKEN"
 _VENDOR_GATEWAY_PATHS = {
     "browser-use": "/api/v1/browser-use",
     # OpenAI SDK appends /v1/audio/speech to this origin.
-    "openai-audio": "/api/v1/ai-proxy",
+    "openai-tts": "/api/v1/ai-proxy",
 }
 
 

@@ -45,13 +45,14 @@ def test_resolves_from_local_server_env(monkeypatch: pytest.MonkeyPatch) -> None
     assert cfg.token == "local-browser-use"
 
 
-def test_resolves_openai_audio_to_local_ai_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_resolves_only_openai_tts_to_local_ai_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ZET_CHAT_APPEND_URL", "http://127.0.0.1:9090/api/v1/internal/chat/append")
     monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-tts-token")
-    cfg = resolve_zettlab_tool_gateway("openai-audio")
+    cfg = resolve_zettlab_tool_gateway("openai-tts")
     assert cfg is not None
     assert cfg.gateway_origin == "http://127.0.0.1:9090/api/v1/ai-proxy"
     assert cfg.token == "local-tts-token"
+    assert resolve_zettlab_tool_gateway("openai-audio") is None
 
 
 def test_can_use_share_action_url_as_local_server_anchor(monkeypatch: pytest.MonkeyPatch) -> None:

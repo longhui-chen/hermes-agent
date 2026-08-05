@@ -277,6 +277,56 @@ def test_zettlab_tts_auto_selects_local_gateway_and_product_model(monkeypatch, t
     assert captured["speech_kwargs"]["speed"] == 2.0
 
 
+def test_zettlab_tts_preserves_managed_scope_provider(monkeypatch, tmp_path):
+    user_home = tmp_path / "user"
+    managed_dir = tmp_path / "managed"
+    user_home.mkdir()
+    managed_dir.mkdir()
+    (user_home / "config.yaml").write_text("tts:\n  speed: 1.0\n")
+    (managed_dir / "config.yaml").write_text("tts:\n  provider: edge\n")
+    monkeypatch.setenv("HERMES_HOME", str(user_home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+    monkeypatch.setenv(
+        "ZET_CHAT_APPEND_URL",
+        "http://127.0.0.1:9090/api/v1/internal/chat/append",
+    )
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-action-token")
+
+    from hermes_cli import config, managed_scope
+
+    config._LOAD_CONFIG_CACHE.clear()
+    config._RAW_CONFIG_CACHE.clear()
+    managed_scope.invalidate_managed_cache()
+    _install_fake_tools_package()
+    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
+
+    tts_config = tts_tool._load_tts_config()
+    assert tts_tool._get_provider(tts_config) == "edge"
+
+
+def test_zettlab_tts_never_sends_action_token_to_custom_endpoint(monkeypatch, tmp_path):
+    captured = {}
+    _install_fake_tools_package()
+    _install_fake_openai_module(captured)
+    monkeypatch.setenv("OPENAI_API_KEY", "direct-openai-key")
+    monkeypatch.setenv(
+        "ZET_CHAT_APPEND_URL",
+        "http://127.0.0.1:9090/api/v1/internal/chat/append",
+    )
+    monkeypatch.setenv("ZETTLAB_AGENT_ACTION_TOKEN", "local-action-token")
+
+    tts_tool = _load_tool_module("tools.tts_tool", "tts_tool.py")
+    output_path = tmp_path / "speech.mp3"
+    tts_tool._generate_openai_tts(
+        "hello world",
+        str(output_path),
+        {"openai": {"base_url": "https://tts.example.test/v1"}},
+    )
+
+    assert captured["api_key"] == "direct-openai-key"
+    assert captured["base_url"] == "https://tts.example.test/v1"
+
+
 def test_openai_tts_coerces_direct_only_model_on_managed_gateway(monkeypatch, tmp_path):
     """A tts.openai.model valid only for direct OpenAI (e.g. tts-1-hd) must be
     coerced to a managed-supported model, else the gateway 400s with

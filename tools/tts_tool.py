@@ -339,6 +339,7 @@ def _load_tts_config() -> Dict[str, Any]:
     """
     try:
         from hermes_cli.config import load_config, read_raw_config
+        from hermes_cli.managed_scope import load_managed_config
         config = load_config()
         tts_config = config.get("tts") or {}
         if not isinstance(tts_config, dict):
@@ -349,7 +350,18 @@ def _load_tts_config() -> Dict[str, Any]:
         raw_config = read_raw_config()
         raw_tts = raw_config.get("tts") if isinstance(raw_config, dict) else None
         raw_provider = raw_tts.get("provider") if isinstance(raw_tts, dict) else None
-        if not isinstance(raw_provider, str) or not raw_provider.strip():
+        managed_config = load_managed_config()
+        managed_tts = (
+            managed_config.get("tts") if isinstance(managed_config, dict) else None
+        )
+        managed_provider = (
+            managed_tts.get("provider") if isinstance(managed_tts, dict) else None
+        )
+        provider_is_explicit = any(
+            isinstance(value, str) and value.strip()
+            for value in (raw_provider, managed_provider)
+        )
+        if not provider_is_explicit:
             tts_config["_provider_is_default"] = True
         return tts_config
     except ImportError:
@@ -373,7 +385,7 @@ def _get_provider(tts_config: Dict[str, Any]) -> str:
     provider_is_default = tts_config.get("_provider_is_default") is True
     if configured and not provider_is_default:
         return str(configured).lower().strip()
-    if resolve_zettlab_tool_gateway("openai-audio") is not None:
+    if resolve_zettlab_tool_gateway("openai-tts") is not None:
         return "openai"
     return str(configured or DEFAULT_PROVIDER).lower().strip()
 
@@ -1082,22 +1094,34 @@ def _generate_openai_tts(
     Returns:
         Path to the saved audio file.
     """
+    # ``tts.openai: null`` in YAML yields None — coalesce so .get() is safe.
+    oai_config = (tts_config.get("openai") if isinstance(tts_config, dict) else None) or {}
+    config_base_url = oai_config.get("base_url")
+
     # Only resolve the OpenAI auth chain when the caller didn't pass explicit
     # credentials. OpenAI-compatible backends (DeepInfra) pass api_key /
     # base_url / model / voice through and never hit the managed-gateway path.
+    # A configured endpoint is also an explicit trust boundary: pair it only
+    # with direct credentials, never with a local-server action token resolved
+    # for the board-local gateway.
     fallback_base: Optional[str] = None
     managed_model: Optional[str] = None
     explicit_base_url = base_url is not None
     if api_key is None:
-        api_key, fallback_base, managed_model = _resolve_openai_audio_client_config()
+        if config_base_url:
+            api_key = resolve_openai_audio_api_key()
+            if not api_key:
+                raise ValueError(
+                    "tts.openai.base_url requires VOICE_TOOLS_OPENAI_KEY or "
+                    "OPENAI_API_KEY"
+                )
+        else:
+            api_key, fallback_base, managed_model = _resolve_openai_audio_client_config()
 
-    # ``tts.openai: null`` in YAML yields None — coalesce so .get() is safe.
-    oai_config = (tts_config.get("openai") if isinstance(tts_config, dict) else None) or {}
     if model is None:
         model = oai_config.get("model", DEFAULT_OPENAI_MODEL)
     if voice is None:
         voice = oai_config.get("voice", DEFAULT_OPENAI_VOICE)
-    config_base_url = oai_config.get("base_url")
     if base_url is None:
         # Config override wins over the auth-chain fallback (restores the
         # pre-refactor precedence, where tts.openai.base_url beat the resolved
@@ -2722,7 +2746,7 @@ def _resolve_openai_audio_client_config() -> tuple[str, str, Optional[str]]:
     Zettlab session, direct OpenAI keeps its historical precedence unless
     ``tts.use_gateway`` selects the Nous managed path.
     """
-    zettlab_gateway = resolve_zettlab_tool_gateway("openai-audio")
+    zettlab_gateway = resolve_zettlab_tool_gateway("openai-tts")
     if zettlab_gateway is not None:
         return (
             zettlab_gateway.token,
