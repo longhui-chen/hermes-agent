@@ -70,6 +70,10 @@ def _add_prefixed_zet_agent_routes(app: web.Application, adapter: ZetAgentAdapte
         adapter._profile_handler(adapter._handle_clarify_respond),
     )
     app.router.add_post(
+        "/p/{profile}/v1/sessions/{session_id}/attachment/action",
+        adapter._profile_handler(adapter._handle_attachment_action),
+    )
+    app.router.add_post(
         "/p/{profile}/v1/sessions/{session_id}/interrupt",
         adapter._profile_handler(adapter._handle_session_interrupt),
     )
@@ -691,6 +695,7 @@ async def test_prefixed_control_routes_registered(profile_homes):
         "/p/{profile}/v1/sessions/{session_id}/pending",
         "/p/{profile}/v1/sessions/{session_id}/approval/respond",
         "/p/{profile}/v1/sessions/{session_id}/clarify/respond",
+        "/p/{profile}/v1/sessions/{session_id}/attachment/action",
         "/p/{profile}/v1/sessions/{session_id}/interrupt",
     }
     assert expected <= registered

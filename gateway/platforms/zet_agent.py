@@ -1451,6 +1451,10 @@ class ZetAgentAdapter(APIServerAdapter):
     # Cap for progress frames parked in a stream_q with no live SSE reader
     # (background children outliving the parent turn). See _cb note.
     _DELEGATION_PROGRESS_BACKLOG_MAX = 2000
+    _ATTACHMENT_STREAM_BACKLOG_MAX = 2000
+    _ATTACHMENT_MAX_BYTES = 256 * 1024
+    _ATTACHMENT_ACTION_QUEUE_MAX = 64
+    _ATTACHMENT_ACTION_WORKERS = 4
 
     @classmethod
     def _make_delegation_progress_cb(cls, stream_q: Any):
@@ -1959,6 +1963,58 @@ class ZetAgentAdapter(APIServerAdapter):
         # config default) differs from the persisted last-seen value, inject a
         # one-shot identity note. Covers session- and agent-level switches,
         # survives restarts; a brand-new session just records its baseline.
+        attachment_emitter_token = None
+        if stream_q is not None:
+            try:
+                from hermes_cli.plugins import bind_attachment_emitter
+
+                def _emit_attachment(attachment: Dict[str, Any]) -> bool:
+                    try:
+                        if not isinstance(attachment, dict):
+                            return False
+                        encoded = json.dumps(
+                            attachment,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ).encode("utf-8")
+                        if len(encoded) > self._ATTACHMENT_MAX_BYTES:
+                            logger.warning(
+                                "[zet_agent] attachment payload rejected: %d bytes",
+                                len(encoded),
+                            )
+                            return False
+                        if stream_q.qsize() > self._ATTACHMENT_STREAM_BACKLOG_MAX:
+                            logger.warning(
+                                "[zet_agent] attachment stream backlog saturated"
+                            )
+                            return False
+                        # Round-trip JSON to detach the queued frame from plugin
+                        # mutation after emit_attachment returns.
+                        safe_attachment = json.loads(encoded)
+                        stream_q.put((
+                            "__tool_progress__",
+                            {
+                                "type": "hermes.attachment",
+                                "attachment": safe_attachment,
+                            },
+                        ))
+                        return True
+                    except Exception:
+                        logger.warning(
+                            "[zet_agent] attachment stream push failed",
+                            exc_info=True,
+                        )
+                        return False
+
+                attachment_emitter_token = bind_attachment_emitter(
+                    _emit_attachment
+                )
+            except Exception:
+                logger.warning(
+                    "[zet_agent] failed to bind attachment emitter",
+                    exc_info=True,
+                )
+
         try:
             if session_id:
                 _eff_model = self._effective_model(session_id, gateway_session_key)
@@ -2128,6 +2184,15 @@ class ZetAgentAdapter(APIServerAdapter):
                     logger.debug("[zet_agent] native auto-title hook failed", exc_info=True)
             return result
         finally:
+            if attachment_emitter_token is not None:
+                try:
+                    from hermes_cli.plugins import reset_attachment_emitter
+                    reset_attachment_emitter(attachment_emitter_token)
+                except Exception:
+                    logger.warning(
+                        "[zet_agent] failed to reset attachment emitter",
+                        exc_info=True,
+                    )
             if old_session_key is None:
                 os.environ.pop("HERMES_SESSION_KEY", None)
             else:
@@ -2397,6 +2462,120 @@ class ZetAgentAdapter(APIServerAdapter):
             "approval": ap,
             "clarify": cl,
         })
+
+    async def _handle_attachment_action(self, request: "web.Request") -> "web.Response":
+        """Queue a validated attachment action for plugin observers."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = str(request.match_info.get("session_id", "") or "").strip()
+        if not session_id or len(session_id.encode("utf-8")) > 256:
+            return web.json_response(
+                _openai_error("Invalid session ID", code="invalid_session_id"),
+                status=400,
+            )
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        if not isinstance(body, dict):
+            return web.json_response(_openai_error("Body must be an object"), status=400)
+
+        limits = {
+            "attachment_id": 256,
+            "action_id": 128,
+            "action_token": 256,
+            "turn_id": 256,
+        }
+        normalized: Dict[str, str] = {}
+        for field, limit in limits.items():
+            value = body.get(field, "")
+            if value is None and field == "turn_id":
+                value = ""
+            if not isinstance(value, str):
+                return web.json_response(
+                    _openai_error(f"{field} must be a string"), status=400
+                )
+            value = value.strip()
+            if field != "turn_id" and not value:
+                return web.json_response(
+                    _openai_error(f"{field} is required"), status=400
+                )
+            if len(value.encode("utf-8")) > limit:
+                return web.json_response(
+                    _openai_error(f"{field} is too long"), status=400
+                )
+            normalized[field] = value
+
+        payload = body.get("payload")
+        if payload is not None and not isinstance(payload, dict):
+            return web.json_response(
+                _openai_error("payload must be an object"), status=400
+            )
+        if payload is not None:
+            payload_size = len(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+            if payload_size > self._ATTACHMENT_MAX_BYTES:
+                return web.json_response(
+                    _openai_error("payload is too large"), status=413
+                )
+
+        profile_name = str(_request_value(request, "hermes_profile") or "default")
+        hook_data: Dict[str, Any] = {
+            "session_id": session_id,
+            "attachment_id": normalized["attachment_id"],
+            "action_id": normalized["action_id"],
+            "action_token": normalized["action_token"],
+            "turn_id": normalized["turn_id"],
+            "payload": payload,
+            "profile_name": profile_name,
+        }
+        queue = self._ensure_attachment_action_workers()
+        try:
+            queue.put_nowait((profile_name, hook_data))
+        except asyncio.QueueFull:
+            return web.json_response(
+                _openai_error(
+                    "attachment action queue is saturated",
+                    code="attachment_action_saturated",
+                ),
+                status=503,
+            )
+        return web.json_response({"accepted": True}, status=202)
+
+    def _ensure_attachment_action_workers(self) -> "asyncio.Queue":
+        queue = getattr(self, "_attachment_action_queue", None)
+        if queue is not None:
+            return queue
+        queue = asyncio.Queue(maxsize=self._ATTACHMENT_ACTION_QUEUE_MAX)
+        self._attachment_action_queue = queue
+        for _ in range(self._ATTACHMENT_ACTION_WORKERS):
+            task = asyncio.create_task(self._attachment_action_worker(queue))
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        return queue
+
+    async def _attachment_action_worker(self, queue: "asyncio.Queue") -> None:
+        while True:
+            profile_name, hook_data = await queue.get()
+            try:
+                def _invoke() -> None:
+                    from hermes_cli.plugins import invoke_hook
+                    if profile_name and profile_name != "default":
+                        with self._profile_api_scope(profile_name):
+                            invoke_hook("attachment_action", **hook_data)
+                    else:
+                        invoke_hook("attachment_action", **hook_data)
+
+                await asyncio.to_thread(_invoke)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "[zet_agent] attachment_action hook dispatch failed",
+                    exc_info=True,
+                )
+            finally:
+                queue.task_done()
 
     # ------------------------------------------------------------------
     # Goal loop (persistent /goal) — driver accessor + HTTP surface
@@ -2681,11 +2860,16 @@ class ZetAgentAdapter(APIServerAdapter):
             finally:
                 self._end_runtime_import_operation(operation_key)
         payload.setdefault("features", {})["session_steer"] = True
+        payload["features"]["attachment_actions"] = True
         payload["features"]["completed_transcript_import"] = True
         payload["features"]["curated_memory_import"] = memory_import_supported
         payload.setdefault("endpoints", {})["session_steer"] = {
             "method": "POST",
             "path": "/v1/sessions/{session_id}/steer",
+        }
+        payload["endpoints"]["attachment_action"] = {
+            "method": "POST",
+            "path": "/v1/sessions/{session_id}/attachment/action",
         }
         payload["endpoints"]["completed_transcript_import"] = {
             "method": "POST",
@@ -4041,6 +4225,10 @@ class ZetAgentAdapter(APIServerAdapter):
                 "/v1/sessions/{session_id}/clarify/respond",
                 self._handle_clarify_respond,
             )
+            self._app.router.add_post(
+                "/v1/sessions/{session_id}/attachment/action",
+                self._handle_attachment_action,
+            )
             self._app.router.add_get(
                 "/v1/sessions/{session_id}/pending",
                 self._handle_pending,
@@ -4178,6 +4366,10 @@ class ZetAgentAdapter(APIServerAdapter):
             self._app.router.add_post(
                 "/p/{profile}/v1/sessions/{session_id}/clarify/respond",
                 self._profile_handler(self._handle_clarify_respond),
+            )
+            self._app.router.add_post(
+                "/p/{profile}/v1/sessions/{session_id}/attachment/action",
+                self._profile_handler(self._handle_attachment_action),
             )
             self._app.router.add_post(
                 "/p/{profile}/v1/sessions/{session_id}/interrupt",
